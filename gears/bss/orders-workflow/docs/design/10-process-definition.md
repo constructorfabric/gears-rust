@@ -96,12 +96,12 @@ be unless the gate is declared failed
 | Requirement | Design Response |
 |-------------|------------------|
 | `cpt-cf-bss-orders-workflow-fr-owf-start-contract` | The definition starts on `OrderSubmitted` or `OrderAmended` through a platform event trigger (§3.3) and `listen`s for the other Lifecycle triggers inside the running invocation, correlated on `orderId`/`orderVersion` (§3.6 (a), (b), (e), (f)); every consumed trigger passes Orders' `admit-trigger` first, which keeps admission and supersession. |
-| `cpt-cf-bss-orders-workflow-fr-owf-approval-request`, `…-fr-owf-approval-escalation`, `…-fr-owf-approval-decision` | Path (a): `obtain-verdict` → `reflect-verdict` → `open-gates` → a competing `fork` of the decision `listen`, the escalation `wait` and the hold arm; the park arm on an unobtainable verdict. |
-| `cpt-cf-bss-orders-workflow-fr-owf-payment-auth`, `…-fr-owf-fulfillment-plan`, `…-fr-owf-provisioning-intent` | Path (b): `evaluate-payment-auth-eligibility` with a `listen` for `OrderAcceptanceRecorded`, `construct-and-freeze-plan`, `begin-fulfillment`, the two waves and the barrier as an explicitly re-evaluated conjunction of the expected-time `wait` and the all-creates condition. |
+| `cpt-cf-bss-orders-workflow-fr-owf-approval-request`, `…-fr-owf-approval-escalation`, `…-fr-owf-approval-decision` | Path (a): `obtain-verdict` → `reflect-verdict` → `open-gates` → a competing `fork` of the decision `listen`, the escalation re-check tick and the hold arm; the park loop on an unobtainable verdict. |
+| `cpt-cf-bss-orders-workflow-fr-owf-payment-auth`, `…-fr-owf-fulfillment-plan`, `…-fr-owf-provisioning-intent` | Path (b): `evaluate-payment-auth-eligibility` with a `listen` for `OrderAcceptanceRecorded`, `construct-and-freeze-plan`, `begin-fulfillment`, the two waves and the barrier as an explicitly re-evaluated conjunction of the expected-time re-check and the all-creates condition, both answered by `evaluate-activation-eligibility` from Orders' record. |
 | `cpt-cf-bss-orders-workflow-fr-owf-retry`, `…-fr-owf-manual-task`, `…-fr-owf-compensation-execution` | Path (c): task retry policy on the dispatch calls, `try`/`catch` around them, `create-manual-task`, a `listen` for the resolution and either resume or `compensate-order` → `report-outcome`. |
 | `cpt-cf-bss-orders-workflow-fr-owf-terminal-order-events` | Path (d) for an authorised cancel and the terminal-event `listen` arm of path (f): `authorize-cancel` / `terminate-on-terminal-event` → `run-cancellation-fence` → `compensate-order` → `report-outcome` → `terminate-instance`. |
-| `cpt-cf-bss-orders-workflow-fr-owf-hold-resume` | Path (e): hold and resume as signal arms that cancel and re-arm the escalation `wait` with the remainder `apply-hold`/`apply-resume` return; the lifetime ceiling as a top-level competing `wait` that no hold cancels. |
-| `cpt-cf-bss-orders-workflow-fr-owf-overdue-escalation` | The overdue window as a `wait` arm competing with the fulfillment path and cancelled only by the order's own terminal process event; on completion `raise-overdue-escalation` and nothing else. |
+| `cpt-cf-bss-orders-workflow-fr-owf-hold-resume` | Path (e): hold and resume as `listen` arms; the hold wins the gate loop's race, `apply-hold` pauses the gate window in Orders' record and `apply-resume` re-bases it and answers the first `due`; the lifetime ceiling as a top-level competing `P90D` `wait` that no hold cancels. |
+| `cpt-cf-bss-orders-workflow-fr-owf-overdue-escalation` | The overdue window as the top-level `overdueMonitor` branch: an hourly re-check through `raise-overdue-escalation`, which is due only past `expected_fulfillment_at` + 24 h and before a settled outcome, records the escalation once and nothing else, and is never paused by a hold. |
 | `cpt-cf-bss-orders-workflow-fr-owf-process-state-nonauth` | Every effect is a step operation that writes Orders' record; the definition holds no state Orders does not also record, and carries references only. |
 
 #### NFR Allocation
@@ -109,7 +109,7 @@ be unless the gate is declared failed
 | NFR ID | NFR Summary | Allocated To | Design Response | Verification Approach |
 |--------|-------------|--------------|-----------------|----------------------|
 | `cpt-cf-bss-orders-workflow-nfr-owf-durability` | Zero in-flight workflows lost across restarts | Platform plugin (invocation history) + `01` envelope | The plugin resumes the invocation; every re-issued call is absorbed under the same key | Platform worker kill/restart with the canonical definitions; no duplicate effect, no lost step |
-| `cpt-cf-bss-orders-workflow-nfr-owf-escalation-timer` | Per-gate window, default 72 h, ± 5 min | Definition `wait` (plugin durable timer) | The escalation `wait` is armed per gate position with the window `open-gates` returns; hold cancels it and resume re-arms the remainder | Timer-accuracy test across a plugin worker restart; hold/resume test asserting the remainder |
+| `cpt-cf-bss-orders-workflow-nfr-owf-escalation-timer` | Per-gate window, default 72 h, ± 5 min | Definition re-check loop (plugin durable timer) + `03` stored deadline | A fixed `PT5M` `waitEscalation` tick re-checks the gate's stored escalation deadline through `escalate-gate` `mode: fire` (§3.6 *Fixed waits and re-check loops*); a hold pauses the window in Orders' record and `apply-resume` re-bases it | Timer-accuracy test across a plugin worker restart; hold/resume test asserting the remainder |
 | `cpt-cf-bss-orders-workflow-nfr-owf-fulfillment-sla` | p95 ≤ 15 min from activation eligibility to terminal outcome | Definition task timeouts and retry policy; `05` admission | Wave-2 task timeout 3 min, retry budget nested inside it by validation (§2); the barrier releases on the first evaluation after both conjuncts hold | Load test over the canonical definition |
 | `cpt-cf-bss-orders-workflow-nfr-owf-audit` | 100 % of transitions recorded independently of engine history | `01` audit writer | The definition performs no effect outside a step operation, so every transition with an Orders consequence is audited by construction | Definition validation rule (§2): no `run`, no `emit`, every `call` a registered operation |
 | `cpt-cf-bss-orders-workflow-nfr-owf-retention` | Gear-owned record ≥ 400 days independent of engine purge | `01` tables | Platform history retention (`TenantRuntimePolicy`, [`DESIGN.md:735`](../../../../serverless-runtime/docs/DESIGN.md#tenantruntimepolicy)) is set independently and may be shorter; nothing Orders needs lives only there | Purge-independence test |
@@ -128,11 +128,12 @@ be unless the gate is declared failed
 ### 1.3 Architecture Layers
 
 ```text
-Platform registry     POST/GET /api/serverless-runtime/v1/functions — the definition versions,
-(host)                validated on publish by Orders' validation hook (§3.3)
+Platform registry     POST/GET /api/serverless-runtime/v1/functions — the definition versions;
+(host)                Orders' pre-publish validation hook is a pending ask (UPSTREAM_REQS §2.9),
+                      the CI test enforces the rules until then (§3.2)
        │
 Platform plugin       interprets the bound version: do · call · listen · wait · switch · fork ·
-(Temporal)            try/catch/raise · set — durable timers, retry policy, replay, correlation
+(Temporal)            try/catch/raise · set — durable timers, DSL retry, replay, correlation
        │  HTTP call tasks
        ▼
 Orders step surface   POST /bss-orders-workflow/v1/steps/{operation}  (01 §3.3)
@@ -143,8 +144,8 @@ Orders record         owf_definition_binding pins the version per instance (01 �
 
 | Layer | Responsibility | Technology |
 |-------|---------------|------------|
-| Definition | The canonical document of §3.6: one workflow, six paths, calling only registered operations | Serverless Workflow DSL 1.0.0, YAML, jq expressions |
-| Registry and validation | Draft, validate, publish, list versions; the pre-publish validation hook Orders supplies | serverless-runtime Function Registry API ([`DESIGN.md:857`](../../../../serverless-runtime/docs/DESIGN.md#function-registry-api)); plugin registration-validation hook (`DESIGN.md:762`) |
+| Definition | The canonical document of §3.6: one workflow, a stage dispatcher over six paths, calling only registered operations | Serverless Workflow DSL 1.0.0, YAML, jq expressions |
+| Registry and validation | Draft, validate, publish, list versions; the pre-publish validation hook Orders supplies — a pending ask, with the CI test as the enforcing check until it lands | serverless-runtime Function Registry API ([`DESIGN.md:857`](../../../../serverless-runtime/docs/DESIGN.md#function-registry-api)); the platform has only the plugin's registration-validation hook (`DESIGN.md:762`); `…-upreq-serverless-runtime-definition-versioning-validation-hook` |
 | Execution | Invocation lifecycle, timers, retry, event correlation, signals | serverless-runtime Temporal plugin (no code today) |
 | Orders | Step operations, the binding, the record | [`01`](./01-foundation.md)–[`09`](./09-read-and-authz.md) |
 
@@ -209,17 +210,18 @@ suspend/resume, and event subscription … using its backend's native primitives
 
 | Construct | Spec meaning | Use in Orders definitions | Platform mapping |
 |-----------|--------------|---------------------------|------------------|
-| `do` | An ordered list of named tasks | The path body; every stage is a `do` list | Sequential activities of the interpreted workflow |
+| `do` | An ordered list of named tasks; a flow directive may target only a task of the same list (dsl.md *Task Flow*) | The stage dispatcher and its stage tasks; every stage is one flat `do` list that ends with `then: exit` back to `dispatch` (§3.6, D-80 as amended) | Sequential activities of the interpreted workflow |
 | `call: http` | Perform an HTTP request (`method`, `endpoint`, `headers`, `body`); a non-2xx answer raises a *communication* error carrying the HTTP `status` | Every step operation: `POST /bss-orders-workflow/v1/steps/{operation}` with `Idempotency-Key` derived from task inputs. A `call` to a registered Function is permitted **only** where the operation is `composable` | The plugin's activity for outbound HTTP; the 4xx/5xx answer is the `$error` the `catch` sees |
-| `listen` | Consume one or more events matching filters (`to.one`, `to.any`, `to.all`), each filter `with` event properties and `correlate`-d on expressions | The eight non-start Lifecycle triggers, the approval decision, Subscriptions confirmations and operator signals, correlated on `orderId` and `orderVersion` | Temporal signal / event subscription with event-driven continuation (ADR-0004 *Option A*, `DESIGN.md:630`) |
-| `wait` | Pause for a duration | Escalation window, barrier polling interval, expected-fulfillment wait, overdue window, lifetime ceiling | Temporal durable timer; survives worker restart |
+| `listen` | Consume one or more events matching filters (`to.one`, `to.any`, `to.all`), each filter `with` event properties and `correlate`-d on expressions; the output is the array of consumed events, read as `data` unless `read` says otherwise (dsl-reference.md *Listen*) | The eight non-start Lifecycle triggers, the approval decision, Subscriptions confirmations and operator signals, correlated on `orderId` and `orderVersion`; always `read: envelope` with an `output.as` over `.[0]` that keeps reference members only | Temporal signal / event subscription with event-driven continuation (ADR-0004 *Option A*, `DESIGN.md:630`) |
+| `wait` | Pause for a duration given as an inline duration object or an ISO 8601 string — never a runtime expression (dsl-reference.md *Wait*) | Fixed ticks of the re-check loops (§3.6 *Fixed waits and re-check loops*) and the literal `P90D` lifetime ceiling | Temporal durable timer; survives worker restart |
 | `switch` | Evaluate cases in order; the first `when` that holds (or the default case) selects a `then` | Verdict, reflection, admission, gate state, policy, resolution branching | Deterministic branch inside the interpreted workflow |
-| `fork` | Run branches concurrently; `compete: true` completes with the first branch to finish and cancels the others | The gate loop (decision × escalation × hold × cancel × amendment), the barrier (confirmation `listen` × poll `wait`), the overdue arm, the lifetime arm | Concurrent branches with cancellation of the losers |
-| `try` / `catch` | Run tasks; on an error matching `catch.errors`, optionally `retry` under a policy, then run `catch.do` | Retry of transient step failures under `use.retries.transient`; the failure arm of path (c) | Temporal retry policy on the activity, then the catch branch |
-| `raise` | Raise an error (`type`, `status`, `title`, `detail`) | Converting an operation's permanent outcome into a fault the enclosing `catch` routes | Interpreted error |
-| `set` | Set data in the task's output | Recording which arm of a `fork` completed, re-keying references into `$context` (with `export.as`) | Workflow-local data |
+| `fork` | Run branches concurrently; `compete: true` completes with the first branch to finish and cancels the others | The top-level `lifetime` fork (process × ceiling × overdue monitor); every stage wait (gate loop, park loop, eligibility, expected time, barrier, task resolution, resume wait, operator wait after the ceiling) | Concurrent branches with cancellation of the losers |
+| `try` / `catch` | Run tasks; on an error matching `catch.errors` and `catch.when`, optionally `retry` under a policy, then run `catch.do` | Retry of transient step failures under `use.retries.transient`; classifying a spent budget, a spent timeout or a 409 into a `set` the next `switch` routes | The plugin's interpretation of the DSL `catch.retry`; **not** the platform `RetryPolicy`, which is invocation-level and keyed by SDK error category (`DESIGN.md:354`–`370`) |
+| `raise` | Raise an error (`type`, `status`, `title`, `detail`) | The dispatcher's `unknownStage` case: a version defect faults the invocation rather than routing anywhere | Interpreted error; the invocation goes to `failed` |
+| `set` | Set data in the task's output | Recording which arm of a `fork` completed, the stage routing (`nextStage`, `stageLoop`, `returnStage`), re-keying references into `$context` (with `export.as`) | Workflow-local data |
 
-Not used: `run` and `emit` (above), and `for` — the spec's `for` iterates **sequentially**, and
+Not used: `run` and `emit` (above), `schedule` (the start mechanism is the platform event
+trigger, §3.3), and `for` — the spec's `for` iterates **sequentially**, and
 `fork` takes a **static** branch list, so the DSL has no per-line dynamic parallel fan-out. Wave
 dispatch is therefore **one `call` per wave carrying the line set as references**, and the bounded
 per-order parallelism is inside `dispatch-wave1-create` / `dispatch-wave2-activate` under the
@@ -227,10 +229,19 @@ admission controls of [`05`](./05-provisioning-intents.md); this is registered u
 
 **Retry policy** is declared once in `use.retries.transient` — `delay` 1 s, `backoff.exponential`,
 `jitter` from 0 s to 30 s, `limit.attempt.count` 5 — and attached by `catch.retry` to the `try`
-around each call whose operation is `retryable-on: transient`. The retry condition is
-`$error.status` in {429, 503, 504, 409}: the envelope answers a transient failure, an open
-breaker, `still-processing` and `idempotency-lease-expired` with those statuses
-([`01 §3.3`](./01-foundation.md#the-step-operation-contract)). A 409 `idempotency-key-conflict`
+around each call whose operation is `retryable-on: transient`; this is the DSL's per-task retry
+(dsl-reference.md *Try*, *Retry*), not the platform's invocation-level `RetryPolicy`
+(`DESIGN.md:354`–`370`). The retry condition is `$error.status` in {429, 503, 504, 409}, written as
+a set test in `catch.when` —
+`'${ $error.status as $s | any((429, 503, 504, 409); . == $s) }'` — over the DSL communication
+error type: the envelope answers a transient failure, an open breaker, `still-processing` and
+`idempotency-lease-expired` with those statuses
+([`01 §3.3`](./01-foundation.md#the-step-operation-contract)). A status the set does not name,
+such as 400, is not retried because no `catch` matches it. Where an outer `catch` owns the 409 —
+`admit-trigger`'s supersession wait, `begin-fulfillment`'s version-mismatch, the waves'
+read-before-re-issue — the inner `catch` uses the same test without 409. Every task that calls an
+operation declares a `timeout` (`use.timeouts`: `step` 3 min, `wave1` 10 min, `wave2` 3 min,
+`admission` 25 h) on the `try` that carries its retry, so rule 4's nesting is checkable per task. A 409 `idempotency-key-conflict`
 is a caller defect the same-key retry cannot fix; it exhausts the budget bounded and lands in the
 failure arm with its reason. Whether the plugin surfaces the Problem body's `error_code` on
 `$error` so the two 409s can be told apart before the budget is spent is part of Q-11.
@@ -240,7 +251,7 @@ failure arm with its reason. Whether the plugin surfaces the Problem body's `err
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-constraint-definition-listen-targets`
 
 A `listen` filter `with.type` **MUST** be one of: the nine Orders Lifecycle state events
-(`OrderSubmitted` and `OrderAmended` as the start triggers of `schedule.on`; `OrderApproved`,
+(`OrderSubmitted` and `OrderAmended` as the two platform event triggers of §3.3; `OrderApproved`,
 `OrderAmended`, `OrderHeld`, `OrderResumed`, `OrderAcceptanceRecorded`, `OrderCancelled`,
 `OrderExpired`, `OrderRejected` as `listen` targets), whose GTS identifiers are Lifecycle's
 (`gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.<name>.v1~`,
@@ -248,7 +259,8 @@ A `listen` filter `with.type` **MUST** be one of: the nine Orders Lifecycle stat
 the approval decision event of [`03 §3.3`](./03-approval-execution.md#33-api-contracts); the
 two Subscriptions outcome events of [`05 §3.3`](./05-provisioning-intents.md#33-api-contracts)
 (`ProvisioningIntentConfirmed`, `ProvisioningIntentFailed`); Orders' own
-`OrderFulfillmentCompleted` and `OrderFulfillmentAborted` (used only to cancel the overdue arm);
+`OrderFulfillmentCompleted` and `OrderFulfillmentAborted` (permitted; the canonical version no longer listens for them,
+because its overdue monitor stops with the invocation, §3.6 (b));
 and the operator signal types of §3.3 — `cancel-requested` (08), `reauthorize-requested` (04),
 `task-resolution-requested` (07) and `unpark-requested`. Every filter **MUST** `correlate` on
 `orderId` and `orderVersion` against `$context`, except the `OrderAmended` `listen`, which
@@ -261,9 +273,11 @@ before publish.
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-constraint-definition-validation-rules`
 
-A definition version **MUST** pass every rule below in the validation hook the platform registry
-calls before publish (§3.3) **and** in the CI test that runs the same rules over the canonical
-definitions of §3.6 in this repository:
+A definition version **MUST** pass every rule below in the CI test that runs them over the
+canonical definitions of §3.6 in this repository **and**, once the platform registry calls a
+consumer-supplied hook before publish — a pending ask
+(`cpt-cf-bss-orders-workflow-upreq-serverless-runtime-definition-versioning-validation-hook`,
+[`../UPSTREAM_REQS.md`](../UPSTREAM_REQS.md) §2.9) — in that hook (§3.2):
 
 1. [ ] - `p1` - Every `protected` operation of each path appears exactly where §4 *The fence* orders it; `settle-from-lookup` never appears - `inst-def-protected-present`
 2. [ ] - `p1` - Every `call: http` targets `POST /bss-orders-workflow/v1/steps/{operation}` with `{operation}` a row of `owf_step_operation`; a `call` to a Function is allowed only where the corresponding operation is `composable` - `inst-def-call-targets`
@@ -271,8 +285,8 @@ definitions of §3.6 in this repository:
 4. [ ] - `p1` - Bounds nest: for every `call`, the operation's `deadline_ms` **<** the cumulative backoff of its retry policy **<** the task's `timeout` **<** the overdue `wait` **<** the lifetime `wait` - `inst-def-bounds-nest`
 5. [ ] - `p1` - Every task `input`, `output`, `export` and every `body` member validates against the operation's registered reference schemas; no member outside them - `inst-def-references-only`
 6. [ ] - `p1` - No `protected` operation is inside a `try` whose `catch` has no `raise` or `then` that leaves the stage — its failure **MUST** propagate to the path's failure arm - `inst-def-no-swallowing-catch`
-7. [ ] - `p1` - No `run`, no `emit`, no `for`; `schedule.on` names exactly `OrderSubmitted` and `OrderAmended` — Lifecycle publishes no `OrderSubmitted` after an amendment ([Lifecycle `04 §4.3`](../../../orders-lifecycle/docs/design/04-versioning.md#43-re-approval-is-a-two-step-seam-interaction-normative), `02 §4.7` item 9) - `inst-def-grammar-subset`
-8. [ ] - `p1` - Every branch of a competing `fork` ends by `set`-ting `arm` so the sibling `switch` can route; every `fork` is followed by a `switch` on `arm` - `inst-def-fork-routing`
+7. [ ] - `p1` - No `run`, no `emit`, no `for`, no `schedule`: the start mechanism is exactly the two platform event triggers of §3.3, `OrderSubmitted` and `OrderAmended` — Lifecycle publishes no `OrderSubmitted` after an amendment ([Lifecycle `04 §4.3`](../../../orders-lifecycle/docs/design/04-versioning.md#43-re-approval-is-a-two-step-seam-interaction-normative), `02 §4.7` item 9); every `wait` is a literal duration (§3.6 *Fixed waits and re-check loops*) - `inst-def-grammar-subset`
+8. [ ] - `p1` - Every branch of a competing `fork` that can complete ends by `set`-ting `arm` so the sibling `switch` can route; every `fork` is followed by a `switch` on `arm`; every `then` names a task of its own `do` list, `exit` or `end` (the stage dispatcher of §3.6) - `inst-def-fork-routing`
 
 #### Versioning, pinning, publish
 
@@ -285,8 +299,10 @@ version** is required for any change to the `do` structure, a `wait` value, a re
 instance is **pinned** at `start-instance` to the version the invocation runs
 ([`01 §3.7` `owf_definition_binding`](./01-foundation.md#table-owf_definition_binding)) and runs
 to termination on it; migration is out of scope (PRD §5.2); a version **MUST NOT** be archived or
-deleted while a binding names it, and the platform registry's `archived`/`deleted` transitions
-(`DESIGN.md:588`) are gated by that check in the validation hook. **Publish roles**: the
+deleted while a binding names it; the platform registry's `archived`/`deleted` transitions
+(`DESIGN.md:599`–`610`) are to be gated by that check in the validation hook once the platform
+offers it (pending ask, §2.2), and until then by the release pipeline and the CI assertion of
+§4.2. **Publish roles**: the
 platform operator today, through the registry's publish operation under platform authorization;
 a seller-scoped fragment role is registered as **Q-10** (`../DECISIONS.md`). **Audit of
 publishes**: the registry is the platform's system of record for who published what and when;
@@ -313,12 +329,23 @@ registry; GTS reference schemas from `01 §3.3` for every task boundary.
 
 The registered Workflow callable `gts.cf.core.sless.workflow.v1~cf.bss.orders_workflow.order_process.v1~`
 (derived from the platform's workflow base type, [`DESIGN.md:279`](../../../../serverless-runtime/docs/DESIGN.md#functions-and-workflows)):
-its `implementation` is the declarative `workflow_spec` of §3.6 (`DESIGN.md:388`), its
-`workflow_traits` declare it **async-only** (it suspends on `listen` and `wait`; a sync invocation
-**MUST** be rejected, `DESIGN.md:653`) and declare **no function-level `on_failure`/`on_cancel`
-handler** — compensation is a path through Orders' own operations (§3.6 (c), (d)), never a
-platform-invoked function that would act outside the record. Its `schema.params` is the reference
-tuple of the start event. One callable, many versions.
+its `implementation` is the declarative `workflow_spec` of §3.6 (`DESIGN.md:388`). Its
+`workflow_traits` (`gts.cf.core.sless.workflow_traits.v1~`,
+[DESIGN_GTS_SCHEMAS.md](../../../../serverless-runtime/docs/DESIGN_GTS_SCHEMAS.md#workflowtraits)
+lines 466–530) declare the three required members: `compensation: { on_failure: null,
+on_cancel: null }` — **no function-level handler**, because compensation is a path through
+Orders' own operations (§3.6 (c), (d)), never a platform-invoked function that would act outside
+the record; `checkpointing: { strategy: automatic }`; and **`max_suspension_days: 90`**
+(schema default 30, lines 520–529), because a suspension longer than the cap moves the invocation
+`suspended → failed` (`DESIGN.md:455`) and the process may legitimately wait up to its lifetime
+ceiling. Whether tenant policy may cap `max_suspension_days` below 90, and whether the cap
+measures one suspension or accumulated suspended time, are upstream asks
+([`../UPSTREAM_REQS.md`](../UPSTREAM_REQS.md) §2.9); with the re-check loops of §3.6 the
+invocation wakes at least hourly, so no single suspension approaches the cap. The platform says a
+workflow's traits SHOULD declare whether it is async-only (`DESIGN.md:653`), but the
+`WorkflowTraits` schema has no such member; how to declare it is an upstream ask, and until it is
+answered the only starts are the asynchronous trigger starts of §3.3. Its `schema.params` is the
+reference tuple of the start event. One callable, many versions.
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-entity-definition-version`
 
@@ -330,14 +357,17 @@ It is what an instance pins to and what the fence of §4 is checked against.
 
 One named task of a version: a `call` bound to one registered operation with a derived
 idempotency key, or a `listen`, `wait`, `switch`, `fork`, `try`, `raise` or `set` of §2.2. A
-`call` task's identity (`$task.name`) plus the invocation id is the `attemptId` the operation
-records until the platform supplies its own ([`01 §3.3` *Attempt identity*](./01-foundation.md#33-api-contracts)).
+`call` task's identity (`$task.name`) plus `$workflow.id` is the `attemptId` the operation
+records until the platform supplies its own ([`01 §3.3` *Attempt identity*](./01-foundation.md#33-api-contracts));
+that `$workflow.id` equals the platform `invocation_id` is assumed, not stated by the platform,
+and is part of the attempt-identity ask (§3.6).
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-entity-process-signal`
 
 An operator-originated instruction delivered to a running invocation and consumed by a `listen`
 arm: `cancel-requested` (an authorised workflow-mediated cancel, [`09 §3.3`](./09-read-and-authz.md#33-api-contracts)),
-`reauthorize-requested` (a payment re-authorisation, [`04`](./04-fulfillment-plan.md)),
+`reauthorize-requested` (an operator's payment re-authorisation, [`04`](./04-fulfillment-plan.md);
+origin route pending, Q-13),
 `task-resolution-requested` (an operator's `retry`, `override` or `cancel` of a manual task,
 [`07 §3.3`](./07-manual-tasks.md#33-api-contracts)) and `unpark-requested` (after a
 lifetime-ceiling park; origin route pending, §3.6 (d)). Hold
@@ -358,14 +388,14 @@ the operation the arm calls.
 graph TB
     AUTH[Definition author / platform operator]
     REG[serverless-runtime Function Registry<br/>/api/serverless-runtime/v1/functions]
-    HOOK[Orders validation hook<br/>rules of §2.2]
+    HOOK[Orders validation hook<br/>rules of §2.2 — pending ask; CI test until then]
     OPR[owf_step_operation<br/>01 §3.7]
     TRG[Event triggers: OrderSubmitted, OrderAmended → order_process]
     PLG[Temporal plugin: running invocation]
     STEPS[Orders step surface 01 §3.3]
     SIG[Orders control gateway 09 §3.3 → invocations/{id}:plugin-control]
     AUTH -->|register draft, validate, publish| REG
-    REG -->|registration-validation hook| HOOK
+    REG -.->|consumer pre-publish hook: pending ask| HOOK
     HOOK -->|reads protected list, deadlines, schemas| OPR
     TRG -->|starts invocation of the bound version| PLG
     PLG -->|call tasks| STEPS
@@ -384,7 +414,7 @@ The platform validates a definition against the Serverless Workflow JSON Schema
 ([`DESIGN.md:762`](../../../../serverless-runtime/docs/DESIGN.md#function-registry)); neither knows
 which operations are protected, which triggers are closed, or what Orders' deadlines are. This
 component supplies that knowledge at the one moment it matters — before a version can be
-published.
+published — once the platform calls it; today it runs only as the CI test (below).
 
 ##### Responsibility scope
 
@@ -422,10 +452,13 @@ process does next, and so that Orders records the decision through `authorize-ca
 
 ##### Responsibility scope
 
-Translating an authorised control operation of [`09 §3.3`](./09-read-and-authz.md#33-api-contracts)
-into a signal to the instance's `invocation_id` (`01 §3.7`), carrying the reference tuple and the
-signal type of §3.3; recording the request in Orders before delivery so a signal the platform loses
-is visible as an unanswered request; retrying delivery under the caller-side duplicate protocol.
+Delivering the request row that an authorised control operation of
+[`09 §3.3`](./09-read-and-authz.md#33-api-contracts) has already recorded — 09's gateway is the
+sole writer of that row — as a signal to the instance's `invocation_id` (`01 §3.7`), carrying the
+reference tuple and the signal type of §3.3; reporting each delivery outcome through 09's
+request-delivery port, the one write path to `delivery_state`, so a signal the platform loses is
+visible as an unanswered request; retrying delivery under the caller-side duplicate protocol. It
+records no row of its own.
 
 ##### Responsibility boundaries
 
@@ -451,12 +484,12 @@ payload that deliver a Temporal signal are an **upstream ask** (§3.3).
 
 | Purpose | Platform endpoint | Reference | Orders' use |
 |---------|-------------------|-----------|-------------|
-| Register draft, validate, publish, list versions, deprecate | `/api/serverless-runtime/v1/functions` (CRUD over Function and Workflow entities) | `DESIGN.md:857` | Publishing a definition version; the validation hook of §3.2 runs inside "validate" and "publish"; `owf_definition_binding` blocks archive/delete of a bound version |
-| Start an invocation | `POST /api/serverless-runtime/v1/invocations` with `function_id`, `mode: async`, `params`, `Idempotency-Key` | `DESIGN.md:865`, `DESIGN.md:895`–`910` | Not called by Orders — the event trigger starts every invocation. An operator re-drive of a dead invocation is `…:control` `retry` keeping `invocation_id` (D-86), never a second start; until the platform confirms that property, the instance is unwound and the order re-submitted, which starts through the trigger again |
+| Register draft, validate, publish, list versions, deprecate | `/api/serverless-runtime/v1/functions` (CRUD over Function and Workflow entities) | `DESIGN.md:857` | Publishing a definition version from the release pipeline after the CI test of §3.2; the validation hook would run inside "validate" and "publish" once the platform calls a consumer hook (pending ask); `owf_definition_binding` is to block archive/delete of a bound version through that hook, and until then through the pipeline |
+| Start an invocation | `POST /api/serverless-runtime/v1/invocations` with `function_id`, `mode: async`, `params`, `Idempotency-Key` | `DESIGN.md:865`, `DESIGN.md:895`–`910` | Not called by Orders — the event trigger starts every invocation. An operator re-drive is `…:control` `retry` from `failed` keeping `invocation_id` (D-86), never a second start; with no function-level handler a failure goes on to `dead_lettered` (`DESIGN.md:458`), from which `retry` is not offered (`DESIGN.md:888`), and "retry from `dead_lettered`, keeping `invocation_id`" is part of the signals ask; until both are confirmed the instance is unwound and the order re-submitted, which starts through the trigger again |
 | Read invocation status | `GET /api/serverless-runtime/v1/invocations/{invocation_id}` | `DESIGN.md:867` | The `reconciliation-sweep` worker's no-live-invocation metric (`01 §3.8`) and the progress read (`09`) |
-| Generic control | `POST …/invocations/{invocation_id}:control` (`cancel`, `suspend`, `resume`, `retry`, `replay`) | `DESIGN.md:868`, `DESIGN.md:883`–`889` | `retry` from `failed` by an operator re-drive only; `cancel` **never** for an order cancel (§3.2); `suspend`/`resume` **never** — hold is a definition arm, not a platform suspension |
+| Generic control | `POST …/invocations/{invocation_id}:control` (`cancel`, `suspend`, `resume`, `retry`, `replay`) | `DESIGN.md:868`, `DESIGN.md:883`–`889` | `retry` from `failed` by an operator re-drive only (the only state the platform offers it from, `DESIGN.md:888`); `cancel` **never** for an order cancel (§3.2); `suspend`/`resume` **never** — hold is a definition arm, not a platform suspension |
 | Plugin control (signals) | `POST …/invocations/{invocation_id}:plugin-control` | `DESIGN.md:869`, `DESIGN.md:893` | Delivery of `cancel-requested`, `reauthorize-requested`, `task-resolution-requested` and `unpark-requested` to the running invocation's `listen` arms |
-| Event trigger binding | `/api/serverless-runtime/v1/event-triggers` (create, enable, disable, metrics) | `DESIGN.md:980`–`987` | Two trigger bindings to `order_process` — `OrderSubmitted`, filtered to `category = new_sale`, and `OrderAmended` (`02 §2.2`); their dead-letter handling is the platform's (`01 §4.8`) |
+| Event trigger binding | `/api/serverless-runtime/v1/event-triggers` (create, enable, disable, metrics) | `DESIGN.md:980`–`987` | Two trigger bindings to `order_process`, the one start mechanism (the document declares no `schedule`) — `OrderSubmitted`, filtered to `category = new_sale`, and `OrderAmended` (`02 §2.2`) — each with `callable_type: workflow` and `execution_context: system`, the platform identity ([DESIGN_GTS_SCHEMAS.md](../../../../serverless-runtime/docs/DESIGN_GTS_SCHEMAS.md) line 1697), because an `event_source` identity would be Lifecycle's producer principal, which the step route refuses; their dead-letter handling is the trigger's `dead_letter_queue` (line 1651; its management API is out of the platform's scope) (`01 §4.8`) |
 | Timeline (debug) | `GET …/invocations/{invocation_id}/timeline` | `DESIGN.md:1061` | Operator debugging only; never an Orders read path |
 
 **Signals.** The operator-facing instructions map as follows:
@@ -466,9 +499,9 @@ payload that deliver a Temporal signal are an **upstream ask** (§3.3).
 | hold | Lifecycle `OrderHeld` | Broker event, correlated `listen` | §3.6 (e) | `apply-hold` (08) |
 | resume | Lifecycle `OrderResumed` | Broker event, correlated `listen` | §3.6 (e) | `apply-resume` (08) |
 | cancel | Seller operator, `POST /bss-orders-workflow/v1/workflows/{orderId}/cancel` (`09 §3.3`) | `…:plugin-control` signal `cancel-requested` | §3.6 (d) | `authorize-cancel` (08) |
-| re-authorise | Operator / Payments outcome (`04`); origin route pending (`09 §3.3`) | `…:plugin-control` signal `reauthorize-requested` | §3.6 (b) | `evaluate-payment-auth-eligibility` (04) |
+| re-authorise | Operator, through a control route that is pending (`09 §3.3`, Q-13); a Payments push would be delivered as the same signal only if Payments adds one (`04 §3.3`) | `…:plugin-control` signal `reauthorize-requested` | §3.6 (b) | `evaluate-payment-auth-eligibility` (04) |
 | resolve a manual task | Fulfillment or Seller operator `retry` / `override` / `cancel` (`07 §3.3`) | `…:plugin-control` signal `task-resolution-requested` | §3.6 (c) | `resolve-manual-task` (07) |
-| unpark after the lifetime ceiling | Origin route pending (`09 §3.3`) | `…:plugin-control` signal `unpark-requested` | §3.6 (d) | `unpark` (01) |
+| unpark after the lifetime ceiling | Origin route pending (`09 §3.3`, Q-13); today an operator `retry` of the `lifetime-ceiling-reached` task reaches the same `unpark` through `task-resolution-requested` | `…:plugin-control` signal `unpark-requested` | §3.6 (d) | `unpark` (01) |
 
 The platform states that the plugin "owns the verb set its backend supports" on
 `:plugin-control` (`DESIGN.md:893`) and that Temporal signals are native (ADR-0004 *Option A*);
@@ -505,28 +538,118 @@ and the Generic Approval service are reached only from inside step operations (s
 ### 3.6 Interactions & Sequences
 
 The canonical definition is **one document**; the six paths below are fragments of its `do` tree,
-shown separately for review. Conventions used throughout: `$context.stepsBase` is the internal
-step surface base URL; `ref` is the reference tuple every body carries —
-`{ correlationId, orderId, orderVersion, resourceTenantId, invocationId: $workflow.id,
-attemptId: ($workflow.id + ":" + $task.name) }`; a `call` shown as
-`step: <operation>` expands to the `call: http` form of the first fragment; a `set` shown in a
-fragment is also exported into `$context` (`export.as: ${ $context + . }`), which the
-specification requires to be written out and these fragments elide; a `try` shown with
-`retry: transient` catches the statuses of the retry condition of §2.2; the word
-**protected** marks operations the fence of §4 requires. Every `body` member is a reference or an
-enum (§2.1). Values marked *Q-11* depend on the DSL accepting a runtime expression where shown.
+shown separately for review. The fragments are **abridged**: they are not the published bytes
+and are not by themselves a valid document. The complete canonical document is the repository
+file `definitions/order-process.yaml` (§3.7), and **that** file is the CI artefact that must
+validate against the Serverless Workflow DSL 1.0.0 schema (dsl-reference.md, *Workflow*) and
+against the rules of §2.2. The abridgements are exactly these, and nothing else is elided:
 
-**Two routing conventions keep the arms honest.** (1) Every branch of a competing `fork`
-**only listens or waits** and then `set`s `arm` (and the references the arm needs); no step
-operation runs inside a competing branch, so a losing branch is never cancelled halfway through an
-operation, and the sibling `switch` routes the winner to the path that calls the operation. (2)
-Every stage loop records its own name in `$context.stageLoop` on entry; the shared paths that
-return to "the stage the arm left" — an admission that answers `absorbed-duplicate`,
-`ignored-superseded` or `ignored-terminated`, a recorded hold outside the approval stage, a
-resume, a denied cancel, a `terminate: false` — end in `returnToStage`, a `switch` on
-`$context.stageLoop` whose cases are the loop tasks named below (`parkLoop`, `parkLoopEscalated`,
-`gateLoop`, `outageArm`, `awaitEligibilityChange`, `barrierLoop`, `awaitResolution`,
-`awaitCompensationResolution`, `awaitOperatorAfterPark`, `awaitResume`).
+- A placeholder in guillemets — `‹lifecycle arm of (f)›`, `‹approval stage, below›`,
+  `‹abridged call›` — stands for the construct it names, written out in full where named.
+- A task written `step: <operation>` stands for the `call: http` task shown in full as `admitStart`
+  in fragment (a): `method: post`, `endpoint` `$context.stepsBase + "/<operation>"`, the
+  `Idempotency-Key` header derived from the task inputs, and a `body` of `ref` plus the members
+  named in the comment. Its `try`, `catch` and `timeout` are **never** elided: where they are not
+  written, the task has none.
+- `ref` is the reference tuple every body carries — `{ correlationId, orderId, orderVersion,
+  resourceTenantId, invocationId: $workflow.id, attemptId: ($workflow.id + ":" + $task.name) }`.
+  **`$workflow.id` is assumed to equal the platform `invocation_id`**: the DSL defines it only as
+  "a unique id of the workflow execution" (dsl.md, *Workflow Descriptor*) and the serverless-runtime
+  design does not state the equality; it is part of the attempt-identity ask
+  ([`../UPSTREAM_REQS.md`](../UPSTREAM_REQS.md) §2.9 *Attempt identity and deadline propagation on
+  every call*).
+- A `set` shown in a fragment is also exported into `$context` with
+  `export: { as: '${ $context + . }' }`, which the complete document writes out.
+- `catch: *transient` and `catch: *transientNo409` are YAML aliases of the two anchors written
+  out in fragment (a); the complete document is one YAML stream, so the aliases resolve there.
+
+**The stage dispatcher** (D-80 as amended: a 1.0.0 flow directive may target only a task in its
+own `do` list, dsl.md *Task Flow*). The dispatcher's level is the `process` branch of the
+top-level `lifetime` fork rather than the document's own `do` list, because the lifetime ceiling
+must compete with every stage; that branch holds
+one composite task per stage — `approval`, `fulfillment`, `failure`, `unwind`, `cancel`,
+`ceiling`, `hold`, `resume`, `lifecycle` — and a `dispatch` switch on `$context.nextStage` whose
+cases `then:` to those siblings. Every stage task carries `then: dispatch`. Inside a stage the
+tasks form **one flat `do` list** and jump only to siblings in it; a stage ends by `set`-ting
+`$context.nextStage` and `then: exit`, which halts the stage's list (dsl-reference.md, *Flow
+Directive*), completes the stage task and returns through its `then: dispatch`. Every stage opens
+with an `enter` switch on `$context.stageLoop` that re-enters the checkpoint the stage last
+recorded, and otherwise starts at its first task. A path that ends the process ends the workflow
+with `then: end` after `terminate-instance`. No `then:` in the canonical definition names a task
+at another depth.
+
+**Listen output** (dsl-reference.md, *Listen*: a `listen` produces "a sequentially ordered array
+of all the events it has consumed", reading `data` by default). Every `listen` below sets
+`read: envelope` and an `output.as` that reads the first consumed event as `.[0]` — `.[0].id`,
+`.[0].type`, `.[0].data.<member>` — and selects **only the reference members** the arm needs; the
+arm's `set` reads those. The `correlate.from` expressions evaluate on the filtered event itself and
+keep `.data.<member>`. The same selection applies to the start trigger's input in `input.from`.
+Whether the plugin persists only the selected members, or the raw event before selection, is not
+stated by the platform: it is the ask
+`cpt-cf-bss-orders-workflow-upreq-serverless-runtime-consumed-event-member-storage`, and the
+alternative route is Lifecycle's thin events, `cpt-cf-bss-orders-workflow-upreq-lifecycle-thin-events`
+([`../UPSTREAM_REQS.md`](../UPSTREAM_REQS.md) §2.9, §2.4); until one lands the consumed events
+sit in engine history as published, the residual of `../ADR/0013` *Trigger inputs and consumed
+events*.
+
+**Retry and timeout.** `catch: *transient` retries under `use.retries.transient` when
+`$error.status` is in {429, 503, 504, 409}; `catch: *transientNo409` is the same set without 409,
+used where an outer `catch` owns the 409 (§2.2). Every task that calls an operation declares a
+`timeout` from `use.timeouts` — `step` (3 min), `wave1` (10 min), `wave2` (3 min), `admission`
+(25 h) — on the `try` that carries its retry, so the cumulative backoff nests inside it (§2.2
+rule 4). A timeout raises the DSL's timeout error (`status` 408, dsl.md *Errors*); it is caught
+only where an outer `catch` names 408, and otherwise faults the invocation.
+
+**Two routing conventions keep the arms honest.** (1) Every branch of a **stage** `fork` only
+listens or waits and then `set`s `arm` (and the references the arm needs); no step operation runs
+inside a competing stage branch, so a losing branch is never cancelled halfway through an
+operation, and the sibling `switch` routes the winner to the task that calls the operation. The
+two top-level branches beside `process` are the exception by construction: `lifetimeCeiling`
+only waits, and `overdueMonitor` calls one `composable` operation whose answer routes nothing, so
+cancelling it in flight loses nothing the envelope has not recorded. (2) The arm values of the
+shared arms are stage names — `hold`, `resume`, `lifecycle`, `cancel` — and every stage routes
+them to its own `leave` task, `{ set: { nextStage: '${ .arm }', returnStage: <this stage> },
+then: exit }`; the shared stage ends in `back`, `{ set: { nextStage: '${ $context.returnStage }' },
+then: exit }`, and the `enter` switch of the returning stage re-enters `$context.stageLoop`.
+Re-entry at a checkpoint re-issues the checkpoint's calls under their unchanged idempotency keys,
+which the envelope answers with the stored outcome (`01 §3.3`).
+
+#### Fixed waits and re-check loops
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-constraint-definition-fixed-waits`
+
+A 1.0.0 `wait` accepts only an inline duration object or an ISO 8601 duration string, not a
+runtime expression (dsl-reference.md, *Wait*; the `duration` definition of the 1.0.0 schema). A
+deadline Orders computes is therefore a **bounded re-check loop**: a `wait` of the fixed
+granularity below, then a `call` to the Orders operation that owns the stored deadline — which
+compares database time with it and answers `due: true|false` — and a `switch` that loops while
+`due` is `false`. No Function is used as a sleeper: serverless-runtime Functions are "bounded by
+platform timeout limits" and durable waits belong to Workflows
+([serverless-runtime DESIGN](../../../../serverless-runtime/docs/DESIGN.md#function) `DESIGN.md:579`,
+`DESIGN.md:582`). A `due: false` answer from `arm-park-escalation`, `escalate-gate` `mode: fire`
+and `raise-overdue-escalation` records nothing and leaves the operation's idempotency record
+`open`, the same pattern `obtain-verdict` uses for an unobtainable verdict, so the loop calls the
+same key again. The granularity is part of the definition version (§2.2 *Versioning*); the
+deadline stays the owning slice's stored value, so no definition version can move it.
+
+| Wait (task name) | Fragment | Fixed granularity | Re-check operation (owner) | Answer the switch reads |
+|------------------|----------|-------------------|----------------------------|-------------------------|
+| `waitCeiling` — lifetime ceiling | (a) | `P90D`, literal; no re-check | — | — |
+| `waitTtlMargin` — park escalation, also the verdict retry interval | (a) | `PT5M` | `arm-park-escalation` (03) | `due` |
+| `waitEscalation` — approval escalation window | (a) | `PT5M` — worst-case lateness one tick plus one call, at the edge of the ± 5 min of `nfr-owf-escalation-timer`; a version that needs margin shortens it | `escalate-gate` `mode: fire` (03) | `due` |
+| `waitProbe` — approval-service probe, and in `outageArm` the outage threshold | (a) | `PT30S` (`03 §4.5` item 5) | `escalate-gate` `mode: probe` (03) | `serviceState`; `due` on `outage` |
+| resumed escalation window | (e) | none of its own: the first answer is `apply-resume`'s | `apply-resume` (08), then `waitEscalation` | `due` |
+| `waitEligibility` — eligibility poll | (b) | `PT5M` (`04 §4.8` item 5) | `evaluate-payment-auth-eligibility` (04) | `eligibility` |
+| `waitDeferral1`, `waitDeferral2` — wave-1 and wave-2 deferral | (b) | `PT1M` | `dispatch-wave1-create` / `dispatch-wave2-activate` (05), under the next `dispatchRound` | `due` on a non-empty `deferred[]` |
+| `waitExpected` — the barrier's timer half | (b) | `PT1H` | `evaluate-activation-eligibility` (04) | `due` |
+| `waitPoll` — barrier confirmation poll | (b) | `PT30S` | `reconcile-intent` (05), then `evaluate-activation-eligibility` | `released` |
+| `waitOverdue` — overdue window (`expected_fulfillment_at` + 24 h) | (b) | `PT1H` | `raise-overdue-escalation` `overdue-fulfillment` (07) | `due`, `raised` |
+| `waitSla` — manual-task SLA | (c) | `PT5M` | `resolve-manual-task` `trigger: sla-check` (07) | `resolution` |
+| `waitRepoll`, `waitRetryLeg` — compensation re-poll and leg retry | (c) | `PT30S`, `PT1H` | `compensate-order` (06) | `compensationState` |
+
+Q-11 (i) now asks only whether the plugin accepts a runtime-expression duration as an extension
+(§4.5); until it is answered, and after it unless a new version says otherwise, the re-check loop
+applies.
 
 #### (a) Start and approval
 
@@ -557,18 +680,22 @@ use:
       delay: { seconds: 10 }
       backoff: { constant: {} }
       limit: { attempt: { count: 5 }, duration: { seconds: 60 } }
-schedule:
-  on:
-    any:                                # the start bindings are exactly { OrderSubmitted, OrderAmended } (02 §4.7 item 9)
-      - with: { type: gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.submitted.v1~ }
-      - with: { type: gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.amended.v1~ }
+  timeouts:                             # §2.2 rule 4: each above the cumulative backoff of the policy its try carries
+    step:      { after: { minutes: 3 } }
+    wave1:     { after: { minutes: 10 } }    # 01 §4.2 (D-70)
+    wave2:     { after: { minutes: 3 } }     # nfr-owf-fulfillment-sla (D-70)
+    admission: { after: { hours: 25 } }      # above the 24 h supersession budget
+# no `schedule`: the only start mechanism is the two platform event triggers of §3.3
 input:
   from: >-
-    ${ { orderId: .data.orderId, orderVersion: .data.orderVersion,
+    ${ { stepsBase: "‹the step surface base URL of this environment, 01 §3.3›",
+         orderId: .data.orderId, orderVersion: .data.orderVersion,
          resourceTenantId: .data.resourceTenantId, triggerEventId: .id,
-         triggerKind: (if (.type | endswith("amended.v1~")) then "OrderAmended" else "OrderSubmitted" end) } }
+         triggerKind: (if (.type | endswith("amended.v1~")) then "OrderAmended" else "OrderSubmitted" end),
+         nextStage: "approval", stageLoop: null, returnStage: null, preAdmitted: false } }
 do:
   - admitTrigger:                       # protected (02); role: start
+      timeout: admission
       try:
         - admitStart:
             try:
@@ -588,8 +715,13 @@ do:
                       resourceTenantId: ${ .resourceTenantId }
                       invocationId: ${ $workflow.id }
                       attemptId: ${ $workflow.id + ":" + $task.name }
-            catch: { errors: { with: { status: 503 } }, retry: transient }   # trigger-applicability-unverified, breaker, timeouts
-      catch: { errors: { with: { status: 409 } }, retry: supersession }      # prior-instance-active (key left open); exhaustion fails the invocation (02 §4.7 item 6)
+            catch: &transientNo409      # trigger-applicability-unverified, breaker, timeouts; the 409 is the outer catch's
+              errors: { with: { type: https://serverlessworkflow.io/spec/1.0.0/errors/communication } }
+              when: '${ $error.status as $s | any((429, 503, 504); . == $s) }'
+              retry: transient
+      catch:                            # prior-instance-active (key left open); exhaustion fails the invocation (02 §4.7 item 6)
+        errors: { with: { type: https://serverlessworkflow.io/spec/1.0.0/errors/communication, status: 409 } }
+        retry: supersession
       export:
         as: '${ $context + { correlationId: .correlationId, admission: .admission } }'
   - onAdmission:                        # 02 §4.7 item 2: only `start` reaches start-instance
@@ -597,7 +729,13 @@ do:
         - start: { when: '${ $context.admission == "start" }', then: startInstance }
         - other: { then: end }          # absorbed-duplicate | ignored-superseded | ignored-terminated | no-active-instance
   - startInstance:                      # protected (01)
-      step: start-instance              # body: ref + definitionId, definitionVersion: $workflow.definition.version, definitionSource: platform, triggerEventId
+      timeout: step
+      try:
+        - call: { step: start-instance }   # ‹abridged call›; body: ref + definitionId, definitionVersion: $workflow.definition.document.version, definitionSource: platform, triggerEventId
+      catch: &transient
+        errors: { with: { type: https://serverlessworkflow.io/spec/1.0.0/errors/communication } }
+        when: '${ $error.status as $s | any((429, 503, 504, 409); . == $s) }'
+        retry: transient
       export: { as: '${ $context + { rowVersion: .rowVersion, boundInvocationId: .invocationId } }' }
   - onBinding:
       switch:
@@ -607,105 +745,158 @@ do:
       fork:
         compete: true
         branches:
-          - process:
+          - process:                    # the stage dispatcher (D-80 as amended)
               do:
-                - approval: { do: [ obtainVerdict, onVerdict, reflectVerdict, afterReflect, openGates, gateLoop, afterGateLoop ] }   # this fragment
-                - fulfillment: { do: [ ...fragment (b) ] }
-                - arm: { set: { arm: process } }
-          - lifetimeCeiling:            # top level, outside every stage fork: a hold never pauses it (08 §4.7 item 2)
+                - dispatch:
+                    switch:
+                      - approval:    { when: '${ $context.nextStage == "approval" }',    then: approval }
+                      - fulfillment: { when: '${ $context.nextStage == "fulfillment" }', then: fulfillment }
+                      - failure:     { when: '${ $context.nextStage == "failure" }',     then: failure }
+                      - unwind:      { when: '${ $context.nextStage == "unwind" }',      then: unwind }
+                      - cancel:      { when: '${ $context.nextStage == "cancel" }',      then: cancel }
+                      - ceiling:     { when: '${ $context.nextStage == "ceiling" }',     then: ceiling }
+                      - hold:        { when: '${ $context.nextStage == "hold" }',        then: hold }
+                      - resume:      { when: '${ $context.nextStage == "resume" }',      then: resume }
+                      - lifecycle:   { when: '${ $context.nextStage == "lifecycle" }',   then: lifecycle }
+                      - unknown:     { then: unknownStage }
+                - unknownStage:         # a defect of the version, never a business outcome: fault the invocation
+                    raise:
+                      error:
+                        type: https://serverlessworkflow.io/spec/1.0.0/errors/runtime
+                        status: 500
+                        title: unknown-stage
+                        detail: '${ "no stage named " + ($context.nextStage | tostring) }'
+                - approval:    { do: [ ‹approval stage, below› ],       then: dispatch }
+                - fulfillment: { do: [ ‹fragment (b)› ],               then: dispatch }
+                - failure:     { do: [ ‹failure stage, fragment (c)› ], then: dispatch }
+                - unwind:      { do: [ ‹unwind stage, fragment (c)› ],  then: dispatch }
+                - cancel:      { do: [ ‹cancel stage, fragment (d)› ],  then: dispatch }
+                - ceiling:     { do: [ ‹ceiling stage, fragment (d)› ], then: dispatch }
+                - hold:        { do: [ ‹hold stage, fragment (e)› ],    then: dispatch }
+                - resume:      { do: [ ‹resume stage, fragment (e)› ],  then: dispatch }
+                - lifecycle:   { do: [ ‹fragment (f)› ],               then: dispatch }
+          - lifetimeCeiling:            # outside every stage: a hold never pauses it (08 §4.7 item 2)
               do:
-                - waitCeiling: { wait: { days: 90 } }
+                - waitCeiling: { wait: P90D }
                 - arm: { set: { arm: lifetime } }
-  - afterLifetime:
+          - overdueMonitor: { do: [ ‹overdue monitor, fragment (b)› ] }   # never completes
+  - afterLifetime:                      # only lifetimeCeiling completes: every process path ends the workflow with `end`
       switch:
-        - ceiling: { when: '${ .arm == "lifetime" }', then: lifetimePark }
-        - done:    { then: end }
-  - lifetimePark:                       # 07 §4.8 item 7: the escalation before the park; park is permitted from started or suspended (01 §3.7)
-      do:
-        - escalate: { step: raise-overdue-escalation }     # body: ref + escalationKind: lifetime-ceiling; output: taskRef (the lifetime-ceiling-reached task)
-        - parkCeiling: { step: park }                      # body: ref + parkReason: lifetime-ceiling, subjectRef: process
-        - toOperator: { set: { stageLoop: awaitOperatorAfterPark }, then: awaitOperatorAfterPark }   # fragment (d)
+        - unwinding: { when: '${ .arm == "lifetime" and $context.nextStage == "unwind" }', then: lifetime }   # no park from compensating (01 §3.7): the unwind continues under a fresh ceiling
+        - ceiling:   { when: '${ .arm == "lifetime" }', then: ceilingEntry }
+        - other:     { then: end }
+  - ceilingEntry:                       # records where the process was, then re-enters the fork at the ceiling stage of fragment (d)
+      set:
+        ceilingReturnStage: '${ if $context.nextStage == "ceiling" then $context.ceilingReturnStage else $context.nextStage end }'
+        ceilingReturnLoop:  '${ if $context.nextStage == "ceiling" then $context.ceilingReturnLoop else $context.stageLoop end }'
+        nextStage: ceiling
+      then: lifetime
 ```
 
-The approval stage, inside `process.approval`:
+The approval stage, the `do` list of `process.approval`:
 
 ```yaml
+- enter:                                # re-entry at the checkpoint the stage recorded (R-A)
+    switch:
+      - resumedDue: { when: '${ $context.stageLoop == "gateLoop" and $context.resumeDue == true }', then: escalateGate }   # apply-resume's due is the first answer (08 §4.7 item 1)
+      - parkLoop:   { when: '${ $context.stageLoop == "parkLoop" }',       then: parkLoop }
+      - gateLoop:   { when: '${ $context.stageLoop == "gateLoop" }',       then: gateLoop }
+      - outageArm:  { when: '${ $context.stageLoop == "outageArm" }',      then: outageArm }
+      - reflect:    { when: '${ $context.stageLoop == "reflectVerdict" }', then: reflectVerdict }
+      - fresh:      { then: obtainVerdict }
 - obtainVerdict:                        # protected (03)
+    timeout: step
     try:
-      - call: { step: obtain-verdict }  # output: verdict ∈ required | not-required | unobtainable; parkRef, parkReason on unobtainable
-    catch: { errors: { with: { status: 503 } }, retry: transient }
-    export: { as: '${ $context + { verdict: .verdict, parkRef: .parkRef, parkReason: .parkReason } }' }
+      - call: { step: obtain-verdict }  # ‹abridged call›; output: verdict ∈ required | not-required | unobtainable; parkRef, parkReason on unobtainable
+    catch: *transient
+    export: { as: '${ $context + { verdict: .verdict, parkRef: .parkRef, parkReason: .parkReason, reflectStage: "requirement" } }' }
 - onVerdict:                            # 03 §4.5 item 2: unobtainable routes only to the park arm
     switch:
-      - unobtainable: { when: '${ $context.verdict == "unobtainable" }', then: parkForVerdict }
+      - unobtainable: { when: '${ $context.verdict == "unobtainable" }', then: park }
       - obtained:     { then: reflectVerdict }
-- parkForVerdict:                       # fail-closed park, ADR-0007 as amended; no hold arm in any park fork (03 §4.5 item 6)
-    do:
-      - park: { step: park }            # body: ref + parkReason: $context.parkReason, subjectRef: $context.parkRef
-      - armEscalation:
-          step: arm-park-escalation     # body: ref + parkRef; output: escalateAfter (null once the park has escalated)
-          export: { as: '${ $context + { escalateAfter: .escalateAfter } }' }
-      - onArm:
-          switch:
-            - escalated: { when: '${ $context.escalateAfter == null }', then: enterParkLoopEscalated }
-            - armed:     { then: enterParkLoop }
-      - enterParkLoop: { set: { stageLoop: parkLoop } }
-      - parkLoop:
-          fork:
-            compete: true
-            branches:
-              - retryVerdict: { do: [ { waitRetry: { wait: { minutes: 5 } } }, { arm: { set: { arm: retry } } } ] }
-              - escalation:   { do: [ { waitTtlMargin: { wait: '${ $context.escalateAfter }' } }, { arm: { set: { arm: escalate } } } ] }   # Q-11 (i)
-              - lifecycle:    { do: [ ...fragment (f) lifecycle listen ] }        # sets arm: lifecycle
-              - cancel:       { do: [ ...fragment (d) cancel listen ] }           # sets arm: cancel
-      - afterParkLoop:
-          switch:
-            - retry:     { when: '${ .arm == "retry" }',     then: retryVerdict }
-            - escalate:  { when: '${ .arm == "escalate" }',  then: escalatePark }
-            - lifecycle: { when: '${ .arm == "lifecycle" }', then: admitLifecycle }   # fragment (f)
-            - cancel:    { then: cancelPath }                                          # fragment (d)
-      - escalatePark:                   # recorded once; the loop is re-entered WITHOUT the escalation branch (03 §4.5 item 6)
-          step: raise-overdue-escalation   # body: ref + escalationKind: park, subjectRef: $context.parkRef
-          then: enterParkLoopEscalated
-      - enterParkLoopEscalated: { set: { stageLoop: parkLoopEscalated } }
-      - parkLoopEscalated:
-          fork:
-            compete: true
-            branches:
-              - retryVerdict: { do: [ { waitRetry: { wait: { minutes: 5 } } }, { arm: { set: { arm: retry } } } ] }
-              - lifecycle:    { do: [ ...fragment (f) lifecycle listen ] }
-              - cancel:       { do: [ ...fragment (d) cancel listen ] }
-      - afterParkLoopEscalated:
-          switch:
-            - retry:     { when: '${ .arm == "retry" }',     then: retryVerdict }
-            - lifecycle: { when: '${ .arm == "lifecycle" }', then: admitLifecycle }
-            - cancel:    { then: cancelPath }
-      - retryVerdict:
-          try:
-            - call: { step: obtain-verdict }
-          catch: { errors: { with: { status: 503 } }, retry: transient }
-          export: { as: '${ $context + { verdict: .verdict } }' }
-      - afterRetry:
-          switch:
-            - obtained: { when: '${ $context.verdict != "unobtainable" }', then: unparkForVerdict }   # unpark only after required | not-required
-            - still:    { then: returnToStage }                                                   # parkLoop or parkLoopEscalated
-      - unparkForVerdict: { step: unpark, then: reflectVerdict }    # body: ref + subjectRef: $context.parkRef
-- reflectVerdict:                       # protected (03): reflects submitted → pending_approval | approved under R1
+- park:                                 # fail-closed park, ADR-0007 as amended; no hold arm in the park loop (03 §4.5 item 6)
+    timeout: step
     try:
-      - call: { step: reflect-verdict } # body: ref + stage: requirement
-    catch:
-      errors: { with: { status: 400 } } # a permanent refusal: approval-reflection-refused needs a human (03 §4.5 item 3)
-      do: [ { toTask: { set: { failureScope: order, failureSubjects: [ '${ $context.correlationId }' ], failureReason: approval-reflection-refused, sourceStep: reflect-verdict }, then: createTasks } } ]   # fragment (c)
-    export: { as: '${ $context + { reflected: .reflected } }' }   # reflected ∈ pending_approval | approved | rejected
+      - call: { step: park }            # body: ref + parkReason: $context.parkReason, subjectRef: $context.parkRef
+    catch: *transient
+- enterParkLoop: { set: { stageLoop: parkLoop } }
+- parkLoop:
+    fork:
+      compete: true
+      branches:
+        - tick:      { do: [ { waitTtlMargin: { wait: PT5M } }, { arm: { set: { arm: tick } } } ] }
+        - lifecycle: { do: [ ‹lifecycle arm of (f)› ] }
+        - cancel:    { do: [ ‹cancel arm of (d)› ] }
+- afterParkLoop:
+    switch:
+      - tick:  { when: '${ .arm == "tick" }', then: retryVerdict }
+      - other: { then: leave }                                   # lifecycle | cancel
+- retryVerdict:
+    timeout: step
+    try:
+      - call: { step: obtain-verdict }
+    catch: *transient
+    export: { as: '${ $context + { verdict: .verdict } }' }
+- afterRetry:
+    switch:
+      - obtained: { when: '${ $context.verdict != "unobtainable" }', then: unparkForVerdict }   # unpark only after required | not-required
+      - still:    { then: checkParkEscalation }
+- checkParkEscalation:                  # composable (03): the re-check of the park's escalation_due_at; due is false once the park has escalated
+    timeout: step
+    try:
+      - call: { step: arm-park-escalation }   # body: ref + parkRef; output: due
+    catch: *transient
+    export: { as: '${ $context + { parkEscalationDue: .due } }' }
+- onParkEscalation:
+    switch:
+      - due:    { when: '${ $context.parkEscalationDue }', then: escalatePark }
+      - notDue: { then: parkLoop }      # the key stays open; the next tick calls it again
+- escalatePark:                         # recorded once; the park clock is never re-armed (03 §4.5 item 6)
+    timeout: step
+    try:
+      - call: { step: raise-overdue-escalation }   # body: ref + escalationKind: park, subjectRef: $context.parkRef
+    catch: *transient
+    then: parkLoop
+- unparkForVerdict:
+    timeout: step
+    try:
+      - call: { step: unpark }          # body: ref + subjectRef: $context.parkRef
+    catch: *transient
+    then: reflectVerdict
+- reflectVerdict:                       # protected (03): requirement stage submitted → pending_approval | approved; gate-outcome stage pending_approval → approved | rejected (R1)
+    try:
+      - reflect:
+          timeout: step
+          try:
+            - call: { step: reflect-verdict }   # body: ref + stage: $context.reflectStage
+          catch: *transient
+    catch:                              # a permanent refusal: approval-reflection-refused needs a human (03 §4.5 item 3)
+      errors: { with: { type: https://serverlessworkflow.io/spec/1.0.0/errors/communication, status: 400 } }
+      do: [ { refused: { set: { reflected: refused } } } ]
+    export: { as: '${ $context + { reflected: .reflected } }' }   # reflected ∈ pending_approval | approved | rejected | refused
 - afterReflect:
     switch:
-      - approved: { when: '${ $context.reflected == "approved" }', then: fulfillment }   # fragment (b)
+      - approved: { when: '${ $context.reflected == "approved" }', then: toFulfillment }
       - rejected: { when: '${ $context.reflected == "rejected" }', then: terminateRejected }
+      - refused:  { when: '${ $context.reflected == "refused" }',  then: reflectionTask }
       - pending:  { then: firstPosition }
-- firstPosition: { set: { position: 0 } }   # 03 §4.5 item 7: 0 first, thereafter record-decision's nextPosition only
+- toFulfillment: { set: { nextStage: fulfillment, stageLoop: null }, then: exit }   # Lifecycle emits OrderApproved; fragment (b) follows in the same invocation
+- reflectionTask:                       # fragment (c): an order-scope task whose retry re-enters reflectVerdict
+    set: { failureScope: order, failureSubjects: [ '${ $context.correlationId }' ], failureReason: approval-reflection-refused, sourceStep: reflect-verdict, forceTask: true, taskReturnStage: approval, taskReturnLoop: reflectVerdict, nextStage: failure, stageLoop: null }
+    then: exit
+- terminateRejected:                    # protected (01); terminationKind: rejected
+    timeout: step
+    try:
+      - call: { step: terminate-instance }
+    catch: *transient
+    then: end
+- firstPosition: { set: { position: 0, reflectStage: gate-outcome } }   # 03 §4.5 item 7: 0 first, thereafter record-decision's nextPosition only
 - openGates:                            # composable (03): opens every gate at the current sequence position
-    step: open-gates                    # body: ref + position: $context.position; output: gateRefs[], position, escalationWindow, escalationRound
-    export: { as: '${ $context + { gateRefs: .gateRefs, escalationRemaining: .escalationWindow, escalationRound: .escalationRound, probeRound: 0 } }' }
+    timeout: step
+    try:
+      - call: { step: open-gates }      # body: ref + position: $context.position; output: gateRefs[], position, escalationRound
+    catch: *transient
+    export: { as: '${ $context + { gateRefs: .gateRefs, escalationRound: .escalationRound, probeRound: 0, resumeDue: false } }' }
 - enterGateLoop: { set: { stageLoop: gateLoop, holdPauses: true } }
 - gateLoop:
     fork:
@@ -717,119 +908,132 @@ The approval stage, inside `process.approval`:
                   listen:
                     to:
                       one:
-                        with: { type: <approval decision event type, 03 §3.3> }
+                        with: { type: ‹approval decision event type, 03 §3.3› }
                         correlate:
                           orderId:      { from: '${ .data.orderId }',      expect: '${ $context.orderId }' }
                           orderVersion: { from: '${ .data.orderVersion }', expect: '${ $context.orderVersion }' }
-              - arm: { set: { arm: decision, gateRef: '${ .data.gateId }', decisionEventId: '${ .data.decisionEventId }', outcome: '${ .data.outcome }' } }
-        - escalation: { do: [ { waitEscalation: { wait: '${ $context.escalationRemaining }' } }, { arm: { set: { arm: escalate } } } ] }   # Q-11 (i); the value last returned by open-gates, escalate-gate or apply-resume
-        - probe:      { do: [ { waitProbe: { wait: { seconds: 30 } } }, { arm: { set: { arm: probe } } } ] }   # 03 §4.5 item 5: ≤ 30 s
-        - hold:       { do: [ ...fragment (e) hold listen ] }       # sets arm: held
-        - resume:     { do: [ ...fragment (e) resume listen ] }     # sets arm: resumed (early resume, 08 §4.7 item 3)
-        - lifecycle:  { do: [ ...fragment (f) lifecycle listen ] }  # sets arm: lifecycle
-        - cancel:     { do: [ ...fragment (d) cancel listen ] }     # sets arm: cancel
+                    read: envelope
+                  output: { as: '${ .[0] | { gateRef: .data.gateId, decisionEventId: .data.decisionEventId, outcome: .data.outcome } }' }
+              - arm: { set: { arm: decision, gateRef: '${ .gateRef }', decisionEventId: '${ .decisionEventId }', outcome: '${ .outcome }' } }
+        - escalation: { do: [ { waitEscalation: { wait: PT5M } }, { arm: { set: { arm: escalate } } } ] }
+        - probe:      { do: [ { waitProbe: { wait: PT30S } }, { arm: { set: { arm: probe } } } ] }   # 03 §4.5 item 5: ≤ 30 s
+        - hold:       { do: [ ‹hold arm of (e)› ] }
+        - resume:     { do: [ ‹resume arm of (e)› ] }       # early resume, 08 §4.7 item 3
+        - lifecycle:  { do: [ ‹lifecycle arm of (f)› ] }
+        - cancel:     { do: [ ‹cancel arm of (d)› ] }
 - afterGateLoop:
     switch:
-      - decision:  { when: '${ .arm == "decision" }',  then: recordDecision }
-      - escalate:  { when: '${ .arm == "escalate" }',  then: escalateGate }
-      - probe:     { when: '${ .arm == "probe" }',     then: probeGate }
-      - held:      { when: '${ .arm == "held" }',      then: holdPath }        # fragment (e): the escalation wait was cancelled by winning
-      - resumed:   { when: '${ .arm == "resumed" }',   then: earlyResumePath } # fragment (e)
-      - lifecycle: { when: '${ .arm == "lifecycle" }', then: admitLifecycle }  # fragment (f)
-      - cancel:    { then: cancelPath }                                         # fragment (d)
+      - decision: { when: '${ .arm == "decision" }', then: recordDecision }
+      - escalate: { when: '${ .arm == "escalate" }', then: escalateGate }
+      - probe:    { when: '${ .arm == "probe" }',    then: probeGate }
+      - other:    { then: leave }       # hold | resume | lifecycle | cancel
 - recordDecision:                       # protected (03)
-    step: record-decision               # body: ref + gateRef, decisionEventId, outcome ∈ approved | rejected
+    timeout: step
+    try:
+      - call: { step: record-decision } # body: ref + gateRef, decisionEventId, outcome ∈ approved | rejected
+    catch: *transient
     export: { as: '${ $context + { gateState: .gateState, position: .nextPosition } }' }
 - afterDecision:
     switch:
-      - decided:      { when: '${ $context.gateState == "approved" or $context.gateState == "rejected" }', then: reflectGateOutcome }
+      - decided:      { when: '${ $context.gateState == "approved" or $context.gateState == "rejected" }', then: reflectVerdict }   # reflectStage: gate-outcome
       - nextPosition: { when: '${ $context.gateState == "next-position" }', then: openGates }
       - pending:      { then: gateLoop }
-- reflectGateOutcome:                   # protected (03): pending_approval → approved | rejected; Lifecycle then emits OrderApproved | OrderRejected
-    step: reflect-verdict               # body: ref + stage: gate-outcome; a permanent refusal takes the reflectVerdict catch above
-    export: { as: '${ $context + { reflected: .reflected } }' }
-    then: afterReflect
-- escalateGate:                         # composable (03); enqueues OrderApprovalEscalated inside the operation
-    step: escalate-gate                 # body: ref + position, mode: fire, round: $context.escalationRound
-    export: { as: '${ $context + { escalationRemaining: .escalationRemaining, escalationRound: .escalationRound } }' }
-    then: gateLoop
+- escalateGate:                         # composable (03): the escalation re-check; fires, and enqueues OrderApprovalEscalated, only when due
+    timeout: step
+    try:
+      - call: { step: escalate-gate }   # body: ref + position, mode: fire, round: $context.escalationRound; output: due, escalationRound
+    catch: *transient
+    export: { as: '${ $context + { escalationRound: .escalationRound, resumeDue: false } }' }
+    then: gateLoop                      # due: false leaves the key open for the next tick
 - probeGate:
-    step: escalate-gate                 # body: ref + position, mode: probe, round: $context.probeRound
-    export: { as: '${ $context + { serviceState: .serviceState, outageThresholdRemaining: .outageThresholdRemaining, probeRound: .probeRound, escalationRemaining: (.escalationRemaining // $context.escalationRemaining) } }' }
+    timeout: step
+    try:
+      - call: { step: escalate-gate }   # body: ref + position, mode: probe, round: $context.probeRound; output: serviceState, due, probeRound
+    catch: *transient
+    export: { as: '${ $context + { serviceState: .serviceState, probeRound: .probeRound } }' }
 - afterProbe:
     switch:
       - outage:    { when: '${ $context.serviceState == "outage" }', then: enterOutageArm }
       - available: { then: gateLoop }
-- enterOutageArm: { set: { stageLoop: outageArm, holdPauses: true } }
+- enterOutageArm: { set: { stageLoop: outageArm, holdPauses: true, outageEscalated: false } }
 - outageArm:                            # 03 §4.5 item 5: probe loop until available, the outage threshold, hold and cancel
     fork:
       compete: true
       branches:
-        - probe:     { do: [ { waitProbe: { wait: { seconds: 30 } } }, { arm: { set: { arm: probe } } } ] }
-        - threshold: { do: [ { waitThreshold: { wait: '${ $context.outageThresholdRemaining }' } }, { arm: { set: { arm: outage-escalate } } } ] }   # Q-11 (i)
-        - hold:      { do: [ ...fragment (e) hold listen ] }
-        - resume:    { do: [ ...fragment (e) resume listen ] }
-        - lifecycle: { do: [ ...fragment (f) lifecycle listen ] }
-        - cancel:    { do: [ ...fragment (d) cancel listen ] }
+        - probe:     { do: [ { waitProbe: { wait: PT30S } }, { arm: { set: { arm: probe } } } ] }   # also the outage-threshold re-check
+        - hold:      { do: [ ‹hold arm of (e)› ] }
+        - resume:    { do: [ ‹resume arm of (e)› ] }
+        - lifecycle: { do: [ ‹lifecycle arm of (f)› ] }
+        - cancel:    { do: [ ‹cancel arm of (d)› ] }
 - afterOutageArm:
     switch:
-      - probe:     { when: '${ .arm == "probe" }',           then: probeOutage }
-      - escalate:  { when: '${ .arm == "outage-escalate" }', then: escalateOutage }
-      - held:      { when: '${ .arm == "held" }',            then: holdPath }
-      - resumed:   { when: '${ .arm == "resumed" }',         then: earlyResumePath }
-      - lifecycle: { when: '${ .arm == "lifecycle" }',       then: admitLifecycle }
-      - cancel:    { then: cancelPath }
+      - probe: { when: '${ .arm == "probe" }', then: probeOutage }
+      - other: { then: leave }
 - probeOutage:
-    step: escalate-gate                 # body: ref + position, mode: probe, round: $context.probeRound
-    export: { as: '${ $context + { serviceState: .serviceState, probeRound: .probeRound, escalationRemaining: (.escalationRemaining // $context.escalationRemaining) } }' }
+    timeout: step
+    try:
+      - call: { step: escalate-gate }   # body: ref + position, mode: probe, round: $context.probeRound; due: the outage-threshold deadline on outage
+    catch: *transient
+    export: { as: '${ $context + { serviceState: .serviceState, outageDue: (.due // false), probeRound: .probeRound } }' }
 - afterProbeOutage:
     switch:
-      - available: { when: '${ $context.serviceState == "available" }', then: enterGateLoop }   # re-enters gateLoop with the returned escalationRemaining
+      - available: { when: '${ $context.serviceState == "available" }', then: enterGateLoop }
+      - threshold: { when: '${ $context.outageDue and ($context.outageEscalated | not) }', then: escalateOutage }
       - still:     { then: outageArm }
-- escalateOutage:                       # recorded once per outage; the threshold is not re-armed
-    step: raise-overdue-escalation      # body: ref + escalationKind: approval-outage, subjectRef: $context.position
-    export: { as: '${ $context + { outageThresholdRemaining: { days: 90 } } }' }   # the threshold branch now never wins; the probe, hold, resume, lifecycle and cancel arms remain
+- escalateOutage:                       # recorded once per outage
+    timeout: step
+    try:
+      - call: { step: raise-overdue-escalation }   # body: ref + escalationKind: approval-outage, subjectRef: $context.position
+    catch: *transient
+    export: { as: '${ $context + { outageEscalated: true } }' }
     then: outageArm
-- terminateRejected: { step: terminate-instance, then: end }   # protected (01); terminationKind: rejected
+- leave: { set: { nextStage: '${ .arm }', returnStage: approval }, then: exit }
 ```
 
 **Description**: The fragment reproduces [`02 §3.6`](./02-triggers-and-start.md#36-interactions--sequences)
 *Start on trigger* and *Duplicate absorption* and [`03 §3.6`](./03-approval-execution.md#36-interactions--sequences)
 *Verdict retrieval and reflection*, *Multi-party gate open* and *Decision reflection*, with the
-timer and the pause moved into the definition. **Start.** The invocation starts on either start
-binding (`OrderSubmitted` for a first version, `OrderAmended` for an amended one — Lifecycle
-publishes no `OrderSubmitted` after an amendment, [Lifecycle `04 §4.3`](../../../orders-lifecycle/docs/design/04-versioning.md#43-re-approval-is-a-two-step-seam-interaction-normative));
-only `admission = start` reaches `start-instance`, and every other admission ends the invocation
-with no further call. A `prior-instance-active` refusal (409) is retried on the constant 5-minute
-`supersession` policy for up to 24 h while the prior version's instance unwinds; the transient
-policy handles the 503 family inside it. Because the plugin may not surface `error_code` on
-`$error` (Q-11 (ii)), `still-processing` and `idempotency-lease-expired` also ride the
-supersession cadence on this one call; the key stays `open` and the answer is the same.
-**Approval.** The escalation window is the `wait` in the `escalation` branch; because the `fork`
-competes and every branch only listens or waits, a decision, a hold, a probe or a cancel winning
-the race cancels that `wait` — which is exactly the pause `03 §3.6` *Escalation timer fire and
-approval-service outage pause* used to write into `owf_timer_pause`. Every re-entry arms the
-duration the last operation returned (`open-gates`, `escalate-gate` or `apply-resume`), never a
-literal, and `open-gates` receives `position = 0` first and `record-decision`'s `nextPosition`
-thereafter; `escalate-gate` receives the `escalationRound` or `probeRound` it last returned. The
-**approval-service outage** is observed by the `probe` branch (`escalate-gate` `mode: probe`); an
-`outage` answer enters `outageArm`, which competes the probe loop, the outage threshold (followed
-by one `raise-overdue-escalation` with `escalationKind: approval-outage`), the hold, the lifecycle
-and the cancel arms, and an `available` answer re-enters `gateLoop` with the returned
-`escalationRemaining`. **Park.** The park loop carries the verdict retry, the park escalation,
-the lifecycle and the cancel arms and no hold arm; once `raise-overdue-escalation` has recorded the
-park escalation — or `arm-park-escalation` answers a null `escalateAfter` on re-entry — the loop
-continues as `parkLoopEscalated`, which has no escalation branch, so the park clock is never
-re-armed. A repeat `obtain-verdict` for a version whose verdict is already reflected returns the
-cached answer inside the operation and never re-reflects, as `03` requires; the definition does
-not need to know. A permanent refusal of `reflect-verdict` (`approval-reflection-refused`) goes to
-an order-scope manual task (fragment (c)), whose waiter carries the lifecycle and cancel arms. The
-approved path ends at `reflect-verdict`; Lifecycle emits `OrderApproved`, and the fulfillment
-stage is entered from `afterReflect` in the same invocation rather than from a second trigger. The
-lifetime ceiling is the top-level competing arm: when it fires, `raise-overdue-escalation`
-(`lifetime-ceiling`, which also opens the `lifetime-ceiling-reached` order task) precedes `park`,
-from `started` or from `suspended` (`01 §3.7`), and the instance waits in
-`awaitOperatorAfterPark`.
+timer and the pause moved into the definition. **Start.** The invocation starts on either
+platform event trigger of §3.3 (`OrderSubmitted` for a first version, `OrderAmended` for an
+amended one — Lifecycle publishes no `OrderSubmitted` after an amendment,
+[Lifecycle `04 §4.3`](../../../orders-lifecycle/docs/design/04-versioning.md#43-re-approval-is-a-two-step-seam-interaction-normative));
+the document declares no `schedule`, so the trigger bindings are the one start mechanism. The
+`input.from` expression reads the trigger's event envelope as the invocation input; the shape a
+trigger passes is not stated by the platform and is part of the trigger ask
+([`../UPSTREAM_REQS.md`](../UPSTREAM_REQS.md) §2.9 *Event triggers over event-broker GTS events*).
+Only `admission = start` reaches `start-instance`, and every other admission ends the invocation
+with no further call. A `prior-instance-active` refusal (409) is retried on the constant
+5-minute `supersession` policy for up to 24 h while the prior version's instance unwinds; the
+inner `*transientNo409` catch handles the rest of the transient set. Because the plugin may not
+surface `error_code` on `$error` (Q-11 (ii)), `still-processing` and `idempotency-lease-expired`
+also ride the supersession cadence on this one call; the key stays `open` and the answer is the
+same. **Approval.** The escalation window is Orders' stored deadline, re-checked by
+`escalate-gate` `mode: fire` on every `waitEscalation` tick; `due: false` escalates nothing and
+leaves the key `open`, and the next tick calls the same key again. A decision, a hold, a probe or
+a cancel winning the race cancels only the tick; the pause itself is in Orders' record, where
+`apply-hold` pauses the gate window through slice 03's gate-window port and `apply-resume`
+re-bases it, so the definition carries no remainder. `open-gates` receives `position = 0` first
+and `record-decision`'s `nextPosition` thereafter; `escalate-gate` receives the `escalationRound`
+or `probeRound` it last returned. The **approval-service outage** is observed by the `probe`
+branch (`escalate-gate` `mode: probe`); an `outage` answer enters `outageArm`, whose probe also
+re-checks the outage threshold (`due` on `outage`) and leads to one `raise-overdue-escalation`
+with `escalationKind: approval-outage`, and an `available` answer re-enters `gateLoop`. **Park.**
+The park loop carries one `PT5M` tick, the lifecycle and the cancel arms and no hold arm; each
+tick retries `obtain-verdict` and, while the verdict is still unobtainable, re-checks the park's
+`escalation_due_at` through `arm-park-escalation`, whose `due` is `false` once the park escalation
+is recorded, so the park clock is never re-armed. A repeat `obtain-verdict` for a version whose
+verdict is already reflected returns the cached answer inside the operation and never
+re-reflects, as `03` requires. A permanent refusal of `reflect-verdict`
+(`approval-reflection-refused`) goes to an order-scope manual task (fragment (c)), whose retry
+re-enters this stage at `reflectVerdict`. The approved path ends at `reflect-verdict`; Lifecycle
+emits `OrderApproved`, and the fulfillment stage is entered through the dispatcher in the same
+invocation rather than from a second trigger. **Lifetime.** The ceiling is the top-level
+competing arm, a literal `P90D`. When it fires, `ceilingEntry` records the stage and checkpoint
+the process was in and re-enters the `lifetime` fork at the ceiling stage of fragment (d), which
+raises the escalation and parks; the re-entered fork arms a fresh ceiling, so an instance the
+operator unparks continues under a new 90-day bound. A ceiling that fires during an unwind does
+not park (no `compensating → parked` edge, `01 §3.7`); the unwind continues under the fresh
+ceiling.
 
 #### (b) Fulfillment: eligibility, plan, two waves and the barrier
 
@@ -839,231 +1043,327 @@ from `started` or from `suspended` (`01 §3.7`), and the instance waits in
 
 **Actors**: `cpt-cf-bss-orders-workflow-actor-owf-orders-lifecycle`, `cpt-cf-bss-orders-workflow-actor-owf-payments`, `cpt-cf-bss-orders-workflow-actor-owf-subscriptions`
 
+The fulfillment stage, the `do` list of `process.fulfillment`:
+
 ```yaml
-- fulfillment:
-    do:
-      - initEligibility: { set: { eligibilityTrigger: initial, evaluationSeq: 0, barrierSeq: 0, recheckSeq: 0, wave1Round: 0, wave2Round: 0, sweepRound: 0, planAttempt: 0, wave1Failed: [], wave2Failed: [] } }
-      - eligibility:                                # protected (04)
+- enter:
+    switch:
+      - eligibilityWait: { when: '${ $context.stageLoop == "awaitEligibilityChange" }', then: awaitEligibilityChange }
+      - plan:            { when: '${ $context.stageLoop == "freezePlan" }',             then: freezePlan }
+      - wave1:           { when: '${ $context.stageLoop == "wave1" }',                  then: wave1 }
+      - expected:        { when: '${ $context.stageLoop == "awaitExpected" }',          then: evaluate }
+      - barrier:         { when: '${ $context.stageLoop == "barrierLoop" }',            then: evaluate }
+      - fresh:           { then: initEligibility }
+- initEligibility: { set: { eligibilityTrigger: initial, requestRef: null, evaluationSeq: 0, barrierSeq: 0, recheckSeq: 0, wave1Round: 0, wave2Round: 0, sweepRound: 0, planAttempt: 0, wave1Failed: [], wave2Failed: [], spawned: false } }
+- eligibility:                          # protected (04)
+    timeout: step
+    try:
+      - call: { step: evaluate-payment-auth-eligibility }   # body: ref + trigger: $context.eligibilityTrigger, requestRef: $context.requestRef, evaluationSeq: $context.evaluationSeq
+    catch: *transient
+    export: { as: '${ $context + { eligibility: .eligibility, eligibilitySeq: (if .eligibility == "eligible" then $context.evaluationSeq else $context.eligibilitySeq end), evaluationSeq: .nextEvaluationSeq } }' }
+- onEligibility:
+    switch:
+      - eligible: { when: '${ $context.eligibility == "eligible" }', then: enterPlan }
+      - waiting:  { then: enterEligibilityWait }   # pending | withheld: settled successes that select the wait; the order stays approved
+- enterEligibilityWait: { set: { stageLoop: awaitEligibilityChange, holdPauses: false } }
+- awaitEligibilityChange:
+    fork:
+      compete: true
+      branches:
+        - acceptance:
+            do:
+              - listenAcceptance:
+                  listen:
+                    to:
+                      one:
+                        with: { type: gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.acceptance_recorded.v1~ }
+                        correlate:
+                          orderId:      { from: '${ .data.orderId }',      expect: '${ $context.orderId }' }
+                          orderVersion: { from: '${ .data.orderVersion }', expect: '${ $context.orderVersion }' }
+                    read: envelope
+                  output: { as: '${ .[0] | { eventId: .id } }' }
+              - arm: { set: { arm: acceptance, lifecycleEventId: '${ .eventId }', triggerKind: OrderAcceptanceRecorded } }
+        - reauthorize:
+            do:
+              - listenReauth:
+                  listen:
+                    to:
+                      one:
+                        with: { type: gts.cf.core.events.event.v1~cf.bss.orders_workflow.signal.v1~cf.bss.orders_workflow.reauthorize_requested.v1~ }
+                        correlate:
+                          orderId:      { from: '${ .data.orderId }',      expect: '${ $context.orderId }' }
+                          orderVersion: { from: '${ .data.orderVersion }', expect: '${ $context.orderVersion }' }
+                    read: envelope
+                  output: { as: '${ .[0] | { requestRef: .data.requestRef } }' }
+              - arm: { set: { arm: reevaluate, eligibilityTrigger: reauthorize-requested, requestRef: '${ .requestRef }' } }
+        - poll:      { do: [ { waitEligibility: { wait: PT5M } }, { arm: { set: { arm: reevaluate, eligibilityTrigger: poll, requestRef: null } } } ] }   # 04 §4.8 item 5: covers an event delivered before the listen was armed
+        - hold:      { do: [ ‹hold arm of (e)› ] }
+        - resume:    { do: [ ‹resume arm of (e)› ] }
+        - lifecycle: { do: [ ‹lifecycle arm of (f)› ] }
+        - cancel:    { do: [ ‹cancel arm of (d)› ] }
+- afterEligibilityChange:
+    switch:
+      - acceptance: { when: '${ .arm == "acceptance" }', then: admitAcceptance }
+      - again:      { when: '${ .arm == "reevaluate" }', then: eligibility }
+      - other:      { then: leave }
+- admitAcceptance:                      # protected (02): admission before consumption (02 §4.7 item 1)
+    timeout: step
+    try:
+      - call: { step: admit-trigger }   # body: ref + triggerEventId: $context.lifecycleEventId, triggerKind, role: listen
+    catch: *transient
+    export: { as: '${ $context + { admission: .admission } }' }
+- onAcceptanceAdmission:
+    switch:
+      - advance:  { when: '${ $context.admission == "advance" }', then: acceptanceRecorded }
+      - onward:   { when: '${ $context.admission == "supersede" or $context.admission == "terminate" }', then: toLifecycle }
+      - back:     { then: awaitEligibilityChange }
+- toLifecycle: { set: { nextStage: lifecycle, preAdmitted: true, returnStage: fulfillment }, then: exit }   # fragment (f) routes the admitted answer
+- acceptanceRecorded: { set: { eligibilityTrigger: acceptance-recorded, requestRef: null }, then: eligibility }
+- enterPlan: { set: { stageLoop: freezePlan } }
+- freezePlan:                           # protected (04)
+    timeout: step
+    try:
+      - call: { step: construct-and-freeze-plan }   # body: ref + attempt: $context.planAttempt; output: planRef, lineRefs[], expectedFulfillmentAt, policy, planState, reason
+    catch: *transient
+    export: { as: '${ $context + { planRef: .planRef, lineRefs: .lineRefs, wave1LineRefs: .lineRefs, policy: .policy, planState: .planState, planReason: .reason } }' }
+- onPlan:                               # 04 §4.8 item 3 and §4.3
+    switch:
+      - frozen:           { when: '${ $context.planState == "frozen" }', then: beginFulfillment }
+      - topology:         { when: '${ $context.planState == "topology-unavailable" }', then: planTask }   # a plan task under EITHER policy
+      - invalidRemediate: { when: '${ $context.policy == "remediate" }', then: planTask }
+      - invalidFailFast:  { then: planFailFast }
+- planTask:                             # fragment (c)
+    set: { failureScope: plan, failureSubjects: [ '${ $context.planRef }' ], failureReason: '${ $context.planReason }', sourceStep: construct-and-freeze-plan, forceTask: true, nextStage: failure, stageLoop: null }
+    then: exit
+- planFailFast:                         # no Workflow transition leaves approved: begin-fulfillment is passed before the unwind (04 §4.3)
+    timeout: step
+    try:
+      - call: { step: begin-fulfillment }   # body: ref + planRef, eligibilitySeq
+    catch: *transient
+    then: planFailFastUnwind
+- planFailFastUnwind: { set: { unwind: failure, reportAs: failed, terminationKind: compensated, nextStage: unwind, stageLoop: null }, then: exit }   # fragment (c): nothing to void; fulfillment_failed with invalid-dependency-graph
+- beginFulfillment:                     # protected (04): the R1 seam call approved → in_fulfillment; enqueues OrderFulfillmentStarted
+    try:
+      - begin:
+          timeout: step
           try:
-            - call: { step: evaluate-payment-auth-eligibility }   # body: ref + trigger: $context.eligibilityTrigger, requestRef: $context.requestRef, evaluationSeq: $context.evaluationSeq
-          catch: { errors: { with: { status: 503 } }, retry: transient }
-          export: { as: '${ $context + { eligibility: .eligibility, eligibilitySeq: (if .eligibility == "eligible" then $context.evaluationSeq else $context.eligibilitySeq end), evaluationSeq: .nextEvaluationSeq } }' }
-      - onEligibility:
-          switch:
-            - eligible: { when: '${ $context.eligibility == "eligible" }', then: freezePlan }
-            - waiting:  { then: enterEligibilityWait }   # pending | withheld: settled successes that select the wait; the order stays approved
-      - enterEligibilityWait: { set: { stageLoop: awaitEligibilityChange, holdPauses: false } }
-      - awaitEligibilityChange:
-          fork:
-            compete: true
-            branches:
-              - acceptance:
-                  do:
-                    - listenAcceptance:
-                        listen:
-                          to:
-                            one:
-                              with: { type: gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.acceptance_recorded.v1~ }
-                              correlate:
-                                orderId:      { from: '${ .data.orderId }',      expect: '${ $context.orderId }' }
-                                orderVersion: { from: '${ .data.orderVersion }', expect: '${ $context.orderVersion }' }
-                    - arm: { set: { arm: acceptance, lifecycleEventId: '${ .id }', triggerKind: OrderAcceptanceRecorded } }
-              - reauthorize:
-                  do:
-                    - listenReauth: { listen: { to: { one: { with: { type: <reauthorize-requested signal, §3.3> }, correlate: { orderId: { from: '${ .data.orderId }', expect: '${ $context.orderId }' }, orderVersion: { from: '${ .data.orderVersion }', expect: '${ $context.orderVersion }' } } } } } }
-                    - arm: { set: { arm: reevaluate, eligibilityTrigger: reauthorize-requested, requestRef: '${ .data.requestRef }' } }
-              - poll:      { do: [ { waitPoll: { wait: { minutes: 5 } } }, { arm: { set: { arm: reevaluate, eligibilityTrigger: poll, requestRef: null } } } ] }   # 04 §4.8 item 5: bounded durable polling; covers an event delivered before the listen was armed
-              - hold:      { do: [ ...fragment (e) hold listen ] }
-              - resume:    { do: [ ...fragment (e) resume listen ] }
-              - lifecycle: { do: [ ...fragment (f) lifecycle listen ] }
-              - cancel:    { do: [ ...fragment (d) cancel listen ] }
-      - afterEligibilityChange:
-          switch:
-            - acceptance: { when: '${ .arm == "acceptance" }', then: admitAcceptance }
-            - again:      { when: '${ .arm == "reevaluate" }', then: eligibility }
-            - held:       { when: '${ .arm == "held" }',       then: holdPath }
-            - resumed:    { when: '${ .arm == "resumed" }',    then: earlyResumePath }
-            - lifecycle:  { when: '${ .arm == "lifecycle" }',  then: admitLifecycle }
-            - cancel:     { then: cancelPath }
-      - admitAcceptance:                            # protected (02): admission before consumption (02 §4.7 item 1)
-          step: admit-trigger                       # body: ref + triggerEventId: $context.lifecycleEventId, triggerKind, role: listen
-          export: { as: '${ $context + { admission: .admission } }' }
-      - onAcceptanceAdmission:
-          switch:
-            - advance:   { when: '${ $context.admission == "advance" }',   then: acceptanceRecorded }
-            - supersede: { when: '${ $context.admission == "supersede" }', then: supersedePath }   # fragment (f)
-            - terminate: { when: '${ $context.admission == "terminate" }', then: terminalEvent }   # fragment (f)
-            - back:      { then: awaitEligibilityChange }
-      - acceptanceRecorded: { set: { eligibilityTrigger: acceptance-recorded, requestRef: null }, then: eligibility }
-      - freezePlan:                                 # protected (04)
+            - call: { step: begin-fulfillment }   # body: ref + planRef, eligibilitySeq: $context.eligibilitySeq; output: result ∈ in-fulfillment | withheld, withheldCause
+          catch: *transientNo409
+    catch:                              # version-mismatch from a concurrent amendment: wait for the amendment arm, never the failure path (02 §4.7 item 8)
+      errors: { with: { type: https://serverlessworkflow.io/spec/1.0.0/errors/communication, status: 409 } }
+      do: [ { mismatch: { set: { result: version-mismatch } } } ]
+    export: { as: '${ $context + { beginResult: .result } }' }
+- onBegin:                              # 04 §4.8 item 2
+    switch:
+      - started: { when: '${ $context.beginResult == "in-fulfillment" }', then: enterWave1 }
+      - waiting: { then: enterEligibilityWait }   # withheld | version-mismatch; the next eligible round carries a new eligibilitySeq
+- enterWave1: { set: { stageLoop: wave1 } }
+- wave1:                                # protected (05): ONE call per wave carrying lineRefs[]; per-order parallelism and admission inside (05 §4.3)
+    try:
+      - dispatchWave1:
+          timeout: wave1
           try:
-            - call: { step: construct-and-freeze-plan }   # body: ref + attempt: $context.planAttempt; output: planRef, lineRefs[], expectedFulfillmentAt, policy, planState, reason
-          catch: { errors: { with: { status: 503 } }, retry: transient }
-          export: { as: '${ $context + { planRef: .planRef, lineRefs: .lineRefs, wave1LineRefs: .lineRefs, expectedFulfillmentAt: .expectedFulfillmentAt, policy: .policy, planState: .planState, planReason: .reason } }' }
-      - onPlan:                                     # 04 §4.8 item 3 and §4.3
-          switch:
-            - frozen:           { when: '${ $context.planState == "frozen" }', then: beginFulfillment }
-            - topology:         { when: '${ $context.planState == "topology-unavailable" }', then: planTask }       # a plan task under EITHER policy
-            - invalidRemediate: { when: '${ $context.policy == "remediate" }', then: planTask }
-            - invalidFailFast:  { then: planFailFast }
-      - planTask: { set: { failureScope: plan, failureSubjects: [ '${ $context.planRef }' ], failureReason: '${ $context.planReason }', sourceStep: construct-and-freeze-plan, forceTask: true }, then: createTasks }   # fragment (c)
-      - planFailFast:                               # no Workflow transition leaves approved: begin-fulfillment is passed before the unwind (04 §4.3)
-          do:
-            - passBegin: { step: begin-fulfillment }   # body: ref + planRef, eligibilitySeq
-            - toUnwind: { set: { unwind: failure, reportAs: failed, terminationKind: compensated }, then: compensateOrder }   # fragment (c): nothing to void; fulfillment_failed with invalid-dependency-graph
-      - beginFulfillment:                           # protected (04): the R1 seam call approved → in_fulfillment; enqueues OrderFulfillmentStarted
+            - call: { step: dispatch-wave1-create }   # body: ref + planRef, lineRefs: $context.wave1LineRefs, dispatchRound: $context.wave1Round, attemptKey: $context.attemptKey; output: accepted[], failed[], deferred[], due, nextDispatchRound
+          catch: *transientNo409
+    catch:                              # 409: still-processing | idempotency-lease-expired (Q-11 (ii)), read before re-issuing (05 §4.5 item 3); otherwise the budget or the timeout is spent
+      as: waveError
+      when: '${ $waveError.status as $s | any((409, 408, 429, 503, 504); . == $s) }'
+      do: [ { classify: { set: { waveOutcome: '${ if $waveError.status == 409 then "reread" else "exhausted" end }' } } } ]
+    export: { as: '${ $context + { waveOutcome: (.waveOutcome // "answered"), wave1Failed: ($context.wave1Failed + (.failed // [])), wave1Deferred: (.deferred // []), wave1Round: (.nextDispatchRound // $context.wave1Round) } }' }
+- onWave1:
+    switch:
+      - reread:    { when: '${ $context.waveOutcome == "reread" }',    then: wave1Reread }
+      - exhausted: { when: '${ $context.waveOutcome == "exhausted" }', then: wave1Exhausted }
+      - deferred:  { when: '${ ($context.wave1Deferred | length) > 0 }', then: waitDeferral1 }   # a settled success, never a failure (05 §4.5 item 4); due: false until the recorded instant
+      - anyFailed: { when: '${ ($context.wave1Failed | length) > 0 }', then: lineFailure1 }
+      - accepted:  { then: enterAwaitExpected }
+- wave1Reread:
+    timeout: step
+    try:
+      - call: { step: reconcile-intent }   # body: ref + sweepRound
+    catch: *transient
+    then: wave1
+- wave1Exhausted:
+    set: { failureScope: line, failureSubjects: '${ $context.wave1LineRefs }', failureReason: wave1-create-failed, sourceStep: dispatch-wave1-create, nextStage: failure, stageLoop: null }
+    then: exit
+- waitDeferral1: { wait: PT1M }         # the re-dispatch is the re-check: before the recorded instant it re-defers with due: false
+- wave1Again: { set: { wave1LineRefs: '${ $context.wave1Deferred }' }, then: wave1 }
+- lineFailure1:                         # fragment (c)
+    set: { failureScope: line, failureSubjects: '${ $context.wave1Failed }', sourceStep: dispatch-wave1-create, nextStage: failure, stageLoop: null }
+    then: exit
+- enterAwaitExpected: { set: { stageLoop: awaitExpected, holdPauses: false } }
+- evaluate:                             # composable (04): both halves from Orders' record — due (database time against expected_fulfillment_at) and every create confirmed
+    timeout: step
+    try:
+      - call: { step: evaluate-activation-eligibility }   # body: ref + planRef, evaluationSeq: $context.barrierSeq; output: due, released, eligibleLineRefs[], pendingLineRefs[], nextEvaluationSeq
+    catch: *transient
+    export: { as: '${ $context + { expectedDue: .due, released: .released, eligibleLineRefs: .eligibleLineRefs, barrierSeq: .nextEvaluationSeq } }' }
+- onEvaluate:
+    switch:
+      - releasedFirst: { when: '${ $context.released and ($context.spawned | not) }', then: preActivation }
+      - releasedAgain: { when: '${ $context.released }', then: wave2 }   # the spawn signal is recorded once
+      - notDue:        { when: '${ $context.expectedDue | not }', then: awaitExpected }
+      - pending:       { then: enterBarrierLoop }
+- awaitExpected:                        # the barrier's timer half: the re-check loop of waitExpected
+    fork:
+      compete: true
+      branches:
+        - tick:      { do: [ { waitExpected: { wait: PT1H } }, { arm: { set: { arm: tick } } } ] }
+        - hold:      { do: [ ‹hold arm of (e)› ] }       # recorded, not waited on: holdPauses is false here
+        - resume:    { do: [ ‹resume arm of (e)› ] }
+        - lifecycle: { do: [ ‹lifecycle arm of (f)› ] }
+        - cancel:    { do: [ ‹cancel arm of (d)› ] }
+- afterExpected:
+    switch:
+      - tick:  { when: '${ .arm == "tick" }', then: evaluate }
+      - other: { then: leave }
+- enterBarrierLoop: { set: { stageLoop: barrierLoop } }
+- awaitConfirmationOrPoll:              # re-evaluate on EVERY contributing signal: a confirmation OR the poll interval
+    fork:
+      compete: true
+      branches:
+        - confirmation:
+            do:
+              - listenConfirmation:
+                  listen:
+                    to:
+                      any:
+                        - with: { type: ‹ProvisioningIntentConfirmed, 05 §3.3› }
+                          correlate: { orderId: { from: '${ .data.orderId }', expect: '${ $context.orderId }' }, orderVersion: { from: '${ .data.orderVersion }', expect: '${ $context.orderVersion }' } }
+                        - with: { type: ‹ProvisioningIntentFailed, 05 §3.3› }
+                          correlate: { orderId: { from: '${ .data.orderId }', expect: '${ $context.orderId }' }, orderVersion: { from: '${ .data.orderVersion }', expect: '${ $context.orderVersion }' } }
+                    read: envelope
+                  output: { as: '${ .[0] | { lineRef: .data.lineRef, wave: .data.wave } }' }
+              - arm: { set: { arm: confirmation, confirmedLineRef: '${ .lineRef }', confirmedWave: '${ .wave }' } }   # 05 §4.5 item 7: the line reference and wave only
+        - poll:      { do: [ { waitPoll: { wait: PT30S } }, { arm: { set: { arm: poll } } } ] }
+        - hold:      { do: [ ‹hold arm of (e)› ] }
+        - resume:    { do: [ ‹resume arm of (e)› ] }
+        - lifecycle: { do: [ ‹lifecycle arm of (f)› ] }
+        - cancel:    { do: [ ‹cancel arm of (d)› ] }
+- afterSignal:
+    switch:
+      - confirmation: { when: '${ .arm == "confirmation" }', then: reconcileHint }
+      - poll:         { when: '${ .arm == "poll" }',         then: reconcilePoll }
+      - other:        { then: leave }
+- reconcileHint:                        # composable (05): the confirmation is a wake-up; read the line before re-evaluating
+    timeout: step
+    try:
+      - call: { step: reconcile-intent }   # body: ref + lineRef: $context.confirmedLineRef, wave: $context.confirmedWave, sweepRound
+    catch: *transient
+    export: { as: '${ $context + { sweepFailed: .failed, sweepUnresolved: .unresolved, redispatch: .redispatch, sweepRound: .nextSweepRound } }' }
+    then: onSweep
+- reconcilePoll:                        # composable (05): an early read of the due intents; settles a dead lease through settle-from-lookup in-process
+    timeout: step
+    try:
+      - call: { step: reconcile-intent }   # body: ref + sweepRound
+    catch: *transient
+    export: { as: '${ $context + { sweepFailed: .failed, sweepUnresolved: .unresolved, redispatch: .redispatch, sweepRound: .nextSweepRound } }' }
+- onSweep:                              # 05 §4.5 item 6: the poll and confirmation arms never discard reconcile-intent's output
+    switch:
+      - failed:      { when: '${ (($context.sweepFailed + $context.sweepUnresolved) | length) > 0 }', then: sweepFailure }
+      - redispatch1: { when: '${ [ $context.redispatch[] | select(.wave == "wave1_create") ] | length > 0 }', then: redispatchWave1 }
+      - redispatch2: { when: '${ [ $context.redispatch[] | select(.wave == "wave2_activate") ] | length > 0 }', then: wave2 }
+      - reevaluate:  { then: evaluate }
+- sweepFailure:                         # fragment (c): never-dispatched | intent-unresolved | wave failures
+    set: { failureScope: line, failureSubjects: '${ $context.sweepFailed + $context.sweepUnresolved }', sourceStep: reconcile-intent, nextStage: failure, stageLoop: null }
+    then: exit
+- redispatchWave1: { set: { wave1LineRefs: '${ [ $context.redispatch[] | select(.wave == "wave1_create") | .lineRef ] }' }, then: enterWave1 }
+- preActivation:                        # protected (04): SUB-O5 overlap presence + market + authorization freshness, immediately before the first activation
+    timeout: step
+    try:
+      - call: { step: re-check-pre-activation }   # body: ref + planRef, evaluationSeq: $context.recheckSeq
+    catch:
+      errors: { with: { type: https://serverlessworkflow.io/spec/1.0.0/errors/communication } }
+      when: '${ $error.status as $s | any((429, 503, 504, 409); . == $s) }'
+      retry: recheck
+    export: { as: '${ $context + { preActivation: .verdict, abortReason: .abortReason, recheckSeq: .nextEvaluationSeq } }' }
+- onPreActivation:                      # 04 §4.8 item 4: proceed only by an explicit case
+    switch:
+      - proceed:         { when: '${ $context.preActivation == "proceed" }', then: spawnSignal }
+      - abort:           { when: '${ $context.preActivation == "abort" }', then: preActivationAbort }
+      - notDispatchable: { then: enterBarrierLoop }   # the barrier's hold, lifecycle and cancel arms consume what the operation observed
+- preActivationAbort: { set: { unwind: failure, reportAs: failed, terminationKind: compensated, nextStage: unwind, stageLoop: null }, then: exit }   # never the failure stage; void wave-1 drafts, fulfillment_failed with abortReason
+- spawnSignal:                          # protected (05): the first activation intent is the Lifecycle spawn/fencing signal
+    timeout: step
+    try:
+      - call: { step: report-spawn-signal }
+    catch: *transient
+    export: { as: '${ $context + { spawned: true } }' }
+- wave2:                                # protected (05): ONE call, eligible lines as references; the draft-liveness re-read is inside
+    try:
+      - dispatchWave2:
+          timeout: wave2
           try:
-            - call: { step: begin-fulfillment }     # body: ref + planRef, eligibilitySeq: $context.eligibilitySeq; output: result ∈ in-fulfillment | withheld, withheldCause
-          catch:
-            errors: { with: { status: 409 } }       # version-mismatch from a concurrent amendment: wait for the amendment arm, never the failure path (02 §4.7 item 8)
-            retry: transient
-            do: [ { toWait: { then: enterEligibilityWait } } ]
-          export: { as: '${ $context + { beginResult: .result } }' }
-      - onBegin:                                    # 04 §4.8 item 2
-          switch:
-            - started:  { when: '${ $context.beginResult == "in-fulfillment" }', then: fulfillmentWithOverdue }
-            - withheld: { then: enterEligibilityWait }   # back to the eligibility wait; the next eligible round carries a new eligibilitySeq
-      - fulfillmentWithOverdue:
-          fork:
-            compete: true
-            branches:
-              - waves:
-                  do:
-                    - wave1:                              # protected (05): ONE call per wave carrying lineRefs[]; per-order parallelism and admission inside (05 §4.3)
-                        try:
-                          - dispatch:
-                              try:
-                                - call: { step: dispatch-wave1-create }   # body: ref + planRef, lineRefs: $context.wave1LineRefs, dispatchRound: $context.wave1Round, attemptKey: $context.attemptKey
-                              catch: { errors: { with: { status: 503 } }, retry: transient, do: [ { toFailure: { set: { failureScope: line, failureSubjects: '${ $context.wave1LineRefs }', failureReason: wave1-create-failed, sourceStep: dispatch-wave1-create }, then: partialFailure } } ] }
-                        catch:
-                          errors: { with: { status: 409 } }   # still-processing | idempotency-lease-expired (Q-11 (ii)): read before re-issuing (05 §4.5 item 3)
-                          do: [ { readFirst: { step: reconcile-intent } }, { reissue: { then: wave1 } } ]   # body: ref + sweepRound
-                        export: { as: '${ $context + { wave1Failed: ($context.wave1Failed + .failed), wave1Deferred: .deferred, retryAfterMs: .retryAfterMs, wave1Round: .nextDispatchRound } }' }
-                    - onWave1:
-                        switch:
-                          - deferred:  { when: '${ ($context.wave1Deferred | length) > 0 }', then: wave1Deferral }   # a settled success, never a failure (05 §4.5 item 4)
-                          - anyFailed: { when: '${ ($context.wave1Failed | length) > 0 }', then: lineFailure1 }
-                          - accepted:  { then: barrier }
-                    - wave1Deferral: { do: [ { waitHint: { wait: '${ $context.retryAfterMs }' } }, { again: { set: { wave1LineRefs: '${ $context.wave1Deferred }' }, then: wave1 } } ] }   # Q-11 (i); a fixed 5 s until answered, the operation re-defers
-                    - lineFailure1: { set: { failureScope: line, failureSubjects: '${ $context.wave1Failed }', sourceStep: dispatch-wave1-create }, then: partialFailure }   # fragment (c)
-                    - barrier:                            # conjunction: expected time reached AND every create confirmed
-                        do:
-                          - waitExpected: { wait: '${ $context.expectedFulfillmentAt }' }   # Q-11 (i): duration to the instant; zero when already past
-                          - enterBarrierLoop: { set: { stageLoop: barrierLoop, holdPauses: false } }
-                          - barrierLoop:
-                              do:
-                                - evaluate:               # composable (04): reads Orders' record of confirmations; never the definition's memory
-                                    step: evaluate-activation-eligibility   # body: ref + planRef, evaluationSeq: $context.barrierSeq
-                                    export: { as: '${ $context + { released: .released, eligibleLineRefs: .eligibleLineRefs, barrierSeq: .nextEvaluationSeq } }' }
-                                - onEvaluate:
-                                    switch:
-                                      - releasedFirst: { when: '${ $context.released and ($context.spawned | not) }', then: preActivation }
-                                      - releasedAgain: { when: '${ $context.released }', then: wave2 }   # the spawn signal is recorded once
-                                      - pending:       { then: awaitConfirmationOrPoll }
-                                - awaitConfirmationOrPoll:     # re-evaluate on EVERY contributing signal: a confirmation OR the poll interval
-                                    fork:
-                                      compete: true
-                                      branches:
-                                        - confirmation:
-                                            do:
-                                              - listenConfirmation:
-                                                  listen:
-                                                    to:
-                                                      any:
-                                                        - with: { type: <ProvisioningIntentConfirmed, 05 §3.3> }
-                                                          correlate: { orderId: { from: '${ .data.orderId }', expect: '${ $context.orderId }' }, orderVersion: { from: '${ .data.orderVersion }', expect: '${ $context.orderVersion }' } }
-                                                        - with: { type: <ProvisioningIntentFailed, 05 §3.3> }
-                                                          correlate: { orderId: { from: '${ .data.orderId }', expect: '${ $context.orderId }' }, orderVersion: { from: '${ .data.orderVersion }', expect: '${ $context.orderVersion }' } }
-                                              - arm: { set: { arm: confirmation, confirmedLineRef: '${ .data.lineRef }', confirmedWave: '${ .data.wave }' } }   # 05 §4.5 item 7: the line reference and wave only
-                                        - poll:      { do: [ { waitPoll: { wait: { seconds: 30 } } }, { arm: { set: { arm: poll } } } ] }
-                                        - hold:      { do: [ ...fragment (e) hold listen ] }     # recorded, not waited on: holdPauses is false here
-                                        - resume:    { do: [ ...fragment (e) resume listen ] }
-                                        - lifecycle: { do: [ ...fragment (f) lifecycle listen ] }
-                                        - cancel:    { do: [ ...fragment (d) cancel listen ] }
-                                - afterSignal:
-                                    switch:
-                                      - confirmation: { when: '${ .arm == "confirmation" }', then: reconcileHint }
-                                      - poll:         { when: '${ .arm == "poll" }',         then: reconcilePoll }
-                                      - held:         { when: '${ .arm == "held" }',         then: holdPath }
-                                      - resumed:      { when: '${ .arm == "resumed" }',      then: earlyResumePath }
-                                      - lifecycle:    { when: '${ .arm == "lifecycle" }',    then: admitLifecycle }
-                                      - cancel:       { then: cancelPath }
-                                - reconcileHint:          # composable (05): the confirmation is a wake-up; read the line before re-evaluating
-                                    step: reconcile-intent   # body: ref + lineRef: $context.confirmedLineRef, wave: $context.confirmedWave, sweepRound
-                                    export: { as: '${ $context + { sweepFailed: .failed, sweepUnresolved: .unresolved, redispatch: .redispatch, sweepRound: .nextSweepRound } }' }
-                                    then: onSweep
-                                - reconcilePoll:          # composable (05): an early read of the due intents; settles a dead lease through settle-from-lookup in-process
-                                    step: reconcile-intent   # body: ref + sweepRound
-                                    export: { as: '${ $context + { sweepFailed: .failed, sweepUnresolved: .unresolved, redispatch: .redispatch, sweepRound: .nextSweepRound } }' }
-                                - onSweep:                # 05 §4.5 item 6: the poll and confirmation arms never discard reconcile-intent's output
-                                    switch:
-                                      - failed:     { when: '${ (($context.sweepFailed + $context.sweepUnresolved) | length) > 0 }', then: sweepFailure }
-                                      - redispatch1: { when: '${ [ $context.redispatch[] | select(.wave == "wave1_create") ] | length > 0 }', then: redispatchWave1 }
-                                      - redispatch2: { when: '${ [ $context.redispatch[] | select(.wave == "wave2_activate") ] | length > 0 }', then: wave2 }
-                                      - reevaluate: { then: evaluate }
-                                - sweepFailure: { set: { failureScope: line, failureSubjects: '${ $context.sweepFailed + $context.sweepUnresolved }', sourceStep: reconcile-intent }, then: partialFailure }   # fragment (c): never-dispatched | intent-unresolved | wave failures
-                                - redispatchWave1: { set: { wave1LineRefs: '${ [ $context.redispatch[] | select(.wave == "wave1_create") | .lineRef ] }' }, then: wave1 }
-                    - preActivation:                      # protected (04): SUB-O5 overlap presence + market + authorization freshness, immediately before the first activation
-                        try:
-                          - call: { step: re-check-pre-activation }   # body: ref + planRef, evaluationSeq: $context.recheckSeq
-                        catch: { errors: { with: { status: 503 } }, retry: recheck }
-                        export: { as: '${ $context + { preActivation: .verdict, abortReason: .abortReason, recheckSeq: .nextEvaluationSeq } }' }
-                    - onPreActivation:                    # 04 §4.8 item 4: proceed only by an explicit case
-                        switch:
-                          - proceed:         { when: '${ $context.preActivation == "proceed" }', then: spawnSignal }
-                          - abort:           { when: '${ $context.preActivation == "abort" }', then: preActivationAbort }
-                          - notDispatchable: { then: barrierLoop }   # the barrier's hold, lifecycle and cancel arms consume what the operation observed
-                    - preActivationAbort: { set: { unwind: failure, reportAs: failed, terminationKind: compensated }, then: compensateOrder }   # never partialFailure; void wave-1 drafts, fulfillment_failed with abortReason
-                    - spawnSignal:                        # protected (05): the first activation intent is the Lifecycle spawn/fencing signal
-                        step: report-spawn-signal
-                        export: { as: '${ $context + { spawned: true } }' }
-                    - wave2:                              # protected (05): ONE call, eligible lines as references; the draft-liveness re-read is inside
-                        try:
-                          - dispatch:
-                              try:
-                                - call: { step: dispatch-wave2-activate }   # body: ref + planRef, lineRefs: $context.eligibleLineRefs, dispatchRound: $context.wave2Round, attemptKey
-                              catch: { errors: { with: { status: 503 } }, retry: transient, do: [ { toFailure: { set: { failureScope: line, failureSubjects: '${ $context.eligibleLineRefs }', failureReason: wave2-activation-failed, sourceStep: dispatch-wave2-activate }, then: partialFailure } } ] }
-                        catch:
-                          errors: { with: { status: 409 } }   # activation-precondition-unmet, still-processing or idempotency-lease-expired: read, then back to the barrier
-                          do: [ { readFirst: { step: reconcile-intent } }, { back: { then: barrierLoop } } ]
-                        export: { as: '${ $context + { wave2Failed: ($context.wave2Failed + .failed), wave2Pending: .pending, lapsed: .lapsed, wave2Deferred: .deferred, retryAfterMs: .retryAfterMs, wave2Round: .nextDispatchRound } }' }
-                    - onWave2:                            # 05 §4.5 items 4–6 and 9
-                        switch:
-                          - lapsed:     { when: '${ ($context.lapsed | length) > 0 }', then: rebuildLapsed }
-                          - deferred:   { when: '${ ($context.wave2Deferred | length) > 0 }', then: wave2Deferral }
-                          - anyFailed:  { when: '${ ($context.wave2Failed | length) > 0 }', then: lineFailure2 }   # D-54
-                          - anyPending: { when: '${ ($context.wave2Pending | length) > 0 }', then: barrierLoop }  # dependents wait for their dependencies; the same conjunction
-                          - complete:   { then: reportCompleted }                                                   # pending[] and failed[] both empty
-                    - rebuildLapsed:                      # composable (05): a lapsed draft is rebuilt and goes back through wave 1 and the barrier, never straight to wave 2
-                        step: rebuild-wave1               # body: ref + planRef, lineRefs: $context.lapsed, dispatchRound: $context.wave1Round
-                        export: { as: '${ $context + { wave1LineRefs: .rebuilt, wave1Round: .nextDispatchRound } }' }
-                        then: wave1
-                    - wave2Deferral: { do: [ { waitHint: { wait: '${ $context.retryAfterMs }' } }, { again: { set: { eligibleLineRefs: '${ $context.wave2Deferred }' }, then: wave2 } } ] }
-                    - lineFailure2: { set: { failureScope: line, failureSubjects: '${ $context.wave2Failed }', sourceStep: dispatch-wave2-activate }, then: partialFailure }
-                    - reportCompleted:                    # protected (06): in_fulfillment → completed with per-line subscription ids; enqueues OrderFulfillmentCompleted
-                        step: report-outcome              # body: ref + outcome: completed
-                    - terminateCompleted: { step: terminate-instance }   # protected (01); terminationKind: completed
-                    - arm: { set: { arm: done } }
-              - overdue:                                  # the process deadline: 24 h past expected fulfillment time, raises an escalation and nothing else; no hold arm here
-                  do:
-                    - waitOverdue: { wait: '${ $context.expectedFulfillmentAt + 24h }' }   # Q-11 (i): duration to the instant
-                    - overdueRace:
-                        fork:
-                          compete: true
-                          branches:
-                            - escalate:
-                                do:
-                                  - raise: { step: raise-overdue-escalation }   # composable (07); body: ref + escalationKind: overdue-fulfillment, stepRef
-                                  - arm: { set: { arm: escalated } }
-                            - terminal:                   # cancelled by the order's own terminal process event
-                                do:
-                                  - listenTerminal: { listen: { to: { any: [ { with: { type: gts.cf.core.events.event.v1~cf.bss.orders_workflow.event.v1~cf.bss.orders_workflow.fulfillment_completed.v1~ } }, { with: { type: gts.cf.core.events.event.v1~cf.bss.orders_workflow.event.v1~cf.bss.orders_workflow.fulfillment_aborted.v1~ } } ] } } }
-                                  - arm: { set: { arm: terminal } }
-                    - keepRunning: { wait: { days: 90 } }   # the overdue arm never wins the outer race; the waves branch or an unwind completes it
-                    - arm: { set: { arm: overdue } }
-      - afterFulfillment:
-          switch:
-            - done: { then: end }
+            - call: { step: dispatch-wave2-activate }   # body: ref + planRef, lineRefs: $context.eligibleLineRefs, dispatchRound: $context.wave2Round, attemptKey; output: accepted[], activated[], failed[], pending[], lapsed[], deferred[], due, nextDispatchRound
+          catch: *transientNo409
+    catch:                              # 409: activation-precondition-unmet, still-processing or idempotency-lease-expired — read, then back to the barrier
+      as: waveError
+      when: '${ $waveError.status as $s | any((409, 408, 429, 503, 504); . == $s) }'
+      do: [ { classify: { set: { waveOutcome: '${ if $waveError.status == 409 then "reread" else "exhausted" end }' } } } ]
+    export: { as: '${ $context + { waveOutcome: (.waveOutcome // "answered"), wave2Failed: ($context.wave2Failed + (.failed // [])), wave2Pending: (.pending // []), lapsed: (.lapsed // []), wave2Deferred: (.deferred // []), wave2Round: (.nextDispatchRound // $context.wave2Round) } }' }
+- onWave2:                              # 05 §4.5 items 4–6 and 9
+    switch:
+      - reread:     { when: '${ $context.waveOutcome == "reread" }',    then: wave2Reread }
+      - exhausted:  { when: '${ $context.waveOutcome == "exhausted" }', then: wave2Exhausted }
+      - lapsed:     { when: '${ ($context.lapsed | length) > 0 }', then: rebuildLapsed }
+      - deferred:   { when: '${ ($context.wave2Deferred | length) > 0 }', then: waitDeferral2 }
+      - anyFailed:  { when: '${ ($context.wave2Failed | length) > 0 }', then: lineFailure2 }   # D-54
+      - anyPending: { when: '${ ($context.wave2Pending | length) > 0 }', then: enterBarrierLoop }  # dependents wait for their dependencies; the same conjunction
+      - complete:   { then: reportCompleted }                                                     # pending[] and failed[] both empty
+- wave2Reread:
+    timeout: step
+    try:
+      - call: { step: reconcile-intent }   # body: ref + sweepRound
+    catch: *transient
+    then: enterBarrierLoop
+- wave2Exhausted:
+    set: { failureScope: line, failureSubjects: '${ $context.eligibleLineRefs }', failureReason: wave2-activation-failed, sourceStep: dispatch-wave2-activate, nextStage: failure, stageLoop: null }
+    then: exit
+- rebuildLapsed:                        # composable (05): a lapsed draft is rebuilt and goes back through wave 1 and the barrier, never straight to wave 2
+    timeout: step
+    try:
+      - call: { step: rebuild-wave1 }   # body: ref + planRef, lineRefs: $context.lapsed, dispatchRound: $context.wave1Round
+    catch: *transient
+    export: { as: '${ $context + { wave1LineRefs: .rebuilt, wave1Round: .nextDispatchRound } }' }
+    then: enterWave1
+- waitDeferral2: { wait: PT1M }
+- wave2Again: { set: { eligibleLineRefs: '${ $context.wave2Deferred }' }, then: wave2 }
+- lineFailure2:
+    set: { failureScope: line, failureSubjects: '${ $context.wave2Failed }', sourceStep: dispatch-wave2-activate, nextStage: failure, stageLoop: null }
+    then: exit
+- reportCompleted:                      # protected (06): in_fulfillment → completed with per-line subscription ids; enqueues OrderFulfillmentCompleted
+    timeout: step
+    try:
+      - call: { step: report-outcome }  # body: ref + outcome: completed
+    catch: *transient
+- terminateCompleted:                   # protected (01); terminationKind: completed
+    timeout: step
+    try:
+      - call: { step: terminate-instance }
+    catch: *transient
+    then: end
+- leave: { set: { nextStage: '${ .arm }', returnStage: fulfillment }, then: exit }
+```
+
+The overdue monitor, the `do` list of the top-level `overdueMonitor` branch of fragment (a):
+
+```yaml
+- waitOverdue: { wait: PT1H }           # the process deadline: expected_fulfillment_at + 24 h, owned by 07; a hold never pauses it
+- overdueCheck:                         # composable (07): due only after begin-fulfillment, past the stored deadline, before a settled report-outcome
+    try:
+      - check:
+          timeout: step
+          try:
+            - call: { step: raise-overdue-escalation }   # body: ref + escalationKind: overdue-fulfillment; output: due, raised
+          catch: *transient
+    catch:                              # a failed check is the next tick's to repeat; nothing routes on it
+      as: overdueError
+      do: [ { unanswered: { set: { due: false, raised: false } } } ]
+- onOverdue:
+    switch:
+      - notDue: { when: '${ (.due | not) and (.raised | not) }', then: waitOverdue }   # the key stays open; the next tick calls it again
+      - done:   { then: overdueIdle }                                                  # raised once, absorbed, or the order already reported
+- overdueIdle: { wait: PT1H, then: overdueIdle }   # the branch never completes, so it never wins the lifetime race
 ```
 
 **Description**: The fragment reproduces [`04 §3.6`](./04-fulfillment-plan.md#36-interactions--sequences)
@@ -1073,38 +1373,47 @@ Dispatch*, *Wave-1 Rebuild* and *Reconciliation Sweep Cycle*, in the order of
 [`04 §4.8`](./04-fulfillment-plan.md#48-constraints-this-slice-places-on-the-definition) and
 [`05 §4.5`](./05-provisioning-intents.md#45-constraints-this-slice-places-on-the-definition).
 **Eligibility.** `evaluate-payment-auth-eligibility` is re-invoked from a competing fork that
-carries the admitted `OrderAcceptanceRecorded` `listen`, the `reauthorize-requested` signal, a
-poll `wait` and the hold, resume, lifecycle and cancel arms; `begin-fulfillment` follows only a
+carries the admitted `OrderAcceptanceRecorded` `listen`, the `reauthorize-requested` signal, the
+`PT5M` poll and the hold, resume, lifecycle and cancel arms; `begin-fulfillment` follows only a
 settled `eligible` and a settled `frozen`, receives the `eligible` round as `eligibilitySeq`, and a
-`withheld` answer returns to the eligibility wait. Each of the three evaluation operations
-returns `nextEvaluationSeq` and the definition passes it back unchanged. **Plan.** A `frozen` plan
-proceeds; `topology-unavailable` opens a plan task under either policy; `invalid-graph` opens a
-plan task under `remediate` and, under `fail-fast`, passes `begin-fulfillment` before the unwind
-because no Workflow transition leaves `approved`. **Waves.** Each wave is **one `call` carrying
-`lineRefs[]`**; per-line parallelism and admission are inside the operation (§2.2), and a wave's
-per-line outcomes come back as reference lists that route the `switch`. A deferral (`deferred[]`
-with `retryAfterMs`) is a settled success that waits and calls again under the next
-`dispatchRound`; a `lapsed[]` line goes to `rebuild-wave1` and back through wave 1 and the
-barrier; a `failed[]` line goes to fragment (c); a 409 is followed by a `reconcile-intent` read
-before the call is re-issued. **The barrier is a conjunction and is re-evaluated on every
-contributing signal**: `waitExpected` supplies the timer half once; `evaluate-activation-eligibility`
-reads the all-creates half from Orders' record, which Orders' own consumer of the Subscriptions
-outcome events maintains ([`09 §3.6` *System-actor delivery over the event broker*](./09-read-and-authz.md#36-interactions--sequences)),
-so the definition never holds the confirmation count itself; and `awaitConfirmationOrPoll`
-returns to `evaluate` on **either** a confirmation event **or** the poll interval — each through
+`withheld` answer — or a 409 `version-mismatch` from a concurrent amendment — returns to the
+eligibility wait. Each of the three evaluation operations returns `nextEvaluationSeq` and the
+definition passes it back unchanged. **Plan.** A `frozen` plan proceeds; `topology-unavailable`
+opens a plan task under either policy; `invalid-graph` opens a plan task under `remediate` and,
+under `fail-fast`, passes `begin-fulfillment` before the unwind because no Workflow transition
+leaves `approved`. **Waves.** Each wave is **one `call` carrying `lineRefs[]`**; per-line
+parallelism and admission are inside the operation (§2.2), and a wave's per-line outcomes come
+back as reference lists that route the `switch`. A deferral (`deferred[]`) is a settled success:
+the definition waits the fixed `PT1M` of `waitDeferral1` or `waitDeferral2` and calls again under the next
+`dispatchRound`, and the operation answers `due: false` and re-defers until the deferral instant
+it recorded; `retryAfterMs` is the operation's, never a `wait` value. A `lapsed[]` line goes to
+`rebuild-wave1` and back through wave 1 and the barrier; a `failed[]` line, an exhausted budget
+and a spent wave timeout go to fragment (c); a 409 is followed by a `reconcile-intent` read before
+the call is re-issued. **The barrier is a conjunction and is re-evaluated on every contributing
+signal**: `evaluate-activation-eligibility` answers both halves from Orders' record — `due`,
+database time against the plan's stored `expected_fulfillment_at`, which `awaitExpected`
+re-checks on the `PT1H` `waitExpected` tick, and the all-creates half, which Orders' own
+consumer of the Subscriptions outcome events maintains
+([`09 §3.6` *System-actor delivery over the event broker*](./09-read-and-authz.md#36-interactions--sequences)),
+so the definition never holds the confirmation count itself. Once `due`, `awaitConfirmationOrPoll`
+returns to `evaluate` on **either** a confirmation event **or** the `PT30S` poll — each through
 `reconcile-intent`, whose `failed[]` and `unresolved[]` route to fragment (c) and whose
 `redispatch[]` routes to the named wave — so a confirmation that landed between an evaluation and
-the `listen` cannot hang the barrier and the timer fire is never the sole trigger
+the `listen` cannot hang the barrier and the timer is never the sole trigger
 ([`../ADR/0004`](../ADR/0004-cpt-cf-bss-orders-workflow-adr-two-wave-activation-barrier.md) as
 amended). The poll arm is an early read of the schedule the `reconciliation-sweep` worker runs on
 `next_sweep_at` for every instance (`01 §3.8`); a hold is recorded here and not waited on, so the
-poll, `waitExpected` and the overdue `wait` keep running while the dispatch operations defer on
-`owf_process_instance.suspended`. `re-check-pre-activation` runs once, before the first
+poll, the `waitExpected` tick and the overdue monitor keep running while the dispatch operations
+defer on `owf_process_instance.suspended`. `re-check-pre-activation` runs once, before the first
 activation: `proceed` is the only case that reaches `report-spawn-signal`, `abort` goes to the
-unwind and `not-dispatchable` returns to the barrier loop. The overdue arm runs beside the waves
-in a non-terminating position: it can escalate, but it never cancels fulfillment, which is why it
-is inside its own `fork` and completes only against the order's terminal event
-([`07`](./07-manual-tasks.md), `cpt-cf-bss-orders-workflow-fr-owf-overdue-escalation`).
+unwind and `not-dispatchable` returns to the barrier loop. **Overdue.** The overdue window is the
+top-level `overdueMonitor` branch: every `PT1H` it calls `raise-overdue-escalation` with
+`escalationKind: overdue-fulfillment`, which answers `due: false`, records nothing and leaves the
+key `open` until database time passes `expected_fulfillment_at` + 24 h, answers `raised: false`
+once `report-outcome` has settled, and otherwise records the escalation once. It raises an
+escalation and nothing else, never cancels fulfillment and is never paused by a hold
+([`07`](./07-manual-tasks.md), `cpt-cf-bss-orders-workflow-fr-owf-overdue-escalation`); it stops
+with the invocation, so it needs no `listen` for Orders' own terminal events.
 
 #### (c) Partial failure: manual task, resume or compensate
 
@@ -1114,155 +1423,214 @@ is inside its own `fork` and completes only against the order's terminal event
 
 **Actors**: `cpt-cf-bss-orders-workflow-actor-owf-fulfillment-operator`, `cpt-cf-bss-orders-workflow-actor-owf-subscriptions`, `cpt-cf-bss-orders-workflow-actor-owf-orders-lifecycle`
 
+The failure stage, the `do` list of `process.failure` — entered with `failureScope`,
+`failureSubjects` (lineRef + reason, or a plan/order reference) and `sourceStep` in `$context`, and,
+for an order-scope task, `taskReturnStage` and `taskReturnLoop`:
+
 ```yaml
-- partialFailure:                                   # entered with failureScope, failureSubjects (lineRef + reason, or a plan/order reference), sourceStep in $context
-    do:
-      - onPolicy:                                   # 07 §4.8 item 1
-          switch:
-            - remediate: { when: '${ $context.policy == "remediate" or $context.forceTask }', then: createTasks }
-            - failFast:  { then: failFastUnwind }   # fail-fast records a tracked incident inside compensate-order's path; no actionable task
-      - failFastUnwind: { set: { unwind: failure, reportAs: failed, terminationKind: compensated }, then: compensateOrder }
-      - createTasks:                                # protected (07): exactly one actionable task per failed subject, reopen semantics inside
-          step: create-manual-task                  # body: ref + scope: $context.failureScope, subjects: $context.failureSubjects, failureCause, sourceStep, sourceAttempt
-          export: { as: '${ $context + { taskRefs: .taskRefs, exhaustedTaskRefs: .exhaustedTaskRefs, slaRemaining: .slaRemaining, slaRound: .slaRound, wave1Failed: [], wave2Failed: [], forceTask: false } }' }
-      - onCreate:
-          switch:
-            - exhausted: { when: '${ ($context.exhaustedTaskRefs | length) > 0 }', then: failFastUnwind }   # the third failed attempt (07 §4.2)
-            - open:      { then: enterAwaitResolution }
-      - enterAwaitResolution: { set: { stageLoop: awaitResolution, holdPauses: false } }
-      - awaitResolution:                            # 07 §4.8 item 3: every task has a waiter
-          fork:
-            compete: true
-            branches:
-              - resolution:
-                  do:
-                    - listenResolution: { listen: { to: { one: { with: { type: <task-resolution-requested signal, §3.3> }, correlate: { orderId: { from: '${ .data.orderId }', expect: '${ $context.orderId }' }, orderVersion: { from: '${ .data.orderVersion }', expect: '${ $context.orderVersion }' } } } } } }
-                    - arm: { set: { arm: resolution, taskRef: '${ .data.taskRef }', requestRef: '${ .data.requestRef }' } }
-              - sla:       { do: [ { waitSla: { wait: '${ $context.slaRemaining }' } }, { arm: { set: { arm: sla } } } ] }   # Q-11 (i)
-              - hold:      { do: [ ...fragment (e) hold listen ] }
-              - resume:    { do: [ ...fragment (e) resume listen ] }
-              - lifecycle: { do: [ ...fragment (f) lifecycle listen ] }
-              - cancel:    { do: [ ...fragment (d) cancel listen ] }
-      - afterResolution:
-          switch:
-            - resolution: { when: '${ .arm == "resolution" }', then: resolveTask }
-            - sla:        { when: '${ .arm == "sla" }',        then: slaCheck }
-            - held:       { when: '${ .arm == "held" }',       then: holdPath }
-            - resumed:    { when: '${ .arm == "resumed" }',    then: earlyResumePath }
-            - lifecycle:  { when: '${ .arm == "lifecycle" }',  then: admitLifecycle }
-            - cancel:     { then: cancelPath }
-      - resolveTask:                                # composable (07)
-          step: resolve-manual-task                 # body: ref + trigger: request, taskRef, requestRef
-          export: { as: '${ $context + { resolution: .resolution, resumeAt: .resumeAt, attemptKey: .attemptKey, slaRemaining: .slaRemaining, slaRound: .slaRound } }' }
-          then: onResolution
-      - slaCheck:                                   # composable (07): an SLA breach escalates inside the operation
-          step: resolve-manual-task                 # body: ref + trigger: sla-check, slaRound: $context.slaRound
-          export: { as: '${ $context + { resolution: .resolution, slaRemaining: .slaRemaining, slaRound: .slaRound } }' }
-      - onResolution:                               # 07 §4.8 item 4
-          switch:
-            - exhausted: { when: '${ $context.resolution == "exhausted" }', then: failFastUnwind }
-            - override:  { when: '${ $context.resolution == "override" }',  then: verifyOverride }
-            - retry:     { when: '${ $context.resolution == "retry" }',     then: routeRetry }
-            - wait:      { then: returnToStage }    # closed | escalated | refused | none: back to the waiting fork
-      - routeRetry:                                 # by resumeAt, carrying attemptKey
-          switch:
-            - barrier:      { when: '${ $context.resumeAt == "barrier" }',      then: barrier }          # the line re-enters the conjunction; the wave re-dispatches it under attemptKey
-            - plan:         { when: '${ $context.resumeAt == "plan" }',         then: retryPlan }
-            - compensation: { when: '${ $context.resumeAt == "compensation" }', then: compensate }       # a new pass of compensate-order
-            - stage:        { then: retryStage }                                                        # an order-scope task: the stage whose operation failed
-      - retryPlan: { set: { planAttempt: '${ $context.attemptKey }' }, then: freezePlan }   # a new attempt of construct-and-freeze-plan
-      - retryStage:
-          switch:
-            - reflection: { when: '${ $context.sourceStep == "reflect-verdict" }', then: reflectVerdict }
-            - cancel:     { when: '${ $context.sourceStep == "authorize-cancel" }', then: returnToStage }
-            - admission:  { then: returnToStage }   # an unverified trigger on a listen arm: the arm's stage re-listens
-      - verifyOverride:                             # composable (07): follows only a resolve-manual-task that answered override for the same requestRef
-          step: verify-override                     # body: ref + taskRef, requestRef; output: verified, rejection, exhausted
-          export: { as: '${ $context + { overrideVerified: .verified, overrideExhausted: .exhausted } }' }
-      - afterOverride:
-          switch:
-            - verified:  { when: '${ $context.overrideVerified }', then: barrier }        # the line is activated; the conjunction decides whether the order completes
-            - exhausted: { when: '${ $context.overrideExhausted }', then: failFastUnwind }
-            - rejected:  { then: awaitResolution }                                       # the task remains open
-- compensateOrder:                                  # the unwind (06 §4.7): fence < compensate-order < report-outcome < terminate-instance
-    do:                                             # entered with unwind ∈ failure | cancel | supersede | terminal-event, reportAs and terminationKind in $context
-      - fence:                                      # protected (06): claims or absorbs, promotes failure → cancel (06 §4.3)
+- enter:
+    switch:
+      - waiting: { when: '${ $context.stageLoop == "awaitResolution" }', then: awaitResolution }
+      - fresh:   { then: onPolicy }
+- onPolicy:                             # 07 §4.8 item 1
+    switch:
+      - remediate: { when: '${ $context.policy == "remediate" or $context.forceTask }', then: createTasks }
+      - failFast:  { then: failFastUnwind }   # fail-fast records a tracked incident inside compensate-order's path; no actionable task
+- failFastUnwind: { set: { unwind: failure, reportAs: failed, terminationKind: compensated, nextStage: unwind, stageLoop: null }, then: exit }
+- createTasks:                          # protected (07): exactly one actionable task per failed subject, reopen semantics inside
+    timeout: step
+    try:
+      - call: { step: create-manual-task }   # body: ref + scope: $context.failureScope, subjects: $context.failureSubjects, failureCause, sourceStep, sourceAttempt
+    catch: *transient
+    export: { as: '${ $context + { taskRefs: .taskRefs, exhaustedTaskRefs: .exhaustedTaskRefs, slaRound: .slaRound, wave1Failed: [], wave2Failed: [], forceTask: false } }' }
+- onCreate:
+    switch:
+      - exhausted: { when: '${ ($context.exhaustedTaskRefs | length) > 0 }', then: failFastUnwind }   # the third failed attempt (07 §4.2)
+      - open:      { then: enterAwaitResolution }
+- enterAwaitResolution: { set: { stageLoop: awaitResolution, holdPauses: false } }
+- awaitResolution:                      # 07 §4.8 item 3: every task has a waiter
+    fork:
+      compete: true
+      branches:
+        - resolution:                   # the task-resolution arm, also used by (c) awaitCompensationResolution and (d) awaitOperatorAfterPark
+            do:
+              - listenResolution:
+                  listen:
+                    to:
+                      one:
+                        with: { type: gts.cf.core.events.event.v1~cf.bss.orders_workflow.signal.v1~cf.bss.orders_workflow.task_resolution_requested.v1~ }
+                        correlate:
+                          orderId:      { from: '${ .data.orderId }',      expect: '${ $context.orderId }' }
+                          orderVersion: { from: '${ .data.orderVersion }', expect: '${ $context.orderVersion }' }
+                    read: envelope
+                  output: { as: '${ .[0] | { taskRef: .data.taskRef, requestRef: .data.requestRef } }' }
+              - arm: { set: { arm: resolution, taskRef: '${ .taskRef }', requestRef: '${ .requestRef }' } }
+        - sla:       { do: [ { waitSla: { wait: PT5M } }, { arm: { set: { arm: sla } } } ] }
+        - hold:      { do: [ ‹hold arm of (e)› ] }
+        - resume:    { do: [ ‹resume arm of (e)› ] }
+        - lifecycle: { do: [ ‹lifecycle arm of (f)› ] }
+        - cancel:    { do: [ ‹cancel arm of (d)› ] }
+- afterResolution:
+    switch:
+      - resolution: { when: '${ .arm == "resolution" }', then: resolveTask }
+      - sla:        { when: '${ .arm == "sla" }',        then: slaCheck }
+      - other:      { then: leave }
+- resolveTask:                          # composable (07)
+    timeout: step
+    try:
+      - call: { step: resolve-manual-task }   # body: ref + trigger: request, taskRef, requestRef
+    catch: *transient
+    export: { as: '${ $context + { resolution: .resolution, resumeAt: .resumeAt, attemptKey: .attemptKey, slaRound: .slaRound } }' }
+    then: onResolution
+- slaCheck:                             # composable (07): the SLA re-check; escalates inside the operation only once the stored SLA deadline has passed
+    timeout: step
+    try:
+      - call: { step: resolve-manual-task }   # body: ref + trigger: sla-check, slaRound: $context.slaRound
+    catch: *transient
+    export: { as: '${ $context + { resolution: .resolution, slaRound: .slaRound } }' }
+- onResolution:                         # 07 §4.8 item 4
+    switch:
+      - exhausted: { when: '${ $context.resolution == "exhausted" }', then: failFastUnwind }
+      - override:  { when: '${ $context.resolution == "override" }',  then: verifyOverride }
+      - retry:     { when: '${ $context.resolution == "retry" }',     then: routeRetry }
+      - wait:      { then: awaitResolution }   # closed | escalated | refused | none: back to the waiting fork
+- routeRetry:                           # by resumeAt, carrying attemptKey
+    switch:
+      - barrier:      { when: '${ $context.resumeAt == "barrier" }',      then: toBarrier }
+      - plan:         { when: '${ $context.resumeAt == "plan" }',         then: toPlan }
+      - compensation: { when: '${ $context.resumeAt == "compensation" }', then: toCompensation }
+      - stage:        { then: retryStage }   # an order-scope task: the stage whose operation failed
+- toBarrier: { set: { nextStage: fulfillment, stageLoop: barrierLoop }, then: exit }   # the line re-enters the conjunction; the wave re-dispatches it under attemptKey
+- toPlan: { set: { nextStage: fulfillment, stageLoop: freezePlan, planAttempt: '${ $context.attemptKey }' }, then: exit }   # a new attempt of construct-and-freeze-plan
+- toCompensation: { set: { nextStage: unwind, stageLoop: compensate }, then: exit }   # a new pass of compensate-order
+- retryStage: { set: { nextStage: '${ $context.taskReturnStage }', stageLoop: '${ $context.taskReturnLoop }' }, then: exit }   # reflect-verdict → approval at reflectVerdict; authorize-cancel → the stage the cancel was taken from
+- verifyOverride:                       # composable (07): follows only a resolve-manual-task that answered override for the same requestRef
+    timeout: step
+    try:
+      - call: { step: verify-override } # body: ref + taskRef, requestRef; output: verified, rejection, exhausted
+    catch: *transient
+    export: { as: '${ $context + { overrideVerified: .verified, overrideExhausted: .exhausted } }' }
+- afterOverride:
+    switch:
+      - verified:  { when: '${ $context.overrideVerified }', then: toBarrier }      # the line is activated; the conjunction decides whether the order completes
+      - exhausted: { when: '${ $context.overrideExhausted }', then: failFastUnwind }
+      - rejected:  { then: awaitResolution }                                      # the task remains open
+- leave: { set: { nextStage: '${ .arm }', returnStage: failure }, then: exit }
+```
+
+The unwind stage, the `do` list of `process.unwind` — the order of `06 §4.7`: fence **<**
+`compensate-order` **<** `report-outcome` **<** `terminate-instance`, entered with
+`unwind` ∈ `failure` · `cancel` · `supersede` · `terminal-event`, `reportAs` and
+`terminationKind` in `$context`:
+
+```yaml
+- enter:
+    switch:
+      - waiting:    { when: '${ $context.stageLoop == "awaitCompensationResolution" }', then: awaitCompensationResolution }
+      - compensate: { when: '${ $context.stageLoop == "compensate" }', then: compensate }
+      - fresh:      { then: fence }
+- fence:                                # protected (06): claims or absorbs, promotes failure → cancel (06 §4.3); a permanent failure faults the invocation
+    timeout: step
+    try:
+      - call: { step: run-cancellation-fence }   # body: ref + trigger: $context.unwind, failureReason, cancelRequestRef, triggerEventId
+    catch: *transient
+    export: { as: '${ $context + { pass: ($context.pass // 1) } }' }
+- enterCompensate: { set: { stageLoop: compensate } }
+- compensate:                           # protected (06): the whole reverse walk, ONE operation because the ordinal is Orders'
+    try:
+      - walk:
+          timeout: step
           try:
-            - call: { step: run-cancellation-fence }   # body: ref + trigger: $context.unwind, failureReason, cancelRequestRef, triggerEventId
-          catch: { errors: { with: { status: 503 } }, retry: transient }   # a permanent failure raises into the path's failure arm with the returned reason
-          export: { as: '${ $context + { pass: ($context.pass // 1) } }' }
-      - compensate:                                 # protected (06): the whole reverse walk, ONE operation because the ordinal is Orders'
-          try:
-            - call: { step: compensate-order }      # body: ref + pass: $context.pass; output: compensationState ∈ complete | in-progress | pending-escalation, nextPass, taskRefs[]
-          catch:
-            errors: { with: { status: 503 } }
-            retry: transient
-            do: [ { nextPassAfterExhaustion: { set: { pass: '${ $context.pass + 1 }' }, then: enterAwaitCompensationResolution } } ]   # 06 §4.7 item 5
-          export: { as: '${ $context + { compensationState: .compensationState, pass: .nextPass } }' }
-      - onCompensation:                             # 06 §4.7 item 2: only complete reaches report-outcome
-          switch:
-            - complete:   { when: '${ $context.compensationState == "complete" }', then: reportOutcome }
-            - inProgress: { when: '${ $context.compensationState == "in-progress" }', then: compensationRepoll }
-            - pending:    { then: enterAwaitCompensationResolution }   # a leg failed: compensate-order already opened its manual task; the order stays non-terminal
-      - compensationRepoll: { do: [ { waitRepoll: { wait: { seconds: 30 } } }, { again: { then: compensate } } ] }   # the barrier's poll interval; well inside the sweep floor
-      - enterAwaitCompensationResolution: { set: { stageLoop: awaitCompensationResolution, holdPauses: false } }
-      - slaOnEntry:                                 # 07 §4.8 item 3: the SLA branch calls sla-check on entry and waits the returned remainder
-          step: resolve-manual-task                 # body: ref + trigger: sla-check, slaRound: $context.slaRound
-          export: { as: '${ $context + { slaRemaining: .slaRemaining, slaRound: .slaRound } }' }
-      - awaitCompensationResolution:                # no hold arm: a hold does not pause an unwind (06 §4.7 item 7)
-          fork:
-            compete: true
-            branches:
-              - resolution: { do: [ ...task-resolution-requested listen as in awaitResolution ] }   # sets arm: resolution, taskRef, requestRef
-              - sla:        { do: [ { waitSla: { wait: '${ $context.slaRemaining }' } }, { arm: { set: { arm: sla } } } ] }
-              - retryLeg:   { do: [ { waitRetry: { wait: { hours: 1 } } }, { arm: { set: { arm: retry } } } ] }   # inside the sweep floor
-              - cancel:     { do: [ ...fragment (d) cancel listen ] }   # authorize-cancel, then the fence absorbs and promotes, then compensate
-      - afterCompensationResolution:
-          switch:
-            - resolution: { when: '${ .arm == "resolution" }', then: resolveCompensationTask }
-            - sla:        { when: '${ .arm == "sla" }',        then: slaOnEntry }
-            - retry:      { when: '${ .arm == "retry" }',      then: compensate }    # the next pass; already-settled legs are absorbed
-            - cancel:     { then: cancelPath }
-      - resolveCompensationTask:
-          step: resolve-manual-task                 # body: ref + trigger: request, taskRef, requestRef
-          export: { as: '${ $context + { resolution: .resolution, attemptKey: .attemptKey } }' }
-      - onCompensationResolution:
-          switch:
-            - again: { when: '${ $context.resolution == "retry" or $context.resolution == "exhausted" }', then: compensate }   # resumeAt: compensation
-            - wait:  { then: slaOnEntry }                                                                                    # closed | escalated | refused | none
-      - reportOutcome:                              # protected (06): the sole Lifecycle outcome caller
-          try:
-            - call: { step: report-outcome }        # body: ref + outcome: $context.reportAs ∈ failed | cancelled | superseded | terminal-event
-          catch: { errors: { with: { status: 503 } }, retry: transient }   # outcome-not-reportable or fence-not-claimed raise into the path's failure arm
-      - terminateAborted: { step: terminate-instance, then: end }   # protected (01); terminationKind: $context.terminationKind, supersededByOrderVersion on supersede
+            - call: { step: compensate-order }   # body: ref + pass: $context.pass; output: compensationState ∈ complete | in-progress | pending-escalation, nextPass, taskRefs[]
+          catch: *transient
+    catch:                              # the budget or the timeout spent: the next pass waits in awaitCompensationResolution (06 §4.7 item 5)
+      errors: { with: { type: https://serverlessworkflow.io/spec/1.0.0/errors/communication } }
+      when: '${ $error.status as $s | any((408, 429, 503, 504, 409); . == $s) }'
+      do: [ { exhausted: { set: { compensationState: retry-exhausted } } } ]
+    export: { as: '${ $context + { compensationState: .compensationState, pass: (.nextPass // ($context.pass + 1)) } }' }
+- onCompensation:                       # 06 §4.7 item 2: only complete reaches report-outcome
+    switch:
+      - complete:   { when: '${ $context.compensationState == "complete" }', then: reportOutcome }
+      - inProgress: { when: '${ $context.compensationState == "in-progress" }', then: waitRepoll }
+      - pending:    { then: enterAwaitCompensationResolution }   # pending-escalation | retry-exhausted: compensate-order opened its task; the order stays non-terminal
+- waitRepoll: { wait: PT30S, then: compensate }   # the barrier's poll interval; well inside the sweep floor
+- enterAwaitCompensationResolution: { set: { stageLoop: awaitCompensationResolution, holdPauses: false } }
+- awaitCompensationResolution:          # no hold arm: a hold does not pause an unwind (06 §4.7 item 7)
+    fork:
+      compete: true
+      branches:
+        - resolution: { do: [ ‹task-resolution arm of awaitResolution› ] }   # sets arm: resolution, taskRef, requestRef
+        - sla:        { do: [ { waitSla: { wait: PT5M } }, { arm: { set: { arm: sla } } } ] }
+        - retryLeg:   { do: [ { waitRetryLeg: { wait: PT1H } }, { arm: { set: { arm: retry } } } ] }   # inside the sweep floor
+        - cancel:     { do: [ ‹cancel arm of (d)› ] }   # authorize-cancel, then the fence absorbs and promotes, then compensate
+- afterCompensationResolution:
+    switch:
+      - resolution: { when: '${ .arm == "resolution" }', then: resolveCompensationTask }
+      - sla:        { when: '${ .arm == "sla" }',        then: slaCheckUnwind }
+      - retry:      { when: '${ .arm == "retry" }',      then: compensate }    # the next pass; already-settled legs are absorbed
+      - other:      { then: leave }                                          # cancel
+- slaCheckUnwind:
+    timeout: step
+    try:
+      - call: { step: resolve-manual-task }   # body: ref + trigger: sla-check, slaRound: $context.slaRound
+    catch: *transient
+    export: { as: '${ $context + { slaRound: .slaRound } }' }
+    then: awaitCompensationResolution
+- resolveCompensationTask:
+    timeout: step
+    try:
+      - call: { step: resolve-manual-task }   # body: ref + trigger: request, taskRef, requestRef
+    catch: *transient
+    export: { as: '${ $context + { resolution: .resolution, attemptKey: .attemptKey } }' }
+- onCompensationResolution:
+    switch:
+      - again: { when: '${ $context.resolution == "retry" or $context.resolution == "exhausted" }', then: compensate }   # resumeAt: compensation
+      - wait:  { then: awaitCompensationResolution }                                                                    # closed | escalated | refused | none
+- reportOutcome:                        # protected (06): the sole Lifecycle outcome caller; outcome-not-reportable or fence-not-claimed fault the invocation
+    timeout: step
+    try:
+      - call: { step: report-outcome }  # body: ref + outcome: $context.reportAs ∈ failed | cancelled | superseded | terminal-event
+    catch: *transient
+- terminateAborted:                     # protected (01); terminationKind: $context.terminationKind, supersededByOrderVersion on supersede
+    timeout: step
+    try:
+      - call: { step: terminate-instance }
+    catch: *transient
+    then: end
+- leave: { set: { nextStage: '${ .arm }', returnStage: unwind }, then: exit }
 ```
 
 **Description**: The fragment reproduces [`06 §3.6`](./06-saga-and-compensation.md#36-interactions--sequences)
 *Order-Level Failure Compensation* and *Compensation Walk Order*, and
 [`07 §3.6`](./07-manual-tasks.md#36-interactions--sequences) *Manual Task Created on Failure* and
 *Override Rejected Without Verified Subscription*. Retry exhaustion is the definition's — the
-`catch.retry` on a wave call — and what follows it is `create-manual-task`, exactly as
+`catch.retry` on a wave call, and the wave's timeout — and what follows it is
+`create-manual-task`, exactly as
 [`08 §3.6` *Transient Outage: Retry-Then-Manual-Task*](./08-hold-and-cancel.md#36-interactions--sequences)
 draws it; the envelope creates no task (`01 §4.5`). **Every task has a waiter**: `awaitResolution`
-and `awaitCompensationResolution` compete the `task-resolution-requested` `listen` with an SLA
-branch that waits the `slaRemaining` the last `resolve-manual-task` or `create-manual-task`
-returned and then calls `resolve-manual-task` with `trigger: sla-check`. A non-empty
-`exhaustedTaskRefs`, an `exhausted` resolution and an `exhausted: true` override route to the
-unwind; a `retry` routes by `resumeAt` — `barrier` (a line), `plan` (a new
-`construct-and-freeze-plan` attempt), `compensation` (a new `compensate-order` pass) or `stage` (an
-order-scope task) — and carries `attemptKey`; `closed`, `escalated`, `refused` and `none` return
-to the waiting fork. **The reverse walk is one operation**: `compensate-order` owns
-`compensation_sequence`, the descending walk, the per-subject phase resolution and the
-`failed-pending-escalation` records
+and `awaitCompensationResolution` compete the `task-resolution-requested` `listen` with the
+`PT5M` `waitSla` tick, which calls `resolve-manual-task` with `trigger: sla-check`; the operation
+escalates only once the task's stored SLA deadline has passed in database time, so the tick is a
+re-check and no remainder is carried. A non-empty `exhaustedTaskRefs`, an `exhausted` resolution
+and an `exhausted: true` override route to the unwind; a `retry` routes by `resumeAt` — `barrier`
+(a line), `plan` (a new `construct-and-freeze-plan` attempt), `compensation` (a new
+`compensate-order` pass) or `stage` (an order-scope task, back to the `taskReturnStage` and
+`taskReturnLoop` the failing stage recorded) — and carries `attemptKey`; `closed`, `escalated`,
+`refused` and `none` return to the waiting fork. **The reverse walk is one operation**:
+`compensate-order` owns `compensation_sequence`, the descending walk, the per-subject phase
+resolution and the `failed-pending-escalation` records
 ([`../ADR/0005`](../ADR/0005-cpt-cf-bss-orders-workflow-adr-saga-compensable-no-pivot.md) as
 amended), because splitting the walk into definition tasks would put the ordinal — a fact
 Orders' saga log is authoritative for — into engine state. The definition keeps only `pass`, the
 walk's resumption counter, and presents a greater `pass` on every re-invocation. `in-progress` is
-re-polled on the barrier's interval; `pending-escalation` waits in `awaitCompensationResolution`,
-which carries the cancel arm (a cancel during an unwind is authorized, then absorbed and promoted
-by the fence, then the walk continues) and no hold arm. `report-outcome` is called only when
-`compensate-order` reports `complete`, which is the PRD's "order remains non-terminal until
-operational compensation reaches a known outcome".
+re-polled on the `PT30S` interval; `pending-escalation` and an exhausted budget wait in
+`awaitCompensationResolution`, which carries the cancel arm (a cancel during an unwind is
+authorized, then absorbed and promoted by the fence, then the walk continues) and no hold arm. A
+permanent refusal of `run-cancellation-fence` or `report-outcome` is not caught: it faults the
+invocation, which the platform records as `failed` and, with no function-level handler,
+`dead_lettered` (§3.3 *Generic control*). `report-outcome` is called only when `compensate-order`
+reports `complete`, which is the PRD's "order remains non-terminal until operational compensation
+reaches a known outcome".
 
 #### (d) Cancel
 
@@ -1273,66 +1641,134 @@ operational compensation reaches a known outcome".
 **Actors**: `cpt-cf-bss-orders-workflow-actor-owf-seller-operator`, `cpt-cf-bss-orders-workflow-actor-owf-orders-lifecycle`, `cpt-cf-bss-orders-workflow-actor-owf-subscriptions`
 
 ```yaml
-# the cancel arm of every competing fork above: it only listens
-- cancel:
-    do:
-      - awaitCancel:
-          listen:
-            to:
-              one:
-                with: { type: gts.cf.core.events.event.v1~cf.bss.orders_workflow.signal.v1~cf.bss.orders_workflow.cancel_requested.v1~ }
-                correlate:
-                  orderId:      { from: '${ .data.orderId }',      expect: '${ $context.orderId }' }
-                  orderVersion: { from: '${ .data.orderVersion }', expect: '${ $context.orderVersion }' }
-      - arm: { set: { arm: cancel, cancelRequestRef: '${ .data.requestRef }' } }
-# the path the sibling switch routes to:
-- cancelPath:
-    do:
-      - authorize:                                  # protected (08): the apply-time re-check of authority (09 §4.4); precedes the fence on every cancel path
+# the cancel arm of every stage fork: it only listens
+- awaitCancel:
+    listen:
+      to:
+        one:
+          with: { type: gts.cf.core.events.event.v1~cf.bss.orders_workflow.signal.v1~cf.bss.orders_workflow.cancel_requested.v1~ }
+          correlate:
+            orderId:      { from: '${ .data.orderId }',      expect: '${ $context.orderId }' }
+            orderVersion: { from: '${ .data.orderVersion }', expect: '${ $context.orderVersion }' }
+      read: envelope
+    output: { as: '${ .[0] | { requestRef: .data.requestRef } }' }
+- arm: { set: { arm: cancel, cancelRequestRef: '${ .requestRef }' } }
+```
+
+The cancel stage, the `do` list of `process.cancel`, entered with `returnStage` and `stageLoop`
+of the stage the cancel was taken from:
+
+```yaml
+- authorize:                            # protected (08): the apply-time re-check of authority (09 §4.4); precedes the fence on every cancel path
+    try:
+      - authorizeCall:
+          timeout: step
           try:
-            - call: { step: authorize-cancel }      # body: ref + cancelRequestRef; output: authorized (bool), taskRef
-          catch:
-            errors: { with: { status: 503 } }
-            retry: transient
-            do: [ { toTask: { set: { failureScope: order, failureSubjects: [ '${ $context.correlationId }' ], failureReason: authority-withdrawn, sourceStep: authorize-cancel }, then: createTasks } } ]   # 08 §4.7 item 6
-          export: { as: '${ $context + { cancelAuthorized: .authorized } }' }
-      - onAuthorize:
-          switch:
-            - authorized: { when: '${ $context.cancelAuthorized }', then: toCancelUnwind }
-            - denied:     { then: returnToStage }   # the stage the cancel was taken from — the resume wait when taken from a hold (08 §4.7 item 5)
-      - toCancelUnwind: { set: { unwind: cancel, reportAs: cancelled, terminationKind: compensated }, then: compensateOrder }   # fragment (c): workflow-mediated cancel with evidence
-- awaitOperatorAfterPark:                           # after the lifetime ceiling parked the instance; no hold arm
+            - call: { step: authorize-cancel }   # body: ref + cancelRequestRef; output: authorized (bool), taskRef
+          catch: *transient
+    catch:                              # the budget or the timeout spent: the authority-withdrawn task (08 §4.7 item 6)
+      errors: { with: { type: https://serverlessworkflow.io/spec/1.0.0/errors/communication } }
+      when: '${ $error.status as $s | any((408, 429, 503, 504, 409); . == $s) }'
+      do: [ { withdrawn: { set: { authorized: null } } } ]
+    export: { as: '${ $context + { cancelAuthorized: .authorized } }' }
+- onAuthorize:
+    switch:
+      - authorized: { when: '${ $context.cancelAuthorized == true }', then: toCancelUnwind }
+      - withdrawn:  { when: '${ $context.cancelAuthorized == null }', then: authorityTask }
+      - denied:     { then: back }      # the stage and loop the cancel was taken from — the resume wait when taken from a hold (08 §4.7 item 5)
+- toCancelUnwind: { set: { unwind: cancel, reportAs: cancelled, terminationKind: compensated, nextStage: unwind, stageLoop: null }, then: exit }   # fragment (c): workflow-mediated cancel with evidence
+- authorityTask:                        # fragment (c): an order-scope task whose retry returns to the stage the cancel was taken from
+    set: { failureScope: order, failureSubjects: [ '${ $context.correlationId }' ], failureReason: authority-withdrawn, sourceStep: authorize-cancel, forceTask: true, taskReturnStage: '${ $context.returnStage }', taskReturnLoop: '${ $context.stageLoop }', nextStage: failure, stageLoop: null }
+    then: exit
+- back: { set: { nextStage: '${ $context.returnStage }' }, then: exit }
+```
+
+The ceiling stage, the `do` list of `process.ceiling`, entered from `ceilingEntry` of fragment (a):
+
+```yaml
+- enter:
+    switch:
+      - parked: { when: '${ $context.stageLoop == "awaitOperatorAfterPark" }', then: awaitOperatorAfterPark }
+      - fresh:  { then: escalateCeiling }
+- escalateCeiling:                      # 07 §4.8 item 7: the escalation before the park; it opens the lifetime-ceiling-reached order task
+    timeout: step
+    try:
+      - call: { step: raise-overdue-escalation }   # body: ref + escalationKind: lifetime-ceiling; output: taskRef
+    catch: *transient
+    export: { as: '${ $context + { ceilingTaskRef: .taskRef } }' }
+- parkCeiling:                          # park is permitted from started or suspended (01 §3.7)
+    timeout: step
+    try:
+      - call: { step: park }            # body: ref + parkReason: lifetime-ceiling, subjectRef: process
+    catch: *transient
+- enterOperatorWait: { set: { stageLoop: awaitOperatorAfterPark } }
+- awaitOperatorAfterPark:               # no hold arm
     fork:
       compete: true
       branches:
-        - cancel:    { do: [ ...cancel arm ] }
-        - lifecycle: { do: [ ...fragment (f) lifecycle listen ] }
-        - unpark:    { do: [ { listenUnpark: { listen: { to: { one: { with: { type: <unpark-requested signal, §3.3> }, correlate: { orderId: { from: '${ .data.orderId }', expect: '${ $context.orderId }' } } } } } } }, { arm: { set: { arm: unpark } } } ] }
+        - resolution: { do: [ ‹task-resolution arm of (c) awaitResolution› ] }   # an operator retry of the lifetime-ceiling-reached task
+        - unpark:
+            do:
+              - listenUnpark:
+                  listen:
+                    to:
+                      one:
+                        with: { type: gts.cf.core.events.event.v1~cf.bss.orders_workflow.signal.v1~cf.bss.orders_workflow.unpark_requested.v1~ }
+                        correlate:
+                          orderId:      { from: '${ .data.orderId }',      expect: '${ $context.orderId }' }
+                          orderVersion: { from: '${ .data.orderVersion }', expect: '${ $context.orderVersion }' }
+                    read: envelope
+                  output: { as: '${ .[0] | { requestRef: .data.requestRef } }' }
+              - arm: { set: { arm: unpark, requestRef: '${ .requestRef }' } }
+        - lifecycle: { do: [ ‹lifecycle arm of (f)› ] }
+        - cancel:    { do: [ ‹cancel arm of (d)› ] }
 - afterOperatorPark:
     switch:
-      - cancel:    { when: '${ .arm == "cancel" }',    then: cancelPath }        # parked → compensating through the fence (01 §3.7)
-      - lifecycle: { when: '${ .arm == "lifecycle" }', then: admitLifecycle }
-      - unpark:    { then: unparkAfterCeiling }
-- unparkAfterCeiling: { step: unpark, then: returnToStage }   # body: ref + subjectRef: process
+      - resolution: { when: '${ .arm == "resolution" }', then: resolveCeilingTask }
+      - unpark:     { when: '${ .arm == "unpark" }',     then: unparkAfterCeiling }
+      - other:      { then: leave }     # cancel: parked → compensating through the fence (01 §3.7); lifecycle
+- resolveCeilingTask:                   # composable (07)
+    timeout: step
+    try:
+      - call: { step: resolve-manual-task }   # body: ref + trigger: request, taskRef, requestRef
+    catch: *transient
+    export: { as: '${ $context + { resolution: .resolution } }' }
+- onCeilingResolution:
+    switch:
+      - retry: { when: '${ $context.resolution == "retry" }', then: unparkAfterCeiling }
+      - wait:  { then: awaitOperatorAfterPark }
+- unparkAfterCeiling:
+    timeout: step
+    try:
+      - call: { step: unpark }          # body: ref + subjectRef: process; output: phase = the pre-park phase
+    catch: *transient
+- backToProcess: { set: { nextStage: '${ $context.ceilingReturnStage }', stageLoop: '${ $context.ceilingReturnLoop }' }, then: exit }
+- leave: { set: { nextStage: '${ .arm }', returnStage: ceiling }, then: exit }
 ```
 
 **Description**: The fragment reproduces [`06 §3.6`](./06-saga-and-compensation.md#36-interactions--sequences)
 *Authorized-Cancellation Compensation* and *Five-Step Cancellation Fencing* and
 [`08 §3.6` *Workflow-Mediated Cancel with Compensation Evidence*](./08-hold-and-cancel.md#36-interactions--sequences).
 The cancel is a signal (§3.3) because the platform's generic `cancel` would end the invocation
-without the fence; the arm exists in every competing `fork` of the process so a cancel is
-consumable in every stage, and the `switch` after each fork routes it to one `cancelPath`.
-`authorize-cancel` is where the request's authority is re-checked at apply time — fencing can
-outlive the request by days — and precedes `run-cancellation-fence` on every cancel path; a denied
-re-check returns through `returnToStage` to the loop the cancel was taken from, which is the
-resume wait (`awaitResume`) when the cancel was taken during a hold, because the instance is still
-`suspended`. A retry exhaustion of `authorize-cancel` opens the `authority-withdrawn` task. A
-parked instance — including one parked at the lifetime ceiling — reaches an unwind only through
-this path and the fence (`parked → compensating`, `01 §3.7`). The terminal-event case
-(`OrderCancelled`, `OrderExpired`, `OrderRejected`) is the same unwind entered through
-`terminate-on-terminal-event` in fragment (f). `unpark-requested` has no origin route in this
-design set yet ([`09 §3.3`](./09-read-and-authz.md#33-api-contracts); open question Q-13: the origin routes and catalogue pairs for `reauthorize-requested` and
-`unpark-requested`, or their removal from the canonical definition).
+without the fence; the arm exists in every stage `fork` of the process so a cancel is consumable
+in every stage, and every stage's `leave` routes it to the one cancel stage. `authorize-cancel`
+is where the request's authority is re-checked at apply time — fencing can outlive the request
+by days — and precedes `run-cancellation-fence` on every cancel path; a denied re-check returns
+through `back` to the stage and loop the cancel was taken from, which is the resume wait
+(`awaitResume`) when the cancel was taken during a hold, because the instance is still
+`suspended`. A spent budget of `authorize-cancel` opens the `authority-withdrawn` task, whose
+retry returns to that same stage and loop. A parked instance — including one parked at the
+lifetime ceiling — reaches an unwind only through this path and the fence
+(`parked → compensating`, `01 §3.7`). **After the ceiling** the instance waits in
+`awaitOperatorAfterPark` for either the `unpark-requested` signal or an operator `retry` of the
+`lifetime-ceiling-reached` task (`07 §3.3`), which `resolve-manual-task` records and which reaches
+the same `unpark`; `unpark` restores the pre-park phase and the process resumes at the stage and
+checkpoint `ceilingEntry` recorded, under the fresh ceiling of the re-entered fork. The
+terminal-event case (`OrderCancelled`, `OrderExpired`, `OrderRejected`) is the same unwind entered
+through `terminate-on-terminal-event` in fragment (f). `unpark-requested` has no origin route in
+this design set yet ([`09 §3.3`](./09-read-and-authz.md#33-api-contracts); open question Q-13:
+the origin routes and catalogue pairs for `reauthorize-requested` and `unpark-requested`, or their
+removal from the canonical definition); the task-resolution arm is the route that exists today.
 
 #### (e) Hold and resume
 
@@ -1343,133 +1779,140 @@ design set yet ([`09 §3.3`](./09-read-and-authz.md#33-api-contracts); open ques
 **Actors**: `cpt-cf-bss-orders-workflow-actor-owf-orders-lifecycle`, `cpt-cf-bss-orders-workflow-actor-owf-generic-approval`
 
 ```yaml
-# the hold and resume arms of every stage fork (not the park loops, not the unwind): they only listen
-- hold:
-    do:
-      - awaitHold:
-          listen:
-            to:
-              one:
-                with: { type: gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.held.v1~ }
-                correlate:
-                  orderId:      { from: '${ .data.orderId }',      expect: '${ $context.orderId }' }
-                  orderVersion: { from: '${ .data.orderVersion }', expect: '${ $context.orderVersion }' }
-      - arm: { set: { arm: held, lifecycleEventId: '${ .id }', triggerKind: OrderHeld } }
-- resume:                                           # the stage-level (early) resume arm: a resume delivered before its hold is not lost (08 §4.7 item 3)
-    do:
-      - awaitResume:
-          listen:
-            to:
-              one:
-                with: { type: gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.resumed.v1~ }
-                correlate:
-                  orderId:      { from: '${ .data.orderId }',      expect: '${ $context.orderId }' }
-                  orderVersion: { from: '${ .data.orderVersion }', expect: '${ $context.orderVersion }' }
-      - arm: { set: { arm: resumed, lifecycleEventId: '${ .id }', resumeEventId: '${ .id }', triggerKind: OrderResumed, suspensionRef: null } }
-# the path the sibling switch routes `held` to
-- holdPath:
-    do:
-      - admitHold:                                  # protected (02): admission before consumption
-          step: admit-trigger                       # body: ref + triggerEventId: $context.lifecycleEventId, triggerKind: OrderHeld, role: listen
-          export: { as: '${ $context + { admission: .admission } }' }
-      - onHoldAdmission:
-          switch:
-            - advance:   { when: '${ $context.admission == "advance" }',   then: applyHold }
-            - supersede: { when: '${ $context.admission == "supersede" }', then: supersedePath }
-            - terminate: { when: '${ $context.admission == "terminate" }', then: terminalEvent }
-            - back:      { then: returnToStage }
-      - applyHold:                                  # protected (08): phase → suspended; pauses the gate windows through slice 03's gate-window port
-          step: apply-hold                          # body: ref + holdEventId: $context.lifecycleEventId, gateRefs: ($context.gateRefs // []); output: holdOutcome, suspensionRef, escalationRemaining
-          export: { as: '${ $context + { holdOutcome: .holdOutcome, suspensionRef: .suspensionRef, escalationRemaining: (.escalationRemaining // $context.escalationRemaining) } }' }
-      - onHold:
-          switch:
-            - pause:  { when: '${ $context.holdOutcome == "suspended" and $context.holdPauses }', then: enterResumeWait }   # only the approval stage waits on the resume
-            - record: { then: returnToStage }       # suspended elsewhere, or reconciled-out-of-order | absorbed-duplicate | not-applicable: the stage continues, dispatch defers while suspended
-      - enterResumeWait: { set: { heldStage: '${ $context.stageLoop }', stageLoop: awaitResume } }
-      - awaitResume:
-          fork:
-            compete: true
-            branches:
-              - resume:
-                  do:
-                    - listenResume:
-                        listen:
-                          to:
-                            one:
-                              with: { type: gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.resumed.v1~ }
-                              correlate:
-                                orderId:      { from: '${ .data.orderId }',      expect: '${ $context.orderId }' }
-                                orderVersion: { from: '${ .data.orderVersion }', expect: '${ $context.orderVersion }' }
-                    - arm: { set: { arm: resume, lifecycleEventId: '${ .id }', resumeEventId: '${ .id }', triggerKind: OrderResumed } }   # 08 §4.7 item 4: resumeEventId exported from the listen
-              - lifecycle: { do: [ ...fragment (f) lifecycle listen ] }
-              - cancel:    { do: [ ...fragment (d) cancel listen ] }   # a denied cancel returns here: stageLoop is awaitResume
-      - afterResumeRace:
-          switch:
-            - resume:    { when: '${ .arm == "resume" }',    then: resumePath }
-            - lifecycle: { when: '${ .arm == "lifecycle" }', then: admitLifecycle }
-            - cancel:    { then: cancelPath }                    # an authorized cancel taken from hold: suspended → compensating
-# the resume paths: from the resume wait (suspensionRef set) and from a stage-level resume arm (suspensionRef null)
-- earlyResumePath: { set: { heldStage: '${ $context.stageLoop }' }, then: resumePath }
-- resumePath:
-    do:
-      - admitResume:                                # protected (02)
-          step: admit-trigger                       # body: ref + triggerEventId: $context.resumeEventId, triggerKind: OrderResumed, role: listen
-          export: { as: '${ $context + { admission: .admission } }' }
-      - onResumeAdmission:
-          switch:
-            - advance:   { when: '${ $context.admission == "advance" }',   then: applyResume }
-            - supersede: { when: '${ $context.admission == "supersede" }', then: supersedePath }
-            - terminate: { when: '${ $context.admission == "terminate" }', then: terminalEvent }
-            - back:      { then: returnToStage }
-      - applyResume:                                # protected (08): phase → started; re-arms the gate windows through the gate-window port
-          step: apply-resume                        # body: ref + resumeEventId, suspensionRef (null on the stage-level arm); output: resumeOutcome, escalationRemaining, failedTaskRefs[]
-          export: { as: '${ $context + { escalationRemaining: (.escalationRemaining // $context.escalationRemaining), resumeFailed: .failedTaskRefs, stageLoop: $context.heldStage } }' }
-      - onResume:                                   # 08 §4.7 item 8: deferred failures first, before any dispatch
-          switch:
-            - deferredFailures: { when: '${ ($context.resumeFailed | length) > 0 }', then: resumeFailure }
-            - back:             { then: returnToStage }   # the stage loop the hold interrupted, re-armed with escalationRemaining
-      - resumeFailure: { set: { failureScope: line, failureSubjects: '${ $context.resumeFailed }', sourceStep: apply-resume }, then: partialFailure }   # fragment (c)
-- returnToStage:                                    # routing convention (2) of §3.6
+# the hold arm of every stage fork except the park loop, the ceiling wait and the unwind: it only listens
+- awaitHold:
+    listen:
+      to:
+        one:
+          with: { type: gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.held.v1~ }
+          correlate:
+            orderId:      { from: '${ .data.orderId }',      expect: '${ $context.orderId }' }
+            orderVersion: { from: '${ .data.orderVersion }', expect: '${ $context.orderVersion }' }
+      read: envelope
+    output: { as: '${ .[0] | { eventId: .id } }' }
+- arm: { set: { arm: hold, lifecycleEventId: '${ .eventId }', triggerKind: OrderHeld } }
+# the stage-level (early) resume arm beside it: a resume delivered before its hold is not lost (08 §4.7 item 3)
+- awaitResume:
+    listen:
+      to:
+        one:
+          with: { type: gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.resumed.v1~ }
+          correlate:
+            orderId:      { from: '${ .data.orderId }',      expect: '${ $context.orderId }' }
+            orderVersion: { from: '${ .data.orderVersion }', expect: '${ $context.orderVersion }' }
+      read: envelope
+    output: { as: '${ .[0] | { eventId: .id } }' }
+- arm: { set: { arm: resume, lifecycleEventId: '${ .eventId }', resumeEventId: '${ .eventId }', triggerKind: OrderResumed, suspensionRef: null } }
+```
+
+The hold stage, the `do` list of `process.hold`:
+
+```yaml
+- enter:
     switch:
-      - parkLoop:                    { when: '${ $context.stageLoop == "parkLoop" }',                    then: parkLoop }
-      - parkLoopEscalated:           { when: '${ $context.stageLoop == "parkLoopEscalated" }',           then: parkLoopEscalated }
-      - gateLoop:                    { when: '${ $context.stageLoop == "gateLoop" }',                    then: gateLoop }
-      - outageArm:                   { when: '${ $context.stageLoop == "outageArm" }',                   then: outageArm }
-      - awaitEligibilityChange:      { when: '${ $context.stageLoop == "awaitEligibilityChange" }',      then: awaitEligibilityChange }
-      - barrierLoop:                 { when: '${ $context.stageLoop == "barrierLoop" }',                 then: barrierLoop }
-      - awaitResolution:             { when: '${ $context.stageLoop == "awaitResolution" }',             then: awaitResolution }
-      - awaitCompensationResolution: { when: '${ $context.stageLoop == "awaitCompensationResolution" }', then: awaitCompensationResolution }
-      - awaitOperatorAfterPark:      { when: '${ $context.stageLoop == "awaitOperatorAfterPark" }',      then: awaitOperatorAfterPark }
-      - awaitResume:                 { then: awaitResume }
+      - waiting: { when: '${ $context.stageLoop == "awaitResume" }', then: awaitResume }
+      - fresh:   { then: admitHold }
+- admitHold:                            # protected (02): admission before consumption
+    timeout: step
+    try:
+      - call: { step: admit-trigger }   # body: ref + triggerEventId: $context.lifecycleEventId, triggerKind: OrderHeld, role: listen
+    catch: *transient
+    export: { as: '${ $context + { admission: .admission } }' }
+- onHoldAdmission:
+    switch:
+      - advance: { when: '${ $context.admission == "advance" }', then: applyHold }
+      - onward:  { when: '${ $context.admission == "supersede" or $context.admission == "terminate" }', then: toLifecycle }
+      - back:    { then: back }
+- toLifecycle: { set: { nextStage: lifecycle, preAdmitted: true }, then: exit }
+- applyHold:                            # protected (08): phase → suspended; pauses the gate windows through slice 03's gate-window port
+    timeout: step
+    try:
+      - call: { step: apply-hold }      # body: ref + holdEventId: $context.lifecycleEventId, gateRefs: ($context.gateRefs // []); output: holdOutcome, suspensionRef
+    catch: *transient
+    export: { as: '${ $context + { holdOutcome: .holdOutcome, suspensionRef: .suspensionRef } }' }
+- onHold:
+    switch:
+      - pause:  { when: '${ $context.holdOutcome == "suspended" and $context.holdPauses }', then: enterResumeWait }   # only the approval stage waits on the resume
+      - record: { then: back }          # suspended elsewhere, or reconciled-out-of-order | absorbed-duplicate | not-applicable: the stage continues, dispatch defers while suspended
+- enterResumeWait: { set: { heldStage: '${ $context.returnStage }', heldLoop: '${ $context.stageLoop }', stageLoop: awaitResume } }
+- awaitResume:
+    fork:
+      compete: true
+      branches:
+        - resume:    { do: [ ‹resume arm above› ] }   # 08 §4.7 item 4: resumeEventId exported from the listen
+        - lifecycle: { do: [ ‹lifecycle arm of (f)› ] }
+        - cancel:    { do: [ ‹cancel arm of (d)› ] }  # a denied cancel returns here: stageLoop is awaitResume
+- afterResumeRace:
+    switch:
+      - any: { then: leave }            # resume → the resume stage; lifecycle; cancel: an authorized cancel taken from hold, suspended → compensating
+- leave: { set: { nextStage: '${ .arm }', returnStage: hold }, then: exit }
+- back: { set: { nextStage: '${ $context.returnStage }' }, then: exit }
+```
+
+The resume stage, the `do` list of `process.resume` — entered from the resume wait
+(`returnStage = hold`, `suspensionRef` set) or from a stage-level resume arm (`suspensionRef`
+null):
+
+```yaml
+- enter:
+    switch:
+      - fromWait: { when: '${ $context.returnStage == "hold" }', then: admitResume }   # heldStage and heldLoop recorded by the hold stage
+      - early:    { then: noteEarly }
+- noteEarly: { set: { heldStage: '${ $context.returnStage }', heldLoop: '${ $context.stageLoop }' } }
+- admitResume:                          # protected (02)
+    timeout: step
+    try:
+      - call: { step: admit-trigger }   # body: ref + triggerEventId: $context.resumeEventId, triggerKind: OrderResumed, role: listen
+    catch: *transient
+    export: { as: '${ $context + { admission: .admission } }' }
+- onResumeAdmission:
+    switch:
+      - advance: { when: '${ $context.admission == "advance" }', then: applyResume }
+      - onward:  { when: '${ $context.admission == "supersede" or $context.admission == "terminate" }', then: toLifecycle }
+      - back:    { then: back }
+- toLifecycle: { set: { nextStage: lifecycle, preAdmitted: true }, then: exit }
+- applyResume:                          # protected (08): phase → started; re-arms the gate windows through the gate-window port
+    timeout: step
+    try:
+      - call: { step: apply-resume }    # body: ref + resumeEventId, suspensionRef (null on the stage-level arm); output: resumeOutcome, due, failedTaskRefs[]
+    catch: *transient
+    export: { as: '${ $context + { resumeDue: (.due // false), resumeFailed: .failedTaskRefs, returnStage: $context.heldStage, stageLoop: $context.heldLoop } }' }
+- onResume:                             # 08 §4.7 item 8: deferred failures first, before any dispatch
+    switch:
+      - deferredFailures: { when: '${ ($context.resumeFailed | length) > 0 }', then: resumeFailure }
+      - back:             { then: back }   # the stage and loop the hold interrupted; apply-resume's due is the escalation re-check's first answer
+- resumeFailure:                        # fragment (c)
+    set: { failureScope: line, failureSubjects: '${ $context.resumeFailed }', sourceStep: apply-resume, nextStage: failure, stageLoop: null }
+    then: exit
+- back: { set: { nextStage: '${ $context.returnStage }' }, then: exit }
 ```
 
 **Description**: The fragment reproduces [`08 §3.6` *Hold Then Resume with Remaining-Window
 Timer Preservation*](./08-hold-and-cancel.md#36-interactions--sequences) as a definition pattern,
 in the order of [`08 §4.7`](./08-hold-and-cancel.md#47-constraints-this-slice-places-on-the-definition).
-**Only the approval-escalation wait pauses on hold**: the hold arm sits inside `gateLoop` (and
-`outageArm`), and because it only listens, the hold winning the race cancels the `escalation`
-branch's `wait` at once. `holdPath` admits the event, and `apply-hold` records the suspension and
-pauses the gate windows through slice 03's gate-window port; in the approval stage
-(`holdPauses`) the definition then waits in `awaitResume`, and after `apply-resume` the stage
-loop is re-entered with the `escalationRemaining` `apply-resume` returned — the remainder the
-gate-window port computed from `owf_approval_gate`, never the definition's own arithmetic and
-never a value re-derived from the gate's `opened_at`. `apply-resume` does not re-read drafts: the
-draft-liveness re-read is inside the wave-2 dispatch (slice 05). A non-empty `failedTaskRefs[]`
-(failures slice 05 recorded as deferred while held) routes to fragment (c) before any dispatch.
-**The lifetime ceiling, the barrier and the overdue window keep running**: the lifetime `wait` is
-the top-level competing arm of fragment (a), outside every stage fork; outside the approval stage
-a hold is recorded and the stage loop continues, so the barrier poll, `waitExpected` and the
-overdue `waitOverdue` are never cancelled by a hold, and the dispatch operations defer while
-`owf_process_instance.suspended` is set ([`01 §3.7`](./01-foundation.md#table-owf_process_instance));
-the stage-level resume arm then records the resume. Every stage fork that carries a hold arm also
-carries that resume arm, so a resume delivered before its hold is recorded as
-`resume-ahead-recorded` and not lost, and the resume wait is entered only on
-`holdOutcome = suspended`. A cancel taken from the resume wait that `authorize-cancel` denies
-returns to the resume wait, because the instance is still `suspended`. The park loops and the
-unwind carry no hold arm (`03 §4.5` item 6, `06 §4.7` item 7). Whether the DSL accepts the
-remainder as a runtime-expression `wait` duration, and whether the pattern as a whole is
-expressible natively, is **Q-11** (§4.5); if it is not, the re-arm is a registered Function that
-sleeps the remainder, which is the one place a Function would enter these definitions.
+**Only the approval-escalation window pauses on hold**: the hold arm sits inside `gateLoop` (and
+`outageArm`), and because it only listens, the hold winning the race cancels the
+`waitEscalation` tick at once. The hold stage admits the event, and `apply-hold` records the
+suspension and pauses the gate windows through slice 03's gate-window port; in the approval stage
+(`holdPauses`) the definition then waits in `awaitResume`, and after `apply-resume` the approval
+stage is re-entered at `gateLoop`. The remainder is never the definition's: slice 03's
+gate-window port stores it in `owf_approval_gate.window_remaining_ms` and re-bases the gate's
+escalation deadline on resume; `apply-resume` answers `due` against that deadline, and the
+approval stage's `enter` switch takes a `due: true` straight to `escalateGate` before the next
+tick. `apply-resume` does not re-read drafts: the draft-liveness re-read is inside the wave-2
+dispatch (slice 05). A non-empty `failedTaskRefs[]` (failures slice 05 recorded as deferred while
+held) routes to fragment (c) before any dispatch. **The lifetime ceiling, the barrier and the
+overdue window keep running**: the ceiling and the overdue monitor are top-level branches of
+fragment (a), outside every stage; outside the approval stage a hold is recorded and the stage
+loop continues, so the barrier poll and the `waitExpected` tick are never cancelled by a hold, and
+the dispatch operations defer while `owf_process_instance.suspended` is set
+([`01 §3.7`](./01-foundation.md#table-owf_process_instance)); the stage-level resume arm then
+records the resume. Every stage fork that carries a hold arm also carries that resume arm, so a
+resume delivered before its hold is recorded as `resume-ahead-recorded` and not lost, and the
+resume wait is entered only on `holdOutcome = suspended`. A cancel taken from the resume wait
+that `authorize-cancel` denies returns to the resume wait, because the instance is still
+`suspended`. The park loop, the ceiling wait and the unwind carry no hold arm (`03 §4.5` item 6,
+`06 §4.7` item 7). With the re-check loop the hold pattern needs no Function (§4.5).
 
 #### (f) Amendment and terminal order events
 
@@ -1480,40 +1923,60 @@ sleeps the remainder, which is the one place a Function would enter these defini
 **Actors**: `cpt-cf-bss-orders-workflow-actor-owf-orders-lifecycle`
 
 ```yaml
-# the lifecycle arm of every competing fork before and after begin-fulfillment: it only listens
-- lifecycle:
-    do:
-      - awaitLifecycle:
-          listen:
-            to:
-              any:
-                - with: { type: gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.amended.v1~ }
-                  correlate: { orderId: { from: '${ .data.orderId }', expect: '${ $context.orderId }' } }   # a NEWER version: no orderVersion correlation (02 §4.7 item 8)
-                - with: { type: gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.cancelled.v1~ }
-                  correlate: { orderId: { from: '${ .data.orderId }', expect: '${ $context.orderId }' }, orderVersion: { from: '${ .data.orderVersion }', expect: '${ $context.orderVersion }' } }
-                - with: { type: gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.expired.v1~ }
-                  correlate: { orderId: { from: '${ .data.orderId }', expect: '${ $context.orderId }' }, orderVersion: { from: '${ .data.orderVersion }', expect: '${ $context.orderVersion }' } }
-                - with: { type: gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.rejected.v1~ }
-                  correlate: { orderId: { from: '${ .data.orderId }', expect: '${ $context.orderId }' }, orderVersion: { from: '${ .data.orderVersion }', expect: '${ $context.orderVersion }' } }
-      - arm: { set: { arm: lifecycle, lifecycleEventId: '${ .id }', triggerKind: '${ .type }', newOrderVersion: '${ .data.orderVersion }' } }   # triggerKind is mapped to the closed nine-value enum; nothing branches on it
-# the paths the sibling switch routes to: admission first, and the admission alone decides (02 §4.7 items 1 and 3)
-- admitLifecycle:                                   # protected (02)
-    step: admit-trigger                             # body: ref + triggerEventId: $context.lifecycleEventId, triggerKind, role: listen; output: admission ∈ advance | supersede | terminate | absorbed-duplicate | ignored-superseded | ignored-terminated
+# the lifecycle arm of every stage fork: it only listens
+- awaitLifecycle:
+    listen:
+      to:
+        any:
+          - with: { type: gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.amended.v1~ }
+            correlate: { orderId: { from: '${ .data.orderId }', expect: '${ $context.orderId }' } }   # a NEWER version: no orderVersion correlation (02 §4.7 item 8)
+          - with: { type: gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.cancelled.v1~ }
+            correlate: { orderId: { from: '${ .data.orderId }', expect: '${ $context.orderId }' }, orderVersion: { from: '${ .data.orderVersion }', expect: '${ $context.orderVersion }' } }
+          - with: { type: gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.expired.v1~ }
+            correlate: { orderId: { from: '${ .data.orderId }', expect: '${ $context.orderId }' }, orderVersion: { from: '${ .data.orderVersion }', expect: '${ $context.orderVersion }' } }
+          - with: { type: gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.rejected.v1~ }
+            correlate: { orderId: { from: '${ .data.orderId }', expect: '${ $context.orderId }' }, orderVersion: { from: '${ .data.orderVersion }', expect: '${ $context.orderVersion }' } }
+      read: envelope
+    output: { as: '${ .[0] | { eventId: .id, type: .type, orderVersion: .data.orderVersion } }' }
+- arm: { set: { arm: lifecycle, lifecycleEventId: '${ .eventId }', triggerKind: '${ .type }', newOrderVersion: '${ .orderVersion }' } }   # triggerKind is mapped to the closed nine-value enum; nothing branches on it
+```
+
+The lifecycle stage, the `do` list of `process.lifecycle` — admission first, and the admission
+alone decides (`02 §4.7` items 1 and 3):
+
+```yaml
+- enter:
+    switch:
+      - preAdmitted: { when: '${ $context.preAdmitted == true }', then: onLifecycleAdmission }   # the hold, resume or acceptance admission already answered supersede | terminate
+      - fresh:       { then: admitLifecycle }
+- admitLifecycle:                       # protected (02)
+    timeout: step
+    try:
+      - call: { step: admit-trigger }   # body: ref + triggerEventId: $context.lifecycleEventId, triggerKind, role: listen; output: admission ∈ advance | supersede | terminate | absorbed-duplicate | ignored-superseded | ignored-terminated
+    catch: *transient
     export: { as: '${ $context + { admission: .admission } }' }
 - onLifecycleAdmission:
     switch:
       - supersede: { when: '${ $context.admission == "supersede" }', then: supersedePath }
       - terminate: { when: '${ $context.admission == "terminate" }', then: terminalEvent }
-      - back:      { then: returnToStage }          # absorbed-duplicate (an OrderAmended at the pinned version) | ignored-superseded | ignored-terminated
-- supersedePath: { set: { unwind: supersede, reportAs: superseded, terminationKind: superseded, triggerEventId: '${ $context.lifecycleEventId }' }, then: compensateOrder }   # fragment (c): fence (supersede) cancels open gates, voids un-activated wave-1 drafts, compensates activated; report-outcome makes no seam call
-- terminalEvent:                                    # protected (02): OrderCancelled | OrderExpired | OrderRejected for an active instance
-    step: terminate-on-terminal-event               # body: ref + triggerEventId: $context.lifecycleEventId; output: terminate (bool)
+      - back:      { then: back }       # absorbed-duplicate (an OrderAmended at the pinned version) | ignored-superseded | ignored-terminated
+- supersedePath:                        # fragment (c): fence (supersede) cancels open gates, voids un-activated wave-1 drafts, compensates activated; report-outcome makes no seam call
+    set: { unwind: supersede, reportAs: superseded, terminationKind: superseded, triggerEventId: '${ $context.lifecycleEventId }', preAdmitted: false, nextStage: unwind, stageLoop: null }
+    then: exit
+- terminalEvent:                        # protected (02): OrderCancelled | OrderExpired | OrderRejected for an active instance
+    timeout: step
+    try:
+      - call: { step: terminate-on-terminal-event }   # body: ref + triggerEventId: $context.lifecycleEventId; output: terminate (bool)
+    catch: *transient
     export: { as: '${ $context + { terminate: .terminate } }' }
 - onTerminal:
     switch:
       - unwind: { when: '${ $context.terminate }', then: terminalUnwind }
-      - back:   { then: returnToStage }             # terminate: false returns to the arm's stage and never skips to terminate-instance (02 §4.7 item 4)
-- terminalUnwind: { set: { unwind: terminal-event, reportAs: terminal-event, terminationKind: terminal-order-event, triggerEventId: '${ $context.lifecycleEventId }' }, then: compensateOrder }   # report-outcome makes no Lifecycle transition: the order is already terminal
+      - back:   { then: back }          # terminate: false returns to the arm's stage and never skips to terminate-instance (02 §4.7 item 4)
+- terminalUnwind:                       # report-outcome makes no Lifecycle transition: the order is already terminal
+    set: { unwind: terminal-event, reportAs: terminal-event, terminationKind: terminal-order-event, triggerEventId: '${ $context.lifecycleEventId }', preAdmitted: false, nextStage: unwind, stageLoop: null }
+    then: exit
+- back: { set: { nextStage: '${ $context.returnStage }', preAdmitted: false }, then: exit }
 ```
 
 **The new version's invocation.** `OrderAmended` has two consumers. The platform event trigger of
@@ -1537,12 +2000,14 @@ version rule, in the order of
 [`02 §4.7`](./02-triggers-and-start.md#47-constraints-this-slice-places-on-the-definition). Every
 listened Lifecycle trigger — here, and `OrderAcceptanceRecorded`, `OrderHeld` and `OrderResumed`
 in fragments (b) and (e) — passes `admit-trigger` with `role: listen` before any consuming
-operation, and the returned `admission`, never event data, selects the path. Termination is
-symmetric with start: a terminal order event and a superseding version both run the cancellation
-fence and the compensation walk before `terminate-instance`, and neither leaves a wave-1 draft for
-a platform TTL this gear does not own. The admission decision — is this event for a superseded,
-current or newer version — stays in `admit-trigger`, read against Lifecycle under R1, never in a
-jq comparison over event data.
+operation, and the returned `admission`, never event data, selects the path; a hold, resume or
+acceptance admission that answers `supersede` or `terminate` enters this stage with
+`preAdmitted` and is routed without a second admission. Termination is symmetric with start: a
+terminal order event and a superseding version both run the cancellation fence and the
+compensation walk before `terminate-instance`, and neither leaves a wave-1 draft for a platform
+TTL this gear does not own. The admission decision — is this event for a superseded, current or
+newer version — stays in `admit-trigger`, read against Lifecycle under R1, never in a jq
+comparison over event data.
 
 ### 3.7 Database schemas & tables
 
@@ -1551,10 +2016,11 @@ This document owns **no table**. Definition versions live in the platform functi
 the binding of an instance to a version is `owf_definition_binding`
 ([`01 §3.7`](./01-foundation.md#table-owf_definition_binding)); the operations a definition may
 call are `owf_step_operation` ([`01 §3.7`](./01-foundation.md#table-owf_step_operation)). The
-canonical definitions of §3.6 are also kept **in this repository** as YAML under the gear's
-`definitions/` directory so the CI validation test of §2.2 runs against the same bytes that are
-published; the repository copy is the review artifact, the registry copy is the executed one, and
-the publish step asserts they are byte-identical.
+complete canonical definition is kept **in this repository** as `definitions/order-process.yaml`
+under the gear; it is the CI artefact that validates against the Serverless Workflow DSL 1.0.0
+schema and the rules of §2.2, and the release pipeline publishes it after writing the
+environment's step base URL into `input.from`, asserting that nothing else differs. The fragments
+of §3.6 are an abridged review view of that file, not its bytes.
 
 ### 3.8 Deployment Topology
 
@@ -1564,9 +2030,9 @@ The definition executes on the platform's Temporal plugin workers
 ([serverless-runtime DESIGN §1.4.4](../../../../serverless-runtime/docs/DESIGN.md#144-gear-lifecycle)),
 which are a platform deployable, not an Orders one; Orders deploys no workflow worker. Orders'
 side of the topology is: the step surface of `01 §3.3` reachable from the plugin's workers under
-the service principal; the event trigger of §3.3 provisioned once per environment and enabled
-only after the readiness gate; the validation hook of §3.2 registered with the platform registry
-(or, until the hook exists on the platform side, the CI test as the gate); and the repository
+the service principal; the two event triggers of §3.3 (`execution_context: system`)
+provisioned once per environment and enabled only after the readiness gate; the validation hook of §3.2 registered with the platform registry once
+the platform calls a consumer hook (a pending ask; until then the CI test is the gate); and the repository
 `definitions/` directory published to the registry by the release pipeline, never by hand. One
 definition version is **active for new instances** per environment at a time; older versions stay
 published while bindings name them and are deprecated, never deleted, thereafter.
@@ -1610,14 +2076,20 @@ else is the flow's to arrange.
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-constraint-definition-validation-hook`
 
-The validation hook of §3.2 **MUST** run the eight rules of §2.2 *Validation before publish* over
-every candidate version before the platform registry publishes it, **and** the same rules
-**MUST** run as a CI test over the repository copy of every canonical definition on every change
-to `definitions/` or to any slice's §3.3 declaration. A refusal **MUST** name the rule and the
-task location in the platform's `ValidationError` shape. A version **MUST NOT** be published from
-outside the pipeline that runs the test. The hook **MUST** also refuse the platform's `archive`
-and `delete` transitions for a version an `owf_definition_binding` names, and the CI test **MUST**
-assert that every version named by a binding in each environment is still published there.
+The eight rules of §2.2 *Validation before publish* **MUST** run as a CI test over the
+repository copy of every canonical definition on every change to `definitions/` or to any slice's
+§3.3 declaration, and a version **MUST NOT** be published from outside the pipeline that runs the
+test. The CI test **MUST** assert that every version named by a binding in each environment is
+still published there. Whether the platform registry calls a consumer-supplied hook before
+publish is a **pending upstream ask**
+(`cpt-cf-bss-orders-workflow-upreq-serverless-runtime-definition-versioning-validation-hook`,
+[`../UPSTREAM_REQS.md`](../UPSTREAM_REQS.md) §2.9); the platform today has only the plugin's
+registration-validation hook (`DESIGN.md:762`). When the ask lands, the validation hook of §3.2
+**MUST** run the same rules over every candidate version before publish, **MUST** name the rule
+and the task location in the platform's `ValidationError` shape, and **MUST** refuse the
+platform's `archive` and `delete` transitions for a version an `owf_definition_binding` names;
+until then a publish outside the pipeline is an unvalidated publish this design does not
+permit.
 
 ### 4.3 Pinning
 
@@ -1629,7 +2101,7 @@ binding, no operator surface **MAY** migrate an instance (PRD §5.2), and a new 
 affect only instances started after its publication. The platform's own pin of the invocation to
 the callable version ([`DESIGN.md:614`](../../../../serverless-runtime/docs/DESIGN.md#versioning-model))
 and Orders' binding **MUST** agree; `start-instance` records the version the invocation reports
-(`$workflow.definition.version`) and a disagreement between that value and the version the
+(`$workflow.definition.document.version`, dsl.md *Workflow Descriptor*) and a disagreement between that value and the version the
 release pipeline marked active is an alert, not a silent choice.
 
 ### 4.4 Signal semantics
@@ -1642,8 +2114,11 @@ suspension would pause every `wait` including the lifetime ceiling. An operator 
 delivered as the `cancel-requested` signal to the running invocation and **MUST NOT** use the
 platform's generic `cancel`, which ends the invocation without the fence. A re-authorisation
 **MUST** be delivered as `reauthorize-requested`. Every signal **MUST** be recorded in Orders
-before delivery (the request row of the originating control operation, `09`) and **MUST** be
-delivered idempotently under the caller-side duplicate protocol; a signal with no consuming arm in
+before delivery — the request row the originating control operation of `09` writes; slice 10
+delivers that row and records none — and **MUST** be delivered idempotently under the
+caller-side duplicate protocol. For `reauthorize-requested` and `unpark-requested` the
+record-before-delivery rule is **deferred until Q-13** is answered: neither has an origin route
+or a request row in this design set (`09 §3.3`), so neither is delivered today; a signal with no consuming arm in
 the current stage **MUST** be held by the plugin's subscription until an arm consumes it, and if
 the platform cannot guarantee that, the originating control operation **MUST** answer
 `still-processing` until Orders observes the arm's recording operation (`authorize-cancel`,
@@ -1654,27 +2129,32 @@ upstream ask (§3.3); this rule binds regardless of their shape.
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-constraint-definition-hold-pattern`
 
-The escalation `wait` **MUST** be inside a competing `fork` that also contains the hold arm, so
-that a hold cancels it; `apply-hold` and `apply-resume` **MUST** return the remaining window
-slice 03's gate-window port computed from Orders' record, and the definition **MUST** re-arm
-exactly the remainder `apply-resume` returned. The lifetime `wait` **MUST** be a top-level
-competing arm outside every stage fork, and the barrier poll, the expected-fulfillment `wait` and
-the overdue `wait` **MUST** be in branches a hold arm does not cancel: outside the approval stage
-a hold is recorded and the stage loop continues (§3.6 (e)). **Q-11 is registered open**
-(`../DECISIONS.md`): whether the Serverless Workflow DSL 1.0.0, as the platform's plugin
-implements it, (i) accepts a runtime expression as a `wait` duration, so the remainder and the
-expected-fulfillment instant can be armed without a Function; (ii) surfaces the Problem body's
-`error_code` on `$error` so a `catch` can tell `idempotency-key-conflict` from `still-processing`
-before the retry budget is spent; (iii) offers any dynamic parallel construct, so a wave could
-fan out per line inside the definition rather than inside the operation; and (iv) treats a
-`listen` inside a competing `fork` as cancellable without losing an event delivered during
-cancellation; and (v) expresses **the hold pattern** as a whole — a hold arm that wins a
-competing `fork` to cancel the escalation `wait`, a resume wait, and a re-armed `wait` of the
-remainder Orders returns — natively, without a Function. Until Q-11 is answered, (i) falls back
-to a registered Function that sleeps the remainder, (ii) is bounded by the retry budget, (iii) is
-settled as one `call` per wave carrying `lineRefs[]`, (iv) is covered by the poll arms and the
-re-entry of every stage loop, and (v) falls back to the same Function as (i) for the re-armed
-`wait` (open question Q-11: Q-11 carries the five sub-questions (i)–(v)).
+The approval-escalation re-check tick **MUST** be inside a competing `fork` that also contains
+the hold arm, so that a hold cancels it; the window itself **MUST** stay Orders' record —
+`apply-hold` pauses it and `apply-resume` re-bases it through slice 03's gate-window port
+(`owf_approval_gate.window_remaining_ms`) — and the definition **MUST NOT** carry or re-arm a
+remainder: it re-checks the stored deadline through `escalate-gate` `mode: fire` and takes
+`apply-resume`'s `due` as the first answer after a resume. The lifetime `wait` **MUST** be a
+literal `P90D` in a top-level competing branch outside every stage, and the barrier poll, the
+expected-fulfillment re-check and the overdue monitor **MUST** be in branches a hold arm does not
+cancel: outside the approval stage a hold is recorded and the stage loop continues (§3.6 (e)).
+Every computed deadline **MUST** be a bounded re-check loop of §3.6 *Fixed waits and re-check
+loops*; a Function **MUST NOT** be used to sleep, because serverless-runtime Functions are bounded
+by platform timeout limits and durable waits belong to Workflows (`DESIGN.md:579`,
+`DESIGN.md:582`). **Q-11 is registered open** (`../DECISIONS.md`): whether the Serverless
+Workflow DSL 1.0.0, as the platform's plugin implements it, (i) accepts a runtime-expression
+`wait` duration **as an extension** — the 1.0.0 schema admits only an inline duration or an ISO
+8601 string, so this is a question about the plugin, not about the specification; (ii) surfaces
+the Problem body's `error_code` on `$error` so a `catch` can tell `idempotency-key-conflict` from
+`still-processing` before the retry budget is spent; (iii) offers any dynamic parallel construct,
+so a wave could fan out per line inside the definition rather than inside the operation; (iv)
+treats a `listen` inside a competing `fork` as cancellable without losing an event delivered
+during cancellation; and (v) expresses the hold pattern natively. Until Q-11 is answered, (i) is
+the re-check loop, (ii) is bounded by the retry budget, (iii) is settled as one `call` per wave
+carrying `lineRefs[]`, (iv) is covered by the poll arms and the re-entry of every stage loop, and
+(v) is satisfied by the re-check loop, which needs no Function; (v) asks only whether a remainder
+could be armed directly, which is (i) (open question Q-11: Q-11 carries the five sub-questions
+(i)–(v)).
 
 ### 4.6 Protected operations are never inside a swallowing `catch`
 
