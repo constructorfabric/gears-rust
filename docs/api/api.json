@@ -1508,7 +1508,11 @@
             ]
           },
           "value": {
-            "description": "The new value, carried by a `set` and absent from a `revert`; a\nmismatch either way refuses this change alone with `invalid`. For a\n`secret`-trait setting this may instead be `{ \"pending_id\": \"…\" }`,\nnaming a secret staged earlier through `/secret-stage`: the staged\nentry is adopted and nothing is stored a second time. Any other shape\nis a value and validates as one."
+            "description": "The new value, carried by a `set` and absent from a `revert`; a\nmismatch either way refuses this change alone with `invalid`. For a\n`secret`-trait setting this may instead be `{ \"pending_id\": \"…\" }`,\nnaming a secret staged earlier through `/secret-stage`: the staged\nentry is adopted and nothing is stored a second time. Any other shape\nis a value and validates as one — an explicit `null` included, which\nis a value and not the field's absence.",
+            "type": [
+              "object",
+              "null"
+            ]
           }
         },
         "required": [
@@ -7744,7 +7748,8 @@
             ]
           },
           "value": {
-            "description": "The candidate value."
+            "description": "The candidate value.",
+            "type": "object"
           }
         },
         "required": [
@@ -18028,7 +18033,8 @@
         "description": "`PUT /settings/{key}/value`: the value to store.",
         "properties": {
           "value": {
-            "description": "The new value, validated against the declaration's value type."
+            "description": "The new value, validated against the declaration's value type. Kept as\ntext until the guards have seen it: a number is refused, not rounded.",
+            "type": "object"
           }
         },
         "required": [
@@ -18289,7 +18295,8 @@
         "description": "`POST /settings/{key}/secret-stage`: the plaintext to stage ahead of the\nstep-up redirect.",
         "properties": {
           "value": {
-            "description": "The secret value, validated against the declaration's type exactly as\na set validates it."
+            "description": "The secret value, validated against the declaration's type exactly as\na set validates it.",
+            "type": "object"
           }
         },
         "required": [
@@ -20759,7 +20766,8 @@
             ]
           },
           "value": {
-            "description": "The candidate value."
+            "description": "The candidate value.",
+            "type": "object"
           }
         },
         "required": [
