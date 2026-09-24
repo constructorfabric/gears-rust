@@ -42,13 +42,13 @@ Updated:  2026-07-02 by Constructor Tech
 
 ### 1.1 Overview
 
-Server-authoritative multipart upload coordinator for file-storage: the client declares total size and a preferred part size; the control plane computes the exact parts plan (part_number, offset, size) and returns one signed sidecar URL per part. The client uploads each part directly to the sidecar, which enforces the declared size — a buffered length check against the token claim **before** any backend write on `multipart_native` paths, plus a streaming `max_size` abort (HTTP 413) that can fire mid-read and after backend I/O on non-native (offset-object) paths (see [Sidecar Per-Part Enforcement](#sidecar-per-part-enforcement)). The control plane then combines per-part hashes into the root hash at complete and finalizes the new file version — binding it as live content only for auto-bind sessions (`session.auto_bind`), else leaving `content_id` untouched for a separate client `bind`.
+Server-authoritative multipart upload coordinator for file-storage: the client declares total size and a preferred part size; the control plane computes the exact parts plan (part_number, offset, size) and returns one signed sidecar URL per part. The client uploads each part directly to the sidecar, which streams the part straight into the backend on both write paths — never buffering a whole part — and enforces the declared size: a streaming `max_size` abort (HTTP 413) on `multipart_native` paths (a sidecar-side counter ahead of the backend's own `upload_part_stream`, which itself takes the claim as an exact, authoritative length rather than a ceiling), and the same streaming `max_size` abort (HTTP 413) that can fire mid-read and after backend I/O on non-native (offset-object) paths (see [Sidecar Per-Part Enforcement](#sidecar-per-part-enforcement)). The control plane then combines per-part hashes into the root hash at complete and finalizes the new file version — binding it as live content only for auto-bind sessions (`session.auto_bind`), else leaving `content_id` untouched for a separate client `bind`.
 
 **Traces to**: `cpt-cf-file-storage-fr-multipart-upload`, `cpt-cf-file-storage-fr-size-limits-policy`, `cpt-cf-file-storage-fr-storage-quota`
 
 ### 1.2 Purpose
 
-Provide a safe, resumable, server-controlled multipart upload path. Each part's exact byte length is a claim inside its signed URL, and the sidecar enforces that claim — on `multipart_native` paths the whole part body is buffered and its length checked against the claim before any backend write; on non-native (offset-object) paths exceeding the claim aborts mid-stream with HTTP 413 as soon as the byte count passes the claim (possibly after some bytes reached the backend, which then requires cleanup), while a body that ends short of the claim fails the post-write exact-length check with HTTP 400. The part hash is always computed from the received bytes but a part whose length is correct is recorded as-is — the assembled content's root is computed at `complete` from the stored part hashes, not derived by re-verifying the part bytes at part-write. So a client cannot get oversized bytes recorded as a valid part regardless of the `declared_size` it declares up front.
+Provide a safe, resumable, server-controlled multipart upload path. Each part's exact byte length is a claim inside its signed URL, and the sidecar enforces that claim without ever buffering a whole part on either write path: on `multipart_native` paths a sidecar-side streaming counter (`part_size_guard`) aborts mid-stream with HTTP 413 as soon as the byte count would exceed the claim, and the claim is also what the sidecar declares as the backend request's exact `Content-Length`, so an undersized body fails that backend write directly (nothing is ever stored, nothing needs cleanup); on non-native (offset-object) paths exceeding the claim aborts mid-stream with HTTP 413 as soon as the byte count passes the claim (possibly after some bytes reached the backend, which then requires cleanup), while a body that ends short of the claim fails the post-write exact-length check with HTTP 400. The part hash is always computed from the received bytes but a part whose length is correct is recorded as-is — the assembled content's root is computed at `complete` from the stored part hashes, not derived by re-verifying the part bytes at part-write. So a client cannot get oversized bytes recorded as a valid part regardless of the `declared_size` it declares up front.
 
 All part bytes flow exclusively through sidecar signed URLs (ADR-0004); there is no control-plane byte route (ADR-0003) -- part bytes are never PUT to the control plane. See [Combine Part Hashes at Complete](#combine-part-hashes-at-complete) for how the content hash is computed.
 
@@ -337,20 +337,25 @@ count implied by `declared_size` and the computed `part_size` would exceed the c
 **Input**: request body (stream), size_claim (uint64 from signed token)
 **Output**: accepted body bytes, or a 413/400 rejection
 
-> **Note (matches implementation):** the sidecar does **not** read the `Content-Length`
-> header. Enforcement is by received body length: on `multipart_native` the whole
-> part is buffered and the buffered length is checked against `size_claim`
-> **before** the backend write; on offset-object (non-native) paths the body streams
-> to the object with a mid-stream `max_size` guard and a post-write exact-length
-> check. Steps below describe the streamed counter the offset path uses; the
-> buffered native path reaches the same accept/reject outcomes without partial
-> backend I/O.
+> **Note (matches implementation):** the sidecar does **not** read the client's
+> `Content-Length` header. Enforcement is by received body length, and neither write
+> path buffers a whole part: on `multipart_native`, a sidecar-side streaming guard
+> (`part_size_guard`) counts bytes as they pass through to the backend's own
+> `upload_part_stream`, rejecting mid-stream (413) the moment the running count
+> would exceed `size_claim` — `size_claim` itself is also what the sidecar declares
+> as the backend request's exact `Content-Length` (S3's `UploadPart` needs the exact
+> length up front, not a flexible ceiling), so an undersized stream fails that
+> backend write outright rather than needing a separate post-write check; on
+> offset-object (non-native) paths the body streams to the object with a
+> mid-stream `max_size` guard and a post-write exact-length check. Both paths reach
+> the same accept/reject outcomes without ever buffering a whole part in the
+> sidecar process.
 
 **Steps**:
-1. [ ] - `p1` - Stream the body; count bytes as they arrive (the native path buffers them; the offset path streams them to the object) - `inst-enforce-stream`
+1. [ ] - `p1` - Stream the body; count bytes as they arrive on both paths - `inst-enforce-stream`
 2. [ ] - `p1` - **IF** byte count exceeds size_claim before body ends: RETURN HTTP 413 -- abort the write mid-stream; rollback any partially written bytes (on the offset path the write may already have reached the backend, requiring cleanup) - `inst-enforce-oversize`
 3. [ ] - `p1` - **IF** body ends before size_claim bytes received: RETURN HTTP 400 Bad Request (short body) - `inst-enforce-undersize`
-4. [ ] - `p1` - On `multipart_native`, verify buffered length == size_claim **before** the backend write - `inst-enforce-cl-reject` (no-op on the offset path, where the counter above already enforced it)
+4. [ ] - `p1` - On `multipart_native`, the backend's own exact-length contract (`size_claim` sent as `Content-Length`) rejects an undersized stream as part of the backend write itself - `inst-enforce-cl-reject` (no-op on the offset path, where the counter above already enforced it)
 5. [ ] - `p1` - RETURN accepted bytes (exactly size_claim bytes) -- proceed to write - `inst-enforce-accept`
 
 ### Combine Part Hashes at Complete
@@ -422,14 +427,17 @@ The system **MUST** implement `POST /api/file-storage/v1/files/{id}/multipart` o
 
 The sidecar part-upload handler verifies the signed token (Ed25519, codec-equivalent to but not literal
 PASETO -- ADR-0004's Implementation note); calls `cpt-cf-file-storage-algo-enforce-part-size` to reject with HTTP 413
-if the body length does not match the size claim — on `multipart_native` paths the whole part body is buffered and
-the length checked **before** the backend write; on offset-object (non-native) paths enforcement is a streaming
-`max_size` abort (which may fire after some bytes reached the object) plus a post-write exact-length check; there is
-no pre-write `Content-Length` check. The handler then writes the part bytes to the backend (`PutPart` for
-`multipart_native`, or a separate `{backend_path}.part.{n}` object for non-native backends -- not an offset-write into
-the shared version object); computes the per-part hash; and reports it to the control plane over a token-authenticated
-callback, which upserts the part row (the sidecar itself never touches the DB). Re-PUT of the same (upload_id,
-part_number) is idempotent.
+if the body length does not match the size claim — neither write path buffers a whole part: on `multipart_native`
+paths a sidecar-side streaming counter (`part_size_guard`) enforces the ceiling ahead of the backend write, and the
+claim is separately sent as the backend request's exact `Content-Length` (S3's `UploadPart` requires the length up
+front), so an undersized body fails that backend write directly rather than needing its own pre-write check; on
+offset-object (non-native) paths enforcement is a streaming `max_size` abort (which may fire after some bytes
+reached the object) plus a post-write exact-length check; there is no pre-write client-supplied `Content-Length`
+check on either path (the client's own header is never read). The handler then writes the part bytes to the backend
+(`UploadPart` for `multipart_native`, or a separate `{backend_path}.part.{n}` object for non-native backends -- not
+an offset-write into the shared version object); computes the per-part hash on the same streamed pass; and reports
+it to the control plane over a token-authenticated callback, which upserts the part row (the sidecar itself never
+touches the DB). Re-PUT of the same (upload_id, part_number) is idempotent.
 
 **Implements**:
 - `cpt-cf-file-storage-flow-multipart-upload-part`
@@ -544,7 +552,7 @@ The system **MUST** add `version_id uuid NOT NULL`, `declared_size bigint NOT NU
 - [x] `POST /api/file-storage/v1/files/{id}/multipart` returns a parts plan with one signed sidecar URL per part; each URL token includes part_number, offset, size, op, and exp claims
 - [x] The parts plan is server-computed from declared_size and the effective part_size; clients cannot choose part boundaries
 - [x] The control-plane route `PUT /files/{id}/multipart/{upload_id}/parts/{part_number}` does not exist; all part bytes flow through sidecar signed URLs only (ADR-0003)
-- [x] The sidecar rejects a part PUT whose body length violates the size claim -- on `multipart_native` paths the buffered body is length-checked before the backend write; on non-native (offset-object) paths the body streams and an oversize fires HTTP 413 immediately (mid-stream), while a short body fails the post-write exact-length check with HTTP 400 (the part hash is computed but not re-verified at part-write; the assembled root is computed at `complete` from the stored part hashes)
+- [x] The sidecar rejects a part PUT whose body length violates the size claim -- neither write path buffers a whole part: on `multipart_native` paths a sidecar-side streaming counter enforces an oversize rejection (HTTP 413) ahead of the backend write, and the backend's own exact-`Content-Length` contract rejects an undersized stream as part of that write itself; on non-native (offset-object) paths the body streams and an oversize fires HTTP 413 immediately (mid-stream), while a short body fails the post-write exact-length check with HTTP 400 (the part hash is computed but not re-verified at part-write; the assembled root is computed at `complete` from the stored part hashes)
 - [x] Re-PUT of the same (upload_id, part_number) is idempotent; the part row is overwritten and no duplicate rows are created
 - [x] `POST .../complete` rejects with `409 Conflict` and the missing part numbers in the error detail when one or
   more planned parts have not been reported yet; a residual generic `409` still guards
