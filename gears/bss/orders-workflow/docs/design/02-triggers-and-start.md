@@ -219,9 +219,10 @@ with a different `orderId`, `orderVersion` or `triggerKind` fails the request fi
 **key conflict** (`idempotency-key-conflict`, `permanent-failure`), never admitted under a fresh
 key. The `correlationId` rides the registry row (`owf_idempotency_registry.correlation_id`) as the
 cross-reference that lets an absorbed duplicate say which instance it belongs to, and never
-participates in key equality. This key shape is an event-scoped form of ADR-0006's instance-scoped
-family (decision D-74: the `trigger` key family
-`{tenant}:{eventId}:admit-trigger[:listen]` is added to ADR-0006 and to
+participates in key equality. This key shape is its own event-scoped family, not a form of
+ADR-0006's instance-scoped families, because an admission happens before an instance exists
+(decision D-74: the fifth key family, `trigger`,
+`{tenant}:{eventId}:admit-trigger[:listen]`, is added to ADR-0006 and to
 `owf_step_operation.key_family`).
 
 The registry outcomes of [`01 §4.3`](./01-foundation.md) apply unchanged. Two deserve a note at
@@ -237,7 +238,7 @@ and the instance table, which resolves a long-delayed redelivery to `ignored-sup
 Lifecycle publishes through the platform producer outbox, whose ordering is per broker partition
 and whose permanent rejection may leave a gap (Lifecycle
 [`ADR-0006`](../../../orders-lifecycle/docs/ADR/0006-cpt-cf-bss-orders-lifecycle-adr-outbox-publication.md),
-D-87). Lifecycle `01 §4.4` imposes one rule on every consumer of its stream, and it now binds
+Lifecycle [D-87](../../../orders-lifecycle/docs/DECISIONS.md)). Lifecycle `01 §4.4` imposes one rule on every consumer of its stream, and it now binds
 **every `listen` of a Lifecycle trigger as well as the start trigger**, because each of them
 reaches the process through `admit-trigger`: de-duplicate by event id (the registry above); before
 acting, verify the event's `orderVersion` and the resulting state through the authenticated,
@@ -270,7 +271,7 @@ The comparison has **three** branches — the event's version can be equal to, o
 newer than what the read returns. The third is **not replica lag**: Lifecycle forbids replica
 reads and serves the aggregate row itself
 ([Lifecycle `08 §3.8`](../../../orders-lifecycle/docs/design/08-read-and-authz.md#38-deployment-topology),
-D-51), and it publishes only after the state write commits, so an event ahead of the read is a
+Lifecycle [D-51](../../../orders-lifecycle/docs/DECISIONS.md)), and it publishes only after the state write commits, so an event ahead of the read is a
 divergence between the stream and the system of record. The full rule is §4.2.
 
 **ADRs**: `cpt-cf-bss-orders-workflow-adr-process-state-non-authoritative`
@@ -299,7 +300,9 @@ trigger and be delivered to a running invocation's `listen` is not stated by the
 the upstream ask `10 §3.6` (f) registers.
 
 Delivery count, redelivery backoff and the dead letter of a trigger that keeps failing belong to
-the platform trigger path (`01 §4.8`; `dead_lettered`, `DESIGN.md:458`). This gear keeps no
+the platform trigger path (`01 §4.8`): the trigger's `dead_letter_queue`
+([`DESIGN_GTS_SCHEMAS.md:1651`](../../../../serverless-runtime/docs/DESIGN_GTS_SCHEMAS.md#trigger); its management API is out of scope in the platform
+design), not an invocation's `dead_lettered` status. This gear keeps no
 consumer group, no delivery counter and no dead-letter table for triggers. The outbound calls to
 Orders Lifecycle are unchanged in kind — synchronous seam calls made inside step operations of
 slices 03, 04 and 06 — and this slice's own only outbound call is the R1 read.
@@ -932,7 +935,9 @@ violates one **MUST** be refused.
 - **Definition**: [`10-process-definition.md`](./10-process-definition.md) — §3.6 (a) start path,
   §3.6 (f) amendment and terminal events, §2.2 grammar and validation rules, §4.1 the fence
 - **Platform**: [serverless-runtime DESIGN](../../../../serverless-runtime/docs/DESIGN.md) — §3.1
-  *Trigger*, §3.3 *Event Trigger Management API*, invocation status (`dead_lettered`)
+  *Trigger*, §3.3 *Event Trigger Management API*;
+  [DESIGN_GTS_SCHEMAS](../../../../serverless-runtime/docs/DESIGN_GTS_SCHEMAS.md#trigger) *Trigger*
+  (`dead_letter_queue`)
 - **Boundary reference (by-reference, not restated)**: [`../../../orders-lifecycle/docs/design/06-workflow-seam.md`](../../../orders-lifecycle/docs/design/06-workflow-seam.md)
   §3.3 (the five seam operations), §4.1–§4.6 (normative R1–R5 consequences);
   [`../../../orders-lifecycle/docs/design/04-versioning.md`](../../../orders-lifecycle/docs/design/04-versioning.md)

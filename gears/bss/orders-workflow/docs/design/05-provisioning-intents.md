@@ -183,7 +183,7 @@ wave it names, and only the non-terminal status read (`SUB-O13`, §4.1) that `re
 performs may move an intent or a task. This is the consumer obligation Lifecycle `01 §4.4` states
 for every event consumer (Lifecycle
 [`ADR-0006`](../../../orders-lifecycle/docs/ADR/0006-cpt-cf-bss-orders-lifecycle-adr-outbox-publication.md),
-D-87), in its strongest form: a replayed, reordered or forged confirmation can at most cause one
+Lifecycle [D-87](../../../orders-lifecycle/docs/DECISIONS.md)), in its strongest form: a replayed, reordered or forged confirmation can at most cause one
 additional read. A timeout, 503 or authorization failure on that read is retryable, never
 evidence that the confirmation is stale or already applied. The unmatched-confirmation rule is
 §4.4.
@@ -200,8 +200,8 @@ allowance or the aggregate cap exhausted, a downstream throttle, an open hold �
 `deferred[]` of a **settled success**, with a `retryAfterMs` hint, and the definition waits and
 calls again under the next dispatch round (§4.5). It is never a `retryable-failure`, because the
 PRD forbids a throttle from consuming the retry budget
-(`cpt-cf-bss-orders-workflow-fr-owf-backpressure`) and the retry budget is now the platform's
-task retry policy, which counts every failed attempt. (decision D-96: an
+(`cpt-cf-bss-orders-workflow-fr-owf-backpressure`) and the retry budget is now the definition's
+per-task retry (`catch.retry` under `use.retries`, `10 §2`), which counts every failed attempt. (decision D-96: an
 admission deferral settles as success carrying `deferred[]` and `retryAfterMs`, amending the
 first rule of `01 §4.12`, which settles a non-admitted dispatch as `retryable-failure`.)
 
@@ -590,7 +590,7 @@ definition never computes one (`01 §4.14`). Every step key is recomposed server
 |-------|-------|
 | `protection` | `protected` — Waves stage: after `begin-fulfillment`, before `re-check-pre-activation` (`10 §4.1`) |
 | `input` | `ref`, `planRef`, `lineRefs[]` (the whole plan on first entry; the rebuilt lines after `rebuild-wave1`; the deferred lines of the previous round), `dispatchRound`, `attemptKey` (nullable; the key `retry-step` minted for a manual `retry` of one line) |
-| `output` | `accepted[]` (lineRef), `failed[]` (lineRef + reason code), `deferred[]` (lineRef), `deferReason` (`admission` · `throttle` · `held`, nullable), `retryAfterMs` (nullable), `nextDispatchRound` |
+| `output` | `accepted[]` (lineRef), `failed[]` (lineRef + reason code), `deferred[]` (lineRef), `deferReason` (`admission` · `throttle` · `held`, nullable), `retryAfterMs` (nullable), `due: true\|false` on a non-empty `deferred[]` — database time against the deferral instant this operation records with the round (`now + retryAfterMs`), the answer the definition's deferral re-check loop switches on (`10 §3.6` (b)); a call before that instant re-defers with `due: false`, `nextDispatchRound` |
 | `idempotency_key` | step key, instance-scoped: `{tenant}:{correlationId}:dispatch-wave1-create:{planRef}:{dispatchRound}`; per line, the intent key `{tenant}:{orderId}:{orderVersion}:{orderLineId}:wave1_create:draft_create[:{wave_attempt}]` resolved from the record, never supplied |
 | `declared_event` | `OrderFulfillmentStepCompleted`, once per line a synchronous Subscriptions refusal moves `pending → failed` (04's terminal-state rule); none for an accepted line |
 | `compensation` | `compensate-order` (06) — the draft-void leg for every `draft_created` line |
@@ -605,7 +605,7 @@ definition never computes one (`01 §4.14`). Every step key is recomposed server
 |-------|-------|
 | `protection` | `protected` — Waves stage: after `report-spawn-signal` (`10 §4.1`); the only route to `report-outcome` with `outcome: completed` |
 | `input` | `ref`, `planRef`, `lineRefs[]` (the eligible set `evaluate-activation-eligibility` returned; empty is permitted and is the completion check), `dispatchRound`, `attemptKey` (nullable) |
-| `output` | `accepted[]`, `activated[]`, `failed[]` (lineRef + reason code), `pending[]`, `lapsed[]`, `deferred[]` (all lineRef), `deferReason`, `retryAfterMs`, `nextDispatchRound`. `pending[]` names **every** plan line not yet recorded `activated` or `failed` — in flight, not yet eligible, lapsed or deferred — so an empty `pending[]` and an empty `failed[]` together mean the order is complete; `lapsed[]` and `deferred[]` are subsets of `pending[]` that name why |
+| `output` | `accepted[]`, `activated[]`, `failed[]` (lineRef + reason code), `pending[]`, `lapsed[]`, `deferred[]` (all lineRef), `deferReason`, `retryAfterMs`, `due: true\|false` on a non-empty `deferred[]` — database time against the deferral instant this operation records with the round (`now + retryAfterMs`), the answer the definition's deferral re-check loop switches on (`10 §3.6` (b)); a call before that instant re-defers with `due: false`, `nextDispatchRound`. `pending[]` names **every** plan line not yet recorded `activated` or `failed` — in flight, not yet eligible, lapsed or deferred — so an empty `pending[]` and an empty `failed[]` together mean the order is complete; `lapsed[]` and `deferred[]` are subsets of `pending[]` that name why |
 | `idempotency_key` | step key, instance-scoped: `{tenant}:{correlationId}:dispatch-wave2-activate:{planRef}:{dispatchRound}`; per line, the intent key `{tenant}:{orderId}:{orderVersion}:{orderLineId}:wave2_activate:activation` |
 | `declared_event` | `OrderFulfillmentStepCompleted`, once per line a synchronous refusal moves `draft_created → failed` |
 | `compensation` | `compensate-order` (06) — the activated-cancel leg for every line whose activation was accepted |
@@ -759,7 +759,7 @@ sequenceDiagram
     SUB -->> OP: accepted (transition_request_id) | refused
     OP ->> DB: settle: acceptance fields; refused line pending → failed
     OP -->> PL: accepted[], failed[], deferred[], nextDispatchRound
-    Note over PL: deferred → wait retryAfterMs, call again; failed → fragment (c)
+    Note over PL: deferred → re-check loop until due, call again; failed → fragment (c)
     Note over PL: barrier: waitExpected, then evaluate (04) ⇄ confirmation listen / poll
     PL ->> OP: confirmation arm or poll arm: reconcile-intent
     OP ->> SUB: status read (SUB-O13)
@@ -1073,8 +1073,9 @@ Related, already-registered asks:
   by slice 04 and inherited by the draft-liveness gate, which fails closed on an unevaluable read.
 
 **Platform asks this slice depends on** (recorded in `UPSTREAM_REQS.md` §2.9,
-serverless-runtime section): a `wait` whose duration is a runtime expression (`retryAfterMs`,
-`expectedFulfillmentAt`; Q-11 (i)); a `listen` whose stored event can be restricted to the
+serverless-runtime section): a `wait` whose duration is a runtime expression as a plugin
+extension (`retryAfterMs`, `expectedFulfillmentAt`; Q-11 (i)), until which the re-check loop of
+§4.5 item 4 applies; a `listen` whose stored event can be restricted to the
 exported members, because the Subscriptions outcome event as published carries a
 `subscriptionId`, which ADR-0013 keeps out of engine history (decision D-97: until the platform can filter a consumed event, the confirmation arm targets a
 reference-only Subscriptions notification — a further Subscriptions ask — or is dropped in favour
@@ -1205,10 +1206,13 @@ slice operations (D-80, D-81).
 3. **A 409 is followed by a read.** After a 409 from a dispatch operation (which may be
    `idempotency-lease-expired`, Q-11 (ii)) the definition **MUST** call `reconcile-intent` before
    re-issuing the same call †.
-4. **Deferral routes to a wait, never to failure.** A non-empty `deferred[]` **MUST** route to a
-   `wait` of `retryAfterMs` and then the same operation with `nextDispatchRound`; it **MUST NOT**
-   route to fragment (c) and **MUST NOT** be raised as an error †. Until Q-11 (i) is answered the
-   `wait` is a fixed 5 s and the operation re-defers if the hint has not elapsed.
+4. **Deferral routes to a wait, never to failure.** A non-empty `deferred[]` **MUST** route to
+   the deferral re-check loop and then the same operation with `nextDispatchRound`; it **MUST
+   NOT** route to fragment (c) and **MUST NOT** be raised as an error †. A 1.0.0 `wait` takes no
+   runtime expression, so until Q-11 (i) is answered the loop is a fixed-granularity `wait` (the
+   granularity `10 §3.6` declares for deferral) followed by the same call, which re-defers with
+   `due: false` while the recorded deferral instant has not been reached; the loop repeats while
+   `due` is `false`.
 5. **Lapsed routes to rebuild, rebuild routes to wave 1.** A non-empty `lapsed[]` **MUST** route to
    `rebuild-wave1`, and its `rebuilt[]` to `dispatch-wave1-create` and back through the barrier;
    never directly to `dispatch-wave2-activate` †.
@@ -1238,7 +1242,7 @@ slice operations (D-80, D-81).
 - `cfs validate --artifact` reports this file as unmatched: `docs/design/*.md` is excluded from
   `cfs` autodetect per `.cf-studio/config/artifacts.toml`. This is expected. `cfs toc`,
   `cfs validate-toc` and `cfs check-language` were run instead.
-- **Reasons pending registration** (decision D-77: `01 §4.9` registers
+- **Reasons registered** (decision D-77: `01 §4.9` registers
   `activation-precondition-unmet` — owner `05-provisioning-intents`, `ACTIVATION_PRECONDITION_UNMET`,
   Aborted, 409 — and `intent-unresolved` — owner `05-provisioning-intents`, `INTENT_UNRESOLVED`,
   FailedPrecondition, 400).

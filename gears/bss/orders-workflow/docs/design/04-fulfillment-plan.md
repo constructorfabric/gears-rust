@@ -489,8 +489,9 @@ compensation, not order state.
   `owf_durable_timer` ([`01 §3.7` *Retired tables*](./01-foundation.md#retired-tables)); the wake-ups
   are the definition's `listen` arms and eligibility poll `wait` (§2.1, §4.8).
 - The barrier's timer half (the expected-fulfillment wake-up) — retired by ADR-0011; the instant is
-  returned by `construct-and-freeze-plan` as `expectedFulfillmentAt` and awaited by the
-  definition's `waitExpected` task; the all-creates half is `evaluate-activation-eligibility`,
+  returned by `construct-and-freeze-plan` as `expectedFulfillmentAt`, stored on the plan, and
+  awaited by the definition's `waitExpected` re-check loop, which switches on the `due` of
+  `evaluate-activation-eligibility`; the all-creates half is `evaluate-activation-eligibility`,
   re-evaluated by the definition on every contributing signal.
 - The Progress Tracker's execution of the abort path (draft void, `ActivationAbortRecord` void
   outcome, `fulfillment_failed` acknowledgement) and of the completion acknowledgement — moved to
@@ -543,11 +544,11 @@ gear's authority — the caller supplies references, never authority (ADR-0013, 
 |-------|-------------------------------------|-----------------------------|---------------------|-----------------------------------|---------------------------|
 | `protection` | `protected` | `protected` | `protected` — the R1 seam call | `composable` | `protected` |
 | `input` (beyond the common members) | `trigger` ∈ `initial` · `acceptance-recorded` · `reauthorize-requested` · `poll`; `requestRef` (the signal's request, nullable); `evaluationSeq` | `attempt` (default 0; minted by `retry-step` on a plan-level task's retry) | `planRef`, `eligibilitySeq` (the `evaluationSeq` of the `eligible` answer) | `planRef`, `evaluationSeq` | `planRef`, `evaluationSeq` |
-| `output` | `eligibility` ∈ `eligible` · `pending` · `withheld`; `withheldCause` ∈ `acceptance-not-recorded` · `acceptance-unevaluable` · `null`; `nextEvaluationSeq` | `planRef`, `lineRefs[]`, `expectedFulfillmentAt` (instant), `policy` ∈ `remediate` · `fail-fast`, `planState` ∈ `frozen` · `invalid-graph` · `topology-unavailable`, `reason` (catalogue code, nullable) | `result` ∈ `in-fulfillment` · `withheld`; `withheldCause` ∈ `authorization-pending` · `authorization-failed` · `acceptance-required-not-recorded` · `acceptance-requirement-unevaluable` · `null` | `released` (bool), `eligibleLineRefs[]`, `pendingLineRefs[]`, `nextEvaluationSeq` | `verdict` ∈ `proceed` · `abort` · `not-dispatchable`; `abortReason` (catalogue code, nullable); `observed` ∈ `on-hold` · `superseded` · `terminal` · `null`; `nextEvaluationSeq` |
+| `output` | `eligibility` ∈ `eligible` · `pending` · `withheld`; `withheldCause` ∈ `acceptance-not-recorded` · `acceptance-unevaluable` · `null`; `nextEvaluationSeq` | `planRef`, `lineRefs[]`, `expectedFulfillmentAt` (instant), `policy` ∈ `remediate` · `fail-fast`, `planState` ∈ `frozen` · `invalid-graph` · `topology-unavailable`, `reason` (catalogue code, nullable) | `result` ∈ `in-fulfillment` · `withheld`; `withheldCause` ∈ `authorization-pending` · `authorization-failed` · `acceptance-required-not-recorded` · `acceptance-requirement-unevaluable` · `null` | `due: true\|false` — database time against the plan's stored `expected_fulfillment_at`, the answer the barrier's re-check loop switches on (`10 §3.6` (b)); `released` (bool), `eligibleLineRefs[]`, `pendingLineRefs[]`, `nextEvaluationSeq` | `verdict` ∈ `proceed` · `abort` · `not-dispatchable`; `abortReason` (catalogue code, nullable); `observed` ∈ `on-hold` · `superseded` · `terminal` · `null`; `nextEvaluationSeq` |
 | `idempotency_key` | instance-scoped `{tenant}:{correlationId}:evaluate-payment-auth-eligibility:{evaluationSeq}` | instance-scoped `{tenant}:{correlationId}:construct-and-freeze-plan:{attempt}` | lifecycle-transition `{tenant}:{orderId}:{orderVersion}:begin-fulfillment:{eligibilitySeq}` (§4.1) | instance-scoped `{tenant}:{correlationId}:evaluate-activation-eligibility:{planRef}:{evaluationSeq}` | instance-scoped `{tenant}:{correlationId}:re-check-pre-activation:{planRef}:{evaluationSeq}` |
 | `declared_event` | none | none | `OrderFulfillmentStarted` on `result = in-fulfillment` | none | none |
 | `compensation` | none | none — a frozen plan is superseded by a new order version, never undone | none — the unwind of an order in fulfillment is `run-cancellation-fence` → `compensate-order` → `report-outcome` (06), a path, not a paired undo | none (read-only) | none |
-| `reasons` | `version-mismatch`, `circuit-breaker-open`, `per-attempt-timeout` | `invalid-dependency-graph`, `catalog-topology-unavailable`, `line-count-exceeded`, `idempotency-key-conflict`, `version-mismatch` | `version-mismatch`, `idempotency-key-conflict`, `circuit-breaker-open`, `per-attempt-timeout` | `version-mismatch` | `overlap-collision`, `market-divergence`, `payment-authorization-stale`, `overlap-read-unevaluable`, `version-mismatch`, `circuit-breaker-open`, `per-attempt-timeout` |
+| `reasons` | `version-mismatch`, `circuit-breaker-open`, `per-attempt-timeout` | `invalid-dependency-graph`, `catalog-topology-unavailable`, `line-count-exceeded`, `idempotency-key-conflict`, `version-mismatch` | `version-mismatch`, `idempotency-key-conflict`, `circuit-breaker-open`, `per-attempt-timeout` | `version-mismatch` | `overlap-collision`, `market-divergence`, `payment-authorization-stale`, `overlap-read-unevaluable`, `identity-party-unavailable` (the identity port behind the payer commercial-profile read is unavailable), `version-mismatch`, `circuit-breaker-open`, `per-attempt-timeout` |
 | `audit_kind` | `step-completion` | `step-completion` | `step-completion` | `step-completion` | `step-completion` |
 | `retry_class` | `retryable-on: transient` | `retryable-on: transient` | `retryable-on: transient` | `retryable-on: transient` | `retryable-on: transient` |
 | `deadline` | 10 s (Payments and Lifecycle reads) | 10 s (Catalog, Lifecycle, Account Management and `SUB-O5` reads) | 10 s (Lifecycle write) | 5 s (local reads only) | 10 s (Account Management and `SUB-O5` reads) |
@@ -777,9 +778,9 @@ own key handling, so the transition is applied once.
 **Algorithm: Evaluate Activation Eligibility**
 
 Input: correlationId, planRef, evaluationSeq, attemptId
-Output: released, eligibleLineRefs[], pendingLineRefs[], nextEvaluationSeq
+Output: due, released, eligibleLineRefs[], pendingLineRefs[], nextEvaluationSeq
 
-1. [ ] - `p1` - Read the frozen plan and every task in one snapshot at database time; **IF** the plan is not frozen or carries an `abort_record`: **RETURN** `released: false` with empty lists - `inst-ae-read`
+1. [ ] - `p1` - Read the frozen plan and every task in one snapshot at database time; set `due` to whether database now has reached `expected_fulfillment_at`, returned on every answer below; **IF** the plan is not frozen or carries an `abort_record`: **RETURN** `released: false` with empty lists - `inst-ae-read`
 2. [ ] - `p1` - **IF** `owf_process_instance.suspended` is true: **RETURN** `released: false` — a hold never releases the barrier, though it does not stop its evaluation - `inst-ae-if-suspended`
 3. [ ] - `p1` - **IF** database now is before `expected_fulfillment_at`, or any task is still `pending` or `failed`: **RETURN** `released: false` with `pendingLineRefs` = the tasks not yet `draft_created` - `inst-ae-if-conjunction-false`
 4. [ ] - `p1` - Otherwise the conjunction holds; `eligibleLineRefs` = every `draft_created` task whose dependencies in the frozen graph are all `activated`; `pendingLineRefs` = every `draft_created` task with an unactivated dependency; **RETURN** `released: true` - `inst-ae-released`
@@ -848,10 +849,9 @@ barrier can defer wave 2 by up to the future-dated horizon, and an authorization
 begin-fulfillment can age out inside that wait. The previous revision treated an unevaluable
 overlap read as a collision on the first failure; this revision follows Lifecycle's `defer`
 ladder and aborts only on its exhaustion, with the honest reason (decision D-91: an unevaluable re-check follows Lifecycle's `defer` ladder, 3 attempts within 60 s, and then
-aborts with `overlap-read-unevaluable`; the construction-time check is advisory; the reason
-`identity-party-unavailable` for an unavailable identity port is registered in the catalogue of
-`01 §4.9` beside `overlap-read-unevaluable`, and until it is, that case carries
-`overlap-read-unevaluable`).
+aborts with `overlap-read-unevaluable`; the construction-time check is advisory). An unavailable
+identity port is `identity-party-unavailable`, registered in the catalogue of `01 §4.9` beside
+`overlap-read-unevaluable` and raised by `re-check-pre-activation`.
 
 #### Per-Line Progress to Terminal State
 
@@ -1180,41 +1180,41 @@ catalogue** (`01 §4.9`) — `identity-party-unavailable` (§3.6); (h) **`DESIGN
 
 These are inputs to the validation rules of
 [`10 §2.2` *Validation before publish*](./10-process-definition.md#validation-before-publish) and
-the fence of `10 §4.1`; the items marked **alignment** are where the canonical fragment of
-`10 §3.6` (b) was brought into line when the fragments were reconciled with the slice operations
-(D-80, D-81):
+the fence of `10 §4.1`; the items marked **alignment** name a defect the canonical fragment of
+`10 §3.6` (b) had before the fragments were reconciled with the slice operations (D-80, D-81);
+the fragment now carries each rule, and the note is kept as the reason the rule exists:
 
 1. **Order.** `evaluate-payment-auth-eligibility` **<** `construct-and-freeze-plan` **<**
    `begin-fulfillment` **<** `dispatch-wave1-create` **<** `re-check-pre-activation` **<**
    `report-spawn-signal` **<** `dispatch-wave2-activate`, as `10 §4.1` states. `begin-fulfillment`
-   **MUST** follow a settled `eligible` of the same round and a settled `frozen`. ADR-0012's
-   *Decision Outcome* item listing `construct-and-freeze-plan` before
-   `evaluate-payment-auth-eligibility` disagrees with `10 §4.1` and is to be corrected there.
+   **MUST** follow a settled `eligible` of the same round and a settled `frozen`.
 2. **`begin-fulfillment` `withheld`** **MUST** route back to the eligibility wait, never forward to
-   the waves and never to a failure arm (**alignment**: the fragment has no `switch` after
+   the waves and never to a failure arm (**alignment**: the fragment had no `switch` after
    `beginFulfillment`).
 3. **`planState`** — `frozen` → `begin-fulfillment`; `invalid-graph` → fragment (c) per policy,
    with `begin-fulfillment` passed before the unwind (§4.3); `topology-unavailable` →
-   `create-manual-task` under either policy (**alignment**: the fragment routes every non-frozen
+   `create-manual-task` under either policy (**alignment**: the fragment routed every non-frozen
    state to `partialFailure`).
 4. **`re-check-pre-activation`** — `abort` → the unwind path (`run-cancellation-fence` →
    `compensate-order` → `report-outcome`), **never** `partialFailure`; `not-dispatchable` → back
    into the barrier loop, whose hold, amendment and cancel arms consume the observed state;
    `proceed` only by an explicit case (**alignment**: the fragment's `onPreActivation` default
-   case is `proceed`, which would advance a `not-dispatchable` answer to the spawn signal). Its
+   case was `proceed`, which advanced a `not-dispatchable` answer to the spawn signal). Its
    `catch.retry` **MUST** allow at least 3 attempts within 60 s so the operation, not the retry
    budget, decides the ladder's exhaustion.
 5. **Eligibility wake-ups** — the eligibility fork **MUST** contain the `OrderAcceptanceRecorded`
    `listen` (`PRD.md:253`), the `reauthorize-requested` signal arm, and a poll `wait` arm that
    re-invokes `evaluate-payment-auth-eligibility` with `trigger: poll` — the poll is the bounded
    durable polling the Payments read needs and the cover for an event delivered before the
-   `listen` was armed (`10 §4.5` Q-11 (iv)) (**alignment**: the fragment has no poll arm).
+   `listen` was armed (`10 §4.5` Q-11 (iv)) (**alignment**: the fragment had no poll arm).
 6. **Evaluation sequences** — the definition **MUST** export `nextEvaluationSeq` from each of the
    three evaluation operations and pass it (and, to `begin-fulfillment`, the `eligible` round's
    value as `eligibilitySeq`) into the next call (§4.1) (**alignment**).
-7. **The barrier** — `waitExpected` **MUST** wait to `expectedFulfillmentAt` as returned by
-   `construct-and-freeze-plan` (a runtime-expression duration, Q-11 (i)); the overdue `wait` is
-   the same instant plus 24 h; `evaluate-activation-eligibility` **MUST** be re-invoked on every
+7. **The barrier** — `waitExpected` **MUST** wait until `expectedFulfillmentAt` as returned by
+   `construct-and-freeze-plan`. A 1.0.0 `wait` takes no runtime expression, so until Q-11 (i) is
+   answered it is the bounded re-check loop of `10 §3.6` (b) — a fixed-granularity `wait`, then
+   `evaluate-activation-eligibility`, looping while its `due` is `false`; the overdue deadline is
+   the same instant plus 24 h, owned by slice 07; `evaluate-activation-eligibility` **MUST** be re-invoked on every
    Subscriptions draft-create outcome event **and** on the poll interval; the definition **MUST
    NOT** decide release from its own memory of confirmations.
 8. **No swallowing `catch`** — `evaluate-payment-auth-eligibility`, `construct-and-freeze-plan`,
@@ -1225,7 +1225,8 @@ the fence of `10 §4.1`; the items marked **alignment** are where the canonical 
    references; the definition **MUST NOT** carry any other plan member. Their cardinality is
    visible in engine history; that residual is ADR-0013's to state.
 
-**Platform capabilities assumed, as asks.** A `wait` on a runtime-expression instant (Q-11 (i));
+**Platform capabilities assumed, as asks.** A `wait` on a runtime-expression instant as a plugin
+extension (Q-11 (i); until then the re-check loop of item 7 applies);
 the `reauthorize-requested` plugin-control signal and its buffering until an arm consumes it
 (`10 §3.3`, `10 §4.4`); a `listen` in a competing `fork` that does not lose an event delivered
 during cancellation (Q-11 (iv)); the platform `attempt_id` carried on the HTTP `call`

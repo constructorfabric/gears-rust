@@ -595,11 +595,11 @@ calls a downstream, 5 s for a record-only one.
 | `name` | `protection` | `input` | `output` | `idempotency_key` | `declared_event` | `compensation` | `reasons` | `audit_kind` | `retry_class` | `deadline` |
 |--------|--------------|---------|----------|-------------------|------------------|----------------|-----------|--------------|---------------|------------|
 | `obtain-verdict` | `protected` | ref | `verdict` ∈ `required` · `not-required` · `unobtainable`; `parkRef` and `parkReason` (the §3.7 enum) only on `unobtainable` | instance-scoped `{tenant}:{correlationId}:obtain-verdict:{orderVersion}`; an `unobtainable` answer leaves the registry record `open` (§4.4) | none | none | `per-attempt-timeout`, `idempotency-key-conflict`, `version-mismatch` | `step-completion` | `retryable-on: transient` | 10 s |
-| `reflect-verdict` | `protected` | ref + `stage` ∈ `requirement` · `gate-outcome` | `reflected` ∈ `pending_approval` · `approved` · `rejected` | step: instance-scoped `{tenant}:{correlationId}:reflect-verdict:{orderVersion}:{stage}`; seam: lifecycle-transition `{tenant}:{orderId}:{orderVersion}:{trigger}` with `trigger` one of the four `reflect-approval-*` (§4.4) | none (Lifecycle emits `OrderApproved` / `OrderRejected`) | none | `version-mismatch`, `gate-not-open`, `circuit-breaker-open`, `per-attempt-timeout`, `idempotency-key-conflict` | `step-completion` | `retryable-on: transient` | 10 s |
+| `reflect-verdict` | `protected` | ref + `stage` ∈ `requirement` · `gate-outcome` | `reflected` ∈ `pending_approval` · `approved` · `rejected` | step: instance-scoped `{tenant}:{correlationId}:reflect-verdict:{orderVersion}:{stage}`; seam: lifecycle-transition `{tenant}:{orderId}:{orderVersion}:{trigger}` with `trigger` one of the four `reflect-approval-*` (§4.4) | none (Lifecycle emits `OrderApproved` / `OrderRejected`) | none | `approval-reflection-refused` (the `permanent-failure` of a refused seam transition, §4.5; the manual-task reason of `07 §3.3`), `version-mismatch`, `gate-not-open`, `circuit-breaker-open`, `per-attempt-timeout`, `idempotency-key-conflict` | `step-completion` | `retryable-on: transient` | 10 s |
 | `open-gates` | `composable` | ref + `position` (0 on first entry, else `record-decision`'s `nextPosition`) | `gateRefs[]`, `position`, `escalationWindow` (duration), `escalationRound = 0` | step: instance-scoped `{tenant}:{correlationId}:open-gates:{orderVersion}:{position}`; downstream: approval-request `{tenant}:{orderId}:{orderVersion}:{gateId}` per gate | `OrderApprovalRequested`, one per gate opened in the settlement transaction | none — gates are closed by the closure port, not by an undo | `circuit-breaker-open`, `per-attempt-timeout`, `idempotency-key-conflict`, `version-mismatch` | `step-completion` | `retryable-on: transient` | 10 s |
 | `record-decision` | `protected` | ref + `gateRef`, `decisionEventId`, `outcome` ∈ `approved` · `rejected` | `applied` (boolean), `gateState` ∈ `approved` · `rejected` · `next-position` · `pending`, `nextPosition` (on `next-position`) | instance-scoped `{tenant}:{correlationId}:record-decision:{gateRef}:{decisionEventId}` | none | none | `gate-not-open`, `submitter-barred` (both recorded refusals, §4.4), `not-found`, `circuit-breaker-open`, `idempotency-key-conflict`, `version-mismatch` | `step-completion` | `retryable-on: transient` | 10 s |
-| `arm-park-escalation` | `composable` | ref + `parkRef` | `escalateAfter` (duration, or null once the park has escalated) | instance-scoped `{tenant}:{correlationId}:arm-park-escalation:{parkRef}` | none | none | `not-found`, `version-mismatch` | `step-completion` | `retryable-on: transient` | 5 s |
-| `escalate-gate` | `composable` | ref + `position`, `mode` ∈ `fire` · `probe`, `round` (the `escalationRound` or `probeRound` last returned) | `fire`: `escalationRemaining` (duration), `escalationRound`; `probe`: `serviceState` ∈ `available` · `outage`, `escalationRemaining` (duration, on the transition back to `available`), `outageThresholdRemaining` (duration, on `outage`), `probeRound` | instance-scoped `{tenant}:{correlationId}:escalate-gate:{orderVersion}:{position}:{mode}:{round}` | `OrderApprovalEscalated` per gate escalated (`fire` only) | none | `gate-not-open`, `circuit-breaker-open` (`fire` in outage), `per-attempt-timeout`, `version-mismatch` | `escalation` (`fire`); `step-completion` (`probe`) | `retryable-on: transient` | 10 s |
+| `arm-park-escalation` | `composable` | ref + `parkRef` | `due: true\|false` — database time against the park row's stored `escalation_due_at`, the answer the definition's re-check loop switches on (`10 §3.6` (a)); a `false` answer leaves the registry record `open`, so the next re-check re-runs; `escalateAfter` (duration, or null once the park has escalated) | instance-scoped `{tenant}:{correlationId}:arm-park-escalation:{parkRef}` | none | none | `not-found`, `version-mismatch` | `step-completion` | `retryable-on: transient` | 5 s |
+| `escalate-gate` | `composable` | ref + `position`, `mode` ∈ `fire` · `probe`, `round` (the `escalationRound` or `probeRound` last returned) | `due: true\|false` — database time against the stored deadline (`fire`: the gate's escalation deadline, never due while a `pause_causes` member is set; `probe` on `outage`: the outage-threshold deadline), the answer the definition's re-check loop switches on (`10 §3.6` (a)); `fire` with `due: false` escalates nothing and leaves the registry record `open`; `fire`: `escalationRemaining` (duration), `escalationRound`; `probe`: `serviceState` ∈ `available` · `outage`, `escalationRemaining` (duration, on the transition back to `available`), `outageThresholdRemaining` (duration, on `outage`), `probeRound` | instance-scoped `{tenant}:{correlationId}:escalate-gate:{orderVersion}:{position}:{mode}:{round}` | `OrderApprovalEscalated` per gate escalated (`fire` only) | none | `gate-not-open`, `circuit-breaker-open` (`fire` in outage), `per-attempt-timeout`, `version-mismatch` | `escalation` (`fire`); `step-completion` (`probe`) | `retryable-on: transient` | 10 s |
 
 `arm-park-escalation` and `escalate-gate` are `composable`: a definition version may reposition
 them inside the verdict stage, but the constraints of §4.5 still bind any version that contains
@@ -1141,7 +1141,10 @@ precisely the case where no authority answered. The phase alone is also insuffic
 process is parked, not why, not since when, and not whether the escalation has fired.
 
 **Its clock.** `arm-park-escalation` returns `escalateAfter = escalation_due_at − now` from the
-park row, and the definition's `waitTtlMargin` arms exactly that. The park clock is **not**
+park row and `due`, database time against `escalation_due_at`. A 1.0.0 `wait` takes no runtime
+expression, so the definition's `waitTtlMargin` is the bounded re-check loop of `10 §3.6` (a) — a
+fixed-granularity `wait`, then `arm-park-escalation`, looping while `due` is `false` — and the
+deadline stays this slice's stored value. The park clock is **not**
 pausable: the `parkLoop` fork contains no hold arm that could cancel it, because a hold does not
 stop the Lifecycle TTL, and pausing the thing that races it would be an escalation that arrives
 after the order has already expired (§4.5). There is no park timer row any more — the retired
@@ -1206,9 +1209,9 @@ here as a deliberate interim posture rather than left as an unexamined assumptio
   failure modes that would otherwise make the escalation silently inert.
 
 **Where the values live.** They are configuration of **this gear's operations**, not of the
-definition: `obtain-verdict` computes `escalation_due_at`, `arm-park-escalation` turns it into a
-duration, and `escalate-gate` computes `outageThresholdRemaining`. The definition arms whatever
-duration it is given (`10 §4.5`), so a definition version cannot shorten or lengthen the
+definition: `obtain-verdict` computes `escalation_due_at`, `arm-park-escalation` answers `due`
+against it, and `escalate-gate` answers `due` against the escalation and outage-threshold
+deadlines it stores. The definition's re-check loop only switches on `due` (`10 §3.6`), so a definition version cannot shorten or lengthen the
 fail-closed bound, and a change to either value is an Orders configuration change, not a
 definition publish.
 
@@ -1365,12 +1368,13 @@ that violates any of them **MUST** be refused.
 7. [ ] - `p1` - **Positions and rounds.** `open-gates` **MUST** be called with `position = 0` first and thereafter only with `record-decision`'s `nextPosition`; `escalate-gate` **MUST** carry the `escalationRound` or `probeRound` the previous call returned. These are re-keyed references, not computed values (`01 §4.14`) - `inst-c3-positions`
 8. [ ] - `p1` - **Signals handled.** This slice's stage consumes the approval decision event (`listen`, correlated on `orderId` and `orderVersion`); it is paused by `OrderHeld` / `OrderResumed` through `apply-hold` / `apply-resume` (slice 08), which call the gate-window port with the `gateRefs` `open-gates` returned; it is left by `cancel-requested`, `OrderAmended` and the terminal order events, whose paths close its records through the closure port inside `run-cancellation-fence` (slice 06) - `inst-c3-signals`
 
-`10 §3.6` (a) as committed with ADR-0011 shows the escalation branch, the hold, amendment and
-cancel arms and the park loop; items 4 to 7 are the parts of this contract its fragment does not yet
-show — the probe branch and outage arm, the `position` and `round` members, and the no-re-arm rule
-after a park escalation — and the canonical YAML is to carry them before the validation hook
-enforces this list. Items 4 and 6 depend on the runtime-expression `wait` of Q-11 (i)
-(`10 §4.5`); until it is answered, the fallback that section names applies.
+`10 §3.6` (a) carries every part of this contract: the escalation branch, the probe branch and
+outage arm, the `position` and `round` members, the hold, amendment and cancel arms, the park loop
+and the no-re-arm rule after a park escalation. Items 4 to 6 name the duration each `wait`
+stands for; a 1.0.0 `wait` takes no runtime expression, so until Q-11 (i) is answered each of those
+waits is the bounded re-check loop of `10 §3.6` — a fixed-granularity `wait`, then the call to
+`escalate-gate` or `arm-park-escalation`, looping while its `due` is `false` — and the deadline
+remains the value this slice stores.
 
 ### Disclosure 1 — the whole capability is inert in phase 1
 

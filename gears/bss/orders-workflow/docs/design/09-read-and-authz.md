@@ -573,7 +573,7 @@ that is Orders Lifecycle's own PDP-authorized surface, invoked independently on 
 operations and by this gear's operations through the `order × read` of `02 §2.1`. Does not
 authorize the platform's own APIs — definition publish, invocation start, `:control`,
 `:plugin-control` — which are authorized platform-side
-([serverless-runtime `DESIGN.md:845`](../../../../serverless-runtime/docs/DESIGN.md#33-api-contracts)).
+([serverless-runtime `DESIGN.md:847`](../../../../serverless-runtime/docs/DESIGN.md#33-api-contracts)).
 Does not itself execute the scope against the target row — the row is read or written inside the
 owning slice's transaction, under the scope this component compiled — and does not decide policy:
 which roles hold which pairs, whether a seller relationship or a delegation proof satisfies a
@@ -613,7 +613,9 @@ audit entry, and hands the request to the signal delivery of
 [`10 §3.2`](./10-process-definition.md#32-component-model)
 (`cpt-cf-bss-orders-workflow-component-signal-delivery`), which delivers it to the instance's
 `invocation_id` — or, for a retry whose invocation the platform reports `failed`, issues the
-platform's `:control` `retry` instead (§3.6). The gateway performs no business effect for a
+platform's `:control` `retry` instead, under D-86's confirmation condition (§3.3) — and reports the
+outcome back through the gateway's **request-delivery port**, the one write path to
+`owf_cancel_request.delivery_state` (§3.7); slice 10 records no request row of its own. The gateway performs no business effect for a
 control operation itself: the effect is the step operation the definition's arm calls.
 
 ##### Responsibility boundaries
@@ -779,19 +781,23 @@ catalogue rows of §3.1 and the `Gr` row of §4.1. There is therefore no operati
 |--------|------|--------------|-----------|
 | `POST` | `/bss-orders-workflow/v1/steps/{operation}` | The step surface of `01 §3.3`, authorized here as `process_step × execute` with `operation` as the resource property; serverless-runtime service principal only (`Gr`) | unstable — internal |
 | `GET` | `/bss-orders-workflow/v1/workflows/{orderId}/progress` | Query process progress (§4.1 read projection, §4.5 field projection). Unchanged | unstable |
-| `POST` | `/bss-orders-workflow/v1/workflows/{orderId}/steps/{stepId}/retry` | Retry failed step. `If-Match` with the process instance's `row_version` REQUIRED; `Idempotency-Key` REQUIRED, recomposed as `{tenant}:{orderId}:{stepId}:retry:{row_version}`. A failed step under `remediate` always holds an open manual task (`10 §4.1` *Failure*); the route is an **alias** of that task's `…/fulfillment-operator/tasks/{taskId}/retry` (`07 §3.3`): it writes the same `owf_task_resolution_request` row (action `retry`) and delivers the same `task-resolution-requested` signal, so `retry-step`'s quarantine and new attempt key (`01 §3.3`) run inside `resolve-manual-task`. A step with no open task is `not-found`; the task's own preconditions (`order-fenced`, `action-not-offered`) apply unchanged. Answers `202 Accepted` with `requestRef`. When the platform reports the invocation `failed`, the gateway issues `…/invocations/{invocation_id}:control` `retry` instead of a signal (valid from `failed`, [`DESIGN.md:883`–`889`](../../../../serverless-runtime/docs/DESIGN.md#invocation-api)) | unstable |
+| `POST` | `/bss-orders-workflow/v1/workflows/{orderId}/steps/{stepId}/retry` | Retry failed step. `If-Match` with the process instance's `row_version` REQUIRED; `Idempotency-Key` REQUIRED, recomposed as `{tenant}:{orderId}:{stepId}:retry:{row_version}`. A failed step under `remediate` always holds an open manual task (`10 §4.1` *Failure*); the route is an **alias** of that task's `…/fulfillment-operator/tasks/{taskId}/retry` (`07 §3.3`): it writes the same `owf_task_resolution_request` row (action `retry`) and delivers the same `task-resolution-requested` signal, so `retry-step`'s quarantine and new attempt key (`01 §3.3`) run inside `resolve-manual-task`. A step with no open task is `not-found`; the task's own preconditions (`order-fenced`, `action-not-offered`) apply unchanged. Answers `202 Accepted` with `requestRef`. When the platform reports the invocation `failed`, the gateway issues `…/invocations/{invocation_id}:control` `retry` instead of a signal — valid only from `failed` ([`DESIGN.md:888`](../../../../serverless-runtime/docs/DESIGN.md#invocation-api)) — once the platform confirms that `retry` keeps `invocation_id` (decision D-86, `…-upreq-serverless-runtime-signals`). An invocation that fails with no `on_failure` handler moves on to `dead_lettered` ([`DESIGN.md:458`](../../../../serverless-runtime/docs/DESIGN.md#invocation-status-state-machine)), from which `retry` is not valid today; until the platform confirms both properties — `retry` keeps `invocation_id`, and `retry` is valid from `dead_lettered` — a dead invocation's instance is unwound through the fence and the order re-submitted (D-86) | unstable |
 | `POST` | `/bss-orders-workflow/v1/workflows/{orderId}/cancel` | Cancel workflow with compensation. `If-Match` REQUIRED; `Idempotency-Key` REQUIRED, recomposed as `{tenant}:{orderId}:{orderVersion}:cancel:{subject_id}`. Records an `owf_cancel_request` with the authorization snapshot (§4.4) and delivers `cancel-requested` carrying only the reference tuple and `requestRef` (`10 §3.3`); authority is re-checked at apply time by `authorize-cancel` and at the two later points of §4.4, because fencing can outlive the request by days. Never the platform's generic `:control` `cancel` (`10 §4.4`). Answers `202 Accepted` with `requestRef` | unstable |
 
 **Removed.** `POST /bss-orders-workflow/v1/workflows` (start workflow) is **removed** in favour of
 the platform event trigger: PRD §9.1 *Start workflow* is realised by the serverless-runtime event
 triggers on `OrderSubmitted` and `OrderAmended` (`02 §2.2`, `10 §3.3`), whose invocation's first
 calls are `admit-trigger` and `start-instance`. No Orders route calls
-`POST /api/serverless-runtime/v1/invocations`. A re-drive of an invocation the platform reports
-`dead_lettered` is **not** offered: `start-instance` answers the existing binding to a second
-invocation and that invocation ends itself (`01 §3.3`), so a platform re-start cannot adopt a bound
-instance (decision D-86: whether an operator re-drive of a
-`dead_lettered` invocation re-binds `owf_process_instance.invocation_id`, or the instance is
-unwound and the order re-submitted).
+`POST /api/serverless-runtime/v1/invocations`. No route re-starts an
+invocation: `start-instance` answers the existing binding to a second invocation and that
+invocation ends itself (`01 §3.3`), so a platform re-start cannot adopt a bound instance and
+`owf_process_instance.invocation_id` is never re-bound (decision D-86). The only re-drive is the
+platform's `:control` `retry` of the same invocation, valid from `failed` only
+([`DESIGN.md:888`](../../../../serverless-runtime/docs/DESIGN.md#invocation-api)); a `dead_lettered` invocation
+([`DESIGN.md:458`](../../../../serverless-runtime/docs/DESIGN.md#invocation-status-state-machine)) cannot be re-driven until the
+platform confirms `retry` from `dead_lettered` keeping `invocation_id`
+(`…-upreq-serverless-runtime-signals`), and until then its instance is unwound through the fence
+and the order re-submitted (D-86).
 
 **The routes of other slices** — the approver inbox and decision of
 [`03 §3.3`](./03-approval-execution.md#33-api-contracts), the operator task queue and per-action
@@ -905,7 +911,7 @@ reference, with these Workflow bindings:
 
 | Dependency Gear | Interface Used | Purpose |
 |-------------------|---------------|----------|
-| `serverless-runtime` | Its service principal as the caller of the step routes; `GET …/invocations/{invocation_id}`, `…:control` (`retry` only), `…:plugin-control` ([`DESIGN.md:865`–`869`](../../../../serverless-runtime/docs/DESIGN.md#invocation-api), [`DESIGN.md:893`](../../../../serverless-runtime/docs/DESIGN.md#invocation-api)) | The `Gr` grant of §4.1; the retry route's status read and `:control` `retry`; the signal delivery of `10 §3.2`. The platform authorizes these calls itself ([`DESIGN.md:845`](../../../../serverless-runtime/docs/DESIGN.md#33-api-contracts)); this gear authorizes the operator first and then calls as its own service principal. **No code today** (`10 §1`); the plugin-control verb and payload for a named signal are an upstream ask (`10 §3.3`) |
+| `serverless-runtime` | Its service principal as the caller of the step routes; `GET …/invocations/{invocation_id}`, `…:control` (`retry` only), `…:plugin-control` ([`DESIGN.md:865`–`869`](../../../../serverless-runtime/docs/DESIGN.md#invocation-api), [`DESIGN.md:893`](../../../../serverless-runtime/docs/DESIGN.md#invocation-api)) | The `Gr` grant of §4.1; the retry route's status read and `:control` `retry`; the signal delivery of `10 §3.2`. The platform authorizes these calls itself ([`DESIGN.md:847`](../../../../serverless-runtime/docs/DESIGN.md#33-api-contracts)); this gear authorizes the operator first and then calls as its own service principal. **No code today** (`10 §1`); the plugin-control verb and payload for a named signal are an upstream ask (`10 §3.3`) |
 
 **Dependency Rules** (per project conventions):
 - No circular dependencies
@@ -1169,9 +1175,10 @@ refused`); `(correlation_id, delivery_state)` indexed for the projection and the
 `still-processing` answer.
 
 **Additional info**: **Ownership**: inserted only by the Control Operation Gateway
-(`cpt-cf-bss-orders-workflow-component-control-operation-gateway`); `delivery_state` advanced by
-the signal delivery of `10 §3.2` and, with `last_recheck_point`, by slice 08's cancel-authority
-port inside `authorize-cancel`, `compensate-order` and `report-outcome` through the envelope.
+(`cpt-cf-bss-orders-workflow-component-control-operation-gateway`); `delivery_state` advanced
+only through the gateway's **request-delivery port** — the signal delivery of `10 §3.2` reports
+`delivered` or `delivery-failed` through it and never writes the row itself — and, with
+`last_recheck_point`, by slice 08's cancel-authority port inside `authorize-cancel`, `compensate-order` and `report-outcome` through the envelope.
 **Mutability**: declared mutable in the three columns above, append-only otherwise. **Tenant
 axes**: all three. **Retention**: ≥ 400 days — it is the evidence of who asked for a destructive
 command and under what authority — never ahead of the audit entry that names it. It never crosses

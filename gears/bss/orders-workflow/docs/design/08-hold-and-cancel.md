@@ -206,10 +206,10 @@ time; those would refuse a legitimate commercial hold, whereas a lifetime ceilin
 order that has been non-terminal for a quarter of a year. On expiry the order still reaches a
 decided outcome through a human, not through a timeout. The ceiling most often fires while the
 instance is `suspended`; the phase table of
-[`01 §3.7`](./01-foundation.md#table-owf_process_instance) permits `park` only from `started`, so a
-`suspended → parked` transition for `parkReason = lifetime-ceiling` is required there, with the
-open suspension left open because the hold is still Lifecycle's fact (decision D-82: the lifetime-ceiling park is permitted from `suspended` and leaves the suspension
-open). This slice writes nothing against the ceiling.
+[`01 §3.7`](./01-foundation.md#table-owf_process_instance) permits `park` from `started` and, for
+`parkReason = lifetime-ceiling` only, from `suspended`, with the open suspension left open because
+the hold is still Lifecycle's fact, and its `unpark` restores `suspended` (decision D-82: the
+lifetime-ceiling park is permitted from `suspended` and leaves the suspension open). This slice writes nothing against the ceiling.
 
 #### One Open Suspension Per Order, Reconciled Regardless of Arrival Order
 
@@ -503,13 +503,14 @@ operation resolves `correlationId` to the instance, narrows every read and write
 | `name` | `protection` | `input` | `output` | `idempotency_key` | `declared_event` | `compensation` | `reasons` | `audit_kind` | `retry_class` | `deadline` |
 |--------|--------------|---------|----------|-------------------|------------------|----------------|-----------|--------------|---------------|------------|
 | `apply-hold` | `protected` | ref + `holdEventId`, `gateRefs[]` (the references `open-gates` last returned; empty outside the approval stage) | `holdOutcome` ∈ `suspended` · `reconciled-out-of-order` · `absorbed-duplicate` · `not-applicable`; `suspensionRef` (nullable); `escalationRemaining` (duration, nullable — null when no named window was armed) | instance-scoped `{tenant}:{correlationId}:apply-hold:{holdEventId}` | none (`OrderHeld` is Lifecycle's) | `apply-resume` (the paired close, like `park`/`unpark`; not a saga leg) | `version-mismatch`, `not-found` (a `gateRef` not of this instance), `idempotency-key-conflict` | `phase-transition` | `retryable-on: transient` | 5 s |
-| `apply-resume` | `protected` | ref + `resumeEventId`, `suspensionRef` (nullable — null on the stage-level resume arm) | `resumeOutcome` ∈ `resumed` · `resume-ahead-recorded` · `absorbed-duplicate`; `escalationRemaining` (duration, nullable); `failedTaskRefs[]` (tasks advanced to `failed` from deferred outcomes; opaque `owf_fulfillment_task` references) | instance-scoped `{tenant}:{correlationId}:apply-resume:{resumeEventId}` | none (`OrderResumed` is Lifecycle's) | none | `version-mismatch`, `not-found` (a `suspensionRef` not of this instance), `idempotency-key-conflict` | `phase-transition` | `retryable-on: transient` | 5 s |
+| `apply-resume` | `protected` | ref + `resumeEventId`, `suspensionRef` (nullable — null on the stage-level resume arm) | `resumeOutcome` ∈ `resumed` · `resume-ahead-recorded` · `absorbed-duplicate`; `escalationRemaining` (duration, nullable); `due: true\|false` — database time against the escalation deadline re-armed from the stored `window_remaining_ms` (true when no remainder is left), the answer the resumed escalation re-check loop switches on first (`10 §3.6` (e)); `failedTaskRefs[]` (tasks advanced to `failed` from deferred outcomes; opaque `owf_fulfillment_task` references) | instance-scoped `{tenant}:{correlationId}:apply-resume:{resumeEventId}` | none (`OrderResumed` is Lifecycle's) | none | `version-mismatch`, `not-found` (a `suspensionRef` not of this instance), `idempotency-key-conflict` | `phase-transition` | `retryable-on: transient` | 5 s |
 | `authorize-cancel` | `protected` | ref + `cancelRequestRef` | `authorized` (bool); `taskRef` (the `authority-withdrawn` manual task, on `authorized = false`) | instance-scoped `{tenant}:{correlationId}:authorize-cancel:{cancelRequestRef}` | none (`OrderFulfillmentAborted` is `report-outcome`'s, slice 06) | none | `authority-withdrawn` (recorded refusal, rides the task), `not-found` (a request not of this instance), `version-mismatch`, `per-attempt-timeout`, `idempotency-key-conflict` | `step-completion` | `retryable-on: transient` | 10 s (one PDP decision) |
 
 **What each answer means to the definition.** `suspended` enters the resume wait of `10 §3.6` (e);
 `reconciled-out-of-order`, `absorbed-duplicate` and `not-applicable` are settled successes that
 return to the stage the hold arm interrupted. `resumed` and `resume-ahead-recorded` return to the
-stage with `escalationRemaining` as the escalation `wait`'s duration; a non-empty
+stage with `escalationRemaining` as the escalation window left and `due` as the first answer of
+its re-check loop (a 1.0.0 `wait` takes no runtime expression, `10 §3.6`); a non-empty
 `failedTaskRefs[]` routes to the partial-failure arm of `10 §3.6` (c) first. `authorized = true`
 routes into `run-cancellation-fence`; `authorized = false` is a settled success that returns to
 where the cancel arm was taken (§4.7 item 5). A PDP outage is `retryable-failure` without a
@@ -898,18 +899,17 @@ that violates any of them **MUST** be refused.
 8. [ ] - `p1` - **Deferred failures.** After `apply-resume`, a non-empty `failedTaskRefs[]` **MUST** route to the partial-failure arm of `10 §3.6` (c) before any dispatch operation is called - `inst-c8-deferred`
 9. [ ] - `p1` - **Signals handled.** This slice's operations are called from the `OrderHeld` and `OrderResumed` `listen`s and the `cancel-requested` signal only; hold and resume **MUST NOT** be delivered as platform `suspend`/`resume` and cancel **MUST NOT** use the platform's generic `cancel` (`10 §4.4`) - `inst-c8-signals`
 
-`10 §3.6` (e) as committed with ADR-0011 shows items 1, 2 and 4 in part. Items 3 (the stage-level
-resume arm), 4 (`resumeEventId` exported from the resume `listen`) and 5 (return to the resume wait
-on a denied cancel taken from hold) are parts of this contract its fragment does not yet show, and
-two of its comments are superseded by this slice: `apply-resume` does not re-read drafts (§3.2,
-the re-read is inside the wave-2 dispatch), and the remainder is computed through slice 03's
-gate-window port, not "from the gate's `opened_at` and window". The canonical YAML is to carry
-these before the validation hook enforces this list. Item 1 depends on the runtime-expression
-`wait` of Q-11 (i).
+`10 §3.6` (e) carries every item of this contract, including the stage-level resume arm (item 3),
+`resumeEventId` exported from the resume `listen` (item 4) and the return to the resume wait on a
+denied cancel taken from hold (item 5); `apply-resume` re-reads no drafts (the re-read is inside
+the wave-2 dispatch, §3.2) and the remainder is slice 03's gate-window port value. Item 1's
+escalation `wait` stands for the remainder `apply-resume` returned; a 1.0.0 `wait` takes no runtime
+expression, so until Q-11 (i) is answered it is the bounded re-check loop of `10 §3.6`, which
+switches on `due`.
 
 ### 4.8 Cross-slice asks raised by this slice
 
-1. [ ] - `p2` - **01 §3.7**: a `suspended → parked` transition for `parkReason = lifetime-ceiling`, and a `suspended → terminated` transition is not needed because every unwind from hold passes `compensating` (decision D-82) - `inst-x8-phase`
+1. [ ] - `p2` - **01 §3.7** (now reflected there): a `suspended → parked` transition for `parkReason = lifetime-ceiling` with its `parked → suspended` unpark, and a `suspended → terminated` transition is not needed because every unwind from hold passes `compensating` (decision D-82) - `inst-x8-phase`
 2. [ ] - `p2` - **05**: the dispatch operations read `owf_process_instance.suspended` (not `owf_process_suspension`) and permit a same-key re-issue while suspended; `reconcile-intent` records a failure observed while suspended as deferred on `owf_provisioning_intent` with its observation instant - `inst-x8-05`
 3. [ ] - `p2` - **06**: `run-cancellation-fence` calls the suspension closure port in fencing step 1; `compensate-order` and `report-outcome` call the cancel-authority port at `pre-compensation` and `pre-submission` on the cancel trigger and mark the fence awaiting re-authorization on `withdrawn` - `inst-x8-06`
 4. [ ] - `p2` - **09**: the accepted cancel's request record, carrying the authorization snapshot, is declared as a table of 09 and is what `cancelRequestRef` names; `09 §4.4` step 4 is reworded per §4.3 - `inst-x8-09`

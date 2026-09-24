@@ -396,7 +396,9 @@ names, or runs the SLA check, and answers the branch; the actions and their effe
 
 Does not decide remediation policy (pinned by slice 04's plan) and does not sequence anything: the
 wait for a resolution and the branch after it are the definition's. Does not create incidents or
-dead-letter records. It is the **sole writer** of `owf_manual_task` and of the `state` column of
+dead-letter records. It is the **sole creator** of `owf_manual_task` rows and the writer of every
+column except the assignment and escalation columns the Escalation Router writes and the override
+columns the Override Verifier writes (§3.7 *Ownership*), and the sole writer of the `state` column of
 `owf_task_resolution_request`: slice 06 calls the creation port and supplies the reason; it does
 not write the row. Does not execute the line's re-dispatch: a `retry` returns the line to the state
 before the failed wave through slice 04's transition function and mints the next `attempt` through
@@ -607,9 +609,12 @@ whose only effect is an operator escalation. This component is the one recorder 
 
 Owns `raise-overdue-escalation` (§3.3). **It owns no timer** (retired by ADR-0011): the clocks
 are definition `wait` arms — `waitOverdue` on `expectedFulfillmentAt + 24 h` in fragment (b),
-`waitCeiling` in fragment (a), `waitTtlMargin` on `arm-park-escalation`'s `escalateAfter` in the
-park loop, and the outage threshold wait of `03 §4.5` — and each, on completion, calls this
-operation with its `escalationKind`. The operation:
+`waitCeiling` in fragment (a), `waitTtlMargin` on the park's `escalation_due_at` in the park loop,
+and the outage threshold wait of `03 §4.5` — and each, on completion, calls this operation with
+its `escalationKind`. A 1.0.0 `wait` takes no runtime expression, so `waitCeiling` is a literal
+`P90D` and the three computed clocks are bounded re-check loops (`10 §3.6`): `waitOverdue` re-calls
+this operation, whose `due` answers against the stored deadline, and the park and outage clocks
+re-call the slice 03 operation that owns their deadline. The operation:
 
 - reads the **step context** from Orders' record, not from the definition: the last settled step
   operation of the instance, the wave, the lines not yet terminal, and the blocking object (the open
@@ -674,7 +679,7 @@ calls a downstream, 5 s for a record-only one.
 | `create-manual-task` | `protected` | ref + `scope` ∈ `line` · `plan` · `order`; `subjects[]` (`subjectRef` — `lineRef`, `planRef` or `correlationId` — plus `reason`, the §3.7 enum); `failureCause` (§3.7 enum); `sourceStep` (operation name); `sourceAttempt` (that step's key `attempt` component) | `taskRefs[]`; `exhaustedTaskRefs[]` (tasks whose re-entrance was the third failed attempt, §4.2); `slaRemaining` (duration to the earliest open deadline); `slaRound` | instance-scoped `{tenant}:{correlationId}:create-manual-task:{sourceStep}:{sourceAttempt}`; a re-failure after a retry carries the new `attempt` and therefore a new key, which is what reaches the reopen branch | none | none | `idempotency-key-conflict`, `not-found` (a subject the record does not show failed), `version-mismatch` | `step-completion` | `retryable-on: transient` | 5 s |
 | `resolve-manual-task` | `composable` | ref + `trigger` ∈ `request` · `sla-check`; `taskRef` and `requestRef` (on `request`, from the signal's `data`); `slaRound` (on `sla-check`, as last returned) | `resolution` ∈ `retry` · `override` · `closed` · `escalated` · `exhausted` · `refused` · `none`; `resumeAt` ∈ `plan` · `barrier` · `compensation` · `stage` (on `retry`); `attemptKey` (on `retry`, from `retry-step`); `openTaskCount`; `slaRemaining`; `slaRound` | instance-scoped `{tenant}:{correlationId}:resolve-manual-task:{taskRef}:{requestRef}` on `request`; `{tenant}:{correlationId}:resolve-manual-task:sla:{slaRound}` on `sla-check` | none (`retry` of a line re-enters `failed` → prior state through slice 04's function, which emits nothing on a non-terminal entry) | none | `order-fenced`, `action-not-offered`, `poison-step` (from `retry-step`), `not-found`, `version-mismatch` | `step-completion`; `escalation` when an SLA breach escalates; `retry` (written by `retry-step`) | `retryable-on: transient` | 5 s |
 | `verify-override` | `composable` | ref + `taskRef`, `requestRef` | `verified` (bool); `rejection` ∈ `not-active` · `binding-mismatch` · `no-binding-reference` · `corroboration-divergent` · `not-found` · `order-fenced` · `null`; `exhausted` (bool) | instance-scoped `{tenant}:{correlationId}:verify-override:{taskRef}:{requestRef}`; the Subscriptions status read is a read and carries no key | `OrderFulfillmentStepCompleted` with `provenance = operator-override`, enqueued by slice 04's transition function in this settlement transaction, on `verified` only | none — an override-attached subscription is undone as a subject of `compensate-order`, not by a paired undo | `override-unverified`, `order-fenced`, `circuit-breaker-open`, `per-attempt-timeout`, `not-found`, `version-mismatch` | `step-completion` (justification in `owf_audit_entry.justification`) | `retryable-on: transient` | 10 s |
-| `raise-overdue-escalation` | `composable` | ref + `escalationKind` ∈ `overdue-fulfillment` · `lifetime-ceiling` · `park` · `approval-outage`; `subjectRef` (`parkRef` on `park`; the gate `position` on `approval-outage`; null otherwise); `stepRef` (the definition's position, nullable) | `escalationRef`; `raised` (bool; false when absorbed or when the subject has already resolved); `taskRef` (on `lifetime-ceiling`) | instance-scoped `{tenant}:{correlationId}:raise-overdue-escalation:{escalationKind}:{orderVersion}:{subjectRef or "-"}` | none | none | `not-found` (unknown `parkRef` or position), `version-mismatch` | `escalation` | `retryable-on: transient` | 5 s |
+| `raise-overdue-escalation` | `composable` | ref + `escalationKind` ∈ `overdue-fulfillment` · `lifetime-ceiling` · `park` · `approval-outage`; `subjectRef` (`parkRef` on `park`; the gate `position` on `approval-outage`; null otherwise); `stepRef` (the definition's position, nullable) | `due: true\|false` on `overdue-fulfillment` — database time against the stored `expected_fulfillment_at` + 24 h, the answer the overdue re-check loop switches on (`10 §3.6` (b)); `due: false` raises nothing and leaves the registry record `open`; `escalationRef`; `raised` (bool; false when absorbed, not due, or when the subject has already resolved); `taskRef` (on `lifetime-ceiling`) | instance-scoped `{tenant}:{correlationId}:raise-overdue-escalation:{escalationKind}:{orderVersion}:{subjectRef or "-"}` | none | none | `not-found` (unknown `parkRef` or position), `version-mismatch` | `escalation` | `retryable-on: transient` | 5 s |
 
 `resolve-manual-task`, `verify-override` and `raise-overdue-escalation` are `composable`: a
 definition version may reposition them, but the constraints of §4.8 bind any version that contains
@@ -953,7 +958,7 @@ sequenceDiagram
 1. [ ] - `p1` - Resolve the instance; refuse `version-mismatch` if terminal - `inst-roe-resolve`
 2. [ ] - `p1` - **IF** `escalationKind = park`: read the park by `subjectRef`; **IF** it is resolved or `escalated_at` is set **RETURN** `raised: false`; **ELSE** stamp `escalated_at` through slice 03's park port and record `park_reason` and the time remaining before the `submitted` TTL (D-57) - `inst-roe-park`
 3. [ ] - `p1` - **IF** `escalationKind = approval-outage`: record the paused gates at `subjectRef` as the blocking object - `inst-roe-outage`
-4. [ ] - `p1` - **IF** `escalationKind = overdue-fulfillment`: **IF** the instance already has a settled `report-outcome` **RETURN** `raised: false`; read `expected_fulfillment_at` from the plan (04), the last settled step operation and the non-terminal lines and intents - `inst-roe-overdue`
+4. [ ] - `p1` - **IF** `escalationKind = overdue-fulfillment`: **IF** the instance already has a settled `report-outcome` **RETURN** `raised: false`; read `expected_fulfillment_at` from the plan (04); **IF** database now is before it plus 24 h **RETURN** `due: false`, `raised: false` and leave the key `open`; **ELSE** set `due: true` and read the last settled step operation and the non-terminal lines and intents - `inst-roe-overdue`
 5. [ ] - `p1` - **IF** `escalationKind = lifetime-ceiling`: create the order-scope `lifetime-ceiling-reached` task through the creation port - `inst-roe-lifetime`
 6. [ ] - `p1` - Insert `owf_overdue_escalation` under its uniqueness; write the `escalation` entry; settle the key; **RETURN** `escalationRef`, `raised: true`, `taskRef` - `inst-roe-settle`
 
@@ -989,7 +994,7 @@ it.
 | task_scope | enum | `line` \| `plan` \| `order` — the subject the task is about (slice 04 §4.7 ask) |
 | scope_ref | text | `lineRef`, `planRef` or `correlationId`, per `task_scope`; replaces the former `*plan*` sentinel |
 | line_ref | text, nullable | Line item reference; equals `scope_ref` when `task_scope = line`, NULL otherwise |
-| failure_reason | enum | **Enum, not text**; a catalogue reason (`01 §4.9`). Line: `wave1-create-failed`, `wave2-activation-failed`, `never-dispatched`, `intent-unresolved`; compensation (line): `draft-void-failed`, `activated-cancel-failed`; plan: `invalid-dependency-graph`, `catalog-topology-unavailable`; order: `trigger-applicability-unverified`, `approval-reflection-refused`, `authority-withdrawn`, `lifetime-ceiling-reached`. The wave pair is the **wave discriminator** the PRD requires. `overlap-collision` and `market-divergence` are **not** members: a pre-activation abort creates no task (04 §2.1) |
+| failure_reason | enum | **Enum, not text**; a catalogue reason (`01 §4.9`). Line: `wave1-create-failed`, `wave2-activation-failed`, `never-dispatched`, `intent-unresolved`; compensation (line): `draft-void-failed`, `activated-cancel-failed`, `blocked-upstream`; plan: `invalid-dependency-graph`, `catalog-topology-unavailable`; order: `trigger-applicability-unverified`, `approval-reflection-refused`, `authority-withdrawn`, `lifetime-ceiling-reached`. The wave pair is the **wave discriminator** the PRD requires. `overlap-collision` and `market-divergence` are **not** members: a pre-activation abort creates no task (04 §2.1) |
 | failure_cause | enum | Why, orthogonal to which step: `retry-budget-exhausted`, `step-deadline-exceeded`, `explicit-failure-confirmation`, `sweep-discovered-terminal-failure`, `sweep-floor-reached`, `permanent-refusal`, `plan-not-frozen`, `lifetime-elapsed` |
 | source_step | text | The operation whose failure produced the entrance (`sourceStep`) |
 | source_attempt | integer | That step's key `attempt` component at the entrance |
@@ -1322,7 +1327,7 @@ forward task under `remediate`, projected as a flag, not an assignment state).
 | `line`, forward reason | yes, unless fenced or terminal; per wave (04 §3.7: wave 1 → `pending`, wave 2 → `draft_created`) | yes, unless fenced or terminal | yes | Seller Operator |
 | `line`, compensation reason | yes while the fence is open; not on a terminal order | no — there is no fulfillment to confirm | yes | no while the subject is live |
 | `plan` | yes — a new `attempt` of `construct-and-freeze-plan` | no | yes | Seller Operator |
-| `order` | yes — re-enter the stage whose operation failed (`admit-trigger`, `reflect-verdict`, `authorize-cancel`); for `lifetime-ceiling-reached`, `unpark` via the operator's disposition in `10 §3.6` (a) | no | yes | Seller Operator |
+| `order` | yes — re-enter the stage whose operation failed (`admit-trigger`, `reflect-verdict`, `authorize-cancel`); for `lifetime-ceiling-reached`, `unpark` through the task-resolution arm of the lifetime-ceiling park in `10 §3.6` (d), beside its unpark-requested arm | no | yes | Seller Operator |
 
 The Fulfillment Operator (`cpt-cf-bss-orders-workflow-actor-owf-fulfillment-operator`) views the
 queue within their seller scope and submits `assign` (self), `retry`, `override` and `escalate`.
@@ -1363,12 +1368,12 @@ for the four operations; the per-action task routes of §3.3 are the resolution 
 `manual_task × escalate` and `assign` as in §4.4; `dead_letter × *` marked pending;
 (d) **slice 10** — `task-resolution-requested` joins the closed `listen` set and the signal table of
 §3.3; fragment (c) gains the SLA branch, the `exhaustedTaskRefs` and `exhausted` routing and the
-`resumeAt` routing of §4.8; (e) **reason catalogue** (`01 §4.9`) — five reasons owned by
+`resumeAt` routing of §4.8; (e) **reason catalogue** (`01 §4.9`) — four reasons owned by
 `07-manual-tasks`: `order-fenced` (`ORDER_FENCED`, FailedPrecondition, 400), `action-not-offered`
 (`ACTION_NOT_OFFERED`, FailedPrecondition, 400), `override-unverified` (`OVERRIDE_UNVERIFIED`,
 FailedPrecondition, 400), `lifetime-ceiling-reached` (`LIFETIME_CEILING_REACHED`,
-FailedPrecondition, 400), and `approval-reflection-refused` (owner `03-approval-execution`,
-`APPROVAL_REFLECTION_REFUSED`, FailedPrecondition, 400), with `intent-unresolved` as slice 05
+FailedPrecondition, 400) — and, used on its tasks but owned by `03-approval-execution`,
+`approval-reflection-refused` (`APPROVAL_REFLECTION_REFUSED`, FailedPrecondition, 400), with `intent-unresolved` as slice 05
 registers it (decision D-98: the manual-task reason enum is the catalogue
 subset of §3.7, covering plan-level, order-level and lifetime-ceiling subjects);
 (f) **platform** — operator visibility and re-drive of platform dead letters (§3.7), and the

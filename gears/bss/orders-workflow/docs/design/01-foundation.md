@@ -72,11 +72,14 @@ That definition is specified in [`10-process-definition.md`](./10-process-defini
 platform drives; Orders records.** Every task of the definition that does work calls one Orders
 **step operation** over an internal REST surface (§3.3); the operation performs the effect through
 the envelope and writes Orders' record in its own transaction. Durable timers, task retry policy,
-checkpoints, replay after a crash, event correlation into a running process and poison handling
-are the platform plugin's
+checkpoints, replay after a crash and event correlation into a running process are the platform
+plugin's
 ([serverless-runtime DESIGN §1.1](../../../../serverless-runtime/docs/DESIGN.md#11-architectural-vision),
-`DESIGN.md:85`), so this slice owns no timer service, no retry controller and no dead-letter store
-of its own any more.
+`DESIGN.md:85`); an event whose processing keeps failing goes to the trigger's dead letter queue
+([`DESIGN_GTS_SCHEMAS.md:1651`](../../../../serverless-runtime/docs/DESIGN_GTS_SCHEMAS.md#trigger), whose management API is out of scope
+there), and an invocation that fails with no compensation ends `dead_lettered`
+([`DESIGN.md:458`](../../../../serverless-runtime/docs/DESIGN.md#invocation-status-state-machine)). This slice therefore
+owns no timer service, no retry controller and no dead-letter store of its own any more.
 
 The engine still owns **no commercial policy**: it cannot evaluate whether an approval gate
 applies, does not know what a provisioning wave means commercially, and never decides fulfillment
@@ -769,14 +772,16 @@ Every call on this surface **MUST** satisfy, in this order, before the operation
 
 1. [ ] - `p1` - **Service principal.** The gateway-asserted `SecurityContext` **MUST** identify a service subject (`subject_type` service) whose `token_scopes` names this gear; anything else is `not-authorized` (403) before the PDP is asked, exactly as [`09 §3.6` *System-actor call on the REST surface*](./09-read-and-authz.md#36-interactions--sequences) states - `inst-owf-step-principal`
 2. [ ] - `p1` - **PDP decision.** The route requests resource `gts.cf.bss.orders_workflow.process_step.v1~` × action `execute` through the shared `PolicyEnforcer` adapter with the target `correlationId` and the resource property `operation = {operation}` (`cpt-cf-bss-orders-workflow-adr-platform-pdp-authorization`); a deny is `not-found` (404) per the existence-oracle rule of `09 §4.4`, a PDP outage the canonical 503 - `inst-owf-step-pdp`
-3. [ ] - `p1` - **Required headers and body.** `Idempotency-Key` is **REQUIRED** and is validated by server-side recomposition from the body per the operation's registered key family (`cpt-cf-bss-orders-workflow-constraint-tenant-namespaced-idempotency`, [`09 §2.2`](./09-read-and-authz.md#22-constraints)); a missing or non-matching key is `idempotency-key-mismatch` (400). The body **MUST** validate against the operation's registered `input` GTS reference schema; a body carrying a member the schema does not declare is a validation refusal (400), which is the runtime half of the references-not-payloads rule. The body **MUST** carry `invocationId` (the platform invocation, from the definition's `$workflow.id` runtime argument) and `attemptId` (the platform attempt identifier, see *Attempt identity* below) - `inst-owf-step-shape`
+3. [ ] - `p1` - **Required headers and body.** `Idempotency-Key` is **REQUIRED** and is validated by server-side recomposition from the body per the operation's registered key family (`cpt-cf-bss-orders-workflow-constraint-tenant-namespaced-idempotency`, [`09 §2.2`](./09-read-and-authz.md#22-constraints)); a missing or non-matching key is `idempotency-key-mismatch` (400). The body **MUST** validate against the operation's registered `input` GTS reference schema; a body carrying a member the schema does not declare is a validation refusal (400), which is the runtime half of the references-not-payloads rule. The body **MUST** carry `invocationId` (the platform invocation, from the definition's `$workflow.id` runtime argument — that `$workflow.id` equals the platform `invocation_id` is part of the attempt-identity ask below) and `attemptId` (the platform attempt identifier, see *Attempt identity* below) - `inst-owf-step-shape`
 4. [ ] - `p1` - **Deadline.** The envelope computes the attempt's deadline as `min(now + operation.deadline_ms, caller deadline)` against database time, where the caller deadline is the remaining budget the platform propagates on the call when it does; the effective deadline is propagated on every outbound call the operation makes (§4.5 *Deadline propagation*) - `inst-owf-step-deadline`
 5. [ ] - `p1` - **Registry resolution.** Resolve the key to exactly one of the six registry outcomes of §4.3; only *first call / re-run* proceeds to the effect - `inst-owf-step-resolve`
 
 **Attempt identity.** `attempt_id` is the platform's identifier for the attempt that issued the
 call and is recorded on every step record. Whether the plugin's HTTP `call` task carries its
-attempt identifier to the callee is **not stated** in the serverless-runtime design; it is
-registered as an upstream ask in `UPSTREAM_REQS.md` §2.9. Until it is answered, the
+attempt identifier to the callee is **not stated** in the serverless-runtime design, and neither
+is whether the spec's `$workflow.id` runtime argument equals the platform `invocation_id`; both
+are registered as the upstream ask `…-upreq-serverless-runtime-attempt-and-deadline-propagation`
+in `UPSTREAM_REQS.md` §2.9. Until it is answered, the
 definition supplies `attemptId` as `"{invocationId}:{taskName}"` from the spec's `$workflow.id`
 and `$task.name` runtime arguments, and the envelope appends its own receipt ordinal to make the
 recorded value unique per receipt. Recording it is what lets an auditor join Orders' record to
@@ -824,7 +829,7 @@ declaration is mirrored into `owf_step_operation` (§3.7):
 
 | Field | Meaning | Closed values |
 |-------|---------|---------------|
-| `name` | Kebab-case, stable; the route segment, the PDP resource property and the definition's `call` target | one per registered operation; the canonical list is `10 §2` |
+| `name` | Kebab-case, stable; the route segment, the PDP resource property and the definition's `call` target | one per registered operation; the canonical names and their protection are fixed by [ADR-0012](../ADR/0012-cpt-cf-bss-orders-workflow-adr-definition-versioning-and-protected-steps.md) (`cpt-cf-bss-orders-workflow-adr-definition-versioning-and-protected-steps`) |
 | `protection` | Whether a definition may omit or replace it | `protected` (must appear on its path, never replaced) · `composable` (may be omitted) |
 | `input` | GTS reference schema of the request body; references and small enums only | a `gts.cf.bss.orders_workflow.step.<name>.input.v1~` type |
 | `output` | GTS reference schema of the success body | a `gts.cf.bss.orders_workflow.step.<name>.output.v1~` type |
@@ -944,7 +949,7 @@ The re-dispatch itself is the definition's resume arm (`10 §3.6` (c)).
 |-------|--------|----------|
 | `protection` | `composable` | `composable` |
 | `input` | `correlationId`, `parkReason` (the closed park reasons of [`03 §3.7`](./03-approval-execution.md#37-database-schemas--tables), the fail-closed park of `cpt-cf-bss-orders-workflow-adr-fail-closed-verdict-park` as amended, or `lifetime-ceiling`), `subjectRef`, `attemptId` | `correlationId`, `subjectRef`, `attemptId` |
-| `output` | `phase = parked`, `rowVersion` | `phase = started`, `rowVersion` |
+| `output` | `phase = parked`, `rowVersion` | `phase` = the pre-park phase (`started`, or `suspended` while the hold flag `suspended` is set), `rowVersion` |
 | `idempotency_key` | `{tenant}:{correlationId}:park:{subjectRef}:{attempt}` | `{tenant}:{correlationId}:unpark:{subjectRef}:{attempt}` |
 | `declared_event` | none | none |
 | `compensation` | `unpark` | none |
@@ -954,7 +959,10 @@ The re-dispatch itself is the definition's resume arm (`10 §3.6` (c)).
 | `deadline` | 5 s | 5 s |
 
 Effect: the `started → parked` and `parked → started` transitions of §3.7 — and, for `park` with
-`parkReason = lifetime-ceiling` only, `suspended → parked` — recorded as the phase projection. Whether a verdict is obtainable, and when to try again, is the definition's park arm
+`parkReason = lifetime-ceiling` only, `suspended → parked`, whose `unpark` is `parked → suspended`
+because the hold flag is still set — recorded as the phase projection. `unpark` restores the
+pre-park phase from the `suspended` flag and never clears the flag, which only `apply-resume`
+does (slice 08). Whether a verdict is obtainable, and when to try again, is the definition's park arm
 (`10 §3.6` (a)); Orders records the park and its reason.
 
 ##### `terminate-instance`
@@ -1243,8 +1251,8 @@ is by reference only.
 | `suspended` | `started` | `apply-resume` (slice 08) |
 | `started` | `parked` | `park` |
 | `suspended` | `parked` | `park` with `parkReason = lifetime-ceiling` only — the lifetime ceiling fired while the order is held; the open suspension of slice 08 is left open, because the hold is still Lifecycle's fact ([`08 §2.1`](./08-hold-and-cancel.md#21-design-principles)) |
-| `parked` | `started` | `unpark` |
-| `parked` | `terminated` | `terminate-instance` |
+| `parked` | `started` | `unpark`, when the hold flag `suspended` is false |
+| `parked` | `suspended` | `unpark`, when the hold flag `suspended` is true — restores the pre-park phase of a lifetime-ceiling park taken while held; the open suspension resumes only through `apply-resume` |
 | `parked` | `compensating` | `run-cancellation-fence` (slice 06) — a parked instance, including one parked at the lifetime ceiling, reaches an unwind only by passing the cancellation fence |
 | `started` | `compensating` | `run-cancellation-fence` (slice 06) |
 | `suspended` | `compensating` | `run-cancellation-fence` (slice 06) |
@@ -1515,7 +1523,7 @@ dropped. **Verification and roll-ups**: the `audit/<audit-tenant>` worker of §3
 
 **ID**: `cpt-cf-bss-orders-workflow-dbtable-audit-checkpoint`
 
-A D-100-pattern roll-up, mirroring Lifecycle's `orders_audit_checkpoint` with the process
+A Lifecycle [D-100](../../../orders-lifecycle/docs/DECISIONS.md)-pattern roll-up, mirroring Lifecycle's `orders_audit_checkpoint` with the process
 instance as the member unit (D-59). Unchanged by ADR-0011.
 
 | Column | Type | Description |
@@ -1581,18 +1589,27 @@ at-least-once; consumers de-duplicate by the event envelope `id` (§4.7).
 Each responsibility a retired table carried has a named new owner:
 
 - `cpt-cf-bss-orders-workflow-dbtable-durable-timer` (`owf_durable_timer`) — retired by
-  ADR-0011. Fire instants are the plugin's durable timers behind the definition's `wait` tasks;
-  the pause remainder of an approval-escalation window is computed by `apply-hold` from the
-  gate's `opened_at` and window (slice 08) and returned to the definition, which re-arms it
-  (`10 §3.6` (e)); the sweep tick is the definition's reconcile arm plus the `reconciliation-sweep`
-  worker; the overdue and lifetime windows are `wait` arms (`10 §3.6` (b), (e)).
+  ADR-0011. Fire instants are the plugin's durable timers behind the definition's `wait` tasks.
+  A computed deadline is a bounded re-check loop — a fixed-granularity `wait`, then a `call` to
+  the operation that owns the stored deadline, which returns `due: true|false` from database time
+  — because a 1.0.0 `wait` takes no runtime expression (`10 §3.6`); the lifetime ceiling is a
+  literal `P90D` wait. The pause remainder of an approval-escalation window is
+  `owf_approval_gate.window_remaining_ms`, written only through slice 03's gate-window port
+  ([`08 §3.7`](./08-hold-and-cancel.md#table-owf_timer_pause)); the sweep tick is the definition's
+  reconcile arm plus the `reconciliation-sweep` worker; the overdue and lifetime windows are
+  arms of `10 §3.6` (b) and (e).
+- `cpt-cf-bss-orders-workflow-dbtable-owf-timer-pause` (`owf_timer_pause`, slice 08) — retired by
+  ADR-0011. The hold pause is the `hold` member of `owf_approval_gate.pause_causes` and the
+  remainder is `window_remaining_ms`, both through slice 03's gate-window port; the outage pause
+  is `escalate-gate`'s in `probe` mode ([`08 §3.7`](./08-hold-and-cancel.md#table-owf_timer_pause)).
 - `cpt-cf-bss-orders-workflow-dbtable-retry-state` (`owf_retry_state`) — retired by ADR-0011.
   Attempt count, backoff position and next-attempt instant are the plugin's under the task retry
   policy (`10 §2`); Orders records the platform `attempt_id` and its own `attempt_number` on every
   `owf_step_log` row; the crash-loop counter is the Orders-side quarantine of `retry-step` (§4.13).
 - `cpt-cf-bss-orders-workflow-dbtable-dead-letter-record` (`owf_dead_letter_record`) — retired
-  by ADR-0011 with ADR-0009 as amended. An inbound delivery that exhausts its cap is the platform
-  event-trigger path's dead letter (`DESIGN.md:976`, *dead-letter handling*); its operator
+  by ADR-0011 with ADR-0009 as amended. An inbound delivery that exhausts its cap goes to the
+  platform trigger's `dead_letter_queue` ([`DESIGN_GTS_SCHEMAS.md:1651`](../../../../serverless-runtime/docs/DESIGN_GTS_SCHEMAS.md#trigger); its
+  management API is out of scope there); its operator
   visibility is the platform's, requested in `UPSTREAM_REQS.md` §2.9; the manual task
   remains the inspectable object for a step failure (§4.8).
 
@@ -2033,10 +2050,10 @@ process events identically.
 An inbound Lifecycle trigger, approval decision or Subscriptions confirmation reaches the process
 through the platform's event-trigger path — as the start trigger of a new invocation or as a
 correlated event a running definition `listen`s for (`10 §3.3`). A delivery that keeps failing
-there exhausts the platform trigger's delivery handling and is the **platform's dead letter**
-([`DESIGN.md:976`](../../../../serverless-runtime/docs/DESIGN.md#event-trigger-management-api)
-*dead-letter handling*; `dead_lettered` invocation status, `DESIGN.md:458`), never an Orders
-record: this gear owns no dead-letter table (§3.7 *Retired tables*,
+there exhausts the trigger's retry policy and moves to the trigger's **dead letter queue**
+([`DESIGN_GTS_SCHEMAS.md:1651`](../../../../serverless-runtime/docs/DESIGN_GTS_SCHEMAS.md#trigger), `dead_letter_queue`; the DLQ management API is
+out of scope in the platform design) — a trigger-side dead letter, distinct from an invocation's
+`dead_lettered` status — never an Orders record: this gear owns no dead-letter table (§3.7 *Retired tables*,
 `cpt-cf-bss-orders-workflow-adr-manual-task-dead-letter-separation` as amended by ADR-0011). A
 platform dead letter **MUST NOT** be an order state, **MUST NOT** be inferred as a process
 outcome, and **MUST** be visible to the fulfillment operator — that visibility is a platform
@@ -2270,9 +2287,12 @@ is the definition's task timeout, not Orders'.
 
 A failure **outside** an operation's effect — a malformed task input, a call the envelope cannot
 even resolve a key for — is answered as a validation refusal (400) and recorded; it is a
-deterministic answer to the same input, and the platform's retry policy classifies a 400 as
-non-retryable (`RetryPolicy` precedence, [`DESIGN.md:360`](../../../../serverless-runtime/docs/DESIGN.md#retry-precedence)),
-so the definition's failure arm runs. A crash loop of the **platform worker** itself is the
+deterministic answer to the same input. Per-task retry is the definition's own — a `try` whose
+`catch` names a `use.retries` policy through `catch.retry` (Serverless Workflow DSL 1.0.0,
+dsl-reference.md *Try*, *Retry*; `10 §2`) — and a 400 is not retried because no `catch` of the
+canonical definition matches it, so the definition's failure arm runs. The platform
+`RetryPolicy` ([`DESIGN.md:354`–`370`](../../../../serverless-runtime/docs/DESIGN.md#retrypolicy))
+is invocation-level, by SDK error category, and is not a per-task policy. A crash loop of the **platform worker** itself is the
 plugin's poison handling and ends in the invocation's `failed` or `dead_lettered` status
 (`DESIGN.md:449`, `DESIGN.md:458`); the sweep of §3.8 keeps reading that instance's due intents
 and reports them as having no live invocation. This slice keeps
@@ -2398,7 +2418,7 @@ fallback to v1. It hashes the stored opaque actor reference without identity res
 erasure record exempts a mismatch (D-61). A chain under dispute **MAY** additionally be verified
 on demand; that path is a read.
 
-**Roll-ups (D-100 pattern, per audit namespace).** The checkpoint phase of the same worker
+**Roll-ups (Lifecycle [D-100](../../../orders-lifecycle/docs/DECISIONS.md) pattern, per audit namespace).** The checkpoint phase of the same worker
 captures each `audit_tenant_id` at least once per **24 hours** into `owf_audit_checkpoint` and
 `owf_audit_checkpoint_member` (§3.7), following Lifecycle `01 §4.4` *Tenant roll-ups and
 completeness* by reference — one consistent snapshot under the namespace advisory lock, members
