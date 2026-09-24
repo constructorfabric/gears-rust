@@ -98,7 +98,10 @@ and audit grade. Concretely:
   `gts.cf.core.sless.workflow.v1~` callable and executed by the serverless-runtime Temporal plugin.
   The definition uses the grammar subset `call` (HTTP to a step operation; a registered Function
   only for a `composable` operation), `listen` (the nine Lifecycle triggers, the approval decision,
-  Subscriptions confirmations — event-broker GTS events), `wait`, `switch`, `fork`,
+  the Subscriptions confirmation and failure events and Orders' own two terminal process events on
+  the overdue arm — event-broker GTS events — and the four operator signals `cancel-requested`,
+  `reauthorize-requested`, `task-resolution-requested`, `unpark-requested`; the closed set is
+  ADR-0012 rule 3), `wait`, `switch`, `fork`,
   `try`/`catch`/`raise` and `set`. It does not use `run` (containers and scripts) and does not use
   `emit`: the six process events are produced by this gear's own producer outbox inside step
   operations (ADR-0008), never by the definition. `design/10-process-definition.md` is the
@@ -125,8 +128,9 @@ and audit grade. Concretely:
   written by `start-instance`, and `owf_process_instance.definition_version` is a foreign key to
   it. `owf_step_log` records the platform `attempt_id` on every row.
 * **Timers, retry policy, waits and signals are the platform's.** `owf_durable_timer`,
-  `owf_retry_state` and slice 08's `owf_timer_pause` are removed. The per-task retry policy, the
-  waits (expected-fulfillment, escalation, overdue, lifetime ceiling) and the hold/resume/cancel
+  `owf_retry_state` and slice 08's `owf_timer_pause` are removed. The per-task retry policy (the
+  DSL's `use.retries` policy referenced from a `try`'s `catch.retry`, Serverless Workflow DSL
+  1.0.0, dsl-reference.md *Try*, *Retry*), the waits (expected-fulfillment, escalation, overdue, lifetime ceiling) and the hold/resume/cancel
   signals are expressed in the definition and executed by the plugin (DESIGN.md line 632: the
   plugin owns step identification, retry scheduling, checkpointing, suspend/resume and
   event-driven continuation). Hold, resume, cancel and re-authorisation are signals to the running
@@ -134,17 +138,23 @@ and audit grade. Concretely:
   `apply-hold`, `apply-resume` or `authorize-cancel` so that Orders records them. The rule "only
   approval-escalation waits pause on hold; the lifetime ceiling and the barrier keep running" is a
   definition pattern: the escalation `wait` sits inside the arm a hold signal cancels and a resume
-  re-arms with the remaining window Orders returns; the lifetime `wait` is at the top level.
-  Whether the DSL expresses that natively or needs a registered Function is Q-11.
+  re-arms with the remaining window Orders returns; the lifetime `wait` is at the top level. A
+  1.0.0 `wait` takes only a fixed duration, never a runtime expression (dsl-reference.md *Wait*,
+  *Duration*), so a remainder is re-armed as the bounded re-check loop of D-70 as amended — a
+  fixed-granularity `wait`, a `call` to the operation that owns the deadline, a `switch` that
+  loops while it answers `due: false` — and never by a Function that sleeps; whether the plugin
+  accepts a runtime-expression duration as an extension is Q-11 (i).
 * **Workers reduce to three.** `timer-wakeup` and `dead-lease-scan` are removed from the D-62
   roster; `reconciliation-sweep`, `retention-purge` and `audit/<tenant>` remain. A dead lease is
   detected by the sweep's status read, which the definition drives through a `wait`/retry rather
   than an Orders timer.
-* **Bounds nest, and the nesting is validated.** Per-task timeout < task retry budget <
-  wait/deadline < overdue window < lifetime ceiling (D-02, D-53). The ordering is a validation rule
+* **Bounds nest, and the nesting is validated.** Per-operation deadline < task retry budget <
+  task timeout < overdue window < lifetime ceiling (D-02, D-53, D-67, D-70). The ordering is a validation rule
   of ADR-0012, not a convention.
 * **Engine history is reference-only and non-authoritative.** Task inputs and outputs carry
-  identifiers and small enums only (ADR-0013). Nothing in this gear reads the platform timeline
+  identifiers and small enums only, and the start trigger and every `listen` must keep only
+  references of what they consume (ADR-0013, whose residual names the consumed events until the
+  member-storage or thin-event ask lands). Nothing in this gear reads the platform timeline
   (`GET …/invocations/{id}/timeline`, DESIGN.md line 1061) as process state, audit or operator
   progress; ADR-0001 as rewritten states the record side of the same rule.
 
@@ -156,7 +166,7 @@ and audit grade. Concretely:
 |---|---|---|
 | Step sequencing, branching (`switch`), parallelism (`fork`) | Platform definition, executed by the Temporal plugin | `design/10-process-definition.md` §2 |
 | Timers and waits (expected-fulfillment, escalation, overdue, lifetime ceiling) | Platform definition (`wait`), plugin-native timers | `10` §2; D-02, D-53 as nesting bounds |
-| Per-task retry policy and attempt scheduling | Platform (`RetryPolicy`, DESIGN.md lines 354–366); Orders declares `retry_class` per operation | `owf_step_operation.retry_class`; ADR-0006 as amended |
+| Per-task retry policy and attempt scheduling | Platform definition (`use.retries` referenced from `catch.retry`), executed by the plugin; not the platform `RetryPolicy`, which is invocation-level by SDK error category (DESIGN.md lines 354–370). Orders declares `retry_class` per operation | `owf_step_operation.retry_class`; ADR-0006 as amended; D-70 as amended |
 | Event listening (nine triggers, approval decision, Subscriptions confirmations) | Platform definition (`listen`) over the platform event-trigger path | `10` §2; ADR-0009 as amended |
 | Hold / resume / cancel / re-authorisation signals | Platform (`:control`, `:plugin-control`) → definition `listen` arm | `10` §2; ADR-0007 as amended; Q-11 |
 | Compensation **structure** (`try`/`catch`) | Platform definition | ADR-0005 as amended |
@@ -208,7 +218,10 @@ before then; the fallback property is what holds in the meantime.
    accordingly and no longer says it selects no engine.
 2. *The PRD §15 evaluation of engine-history isolation, retention and residency is pending on the
    platform asks.* ADR-0013 bounds what can be in history to references, which answers "which
-   commercial data would sit in engine history" with "none". Isolation, retention and residency of
+   commercial data would sit in engine history" with "none" for task inputs and outputs; for the
+   start trigger's input and the consumed events the answer is "none" only once the platform
+   stores selected members or Lifecycle publishes thin events, and until then those events are
+   ADR-0013's stated residual. Isolation, retention and residency of
    the history that remains are platform properties this gear cannot assert from the platform's
    documents today; they are raised as upstream asks in `UPSTREAM_REQS.md` under the
    serverless-runtime section, and Q-01 closes fully when they are agreed.
@@ -216,26 +229,43 @@ before then; the fallback property is what holds in the meantime.
 **Platform asks this decision depends on** (recorded in `UPSTREAM_REQS.md`, serverless-runtime
 section; stated here as asks because no platform document states them as facts):
 
-* **Execution identity for outbound `call` tasks.** The plugin must call
-  `POST /bss-orders-workflow/v1/steps/{operation}` as the serverless-runtime service principal
-  with a token whose `token_scopes` name this gear. The platform lists execution identity per
-  function as an unaddressed blocker
-  ([NEXT_ADR_SCOPE.md](../../../../serverless-runtime/docs/NEXT_ADR_SCOPE.md) line 15, BR-006).
+* **Execution identity on outbound `call` tasks.** A triggered execution's identity is already a
+  trigger field, `execution_context: system | event_source`
+  ([DESIGN_GTS_SCHEMAS.md](../../../../serverless-runtime/docs/DESIGN_GTS_SCHEMAS.md) line 1697),
+  and the start triggers take `system`. What is asked is how that identity is presented on the
+  plugin's outbound HTTP call: `POST /bss-orders-workflow/v1/steps/{operation}` as the
+  serverless-runtime service principal with a token whose `token_scopes` name this gear, refreshed
+  across a long-running invocation. The platform lists the execution-identity model as an
+  unaddressed blocker
+  ([NEXT_ADR_SCOPE.md](../../../../serverless-runtime/docs/NEXT_ADR_SCOPE.md) lines 15, 96–97,
+  BR-006, BR-013).
 * **Named signals to a running invocation.** Hold, resume, cancel and re-authorisation must reach a
   `listen` arm as distinguishable signals; the platform has generic `suspend`/`resume`/`cancel`
   (DESIGN.md lines 885–888) and a plugin-control passthrough (line 893) but records "no signal
-  delivery model" (NEXT_ADR_SCOPE.md line 40, BR-108).
+  delivery model" (NEXT_ADR_SCOPE.md line 40, BR-108). The same ask covers the operator re-drive
+  (D-86 as amended): `retry` keeping `invocation_id` from `failed` (line 888) and also from
+  `dead_lettered`, where a failure without an `on_failure` handler lands (line 458), and one stated
+  path for the verb, which the platform describes both as host-executed (line 873) and as routed
+  to the plugin (line 893).
 * **Event-trigger binding to the platform event broker.** `listen` targets are event-broker GTS
   events; the platform's event-broker integration is "TBD per deployment" (DESIGN.md line 150) and
   event matching is plugin-native (line 808).
-* **Attempt identity on each task invocation.** `owf_step_log.attempt_id` needs the platform's
-  attempt identifier on every call; the retry contract (lines 360–366) does not state how the
-  called endpoint learns it.
-* **Suspension window at least the lifetime ceiling.** The definition waits up to the 90-day
-  `max_process_lifetime` (D-53); the platform commits to suspension periods of at least 30 days
-  and a tenant-configurable maximum
-  ([serverless-runtime PRD](../../../../serverless-runtime/docs/PRD.md) line 404, BR-009), which
-  must be configured to at least 90 days for this gear's tenant policy.
+* **Member-only storage of trigger inputs and consumed events**, per ADR-0013: the plugin persists
+  only the members the definition selects from the start trigger's input and every consumed
+  event; the alternative route is a Lifecycle ask for thin event variants.
+* **Attempt identity and deadline on each outbound call.** The SDK `Context` already carries
+  `attempt_number` and a `deadline` with `remaining_time()`
+  ([serverless-sdk DESIGN.md](../../../../serverless-runtime/serverless-sdk/docs/DESIGN.md) lines
+  123, 303, 307); the ask is that a `call: http` task carries them to the callee, and that the
+  DSL's `$workflow.id` is the platform `invocation_id`, which `start-instance` binds.
+* **No tenant cap on suspension below the lifetime ceiling.** The Workflow declares
+  `workflow_traits.max_suspension_days: 90`, the required field whose default is 30
+  ([DESIGN_GTS_SCHEMAS.md](../../../../serverless-runtime/docs/DESIGN_GTS_SCHEMAS.md) lines
+  520–529), for the 90-day `max_process_lifetime` (D-53); what is asked is whether a tenant policy
+  may cap it lower — the platform commits to at least 30 days and a tenant-configurable maximum
+  ([serverless-runtime PRD](../../../../serverless-runtime/docs/PRD.md) line 404, BR-009) — and a
+  field for the async-only declaration DESIGN.md line 653 says `workflow_traits` SHOULD carry but
+  its schema (DESIGN_GTS_SCHEMAS.md lines 466–530) does not.
 * **Engine-history isolation, retention and residency**, per ADR-0013 and Q-01 part 2: Temporal
   Server's persistence backend is a platform infrastructure dependency (serverless-runtime
   ADR-0004 line 100) whose location and retention this gear cannot pin.
@@ -296,7 +326,10 @@ operation-level tests under the code sequencer with `definition_source = code`.
 
 This decision answers `DECISIONS.md` Q-01 in the two parts stated above; the register entries that
 carry it are numbered from D-65 onward in `DECISIONS.md`, and Q-10 (a seller-scoped publish role)
-and Q-11 (native expression of the hold-pausable escalation wait) are the questions it opens. It
+and Q-11 (whether the plugin's DSL expresses the constructs the definition needs — a
+runtime-expression `wait` duration as an extension, `error_code` on `$error`, a dynamic parallel
+construct, a cancellable `listen` in a competing `fork`, the hold pattern — or they need
+fallbacks) are the questions it opens. It
 rewrites ADR-0001, is refined by ADR-0012 (definition versioning and protected steps) and ADR-0013
 (references, not payloads), and amends ADR-0002, 0003, 0004, 0005, 0006, 0007, 0009 and 0010 with
 dated notes; ADR-0008 is unchanged. Everything decided in the platform-alignment commits stays:
@@ -314,7 +347,7 @@ its ADR-0003, ADR-0004 and ADR-0005, and its API surface is its DESIGN.md §3.3.
   [`design/10-process-definition.md`](../design/10-process-definition.md);
   [`design/01-foundation.md`](../design/01-foundation.md) §3.7, §3.8
 - **Decisions register**: [`DECISIONS.md`](../DECISIONS.md) — Q-01 (answered in two parts), D-02,
-  D-53, D-62 (amended), Q-10, Q-11
+  D-53, D-62 (amended), D-65, D-69, D-70 (as amended), D-86 (as amended), Q-10, Q-11
 - **Upstream asks**: [`UPSTREAM_REQS.md`](../UPSTREAM_REQS.md) — serverless-runtime section
 - **Platform**: serverless-runtime
   [ADR-0003](../../../../serverless-runtime/docs/ADR/0003-cpt-cf-serverless-runtime-adr-workflow-dsl.md),
@@ -325,10 +358,10 @@ its ADR-0003, ADR-0004 and ADR-0005, and its API surface is its DESIGN.md §3.3.
 This decision directly addresses the following requirements or design elements:
 
 * `cpt-cf-bss-orders-workflow-fr-owf-process-state-nonauth` — the platform drives and Orders records: every step operation writes the gear-owned record in its own transaction, the definition version is pinned in `owf_definition_binding`, and engine history is reference-only and never read as process state
-* `cpt-cf-bss-orders-workflow-fr-owf-retry` — retry scheduling is the platform's per-task policy; the operation's `retry_class` and idempotency key make a platform re-invocation an absorbed duplicate rather than a second effect
+* `cpt-cf-bss-orders-workflow-fr-owf-retry` — retry scheduling is the definition's per-task retry (`use.retries` from `catch.retry`), executed by the plugin; the operation's `retry_class` and idempotency key make a platform re-invocation an absorbed duplicate rather than a second effect
 * `cpt-cf-bss-orders-workflow-fr-owf-hold-resume` — hold and resume are signals handled by a definition arm that calls `apply-hold`/`apply-resume`; the pausable-escalation-only rule is a definition pattern
 * `cpt-cf-bss-orders-workflow-nfr-owf-durability` — zero loss for committed steps is asserted against the gear-owned record, which no sequencer change touches
 * `cpt-cf-bss-orders-workflow-nfr-owf-audit` — the audit entry is written by the operation in the transaction that makes the step true, independent of engine history
 * `cpt-cf-bss-orders-workflow-component-foundation` (**step executor**, the component `design/01-foundation.md` §3.2 declares under its unchanged identifier) — becomes the family of step operations behind `/bss-orders-workflow/v1/steps/{operation}`; the sequencing role it held moves to the definition
-* `cpt-cf-bss-orders-workflow-component-foundation` (**durable timer service** and **retry backoff controller**) — retired by this decision; their responsibilities are the platform's `wait` and `RetryPolicy`
+* `cpt-cf-bss-orders-workflow-component-foundation` (**durable timer service** and **retry backoff controller**) — retired by this decision; their responsibilities are the definition's `wait` and per-task retry (`use.retries` from `catch.retry`), executed by the plugin
 * `cpt-cf-bss-orders-workflow-adr-durable-execution-substrate` — rewritten by this decision: the substrate is now selected

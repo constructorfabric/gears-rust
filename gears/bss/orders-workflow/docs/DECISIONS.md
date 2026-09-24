@@ -554,7 +554,7 @@ already observes toward order state.
 
 ### D-23: A pre-activation draft re-read immediately before every activation intent is the sole detection mechanism for an auto-voided wave-1 draft
 
-**Amended by D-78 (2026-09-24).** The re-read is the operation `reread-draft-liveness`, ordered by the definition immediately before `dispatch-wave2-activate`; the rule that it is the sole detection mechanism stands.
+**Amended by D-78 (2026-09-24), as corrected there.** The re-read runs **inside** `dispatch-wave2-activate`, immediately before it submits any activation intent, and a lapsed draft is reported in its `lapsed[]`; `reread-draft-liveness` is a `composable`, advisory early read the definition may place after the expected-fulfillment wait, and the definition is not required to call it. The rule that the re-read immediately before every activation intent is the sole detection mechanism stands.
 
 **Decision**: the Draft-Liveness Re-reader re-reads the wave-1 draft's liveness immediately before
 every activation intent, and this re-read is the only detection mechanism this design relies on
@@ -1618,10 +1618,26 @@ retains; references answer PRD §15's "which commercial data would sit in engine
 "none" and keep D-61's erasure and ADR-0010's `assigned_principal` constraint enforceable in one
 store. The residual — identifiers in engine history — is bounded by the residency ask and Q-12.
 
+**Amended (2026-09-24).** The rule extends to **trigger inputs and consumed events**, which are
+engine data as much as task inputs are: the start trigger's input is the raw `$workflow.input`
+(Serverless Workflow DSL 1.0.0, dsl.md *Runtime expression arguments*) and a `listen` output is
+the array of consumed events (dsl-reference.md *Listen*), while Lifecycle's events as published
+carry tenant axes, per-line net components, the deciding authority and actor and reason fields
+([Lifecycle `01 §4.4`](../../orders-lifecycle/docs/design/01-foundation.md#44-events-audit-and-the-outbox-normative),
+lines 2396–2406). The start trigger and every Lifecycle, Generic Approval and Subscriptions
+`listen` **MUST** keep only references. Two routes are registered and either closes the gap: the
+platform persists only the members the definition selects
+(`…-upreq-serverless-runtime-consumed-event-member-storage`), or Lifecycle publishes thin event
+variants or confirms the full events may be stored (`…-upreq-lifecycle-thin-events`), with the
+Generic Approval decision event reference-only by `…-upreq-generic-approval-expectations-contract`.
+Until one lands, "no commercial data in engine history" holds for task inputs and outputs only, and
+the consumed events as published are the stated residual of ADR-0013 and `DESIGN.md` §4.2.
+
 **ADR**: ADR-0013 (`cpt-cf-bss-orders-workflow-adr-references-not-payloads`).
 
 **Propagated**: `design/01-foundation.md` §2.1, §3.3, §4.14; `design/10-process-definition.md`
-§2.1, §2.2 rule 5; every slice §3.3; `DESIGN.md` §2.1, §4.2, §4.3; `UPSTREAM_REQS.md` §2.3, §2.9.
+§2.1, §2.2 rule 5; every slice §3.3; `DESIGN.md` §2.1, §4.2, §4.3; `UPSTREAM_REQS.md` §2.3, §2.4,
+§2.9.
 
 ### D-67 (H) Protected steps are fenced by six validation rules and by run-time guards
 
@@ -1725,6 +1741,25 @@ the definition's per-task retry policy, which **MAY** be tighter per task and **
 the task timeout. The only remainder authority for a paused escalation window is
 `owf_approval_gate.window_remaining_ms` with `pause_causes`, written through slice 03's gate-window
 port.
+
+**Amended (2026-09-24).** Two corrections against the platform schemas and the 1.0.0 DSL.
+(1) *Task retry is the DSL's.* The per-task policy is the definition's `use.retries` policy
+referenced from a `try`'s `catch.retry`, with `catch.errors`/`catch.when` selecting the statuses
+(Serverless Workflow DSL 1.0.0, dsl-reference.md *Try*, *Retry*); a status no `catch` matches,
+such as 400, is not retried. The platform's `RetryPolicy` is a different, **invocation-level**
+policy keyed by SDK error category ([serverless-runtime DESIGN.md](../../../serverless-runtime/docs/DESIGN.md)
+lines 354–370) and is not what re-issues a step operation. (2) *Computed waits are fixed-duration
+loops.* A 1.0.0 `wait` accepts only an inline duration object or an ISO 8601 string, never a
+runtime expression (dsl-reference.md *Wait*, *Duration*). A wait whose length Orders computes — the
+remaining escalation window, the expected-fulfillment instant, a deferral's `retryAfterMs`, the SLA
+remainder — is therefore a **bounded re-check loop**: a `wait` of fixed granularity declared per
+wait in `design/10-process-definition.md` §3 (for example PT1M for a deferral, PT5M for approval
+escalation and the park, PT1H for the barrier and the overdue window), then a `call` to the
+Orders operation that owns the deadline, which compares database time with the stored deadline and
+returns `due: true | false`, then a `switch` that loops while not due. The lifetime ceiling needs no
+loop: it is a literal `P90D` wait. No Function sleeps: a Function is bounded by platform timeout
+limits and durable waits belong to Workflows (serverless-runtime DESIGN.md lines 579, 582).
+Whether the plugin accepts a runtime-expression duration as an extension is Q-11 (i).
 
 **Rationale**: a durable timer service and a retry controller in a business gear are the
 duplication ADR-0005 of serverless-runtime refuses; the plugin already owns them. What PRD §6.1
@@ -1865,14 +1900,15 @@ and `start-instance` needs the seller axis for every seller-scoped row it writes
 `prior-instance-active` (409) for slice 02; `identity-party-unavailable` for slice 04;
 `activation-precondition-unmet` (409) and `intent-unresolved` (400) for slice 05;
 `fence-not-claimed` and `outcome-not-reportable` for slice 06; `order-fenced`,
-`action-not-offered`, `override-unverified`, `lifetime-ceiling-reached` and
-`approval-reflection-refused` for slice 07. The engine contributes ten families (adding
+`action-not-offered`, `override-unverified` and `lifetime-ceiling-reached` for slice 07; and
+`approval-reflection-refused` (400) for slice 03, which raises it from `reflect-verdict` and
+whose manual task slice 07 creates (`01 §4.9`). The engine contributes ten families (adding
 `definition-not-bound`); the catalogue is **42** reasons — ten engine, thirty-two slice.
 
 **Rationale**: a reason a slice raises but the catalogue does not register does not compile
 (D-64); registering them once with their categories stops two slices choosing different statuses.
 
-**Propagated**: `design/01-foundation.md` §3.3 *Error surface*, §4.9; slices 02, 04, 05, 06, 07 §3.3;
+**Propagated**: `design/01-foundation.md` §3.3 *Error surface*, §4.9; slices 02, 03, 04, 05, 06, 07 §3.3;
 `DESIGN.md` §3.3 *Error envelope*.
 
 ### D-78 (M) The barrier and the park are definition patterns over Orders guards
@@ -1889,6 +1925,14 @@ both ordered by the definition before wave 2; a lapsed draft routes rebuild → 
 fail-closed park (D-12) is a definition arm — `park`, then a park loop whose escalation `wait` is
 armed by `arm-park-escalation` — and exits only through `unpark` or the fence; it never suspends
 the Lifecycle `submitted` TTL.
+
+**Amended (2026-09-24).** The pre-activation draft re-read of D-23 is not a separate step the
+definition orders before wave 2: it is inside `dispatch-wave2-activate`, which re-reads draft
+liveness immediately before submitting any activation intent and reports a lapsed draft in
+`lapsed[]` (`design/05-provisioning-intents.md` §3.3; ADR-0004 as amended).
+`reread-draft-liveness` is `composable` and advisory — an optional early read after the
+expected-fulfillment wait — and a definition that never calls it is valid. A lapsed draft still
+routes `rebuild-wave1` → wave 1.
 
 **Rationale**: timing and ordering are the definition's under D-65; the invariants those
 mechanisms protect stay Orders' guards so a publish cannot weaken them.
@@ -1929,6 +1973,17 @@ expected-fulfillment and overdue `wait`s and the lifetime ceiling do not pause.
 **Rationale**: an operation cancelled mid-flight by a competing arm would leave an `open` key and a
 half-recorded effect; routing after the switch keeps every operation whole. Pausing only where PRD
 §6.3 requires a pause keeps the other clocks honest.
+
+**Amended (2026-09-24).** In Serverless Workflow DSL 1.0.0 a flow directive (`then`) may target
+only a sibling task in the same `do` list, never a task at a different depth (dsl.md *Task
+Flow*). The shared return is therefore a **stage dispatcher**, not a jump: the top-level `do` list
+holds one composite task per stage (approval, fulfillment, unwind, park, hold and the others of
+`design/10-process-definition.md` §3.6) and a `dispatch` task, a `switch` on `$context.nextStage`
+whose `then:` names sibling stage tasks. A stage ends by `set`-ting `$context.nextStage` and
+`then: exit`, which returns to the top-level list, whose next task is `dispatch`. Inside a stage a
+loop is flat: one `do` list whose tasks jump only to siblings. `returnToStage` is this dispatcher:
+a shared path returns to the stage an arm left by `set`-ting `$context.nextStage` to that stage and
+exiting to the top level.
 
 **Propagated**: `design/10-process-definition.md` §3.6, §4.5; `design/08-hold-and-cancel.md` §3.3.
 
@@ -2031,6 +2086,16 @@ platform confirms that property (`…-upreq-serverless-runtime-signals`); `owf_p
 is never re-bound to a second invocation, and `start-instance` answers an existing binding to a
 second invocation, which then ends itself. Until the platform confirms it, a dead invocation's
 instance is unwound through the fence and the order re-submitted.
+
+**Amended (2026-09-24).** The platform accepts `retry` only from `failed`
+([serverless-runtime DESIGN.md](../../../serverless-runtime/docs/DESIGN.md) line 888), and a failed
+invocation with no `on_failure` handler — this definition declares none — moves `failed →
+dead_lettered` (line 458). The re-drive is therefore `:control` `retry` **from `failed`**, keeping
+`invocation_id`; the signals ask additionally asks that `retry` be valid **from `dead_lettered`**,
+keeping `invocation_id`, and that the platform name one path for the verb, since `:control`
+actions "never reach the plugin" (line 873) while the plugin-control passthrough routes `retry` to
+the plugin (line 893). Until both properties are confirmed, a dead invocation's instance is unwound
+through the fence and the order re-submitted.
 
 **Rationale**: re-binding would let two invocations believe they drive one instance; the platform's
 own retry of the same invocation preserves the one-to-one binding the record depends on.
@@ -2425,9 +2490,12 @@ registered PRD amendment (`UPSTREAM_REQS.md` §4 item 7).
 DSL 1.0.0 may or may not provide as the platform's plugin implements it
 (`design/10-process-definition.md` §4.5):
 
-1. **(i)** a runtime expression as a `wait` duration, so the remaining escalation window, the
-   expected-fulfillment instant, the SLA remainder and a deferral's `retryAfterMs` can be armed
-   without a Function;
+1. **(i)** whether the plugin accepts a runtime-expression `wait` duration **as an extension**:
+   the 1.0.0 `wait` accepts only an inline duration object or an ISO 8601 string (dsl-reference.md
+   *Wait*, *Duration*), so a computed wait — the remaining escalation window, the
+   expected-fulfillment instant, the SLA remainder, a deferral's `retryAfterMs` — is not
+   expressible in the spec itself; until the plugin answers, the bounded re-check loop of D-70 as
+   amended applies;
 2. **(ii)** the Problem body's `error_code` visible on `$error`, so a `catch` can tell
    `idempotency-key-conflict` from `still-processing` before the retry budget is spent;
 3. **(iii)** a dynamic parallel construct, so a wave could fan out per line inside the definition;
@@ -2437,8 +2505,11 @@ DSL 1.0.0 may or may not provide as the platform's plugin implements it
    the escalation `wait`, a resume wait, and a re-armed `wait` of the remainder Orders returns —
    natively, without a Function.
 
-**Fallbacks in force until answered**: (i) and (v) a registered Function that sleeps the
-remainder, called only from a `composable` position; (ii) bounded by the retry budget; (iii)
+**Fallbacks in force until answered**: (i) and the re-armed remainder of (v) the bounded
+re-check loop of D-70 as amended — a fixed-granularity `wait`, a `call` to the operation that
+owns the deadline and a `switch` that loops while it answers `due: false`; no Function sleeps,
+because a Function is bounded by platform timeout limits and durable waits belong to Workflows
+(serverless-runtime DESIGN.md lines 579, 582); (ii) bounded by the retry budget; (iii)
 settled as one `call` per wave carrying `lineRefs[]` (D-79); (iv) covered by the poll arms and the
 re-entry of every stage loop (D-80).
 

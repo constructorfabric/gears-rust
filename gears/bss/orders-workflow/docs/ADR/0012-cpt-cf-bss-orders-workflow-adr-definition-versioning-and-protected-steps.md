@@ -91,13 +91,17 @@ rather than one task, fails closed before a definition can be executed, and stil
      events (the overdue arm only) and the operator signals of `design/10-process-definition.md`
      §3.3 (`cancel-requested`, `reauthorize-requested`, `task-resolution-requested`,
      `unpark-requested`);
-  4. bounds nest: per-task timeout < task retry budget < the enclosing `wait`/deadline < the
-     overdue window < the lifetime ceiling (D-02, D-53), and every `wait` has a bound;
+  4. bounds nest: per-operation deadline < task retry budget < task timeout < the overdue window
+     < the lifetime ceiling (D-02, D-53, D-67), and every `wait` has a bound;
   5. no payload field crosses: every task input and output conforms to the reference schema the
      operation declares (ADR-0013), checked structurally against the declared `input` and `output`;
   6. no `protected` operation is wrapped in a `catch` that swallows its failure: a `catch` around a
      protected operation may only `raise`, call `park`, call `create-manual-task`, or route to the
      compensation path; it may not continue the forward path.
+  `design/10-process-definition.md` §2.2 states these six rules as **eight** numbered checks: it
+  adds the grammar subset (no `run`, `emit` or `for`; the two start triggers) and the fork-routing
+  convention (every competing `fork` followed by a `switch` on `arm`) as rules 7 and 8, which
+  restate this ADR's grammar and D-80's routing rule rather than adding a fence (D-67).
   The `protected` list is closed and fixed here; adding to it or removing from it is an Orders
   release and an amendment of this ADR: `start-instance`, `settle-from-lookup` (sweep-only),
   `terminate-instance`, `admit-trigger`, `terminate-on-terminal-event`, `obtain-verdict`,
@@ -210,7 +214,7 @@ apply by reference.
   [`design/10-process-definition.md`](../design/10-process-definition.md);
   [`design/01-foundation.md`](../design/01-foundation.md) §3.7 (`owf_definition_binding`,
   `owf_step_operation`)
-- **Decisions register**: [`DECISIONS.md`](../DECISIONS.md) — D-02, D-53, Q-10
+- **Decisions register**: [`DECISIONS.md`](../DECISIONS.md) — D-02, D-53, D-67, D-68, Q-10
 - **Upstream asks**: [`UPSTREAM_REQS.md`](../UPSTREAM_REQS.md) — serverless-runtime section
   (pre-publish validation hook, publish audit, version retention while bound)
 - **Platform**: serverless-runtime [DESIGN.md](../../../../serverless-runtime/docs/DESIGN.md)

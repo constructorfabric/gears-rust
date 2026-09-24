@@ -74,8 +74,8 @@ Chosen option: **two-wave barrier**, because it is the only option under which m
 > `lapsed[]`, whose draft-liveness re-read is inside the operation — routes to `rebuild-wave1`,
 > after which wave 1 and the barrier run again for that line before wave 2 (D-23, D-24). The
 > "hold suspension" clause of the second consequence is superseded by ADR-0011's signal pattern:
-> the barrier wait is at the top level of the definition and does **not** pause on hold (D-35,
-> D-53); only approval-escalation waits do.
+> the barrier wait is at the top level of the definition and does **not** pause on hold (D-35 as
+> amended by D-80, D-53); only approval-escalation waits do.
 
 ### Confirmation
 

@@ -51,15 +51,15 @@ normative interface until a canonical specification exists. Two further Subscrip
 `SUB-O15` and `SUB-O16`, are raised here for the first time — they are new asks at the next free
 numbers, not renumberings of anything. It further carries asks on **Orders
 Lifecycle** (visibility of the `submitted` TTL, which a normative MUST in this design depends on
-and which this gear cannot see), on **Catalog** (the dependency-topology read every fulfillment
+and which this gear cannot see, and thin variants of the events the platform consumes for it), on **Catalog** (the dependency-topology read every fulfillment
 plan is constructed from, a dependency this register did not previously name at all), and on the
 **PRD owner** for a privacy and data-classification ruling this design cannot make for itself,
 and on the **platform authorization policy owner** for the PDP catalogue registration, role
 provisioning and the `assigned_principal` approver grant that every authorized operation in this
 design depends on (§2.8, `ADR/0010`, `DECISIONS.md` D-63). Finally, it carries the asks on the
 platform gear **serverless-runtime**, which executes the order process definition since `ADR/0011`
-(§2.9, `DECISIONS.md` D-65…D-69): delivery and readiness, event triggers over the broker, the
-service identity of outbound calls, attempt and deadline propagation, engine-history residency and
+(§2.9, `DECISIONS.md` D-65…D-69): delivery and readiness, event triggers over the broker, member-only
+storage of trigger inputs and consumed events, the service identity of outbound calls, attempt and deadline propagation, engine-history residency and
 retention, definition versioning with a pre-publish validation hook, named signals, operator
 visibility of trigger-path dead letters and a failure-handler safety net.
 
@@ -70,11 +70,11 @@ visibility of trigger-path dead letters and a failure-handler safety net.
 | Subscriptions (`gears/bss/subscriptions/docs/SEAMS.md`) | `SUB-O1`, `SUB-O5` registered-and-unagreed; `SUB-O10` registered by the sibling Lifecycle design, unagreed; `SUB-O11`..`SUB-O16` UNASKED (never registered) | Provisioning intents, compensation, in-flight status, correlation propagation, the seam's latency budget, and callback attribution all cross this seam; several gaps make parts of the design fail closed or unenforceable until they land. |
 | Payments | No specification or register exists in this repository | Begin-fulfillment gating needs an authorization outcome distinguishing authorized/pending/failed; there is no owner to receive the ask. |
 | Generic Approval service | No canonical specification; PRD §9.2 expectations contract is the normative interface until one exists | Approval-requirement verdict acquisition, routing, multi-party gates, and escalation are executed against this contract via a phase-1 stand-in that returns `approval not required` (audited), pending the real service. |
-| Orders Lifecycle (`gears/bss/orders-lifecycle`) | UNASKED (never registered) | This design's escalation obligation is stated relative to the order's `submitted` TTL, which Orders Lifecycle owns and this gear can neither read nor derive; without it the obligation is a strict inequality between two quantities, only one of which is knowable here. |
+| Orders Lifecycle (`gears/bss/orders-lifecycle`) | UNASKED (never registered) | This design's escalation obligation is stated relative to the order's `submitted` TTL, which Orders Lifecycle owns and this gear can neither read nor derive; without it the obligation is a strict inequality between two quantities, only one of which is knowable here. The events the platform consumes for this gear carry Lifecycle's commercial fields into engine history unless a thin variant exists or the platform stores selected members only (ADR-0013). |
 | Catalog | UNASKED (never registered; not a PRD-registered actor either) | Every fulfillment plan is constructed from Catalog's dependency topology and frozen against it; the plan cannot be built, validated for cycles, or ordered for compensation without a read contract. |
 | Event Broker (`gears/system/event-broker`) | REGISTERED by Orders Lifecycle (`gears/bss/orders-lifecycle/docs/UPSTREAM_REQS.md` §2.7), open; co-signed here | Process events publish through the platform producer outbox (`ADR/0008`, D-58); the runtime, cursor/retry semantics, dead-letter recovery, root tenancy and delivery observability are platform prerequisites this gear cannot report ready without. |
 | Platform authorization policy owner (`authz-resolver` PDP provider and policy provisioning) | UNASKED (never registered); Orders Lifecycle's `…-upreq-pdp-policy-integration` (`gears/bss/orders-lifecycle/docs/UPSTREAM_REQS.md` §2.9) is the precedent and the two should be provisioned together | Every operation is authorized by the platform PDP on a registered `(resource, action)` pair through the shared `PolicyEnforcer` adapter (`ADR/0010`, D-63); until the catalogue is registered and the roles, the `assigned_principal` approver grant and the service-principal grants are provisioned and verified against the deployed provider, no caller-driven operation is authorizable in production, and this design fabricates no default grant. |
-| serverless-runtime (`gears/serverless-runtime`) | UNASKED (never registered); the platform's own `NEXT_ADR_SCOPE.md` names several of the gaps as open | Since `ADR/0011` the order process flow is a platform workflow definition executed by the serverless-runtime Temporal plugin; the gear has no code today, and the service identity of outbound calls, event triggers over the broker, named signals, attempt identity, a pre-publish validation hook, version retention while bound, history residency and dead-letter visibility are not stated by any platform document. Until they land the platform path is not ready and only the fallback property holds (§2.9). |
+| serverless-runtime (`gears/serverless-runtime`) | UNASKED (never registered); the platform's own `NEXT_ADR_SCOPE.md` names several of the gaps as open | Since `ADR/0011` the order process flow is a platform workflow definition executed by the serverless-runtime Temporal plugin; the gear has no code today, and the service identity of outbound calls, event triggers over the broker, member-only storage of consumed events, named signals, attempt identity, a pre-publish validation hook, version retention while bound, history residency and dead-letter visibility are not stated by any platform document. Until they land the platform path is not ready and only the fallback property holds (§2.9). |
 | PRD owner (privacy / data classification) | UNASKED | The PRD's "Privacy / PII: not applicable" exclusion does not survive contact with a 400-day audit trail carrying actor, operator and approver identities; the ruling is a PRD amendment, not a design change. |
 
 ## 2. Requirements
@@ -412,6 +412,36 @@ have different deadlines and should escalate at different times.
 - **Source**: `ADR/0007` (`cpt-cf-bss-orders-workflow-adr-fail-closed-verdict-park`); `DECISIONS.md`
   D-46 and Q-02. Raised against `gears/bss/orders-lifecycle/docs/UPSTREAM_REQS.md`.
 
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-upreq-lifecycle-thin-events`
+
+Orders Lifecycle **MUST** either publish, for each state event this gear consumes through the
+platform, a **thin variant** that carries only the envelope, the event type, `orderId`,
+`orderVersion`, `category` on `OrderSubmitted` (the start filter) and `supersedesVersion` on
+`OrderAmended`, **or confirm** that the full events as published may be stored in the platform
+engine's history for the tenants it serves. This gear reads everything else from Lifecycle under
+the PDP inside its step operations (ADR-0013), so a thin variant loses it nothing.
+
+- **Owning upstream gear**: Orders Lifecycle (`gears/bss/orders-lifecycle`).
+- **Why this gear cannot satisfy it alone**: Lifecycle owns the event schemas. The events as
+  published carry commercial data — `OrderSubmitted` the tenant axes, per-line references and pins
+  and the resolved total's per-line net components; `OrderApproved` and `OrderRejected` the
+  deciding authority; `OrderHeld` the hold reason; `OrderCancelled` the cancelling actor and the
+  cancel reason; `OrderCompleted` the line-to-subscription mapping
+  ([Lifecycle `01 §4.4`](../../orders-lifecycle/docs/design/01-foundation.md#44-events-audit-and-the-outbox-normative),
+  lines 2396–2406) — and under ADR-0011 the platform, not this gear, consumes them: the start
+  trigger's input and every `listen` output are engine data (Serverless Workflow DSL 1.0.0, dsl.md
+  *Runtime expression arguments*; dsl-reference.md *Listen*).
+- **Rationale**: this is the second of the two routes of ADR-0013 *Trigger inputs and consumed
+  events*; the first is `…-upreq-serverless-runtime-consumed-event-member-storage` (§2.9). Either
+  one closes the residual; a Lifecycle confirmation closes it by accepting it on the data owner's
+  authority rather than by removing it.
+- **Consequence if it does not land** (and the §2.9 route does not either): Lifecycle's commercial
+  event fields sit in Temporal history under the platform's retention and authorization, and the
+  "commercial data in engine history" threat of `DESIGN.md` §4.2 keeps that residual.
+- **Agreement status**: **UNASKED**.
+- **Source**: `ADR/0013`; `DECISIONS.md` D-66 (as amended); `DESIGN.md` §4.2. Raised against
+  `gears/bss/orders-lifecycle/docs/UPSTREAM_REQS.md`.
+
 ### 2.5 Catalog
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-upreq-catalog-dependency-topology-read`
@@ -644,24 +674,40 @@ section is also the content of the readiness gate.
 serverless-runtime **MUST** deliver its host, the Function Registry, the Invocation and Event
 Trigger APIs and the Temporal plugin to a state this gear can report ready against: the registered
 definition version this gear binds new instances to resolves in the registry and the invocation
-API answers (`design/01-foundation.md` §3.8). Delivery includes a tenant runtime policy whose
-maximum suspension window is at least this gear's 90-day `max_process_lifetime` (D-53) — the
-platform commits to suspension of at least 30 days with a tenant-configurable maximum
+API answers (`design/01-foundation.md` §3.8). The suspension window is not asked: the Workflow
+callable declares `workflow_traits.max_suspension_days: 90` (`design/10-process-definition.md`
+§3.1), the required field of the platform schema whose default is 30
+([DESIGN_GTS_SCHEMAS.md](../../../serverless-runtime/docs/DESIGN_GTS_SCHEMAS.md) lines 520–529),
+because a suspension that outlives it moves the invocation `suspended → failed`
+([DESIGN.md](../../../serverless-runtime/docs/DESIGN.md) line 455). What is asked is only
+**whether a tenant runtime policy may cap that value below 90** — the platform commits to
+suspension of at least 30 days with a tenant-configurable maximum
 ([serverless-runtime PRD.md](../../../serverless-runtime/docs/PRD.md) line 404; open as BR-009,
-[NEXT_ADR_SCOPE.md](../../../serverless-runtime/docs/NEXT_ADR_SCOPE.md) line 21) — and an
-answer to the DSL expressiveness questions of `DECISIONS.md` Q-11 as the plugin implements them
-(a runtime-expression `wait` duration, `error_code` visible on `$error`, a dynamic parallel
-construct, a cancellable `listen` inside a competing `fork` without event loss, the hold pattern
-without a Function). An aggregate retry cap, the gear-wide 10 % retry budget of D-43, is asked as
-a platform-side property of the task retry policy rather than rebuilt here.
+[NEXT_ADR_SCOPE.md](../../../serverless-runtime/docs/NEXT_ADR_SCOPE.md) line 21) — and, if it may,
+that this gear's tenants are provisioned with a cap of at least 90 days, the `max_process_lifetime`
+of D-53. Delivery further includes (a) **a stated way for a Workflow to declare itself
+async-only**: the platform says `workflow_traits` SHOULD declare it and that a Workflow which
+suspends MUST be marked (DESIGN.md line 653), but the `workflow_traits` schema holds only
+`compensation`, `checkpointing` and `max_suspension_days` (DESIGN_GTS_SCHEMAS.md lines 466–530),
+so the canonical definition declares no such trait until the field exists, and a synchronous start
+would fail at its first suspension point with `sync_suspension` (409, DESIGN.md line 653); and
+(b) an answer to the DSL expressiveness questions of `DECISIONS.md` Q-11 as the plugin implements
+them (whether it accepts a runtime-expression `wait` duration as an extension — Serverless
+Workflow DSL 1.0.0 admits only an inline duration object or an ISO 8601 string (dsl-reference.md,
+*Wait* and *Duration*), so until then the definition arms its computed waits as the bounded
+re-check loop of D-70 as amended; `error_code` visible on `$error`; a dynamic parallel construct;
+a cancellable `listen` inside a competing `fork` without event loss; the hold pattern without a
+Function). An aggregate retry cap, the gear-wide 10 % retry budget of D-43, is asked as a
+platform-side property of the plugin's execution of the definition's task retries (`use.retries`)
+rather than rebuilt here.
 
 - **What the design cannot do until it lands**: nothing on the platform path runs — the canonical
   definitions of `design/10-process-definition.md` are documentation, the event triggers are not
   enabled, and this gear **MUST NOT** report ready for the `platform` definition source. A
-  suspension window shorter than 90 days would end a held or long-running instance on the platform
-  side before the lifetime ceiling could park it.
-- **Source**: `ADR/0011` (*Runtime gate*); `design/01-foundation.md` §3.8; `design/10-process-definition.md` §1.1, §4.5;
-  serverless-runtime [ADR-0004](../../../serverless-runtime/docs/ADR/0004-cpt-cf-serverless-runtime-adr-temporal-workflow-engine.md),
+  tenant cap on `max_suspension_days` below 90 would move a held or long-running invocation
+  `suspended → failed` before the lifetime ceiling could park it, so such a cap fails the gate.
+- **Source**: `ADR/0011` (*Runtime gate*); `design/01-foundation.md` §3.8; `design/10-process-definition.md` §1.1, §3.1, §4.5;
+  `DECISIONS.md` D-70 (as amended), Q-11; serverless-runtime [ADR-0004](../../../serverless-runtime/docs/ADR/0004-cpt-cf-serverless-runtime-adr-temporal-workflow-engine.md),
   [ADR-0005](../../../serverless-runtime/docs/ADR/0005-cpt-cf-serverless-runtime-adr-thin-host.md) line 83 (plugin layout).
 
 #### Event triggers over event-broker GTS events
@@ -675,11 +721,10 @@ events — under **platform-root tenancy** (Lifecycle D-95) with **per-order ord
 support two start triggers (`OrderSubmitted` filtered to `category = new_sale`, and
 `OrderAmended`) on one Workflow callable. One broker event **MUST** be able both to start an
 invocation through a trigger and to reach a running invocation's `listen` (an `OrderAmended` for a
-new version while the prior version's invocation is still unwinding). A `listen` **MUST** be able
-to store only the exported members of a consumed event, because the Subscriptions outcome event as
-published carries a `subscriptionId` that ADR-0013 keeps out of engine history; and an event that
-correlates to no running invocation **MUST** be handled on the platform trigger path, not dropped
-silently. The platform's event-broker integration is "TBD per deployment"
+new version while the prior version's invocation is still unwinding). An event that correlates to
+no running invocation **MUST** be handled on the platform trigger path, not dropped silently. What
+the engine stores of a trigger input or a consumed event is the separate ask
+`…-upreq-serverless-runtime-consumed-event-member-storage` below. The platform's event-broker integration is "TBD per deployment"
 ([serverless-runtime DESIGN.md](../../../serverless-runtime/docs/DESIGN.md) line 150) and event
 matching is plugin-native (line 808).
 
@@ -691,6 +736,40 @@ matching is plugin-native (line 808).
   arm is dropped for the poll arm (D-97).
 - **Source**: `design/02-triggers-and-start.md` §2.2, §4.7; `design/10-process-definition.md` §2.2 *The closed trigger set*, §3.3, §3.6 (f); `design/05-provisioning-intents.md` §4.1.
 
+#### Member-only storage of trigger inputs and consumed events
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-upreq-serverless-runtime-consumed-event-member-storage`
+
+For the start trigger's input and for every event a `listen` consumes, the plugin **MUST** persist
+in engine history only the members the definition selects — the workflow's `input.from`, and a
+`listen` task's `read` mode with its `output.as` and `export.as`, applied **before** the value is
+written to history, not only to the in-memory workflow data — so that no raw event reaches the
+Temporal persistence backend. The
+Serverless Workflow DSL 1.0.0 exposes the raw workflow input as `$workflow.input` (dsl.md, *Runtime
+expression arguments*), and the output of a `listen` is the array of consumed events (dsl-reference.md,
+*Listen*); nothing in the platform states whether what the engine records is the value before or
+after that filtering. The events as published carry commercial data ADR-0013 keeps out of history:
+Lifecycle's `OrderSubmitted` carries the tenant axes, per-line references and pins and the resolved
+total's per-line net components; `OrderApproved` and `OrderRejected` the deciding authority;
+`OrderHeld` the hold reason; `OrderCancelled` the cancelling actor and the cancel reason;
+`OrderCompleted` the line-to-subscription mapping
+([Lifecycle `01 §4.4`](../../orders-lifecycle/docs/design/01-foundation.md#44-events-audit-and-the-outbox-normative),
+lines 2396–2406); the Subscriptions outcome event carries a `subscriptionId`; the Generic Approval
+decision event has no specification (§2.3, Q-05). The platform has no data-classification model
+for execution history ([NEXT_ADR_SCOPE.md](../../../serverless-runtime/docs/NEXT_ADR_SCOPE.md)
+line 23, BR-017).
+
+- **What the design cannot do until it lands**: ADR-0013's "no commercial data in engine history"
+  holds for task inputs and outputs only; the start trigger's input and every consumed Lifecycle,
+  Generic Approval and Subscriptions event may sit in history in full, which is the stated residual
+  of ADR-0013 and of the "commercial data in engine history" threat (`DESIGN.md` §4.2). The
+  residual closes when this ask **or** the Lifecycle thin-event ask
+  (`…-upreq-lifecycle-thin-events`, §2.4) together with the §2.3 reference-only decision event
+  lands; until then PRD §15's first question is answered "none" for task data and "the consumed
+  events, as published" for trigger inputs and `listen` outputs.
+- **Source**: `ADR/0013` (*Trigger inputs and consumed events*); `DECISIONS.md` D-66 (as amended);
+  `DESIGN.md` §4.2; `design/10-process-definition.md` §3.3.
+
 #### PDP-guarded calls under a propagated service identity
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-upreq-serverless-runtime-pdp-guarded-call`
@@ -700,11 +779,18 @@ the **serverless-runtime service principal** — a gateway-asserted `SecurityCon
 `subject_type` is the platform service-subject type and whose `token_scopes` name this gear — so
 the step route's principal check and the PDP's `process_step × execute` decision
 (`design/09-read-and-authz.md` §3.1, §4.1) have a caller to decide on, and **MUST** carry the
-invocation's `resource_tenant_id` as the tenant context of that principal's call. The platform
-lists execution identity per function as unaddressed
-([NEXT_ADR_SCOPE.md](../../../serverless-runtime/docs/NEXT_ADR_SCOPE.md) line 15, BR-006) and
-states that the `SecurityContext` is passed through but not how an event-triggered execution
-resolves identity (line 96).
+invocation's `resource_tenant_id` as the tenant context of that principal's call. The ask is
+narrowed to the **outbound** call. Which identity a triggered execution runs under is already a
+trigger field — `execution_context: system | event_source`, default `system`, "platform identity"
+([DESIGN_GTS_SCHEMAS.md](../../../serverless-runtime/docs/DESIGN_GTS_SCHEMAS.md) line 1697) — and
+this gear's two start triggers take `system`, because an `event_source` identity would be
+Lifecycle's producer principal, which the step route refuses. What no platform document states is
+how that identity is presented on an HTTP `call` the plugin issues: the `subject_type`, the
+`token_scopes` naming this gear, the tenant context, and the refresh of that credential across an
+invocation that runs up to 90 days. The platform lists the execution-identity model and the
+credential lifecycle of long-running workflows as open
+([NEXT_ADR_SCOPE.md](../../../serverless-runtime/docs/NEXT_ADR_SCOPE.md) lines 15 and 96–97,
+BR-006, BR-013).
 
 - **What the design cannot do until it lands**: no step route can be authorized, because the only
   principal the policy may grant `execute` to has no defined identity on an outbound call; the
@@ -715,18 +801,29 @@ resolves identity (line 96).
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-upreq-serverless-runtime-attempt-and-deadline-propagation`
 
-Every `call` the plugin issues **MUST** carry, to the callee, the platform's identifier of the
-attempt that issued it and the remaining deadline of the enclosing task timeout. The retry
-contract ([serverless-runtime DESIGN.md](../../../serverless-runtime/docs/DESIGN.md) lines
-360–366) states when an invocation is retried but not how a called endpoint learns the attempt or
-its remaining budget.
+Every HTTP `call` the plugin issues **MUST** carry, to the callee, the attempt that issued it and
+the remaining deadline of the enclosing task timeout, and the platform **MUST** confirm that the
+DSL's `$workflow.id` is the platform `invocation_id`. The values exist inside the platform: the
+SDK `Context` carries `invocation_id`, `attempt_number` (1-indexed, adapter-tracked) and a
+`deadline` with `remaining_time()`
+([serverless-sdk DESIGN.md](../../../serverless-runtime/serverless-sdk/docs/DESIGN.md) lines 123,
+299–307). What is asked is only that they are **carried on the outbound HTTP call** — as request
+headers the step envelope reads — because a step operation is an HTTP route, not an SDK handler,
+and nothing states that a DSL `call: http` task transmits them. `$workflow.id` is the DSL's
+"unique id of the workflow execution" (Serverless Workflow DSL 1.0.0, dsl.md, *Runtime expression
+arguments*); that it equals the Invocation API's `invocation_id` is assumed by `start-instance`,
+which binds `owf_process_instance.invocation_id` from it (`design/01-foundation.md` §3.3
+*Attempt identity*), and by the definition's call envelope (`design/10-process-definition.md`
+§3.6), and no platform document states it.
 
 - **What the design cannot do until it lands**: `owf_step_log.attempt_id` records the stand-in
   `"{invocationId}:{taskName}"` plus the envelope's receipt ordinal (`01 §3.3` *Attempt identity*)
   rather than the platform's attempt, so an auditor's join to the platform timeline is by task
   name rather than attempt; and the envelope bounds each attempt by the operation's own
   `deadline_ms` only, so an attempt started late in the task timeout can outlive it and be
-  answered to a caller that has already given up (absorbed on the re-issue, but wasted).
+  answered to a caller that has already given up (absorbed on the re-issue, but wasted). If
+  `$workflow.id` is not the `invocation_id`, the binding holds an identifier no Invocation API call
+  accepts, so the sweep's status read and the operator re-drive of D-86 address nothing.
 - **Source**: `design/01-foundation.md` §3.3 step 4, *Attempt identity*, §4.5; `design/10-process-definition.md` §3.1.
 
 #### Engine-history residency, retention and reference-only task inputs
@@ -738,8 +835,11 @@ history **MUST** be pinned to the tenant's jurisdiction with no cross-boundary r
 retention **MUST** be stated and bounded to the recovery window this gear needs (the 90-day
 lifetime ceiling plus the sweep floor), and the platform **MUST** confirm that its timeline, debug
 and trace endpoints expose task inputs and outputs only to principals the platform authorizes for
-this gear's tenant. The inputs themselves are reference-only by this gear's own rule (ADR-0013);
-the ask is about where and for how long those references live. Temporal Server's persistence is a
+this gear's tenant. Task inputs and outputs are reference-only by this gear's own rule (ADR-0013);
+trigger inputs and consumed events are reference-only only once
+`…-upreq-serverless-runtime-consumed-event-member-storage` or the Lifecycle thin-event ask lands
+(ADR-0013 *Trigger inputs and consumed events*). This ask is about where and for how long what
+remains in history lives. Temporal Server's persistence is a
 platform infrastructure dependency
 ([serverless-runtime ADR-0004](../../../serverless-runtime/docs/ADR/0004-cpt-cf-serverless-runtime-adr-temporal-workflow-engine.md)
 line 100), retention is a `TenantRuntimePolicy` concern
@@ -790,17 +890,26 @@ control operation can answer `still-processing`). The platform has generic
 ([DESIGN.md](../../../serverless-runtime/docs/DESIGN.md) lines 883–889) and a plugin-control
 passthrough whose verb set the plugin owns (line 893), but records "no signal delivery model"
 ([NEXT_ADR_SCOPE.md](../../../serverless-runtime/docs/NEXT_ADR_SCOPE.md) line 40, BR-108). In
-addition, `:control` `retry` of a `failed` invocation (line 888) **MUST** keep the
-`invocation_id`, so an operator re-drive resumes the instance Orders has bound rather than
-starting a second invocation the binding refuses (D-86).
+addition, for the operator re-drive of D-86: `:control` `retry` of a `failed` invocation (line 888)
+**MUST** keep the `invocation_id`, so the re-drive resumes the instance Orders has bound rather
+than starting a second invocation the binding refuses; and `retry` **MUST** also be valid from
+`dead_lettered`, keeping the `invocation_id`. The second clause is needed because `retry` is
+listed as valid only from `failed` (line 888), while a failed invocation with no compensation
+handler — this definition declares none (`design/10-process-definition.md` §3.1) — moves
+`failed → dead_lettered` (line 458), so the state an operator finds is the one `retry` does not
+accept. The platform also states two different paths for the same verb, and the ask is that it
+names one: `:control` actions are executed by the host directly and "never reach the plugin"
+(line 873), while the plugin-control passthrough routes "cancel / suspend / resume / retry" to the
+plugin, which owns the verb set (line 893).
 
 - **What the design cannot do until it lands**: hold and resume still arrive as Lifecycle events,
   but an operator cancel, a payment re-authorisation, a manual-task resolution and an unpark after
   the lifetime ceiling cannot reach the running definition; the control operations record the
   request and answer `still-processing` indefinitely. The generic `:control` `cancel` is never a
   substitute, because it ends the invocation without the cancellation fence
-  (`design/10-process-definition.md` §4.4). Without an invocation-preserving `retry`, a
-  `dead_lettered` or `failed` invocation is unwound and the order re-submitted (D-86).
+  (`design/10-process-definition.md` §4.4). Until an invocation-preserving `retry` is confirmed
+  from both `failed` and `dead_lettered`, a dead invocation's instance is unwound through the fence
+  and the order re-submitted (D-86 as amended).
 - **Source**: `design/10-process-definition.md` §3.2 *Signal delivery*, §3.3, §4.4; `design/09-read-and-authz.md` §3.3, §3.6; `design/07-manual-tasks.md` §3.3; `design/08-hold-and-cancel.md` §3.3.
 
 #### Operator visibility and re-drive of trigger-path dead letters
@@ -826,12 +935,22 @@ of event-driven invocation ([DESIGN.md](../../../serverless-runtime/docs/DESIGN.
 
 - [ ] `p2` - **ID**: `cpt-cf-bss-orders-workflow-upreq-serverless-runtime-failure-handler-target`
 
-The platform's function-level `on_failure` / `on_cancel` handler, which takes a registered GTS
-function reference ([DESIGN.md](../../../serverless-runtime/docs/DESIGN.md) lines 402–409),
-**SHOULD** be able to target this gear's `compensate-order` step route, so an invocation that ends
-abnormally without reaching `report-outcome` still starts the unwind. The canonical definition
-declares no such handler today (`design/10-process-definition.md` §3.1), because compensation is a
-path through Orders' own operations.
+The platform's function-level `on_failure` / `on_cancel` handler already takes any registered GTS
+Function reference (`x-gts-ref: gts.cf.core.sless.function.v1~*`,
+[DESIGN_GTS_SCHEMAS.md](../../../serverless-runtime/docs/DESIGN_GTS_SCHEMAS.md) lines 477–490)
+and is invoked with a `CompensationContext` carrying the original invocation identity
+([DESIGN.md](../../../serverless-runtime/docs/DESIGN.md) lines 402–413). A thin Function this gear
+registers, whose only work is to call this gear's unwind step routes for the failed invocation's
+instance, is therefore expressible today; nothing about targeting is asked. What remains asked is
+**identity**: the outbound HTTP call that Function makes **SHOULD** be made as the
+serverless-runtime service principal under the same terms as
+`…-upreq-serverless-runtime-pdp-guarded-call`, carrying the failed invocation's
+`resource_tenant_id`, so the step route's principal check and the PDP's `process_step × execute`
+decision admit it. The canonical definition declares no handler today
+(`design/10-process-definition.md` §3.1), because compensation is a path through Orders' own
+operations; declaring one also changes the platform path of a failure from `failed →
+dead_lettered` to `failed → compensating` (DESIGN.md line 457), which the re-drive of D-86 would
+then have to accept.
 
 - **What the design cannot do until it lands**: nothing it needs for correctness — the safety net
   for an invocation that ends without `report-outcome` is the reconciliation sweep's
@@ -843,8 +962,8 @@ path through Orders' own operations.
 
 | Priority | Requirements |
 |----------|-------------|
-| `p1` (critical) | `…-upreq-overlap-presence-read`, `…-upreq-compensation-cancel-reason`, `…-upreq-explicit-start-instant`, `…-upreq-in-flight-rejection`, `…-upreq-cancel-accepted-transition`, `…-upreq-nonterminal-status-read`, `…-upreq-provisioning-latency-budget`, `…-upreq-identity-envelope-echo`, `…-upreq-payment-authorization-outcome`, `…-upreq-generic-approval-expectations-contract`, `…-upreq-submitted-ttl-visibility`, `…-upreq-catalog-dependency-topology-read`, `…-upreq-pii-classification-ruling`, `…-upreq-event-broker-shared-prerequisites`, `…-upreq-pdp-policy-integration` |
-| `p1` (critical), platform path | `…-upreq-serverless-runtime-readiness-gate`, `…-upreq-serverless-runtime-event-triggers-gts`, `…-upreq-serverless-runtime-pdp-guarded-call`, `…-upreq-serverless-runtime-attempt-and-deadline-propagation`, `…-upreq-serverless-runtime-history-residency-retention`, `…-upreq-serverless-runtime-definition-versioning-validation-hook`, `…-upreq-serverless-runtime-signals`, `…-upreq-serverless-runtime-dead-letter-operator-visibility` |
+| `p1` (critical) | `…-upreq-overlap-presence-read`, `…-upreq-compensation-cancel-reason`, `…-upreq-explicit-start-instant`, `…-upreq-in-flight-rejection`, `…-upreq-cancel-accepted-transition`, `…-upreq-nonterminal-status-read`, `…-upreq-provisioning-latency-budget`, `…-upreq-identity-envelope-echo`, `…-upreq-payment-authorization-outcome`, `…-upreq-generic-approval-expectations-contract`, `…-upreq-submitted-ttl-visibility`, `…-upreq-lifecycle-thin-events`, `…-upreq-catalog-dependency-topology-read`, `…-upreq-pii-classification-ruling`, `…-upreq-event-broker-shared-prerequisites`, `…-upreq-pdp-policy-integration` |
+| `p1` (critical), platform path | `…-upreq-serverless-runtime-readiness-gate`, `…-upreq-serverless-runtime-event-triggers-gts`, `…-upreq-serverless-runtime-consumed-event-member-storage`, `…-upreq-serverless-runtime-pdp-guarded-call`, `…-upreq-serverless-runtime-attempt-and-deadline-propagation`, `…-upreq-serverless-runtime-history-residency-retention`, `…-upreq-serverless-runtime-definition-versioning-validation-hook`, `…-upreq-serverless-runtime-signals`, `…-upreq-serverless-runtime-dead-letter-operator-visibility` |
 | `p2` (important) | `…-upreq-correlation-propagation`, `…-upreq-serverless-runtime-failure-handler-target` |
 
 `cpt-cf-bss-orders-workflow-upreq-pdp-policy-integration` is `p1` because every caller-driven

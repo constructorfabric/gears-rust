@@ -48,11 +48,12 @@ workflow data and branch on it with `switch`; done naively, the frozen plan, the
 with its resolved total, the approver's identity and every last-error text would be in Temporal
 history.
 
-What may a task input or output contain?
+What may a task input or output contain, and what may the engine keep of the events that start
+and advance an instance?
 
 ## Decision Drivers
 
-* PRD §15: no commercial data in engine history is the criterion Q-01 is evaluated on; the content of task inputs and outputs is the only lever this gear holds over what the engine persists.
+* PRD §15: no commercial data in engine history is the criterion Q-01 is evaluated on; the content of task inputs and outputs, and what the start trigger and every `listen` keep of the events they consume, are what the engine persists.
 * PRD §6.1 and the data-classification note: process artifacts carry commercial order context and must be retained at audit grade by this gear; a copy in a store this gear does not own is a second, uncontrolled retention.
 * ADR-0010: every read of commercial data is a PDP-authorized read inside this gear, under a `(resource, action)` pair and a compiled `AccessScope`. Data that crosses into the engine is readable through the platform's timeline endpoints under the platform's authorization, not this gear's.
 * Approver identities are authorization inputs (`owf_approval_gate.assigned_principal`, ADR-0010) and personal data (D-61 erasure rules); they must not be copied into a history this gear cannot erase.
@@ -97,6 +98,27 @@ reach. Concretely:
   lookup tuple); the frozen plan or any part of it; approval context; the saga/compensation log;
   free text of any kind — error messages, manual-task text, operator notes; and anything the PRD
   classifies as commercial order context (§6.1, line 263).
+* **Trigger inputs and consumed events.** The rule covers them as well as task data. The start
+  trigger's input is the raw `$workflow.input` (Serverless Workflow DSL 1.0.0, dsl.md *Runtime
+  expression arguments*) and a `listen` output is the array of consumed events (dsl-reference.md
+  *Listen*), and the events as published are not references: Lifecycle's `OrderSubmitted` carries
+  the tenant axes, per-line references and pins and the resolved total's per-line net components;
+  `OrderApproved` and `OrderRejected` the deciding authority; `OrderHeld` the hold reason;
+  `OrderCancelled` the cancelling actor and the cancel reason; `OrderCompleted` the
+  line-to-subscription mapping
+  ([Lifecycle `01 §4.4`](../../../orders-lifecycle/docs/design/01-foundation.md#44-events-audit-and-the-outbox-normative),
+  lines 2396–2406); the Subscriptions outcome event carries a `subscriptionId`. The start trigger
+  and every Lifecycle, Generic Approval and Subscriptions `listen` **MUST** therefore keep only the
+  members of the permitted list above — the envelope's event identity, `orderId`, `orderVersion`
+  and the fields a filter or correlation needs — through the workflow's `input.from` and the
+  `listen` task's `read` mode, `output.as` and `export.as`. Whether that filtering keeps the raw
+  event out of **history**, rather than only out of the workflow data, is not stated by the
+  platform, so two routes are registered in `UPSTREAM_REQS.md` and either closes the gap: (1) the
+  platform persists only the selected members
+  (`cpt-cf-bss-orders-workflow-upreq-serverless-runtime-consumed-event-member-storage`); (2)
+  Lifecycle publishes thin event variants, or confirms that the full events may be stored
+  (`cpt-cf-bss-orders-workflow-upreq-lifecycle-thin-events`), with the Generic Approval decision
+  event reference-only under `cpt-cf-bss-orders-workflow-upreq-generic-approval-expectations-contract`.
 * **Operations read commercial data under the PDP, inside Orders.** Every operation resolves
   `correlationId` (and `taskRef`/`gateRef` where given) to rows in this gear's record and performs
   its Lifecycle, Subscriptions, Payments and Generic Approval reads and writes through the seam
@@ -106,7 +128,9 @@ reach. Concretely:
   never authority). The resolved total reaches the approval request from Lifecycle through
   `obtain-verdict`/`open-gates` and is never returned to the definition.
 * **How this bounds the PRD §15 criteria.** *Which commercial data would sit in engine history*:
-  none — identifiers and enums only. *Isolation and retention of that history*: what remains to
+  none in task inputs and outputs — identifiers and enums only; in trigger inputs and consumed
+  events, none once one of the two routes above lands, and the events as published until then
+  (the residual below). *Isolation and retention of that history*: what remains to
   isolate and retain is a set of identifiers that name rows in this gear's record; their exposure
   through the platform timeline discloses that an order and a process exist and how far the
   process has come, not what was ordered, for whom, at what price or who approved it. *BSS/OSS
@@ -119,7 +143,11 @@ reach. Concretely:
   line 100; retention is a `TenantRuntimePolicy` concern, DESIGN.md line 739). That history must
   be residency-pinned to the jurisdictions this gear's tenants require, and its retention stated,
   before Q-01 closes (ADR-0011, Q-01 part 2). This is an upstream ask in `UPSTREAM_REQS.md`,
-  serverless-runtime section, not an assertion.
+  serverless-runtime section, not an assertion. **Until the member-storage ask or the Lifecycle
+  thin-event ask lands, the start trigger's input and the consumed events may sit in history in
+  full**: the Lifecycle commercial fields listed above, the Subscriptions `subscriptionId`, and
+  whatever the unspecified Generic Approval decision event carries. That is the stated residual of
+  this decision, and the platform path is not ready for a tenant for whom it is disqualifying.
 
 ### Consequences
 
@@ -141,8 +169,10 @@ operation given only `correlationId` and `resource_tenant_id` reconstructs the p
 and the intent it needs from this gear's record; a test that `obtain-verdict` and `open-gates`
 pass the resolved total to the approval seam and return only a verdict class to the caller; a
 review check that no operation logs its request or response at a level that reaches the platform;
-and — once the plugin exists — an end-to-end run followed by a read of the invocation timeline
-asserting that no value outside the permitted list appears in any recorded task input or output.
+a conformance check that the start trigger and every `listen` of the canonical definitions
+select only permitted members; and — once the plugin exists — an end-to-end run followed by a read
+of the invocation timeline asserting that no value outside the permitted list appears in any
+recorded task input or output, trigger input or consumed event.
 
 ## Pros and Cons of the Options
 
@@ -182,9 +212,11 @@ D-65 onward.
 - **DESIGN**: [DESIGN.md](../DESIGN.md) §4.2, §4.3;
   [`design/10-process-definition.md`](../design/10-process-definition.md) (reference schemas);
   each slice §3.3 (`input`/`output` per operation)
-- **Decisions register**: [`DECISIONS.md`](../DECISIONS.md) — Q-01, D-61, D-64
+- **Decisions register**: [`DECISIONS.md`](../DECISIONS.md) — Q-01, D-61, D-64, D-66 (as amended), Q-12
 - **Upstream asks**: [`UPSTREAM_REQS.md`](../UPSTREAM_REQS.md) — serverless-runtime section
-  (history residency and retention)
+  (history residency and retention; member-only storage of trigger inputs and consumed events);
+  Orders Lifecycle section (thin event variants); Generic Approval section (reference-only
+  decision event)
 - **Platform**: serverless-runtime [DESIGN.md](../../../../serverless-runtime/docs/DESIGN.md)
   §1.4.2, §3.1 (`TenantRuntimePolicy`), §3.3 (Executions API);
   [ADR-0004](../../../../serverless-runtime/docs/ADR/0004-cpt-cf-serverless-runtime-adr-temporal-workflow-engine.md);

@@ -78,11 +78,14 @@ The distinction matters where a create is accepted **after** an activation, whic
 > that tried to express the walk as per-line tasks could only order by wave, which is exactly the
 > second formulation this ADR refuses. An incompletable compensating action is still a manual task
 > with a leg-specific reason and a non-terminal order; the operation returns a `terminal` outcome
-> class to the definition and the manual task carries the detail (ADR-0013). Whether the
-> platform's function-level `on_failure`/`on_cancel` safety net (serverless-runtime DESIGN.md
-> lines 402–409), which takes a registered GTS function reference, can target this gear's
-> `compensate-order` route is an upstream ask; until it can, the safety net for an invocation that
-> ends without `report-outcome` is the reconciliation sweep's `settle-from-lookup`.
+> class to the definition and the manual task carries the detail (ADR-0013). The platform's
+> function-level `on_failure`/`on_cancel` safety net (serverless-runtime DESIGN.md lines 402–413)
+> takes any registered GTS Function reference (DESIGN_GTS_SCHEMAS.md lines 477–490), so a thin
+> Function that calls this gear's unwind step routes is expressible; the upstream ask
+> (`…-upreq-serverless-runtime-failure-handler-target`, `p2`) is only that its outbound call runs
+> as the serverless-runtime service principal the step routes admit. The canonical definition
+> declares no handler; the safety net for an invocation that ends without `report-outcome` is the
+> reconciliation sweep's `settle-from-lookup`.
 
 ### Confirmation
 

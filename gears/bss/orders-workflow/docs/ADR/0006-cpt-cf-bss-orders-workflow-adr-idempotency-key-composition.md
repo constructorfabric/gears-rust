@@ -103,8 +103,10 @@ derived from, the process `correlationId`.
 
 > **Amended 2026-09-24 by ADR-0011** (`cpt-cf-bss-orders-workflow-adr-flow-as-platform-definition`):
 > retries are now the platform's, and the key composition is what makes that safe. A platform
-> task retry — the plugin's per-task `RetryPolicy` (serverless-runtime DESIGN.md lines 354–366)
-> or the `retry` control action, which re-runs "with same parameters" (line 888) — **re-invokes
+> task retry — the definition's per-task `use.retries` policy referenced from `catch.retry`
+> (Serverless Workflow DSL 1.0.0, dsl-reference.md *Try*, *Retry*), executed by the plugin, or the
+> `retry` control action, which re-runs "with same parameters" (serverless-runtime DESIGN.md
+> line 888); the platform `RetryPolicy` is invocation-level (lines 354–370) — **re-invokes
 > the step operation with the same inputs**, and because every key family is a deterministic
 > composition over those inputs (`orderId`, `orderVersion`, the line or gate resolved from
 > `taskRef`/`gateRef`, wave, kind), the same inputs derive the **same key**: the re-invocation is
