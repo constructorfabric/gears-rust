@@ -157,6 +157,83 @@ def test_s3_single_part_full_lifecycle(
     )
 
 
+@pytest.mark.timeout(60)
+def test_s3_replay_put_with_different_bytes_does_not_overwrite(
+    lifecycle_s3_base_url: str,
+    lifecycle_s3_auth_headers: dict,
+    gts_file_type: str,
+):
+    """A second `PUT` on the same signed upload URL, carrying DIFFERENT bytes
+    than the first, must not overwrite the already-published version.
+
+    Per `docs/api.md` ("An honest PUT retry ... is idempotent: `publish_exclusive`
+    is replay-safe and finalize converges an already-`available` version with
+    matching size/hash to the same headers — never a 409") a retry with the
+    SAME bytes converges silently; this test is the other half of that
+    contract — a retry with DIFFERENT bytes cannot converge (the measured
+    hash no longer matches the already-`available` version), so
+    `bin/sidecar.rs::upload`'s `!created` branch reports `409` (see
+    `docs/operations.md`'s "conditional writes" section and the `upload`
+    decision table) rather than silently replacing the stored object.
+    `publish_exclusive`'s own create-exclusive write (`If-None-Match: *`,
+    verified against `s3s-fs` in this crate's `s3_tests.rs`) is what makes the
+    second PUT's bytes never reach the backend at all.
+    """
+    client = httpx.Client(
+        base_url=lifecycle_s3_base_url,
+        headers=lifecycle_s3_auth_headers,
+        timeout=REQUEST_TIMEOUT,
+        follow_redirects=False,
+    )
+
+    first_payload = b"first-publish-wins: \xca\xfe\xba\xbe"
+    replay_payload = b"a completely different, and longer, second attempt"
+    assert replay_payload != first_payload
+    assert len(replay_payload) != len(first_payload)
+
+    # ── 1. Create a file and get the signed upload URL ────────────────────
+    ticket = _create_file(client, gts_file_type)
+    file_id: str = ticket["file_id"]
+    upload_url: str = ticket["upload_url"]
+
+    # ── 2. First PUT succeeds and auto-binds ──────────────────────────────
+    first_resp = httpx.put(upload_url, content=first_payload, timeout=REQUEST_TIMEOUT)
+    assert first_resp.status_code == 200, (
+        f"first PUT {upload_url!r} failed: {first_resp.status_code}\n{first_resp.text}"
+    )
+    assert first_resp.headers.get("x-fs-bound") == "true", (
+        f"expected X-FS-Bound: true on the first, winning PUT, "
+        f"got headers: {dict(first_resp.headers)}"
+    )
+
+    # ── 3. Replay the same signed URL with DIFFERENT bytes — must fail,
+    #        not overwrite ───────────────────────────────────────────────
+    replay_resp = httpx.put(upload_url, content=replay_payload, timeout=REQUEST_TIMEOUT)
+    assert replay_resp.status_code == 409, (
+        f"replay PUT {upload_url!r} with different bytes should be rejected "
+        f"with 409 (see docs/api.md/operations.md), got: "
+        f"{replay_resp.status_code}\n{replay_resp.text}"
+    )
+
+    # ── 4. Downloaded bytes are still the FIRST payload, never the replay ─
+    dl_ticket_resp = client.get(f"{API_BASE}/files/{file_id}/download-url")
+    assert dl_ticket_resp.status_code == 200, (
+        f"GET /files/{file_id}/download-url failed: "
+        f"{dl_ticket_resp.status_code}\n{dl_ticket_resp.text}"
+    )
+    download_url = dl_ticket_resp.json()["download_url"]
+
+    dl_resp = httpx.get(download_url, timeout=REQUEST_TIMEOUT)
+    assert dl_resp.status_code == 200, (
+        f"GET {download_url!r} failed: {dl_resp.status_code}\n{dl_resp.text}"
+    )
+    assert dl_resp.content == first_payload, (
+        "published bytes were overwritten by the rejected replay PUT!\n"
+        f"  expected (first payload): {first_payload!r}\n"
+        f"  got:                      {dl_resp.content!r}"
+    )
+
+
 @pytest.mark.timeout(90)
 def test_s3_multipart_full_lifecycle(
     lifecycle_s3_base_url: str,

@@ -224,50 +224,56 @@ jobs:
       # testing/e2e/suites/file_storage/lifecycle_s3/conftest.py's module
       # docstring, "Prerequisites" / "Running the S3 e2e locally") — local-fs
       # cannot do multipart at all, so without this double the suite's only
-      # multipart-over-S3 coverage never actually runs. This starts Option B
-      # from that docstring (MinIO via docker) rather than Option A
-      # (`cargo install s3s-fs`): this runner already has a reachable Docker
-      # daemon with no extra setup (the usage-collector step further below
-      # relies on that same daemon via testcontainers), so a prebuilt image
-      # is faster and more reliable here than compiling and installing a
-      # crates.io binary on every run.
-      - name: Start S3 test double (MinIO) for file-storage e2e
-        env:
-          # Floating `minio`/`mc` tags make this step non-reproducible and
-          # liable to break without warning. Pinned to a specific release, by
-          # digest, so the image can't change under us.
-          #
-          # Pulled from quay.io, not Docker Hub: `docker.io/minio/minio` now
-          # answers every pull — including `:latest` — with "pull access
-          # denied ... repository does not exist or may require 'docker
-          # login'", which took this step (and only this step) down with
-          # exit 125. quay.io is MinIO's other official registry and serves
-          # the very same images: these digests are unchanged from the
-          # Docker Hub ones, because they name the same multi-arch manifest
-          # list. Keep them pointing at the LIST, never at one platform's
-          # manifest — an arm64-only digest pulls happily on a laptop and
-          # then dies with "exec format error" on the amd64 runner.
-          MINIO_IMAGE: "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e"
-          MC_IMAGE: "quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727"
+      # multipart-over-S3 coverage never actually runs. `s3s-fs` is the same
+      # in-process, filesystem-backed double the crate's own dev-dependency
+      # tests use (`s3s`/`s3s-fs` 0.14.1 in
+      # gears/file-storage/file-storage/Cargo.toml), so its conditional-write
+      # behaviour (`If-None-Match: *` -> 412, see docs/operations.md) is
+      # already exercised by the crate's own test suite. It also isn't
+      # fetched from any external image registry, unlike a container image.
+      - name: Cache s3s-fs binary
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/s3s-fs-install
+          key: s3s-fs-0.14.1-${{ runner.os }}
+
+      - name: Install s3s-fs (S3 test double for file-storage e2e)
+        # --locked, same as this workflow's other pinned crates.io binaries
+        # (see gts-validation.yml's gts-validator install). On a cache hit
+        # cargo detects the existing install under --root and skips the
+        # compile.
         run: |
-          docker run -d --name fs-e2e-minio -p 19099:9000 \
-            -e MINIO_ROOT_USER=test-access-key -e MINIO_ROOT_PASSWORD=test-secret-key \
-            "$MINIO_IMAGE" server /data
+          cargo install s3s-fs --version 0.14.1 --locked --features binary \
+            --root "${{ runner.temp }}/s3s-fs-install"
+
+      - name: Start S3 test double (s3s-fs) for file-storage e2e
+        run: |
+          set -euo pipefail
+          mkdir -p testing/e2e/logs
+          DATA_DIR="${{ runner.temp }}/s3s-fs-data"
+          mkdir -p "$DATA_DIR/file-storage-e2e"
+          "${{ runner.temp }}/s3s-fs-install/bin/s3s-fs" --host 127.0.0.1 --port 19099 \
+            --access-key test-access-key --secret-key test-secret-key \
+            "$DATA_DIR" > testing/e2e/logs/s3s-fs.log 2>&1 &
+          echo "S3S_FS_PID=$!" >> "$GITHUB_ENV"
+          disown
           for i in $(seq 1 30); do
-            if curl -fs http://127.0.0.1:19099/minio/health/live >/dev/null 2>&1; then
+            if curl -s -o /dev/null http://127.0.0.1:19099/; then
               break
+            fi
+            if [ "$i" -eq 30 ]; then
+              echo "s3s-fs did not become reachable on 127.0.0.1:19099 within 30s" >&2
+              exit 1
             fi
             sleep 1
           done
-          docker run --rm --network host --entrypoint sh "$MC_IMAGE" -c \
-            "mc alias set local http://127.0.0.1:19099 test-access-key test-secret-key && \
-             mc mb local/file-storage-e2e"
 
       - name: Run E2E tests
         env:
           INPUT_MODE: ${{ inputs.mode }}
-          # See "Start S3 test double" above — values match conftest.py's
-          # own defaults, set explicitly so this doesn't silently drift.
+          # See "Start S3 test double (s3s-fs)" above — values match
+          # conftest.py's own defaults, set explicitly so this doesn't
+          # silently drift.
           FS_E2E_S3_ENDPOINT: "http://127.0.0.1:19099"
           FS_E2E_S3_BUCKET: "file-storage-e2e"
           FS_E2E_S3_ACCESS_KEY: "test-access-key"
@@ -282,9 +288,12 @@ jobs:
             make e2e-local            # PR / manual-smoke, TODO: switch to e2e-local-smoke later
           fi
 
-      - name: Stop S3 test double (MinIO)
+      - name: Stop S3 test double (s3s-fs)
         if: always()
-        run: docker rm -f fs-e2e-minio || true
+        run: |
+          if [ -n "${S3S_FS_PID:-}" ]; then
+            kill "$S3S_FS_PID" 2>/dev/null || true
+          fi
 
       # Self-managed suite (launcher: pytest): owns its own offline server.
       - name: Run mini-chat E2E tests

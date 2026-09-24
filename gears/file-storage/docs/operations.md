@@ -342,7 +342,8 @@ the multipart `CompleteMultipartUpload` both carry `If-None-Match: *`, and the e
 Failed` when the key already exists. That is what stops a replayed `PUT` on a still-valid signed URL from overwriting
 bytes that are already published. FileStorage does not probe for this at runtime: an endpoint that silently ignores
 the header degrades to last-write-wins with no error anywhere in the request path, so it **must not** be used with
-this gear. AWS S3 and MinIO (the CI test double) honour it; check any other endpoint before configuring it, with a
+this gear. AWS S3 documents support for it (since 2024-08-20); `s3s-fs` — the test double this crate's own tests and
+CI use — is verified against it by the crate's `s3_tests.rs`. Check any other endpoint before configuring it, with a
 recent AWS CLI v2 (one that accepts `--if-none-match`) and credentials for the target bucket:
 
 ```bash

@@ -326,14 +326,14 @@ pub struct S3BackendConfig {
     /// `BackendRegistry::new`).
     pub id: String,
 
-    /// S3-compatible HTTP(S) endpoint, e.g. `http://127.0.0.1:9000` for
-    /// `MinIO`/`s3s-fs`. `None` means real AWS S3 — the endpoint is derived
-    /// from `region` (`https://s3.{region}.amazonaws.com`).
+    /// S3-compatible HTTP(S) endpoint, e.g. `http://127.0.0.1:19099` for a
+    /// local `s3s-fs` test double. `None` means real AWS S3 — the endpoint
+    /// is derived from `region` (`https://s3.{region}.amazonaws.com`).
     #[serde(default)]
     pub endpoint: Option<String>,
 
     /// AWS region (or the region the S3-compatible endpoint expects for
-    /// `SigV4` signing, e.g. `us-east-1` for most `MinIO`/`s3s-fs` setups).
+    /// `SigV4` signing, e.g. `us-east-1` for most `s3s-fs`-style setups).
     pub region: String,
 
     /// Target bucket name.
@@ -353,9 +353,10 @@ pub struct S3BackendConfig {
     )]
     pub secret_access_key: Option<SecretString>,
 
-    /// `true` for path-style addressing (`MinIO`/`s3s-fs`-style endpoints),
-    /// `false` for virtual-hosted-style real S3. Defaults to `true` since
-    /// most non-AWS S3-compatible endpoints require it.
+    /// `true` for path-style addressing (`s3s-fs`-style endpoints and most
+    /// other non-AWS S3-compatible stores), `false` for virtual-hosted-style
+    /// real S3. Defaults to `true` since most non-AWS S3-compatible
+    /// endpoints require it.
     ///
     /// NOTE: `S3Backend::new` (Stage 1) always builds its `rusty_s3::Bucket`
     /// with `UrlStyle::Path` regardless of this flag — path-style addressing
@@ -387,7 +388,7 @@ impl fmt::Debug for S3BackendConfig {
 }
 
 fn default_path_style() -> bool {
-    true // most non-AWS S3-compatible endpoints (MinIO, s3s-fs) require it
+    true // most non-AWS S3-compatible endpoints (e.g. s3s-fs) require it
 }
 
 impl FileStorageConfig {

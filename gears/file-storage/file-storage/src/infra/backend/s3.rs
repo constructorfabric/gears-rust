@@ -83,7 +83,8 @@ const SIGN_DURATION: Duration = Duration::from_mins(1);
 const DEFAULT_MULTIPART_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
 
 /// An S3-compatible storage backend. Talks to any S3-compatible HTTP API
-/// (real AWS S3, `MinIO`, `s3s-fs` in tests) via path-style addressing.
+/// (real AWS S3, `s3s-fs` in tests, or any other S3-compatible endpoint) via
+/// path-style addressing.
 pub struct S3Backend {
     id: String,
     bucket: rusty_s3::Bucket,
@@ -105,8 +106,8 @@ impl S3Backend {
     ///
     /// `endpoint` is the S3-compatible HTTP(S) endpoint (path-style
     /// addressing is used throughout, i.e. `UrlStyle::Path` — matches
-    /// `s3s-fs`/MinIO-style deployments as well as real S3 when path-style is
-    /// explicitly requested).
+    /// `s3s-fs`-style deployments and most other non-AWS S3-compatible
+    /// stores, as well as real S3 when path-style is explicitly requested).
     pub fn new(
         id: impl Into<String>,
         endpoint: url::Url,
@@ -160,7 +161,7 @@ impl S3Backend {
     ///
     /// - `endpoint: None` derives a real-AWS endpoint from `region`
     ///   (`https://s3.{region}.amazonaws.com`); `Some(url)` is used verbatim
-    ///   (`MinIO`/`s3s-fs`/any other S3-compatible endpoint).
+    ///   (`s3s-fs` or any other S3-compatible endpoint).
     /// - Credentials fall back to the standard `AWS_ACCESS_KEY_ID`/
     ///   `AWS_SECRET_ACCESS_KEY` environment variables when the config entry
     ///   itself leaves them unset — a deliberately simple fallback, not a
@@ -618,9 +619,10 @@ impl StorageBackend for S3Backend {
     /// **Provider requirement:** the target endpoint MUST honour conditional
     /// writes — native AWS S3 (since 2024-08-20) and any S3-compatible store
     /// implementing `If-None-Match: *` on `PutObject`/`CompleteMultipartUpload`
-    /// (e.g. recent `MinIO`). Against an endpoint that silently ignores the
-    /// header this degrades to last-write-wins; validating a specific
-    /// deployment's support is part of the ADR-0005 release gate.
+    /// (verified here against `s3s-fs` — see `s3_tests.rs`). Against an
+    /// endpoint that silently ignores the header this degrades to
+    /// last-write-wins; validating a specific deployment's support is part
+    /// of the ADR-0005 release gate.
     async fn publish_exclusive(
         &self,
         path: &str,
