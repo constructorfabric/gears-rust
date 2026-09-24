@@ -5,9 +5,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use toolkit::api::canonical_prelude::*;
-use toolkit::api::operation_builder::{
-    ParamLocation, ParamSpec, ResponseHeaderSpec, ResponseHeaderType,
-};
+use toolkit::api::operation_builder::{ParamSpec, ResponseHeaderSpec, ResponseHeaderType};
 use toolkit::api::{OpenApiRegistry, OperationBuilder};
 
 use crate::api::rest::value_dto::{
@@ -21,36 +19,26 @@ use crate::infra::value_writes::WriteCoordinator;
 const TAG: &str = "settings-values";
 
 fn if_match_param() -> ParamSpec {
-    ParamSpec {
-        name: "If-Match".to_owned(),
-        location: ParamLocation::Header,
-        required: true,
-        description: Some("The value state tag the caller last read for this scope, or `absent` when no row existed; a moved value is refused 412".to_owned()),
-        param_type: "string".to_owned(),
-        array: false,
-    }
+    ParamSpec::header("If-Match").required(true).description(
+        "The value state tag the caller last read for this scope, or `absent` when no row \
+         existed; a moved value is refused 412",
+    )
 }
 
 fn step_up_param() -> ParamSpec {
-    ParamSpec {
-        name: "X-Step-Up-Token".to_owned(),
-        location: ParamLocation::Header,
-        required: false,
-        description: Some("A fresh token from the identity provider proving the caller re-authenticated just now; absent, the bearer token itself is checked. Required by declarations that require step-up".to_owned()),
-        param_type: "string".to_owned(),
-        array: false,
-    }
+    ParamSpec::header("X-Step-Up-Token")
+        .required(false)
+        .description(
+            "A fresh token from the identity provider proving the caller re-authenticated just \
+         now; absent, the bearer token itself is checked. Required by declarations that \
+         require step-up",
+        )
 }
 
 fn tenant_param() -> ParamSpec {
-    ParamSpec {
-        name: "tenant".to_owned(),
-        location: ParamLocation::Query,
-        required: false,
-        description: Some("Target tenant id; omitted, the caller's own tenant".to_owned()),
-        param_type: "string".to_owned(),
-        array: false,
-    }
+    ParamSpec::query("tenant")
+        .required(false)
+        .description("Target tenant id; omitted, the caller's own tenant")
 }
 
 fn etag_header() -> ResponseHeaderSpec {

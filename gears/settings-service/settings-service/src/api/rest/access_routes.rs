@@ -5,9 +5,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use toolkit::api::canonical_prelude::*;
-use toolkit::api::operation_builder::{
-    ParamLocation, ParamSpec, ResponseHeaderSpec, ResponseHeaderType,
-};
+use toolkit::api::operation_builder::{ParamSpec, ResponseHeaderSpec, ResponseHeaderType};
 use toolkit::api::{OpenApiRegistry, OperationBuilder};
 use toolkit_db::{DBProvider, DbError};
 
@@ -17,25 +15,16 @@ use crate::api::rest::access_handlers::{self as handlers, ConcreteAccessService}
 const TAG: &str = "settings-tenant-access";
 
 fn tenant_param() -> ParamSpec {
-    ParamSpec {
-        name: "tenant".to_owned(),
-        location: ParamLocation::Query,
-        required: true,
-        description: Some("The tenant the restriction is about, never the caller".to_owned()),
-        param_type: "string".to_owned(),
-        array: false,
-    }
+    ParamSpec::query("tenant")
+        .required(true)
+        .description("The tenant the restriction is about, never the caller")
 }
 
 fn if_match_param() -> ParamSpec {
-    ParamSpec {
-        name: "If-Match".to_owned(),
-        location: ParamLocation::Header,
-        required: true,
-        description: Some("The restriction state tag the caller last read for this pair: the stored row's, or `absent`".to_owned()),
-        param_type: "string".to_owned(),
-        array: false,
-    }
+    ParamSpec::header("If-Match").required(true).description(
+        "The restriction state tag the caller last read for this pair: the stored row's, or \
+         `absent`",
+    )
 }
 
 fn etag_header() -> ResponseHeaderSpec {

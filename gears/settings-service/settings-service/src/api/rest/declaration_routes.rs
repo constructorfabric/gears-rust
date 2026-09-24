@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use toolkit::api::operation_builder::{
-    OperationBuilderODataExt, ParamLocation, ParamSpec, ResponseHeaderSpec, ResponseHeaderType,
+    OperationBuilderODataExt, ParamSpec, ResponseHeaderSpec, ResponseHeaderType,
 };
 use toolkit::api::{OpenApiRegistry, OperationBuilder};
 use toolkit_db::{DBProvider, DbError};
@@ -27,37 +27,23 @@ const TAG: &str = "settings-declarations";
 
 /// The step-up assertion a lifecycle change or a loosened gate presents.
 fn step_up_param() -> ParamSpec {
-    ParamSpec {
-        name: "X-Step-Up-Token".to_owned(),
-        location: ParamLocation::Header,
-        required: false,
-        description: Some(
+    ParamSpec::header("X-Step-Up-Token")
+        .required(false)
+        .description(
             "A fresh token from the identity provider proving the caller \
-             re-authenticated just now; absent, the bearer token itself is checked. \
-             Required by a retire, a revive, and any edit that loosens a gate or a \
-             classification."
-                .to_owned(),
-        ),
-        param_type: "string".to_owned(),
-        array: false,
-    }
+         re-authenticated just now; absent, the bearer token itself is checked. \
+         Required by a retire, a revive, and any edit that loosens a gate or a \
+         classification.",
+        )
 }
 
 /// The `If-Match` a declaration mutation presents.
 fn if_match_param() -> ParamSpec {
-    ParamSpec {
-        name: "If-Match".to_owned(),
-        location: ParamLocation::Header,
-        required: true,
-        description: Some(
-            "The `ETag` from the caller's last read of this declaration. Absent -> 428; \
-             stale -> 412. The edit happens only against the representation the caller \
-             saw."
-                .to_owned(),
-        ),
-        param_type: "string".to_owned(),
-        array: false,
-    }
+    ParamSpec::header("If-Match").required(true).description(
+        "The `ETag` from the caller's last read of this declaration. Absent -> 428; \
+         stale -> 412. The edit happens only against the representation the caller \
+         saw.",
+    )
 }
 
 /// The `Location` of the declaration a create or revive answers with.

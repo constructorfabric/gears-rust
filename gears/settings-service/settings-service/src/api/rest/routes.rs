@@ -13,7 +13,7 @@ use std::sync::Arc;
 use axum::Router;
 use toolkit::api::canonical_prelude::*;
 use toolkit::api::operation_builder::{
-    OperationBuilderODataExt, ParamLocation, ParamSpec, ResponseHeaderSpec, ResponseHeaderType,
+    OperationBuilderODataExt, ParamSpec, ResponseHeaderSpec, ResponseHeaderType,
 };
 use toolkit::api::{OpenApiRegistry, OperationBuilder};
 use toolkit_db::{DBProvider, DbError};
@@ -250,19 +250,11 @@ pub fn register_routes(
 /// One definition for `PATCH` and `DELETE`, so the two cannot describe the
 /// header differently -- and so a generated client sends it on both.
 fn if_match_param() -> ParamSpec {
-    ParamSpec {
-        name: "If-Match".to_owned(),
-        location: ParamLocation::Header,
-        required: true,
-        description: Some(
-            "The `ETag` from the caller's last read of this category. Absent -> 428; \
-             stale -> 412. The write happens only against the representation the \
-             caller saw."
-                .to_owned(),
-        ),
-        param_type: "string".to_owned(),
-        array: false,
-    }
+    ParamSpec::header("If-Match").required(true).description(
+        "The `ETag` from the caller's last read of this category. Absent -> 428; \
+         stale -> 412. The write happens only against the representation the \
+         caller saw.",
+    )
 }
 
 /// The `ETag` every category representation carries.
