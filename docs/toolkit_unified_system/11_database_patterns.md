@@ -313,3 +313,4 @@ Raw SQL is **allowed only in migration infrastructure** (migration runner + migr
 - Security data path (AuthN/AuthZ, SecureConn, AccessScope): [`06_authn_authz_secure_orm.md`](./06_authn_authz_secure_orm.md)
 - OData pagination / filtering: [`07_odata_pagination_select_filter.md`](./07_odata_pagination_select_filter.md)
 - Canonical example: `examples/toolkit/users-info/`
+- DB-behavior testing & audit (transaction/concurrency defect catalog, row-lock races, migration hazards): [`14_db_behavior_testing.md`](./14_db_behavior_testing.md)
