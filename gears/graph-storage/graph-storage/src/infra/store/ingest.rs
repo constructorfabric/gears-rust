@@ -1048,6 +1048,11 @@ async fn upsert_node(
     // tombstone told the caller to wait for a purge that had just happened,
     // and a retry policy reading "not before purge" would back off instead of
     // simply re-ingesting.
+    //
+    // The tombstone and the moved-version arms are both reached under real
+    // contention by `a_delete_racing_an_upsert_leaves_no_rewritten_tombstone`.
+    // The vanished arm is not: it needs a hard delete to commit inside this
+    // transaction's window, which no seam in the public API can hold open.
     if written.rows_affected == 0 {
         let settled = node::Entity::find()
             .filter(Condition::all().add(node::Column::Id.eq(id)))
@@ -1322,6 +1327,16 @@ async fn upsert_edge(
     // tombstoned edge is deliberately revived by this very statement, which
     // clears `deleted_at`. What is left is the one case, and it is retryable
     // -- the key is free, so a re-ingest inserts rather than updates.
+    //
+    // Not covered by a case, and said so rather than left to be assumed.
+    // Reaching it needs a hard delete to commit between the read above and
+    // this write, and the two are inside one transaction with no seam to
+    // hold it open at; a test that raced for it would assert nothing on the
+    // runs where the timing did not happen -- the same reasoning the
+    // migration compare-and-set records. What *is* covered is the decision
+    // this branch rests on, that a deleted edge is revived rather than
+    // refused, which `a_deleted_edge_is_revived_by_the_next_upsert` holds
+    // against both stores.
     if written.rows_affected == 0 {
         return Err(GraphStoreError::Conflict {
             reason: format!(
@@ -1384,9 +1399,14 @@ pub async fn soft_delete(
                             .await
                             .map_err(map_scope_err)?;
 
+                        // Counted from what the statements matched, not
+                        // from what the scan found: a scope replacement can
+                        // hard-delete a row between the two, and a count the
+                        // caller reconciles against is worth nothing if it
+                        // reports writes that did not land.
                         let mut edges = 0u64;
                         for e in incident {
-                            edge::Entity::update_many()
+                            edges += edge::Entity::update_many()
                                 .col_expr(edge::Column::DeletedAt, Expr::value(Some(now)))
                                 .col_expr(
                                     edge::Column::DeletedBySubjectId,
@@ -1401,11 +1421,11 @@ pub async fn soft_delete(
                                 .scope_with(&scope)
                                 .exec(tx)
                                 .await
-                                .map_err(map_scope_err)?;
-                            edges += 1;
+                                .map_err(map_scope_err)?
+                                .rows_affected;
                         }
 
-                        node::Entity::update_many()
+                        let removed = node::Entity::update_many()
                             .col_expr(node::Column::DeletedAt, Expr::value(Some(now)))
                             .col_expr(
                                 node::Column::DeletedBySubjectId,
@@ -1420,8 +1440,9 @@ pub async fn soft_delete(
                             .scope_with(&scope)
                             .exec(tx)
                             .await
-                            .map_err(map_scope_err)?;
-                        (1u64, edges)
+                            .map_err(map_scope_err)?
+                            .rows_affected;
+                        (removed, edges)
                     }
                     DeleteRequest::Edge(key) => {
                         let live = edge::Entity::find()
@@ -1452,7 +1473,7 @@ pub async fn soft_delete(
                         if visible.len() != endpoints.len() {
                             return Err(GraphStoreError::NotFound.into());
                         }
-                        edge::Entity::update_many()
+                        let removed = edge::Entity::update_many()
                             .col_expr(edge::Column::DeletedAt, Expr::value(Some(now)))
                             .col_expr(
                                 edge::Column::DeletedBySubjectId,
@@ -1467,8 +1488,9 @@ pub async fn soft_delete(
                             .scope_with(&scope)
                             .exec(tx)
                             .await
-                            .map_err(map_scope_err)?;
-                        (0u64, 1u64)
+                            .map_err(map_scope_err)?
+                            .rows_affected;
+                        (0u64, removed)
                     }
                 };
 
