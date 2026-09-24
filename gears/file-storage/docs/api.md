@@ -106,13 +106,17 @@ Notes:
   `GET /files/{id}/multipart/{upload_id}` (the `upload_id` now arrives from `POST /files`). A plan that collapses to
   one part falls back to the single-part `upload_url` path below. `bind: "auto"` (default) makes the upload itself
   bind the first content — see the `X-FS-Bound` contract and the `complete` `bind_state` field below — for a total of
-  **2 requests** single-part and **N+2** multipart; `bind: "manual"` keeps the staged flow (explicit `bind`).
+  **2 requests** single-part and **N+2** multipart; `bind: "manual"` keeps the staged flow (explicit `bind`, see
+  "Upload, bind, and the conflict retry" below).
 - `POST /files/{id}/versions` takes **no** request body and does **not** read `If-Match`.
 - `GET /files` **requires** both `owner_kind` and `owner_id` query params (`400` if either is missing/invalid). A
-  caller listing their own files (`owner_id == ` the caller's own subject id) proceeds under the ordinary `READ`
-  grant; listing **any other** owner's files additionally requires the caller's `ADMIN_POLICY` authorization scope
+  caller listing with `(owner_kind, owner_id)` equal to the caller's own kind and subject id proceeds under the
+  ordinary `READ` grant; **any other pair** additionally requires the caller's `ADMIN_POLICY` authorization scope
   (`403` otherwise) — this closes an enumeration vector where any tenant member could otherwise list an arbitrary
-  other subject's files via `?owner_kind=user&owner_id=<victim>`. Each returned item's `custom_metadata` is real,
+  other subject's files via `?owner_kind=user&owner_id=<victim>`. The comparison is on the *pair*, not `owner_id`
+  alone, for the same reason `POST /files` checks it that way (see above): `user` and `app` are disjoint owner
+  spaces, so a caller could otherwise pass their own id under the *other* `owner_kind` and have the self-service
+  check pass while actually listing the other owner space's files. Each returned item's `custom_metadata` is real,
   batch-fetched per page (one `IN (...)` query), not an always-empty placeholder.
 - `POST /files` and `POST /files/{id}/versions` return `{ file_id, version_id, upload_url }` (the control plane
   creates a `pending` `file_versions` row for `version_id` before returning the URL). The client `PUT`s the bytes to
@@ -128,7 +132,10 @@ Notes:
   the version is `available`, resolve with a manual `bind` using that ETag as `If-Match`, no re-upload). No headers
   for `bind: "manual"` uploads. An honest `PUT` retry (lost response) is idempotent: `publish_exclusive` is
   replay-safe and finalize converges an already-`available` version with matching size/hash to the same headers —
-  never a 409. With `bind: "manual"` (or `POST /files/{id}/versions`, which never auto-binds), the client follows up
+  never a 409 — **regardless of the upload's bind mode**: the sidecar publishes every single-part upload through the
+  same replay-safe path whether or not the token carries the auto-bind claim, so a `bind: "manual"` retry converges
+  exactly like an auto-bind one, simply with no `X-FS-Bound`/`ETag` headers to report (as on the first call). With
+  `bind: "manual"` (or `POST /files/{id}/versions`, which never auto-binds), the client follows up
   with an explicit `POST /files/{id}/bind` (see "Upload, bind, and the conflict retry" below).
 - `GET /files/{id}/versions` returns a JSON array of version objects. Each carries
   `{ version_id, mime_type, size, hash_algorithm, hash, hash_mode, part_count?, manifest?, status, is_current, created_at }`
@@ -139,7 +146,14 @@ Notes:
   re-served from the stored `version_hash_manifest` row so a client can re-verify `hash` for an already-existing
   version, per [content-hash-modes.md](./features/content-hash-modes.md) §"Client-Side Manifest Re-Verification").
   Note that a multipart upload whose plan had exactly **one part** finalizes as `whole-sha256` (ADR-0006 single-part
-  amendment), so it too carries no `part_count`/`manifest` here.
+  amendment), so it too carries no `part_count`/`manifest` here. `?limit` itself is **not** additionally capped for
+  this — a page of ordinary `whole-sha256` versions is sized exactly like any other listing (`?limit` clamped only
+  to `max_page_size`). Instead, the manifests actually attached to a page are bounded by a 4 MiB aggregate budget:
+  if attaching the next `multipart-composite-sha256` version's manifest, in page order, would push the running
+  total over budget, the page is cut short right before that version (the version already-included even if its own
+  single manifest exceeds the budget alone, so the listing always makes forward progress). Such a page can
+  therefore come back shorter than `?limit` with more versions still to list. There is no `has_more`/`next_offset`
+  field for this — as with any other short page, the client resumes at `offset + <versions actually received>`.
 - `GET /files/{id}/download-url` returns `{ download_url, etag, version_id }`. By default it pins the current
   `content_id`; `?version_id=<v>` pins a specific version.
 - Restoring a prior version is `POST /files/{id}/bind` with that `version_id` (a pointer swap, no re-upload).
@@ -166,6 +180,13 @@ distinct from "not found" → `500`.
 already single-use-scoped to one `(file_id, version_id)`, so the bandwidth win of a conditional download is small.
 (`If-None-Match` → `304` **is** implemented on the control plane's `GET /files/{id}`, which is a distinct surface —
 see "Conditional headers" below.)
+
+**A transient read race.** Both `GET` and `HEAD` resolve the object's size with one `stat`/`HeadObject` call before
+streaming or measuring it. If the backend object's size disagrees with that already-resolved length by the time the
+actual read (full or ranged) reaches the backend, the read is refused **before the first byte is streamed** rather
+than served against a length that no longer matches: `503 Service Unavailable` with `Retry-After: 1` and a short text
+body (`"object changed during read, retry"`). This is a transient-race signal, not a fault — logged at `warn`, not
+`error` — and the recovery is a plain retry. Any other backend read failure is a genuine I/O fault and stays `500`.
 
 The sidecar verifies the signed token and its claims before serving — a valid token is the delegated authorization
 decision, so there is no request-time PDP call and no platform-JWT check of any kind (the `tok.<claim>` predicate
@@ -352,6 +373,16 @@ already-assembled object where possible). Sessions stuck in `completing` past `e
 are backstopped by the cleanup engine's abandoned-session sweep. The complete per-state failure matrix and race
 catalog for both upload paths is [concurrency-and-failure-model.md](./concurrency-and-failure-model.md).
 
+**Wire-spelling stability (`bind_state` / `state`).** `bind_state` (`"bound"`/`"conflict"`/`"manual"`) and the
+multipart session's `state` field (`"in_progress"`/`"completing"`/`"completed"`/`"aborted"`) are stable string
+values, not integers to be renumbered — the spellings above are exhaustive today, but a future release **may add** a
+new value to either set as a backward-compatible, additive change (removing or repurposing an existing value would
+instead be breaking and would require a new API version). A client **MUST** treat any `bind_state`/`state` value it
+does not recognize as "not yet resolved, re-check" — re-`GET`/re-`complete` and read the fresh response — rather
+than as an error, the same posture already required for a recognized `"completing"`. The single-part `X-FS-Bound`
+header carries the same three-value bind-state model (spelled `true`/`conflict`, with no header at all standing in
+for `manual`) and is covered by the same stability contract.
+
 **One-part plans degenerate to `whole-sha256`** (ADR-0006 single-part amendment): when the plan had exactly one
 part, `hash_mode` is `"whole-sha256"`, `content_hash` is plain `sha256(object bytes)` (identical to the single
 part's digest), and `manifest` is **omitted** — there is no composite and no stored manifest row; the version then
@@ -480,12 +511,24 @@ POST /files/{id}/transfer   { "new_owner_kind": "user"|"app", "new_owner_id": "<
 ```
 
 Atomically replaces the file's `owner_kind` + `owner_id`, records an audit row (`TransferOwnership`), and enqueues a
-`file.owner_transferred` event in the same transaction.
+`file.owner_transferred` event in the same transaction. Authorized on the file's ordinary `WRITE` grant, not
+`ADMIN_POLICY` — this gear has no principal directory, so it cannot verify `new_owner_id` names a real, same-tenant
+principal, only that it is not the nil UUID (`400` otherwise); a cross-tenant transfer is structurally impossible,
+since the updated row's `tenant_id` always comes from the existing file, never the request. If the file is deleted
+concurrently between the caller's read and the atomic ownership update, the update matches no row and the response
+is `404` — identical to transferring a `file_id` that never existed.
 
 ## Upload, bind, and the conflict retry
 
 Content is an immutable blob per version; a file's live content is the `content_id` pointer, swapped under optimistic
-CAS. Every write is **presign (control) → `PUT` (data) → finalize (data-plane callback) → bind (control)**:
+CAS. This section spells out the **`bind: "manual"`** flow (and `POST /files/{id}/versions`, which never auto-binds):
+presign (control) → `PUT` (data) → finalize (data-plane callback) → bind (control) — three control-plane touches and
+one data-plane touch, the last control touch an explicit, separate client call. **`bind: "auto"` (the default for
+`POST /files`) skips step 4**: finalize itself swaps `content_id` inline, under the same CAS, and reports the
+outcome via the `X-FS-Bound` header (single-part) / `complete`'s `bind_state` field (multipart) instead of requiring
+a separate `bind` call — see "Single-part bind outcome headers" and "Bind inside complete" above (§P1 control plane
+/ §P2 multipart upload). Everything below — the conflict, the retry, and the "don't re-presign" guidance — applies
+identically to a manual bind and to an auto-bind whose CAS lost and reported `bind_state: "conflict"`.
 
 1. **Presign**: `POST /files` (or `POST /files/{id}/versions`) → `{ file_id, version_id, upload_url }`. The control
    plane creates a `pending` `file_versions` row for `version_id` before returning the signed `upload_url`.
@@ -494,9 +537,11 @@ CAS. Every write is **presign (control) → `PUT` (data) → finalize (data-plan
 3. **Finalize**: once the `PUT` completes, the sidecar calls the control plane's token-authenticated
    `POST /files/{id}/versions/{version_id}/finalize` callback (see
    [Data-plane callbacks](#data-plane-callbacks-sidecar--control-plane-s2s-token-authenticated)). The control plane
-   reads the blob back, verifies size + SHA-256, and flips the version `pending → available`. This step never
-   touches `content_id`.
-4. **Bind**: the client separately calls `POST /files/{id}/bind { version_id }` with `If-Match: "<current content
+   reads the blob back, verifies size + SHA-256, and flips the version `pending → available`. For a `bind: "manual"`
+   upload this step never touches `content_id`; for `bind: "auto"` it also performs the pointer swap inline, in the
+   same transaction, under CAS (see above) — there is no separate step 4 in that case.
+4. **Bind** (`bind: "manual"` only, or a rebind after an auto-bind's CAS lost): the client calls
+   `POST /files/{id}/bind { version_id }` with `If-Match: "<current content
    ETag>"` to swap `content_id := version_id` under optimistic CAS. Binding a version whose upload has not yet been
    finalized (still `pending`) fails with `409`.
 
@@ -542,7 +587,11 @@ avoid leaving this unswept sibling behind.
   every other participant (browser, CDN, proxy, app, logs, SDK transport) MUST treat it as **opaque bytes** and never
   parse it — the format can and will change ("Token Opacity Contract").
 - **Two carriers, same bytes:** the `fs-token` **query** parameter (`?fs-token=<token>`, bare embeddable URL) **or** the
-  `X-FS-Token` **header** (programmatic / batch — credential out of the URL, stable cacheable URL). The token is **never**
+  `X-FS-Token` **header** (programmatic / batch — credential out of the URL, stable cacheable URL). Both may be present
+  on the same request: if they agree, either serves; if they **disagree**, the sidecar treats this as a malformed
+  request (a caller or intermediary that attached two different credentials), rejecting with `400` before either
+  value is ever handed to the verifier — not a query-wins/header-wins ambiguity resolved silently one way. The token
+  is **never**
   carried in `Authorization` — that header always carries the standard platform JWT. `file_id` is **also** the URL
   **path**. **`backend_id` and `backend_path` ARE carried in the token** (`Claims::backend_id`/`backend_path`,
   `infra/signed_url/mod.rs`) — this is deliberate, not an oversight: the sidecar has **no DB connection at all** (see
@@ -715,8 +764,9 @@ access or carry substantially more per-request state in the token than it does t
   multipart initiate whose target backend does not support native multipart (`MULTIPART_NOT_SUPPORTED`); the
   finalize callback's read-back size/hash/mime not matching the sidecar's claim, or no blob present at the
   version's backend path at all (control plane, `POST .../finalize` — see
-  [Data-plane callbacks](#data-plane-callbacks-sidecar--control-plane-s2s-token-authenticated)); or invalid GTS file
-  type format (control plane).
+  [Data-plane callbacks](#data-plane-callbacks-sidecar--control-plane-s2s-token-authenticated)); invalid GTS file
+  type format (control plane); or the sidecar's `fs-token` query param and `X-FS-Token` header both present but
+  disagreeing on the same request (sidecar, any signed-URL route — see "Signed URLs" above).
 - `401 Unauthorized` — the sidecar's `PUT`/`GET`/multipart-part routes require the signed token via the `fs-token`
   query param or `X-FS-Token` header; a request that supplies **no** token at all gets `401` (a request with a token
   that fails to verify gets `403` instead — see below).
@@ -737,7 +787,17 @@ access or carry substantially more per-request state in the token than it does t
     or more planned parts have not been reported yet (`MultipartPartsMissing`; the error detail lists the missing
     part numbers, checked **before** the size check below), the assembled size does not match `declared_size`, or
     the pending version row was removed concurrently.
-  - `create_file` (idempotent retry): the same `idempotency_key` was reused with a materially different request body.
+  - `create_file` (idempotent retry): the same `idempotency_key` was reused with a materially different request body
+    — including `bind` alone, which is deliberately excluded from the request-hash comparison but still checked
+    separately, so a retry that flips `bind` gets this same `409`; the file's owner has changed since the ticket was
+    created (e.g. via `POST /files/{id}/transfer`), so a stale-owner replay no longer matches the request's
+    `(owner_kind, owner_id)`; or the ticket's target version is no longer `pending` (an earlier, successfully
+    delivered `PUT`+finalize already completed it, and only the `201` response back to the client was lost — a
+    replay must not re-mint a fresh upload token against content that already exists). A retry against a key whose
+    file has since been **deleted** is not one of these cases: `idempotency_keys.file_id` carries `ON DELETE CASCADE`
+    from `files`, so the key is removed along with the file, and the retry creates a brand-new file exactly as if the
+    key had never been used. See [operations.md](./operations.md#idempotent-create-semantics) for the full replay
+    contract.
   - `download_url` (`GET /files/{id}/download-url`): the file has no bound content yet (never bound), or the target
     version's upload has not been finalized. This route's OpenAPI registration in `routes.rs` declares only
     `401`/`403`/`404`/`500`, so this `409` is not represented in the generated OpenAPI schema even though the domain
@@ -760,6 +820,10 @@ access or carry substantially more per-request state in the token than it does t
 - `413 Payload Too Large` — upload exceeds the `max_size` claim, aborted mid-stream (sidecar, `PUT`).
 - `416 Range Not Satisfiable` — a well-formed `Range` that cannot be satisfied against the size (sidecar). An
   unparseable `Range` is **not** a `416` — it is ignored and the full body is served with `200`.
+- `503 Service Unavailable` — the sidecar's own response when a backend read (`GET`/`HEAD`, full or range) finds the
+  object's size disagrees with the length already resolved by the caller's earlier `stat`/`HeadObject` — a transient
+  read race, not a fault (see "P1 — Sidecar" above). Carries `Retry-After: 1`; the recovery is a plain retry. Distinct
+  from `502` (control-plane callback failure) and `500` (a genuine backend I/O fault).
 - `429 Too Many Requests` — not implemented as a sidecar per-URL `max_conns` cause (that claim does not exist, see
   "Signed URLs" above); the only live `429` source is the control-plane storage quota check on
   `create_file`/`presign_version`/multipart `initiate` (`QuotaExceeded`). That check is itself only reachable when a

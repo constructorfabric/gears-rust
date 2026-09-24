@@ -26,9 +26,10 @@ gear started with no `file-storage` config section at all gets every default bel
 actually boot**: `require_signing_key_seed` defaults to `true` with `signing_key_seed` unset, and
 `FileStorageConfig::validate()` fails gear init on exactly that combination (see `require_signing_key_seed` below).
 A genuinely zero-config deployment is dev/test-only (set `require_signing_key_seed: false` there).
-`FileStorageConfig::validate()` (called at gear init, before anything is wired up) rejects **seven**
+`FileStorageConfig::validate()` (called at gear init, before anything is wired up) rejects **eight**
 invalid configurations — three missing-secret/zero-interval guards (`sweep_interval_secs == 0` with the sweep
-enabled; `signing_key_seed` absent while required; `finalize_internal_secret` absent while required) and four
+enabled; `signing_key_seed` absent while required; `finalize_internal_secret` absent while required); one absolute
+ceiling (`finalize_token_grace_secs` above `MAX_FINALIZE_TOKEN_GRACE_SECS`, 7 days — see that field below); and four
 cross-field ordering invariants (`default_url_ttl_secs` vs. `max_url_ttl_secs`; `default_page_size` vs.
 `max_page_size`; `default_url_ttl_secs` vs. `orphan_grace_secs`; `multipart_session_ttl_secs` vs.
 `default_url_ttl_secs`) — noted inline below. Function names (rather than line numbers) are used as source pointers
@@ -84,7 +85,11 @@ revocation mechanism to claw it back. Lowering it below `default_url_ttl_secs` i
 ### `finalize_token_grace_secs`
 How far past its `exp` (seconds, default `3600` = 1 hour) the signed upload token is still accepted **on the
 server-to-server finalize and report-part callbacks only** (`Verifier::verify_with_grace`); `0` restores strict
-`exp` enforcement everywhere. It exists because the sidecar verifies the token once, at the start of the `PUT`, and
+`exp` enforcement everywhere. Capped at `MAX_FINALIZE_TOKEN_GRACE_SECS` (`604800` s = 7 days):
+`FileStorageConfig::validate()` fails gear init outright if configured above that ceiling, rather than letting an
+oversized value degrade the finalize/report-part callbacks' `exp` check into a de-facto no-op (`gear.rs` converts
+this field to `i64` via a saturating `unwrap_or(i64::MAX)`, so an unchecked oversized value would otherwise become
+effectively infinite grace). It exists because the sidecar verifies the token once, at the start of the `PUT`, and
 deliberately never re-checks it mid-stream — `FS_SIDECAR_BODY_IDLE_TIMEOUT_SECS` bounds the gap between chunks, not
 the transfer's total duration — and then forwards that same token to the control plane once the bytes have landed.
 Without the grace, an upload slower than `default_url_ttl_secs` would have every byte durably published and its
@@ -335,9 +340,9 @@ share `FileStorageConfig`. All of these are read once in `main()`.
 | `FS_SIDECAR_CONTROL_URL` | `http://localhost:8080` | Base URL of the control plane, used for the finalize/report-part callbacks. Setting it to the **empty string** explicitly disables the callback (dev/test only) — uploaded versions then stay `pending` forever, since nothing ever calls finalize; production must always set this to a reachable control-plane URL. The scheme is **not** validated, and the callbacks carry `x-fs-token` plus, when configured, the `x-fs-internal-token` shared secret — so keep this hop inside a trusted network boundary or point it at an HTTPS/mTLS endpoint; a plain-HTTP URL puts that secret on the wire in the clear. |
 | `FS_SIDECAR_MAX_BODY_BYTES` | `5368709120` (5 GiB) | Raises axum's blanket request-body floor (default 2 MiB). The limit is a `DefaultBodyLimit` layer on the **whole** sidecar router (`build_router`), so it applies to the request bodies of the single-part `PUT` and of multipart part uploads alike — not only to the single-part route. It does **not** bound download responses: the limit governs request-body extraction, and a download is a `GET`/`HEAD` whose response is streamed past it. This is a transport-layer ceiling only — the real per-request limit is the signed token's `max_size`/`exact_size` claim. **Misconfiguration risk**: setting it below the largest policy-permitted single-part upload causes legitimate uploads to be rejected at the transport layer before the token-level check even runs; because the planner may widen `part_size` up to `MAX_PART_SIZE` (5 GiB) for very large objects, lowering this variable can also reject every *part* of a multipart upload with `413`, which is easy to miss when tuning it with only single-part uploads in mind. |
 | `FS_SIDECAR_BODY_IDLE_TIMEOUT_SECS` | `60` | Maximum pause the sidecar tolerates between two consecutive chunks of a client's request body — and before the first one — on the single-part `PUT` upload and on `upload_multipart_part`; `0` disables the guard. This is a **per-chunk idle** bound, not a deadline on the whole stream: a slow-but-steady multi-GiB upload that never pauses longer than this between chunks still completes, no matter how long it takes overall. It closes a gap neither of the other two body-related controls covers: the signed token's `exp` is checked exactly once, before any body bytes are read, and `FS_SIDECAR_MAX_BODY_BYTES` bounds bytes, not time — without this timeout, a client that opens the connection and then stalls (or never sends at all) could hold the request open indefinitely (CWE-400). A client that goes idle past the deadline gets `408 Request Timeout`; the partial object is cleaned up exactly like any other broken upload stream (see F2 in [concurrency-and-failure-model.md](./concurrency-and-failure-model.md)). Independent of `FS_SIDECAR_FINALIZE_TIMEOUT_SECS`/`FS_SIDECAR_FINALIZE_CONNECT_TIMEOUT_SECS` below, which bound the sidecar→control-plane callback *after* the body stream has already finished. **Misconfiguration risk**: too low rejects legitimate uploads from clients on slow or lossy links (a real, live upload that merely pauses between chunks) with a `408` that looks like a client bug; too high re-opens the held-open-connection exposure this control exists to close. |
-| `FS_SIDECAR_FINALIZE_TIMEOUT_SECS` | `10` | Total request timeout for the sidecar → control-plane finalize/report-part callbacks, applied **per attempt** (up to `CALLBACK_MAX_ATTEMPTS = 3`). The control plane re-reads and re-hashes the whole object inside this window on the single-part finalize path, so the budget has to cover a full read-back, not just the round trip. **Misconfiguration risk**: a single-part object whose read-back reliably exceeds the timeout never finalizes — every attempt is cut short and the client sees `502` even though the bytes landed (F5 in [concurrency-and-failure-model.md](./concurrency-and-failure-model.md)). Raise the timeout for such workloads, or use multipart, whose `complete` performs no full read-back (ADR-0006). |
+| `FS_SIDECAR_FINALIZE_TIMEOUT_SECS` | `10` | Total wall-clock **budget** for the sidecar → control-plane finalize/report-part callback, covering the **entire retry loop** (all `CALLBACK_MAX_ATTEMPTS = 3` attempts and the delays between them), not a per-attempt allowance — `post_with_retry` wraps the whole loop in one deadline sized to this value, so a hung/unreachable control plane can never hold the client's request open for more than this long regardless of how many attempts it takes. The control plane re-reads and re-hashes the whole object inside this window on the single-part finalize path, so the budget has to cover a full read-back, not just the round trip. **Misconfiguration risk**: a single-part object whose read-back reliably exceeds the timeout never finalizes — the client sees `502` even though the bytes landed (F5 in [concurrency-and-failure-model.md](./concurrency-and-failure-model.md)). Raise the timeout for such workloads, or use multipart, whose `complete` performs no full read-back (ADR-0006). |
 | `FS_SIDECAR_FINALIZE_CONNECT_TIMEOUT_SECS` | `5` | Connect timeout for the same callbacks. Together with the timeout above, bounds how long a client's upload request can be held open by an unreachable or hung control plane — without these timeouts, a hung control plane could block the client indefinitely. **Misconfiguration risk**: too low in a high-latency network path causes spurious `502 Bad Gateway` responses to clients on otherwise-successful uploads; too high re-opens the "held open indefinitely" problem these timeouts exist to close. |
-| `FS_SIDECAR_MAX_CONCURRENT_PART_UPLOADS` | `2` | Caps how many `upload_multipart_part` requests take the `multipart_native` write path (`write_multipart_part_native`) concurrently. Each in-flight request on that path buffers up to `MAX_PART_SIZE` (5 GiB) in memory before writing it out, so with no cap N concurrent part uploads could drive memory to roughly `N * MAX_PART_SIZE`; at the default of `2` that is up to 10 GiB. A request that cannot immediately acquire a slot waits briefly (`PART_UPLOAD_ACQUIRE_TIMEOUT`, 200ms) for one to free up before it is rejected with `503`/`Retry-After: 1` — not queued indefinitely, but not rejected outright the instant the limit is hit either. |
+| `FS_SIDECAR_MAX_CONCURRENT_PART_UPLOADS` | `2` | Caps how many `upload_multipart_part` requests take the `multipart_native` write path (`write_multipart_part_native`) concurrently. Each in-flight request on that path buffers up to `MAX_PART_SIZE` (5 GiB) in memory before writing it out, so with no cap N concurrent part uploads could drive memory to roughly `N * MAX_PART_SIZE`; at the default of `2` that is up to 10 GiB. A request that cannot immediately acquire a slot waits briefly (`PART_UPLOAD_ACQUIRE_TIMEOUT`, 200ms) for one to free up before it is rejected with `503`/`Retry-After: 1` — not queued indefinitely, but not rejected outright the instant the limit is hit either. At startup the sidecar checks this worst case against a process memory limit read from the cgroup filesystem (v2 `memory.max`, falling back to v1 `memory.limit_in_bytes`): if a limit is known and would clearly be exceeded, the sidecar refuses to start; if no limit can be read (not Linux, or unbounded), it only logs a warning with the computed worst case. |
 | `FS_SIDECAR_INTERNAL_TOKEN` | unset (header omitted) | Interim shared secret sent as `x-fs-internal-token` on both the finalize and report-part control-plane callbacks — the sidecar's half of the control plane's `finalize_internal_secret`/`require_finalize_internal_secret` (see above). Unset/empty = the header is not sent, matching a control plane with the check disabled. Must match the control plane's configured secret from the moment `finalize_internal_secret` is set on the control plane, regardless of `require_finalize_internal_secret`. |
 | `FS_SIDECAR_S3_BACKENDS` | unset (no S3 backends) | Optional JSON array of `S3BackendConfig` entries (mirrors the control plane's `s3_backends`), folded into the sidecar's own `BackendRegistry` alongside the always-present `local-fs` backend so a control-plane-registered `S3Backend` is reachable by real traffic dispatched per-request via `claims.backend_id`. Credentials embedded in this JSON blob are acceptable for the sidecar (the one component authorized to hold them, per ADR-0003) but should be sourced from a secrets manager / mounted file in production where supported. **Keep this list in lockstep with the control plane's `s3_backends`**: signed tokens carry `backend_id` and `backend_path`, and the sidecar resolves them against *its own* registry, with no reconciliation, handshake or version check between the two. A `backend_id` the sidecar does not know fails the request with `500` ("unknown backend") after the URL was already minted; worse, an id that resolves on both sides but points at a different endpoint/bucket fails silently in the other direction — the upload lands in the wrong bucket and the control plane's read-back finds nothing, surfacing as a `502` on finalize (or a `404` on a later download) rather than as a configuration error. |
 
@@ -355,15 +360,17 @@ given backend path is empty — a retried `PUT` to the same signed URL never ove
 it reports `created: false` and leaves the stored blob untouched. The documented recovery is still to retry the
 `PUT`: if the earlier publish landed but finalize never ran, this retry's measured bytes match what's already
 stored and the handler answers `200` (a benign retry has converged) via a fresh finalize attempt. If the version
-was already finalized, the outcome depends on the token: a replay **with** the `bind_on_finalize` claim
-(auto-bind `POST /files` path) whose size and content hash match the stored version is answered `200` — the
-`X-FS-Bound`/`ETag` headers are recomputed against the file's *current* `content_id`, so a concurrent bind in
-between can still flip `bound`↔`conflict` (F4 in the concurrency-and-failure model, and `write.rs`'s
-already-available replay branch); a manual path replaying an already-`available` version answers `409`
-("version already finalized"), and a mismatched replay is answered `409`/`400` (hash or size check) — never a
-silent overwrite. For the finalize case specifically, the version may already be correctly finalized server-side
-even though the client saw a transient `502` on a preceding attempt (re-verify via `GET /files/{id}/versions`
-before assuming failure).
+was already finalized, the outcome converges **regardless of the token's bind mode**: a replay whose size and
+content hash match the stored version is answered `200` — for a token carrying the `bind_on_finalize` claim
+(auto-bind `POST /files` path) the `X-FS-Bound`/`ETag` headers are recomputed against the file's *current*
+`content_id`, so a concurrent bind in between can still flip `bound`↔`conflict` (F4 in the concurrency-and-failure
+model, and `write.rs`'s already-available replay branch); a manual-bind token converges the same way, simply with no
+bind-outcome headers to report, exactly as on the first call. A mismatched replay (different size or hash) is
+answered `400` (hash/size check) — never a silent overwrite. `409` ("version already finalized") is now reserved for
+a genuine **concurrent** double-finalize — two callbacks racing before either has observed the other's
+already-`available` status — not for an ordinary sequential retry, which converges as above. For the finalize case
+specifically, the version may already be correctly finalized server-side even though the client saw a transient
+`502` on a preceding attempt (re-verify via `GET /files/{id}/versions` before assuming failure).
 
 ## The background cleanup sweep
 
@@ -433,7 +440,7 @@ The sweep runs **four** steps, in this order:
 
 `POST /files` accepts an optional `idempotency_key`. A retry with the same key, by the same `(tenant_id, owner_kind,
 owner_id)`, within `idempotency_ttl_secs`, returns the original response instead of creating a second file — guarded
-by two checks, both of which must pass:
+by checks that must all pass:
 
 - **Subject binding**: the stored row's `subject_id` (the authenticated caller who created the key) must match
   `ctx.subject_id()` on replay; a mismatch is `Forbidden`, not a silent fresh-create fallthrough. Pre-migration rows
@@ -442,6 +449,20 @@ by two checks, both of which must pass:
   `name`, `gts_file_type`, `mime_type`, `custom_metadata`) is recomputed on replay and compared; a mismatch is
   `409 Conflict` ("idempotency key reused with a different request body"), rather than silently replaying the
   original ticket for a request the caller never actually made.
+- **Bind-mode binding**: `bind` is deliberately excluded from `request_hash` (so a key minted before this flag
+  existed still matches), but a replay that changes it is rejected with the same `409` as an outright body mismatch —
+  a caller can never silently flip whether the replayed upload auto-binds.
+- **Owner binding**: a replay re-reads the file's *live* owner and requires it to still match the request's
+  `(owner_kind, owner_id)` — closing the gap where `POST /files/{id}/transfer` changes the file's owner without
+  touching an already-stored ticket. A stale-owner replay is `409`, not a still-valid ticket.
+- **Version-state binding**: a replay is rejected with `409` if the ticket's target version is no longer `pending`
+  — i.e. an earlier, successfully delivered `PUT`+finalize already completed it and only the `201` response back to
+  the client was lost. Re-minting a fresh upload token against content that already exists is not what a replay is
+  for.
+
+Deletion is deliberately **not** one of these replay cases: `idempotency_keys.file_id` carries `ON DELETE CASCADE`
+from `files`, so deleting a file also deletes its idempotency key. A subsequent retry with the same key then finds
+no stored ticket at all and creates a brand-new file, exactly as if the key had never been used — not a `409`.
 
 See `docs/migration.sql`'s `idempotency_keys` table and `docs/api.md`'s `409` summary for the wire-level contract.
 

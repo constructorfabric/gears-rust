@@ -119,6 +119,12 @@ CREATE INDEX files_owner_listing_idx
 CREATE INDEX files_tenant_gts_idx
     ON file_storage.files (tenant_id, gts_file_type);
 
+-- Covers the cleanup engine's versionless-orphan-file sweep
+-- (FileRepo::list_versionless_orphan_files: content_id IS NULL AND created_at <
+-- cutoff, ordered by (created_at, file_id)) (shipped, m20260902_000001_index_hardening).
+CREATE INDEX files_versionless_sweep_idx
+    ON file_storage.files (created_at, file_id)
+    WHERE content_id IS NULL;
 
 -- Table: file_storage.file_versions ------------------------------------------
 -- @cpt-cf-file-storage-dbtable-file-versions
@@ -184,8 +190,21 @@ CREATE TABLE file_storage.file_versions (
 COMMENT ON TABLE file_storage.file_versions IS
     'Immutable content versions. Backend object /{file_id}/{version_id} is never mutated; a content write is a new version + a pointer swap (files.content_id).';
 
--- ADR-0006: hash_mode = 'multipart-composite-sha256' <=> part_count IS NOT NULL; a composite row always has >= 2 parts (a one-part plan degenerates to whole-sha256).
+-- ADR-0006: hash_mode = 'multipart-composite-sha256' <=> part_count IS NOT NULL (shipped, m20260707_000001_content_hash_modes).
 ALTER TABLE file_storage.file_versions
+    ADD CONSTRAINT file_versions_part_count_presence_check
+        CHECK ((hash_mode = 'multipart-composite-sha256') = (part_count IS NOT NULL));
+
+-- A composite row always has >= 2 parts (a one-part plan degenerates to whole-sha256
+-- with part_count = NULL) -- pinned by a later migration, not folded into the CHECK
+-- above, since m20260707 had already applied and cannot be edited in place
+-- (m20260923_000001_part_count_floor). One atomic DROP+ADD CONSTRAINT on Postgres;
+-- SQLite cannot alter a CHECK in place and file_versions cannot safely be rebuilt
+-- (version_hash_manifest's ON DELETE CASCADE FK into it -- see that migration's doc
+-- comment), so on SQLite the floor is two BEFORE INSERT / BEFORE UPDATE OF part_count
+-- triggers with a fixed RAISE(ABORT, ...) instead.
+ALTER TABLE file_storage.file_versions
+    DROP CONSTRAINT file_versions_part_count_presence_check,
     ADD CONSTRAINT file_versions_part_count_presence_check
         CHECK ((hash_mode = 'multipart-composite-sha256') = (part_count IS NOT NULL)
                AND (part_count IS NULL OR part_count >= 2));
@@ -319,6 +338,18 @@ CREATE TABLE file_storage.multipart_uploads (
     lease_until      timestamptz,
     lease_owner      text,
     complete_result  text,
+
+    -- The backend and object path this session's upload actually targets
+    -- (same migration). Set once, at initiate, from the values the pending
+    -- file_versions row was just given -- never recomputed. Nullable because
+    -- a session created before this migration shipped predates the columns
+    -- (backfilled from its file_versions row where one still exists; NULL
+    -- otherwise, a legacy case cleanup falls back on the deterministic path
+    -- for). Read by the expired-multipart-session cleanup when the
+    -- file_versions row is already gone (e.g. reclaimed by a racing sweep
+    -- step) -- see `CleanupEngine::cleanup_expired_session_version_with_file`.
+    backend_id       text,
+    backend_path     text,
 
     -- TTL for abandoned uploads. The reaper marks expired in-flight uploads
     -- as 'aborted' and asks the backend to abort, freeing storage.
