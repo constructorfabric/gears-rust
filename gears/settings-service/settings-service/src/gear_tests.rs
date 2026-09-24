@@ -121,6 +121,18 @@ fn gear_with_writes(
         .set(writes)
         .map_err(|_| "already set")
         .expect("a fresh gear");
+    // The lifecycle also runs the audit retention pass, over the database
+    // with the configured default.
+    gear.db
+        .set(std::sync::Arc::clone(&inner.db))
+        .map_err(|_| "already set")
+        .expect("a fresh gear");
+    gear.config
+        .set(std::sync::Arc::new(
+            serde_json::from_value(serde_json::json!({})).expect("the defaults parse"),
+        ))
+        .map_err(|_| "already set")
+        .expect("a fresh gear");
     std::sync::Arc::new(gear)
 }
 
@@ -625,4 +637,38 @@ async fn init_refuses_a_blank_step_up_pin() {
         .await
         .expect_err("a blank issuer");
     assert!(err.to_string().contains("step_up.issuer"), "got `{err}`");
+}
+
+#[tokio::test]
+async fn a_retention_pass_prunes_what_is_past_its_horizon_and_nothing_younger() {
+    // The pass the lifecycle runs once a day: records past the configured
+    // default leave, a fresh record stays. `now` is passed in, so the test
+    // moves the clock instead of waiting a year.
+    use crate::audit::{AuditOperation, AuditRecord, AuditSink as _};
+    let db = crate::test_support::sqlite_provider().await;
+    let tenant = uuid::Uuid::new_v4();
+    {
+        let conn = db.conn().expect("connection");
+        crate::infra::storage::audit_store::AuditStore
+            .append(
+                &conn,
+                &toolkit_security::AccessScope::allow_all(),
+                AuditRecord::new("k", Some(tenant), "admin", AuditOperation::Change, "req"),
+            )
+            .await
+            .expect("append");
+    }
+    let year = std::time::Duration::from_hours(365 * 24);
+    let now = time::OffsetDateTime::now_utc();
+
+    assert_eq!(
+        SettingsService::prune_once(&db, year, now).await,
+        0,
+        "a fresh record stays"
+    );
+    assert_eq!(
+        SettingsService::prune_once(&db, year, now + time::Duration::days(400)).await,
+        1,
+        "past its horizon, it leaves"
+    );
 }

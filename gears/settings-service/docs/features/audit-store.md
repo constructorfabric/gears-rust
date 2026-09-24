@@ -139,7 +139,7 @@ Two things about the record itself are fixed before it is written. Masking happe
 **Steps**:
 1. [x] - `p1` - **IF** the record carries `retain_until` → its horizon is that instant - `inst-as-ret-1`
 2. [x] - `p1` - **ELSE** its horizon is `occurred_at` plus the configured default, which **MUST NOT** be shorter than twelve months - `inst-as-ret-2`
-3. [x] - `p1` - Pruning deletes only records past their horizon, located through the partial `idx_audit_retention`; no other `DELETE` and no `UPDATE` is ever issued against the table - `inst-as-ret-3`
+3. [x] - `p1` - Pruning, run by the gear's managed lifecycle at start and once a day, deletes only records past their horizon, located through the partial `idx_audit_retention`; no other `DELETE` and no `UPDATE` is ever issued against the table - `inst-as-ret-3`
 4. [x] - `p1` - **RETURN** the horizon; R2 shipping copies a record onward but changes nothing about its online window here - `inst-as-ret-4`
 
 ## 4. States (CDSL)

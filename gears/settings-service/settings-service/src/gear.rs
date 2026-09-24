@@ -111,10 +111,22 @@ impl Default for SettingsService {
 /// How often the managed lifecycle releases the staged secrets nobody claimed.
 const SWEEP_TICK: Duration = Duration::from_mins(1);
 
+/// An interval that delays rather than bursts after a missed tick.
+fn ticking(period: Duration) -> tokio::time::Interval {
+    let mut interval = tokio::time::interval(period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval
+}
+
+/// How often the managed lifecycle prunes audit records past their retention
+/// horizon. A horizon is at least twelve months away, so once a day loses
+/// nothing and keeps the pass cheap.
+const RETENTION_TICK: Duration = Duration::from_hours(24);
+
 impl SettingsService {
-    /// The managed lifecycle: the pending-secret sweep, once a minute until
-    /// cancelled. The only long-running work this gear owns; everything else
-    /// is request-driven.
+    /// The managed lifecycle: the pending-secret sweep once a minute and the
+    /// audit retention pass once a day, until cancelled. The only long-running
+    /// work this gear owns; everything else is request-driven.
     #[allow(
         clippy::redundant_pub_crate,
         reason = "module-private serve entry-point invoked by the toolkit runtime"
@@ -125,22 +137,65 @@ impl SettingsService {
         ready: ReadySignal,
     ) -> anyhow::Result<()> {
         let writes = self.writes()?;
-        let mut interval = tokio::time::interval(SWEEP_TICK);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let db = self.db()?;
+        let retention = Duration::from_hours(u64::from(self.config()?.audit_retention_days) * 24);
         ready.notify();
         info!(
             tick_secs = SWEEP_TICK.as_secs(),
-            "pending-secret sweep started"
+            "pending-secret sweep and audit retention started"
         );
+        Self::tick_until_cancelled(&writes, &db, retention, &cancel).await;
+        info!("pending-secret sweep and audit retention stopped");
+        Ok(())
+    }
+
+    /// The two periodic passes, until the lifecycle is cancelled.
+    async fn tick_until_cancelled(
+        writes: &crate::infra::value_writes::WriteCoordinator,
+        db: &DBProvider<DbError>,
+        retention: Duration,
+        cancel: &CancellationToken,
+    ) {
+        let mut interval = ticking(SWEEP_TICK);
+        let mut retention_interval = ticking(RETENTION_TICK);
         loop {
             tokio::select! {
                 biased;
                 () = cancel.cancelled() => break,
-                _ = interval.tick() => Self::sweep_once(&writes).await,
+                _ = interval.tick() => Self::sweep_once(writes).await,
+                _ = retention_interval.tick() => Self::retention_tick(db, retention).await,
             }
         }
-        info!("pending-secret sweep stopped");
-        Ok(())
+    }
+
+    /// The daily tick: one retention pass against the clock now.
+    async fn retention_tick(db: &DBProvider<DbError>, retention: Duration) {
+        Self::prune_once(db, retention, time::OffsetDateTime::now_utc()).await;
+    }
+
+    /// One audit retention pass, logged and never fatal: records past their
+    /// horizon leave — an explicit `retain_until`, or `occurred_at` plus the
+    /// configured default. What a failed pass could not prune waits for the
+    /// next tick. Returns how many records went.
+    async fn prune_once(
+        db: &DBProvider<DbError>,
+        default_retention: Duration,
+        now: time::OffsetDateTime,
+    ) -> u64 {
+        match Self::prune(db, default_retention, now).await {
+            Ok(0) => 0,
+            Ok(pruned) => {
+                info!(pruned, "audit records past their retention horizon pruned");
+                pruned
+            }
+            Err(err) => {
+                tracing::warn!(
+                    err = %LogSafe(&err),
+                    "audit retention pass failed; retried next tick"
+                );
+                0
+            }
+        }
     }
 
     /// One pass of the sweep, logged and never fatal: what it could not
@@ -159,6 +214,34 @@ impl SettingsService {
             ),
         }
         // @cpt-end:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-9
+    }
+
+    /// The retention pass itself, its failures returned for the caller to log.
+    async fn prune(
+        db: &DBProvider<DbError>,
+        default_retention: Duration,
+        now: time::OffsetDateTime,
+    ) -> Result<u64, crate::domain::error::DomainError> {
+        let retention = time::Duration::try_from(default_retention).map_err(|_| {
+            crate::domain::error::DomainError::Internal {
+                diagnostic: "the audit retention does not fit a timestamp span".to_owned(),
+            }
+        })?;
+        let conn = db.conn().map_err(|err| {
+            crate::domain::error::DomainError::dependency_unavailable(
+                "database",
+                "open a connection",
+                err,
+            )
+        })?;
+        crate::infra::storage::audit_store::AuditStore
+            .prune_expired(
+                &conn,
+                &toolkit_security::AccessScope::allow_all(),
+                now,
+                retention,
+            )
+            .await
     }
 
     /// The bootstrap configuration, once initialization has run.
