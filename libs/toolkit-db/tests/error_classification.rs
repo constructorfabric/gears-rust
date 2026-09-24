@@ -202,7 +202,7 @@ async fn mysql_duplicate_insert_is_classified_as_unique_violation() -> Result<()
 
 // ── FK-violation-with-a-confusable-message regression ──────────────────────────
 
-#[cfg(feature = "pg")]
+#[cfg(any(feature = "pg", feature = "mysql"))]
 #[derive(Iden)]
 enum FkParentTbl {
     #[iden = "error_classify_fk_parent"]
@@ -210,7 +210,7 @@ enum FkParentTbl {
     Id,
 }
 
-#[cfg(feature = "pg")]
+#[cfg(any(feature = "pg", feature = "mysql"))]
 #[derive(Iden)]
 enum FkChildTbl {
     #[iden = "error_classify_fk_child"]
@@ -220,10 +220,10 @@ enum FkChildTbl {
     ParentId,
 }
 
-#[cfg(feature = "pg")]
+#[cfg(any(feature = "pg", feature = "mysql"))]
 struct CreateFkClassifyTables;
 
-#[cfg(feature = "pg")]
+#[cfg(any(feature = "pg", feature = "mysql"))]
 impl mig::MigrationName for CreateFkClassifyTables {
     #[allow(clippy::unnecessary_literal_bound)]
     fn name(&self) -> &str {
@@ -231,7 +231,7 @@ impl mig::MigrationName for CreateFkClassifyTables {
     }
 }
 
-#[cfg(feature = "pg")]
+#[cfg(any(feature = "pg", feature = "mysql"))]
 #[async_trait::async_trait]
 impl mig::MigrationTrait for CreateFkClassifyTables {
     async fn up(&self, manager: &mig::SchemaManager) -> Result<(), mig::DbErr> {
@@ -265,14 +265,15 @@ impl mig::MigrationTrait for CreateFkClassifyTables {
                     .col(mig::ColumnDef::new(FkChildTbl::ParentId).uuid().not_null())
                     .foreign_key(
                         sea_query::ForeignKey::create()
-                            // Deliberately named so a real Postgres FK-violation
-                            // message (which echoes the constraint name verbatim)
-                            // contains "duplicate key" -- the exact confusable
-                            // text `is_unique_violation`'s string fallback
-                            // matches on. This reproduces the bug this test
-                            // guards against: an authoritative, non-matching
-                            // `sql_err()` result (`ForeignKeyConstraintViolation`)
-                            // must short-circuit to `false` rather than still
+                            // Deliberately named so a real FK-violation message
+                            // (both Postgres's and MySQL's echo the constraint
+                            // name verbatim) contains "duplicate key" -- the
+                            // exact confusable text `is_unique_violation`'s
+                            // string fallback matches on. This reproduces the
+                            // bug this test guards against: an authoritative,
+                            // non-matching `sql_err()` result
+                            // (`ForeignKeyConstraintViolation`) must
+                            // short-circuit to `false` rather than still
                             // falling through to that fallback.
                             .name("totally not a duplicate key issue")
                             .from(FkChildTbl::Table, FkChildTbl::ParentId)
@@ -293,7 +294,7 @@ impl mig::MigrationTrait for CreateFkClassifyTables {
     }
 }
 
-#[cfg(feature = "pg")]
+#[cfg(any(feature = "pg", feature = "mysql"))]
 mod fk_ent_child {
     use sea_orm::entity::prelude::*;
     use uuid::Uuid;
@@ -313,7 +314,7 @@ mod fk_ent_child {
     impl ActiveModelBehavior for ActiveModel {}
 }
 
-#[cfg(feature = "pg")]
+#[cfg(any(feature = "pg", feature = "mysql"))]
 impl ScopableEntity for fk_ent_child::Entity {
     fn tenant_col() -> Option<<Self as EntityTrait>::Column> {
         Some(fk_ent_child::Column::TenantId)
@@ -345,12 +346,14 @@ impl ScopableEntity for fk_ent_child::Entity {
 /// `is_unique_violation() == false`, even when its message text happens to
 /// contain a unique-violation-sounding phrase.
 ///
-/// Only Postgres is exercised: its FK-violation message echoes the
-/// constraint name verbatim (`violates foreign key constraint "..."`), which
-/// lets the migration above force that phrase into a *genuine*, live
-/// database error rather than a hand-built one -- `SQLite`'s equivalent
-/// message ("FOREIGN KEY constraint failed") carries no such name, so it
-/// cannot reproduce the confusable-message half of this scenario.
+/// Postgres and `MySQL` are exercised (see the `mysql_*` variant below): both
+/// engines' FK-violation messages echo the constraint name verbatim
+/// (Postgres: `violates foreign key constraint "..."`; `MySQL`: `CONSTRAINT
+/// ... FOREIGN KEY`), which lets the migration above force that phrase into
+/// a *genuine*, live database error rather than a hand-built one --
+/// `SQLite`'s equivalent message ("FOREIGN KEY constraint failed") carries
+/// no such name, so it cannot reproduce the confusable-message half of this
+/// scenario.
 ///
 /// Before the fix, `is_unique_violation` fell through to its string fallback
 /// on *any* non-unique `sql_err()` result, so this exact error -- a real FK
@@ -361,6 +364,58 @@ impl ScopableEntity for fk_ent_child::Entity {
 #[tokio::test]
 async fn pg_foreign_key_violation_with_confusable_message_is_not_unique_violation() -> Result<()> {
     let dut = common::bring_up_postgres().await?;
+    let config = DbConnConfig {
+        dsn: Some(toolkit_utils::SecretString::new(dut.url)),
+        ..Default::default()
+    };
+    let db = build_db(config, None).await?;
+    run_migrations_for_testing(&db, vec![Box::new(CreateFkClassifyTables)])
+        .await
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+    let tenant_id = Uuid::new_v4();
+    let scope = AccessScope::for_tenants(vec![tenant_id]);
+    let conn = db.conn().expect("conn");
+
+    // No row in `error_classify_fk_parent` has this id -- the insert below
+    // must fail the foreign key, not succeed.
+    let orphan_parent_id = Uuid::new_v4();
+    let am = fk_ent_child::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        tenant_id: Set(tenant_id),
+        parent_id: Set(orphan_parent_id),
+    };
+    let err = secure_insert::<fk_ent_child::Entity>(am, &scope, &conn)
+        .await
+        .expect_err("insert referencing a nonexistent parent must be rejected by the database");
+
+    assert!(
+        err.is_foreign_key_violation(),
+        "must still be recognised as a foreign-key violation; classifier saw: {err}"
+    );
+    assert!(
+        !err.is_unique_violation(),
+        "a real foreign-key violation must never classify as a unique-constraint \
+         violation, even with a confusable message; classifier saw: {err}"
+    );
+
+    Ok(())
+}
+
+/// `MySQL` counterpart of
+/// [`pg_foreign_key_violation_with_confusable_message_is_not_unique_violation`]:
+/// `InnoDB`'s own FK-violation message (`Cannot add or update a child row: a
+/// foreign key constraint fails (..., CONSTRAINT "totally not a duplicate
+/// key issue" FOREIGN KEY ...)`) also echoes the constraint name verbatim,
+/// reproducing the same confusable-text scenario against `sea_orm`'s `MySQL`
+/// error numbers 1216/1217/1451/1452/1557/1761/1762 (`sql_err()` ->
+/// `SqlErr::ForeignKeyConstraintViolation`) instead of Postgres's SQLSTATE
+/// `23503`.
+#[cfg(feature = "mysql")]
+#[tokio::test]
+async fn mysql_foreign_key_violation_with_confusable_message_is_not_unique_violation() -> Result<()>
+{
+    let dut = common::bring_up_mysql().await?;
     let config = DbConnConfig {
         dsn: Some(toolkit_utils::SecretString::new(dut.url)),
         ..Default::default()
