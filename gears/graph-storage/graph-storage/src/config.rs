@@ -344,6 +344,10 @@ impl GraphStorageConfig {
     /// cannot be exported by an ordinary shell, so refusing it costs a
     /// deployment nothing it could have used -- and says at configuration time
     /// what it would otherwise learn from a lookup that silently never matches.
+    /// `get_node` returns outgoing and incoming adjacency, each bounded by
+    /// `node_read_max_adjacency` in its own right.
+    const ADJACENCY_DIRECTIONS: u64 = 2;
+
     fn check_api_key_env(&self, errors: &mut Vec<String>) {
         let Some(variable) = &self.embedding_remote_api_key_env else {
             return;
@@ -418,14 +422,24 @@ impl GraphStorageConfig {
         // same shape of gap as a page bounded by a count alone, and it has no
         // runtime measure behind it -- the ceiling is small and fixed, which
         // is exactly when a startup check is the right instrument.
+        //
+        // **Twice the limit, because `get_node` applies it per direction.**
+        // Adjacency is bidirectional and the limit bounds each side, which is
+        // what makes a node read useful: a combined budget spent on the
+        // outgoing side would hide the incoming one entirely, and the caller
+        // could not tell an unreferenced node from a truncated answer. So the
+        // worst case a single read returns is two full sides, and sizing this
+        // for one was the check quietly guaranteeing half of what it claimed.
         let entry = 4u64.saturating_mul(u64::from(self.identifier_max_bytes));
-        let node_read = u64::from(self.item_max_bytes)
-            .saturating_add(u64::from(self.node_read_max_adjacency).saturating_mul(entry));
+        let entries = u64::from(self.node_read_max_adjacency)
+            .saturating_mul(Self::ADJACENCY_DIRECTIONS)
+            .saturating_mul(entry);
+        let node_read = u64::from(self.item_max_bytes).saturating_add(entries);
         if node_read > self.response_max_bytes {
             errors.push(format!(
                 "one node read is up to {node_read} bytes -- item_max_bytes ({}) plus \
-                 node_read_max_adjacency ({}) entries of four identifiers each \
-                 ({}) -- above response_max_bytes ({})",
+                 node_read_max_adjacency ({}) entries of four identifiers each ({}) in \
+                 each of two directions -- above response_max_bytes ({})",
                 self.item_max_bytes,
                 self.node_read_max_adjacency,
                 self.identifier_max_bytes,
@@ -567,6 +581,48 @@ mod tests {
             GraphStorageConfig::default().validate().is_ok(),
             "no variable named is not a malformed name"
         );
+    }
+
+    /// The node-read invariant is sized for what a node read actually
+    /// returns, which is two directions of adjacency and not one.
+    ///
+    /// `get_node` bounds outgoing and incoming separately, so the worst case
+    /// is twice `node_read_max_adjacency`. Sizing the check for one side let
+    /// a deployment pass startup and then answer a node read at up to double
+    /// the size the check had just guaranteed -- and that check is the only
+    /// guard there is, since nothing measures a node read at run time.
+    ///
+    /// The budget here sits between the two: comfortably above one side's
+    /// worth of adjacency, below both.
+    #[test]
+    fn the_node_read_invariant_counts_both_directions_of_adjacency() {
+        let defaults = GraphStorageConfig::default();
+        let entry = 4 * u64::from(defaults.identifier_max_bytes);
+        let one_side = u64::from(defaults.item_max_bytes)
+            + u64::from(defaults.node_read_max_adjacency) * entry;
+        let both_sides = one_side + u64::from(defaults.node_read_max_adjacency) * entry;
+        let between = u64::midpoint(one_side, both_sides);
+        assert!(
+            one_side < between && between < both_sides,
+            "the fixture is the gap"
+        );
+
+        let cfg = GraphStorageConfig {
+            response_max_bytes: between,
+            // Held out of the way: this budget is about adjacency, and the
+            // other surfaces sized against response_max_bytes would refuse
+            // it for their own reasons and prove nothing.
+            traversal_max_nodes: 1,
+            search_max_arm_limit: 1,
+            projection_max_page: 1,
+            ..defaults
+        };
+        let message = match cfg.validate() {
+            Err(error) => error.to_string(),
+            Ok(()) => panic!("a budget under two directions of adjacency must be refused"),
+        };
+        assert!(message.contains("node_read_max_adjacency"), "{message}");
+        assert!(message.contains("two directions"), "{message}");
     }
 
     /// Every number legal on its own, and the product is four gigabytes.

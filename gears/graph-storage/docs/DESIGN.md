@@ -1153,7 +1153,12 @@ because each was answerable more than one way:
   needs it.
 - **Adjacency on node read is bounded by a named parameter**, `adjacency_limit`,
   defaulting to `limits.node_read_max_adjacency`, with a truncation flag in the
-  response.
+  response. The bound is **per direction**: outgoing and incoming are each
+  limited to it, so a node read returns at most twice the parameter in total.
+  A single combined budget would be the wrong instrument here — spent on the
+  outgoing side it would hide the incoming one entirely, and the caller could
+  not tell a node nothing references from a truncated answer. The startup size
+  invariant is sized for both sides accordingly.
 - **Asking what an edit costs is its own operation.** `POST /types/compatibility`
   could have been a `dry_run` flag on `POST /types`, and was not, for two
   reasons: a dry run is a *read* and should not need the permission a write
@@ -2899,7 +2904,7 @@ Every bound the gear enforces is a named configuration key with a safe default a
 | Search query text | `search_query_max_bytes` | 8 KiB | 64 B – 1 MiB | Admission |
 | Node content size | `content_max_bytes` | 2 MiB | 64 KiB – 16 MiB | Admission |
 | Total size of one node or edge (envelope + name + payload + content) | `item_max_bytes` | 256 KiB | 4 KiB – 4 MiB | Admission, per item |
-| Adjacency returned on node read | `node_read_max_adjacency` | 100 | 1 – 1,000 | Admission |
+| Adjacency returned on node read, **per direction** (outgoing and incoming are bounded separately, so one read returns at most twice this) | `node_read_max_adjacency` | 100 | 1 – 1,000 | Admission |
 | Labels attached to one node or edge | `labels_max_per_object` | 32 | 1 – 256 | Admission |
 | Labels in a tenant's registry | `labels_max_per_tenant` | 1,000 | 10 – 100,000 | Admission |
 | Traversal depth | `traversal_max_depth` | 5 | 1 – 8 | Admission |
