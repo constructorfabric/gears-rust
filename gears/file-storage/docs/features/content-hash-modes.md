@@ -358,10 +358,13 @@ backend, recompute SHA-256 incrementally, and reject on any divergence from the 
 plane never trusts the caller's claim. This read-back is retained for mode 1 -- only the multipart (mode 2) path
 avoids re-reading the assembled object.
 
-**Backend migration**: reads the whole blob from the source backend, then verifies it mode-aware: for
-`whole-sha256` it hashes the blob directly and compares; for `multipart-composite-sha256` it fetches the version's
-manifest row, splits the blob at the manifest's recorded offsets, rebuilds the manifest from the recomputed per-part
-digests, and compares its hash to the stored value -- before writing to the destination.
+**Backend migration**: streams the blob from the source backend straight into the destination — never buffering the
+whole object in memory — verifying it mode-aware on the same pass: for `whole-sha256` it hashes the streamed bytes
+directly and compares; for `multipart-composite-sha256` it fetches the version's manifest row up front and hashes
+each part against that manifest's recorded offsets/digests as the corresponding bytes stream past, rebuilding the
+manifest from the recomputed per-part digests and comparing its hash to the stored value. The verdict is only known
+once the destination has finished receiving the stream, so the version's backend pointer is repointed only after
+verification passes -- see [backend-migration.md](backend-migration.md) for the full failure/cleanup contract.
 
 **Schema** (`m20260624_000001_p1_initial.rs`):
 ```sql
@@ -754,7 +757,7 @@ existing session-scoped lifecycle.
 | Single-part `finalize_upload[_by_token]` (`write.rs`) | re-read whole object, `hash::sha256`, compare | unchanged | N/A (multipart only) |
 | Multipart `complete_multipart_upload` (`multipart_service.rs`) | `backend.complete_multipart` re-reads + flat SHA-256 | N/A | build manifest from already-collected `(offset, part_hash)` pairs, `root = sha256(manifest)` — **no re-read** |
 | Client-side re-verification | N/A (no multipart mode existed with an independent client check) | re-read/re-fetch the object, `sha256`, compare to `hash_value` — always possible from object bytes alone | **retain the composite root (wire field `content_hash` on the `POST .../complete` response) and `manifest`** (retaining them is the cheapest path; the manifest is also re-fetchable later, since `VersionDto` carries a `manifest` field re-served on composite versions by `GET /files/{id}/versions`), split the object at the manifest's recorded offsets, `sha256` each part, rebuild the manifest string per §3, `sha256(manifest) == root` — self-contained given object bytes + the retained manifest; not possible from object bytes alone |
-| `migrate_backend` | `Store::verify_content_hash` = hard-coded `hash::sha256(blob)` | unchanged: re-read + whole-object SHA-256 rehash, compare to `hash_value` | fetch the `version_hash_manifest` row alongside the version; re-read the (already necessarily re-read, since this is a backend copy) object bytes; split at the manifest's offsets, `sha256` each part, rebuild the manifest, compare `sha256(manifest)` to `hash_value` — **fully self-contained from object bytes + the stored manifest row, no dependency on `multipart_upload_parts` surviving** |
+| `migrate_backend` | `Store::verify_content_hash` = hard-coded `hash::sha256(blob)` | streamed: hash the bytes incrementally as they pass from source to destination (the already-necessary copy pass, never a separate re-read), compare to `hash_value` | fetch the `version_hash_manifest` row alongside the version; hash each part incrementally against the manifest's recorded offsets/digests as the corresponding bytes stream past (the same already-necessary copy pass); rebuild the manifest, compare `sha256(manifest)` to `hash_value` — **fully self-contained from the streamed bytes + the stored manifest row, no dependency on `multipart_upload_parts` surviving** |
 | Any future generic "re-verify a version's integrity" tool | implicit, whole-object | dispatch by `hash_mode`, whole-object rehash | dispatch by `hash_mode`; fetch the manifest row, re-derive per the migrate_backend path above |
 
 `Store::verify_content_hash` is mode-aware:
@@ -825,13 +828,19 @@ pub trait StorageBackend: Send + Sync {
 }
 ```
 
+**Since superseded**: `upload_part` above (a whole buffered `Bytes` part) was later replaced by a streamed
+`upload_part_stream(path, upload_handle, part_number, part_offset, stream, len)` — a byte stream plus the part's
+exact declared length, so no backend needs to buffer a whole part to compute its hash or send it. The
+`part_hash`/manifest/root construction this section describes is unaffected — only how the bytes reach the
+backend changed.
+
 Key points:
 - `complete_multipart`'s contract is to build the manifest and root from the
   hashes and offsets already collected during upload, not to re-read and hash
   the assembled object — this applies to the *only* multipart mode there is,
   so every backend's multipart-capable implementation needs exactly one
   `complete_multipart` arm.
-- `upload_part` takes the part's byte offset — already known by the caller
+- `upload_part_stream` takes the part's byte offset — already known by the caller
   (`compute_plan` produces it) — as part of the trait call.
 - `MultipartService::complete_multipart_upload` (`multipart_service.rs`)
   threads `(part_number, offset, part_hash, backend_etag)` for every part
@@ -850,9 +859,9 @@ Key points:
 
 | Backend | Mode 1 (`whole-sha256`) | Mode 2 (`multipart-composite-sha256`) |
 |---|---|---|
-| **S3** (`s3.rs`) | `put_stream`/`put` | `upload_part` computes a flat per-part SHA-256 and threads `part_offset` through; `complete_multipart` calls `CompleteMultipartUpload` (S3 still needs the ETags to assemble) **then builds the manifest and computes `root` from the already-collected `(offset, part_hash)` pairs**, without calling `get_and_hash_streaming`. **Every large multipart upload thereby avoids the mandatory re-`GetObject`** a full re-read would otherwise cost — no redundant read of a potentially multi-GB object, no doubled egress/bandwidth. |
-| **In-memory** (`in_memory.rs`) | as above | `upload_part` as above; `complete_multipart` builds the manifest/root instead of `hash::sha256(&assembled)` (it still assembles bytes into the blob store for `get`, but computing the **hash** does not require touching those bytes) |
-| **local-fs** (`local_fs.rs`) | unchanged (single-object writes only) | **N/A — still no multipart support.** `initiate_multipart`/`upload_part`/`complete_multipart`/`abort_multipart` remain the trait's default `Err(multipart_not_supported)`. If local-fs multipart is ever added, it needs no special accommodation for this mode beyond any other backend — offsets and per-part digests are backend-agnostic inputs to the same shared `Manifest` builder. |
+| **S3** (`s3.rs`) | `put_stream` | `upload_part_stream` computes a flat per-part SHA-256 (streamed, never buffering a whole part) and threads `part_offset` through; `complete_multipart` calls `CompleteMultipartUpload` (S3 still needs the ETags to assemble) **then builds the manifest and computes `root` from the already-collected `(offset, part_hash)` pairs**, without calling `read_back_and_hash_streaming`. **Every large multipart upload thereby avoids the mandatory re-`GetObject`** a full re-read would otherwise cost — no redundant read of a potentially multi-GB object, no doubled egress/bandwidth. |
+| **In-memory** (`in_memory.rs`) | as above | `upload_part_stream` as above; `complete_multipart` builds the manifest/root instead of `hash::sha256(&assembled)` (it still assembles bytes into the blob store for a later `get_stream` read, but computing the **hash** does not require touching those bytes) |
+| **local-fs** (`local_fs.rs`) | unchanged (single-object writes only) | **N/A — still no multipart support.** `initiate_multipart`/`upload_part_stream`/`complete_multipart`/`abort_multipart` remain the trait's default `Err(multipart_not_supported)`. If local-fs multipart is ever added, it needs no special accommodation for this mode beyond any other backend — offsets and per-part digests are backend-agnostic inputs to the same shared `Manifest` builder. |
 
 ### 9. Mode selection
 

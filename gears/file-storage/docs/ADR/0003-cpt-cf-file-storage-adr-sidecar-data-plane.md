@@ -220,9 +220,10 @@ emergency revocation is the platform auth module's token revocation, not the URL
   hash from a sidecar-side value the control plane can independently trust,
   or re-hashing the assembled object) is future work, out of scope for this
   remediation. A related gap in the same release gate is now closed in code for every shipping
-  backend, though the closure differs by backend: `StorageBackend::publish_exclusive`'s **default**
-  trait implementation is a non-atomic (TOCTOU) `exists`-then-`put`, but no
-  shipping backend relies on that default. `LocalFsBackend` (`std::fs::hard_link`, which atomically
+  backend: `StorageBackend::publish_exclusive` has **no default trait implementation** at all (a
+  backend-agnostic `exists`-then-write fallback would necessarily be the same non-atomic TOCTOU this
+  paragraph closes, so the trait does not offer one) — every backend implements its own atomic write.
+  `LocalFsBackend` (`std::fs::hard_link`, which atomically
   fails `AlreadyExists` if the target already exists) and `InMemoryBackend` (a single mutex guarding
   both the check and the insert) each override it with a fully atomic, provider-independent
   implementation; `S3Backend` **overrides** it with an atomic conditional write (`If-None-Match: *`

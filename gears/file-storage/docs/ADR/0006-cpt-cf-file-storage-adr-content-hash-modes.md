@@ -114,12 +114,12 @@ multipart-composite mode's assembly step avoids a full re-read.)
    check `sha256(manifest) == root`.
 3. **The multipart composite hash is never computed by re-downloading/re-reading the assembled stored object.** It is
    always computed on-the-fly, from the per-part digests already collected as bytes flow to the backend, inside the
-   sidecar's streaming `upload_part`. This removes the S3 `complete_multipart` re-`GetObject` that a flat-rehash
+   sidecar's streaming `upload_part_stream`. This removes the S3 `complete_multipart` re-`GetObject` that a flat-rehash
    design would otherwise need. **This does not extend to single-part uploads**: `write.rs`'s
    `read_back_and_hash_streaming` is still called on every single-part `finalize` (both `finalize_upload` and
    `finalize_upload_by_token`) as a defense-in-depth re-derivation of size/hash/MIME from the real backend object —
    that read-back was never proposed for elimination by this ADR and remains unchanged. `complete_multipart` does
-   still issue one bounded (~8 KiB) ranged `GetObject`/`get_range` against the assembled object, but only for MIME
+   still issue one bounded (~8 KiB) ranged `GetObject`/`read_prefix` against the assembled object, but only for MIME
    magic-byte sniffing (P2 remediation item 1.10), not to (re)compute the hash. See
    [below](#the-on-the-fly--no-re-read-principle-and-its-trust-model) for why this still closes the 0.1
    vulnerability.
@@ -348,11 +348,11 @@ All confirmation items are satisfied by the shipped code and tests:
 * [x] Unit test confirming the manifest wire format is unambiguous: a fixed set of `(offset, digest)` pairs always
   serializes to the same expected byte string, and `sha256` of that string matches an independently-computed
   reference `root`.
-* [x] Integration test asserting **no whole-object `GetObject`/re-read call** occurs at `complete_multipart` time —
-  a request-counting wrapper backend that counts `get`/`get_stream` but deliberately not `get_range` (a bounded
-  range read is not a "whole-object read" for this guarantee's purposes — see the test's own `CountingBackend` doc
-  comment). This qualifier matters in practice: `complete_multipart_upload` does issue one small (~8 KiB) `get_range`
-  against the assembled object for MIME magic-byte sniffing (P2 remediation item 1.10, added after this test), which
+* [x] Integration test asserting **no whole-object read call** occurs at `complete_multipart` time —
+  a request-counting wrapper backend that counts `get_stream` but deliberately not `read_prefix` (a bounded
+  prefix read is not a "whole-object read" for this guarantee's purposes — see the test's own `CountingBackend` doc
+  comment). This qualifier matters in practice: `complete_multipart_upload` does issue one small (~8 KiB) `read_prefix`
+  call against the assembled object for MIME magic-byte sniffing (P2 remediation item 1.10, added after this test), which
   is intentionally excluded from what this test guards.
 * [x] Integration test asserting a client-side re-verification helper — split the object at the manifest's offsets,
   rehash each part, rebuild the manifest, compare to `root` — succeeds against real uploaded content and fails when

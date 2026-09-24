@@ -195,15 +195,23 @@ see "Conditional headers" below.)
 
 **A transient read race.** Both `GET` and `HEAD` resolve the object's size with one `stat`/`HeadObject` call before
 streaming or measuring it. If the backend object's size disagrees with that already-resolved length by the time the
-actual read (full or ranged) reaches the backend, the read is refused **before the first byte is streamed** rather
-than served against a length that no longer matches: `503 Service Unavailable` with `Retry-After: 1` and a short text
-body (`"object changed during read, retry"`). This is a transient-race signal, not a fault — logged at `warn`, not
-`error` — and the recovery is a plain retry. Any other backend read failure is a genuine I/O fault and stays `500`.
-This length check is enforced identically across backends and does not depend on the upstream response carrying a
-usable length up front: the local-fs backend re-stats the file before streaming and rejects a mismatch the same
-way, and the S3 backend wraps every stream (ranged or whole-object) in a length guard that still catches a
-truncated or overlong object even when the upstream response has no `Content-Length` at all (a chunked-transfer
-response) — the same guard S3's own `Content-Length`-present fast path uses when that header happens to be there.
+actual read (full or ranged) reaches the backend, the mismatch is always caught — but *when* depends on whether the
+backend can learn the object's real length before handing back any bytes:
+
+- **Local-fs, and S3 when the `GetObject`/ranged response carries a `Content-Length` header:** the backend re-stats
+  (local-fs) or reads that header (S3) before streaming a single byte, and refuses **before the first byte is
+  streamed**: `503 Service Unavailable` with `Retry-After: 1` and a short text body (`"object changed during read,
+  retry"`). This is a transient-race signal, not a fault — logged at `warn`, not `error` — and the recovery is a
+  plain retry.
+- **S3 when the response has no `Content-Length` at all** (a chunked-transfer-encoded response — the S3-compatible
+  store did not, or could not, declare a length up front): there is no length to check before streaming starts, so
+  the sidecar has already sent its own response headers (status, the `Content-Length` it committed to from the
+  earlier `stat`) by the time a length guard wrapping the stream catches the disagreement mid-transfer. The client
+  does **not** see a `503` in this case — the connection ends with a body shorter (or, for a chunk that would have
+  overrun the promised length, capped at) than the `Content-Length` already sent, i.e. a truncated/incomplete
+  response, the same way any other server-side stream failure partway through a response looks to an HTTP client.
+
+Any other backend read failure (not a length mismatch) is a genuine I/O fault and stays `500`.
 
 The sidecar verifies the signed token and its claims before serving — a valid token is the delegated authorization
 decision, so there is no request-time PDP call and no platform-JWT check of any kind (the `tok.<claim>` predicate
@@ -343,12 +351,14 @@ finishes streaming:
   cross the claim, with `413 Payload Too Large` — before the excess bytes are ever written.
 - **Undersized** (body is shorter than the `size` claim): only detectable once the stream is fully drained, so it
   streams to completion and is then rejected with `400 Bad Request`. For a `multipart_native` backend (e.g. S3) the
-  part was only ever buffered in memory pending the native `UploadPart` call, so nothing needs cleanup; for a
-  non-native backend (the `local-fs`-style offset-object model), the part *was* already written to its own backend
-  object (`{backend_path}.part.{n}`) as bytes streamed in, so the sidecar explicitly **deletes that partial object**
+  part body is streamed straight into the backend's native `UploadPart` call — never buffered whole — with the
+  declared `size` sent as the request's exact `Content-Length`; an undersized body simply fails that PUT (S3 never
+  receives a complete request), so nothing was ever stored and nothing needs cleanup. For a non-native backend (the
+  `local-fs`-style offset-object model), the part *was* already written to its own backend object
+  (`{backend_path}.part.{n}`) as bytes streamed in, so the sidecar explicitly **deletes that partial object**
   before returning `400`, rather than leaving a mismatched part object behind.
 
-Re-`PUT` of the same part is idempotent (enables resume — a fresh `PUT` simply overwrites/re-buffers). For a
+Re-`PUT` of the same part is idempotent (enables resume — a fresh `PUT` simply overwrites/re-streams). For a
 `multipart_native` backend the sidecar drives the backend multipart API; the sidecar's write path also has a
 non-native, `local-fs`-style offset-object fallback, though it is not reachable through the real initiate flow today
 since initiate rejects any default backend that isn't `multipart_native` (see the Notes above). Per-part **SHA-256**
@@ -517,7 +527,10 @@ POST /files/{id}/migrate   { "target_backend_id": "<string>" }   → 204
 Migrates a file's content to a different configured storage backend, preserving the file's identity (`file_id`
 unchanged). **Non-versioned files only** — a file with more than one `file_versions` row is rejected
 (`VersionedFileMigrationNotSupported`, `409`). The version must already be `available` (`409` otherwise). The
-content hash is re-verified against the source backend's blob before the destination write is committed. Migrating
+content streams straight from the source backend into the destination, with its hash re-verified incrementally on
+the same pass; the verdict is only known once the destination has received the whole stream, and the version's
+backend pointer is only ever repointed (CAS) once that verification has passed — see
+[backend-migration.md](./features/backend-migration.md) for the full failure/cleanup contract. Migrating
 onto a non-durable backend (e.g. a dev/test `memory` backend) additionally requires the caller's `ADMIN_POLICY`
 authorization scope, not just `WRITE`, since it risks silent data loss on the next restart.
 

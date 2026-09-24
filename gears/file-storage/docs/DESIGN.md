@@ -142,7 +142,7 @@ See [PRD.md](./PRD.md) §1 "Overview" and §1.3 "Goals":
 | `cpt-cf-file-storage-nfr-metadata-latency`      | `<25 ms` p95 metadata queries                                        | `cpt-cf-file-storage-component-metadata-service`, `cpt-cf-file-storage-component-http-gateway`                                            | Single-row Postgres lookup on PK; covering index on `(tenant_id, owner_kind, owner_id, created_at)`. No backend round-trip on the `GET /files/{id}` metadata path                                                                                            | Load test driving `GET /files/{id}` at expected p95 traffic; p95 latency captured by OpenTelemetry histogram on `http-gateway`                       |
 | `cpt-cf-file-storage-nfr-transfer-latency`      | `<50 ms` fixed overhead p95 on content transfer                      | `cpt-cf-file-storage-component-stream-proxy`, `cpt-cf-file-storage-component-backend-abstraction`                                         | Streaming I/O end-to-end (axum `Body` ↔ `Stream<Bytes>` ↔ backend client); no full-file buffering. Range translated to backend-native range where supported                                                                                                    | Measure fixed delta between request arrival at the sidecar and first byte returned by backend; histogram per backend driver                           |
 | `cpt-cf-file-storage-nfr-url-availability`      | URLs available for retention duration matching platform SLA          | `cpt-cf-file-storage-component-metadata-service`, `cpt-cf-file-storage-component-backend-abstraction`                                     | URLs are derived from `file_id` and remain valid as long as the file row exists; deleted files return `404`; ETag changes do not invalidate URLs (only their cached representations)                                                                            | Long-running soak: re-fetch a set of `file_id`s over the SLA window; verify no transient `5xx`/`404` for live files                                  |
-| `cpt-cf-file-storage-nfr-durability`            | RPO=0 for committed writes; RTO ≤ 15 min                              | `cpt-cf-file-storage-component-metadata-service`, `cpt-cf-file-storage-component-backend-abstraction`                                     | DB row committed *after* backend `put()` returns success; backend durability is inherited from the chosen driver. A request-scoped **best-effort cleanup guard** fires `backend.delete(backend_path)` on any error between a successful `put()` and the committed `INSERT` (DB blip, client drop, panic), so the only residual leak is a hard process kill in that window — bounded and swept by the P2 `orphan-reconciler`. RTO covered by Postgres HA + gear restart procedures                                                                                       | Chaos test: kill gear mid-upload — partial uploads MUST NOT leave a committed row pointing to missing content; inject a post-`put()` DB failure and assert the backend object is cleaned up (no orphan)                                       |
+| `cpt-cf-file-storage-nfr-durability`            | RPO=0 for committed writes; RTO ≤ 15 min                              | `cpt-cf-file-storage-component-metadata-service`, `cpt-cf-file-storage-component-backend-abstraction`                                     | DB row committed *after* the backend's streaming write (`put_stream`/`publish_exclusive`) returns success; backend durability is inherited from the chosen driver. A request-scoped **best-effort cleanup guard** fires `backend.delete(backend_path)` on any error between a successful streamed write and the committed `INSERT` (DB blip, client drop, panic), so the only residual leak is a hard process kill in that window — bounded and swept by the P2 `orphan-reconciler`. RTO covered by Postgres HA + gear restart procedures                                                                                       | Chaos test: kill gear mid-upload — partial uploads MUST NOT leave a committed row pointing to missing content; inject a post-write DB failure and assert the backend object is cleaned up (no orphan)                                       |
 | `cpt-cf-file-storage-nfr-scalability`           | ≥1000 concurrent operations/instance; linear horizontal scaling      | All P1 components — they are stateless except for the metadata DB                                                                         | No instance-local state in the request path; every instance can serve any file given the shared metadata DB and backend driver. Streaming I/O keeps **CPU and memory** bounded per request. The **bandwidth** dimension — the cost consciously accepted by `cpt-cf-file-storage-adr-sidecar-data-plane`, and confined to the sidecar — is modeled separately in `cpt-cf-file-storage-nfr-bandwidth`                                                                  | Load test: scale N → 2N instances, verify near-2× throughput; per-instance concurrency target measured at saturation                                  |
 | `cpt-cf-file-storage-nfr-bandwidth`             | Per-sidecar-instance ingress+egress budget; full content traffic transits the sidecar | `cpt-cf-file-storage-component-stream-proxy`, `cpt-cf-file-storage-component-backend-abstraction`, deployment topology                    | `cpt-cf-file-storage-adr-sidecar-data-plane` routes every uploaded and downloaded byte through the sidecar, so per-sidecar-instance bandwidth — not CPU/memory, and not the control plane — is the binding constraint. P1 deployment budget: **target ≥ 2.5 GiB/s combined ingress+egress per instance** (≈ 1.25 GiB/s each way on a 25 GbE NIC, sized so the ≥1000 concurrent-ops target is bandwidth- rather than CPU-bound at typical media object sizes). Capacity = `ceil(peak aggregate transfer rate / per-instance budget)` instances; transfer load scales horizontally with the stateless replicas. Download caching is offloaded to the API-Gateway / CDN layer keyed on the content-only `ETag` the sidecar emits (plus any `Cache-Control`/`Vary` policy applied at that layer), so repeat-read egress need not re-transit the sidecar | Load test: saturate a single sidecar instance's NIC with concurrent downloads, confirm it sustains the per-instance budget before CPU saturates; verify CDN/proxy serves conditional re-reads from cache (no FileStorage egress on a cache hit) |
 
@@ -553,7 +553,7 @@ component clients hit for content.
   (the CAS swap of `content_id`) is a separate request the client issues to the control plane afterwards
 - Echo the token's `content_type`/`etag` claims as `Content-Type`/`ETag` — the only response-header values the
   token carries; advertise `Accept-Ranges: bytes`
-- Own the **best-effort cleanup**: on any error after `put()` started (the sidecar itself aborts only on stream
+- Own the **best-effort cleanup**: on any error after the streaming write started (the sidecar itself aborts only on stream
   errors and the size/hash constraint checks — there is no in-sidecar `415` magic-bytes abort, see
   `content-pipeline` above), delete the partially-written object; a hard crash leaves an orphan swept by the P2
   cleanup engine
@@ -601,11 +601,12 @@ directions, without buffering the whole file at any point.
 
 - **Upload path**: receive the raw `axum::body::Body` of the signed `PUT` (or one multipart part); tee chunks through
   the incremental SHA-256 hasher (no in-stream MIME/magic-byte check — see `content-pipeline` above for why); forward
-  chunks to the selected backend driver via `StorageBackend::put()` at `/{file_id}/{version_id}`. On stream
-  completion, emit final hash and the persisted `ObjectRef` from the driver
-- **Download path**: invoke `StorageBackend::get(backend_path, range)` and pipe the returned `Stream<Bytes>` into
-  the HTTP response body. Pass `ByteRange` through to backends that declare `range_native = true`; otherwise the
-  driver's own range adapter applies (see §4.1)
+  chunks to the selected backend driver via `StorageBackend::publish_exclusive()`/`put_stream()` at
+  `/{file_id}/{version_id}`. On stream completion, emit final hash and the persisted `ObjectRef` from the driver
+- **Download path**: invoke `StorageBackend::get_stream(backend_path, expected_len)` (whole object) or
+  `get_range_stream(backend_path, range, expected_len)` and pipe the returned `Stream<Bytes>` into the HTTP response
+  body. Pass `ByteRange` through to backends that declare `range_native = true`; otherwise the driver's own range
+  adapter applies (see §4.1)
 - **Backpressure**: respect the slowest of (client, backend) by holding flow control on the stream; no internal
   queueing beyond the natural one-chunk lookahead
 - **Cancellation**: if the client drops, the upstream backend operation is aborted (S3 SDK abort / fs handle drop)
@@ -709,7 +710,9 @@ Versioning is **not** a backend capability — FileStorage versions via distinct
 
 ##### Responsibility scope
 
-- Define the `StorageBackend` async trait: `put`, `get(range)`, `delete`, `stat`, `capabilities`
+- Define the `StorageBackend` async trait: `put_stream`/`publish_exclusive` (streamed writes; no whole-object `put`),
+  `get_stream`/`get_range_stream`/`read_prefix` (streamed reads, plus a capped small-prefix read for MIME sniffing;
+  no whole-object `get`), `delete`, `stat`, `capabilities`
 - Define capability sub-traits: `MultipartCapable`, `EncryptionCapable` (both P2/P3 use, but the trait shapes are
   declared from P1 so consumers can downcast/probe)
 - Maintain the `BackendRegistry` — in-sidecar map of `backend_id → Arc<dyn StorageBackend>` populated at startup from
@@ -854,9 +857,12 @@ client, owns the plan.
 - For a `multipart_native` backend the sidecar drives the backend's multipart API (`CreateMultipartUpload` → `PutPart`
   → `CompleteMultipartUpload`); for a non-native backend the sidecar offset-writes each part into the single
   new-version object `/{file_id}/{version_id}` (still never mutating an existing object). **`local-filesystem` has no
-  multipart support at all** — `initiate_multipart`/`upload_part`/`complete_multipart`/`abort_multipart` all inherit
-  the trait's default `Err(multipart_not_supported)`; only `s3-compatible` and the in-memory backend implement
-  multipart
+  multipart support at all** — `initiate_multipart`/`upload_part_stream`/`complete_multipart`/`abort_multipart` all
+  inherit the trait's default `Err(multipart_not_supported)`; only `s3-compatible` and the in-memory backend
+  implement multipart. A part is streamed straight into the backend (`upload_part_stream` takes a byte stream plus
+  the part's exact declared length, not a buffered `Bytes`), so a `multipart_native` backend's part write never
+  buffers a whole part in the sidecar process either — the same streaming-without-buffering property the rest of
+  this document claims for every other transfer path
 - Each **per-part signed URL carries the part's exact `size` as a token claim**; the sidecar rejects a body whose
   length ≠ the claim (`413`) **before** writing, so oversized bytes never reach the backend — per-part size enforcement
   is therefore transfer-time, not deferred to `complete`
@@ -1065,7 +1071,7 @@ sequenceDiagram
     CTL-->>C: 200 { signed GET url -> sidecar (pins content_id), metadata, ETag }
     C->>SC: GET signed url (optional Range)
     SC->>SC: verify signed token + claims (exp, op)
-    SC->>BA: get(/file_id/content_id, range)
+    SC->>BA: get_stream(/file_id/content_id, expected_len)
     BA-->>SC: Stream<Bytes>
     SC-->>C: 200/206 + body + Content-Type/ETag (from token claims) + Accept-Ranges
 ```
@@ -1095,14 +1101,10 @@ sequenceDiagram
     alt range unsatisfiable (start ≥ size)
         SC-->>C: 416 + Content-Range: bytes */size
     else
-        SC->>SP: stream_get(/file_id/content_id, Some(range))
-        alt backend.range_native == true
-            SP->>BA: get(path, Some(range))
-            BA-->>SP: partial Stream<Bytes>
-        else
-            SP->>BA: get(path, None)
-            SP->>SP: skip start bytes, take (end-start+1)
-        end
+        SC->>SP: resolve range against expected_len
+        SP->>BA: get_range_stream(path, range, expected_len)
+        Note over BA: native seek+take (local-fs) or a native ranged<br/>request (S3); each driver translates internally —<br/>see §4.1's per-driver translation table
+        BA-->>SP: partial Stream<Bytes>
         SP-->>SC: pipe to response body
         SC-->>C: 206 + Content-Range: bytes <s>-<e>/<size>
     end
@@ -1492,11 +1494,19 @@ range adapter wraps the backend stream in `Skip + Take` style adapters operating
 
 **Truncation/growth guard.** Every backend read (full or ranged) is handed the exact length the sidecar already
 committed to from its own earlier `stat`/`HeadObject` call, never a fresh, trusting read. If the backend's read
-response disagrees with that length — the object changed size in the window between the two calls — the backend
-driver refuses **before the first byte is streamed**, rather than handing back a body that would contradict the
-`Content-Length`/`Content-Range` headers already sent; the sidecar surfaces this as `503` with `Retry-After: 1` (a
-transient race, not a fault — see [api.md](./api.md#status-code-summary)). Any other backend read failure remains
-`500`.
+response disagrees with that length — the object changed size in the window between the two calls — the point at
+which that is caught depends on whether the driver learns the object's real length before yielding any byte:
+
+- **Local-fs, and S3 when the response carries a `Content-Length` header:** the driver refuses **before the first
+  byte is streamed**, rather than handing back a body that would contradict the `Content-Length`/`Content-Range`
+  headers already sent; the sidecar surfaces this as `503` with `Retry-After: 1` (a transient race, not a fault —
+  see [api.md](./api.md#status-code-summary)).
+- **S3 with a chunked-transfer response (no `Content-Length` at all):** there is nothing to check up front, so the
+  mismatch is only caught by a length guard wrapping the stream once the response is already underway — after the
+  sidecar's own headers (including the `Content-Length` it already committed to) have been sent. The client sees a
+  truncated/incomplete body, not a `503`, exactly like any other stream failure partway through a response.
+
+Any other backend read failure remains `500`.
 
 **`Accept-Ranges: bytes` advertising.** Every `GET` response from the sidecar (`200`/`206`) includes
 `Accept-Ranges: bytes`. This is independent of whether the request had a `Range` header — it advertises that the
@@ -1534,7 +1544,7 @@ hash: it folds the per-part `(offset, sha256(part_bytes))` pairs already collect
 offset-manifest, and the version's `hash_value` is `root = sha256(manifest)` with `hash_mode =
 'multipart-composite-sha256'` and `part_count` set. The manifest text is persisted in `version_hash_manifest`
 (transactionally with the version row). The **only** read against the assembled object at complete-time is a bounded
-~8 KiB ranged `GetObject`/`get_range` for MIME magic-byte sniffing (`MIME_SNIFF_PREFIX_BYTES`) — not a full re-read.
+~8 KiB ranged `GetObject`/`read_prefix` for MIME magic-byte sniffing (`MIME_SNIFF_PREFIX_BYTES`) — not a full re-read.
 
 **One-part plans degenerate to `whole-sha256`** (ADR-0006 single-part amendment): when the plan has exactly one part,
 that part's streaming digest is already `sha256(whole object bytes)`, so `complete_multipart` stores it directly with
@@ -1557,7 +1567,7 @@ both modes (ADR-0006 defines the two hash modes; ADR-0002 covers the algorithm-s
 
 | Backend              | Multipart support                                                                                                                                 | Hash mode                                                                                                       |
 |----------------------|----------------------------------------------------------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------|
-| `local-filesystem`   | **No** — `initiate_multipart`/`upload_part`/`complete_multipart`/`abort_multipart` all inherit the trait's default `Err(multipart_not_supported)` | whole-object SHA-256 only (single-part, with the read-back re-hash above)                                       |
+| `local-filesystem`   | **No** — `initiate_multipart`/`upload_part_stream`/`complete_multipart`/`abort_multipart` all inherit the trait's default `Err(multipart_not_supported)` | whole-object SHA-256 only (single-part, with the read-back re-hash above)                                       |
 | `s3-compatible` (S3) | Yes (native `CreateMultipartUpload`/`PutPart`/`CompleteMultipartUpload`)                                                                           | whole-object SHA-256 (single-part, read-back); multipart-composite-SHA-256 (ADR-0006) — no full re-read, only an 8 KiB ranged `GetObject` for MIME sniffing |
 | in-memory            | Yes (test/dev backend)                                                                                                                              | whole-object SHA-256 (single-part, read-back); multipart-composite-SHA-256 (ADR-0006) — no full re-concat for hashing, only an 8 KiB slice for MIME sniffing |
 
@@ -1597,8 +1607,8 @@ Every request flows through async tokio tasks; no thread-pool style blocking. Th
 - **No request-scoped buffering.** Upload and download paths use `axum::body::Body` and `futures::Stream<Bytes>` end
   to end. On upload, chunks flow through the sidecar's incremental SHA-256 hasher synchronously (negligible CPU per
   chunk; no magic-byte/MIME detector runs in this stream — that check is control-plane, post-write, see
-  `content-pipeline` in §3.2), then onward. The `Stream<Bytes>` from a backend `get()` is plumbed directly into the
-  response body without `.collect()`
+  `content-pipeline` in §3.2), then onward. The `Stream<Bytes>` from a backend `get_stream()`/`get_range_stream()`
+  call is plumbed directly into the response body without `.collect()`
 - **Backpressure propagates.** A slow client makes the response stream block; that blocks `stream-proxy` from
   consuming more chunks from the backend; that blocks the backend driver from reading more bytes; that throttles the
   backend connection. The same applies in the upload direction. There is no internal queue that can grow without
@@ -1619,7 +1629,7 @@ Concurrency caps:
 | `cpt-cf-file-storage-nfr-metadata-latency`      | Designed              | Single-row Postgres lookup; expected p95 well within budget under target load                                                                        |
 | `cpt-cf-file-storage-nfr-transfer-latency`      | Designed              | Sidecar streams end-to-end; no full-file buffering; range translated to backend-native where supported. The extra control round-trip (presign) is a small metadata call, off the byte path |
 | `cpt-cf-file-storage-nfr-url-availability`      | Designed              | File identity (`file_id`) is stable for the file's lifetime; access is via re-presignable signed URLs; deleted files return `404`                    |
-| `cpt-cf-file-storage-nfr-durability`            | Designed              | Finalize-then-bind model: the version is `pending` at pre-register and flips to `available` only after a successful sidecar `put()` + **finalize** (the sidecar's token-authenticated callback, which re-reads the blob from the backend and independently verifies size/hash before persisting) — so `content_id` never points at missing or unverified bytes once a later client `bind` swaps the pointer. A `pending` version whose finalize never completes, plus its blob, is an orphan: the sidecar best-effort deletes the partial object on a stream/size-constraint error path, and the P2 cleanup engine sweeps the residue (hard sidecar crash between `put()` and finalize). The `files` row never points at a non-`available` version |
+| `cpt-cf-file-storage-nfr-durability`            | Designed              | Finalize-then-bind model: the version is `pending` at pre-register and flips to `available` only after a successful sidecar streaming write (`publish_exclusive`) + **finalize** (the sidecar's token-authenticated callback, which re-reads the blob from the backend and independently verifies size/hash before persisting) — so `content_id` never points at missing or unverified bytes once a later client `bind` swaps the pointer. A `pending` version whose finalize never completes, plus its blob, is an orphan: the sidecar best-effort deletes the partial object on a stream/size-constraint error path, and the P2 cleanup engine sweeps the residue (hard sidecar crash between the streamed write and finalize). The `files` row never points at a non-`available` version |
 | `cpt-cf-file-storage-nfr-scalability`           | Designed              | Stateless request path on both planes; shared metadata DB; the control plane is bandwidth-light, the sidecar scales independently on bandwidth; streaming I/O bounds per-request CPU and memory |
 | `cpt-cf-file-storage-nfr-bandwidth`             | Designed              | Per-**sidecar**-instance ingress+egress budget (≥ 2.5 GiB/s combined on 25 GbE) sized so the concurrency target is bandwidth- not CPU-bound; sidecar capacity scales horizontally with stateless replicas; conditional re-reads offloaded to API-Gateway/CDN keyed on the content-only `ETag` the sidecar emits. Models the cost accepted by `cpt-cf-file-storage-adr-sidecar-data-plane`, confined to the sidecar |
 | `cpt-cf-file-storage-nfr-audit-completeness`    | Deferred to P2        | P1 has no audit emission; the seam is reserved in `metadata-service` and `audit-publisher` is declared as P2                                         |
