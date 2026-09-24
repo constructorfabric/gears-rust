@@ -113,6 +113,16 @@ def test_s3_single_part_full_lifecycle(
     assert upload_resp.status_code == 200, (
         f"PUT {upload_url!r} failed: {upload_resp.status_code}\n{upload_resp.text}"
     )
+    # api.md §"Single-part bind outcome headers": the sidecar's own PUT
+    # response must forward the won-CAS outcome transparently -- the real
+    # two-process HTTP hop (sidecar → control-plane finalize → sidecar →
+    # client), not just the control-plane handler's own response.
+    assert upload_resp.headers.get("x-fs-bound") == "true", (
+        f"Expected X-FS-Bound: true on a won auto-bind, got headers: {dict(upload_resp.headers)}"
+    )
+    assert upload_resp.headers.get("etag"), (
+        f"Expected an ETag header on a won auto-bind, got headers: {dict(upload_resp.headers)}"
+    )
 
     # ── 3. The upload already bound the content (auto-bind) ──────────────
     # `bind: "auto"` is the default, so the sidecar's finalize callback swaps

@@ -93,6 +93,17 @@ def test_localfs_single_part_full_lifecycle(
     assert upload_resp.status_code == 200, (
         f"PUT {upload_url!r} failed: {upload_resp.status_code}\n{upload_resp.text}"
     )
+    # api.md §"Single-part bind outcome headers": for a `bind: "auto"` upload
+    # (the default), the sidecar's own PUT response must forward the won-CAS
+    # outcome transparently -- this is the real two-process HTTP hop
+    # (sidecar → control-plane finalize → sidecar → client), not just the
+    # control-plane handler's own response.
+    assert upload_resp.headers.get("x-fs-bound") == "true", (
+        f"Expected X-FS-Bound: true on a won auto-bind, got headers: {dict(upload_resp.headers)}"
+    )
+    assert upload_resp.headers.get("etag"), (
+        f"Expected an ETag header on a won auto-bind, got headers: {dict(upload_resp.headers)}"
+    )
 
     # ── 3. Verify on-disk: the blob must be at <storage_root>/<file_id>/<version_id>
     on_disk_path = Path(fs_storage_root) / file_id / version_id
