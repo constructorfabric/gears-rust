@@ -631,6 +631,17 @@ jobs:
       # a real server, and a green run that quietly skipped it proves nothing.
       # The thread bound is the lane's own — every case gets its own server,
       # and more than a couple at once is more than the runner will take.
+      #
+      # The remote embedding plugin is here rather than left to the workspace
+      # coverage job, which gates on nothing: it is shipped as a first-class
+      # deliverable of this gear and it holds the credential handling, the URL
+      # validation and the retry classification, which is exactly the code a
+      # floor is worth having on. Its contract suite answers a mock endpoint
+      # and needs nothing this lane does not already have.
+      #
+      # The ONNX plugin is not, and cannot be from here: its tests need a real
+      # ONNX Runtime and a real model, which only its own lane downloads, so a
+      # figure measured here would be the coverage of a suite that skipped.
       - name: Test and enforce the coverage floor
         timeout-minutes: 30
         env:
@@ -640,6 +651,7 @@ jobs:
         run: |
           cargo llvm-cov nextest \
             -p cf-gears-graph-storage -p cf-gears-graph-storage-sdk \
+            -p cf-gears-graph-storage-remote-embedding-plugin \
             --test-threads=2 \
             --lcov --output-path lcov.info --fail-under-lines 85
 
