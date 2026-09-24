@@ -23,30 +23,37 @@
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::doc_markdown)]
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use sea_orm::{ConnectionTrait, Database, Statement, TransactionTrait};
 use sea_orm_migration::MigratorTrait;
+use time::OffsetDateTime;
 use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use toolkit_gts::gts_id;
-use toolkit_security::SecurityContext;
+use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
 use file_storage::domain::audit::{AuditEntry, AuditOperation};
 use file_storage::domain::authz::TenantOnlyAuthorizer;
 use file_storage::domain::error::DomainError;
 use file_storage::domain::etag;
-use file_storage::domain::multipart::BindState;
+use file_storage::domain::multipart::{BindState, MultipartPart, MultipartUploadSession};
 use file_storage::domain::multipart_service::MultipartService;
-use file_storage::domain::ports::MultipartStore;
+use file_storage::domain::policy::{PolicyScope, StoredPolicy};
+use file_storage::domain::ports::{
+    AutoBindOnFinalize, FinalizeMultipartOutcome, FinalizeVersionOutcome, MultipartFinishSnapshot,
+    MultipartStore,
+};
 use file_storage::domain::service::{FileService, ServiceConfig};
 use file_storage::infra::backend::{BackendRegistry, InMemoryBackend, StorageBackend};
 use file_storage::infra::content::hash_mode::HashMode;
 use file_storage::infra::signed_url::Issuer;
 use file_storage::infra::storage::Store;
 use file_storage::infra::storage::migrations::Migrator;
-use file_storage_sdk::{NewFile, OwnerKind, VersionStatus};
+use file_storage_sdk::{File, FileVersion, NewFile, OwnerKind, VersionStatus};
 
 const GTS: &str = gts_id!("cf.fstorage.file.type.v1~x.test.file.type.v1~");
 
@@ -306,6 +313,286 @@ async fn set_hash_mode_bypassing_check(dsn: &str, version_id: Uuid, value: &str)
         "tamper UPDATE must hit exactly the one row the test prepared"
     );
     txn.commit().await.expect("commit tamper txn");
+}
+
+/// Simulate `FinalizeMultipartOutcome::session_completed == false` (thread
+/// #16, item 2a): flip the session straight from `completing` to `completed`
+/// on a SEPARATE connection, as if some other completer's own attempt had
+/// already closed it -- bypassing `finish_complete`'s own state CAS the way
+/// no legitimate caller ever could (see that method's doc comment: nothing
+/// can beat this call's own `finalize_multipart_version` to it under normal
+/// operation), so this is simulated directly rather than raced for real.
+/// `complete_result` is left `NULL` so a later fallback replay (if the fix
+/// under test did not close the session correctly) keeps re-deriving from
+/// live state instead of masking the bug behind a stale-but-present snapshot.
+async fn tamper_session_to_completed_out_from_under(dsn: &str, upload_id: Uuid) {
+    exec_expect_one_row(
+        dsn,
+        &format!(
+            "UPDATE multipart_uploads SET state = 'completed', complete_result = NULL, \
+             lease_owner = NULL, lease_until = NULL WHERE upload_id = {} AND state = 'completing'",
+            uuid_blob(upload_id)
+        ),
+    )
+    .await;
+}
+
+/// Land a legitimate, unrelated rebind exactly in the window between
+/// `finalize_multipart_version`'s commit and the OLD, buggy
+/// `converge_or_error_after_lost_finalize_cas` -> `replay_completed`
+/// fallback's own fresh `require_file` read of `files.content_id` (thread
+/// #16) -- direct tamper because landing a real second completer's write in
+/// that microsecond window is not something a test can reliably time; see
+/// `SessionCasRaceStore::require_file` for where this fires.
+async fn tamper_rebind_content(dsn: &str, file_id: Uuid, new_content_id: Uuid) {
+    exec_expect_one_row(
+        dsn,
+        &format!(
+            "UPDATE files SET content_id = {} WHERE file_id = {}",
+            uuid_blob(new_content_id),
+            uuid_blob(file_id)
+        ),
+    )
+    .await;
+}
+
+/// `MultipartStore` decorator reproducing thread #16/item-2(a)'s race
+/// deterministically: `finalize_multipart_version` tampers the session out
+/// from under its own terminal CAS (`session_completed` will read back
+/// `false` even though `updated`/`bound` are decided normally), arming a
+/// one-shot rebind that the very next `require_file` call lands -- which,
+/// on the OLD, buggy `assemble_and_finish_inner`, is exactly the fallback
+/// `converge_or_error_after_lost_finalize_cas` -> `replay_completed` takes
+/// when `session_completed` reads `false`. The fix under test must never
+/// reach that fallback for this outcome, so `require_file`'s tamper never
+/// fires against the fixed code -- only the response actually returned is
+/// asserted either way.
+struct SessionCasRaceStore {
+    inner: Arc<dyn MultipartStore>,
+    dsn: String,
+    rebind_content_id: Uuid,
+    armed: AtomicBool,
+}
+
+#[async_trait]
+impl MultipartStore for SessionCasRaceStore {
+    async fn require_file(&self, scope: &AccessScope, file_id: Uuid) -> Result<File, DomainError> {
+        if self.armed.swap(false, Ordering::SeqCst) {
+            tamper_rebind_content(&self.dsn, file_id, self.rebind_content_id).await;
+        }
+        self.inner.require_file(scope, file_id).await
+    }
+
+    async fn get_policy(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        policy_scope: &PolicyScope,
+        scope_owner_id: Option<Uuid>,
+    ) -> Result<Option<StoredPolicy>, DomainError> {
+        self.inner
+            .get_policy(scope, tenant_id, policy_scope, scope_owner_id)
+            .await
+    }
+
+    async fn insert_pending_version(
+        &self,
+        file_id: Uuid,
+        version_id: Uuid,
+        mime_type: &str,
+        backend_id: &str,
+        backend_path: &str,
+        now: OffsetDateTime,
+    ) -> Result<(), DomainError> {
+        self.inner
+            .insert_pending_version(
+                file_id,
+                version_id,
+                mime_type,
+                backend_id,
+                backend_path,
+                now,
+            )
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_multipart_upload(
+        &self,
+        upload_id: Uuid,
+        file_id: Uuid,
+        version_id: Uuid,
+        backend_upload_handle: &str,
+        backend_id: Option<&str>,
+        backend_path: Option<&str>,
+        declared_mime: &str,
+        declared_size: u64,
+        part_size: u64,
+        auto_bind: bool,
+        expires_at: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> Result<(), DomainError> {
+        self.inner
+            .create_multipart_upload(
+                upload_id,
+                file_id,
+                version_id,
+                backend_upload_handle,
+                backend_id,
+                backend_path,
+                declared_mime,
+                declared_size,
+                part_size,
+                auto_bind,
+                expires_at,
+                now,
+            )
+            .await
+    }
+
+    async fn get_multipart_upload(
+        &self,
+        upload_id: Uuid,
+    ) -> Result<Option<MultipartUploadSession>, DomainError> {
+        self.inner.get_multipart_upload(upload_id).await
+    }
+
+    async fn get_version(
+        &self,
+        file_id: Uuid,
+        version_id: Uuid,
+    ) -> Result<Option<FileVersion>, DomainError> {
+        self.inner.get_version(file_id, version_id).await
+    }
+
+    async fn get_version_manifest(&self, version_id: Uuid) -> Result<Option<String>, DomainError> {
+        self.inner.get_version_manifest(version_id).await
+    }
+
+    async fn upsert_multipart_part(
+        &self,
+        upload_id: Uuid,
+        part_number: i32,
+        backend_etag: &str,
+        part_hash: Vec<u8>,
+        size: i64,
+        now: OffsetDateTime,
+    ) -> Result<(), DomainError> {
+        self.inner
+            .upsert_multipart_part(upload_id, part_number, backend_etag, part_hash, size, now)
+            .await
+    }
+
+    async fn list_multipart_parts(
+        &self,
+        upload_id: Uuid,
+    ) -> Result<Vec<MultipartPart>, DomainError> {
+        self.inner.list_multipart_parts(upload_id).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn finalize_version(
+        &self,
+        file_id: Uuid,
+        version_id: Uuid,
+        size: i64,
+        hash_value: Vec<u8>,
+        hash_mode: HashMode,
+        part_count: Option<i32>,
+        manifest: Option<String>,
+        validated_mime: Option<String>,
+        audit: AuditEntry,
+        auto_bind: Option<AutoBindOnFinalize>,
+    ) -> Result<FinalizeVersionOutcome, DomainError> {
+        self.inner
+            .finalize_version(
+                file_id,
+                version_id,
+                size,
+                hash_value,
+                hash_mode,
+                part_count,
+                manifest,
+                validated_mime,
+                audit,
+                auto_bind,
+            )
+            .await
+    }
+
+    async fn finalize_multipart_version(
+        &self,
+        file_id: Uuid,
+        manifest: Option<String>,
+        validated_mime: Option<String>,
+        finalize_audit: AuditEntry,
+        auto_bind: Option<AutoBindOnFinalize>,
+        finish: MultipartFinishSnapshot,
+    ) -> Result<FinalizeMultipartOutcome, DomainError> {
+        tamper_session_to_completed_out_from_under(&self.dsn, finish.upload_id).await;
+        self.armed.store(true, Ordering::SeqCst);
+        self.inner
+            .finalize_multipart_version(
+                file_id,
+                manifest,
+                validated_mime,
+                finalize_audit,
+                auto_bind,
+                finish,
+            )
+            .await
+    }
+
+    async fn complete_multipart_upload(
+        &self,
+        upload_id: Uuid,
+        lease_owner: &str,
+        result_json: &str,
+        audit: AuditEntry,
+    ) -> Result<bool, DomainError> {
+        self.inner
+            .complete_multipart_upload(upload_id, lease_owner, result_json, audit)
+            .await
+    }
+
+    async fn acquire_multipart_complete_lease(
+        &self,
+        upload_id: Uuid,
+        owner: &str,
+        lease_until: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> Result<bool, DomainError> {
+        self.inner
+            .acquire_multipart_complete_lease(upload_id, owner, lease_until, now)
+            .await
+    }
+
+    async fn release_multipart_complete_lease(
+        &self,
+        upload_id: Uuid,
+        owner: &str,
+    ) -> Result<bool, DomainError> {
+        self.inner
+            .release_multipart_complete_lease(upload_id, owner)
+            .await
+    }
+
+    async fn abort_multipart_upload(
+        &self,
+        upload_id: Uuid,
+        audit: AuditEntry,
+    ) -> Result<bool, DomainError> {
+        self.inner.abort_multipart_upload(upload_id, audit).await
+    }
+
+    async fn delete_version(
+        &self,
+        file_id: Uuid,
+        version_id: Uuid,
+        audit: AuditEntry,
+    ) -> Result<bool, DomainError> {
+        self.inner.delete_version(file_id, version_id, audit).await
+    }
 }
 
 // -- with_complete_lease_secs + unknown upload_id (multipart_service.rs 185-188, 760) ---
@@ -912,6 +1199,276 @@ async fn replay_completed_snapshot_survives_a_later_rebind_without_tampering() {
     // outcome", not a no-op rebind.
     let file = svc.get_file(&ctx, file_id).await.expect("file");
     assert_eq!(file.content_id, Some(plan_b.version_id));
+}
+
+// -- session-CAS race: transaction outcome must win (thread #16, item 2a) ---------------
+
+/// `assemble_and_finish_inner`'s own terminal session CAS losing
+/// (`FinalizeMultipartOutcome::session_completed == false`, with `updated`
+/// still `true`) must answer from that SAME transaction's own authoritative
+/// finalize+auto-bind decision (`bound`/`current_etag`) -- never from a
+/// recompute against the file's live `content_id`, which the OLD, buggy
+/// `converge_or_error_after_lost_finalize_cas` -> `replay_completed` fallback
+/// did. `SessionCasRaceStore` forces exactly that outcome and arms a
+/// one-shot rebind that lands in the fallback's own `require_file` read
+/// window; on the fixed code that fallback is never reached for this
+/// outcome, so the rebind never fires and the file's real content pointer is
+/// untouched.
+#[tokio::test]
+async fn complete_reports_transaction_bind_outcome_when_own_session_cas_is_lost() {
+    let (db, dsn) = build_db_with_dsn().await;
+    let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let backends = BackendRegistry::new(vec![Arc::clone(&backend)], "mem").expect("registry");
+    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let authorizer: Arc<dyn file_storage::domain::authz::Authorizer> =
+        Arc::new(TenantOnlyAuthorizer);
+    let cfg = ServiceConfig {
+        default_url_ttl_secs: 3600,
+        sidecar_base_url: "http://sidecar.test".to_owned(),
+        default_page_size: 50,
+        max_page_size: 1000,
+        idempotency_ttl_secs: 86400,
+    };
+    let store = Store::new(Arc::clone(&db));
+    let real_multipart_store: Arc<dyn MultipartStore> = Arc::new(store.clone());
+    let svc = Arc::new(FileService::new(
+        store.clone(),
+        backends.clone(),
+        Arc::clone(&issuer),
+        Arc::clone(&authorizer),
+        cfg,
+        None,
+        None,
+    ));
+    let raced_store: Arc<dyn MultipartStore> = Arc::new(SessionCasRaceStore {
+        inner: Arc::clone(&real_multipart_store),
+        dsn: dsn.clone(),
+        // Stands in for "some other, unrelated version" -- never
+        // dereferenced as a real row, only ever compared against by
+        // `bind_state_for` on the (buggy) fallback path.
+        rebind_content_id: Uuid::now_v7(),
+        armed: AtomicBool::new(false),
+    });
+    let msvc = Arc::new(
+        MultipartService::new(
+            Arc::clone(&raced_store),
+            backends,
+            Arc::clone(&authorizer),
+            None,
+            issuer,
+            "http://sidecar.test".to_owned(),
+            3600,
+        )
+        .with_complete_lease_secs(90),
+    );
+    let ctx = ctx(Uuid::now_v7());
+    let file_id = svc.create_file_bare(&ctx, new_file()).await.unwrap();
+
+    // auto_bind: the finalize's own auto-bind CAS is what must win
+    // authoritatively. `if_match: None` on a content-less file targets
+    // `expected_content_id: None`, which the real transaction's CAS wins
+    // (`bound: true`) regardless of the session-row tamper below (a
+    // different table, untouched by it).
+    let plan = msvc
+        .initiate_multipart_upload(
+            &ctx,
+            file_id,
+            "application/octet-stream",
+            13,
+            None,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+    let session = real_multipart_store
+        .get_multipart_upload(plan.upload_id)
+        .await
+        .unwrap()
+        .expect("session");
+    let backend_path = format!("/{file_id}/{}", plan.version_id);
+    simulate_sidecar_put_part(
+        &real_multipart_store,
+        &backend,
+        &plan,
+        &backend_path,
+        &session.backend_upload_handle,
+        1,
+        Bytes::from_static(b"Hello, World!"),
+    )
+    .await;
+
+    let completed = msvc
+        .complete_multipart_upload(&ctx, file_id, plan.upload_id, None)
+        .await
+        .expect("finalize won its own CAS -- session_completed==false must still succeed")
+        .unwrap_completed();
+
+    assert_eq!(
+        completed.bind_state,
+        BindState::Bound,
+        "must report THIS transaction's own auto-bind decision, not a live recompute"
+    );
+    assert_eq!(
+        completed.etag.as_deref(),
+        Some(etag::content_etag(file_id, plan.version_id).as_str()),
+        "must carry this version's own content etag"
+    );
+    assert_eq!(completed.current_etag, None);
+
+    // Sanity: the rebind hook was armed by `finalize_multipart_version`'s own
+    // tamper but never consumed -- the fixed code never called
+    // `require_file` from `replay_completed`'s fallback for this outcome, so
+    // the file's REAL content pointer is untouched.
+    let file = svc.get_file(&ctx, file_id).await.expect("file");
+    assert_eq!(
+        file.content_id,
+        Some(plan.version_id),
+        "the file must really be bound to this version -- the rebind tamper never fired"
+    );
+}
+
+// -- persisted-snapshot 404 on a since-deleted version (thread #16, item 2b) ------------
+
+/// The persisted-snapshot fast path in `replay_completed` must 404 when its
+/// own version has since been deleted (never bound as current, later
+/// individually removed via the real `delete_version` API) instead of
+/// silently answering with `manifest: null` -- `get_version_manifest` alone
+/// can't distinguish "no manifest ever existed" (a `whole-sha256` version)
+/// from "the manifest existed but its version is gone" (`version_hash_manifest`
+/// cascades with the version row it belongs to).
+#[tokio::test]
+async fn replay_completed_snapshot_404s_when_its_composite_version_is_deleted() {
+    let (svc, msvc, multipart_store, backend, _store, ctx, _dsn) = build_env().await;
+    let file_id = svc.create_file_bare(&ctx, new_file()).await.unwrap();
+
+    // Composite (2-part) upload -> V1, manual bind (auto_bind: false) so it
+    // can be rebound away later with a plain `svc.bind` call.
+    let part_size = 5 * 1024 * 1024usize;
+    let part1 = vec![b'a'; part_size];
+    let part2 = vec![b'b'; 4096];
+    let declared_size = (part1.len() + part2.len()) as u64;
+    let plan = msvc
+        .initiate_multipart_upload(
+            &ctx,
+            file_id,
+            "application/octet-stream",
+            declared_size,
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    let session = multipart_store
+        .get_multipart_upload(plan.upload_id)
+        .await
+        .unwrap()
+        .expect("session");
+    let backend_path = format!("/{file_id}/{}", plan.version_id);
+    simulate_sidecar_put_part(
+        &multipart_store,
+        &backend,
+        &plan,
+        &backend_path,
+        &session.backend_upload_handle,
+        1,
+        Bytes::from(part1),
+    )
+    .await;
+    simulate_sidecar_put_part(
+        &multipart_store,
+        &backend,
+        &plan,
+        &backend_path,
+        &session.backend_upload_handle,
+        2,
+        Bytes::from(part2),
+    )
+    .await;
+
+    let first = msvc
+        .complete_multipart_upload(&ctx, file_id, plan.upload_id, None)
+        .await
+        .unwrap()
+        .unwrap_completed();
+    assert_eq!(
+        first.hash_mode,
+        HashMode::MultipartCompositeSha256,
+        "sanity: 2 parts must produce a composite version with a real manifest"
+    );
+    assert!(
+        first.manifest.is_some(),
+        "sanity: a composite version must have a manifest"
+    );
+
+    // Bind V1, then complete + bind a second version V2 over it -- V1 is no
+    // longer the file's current content.
+    svc.bind(&ctx, file_id, plan.version_id, None)
+        .await
+        .expect("first bind");
+    let plan2 = msvc
+        .initiate_multipart_upload(
+            &ctx,
+            file_id,
+            "application/octet-stream",
+            5,
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    let session2 = multipart_store
+        .get_multipart_upload(plan2.upload_id)
+        .await
+        .unwrap()
+        .expect("session2");
+    let backend_path2 = format!("/{file_id}/{}", plan2.version_id);
+    simulate_sidecar_put_part(
+        &multipart_store,
+        &backend,
+        &plan2,
+        &backend_path2,
+        &session2.backend_upload_handle,
+        1,
+        Bytes::from_static(b"BBBBB"),
+    )
+    .await;
+    msvc.complete_multipart_upload(&ctx, file_id, plan2.upload_id, None)
+        .await
+        .unwrap();
+    svc.bind(
+        &ctx,
+        file_id,
+        plan2.version_id,
+        Some(&etag::content_etag(file_id, plan.version_id)),
+    )
+    .await
+    .expect("rebind to V2");
+
+    // V1 is no longer current -- delete it for real (production API).
+    svc.delete_version(&ctx, file_id, plan.version_id)
+        .await
+        .expect("delete the now-unbound V1");
+
+    // Replay the ORIGINAL complete for V1's upload_id: the persisted
+    // snapshot is still there, but its version is gone -- must 404, never a
+    // response with `manifest: null`.
+    let err = msvc
+        .complete_multipart_upload(&ctx, file_id, plan.upload_id, None)
+        .await
+        .expect_err("replay of a completed session whose version was since deleted must fail");
+    match err {
+        DomainError::VersionNotFound {
+            file_id: f,
+            version_id: v,
+        } => {
+            assert_eq!(f, file_id);
+            assert_eq!(v, plan.version_id);
+        }
+        other => panic!("expected VersionNotFound, got {other:?}"),
+    }
 }
 
 // -- lease takeover fast path (multipart_service.rs 1088-1090) --------------------------

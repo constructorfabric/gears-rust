@@ -452,6 +452,18 @@ impl FileStorageConfig {
                 MAX_URL_TTL_CEILING
             );
         }
+        // `MultipartService` applies `url_ttl_secs.max(1)` (per-part URLs,
+        // resume-URL caps) as defense-in-depth against a zero TTL reaching
+        // `checked_add`; unlike `finalize_token_grace_secs`, `0` has no
+        // documented "disabled" meaning here; it would just silently mint
+        // every signed URL with a 1-second TTL. Reject it up front instead of
+        // letting that substitution paper over a misconfiguration.
+        if self.default_url_ttl_secs == 0 {
+            anyhow::bail!(
+                "invalid file-storage config: default_url_ttl_secs must be > 0 (a zero-second \
+                 signed URL TTL would expire before any client could plausibly use it)"
+            );
+        }
         // `default_url_ttl_secs` is what every mint uses absent a caller
         // override, so it must itself respect the ceiling the control plane
         // is supposed to enforce -- otherwise the very first signed URL
@@ -519,6 +531,18 @@ impl FileStorageConfig {
                 MAX_ORPHAN_GRACE_SECS
             );
         }
+        // `MultipartService` applies `session_ttl_secs.max(1)` as defense-in-
+        // depth against a zero TTL reaching `checked_add`; `0` has no
+        // documented "disabled" meaning for a session lifetime -- it would
+        // just silently mint a 1-second session, breaking every multipart
+        // upload. Reject it up front, the same way `default_url_ttl_secs`
+        // is rejected above.
+        if self.multipart_session_ttl_secs == 0 {
+            anyhow::bail!(
+                "invalid file-storage config: multipart_session_ttl_secs must be > 0 (a \
+                 zero-second session lifetime would expire before any upload could complete)"
+            );
+        }
         // A multipart session must outlive (or at least match) the per-part
         // signed URLs minted at initiate time -- otherwise the very first
         // batch of upload URLs would carry an `exp` beyond the session's own
@@ -550,6 +574,19 @@ impl FileStorageConfig {
                  MAX_MULTIPART_SESSION_TTL_SECS ({})",
                 self.multipart_session_ttl_secs,
                 MAX_MULTIPART_SESSION_TTL_SECS
+            );
+        }
+        // `MultipartService` applies `complete_lease_secs.max(1)` as defense-
+        // in-depth against a zero TTL reaching `checked_add`; `0` has no
+        // documented "disabled" meaning for the lease -- it would just
+        // silently grant a 1-second lease, letting a second caller take over
+        // the lease almost immediately and defeating the crash-recovery
+        // purpose it exists for. Reject it up front, the same way the other
+        // `*_ttl_secs`/lease knobs above are.
+        if self.multipart_complete_lease_secs == 0 {
+            anyhow::bail!(
+                "invalid file-storage config: multipart_complete_lease_secs must be > 0 (a \
+                 zero-second lease would let another caller take it over almost immediately)"
             );
         }
         // `multipart_complete_lease_secs` otherwise has no ceiling of its own

@@ -1199,7 +1199,7 @@ async fn initiate_returns_coherent_parts_plan() {
 
 /// `initiate_multipart_upload` must persist the actual backend/path the
 /// upload was initiated against on the session row itself
-/// (`m20260722_000001_multipart_auto_bind`'s `backend_id`/`backend_path`
+/// (`m20260924_000001_upload_flow_redesign`'s `backend_id`/`backend_path`
 /// columns) -- not leave cleanup/`MultipartService` to reconstruct them from
 /// the `file_versions` row later, which is unavailable once that row is
 /// reclaimed. Both must be `Some` and agree with the pending version's own

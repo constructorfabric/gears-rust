@@ -9,7 +9,7 @@ use uuid::Uuid;
 ///
 /// The single definition of the layout. The path is computed once when a
 /// version is created and persisted in `file_versions.backend_path` (and,
-/// since `m20260722_000001_multipart_auto_bind`, mirrored onto the session
+/// since `m20260924_000001_upload_flow_redesign`, mirrored onto the session
 /// row in `multipart_uploads.backend_path` at initiate time); every later
 /// reader uses one of those stored values instead of calling this function
 /// again. The only remaining callers are the expired-multipart-session

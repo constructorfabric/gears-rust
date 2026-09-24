@@ -1567,8 +1567,8 @@ async fn expired_multipart_session_is_aborted_by_sweep() {
     );
 }
 
-/// `m20260902_000001_index_hardening`'s `multipart_uploads_sweep_idx` exists
-/// specifically to serve the OR's `completing AND lease_until < now` branch
+/// `m20260924_000001_upload_flow_redesign`'s `multipart_uploads_sweep_idx`
+/// exists specifically to serve the OR's `completing AND lease_until < now` branch
 /// (see that migration's own doc comment) -- everything above only exercises
 /// the `in_progress` branch. A `completing` session is left behind when its
 /// completer dies mid-assembly (after acquiring the completion lease, before
@@ -1676,7 +1676,7 @@ async fn sweep_aborts_expired_completing_session() {
     );
 }
 
-/// End-to-end regression for `m20260902_000001_index_hardening`'s
+/// End-to-end regression for `m20260924_000001_upload_flow_redesign`'s
 /// `idempotency_keys_file_idx`: `idempotency_keys.file_id` carries `ON DELETE
 /// CASCADE` back to `files`, so deleting a file through the real service path
 /// must leave no `idempotency_keys` row behind for it. Asserted via a raw
@@ -2517,7 +2517,7 @@ async fn sweep_reclaims_version_after_session_expires_still_aborts_backend_and_d
     );
 }
 
-/// Regression (`m20260722_000001_multipart_auto_bind`'s `backend_id`/
+/// Regression (`m20260924_000001_upload_flow_redesign`'s `backend_id`/
 /// `backend_path` columns): when the `file_versions` row backing an expired
 /// session is already gone, cleanup must abort the backend upload on the
 /// session's OWN backend/path -- read from the session row itself -- not

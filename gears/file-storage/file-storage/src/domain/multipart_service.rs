@@ -531,6 +531,8 @@ impl MultipartService {
         // invariant living in a different module is exactly the kind of thing
         // that can silently drift, and the fallout of an unchecked overflow
         // here is a panic, not a wrong-but-recoverable value. Defense in depth.
+        // `.max(1)`: `validate()` also rejects `== 0` for both fields, so this
+        // is defense in depth too, not the primary guard against a zero TTL.
         let session_expires_at = now
             .checked_add(time::Duration::seconds(self.session_ttl_secs.max(1)))
             .ok_or_else(|| {
@@ -538,6 +540,9 @@ impl MultipartService {
                     "multipart session TTL overflowed computing the session expiry",
                 )
             })?;
+        // `.max(1)`: `validate()` also rejects `default_url_ttl_secs == 0`
+        // (see the `session_expires_at` comment above), so this is defense in
+        // depth too, not the primary guard against a zero TTL.
         let url_expires_at = now
             .checked_add(time::Duration::seconds(self.url_ttl_secs.max(1)))
             .ok_or_else(|| {
@@ -878,6 +883,8 @@ impl MultipartService {
         // above: `FileStorageConfig::validate()` already bounds
         // `complete_lease_secs`, so this should never actually overflow, but
         // defense in depth turns a would-be panic into a clean error.
+        // `.max(1)`: `validate()` also rejects `== 0`, so this is defense in
+        // depth too, not the primary guard against a zero-second lease.
         let lease_until = now
             .checked_add(time::Duration::seconds(self.complete_lease_secs.max(1)))
             .ok_or_else(|| {
@@ -990,7 +997,10 @@ impl MultipartService {
     /// `StoredCompleteResult` carries no `manifest` of its own (see its doc
     /// comment) — the persisted-snapshot branch re-reads it from
     /// `version_hash_manifest` the same way the version-row fallback below
-    /// always has, via `get_version_manifest`.
+    /// always has, via `get_version_manifest`. It first confirms the
+    /// snapshot's version still exists (404 if not) -- otherwise a since-
+    /// deleted version's manifest would silently come back `None` instead of
+    /// surfacing a 404.
     async fn replay_completed(
         &self,
         file_id: Uuid,
@@ -999,6 +1009,24 @@ impl MultipartService {
         if let Some(json) = &session.complete_result
             && let Ok(stored) = serde_json::from_str::<StoredCompleteResult>(json)
         {
+            // The snapshot's own version can have been deleted since
+            // completion (never bound as the file's current content, or
+            // rebound away and later individually deleted) -- its
+            // `version_hash_manifest` row cascades with it, so
+            // `get_version_manifest` alone can't tell "no manifest ever
+            // existed" (a `whole-sha256` version) apart from "the manifest
+            // existed but the version is gone". Confirm the version itself
+            // is still there first, or this would silently answer a stale
+            // replay with `manifest: null` instead of the 404 a caller could
+            // actually act on.
+            if self
+                .store
+                .get_version(file_id, stored.version_id)
+                .await?
+                .is_none()
+            {
+                return Err(DomainError::version_not_found(file_id, stored.version_id));
+            }
             let manifest = self.store.get_version_manifest(stored.version_id).await?;
             if let Some(completed) = stored.into_completed(manifest) {
                 return Ok(completed);
@@ -1458,33 +1486,18 @@ impl MultipartService {
                 )
                 .await;
         }
-        if !finalize_outcome.session_completed {
-            // The version this call just finalized is committed either way;
-            // only the session's OWN terminal CAS (inside that same
-            // transaction) lost its race -- this call's completion lease was
-            // taken over between the finalize and that CAS. Converge exactly
-            // like the finalize-side race above: re-read and replay rather
-            // than erroring, since the outcome (this exact version, now
-            // available) is the same no matter who's session-state CAS
-            // ultimately won.
-            return self
-                .converge_or_error_after_lost_finalize_cas(
-                    ctx,
-                    file_id,
-                    session,
-                    lease_owner,
-                    upload_id,
-                )
-                .await;
-        }
-
         // Same bind-state model as [`Self::bind_state_for`]'s doc — the
         // decision itself was already made inside `finalize_multipart_version`'s
         // transaction; `current_etag` comes back from there rather than a
         // second, post-commit read (which could otherwise observe a
         // legitimate rebind that landed after that transaction committed and
         // report a live response that disagrees with the snapshot the same
-        // transaction just persisted).
+        // transaction just persisted). Built regardless of
+        // `finalize_outcome.session_completed` below -- `bound`/`current_etag`
+        // are computed by `finalize_multipart_version` unconditionally
+        // (independent of whether its own terminal session CAS also won), so
+        // this is the authoritative outcome of THIS call's finalize either
+        // way.
         let (bind_state, bind_etag, current_etag) = if bound {
             (
                 BindState::Bound,
@@ -1509,6 +1522,28 @@ impl MultipartService {
             etag: bind_etag,
             current_etag,
         };
+
+        if !finalize_outcome.session_completed {
+            // The version this call just finalized is committed either way,
+            // and `result` above already reflects that SAME transaction's
+            // authoritative bind decision; only the session's OWN terminal
+            // CAS (inside that same transaction, deliberately owner-blind --
+            // fenced only by `state = 'completing'`) lost its race, because
+            // this call's completion lease was taken over and closed by
+            // another completer before this transaction's own terminal CAS
+            // ran. Close the session with THIS exact snapshot via
+            // `finish_session` instead of falling back to
+            // `converge_or_error_after_lost_finalize_cas`'s `replay_completed`
+            // -- that fallback re-derives `bind_state` from the file's
+            // CURRENT (possibly since legitimately rebound) content pointer,
+            // which can disagree with the outcome this transaction actually
+            // computed (see `MultipartStore::finalize_multipart_version`'s
+            // doc). `finish_session` itself already converges silently if
+            // the other completer's own attempt won the race to close the
+            // session first with the same outcome.
+            self.finish_session(ctx, session, lease_owner, &result)
+                .await?;
+        }
 
         // Credit the assembled object's total bytes. Multipart finalize does
         // not go through `FileService::finalize_upload`, so it needs its own
@@ -1563,13 +1598,14 @@ impl MultipartService {
     /// that branch did not need to change). Anything else (row gone, or
     /// genuinely still `pending`) keeps the original hard error.
     ///
-    /// Also reused for a second, narrower race: `finalize_multipart_version`
-    /// itself WON its finalize CAS (nothing lost there) but its own,
-    /// same-transaction terminal session CAS lost
-    /// (`FinalizeMultipartOutcome::session_completed == false` -- this call's
-    /// lease was taken over between the two steps of that one transaction).
-    /// The version is unconditionally `Available` in that case (this call
-    /// just committed it), so this always takes the converge branch (a).
+    /// NOT used for `FinalizeMultipartOutcome::session_completed == false`
+    /// (this call's own finalize CAS won, but its same-transaction terminal
+    /// session CAS lost): that case has its own authoritative outcome fresh
+    /// out of `finalize_multipart_version`'s transaction (`bound`/
+    /// `current_etag`), so `assemble_and_finish_inner` builds the response
+    /// from that directly and closes the session via `finish_session` with
+    /// it, rather than re-deriving `bind_state` here from the file's CURRENT
+    /// (possibly since legitimately rebound) content pointer.
     async fn converge_or_error_after_lost_finalize_cas(
         &self,
         ctx: &SecurityContext,
@@ -1738,7 +1774,8 @@ impl MultipartService {
         // `FileStorageConfig::validate()` already bounds `url_ttl_secs`
         // (`default_url_ttl_secs`/`max_url_ttl_secs`), so this should never
         // actually overflow, but defense in depth turns a would-be panic into
-        // a clean error.
+        // a clean error. `.max(1)`: `validate()` also rejects `== 0`, so this
+        // is defense in depth too, not the primary guard against a zero TTL.
         let url_ttl_cap = now
             .checked_add(time::Duration::seconds(self.url_ttl_secs.max(1)))
             .ok_or_else(|| {

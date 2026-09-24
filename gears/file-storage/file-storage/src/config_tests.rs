@@ -490,6 +490,39 @@ fn validate_accepts_default_config_url_ttl_pair() {
     assert!(cfg.validate().is_ok());
 }
 
+// ── default_url_ttl_secs lower bound ────────────────────────────────────────
+//
+// `MultipartService` applies `url_ttl_secs.max(1)` as defense-in-depth
+// against a zero TTL reaching `checked_add`; unlike `finalize_token_grace_secs`,
+// `0` has no documented "disabled" meaning here, so `validate()` must reject
+// it outright rather than let every signed URL silently get a 1-second TTL.
+
+#[test]
+fn validate_rejects_zero_default_url_ttl() {
+    let cfg = FileStorageConfig {
+        default_url_ttl_secs: 0,
+        require_signing_key_seed: false,
+        ..FileStorageConfig::default()
+    };
+    assert!(
+        cfg.validate().is_err(),
+        "default_url_ttl_secs == 0 must be rejected"
+    );
+}
+
+#[test]
+fn validate_accepts_default_url_ttl_of_one() {
+    let cfg = FileStorageConfig {
+        default_url_ttl_secs: 1,
+        require_signing_key_seed: false,
+        ..FileStorageConfig::default()
+    };
+    assert!(
+        cfg.validate().is_ok(),
+        "default_url_ttl_secs == 1 must be accepted"
+    );
+}
+
 // ── default-page-size / max-page-size cross-field validation ───────────────
 //
 // `default_page_size` is what `GET /files` uses absent a caller-supplied
@@ -731,6 +764,39 @@ fn validate_accepts_default_config_multipart_session_ttl_ceiling() {
     assert!(cfg.validate().is_ok());
 }
 
+// ── multipart_session_ttl_secs lower bound ──────────────────────────────────
+//
+// `MultipartService` applies `session_ttl_secs.max(1)` as defense-in-depth
+// against a zero TTL reaching `checked_add`; `0` has no documented "disabled"
+// meaning for a session lifetime, so `validate()` must reject it outright.
+
+#[test]
+fn validate_rejects_zero_multipart_session_ttl() {
+    let cfg = FileStorageConfig {
+        multipart_session_ttl_secs: 0,
+        require_signing_key_seed: false,
+        ..FileStorageConfig::default()
+    };
+    assert!(
+        cfg.validate().is_err(),
+        "multipart_session_ttl_secs == 0 must be rejected"
+    );
+}
+
+#[test]
+fn validate_accepts_multipart_session_ttl_of_one() {
+    let cfg = FileStorageConfig {
+        default_url_ttl_secs: 1,
+        multipart_session_ttl_secs: 1,
+        require_signing_key_seed: false,
+        ..FileStorageConfig::default()
+    };
+    assert!(
+        cfg.validate().is_ok(),
+        "multipart_session_ttl_secs == 1 must be accepted"
+    );
+}
+
 // ── multipart_complete_lease_secs absolute ceiling ──────────────────────────
 //
 // Unlike the TTL/grace knobs above, `gear.rs` already falls back to a safe
@@ -779,6 +845,39 @@ fn validate_accepts_default_config_multipart_complete_lease() {
          ceiling"
     );
     assert!(cfg.validate().is_ok());
+}
+
+// ── multipart_complete_lease_secs lower bound ───────────────────────────────
+//
+// `MultipartService` applies `complete_lease_secs.max(1)` as defense-in-depth
+// against a zero TTL reaching `checked_add`; `0` has no documented "disabled"
+// meaning for the lease, so `validate()` must reject it outright rather than
+// let another caller take the lease over almost immediately.
+
+#[test]
+fn validate_rejects_zero_multipart_complete_lease() {
+    let cfg = FileStorageConfig {
+        multipart_complete_lease_secs: 0,
+        require_signing_key_seed: false,
+        ..FileStorageConfig::default()
+    };
+    assert!(
+        cfg.validate().is_err(),
+        "multipart_complete_lease_secs == 0 must be rejected"
+    );
+}
+
+#[test]
+fn validate_accepts_multipart_complete_lease_of_one() {
+    let cfg = FileStorageConfig {
+        multipart_complete_lease_secs: 1,
+        require_signing_key_seed: false,
+        ..FileStorageConfig::default()
+    };
+    assert!(
+        cfg.validate().is_ok(),
+        "multipart_complete_lease_secs == 1 must be accepted"
+    );
 }
 
 // ── orphan_grace_secs absolute ceiling ──────────────────────────────────────
