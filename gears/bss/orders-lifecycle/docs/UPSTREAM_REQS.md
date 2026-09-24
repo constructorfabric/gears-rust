@@ -684,7 +684,7 @@ from line fields would let Orders and Subscriptions disagree about which orders 
 needs, through a Contracts SDK, one batched read returning the contract's status (active or not)
 and whether the payer is party-eligible to purchase the basket's catalog scope under it, with a
 machine-readable business reason on a negative answer. This is the predicate the Contracts PRD
-already names (`cpt-cf-bss-contracts-fr-party-eligibility`, consumed by the order-capture gate).
+already names (Contracts PRD §6.6 *Party eligibility predicate*, consumed by the order-capture gate).
 Orders maps an inactive contract to `contract-not-active`, an ineligible party to
 `contract-party-ineligible`, and outage or an unimplemented operation to
 `contract-resolution-unavailable` (fail closed, ADR-0003). The gear has a PRD and no
@@ -695,7 +695,7 @@ implementation or SDK today (`design/03-gate-and-pin.md` §3.5, §4.2 predicate 
 **The contract's acceptance-required declaration.** The same contract-resolution read must also
 return, where an order references a `contractId`, whether customer acceptance is required for
 services sold under that contract (`acceptance_required`). This is the declaration the Contracts PRD
-already requires the contract to carry (`cpt-cf-bss-contracts-fr-booking-acceptance`: the contract
+already requires the contract to carry (Contracts PRD §6.6 *Booking instant and acceptance*: the contract
 "**MUST** declare whether customer acceptance is required"). Orders reads it live — not snapshotted
 at submit — at the acceptance-recording and begin-fulfillment guards, where it outranks the seller
 and platform elections (`design/05-preconditions.md` §3.5, §4.1, D-107, D-132). Until the SDK
@@ -725,4 +725,4 @@ mitigation exists.
 - **DESIGN**: [`./DESIGN.md`](./DESIGN.md) §3.5, §3.8; [`./design/01-foundation.md`](./design/01-foundation.md) §3.8, §4.4; [`./design/03-gate-and-pin.md`](./design/03-gate-and-pin.md) §2.2; [`./design/06-workflow-seam.md`](./design/06-workflow-seam.md) §4.2, §4.6
 - **Decisions**: [`./DECISIONS.md`](./DECISIONS.md) — D-32, D-56, D-108, D-111, D-122, D-124, Q-04, Q-05, Q-08
 - **ADRs**: [`./ADR/0003`](./ADR/0003-cpt-cf-bss-orders-lifecycle-adr-fail-closed-gate.md) — the fail-closed posture that makes `SUB-O5` a blocker rather than a degradation; [`./ADR/0006`](./ADR/0006-cpt-cf-bss-orders-lifecycle-adr-outbox-publication.md) — the platform producer path and Event Broker readiness gate
-- **Upstream registers**: `gears/bss/subscriptions/docs/SEAMS.md` §I (`SUB-O1`…`SUB-O6`); the sibling Workflow PRD §13 (`SUB-O5`…`SUB-O9`); `gears/bss/rating/docs/SEAMS.md` for the three Rating asks; `gears/bss/contracts/docs/PRD.md` (`cpt-cf-bss-contracts-fr-party-eligibility`, `cpt-cf-bss-contracts-fr-booking-acceptance`) for the Contracts asks; `gears/bss/subscriptions/docs/SEAMS.md` `SUB-G1` (PR #4177) for the catalog-registry product key. Rating and the billing chain **are** specified in this repository — Rating carries a PRD, a DESIGN, ADRs and its own seam register, and the billing chain is specified as `gears/bss/ledger` — so both asks must be raised against those specifications rather than treated as unowned. **Payments alone has no specification and no register**, which is why that one ask is recorded here for whichever specification takes it; the same applies to a distinct tax owner, which `ledger` does not claim to be
+- **Upstream registers**: `gears/bss/subscriptions/docs/SEAMS.md` §I (`SUB-O1`…`SUB-O6`); the sibling Workflow PRD §13 (`SUB-O5`…`SUB-O9`); `gears/bss/rating/docs/SEAMS.md` for the three Rating asks; `gears/bss/contracts/docs/PRD.md` §6.6 (*Party eligibility predicate*, *Booking instant and acceptance*) for the Contracts asks; `gears/bss/subscriptions/docs/SEAMS.md` `SUB-G1` (PR #4177) for the catalog-registry product key. Rating and the billing chain **are** specified in this repository — Rating carries a PRD, a DESIGN, ADRs and its own seam register, and the billing chain is specified as `gears/bss/ledger` — so both asks must be raised against those specifications rather than treated as unowned. **Payments alone has no specification and no register**, which is why that one ask is recorded here for whichever specification takes it; the same applies to a distinct tax owner, which `ledger` does not claim to be

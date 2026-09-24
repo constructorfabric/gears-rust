@@ -2455,7 +2455,7 @@ the contract's `acceptance_required` declaration beside contract status and part
 and read the declaration live at each guard; nothing is snapshotted onto the version. The count
 of outbound operations stays nine. A new ask,
 `cpt-cf-bss-orders-lifecycle-upreq-contract-acceptance-declaration` (p1), sits in
-`UPSTREAM_REQS.md §2.11` and cites `cpt-cf-bss-contracts-fr-booking-acceptance`. Until the
+`UPSTREAM_REQS.md §2.11` and cites Contracts PRD §6.6 *Booking instant and acceptance*. Until the
 Contracts SDK exists, a contract-referenced order resolves the existing
 `acceptance-requirement-unevaluable` at both guards and never falls back to an election.
 

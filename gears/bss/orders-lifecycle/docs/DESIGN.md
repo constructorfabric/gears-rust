@@ -522,8 +522,7 @@ what it replaced, without mutating what a reviewer already saw.
 The amendment path from `submitted`, `pending_approval` and `approved`; the new-version append
 with its `supersedesVersion` reference; the gate re-run and re-pin trigger; historical version
 retrieval; the non-versioned audited administrative edit path; and the absence of any amendment row
-from `in_fulfillment` onward (engine `not-admissible`;
-`cpt-cf-bss-orders-lifecycle-constraint-no-amendment-in-fulfillment`).
+from `in_fulfillment` onward (engine `not-admissible`; `04 §2.2` *Amendment stops at `in_fulfillment`*).
 
 ##### Responsibility boundaries
 
