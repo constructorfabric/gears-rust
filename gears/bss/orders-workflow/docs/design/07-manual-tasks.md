@@ -552,7 +552,8 @@ Projects `ManualTask`, `Incident` (read-only) and `OverdueEscalation` rows with 
 SLA countdown, severity, the derived `remediationHold` flag (§4.3), subject context, failure
 reason and cause, the pending resolution request if any, correlation identifiers and the
 resolution actions the row offers. Keyset-paginated (default page 50, maximum 200, opaque cursor,
-stable sort on `(sla_deadline, task_id)`).
+stable sort on the immutable key `(created_at, task_id)` per 09 §2.2 *Every collection response is paged*; `sla_deadline` is recomputed
+on `reopened`, so it is a displayed countdown and a filter, never the cursor key).
 
 *Resolution intake.* For `retry`, `override` and `cancel` it writes one `owf_task_resolution_request`
 row — action, `SecurityContext` principal, justification, the claimed `subscriptionId` for an
@@ -711,7 +712,7 @@ are listed in §4.7.
 
 | Method | Path | Description | Stability |
 |--------|------|--------------|-----------|
-| `GET` | `/bss-orders-workflow/v1/fulfillment-operator/tasks` | List manual tasks, incidents and escalations in the caller's seller scope, with assignment state, SLA countdown, severity, `remediationHold`, the pending request and the offered actions. Keyset-paginated: `limit` (default 50, max 200), opaque `cursor`, stable sort on `(sla_deadline, task_id)` | unstable |
+| `GET` | `/bss-orders-workflow/v1/fulfillment-operator/tasks` | List manual tasks, incidents and escalations in the caller's seller scope, with assignment state, SLA countdown, severity, `remediationHold`, the pending request and the offered actions. Keyset-paginated: `limit` (default 50, max 200), opaque `cursor`, stable sort on the immutable key `(created_at, task_id)`; `sla_deadline` is shown and filterable, not the sort key | unstable |
 | `POST` | `/bss-orders-workflow/v1/fulfillment-operator/tasks/{taskId}/assign` | Claim (`unassigned → assigned`), release (`assigned → unassigned`) or begin (`assigned → in_progress`). A Fulfillment Operator assigns only to self (the `SecurityContext` principal); a Seller Operator may name an `assignee` within the same seller scope, validated against that scope. Applied in-process; `200`. `If-Match`, `Idempotency-Key` `{tenant}:{taskId}:assign:{rowVersion}` | unstable |
 | `POST` | `/bss-orders-workflow/v1/fulfillment-operator/tasks/{taskId}/retry` | Request a retry of the failed subject. Refused with `order-fenced` per `cpt-cf-bss-orders-workflow-constraint-no-fulfillment-after-fence`, with `action-not-offered` when `retry` is not in the row's actions. Writes the request row and signals `task-resolution-requested`; `202` with `requestRef`. `If-Match`, `Idempotency-Key` `{tenant}:{taskId}:retry:{rowVersion}` | unstable |
 | `POST` | `/bss-orders-workflow/v1/fulfillment-operator/tasks/{taskId}/override` | Request an override carrying **only** the claimed `subscriptionId` and a free-text `justification`. Operator identity comes from the `SecurityContext` principal and **MUST NOT** appear in the body; a body carrying an identity field is rejected as malformed. Same preconditions as `retry`; line-scope forward tasks only. Writes the request row and signals; `202` with `requestRef`. `If-Match`, `Idempotency-Key` `{tenant}:{taskId}:override:{rowVersion}` | unstable |
