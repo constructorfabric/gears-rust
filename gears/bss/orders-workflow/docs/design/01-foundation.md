@@ -1,5 +1,5 @@
 <!-- CONFLUENCE_TITLE: [BSS]: Orders Workflow — Process Engine (Slice 1) -->
-<!-- Related: ../DESIGN.md, ../PRD.md, ./README.md | Owners: BSS Orders team -->
+<!-- Related: ../DESIGN.md, ../PRD.md, ./README.md, ./10-process-definition.md | Owners: BSS Orders team -->
 
 # DESIGN — Process Engine (Slice 1)
 
@@ -23,21 +23,21 @@
   - [3.8 Deployment Topology](#38-deployment-topology)
 - [4. Engine Normative Rules](#4-engine-normative-rules)
   - [4.1 Engine execution history is not the audit source of record](#41-engine-execution-history-is-not-the-audit-source-of-record)
-  - [4.2 Five distinct bounds, not one](#42-five-distinct-bounds-not-one)
+  - [4.2 Five distinct bounds, two owners](#42-five-distinct-bounds-two-owners)
   - [4.3 The idempotency registry's non-success outcomes are exhaustive](#43-the-idempotency-registrys-non-success-outcomes-are-exhaustive)
-  - [4.4 The durable timer service](#44-the-durable-timer-service)
-  - [4.5 The retry/backoff controller and the caller-side duplicate protocol](#45-the-retrybackoff-controller-and-the-caller-side-duplicate-protocol)
+  - [4.4 Timers and retry policy are the definition's](#44-timers-and-retry-policy-are-the-definitions)
+  - [4.5 The envelope's bound and the caller-side duplicate protocol](#45-the-envelopes-bound-and-the-caller-side-duplicate-protocol)
   - [4.6 The process audit log is 100% complete with zero silent drops](#46-the-process-audit-log-is-100-complete-with-zero-silent-drops)
   - [4.7 One event per committed step outcome, and the six named process events only](#47-one-event-per-committed-step-outcome-and-the-six-named-process-events-only)
-  - [4.8 The dead-letter record is never an order state](#48-the-dead-letter-record-is-never-an-order-state)
+  - [4.8 Dead letters are the platform's; the manual task is Orders'](#48-dead-letters-are-the-platforms-the-manual-task-is-orders)
   - [4.9 The machine-readable reason catalogue](#49-the-machine-readable-reason-catalogue)
-  - [4.10 The extension boundary for capability handlers](#410-the-extension-boundary-for-capability-handlers)
+  - [4.10 The operation registration boundary](#410-the-operation-registration-boundary)
   - [4.11 Data classification](#411-data-classification)
-  - [4.12 Concurrency and back-pressure working baselines](#412-concurrency-and-back-pressure-working-baselines)
-  - [4.13 The crash-loop guard is distinct from the retry budget](#413-the-crash-loop-guard-is-distinct-from-the-retry-budget)
-  - [4.14 Determinism discipline for replayed execution](#414-determinism-discipline-for-replayed-execution)
+  - [4.12 Concurrency and back-pressure: admission on dispatch](#412-concurrency-and-back-pressure-admission-on-dispatch)
+  - [4.13 Poison handling is the platform's; the Orders-side quarantine is `retry-step`'s](#413-poison-handling-is-the-platforms-the-orders-side-quarantine-is-retry-steps)
+  - [4.14 Determinism discipline: what is computed on which side of the boundary](#414-determinism-discipline-what-is-computed-on-which-side-of-the-boundary)
   - [4.15 Clock-skew tolerance and evaluation against database time](#415-clock-skew-tolerance-and-evaluation-against-database-time)
-  - [4.16 Recovery-rate target and the cold-start admission ramp](#416-recovery-rate-target-and-the-cold-start-admission-ramp)
+  - [4.16 Recovery is the platform's invocation and Orders' record](#416-recovery-is-the-platforms-invocation-and-orders-record)
   - [4.17 The audit contract (normative)](#417-the-audit-contract-normative)
 - [5. Traceability](#5-traceability)
 
@@ -49,47 +49,71 @@
 
 ### 1.1 Architectural Vision
 
-This slice is the shared engine every other Orders Workflow slice executes through. It owns the
-process-instance aggregate correlated to `orderId` + `orderVersion`, definition-version pinning
-for the lifetime of an instance, the durable step log, the idempotency registry for outbound
-calls, the retry/backoff controller enforcing four distinct bounds, the durable timer service,
-the process audit log, the platform event producer adapter, and the registry of machine-readable
-process reasons. It
-owns **no commercial policy**: it cannot evaluate whether an approval gate applies, does not know
-what a provisioning wave means commercially, and never decides fulfillment eligibility — those
-are handler concerns layered on top by slices 02 through 09
-([`./README.md`](./README.md); rationale in
-[`../ADR/0001`](../ADR/0001-cpt-cf-bss-orders-workflow-adr-durable-execution-substrate.md)).
+This slice is the shared engine every other Orders Workflow slice executes through, and after
+[`../ADR/0011`](../ADR/0011-cpt-cf-bss-orders-workflow-adr-flow-as-platform-definition.md) the
+engine is exactly two things: **the step-operation envelope** and **the process record**. The
+envelope is the one unit of work every step of the order process runs inside — idempotency
+resolution before the step's effect, the audit entry, the typed process event and the idempotency
+settlement in one transaction after it, a per-operation deadline around it, and a closed vocabulary
+of outcomes out of it. The record is the gear-owned set of tables that make process execution
+reconstructible at audit grade: the process instance, the step log, the idempotency registry, the
+hash-chained audit trail, and the two registries that bind an instance to the definition version it
+runs under and declare which operations exist.
 
-The engine exists because the PRD's dual-authority rule
-(`cpt-cf-bss-orders-workflow-fr-owf-process-state-nonauth`) and its `p1` NFRs — durability,
-idempotency, audit completeness, and recoverability — are properties of *how a step executes and
-is recorded* rather than of any capability that runs one. Orders Lifecycle is authoritative for
-the commercial order document and order state; this gear's process audit and saga log are
-authoritative for process execution progress — step progress, accepted provisioning intents, the
-saga/compensation log, timer state, and retry counters — **independently of** whatever
-durable-execution substrate is chosen, whose own run history is explicitly **not** the audit
+What the engine **no longer owns** is sequencing. The order of steps, the branches, the waits,
+the two-wave barrier, the event listening, the hold/resume/cancel signal arms and the structure
+of compensation are a **versioned Serverless Workflow definition** (CNCF Serverless Workflow
+Specification v1.0.0, per
+[serverless-runtime ADR-0003](../../../../serverless-runtime/docs/ADR/0003-cpt-cf-serverless-runtime-adr-workflow-dsl.md))
+registered in the platform gear `serverless-runtime` and executed by its Temporal plugin
+([serverless-runtime ADR-0004](../../../../serverless-runtime/docs/ADR/0004-cpt-cf-serverless-runtime-adr-temporal-workflow-engine.md),
+[ADR-0005](../../../../serverless-runtime/docs/ADR/0005-cpt-cf-serverless-runtime-adr-thin-host.md)).
+That definition is specified in [`10-process-definition.md`](./10-process-definition.md). **The
+platform drives; Orders records.** Every task of the definition that does work calls one Orders
+**step operation** over an internal REST surface (§3.3); the operation performs the effect through
+the envelope and writes Orders' record in its own transaction. Durable timers, task retry policy,
+checkpoints, replay after a crash, event correlation into a running process and poison handling
+are the platform plugin's
+([serverless-runtime DESIGN §1.1](../../../../serverless-runtime/docs/DESIGN.md#11-architectural-vision),
+`DESIGN.md:85`), so this slice owns no timer service, no retry controller and no dead-letter store
+of its own any more.
+
+The engine still owns **no commercial policy**: it cannot evaluate whether an approval gate
+applies, does not know what a provisioning wave means commercially, and never decides fulfillment
+eligibility — those are the step operations that slices 02 through 09 register against the
+operation registration boundary (§3.2), and their ordering is the definition's. It exists because
+the PRD's dual-authority rule (`cpt-cf-bss-orders-workflow-fr-owf-process-state-nonauth`) and its
+`p1` NFRs — durability, idempotency, audit completeness and recoverability — are properties of
+*how a step executes and is recorded*, and those properties must hold whichever definition version
+sequences the steps and whatever the platform keeps in its own history. Orders Lifecycle is
+authoritative for the commercial order document and order state; this gear's process audit and
+saga log are authoritative for process execution progress — step progress, accepted provisioning
+intents, the saga/compensation log, the pinned definition version and the platform attempt ids —
+**independently of** the platform engine's run history, which is explicitly **not** the audit
 source of record
 ([`../ADR/0003`](../ADR/0003-cpt-cf-bss-orders-workflow-adr-process-state-non-authoritative.md)).
-Process state must never be presented as authoritative commercial order state: what was ordered
-and the current order state are always read from Orders Lifecycle. This slice makes that
-separation structural rather than a discipline every handler must remember — a handler cannot
-accidentally become a second source of truth because it has no store of its own to become one in.
 
-Two consequences shape everything downstream. First, **an instance runs to completion under the
-definition version it started with** — the version is recorded on the instance and in the audit
-trail, and an operator cannot migrate a running instance onto a later definition; a definition
-change only affects instances started after it. Second, **the engine's own record, not the
-durable-execution substrate's history, is what recovery and audit reconstruct from** — execution
-state must be reconstructible and replayable from the gear-owned record with zero loss for
-committed steps, so a substrate migration or a substrate-internal history purge cannot erase the
-audit trail this gear is obligated to keep.
+Three consequences shape everything downstream. First, **an instance runs to termination under
+the definition version it started with**: `start-instance` writes the binding, the audit trail
+carries it, and the platform's own pinning of an invocation to the callable version it started
+under ([serverless-runtime DESIGN `DESIGN.md:614`](../../../../serverless-runtime/docs/DESIGN.md#versioning-model))
+is what makes that pin hold on the executing side too; migration of a running instance is out of
+scope (PRD §5.2). Second, **references, not payloads, cross the engine boundary**
+([`../ADR/0013`](../ADR/0013-cpt-cf-bss-orders-workflow-adr-references-not-payloads.md)): a task
+input or output is `correlationId`, `orderId`, `orderVersion`, a `stepRef`/`gateRef`/`taskRef`/
+`lineRef` identifier and small enums — never a resolved total, an approver identity, a tenant axis
+beyond `resource_tenant_id`, or a downstream payload — so nothing commercial sits in engine
+history and the PRD §15 Q-01 criteria are met by construction. Third, **the engine's own record,
+not the platform's history, is what audit and recovery reconstruct from**: the platform replays
+the definition after a crash, and every replayed call lands on an envelope that absorbs it under
+the same idempotency key, so a platform-side purge or a plugin migration cannot erase what this
+gear is obligated to keep.
 
 The shape is adopted rather than invented. The sibling Orders Lifecycle gear commits every state
 change through one transition engine that is the single writer of order state; this slice is the
-analogous pattern applied to long-running, externally-dispatching process execution instead of a
-single-transaction state transition — the engine is the single writer of process execution state,
-and every handler is a caller against its API, never a second place where step progress can be
+analogous pattern for long-running, externally-dispatching process execution — the envelope is the
+single writer of process execution state, every step operation is a caller against it, and the
+definition is a caller against the operations, never a second place where step progress can be
 recorded.
 
 ### 1.2 Architecture Drivers
@@ -98,71 +122,77 @@ recorded.
 
 | Requirement | Design Response |
 |-------------|------------------|
-| `cpt-cf-bss-orders-workflow-fr-owf-process-state-nonauth` | The process-instance aggregate and the audit writer are the only stores of execution progress; the domain model (§3.1) carries no commercial order fields, and every read of "what was ordered" is a call out to Orders Lifecycle, never a local field. |
-| `cpt-cf-bss-orders-workflow-fr-owf-start-contract` | The process-instance aggregate carries a process `correlationId` generated at start, distinct from per-call idempotency keys and from downstream transition-request identifiers (§3.1); duplicate-trigger absorption is a property of the idempotency registry keyed by event ID plus that `correlationId`. |
-| `cpt-cf-bss-orders-workflow-fr-owf-retry` | The retry/backoff controller enforces the retry budget on intent-submission failures only, distinct from the per-attempt timeout and the step deadline (§3.2); a hang after accept does not consume the budget and is not resubmitted. |
-| `cpt-cf-bss-orders-workflow-fr-owf-dead-letter` | The dead-letter record is a distinct entity from the step log and from the manual-task path (§3.1); it parks a payload after a finite delivery-count cap is exhausted and is never itself an order state. |
-| `cpt-cf-bss-orders-workflow-fr-owf-intent-sweep` | The durable timer service schedules the reconciliation sweep on an escalating interval; the sweep is read-only once the idempotency-key lifetime elapses, a property enforced by the idempotency registry's own key-lifetime tracking. |
-| `cpt-cf-bss-orders-workflow-fr-owf-backpressure` | The concurrency/back-pressure component enforces a per-order parallel-line limit, a cross-process in-flight-intent aggregate limit, and per-tenant fairness keyed on `seller_tenant_id` at dispatch, with a bounded queue and reject-on-full behind both; a downstream throttle signal delays dispatch without touching the retry budget (§3.2, §4.12). |
-| `cpt-cf-bss-orders-workflow-fr-owf-hold-resume` | Timer pause/resume is a first-class operation of the durable timer service, so a hold suspends escalation windows without losing their remaining duration, and resume restarts execution from the last durable checkpoint recorded by the step executor. |
-| `cpt-cf-bss-orders-workflow-fr-owf-terminal-order-events` | Process termination is recorded in the process audit log as a terminal step-log entry, distinguishing termination-with-compensation from ordinary step completion. |
+| `cpt-cf-bss-orders-workflow-fr-owf-process-state-nonauth` | The process-instance aggregate, the step log and the audit writer are the only stores of execution progress; the domain model (§3.1) carries no commercial order fields; the definition binding (§3.7) records the pinned version and every `owf_step_log` row records the platform `attempt_id`, so progress is reconstructible without the platform's history. |
+| `cpt-cf-bss-orders-workflow-fr-owf-start-contract` | `start-instance` (§3.3) generates and persists the process `correlationId`, writes the binding and the `instance-start` audit entry in one transaction; duplicate-trigger absorption is the idempotency registry's, keyed per [`02 §2.1`](./02-triggers-and-start.md#21-design-principles). |
+| `cpt-cf-bss-orders-workflow-fr-owf-retry` | Retry policy is declared on the definition's tasks and executed by the platform plugin (`10 §2`); the envelope makes each retried call land on the same key, and the operation's `retry_class` declares whether its transient failures may be retried at all (§3.3). The per-operation deadline inside the envelope is the only time bound this slice enforces itself (§4.2). |
+| `cpt-cf-bss-orders-workflow-fr-owf-dead-letter` | An inbound trigger or callback that exhausts delivery is the platform trigger path's dead letter ([`../ADR/0009`](../ADR/0009-cpt-cf-bss-orders-workflow-adr-manual-task-dead-letter-separation.md) as amended); a step that exhausts remediation has the manual task. This slice owns no dead-letter store (§4.8). |
+| `cpt-cf-bss-orders-workflow-fr-owf-intent-sweep` | The sweep's status read runs on the definition's `wait`/retry cadence (`10 §3.6`) and, as a backstop for instances no invocation drives, on the `reconciliation-sweep` worker (§3.8); settlement happens only through `settle-from-lookup` (§3.3), which is read-only past the key lifetime by the registry's own aging. |
+| `cpt-cf-bss-orders-workflow-fr-owf-backpressure` | Admission on dispatch — per-order parallelism, the aggregate in-flight cap, per-seller fairness and reject-on-full — is enforced inside the dispatch operations and specified in [`05`](./05-provisioning-intents.md) (§4.12 here is a pointer). |
+| `cpt-cf-bss-orders-workflow-fr-owf-hold-resume` | Hold and resume are signal arms of the definition (`10 §3.6` (e)); `apply-hold`/`apply-resume` (slice 08) record them through the envelope and return the remaining escalation window Orders computed, which the definition re-arms. |
+| `cpt-cf-bss-orders-workflow-fr-owf-terminal-order-events` | `terminate-instance` (§3.3) records termination as a `termination` audit entry, distinguishing termination-with-compensation, supersession and ordinary completion by the terminal outcome and reason it carries. |
 
 #### NFR Allocation
 
 | NFR ID | NFR Summary | Allocated To | Design Response | Verification Approach |
 |--------|-------------|--------------|-----------------|----------------------|
-| `cpt-cf-bss-orders-workflow-nfr-owf-durability` | Zero in-flight workflows lost across restarts; zero loss for committed process state | Step executor + audit writer | Every committed step writes its durable record before the executor reports completion; restart resumes from the last durably recorded checkpoint without re-running committed steps | Restart/kill test asserting no re-execution of a committed step and full resumption of pending steps |
-| `cpt-cf-bss-orders-workflow-nfr-owf-idempotency` | Zero duplicate durable effects from retried outbound calls | Idempotency registry | Every outbound call carries an idempotency key recorded before dispatch; a retried call reuses the same key and the registry's stored outcome absorbs a duplicate response | Parallel-retry test asserting one durable effect per key; replay test asserting a stored outcome is returned rather than re-dispatched |
-| `cpt-cf-bss-orders-workflow-nfr-owf-audit` | 100% of process state transitions recorded, zero silent drops, engine history not the audit SoR | Audit writer | Every instance start, step start, completion, retry, timeout, sweep action, escalation, compensation step, phase transition, termination and dead-letter event is written to the gear-owned audit log in the same transaction as the transition it records, independently of substrate history; each entry is hash-chained to its predecessor under the frozen byte contract of §4.17, and the store is trigger-protected against UPDATE and DELETE, so the trail is tamper-**evident** and not merely write-protected (§3.7) | Structural test asserting every step-executor code path writes an audit entry; frozen preimage/digest vectors for the §4.17 v1 encoding; every-field mutation test asserting the verifier detects an out-of-band edit or deletion; database trigger test asserting UPDATE and DELETE are rejected for every role; substrate-history-purge test asserting the gear-owned audit log is unaffected |
-| `cpt-cf-bss-orders-workflow-nfr-owf-event-latency` | p95 < 30 s from internal state change to event delivery | Platform event producer adapter | The typed event is enqueued through the bound platform producer outbox (`toolkit_db::outbox`) in the same transaction as the audit entry when a step commits; platform workers publish it asynchronously to Event Broker | Producer-queue lag (platform metric) measured from enqueue to broker acceptance at expected load; commit success alone is not evidence |
-| `cpt-cf-bss-orders-workflow-nfr-owf-fulfillment-sla` | p95 ≤ 15 minutes from activation-wave eligibility to terminal fulfillment outcome | Step executor + retry/backoff controller | Bounded per-attempt timeouts and step deadlines keep a stalled attempt from silently consuming the SLA window; concurrency limits keep the provisioning path from saturating under load | Load test measuring wave-to-terminal latency at p95 under configured concurrency caps |
-| `cpt-cf-bss-orders-workflow-nfr-owf-escalation-timer` | Configurable per-gate window, default 72 h, accuracy ± 5 min | Durable timer service | Timers are durable records with a scheduled fire instant, recovered on restart from the persisted record rather than an in-memory scheduler | Timer-accuracy test across a restart mid-window; configuration test per approval gate |
-| `cpt-cf-bss-orders-workflow-nfr-owf-availability` | 99.9% control-plane availability; in-flight processes unaffected by restarts | Step executor + durable timer service | Control-plane restart resumes from durable state without operator intervention; no in-memory-only component holds execution-critical state | Chaos test restarting the control plane under active in-flight processes |
-| `cpt-cf-bss-orders-workflow-nfr-owf-retention` | Gear-owned records retained ≥ 400 days independently of substrate history | Audit writer + dead-letter store | Retention is stated per store (§3.7): ≥ 400 days on the audit log and the dead-letter store, shorter windows on the recovery-scaffolding stores that carry no compliance obligation; a substrate purge of its own run history has no bearing on any of them | Retention-policy test confirming gear-owned records outlive a substrate history purge, and a per-store test asserting each window |
+| `cpt-cf-bss-orders-workflow-nfr-owf-durability` | Zero in-flight workflows lost across restarts; zero loss for committed process state | Step envelope + audit writer; platform plugin for the invocation itself | Every committed step writes its durable record before the envelope answers; the platform resumes the definition from its own history and every re-invoked call is absorbed by the registry rather than re-executed | Kill/restart test of the Orders gear asserting no re-execution of a settled step; kill/restart of the platform worker asserting the definition resumes and every re-issued call is an absorbed duplicate |
+| `cpt-cf-bss-orders-workflow-nfr-owf-idempotency` | Zero duplicate durable effects from retried outbound calls | Idempotency registry | Every step operation carries a required idempotency key recorded before its effect; a platform retry reuses the same key and the stored outcome absorbs it; an `open` record after a retryable failure is the only state in which the effect may run again | Parallel-retry test asserting one durable effect per key; replay test asserting a stored outcome is returned rather than re-dispatched; re-run test asserting an `open` key runs the closure exactly once more per settled retryable failure |
+| `cpt-cf-bss-orders-workflow-nfr-owf-audit` | 100% of process state transitions recorded, zero silent drops, engine history not the audit SoR | Audit writer | Every instance start, step start, settlement, retry, timeout, sweep settlement, escalation, compensation step, phase transition and termination is written to the gear-owned audit log in the transaction that records it, independently of platform history; each entry is hash-chained under the frozen byte contract of §4.17 and the store is trigger-protected against UPDATE and DELETE (§3.7) | Structural test asserting every envelope code path writes an audit entry; frozen preimage/digest vectors for §4.17; every-field mutation test; trigger test rejecting UPDATE and DELETE for every role; platform-history-purge test asserting the gear-owned audit log is unaffected |
+| `cpt-cf-bss-orders-workflow-nfr-owf-event-latency` | p95 < 30 s from internal state change to event delivery | Platform event producer adapter | The typed event is enqueued through the bound platform producer outbox in the settlement transaction; platform workers publish asynchronously | Producer-queue lag measured from enqueue to broker acceptance at expected load |
+| `cpt-cf-bss-orders-workflow-nfr-owf-fulfillment-sla` | p95 ≤ 15 minutes from activation-wave eligibility to terminal fulfillment outcome | Step envelope (per-operation deadline) + definition (task timeout and retry budget, `10 §2`) | The per-operation deadline keeps a stalled attempt from silently consuming the window; the definition's retry limits nest inside its task timeouts by validation (§4.2) | Load test measuring wave-to-terminal latency at p95 under the admission controls of `05` |
+| `cpt-cf-bss-orders-workflow-nfr-owf-escalation-timer` | Configurable per-gate window, default 72 h, accuracy ± 5 min | Platform plugin durable timers (definition `wait`), `10 §3.6` (a) | Timers are the plugin's durable timers, recovered from the platform's history on restart; Orders records arm, pause and fire through `open-gates`, `apply-hold`, `apply-resume` and `escalate-gate` | Timer-accuracy test across a platform worker restart mid-window; configuration test per approval gate |
+| `cpt-cf-bss-orders-workflow-nfr-owf-availability` | 99.9% control-plane availability; in-flight processes unaffected by restarts | Step envelope + platform plugin | An Orders restart loses no state because every step is a transaction; a platform restart resumes invocations from history; readiness includes the platform engine (§3.8) | Chaos test restarting each side under active in-flight processes |
+| `cpt-cf-bss-orders-workflow-nfr-owf-retention` | Gear-owned records retained ≥ 400 days independently of platform history | Audit writer | Retention is per store (§3.7): ≥ 400 days on the audit log, shorter windows on recovery scaffolding; a platform purge of invocation history has no bearing on any of them | Retention-policy test confirming gear-owned records outlive a platform history purge |
 
 #### Key ADRs
 
 | ADR ID | Decision Summary |
 |--------|-----------------|
-| `cpt-cf-bss-orders-workflow-adr-durable-execution-substrate` | A durable-execution substrate hosts the step executor and timer service, but its own run history is not the audit source of record — the gear-owned audit writer is |
+| `cpt-cf-bss-orders-workflow-adr-flow-as-platform-definition` | The order process flow is a versioned Serverless Workflow definition registered in `serverless-runtime` and executed by its Temporal plugin; Orders provides step operations and the process record |
+| `cpt-cf-bss-orders-workflow-adr-definition-versioning-and-protected-steps` | Definition versions are validated before publish against the protected-operation list, the closed trigger set and the bound nesting rule; instances are pinned to the version they started under |
+| `cpt-cf-bss-orders-workflow-adr-references-not-payloads` | Task inputs and outputs carry identifiers and small enums only; no commercial payload crosses the engine boundary |
+| `cpt-cf-bss-orders-workflow-adr-durable-execution-substrate` | The substrate is selected (serverless-runtime, Temporal plugin); its run history is not the audit source of record — the gear-owned audit writer is; code sequencing remains a stated fallback property |
 | `cpt-cf-bss-orders-workflow-adr-process-state-non-authoritative` | Process execution state is never presented as authoritative commercial order state; Orders Lifecycle remains the sole read path for order state |
-| `cpt-cf-bss-orders-workflow-adr-slice-decomposition` | A foundation slice plus eight handler slices, so the engine has an independent review boundary from any commercial policy |
-| `cpt-cf-bss-orders-workflow-adr-idempotency-key-composition` | Idempotency keys are structurally distinct from the process `correlationId` and from downstream transition-request identifiers |
-| `cpt-cf-bss-orders-workflow-adr-outbox-process-events` | Process events are enqueued through the platform producer outbox in the step's transaction and published asynchronously by platform workers; Workflow owns no outbox table, drain or re-drive |
-| `cpt-cf-bss-orders-workflow-adr-manual-task-dead-letter-separation` | The dead-letter record and the manual-task record are distinct inspectable objects with distinct triggers, never merged into one |
+| `cpt-cf-bss-orders-workflow-adr-slice-decomposition` | A foundation slice plus eight operation slices plus the definition document, so the engine has an independent review boundary from any commercial policy |
+| `cpt-cf-bss-orders-workflow-adr-idempotency-key-composition` | Idempotency keys are structurally distinct from the process `correlationId` and from downstream transition-request identifiers; the platform retries under the same key |
+| `cpt-cf-bss-orders-workflow-adr-outbox-process-events` | Process events are enqueued through the platform producer outbox in the step's transaction and published asynchronously by platform workers |
+| `cpt-cf-bss-orders-workflow-adr-manual-task-dead-letter-separation` | The manual task is the inspectable object for a step failure; an inbound delivery that exhausts its cap is the platform trigger path's dead letter, never merged with the manual task |
 
 ### 1.3 Architecture Layers
 
 - [ ] `p2` - **ID**: `cpt-cf-bss-orders-workflow-tech-engine-stack`
 
 ```text
-Handler slices        capability-specific steps registered against the engine's step API
-(02-09)                (approval, fulfillment plan, provisioning intents, saga, manual tasks,
-                        hold/cancel, reads/authz — this slice owns none of their content)
+Platform durable      serverless-runtime host (registry, invocations, event-triggers) and its
+execution             Temporal plugin: interprets the definition of design/10, owns timers,
+                      task retry, checkpoints, replay, event correlation, poison handling
+       │  HTTP `call` tasks → POST /bss-orders-workflow/v1/steps/{operation}
+       ▼
+Step operations       one Rust operation per registered step, slices 02-09 (approval, plan,
+(02-09)               intents, saga, manual tasks, hold/cancel) and the six foundation
+                      operations of §3.3 — this slice owns none of their commercial content
        │
        ▼
-Step executor          step dispatch · durable checkpointing · compensation invocation
+Step envelope         idempotency resolution · per-operation deadline · audit append ·
+                      producer enqueue · registry settlement · closed outcome vocabulary
        │
        ▼
-Engine components       durable timer service · idempotency registry · retry/backoff
-                        controller · concurrency/back-pressure controller · audit writer ·
-                        platform event producer adapter · reason catalogue
+Engine components     idempotency registry · audit writer · platform event producer adapter ·
+                      reason catalogue · operation registry · operation registration boundary
        │
        ▼
-Durable-execution      hosts step executor and timer scheduling; its run history is not
-substrate              the audit source of record (ADR 0001, ADR 0003)
-       │
-       ▼
-Persistence            process-instance aggregate · step log · dead-letter store ·
-                        process audit log — gear-owned, tenant-scoped, audit-grade
+Persistence           process instance · step log · idempotency registry · audit chain and
+                      checkpoints · definition binding · step-operation registry —
+                      gear-owned, tenant-scoped, audit-grade
 ```
 
 | Layer | Responsibility | Technology |
 |-------|---------------|------------|
-| Presentation | Not owned by this slice; process control and read surfaces are registered by [`09-read-and-authz`](./09-read-and-authz.md) | — |
-| Application | The step executor, the retry/backoff controller, and the concurrency/back-pressure controller | Rust module in the `orders-workflow` gear, hosted on the durable-execution substrate (ADR 0001) |
-| Domain | Process-instance aggregate invariants, definition-version pinning, step log semantics, reason catalogue | Rust domain structs; GTS for cross-gear contract types (specified in a later section of this slice) |
-| Infrastructure | Durable timer service, idempotency registry, audit writer, platform event producer adapter, dead-letter store | Durable-execution substrate, PostgreSQL via SecureORM, toolkit-db session advisory locks (`Db::lock`) for the worker roster of §3.8, `event-broker-sdk` over `toolkit_db::outbox` |
+| Platform durable execution | Executing the registered definition version: task ordering, `wait` timers, task retry policy, `listen` correlation, `fork` and `try`/`catch`, checkpoints and replay; invocation status and signals | `serverless-runtime` host and Temporal plugin ([DESIGN §1.4](../../../../serverless-runtime/docs/DESIGN.md#14-toolkit-integration), ADR-0004, ADR-0005); **no code exists today** (`10 §1`) |
+| Presentation | The internal step surface `POST /bss-orders-workflow/v1/steps/{operation}` (§3.3), service-principal only; operator and read surfaces are [`09-read-and-authz`](./09-read-and-authz.md)'s | REST, RFC 9457, `OperationBuilder` |
+| Application | The step envelope and the six foundation operations | Rust module in the `orders-workflow` gear |
+| Domain | Process-instance invariants, definition binding, step-log semantics, the step-operation contract, reason catalogue | Rust domain structs; GTS reference schemas for task inputs and outputs (§3.3) |
+| Infrastructure | Idempotency registry, audit writer, platform event producer adapter, operation registry | PostgreSQL via SecureORM, toolkit-db session advisory locks (`Db::lock`) for the worker roster of §3.8, `event-broker-sdk` over `toolkit_db::outbox` |
 
 ## 2. Principles & Constraints
 
@@ -174,70 +204,106 @@ Persistence            process-instance aggregate · step log · dead-letter sto
 
 Orders Lifecycle is authoritative for the commercial order document and order state; this gear's
 process audit and saga log are authoritative for process execution progress — independently of
-any durable-execution substrate's own history, which is not the audit source of record. Process
-state is never presented as authoritative commercial order state: what was ordered and the
-current order state are always read from Orders Lifecycle, never inferred from step progress.
-This is the central principle every other engine property serves, and it is why the domain model
-in §3.1 carries no order-document fields at all.
+the platform engine's own history, which is not the audit source of record. Process state is
+never presented as authoritative commercial order state: what was ordered and the current order
+state are always read from Orders Lifecycle, never inferred from step progress, and never from the
+definition's task outputs, which carry references only. This is the central principle every other
+engine property serves, and it is why the domain model in §3.1 carries no order-document fields.
 
 **ADRs**: `cpt-cf-bss-orders-workflow-adr-process-state-non-authoritative`
+
+#### One envelope wraps every step; one definition sequences them
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-principle-one-envelope-one-definition`
+
+Every step of the order process — foundation, approval, plan, intent, saga, manual task,
+hold/cancel — runs as a registered **step operation** inside the one envelope of §3.3, and the
+order in which the operations run is the business of exactly one artifact: the registered
+definition version the instance is bound to (`10`). Neither half may absorb the other. An
+operation **MUST NOT** call another step operation to advance the process (it may call the
+foundation's own `settle-from-lookup` and `park`/`unpark` in-process as part of its effect), and
+the definition **MUST NOT** perform an effect the envelope does not record — it has no `run`, no
+`emit`, and no direct call to Lifecycle, Subscriptions, Payments or Generic Approval (seam rules
+R1–R5 bind the operations, `10 §2`). Adjusting the flow is a new definition version; changing what
+a step does is an Orders release.
+
+**ADRs**: `cpt-cf-bss-orders-workflow-adr-flow-as-platform-definition`
 
 #### An instance runs under the definition it started with
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-principle-definition-version-pinning`
 
-A process instance executes to completion under the process-definition version it started with.
-That version is recorded on the instance and in the audit trail at start and never overwritten.
-An operator cannot migrate a running instance onto a later definition; a definition change takes
-effect only for instances started after the change. Pinning is what makes an in-flight process's
-behavior explainable from its own record months later, independent of how many times the
-definition has since evolved.
+`start-instance` writes `owf_definition_binding` — definition id, version and source — in the
+transaction that creates the instance, and that row is never updated. The platform independently
+pins the invocation to the callable version it started under
+([`DESIGN.md:614`](../../../../serverless-runtime/docs/DESIGN.md#versioning-model)); the binding is
+Orders' own record of the same fact, kept so an in-flight process's behavior is explainable from
+this gear's record months later. An operator cannot migrate a running instance onto a later
+definition (PRD §5.2); a definition version **MUST NOT** be deleted or archived while an instance
+is bound to it (`10 §4`).
 
-**ADRs**: `cpt-cf-bss-orders-workflow-adr-slice-decomposition`
+**ADRs**: `cpt-cf-bss-orders-workflow-adr-definition-versioning-and-protected-steps`
+
+#### References, not payloads
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-principle-references-not-payloads`
+
+Every value that crosses the engine boundary — a task input, a task output, an event the
+definition correlates on — is a **reference**: `correlationId`, `orderId`, `orderVersion`,
+`resourceTenantId`, `stepRef`, `gateRef`, `taskRef`, `lineRef`, the platform `invocationId` and
+`attemptId`, and small closed enums (an outcome class, a wave number, a catalogue reason). A step
+operation resolves a reference against Orders' own record or against the authoritative gear
+inside its transaction. The resolved total, an approver's identity, the payer and seller tenant
+axes, a manual-task justification and any downstream payload **MUST NOT** appear in a task input
+or output; the schema check of `10 §2` rejects a definition that names one.
+
+**ADRs**: `cpt-cf-bss-orders-workflow-adr-references-not-payloads`
 
 #### Engine history is not the audit source of record
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-principle-engine-history-not-sor`
 
-Whatever durable-execution substrate hosts the step executor and timer service, its own run
-history is an implementation detail of execution, not this gear's audit record. The gear-owned
-audit writer independently records every step start, completion, retry, timeout, sweep action,
-escalation, compensation step and dead-letter event, and that record is what recovery, audit and
-retention obligations are built on. A substrate migration or a substrate-internal history purge
-must never be able to erase what this gear is obligated to keep.
+The platform's invocation history and timeline
+([`DESIGN.md:661`](../../../../serverless-runtime/docs/DESIGN.md#invocationrecord)) are an
+implementation detail of execution, not this gear's audit record. The gear-owned audit writer
+independently records every step start, settlement, retry, timeout, sweep settlement,
+escalation, compensation step, phase transition and termination, and that record is what audit
+and retention obligations are built on. A plugin migration, a Temporal namespace purge or a
+platform retention policy must never be able to erase what this gear is obligated to keep.
 
 **ADRs**: `cpt-cf-bss-orders-workflow-adr-durable-execution-substrate`
 
-#### Five bounds, not one
+#### Five bounds, two owners
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-principle-distinct-bounds`
 
-The retry budget (bounded attempt count with backoff, applying to intent-submission failures
-only), the per-attempt timeout, the step deadline, the overdue-fulfillment escalation window, and
-the process-lifetime ceiling are **five** different things and are enforced independently. The last
-two are distinct in kind as well as in value. Exhausting the overdue window raises an operator
-escalation but must not by itself mark lines failed and must not auto-terminal the order; it runs
-from expected fulfillment time and only while the order is in fulfillment. The process-lifetime
-ceiling runs from process start regardless of phase and is non-pausable, because the case it exists
-to bound — an order held and resumed repeatedly before it ever reaches fulfillment — is precisely
-the case in which no other clock here is running. Collapsing any of these five into another either
-stalls a transient failure indefinitely, provisions against a payer who has not been charged, or
-leaves an order non-terminal forever. The count is **five** throughout this document; only three of
-them — the retry budget, the per-attempt timeout and the step deadline — are enforced by the
-retry/backoff controller, which is why §3.2 scopes that component to three and §4.2 states all
-five.
+The per-attempt timeout, the retry budget, the step deadline, the overdue-fulfillment window and
+the process-lifetime ceiling remain **five** different things, but they now have **two owners**.
+The **operation enforces** exactly one of them: the **per-operation deadline** inside the
+envelope, evaluated against database time. The **definition declares** the other four — the
+task retry policy (budget, backoff, jitter), the task timeout that bounds a whole step, the
+overdue `wait` and the top-level lifetime `wait` — and the platform plugin executes them
+(`10 §2`, `10 §3.6`). The nesting invariant — per-operation deadline **<** the task's cumulative
+retry budget **<** the task timeout **<** the overdue window **<** the lifetime ceiling — is a
+**definition validation rule** enforced before publish
+(`cpt-cf-bss-orders-workflow-adr-definition-versioning-and-protected-steps`), and the operation's
+own deadline is asserted against the published bounds at configuration load (§4.2). Collapsing any
+of the five into another either stalls a transient failure indefinitely, provisions against a
+payer who has not been charged, or leaves an order non-terminal forever.
 
-**ADRs**: `cpt-cf-bss-orders-workflow-adr-idempotency-key-composition`
+**ADRs**: `cpt-cf-bss-orders-workflow-adr-definition-versioning-and-protected-steps`
 
 #### Recoverable by construction
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-principle-recoverable-by-construction`
 
-Execution state is reconstructible and replayable from the gear-owned record with zero loss for
-committed steps. A restart, a substrate failover, or an operator-initiated resume must never
-re-execute a step already durably recorded as committed, and must never lose a step recorded as
-pending. This is a property of where and when the step executor writes its durable record, not of
-any substrate-provided replay mechanism.
+Execution state is reconstructible from the gear-owned record with zero loss for committed steps,
+and re-executable without a second effect. The platform recovers the **invocation** — after a
+worker crash it replays the definition from its own history — and Orders guarantees that every
+call the replay re-issues lands on an envelope that resolves the same key to the same settled
+outcome. The property therefore rests on two facts this slice controls: the step's record is
+written in the transaction that produces its effect, and the idempotency key is the same on every
+re-issue of the same logical step. Nothing here depends on the platform never replaying a call.
 
 **ADRs**: `cpt-cf-bss-orders-workflow-adr-durable-execution-substrate`
 
@@ -247,13 +313,14 @@ any substrate-provided replay mechanism.
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-constraint-correlation-id-distinctness`
 
-The process `correlationId`, per-call idempotency keys, and downstream transition-request
-identifiers are three structurally distinct identifiers that must never be reused for one
-another. The `correlationId` is generated once at process start and identifies the instance
-across its lifetime; an idempotency key identifies one outbound call attempt; a
-transition-request identifier is assigned by the downstream service (Subscriptions) to one
-accepted intent. Conflating any two breaks either duplicate-trigger absorption or duplicate-call
-absorption.
+The process `correlationId`, per-call idempotency keys, downstream transition-request identifiers
+and the platform's `invocationId`/`attemptId` are structurally distinct identifiers that must
+never be reused for one another. The `correlationId` is generated once at process start and
+identifies the instance across its lifetime; an idempotency key identifies one logical step
+operation call; a transition-request identifier is assigned by Subscriptions to one accepted
+intent; the invocation and attempt ids are the platform's handles on its own execution and are
+recorded, never derived from. Conflating any two breaks either duplicate-trigger absorption,
+duplicate-call absorption or the sweep's ability to name a stuck intent.
 
 **ADRs**: `cpt-cf-bss-orders-workflow-adr-idempotency-key-composition`
 
@@ -261,28 +328,29 @@ absorption.
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-constraint-retry-budget-scope`
 
-The retry budget applies only to intent-submission failures — the call was not accepted by the
-downstream service. An intent already accepted and in flight is never retried as a resubmit; a
-hang after accept does not consume the retry budget and is recovered by the reconciliation sweep,
-not by a retry attempt. A submission that hangs before any accept or fail is cut by the
-per-attempt timeout and does consume one retry attempt. Numeric values — the backoff curve,
-maximum attempts, the per-attempt timeout, the step deadlines and the process deadline — are
-stated as working baselines in **§4.2 and §4.5 of this document**; the engine ADRs record the
-shape of the decision, never a tuning value.
+The retry budget is the definition's task retry policy, and it applies only to a step whose
+operation is registered `retry_class = retryable-on: transient` and only to a transient outcome
+— the call was not accepted by the downstream, the per-operation deadline cut it before an accept,
+or the registry answered `still-processing`. An intent already accepted and in flight is never
+retried as a resubmit: the envelope answers a retried key with the stored acceptance or with
+`still-processing`, and a post-accept hang is recovered by lookup through `settle-from-lookup`,
+never by a further attempt. The numeric values — backoff curve, maximum attempts, task timeouts,
+the overdue window and the lifetime ceiling — are declared on the definition (`10 §2`) and
+recorded here only as the working baselines of §4.2.
 
 **ADRs**: `cpt-cf-bss-orders-workflow-adr-idempotency-key-composition`
 
-#### Concurrency is bounded and fair
+#### Concurrency is bounded and fair, at dispatch
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-constraint-concurrency-fairness`
 
-Parallel line execution within one order is bounded by a configurable limit; in-flight
-provisioning intents across all processes are bounded by a configurable aggregate limit;
-dispatch applies per-tenant fairness **keyed on `seller_tenant_id`** so one tenant's burst cannot
-starve another tenant's dispatch. A dispatch that can acquire neither allowance is queued in a
-**bounded** queue and rejected once that queue is full — never queued without limit. A downstream
-throttle signal is honoured by delaying dispatch up to a bounded maximum, and that delay does not
-consume the retry budget — a throttle is not a submission failure (§4.5, §4.12).
+Parallel line execution within one order, the aggregate number of in-flight provisioning intents
+across processes, per-tenant fairness keyed on `seller_tenant_id`, the bounded queue with
+reject-on-full and the handling of a downstream throttle signal are **admission controls applied
+inside the dispatch operations** and are specified in
+[`05-provisioning-intents.md`](./05-provisioning-intents.md). The definition does not fan out per
+line (the DSL has no dynamic parallel branch, `10 §2`), so the concurrency of a wave is Orders'
+to bound; a throttle-induced delay inside an operation never counts as a failed attempt.
 
 **ADRs**: `cpt-cf-bss-orders-workflow-adr-slice-decomposition`
 
@@ -290,13 +358,15 @@ consume the retry budget — a throttle is not a submission failure (§4.5, §4.
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-constraint-data-classification`
 
-Process artifacts owned by this engine — step log entries, saga/compensation log entries, timer
-records, retry counters, dead-letter records, and the process audit log — carry commercial order
-context and are tenant-scoped by a **column, not by convention**: every engine table carries
-`resource_tenant_id` NOT NULL, and the tables backing an operator- or seller-scoped surface carry
-`seller_tenant_id` as well (§3.7, §4.11). They are retained at audit grade by this gear
-independently of substrate history, and must never carry payment-card data. Classification is
-aligned with the underlying order record owned by Orders Lifecycle.
+Process artifacts owned by this engine — step log entries, idempotency records, definition
+bindings and the process audit log — carry commercial order context and are tenant-scoped by a
+**column, not by convention**: every engine table except the configuration-only
+`owf_step_operation` carries `resource_tenant_id` NOT NULL, and the tables backing an operator- or
+seller-scoped surface carry `seller_tenant_id` as well (§3.7, §4.11). They are retained at audit
+grade by this gear independently of platform history, and must never carry payment-card data.
+Classification is aligned with the underlying order record owned by Orders Lifecycle. The same
+classification is what forbids these values from crossing into the definition
+(`cpt-cf-bss-orders-workflow-principle-references-not-payloads`).
 
 **ADRs**: `cpt-cf-bss-orders-workflow-adr-durable-execution-substrate`
 
@@ -304,185 +374,205 @@ aligned with the underlying order record owned by Orders Lifecycle.
 
 ### 3.1 Domain Model
 
-**Technology**: Rust domain structs internally; GTS types for the cross-gear contract surface,
-specified in a later section of this slice.
+**Technology**: Rust domain structs internally; GTS reference schemas for every task input and
+output that crosses the engine boundary (§3.3); GTS event types for the cross-gear contract (§4.7).
 
 **Core Entities**:
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-entity-step-operation`
+
+One registered, named unit of process work: the thing a definition `call` task targets. Carries
+the contract of §3.3 — `name`, `protection`, the GTS reference schemas of its `input` and
+`output`, its `idempotency_key` derivation family, its `declared_event`, its paired
+`compensation` operation, its catalogue `reasons`, its `audit_kind`, its `retry_class` and its
+per-operation `deadline`. The set is closed and compiled: an operation exists because a slice
+registered it against the operation registration boundary (§3.2), and the operation registry
+(§3.7 `owf_step_operation`) is loaded from that compiled set at startup and never written at
+runtime. `protected` operations may be ordered by a definition but never omitted or replaced
+(`10 §2`); `composable` operations may be omitted.
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-entity-process-instance`
 
 The aggregate root of one process execution, correlated to `orderId` + `orderVersion`. Carries
-the process `correlationId` generated at start (distinct from idempotency keys and from
-downstream transition-request identifiers), the **pinned process-definition version** the
-instance started with and executes to completion under, the current lifecycle phase (`started`,
-`suspended`, `parked`, `compensating`, `terminated` — enumerated with its permitted transitions in
-§3.7), the three tenant axes, the suspension state set by hold/resume, the last durable checkpoint
-reference, the optimistic-concurrency row version, and the terminal outcome when reached. It does
-**not** hold the paused-timer remainder — that datum has exactly one authority, the durable timer
-service (§3.7 `owf_durable_timer`). This is the only entity a handler slice's step logic reads or
-writes state against.
+the process `correlationId` generated at start, the platform `invocationId` that drives it, the
+recorded **phase projection** (`started`, `suspended`, `parked`, `compensating`, `terminated` —
+enumerated with its permitted transitions in §3.7, and written only by step operations as a
+record of what the definition has done, never read by the definition to decide what to do next),
+the three tenant axes, the suspension flag set by hold/resume, the reference to the last settled
+protected step, the optimistic-concurrency row version, the audit-chain head counter and the
+terminal outcome when reached. The **pinned definition version** it executes under is the
+definition binding's (below); the instance repeats it as a denormalised column for reads. This is
+the only entity a step operation reads or writes process state against.
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-entity-definition-binding`
+
+The immutable record, written once by `start-instance`, of which definition sequences this
+instance: the platform `definition_id`, the `definition_version`, the `definition_source`
+(`platform` — the registered Serverless Workflow definition executed by the plugin — or `code` —
+the stated fallback in which Orders sequences the same operations in Rust, `10 §1`), the instant
+of pinning, the principal that published that version and the resource tenant. A binding is never
+updated and never deleted before the instance it binds; it is what an auditor reads to know which
+published flow a months-old instance followed.
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-entity-step-log-entry`
 
-One durable, append-only record per step attempt: the step identifier, the owning process
-instance, the attempt number, the outcome (`pending`, `success`, `retryable-failure`,
-`permanent-failure`, `still-processing`, `aged-out` — the one enumeration, declared in §3.7), the
-idempotency key used for any outbound call the step made, the **settled result** the attempt
-produced (including the downstream `transition_request_id` where the step accepted one), the
-per-attempt timeout and step deadline that bounded it, the retry-attempt count consumed, and the
-timestamp. `dead-lettered` is **not** a step outcome: it is a delivery-level outcome of an inbound
-trigger or callback and is recorded in `owf_dead_letter_record`, never here
-(`cpt-cf-bss-orders-workflow-adr-manual-task-dead-letter-separation`). A committed entry is never
-rewritten; a retried attempt appends a new entry rather than mutating the prior one, which is what
-makes replay-from-record possible without consulting substrate history.
+One durable, append-only **step record** per settled attempt of a step operation: the operation
+name, the owning process instance, the idempotency key, the platform `attempt_id` the call
+carried, the attempt number Orders counted under that key, the outcome (`success`,
+`retryable-failure`, `permanent-failure`, `still-processing`, `aged-out` — the one enumeration,
+declared in §3.7), the **settled result** the attempt produced (including the downstream
+`transition_request_id` where the step accepted one), the per-operation deadline that bounded it
+and the receipt and settlement instants. There is no `pending` row: the row is written at
+settlement, in the settlement transaction, so a row's existence is the fact that the attempt
+concluded. A committed entry is never rewritten; a re-run under an `open` key appends a new entry.
 
-- [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-entity-dead-letter-record`
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-entity-idempotency-record`
 
-An inspectable record parking a payload — an inbound Lifecycle trigger or a Subscriptions/
-Payments/Generic-Approval callback — after its finite delivery-count cap is exhausted. Carries
-`orderId`, `orderVersion`, the tenant axes, the process `correlationId`, the source event or
-callback id — **unique**, so one payload parks at most once — and the last error, redacted per
-§4.11. The delivery count it parks against is accumulated durably on the inbound key *before*
-parking, not on this record. Distinct from the manual-task record: a dead-letter record is never itself an order
-state and never grows a second inspectable object for a step failure that already has the
-manual-task path.
-
-- [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-entity-retry-state`
-
-The per-step record of the controller-enforced bounds: attempts consumed against the retry budget,
-the backoff curve position, the per-attempt timeout deadline for the current attempt, and the
-step deadline for the step as a whole. Distinguishes a submission-failure attempt (budget
-consumed) from a post-accept hang (budget not consumed, handed to the reconciliation sweep) and
-from a downstream-throttle delay (budget not consumed).
-
-- [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-entity-durable-timer`
-
-A scheduled fire instant owned by the durable timer service: an approval-escalation timer, an
-expected-fulfillment wait, an activation-barrier instant, a reconciliation sweep tick, an
-overdue-fulfillment window, or the process-lifetime ceiling. Carries the **subject** it is armed
-against — the approval gate for an escalation timer, the intent for a sweep tick — so two timers
-of the same kind on one instance are distinguishable by the handler that scheduled them, and
-carries its remaining duration when paused by a hold, so resume restores the original window
-rather than resetting it. It is the **sole authority** for that remainder. Only
-approval-escalation timers pause on hold. Recovered from its persisted record on restart, never
-from an in-memory scheduler.
+The registry's record for one idempotency key: the operation it scopes, the owning
+`correlationId`, the SHA-256 fingerprint of the canonical request body, the status (`in_flight`,
+`open`, `settled`), the lease and heartbeat instants while `in_flight`, the settled outcome and a
+reference to the step record that produced it, and the key's retention window. `open` is the
+state left by a settled `retryable-failure`: the key's effect **may run again** under the same
+key, and only in that state. It is what makes the platform's same-key retry safe on both sides of
+the accept boundary (§4.3).
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-entity-audit-entry`
 
 One append-only process audit record per transition: instance start, step start, step
-completion, retry, timeout, sweep action, sweep settlement, escalation, compensation step, phase
-transition, termination, or dead-letter event, with the actor's opaque subject identifier
-(D-61), timestamp, idempotency key, the process `correlationId`, and — where the transition has
-them — the step identifier, the attempt number and the pinned definition version as evidence
-fields. Each entry is **hash-chained** to its predecessor for the same instance under the frozen
-byte contract of §4.17, with its sequence allocated from the instance's transactional counter, so
-a deletion or an edit anywhere in the trail is detectable rather than merely ungranted. It carries
-a catalogue `reason` — the machine-readable value that rides event payloads — and, separately, a
-free-text `justification` for the human-supplied text an override or a cancellation records; the
-two are never the same column. Written independently of whatever record the durable-execution
-substrate keeps of its own run, which is not the audit source of record, and never read as the
-recovery record — that is `owf_step_log`'s job.
+completion, retry, timeout, sweep settlement, escalation, compensation step, phase transition or
+termination, with the actor's opaque subject identifier (D-61), timestamp, idempotency key, the
+process `correlationId`, and — where the transition has them — the operation name, the attempt
+number and the pinned definition version as evidence fields. Each entry is **hash-chained** to its
+predecessor for the same instance under the frozen byte contract of §4.17, with its sequence
+allocated from the instance's transactional counter. It carries a catalogue `reason` and,
+separately, a free-text `justification`; the two are never the same column. Written independently
+of whatever the platform keeps of its own run, and never read as the recovery record — that is
+`owf_step_log`'s job.
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-entity-outbox-entry`
 
-One typed event per process event a committed step declares, enqueued through the bound platform
-producer outbox in the step's transaction: the event identity, its GTS type, `orderId` (the
+One typed event per process event a settled step declares, enqueued through the bound platform
+producer outbox in the settlement transaction: the event identity, its GTS type, `orderId` (the
 partition key), the tenant axes, the process `correlationId` and the `data` payload of §4.7.
-Local sequence, delivery bookkeeping and retry state are platform-owned
-(`toolkit_db::outbox`); this gear persists no ordinal of its own.
+Local sequence, delivery bookkeeping and retry state are platform-owned (`toolkit_db::outbox`);
+this gear persists no ordinal of its own.
+
+**Retired entities.** `cpt-cf-bss-orders-workflow-entity-durable-timer` — retired by ADR-0011;
+timers are the definition's `wait` tasks executed by the plugin, see `10 §2` and `10 §4`.
+`cpt-cf-bss-orders-workflow-entity-retry-state` — retired by ADR-0011; retry policy is the
+definition's task retry policy and the platform `attempt_id` is recorded on every step record
+instead, see `10 §2`. `cpt-cf-bss-orders-workflow-entity-dead-letter-record` — retired by
+ADR-0011 with ADR-0009 as amended; an inbound delivery that exhausts its cap is the platform
+trigger path's dead letter, see §4.8 and `10 §3.3`.
 
 **Relationships**:
-- `Process instance` → `Step log entry`: one-to-many, append-only; every step attempt against the instance is a new entry.
-- `Process instance` → `Retry state`: one-to-many, one active record per in-progress step; consumed budget and bound deadlines travel with the step, not the instance.
-- `Process instance` → `Durable timer`: one-to-many; escalation timers, sweep ticks and step-deadline watchdogs are all timers owned by the instance that scheduled them.
-- `Process instance` → `Audit entry`: one-to-many, append-only; the audit trail also carries the pinned definition version recorded at start.
-- `Process instance` → `Outbox entry`: one-to-many; one enqueued typed event per committed step that declares a process event.
-- `Dead-letter record` → `Process instance`: many-to-one via `orderId` + `orderVersion` + `correlationId`; a dead-letter record references the instance whose inbound payload it parked but is never itself part of the instance's step log.
+- `Process instance` → `Definition binding`: one-to-one, written in the same transaction; the binding is never rewritten.
+- `Process instance` → `Step log entry`: one-to-many, append-only; every settled attempt of a step operation against the instance is a new entry.
+- `Process instance` → `Idempotency record`: one-to-many; one record per logical step call, re-runnable only while `open`.
+- `Step operation` → `Step log entry`: one-to-many by operation name; the registry row is the contract every entry was produced under.
+- `Process instance` → `Audit entry`: one-to-many, append-only; the `instance-start` entry carries the pinned definition version.
+- `Process instance` → `Outbox entry`: one-to-many; one enqueued typed event per settled step that declares a process event.
 
 ### 3.2 Component Model
 
 ```mermaid
 graph TB
-    H[Handler slices 02-09]
-    E[Step executor]
-    T[Durable timer service]
+    P[Platform: serverless-runtime host + Temporal plugin<br/>executes the definition of design/10]
+    R[Internal step surface<br/>POST /bss-orders-workflow/v1/steps/operation]
+    O[Step operations 02-09 and the six foundation operations]
+    E[Step envelope]
+    G[Operation registry]
     I[Idempotency registry]
-    R[Retry/backoff controller]
-    C[Concurrency and back-pressure controller]
     A[Audit writer]
     X[Platform event producer adapter]
     D[Reason catalogue]
-    H -->|dispatches steps against| E
-    E --> T
+    B[Operation registration boundary]
+    P -->|HTTP call task, same key on retry| R
+    R -->|service principal, PDP execute| O
+    O -->|runs inside| E
     E --> I
-    E --> R
-    E --> C
     E --> A
     E --> X
     E --> D
+    E -->|resolves contract| G
+    B -->|compiles into| G
     X -->|enqueues; platform workers publish| BUS[Event Broker]
-    T -->|fires| E
 ```
 
-#### Step executor
+#### Step envelope
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-component-step-executor`
 
 ##### Why this component exists
 
-Every handler slice runs steps with the same durability and audit obligations; concentrating
-dispatch, checkpointing and compensation invocation here is what makes those obligations
-assertable once rather than re-implemented per handler.
+Every step operation, whichever slice registers it and whichever definition version orders it,
+carries the same durability, idempotency and audit obligations; concentrating them in one
+envelope is what makes those obligations assertable once rather than re-implemented per
+operation, and what makes a platform retry safe without the platform knowing anything about
+Orders' record. The id is the former step executor's: the component is the same boundary with
+dispatch, checkpointing and compensation *invocation* removed, because those are now the
+definition's and the plugin's.
 
 ##### Responsibility scope
 
-Dispatching a registered step against the definition-pinned instance; writing the durable
-checkpoint before reporting completion; invoking compensation steps on saga rollback; resuming
-execution from the last durable checkpoint after a restart or a resume-from-hold; and mapping a
-step outcome to the audit writer and the reason catalogue.
+Receiving a step-operation call on the internal surface (§3.3); resolving the required
+idempotency key against the registry before the operation's effect runs and taking the lease;
+enforcing the operation's registered per-operation deadline against database time; running the
+operation's effect; and settling — writing the step record with the platform `attempt_id`, the
+audit entry, the declared typed event through the producer adapter and the registry settlement in
+**one** transaction — before answering. Mapping the operation's outcome onto the closed outcome
+set and the RFC 9457 envelope of §3.3. Recording the recorded phase projection and the last
+settled protected step on the instance when the operation's contract says so.
 
 ##### Responsibility boundaries
 
-It executes steps but authors none — step logic (what an approval step or a provisioning-intent
-step actually does) belongs to the handler slice that registers it. It holds no commercial
-vocabulary and makes no decision about what constitutes fulfillment eligibility or approval
-requirement.
+It executes operations but authors none — what `open-gates` or `dispatch-wave1-create` actually
+does belongs to the slice that registers it. It holds no commercial vocabulary. It does not
+schedule, wait, retry or replay: it has no timer, no retry loop and no queue of its own, and a
+transient failure is answered to the caller so the definition's retry policy can re-issue the call.
+It never advances the process to a next step — there is no "next step" inside Orders.
 
 ##### Related components (by ID)
 
-- `cpt-cf-bss-orders-workflow-component-durable-timer-service` — depends on
+- `cpt-cf-bss-orders-workflow-component-operation-registry` — depends on
 - `cpt-cf-bss-orders-workflow-component-idempotency-registry` — depends on
-- `cpt-cf-bss-orders-workflow-component-retry-backoff-controller` — depends on
-- `cpt-cf-bss-orders-workflow-component-concurrency-backpressure-controller` — depends on
 - `cpt-cf-bss-orders-workflow-component-audit-writer` — owns data for
 - `cpt-cf-bss-orders-workflow-component-event-outbox` — owns data for
 - `cpt-cf-bss-orders-workflow-component-reason-catalogue` — depends on
 
-#### Durable timer service
+#### Operation registry
 
-- [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-component-durable-timer-service`
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-component-operation-registry`
 
 ##### Why this component exists
 
-Approval escalation windows, the reconciliation sweep schedule, and step-deadline watchdogs must
-survive a restart with accuracy, and a hold must be able to pause and later exactly resume a
-window's remaining duration — properties an in-memory scheduler cannot provide.
+The definition names operations by string, the PDP authorises them by name, the validation hook
+of `10 §2` must know which names exist and which are protected, and the envelope must know each
+operation's deadline, retry class and declared event without asking the operation. One compiled
+registry, mirrored into a read-only table, is what gives every one of those consumers the same
+answer.
 
 ##### Responsibility scope
 
-Scheduling and firing durable timers; recording remaining duration on pause and restoring it on
-resume; recovering all pending timers from their persisted record on restart; and triggering the
-reconciliation sweep on its escalating interval.
+Holding the compiled set of step-operation contracts (§3.3 fields) built from the registrations
+of every slice; loading that set into `owf_step_operation` at startup inside one transaction,
+replacing the previous content, and writing an audit entry under the gear's deployment marker when
+the loaded set differs from the stored one — the same shape as the routing-table conformance check
+of [`09 §3.7`](./09-read-and-authz.md#37-database-schemas--tables); serving the validation hook's
+lookup (`10 §3.3`) and the envelope's per-call contract resolution; refusing to become ready if
+the compiled set and the table disagree after load.
 
 ##### Responsibility boundaries
 
-It fires timers but decides no business consequence of a fired timer — what an escalation timer
-firing means (notify the fulfillment-operator queue) is a handler concern. It does not perform
-the sweep's status lookups itself; it only schedules the sweep's ticks.
+No runtime write path: nothing inserts, updates or deletes a registry row after load, and an
+operator surface that could would be a second place to define a step. It holds no definition and
+no ordering — which operations a path must contain is the protected list the validation hook reads
+from it, and how they are ordered is the definition's.
 
 ##### Related components (by ID)
 
 - `cpt-cf-bss-orders-workflow-component-step-executor` — depends on
+- `cpt-cf-bss-orders-workflow-component-handler-extension-boundary` — shares model with
 
 #### Idempotency registry
 
@@ -490,96 +580,30 @@ the sweep's status lookups itself; it only schedules the sweep's ticks.
 
 ##### Why this component exists
 
-Long-running processes with retries are inherently susceptible to double-execution against
-Orders Lifecycle, Subscriptions and the Generic Approval service; storing the outcome of an
-outbound call under its key is what makes a retried call safe rather than merely likely-safe.
+A definition executed by a durable engine re-issues calls by design — on task retry, on worker
+replay, on operator `retry` of a failed invocation — and each re-issue reaches Orders Lifecycle,
+Subscriptions or the Generic Approval service through an Orders operation. Storing the outcome of
+each logical call under its key is what makes every one of those re-issues safe rather than merely
+likely-safe.
 
 ##### Responsibility scope
 
-Assigning and recording an idempotency key ahead of every outbound call; storing the settled
-outcome of a call; absorbing a duplicate response on retry without a second durable effect; and
-tracking the key-lifetime window after which the reconciliation sweep must become read-only.
+Recording the required idempotency key ahead of every step operation's effect; storing the
+settled outcome; absorbing a duplicate without a second durable effect; holding a settled
+`retryable-failure` as `open` so the same key may run once more per settled failure; refusing a
+key replayed against a different fingerprint; and tracking the key-lifetime window after which
+`settle-from-lookup` is read-only and a next attempt is a new key.
 
 ##### Responsibility boundaries
 
 It never generates the process `correlationId` and never generates a downstream
-transition-request identifier — those are distinct identifiers under
-`cpt-cf-bss-orders-workflow-constraint-correlation-id-distinctness`. It does not decide whether a
-call should be retried; that is the retry/backoff controller's job.
+transition-request identifier (`cpt-cf-bss-orders-workflow-constraint-correlation-id-distinctness`).
+It does not decide whether a call should be retried — the definition's retry policy does — it only
+makes the retry land correctly.
 
 ##### Related components (by ID)
 
 - `cpt-cf-bss-orders-workflow-component-step-executor` — depends on
-- `cpt-cf-bss-orders-workflow-component-retry-backoff-controller` — depends on
-
-#### Retry/backoff controller
-
-- [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-component-retry-backoff-controller`
-
-##### Why this component exists
-
-The BSS-to-OSS provisioning path is distributed and transient failures are expected; unbounded
-retries waste resources while zero retries leave transient failures unresolved, and the three
-bounds this controller owns (retry budget, per-attempt timeout, step deadline) must be enforced
-independently rather than conflated into one counter. They are three of the five bounds of §4.2;
-the fourth, the process deadline, is enforced elsewhere.
-
-##### Responsibility scope
-
-Enforcing the retry budget on intent-submission failures only, with backoff and a bounded maximum
-attempt count; enforcing the per-attempt timeout, cutting a hanging submission and consuming one
-retry attempt when it does; enforcing the step deadline independently of the retry budget; marking
-a step `permanent-failure` on exhausting either the step deadline or the retry budget; and
-honouring a downstream throttle signal by delaying dispatch, up to a bounded maximum, without
-consuming the retry budget.
-
-Marking the step is the whole of the engine's part. **What follows from a `permanent-failure` is
-the registering handler slice's declared partial-failure policy**, never a decision this
-controller takes: the controller creates no manual task, opens no incident and acknowledges
-nothing to Lifecycle. Where a handler routes an exhausted budget to an operator escalation, that
-escalation is that handler's policy consuming this outcome, not a second, competing verdict on the
-same step (§4.5).
-
-##### Responsibility boundaries
-
-It does not retry an intent already accepted and in flight as a resubmit — a post-accept hang is
-handed to the reconciliation sweep, not retried here. It does not enforce the process deadline
-(the overdue-fulfillment escalation window); that is a fourth, distinct bound owned by the
-handler slice that raises the operator escalation, not by this controller.
-
-##### Related components (by ID)
-
-- `cpt-cf-bss-orders-workflow-component-step-executor` — depends on
-- `cpt-cf-bss-orders-workflow-component-idempotency-registry` — depends on
-- `cpt-cf-bss-orders-workflow-component-concurrency-backpressure-controller` — depends on
-
-#### Concurrency and back-pressure controller
-
-- [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-component-concurrency-backpressure-controller`
-
-##### Why this component exists
-
-Independent lines within an order and concurrent orders across tenants share a finite
-provisioning path; unbounded parallelism saturates it and makes the fulfillment SLA unmeasurable,
-and without per-tenant fairness one tenant's burst degrades every other tenant's dispatch.
-
-##### Responsibility scope
-
-Enforcing a configurable limit on parallel line execution within one order; enforcing a
-configurable aggregate limit on in-flight provisioning intents across processes; applying
-per-tenant fairness at dispatch; and honouring a downstream throttle signal (`Retry-After` or
-equivalent) by delaying dispatch.
-
-##### Responsibility boundaries
-
-It does not decide which lines to prioritize commercially — fairness and concurrency limits are
-capacity controls, not business sequencing, which remains a handler concern. A throttle-induced
-delay it applies is never reported to the retry/backoff controller as a consumed retry attempt.
-
-##### Related components (by ID)
-
-- `cpt-cf-bss-orders-workflow-component-step-executor` — depends on
-- `cpt-cf-bss-orders-workflow-component-retry-backoff-controller` — shares model with
 
 #### Audit writer
 
@@ -588,28 +612,28 @@ delay it applies is never reported to the retry/backoff controller as a consumed
 ##### Why this component exists
 
 Financial-grade audit requires a record of the full execution path — not just order-level
-transitions — that is independently trustworthy and does not depend on the durable-execution
-substrate's own history, which this gear does not treat as its source of record.
+transitions — that is independently trustworthy and does not depend on the platform's invocation
+history, which this gear does not treat as its source of record.
 
 ##### Responsibility scope
 
-Recording every instance start, step start, completion, retry, timeout, sweep action, sweep
-settlement, escalation, compensation step, phase transition, termination and dead-letter event
-with the actor's opaque subject identifier, timestamp, idempotency key and the process
-`correlationId`, in the same transaction as the transition it records; recording the pinned
-process-definition version on the instance-start entry; allocating each entry's `sequence` from
-the `owf_process_instance.audit_sequence` counter under the instance row lock and computing its
-`entry_hash` under the frozen byte contract of §4.17; retaining the record at audit grade
-independently of substrate history and of engine purges; and owning the checkpoint-append phase
-and the read-only verification pass of the `audit/<audit-tenant>` worker (§3.8, §4.17).
+Recording every instance start, step start, settlement, retry, timeout, sweep settlement,
+escalation, compensation step, phase transition and termination with the actor's opaque subject
+identifier, timestamp, idempotency key and the process `correlationId`, in the same transaction as
+the transition it records; recording the pinned definition version on the instance-start entry;
+allocating each entry's `sequence` from the `owf_process_instance.audit_sequence` counter under
+the instance row lock and computing its `entry_hash` under the frozen byte contract of §4.17;
+retaining the record at audit grade independently of platform history and of engine purges; and
+owning the checkpoint-append phase and the read-only verification pass of the
+`audit/<audit-tenant>` worker (§3.8, §4.17).
 
 ##### Responsibility boundaries
 
 It records commercial order context carried by process artifacts but never becomes a second
-source of commercial order state — a read of "what was ordered" never resolves against this
-writer's records — and it never becomes the recovery record: replay resumes from `owf_step_log`
-and the substrate, never from the audit trail. It never carries payment-card data, and it never
-updates, deletes or re-hashes a committed entry — the verifier alerts and does not repair (D-59).
+source of commercial order state, and it never becomes the recovery record: a replayed call
+resolves through the registry and `owf_step_log`, never through the audit trail. It never carries
+payment-card data, and it never updates, deletes or re-hashes a committed entry — the verifier
+alerts and does not repair (D-59).
 
 ##### Related components (by ID)
 
@@ -623,13 +647,14 @@ updates, deletes or re-hashes a committed entry — the verifier alerts and does
 ##### Why this component exists
 
 Operator monitoring dashboards and downstream audit systems consume the six named process events
-asynchronously. Publishing inside the step transaction would put an external dependency in the
-commit path, while a Workflow-owned outbox would duplicate platform sequencing, leasing, retry and
-dead-letter capabilities. The adapter binds Workflow's events to the supported platform path, as
-the sibling gear's adapter does
+asynchronously. Publishing inside the settlement transaction would put an external dependency in
+the commit path, while a Workflow-owned outbox would duplicate platform sequencing, leasing, retry
+and dead-letter capabilities. The adapter binds Workflow's events to the supported platform path,
+as the sibling gear's adapter does
 ([Lifecycle `01 §3.2`](../../../orders-lifecycle/docs/design/01-foundation.md#32-component-model)).
 Enqueuing in the same durable commit as the audit entry is what guarantees an event is never
-emitted for a step that did not actually commit.
+emitted for a step that did not actually settle — and it is why the definition has no `emit`
+task: an event emitted by the engine would be one no Orders transaction vouches for.
 
 ##### Responsibility scope
 
@@ -637,19 +662,17 @@ Constructing the six `TypedEvent` values of §4.7; preparing their GTS schemas b
 configuring `event_broker_sdk::DbProducer` with managed `ProducerMode::Chained` and the gear's
 gateway-issued service `SecurityContext`; binding one `ProducerOutboxQueue`
 (`bss-orders-workflow-events`, 16 toolkit partitions, high-throughput profile) to
-`toolkit_db::outbox`; and enqueuing through that bound handle using the step's transaction
+`toolkit_db::outbox`; and enqueuing through that bound handle using the settlement transaction
 runner, so the enqueue commits with the audit entry and the idempotency settlement. Every event
-carries the process `correlationId` for consumer-side correlation; `orderId` is the event type's
-broker partition key.
+carries the process `correlationId`; `orderId` is the event type's broker partition key.
 
 ##### Responsibility boundaries
 
 Workflow owns event meaning and payload construction, but does not own an outbox table, lease
 acquisition, sequence assignment, retry classification, dead-letter lifecycle, vacuuming or a
-re-drive API. Those are platform library responsibilities. Publication failure never alters
-process state. It does not guarantee event ordering across orders, only per broker partition
-(§4.7). It does not decide which handler steps declare an event — that declaration is made by the
-handler slice registering the step.
+re-drive API. Publication failure never alters process state. It does not guarantee event ordering
+across orders, only per broker partition (§4.7). Which operation declares which event is the
+registering slice's contract (§3.3 `declared_event`).
 
 ##### Related components (by ID)
 
@@ -662,154 +685,302 @@ handler slice registering the step.
 
 ##### Why this component exists
 
-A machine-readable failure or refusal reason is what lets an operator queue, a dead-letter record
-and a manual task distinguish causes without free-text parsing, and what lets a handler-slice
-extension declare a new failure mode without inventing an ad hoc string.
+A machine-readable failure or refusal reason is what lets an operator queue, a manual task, an
+event payload and a definition `catch` arm distinguish causes without free-text parsing, and what
+lets a slice declare a new failure mode without inventing an ad hoc string.
 
 ##### Responsibility scope
 
-The registry of machine-readable reasons a step, a dead-letter parking, a compensation failure or
-a synchronous refusal can carry: one variant per reason on the gear's `#[derive(ContractError)]`
+The registry of machine-readable reasons a step operation, a compensation failure or a
+synchronous refusal can carry: one variant per reason on the gear's `#[derive(ContractError)]`
 enum, each with its `error_code`, canonical category and derived GTS error-type key (§4.9).
-Well-formedness and uniqueness are compile-time properties of that enum plus a contract test
-rejecting duplicate GTS keys or domain/code pairs, not a registration-time check
-(`../DECISIONS.md` D-64).
+Well-formedness and uniqueness are compile-time properties of that enum plus a contract test,
+not a registration-time check (`../DECISIONS.md` D-64). Each operation's contract names the
+catalogue subset it may raise (§3.3 `reasons`).
 
 ##### Responsibility boundaries
 
-It holds no policy about which reason applies when — that mapping is decided by the handler slice
-or controller that raises the reason. It does not itself write audit entries.
+It holds no policy about which reason applies when — that mapping is decided by the operation
+that raises the reason. It does not itself write audit entries.
 
 ##### Related components (by ID)
 
 - `cpt-cf-bss-orders-workflow-component-step-executor` — depends on
 - `cpt-cf-bss-orders-workflow-component-audit-writer` — depends on
 
-#### Extension boundary for capability handlers
+#### Operation registration boundary
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-component-handler-extension-boundary`
 
 ##### Why this component exists
 
-Nine slices run on top of one engine; without a named, stable registration surface each handler
-slice would need to reimplement dispatch, checkpointing, retry and audit discipline, defeating the
-purpose of a shared engine.
+Eight slices register operations against one envelope; without a named, stable registration
+contract each slice would need to reimplement idempotency, audit and outcome discipline, and the
+definition would have no closed list of names to be validated against. The id is the former
+handler extension boundary's; what is registered is now an operation with the contract of §3.3
+rather than a handler closure.
 
 ##### Responsibility scope
 
-Defining the contract by which a handler slice registers a step (its idempotency-key derivation,
-its declared event types, its compensation step where one exists, and its reason-catalogue
-entries) and by which the step executor invokes it; enforcing that a registered step cannot bypass
-the audit writer, the idempotency registry, or the retry/backoff controller.
+Defining the contract by which a slice registers a step operation — every field of §3.3 — and by
+which the envelope invokes it; enforcing that a registered operation cannot bypass the audit
+writer, the idempotency registry or the producer adapter; compiling the registrations into the
+operation registry; and exposing one route per registered operation on the internal surface.
 
 ##### Responsibility boundaries
 
-It contains no step logic of its own and no commercial policy — every capability behavior lives
-in the handler slice that registers against it. It never allows a handler slice to write the
-process-instance aggregate, the step log, or the audit log directly.
+It contains no operation logic and no commercial policy. It never allows a slice to write the
+process-instance aggregate, the step log, the registry or the audit log outside the envelope, and
+it never allows a slice to register an operation that advances the process to another operation.
 
 ##### Related components (by ID)
 
 - `cpt-cf-bss-orders-workflow-component-step-executor` — depends on
+- `cpt-cf-bss-orders-workflow-component-operation-registry` — shares model with
+
+#### Retired components
+
+- `cpt-cf-bss-orders-workflow-component-durable-timer-service` — retired by ADR-0011; every
+  timer is a definition `wait` executed by the plugin's durable timers, see `10 §2` and `10 §4`.
+- `cpt-cf-bss-orders-workflow-component-retry-backoff-controller` — retired by ADR-0011; retry
+  budget, backoff and jitter are the definition's task retry policy (`10 §2`); the per-operation
+  deadline stays in the envelope (§4.2, §4.5).
+- `cpt-cf-bss-orders-workflow-component-concurrency-backpressure-controller` — retired by
+  ADR-0011; admission on dispatch is specified in [`05`](./05-provisioning-intents.md) (§4.12).
 
 ### 3.3 API Contracts
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-interface-step-executor-api`
 
 - **Requirement**: `cpt-cf-bss-orders-workflow-fr-owf-start-contract`
-- **Technology**: internal Rust API surface exposed by the engine library to a registered handler; no REST surface of its own — the REST/event entry points for starting or observing a process belong to the slices that register against this engine (slices 02-09)
+- **Technology**: internal REST surface, `OperationBuilder` `.authenticated()`, RFC 9457 Problem
+  Details, one route per registered operation; callable **only** by the `serverless-runtime`
+  service principal executing a definition (and, for the operator-class operations, by this gear's
+  own control gateway of [`09 §3.3`](./09-read-and-authz.md#33-api-contracts) in-process)
 
-The engine exposes exactly one in-process operation a capability handler calls to advance a
-process: **execute step**, taking the process `correlationId`, the pinned definition version, the
-step identifier, the caller-derived idempotency key, the step's declared inputs, and the handler
-closure that performs the step's effect. It returns one of a closed set of outcomes — success, a
-non-success idempotency outcome (§3.3.2), retryable failure, permanent failure, or dead-letter —
-and never a bare exception the caller must interpret. There is no second entry point and no
-variant that lets a handler skip the idempotency registry, the audit writer, or the retry/backoff
-controller.
+**The internal step surface.** The engine exposes exactly one shape of entry point:
 
-**What the engine guarantees around a step invocation**: the idempotency key is resolved before
-the handler closure runs; the closure's outcome is durably recorded — audit entry and, where the
-step declares one, a typed event enqueued through the bound platform producer outbox with the same
-transaction runner — in the same unit of work that settles the idempotency record;
-a step that raises inside the closure is caught and mapped to a retryable or permanent outcome
-per the registered retry policy, never left unrecorded; and the process instance's checkpoint
-advances only after that unit of work commits, so a crash between closure return and checkpoint
-advance replays the step under the same idempotency key rather than silently skipping or
-duplicating it.
+| Method | Path | Description | Stability |
+|--------|------|-------------|-----------|
+| `POST` | `/bss-orders-workflow/v1/steps/{operation}` | Invoke the registered step operation `{operation}` for one process instance under the caller's idempotency key. One route per row of `owf_step_operation`; an unregistered name is `not-found` (404) | unstable — internal, versioned with the definition grammar of `10 §2` |
 
-- [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-interface-timer-api`
+Every call on this surface **MUST** satisfy, in this order, before the operation's effect runs:
 
-The durable timer registration and cancellation contract (§3.3 Durable Timer Service): a handler
-schedules a timer against the process `correlationId` **plus a `timer_kind` and a subject
-reference** — the approval gate, the intent, the line — with a fire time or a duration, and
-receives a wake-up callback through the same step-executor entry point carrying that same triple,
-so a fire handler can tell two timers of one kind on one instance apart and a cancellation can
-target exactly one of them. A timer fire is itself a step invocation, not a distinct code path.
+1. [ ] - `p1` - **Service principal.** The gateway-asserted `SecurityContext` **MUST** identify a service subject (`subject_type` service) whose `token_scopes` names this gear; anything else is `not-authorized` (403) before the PDP is asked, exactly as [`09 §3.6` *System-actor call on the REST surface*](./09-read-and-authz.md#36-interactions--sequences) states - `inst-owf-step-principal`
+2. [ ] - `p1` - **PDP decision.** The route requests resource `gts.cf.bss.orders_workflow.process_step.v1~` × action `execute` through the shared `PolicyEnforcer` adapter with the target `correlationId` and the resource property `operation = {operation}` (`cpt-cf-bss-orders-workflow-adr-platform-pdp-authorization`); a deny is `not-found` (404) per the existence-oracle rule of `09 §4.4`, a PDP outage the canonical 503 - `inst-owf-step-pdp`
+3. [ ] - `p1` - **Required headers and body.** `Idempotency-Key` is **REQUIRED** and is validated by server-side recomposition from the body per the operation's registered key family (`cpt-cf-bss-orders-workflow-constraint-tenant-namespaced-idempotency`, [`09 §2.2`](./09-read-and-authz.md#22-constraints)); a missing or non-matching key is `idempotency-key-mismatch` (400). The body **MUST** validate against the operation's registered `input` GTS reference schema; a body carrying a member the schema does not declare is a validation refusal (400), which is the runtime half of the references-not-payloads rule. The body **MUST** carry `invocationId` (the platform invocation, from the definition's `$workflow.id` runtime argument) and `attemptId` (the platform attempt identifier, see *Attempt identity* below) - `inst-owf-step-shape`
+4. [ ] - `p1` - **Deadline.** The envelope computes the attempt's deadline as `min(now + operation.deadline_ms, caller deadline)` against database time, where the caller deadline is the remaining budget the platform propagates on the call when it does; the effective deadline is propagated on every outbound call the operation makes (§4.5 *Deadline propagation*) - `inst-owf-step-deadline`
+5. [ ] - `p1` - **Registry resolution.** Resolve the key to exactly one of the six registry outcomes of §4.3; only *first call / re-run* proceeds to the effect - `inst-owf-step-resolve`
+
+**Attempt identity.** `attempt_id` is the platform's identifier for the attempt that issued the
+call and is recorded on every step record. Whether the plugin's HTTP `call` task carries its
+attempt identifier to the callee is **not stated** in the serverless-runtime design; it is
+registered as an upstream ask in `UPSTREAM_REQS.md` (commit D). Until it is answered, the
+definition supplies `attemptId` as `"{invocationId}:{taskName}"` from the spec's `$workflow.id`
+and `$task.name` runtime arguments, and the envelope appends its own receipt ordinal to make the
+recorded value unique per receipt. Recording it is what lets an auditor join Orders' record to
+the platform's timeline without depending on the timeline surviving.
+
+**What the envelope guarantees around a call**: the idempotency key is resolved before the
+operation's effect runs; the outcome is durably recorded — step record, audit entry and, where the
+operation declares one, a typed event enqueued through the bound platform producer outbox with
+the same transaction runner — in the same unit of work that settles the idempotency record; an
+effect that raises is caught and mapped to a retryable or permanent outcome per the operation's
+`retry_class`, never left unrecorded; and the answer is sent only after that unit of work
+commits, so a caller crash between effect and answer replays the call under the same key and is
+absorbed rather than duplicated.
+
+**Error surface**: every non-success answer carries a reason from the reason catalogue (§4.9)
+through the platform `ContractError` contract: `error_domain` `orders-workflow.v1`, a per-reason
+`error_code`, and a canonical category that fixes `type`, `status` and `title`
+(`../DECISIONS.md` D-64). The engine contributes exactly **ten** reason families of its own —
+`still-processing`, `idempotency-key-aged-out`, `idempotency-key-conflict`,
+`idempotency-lease-expired`, `per-attempt-timeout`, `retry-budget-exhausted`,
+`step-deadline-exceeded`, `circuit-breaker-open`, `poison-step`, `definition-not-bound` — and
+the operation slices contribute the rest. No slice may register a second name for any of them.
 
 - [ ] `p2` - **ID**: `cpt-cf-bss-orders-workflow-interface-progress-read`
 
-The engine-owned read of process-instance progress (phase, per-step outcomes, pending timers) that
-slice 09's read surface projects from; it exposes no idempotency-registry content and no audit
-detail beyond what the step log already carries.
+The engine-owned read of process-instance progress (recorded phase, definition binding, per-step
+settled outcomes with their platform `attempt_id`s, and the invocation id the platform status can
+be read under) that slice 09's read surface projects from; it exposes no idempotency-registry
+content and no audit detail beyond what the step log already carries. It is the source of the
+progress projection, never the definition's input: no operation reads it to decide a next step.
 
-**Endpoints Overview**: this engine has no HTTP surface of its own. Slices 02-09 register the REST
-and event endpoints that ultimately invoke `execute step`; those endpoints and their stability are
-documented in the slices that own them.
+**Retired interface.** `cpt-cf-bss-orders-workflow-interface-timer-api` — retired by ADR-0011;
+a timer is a definition `wait` task and its pause/re-arm is the hold pattern of `10 §3.6` (e) and
+`10 §4`.
 
-**Error surface**: every non-success outcome carries a reason from the reason catalogue (§4.9)
-and is machine-readable end to end. Reasons are derived GTS error types under
-`gts.cf.bss.orders_workflow.err.v1~` — registry keys, never wire values — and reach the wire
-through the platform `ContractError` contract: `error_domain` `orders-workflow.v1`, a per-reason
-`error_code`, and a canonical category that fixes `type`, `status` and `title` (§4.9,
-`../DECISIONS.md` D-64). The engine contributes exactly these nine reason families of its own —
-`still-processing`, `idempotency-key-aged-out`, `idempotency-key-conflict`,
-`idempotency-lease-expired`, `per-attempt-timeout`, `retry-budget-exhausted`,
-`step-deadline-exceeded`, `circuit-breaker-open`, `poison-step` — and handler slices contribute
-the rest. No handler slice may register a second name for any of them; the read-and-authz
-slice's former `key-conflict` is `idempotency-key-conflict`.
-
-#### The transition/step contract
+#### The step-operation contract
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-contract-step-invocation`
 
-A capability handler never calls a downstream dependency directly from arbitrary code — it
-registers a step against the extension boundary
-(`cpt-cf-bss-orders-workflow-component-handler-extension-boundary`) and the step executor invokes
-that registration. The engine's guarantee is one of *envelope*, not of *outcome*: it guarantees
-the step runs at most once to a durably recorded conclusion per idempotency key, that the
-conclusion is audited before the caller's process advances past it, and that the closed set of
-non-success outcomes below is the only vocabulary a handler ever needs to interpret a step's
-failure to complete synchronously. It does not guarantee the step's downstream call succeeds, and
-it holds no opinion on what the handler does with a given non-success outcome beyond the
-partial-failure and escalation policy each handler slice declares.
+A slice never calls a downstream dependency from arbitrary code — it registers a step operation
+against the operation registration boundary
+(`cpt-cf-bss-orders-workflow-component-handler-extension-boundary`) and the definition orders it.
+Each operation is declared **once**, in its slice's §3.3, with exactly these fields, and the
+declaration is mirrored into `owf_step_operation` (§3.7):
 
-**The closed set of non-success outcomes** a step invocation can return:
+| Field | Meaning | Closed values |
+|-------|---------|---------------|
+| `name` | Kebab-case, stable; the route segment, the PDP resource property and the definition's `call` target | one per registered operation; the canonical list is `10 §2` |
+| `protection` | Whether a definition may omit or replace it | `protected` (must appear on its path, never replaced) · `composable` (may be omitted) |
+| `input` | GTS reference schema of the request body; references and small enums only | a `gts.cf.bss.orders_workflow.step.<name>.input.v1~` type |
+| `output` | GTS reference schema of the success body | a `gts.cf.bss.orders_workflow.step.<name>.output.v1~` type |
+| `idempotency_key` | Derivation family per [`../ADR/0006`](../ADR/0006-cpt-cf-bss-orders-workflow-adr-idempotency-key-composition.md), recomposed server-side | intent · approval-request · lifecycle-transition · instance-scoped (`{tenant}:{correlationId}:{name}[:{subject}][:{attempt}]`) |
+| `declared_event` | The process event enqueued in the settlement transaction on success | one of the six of §4.7, or none |
+| `compensation` | The operation that undoes this one's effect | a registered operation name, or none |
+| `reasons` | The catalogue subset it may raise | names from §4.9 |
+| `audit_kind` | The `owf_audit_entry.event_kind` its settlement writes | one of the closed kinds of §3.7 |
+| `retry_class` | Whether the definition may retry its transient failures | `retryable-on: transient` · `never` |
+| `deadline` | Per-operation budget inside the envelope, ms | value stated per operation; must nest per §4.2 |
 
-| Outcome | Meaning |
-|---------|---------|
-| `retryable-failure` | The attempt failed transiently; the retry/backoff controller schedules another attempt within the retry budget |
-| `permanent-failure` | The attempt failed in a way the handler declared non-retryable, or the retry budget or step deadline is exhausted; the handler's partial-failure policy applies |
-| `still-processing` | The idempotency registry found an in-flight record under this key with a live lease; the caller must not infer success and must not resubmit under a new key |
-| `aged-out` | The idempotency key's retention window (§3.7) has elapsed with no settled record; the next attempt is a **new operation under a new key** — it appends the key's `attempt` component rather than replaying the identical string, which `UNIQUE(idempotency_key)` would reject — never a resume of the old one |
-| `dead-lettered` | **Delivery-level only**: the step's inbound trigger or callback exhausted its bounded delivery-count cap and the payload is parked for operator inspection. It is never inferred as a process outcome and is never written to `owf_step_log.outcome` — a step-level failure cannot reach the dead-letter path by construction (§4.8) |
+The envelope's guarantee is one of *envelope*, not of *outcome*: the operation runs at most once
+to a durably recorded conclusion per idempotency key (once more per settled retryable failure),
+the conclusion is audited before the caller sees it, and the closed set below is the only
+vocabulary a definition's `catch` arm ever needs. It does not guarantee the operation's downstream
+call succeeds, and it holds no opinion on what the definition does with a non-success outcome
+beyond what the partial-failure and escalation arms of `10 §3.6` declare.
 
-A handler receiving `still-processing` or `dead-lettered` **MUST NOT** advance the
-`FulfillmentTask` or any process-instance field it does not own; only a settled success or a
-settled permanent failure may do so
-(`cpt-cf-bss-orders-workflow-fr-owf-retry`,
-`cpt-cf-bss-orders-workflow-fr-owf-dead-letter`).
+**The closed set of non-success outcomes** a step operation can return, and the HTTP answer the
+definition's `catch` sees (`$error.status`, `10 §2`):
+
+| Outcome | Meaning | Answer |
+|---------|---------|--------|
+| `retryable-failure` | The attempt failed transiently — downstream not accepting, per-operation deadline cut it before an accept, or an open breaker; the registry record is left `open` and the definition's retry policy may re-issue the same key | 503 or 504 with the catalogue reason |
+| `permanent-failure` | The attempt failed in a way the operation declared non-retryable, or the caller presented a key conflict; the definition's failure arm applies | 400, 403, 404 or 409 (`AlreadyExists`) with the catalogue reason |
+| `still-processing` | The registry found an `in_flight` record under this key with a live lease, or a dead lease inside the key lifetime; the caller must not infer success and must not resubmit under a new key; re-issue the same key after backoff or wait for `settle-from-lookup` | 409 `Aborted`, `still-processing` or `idempotency-lease-expired` |
+| `aged-out` | The key's retention window (§3.7) elapsed with no settled record; the next attempt is a **new operation under a new key** — it appends the key's `attempt` component — never a resume of the old one | 400, `idempotency-key-aged-out` |
+
+`dead-lettered` is **not** an outcome of this surface: a delivery that exhausts its cap is the
+platform trigger path's (§4.8), and a step-level failure has the manual task. A definition
+receiving `still-processing` **MUST NOT** treat it as success and **MUST NOT** call a different
+operation to "move on"; only a settled success or a settled permanent failure may advance the path
+(`cpt-cf-bss-orders-workflow-fr-owf-retry`).
+
+#### The foundation's own operations
+
+The foundation registers six operations. They carry no commercial policy; each records a fact
+about the instance the definition has established.
+
+##### `start-instance`
+
+| Field | Value |
+|-------|-------|
+| `protection` | `protected` — the first operation of every path after `admit-trigger` |
+| `input` | `correlationId` (derived by `admit-trigger`, [`02 §2.1`](./02-triggers-and-start.md#21-design-principles)), `orderId`, `orderVersion`, `resourceTenantId`, `sellerTenantId`, `definitionId`, `definitionVersion`, `definitionSource`, `invocationId`, `triggerEventId`, `attemptId` |
+| `output` | `correlationId`, `phase = started`, `definitionVersion`, `rowVersion` |
+| `idempotency_key` | instance-scoped: `{tenant}:{correlationId}:start-instance`; the fingerprint **excludes** `invocationId` and `attemptId` |
+| `declared_event` | none (`OrderFulfillmentStarted` belongs to `begin-fulfillment`, slice 04) |
+| `compensation` | none (`terminate-instance` is a path step, not a paired undo) |
+| `reasons` | `idempotency-key-conflict`, `definition-not-bound` (the named `definitionVersion` is not one the registry hook of `10 §3.3` has validated), `line-count-exceeded` (delegated check, slice 04) |
+| `audit_kind` | `instance-start` at sequence 1 (or the next sequence of a pre-admission chain, §3.7) |
+| `retry_class` | `retryable-on: transient` |
+| `deadline` | 5 s |
+
+Effect, in one transaction: insert `owf_process_instance` (the partial unique index
+`UNIQUE (order_id) WHERE terminal_outcome IS NULL` arbitrates a race, not a prior read), insert
+`owf_definition_binding`, write `instance-start` with `definition_version` set, settle the key.
+A second invocation presenting a different `invocationId` for a bound, non-terminal correlation
+is an absorbed duplicate that answers the **existing** binding; the caller detects the mismatch
+from `invocationId` in the output and the definition ends its own invocation (`10 §3.6` (f)).
+
+##### `settle-from-lookup`
+
+| Field | Value |
+|-------|-------|
+| `protection` | `protected`, **sweep-only**: it is never a definition `call` target (the validation hook rejects one, `10 §2`); it is invoked in-process by `reconcile-intent` (slice 05) and by the `reconciliation-sweep` worker (§3.8) |
+| `input` | `correlationId`, `operation`, `idempotencyKey` (the stuck key), `lookupOutcome` (`success` · `failure` · `absent` · `non-terminal`), `lookupRef` (the downstream `transition_request_id` or null), `reason` (catalogue, on `failure`), `attemptId` |
+| `output` | `registryStatus`, `outcome` |
+| `idempotency_key` | instance-scoped: `{tenant}:{idempotencyKey}:settle-from-lookup:{lookupOutcome}` |
+| `declared_event` | none — advancing the task the key belongs to is the owning slice's operation, which the definition calls next |
+| `compensation` | none |
+| `reasons` | `idempotency-key-aged-out`, `idempotency-key-conflict` |
+| `audit_kind` | `sweep-settlement` |
+| `retry_class` | `never` |
+| `deadline` | 5 s |
+
+Effect: under the registry row's lock, re-read `status` and `lease_expires_at`; if the row is
+still `in_flight` with a dead lease, or `open`, write the step record for the stuck attempt with
+the looked-up result, settle the key (`settled/success` or `settled/failure` on a terminal lookup,
+leave `open` on `non-terminal` inside the key lifetime), and write `sweep-settlement`. A row that
+settled in the meantime — the original holder answered after all — makes this call an absorbed
+no-op. Past the key lifetime the operation is **read-only**: it records `aged-out` and settles
+nothing. This is the only path that may settle a key whose closure it did not run (§4.3
+*Lease-expired*), which is what closes the former finding that a dead lease had no settler.
+
+##### `retry-step`
+
+| Field | Value |
+|-------|-------|
+| `protection` | `composable` (operator) |
+| `input` | `correlationId`, `stepRef` (operation name plus subject reference), `taskRef` (the manual task whose `retry` resolution invokes it), `attemptId` |
+| `output` | `attemptKey` (the new key the definition passes to the re-dispatched operation), `quarantined` |
+| `idempotency_key` | instance-scoped: `{tenant}:{correlationId}:retry-step:{taskRef}:{resolutionSeq}` |
+| `declared_event` | none |
+| `compensation` | none |
+| `reasons` | `poison-step`, `version-mismatch`, `not-found` |
+| `audit_kind` | `retry` |
+| `retry_class` | `never` |
+| `deadline` | 5 s |
+
+Effect: verify the instance `row_version` the caller presents, apply the Orders-side quarantine
+of §4.13 (three consecutive retries of one `stepRef` whose attempts terminated without a settled
+outcome trip `poison-step`), mint the next `attempt` component for the step's key family, and
+record the operator's retry as a `retry` audit entry with the actor from the `SecurityContext`.
+The re-dispatch itself is the definition's resume arm (`10 §3.6` (c)).
+
+##### `park` and `unpark`
+
+| Field | `park` | `unpark` |
+|-------|--------|----------|
+| `protection` | `composable` | `composable` |
+| `input` | `correlationId`, `parkReason` (the closed park reasons of [`03 §3.7`](./03-approval-execution.md#37-database-schemas--tables), the fail-closed park of `cpt-cf-bss-orders-workflow-adr-fail-closed-verdict-park` as amended, or `lifetime-ceiling`), `subjectRef`, `attemptId` | `correlationId`, `subjectRef`, `attemptId` |
+| `output` | `phase = parked`, `rowVersion` | `phase = started`, `rowVersion` |
+| `idempotency_key` | `{tenant}:{correlationId}:park:{subjectRef}:{attempt}` | `{tenant}:{correlationId}:unpark:{subjectRef}:{attempt}` |
+| `declared_event` | none | none |
+| `compensation` | `unpark` | none |
+| `reasons` | `version-mismatch` | `version-mismatch` |
+| `audit_kind` | `phase-transition` | `phase-transition` |
+| `retry_class` | `retryable-on: transient` | `retryable-on: transient` |
+| `deadline` | 5 s | 5 s |
+
+Effect: the `started → parked` and `parked → started` transitions of §3.7, recorded as the phase
+projection. Whether a verdict is obtainable, and when to try again, is the definition's park arm
+(`10 §3.6` (a)); Orders records the park and its reason.
+
+##### `terminate-instance`
+
+| Field | Value |
+|-------|-------|
+| `protection` | `protected` — the last operation of every path |
+| `input` | `correlationId`, `terminalOutcome` (`completed` · `aborted`), `terminationKind` (`completed` · `compensated` · `superseded` · `rejected` · `terminal-order-event`), `reason` (catalogue, nullable), `supersededByOrderVersion` (nullable), `attemptId` |
+| `output` | `phase = terminated`, `terminalOutcome`, `rowVersion` |
+| `idempotency_key` | instance-scoped: `{tenant}:{correlationId}:terminate-instance` |
+| `declared_event` | none (`OrderFulfillmentCompleted`/`Aborted` belong to `report-outcome`, slice 06) |
+| `compensation` | none |
+| `reasons` | `version-mismatch` |
+| `audit_kind` | `termination` |
+| `retry_class` | `retryable-on: transient` |
+| `deadline` | 5 s |
+
+Effect: set `terminal_outcome`, move the phase projection to `terminated` from any non-terminal
+phase per §3.7, write `termination` with `phase_from`/`phase_to`, release the partial unique
+index so a new version's instance may start. A terminated instance accepts no further operation:
+every other operation answers `permanent-failure` with `version-mismatch` once the row is
+terminal.
 
 ### 3.4 Internal Dependencies
 
 | Dependency Gear | Interface Used | Purpose |
 |-------------------|----------------|----------|
-| `orders-lifecycle` | Versioned contract / SDK client | Reading current order state and order document content as a guard input before dispatching a step; this gear never writes the order aggregate directly |
-| `toolkit-db` | Runtime-scoped database access plus `outbox` | The durable step log, idempotency registry, audit log and durable-timer tables; toolkit outbox migrations and the managed producer queue |
+| `serverless-runtime` | Function registry, invocation and event-trigger APIs of its [DESIGN §3.3](../../../../serverless-runtime/docs/DESIGN.md#33-api-contracts) — by reference from `10 §3.3` | Publishing and validating definition versions; reading invocation status for the sweep and the progress read; delivering operator signals to a running invocation. **No SDK exists today** (`10 §1`) |
+| `orders-lifecycle` | Versioned contract / SDK client | Read of current order state and version inside an operation before it acts; this gear never writes the order aggregate directly |
+| `toolkit-db` | Runtime-scoped database access plus `outbox` | The process instance, step log, idempotency registry, audit chain, definition binding and operation registry; toolkit outbox migrations and the managed producer queue |
 | `event-broker-sdk` | `EventBrokerApi`, `DbProducer`, `ProducerOutboxQueue` (`outbox` feature) | Typed validation, managed chained producer registration, broker partitioning and asynchronous publication of the six process events |
-| `types-registry` | SDK client | Resolving and registering the GTS event and subject types of §4.7 before readiness; a type that fails to register fails the boot |
-| `toolkit-db` advisory locks | `Db::lock` / `Db::try_lock`, `DbLockGuard` | Session-bound coordination for the authoritative Workflow worker roster in §3.8; toolkit owns outbox coordination |
-| Platform durable-execution substrate | SDK client per `cpt-cf-bss-orders-workflow-adr-durable-execution-substrate` | Hosting step scheduling and crash recovery; its own run history is explicitly not the audit source of record (§1.1) |
+| `types-registry` | SDK client | Resolving and registering the GTS event types of §4.7, the error types of §4.9 and the step input/output reference schemas of §3.3 before readiness; a type that fails to register fails the boot |
+| `authz-resolver` | `PolicyEnforcer` adapter (`dyn AuthZResolverApi`) | The `execute` decision on every step call (§3.3) |
+| `toolkit-db` advisory locks | `Db::lock` / `Db::try_lock`, `DbLockGuard` | Session-bound coordination for the three-worker roster of §3.8 |
 
 **Dependency Rules** (per project conventions):
 - No circular dependencies
@@ -822,19 +993,16 @@ settled permanent failure may do so
 
 This engine slice **calls** no external dependency itself. Every outbound call — to Subscriptions
 for provisioning, to Payments for authorization outcomes, to the Generic Approval service for gate
-decisions — is made by the handler slice that registers the step, through that slice's own port,
-under the retry/backoff controller and idempotency registry this engine provides. The engine only
-provides the envelope (idempotency, retry, audit, timers, producer enqueue) that makes a handler's
-outbound call safe to retry. The one platform egress the engine binds itself is the Event Broker,
-through `EventBrokerApi` obtained from `ClientHub`; only the toolkit outbox worker calls it, never
-a step transaction, and type preparation plus managed producer registration happen before the
-instance becomes ready.
+decisions — is made by the step operation that owns it, through that slice's own port, inside the
+envelope this engine provides; and the definition of `10` calls none of them directly (seam rules
+R1–R5, `10 §2`). The one platform egress the engine binds itself is the Event Broker, through
+`EventBrokerApi` obtained from `ClientHub`; only the toolkit outbox worker calls it, never a
+settlement transaction.
 
-It is nonetheless **not** dependency-free, and the table below is not decoration: the engine owns
-the idempotency, retry, circuit-breaker and sweep semantics for the Subscriptions provisioning
-path, so that contract constrains this slice's design even though no line of this slice dials it.
-That is the one external contract bound here; Payments and Generic Approval are bound in the
-slices that call them.
+It is nonetheless **not** dependency-free: the engine owns the idempotency, breaker and
+settlement semantics for the Subscriptions provisioning path, so that contract constrains this
+slice's design even though no line of this slice dials it. Payments and Generic Approval are bound
+in the slices that call them.
 
 #### Subscriptions (provisioning path)
 
@@ -842,7 +1010,7 @@ slices that call them.
 
 | Dependency Gear | Interface Used | Purpose |
 |-------------------|---------------|---------|
-| `subscriptions` | Versioned contract / SDK client (invoked by handler slices, envelope owned here) | All provisioning flows through Subscriptions; this gear never calls OSS directly |
+| `subscriptions` | Versioned contract / SDK client (invoked by the dispatch operations of slice 05, envelope owned here) | All provisioning flows through Subscriptions; this gear never calls OSS directly |
 
 **Dependency Rules** (per project conventions):
 - No circular dependencies
@@ -853,7 +1021,7 @@ slices that call them.
 
 ### 3.6 Interactions & Sequences
 
-#### Step execution with idempotent replay
+#### A definition task invokes a step operation, retries with the same key, settles
 
 **ID**: `cpt-cf-bss-orders-workflow-seq-step-idempotent-replay`
 
@@ -863,66 +1031,114 @@ slices that call them.
 
 ```mermaid
 sequenceDiagram
-    participant H as Capability handler
-    participant SE as Step executor
+    participant PL as Platform plugin (definition call task)
+    participant SE as Step envelope
     participant IR as Idempotency registry
+    participant OP as Step operation (slice 05)
     participant AW as Audit writer
     participant OB as Bound platform producer outbox
-    H ->> SE: execute step (key K)
+    PL ->> SE: POST /steps/dispatch-wave1-create (key K, attemptId a1)
     SE ->> IR: resolve K
-    IR -->> SE: none
-    SE ->> IR: insert in-flight K, re-read
-    SE ->> H: invoke closure
-    H -->> SE: success
-    SE ->> AW: append step-completion entry (actor, key K, correlationId)
-    SE ->> OB: enqueue typed OrderFulfillmentStepCompleted (same transaction runner)
-    SE ->> IR: settle K = success
-    SE -->> H: settled success
-    H ->> SE: execute step (key K) - client-side timeout retry
+    IR -->> SE: none — first call
+    SE ->> IR: insert in_flight K, take lease; append step-start (txn 1)
+    SE ->> OP: run effect under deadline
+    OP -->> SE: transient failure (downstream 503)
+    SE ->> AW: append retry entry; step record (a1, retryable-failure); IR: K = open (txn 2)
+    SE -->> PL: 503 retryable-failure
+    Note over PL: task retry policy: backoff, same key
+    PL ->> SE: POST /steps/dispatch-wave1-create (key K, attemptId a2)
     SE ->> IR: resolve K
-    IR -->> SE: settled success
-    SE -->> H: same outcome, closure not re-invoked
+    IR -->> SE: open, fingerprint matches — re-run
+    SE ->> IR: K = in_flight, take lease; append step-start (txn 3)
+    SE ->> OP: run effect under deadline
+    OP -->> SE: accepted (transition_request_id)
+    SE ->> AW: append step-completion (actor, key K, correlationId, attempt 2)
+    SE ->> OB: enqueue typed event where declared (same transaction runner)
+    SE ->> IR: settle K = success, outcome_ref → step record (a2) (txn 4)
+    SE -->> PL: 200 settled success
+    PL ->> SE: POST /steps/dispatch-wave1-create (key K, attemptId a2) — worker replay
+    SE ->> IR: resolve K
+    IR -->> SE: settled success, fingerprint matches
+    SE -->> PL: 200 same output, effect not re-run
 ```
 
-**Description**: A client-side timeout of the first call never causes a second durable effect —
-the handler retries with the same key and the registry absorbs the duplicate, per the caller-side
-duplicate protocol (§4). The enqueue is a write into the platform `toolkit_db::outbox` tables
-under the step's own transaction runner; it commits or rolls back with the audit entry and the
-idempotency settlement, and no Event Broker call happens inside the transaction.
+**Description**: The platform's retry policy and its replay after a worker crash both re-issue
+the call with the same idempotency key, because the key is derived from the task's inputs and not
+minted per attempt (`10 §2`). The registry distinguishes the two re-issues: the first lands on an
+`open` record and is allowed to run the effect once more; the second lands on a `settled` record
+and is absorbed. Each settlement is one transaction under the step's transaction runner —
+step record, audit entry, producer enqueue and registry settlement commit or roll back together,
+and no Event Broker call happens inside it. The `attempt_id` on each step record is what joins
+Orders' account of the step to the platform's.
 
-#### Overdue escalation via the durable timer service
+#### `start-instance` binds the definition version
 
-**ID**: `cpt-cf-bss-orders-workflow-seq-overdue-escalation-timer`
+**ID**: `cpt-cf-bss-orders-workflow-seq-start-instance-binding`
 
-**Use cases**: `cpt-cf-bss-orders-workflow-fr-owf-overdue-escalation`
+**Use cases**: `cpt-cf-bss-orders-workflow-fr-owf-start-contract`
 
-**Actors**: `cpt-cf-bss-orders-workflow-actor-owf-fulfillment-operator`
+**Actors**: `cpt-cf-bss-orders-workflow-actor-owf-orders-lifecycle`
 
 ```mermaid
 sequenceDiagram
-    participant TS as Durable timer service
-    participant SE as Step executor
-    participant AW as Audit writer
-    participant FO as Fulfillment-operator queue (slice 07)
-    TS ->> TS: process restarts; timer reloaded from durable store
-    TS ->> SE: fire overdue-fulfillment timer (kind, subject)
-    SE ->> AW: append escalation entry (event_kind = escalation)
-    SE ->> FO: raise operational escalation
-    SE -->> TS: acknowledge, timer retired
+    participant PL as Platform plugin (invocation of definition vN)
+    participant AT as admit-trigger (slice 02)
+    participant SE as Step envelope
+    participant DB as owf_process_instance / owf_definition_binding / owf_audit_entry
+    PL ->> AT: POST /steps/admit-trigger (eventId, orderId, orderVersion)
+    AT -->> PL: admitted, correlationId (derived), resourceTenantId
+    PL ->> SE: POST /steps/start-instance (correlationId, definitionId, vN, invocationId, key)
+    SE ->> DB: INSERT instance (partial unique index arbitrates)
+    SE ->> DB: INSERT binding (definition_id, vN, source = platform, pinned_at, published_by)
+    SE ->> DB: audit instance-start (definition_version = vN, phase_to = started)
+    SE -->> PL: 200 correlationId, definitionVersion = vN
+    PL ->> SE: POST /steps/start-instance (same key) — replay or duplicate trigger
+    SE -->> PL: 200 existing binding (vN), effect not re-run
 ```
 
-**Description**: The timer's wake-up never depends on an external trigger arriving; a process
-restart reloads it from the durable store and it fires on schedule regardless of whether any
-other message arrives in the interim.
+**Description**: The binding is written in the transaction that creates the instance and is never
+updated; the platform's pin of the invocation to callable version vN
+([`DESIGN.md:614`](../../../../serverless-runtime/docs/DESIGN.md#versioning-model)) and Orders'
+binding record the same fact on both sides of the boundary. A later definition version affects
+only instances started after it; nothing here migrates an instance.
 
-**No process event is enqueued on this path.** An overdue-fulfillment escalation is an
-*operational* escalation, not one of the six named process events, and the producer adapter
-constructs only the six registered `TypedEvent`s of §4.7 — there is no seventh type to enqueue,
-and an attempt to publish one would fail GTS schema validation at enqueue rather than reach the
-broker. The approval-gate escalation timer is a **different timer of a different kind** with a
-different consequence: it does publish `OrderApprovalEscalated`, and that path belongs to
-[`03-approval-execution`](./03-approval-execution.md), not to the overdue window. The two are the
-distinct bounds §4.2 keeps apart and must never be drawn as one line.
+#### `settle-from-lookup`
+
+**ID**: `cpt-cf-bss-orders-workflow-seq-settle-from-lookup`
+
+**Use cases**: `cpt-cf-bss-orders-workflow-fr-owf-intent-sweep`
+
+**Actors**: `cpt-cf-bss-orders-workflow-actor-owf-subscriptions`
+
+```mermaid
+sequenceDiagram
+    participant PL as Platform plugin (retry of the stuck call)
+    participant SE as Step envelope
+    participant IR as Idempotency registry
+    participant RI as reconcile-intent (slice 05)
+    participant SUB as Subscriptions
+    participant SL as settle-from-lookup
+    PL ->> SE: POST /steps/dispatch-wave2-activate (key K) — holder crashed after accept
+    SE ->> IR: resolve K
+    IR -->> SE: in_flight, lease dead, key inside lifetime
+    SE -->> PL: 409 idempotency-lease-expired (still-processing)
+    Note over PL: definition: wait, then call reconcile-intent
+    PL ->> RI: POST /steps/reconcile-intent (correlationId, lineRef, wave)
+    RI ->> SUB: status read (correlationId + orderId/orderVersion/line/wave)
+    SUB -->> RI: activated (transition_request_id)
+    RI ->> SL: settle-from-lookup(K, lookupOutcome = success, lookupRef) — in-process
+    SL ->> IR: lock row; recheck status and lease
+    SL ->> IR: step record for the stuck attempt; K = settled/success; audit sweep-settlement
+    SL -->> RI: settled
+    RI -->> PL: 200 line activated
+```
+
+**Description**: A dead lease is never a free key: the envelope answers `still-processing` and
+the only thing that may settle the key without re-running the effect is a lookup of the real
+downstream outcome. The recheck under the row lock is what keeps two overlapping settlers — the
+definition's reconcile arm and the `reconciliation-sweep` worker — from settling one key twice.
+This closes the former findings that the dead-lease state had no settler and that the sweep's
+settlement was undefined.
 
 #### Platform producer-outbox publication
 
@@ -941,43 +1157,40 @@ Output: acknowledged, retained for retry, or platform dead-lettered
 2. [ ] - `p1` - Let the Event Broker SDK decode the producer envelope and publish through `EventBrokerApi` under its registered producer in managed `ProducerMode::Chained`: `meta.sequence` comes from `OutboxMessage.seq`, and `meta.previous` comes from the SDK-managed cursor for that producer/topic/broker partition. Event ID is not a broker de-duplication token - `inst-owf-try-publish`
 3. [ ] - `p1` - **IF** Event Broker returns accepted, persisted or duplicate: return `MessageResult::Ok`, allowing toolkit-db to advance the queue cursor - `inst-owf-mark-delivered`
 4. [ ] - `p1` - **IF** the SDK classifies the fault as transport or rate limiting: return `MessageResult::Retry`; toolkit-db retains the cursor and applies its retry cadence, so the entire toolkit queue partition remains FIFO-blocked until the message succeeds; Workflow imposes no attempt cap - `inst-owf-backoff-reschedule`
-5. [ ] - `p1` - **IF** the SDK classifies the fault as permanent — including invalid envelope/schema, unrecoverable producer identity or persistent chained-sequence divergence: return `MessageResult::Reject`; toolkit-db writes its dead-letter record and advances the queue-partition cursor; no `owf_dead_letter_record` row is written (§4.8) - `inst-owf-park-dead-letter`
+5. [ ] - `p1` - **IF** the SDK classifies the fault as permanent — including invalid envelope/schema, unrecoverable producer identity or persistent chained-sequence divergence: return `MessageResult::Reject`; toolkit-db writes its dead-letter record and advances the queue-partition cursor; Workflow writes nothing (§4.8) - `inst-owf-park-dead-letter`
 
 **Description**: This algorithm documents the behaviour Workflow relies on; its implementation is
 the platform `ProducerOutboxProcessor` and toolkit leased worker, exactly as
 [Lifecycle `01 §3.6` *Platform producer-outbox publication*](../../../orders-lifecycle/docs/design/01-foundation.md#36-interactions-and-sequences)
-documents for the sibling gear. There is no Workflow-owned drain. Transient retry is intentionally
-not capped: an Event Broker outage must not convert valid events into permanent rejects. Permanent
-faults are rejected immediately because retry cannot repair invalid data or producer state.
+documents for the sibling gear. Transient retry is intentionally not capped; permanent faults
+are rejected immediately. `orderId` is the typed event's broker partition key; a permanent
+dead letter is operational evidence, not a process outcome and not an order state (§4.7).
 
-`orderId` is the typed event's broker partition key, so the events of one order share a broker
-partition and preserve FIFO in ordinary operation; the toolkit queue maps `(topic, broker
-partition)` to one of its 16 partitions, so a transient retry blocks that whole toolkit partition,
-not merely one order. Once a permanent message is dead-lettered the cursor advances and later
-messages may proceed (Lifecycle D-87). Consumers tolerate that gap by de-duplicating on event ID
-and reconciling `orderVersion` and resulting state against the authoritative Lifecycle read
-(§4.7). A platform dead letter is operational evidence, not a process outcome and not an order
-state. Independent queue measurements expose depth, oldest-message age and pending dead letters;
-`DESIGN.md §4.4` alerts on them as platform metrics.
+**Retired sequence.** `cpt-cf-bss-orders-workflow-seq-overdue-escalation-timer` — retired by
+ADR-0011; the overdue window is the competing `wait` arm of `10 §3.6` (b) and the lifetime
+ceiling the top-level arm of `10 §3.6` (e); Orders records the escalation through
+`raise-overdue-escalation` (slice 07).
 
 ### 3.7 Database schemas & tables
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-db-engine-schema`
 
-The canonical schema for every engine-owned table. Each table's ownership rule below names the
-single component that may write it; no handler slice writes any of these tables directly.
+The canonical schema for every engine-owned table — **eight**: `owf_process_instance`,
+`owf_step_log`, `owf_idempotency_registry`, `owf_audit_entry`, `owf_audit_checkpoint`,
+`owf_audit_checkpoint_member`, `owf_definition_binding`, `owf_step_operation`. Each table's
+ownership rule below names the single component that may write it; no slice writes any of these
+tables outside the envelope.
 
-**Tenancy is a column on every table here, not a convention.** Every table carries
-`resource_tenant_id uuid NOT NULL` — the resource-recipient axis — and the tables backing an
-operator- or seller-scoped surface additionally carry `seller_tenant_id uuid NOT NULL`, the
-selling-party axis. `payer_tenant_id` is the billing axis and is carried only where a payment or
-commercial-profile decision is recorded against the row; the engine tables do not record one, so
-none carries it. The axis names are the sibling gear's
-([`orders-lifecycle` §3.7](../../../orders-lifecycle/docs/design/01-foundation.md)) and are
-identical across this design set. Each table states its axis choice in **Additional info**.
-Without the column the platform's SecureORM `#[secure(tenant_col = ...)]` isolation has nothing to
-attach to and §4.11's tenant-scoping claim has no enforcing predicate; per-tenant fairness and
-back-pressure key on `seller_tenant_id` (§4.12).
+**Tenancy is a column on every process table here, not a convention.** Every table except the
+configuration-only `owf_step_operation` carries `resource_tenant_id uuid NOT NULL` — the
+resource-recipient axis — and the tables backing an operator- or seller-scoped surface
+additionally carry `seller_tenant_id uuid NOT NULL`, the selling-party axis. `payer_tenant_id` is
+the billing axis and is carried only where a payment decision is recorded against the row; the
+engine tables record none. The axis names are the sibling gear's
+([`orders-lifecycle` §3.7](../../../orders-lifecycle/docs/design/01-foundation.md)). Each table
+states its axis choice in **Additional info**. Without the column the platform's SecureORM
+`#[secure(tenant_col = ...)]` isolation has nothing to attach to and §4.11's tenant-scoping claim
+has no enforcing predicate.
 
 #### Table: owf_process_instance
 
@@ -987,59 +1200,86 @@ back-pressure key on `seller_tenant_id` (§4.12).
 
 | Column | Type | Description |
 |--------|------|-------------|
-| correlation_id | uuid | Process aggregate identity |
+| correlation_id | uuid | Process aggregate identity; FK to `owf_definition_binding.correlation_id` (one-to-one) |
 | order_id, order_version | text, integer | The order this instance acts on (Lifecycle is system of record) |
 | resource_tenant_id | uuid, NOT NULL | Resource-recipient axis |
-| seller_tenant_id | uuid, NOT NULL | Selling-party axis; the key the operator surfaces scope by and the key per-tenant fairness buckets on (§4.12) |
-| definition_version | text | Pinned for the instance's lifetime |
-| phase | enum | `started`, `suspended`, `parked`, `compensating`, `terminated` — see the transition table below |
-| suspended | boolean | Set on `OrderHeld`, cleared on `OrderResumed`; redundant with `phase = suspended` and kept as the hold predicate the resume path reads |
-| last_checkpoint | text | The last durably completed step |
-| row_version | bigint, NOT NULL, DEFAULT 0 | Optimistic-concurrency version, incremented on **every** write to this row; surfaced to callers as an ETag and required as `If-Match` on the mutating process operations |
-| audit_sequence | bigint, NOT NULL, DEFAULT 0 | The instance's committed audit-chain head: incremented under this row's lock in the same transaction as every `owf_audit_entry` append for this `correlation_id`, so the counter, the entry and the business mutation commit or roll back together (§4.17). The admission transaction that inserts this row also writes the `instance-start` entry at sequence 1 |
+| seller_tenant_id | uuid, NOT NULL | Selling-party axis; the key the operator surfaces scope by |
+| definition_version | text, NOT NULL | Denormalised from the binding for reads; equal to the binding's value by CHECK-on-insert and never rewritten |
+| invocation_id | text, nullable | The platform invocation driving this instance (`DESIGN.md:865`); the handle the sweep's status read and the signal delivery of `10 §3.3` use; NULL only under `definition_source = code` |
+| phase | enum | `started`, `suspended`, `parked`, `compensating`, `terminated` — a **recorded projection** written by step operations, see the transition table below |
+| suspended | boolean | Set by `apply-hold`, cleared by `apply-resume`; redundant with `phase = suspended` and kept as the hold predicate the dispatch operations read |
+| last_settled_step | text, nullable | The last settled **protected** operation and its subject; a read-side marker, not a resume pointer — the platform resumes from its own history |
+| row_version | bigint, NOT NULL, DEFAULT 0 | Optimistic-concurrency version, incremented on **every** write to this row; surfaced to operator callers as an ETag and required as `If-Match` on the mutating operations of `09 §3.3` |
+| audit_sequence | bigint, NOT NULL, DEFAULT 0 | The instance's committed audit-chain head: incremented under this row's lock in the same transaction as every `owf_audit_entry` append for this `correlation_id` (§4.17). The `start-instance` transaction that inserts this row also writes the `instance-start` entry |
 | terminal_outcome | enum, nullable | `completed`, `aborted`, or NULL while non-terminal |
 | created_at, updated_at | timestamptz | Bookkeeping |
 
 **PK**: correlation_id
 
 **Constraints**: **`UNIQUE (order_id) WHERE terminal_outcome IS NULL`** — at most one active
-instance per order, enforced by the index rather than by a read-then-insert admission check;
-`(order_id, order_version)` indexed for lookup; `(seller_tenant_id, phase, updated_at)` indexed
-for the tenancy-scoped operator list; FK relationship to Lifecycle is by reference only — this
-gear holds no foreign key into another gear's database.
+instance per order, enforced by the index rather than by a read-then-insert; `(order_id,
+order_version)` indexed for lookup; `(seller_tenant_id, phase, updated_at)` indexed for the
+tenancy-scoped operator list; `invocation_id` indexed for the sweep; FK relationship to Lifecycle
+is by reference only.
 
-**The `phase` enum and its permitted transitions**:
+**The `phase` enum and its permitted transitions** — each written by the named operation:
 
-| From | To | Trigger |
-|------|----|---------|
-| — | `started` | Instance creation on an admitted start trigger |
-| `started` | `suspended` | `OrderHeld` |
-| `suspended` | `started` | `OrderResumed` |
-| `started` | `parked` | A required verdict is unobtainable and the fail-closed park applies (`cpt-cf-bss-orders-workflow-adr-fail-closed-verdict-park`) |
-| `parked` | `started` | The verdict becomes obtainable and is resolved |
-| `parked` | `terminated` | An operator-initiated cancellation or an expiry resolves the parked order |
-| `started` | `compensating` | Saga rollback begins |
-| `suspended` | `compensating` | A cancellation taken from hold |
-| `compensating` | `terminated` | Compensation reaches a terminal outcome |
-| `started` | `terminated` | A terminal outcome with nothing to compensate |
+| From | To | Operation |
+|------|----|-----------|
+| — | `started` | `start-instance` |
+| `started` | `suspended` | `apply-hold` (slice 08) |
+| `suspended` | `started` | `apply-resume` (slice 08) |
+| `started` | `parked` | `park` |
+| `parked` | `started` | `unpark` |
+| `parked` | `terminated` | `terminate-instance` |
+| `started` | `compensating` | `run-cancellation-fence` (slice 06) |
+| `suspended` | `compensating` | `run-cancellation-fence` (slice 06) |
+| `compensating` | `terminated` | `terminate-instance` |
+| `started` | `terminated` | `terminate-instance` |
 
 `parked` is a **distinct** state, not a flavour of `suspended`: a suspension is operator-initiated
-and resumable by an operator, a park is the fail-closed consequence of an unobtainable verdict and
-clears only when the verdict becomes obtainable. Collapsing them makes AC 0b's
-"verdict unobtainable" case indistinguishable from an ordinary hold. No transition leaves
-`terminated`.
+and resumable by an operator, a park is the fail-closed consequence of an unobtainable verdict or
+an exhausted lifetime ceiling and clears only when an operation records that it may. No transition
+leaves `terminated`. **The projection never drives the definition**: no task reads `phase` to
+choose a branch; the definition's own state does that, and the projection exists so an operator
+read and an audit trail can say where the definition has taken the instance.
 
-**Additional info**: **Ownership**: written only by the step executor
-(`cpt-cf-bss-orders-workflow-component-step-executor`). **Tenant axes**: `resource_tenant_id` and
-`seller_tenant_id` — the instance backs the seller-scoped process list and the operator console,
-so it carries both; `resource_tenant_id` is fixed at admission and never rewritten, which is
-what lets it serve as the immutable audit namespace `owf_audit_entry.audit_tenant_id` copies.
-**Optimistic concurrency**: a caller presenting a stale `row_version` is
-refused with **409** in the RFC-9457 envelope, never silently overwritten; this is the concrete
-mechanism behind the PRD's "Optimistic workflow-version check REQUIRED". **Audit counter**:
-`audit_sequence` is written only inside an audit-appending transaction and is never reset; a
-rollback does not consume a sequence. **Retention**: sized by
-order count, not by traffic; no partitioning at this phase.
+**Additional info**: **Ownership**: written only by the step envelope on behalf of the operation
+named per transition (`cpt-cf-bss-orders-workflow-component-step-executor`). **Tenant axes**:
+`resource_tenant_id` and `seller_tenant_id`; `resource_tenant_id` is fixed at start and never
+rewritten, which is what lets it serve as the immutable audit namespace
+`owf_audit_entry.audit_tenant_id` copies. **Optimistic concurrency**: a caller presenting a stale
+`row_version` is refused with **409** in the RFC-9457 envelope, never silently overwritten.
+**Audit counter**: `audit_sequence` is written only inside an audit-appending transaction and is
+never reset; a rollback does not consume a sequence. **Retention**: sized by order count; no
+partitioning at this phase.
+
+#### Table: owf_definition_binding
+
+**ID**: `cpt-cf-bss-orders-workflow-dbtable-definition-binding`
+
+**Schema**:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| correlation_id | uuid | The instance bound; one row per instance |
+| definition_id | text, NOT NULL | The platform callable id of the registered workflow (`gts.cf.core.sless.workflow.v1~cf.bss.orders_workflow.order_process.v1~`, `10 §3.3`) |
+| definition_version | text, NOT NULL | The published version pinned at start |
+| definition_source | enum, NOT NULL | `platform` — the registered definition executed by the plugin; `code` — the stated fallback in which Orders sequences the same operations in Rust (`10 §1`) |
+| pinned_at | timestamptz, NOT NULL | Database time of `start-instance` |
+| published_by | text, NOT NULL | Opaque subject id of the principal that published the pinned version, copied from the registry's record at start (D-61 minimisation applies) |
+| resource_tenant_id | uuid, NOT NULL | Resource-recipient axis |
+
+**PK**: correlation_id
+
+**Constraints**: no UPDATE and no DELETE grant to any application role; the retention purge holds
+no grant on it — a binding lives as long as its instance row, and an instance row lives for the
+life of the order record. A definition version **MUST NOT** be archived or deleted in the platform
+registry while any row here names it (`10 §4`); the CI check of `10 §2` asserts the set of
+versions named here against the registry.
+
+**Additional info**: **Ownership**: written only by `start-instance` through the envelope.
+**Tenant axis**: `resource_tenant_id` only. Not partitioned; sized by instance count.
 
 #### Table: owf_step_log
 
@@ -1052,36 +1292,37 @@ order count, not by traffic; no partitioning at this phase.
 | step_log_id | uuid | Entry identity |
 | correlation_id | uuid | Owning process instance |
 | resource_tenant_id | uuid, NOT NULL | Resource-recipient axis |
-| step_id | text | The registered step identifier |
-| idempotency_key | text | The key resolved for this attempt |
-| outcome | enum | `pending`, `success`, `retryable-failure`, `permanent-failure`, `still-processing`, `aged-out` |
-| result | jsonb, nullable | **The settled outcome's machine-readable result.** For a step that accepted a downstream intent it carries the `transition_request_id` the downstream assigned, plus the downstream's own status token; for a refusal it carries the catalogue reason and the redacted diagnostic (§4.11). NULL while `pending` |
-| attempt_number | integer | Position within the retry budget |
-| started_at, completed_at | timestamptz | Bookkeeping |
+| operation | text, NOT NULL | The registered operation name; FK to `owf_step_operation.name` |
+| subject_ref | text, nullable | The per-line, per-gate or per-task reference the call named; NULL for instance-scoped operations |
+| idempotency_key | text, NOT NULL | The key the call carried |
+| attempt_id | text, NOT NULL | **The platform's attempt identifier** the call carried (§3.3 *Attempt identity*); the join to the platform timeline |
+| attempt_number | integer, NOT NULL | Orders' count of settled attempts under this key, starting at 1 |
+| outcome | enum | `success`, `retryable-failure`, `permanent-failure`, `still-processing`, `aged-out` |
+| result | jsonb, nullable | **The settled outcome's machine-readable result.** For an operation that accepted a downstream intent it carries the `transition_request_id` the downstream assigned plus the downstream's own status token; for a refusal it carries the catalogue reason and the redacted diagnostic (§4.11); NULL on `still-processing` and `aged-out` |
+| deadline_at | timestamptz, NOT NULL | The effective per-operation deadline that bounded the attempt (§3.3 step 4) |
+| received_at, settled_at | timestamptz, NOT NULL | Receipt of the call and commit of its settlement, database time |
 
 **PK**: step_log_id
 
-**Constraints**: `(correlation_id, step_id, attempt_number)` UNIQUE; indexed on
-`(correlation_id, step_id, completed_at DESC)` for the settled-result lookup the registry's
-`outcome_ref` resolves through.
+**Constraints**: `(correlation_id, idempotency_key, attempt_number)` UNIQUE; indexed on
+`(correlation_id, operation, subject_ref, settled_at DESC)` for the settled-result lookup the
+registry's `outcome_ref` resolves through and the progress read projects from; indexed on
+`attempt_id`.
 
-**One outcome enumeration, and `result` is why replay is usable.** This is the only enumeration of
-step outcomes in the set; §3.1 restates it and adds nothing. `timed-out` is **not** a member — a
-per-attempt timeout settles as `retryable-failure` carrying the per-attempt-timeout reason, so the
-timeout is visible in the reason without splitting the enum. `dead-lettered` is **not** a member
-either: ADR-0009 makes a step-level failure structurally unable to reach the dead-letter path, so
-carrying it here would be a value nothing can ever write (§4.8). `result` closes the gap that made
-a replay useless: without it the registry resolves a replayed key to `settled/success` and the
-handler learns only *that* it worked — it cannot name the intent it created, and therefore cannot
-sweep it, cannot cancel or void it under §4.5's supersede rule, and cannot compensate it. The
-identifier the PRD requires each task to record is stored here and reachable through
-`owf_idempotency_registry.outcome_ref`.
+**No `pending` row, and `result` is why replay is usable.** A row exists only once an attempt has
+concluded — it is written in the settlement transaction — so the log cannot show an attempt as
+running that the platform has already abandoned; "running" is the registry's `in_flight` lease,
+not a log row. `still-processing` and `aged-out` rows record a platform attempt the envelope
+answered without running the effect, so every platform attempt that reached Orders has a row.
+`timed-out` is **not** a member — the per-operation deadline settles as `retryable-failure`
+carrying `per-attempt-timeout`. `dead-lettered` is **not** a member — a delivery that exhausts
+its cap never reaches this surface (§4.8). `result` is what lets a replayed key name the intent
+it created, so the sweep can look it up and compensation can undo it.
 
-**Additional info**: **Ownership**: written only by the step executor. **Tenant axis**:
-`resource_tenant_id` only — this table backs no operator-facing list. This table is execution
-history for recovery/replay — it is explicitly **not** the audit source of record (§4).
-**Retention**: 90 days; **monthly range partition on `started_at`** so the purge is a partition
-drop rather than a bulk DELETE.
+**Additional info**: **Ownership**: written only by the step envelope. **Tenant axis**:
+`resource_tenant_id` only. This table is execution history for recovery and reads — it is
+explicitly **not** the audit source of record (§4.1). **Retention**: 90 days; **monthly range
+partition on `received_at`** so the purge is a partition drop.
 
 #### Table: owf_idempotency_registry
 
@@ -1091,157 +1332,118 @@ drop rather than a bulk DELETE.
 
 | Column | Type | Description |
 |--------|------|-------------|
-| idempotency_key | text | Caller-derived key (never reused as `correlation_id`), **prefixed with `resource_tenant_id`** so keys are tenant-namespaced by construction |
-| operation | text | The step or call the key scopes |
-| correlation_id | uuid | Owning process instance |
+| idempotency_key | text | Caller-derived key, **prefixed with `resource_tenant_id`** so keys are tenant-namespaced by construction, recomposed server-side on every call |
+| operation | text | The operation the key scopes; FK to `owf_step_operation.name` |
+| correlation_id | uuid | Owning process instance (for `admit-trigger`, the derived correlation of [`02 §2.1`](./02-triggers-and-start.md#21-design-principles) before the instance exists) |
 | resource_tenant_id | uuid, NOT NULL | Resource-recipient axis; recomposed from the key and compared against it on every resolve |
-| request_fingerprint | bytea, NOT NULL | **SHA-256 over the canonical request body.** A settled record whose fingerprint does not match the current request is an `idempotency-key-conflict` refusal, not an absorbed duplicate |
-| status | enum | `in_flight` or `settled` |
+| request_fingerprint | bytea, NOT NULL | **SHA-256 over the canonical request body**, excluding `invocationId`, `attemptId` and transport headers. A record whose fingerprint does not match the current request is an `idempotency-key-conflict` refusal, not an absorbed duplicate |
+| status | enum | `in_flight` (lease held, effect running), **`open`** (last attempt settled `retryable-failure`; the effect may run once more under this key), `settled` (absorbed thereafter) |
 | lease_expires_at | timestamptz, nullable | Set while `in_flight`; **60 s** from the last heartbeat |
-| lease_heartbeat_at | timestamptz, nullable | Last heartbeat from the holder; refreshed every **20 s** while the closure runs |
-| delivery_count | integer, NOT NULL, DEFAULT 0 | For an inbound trigger or callback key, the durable count of deliveries received under this key; the §4.8 cap of 5 is evaluated against this column |
-| outcome | enum, nullable | `success` or `failure` once settled |
-| outcome_ref | uuid, nullable | Reference to the `owf_step_log` entry the settlement produced; that entry's `result` is how a replay recovers the downstream `transition_request_id` |
+| lease_heartbeat_at | timestamptz, nullable | Last heartbeat from the holder; refreshed every **20 s** while the effect runs |
+| outcome | enum, nullable | `success` or `failure` once `settled`; `failure` also on an `open` record, describing its last attempt |
+| outcome_ref | uuid, nullable | Reference to the `owf_step_log` entry the last settlement produced; that entry's `result` is how a replay recovers the downstream `transition_request_id` |
 | created_at, expires_at | timestamptz | The key's retention window; `expires_at = created_at + 30 days` |
 
 **PK**: (operation, idempotency_key)
 
-**Constraints**: indexed on `expires_at` for the reconciliation sweep, which becomes read-only
-past this window — no resubmission under an aged-out key; indexed on
-`(lease_expires_at) WHERE status = 'in_flight'` for the dead-lease scan.
+**Constraints**: indexed on `expires_at` for the retention purge and the aging check; indexed on
+`(lease_expires_at) WHERE status = 'in_flight'` and on `(correlation_id) WHERE status <> 'settled'`
+for the `reconciliation-sweep` backstop of §3.8.
 
 **Key lifetime, lease and heartbeat (working baselines)**:
 
 | Value | Working baseline | Derivation |
 |-------|------------------|------------|
-| Key lifetime (`expires_at`) | **30 days** from creation | At or above the maximum retry horizon, which includes manual-task resolution and one or more hold/resume cycles and is therefore measured in days, not hours. A shorter window ages out keys that a legitimately-held order still needs. |
-| In-flight lease (`lease_expires_at`) | **60 s** | Long enough that an ordinary slow downstream call does not lose its lease mid-flight, short enough that a crashed holder's key is re-examinable within one sweep tick. |
-| Lease heartbeat | **20 s** | One third of the lease, so two consecutive missed heartbeats are needed before a lease is considered dead — a single scheduling hiccup never releases a live lease. |
+| Key lifetime (`expires_at`) | **30 days** from creation | At or above the maximum retry horizon, which includes manual-task resolution and one or more hold/resume cycles and is therefore measured in days, not hours |
+| In-flight lease (`lease_expires_at`) | **60 s** | Long enough that an ordinary slow downstream call does not lose its lease mid-flight, short enough that a crashed holder's key is settleable on the next reconcile arm |
+| Lease heartbeat | **20 s** | One third of the lease, so two consecutive missed heartbeats are needed before a lease is considered dead |
 
-**The heartbeat rule is normative.** While a handler closure runs under an `in_flight` record, the
-holder **MUST** refresh `lease_heartbeat_at` and extend `lease_expires_at` every 20 s. A lease
-whose `lease_expires_at` has passed is **dead**, and a dead lease is *not* a free key: it resolves
-to the `lease-expired` outcome of §4.3, which is treated as still-processing and confirmed by
-lookup through the reconciliation sweep. A replica whose clock is outside the §4.15 skew tolerance
-**MUST** drop its lease rather than continue heartbeating it.
+**The heartbeat rule is normative.** While an effect runs under an `in_flight` record, the holder
+**MUST** refresh `lease_heartbeat_at` and extend `lease_expires_at` every 20 s. A lease whose
+`lease_expires_at` has passed is **dead**, and a dead lease is *not* a free key: it resolves to
+the `lease-expired` outcome of §4.3, is answered as still-processing, and is settled only by
+`settle-from-lookup` (§3.3). A replica whose clock is outside the §4.15 skew tolerance **MUST**
+drop its lease rather than continue heartbeating it.
+
+**`open` is the retry contract with the platform.** The definition's task retry policy re-issues
+a failed call with the same key; without a state that says "this key may run again" the envelope
+would have to choose between absorbing the retry (the step never succeeds) and re-running a
+settled key (the property §4.3 forbids). `open` is that state, entered only by a settled
+`retryable-failure` and left only by the next attempt's lease.
 
 **Caller-supplied keys are validated, never trusted.** The server recomposes the key from the
 request — tenant prefix and all — and refuses the call if the recomposition does not match the
-supplied key, or if the `orderId` inside it is outside the caller's authorized scope. Without that
-check a key naming another tenant's order returns that tenant's stored outcome or takes its
-in-flight lease.
+supplied key, or if the `orderId` inside it is outside the caller's authorized scope.
 
 **Additional info**: **Ownership**: written only by the idempotency registry
-(`cpt-cf-bss-orders-workflow-component-idempotency-registry`), except `delivery_count`, which the
-inbound delivery path increments before the closure runs. **Tenant axis**: `resource_tenant_id`
-only. **Retention**: 30 days, aligned with the key lifetime; **monthly range partition on
-`created_at`**.
+(`cpt-cf-bss-orders-workflow-component-idempotency-registry`) inside the envelope and by
+`settle-from-lookup`. There is no `delivery_count`: inbound delivery counting is the platform
+trigger path's (§4.8). **Tenant axis**: `resource_tenant_id` only. **Retention**: 30 days,
+aligned with the key lifetime; **monthly range partition on `created_at`**.
 
-#### Table: owf_retry_state
+#### Table: owf_step_operation
 
-**ID**: `cpt-cf-bss-orders-workflow-dbtable-retry-state`
-
-**Schema**:
-
-| Column | Type | Description |
-|--------|------|-------------|
-| correlation_id, step_id | uuid, text | Composite owner |
-| resource_tenant_id | uuid, NOT NULL | Resource-recipient axis |
-| attempts_used | integer | Consumed against the retry budget (submission failures only) |
-| retry_budget | integer | Maximum attempts for this step |
-| replay_count | integer, NOT NULL, DEFAULT 0 | Replays of this step that terminated **outside** the handler closure; the crash-loop guard of §4.13 trips on this counter, not on `attempts_used` |
-| per_attempt_timeout_ms | integer | Bound on one attempt |
-| step_deadline_at | timestamptz | Bound on the whole step, independent of attempt count |
-| next_attempt_at | timestamptz, nullable | Backoff schedule |
-| created_at, updated_at | timestamptz | Bookkeeping; `created_at` carries the retention window |
-
-**PK**: (correlation_id, step_id)
-
-**Additional info**: **Ownership**: written only by the retry/backoff controller
-(`cpt-cf-bss-orders-workflow-component-retry-backoff-controller`), except `replay_count`, which
-the step executor increments on entry to a replayed step before the closure is reached.
-**Tenant axis**: `resource_tenant_id` only. The process deadline (§4.2) is tracked on
-`owf_durable_timer`, not here — it is a fourth, distinct bound. **Retention**: 90 days from
-`created_at`; sized by in-flight step count rather than by traffic, so no partitioning at this
-phase.
-
-#### Table: owf_durable_timer
-
-**ID**: `cpt-cf-bss-orders-workflow-dbtable-durable-timer`
+**ID**: `cpt-cf-bss-orders-workflow-dbtable-step-operation`
 
 **Schema**:
 
 | Column | Type | Description |
 |--------|------|-------------|
-| timer_id | uuid | Timer identity |
-| correlation_id | uuid | Owning process instance |
-| resource_tenant_id | uuid, NOT NULL | Resource-recipient axis |
-| timer_kind | enum | `approval-escalation`, `expected-fulfillment-wait`, `activation-barrier`, `reconciliation-sweep`, `overdue-fulfillment`, `payment-auth-wait`, `process-lifetime` |
-| subject_ref | text, nullable | **The per-kind discriminator**: the `gate_id` for `approval-escalation`, the intent key for `reconciliation-sweep`, the `order_line_id` for `expected-fulfillment-wait`. NULL only for the instance-wide kinds (`process-lifetime`, `activation-barrier`) |
-| fire_at | timestamptz | Scheduled wake-up, evaluated against **database time** (§4.15) |
-| paused | boolean | Set while an `approval-escalation` timer's owning instance is suspended by a hold; **no other kind pauses** |
-| remaining_window_ms | integer, nullable | Preserved remainder while paused; this column is the **sole authority** for that remainder |
-| fired_at | timestamptz, nullable | Set once the timer has fired |
-| created_at | timestamptz | Bookkeeping |
+| name | text | The operation name; the route segment and the PDP resource property |
+| protection | enum, NOT NULL | `protected`, `composable` |
+| sweep_only | boolean, NOT NULL, DEFAULT false | True only for `settle-from-lookup`: never a definition `call` target |
+| input_type, output_type | text, NOT NULL | The GTS reference schemas of §3.3 |
+| key_family | enum, NOT NULL | `intent`, `approval-request`, `lifecycle-transition`, `instance-scoped` |
+| declared_event | text, nullable | One of the six GTS event types of §4.7, or NULL |
+| compensation | text, nullable | The paired operation name, or NULL; FK to this table |
+| audit_kind | enum, NOT NULL | The `owf_audit_entry.event_kind` its settlement writes |
+| retry_class | enum, NOT NULL | `retryable-on-transient`, `never` |
+| deadline_ms | integer, NOT NULL | Per-operation budget inside the envelope |
+| pdp_action | text, NOT NULL | Always `execute`; the catalogue action of `09 §3.2` the route requests |
+| owning_slice | text, NOT NULL | `01` … `09`, for the conformance test |
+| loaded_at | timestamptz, NOT NULL | Database time of the load that produced this content |
 
-**PK**: timer_id
+**PK**: name
 
-**Constraints**: indexed on `(fire_at) WHERE fired_at IS NULL` for the wake-up scan;
-**`UNIQUE (correlation_id, timer_kind, subject_ref) WHERE fired_at IS NULL`** — one live timer per
-(instance, kind, subject), which is what makes "one timer per open approval gate" expressible and
-makes the cancel-on-decision able to target exactly one row.
+**Constraints**: **no runtime write path** — INSERT only inside the startup load transaction of
+the operation registry (§3.2), which replaces the whole content; no UPDATE or DELETE grant to any
+other role; `deadline_ms` CHECK `> 0`; `compensation` FK self-referential and NULL-able. The load
+is audited: when the loaded content differs from the stored content, one `owf_audit_entry` is
+written under the gear's deployment marker, as [`09 §3.7`](./09-read-and-authz.md#37-database-schemas--tables)
+does for the routing table; a load that fails, or a compiled set that disagrees with the table
+after load, halts readiness.
 
-**Why `subject_ref` exists.** A multi-party approval gate arms one escalation timer per gate, and
-the sweep arms one tick per intent; without a discriminator both write rows the fire handler
-cannot tell apart and a cancellation cannot address. Scheduling "against the process
-`correlationId`" alone is expressive enough for the instance-wide kinds and for nothing else.
-
-**Only approval-escalation timers pause.** A hold pauses the approval-escalation window because
-the approval clock is a commercial obligation on a counterparty that is not being asked to act
-while the order is held. It does **not** pause the overdue-fulfillment window, the process
-deadline, the barrier or the sweep — those are safety nets, and a backstop that pauses whenever
-the thing it backstops is stuck is not a backstop. `paused` is therefore only ever set on an
-`approval-escalation` row.
-
-**A fire is an edge, and a gate is a conjunction.** A timer fires once and sets `fired_at`; the
-signal is not re-raised. Where a handler's release condition is a conjunction of the timer instant
-and some other predicate, the handler **MUST** re-evaluate the whole conjunction on **every**
-contributing signal — the fire *and* each predicate's own completion — and **MUST NOT** treat the
-fire as the sole trigger. A one-shot fire consumed while the other conjunct was false is the
-silent-hang shape this rule exists to prevent.
-
-**Additional info**: **Ownership**: written only by the durable timer service
-(`cpt-cf-bss-orders-workflow-component-durable-timer-service`). **Tenant axis**:
-`resource_tenant_id` only. A timer survives a service restart by construction — it is reloaded
-from this table, and wake-up never depends on an external trigger arriving. **Retention**: fired
-rows purged at 90 days, aligned with `owf_step_log`; sized by in-flight process count, so no
-partitioning at this phase.
+**Additional info**: **Ownership**: the operation registry
+(`cpt-cf-bss-orders-workflow-component-operation-registry`). **Tenant axis**: none — this is
+configuration, not a process artifact, and it is the one table §4.11's column rule exempts.
+**Retention**: replaced on every load; no history is kept here (the audit entry and the release
+are the history). The validation hook of `10 §3.3` reads it; the definition never does.
 
 #### Table: owf_audit_entry
 
 **ID**: `cpt-cf-bss-orders-workflow-dbtable-audit-entry`
 
-**Schema**:
+**Schema** (unchanged by ADR-0011; the v1 byte contract of §4.17 covers every column):
 
 | Column | Type | Description |
 |--------|------|-------------|
 | audit_id | uuid | Entry identity |
 | hash_version | smallint, NOT NULL | Audit encoding version; always `1`, the frozen v1 contract of §4.17 (D-60). A row carrying any other value fails verification explicitly |
 | audit_tenant_id | uuid, NOT NULL | Immutable chain namespace: the instance's `resource_tenant_id` at process start, copied on every entry and never rewritten; genesis and the roll-ups of §4.17 bind to it |
-| correlation_id | uuid, NOT NULL | Owning process instance and chain key. An instance-less inbound dead letter is audited by the delivery path under the synthetic `correlationId` the admission path derives — the UUIDv5 over (`resource_tenant_id`, `orderId`, `orderVersion`) of [`02 §2.1`](./02-triggers-and-start.md#21-design-principles) — so every entry belongs to exactly one chain |
+| correlation_id | uuid, NOT NULL | Owning process instance and chain key. An entry recorded before the instance row exists — an `admit-trigger` attempt on a not-yet-admitted correlation — is audited under the derived `correlationId` of [`02 §2.1`](./02-triggers-and-start.md#21-design-principles) (UUIDv5 over `resource_tenant_id`, `orderId`, `orderVersion`), so every entry belongs to exactly one chain |
 | order_id, order_version | text, integer | Denormalized for query without a join |
 | resource_tenant_id | uuid, NOT NULL | Resource-recipient axis |
 | seller_tenant_id | uuid, NOT NULL | Selling-party axis; the audit read surface is seller-scoped |
 | sequence | bigint, NOT NULL | Per-instance audit counter, allocated from `owf_process_instance.audit_sequence` under the instance row lock; starts at 1 and is gapless within a chain |
 | prev_hash | bytea, NOT NULL | The `entry_hash` of the preceding entry on the same `correlation_id`, or the chain genesis digest of §4.17 for sequence 1. Never NULL: this table has no unchained rows |
 | entry_hash | bytea, NOT NULL | 32-byte SHA-256 digest over every other column of this row under the v1 encoding of §4.17 |
-| event_kind | enum | `instance-start`, `step-start`, `step-completion`, `retry`, `timeout`, `sweep`, `sweep-settlement`, `escalation`, `compensation`, `phase-transition`, `termination`, `dead-letter` |
-| step_id | text, nullable | The step the entry records, where the transition belongs to a step; NULL on instance-level kinds |
-| attempt_number | integer, nullable | The step attempt the entry records, matching `owf_step_log.attempt_number`; NULL where no attempt applies |
+| event_kind | enum | `instance-start`, `step-start`, `step-completion`, `retry`, `timeout`, `sweep`, `sweep-settlement`, `escalation`, `compensation`, `phase-transition`, `termination`, `dead-letter` — the closed v1 token set; `dead-letter` is retained so the v1 vocabulary is unchanged, and no Orders path writes it while inbound dead letters are the platform's (§4.8) |
+| step_id | text, nullable | The operation the entry records (with its subject reference where one applies); NULL on instance-level kinds |
+| attempt_number | integer, nullable | The attempt the entry records, matching `owf_step_log.attempt_number`; NULL where no attempt applies |
 | definition_version | text, nullable | The pinned process-definition version, set on the `instance-start` entry; NULL elsewhere |
 | phase_from, phase_to | enum, nullable | The `owf_process_instance.phase` values a `phase-transition` or `termination` entry moves between; `phase_from` NULL on `instance-start`; both NULL on every other kind |
-| actor | text | Immutable SecurityContext subject UUID rendered as lowercase hyphenated text; no names, emails or caller-supplied labels (D-61); identity lifecycle per `../DESIGN.md` §4.3 |
-| actor_class | enum | `system`, `service` or `user`, derived from the authenticated context and configured identities only; `system` is the configured Workflow worker identity that runs the scans and sweeps of §3.8 |
+| actor | text | Immutable SecurityContext subject UUID rendered as lowercase hyphenated text; no names, emails or caller-supplied labels (D-61); the platform service principal on a definition-driven step, the operator on `retry-step` and the operator operations, the configured worker identity on a sweep settlement |
+| actor_class | enum | `system`, `service` or `user`, derived from the authenticated context and configured identities only; `system` is the configured Workflow worker identity that runs the workers of §3.8 |
 | idempotency_key | text, nullable | The key in force, where one applies |
 | reason | text, nullable | **Catalogue** value from `cpt-cf-bss-orders-workflow-component-reason-catalogue`; the only one of the two reason columns that rides an event payload |
 | justification | text, nullable | **Free text supplied by a human**: an override justification, a cancellation reason. Never a catalogue value, never machine-keyed on, never placed on an event payload |
@@ -1262,53 +1464,44 @@ tenancy-scoped audit read. `event_kind`-shape CHECKs: `definition_version` non-n
 
 **Chain allocation.** Every append runs in the transaction of the transition it records
 (§4.17 *Append rule*): the writer locks the instance row, increments `audit_sequence`, computes
-`entry_hash` over the fully constructed row and inserts it. Where no instance row exists yet — an
-instance-less inbound dead letter — the delivery path allocates the next sequence for the derived
+`entry_hash` over the fully constructed row and inserts it. Where no instance row exists yet — a
+pre-admission `admit-trigger` attempt — the envelope allocates the next sequence for the derived
 `correlation_id` from the chain's current head inside its own transaction, and the uniqueness
-constraint arbitrates a race. When such a correlation is later admitted, the admission
+constraint arbitrates a race. When such a correlation is later admitted, the `start-instance`
 transaction initialises `audit_sequence` from the existing head and writes `instance-start` at
 the next sequence rather than at 1; genesis covers the first entry of a correlation whichever
-kind it is. Sequence 1 is otherwise always `instance-start`, written by the admission transaction
-that inserts the instance row.
+kind it is. Sequence 1 is otherwise always `instance-start`.
 
 **The chaining rule** is the v1 byte contract of §4.17 (D-60), stated once there: SHA-256 over
 a Workflow-specific row tag and the framed, ordered fields of the row, linking the preceding
 committed digest, with a genesis bound to `(audit_tenant_id, correlation_id)`. Verification walks
 an instance's chain in `sequence` order and recomputes each digest (§4.17 *Verifier*). This is
-what makes the trail **tamper-evident** rather than merely tamper-*discouraged*: "append-only, no
-UPDATE or DELETE grant" is access control, and access control that is misconfigured, bypassed at
-the database, or simply changed leaves no trace. A chain does; the triggers make the bypass
-louder; the roll-ups of `owf_audit_checkpoint` bound what a deleted tail can hide. The absent
-DELETE grant and the ≥ 400-day retention are what keep the chain whole — a deleted row would sever
-it and make routine retention indistinguishable from tampering, which is why this table is not
-partitioned for retention and why the retention worker has no grant on it.
+what makes the trail **tamper-evident** rather than merely tamper-*discouraged*; the triggers make
+a bypass louder; the roll-ups of `owf_audit_checkpoint` bound what a deleted tail can hide. The
+absent DELETE grant and the ≥ 400-day retention are what keep the chain whole, which is why this
+table is not partitioned for retention and why the retention worker has no grant on it.
 
 **Two reason columns, deliberately.** `reason` is a closed catalogue value and is what a consumer
-keys on (§4.7, §4.9). `justification` is whatever the human typed. Putting free text into `reason`
-would break every consumer that switches on it; putting the catalogue value in place of the
-justification would discard the only record of *why* an operator overrode a failed line. The PRD
-requires both to be recorded, and an override or a rejection writes both on the same entry.
-Both are hashed as their exact stored UTF-8 text; D-61 minimization precedes hashing, never
-follows it, and an erasure never rewrites either.
+keys on (§4.7, §4.9). `justification` is whatever the human typed. Both are hashed as their exact
+stored UTF-8 text; D-61 minimization precedes hashing, never follows it, and an erasure never
+rewrites either.
 
 **Additional info**: **Ownership**: written only by the audit writer
 (`cpt-cf-bss-orders-workflow-component-audit-writer`). **Tenant axes**: `resource_tenant_id` and
-`seller_tenant_id` — the audit trail backs a seller-scoped operator read — plus the immutable
-`audit_tenant_id` namespace, which grants no read access of its own. 100% of process state
-transitions are recorded here with zero silent drops; this table, not `owf_step_log` and not the
-durable-execution substrate's run history, is the audit source of record (§4). **Retention**:
-**≥ 400 days**, enforced by this gear independently of substrate history; **not partitioned for
-retention** — nothing is purged, so a partition drop would have nothing to drop; monthly range
-partitioning on `created_at` **may** still be applied for query-planner and vacuum cost as volume
-grows, and the chain is unaffected because no partition is ever dropped. **Verification and
-roll-ups**: the `audit/<audit-tenant>` worker of §3.8 under the contract of §4.17.
+`seller_tenant_id` plus the immutable `audit_tenant_id` namespace, which grants no read access of
+its own. 100% of process state transitions are recorded here with zero silent drops; this table,
+not `owf_step_log` and not the platform's invocation history, is the audit source of record
+(§4.1). **Retention**: **≥ 400 days**, enforced by this gear independently of platform history;
+**not partitioned for retention**; monthly range partitioning on `created_at` **may** be applied
+for query-planner and vacuum cost, and the chain is unaffected because no partition is ever
+dropped. **Verification and roll-ups**: the `audit/<audit-tenant>` worker of §3.8 under §4.17.
 
 #### Table: owf_audit_checkpoint
 
 **ID**: `cpt-cf-bss-orders-workflow-dbtable-audit-checkpoint`
 
 A D-100-pattern roll-up, mirroring Lifecycle's `orders_audit_checkpoint` with the process
-instance as the member unit (D-59).
+instance as the member unit (D-59). Unchanged by ADR-0011.
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -1327,8 +1520,7 @@ worker; no application or operational UPDATE/DELETE grant; triggers reject UPDAT
 and members commit in one transaction; a partial snapshot is never visible. The primary key
 rejects a competing checkpoint from a second replica and rolls back all its members.
 **Retention**: retained with the evidence it covers — never purged, never partitioned for
-retention; a storage-tier move must keep it verifiable. **Ownership**: the audit writer's
-checkpoint phase (`cpt-cf-bss-orders-workflow-component-audit-writer`). **Tenant axis**:
+retention. **Ownership**: the audit writer's checkpoint phase. **Tenant axis**:
 `audit_tenant_id`, which is a `resource_tenant_id` value captured at process start.
 
 #### Table: owf_audit_checkpoint_member
@@ -1347,8 +1539,7 @@ checkpoint phase (`cpt-cf-bss-orders-workflow-component-audit-writer`). **Tenant
 
 **Constraints**: FK to the checkpoint header, without cascading deletion. Same append-only grants
 and triggers as the header. No live-instance FK: loss of an instance row must leave its
-checkpoint evidence intact rather than delete it. Namespace and sequence must match the owning
-header. **Retention and ownership**: as the header.
+checkpoint evidence intact rather than delete it. **Retention and ownership**: as the header.
 
 #### Platform-managed producer persistence
 
@@ -1359,370 +1550,306 @@ Workflow defines no `owf_event_outbox` table. Service migrations run the
 their registration, queue, body, partition and dead-letter tables are owned and migrated by those
 libraries and **MUST NOT** be forked into Workflow-specific DDL. They are operational
 infrastructure, are excluded from the Workflow-owned inventory in `DESIGN.md §3.7`, and are not
-counted among the engine's nine tables. This mirrors
+counted among the engine's eight tables. This mirrors
 [Lifecycle `01 §3.7` *Platform-managed producer persistence*](../../../orders-lifecycle/docs/design/01-foundation.md#37-database-schemas-and-tables).
 
 The producer queue name is `bss-orders-workflow-events`, with `Partitions::of(16)` and
 `OutboxProfile::high_throughput()`. Managed producer registration uses the stable key
 `bss-orders-workflow-events-v1`, `MissingProducerRegistration::RegisterNew` and
 `UnknownProducerRegistration::RegisterNew`; the producer source is `bss-orders-workflow`. The
-enqueue is the only Workflow write into these tables and it always rides the step's transaction
-runner (§3.6); no Workflow code reads, updates, purges or re-drives them. Delivery is
-at-least-once; consumers de-duplicate by the event envelope `id` (§4.7). An event the platform
-permanently rejects is a toolkit dead letter, never an `owf_dead_letter_record` (§4.8).
+enqueue is the only Workflow write into these tables and it always rides the settlement
+transaction runner (§3.6); no Workflow code reads, updates, purges or re-drives them. Delivery is
+at-least-once; consumers de-duplicate by the event envelope `id` (§4.7).
 
-#### Table: owf_dead_letter_record
+#### Retired tables
 
-**ID**: `cpt-cf-bss-orders-workflow-dbtable-dead-letter-record`
+Each responsibility a retired table carried has a named new owner:
 
-**Schema**:
-
-| Column | Type | Description |
-|--------|------|-------------|
-| dead_letter_id | uuid | Entry identity |
-| correlation_id | uuid, nullable | Owning process instance, where one exists |
-| order_id, order_version | text, integer | Order context |
-| resource_tenant_id | uuid, NOT NULL | Resource-recipient axis |
-| seller_tenant_id | uuid, NOT NULL | Selling-party axis; the record is projected into the seller-scoped operator queue and would otherwise leak across sellers or be omitted from it entirely |
-| source | enum | The **kind** of parked payload: `lifecycle-trigger`, `subscriptions-callback`, `payments-callback`, `approval-callback`. Inbound only — an outbound process event the platform permanently rejects is a `toolkit_db::outbox` dead letter, never parked here (§4.8) |
-| source_event_id | text, NOT NULL | The id of the inbound event or callback that failed; the key the delivery counter accumulated against |
-| last_error | text | The last recorded error, **redacted** per §4.11: a catalogue reason plus a bounded, sanitised diagnostic — never raw downstream error text, credentials, tokens or payload echoes |
-| delivery_count | integer | The `owf_idempotency_registry.delivery_count` value at the instant of parking, copied here so the record is inspectable on its own |
-| created_at | timestamptz | Park instant |
-
-**PK**: dead_letter_id
-
-**Constraints**: **`UNIQUE (source_event_id)`** — one payload parks at most once, so a redelivery
-after parking updates nothing and creates nothing; a dead-letter record is **never** an order
-state and never carries an `order_state` column of any kind. Indexed on
-`(seller_tenant_id, created_at)` for the operator queue.
-
-**Where the count is accumulated.** `delivery_count` on this row is a *copy taken at parking*, and
-a copy cannot be what the cap is evaluated against — this row does not exist until the cap has
-already been exceeded. The durable counter is
-`owf_idempotency_registry.delivery_count`, keyed by the inbound key that embeds
-`source_event_id`: the delivery path increments it before the closure runs, so it survives a
-restart and accumulates across deliveries. Without it the cap of 5 has nothing to count and either
-never trips or resets on every restart.
-
-**Additional info**: **Ownership**: written only by the step executor on cap exhaustion.
-**Tenant axes**: `resource_tenant_id` and `seller_tenant_id`. Distinct
-from the manual-task record, which slice 07 owns
-(`cpt-cf-bss-orders-workflow-adr-manual-task-dead-letter-separation`). **Retention**:
-**≥ 400 days**; **monthly range partition on `created_at`**.
+- `cpt-cf-bss-orders-workflow-dbtable-durable-timer` (`owf_durable_timer`) — retired by
+  ADR-0011. Fire instants are the plugin's durable timers behind the definition's `wait` tasks;
+  the pause remainder of an approval-escalation window is computed by `apply-hold` from the
+  gate's `opened_at` and window (slice 08) and returned to the definition, which re-arms it
+  (`10 §3.6` (e)); the sweep tick is the definition's reconcile arm plus the `reconciliation-sweep`
+  worker; the overdue and lifetime windows are `wait` arms (`10 §3.6` (b), (e)).
+- `cpt-cf-bss-orders-workflow-dbtable-retry-state` (`owf_retry_state`) — retired by ADR-0011.
+  Attempt count, backoff position and next-attempt instant are the plugin's under the task retry
+  policy (`10 §2`); Orders records the platform `attempt_id` and its own `attempt_number` on every
+  `owf_step_log` row; the crash-loop counter is the Orders-side quarantine of `retry-step` (§4.13).
+- `cpt-cf-bss-orders-workflow-dbtable-dead-letter-record` (`owf_dead_letter_record`) — retired
+  by ADR-0011 with ADR-0009 as amended. An inbound delivery that exhausts its cap is the platform
+  event-trigger path's dead letter (`DESIGN.md:976`, *dead-letter handling*); its operator
+  visibility is the platform's, requested in `UPSTREAM_REQS.md` (commit D); the manual task
+  remains the inspectable object for a step failure (§4.8).
 
 #### Partitioning, retention and immutability
 
 Retention is stated **per store** rather than as one global floor, because the stores have
 materially different obligations: an audit trail is a compliance artifact, a step log is recovery
-scaffolding, and an idempotency key is a short-lived deduplication token. One floor applied to all
-three would either over-retain the scaffolding or under-retain the compliance artifact.
+scaffolding, and an idempotency key is a short-lived deduplication token.
 
 | Store | Retention | Partitioning |
 |-------|-----------|--------------|
-| `owf_audit_entry` | ≥ 400 days; no UPDATE or DELETE grant to any role, triggers reject both; the retention worker never touches it | Not partitioned for retention (nothing is purged); monthly range partition on `created_at` optional for query cost |
-| `owf_audit_checkpoint`, `owf_audit_checkpoint_member` | Retained with the evidence they cover; never purged | Not partitioned for retention; sized by namespace count × checkpoint cadence |
-| `owf_dead_letter_record` | ≥ 400 days | Monthly range partition on `created_at` |
-| `owf_step_log` | 90 days | Monthly range partition on `started_at` |
-| `owf_retry_state` | 90 days | None — sized by in-flight step count |
-| `owf_idempotency_registry` | 30 days, aligned with the key lifetime | Monthly range partition on `created_at` |
-| `owf_durable_timer` | Fired rows purged at 90 days | None — sized by in-flight process count |
+| `owf_audit_entry` | ≥ 400 days; no UPDATE or DELETE grant to any role, triggers reject both; the retention worker never touches it | Not partitioned for retention; monthly range partition on `created_at` optional for query cost |
+| `owf_audit_checkpoint`, `owf_audit_checkpoint_member` | Retained with the evidence they cover; never purged | Not partitioned for retention |
 | `owf_process_instance` | Retained for the life of the order record | None — sized by order count |
+| `owf_definition_binding` | Retained with its instance; no DELETE grant to the retention worker | None — sized by instance count |
+| `owf_step_log` | 90 days | Monthly range partition on `received_at` |
+| `owf_idempotency_registry` | 30 days, aligned with the key lifetime | Monthly range partition on `created_at` |
+| `owf_step_operation` | Replaced on every load | None |
 
 Partitioning is monthly **range** partitioning so a purge is a partition drop rather than a bulk
-DELETE, which is the only shape that stays cheap as history grows — and the audit write sits on
-the hot path of every step, so a table that degrades under its own history degrades every step.
-The platform `toolkit_db::outbox` tables are outside this register: their retention, vacuum and
-indexing follow the library migrations (*Platform-managed producer persistence* above).
+DELETE. The platform `toolkit_db::outbox` tables are outside this register.
 
 **Immutability is per table.** Append-only with **no UPDATE or DELETE grant**: `owf_audit_entry`,
 `owf_audit_checkpoint` and `owf_audit_checkpoint_member` (all three additionally
-trigger-protected, per D-59), `owf_step_log`. Deliberately mutable:
-`owf_process_instance` (denormalized phase and checkpoint), `owf_idempotency_registry` (lease
-heartbeat and settlement), `owf_retry_state` (attempt bookkeeping), `owf_durable_timer` (pause
-and fire bookkeeping). `owf_dead_letter_record` is append-only but carries a DELETE grant to the
-retention worker alone.
+trigger-protected, per D-59), `owf_step_log`, `owf_definition_binding`. Load-only:
+`owf_step_operation`. Deliberately mutable: `owf_process_instance` (recorded projection, row
+version, audit counter), `owf_idempotency_registry` (lease heartbeat, `open`, settlement).
 
 ### 3.8 Deployment Topology
 
 - [ ] `p3` - **ID**: `cpt-cf-bss-orders-workflow-topology-engine-runtime`
 
-The engine is a library hosted inside the Orders Workflow gear process, layered on the platform
-durable-execution substrate (`cpt-cf-bss-orders-workflow-adr-durable-execution-substrate`); it is
-not a separate deployable. This is the authoritative roster and coordination contract for the
-**five Workflow-owned workers** (D-62), in the shape of
+The engine is a library hosted inside the Orders Workflow gear process; it is not a separate
+deployable, and it hosts no workflow worker — the definition runs on the platform's Temporal
+plugin workers ([serverless-runtime DESIGN §1.4.4](../../../../serverless-runtime/docs/DESIGN.md#144-gear-lifecycle)).
+**Readiness** of this gear now includes the platform engine: the gear **MUST NOT** report ready
+until the registered definition version it expects to bind new instances to resolves in the
+platform function registry and the platform invocation API answers; while the platform has no
+code (`10 §1`), that check is the readiness gate ADR-0011 names, and the gear is not ready for the
+`platform` definition source. The operation registry load (§3.7 `owf_step_operation`), GTS type
+registration (§3.4) and the producer registration remain readiness preconditions.
+
+This is the authoritative roster and coordination contract for the **three Workflow-owned
+workers** (D-62 as amended by ADR-0011), in the shape of
 [Lifecycle `01 §3.8`](../../../orders-lifecycle/docs/design/01-foundation.md#38-deployment-topology):
 
 | Worker | Advisory key within gear namespace `bss-orders-workflow` | Correctness check independent of scheduler ownership |
 |--------|-----------------------------------------------------------|-----------------------------------------------------|
-| Durable timer wake-up scan | `timer-wakeup` | Selects `fire_at <= now() AND fired_at IS NULL` (§3.7 `owf_durable_timer`), then rechecks `fire_at` and `fired_at IS NULL` under the timer row lock and fires through *execute step* with an idempotency key that is a UUIDv5 over `timer_id`, so a second firing of the same row is an absorbed duplicate (§4.3) |
-| Intent reconciliation sweep | `reconciliation-sweep` | Per-intent status read on the escalating ladder of `05 §4.2`; settlement only through the engine's **settle-from-lookup** operation, which rechecks the registry row's `status` and lease under its row lock before settling (§4.3 *Lease-expired*, `05 §3.6`) and writes the `sweep-settlement` audit entry in that transaction |
-| Dead-lease scan | `dead-lease-scan` | Selects `in_flight` registry rows with `lease_expires_at < now()` (§3.7 `owf_idempotency_registry`) and hands each to the reconciliation sweep; it writes nothing itself, so two overlapping scans hand over the same row twice and the sweep's transactional recheck settles it once |
-| Retention purge | `retention-purge` | Bounded conditional deletes — partition drops and `DELETE … WHERE` predicates re-evaluated inside the deleting transaction — over the stores whose §3.7 window has elapsed; never `owf_audit_entry`, `owf_audit_checkpoint` or `owf_audit_checkpoint_member`, on which it holds no grant |
+| Intent reconciliation sweep (backstop) | `reconciliation-sweep` | Selects registry rows `status <> 'settled'` whose `correlation_id` names a non-terminal instance and whose owning `invocation_id` the platform reports as `failed`, `dead_lettered`, `canceled` or unknown (`GET /api/serverless-runtime/v1/invocations/{invocation_id}`, [`DESIGN.md:867`](../../../../serverless-runtime/docs/DESIGN.md#invocation-api)) — that is, intents no definition arm is reconciling; performs the status read of `05 §4.2`; settlement only through `settle-from-lookup`, which rechecks the registry row's `status` and lease under its row lock and writes `sweep-settlement` in that transaction. Instances with a live invocation are reconciled by the definition's own arm and skipped here |
+| Retention purge | `retention-purge` | Bounded conditional deletes — partition drops and `DELETE … WHERE` predicates re-evaluated inside the deleting transaction — over `owf_step_log` and `owf_idempotency_registry` whose §3.7 window has elapsed; never `owf_audit_entry`, `owf_audit_checkpoint`, `owf_audit_checkpoint_member` or `owf_definition_binding`, on which it holds no grant |
 | Audit verification and checkpointing | `audit/<canonical audit-tenant UUID>` | SELECT-only verification of each chain (§4.17 *Verifier*); the checkpoint-append phase runs under its own INSERT grant, and the `(audit_tenant_id, checkpoint_sequence)` primary key rejects a competing checkpoint from a second replica |
 
-There is no idempotency-window sweep: registry retention is the monthly partition drop the
-retention purge performs, and an aged-out key needs no worker because §4.3 makes the *next*
-attempt a new key rather than a resumed one.
+There is **no timer wake-up worker**: every timer is a definition `wait` executed by the plugin.
+There is **no dead-lease scan**: a dead lease is detected by the sweep's status read, which runs
+on the definition's retry/`wait` cadence (`10 §3.6`) for a live invocation and on this roster's
+backstop for a dead one, and is settled by `settle-from-lookup`. There is no idempotency-window
+sweep: registry retention is the monthly partition drop, and an aged-out key needs no worker
+because §4.3 makes the *next* attempt a new key.
 
 **Selected primitive: `toolkit_db::Db::lock(gear, key)`**, or bounded non-blocking acquisition
 through `Db::try_lock` with `LockConfig`, holding the `DbLockGuard` for one bounded pass and
 awaiting `release()` on normal completion
 ([`toolkit-db/advisory_locks.rs`](../../../../../libs/toolkit-db/src/advisory_locks.rs)). These
 are PostgreSQL session advisory locks, **not TTL leases**: no renewal, deadline or fencing token.
-The deployment constraint — every replica against the same authoritative database with identical
-gear/key names, the lock connection direct or session-pooled and never behind a transaction-pooling
-proxy, a cross-replica contention probe before workers are enabled, no silent substitution of file
-locks or another backend — and the **session loss is not fencing** rule — a lost session can
-release ownership while an old pass is still running, so holding the guard never proves
-ownership, and correctness rests on the table-level transactional recheck named per worker above
-even when two passes overlap — are Lifecycle `01 §3.8`'s, adopted by reference and not restated.
-Workflow adds one line per worker: the recheck in the third column is what keeps each worker
-correct when its session is lost, and a worker with no such recheck is not admitted to this
+The deployment constraint and the **session loss is not fencing** rule are Lifecycle `01 §3.8`'s,
+adopted by reference: correctness rests on the table-level transactional recheck named per worker
+above even when two passes overlap, and a worker with no such recheck is not admitted to this
 roster. Stop scheduling further work on observed coordination or database failure, abandon the
-pass and reacquire before retrying.
-
-`cluster-sdk` is not selected, for the reason Lifecycle gives: its current guard has no fencing
-token and its critical-section contract forbids database writes, which every worker above
-performs. `gears/bss/libs/coord` — a DB-backed TTL lease with an in-transaction fence, used by
-Pricing — is a candidate for the same roster and is **not** chosen here: whether the two Orders
-gears and Pricing converge on session advisory locks or on the fenced lease is a decision for the
-three owners jointly, registered as `DECISIONS.md` Q-09. Until it is answered this roster runs on
-`Db::lock`, and the recheck column is what makes the answer swappable.
+pass and reacquire before retrying. `cluster-sdk` is not selected, for the reason Lifecycle gives;
+`gears/bss/libs/coord` remains the Q-09 candidate, and the recheck column is what makes the answer
+swappable.
 
 **Required acceptance evidence (pending implementation).** Two replicas with identical keys: only
 one acquires each held lock while distinct worker and namespace keys progress. Kill the lock
 session mid-pass while the old worker keeps its data connection, acquire from a second replica
-and resume the old pass: no double timer fire, no double settlement, no out-of-policy purge, no
-checkpoint fork. Process crash, reconnect and reacquisition, explicit release, cancellation and an
-unsupported pooling configuration are each tested. Outbox takeover and sequencing are tested on
-the library-managed producer path separately; Workflow adds no lock around it.
+and resume the old pass: no double settlement, no out-of-policy purge, no checkpoint fork. Process
+crash, reconnect and reacquisition, explicit release, cancellation and an unsupported pooling
+configuration are each tested. Outbox takeover and sequencing are tested on the library-managed
+producer path separately.
 
 In addition, the gear starts and gracefully stops the platform `toolkit_db::outbox` handle for
 the `bss-orders-workflow-events` queue, whose sequencer, leased processors and vacuum are
-library-managed workers and are not counted as Workflow-owned coordination jobs; Workflow adds no
-lock and no drain around them.
+library-managed workers and are not counted as Workflow-owned coordination jobs.
 
-**The audit worker is the fifth Workflow-owned worker (D-59).** Its verification pass is per
-process instance, walked in a rolling pass with a full pass inside a **30-day** window; a mismatch
-**alerts and never repairs**, and the pass holds SELECT only. Its checkpoint phase rolls up each
-audit namespace at least once per **24 hours** and reconciles live instance counters and the
-previous checkpoint under one consistent snapshot (§4.17 *Roll-ups*). Alert when checkpoint age
-exceeds 24 hours or full verification exceeds 30 days; a missed deadline is degraded integrity
-coverage, not evidence that a check succeeded. Identity removal never changes what it verifies
-(D-61).
+**The audit worker (D-59).** Its verification pass is per process instance, walked in a rolling
+pass with a full pass inside a **30-day** window; a mismatch **alerts and never repairs**, and the
+pass holds SELECT only. Its checkpoint phase rolls up each audit namespace at least once per
+**24 hours** (§4.17 *Roll-ups*). Alert when checkpoint age exceeds 24 hours or full verification
+exceeds 30 days. Identity removal never changes what it verifies (D-61).
 
-**Observability owned here**: step outcome counts by outcome class; idempotency
-still-processing, **lease-expired**, **idempotency-key-conflict** and aged-out counts; retry-budget-exhaustion
-and step-deadline-exhaustion counts, tracked separately from overdue-window and process-lifetime
-escalations; **crash-loop quarantine count** (§4.13, target zero); **circuit-breaker state and
-open-duration per dependency** (§4.5); **queue depth and shed count** against the bounded dispatch
-queue, and per-seller token-bucket rejection rate (§4.12); **measured clock offset against database
-time per replica** and advisory-lock release-on-skew count (§4.15); producer-queue depth, oldest-message age and
-enqueue-to-acceptance lag plus pending platform dead letters for `bss-orders-workflow-events`
-(platform metrics, read rather than produced here); audit-append failure count (target zero), **audit
-hash-chain verification failures** (target zero), verifier coverage age and last successful
-checkpoint age per audit namespace (§4.17); **time to full resumption** and admission-ramp
-position after a restart (§4.16); and durable-timer fire-on-schedule adherence across a service
-restart.
+**Observability owned here**: step outcome counts by outcome class and operation; idempotency
+still-processing, lease-expired, key-conflict, `open` re-run and aged-out counts; per-operation
+deadline exhaustion counts; `retry-step` quarantine count (§4.13, target zero); circuit-breaker
+state and open-duration per dependency (§4.5); measured clock offset against database time per
+replica and advisory-lock release-on-skew count (§4.15); backstop-sweep settlements per pass
+(target zero while the platform is healthy — a non-zero rate means invocations are dying);
+producer-queue depth, oldest-message age and enqueue-to-acceptance lag plus pending platform dead
+letters for `bss-orders-workflow-events` (platform metrics, read rather than produced here);
+audit-append failure count (target zero), audit hash-chain verification failures (target zero),
+verifier coverage age and last successful checkpoint age per audit namespace (§4.17); and the
+definition-version distribution of active bindings, so a version no instance is bound to any more
+can be retired.
 
 ## 4. Engine Normative Rules
 
 ### 4.1 Engine execution history is not the audit source of record
 
-`owf_step_log` and the platform durable-execution substrate's own run history exist for recovery
-and replay. Neither **MUST** be treated as the audit source of record. `owf_audit_entry`, written
-only by the audit writer, is the sole audit source of record for this gear's process execution
-(`cpt-cf-bss-orders-workflow-principle-engine-history-not-sor`,
-`cpt-cf-bss-orders-workflow-nfr-owf-audit`).
+`owf_step_log` and the platform's invocation record and timeline
+([`DESIGN.md:661`](../../../../serverless-runtime/docs/DESIGN.md#invocationrecord)) exist for
+recovery, reads and debugging. Neither **MUST** be treated as the audit source of record.
+`owf_audit_entry`, written only by the audit writer, is the sole audit source of record for this
+gear's process execution (`cpt-cf-bss-orders-workflow-principle-engine-history-not-sor`,
+`cpt-cf-bss-orders-workflow-nfr-owf-audit`). A platform retention policy or namespace purge
+**MUST NOT** be able to remove any entry here, and nothing here **MAY** be reconstructed from the
+platform timeline after the fact.
 
-### 4.2 Five distinct bounds, not one
+### 4.2 Five distinct bounds, two owners
 
-There are **five** bounds (`cpt-cf-bss-orders-workflow-principle-distinct-bounds`): the
-retry budget (submission failures only), the per-attempt timeout, and the step deadline, all three
-enforced by the retry/backoff controller; the **overdue window** of the overdue-fulfillment timer
-(`timer_kind = overdue-fulfillment`), which the controller does **not** enforce and which is owned
-by the handler slice that raises the operator escalation; and the **process-lifetime ceiling**
-(`timer_kind = process-lifetime`, `max_process_lifetime`, §4.12), armed at process start by slice
-02, non-pausable, and independent of order state. The last two are distinct bounds on distinct
-clocks and **MUST NOT** share a timer kind: the overdue window runs from expected fulfillment time
-and only while the order is in fulfillment, whereas the lifetime ceiling runs from process start
-regardless of phase and is what bounds an order that is held and resumed indefinitely before it
-ever reaches fulfillment. Every statement of the count in this document is five; the three that
-recur in §3.2 and §4.5 are the controller's subset, never a competing total. Exhausting the process deadline alone **MUST NOT** mark a `FulfillmentTask`
-`failed` and **MUST NOT** auto-terminal the order; it **MUST** instead raise an operational
-escalation to the fulfillment-operator queue
-(`cpt-cf-bss-orders-workflow-fr-owf-overdue-escalation`,
-`cpt-cf-bss-orders-workflow-fr-owf-retry`).
+There are **five** bounds (`cpt-cf-bss-orders-workflow-principle-distinct-bounds`). **One is the
+operation's**: the **per-operation deadline** inside the envelope (§3.3 step 4), evaluated
+against database time, which cuts a hanging effect and settles it `retryable-failure` with
+`per-attempt-timeout`. **Four are the definition's**, executed by the platform plugin
+(`10 §2`): the **task retry policy** — attempt count, backoff, jitter — which is the retry budget
+and applies only to operations registered `retryable-on: transient`; the **task timeout**, which
+bounds a whole step across its attempts; the **overdue window**, a `wait` arm competing with the
+fulfillment path that on completion calls `raise-overdue-escalation` and nothing else; and the
+**process-lifetime ceiling**, a top-level `wait` arm that on completion calls
+`raise-overdue-escalation` and `park`. The last two are distinct bounds on distinct clocks and
+**MUST NOT** be one arm: the overdue window runs from expected fulfillment time and only while the
+order is in fulfillment, whereas the lifetime ceiling runs from process start regardless of phase,
+is never cancelled by a hold, and is what bounds an order held and resumed indefinitely before it
+ever reaches fulfillment. Exhausting either **MUST NOT** mark a `FulfillmentTask` `failed` and
+**MUST NOT** auto-terminal the order; each raises an operational escalation
+(`cpt-cf-bss-orders-workflow-fr-owf-overdue-escalation`, `cpt-cf-bss-orders-workflow-fr-owf-retry`).
 
 #### Working baselines for the five bounds
 
 These are **working baselines**, proposed into the program-wide non-functional workshop the PRD
-defers to, not settled platform values. They are stated here so an unset value is a visible
-choice rather than an accidental one.
+defers to, not settled platform values. The first is configured on the operation; the other four
+are declared on the definition and recorded here so an unset value is a visible choice.
 
-| Bound | Working baseline | Derivation |
-|-------|------------------|------------|
-| Per-attempt timeout | 10 s | Set from the downstream's service objective, not from caller patience: 3-10x its p99. The PRD puts control-operation acceptance at p95 < 1 s, so 10 s leaves headroom while still cutting a hung socket before it consumes the step. |
-| Step deadline, **wave-2 (activation) steps** | 3 min | Re-derived against the PRD's actual window. The p95 <= 15 min clock starts at **activation-wave eligibility** — after every wave-1 create has succeeded and expected fulfillment time has been reached — so the window bounds wave 2, the barrier release and the acknowledgement, not two serial waves. 3 min per activation step leaves room for the sweep's in-window ladder and the acknowledgement inside 15 min. |
-| Step deadline, **wave-1 (draft-create) steps** | 10 min | Wave 1 sits **outside** the measured window, so it takes no budget from it and can be bounded more generously against Subscriptions' own objective. |
-| Retry budget | 5 submission attempts | With the §4.5 curve this spends ~15-30 s of cumulative backoff, so the budget is provably nested inside even the 3 min wave-2 step deadline rather than competing with it. |
-| Gear-wide retry-budget window | 60 s sliding | A 10 % cap (§4.5) is only a budget if it has a window; 60 s is short enough to react inside one step deadline and long enough not to trip on a single burst. |
-| Process deadline | 24 h past expected fulfillment time | Fixed by the PRD as commercial policy, not chosen here (`cpt-cf-bss-orders-workflow-fr-owf-overdue-escalation`). |
-| Max process lifetime | 90 days, armed at process start, **non-pausable** | accepted (`DECISIONS.md` D-4). Independent of order state, so it backstops an order cycled through hold/resume before approval, which the overdue window — scoped to `in_fulfillment` — never reaches. |
+| Bound | Owner | Working baseline | Derivation |
+|-------|-------|------------------|------------|
+| Per-operation deadline | operation (`deadline`) | 10 s for a dispatch operation; 5 s for a record-only operation | Set from the downstream's service objective, not from caller patience: 3-10x its p99 |
+| Task timeout, **wave-2 (activation) tasks** | definition | 3 min | The p95 ≤ 15 min clock starts at activation-wave eligibility, so the window bounds wave 2, the barrier release and the acknowledgement |
+| Task timeout, **wave-1 (draft-create) tasks** | definition | 10 min | Wave 1 sits outside the measured window |
+| Retry budget | definition (`use.retries`) | 5 attempts, exponential from 1 s, capped 30 s, full jitter | With the curve of §4.5 this spends ~15-30 s of cumulative backoff, provably nested inside the 3 min wave-2 timeout |
+| Overdue window | definition (`wait` arm) | 24 h past expected fulfillment time | Fixed by the PRD as commercial policy (`cpt-cf-bss-orders-workflow-fr-owf-overdue-escalation`) |
+| Max process lifetime | definition (top-level `wait` arm) | 90 days from process start, never cancelled by a hold | Accepted (`DECISIONS.md` D-4) |
 
-**The 15-minute window starts after wave 1.** Any derivation that says the window "spans two
-serial waves" is wrong: wave 1 is outside it. The consequence is load-bearing in two places. The
-**wave-1 rebuild** path re-runs a full wave-1 step; because wave 1 is outside the window that
-re-run costs the SLA nothing, but the rebuild must carry its own distinct idempotency key (the
-`attempt` component) rather than replaying an aged-out one. And an order whose line count exceeds
-the §4.12 cap is **excluded from the SLA population** rather than silently missing the target.
-
-**The nesting invariant is normative and MUST be asserted at configuration load**: per-attempt
-timeout **<** cumulative retry backoff **<** step deadline (each wave's) **<** process deadline
-**<** max process lifetime. A configuration whose values violate that ordering **MUST** be refused
-at startup rather than accepted. A mis-ordered set does not fail
-loudly — it silently disables the inner bound, which is precisely the failure this assertion
-exists to prevent, and nothing else in the engine would detect it.
+**The nesting invariant is normative and is enforced in two places.** Per-operation deadline
+**<** cumulative retry backoff **<** task timeout **<** overdue window **<** lifetime ceiling. The
+validation hook of `10 §2` **MUST** refuse to publish a definition version whose declared values
+violate the ordering against the registered `deadline_ms` of every operation it calls
+(`cpt-cf-bss-orders-workflow-adr-definition-versioning-and-protected-steps`), and the gear
+**MUST** refuse to become ready if a change to an operation's `deadline_ms` breaks the ordering
+against the definition versions active bindings name. A mis-ordered set does not fail loudly — it
+silently disables the inner bound — which is precisely the failure this assertion exists to
+prevent.
 
 ### 4.3 The idempotency registry's non-success outcomes are exhaustive
 
-The registry's outcomes for a given key are exactly **five**, and resolving a key **MUST** land on
+The registry's outcomes for a given key are exactly **six**, and resolving a key **MUST** land on
 exactly one of them:
 
 | Registry outcome | Record state | Rule |
 |------------------|--------------|------|
-| **First call** | No record | Insert `in_flight`, take the lease, run the closure, settle. |
-| **Absorbed duplicate** | `settled`, `request_fingerprint` matches | Return the stored outcome unchanged; the closure is **never** re-invoked. |
-| **Key conflict** | `settled`, `request_fingerprint` does **not** match | Refuse the call. The same key was presented for a materially different request, which is a caller defect, not a duplicate — returning the stored outcome would report another request's result as this one's. |
-| **Still-processing conflict** | `in_flight`, lease **live** | **MUST NOT** be inferred as success and **MUST NOT** be resubmitted under a new key; wait and confirm by lookup. |
-| **Lease-expired** | `in_flight`, `lease_expires_at` passed, `expires_at` **not** passed | Treat as **still-processing**: confirm the real outcome by lookup through the reconciliation sweep, and **never** re-dispatch blind. The holder may have crashed *after* the downstream accepted the call, so a blind re-dispatch is a second durable effect. |
-| **Aged-out key** | `expires_at` passed with no settled record | The reconciliation sweep is read-only past this point. The next attempt is a **new operation under a new key** — it appends the key's `attempt` component — never a resume of the old one and never a replay of the identical key string. |
+| **First call / re-run** | No record, **or** `open` with a matching `request_fingerprint` | Insert or flip to `in_flight`, take the lease, run the effect, settle. An `open` record is re-runnable exactly once per settled retryable failure. |
+| **Absorbed duplicate** | `settled`, `request_fingerprint` matches | Return the stored outcome unchanged; the effect is **never** re-run. |
+| **Key conflict** | Any state, `request_fingerprint` does **not** match | Refuse the call (`idempotency-key-conflict`, `permanent-failure`). The same key was presented for a materially different request, which is a caller defect — a wrongly authored definition input — not a duplicate. |
+| **Still-processing** | `in_flight`, lease **live** | **MUST NOT** be inferred as success and **MUST NOT** be resubmitted under a new key; the definition re-issues the same key after backoff (`still-processing`, 409 `Aborted`). |
+| **Lease-expired** | `in_flight`, `lease_expires_at` passed, `expires_at` **not** passed | Treat as **still-processing** (`idempotency-lease-expired`, 409 `Aborted`): the real outcome is confirmed by lookup and settled only by `settle-from-lookup` (§3.3); the effect is **never** re-run blind, because the holder may have crashed *after* the downstream accepted the call. |
+| **Aged-out key** | `expires_at` passed with no settled record | `settle-from-lookup` is read-only past this point. The next attempt is a **new operation under a new key** — it appends the key's `attempt` component (minted by `retry-step` or by the rebuild path of slice 05) — never a resume of the old one and never a replay of the identical key string. |
 
-No sixth outcome exists. The **lease-expired** row is the one that used to be missing, and it is
-reachable on *every* crash after dispatch: the record is neither still-processing in the "live
-lease" sense nor aged-out in the "retention window elapsed" sense, so a four-outcome enumeration
-left the most common crash state matching nothing, and an implementer resolving it would have had
-to guess — most cheaply, by re-dispatching.
-
-**These five are registry outcomes, not a sixth and seventh step outcome.** They are what resolving
-a key yields *inside* the engine; the handler still sees only the closed set of §3.3. The mapping
-is fixed: first call and absorbed duplicate resolve to the settled outcome, lease-expired and
-still-processing both surface as `still-processing`, aged-out surfaces as `aged-out`, and
-an idempotency-key conflict surfaces as `permanent-failure` carrying the `idempotency-key-conflict` reason — it is a caller
-defect and retrying it under the same key cannot fix it.
+No seventh outcome exists. **These six are registry outcomes, not additional step outcomes.**
+They are what resolving a key yields *inside* the envelope; the definition still sees only the
+closed set of §3.3. The mapping is fixed: first call, re-run and absorbed duplicate resolve to the
+settled outcome; lease-expired and still-processing both surface as `still-processing`; aged-out
+surfaces as `aged-out`; a key conflict surfaces as `permanent-failure` carrying
+`idempotency-key-conflict`.
 
 **`fingerprint` defined.** The fingerprint of a request is a **SHA-256 over its canonical request
 body** — the request's semantic fields in a canonical serialization, excluding transport headers,
-timestamps and the key itself — stored as `owf_idempotency_registry.request_fingerprint` (§3.7).
-It is what makes "absorbed duplicate" a *verified* duplicate rather than an assumed one: without
-it, a key replayed against a different payload is indistinguishable from an honest retry and the
-wrong stored outcome is returned as success.
+`invocationId`, `attemptId` and the key itself — stored as
+`owf_idempotency_registry.request_fingerprint` (§3.7). Excluding the platform identifiers is what
+lets a worker replay and an operator `retry` of a failed invocation present the same logical
+request; including everything else is what makes an absorbed duplicate a *verified* duplicate.
 
-### 4.4 The durable timer service
+### 4.4 Timers and retry policy are the definition's
 
-Every escalation timer, the expected-fulfillment-time wait, and the reconciliation sweep schedule
-are durable: a timer's wake-up **MUST NOT** depend on an external trigger arriving, and a timer
-**MUST** survive a service restart by being reloaded from `owf_durable_timer` rather than held only
-in process memory. A hold **MUST** pause an **approval-escalation** timer with its remaining
-window preserved; resume **MUST** restore that remainder rather than restarting the window. A hold
-**MUST NOT** pause any other timer kind — not the overdue-fulfillment window, not the process
-deadline, not the activation barrier, not the sweep — because those are the backstops that bound
-the hold itself. The remainder has exactly one authority,
-`owf_durable_timer.remaining_window_ms`; no other table restates it (§3.7). Timer kinds are the
-closed set of six enumerated on that table, and a handler **MUST NOT** invent a seventh.
+There is no durable timer service in this gear (retired by ADR-0011). Every escalation window,
+the expected-fulfillment wait, the barrier's polling interval, the sweep cadence for a live
+invocation, the overdue window and the lifetime ceiling **MUST** be expressed as `wait` tasks or
+task timeouts of the registered definition (`10 §2`, `10 §3.6`), executed by the plugin's
+durable timers, which survive a platform worker restart by the plugin's own history
+([serverless-runtime ADR-0004](../../../../serverless-runtime/docs/ADR/0004-cpt-cf-serverless-runtime-adr-temporal-workflow-engine.md)
+*Consequences*). Orders **MUST** record, through a step operation, every arm, pause, re-arm and
+fire that has an audit consequence — `open-gates` (arm), `apply-hold` (pause, returning the
+remainder), `apply-resume` (re-arm with that remainder), `escalate-gate` and
+`raise-overdue-escalation` (fire) — so the audit trail says what the timers did without reading
+the platform's history. A hold **MUST** pause only the approval-escalation wait and **MUST NOT**
+pause the overdue window, the lifetime ceiling, the barrier or the sweep, which is the definition
+pattern of `10 §4`; the remainder has exactly one authority, the value `apply-hold` computes and
+records from the gate's `opened_at` and window (slice 08), and no table in this slice restates it.
 
-### 4.5 The retry/backoff controller and the caller-side duplicate protocol
+### 4.5 The envelope's bound and the caller-side duplicate protocol
 
-Restating the three bounds of §4.2 that this controller owns — the fourth, the process deadline,
-is not its to enforce: the retry budget governs submission-failure attempts only; the per-attempt
-timeout cuts a single hanging attempt and, if it fires before accept, consumes one retry attempt;
-the step deadline bounds the whole step independent of attempt count. The process deadline of §4.2
-**MUST NOT** by itself mark lines failed or auto-terminal an order.
+The envelope enforces the per-operation deadline and nothing else of the five (§4.2). **What
+follows from an exhausted definition bound is the definition's failure arm**, never a decision the
+envelope takes: when the platform's retry policy is exhausted or a task times out, the definition's
+`catch` calls `create-manual-task` (remediate) or the compensation arm (fail-fast) with the
+catalogue reason `retry-budget-exhausted` or `step-deadline-exceeded` (`10 §3.6` (c)); the
+envelope creates no manual task, opens no incident and acknowledges nothing to Lifecycle.
 
-**Exhaustion marks the step and stops.** Exhausting the retry budget or the step deadline settles
-the step `permanent-failure`; the consequence is the registering handler slice's declared
-partial-failure policy. This controller **MUST NOT** raise a manual task, open an incident, or
-acknowledge an outcome to Lifecycle — where a handler routes an exhausted budget to an operator
-escalation, that is the handler consuming this outcome, not a second verdict competing with it.
-
-**Caller-side duplicate protocol** (binding on every handler slice):
+**Caller-side duplicate protocol** (binding on the definition's retry arms and on every operation
+that calls a downstream):
 - On a client-side timeout of a call that may have been accepted: retry **with the same
-  idempotency key**, then confirm the outcome by lookup (the reconciliation sweep) — **never**
-  infer success from silence.
+  idempotency key** — the definition's retry policy does this by construction because the key is
+  derived from the task's inputs — then confirm the outcome by lookup (`reconcile-intent` →
+  `settle-from-lookup`); **never** infer success from silence.
 - On a conflict or an in-flight rejection: **do not** infer success; wait, and retry the same key
   only if the original was not accepted; confirm by lookup.
-- On a call **submitted with no response at all** — acceptance unknown, which is neither "new" nor
-  "accepted": resolve it **by lookup under the same key** before taking any suppression,
-  re-dispatch or cancellation decision. This is the third state a hold or a cancellation arriving
-  mid-flight must handle, and it is not a member of the two-way partition.
+- On a call **submitted with no response at all** — acceptance unknown: resolve it **by lookup
+  under the same key** before taking any suppression, re-dispatch or cancellation decision. This
+  is the third state a hold or a cancellation arriving mid-flight must handle.
 - To supersede an accepted in-flight intent, **cancel/void** it — never issue a second submit
   under a new key.
-- A duplicate success response **MUST** be absorbed without double-advancing the `FulfillmentTask`
-  or any other process-owned field.
+- A duplicate success response **MUST** be absorbed without double-advancing the
+  `FulfillmentTask` or any other process-owned field.
 
-**Backoff curve and jitter (working baseline)**: exponential with base 1 s, coefficient 2.0,
-capped at 30 s, and **full jitter** — the delay before attempt *n* is drawn uniformly from
-`[0, min(30 s, 1 s * 2^n)]`. Full jitter is required, not optional: an unjittered or
-equal-jittered retry train from many concurrent orders re-synchronises on the shared Subscriptions
-path and converts a transient failure into a self-inflicted load spike. Maximum **5** attempts.
-
-**A retry budget bounds the gear, not just the request.** Per-request attempt caps alone do not
-prevent amplification: under a sustained downstream failure, every in-flight order retrying five
-times multiplies offered load at exactly the moment the dependency is weakest. The controller
-**MUST** therefore also enforce a gear-wide budget — a working baseline of retries capped at
-**10 % of request volume over a 60 s sliding window**, with adaptive client-side throttling once
-that share is exceeded — so the aggregate retry rate degrades rather than compounds. The window is
-part of the baseline, not an implementation detail: a share without a window is not a budget,
-because there is no interval over which the share is measured and no point at which it resets.
-60 s is short enough that the throttle reacts inside a single wave-2 step deadline and long enough
-that one burst does not trip it.
+**Backoff curve and jitter (working baseline, declared on the definition)**: exponential with
+base 1 s, coefficient 2.0, capped at 30 s, and **full jitter** — the delay before attempt *n* is
+drawn uniformly from `[0, min(30 s, 1 s * 2^n)]`; maximum **5** attempts. The spec's retry
+policy expresses delay, exponential backoff, a jitter range and an attempt limit (`10 §2`), and
+the draw is the plugin's — inside its own deterministic replay, not Orders' concern (§4.14).
 
 **Circuit breakers on every outbound dependency.** A retry budget throttles *retries*; it does
-nothing about first attempts, which is exactly the traffic that keeps a failing dependency failing.
-Every outbound dependency this gear's handlers call — Subscriptions, Orders Lifecycle, Payments,
-Generic Approval, and any dependency a later slice adds — **MUST** sit behind a circuit breaker at
-a common working baseline: **open at a 50 % failure rate over 20 calls in 10 s, stay open 60 s,
-then admit 3 half-open probes** before closing. A breaker that is open is a *capacity* signal, not
-a submission failure: a call refused by an open breaker **MUST NOT** consume the retry budget, and
-**MUST NOT** be recorded as a retry attempt. Scoping a breaker only to the lowest-volume dependency
-inverts the argument for having one.
+nothing about first attempts. Every outbound dependency an operation calls — Subscriptions, Orders
+Lifecycle, Payments, Generic Approval — **MUST** sit behind a circuit breaker at a common working
+baseline: **open at a 50 % failure rate over 20 calls in 10 s, stay open 60 s, then admit 3
+half-open probes**. A call refused by an open breaker settles `retryable-failure` with
+`circuit-breaker-open` and leaves the key `open`; it is a capacity signal the definition's retry
+policy will re-issue against, and the operation **MUST NOT** count it as a downstream attempt.
 
-**Maximum throttle delay, and what a long throttle must not silently become.** A downstream
-throttle signal delays dispatch by at most **60 s**. A throttle-induced delay that would push the
-call past `step_deadline_at` **MUST extend the step deadline by the delay** rather than letting the
-step expire inside it. Without that rule a sustained, entirely polite throttle converts directly
-into `step-deadline-exceeded` permanent failures and a queue of manual tasks for an order that
-nothing is actually wrong with — the one failure mode honouring `Retry-After` exists to avoid. The
-extension is bounded by the process deadline, which never extends.
+**A gear-wide retry budget is now the platform's to enforce**, because the per-task retry
+policy is the plugin's; Orders exposes the per-dependency breaker state and the `open` re-run
+rate (§3.8) so that the platform tenant quota (`TenantRuntimePolicy`,
+[`DESIGN.md:735`](../../../../serverless-runtime/docs/DESIGN.md#tenantruntimepolicy)) can be set
+against measured load, and registers the absence of an aggregate retry cap on the platform side as
+an upstream ask (commit D).
 
-**Queue depth and shed policy.** A dispatch that can acquire neither the per-tenant allowance nor
-the global semaphore (§4.12) is **queued in a bounded queue**, working baseline **10 × the
-aggregate in-flight cap**, FIFO within a tenant and round-robin across tenants. A dispatch arriving
-at a full queue is **rejected immediately** — reject-on-full, never blocked and never queued
-without limit — with a retryable outcome and a `Retry-After`-style hint. An unbounded queue does
-not remove back-pressure, it hides it behind latency until every bound above it has already been
-breached.
-
-**Deadline propagation**: the remaining step budget **MUST** be propagated on every outbound call
-rather than each hop timing out independently. Without it, Subscriptions continues working on a
-request this gear has already abandoned, which both wastes downstream capacity and widens the
+**Deadline propagation**: the effective deadline of §3.3 step 4 **MUST** be propagated on every
+outbound call an operation makes rather than each hop timing out independently. Without it,
+Subscriptions continues working on a request this gear has already abandoned, which widens the
 window in which a late success creates a subscription nobody is waiting for (slice 06's fencing
-step 3).
+step 3). Whether the plugin propagates the task's remaining timeout on the HTTP `call` is not
+stated in the serverless-runtime design and is an upstream ask (commit D); until it is answered,
+the operation's own `deadline_ms` is the effective deadline.
 
 ### 4.6 The process audit log is 100% complete with zero silent drops
 
-Every process state transition — instance start, step start, step completion, retry, timeout,
-sweep, sweep settlement, escalation, compensation, phase transition, termination, dead-letter —
-**MUST** be recorded in `owf_audit_entry` with the actor's subject identifier, timestamp,
-idempotency key (where one applies), and process `correlationId`, **in the same transaction** as
-the transition; a failed append aborts that transaction (§4.17 *Append rule*). Zero silent drops
-are permitted. Each entry is hash-chained to its predecessor under the frozen contract of §4.17,
-which is what makes the completeness claim *checkable* rather than merely asserted: a missing
-entry is a broken chain or a counter the roll-up cannot reconcile, not an absence nobody can see. The `dead-letter` entry kind here records a **delivery-level** parking of an
-inbound trigger or callback — it is not a step outcome, and no step failure writes one (§4.8).
-This is the concrete mechanism behind §4.1 (`cpt-cf-bss-orders-workflow-nfr-owf-audit`).
-
+Every process state transition — instance start, step start, step settlement, retry, timeout,
+sweep settlement, escalation, compensation step, phase transition, termination — **MUST** be
+recorded in `owf_audit_entry` with the actor's subject identifier, timestamp, idempotency key
+(where one applies), and process `correlationId`, **in the same transaction** as the transition;
+a failed append aborts that transaction (§4.17 *Append rule*). Zero silent drops are permitted.
+Each entry is hash-chained to its predecessor under the frozen contract of §4.17, which is what
+makes the completeness claim *checkable*. A transition the definition takes that has no Orders
+effect — a branch chosen, a `wait` begun — is not a process state transition and is the
+platform timeline's; a transition that has an Orders effect is always a step operation and is
+therefore always audited. This is the concrete mechanism behind §4.1
+(`cpt-cf-bss-orders-workflow-nfr-owf-audit`).
 ### 4.7 One event per committed step outcome, and the six named process events only
 
 This gear **MUST** publish exactly the six named process events —
@@ -1883,38 +2010,39 @@ of its stream, including this gear ([`02 §2.1`](./02-triggers-and-start.md#21-d
 [`05 §2`](./05-provisioning-intents.md#2-principles--constraints)); it binds consumers of the six
 process events identically.
 
-### 4.8 The dead-letter record is never an order state
+### 4.8 Dead letters are the platform's; the manual task is Orders'
 
-Exhausting the bounded delivery-count cap on an inbound trigger or callback parks the payload in
-`owf_dead_letter_record`. A dead-letter record **MUST NOT** be an order state, **MUST NOT** be
-inferred as a process outcome, and is distinct from the manual-task record slice 07 owns
-(`cpt-cf-bss-orders-workflow-adr-manual-task-dead-letter-separation`).
+An inbound Lifecycle trigger, approval decision or Subscriptions confirmation reaches the process
+through the platform's event-trigger path — as the start trigger of a new invocation or as a
+correlated event a running definition `listen`s for (`10 §3.3`). A delivery that keeps failing
+there exhausts the platform trigger's delivery handling and is the **platform's dead letter**
+([`DESIGN.md:976`](../../../../serverless-runtime/docs/DESIGN.md#event-trigger-management-api)
+*dead-letter handling*; `dead_lettered` invocation status, `DESIGN.md:458`), never an Orders
+record: this gear owns no dead-letter table (§3.7 *Retired tables*,
+`cpt-cf-bss-orders-workflow-adr-manual-task-dead-letter-separation` as amended by ADR-0011). A
+platform dead letter **MUST NOT** be an order state, **MUST NOT** be inferred as a process
+outcome, and **MUST** be visible to the fulfillment operator — that visibility is a platform
+surface and is requested in `UPSTREAM_REQS.md` (commit D), not built here.
 
-**The path is delivery-level and inbound-only, by construction.** A **step**-level failure can
-never reach it: a step settles as `retryable-failure` or `permanent-failure` and its consequence is
-the handler's partial-failure policy, which is the manual-task path — which is why
-`owf_step_log.outcome` carries no `dead-lettered` member (§3.7). An **outbound** process event the
-platform permanently rejects is a `toolkit_db::outbox` dead letter owned by the platform (§3.6)
-and writes no dead-letter record either; `owf_dead_letter_record.source` has no legal value for an
-outbound event. One fact, one store, in both directions.
+**The step-level path is the manual task, by construction.** A step operation settles
+`retryable-failure` or `permanent-failure`; what follows is the definition's failure arm, whose
+consequence is `create-manual-task` (slice 07) or the compensation arm — which is why
+`owf_step_log.outcome` carries no `dead-lettered` member and why no operation raises one. An
+**outbound** process event the platform permanently rejects is a `toolkit_db::outbox` dead letter
+(§3.6) and writes no Orders record either. One fact, one store, in all three directions.
 
-**Delivery-count cap (working baseline)**: **5** deliveries before parking. Chosen to absorb
-ordinary at-least-once redelivery from the platform event bus without parking a payload that a
-brief blip would have cleared; comparable managed brokers default to between 5 and 10.
-
-**The count is durable and accumulates on the key, not on the parked row.** The delivery path
-increments `owf_idempotency_registry.delivery_count` under the inbound key — which embeds the
-source event id — **before** the handler closure runs, so the count survives a restart and
-accumulates across deliveries. A counter living only on `owf_dead_letter_record` could never work:
-that row is created *after* the cap is exceeded, so the cap would have nothing to accumulate
-against and would either never trip or reset on every restart. On parking, the value is copied
-onto the record for inspection, and `UNIQUE (source_event_id)` makes the parking itself idempotent.
-
+**What Orders still guarantees for a poisoned trigger.** `admit-trigger` (slice 02) writes its
+`step-start` and settlement entries under the derived correlation on every attempt (§3.7
+`owf_audit_entry` *Chain allocation*), so an event the platform eventually dead-letters after N
+failed admissions leaves N audited attempts in Orders' record; the absence of an
+`instance-start` after them is what an operator reading the chain sees. The former delivery-count
+cap of 5 is now the platform trigger's retry configuration, declared on the event trigger of
+`10 §3.3`.
 ### 4.9 The machine-readable reason catalogue
 
-Every non-success outcome, dead-letter parking, compensation failure and synchronous refusal
+Every non-success outcome, compensation failure and synchronous refusal
 carries a reason from the catalogue owned by `cpt-cf-bss-orders-workflow-component-reason-catalogue`.
-This slice registers the engine's own nine reason families, enumerated in §3.3; the slices below
+This slice registers the engine's own ten reason families, enumerated in §3.3; the slices below
 contribute the rest. The catalogue is a closed set and it is **compiled**: every reason is a
 variant of the gear's `ContractError` enum, so a slice that raises an unregistered reason does not
 fail at configuration load — it does not compile. The properties the former load-time check
@@ -1963,7 +2091,7 @@ no custom `type` URI, no Problem extension member for the reason and no gear-min
 #### The registered reasons
 
 Each reason is registered once, here, with its owner, code, canonical category and the HTTP
-status the category fixes. Most slice values ride manual tasks, dead-letter records and event
+status the category fixes. Most slice values ride manual tasks and event
 payloads (§4.7 `data`) and are never themselves an HTTP response; the category and status apply
 whenever one surfaces as a synchronous refusal — `line-count-exceeded` refusing a start, for
 example — and they are stated once so no slice chooses them again.
@@ -1979,6 +2107,7 @@ example — and they are stated once so no slice chooses them again.
 | `step-deadline-exceeded` | engine (§3.3) | `STEP_DEADLINE_EXCEEDED` | DeadlineExceeded | 504 |
 | `circuit-breaker-open` | engine (§3.3) | `CIRCUIT_BREAKER_OPEN` | ServiceUnavailable | 503 |
 | `poison-step` | engine (§3.3) | `POISON_STEP` | FailedPrecondition | 400 |
+| `definition-not-bound` | engine (§3.3) | `DEFINITION_NOT_BOUND` | FailedPrecondition | 400 |
 | `overlap-collision` | `04-fulfillment-plan` | `OVERLAP_COLLISION` | FailedPrecondition | 400 |
 | `market-divergence` | `04-fulfillment-plan` | `MARKET_DIVERGENCE` | FailedPrecondition | 400 |
 | `invalid-dependency-graph` | `04-fulfillment-plan` | `INVALID_DEPENDENCY_GRAPH` | FailedPrecondition | 400 |
@@ -2006,7 +2135,7 @@ not 409 or 422, so a conflict that must answer 409 is `Aborted` (a retry may suc
 `AlreadyExists` (a retry will not: `idempotency-key-conflict`, the same key settled under a
 different fingerprint — Lifecycle's `idempotency-mismatch`). A time bound exhausted is
 `DeadlineExceeded` (`per-attempt-timeout`, `step-deadline-exceeded`); an attempt bound exhausted
-is a state the caller must change before retrying, `FailedPrecondition` (`retry-budget-exhausted`,
+is a state the caller must change before retrying, `FailedPrecondition` (`retry-budget-exhausted`, `definition-not-bound`,
 `poison-step`). Dependency unavailability is `ServiceUnavailable` (503) and is never disguised as
 a business refusal. Authorization refusals keep the existence-oracle rule of `09 §4.4`:
 `not-found` for a target outside the caller's scope, `not-authorized` only when the caller may
@@ -2035,149 +2164,133 @@ uniqueness (duplicate GTS keys or domain/code pairs fail), and absence of sensit
 `context.data`. Canonical conversion rejects a noncanonical `type` as `UnknownProblemType`;
 generated `ContractError::try_from` matches domain/code, so the two paths are tested separately.
 
-### 4.10 The extension boundary for capability handlers
+### 4.10 The operation registration boundary
 
-A capability handler **MAY** declare: a step's idempotency-key derivation, its declared event
-types, its compensation step where one exists, and its reason-catalogue entries. A capability
-handler **MAY NOT**: write the process-instance aggregate, the step log, the idempotency registry,
-the audit log, or the producer outbox directly; bypass the retry/backoff controller for an outbound call
-made from a registered step; or own a write path that bypasses the engine. Every capability
-behavior lives in the handler slice that registers against the boundary; the engine contains no
-step logic and no commercial policy of its own.
+A slice **MAY** declare, for each operation it registers, every field of the contract in §3.3 —
+name, protection, input and output reference schemas, key family, declared event, paired
+compensation, catalogue reasons, audit kind, retry class and deadline — and nothing else. A slice
+**MAY NOT**: write the process-instance aggregate, the step log, the idempotency registry, the
+audit log or the producer outbox outside the envelope; register an operation whose input or
+output schema names a value outside the reference vocabulary of
+`cpt-cf-bss-orders-workflow-principle-references-not-payloads`; register an operation that calls
+another step operation to advance the process; or expose a second route to an operation. Every
+capability behavior lives in the slice that registers it; the ordering of operations lives in the
+definition (`10`); the engine contains no operation logic and no commercial policy of its own.
 
 ### 4.11 Data classification
 
-Every table in §3.7 is **tenant-scoped by a NOT NULL column**, not by convention: each carries
-`resource_tenant_id`, and `owf_process_instance`, `owf_audit_entry` and
-`owf_dead_letter_record` additionally carry `seller_tenant_id` because each backs an operator- or
-seller-scoped surface. The platform `toolkit_db::outbox` tables are not Workflow tables and carry
-no Workflow tenant column; the tenant axes ride the event `data` (§4.7) and the envelope
-tenancy is platform-root. Every read this gear exposes **MUST** carry the corresponding tenant
-predicate, and the platform's SecureORM `#[secure(tenant_col = ...)]` isolation attaches to that
-column. Retention is **per store** (§3.7) rather than one global floor, is owned by this gear
-**independently of** the durable-execution substrate's own history — a substrate migration or an
-internal history purge **MUST NOT** erase this gear's audit trail (§4.1) — and the audit trail's
-≥ 400-day floor is the one that carries the compliance obligation.
+Every process table in §3.7 is **tenant-scoped by a NOT NULL column**, not by convention: each
+carries `resource_tenant_id`, and `owf_process_instance` and `owf_audit_entry` additionally carry
+`seller_tenant_id` because each backs an operator- or seller-scoped surface; `owf_step_operation`
+is configuration and is the one exemption. The platform `toolkit_db::outbox` tables and the
+platform's own invocation index and history are not Workflow tables; the tenant axes ride the
+event `data` (§4.7) and the envelope tenancy is platform-root. Every read this gear exposes
+**MUST** carry the corresponding tenant predicate, and the platform's SecureORM
+`#[secure(tenant_col = ...)]` isolation attaches to that column. Retention is **per store**
+(§3.7), is owned by this gear **independently of** the platform's history — a plugin migration or
+a platform retention purge **MUST NOT** erase this gear's audit trail (§4.1) — and the audit
+trail's ≥ 400-day floor is the one that carries the compliance obligation.
 
 None of these tables **MAY** carry payment-card data; a payment authorization outcome is consumed
 here as an opaque process precondition, never as card data at rest
-(`cpt-cf-bss-orders-workflow-constraint-data-classification`).
+(`cpt-cf-bss-orders-workflow-constraint-data-classification`). **The same classification bounds
+what may cross into the platform**: a task input or output carrying a resolved total, an approver
+identity, a `payer_tenant_id` or `seller_tenant_id`, a justification or a downstream payload is a
+schema violation the validation hook rejects before publish and the envelope rejects at the call
+(§3.3 step 3), because the platform's history is neither tenant-scoped by Orders' columns nor
+retained under Orders' policy.
 
 **Redaction is normative on every operator-visible and bus-visible string.**
-`owf_dead_letter_record.last_error`, `owf_step_log.result`'s diagnostic field and every event
-payload **MUST** carry a catalogue reason plus a bounded, sanitised diagnostic — never raw
+`owf_step_log.result`'s diagnostic field, every event payload and every RFC 9457 `detail` this
+surface answers **MUST** carry a catalogue reason plus a bounded, sanitised diagnostic — never raw
 downstream error text, stack traces, credentials, tokens, connection strings, request-body echoes
-or PII. The same rule that keeps internal diagnostics off the synchronous RFC-9457 envelope applies
-here: these strings are read by operators through the task queue and, for payloads, by every
-authorized consumer on the bus.
+or PII. The answer to a step call is recorded in the platform's timeline, so the rule that keeps
+internal diagnostics off the synchronous envelope is also what keeps them out of engine history.
 
-### 4.12 Concurrency and back-pressure working baselines
+### 4.12 Concurrency and back-pressure: admission on dispatch
 
-| Control | Working baseline | Derivation |
-|---------|------------------|------------|
-| Per-order parallel line execution | **8** lines | Bounds one order's share of the shared provisioning path. |
-| Maximum lines per order | **200** | accepted (`DECISIONS.md` D-5). Orders above it are **excluded from the 15-minute SLA population**, named the way the PRD already names manual and future-dated orders. At 8-way parallelism a 25-line order runs wave 2 in `ceil(25/8) = 4` serial batches; the cap is what keeps the batch count arithmetic honest against the window instead of leaving the SLA quietly unmeetable above some undeclared line count. |
-| Aggregate in-flight intents | **200** concurrent, **placeholder for a measured value** | Not a tuned constant. It **MUST** be re-derived from measured downstream capacity by Little's Law (`L = lambda * W`, concurrency = accepted throughput x latency) and re-derived again when that capacity changes; 200 is stated so an unset value is a visible choice rather than an accidental one. |
-| Per-tenant token bucket | **20** concurrent in-flight intents sustained, burst **40**, refilled at **20 / s**, keyed on `seller_tenant_id` | 10 % of the aggregate sustained, so ten active sellers fit without contention and no single seller can take more than a tenth of the shared cap before its own allowance throttles it. |
-| Maximum queue depth | **10 ×** the aggregate in-flight cap (2,000 at the baseline) | Reject-on-full (§4.5). |
+The per-order parallel-line limit, the aggregate in-flight-intent cap, the per-seller token bucket
+keyed on `seller_tenant_id`, the bounded queue with reject-on-full and the handling of a
+downstream throttle signal are **admission controls inside the dispatch operations** and are
+specified, with their working baselines, in
+[`05-provisioning-intents.md`](./05-provisioning-intents.md) (moved there by ADR-0011; formerly
+this section). Two rules stay stated here because the envelope depends on them: a dispatch that
+cannot be admitted **MUST** settle `retryable-failure` with a `Retry-After`-style hint and leave
+the key `open`, so the definition's retry policy re-issues it rather than the operation queueing
+without bound; and a throttle-induced delay inside an operation **MUST** stay inside the
+per-operation deadline — an operation never extends its own deadline, because the outer bound
+that would absorb the extension is the definition's task timeout, not Orders'.
 
-**The tenant axis is named, not implied.** Fairness and back-pressure key on **`seller_tenant_id`**
-— the selling party — carried NOT NULL on `owf_process_instance` (§3.7). The seller is the axis
-that actually generates correlated bursts: one seller's campaign submits thousands of orders across
-many resource tenants, and bucketing on the resource tenant would spread that burst across
-thousands of buckets and starve every other seller exactly as if there were no fairness at all.
-Without the column the bucket has no key and degrades silently into the global semaphore.
+### 4.13 Poison handling is the platform's; the Orders-side quarantine is `retry-step`'s
 
-**The bucket sits beneath the semaphore, and both must be acquired.** The arrangement is the
-standard bulkhead: a dispatch **MUST** acquire a token from its seller's bucket **and** a permit
-from the global semaphore, in that order. The bucket bounds one seller's share before it can
-consume the shared aggregate; the semaphore bounds the gear's total offered load against the
-downstream. Acquiring only the semaphore makes the bucket decorative; acquiring only the bucket
-lets the sum of all sellers' allowances exceed the downstream's capacity. A dispatch that cannot
-acquire both is queued and then shed per §4.5.
+A failure **outside** an operation's effect — a malformed task input, a call the envelope cannot
+even resolve a key for — is answered as a validation refusal (400) and recorded; it is a
+deterministic answer to the same input, and the platform's retry policy classifies a 400 as
+non-retryable (`RetryPolicy` precedence, [`DESIGN.md:360`](../../../../serverless-runtime/docs/DESIGN.md#retry-precedence)),
+so the definition's failure arm runs. A crash loop of the **platform worker** itself is the
+plugin's poison handling and ends in the invocation's `failed` or `dead_lettered` status
+(`DESIGN.md:449`, `DESIGN.md:458`), which the backstop sweep of §3.8 observes. This slice keeps
+exactly one crash-loop guard of its own: **`retry-step` MUST quarantine** a step whose operator
+retries keep terminating without a settled outcome — working baseline **3** consecutive retries of
+one `stepRef` whose attempts left the key `in_flight` with a dead lease or produced no step record
+— by refusing the fourth with `poison-step`, writing the `retry` audit entry with that reason and
+leaving the manual task open for escalation. The guard is deliberately separate from the
+definition's retry budget: sharing one counter would let an ordinary retry train exhaust the
+quarantine allowance.
 
-**An adaptive limit is preferred to a static ceiling.** A fixed aggregate cap is either wasteful or
-a bottleneck as Subscriptions' capacity moves, and it cannot tell the two apart; a gradient- or
-delay-based adaptive controller converges on the downstream's actual limit instead, and the
-per-seller bucket is then expressed as a share of the adaptive limit rather than as a constant.
+### 4.14 Determinism discipline: what is computed on which side of the boundary
 
-A downstream throttle signal delays dispatch, up to the §4.5 maximum, and **MUST NOT** consume the
-retry budget (§4.5).
-
-### 4.13 The crash-loop guard is distinct from the retry budget
-
-Every bound in §4.2 is scoped to an outcome the executor *observes*: the retry budget to
-submission failures, the per-attempt timeout to a hanging attempt, the step deadline to a running
-step, the dead-letter cap to inbound deliveries. A failure **outside** the handler closure — a
-deserialization error on the step's persisted inputs, a panic in the dispatch path, a poison
-payload the executor cannot even get as far as running — is observed by none of them. It kills the
-worker before `attempts_used` is incremented, the step replays, and it kills the worker again:
-an unbounded loop that consumes no budget, produces no dead-letter record, and pins a dispatch slot
-with no operator surface at all.
-
-The step executor **MUST** therefore enforce a **crash-loop guard** on a separate counter,
-`owf_retry_state.replay_count`, incremented on entry to a replayed step **before** the closure is
-reached and reset on any settled outcome. Working baseline: **3** consecutive replays that
-terminate outside the closure. On tripping, the executor **MUST** quarantine the step —
-settle it `permanent-failure` with the poison-step reason, release the dispatch slot, write the
-audit entry, and raise the handler's escalation path — rather than replay it a fourth time. The
-guard is deliberately a *separate* counter from `attempts_used`: sharing one counter would let an
-ordinary retry train exhaust the crash-loop allowance, and would let a crash loop that never
-reaches the closure escape it.
-
-### 4.14 Determinism discipline for replayed execution
-
-A replayed step **MUST** be deterministic in everything the durable record already fixed. The
-durability boundary decides where each non-deterministic value is computed:
+Deterministic replay is now the plugin's obligation for the definition (Temporal's replay rules
+bind engine code, not workflow authors —
+[serverless-runtime ADR-0004](../../../../serverless-runtime/docs/ADR/0004-cpt-cf-serverless-runtime-adr-temporal-workflow-engine.md)
+*Option A*, "Deterministic execution constraints"). Orders' obligation is that a **re-issued
+call** is deterministic in everything the record already fixed:
 
 | Value | Computed | Why |
 |-------|----------|-----|
-| The process `correlationId` | **Once, at process start, by the admission path, and persisted on `owf_process_instance` before any step runs** | Every audit entry, timer, retry-state row and enqueued process event is keyed on it, and it is one of the two genesis inputs of the audit chain (§4.17). Regenerating it on replay orphans all of them and silently voids the 100 % audit-completeness claim of §4.6 — the entries still exist, under an identifier nothing points at any more. |
-| The full-jitter delay draw (§4.5) | **Outside the workflow body**, by the retry/backoff controller, and persisted as `owf_retry_state.next_attempt_at` before the wait begins | A draw taken *inside* the replayed body produces a different value on replay and a history mismatch against the substrate. Persisting the resulting instant makes the replay read a value rather than re-draw one. |
-| Timestamps used in a decision | Read from **database time** (§4.15) and persisted with the step's record | Wall-clock reads inside a replayed body diverge across replicas and across replays. |
-| Identifiers a step mints (timer ids, the event envelope `id`) | Minted inside the unit of work that persists them, never re-minted on replay; where a step must mint an identifier *before* it can persist it, that identifier **MUST** be derived deterministically (UUIDv5 over the step's fixed inputs) | A re-minted identifier on replay creates a second row for one logical object — a second gate, a second timer, a duplicate event. |
+| The process `correlationId` | **Once, by `admit-trigger`, deterministically** (UUIDv5 per [`02 §2.1`](./02-triggers-and-start.md#21-design-principles)) and persisted by `start-instance` before any other operation | Every audit entry, step record and event is keyed on it and it is one of the two genesis inputs of the audit chain (§4.17); a re-derived value on replay is the same value by construction |
+| The idempotency key of a call | **In the definition, from the task's inputs** (`10 §2`), never from a per-attempt value; recomposed and verified by the envelope | A key that varied per attempt would make every platform retry a first call and void §4.3 |
+| The backoff delay draw | **By the plugin**, inside its own replay-safe timer | Orders never draws it and never records it; the platform `attempt_id` is what Orders records |
+| Timestamps used in a decision | Read from **database time** (§4.15) inside the operation and persisted with the step record | Wall-clock reads diverge across replicas |
+| Identifiers a step mints (`gateId`, the event envelope `id`, the rebuild `attempt` component) | Inside the unit of work that persists them, never re-minted on replay; where a step must mint an identifier *before* it can persist it, it **MUST** be derived deterministically (UUIDv5 over the step's fixed inputs) | A re-minted identifier on replay creates a second row for one logical object |
+| Values the definition carries between tasks | **Only references and enums returned by an operation** — the definition **MUST NOT** compute a business value with a jq expression beyond selecting and re-keying references | A computed value in engine history is both a payload leak and a second source of a fact Orders' record already fixed |
 
-The rule generalises: **anything drawn from a random source, a clock or an id generator is computed
-on the durable side of the boundary and read by the replayed side, never the reverse.**
+The rule generalises: **anything drawn from a random source, a clock or an id generator is
+computed on the durable side of the boundary and read by the replayed side, never the reverse** —
+and the durable side is Orders' transaction for anything Orders records.
 
 ### 4.15 Clock-skew tolerance and evaluation against database time
 
-Timer fire instants, registry lease expiry and every deadline comparison **MUST** be evaluated
-against **database time**, not against a worker replica's local clock. Background workers
-coordinate through session advisory locks across replicas (§3.8), so a replica whose clock drifts
-forward fires an `expected-fulfillment-wait` timer early and activates a future-dated line ahead
-of its contracted date, and a replica whose clock drifts backward heartbeats an in-flight
-registry lease the rest of the deployment believes is dead.
+Registry lease expiry, the per-operation deadline and every deadline comparison an operation makes
+**MUST** be evaluated against **database time**, not against a replica's local clock. Background
+workers coordinate through session advisory locks across replicas (§3.8), so a replica whose clock
+drifts backward heartbeats an in-flight registry lease the rest of the deployment believes is
+dead, and one that drifts forward settles a deadline early. The definition's `wait` instants are
+the plugin's clock, outside this rule; an operation that receives a wake-up "too early" by Orders'
+clock — the expected-fulfillment instant not yet reached by database time — **MUST** answer
+`retryable-failure` rather than act, which is what the barrier's re-evaluation loop of `10 §3.6`
+(b) expects.
 
 Working baselines:
 
 | Value | Baseline | Derivation |
 |-------|----------|------------|
-| Clock-skew tolerance | **30 s** measured against database time | An order of magnitude inside the ± 5 min timer-accuracy NFR, so skew alone can never account for a miss. |
-| Skew response | A replica measuring its own offset beyond the tolerance **MUST release its advisory locks**, stop firing timers and stop heartbeating its in-flight registry leases, and **MUST NOT** rejoin until it is back inside it | Continuing to act on a clock the deployment does not agree with is the failure mode the tolerance exists to detect. |
-| Timer wake-up scan | **15 s** | ≤ 1/20 of the ± 5 min accuracy budget, so scan granularity is never the dominant term in a miss. |
+| Clock-skew tolerance | **30 s** measured against database time | An order of magnitude inside the ± 5 min timer-accuracy NFR, so skew alone can never account for a miss |
+| Skew response | A replica measuring its own offset beyond the tolerance **MUST release its advisory locks**, stop heartbeating its in-flight registry leases and answer step calls with `retryable-failure` (503), and **MUST NOT** rejoin until it is back inside it | Continuing to act on a clock the deployment does not agree with is the failure mode the tolerance exists to detect |
 
-### 4.16 Recovery-rate target and the cold-start admission ramp
+### 4.16 Recovery is the platform's invocation and Orders' record
 
-Recovery is not established by "it comes back": on restart, every in-flight step is eligible to
-retry and every overdue timer is eligible to fire **at the same instant**, and the full-jitter curve
-of §4.5 disperses *retries* but not *first attempts after resume*. A restart under load therefore
-reproduces, against a dependency that has just seen the same restart, exactly the thundering herd
-the retry budget exists to prevent.
-
-Working baselines:
-
-| Value | Baseline | Derivation |
-|-------|----------|------------|
-| Time to full resumption | **p95 < 5 min** from process start to every recoverable in-flight step being either running or scheduled | Well inside the 24 h process deadline and inside the ± 5 min timer-accuracy budget, so a restart does not by itself breach a timer. |
-| Cold-start admission ramp | Admission opens at **10 %** of the aggregate in-flight cap and doubles every **30 s** to 100 % | Five doublings reach full admission in ~2.5 min, inside the resumption target, while giving a just-restarted dependency a ramp rather than a step. |
-| Overdue-timer release | Timers whose `fire_at` is already past at start are released over a **60 s** spread, in `fire_at` order | Preserves ordering while removing the simultaneity; a timer already overdue is not made materially more overdue by a bounded spread. |
-
-The ramp applies to first attempts *and* retries, and it **MUST NOT** be bypassed by a step whose
-deadline is close to expiry — a step that cannot be admitted within its deadline settles
-`permanent-failure` and is handled by its handler's policy, which is a recorded outcome, where
-bypassing the ramp is an unrecorded amplification.
-
+Recovery of an in-flight process after a restart has two halves with two owners. The platform
+plugin resumes every invocation from its own history and re-issues whatever calls it had not
+seen answered; Orders guarantees that each re-issued call resolves through §4.3 to the same
+settled outcome or to one more run of an `open` key, that the Orders gear itself holds no
+in-memory execution state to lose, and that a step whose deadline has already passed by database
+time when its call arrives settles `retryable-failure` rather than executing late. The **cold-start
+admission ramp** that spreads first attempts after a restart — so that a just-restarted
+Subscriptions sees a ramp rather than a step — is an admission control on dispatch and lives in
+[`05`](./05-provisioning-intents.md) with the other admission rules (§4.12). The working baseline
+that remains this slice's: **time to full resumption p95 < 5 min** from Orders' process start to
+readiness (§3.8), which is the point from which re-issued calls are answered rather than refused.
 ### 4.17 The audit contract (normative)
 
 Workflow retains its gear-owned transactional audit following Pricing and Orders Lifecycle
@@ -2187,9 +2300,9 @@ from [Lifecycle `01 §4.4` *Audit*](../../../orders-lifecycle/docs/design/01-fou
 and not restated; only what is Workflow-specific is written out.
 
 **Append rule.** The audit entry **MUST** be appended in the transaction of the transition it
-records, on **every** path §4.6 enumerates — the admission transaction, the step executor's unit
-of work, the timer fire, the sweep settlement, the compensation step, the delivery path's
-dead-letter park — and a failed append or encoding failure **MUST** abort that unit of work. An
+records, on **every** path §4.6 enumerates — the `start-instance` transaction, the step envelope's unit
+of work, the sweep settlement, the compensation step, the pre-admission `admit-trigger` attempt — and
+a failed append or encoding failure **MUST** abort that unit of work. An
 unaudited transition is not a permitted outcome. The append takes the `owf_process_instance` row
 lock, increments `audit_sequence`, and inserts the entry; counter, entry and business mutation
 commit or roll back together, and no non-transactional database sequence is used. No read
@@ -2248,7 +2361,7 @@ reconciliation against every live instance's `audit_sequence` and against every 
 previous checkpoint before recording, no checkpoint blessing a detected discrepancy, and the
 stated limits: no completeness proof for a chain lost before its first checkpoint, for a suffix
 removed together with its counter before capture, or against a privileged rewrite of all local
-evidence. An instance-less dead-letter chain has no counter and is reconciled against its
+evidence. A pre-admission `admit-trigger` chain with no instance row yet has no counter and is reconciled against its
 previous checkpoint member only. Workflow's tags are `VHP-BSS-ORDERS-WORKFLOW-AUDIT-ROLLUP-v1`
 for the checkpoint digest and `VHP-BSS-ORDERS-WORKFLOW-AUDIT-ROLLUP-GENESIS-v1` for the namespace
 genesis, each followed by `0x1f`; the framed field order is `format_version` (u16),
@@ -2258,7 +2371,7 @@ genesis, each followed by `0x1f`; the framed field order is `format_version` (u1
 conditions and is not presumed available.
 
 **Acceptance evidence (implementation requirements, not claims).** Frozen preimage and digest
-vectors for genesis, `instance-start`, a later step entry, an instance-less `dead-letter` entry
+vectors for genesis, `instance-start`, a later step entry, a pre-admission `admit-trigger` entry
 and a roll-up; every-field mutation tests over every covered column, including NULL/empty and
 adjacent-field boundaries; malformed length and version rejection; database timestamp round
 trips; concurrent same-instance appends that never fork and a rollback that never consumes a
@@ -2271,6 +2384,7 @@ and Pricing's tests are references for design, not evidence that these have run.
 ## 5. Traceability
 
 - **PRD**: [`../PRD.md`](../PRD.md)
-- **ADRs**: [`ADR/0001`](../ADR/0001-cpt-cf-bss-orders-workflow-adr-durable-execution-substrate.md) durable execution substrate; [`ADR/0003`](../ADR/0003-cpt-cf-bss-orders-workflow-adr-process-state-non-authoritative.md) process state non-authoritative; [`ADR/0006`](../ADR/0006-cpt-cf-bss-orders-workflow-adr-idempotency-key-composition.md) idempotency key composition; [`ADR/0008`](../ADR/0008-cpt-cf-bss-orders-workflow-adr-outbox-process-events.md) outbox process events; [`ADR/0009`](../ADR/0009-cpt-cf-bss-orders-workflow-adr-manual-task-dead-letter-separation.md) manual-task/dead-letter separation
-- **Design set**: [`./README.md`](./README.md) — slice map and dependency order
-- **Related requirements**: `cpt-cf-bss-orders-workflow-fr-owf-retry`, `cpt-cf-bss-orders-workflow-fr-owf-dead-letter`, `cpt-cf-bss-orders-workflow-fr-owf-intent-sweep`, `cpt-cf-bss-orders-workflow-fr-owf-backpressure`, `cpt-cf-bss-orders-workflow-fr-owf-overdue-escalation`, `cpt-cf-bss-orders-workflow-fr-owf-hold-resume`, `cpt-cf-bss-orders-workflow-fr-owf-process-events`, `cpt-cf-bss-orders-workflow-nfr-owf-audit`
+- **ADRs**: [`ADR/0011`](../ADR/0011-cpt-cf-bss-orders-workflow-adr-flow-as-platform-definition.md) flow as platform definition; [`ADR/0012`](../ADR/0012-cpt-cf-bss-orders-workflow-adr-definition-versioning-and-protected-steps.md) definition versioning and protected steps; [`ADR/0013`](../ADR/0013-cpt-cf-bss-orders-workflow-adr-references-not-payloads.md) references not payloads; [`ADR/0001`](../ADR/0001-cpt-cf-bss-orders-workflow-adr-durable-execution-substrate.md) durable execution substrate; [`ADR/0003`](../ADR/0003-cpt-cf-bss-orders-workflow-adr-process-state-non-authoritative.md) process state non-authoritative; [`ADR/0006`](../ADR/0006-cpt-cf-bss-orders-workflow-adr-idempotency-key-composition.md) idempotency key composition; [`ADR/0008`](../ADR/0008-cpt-cf-bss-orders-workflow-adr-outbox-process-events.md) outbox process events; [`ADR/0009`](../ADR/0009-cpt-cf-bss-orders-workflow-adr-manual-task-dead-letter-separation.md) manual-task/dead-letter separation; [`ADR/0010`](../ADR/0010-cpt-cf-bss-orders-workflow-adr-platform-pdp-authorization.md) platform PDP authorization
+- **Platform**: [serverless-runtime DESIGN](../../../../serverless-runtime/docs/DESIGN.md) §1.1, §1.4, §3.1, §3.3; [ADR-0003](../../../../serverless-runtime/docs/ADR/0003-cpt-cf-serverless-runtime-adr-workflow-dsl.md), [ADR-0004](../../../../serverless-runtime/docs/ADR/0004-cpt-cf-serverless-runtime-adr-temporal-workflow-engine.md), [ADR-0005](../../../../serverless-runtime/docs/ADR/0005-cpt-cf-serverless-runtime-adr-thin-host.md)
+- **Design set**: [`./README.md`](./README.md) — slice map and dependency order; [`./10-process-definition.md`](./10-process-definition.md) — the definition this engine's operations are sequenced by
+- **Related requirements**: `cpt-cf-bss-orders-workflow-fr-owf-process-state-nonauth`, `cpt-cf-bss-orders-workflow-fr-owf-start-contract`, `cpt-cf-bss-orders-workflow-fr-owf-retry`, `cpt-cf-bss-orders-workflow-fr-owf-dead-letter`, `cpt-cf-bss-orders-workflow-fr-owf-intent-sweep`, `cpt-cf-bss-orders-workflow-fr-owf-backpressure`, `cpt-cf-bss-orders-workflow-fr-owf-overdue-escalation`, `cpt-cf-bss-orders-workflow-fr-owf-hold-resume`, `cpt-cf-bss-orders-workflow-fr-owf-process-events`, `cpt-cf-bss-orders-workflow-nfr-owf-audit`
