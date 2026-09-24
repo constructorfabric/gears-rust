@@ -176,7 +176,7 @@ writes a `CompensationRecord` with `outcome = succeeded` against a subscription 
 live — exactly the stranded-active-subscription state
 `cpt-cf-bss-orders-workflow-adr-saga-compensable-no-pivot` exists to prevent. A compensating
 submission that receives a settled outcome whose request fingerprint does not match the
-compensating request **MUST** be treated as a `key-conflict` refusal, never as an absorbed
+compensating request **MUST** be treated as an `idempotency-key-conflict` refusal, never as an absorbed
 duplicate.
 
 **ADRs**: `cpt-cf-bss-orders-workflow-adr-idempotency-key-composition`,

@@ -52,7 +52,7 @@
   - [D-35: A hold suspends this gear's own dispatch and timers only; it never pauses, reads, or owns the Subscriptions draft auto-void TTL, and a paused timer resumes with its remaining window, never the full window](#d-35-a-hold-suspends-this-gears-own-dispatch-and-timers-only-it-never-pauses-reads-or-owns-the-subscriptions-draft-auto-void-ttl-and-a-paused-timer-resumes-with-its-remaining-window-never-the-full-window)
   - [D-36: Dependency-retry resilience and the Generic Approval fail-closed park are structurally distinct mechanisms, never one code path branching on dependency name](#d-36-dependency-retry-resilience-and-the-generic-approval-fail-closed-park-are-structurally-distinct-mechanisms-never-one-code-path-branching-on-dependency-name)
 - [J. Read projection and authorization (slice 09)](#j-read-projection-and-authorization-slice-09)
-  - [D-37: Every system-actor grant requires a gateway-asserted service principal carrying a scope claim naming the calling gear; actor class alone is never sufficient](#d-37-every-system-actor-grant-requires-a-gateway-asserted-service-principal-carrying-a-scope-claim-naming-the-calling-gear-actor-class-alone-is-never-sufficient)
+  - [D-37: Every system-actor grant requires a verified service principal — `subject_type` plus `token_scopes` naming the calling gear on REST, the broker's produce grant on the event transport; actor class alone is never sufficient](#d-37-every-system-actor-grant-requires-a-verified-service-principal--subject_type-plus-token_scopes-naming-the-calling-gear-on-rest-the-brokers-produce-grant-on-the-event-transport-actor-class-alone-is-never-sufficient)
   - [D-38: Process-record retention defaults to at least 400 days at audit grade, configurable, independently of any durable-execution engine's own run-history retention, with the Orders Workflow platform-audit-policy owner as its named executor](#d-38-process-record-retention-defaults-to-at-least-400-days-at-audit-grade-configurable-independently-of-any-durable-execution-engines-own-run-history-retention-with-the-orders-workflow-platform-audit-policy-owner-as-its-named-executor)
 - [K. Tuning-value working baselines (engine and intent path)](#k-tuning-value-working-baselines-engine-and-intent-path)
   - [D-39: The retry backoff curve is exponential with base 1 s, coefficient 2.0, a 30 s cap and full jitter, over a maximum of 5 submission attempts](#d-39-the-retry-backoff-curve-is-exponential-with-base-1-s-coefficient-20-a-30-s-cap-and-full-jitter-over-a-maximum-of-5-submission-attempts)
@@ -80,6 +80,8 @@
   - [D-60 (H) Freeze the Workflow audit hash byte contract](#d-60-h-freeze-the-workflow-audit-hash-byte-contract)
   - [D-61 (M) Audit actor references are immutable; erasure is not an in-place rewrite](#d-61-m-audit-actor-references-are-immutable-erasure-is-not-an-in-place-rewrite)
   - [D-62 (M) Workflow-owned workers coordinate through toolkit-db session advisory locks under a named roster](#d-62-m-workflow-owned-workers-coordinate-through-toolkit-db-session-advisory-locks-under-a-named-roster)
+  - [D-63 (H) Authorization is delegated to the platform PDP through the shared PolicyEnforcer adapter](#d-63-h-authorization-is-delegated-to-the-platform-pdp-through-the-shared-policyenforcer-adapter)
+  - [D-64 (M) Refusal reasons follow the platform ContractError contract](#d-64-m-refusal-reasons-follow-the-platform-contracterror-contract)
 - [Open Questions](#open-questions)
   - [Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?](#q-01-which-durable-execution-substrate-backs-the-process--the-oss-workflow-engine-or-a-bss-local-mechanism)
   - [Q-02: The Generic Approval escalation threshold — the one PRD-deferred numeric value this design deliberately leaves unset](#q-02-the-generic-approval-escalation-threshold--the-one-prd-deferred-numeric-value-this-design-deliberately-leaves-unset)
@@ -740,21 +742,33 @@ condition indefinitely or parking on a merely transient outage that resilience s
 
 ## J. Read projection and authorization (slice 09)
 
-### D-37: Every system-actor grant requires a gateway-asserted service principal carrying a scope claim naming the calling gear; actor class alone is never sufficient
+### D-37: Every system-actor grant requires a verified service principal — `subject_type` plus `token_scopes` naming the calling gear on REST, the broker's produce grant on the event transport; actor class alone is never sufficient
+
+**Amended by D-63 (2026-09-24).** The original wording required "a gateway-asserted service
+principal carrying a scope claim naming the calling gear" and, on the event transport, a signed
+envelope. The platform `SecurityContext` carries no such claim and the broker signs no envelope,
+so the requirement is restated in the platform's own terms; the requirement itself is unchanged.
 
 **Decision**: every system-actor grant (Orders Lifecycle, Generic Approval, Subscriptions,
-Payments) requires a gateway-asserted service principal carrying a scope claim naming the calling
-gear; actor class alone is insufficient to authorize a call. Generic Approval, Subscriptions, and
-Payments are additionally restricted to reporting an outcome and must not drive order-state
-transitions directly.
+Payments) on the REST surface requires a platform `SecurityContext` whose `subject_type` is the
+service-subject type and whose `token_scopes` names this gear, followed by the platform PDP's
+allow on the route's registered `(resource, action)` pair for that subject; on the event
+transport it requires delivery on a topic whose produce grant the broker issued to the publishing
+gear alone, under platform-root tenancy (Lifecycle D-95), followed by the handler's
+PDP-authorized Lifecycle `order × read` of the named order. Actor class alone is insufficient to
+authorize a call. Generic Approval, Subscriptions and Payments are additionally restricted to
+reporting an outcome and hold no catalogue pair that writes order state.
 
 **Rationale**: an actor-class-only check cannot distinguish a legitimately calling gear from any
 other caller asserting the same class, which is the unscoped-grant defect the sibling Orders
 Lifecycle design's own review found and this design deliberately checked for and avoided by
-following that precedent explicitly rather than re-deriving it.
+following that precedent explicitly rather than re-deriving it. The amendment replaces the
+mechanism with one the platform provides; a control written against a claim nobody issues
+protects nothing.
 
-**Propagates to**: `gears/bss/orders-workflow/docs/design/09-read-and-authz.md` §
-`2.2 System-actor grants require a gateway-asserted service principal`
+**Propagates to**: `gears/bss/orders-workflow/docs/design/09-read-and-authz.md` §2.2
+*System-actor grants require a verified service principal*, §3.6, §4.2; `DESIGN.md` §4.2
+*Service identity*
 
 ### D-38: Process-record retention defaults to at least 400 days at audit grade, configurable, independently of any durable-execution engine's own run-history retention, with the Orders Workflow platform-audit-policy owner as its named executor
 
@@ -1194,7 +1208,8 @@ platform-root per the Lifecycle D-95 precedent, with the resource and seller axe
 fields. Workflow owns typed event construction and the transactional enqueue with the step's
 transaction runner, and nothing else: there is no `owf_event_outbox`, no per-correlation
 `sequence` ordinal, no `schema_version` column, no Workflow drain, lease, retry cap,
-`dead_lettered_at` marker, delivered-row purge or re-drive endpoint. The engine owns seven tables.
+`dead_lettered_at` marker, delivered-row purge or re-drive endpoint. The engine owned seven tables
+at this decision; D-59's two audit checkpoint tables make it nine.
 Ordering follows platform partition semantics and a permanent reject may create a gap (Lifecycle
 D-87); consumers de-duplicate by event id and verify `orderVersion` and resulting state against an
 authoritative Lifecycle read, and this gear carries the same obligation as a consumer of Lifecycle
@@ -1357,6 +1372,97 @@ Q-09 lands on the fenced lease.
 
 **Propagated**: `design/01-foundation.md` §1.3, §3.4, §3.8, §4.15; `DESIGN.md` §1.3, §2.2,
 §3.4, §3.8, §4.1, §4.2 *Supply chain*, §4.5; Q-09.
+
+### D-63 (H) Authorization is delegated to the platform PDP through the shared PolicyEnforcer adapter
+
+**Accepted.** *(carries [`ADR/0010`](./ADR/0010-cpt-cf-bss-orders-workflow-adr-platform-pdp-authorization.md); mirrors Lifecycle D-34 as amended, D-111, D-114, D-141 and D-115; amends D-37)*
+
+**Decision**: every authorization decision in this gear is made by the platform PDP
+(`authz-resolver`), reached through **one shared `PolicyEnforcer`** from `authz-resolver-sdk`
+constructed at initialisation from `dyn AuthZResolverApi` and shared by the Control Operation
+Gateway, the read services and the event handlers' read-before-act gate. Workflow registers a
+resource/action catalogue of six GTS labels `gts.cf.bss.orders_workflow.<noun>.v1~`
+(`process_instance`, `fulfillment_task`, `manual_task`, `dead_letter`, `approval_gate`,
+`progress`) and twelve actions, maps each of its seventeen REST routes to exactly one pair and
+each of its twelve event handlers to a declared topic and read-before-act gate, and asserts the
+mapping against the routing table at startup and in a CI conformance test with a recording PDP
+double. Scopes are PDP constraints — seller scope on the row's `seller_tenant_id`, tenant
+isolation on `resource_tenant_id`, approver assignment as an `Eq` on
+`owf_approval_gate.assigned_principal` populated at gate-open — compiled to an `AccessScope`
+with constraints required and applied by `SecureConn` inside the mutating statement, which is the
+resource-ownership check. Service principals are `subject_type` plus `token_scopes` naming this
+gear; event handlers trust the broker's produce grant and platform-root tenancy. The five
+Workflow-owned workers run under configured system authority as the bounded exception Lifecycle
+`08 §3.5` states. A targeted PDP denial answers `not-found` (404) unless a follow-up `read`
+allows (`not-authorized`, 403); this is the gear's single declared deviation from the platform's
+403 default. PDP outage fails closed with a sanitized 503 and no key settlement; workers
+continue. The apply-time re-check of a long-running command re-runs the same PDP decision and
+routes a refusal to one `authority-withdrawn` manual task with the process phase unchanged, never
+to `parked`. Deleted: the gear-local permission evaluator, `owf_permission_declaration`, the
+`SecurityContext` and `PermissionDeclaration` entities, the invented claims (`actor_class`,
+`seller_scope`, `approval_assignments`, `service_principal`, `delegation_proof`,
+`principal_kind`), the signed-envelope mechanism and its `requires_signed_envelope` control, and
+the `AUTH-O1` gateway ask, which the `assigned_principal` column makes unnecessary. Delegation
+proof is forwarded to the PDP as request context and never validated locally (Lifecycle D-111).
+The decision endpoint drops `+ver`: `owf_approval_gate` gains no `row_version`, because a gate has
+one transition out of `open` and the `state = 'open'` predicate in the decision `UPDATE` is the
+guard; its out-of-assignment refusal becomes 404 and its separation-of-duties refusal is the
+distinct `submitter-barred` (403).
+
+**Rationale**: the previous design evaluated claims the platform does not issue against a table
+the platform policy owner cannot see, in violation of the unified-system rule that all
+authorization decisions go through `PolicyEnforcer`; nothing in it could run. The platform
+`SecurityContext` has five fields, the broker envelope has no producer principal, and the sibling
+gear has already taken the shared-adapter path, so this is the only option that is implementable,
+compliant and consistent across the two Orders gears. Rejected: the hybrid (PDP for tenancy, local
+evaluator for assignment and service scope) — two evaluators are the drift the one-evaluator
+principle forbids, and both scopes are expressible to the PDP as constraints on properties this
+gear already holds. Closes review findings OW-44, OW-47, OW-50, OW-106, OW-108 (predicate half)
+and OW-111.
+
+**Propagated**: `ADR/0010` (new); `DESIGN.md` §1.2, §2.2 *Standard ToolKit authorization
+posture*, §3.2, §3.3, §3.4, §3.5, §3.7 (registry row removed; twenty-five tables), §4.2, §4.8,
+§5; `design/09-read-and-authz.md` §1, §2.1, §2.2, §3.1, §3.2, §3.3, §3.4, §3.5, §3.6, §3.7, §3.8,
+§4.1, §4.2, §4.4, §4.5, §5; `design/03-approval-execution.md` §3.2, §3.3;
+`design/07-manual-tasks.md` §1.2, §3.2, §3.3; `UPSTREAM_REQS.md` §1.1, §1.2, §2.1 (`AUTH-O1`
+withdrawn), §2.8 (new), §3, §5; D-37 (amended).
+
+**ADR**: `cpt-cf-bss-orders-workflow-adr-platform-pdp-authorization`.
+
+### D-64 (M) Refusal reasons follow the platform ContractError contract
+
+**Accepted.** *(mirrors Lifecycle `01 §4.7` *Refusal reasons are derived GTS error types*)*
+
+**Decision**: every reason in the catalogue of `01 §4.9` is a derived GTS error type under the
+abstract base `gts.cf.bss.orders_workflow.err.v1~`, keyed
+`gts.cf.bss.orders_workflow.err.v1~cf.bss.orders_workflow.<name>.v1~` with hyphens as
+underscores; the keys are registry names registered with `types-registry` at startup, never wire
+`type` values. The wire contract is the platform `#[derive(ContractError)]` with
+`#[error_domain("orders-workflow.v1")]` on the enum and a per-variant `#[error_code(...)]` and
+`#[canonical(...)]`; `type`, `status` and `title` come from the canonical category, the business
+reason is the `error_domain`/`error_code` pair, and there is no Problem extension member and no
+gear-minted `type`. `01 §4.9` carries the per-reason table — nine engine families, thirteen slice
+values, and the read-and-authz and approval refusals — each with its code, category and status,
+stated once. Category rule: `FailedPrecondition` is 400 in the SDK, so a 409 conflict is
+`Aborted` (retry may succeed) or `AlreadyExists` (it will not: `idempotency-key-conflict`); a
+time bound exhausted is `DeadlineExceeded`, an attempt bound exhausted `FailedPrecondition`;
+dependency unavailability is `ServiceUnavailable`. Newly registered: `submitter-barred` (403) and
+`gate-not-open` (409) for the decision endpoint, and `authority-withdrawn` (400) for the apply-time
+re-check of `09 §4.4`; retired: the read-and-authz slice's `key-conflict`, a second name for the
+engine's `idempotency-key-conflict`. "An unregistered reason fails at configuration load" becomes
+a compile-time property of the enum plus a contract test for duplicate keys and domain/code pairs.
+
+**Rationale**: `DESIGN.md §3.3` placed the reason in an unnamed Problem extension member and made
+concurrency, replay and validation failures "distinct Problem `type` values", which the canonical
+SDK does not allow — `type` is the category URI and a noncanonical one is rejected as
+`UnknownProblemType`. The registry also had no code, category or status per reason, so two slices
+could have answered the same failure with different statuses. Lifecycle already fixed the same
+gap in the same shape; adopting it keeps the two Orders gears' error contracts uniform for a
+shared client. Closes review finding OW-108 (code half).
+
+**Propagated**: `design/01-foundation.md` §3.2 *Reason catalogue*, §3.3 *Error surface*, §4.9;
+`DESIGN.md` §3.3 *Error envelope*; `design/03-approval-execution.md` §3.2, §3.3;
+`design/09-read-and-authz.md` §2.2, §3.3, §4.4.
 
 ## Open Questions
 
@@ -1538,6 +1644,8 @@ and that hand-check is the only guarantee this document offers.
 | D-60 | L Cross-cutting (audit hash contract) | `design/01-foundation.md` §3.7, §4.17, `DESIGN.md` §4.2 |
 | D-61 | L Cross-cutting (audit identity) | `DESIGN.md` §4.3, §4.2, `design/01-foundation.md` §3.1, §3.7, §4.17, `UPSTREAM_REQS.md` §2.6 |
 | D-62 | L Cross-cutting (worker coordination) | `design/01-foundation.md` §1.3, §3.4, §3.8, §4.15, `DESIGN.md` §1.3, §2.2, §3.4, §3.8, §4.1, §4.2, §4.5, Q-09 |
+| D-63 | L Cross-cutting (authorization) | `ADR/0010-cpt-cf-bss-orders-workflow-adr-platform-pdp-authorization.md`, `design/09-read-and-authz.md` §2, §3, §4.1, §4.2, §4.4, `DESIGN.md` §2.2, §3.4, §3.5, §3.7, §4.2, §4.8, `design/03-approval-execution.md` §3.2, §3.3, `design/07-manual-tasks.md` §3.2, §3.3, `UPSTREAM_REQS.md` §2.8, D-37 |
+| D-64 | L Cross-cutting (error contract) | `design/01-foundation.md` §3.2, §3.3, §4.9, `DESIGN.md` §3.3, `design/03-approval-execution.md` §3.3, `design/09-read-and-authz.md` §3.3, §4.4 |
 
-Highest decision number used: **D-62**. Numbering is one continuous sequence across the whole
+Highest decision number used: **D-64**. Numbering is one continuous sequence across the whole
 register; there are no parts.

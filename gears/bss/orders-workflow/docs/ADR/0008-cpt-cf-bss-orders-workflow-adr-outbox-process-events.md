@@ -123,7 +123,8 @@ D-58, and any relaxation of the number is a Product decision, not a silent widen
 * **No custom Workflow outbox.** There is no `owf_event_outbox`, no Workflow drain, lease, retry
   cap, delivered-row purge, `dead_lettered_at` column or Workflow-owned dead-letter schema for
   outbound events. Platform migration families are not counted as Workflow tables; the engine
-  owns seven tables, not eight. `owf_dead_letter_record` remains the *inbound* store of ADR-0009
+  owned seven tables at this decision — nine once D-59 added the two audit checkpoint tables —
+  and none of them is an outbox. `owf_dead_letter_record` remains the *inbound* store of ADR-0009
   and gains no outbound role.
 * **At-least-once delivery.** Consumers de-duplicate by the event envelope ID. Accepted,
   persisted and duplicate broker outcomes acknowledge the toolkit message. Broker idempotency is

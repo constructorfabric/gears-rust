@@ -668,9 +668,12 @@ extension declare a new failure mode without inventing an ad hoc string.
 
 ##### Responsibility scope
 
-The registry of machine-readable reasons a step, a dead-letter parking, or a compensation failure
-can carry; validation at registration time that a handler slice's declared reason is
-well-formed and not a duplicate of an existing one.
+The registry of machine-readable reasons a step, a dead-letter parking, a compensation failure or
+a synchronous refusal can carry: one variant per reason on the gear's `#[derive(ContractError)]`
+enum, each with its `error_code`, canonical category and derived GTS error-type key (§4.9).
+Well-formedness and uniqueness are compile-time properties of that enum plus a contract test
+rejecting duplicate GTS keys or domain/code pairs, not a registration-time check
+(`../DECISIONS.md` D-64).
 
 ##### Responsibility boundaries
 
@@ -754,12 +757,17 @@ detail beyond what the step log already carries.
 and event endpoints that ultimately invoke `execute step`; those endpoints and their stability are
 documented in the slices that own them.
 
-**Error surface**: every non-success outcome carries a reason from the reason catalogue (§3.3
-Reason Catalogue below) and is machine-readable end to end. The engine contributes exactly these
-reason families of its own — `still-processing`, `idempotency-key-aged-out`,
-`idempotency-key-conflict`, `idempotency-lease-expired`, `per-attempt-timeout`,
-`retry-budget-exhausted`, `step-deadline-exceeded`, `circuit-breaker-open`, `poison-step` — and
-handler slices contribute the rest. No handler slice may register a second name for any of them.
+**Error surface**: every non-success outcome carries a reason from the reason catalogue (§4.9)
+and is machine-readable end to end. Reasons are derived GTS error types under
+`gts.cf.bss.orders_workflow.err.v1~` — registry keys, never wire values — and reach the wire
+through the platform `ContractError` contract: `error_domain` `orders-workflow.v1`, a per-reason
+`error_code`, and a canonical category that fixes `type`, `status` and `title` (§4.9,
+`../DECISIONS.md` D-64). The engine contributes exactly these nine reason families of its own —
+`still-processing`, `idempotency-key-aged-out`, `idempotency-key-conflict`,
+`idempotency-lease-expired`, `per-attempt-timeout`, `retry-budget-exhausted`,
+`step-deadline-exceeded`, `circuit-breaker-open`, `poison-step` — and handler slices contribute
+the rest. No handler slice may register a second name for any of them; the read-and-authz
+slice's former `key-conflict` is `idempotency-key-conflict`.
 
 #### The transition/step contract
 
@@ -1087,7 +1095,7 @@ drop rather than a bulk DELETE.
 | operation | text | The step or call the key scopes |
 | correlation_id | uuid | Owning process instance |
 | resource_tenant_id | uuid, NOT NULL | Resource-recipient axis; recomposed from the key and compared against it on every resolve |
-| request_fingerprint | bytea, NOT NULL | **SHA-256 over the canonical request body.** A settled record whose fingerprint does not match the current request is a `key-conflict` refusal, not an absorbed duplicate |
+| request_fingerprint | bytea, NOT NULL | **SHA-256 over the canonical request body.** A settled record whose fingerprint does not match the current request is an `idempotency-key-conflict` refusal, not an absorbed duplicate |
 | status | enum | `in_flight` or `settled` |
 | lease_expires_at | timestamptz, nullable | Set while `in_flight`; **60 s** from the last heartbeat |
 | lease_heartbeat_at | timestamptz, nullable | Last heartbeat from the holder; refreshed every **20 s** while the closure runs |
@@ -1505,7 +1513,7 @@ coverage, not evidence that a check succeeded. Identity removal never changes wh
 (D-61).
 
 **Observability owned here**: step outcome counts by outcome class; idempotency
-still-processing, **lease-expired**, **key-conflict** and aged-out counts; retry-budget-exhaustion
+still-processing, **lease-expired**, **idempotency-key-conflict** and aged-out counts; retry-budget-exhaustion
 and step-deadline-exhaustion counts, tracked separately from overdue-window and process-lifetime
 escalations; **crash-loop quarantine count** (§4.13, target zero); **circuit-breaker state and
 open-duration per dependency** (§4.5); **queue depth and shed count** against the bounded dispatch
@@ -1601,7 +1609,7 @@ to guess — most cheaply, by re-dispatching.
 a key yields *inside* the engine; the handler still sees only the closed set of §3.3. The mapping
 is fixed: first call and absorbed duplicate resolve to the settled outcome, lease-expired and
 still-processing both surface as `still-processing`, aged-out surfaces as `aged-out`, and
-key-conflict surfaces as `permanent-failure` carrying the key-conflict reason — it is a caller
+an idempotency-key conflict surfaces as `permanent-failure` carrying the `idempotency-key-conflict` reason — it is a caller
 defect and retrying it under the same key cannot fix it.
 
 **`fingerprint` defined.** The fingerprint of a request is a **SHA-256 over its canonical request
@@ -1904,17 +1912,110 @@ onto the record for inspection, and `UNIQUE (source_event_id)` makes the parking
 
 ### 4.9 The machine-readable reason catalogue
 
-Every non-success outcome, dead-letter parking, and compensation failure carries a reason from the
-catalogue owned by `cpt-cf-bss-orders-workflow-component-reason-catalogue`. This slice registers
-the engine's own reason families, enumerated in §3.3. Because the catalogue is a closed set, every
-value a later slice raises is registered here — a slice that raises an unregistered reason is a
-configuration-load failure, not a runtime surprise. The contributed values, by owning slice:
+Every non-success outcome, dead-letter parking, compensation failure and synchronous refusal
+carries a reason from the catalogue owned by `cpt-cf-bss-orders-workflow-component-reason-catalogue`.
+This slice registers the engine's own nine reason families, enumerated in §3.3; the slices below
+contribute the rest. The catalogue is a closed set and it is **compiled**: every reason is a
+variant of the gear's `ContractError` enum, so a slice that raises an unregistered reason does not
+fail at configuration load — it does not compile. The properties the former load-time check
+promised (no unknown reason, no duplicate) are compile-time properties plus one contract test
+(`../DECISIONS.md` D-64, mirroring Lifecycle
+[`01 §4.7`](../../../orders-lifecycle/docs/design/01-foundation.md#refusal-reasons-are-derived-gts-error-types)).
 
-| Slice | Registered reason values |
-|-------|--------------------------|
-| `04-fulfillment-plan` | `overlap-collision`, `market-divergence`, `invalid-dependency-graph`, `catalog-topology-unavailable`, `payment-authorization-stale`, `overlap-read-unevaluable`, `line-count-exceeded` |
-| `05-provisioning-intents` | `wave1-create-failed`, `wave2-activation-failed`, `never-dispatched` |
-| `06-saga-and-compensation` | `draft-void-failed`, `activated-cancel-failed`, `blocked-upstream` |
+#### Reasons are derived GTS error types
+
+Reasons are derived GTS error **types** under this gear's error base in the namespace `§4.7`
+allocates; their identifiers end in `~`. They are registry keys and the SDK's discoverable
+vocabulary, **not** wire `type` values and not instances:
+
+```text
+gts.cf.bss.orders_workflow.err.v1~                                                   -- abstract error base
+gts.cf.bss.orders_workflow.err.v1~cf.bss.orders_workflow.still_processing.v1~
+gts.cf.bss.orders_workflow.err.v1~cf.bss.orders_workflow.idempotency_key_conflict.v1~
+gts.cf.bss.orders_workflow.err.v1~cf.bss.orders_workflow.wave1_create_failed.v1~
+gts.cf.bss.orders_workflow.err.v1~cf.bss.orders_workflow.not_found.v1~
+```
+
+For each row of the table below, its GTS key is
+`gts.cf.bss.orders_workflow.err.v1~cf.bss.orders_workflow.<name>.v1~`, where `<name>` is the
+listed reason with hyphens replaced by underscores. This defines registry names, not a runtime
+error-code guessing algorithm: the enum's variants declare the listed codes and categories
+explicitly. The base type and every derived type are registered with the platform `types-registry`
+at startup alongside the event types (§3.4); a type that fails to register fails the boot.
+
+#### Canonical wire contract
+
+Use the supplied `#[derive(ContractError)]` with an explicit `#[error_domain("orders-workflow.v1")]`
+on the enum, and a per-variant `#[error_code("...")]` and `#[canonical(...)]`. The sources of
+truth are [`toolkit-canonical-errors/src/problem.rs`](../../../../../libs/toolkit-canonical-errors/src/problem.rs)
+and [`toolkit-contract-macros`](../../../../../libs/toolkit-contract-macros/src/lib.rs). There is
+no custom `type` URI, no Problem extension member for the reason and no gear-minted `type` value.
+
+| Wire member | Source |
+|-------------|--------|
+| `type` | `gts://` plus the selected canonical category's GTS identifier under `gts.cf.core.errors.err.v1~cf.core.err.*` |
+| `status`, `title` | The same category's SDK-defined HTTP status and title; this gear declares no same-class status override |
+| `error_domain` | `orders-workflow.v1` for every Workflow-owned reason |
+| `error_code` | The explicit stable code in the table below, not the GTS identifier |
+| `detail` | Sanitized explanation; never a discriminator for client logic and never downstream error text (`../DESIGN.md` §4.2 *Diagnostic leakage*) |
+| `context.data` | Only explicitly permitted variant fields — the reason's owning slice names them — after the applicable authorization and non-disclosure checks; never raw upstream errors, PDP diagnostics or commercial detail the caller's scope excludes |
+
+#### The registered reasons
+
+Each reason is registered once, here, with its owner, code, canonical category and the HTTP
+status the category fixes. Most slice values ride manual tasks, dead-letter records and event
+payloads (§4.7 `data`) and are never themselves an HTTP response; the category and status apply
+whenever one surfaces as a synchronous refusal — `line-count-exceeded` refusing a start, for
+example — and they are stated once so no slice chooses them again.
+
+| Registered reason | Owner | `error_code` | Canonical category | HTTP |
+|-------------------|-------|--------------|--------------------|------|
+| `still-processing` | engine (§3.3) | `STILL_PROCESSING` | Aborted | 409 |
+| `idempotency-key-aged-out` | engine (§3.3) | `IDEMPOTENCY_KEY_AGED_OUT` | FailedPrecondition | 400 |
+| `idempotency-key-conflict` | engine (§3.3) | `IDEMPOTENCY_KEY_CONFLICT` | AlreadyExists | 409 |
+| `idempotency-lease-expired` | engine (§3.3) | `IDEMPOTENCY_LEASE_EXPIRED` | Aborted | 409 |
+| `per-attempt-timeout` | engine (§3.3) | `PER_ATTEMPT_TIMEOUT` | DeadlineExceeded | 504 |
+| `retry-budget-exhausted` | engine (§3.3) | `RETRY_BUDGET_EXHAUSTED` | FailedPrecondition | 400 |
+| `step-deadline-exceeded` | engine (§3.3) | `STEP_DEADLINE_EXCEEDED` | DeadlineExceeded | 504 |
+| `circuit-breaker-open` | engine (§3.3) | `CIRCUIT_BREAKER_OPEN` | ServiceUnavailable | 503 |
+| `poison-step` | engine (§3.3) | `POISON_STEP` | FailedPrecondition | 400 |
+| `overlap-collision` | `04-fulfillment-plan` | `OVERLAP_COLLISION` | FailedPrecondition | 400 |
+| `market-divergence` | `04-fulfillment-plan` | `MARKET_DIVERGENCE` | FailedPrecondition | 400 |
+| `invalid-dependency-graph` | `04-fulfillment-plan` | `INVALID_DEPENDENCY_GRAPH` | FailedPrecondition | 400 |
+| `catalog-topology-unavailable` | `04-fulfillment-plan` | `CATALOG_TOPOLOGY_UNAVAILABLE` | ServiceUnavailable | 503 |
+| `payment-authorization-stale` | `04-fulfillment-plan` | `PAYMENT_AUTHORIZATION_STALE` | FailedPrecondition | 400 |
+| `overlap-read-unevaluable` | `04-fulfillment-plan` | `OVERLAP_READ_UNEVALUABLE` | ServiceUnavailable | 503 |
+| `line-count-exceeded` | `04-fulfillment-plan` | `LINE_COUNT_EXCEEDED` | InvalidArgument | 400 |
+| `wave1-create-failed` | `05-provisioning-intents` | `WAVE1_CREATE_FAILED` | FailedPrecondition | 400 |
+| `wave2-activation-failed` | `05-provisioning-intents` | `WAVE2_ACTIVATION_FAILED` | FailedPrecondition | 400 |
+| `never-dispatched` | `05-provisioning-intents` | `NEVER_DISPATCHED` | FailedPrecondition | 400 |
+| `draft-void-failed` | `06-saga-and-compensation` | `DRAFT_VOID_FAILED` | FailedPrecondition | 400 |
+| `activated-cancel-failed` | `06-saga-and-compensation` | `ACTIVATED_CANCEL_FAILED` | FailedPrecondition | 400 |
+| `blocked-upstream` | `06-saga-and-compensation` | `BLOCKED_UPSTREAM` | FailedPrecondition | 400 |
+| `submitter-barred` | `03-approval-execution` | `SUBMITTER_BARRED` | PermissionDenied | 403 |
+| `gate-not-open` | `03-approval-execution` | `GATE_NOT_OPEN` | Aborted | 409 |
+| `idempotency-key-mismatch` | `09-read-and-authz` | `IDEMPOTENCY_KEY_MISMATCH` | InvalidArgument | 400 |
+| `version-mismatch` | `09-read-and-authz` | `VERSION_MISMATCH` | Aborted | 409 |
+| `not-authorized` | `09-read-and-authz` | `NOT_AUTHORIZED` | PermissionDenied | 403 |
+| `not-found` | `09-read-and-authz` | `NOT_FOUND` | NotFound | 404 |
+| `authority-withdrawn` | `09-read-and-authz` | `AUTHORITY_WITHDRAWN` | FailedPrecondition | 400 |
+
+**Why these categories, stated once.** The canonical SDK fixes `FailedPrecondition` to HTTP 400,
+not 409 or 422, so a conflict that must answer 409 is `Aborted` (a retry may succeed:
+`still-processing`, `idempotency-lease-expired`, `version-mismatch`, `gate-not-open`) or
+`AlreadyExists` (a retry will not: `idempotency-key-conflict`, the same key settled under a
+different fingerprint — Lifecycle's `idempotency-mismatch`). A time bound exhausted is
+`DeadlineExceeded` (`per-attempt-timeout`, `step-deadline-exceeded`); an attempt bound exhausted
+is a state the caller must change before retrying, `FailedPrecondition` (`retry-budget-exhausted`,
+`poison-step`). Dependency unavailability is `ServiceUnavailable` (503) and is never disguised as
+a business refusal. Authorization refusals keep the existence-oracle rule of `09 §4.4`:
+`not-found` for a target outside the caller's scope, `not-authorized` only when the caller may
+read the target or the request has no target. Platform authentication failures, PDP outages and
+unexpected infrastructure failures use the canonical `Unauthenticated` (401), `ServiceUnavailable`
+(503) or `Internal` (500) envelope; they acquire no Workflow reason. The park reasons of
+`03 §3.7` (`verdict-source-unavailable`, `verdict-authority-unnamed`, `verdict-query-refused`)
+and the closed audit `event_kind` tokens of §3.7 are column enumerations, not refusal reasons,
+and are outside this table.
 
 The wave discriminators are registered as distinct values rather than one generic
 `submission-failed`, because `PRD.md:372` requires a wave-1 create failure to be distinguishable in
@@ -1927,6 +2028,12 @@ rather than parsing free text.
 justification, a cancellation reason — is recorded in `owf_audit_entry.justification`, a separate
 column that no consumer keys on and that **MUST NOT** ride an event payload (§3.7). Where a rule
 requires both, both are written on the same audit entry.
+
+**Verification (not yet implemented).** Contract tests cover every listed variant's domain/code and
+canonical URI/status/title, typed server-to-client round-trip, registry mapping completeness and
+uniqueness (duplicate GTS keys or domain/code pairs fail), and absence of sensitive fields in
+`context.data`. Canonical conversion rejects a noncanonical `type` as `UnknownProblemType`;
+generated `ContractError::try_from` matches domain/code, so the two paths are tested separately.
 
 ### 4.10 The extension boundary for capability handlers
 

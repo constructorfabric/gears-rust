@@ -16,6 +16,7 @@
   - [2.5 Catalog](#25-catalog)
   - [2.6 Privacy and data classification](#26-privacy-and-data-classification)
   - [2.7 Event Broker](#27-event-broker)
+  - [2.8 Platform authorization policy](#28-platform-authorization-policy)
 - [3. Priorities](#3-priorities)
 - [4. Required PRD Amendments](#4-required-prd-amendments)
 - [5. Traceability](#5-traceability)
@@ -51,7 +52,10 @@ numbers, not renumberings of anything. It further carries asks on **Orders
 Lifecycle** (visibility of the `submitted` TTL, which a normative MUST in this design depends on
 and which this gear cannot see), on **Catalog** (the dependency-topology read every fulfillment
 plan is constructed from, a dependency this register did not previously name at all), and on the
-**PRD owner** for a privacy and data-classification ruling this design cannot make for itself.
+**PRD owner** for a privacy and data-classification ruling this design cannot make for itself,
+and on the **platform authorization policy owner** for the PDP catalogue registration, role
+provisioning and the `assigned_principal` approver grant that every authorized operation in this
+design depends on (§2.8, `ADR/0010`, `DECISIONS.md` D-63).
 
 ### 1.2 Requesting Gears
 
@@ -63,6 +67,7 @@ plan is constructed from, a dependency this register did not previously name at 
 | Orders Lifecycle (`gears/bss/orders-lifecycle`) | UNASKED (never registered) | This design's escalation obligation is stated relative to the order's `submitted` TTL, which Orders Lifecycle owns and this gear can neither read nor derive; without it the obligation is a strict inequality between two quantities, only one of which is knowable here. |
 | Catalog | UNASKED (never registered; not a PRD-registered actor either) | Every fulfillment plan is constructed from Catalog's dependency topology and frozen against it; the plan cannot be built, validated for cycles, or ordered for compensation without a read contract. |
 | Event Broker (`gears/system/event-broker`) | REGISTERED by Orders Lifecycle (`gears/bss/orders-lifecycle/docs/UPSTREAM_REQS.md` §2.7), open; co-signed here | Process events publish through the platform producer outbox (`ADR/0008`, D-58); the runtime, cursor/retry semantics, dead-letter recovery, root tenancy and delivery observability are platform prerequisites this gear cannot report ready without. |
+| Platform authorization policy owner (`authz-resolver` PDP provider and policy provisioning) | UNASKED (never registered); Orders Lifecycle's `…-upreq-pdp-policy-integration` (`gears/bss/orders-lifecycle/docs/UPSTREAM_REQS.md` §2.9) is the precedent and the two should be provisioned together | Every operation is authorized by the platform PDP on a registered `(resource, action)` pair through the shared `PolicyEnforcer` adapter (`ADR/0010`, D-63); until the catalogue is registered and the roles, the `assigned_principal` approver grant and the service-principal grants are provisioned and verified against the deployed provider, no caller-driven operation is authorizable in production, and this design fabricates no default grant. |
 | PRD owner (privacy / data classification) | UNASKED | The PRD's "Privacy / PII: not applicable" exclusion does not survive contact with a 400-day audit trail carrying actor, operator and approver identities; the ruling is a PRD amendment, not a design change. |
 
 ## 2. Requirements
@@ -272,24 +277,6 @@ exceeded.
   `SEAMS.md` or anywhere in this register today.
 - **Source**: PRD §7 (fulfillment SLA), §6.3 (provisioning intents). Raised against
   `gears/bss/subscriptions/docs/SEAMS.md`, which has no such entry.
-
-#### `AUTH-O1` — resolve an approver principal to their assigned gate set (UNASKED)
-
-**Owner**: platform authentication gateway / Account Management assignment directory.
-
-**What this gear needs**: the `SecurityContext` issued to an approver **MUST** carry the set of
-approval-gate assignments that principal holds, resolvable as an inverse query (principal →
-assigned `gate_id` set), not only as a forward one (gate → party label).
-
-**Why**: `09-read-and-authz.md` §4.1 scopes the approver inbox and the decision endpoint to "own
-assigned requests' orders only". `owf_approval_gate` carries a `party_ref` label, not a principal.
-Without the inverse query the only implementable filter is role-string matching, which returns
-every gate of that party across every order and seller — precisely the unscoped-read defect the
-same section forbids, and the one the sibling Lifecycle design set corrected in its own review.
-
-**Status**: **UNASKED** — never registered against the platform auth gateway. Until it lands, the
-approver inbox cannot enforce its stated scope predicate, and `PRD.md:320`'s "requests outside the
-approver's scope MUST NOT be shown" is unenforceable rather than merely unimplemented.
 
 #### `SUB-O16` — echo the identity envelope on every confirmation (UNASKED)
 
@@ -523,12 +510,85 @@ records.
 - **Source**: `ADR/0008` (`cpt-cf-bss-orders-workflow-adr-outbox-process-events`); `DECISIONS.md`
   D-58, Q-07; `design/01-foundation.md` §3.6, §3.7, §4.7; `DESIGN.md` §3.5, §4.4, §4.5.
 
+### 2.8 Platform authorization policy
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-upreq-pdp-policy-integration`
+
+**Owner**: platform authorization and deployment owners — the `authz-resolver` PDP provider and
+its policy and role provisioning. Mirrors and should be provisioned together with Orders
+Lifecycle's `cpt-cf-bss-orders-lifecycle-upreq-pdp-policy-integration`
+(`gears/bss/orders-lifecycle/docs/UPSTREAM_REQS.md` §2.9).
+
+**Ownership boundary: follow Lifecycle's integration pattern, which is Pricing's.** Workflow
+declares its resource/action catalogue and trusted property inputs, requests decisions through
+`authz-resolver-sdk` `PolicyEnforcer`, and enforces returned scopes and business guards. Platform
+owners select and operate the PDP provider, provision policies and role assignments, and supply the
+tenant relationships those policies evaluate. Workflow builds no parallel evaluator and infers no
+permission from successful registration of an `AuthzPermissionV1` instance. The authoritative
+Workflow policy contract is `design/09-read-and-authz.md` §3.1 (catalogue), §3.2 (endpoint
+mapping) and §4.1 (expected decisions); the bounded worker exception there is separate and exempts
+no REST, SDK or event-handler caller.
+
+**The concrete ask:**
+
+1. **Catalogue registration.** Register the six resource labels
+   `gts.cf.bss.orders_workflow.{process_instance,fulfillment_task,manual_task,dead_letter,approval_gate,progress}.v1~`
+   and their permission instances `…cf.bss.orders_workflow.<resource>_<action>.v1` for the
+   twelve actions of `09 §3.1`, with the `supported_properties` each `ResourceType` advertises.
+2. **Roles.** Provision Approver, Fulfillment Operator and Seller Operator roles producing the
+   expected decisions of `09 §4.1`, with seller scope as a constraint on `seller_tenant_id` and
+   tenant isolation as a constraint on `resource_tenant_id`; Fulfillment Operator holds no
+   `process_instance × cancel`, `manual_task × cancel` or `dead_letter × discard`.
+3. **The approver grant keyed on `assigned_principal`.** `approval_gate × read_inbox` and
+   `approval_gate × approve` granted as an "own resource" constraint
+   `assigned_principal = subject_id` (an `Eq` on a custom property this gear supplies), and
+   `progress × read` / `fulfillment_task × read` for an approver constrained to the orders
+   carrying such a gate. This replaces the former gateway ask (an inverse principal-to-gate query): no token claim and no
+   assignment-directory inverse query is needed, because the assignment is a column on the gate.
+4. **Service-principal grants.** Confirm the service-subject `subject_type` identifier and the
+   token scope that names this gear; grant Orders Lifecycle's service subject
+   `process_instance × start`, `progress × read` and `fulfillment_task × read` with a
+   resource-id constraint to the named order; confirm that no service subject holds a pair that
+   writes order state.
+5. **Subject-only evaluation for the apply-time re-check** (`09 §4.4`): a decision on a context
+   carrying `subject_id`, `subject_type`, `subject_tenant_id` and `token_scopes` but no bearer
+   token, days after acceptance. If the provider cannot evaluate it, say so; the re-check then
+   fails closed into an `authority-withdrawn` manual task.
+6. **Delegation proof as request context.** Lifecycle D-111 items 1–3 (carrier, policy
+   evaluation, distinguishable deny reasons) apply by reference; Workflow never validates proof.
+
+**Acceptance evidence:** identify the deployed provider and policy/configuration revisions, then
+jointly test: principals in the same seller scope with different action grants; an approver not
+assigned to a gate receives 404 on the decision endpoint and an empty inbox page; the submitting
+identity receives `submitter-barred`; a Fulfillment Operator's cancel receives `not-authorized`
+(403) while an operator outside the seller scope receives `not-found` (404); a service subject on
+a human-actor arm is refused; a revoked grant is reflected at the apply-time re-check; PDP outage
+returns 503 with no mutation and no idempotency-key settlement while the workers continue; and
+the CI conformance test's recorded questions match the provisioned policy. Workflow owns the
+integration tests and correct request/scope handling; platform owners own provider policy
+behaviour and provisioning.
+
+**Consequence if it does not land:** no caller-driven operation is authorizable in production —
+the design fails closed on a missing grant rather than fabricating one — and the approver inbox
+in particular cannot list a single gate. `PRD.md:320`'s "requests outside the approver's scope
+MUST NOT be shown" is enforceable by construction once item 3 lands and not before.
+
+**Status:** **UNASKED** — never registered against the platform authorization owner; open
+production-integration verification, not proof that a new platform feature is required. Reuse
+existing provider and toolkit capabilities first; the one item that may need an extension is
+item 5, and it is asked as a question, not a requirement. Record the responsible platform owner
+and evidence before production use of affected operations.
+
 ## 3. Priorities
 
 | Priority | Requirements |
 |----------|-------------|
-| `p1` (critical) | `…-upreq-overlap-presence-read`, `…-upreq-compensation-cancel-reason`, `…-upreq-explicit-start-instant`, `…-upreq-in-flight-rejection`, `…-upreq-cancel-accepted-transition`, `…-upreq-nonterminal-status-read`, `…-upreq-provisioning-latency-budget`, `…-upreq-identity-envelope-echo`, `…-upreq-payment-authorization-outcome`, `…-upreq-generic-approval-expectations-contract`, `…-upreq-submitted-ttl-visibility`, `…-upreq-catalog-dependency-topology-read`, `…-upreq-pii-classification-ruling`, `…-upreq-event-broker-shared-prerequisites` |
+| `p1` (critical) | `…-upreq-overlap-presence-read`, `…-upreq-compensation-cancel-reason`, `…-upreq-explicit-start-instant`, `…-upreq-in-flight-rejection`, `…-upreq-cancel-accepted-transition`, `…-upreq-nonterminal-status-read`, `…-upreq-provisioning-latency-budget`, `…-upreq-identity-envelope-echo`, `…-upreq-payment-authorization-outcome`, `…-upreq-generic-approval-expectations-contract`, `…-upreq-submitted-ttl-visibility`, `…-upreq-catalog-dependency-topology-read`, `…-upreq-pii-classification-ruling`, `…-upreq-event-broker-shared-prerequisites`, `…-upreq-pdp-policy-integration` |
 | `p2` (important) | `…-upreq-correlation-propagation` |
+
+`cpt-cf-bss-orders-workflow-upreq-pdp-policy-integration` is `p1` because every caller-driven
+operation fails closed until the catalogue, roles and the `assigned_principal` approver grant are
+provisioned and verified (`ADR/0010`, `DECISIONS.md` D-63).
 
 ## 4. Required PRD Amendments
 
@@ -583,4 +643,5 @@ records.
 - **Design and decision sources for the new asks**: `ADR/0007` (Lifecycle `submitted` TTL);
   `ADR/0008` and `DECISIONS.md` D-58 (platform producer outbox, §2.7 co-signature);
   `DECISIONS.md` D-16 (Catalog topology), D-46 and Q-02 (relational escalation threshold), D-50 and
-  D-38 (audit retention and the privacy ask)
+  D-38 (audit retention and the privacy ask); `ADR/0010` and `DECISIONS.md` D-63 (platform PDP
+  authorization, §2.8)

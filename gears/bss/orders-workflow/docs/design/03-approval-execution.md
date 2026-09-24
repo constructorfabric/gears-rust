@@ -515,8 +515,10 @@ is surfaced instead through the operator queue, because an unassigned gate is a 
 defect, not a gate belonging to whoever asks first.
 
 **Separation of duties at the decision endpoint.** The identity that submitted the order is
-refused at `POST /bss-orders-workflow/v1/approver-inbox/gates/{gateId}/decision` — RFC-9457 `403`, with a distinct
-problem type from the out-of-scope refusal so the two are separable in the audit trail. The
+refused at `POST /bss-orders-workflow/v1/approver-inbox/gates/{gateId}/decision` — `submitter-barred`
+(403, `PermissionDenied`), a distinct `error_code` from the out-of-scope refusal, which is
+`not-found` (404) because a gate outside the caller's assignment is not readable by them
+(`09 §4.4`), so the two are separable in the audit trail. The
 submitting identity is read from the order context the request was opened with, never from the
 decision request body. Accepted as a settled control (`DECISIONS.md` D-56): `PRD.md:137` permits an
 Approver to be a seller operator, so without this refusal one actor can submit an order and
@@ -550,11 +552,12 @@ same write.
 
 | Method | Path | Description | Stability |
 |--------|------|-------------|-----------|
-| `GET` | `/bss-orders-workflow/v1/approver-inbox/gates` | List gates whose `assigned_principal` is the calling `SecurityContext` identity; keyset-paginated, page size default 50 and maximum 200; empty in phase 1 since no real gate opens | unstable |
-| `POST` | `/bss-orders-workflow/v1/approver-inbox/gates/{gateId}/decision` | Submit approve/reject with a mandatory catalogue `reason` and an optional free-text `justification`, for a gate in the caller's scope and in state `open`; `403` (RFC-9457 Problem envelope) if the gate is outside the caller's assignment, a distinct `403` type if the caller is the order's submitting identity (separation of duties, §3.2), `409` if the gate is not `open` | unstable |
+| `GET` | `/bss-orders-workflow/v1/approver-inbox/gates` | List gates whose `assigned_principal` is the calling `subject_id` — the PDP constraint `assigned_principal = subject_id`, compiled to the `AccessScope` the query runs under (`09 §3.1`); keyset-paginated, page size default 50 and maximum 200; empty in phase 1 since no real gate opens | unstable |
+| `POST` | `/bss-orders-workflow/v1/approver-inbox/gates/{gateId}/decision` | Submit approve/reject with a mandatory catalogue `reason` and an optional free-text `justification`, for a gate in the caller's scope and in state `open`; `not-found` (404) if the gate is outside the caller's PDP scope — the same `assigned_principal = subject_id` constraint as the inbox, applied inside the decision `UPDATE`, and a 403 would confirm the gate exists (`09 §4.4`); `submitter-barred` (403) if the caller is the order's submitting identity (separation of duties, §3.2); `gate-not-open` (409) if the gate is not `open`, enforced by the `state = 'open'` predicate in the same statement, which is why this endpoint carries no `If-Match` | unstable |
 
 Both endpoints follow the platform's canonical OperationBuilder registration and RFC-9457 Problem
-error envelope conventions; no gear-local deviation is introduced.
+error envelope conventions; the one gear-level deviation — 404 for a target outside the caller's
+scope — is declared in [`../DESIGN.md`](../DESIGN.md) §2.2 and `ADR/0010`, not introduced here.
 
 The decision request carries **two** reason fields because they are two different things and
 conflating them loses one of them. `reason` is a closed catalogue value — it is what rides the

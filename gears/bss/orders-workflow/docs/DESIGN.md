@@ -81,7 +81,7 @@ Requirements that significantly influence architecture decisions.
 | `cpt-cf-bss-orders-workflow-fr-owf-override-semantics` | The override-resolution handler verifies the referenced subscription is active and matches the order line via Subscriptions before accepting the override, rejecting any override lacking a verified subscription and recording operator identity and justification in the audit log. |
 | `cpt-cf-bss-orders-workflow-fr-owf-boundary-binding` | Every architectural component is designed to the Lifecycle R1–R5 seam by construction: state reads/writes proxy through Lifecycle (R1), approval-requirement computation is never duplicated here (R2), all provisioning routes only through Subscriptions (R3), no price arithmetic exists in this gear (R4), and the downstream transition-request id is stored only as a correlation column (R5). |
 | `cpt-cf-bss-orders-workflow-fr-owf-process-events` | A platform event producer adapter (`event-broker-sdk::DbProducer` over `toolkit_db::outbox`) emits the six named process events — `OrderApprovalRequested`, `OrderApprovalEscalated`, `OrderFulfillmentStarted`, `OrderFulfillmentStepCompleted`, `OrderFulfillmentCompleted`, `OrderFulfillmentAborted` — with at-least-once delivery and consumer-side de-duplication by event ID, structurally separated from Lifecycle's order-state event set so no consumer sees dual publication of the same semantic change. |
-| `cpt-cf-bss-orders-workflow-fr-owf-authorization` | A per-actor authorization guard, evaluated ahead of every operation (approve/reject, task resolution, workflow cancel, system callbacks), enforces role and seller/gate scope and rejects any attempt by a system actor to drive order state directly. |
+| `cpt-cf-bss-orders-workflow-fr-owf-authorization` | Every operation — approve/reject, task resolution, workflow cancel, system callbacks and the read surfaces — is authorized by the platform PDP through one shared `PolicyEnforcer` adapter on a registered `(resource, action)` pair (`ADR/0010`); seller and gate scope are PDP constraints compiled to an `AccessScope` and applied inside the statement, and no pair a service principal holds writes order state. |
 
 #### NFR Allocation
 
@@ -111,6 +111,7 @@ Requirements that significantly influence architecture decisions.
 | `cpt-cf-bss-orders-workflow-adr-fail-closed-verdict-park` | Establishes that unavailability of the approval-requirement verdict source parks the process with the order remaining `submitted` rather than failing open to `approved`. |
 | `cpt-cf-bss-orders-workflow-adr-outbox-process-events` | Publishes the six named process events (`OrderApprovalRequested`, `OrderApprovalEscalated`, `OrderFulfillmentStarted`, `OrderFulfillmentStepCompleted`, `OrderFulfillmentCompleted`, `OrderFulfillmentAborted`) through the platform producer outbox, as Orders Lifecycle does; Workflow owns no outbox table, drain or re-drive, and event delivery latency is decoupled from the internal state-change transaction. |
 | `cpt-cf-bss-orders-workflow-adr-manual-task-dead-letter-separation` | Keeps the manual-task/incident path (fulfillment-step failure) structurally separate from the dead-letter path (poisoned inbound delivery), so a failing compensation or line escalates via the existing task path rather than growing a second inspectable object. |
+| `cpt-cf-bss-orders-workflow-adr-platform-pdp-authorization` | Delegates every authorization decision to the platform PDP through one shared `PolicyEnforcer` adapter over a registered resource/action catalogue; scopes are PDP constraints compiled to an `AccessScope` and enforced by `SecureConn` inside the statement, approver assignment is the gate row's `assigned_principal`, service principals are `subject_type` plus `token_scopes`, event handlers trust the broker's produce grant, and there is no gear-local evaluator, permission table or envelope-signature control. |
 
 ### 1.3 Architecture Layers
 
@@ -327,6 +328,22 @@ systemic downstream fault into operator work that the design cannot itself absor
 
 **ADRs**: `cpt-cf-bss-orders-workflow-adr-slice-decomposition`
 
+#### Standard ToolKit authorization posture, with one declared deviation
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-constraint-platform-pdp-posture`
+
+This gear takes the unified-system security posture as written — gateway-terminated
+authentication, every authorization decision through `PolicyEnforcer` from `authz-resolver-sdk`,
+every sensitive database access covered by a PDP decision compiled to an `AccessScope` and
+applied by `SecureConn`, fail closed on denial, outage or missing constraints — and requests
+**one** deviation, declared here and in `ADR/0010`: a PDP denial of a **targeted** request is
+answered `not-found` (404) rather than the platform default 403, unless a follow-up `read`
+decision on the same target allows, in which case it is `not-authorized` (403). A 403 on a row
+the caller cannot read is an existence oracle over other sellers' orders; this is Orders
+Lifecycle's D-114 and D-141 applied unchanged, so the two Orders gears answer identically
+(`design/09-read-and-authz.md` §4.4). Nothing else deviates: there is no gear-local evaluator,
+no permission table, no invented `SecurityContext` claim and no envelope-signature control.
+
 ## 3. Technical Architecture
 
 ### 3.1 Domain Model
@@ -411,7 +428,7 @@ exists to close. The table below names which slice declares what, without repeat
 
 - [ ] `p2` - **ID**: `cpt-cf-bss-orders-workflow-component-read-and-authz`
 
-  the permission evaluator, the control-operation gateway, the progress projection. Realized by [`design/09-read-and-authz.md`](./design/09-read-and-authz.md).
+  the authorization adapter (permission evaluator) over the platform PDP, the control-operation gateway, the progress projection. Realized by [`design/09-read-and-authz.md`](./design/09-read-and-authz.md).
 
 
 ```mermaid
@@ -452,7 +469,7 @@ graph TB
 | Saga and compensation | `06 §3.2` | **compensation executor**, **cancellation fencer**, **outcome reporter** |
 | Manual tasks | `07 §3.2` | **manual task creator**, **incident recorder**, **override verifier**, **operator task queue**, **overdue escalation monitor** |
 | Hold and cancel | `08 §3.2` | **suspension controller**, **resume coordinator**, **dependency retry governor**, **cancel mediator** |
-| Read and authorization | `09 §3.2` | **permission evaluator**, **control operation gateway**, **progress read projector** |
+| Read and authorization | `09 §3.2` | **authorization adapter (permission evaluator)**, **control operation gateway**, **progress read projector** |
 
 Component names in the right-hand column are **names, not identifiers**: the identifier is minted
 and owned by the slice named in *Specified in*, and repeating it here would make this index a second
@@ -514,18 +531,25 @@ are non-breaking; removal or rename of an operation or a required field requires
 bump (PRD §9.1), tracked in this design's own compatibility notes rather than restated.
 
 **OperationBuilder registration**: every endpoint above is registered through the canonical
-`OperationBuilder` with explicit response metadata (status codes, content type), authentication
-requirements (actor role, seller/gate scope per the per-actor authorization guard,
-`cpt-cf-bss-orders-workflow-fr-owf-authorization`), and idempotency-key extraction wired to the
-composed key for write operations — no endpoint bypasses `OperationBuilder` registration to hand-roll
-routing.
+`OperationBuilder` with explicit response metadata (status codes, content type),
+`.authenticated()` on every protected route, and idempotency-key extraction wired to the composed
+key for write operations — no endpoint bypasses `OperationBuilder` registration to hand-roll
+routing. Authentication is not authorization: every route is authorized by the platform PDP on
+its registered `(resource, action)` pair through the shared `PolicyEnforcer` adapter
+(`design/09-read-and-authz.md` §3.2, `cpt-cf-bss-orders-workflow-fr-owf-authorization`,
+`ADR/0010`).
 
-**Error envelope**: every error response is a canonical RFC 9457 Problem object (`type`, `title`,
-`status`, `detail`, `instance`) carrying a stable machine-readable business reason in an
-extension member, with no internal diagnostics, stack traces or downstream-service error text on
-the wire (safe wire-error behaviour). Optimistic-concurrency conflicts, duplicate-idempotency-key
-replays and validation failures are distinct Problem `type` values so a caller can branch on the
-reason without string-matching `detail`.
+**Error envelope**: every error response is the platform's canonical RFC 9457 Problem object,
+produced by `#[derive(ContractError)]` with `#[error_domain("orders-workflow.v1")]` and a
+per-variant `#[error_code(...)]` and `#[canonical(...)]`: `type`, `status` and `title` come from
+the canonical category, and the stable machine-readable business reason is the
+`error_domain`/`error_code` pair, with no internal diagnostics, stack traces or
+downstream-service error text on the wire (safe wire-error behaviour). Optimistic-concurrency
+conflicts, duplicate-idempotency-key replays, authorization refusals and validation failures each
+carry a distinct registered `error_code` — the per-reason table of
+`design/01-foundation.md` §4.9 — so a caller branches on the code, never on `type` or `detail`.
+Refusal reasons are derived GTS error types under `gts.cf.bss.orders_workflow.err.v1~`; those
+identifiers are registry keys, not wire values (`DECISIONS.md` D-64).
 
 ### 3.4 Internal Dependencies
 
@@ -540,6 +564,7 @@ reason without string-matching `detail`.
 | `event-broker-sdk` | `EventBrokerApi`, `DbProducer`, `ProducerOutboxQueue` (`outbox` feature) | Typed event validation, managed chained producer registration, broker partitioning and asynchronous publication of the six named process events — `OrderApprovalRequested`, `OrderApprovalEscalated`, `OrderFulfillmentStarted`, `OrderFulfillmentStepCompleted`, `OrderFulfillmentCompleted`, `OrderFulfillmentAborted` |
 | `types-registry` | SDK client | Register and resolve the process-event GTS types of `design/01-foundation.md` §4.7 before readiness; registration failure prevents startup |
 | `toolkit-db` advisory locks | `Db::lock` / `Db::try_lock`, `DbLockGuard` | Session-bound coordination for the authoritative worker roster in `design/01-foundation.md` §3.8; toolkit owns outbox coordination |
+| `authz-resolver-sdk` | `PolicyEnforcer`, `ResourceType`, `AccessRequest` | The shared platform authorization adapter of `design/09-read-and-authz.md` §3.2: one `PolicyEnforcer` per gear, PDP constraints compiled to `AccessScope` and applied by `SecureConn` (`ADR/0010`) |
 
 **Dependency Rules** (per project conventions):
 - No circular dependencies.
@@ -572,6 +597,20 @@ stores — independent of whatever storage the durable-execution substrate uses 
 own checkpoints — and hosts the platform `toolkit_db::outbox` tables for the producer queue, which
 are library-migrated and not Workflow tables (`design/01-foundation.md` §3.7 *Platform-managed
 producer persistence*).
+
+#### Platform authorization (`authz-resolver`)
+
+- **Dependency**: `authz-resolver` through `AuthZResolverApi` resolved from `ClientHub`; **mandatory** — startup fails without wiring
+
+Decides every authorization request this gear makes: the seventeen REST routes on their
+registered `(resource, action)` pairs and the twelve event handlers' read-before-act gate.
+Workflow registers its resource/action catalogue (`design/09-read-and-authz.md` §3.1), asks
+through one shared `PolicyEnforcer` and enforces the returned constraints; the platform policy
+owner provisions roles, the `assigned_principal` approver grant and the service-principal grants,
+and verifies them against the deployed provider before release
+(`UPSTREAM_REQS.md` §2.8). A PDP timeout or outage on a request path is a sanitized 503 with no
+mutation and no idempotency-key settlement; the five Workflow-owned workers continue under
+configured authority (`design/09-read-and-authz.md` §3.5).
 
 #### Platform Events / Audit Bus
 
@@ -714,7 +753,7 @@ or remediation path. **Column-level definitions, keys, constraints, indexes and 
 specified normatively in the slice named in the "Specified in" column, and are not restated here.**
 A schema stated twice is a schema that will disagree with itself, which is exactly what this
 registry exists to prevent. Mutability is declared **per table** rather than globally, because
-eighteen of the twenty-six are deliberately mutable; the platform producer-outbox tables are not in this inventory (`design/01-foundation.md` §3.7 *Platform-managed producer persistence*).
+seventeen of the twenty-five are deliberately mutable; the platform producer-outbox tables are not in this inventory (`design/01-foundation.md` §3.7 *Platform-managed producer persistence*).
 
 Every table carries `resource_tenant_id` NOT NULL; tables backing an operator- or seller-scoped
 surface additionally carry `seller_tenant_id`, and per-tenant fairness and back-pressure key on
@@ -747,7 +786,6 @@ surface additionally carry `seller_tenant_id`, and per-tenant fairness and back-
 | `owf_process_suspension` | `08 §3.7` | hold-and-cancel — suspension controller | **mutable** — `state` settles through `open / resume_ahead / closed`; a partial unique index enforces at most one unsettled row per order |
 | `owf_timer_pause` | `08 §3.7` | hold-and-cancel — suspension controller | **mutable** — the stored remaining window settles on rearm. One record for one clock: `pause_reason` discriminates a hold pause from approval-execution's Generic-Approval outage pause, which writes here rather than to a second table |
 | `owf_process_progress_view` | `09 §3.7` | read-and-authz — progress projection writer (sole writer; the read projector only reads) | **mutable** — materialised projection, refreshed in the same transaction as the change it reflects |
-| `owf_permission_declaration` | `09 §3.7` | read-and-authz — permission evaluator | **mutable** — policy rows; startup fails if any registered operation has no row |
 
 Four of these names replace the ten this section previously carried; the `process_instance`,
 `saga_compensation_log`, `process_audit_log`, `process_event_outbox` and `escalation_timer`
@@ -884,35 +922,55 @@ or session management. Session lifetime, MFA and SSO/federation are properties o
 identity provider and the gateway; this gear holds no session of its own, mints no token, and has
 no local login surface, so it takes those baselines without deviation and declares no exception.
 
-**`SecurityContext`**, which the set references throughout and nowhere defines, carries exactly
-these claims, and every scope predicate in this design resolves against one of them:
+**`SecurityContext`** is the platform type
+([`libs/toolkit-security/src/context.rs`](../../../../libs/toolkit-security/src/context.rs)),
+consumed as the gateway injects it; this design defines no claim of its own. It carries exactly
+five fields, and this is how each is used:
 
-| Claim | Purpose |
+| Field | Purpose |
 |-------|---------|
-| `principal_id` | The authenticated subject; written to `owf_audit_entry.actor` and to the override and decision records |
-| `principal_kind` | `human` or `service`; a `service` principal is refused on any operation that drives order state directly |
-| `roles` | The PRD §3 actor classes held by the principal (approver, fulfillment operator, seller operator, system) |
-| `resource_tenant_id`, `payer_tenant_id`, `seller_tenant_id` | The three tenant axes the principal acts within; the tenant predicate on every read and write is an equality against these, not a role-string match |
-| `seller_scope` | The seller tenant identifiers this principal may act for — what "seller scope" in the permission matrix evaluates against |
-| `approver_assignments` | The gate assignments routed to this principal; what "assigned-approval scope" evaluates against. Without it the only implementable approver-inbox filter is role matching, which returns every finance gate across every order and seller — the outcome `design/09-read-and-authz.md` §4 forbids |
-| `service_scope` | For a `service` principal, the gateway-asserted scope naming **this gear**; actor class alone is insufficient, because on its own nothing distinguishes a sibling gear from any caller presenting that class |
-| `delegation_proof_ref` | Reference to a verifiable cross-tenant delegation assertion, recorded on the audit entry; absence, expiry or revocation is a refusal |
-| `issued_at`, `expires_at` | Token validity window; an expired context is refused, never renewed locally |
+| `subject_id` | The authenticated subject; written to `owf_audit_entry.actor` and to the override, assignment and decision records (D-61); compared by the PDP against `owf_approval_gate.assigned_principal` for every approver grant |
+| `subject_type` | User or service subject; `owf_audit_entry.actor_class` is derived from it and the configured identities alone, and a service subject is never allowed on a human-actor arm |
+| `subject_tenant_id` | The subject's home tenant; the PDP's default context tenant and the namespace a caller-supplied idempotency key may resolve in |
+| `token_scopes` | Capability restrictions; a system actor's arm additionally requires a scope naming this gear |
+| `bearer_token` | Forwarded to the PDP by `PolicyEnforcer`; never read, logged or persisted by this gear |
 
-**Service identity.** System actors — the Generic Approval decision callback, the Subscriptions
-and Payments outcome paths — must present a gateway-asserted service principal with the
-gear-scoped claim above. Where an outcome arrives by **event subscription** rather than through
-the REST gateway, that transport carries no `SecurityContext`, so the broker's own authenticated
-publisher identity plus a topic ACL restricting publication to the owning gear is the enforcing
-mechanism, and the subscribing handler refuses an envelope whose asserted publisher is not the
-expected one. This is named because `PRD.md`'s "MUST NOT be impersonated by other actors" has no
-enforcement on a transport that traverses no gateway.
+**How each scope is supplied by the PDP, not by a claim.** *Seller scope* is a PDP constraint on
+the target row's `seller_tenant_id` (and `resource_tenant_id`) — an `Eq`, `In` or
+`InTenantSubtree` predicate as the policy chooses — compiled to an `AccessScope` and applied by
+`SecureConn` inside the read or the mutating statement; the adapter supplies the row's axes as
+resource properties after a non-disclosing prefetch. *Approver assignment* is a PDP `Eq`
+constraint `assigned_principal = subject_id` on `owf_approval_gate`, the column populated at
+gate-open from the routing configuration; without it the only implementable inbox filter would be
+role matching, which returns every finance gate across every order and seller — the outcome
+`design/09-read-and-authz.md` §4 forbids — and no token claim or assignment-directory query is
+involved. *Tenant isolation* on every read is the constraint on `resource_tenant_id`. *Delegation
+proof*, where a caller presents one, is forwarded to the PDP as request context and never
+validated locally (Lifecycle D-111 by reference). *Service scope* is stated next.
 
-**Authorization** is deny-by-default and evaluated by **exactly one** evaluator,
-**permission evaluator**, invoked from the single call site
-**control operation gateway** — one model rather than two that
-drift. `owf_permission_declaration` is checked exhaustively at startup: an operation with no row
-fails the service, rather than defaulting open.
+**Service identity.** System actors — Orders Lifecycle, the Generic Approval decision callback,
+the Subscriptions and Payments outcome paths — are authorized on the REST surface only when
+`subject_type` is the platform service-subject type **and** `token_scopes` names this gear, and
+the PDP then allows the route's `(resource, action)` pair for that subject; actor class alone is
+insufficient, because on its own nothing distinguishes a sibling gear from any caller presenting
+that class. Where an outcome arrives by **event subscription** rather than through the REST
+gateway, that transport carries no `SecurityContext` and no producer principal: the broker's
+per-topic **produce grant** — only the owning gear may produce on its topic — and platform-root
+tenancy (Lifecycle D-95) are the enforcing mechanism, and every handler additionally performs the
+PDP-authorized Lifecycle `order × read` for the event's order before any effect
+(`design/02-triggers-and-start.md` §2.1). This is named because `PRD.md`'s "MUST NOT be
+impersonated by other actors" has no enforcement on a transport that traverses no gateway
+(`DECISIONS.md` D-37 as amended by D-63).
+
+**Authorization** is deny-by-default and decided by the **platform PDP**, reached through the
+**one shared `PolicyEnforcer` adapter** (`design/09-read-and-authz.md` §3.2, the component
+declared as the permission evaluator) invoked from the single call site
+**control operation gateway** on the REST surface and from every handler's read-before-act gate
+on the event surface — one decision path rather than two that drift. There is no permission
+table: the registered resource/action catalogue is checked against the routing table at startup
+in both directions, and a route with no registered pair, or a service that cannot resolve
+`dyn AuthZResolverApi`, fails to start rather than defaulting open
+(`cpt-cf-bss-orders-workflow-adr-platform-pdp-authorization`).
 
 **Separation of duties.** The submitting identity is refused at the approval-decision endpoint,
 and an SoD expectation is carried as a clause of the §9.2 expectations contract this gear owns.
@@ -939,11 +997,11 @@ The gear stores no cardholder data and holds no payment instrument — it consum
 
 | Threat | Vector | Boundary crossed | Mitigation | Residual risk |
 |--------|--------|------------------|------------|---------------|
-| Cross-tenant process disclosure | A caller reads a process, approval gate or manual task outside their tenancy | Tenant boundary | Every table carries `resource_tenant_id` and the read predicate is an equality against the `SecurityContext` axes, attached through SecureORM rather than written per query | A compromised credential reads within its own granted scope until revoked |
-| Approver-inbox over-disclosure | An approver role string matches every gate of that kind across every order and seller | Assignment boundary | Scoping is the `approver_assignments` claim, not the role; a gate outside the claim is not returned | An over-broad assignment issued upstream is honoured as issued; assignment correctness is Generic Approval's |
+| Cross-tenant process disclosure | A caller reads a process, approval gate or manual task outside their tenancy | Tenant boundary | Every table carries `resource_tenant_id`; the read predicate is the PDP's constraint on the row's tenant axes, compiled to an `AccessScope` and attached by `SecureConn` rather than written per query; a targeted denial answers 404 so the status code is not an existence oracle | A compromised credential reads within its own PDP-granted scope until revoked; the deployed provider's policy is verified under `UPSTREAM_REQS.md` §2.8, not by this gear |
+| Approver-inbox over-disclosure | An approver role string matches every gate of that kind across every order and seller | Assignment boundary | Scoping is the PDP `Eq` constraint on `owf_approval_gate.assigned_principal`, not the role; a gate outside it is not returned by the inbox query and not mutable by the decision `UPDATE` | An over-broad assignment written at gate-open from the routing configuration is honoured as written; assignment correctness is Generic Approval's |
 | Self-approval | The submitting identity decides its own gate | Commercial-control boundary | The decision endpoint refuses the submitting identity, and the SoD clause is carried in the §9.2 expectations contract | Two colluding principals inside one seller tenant; out of scope for a technical control |
-| Callback impersonation | A forged decision or provisioning outcome arrives on the event transport | Service boundary | Broker-authenticated publisher identity plus a topic ACL, checked by the subscribing handler; gateway-asserted service principal on the REST path | A compromised broker or gateway; out of this gear's control |
-| Order state driven directly by a system actor | A service principal calls a state-affecting operation | BSS seam (R1) | `principal_kind = service` is refused on those operations, and no code path in this gear writes order state at all | A defect in Lifecycle's own guard; covered by that gear's evaluator |
+| Callback impersonation | A forged decision or provisioning outcome arrives on the event transport | Service boundary | The broker's per-topic produce grant and platform-root tenancy, then the handler's PDP-authorized Lifecycle read of the named order before any effect; on the REST path, `subject_type` plus `token_scopes` naming this gear and the PDP's allow on the pair | A compromised broker, gateway or PDP; out of this gear's control. The consumer sees no producer principal, so a mis-provisioned produce grant is invisible to it until the shared prerequisites of `UPSTREAM_REQS.md` §2.7 are verified |
+| Order state driven directly by a system actor | A service principal calls a state-affecting operation | BSS seam (R1) | No `(resource, action)` pair a service principal holds writes order state — the catalogue has none — and the gateway refuses a service `subject_type` on a human-actor arm before the PDP is asked; no code path in this gear writes order state at all | A defect in Lifecycle's own guard; covered by that gear's PDP-authorized seam |
 | Audit tampering | A holder of database privilege edits or deletes trail rows | Data boundary | No UPDATE or DELETE grant to any role, database triggers rejecting both, a per-process predecessor-hash chain under the frozen contract of `01 §4.17`, the declared verifier alerting and never repairing, and per-namespace checkpoints reconciled against instance counters every 24 h (D-59, D-60) | Within D-100's stated limits: a holder of the migration role can drop grant and trigger and rewrite all local evidence including the latest checkpoint suffix; a chain lost before its first checkpoint, or a suffix removed with its counter before capture, is not independently evidenced. Independent anchoring is optional hardening, not presumed |
 | Commercial data resident in engine-side history | Resolved totals, approver identities and tenant axes appear in the execution substrate's own run history | Third-party / retention boundary | `cpt-cf-bss-orders-workflow-adr-process-state-non-authoritative` makes engine history non-citable and gear-owned audit independent of engine purge | **Open.** The substrate product is unselected (Q-01), so no isolation, retention or tenancy assessment of that history can be completed. Answering Q-01 must include one; this is the single largest unassessed third-party risk in the design |
 | Diagnostic leakage to operators | Raw downstream error text reaches the task queue via `owf_dead_letter_record.last_error` and event payloads | Wire boundary | The RFC 9457 envelope carries no internal diagnostics; stored downstream error text is sanitised to the reason catalogue before it reaches an operator surface, and the raw form is retained only where the audit role can read it | An unsanitised field added later; caught by the reason-catalogue structural test, not by the type system |
@@ -961,8 +1019,8 @@ posture assessed, and that assessment belongs in answering Q-01.
 
 **Security assumptions**, stated so a reviewer can attack them directly: the gateway terminates
 authentication correctly and does not forge claims; the platform identity provider's tokens are
-not replayable beyond `expires_at`; the message broker authenticates publishers and enforces topic
-ACLs; the platform KMS and secret store are not compromised; database privilege is runtime-owned
+not replayable beyond their validity; the message broker enforces per-topic produce and consumer
+grants; the platform PDP evaluates the provisioned policy and fails closed when unreachable; the platform KMS and secret store are not compromised; database privilege is runtime-owned
 and the audit role's grants are what §3.8 says they are; and Orders Lifecycle enforces its own R1
 guard, because this gear's refusal of direct state mutation protects the seam only from its own
 side.
@@ -1153,7 +1211,9 @@ partial-failure policy election, the overdue window) are the one exception and l
 in the owning slice's store, where a change is an audited write rather than a redeploy.
 
 Configuration is **validated at startup and the service refuses to start on a violation**, not on
-first use: the `owf_permission_declaration` exhaustiveness check (§4.2), the assertion that the
+first use: the catalogue conformance assertion of `design/09-read-and-authz.md` §3.7 — every
+registered route maps to a registered `(resource, action)` pair and `dyn AuthZResolverApi`
+resolves (§4.2) — the assertion that the
 Generic-Approval outage escalation threshold is strictly less than the Lifecycle `submitted` TTL
 it must escalate ahead of, and the assertion that every registered compensable step has exactly
 one compensating action. A configuration error that surfaces on the first failing order instead of
@@ -1194,6 +1254,6 @@ alone.
 ## 5. Traceability
 
 - **PRD**: [`PRD.md`](./PRD.md)
-- **ADRs**: [`ADR/`](./ADR/) — nine decisions: `cpt-cf-bss-orders-workflow-adr-durable-execution-substrate`, `cpt-cf-bss-orders-workflow-adr-slice-decomposition`, `cpt-cf-bss-orders-workflow-adr-process-state-non-authoritative`, `cpt-cf-bss-orders-workflow-adr-two-wave-activation-barrier`, `cpt-cf-bss-orders-workflow-adr-saga-compensable-no-pivot`, `cpt-cf-bss-orders-workflow-adr-idempotency-key-composition`, `cpt-cf-bss-orders-workflow-adr-fail-closed-verdict-park`, `cpt-cf-bss-orders-workflow-adr-outbox-process-events`, `cpt-cf-bss-orders-workflow-adr-manual-task-dead-letter-separation`
+- **ADRs**: [`ADR/`](./ADR/) — ten decisions: `cpt-cf-bss-orders-workflow-adr-durable-execution-substrate`, `cpt-cf-bss-orders-workflow-adr-slice-decomposition`, `cpt-cf-bss-orders-workflow-adr-process-state-non-authoritative`, `cpt-cf-bss-orders-workflow-adr-two-wave-activation-barrier`, `cpt-cf-bss-orders-workflow-adr-saga-compensable-no-pivot`, `cpt-cf-bss-orders-workflow-adr-idempotency-key-composition`, `cpt-cf-bss-orders-workflow-adr-fail-closed-verdict-park`, `cpt-cf-bss-orders-workflow-adr-outbox-process-events`, `cpt-cf-bss-orders-workflow-adr-manual-task-dead-letter-separation`, `cpt-cf-bss-orders-workflow-adr-platform-pdp-authorization`
 - **Design set**: [`design/`](./design/) — the process-execution slice designs; the phased build order is authored in [`design/README.md`](./design/README.md)
 - **Upstream requirements**: [`UPSTREAM_REQS.md`](./UPSTREAM_REQS.md) — the asks this gear raises on gears it does not own
