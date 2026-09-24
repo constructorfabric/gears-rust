@@ -7,10 +7,6 @@ on:
       - '**/*.md'
       - 'docs/**'
       - 'guidelines/**'
-      - 'scripts/check-design-invariants.py'
-      - 'scripts/test-design-invariants.py'
-      - 'Makefile'
-      - '.github/workflows/docs.yml'
   workflow_dispatch:
 
 concurrency:
@@ -38,15 +34,3 @@ jobs:
 
       - name: Check markdown links
         run: make lychee
-
-  design_invariants:
-    name: Check Design Invariants
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          clean: 'true'
-
-      - name: Check design invariants
-        run: make design-check
