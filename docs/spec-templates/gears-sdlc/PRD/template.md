@@ -181,7 +181,7 @@ Contracts this library expects from external systems or provides to downstream c
 
 Optional: Include when interaction flows add clarity beyond requirement statements.
 
-#### {Use Case Name}
+### {Use Case Name}
 
 - [ ] `p2` - **ID**: `cpt-{system}-usecase-{slug}`
 
