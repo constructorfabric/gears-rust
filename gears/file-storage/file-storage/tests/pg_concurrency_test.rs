@@ -148,7 +148,8 @@ use file_storage::domain::multipart::{BindState, MultipartPart};
 use file_storage::domain::multipart_service::MultipartService;
 use file_storage::domain::policy::{PolicyScope, StoredPolicy};
 use file_storage::domain::ports::{
-    AutoBindOnFinalize, CleanupStore, DataPlanePort, FinalizeVersionOutcome, MultipartStore,
+    AutoBindOnFinalize, CleanupStore, DataPlanePort, DeleteVersionOutcome,
+    FinalizeMultipartOutcome, FinalizeVersionOutcome, MultipartFinishSnapshot, MultipartStore,
 };
 use file_storage::domain::service::{FileService, ServiceConfig};
 use file_storage::infra::backend::{
@@ -725,30 +726,33 @@ enum Role {
 ///   in `assemble_and_finish_inner`) notifies `b_checked_pending` right
 ///   after it returns the (still-`pending`, since role `A` is gated below)
 ///   real value.
-/// - Role `A`'s `finalize_version` call **waits** on `b_checked_pending`
-///   before delegating -- guaranteeing `A`'s real finalize commit cannot
-///   *start* before `B` has already observed the pre-finalize state, no
-///   matter how much real wall-clock time separates `A`'s lease acquisition
-///   (which must still genuinely expire before `B`'s own
-///   `acquire_complete_lease` CAS will match) from `B`'s own start -- and
-///   notifies `a_finalized` right after its own commit *returns*.
-/// - Role `B`'s `finalize_version` call **waits** on `a_finalized` before
-///   even starting its own (redundant, doomed-to-lose) attempt -- this is
-///   the gate that makes A's *win* deterministic, not just A's *start*:
-///   without it, B's task (already running, several steps into its own
-///   reassembly) can race ahead of A's freshly-woken one and commit first,
-///   which is a real, also-interesting outcome (the stale completer, not
-///   the fresh one, ends up needing to converge instead) but not the
+/// - Role `A`'s `finalize_multipart_version` call **waits** on
+///   `b_checked_pending` before delegating -- guaranteeing `A`'s real
+///   finalize commit cannot *start* before `B` has already observed the
+///   pre-finalize state, no matter how much real wall-clock time separates
+///   `A`'s lease acquisition (which must still genuinely expire before `B`'s
+///   own `acquire_complete_lease` CAS will match) from `B`'s own start --
+///   and notifies `a_finalized` right after its own commit *returns*.
+/// - Role `B`'s `finalize_multipart_version` call **waits** on `a_finalized`
+///   before even starting its own (redundant, doomed-to-lose) attempt --
+///   this is the gate that makes A's *win* deterministic, not just A's
+///   *start*: without it, B's task (already running, several steps into its
+///   own reassembly) can race ahead of A's freshly-woken one and commit
+///   first, which is a real, also-interesting outcome (the stale completer,
+///   not the fresh one, ends up needing to converge instead) but not the
 ///   specific interleaving this test exists to pin down.
 ///
-/// Post-fix, B's lost `finalize_version` no longer errors-and-releases the
-/// lease -- it converges (re-derives the response and calls
-/// `finish_session` directly, same as the takeover fast path) -- so there
-/// is no third gate here anymore: nothing needs to hold A's own
-/// `finish_session` call back, since the actual race that remains (both A
-/// and B now separately racing to call `finish_session`) is exactly the
-/// race `finish_session`'s own CAS-then-converge logic is designed to
-/// resolve gracefully either way.
+/// Post-fix, B's lost `finalize_multipart_version` no longer
+/// errors-and-releases the lease -- it converges (re-derives the response
+/// and calls `finish_session` directly, same as the takeover fast path).
+/// `finalize_multipart_version` also folds its own terminal
+/// `completing -> completed` transition into the SAME transaction as A's
+/// finalize commit (crash-consistency fix, DBS-05-adjacent), so by the time
+/// B's own (redundant) attempt even starts, A's session is already
+/// `completed` -- there is no third gate needed, and no genuine race left
+/// for `finish_session`'s own CAS-then-converge fallback to resolve; B's
+/// own converge attempt simply finds `state` already `Completed` and
+/// converges silently.
 ///
 /// `tokio::sync::Notify::notify_one` buffers a permit if no waiter is
 /// registered yet, so there is no lost-wakeup risk regardless of which side
@@ -757,10 +761,11 @@ struct GatedMultipartStore {
     inner: Arc<dyn MultipartStore>,
     role: Role,
     b_checked_pending: Arc<Notify>,
-    /// Notified by role A's `finalize_version` right after its real commit
-    /// returns (success or not) -- role B's own `finalize_version` waits on
-    /// this before even starting, so which side wins the real CAS is
-    /// deterministic rather than left to the scheduler.
+    /// Notified by role A's `finalize_multipart_version` right after its
+    /// real commit returns (success or not) -- role B's own
+    /// `finalize_multipart_version` waits on this before even starting, so
+    /// which side wins the real CAS is deterministic rather than left to
+    /// the scheduler.
     a_finalized: Arc<Notify>,
     b_first_get_version_seen: Arc<AtomicBool>,
 }
@@ -856,8 +861,8 @@ impl MultipartStore for GatedMultipartStore {
         let result = self.inner.get_version(file_id, version_id).await;
         if self.role == Role::B && !self.b_first_get_version_seen.swap(true, Ordering::SeqCst) {
             // This is B's takeover fast-path check -- notify A's gated
-            // finalize_version that it may now proceed, only after this
-            // (real, pre-finalize) read has already completed.
+            // finalize_multipart_version that it may now proceed, only after
+            // this (real, pre-finalize) read has already completed.
             self.b_checked_pending.notify_one();
         }
         result
@@ -901,6 +906,35 @@ impl MultipartStore for GatedMultipartStore {
         audit: file_storage::domain::audit::AuditEntry,
         auto_bind: Option<AutoBindOnFinalize>,
     ) -> Result<FinalizeVersionOutcome, DomainError> {
+        // Never called by the real multipart-complete flow (which calls
+        // `finalize_multipart_version` below, where this test's gating now
+        // lives) -- a plain, ungated passthrough, kept only because the
+        // trait still requires an implementation.
+        self.inner
+            .finalize_version(
+                file_id,
+                version_id,
+                size,
+                hash_value,
+                hash_mode,
+                part_count,
+                manifest,
+                validated_mime,
+                audit,
+                auto_bind,
+            )
+            .await
+    }
+
+    async fn finalize_multipart_version(
+        &self,
+        file_id: Uuid,
+        manifest: Option<String>,
+        validated_mime: Option<String>,
+        finalize_audit: file_storage::domain::audit::AuditEntry,
+        auto_bind: Option<AutoBindOnFinalize>,
+        finish: MultipartFinishSnapshot,
+    ) -> Result<FinalizeMultipartOutcome, DomainError> {
         if self.role == Role::A {
             self.b_checked_pending.notified().await;
         } else {
@@ -916,17 +950,13 @@ impl MultipartStore for GatedMultipartStore {
         }
         let result = self
             .inner
-            .finalize_version(
+            .finalize_multipart_version(
                 file_id,
-                version_id,
-                size,
-                hash_value,
-                hash_mode,
-                part_count,
                 manifest,
                 validated_mime,
-                audit,
+                finalize_audit,
                 auto_bind,
+                finish,
             )
             .await;
         if self.role == Role::A {
@@ -938,11 +968,12 @@ impl MultipartStore for GatedMultipartStore {
     async fn complete_multipart_upload(
         &self,
         upload_id: Uuid,
+        lease_owner: &str,
         result_json: &str,
         audit: file_storage::domain::audit::AuditEntry,
     ) -> Result<bool, DomainError> {
         self.inner
-            .complete_multipart_upload(upload_id, result_json, audit)
+            .complete_multipart_upload(upload_id, lease_owner, result_json, audit)
             .await
     }
 
@@ -1004,20 +1035,29 @@ impl MultipartStore for GatedMultipartStore {
 ///    -- the version is still `pending` (A is gated below, hasn't finalized
 ///    yet) -- so B does NOT take the "already finalized, just finish" fast
 ///    path; B proceeds through its own full (redundant) reassembly.
-/// 4. A's gated `finalize_version` was released the instant B's check above
-///    completed; A -- which has zero remaining `.await`s before that call --
-///    wins the real finalize CAS: the version flips `pending -> available`
-///    (+ bind, for an `auto_bind` session), for real, in PostgreSQL.
+/// 4. A's gated `finalize_multipart_version` was released the instant B's
+///    check above completed; A -- which has zero remaining `.await`s before
+///    that call -- wins the real finalize CAS: the version flips
+///    `pending -> available` (+ bind, for an `auto_bind` session), for
+///    real, in PostgreSQL, AND (crash-consistency fix: the terminal session
+///    transition is folded into this SAME transaction) the session flips
+///    `completing -> completed` right there too -- deterministically, since
+///    that embedded transition is not itself owner-fenced (see
+///    `MultipartRepo::finish_complete`'s doc: it is protected by the
+///    finalize CAS's own single-winner guarantee instead, precisely so this
+///    scenario cannot re-strand). A's whole call returns `Ok(Completed(...))`
+///    before B's own attempt below even starts.
 /// 5. B, having finished its own (redundant, slower) reassembly, calls its
-///    own `finalize_version` -- sees `updated = false` (no longer `pending`)
-///    -- **post-fix**, checks the version's real status, sees `Available`,
-///    and converges: re-derives the response via `replay_completed` and
-///    calls `finish_session` directly, same as a genuine takeover fast path.
-/// 6. Both A and B now separately race to call `finish_session` (the
-///    `state = 'completing' -> 'completed'` CAS); whichever gets there
-///    first wins, and the other's own `finish_session` sees `finished =
-///    false`, re-reads the session, finds `state == Completed`, and
-///    converges silently too (this is the *pre-existing* convergence branch
+///    own `finalize_multipart_version` -- sees `updated = false` (no longer
+///    `pending`) -- **post-fix**, checks the version's real status, sees
+///    `Available`, and converges: re-derives the response via
+///    `replay_completed` and calls `finish_session` directly, same as a
+///    genuine takeover fast path. `finish_session`'s own CAS (DBS-05: now
+///    additionally fenced on B's own, still-current `lease_owner`) finds
+///    `state` already `Completed` (A got there first, per step 4) --
+///    `finished = false` for a completely mundane reason (nothing left to
+///    finish), re-reads the session, finds `state == Completed`, and
+///    converges silently (the *pre-existing* convergence branch
 ///    `finish_session` already had for "someone else already finished it" --
 ///    it did not need to change).
 ///
@@ -1711,4 +1751,579 @@ async fn invariant_checker_distinguishes_healthy_file_from_known_orphan() {
          is_versionless_orphan's finding, not find_content_id_violations'; got unexpected \
          content_id violations: {orphan_violations:?}"
     );
+}
+
+// =========================================================================
+// FS-XX -- parent-row-lock races: delete/reclaim vs a concurrent new version
+// =========================================================================
+//
+// The three scenarios below exercise `FileRepo::lock_for_update` -- a
+// `SELECT ... FOR UPDATE` on the `files` row taken as the very first
+// statement of `delete_file_collecting_versions`/`delete_version_or_whole_file`/
+// `delete_orphan_file_with_event`'s transactions -- against real concurrent
+// tasks racing a plain `insert_pending_version` on the exact same `file_id`.
+// Real `tokio::spawn` + `tokio::join!` (not a `Notify`-gated interleaving, per
+// this file's own precedent in `resource-group/tests/pg_concurrency_test.rs::
+// concurrent_non_force_delete_and_create_child`): the row lock guarantees
+// exactly two clean outcomes regardless of which side actually wins the real
+// PostgreSQL lock queue, so there is no need to pin the winner -- only to
+// reject the third, dangerous outcome (insert reports success while its row
+// is silently cascade-removed, uncounted) that these tests exist to catch.
+// Each was confirmed to fail (reliably reproduce the dangerous outcome) with
+// the corresponding `FileRepo::lock_for_update` call temporarily removed from
+// production code, then pass again once restored -- see this task's report.
+//
+// Each scenario loops `RACE_ITERATIONS` times (fresh ids every iteration) and
+// gives the insert task a small, deliberate head-start delay before it issues
+// its `INSERT` -- calibrated empirically (against this suite's own
+// `testcontainers` PostgreSQL) to land inside the narrow single-statement gap
+// this test targets often enough for the loop to reliably reproduce the
+// dangerous interleaving on the pre-fix code within a handful of iterations,
+// without pinning an exact winner via a `Notify` gate (unlike `f2_*` above,
+// there is no fixed "which side must win" here -- both orderings are
+// legitimate; the delay only raises the odds of *sampling* the narrow one).
+// The delay is real-clock, not virtual (`tokio::time::pause` cannot govern
+// real Postgres network I/O), so it is a probabilistic aid to reproduction,
+// not the correctness mechanism itself -- the assertions below hold for
+// whichever interleaving actually occurs, delay or not.
+const RACE_ITERATIONS: usize = 24;
+
+/// Build a helper `AuditEntry` for the races below -- mirrors
+/// `delete_race_test.rs::audit`.
+fn race_audit(
+    tenant_id: Uuid,
+    file_id: Uuid,
+    op: file_storage::domain::audit::AuditOperation,
+    detail: serde_json::Value,
+) -> file_storage::domain::audit::AuditEntry {
+    file_storage::domain::audit::AuditEntry {
+        tenant_id,
+        actor_kind: "user".to_owned(),
+        actor_id: Uuid::now_v7(),
+        file_id: Some(file_id),
+        operation: op,
+        outcome: file_storage::domain::audit::AuditOutcome::Success,
+        detail,
+        occurred_at: OffsetDateTime::now_utc(),
+    }
+}
+
+/// Build a helper `FileEvent` for the races below -- mirrors
+/// `delete_race_test.rs::event`.
+fn race_event(
+    tenant_id: Uuid,
+    owner_id: Uuid,
+    file_id: Uuid,
+) -> file_storage::domain::audit::FileEvent {
+    file_storage::domain::audit::FileEvent {
+        tenant_id,
+        owner_id,
+        file_id,
+        event_type: "file.deleted".to_owned(),
+        payload: serde_json::json!({ "version_count": 0 }),
+    }
+}
+
+/// (a) `Store::delete_file_collecting_versions` vs a concurrent
+/// `insert_pending_version` on the same, about-to-be-deleted file.
+///
+/// The row lock leaves exactly two clean outcomes:
+/// - the insert commits before the delete's lock is granted -- the delete's
+///   fresh, post-lock version list then necessarily includes it, so it is
+///   removed AND collected for backend-blob cleanup along with `v1`;
+/// - the insert loses the lock race, blocks until the delete's transaction
+///   ends, then fails its own FK check against the now-deleted file --
+///   surfaced as `FileNotFound`, and no `v2` row is ever left behind.
+///
+/// The dangerous, pre-fix outcome this test rejects: the insert reports
+/// `Ok(())` (its row did commit) but the delete's collected list does not
+/// contain `v2` -- meaning `v2` was cascade-removed by the delete without
+/// ever being seen, a silent backend-blob leak with no record in the DB to
+/// find it by afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delete_file_vs_concurrent_insert_version_has_no_silent_loss() {
+    let (db, _pg_guard) = pg_db_or_skip!();
+    let store = Store::new(Arc::clone(&db));
+    let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+
+    for iteration in 0..RACE_ITERATIONS {
+        let tenant_id = Uuid::now_v7();
+        let owner_id = Uuid::now_v7();
+        let file_id = Uuid::now_v7();
+        let v1 = Uuid::now_v7();
+        let now = OffsetDateTime::now_utc();
+
+        store
+            .create_file_with_pending_version(
+                &new_file(),
+                file_id,
+                v1,
+                tenant_id,
+                "mem",
+                &format!("/{file_id}/{v1}"),
+                now,
+                race_audit(
+                    tenant_id,
+                    file_id,
+                    file_storage::domain::audit::AuditOperation::Create,
+                    serde_json::json!({}),
+                ),
+            )
+            .await
+            .expect("create file + v1");
+        backend
+            .put(&format!("/{file_id}/{v1}"), Bytes::from_static(b"v1"))
+            .await
+            .expect("seed v1 blob");
+
+        let v2 = Uuid::now_v7();
+        let store_del = store.clone();
+        let store_ins = store.clone();
+        let del_task = tokio::spawn(async move {
+            store_del
+                .delete_file_collecting_versions(
+                    &AccessScope::allow_all(),
+                    file_id,
+                    race_audit(
+                        tenant_id,
+                        file_id,
+                        file_storage::domain::audit::AuditOperation::DeleteFile,
+                        serde_json::json!({ "version_count": 0 }),
+                    ),
+                    Some(race_event(tenant_id, owner_id, file_id)),
+                )
+                .await
+        });
+        let ins_task = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_micros(150)).await;
+            store_ins
+                .insert_pending_version(
+                    file_id,
+                    v2,
+                    "application/octet-stream",
+                    "mem",
+                    &format!("/{file_id}/{v2}"),
+                    now,
+                )
+                .await
+        });
+        let del_res = del_task.await.expect("delete task panicked");
+        let ins_res = ins_task.await.expect("insert task panicked");
+
+        eprintln!(
+            "delete_file_vs_concurrent_insert_version[{iteration}]: delete={} insert={}",
+            describe_result(&del_res),
+            describe_result(&ins_res)
+        );
+
+        match (del_res, ins_res) {
+            (Ok(deleted), Ok(())) => {
+                // Insert won the lock race -- the delete's fresh, post-lock
+                // version list must include v2.
+                assert!(deleted.removed, "the file row must have been removed");
+                let mut ids: Vec<Uuid> = deleted.versions.iter().map(|v| v.version_id).collect();
+                ids.sort_unstable();
+                let mut expected = vec![v1, v2];
+                expected.sort_unstable();
+                assert_eq!(
+                    ids, expected,
+                    "insert succeeded (v2 committed) but the delete's collected list does \
+                 not contain it -- SILENT BLOB LEAK: v2's row was cascade-removed \
+                 without ever being seen by the caller's cleanup"
+                );
+            }
+            (Ok(deleted), Err(e)) => {
+                // Delete won the lock race -- the insert must have failed on the
+                // now-deleted parent, and only v1 (which existed before the
+                // race) may have been collected.
+                assert!(deleted.removed, "the file row must have been removed");
+                let ids: Vec<Uuid> = deleted.versions.iter().map(|v| v.version_id).collect();
+                assert_eq!(
+                    ids,
+                    vec![v1],
+                    "delete won the race -- must have collected exactly v1 (v2 never \
+                 committed)"
+                );
+                assert!(
+                    matches!(&e, DomainError::FileNotFound { id } if *id == file_id),
+                    "insert lost the race -- expected FileNotFound, got: {e}"
+                );
+            }
+            (Err(e), ins_res) => panic!(
+                "delete_file_collecting_versions must not error in this scenario -- got \
+             {e}; insert result was {ins_res:?}",
+                ins_res = ins_res.map_err(|e| e.to_string())
+            ),
+        }
+
+        // Whichever branch fired, the DB must end up with no file, no v1, and no
+        // v2 row -- and no version left uncollected for blob cleanup.
+        assert!(
+            store
+                .get_file(&AccessScope::allow_all(), file_id)
+                .await
+                .expect("get_file")
+                .is_none(),
+            "the file must be gone"
+        );
+        assert!(
+            store
+                .get_version(file_id, v1)
+                .await
+                .expect("get_version v1")
+                .is_none(),
+            "v1 must be gone"
+        );
+        assert!(
+            store
+                .get_version(file_id, v2)
+                .await
+                .expect("get_version v2")
+                .is_none(),
+            "v2 must be gone (either never committed, or cascade-removed and collected)"
+        );
+        backend
+            .delete(&format!("/{file_id}/{v1}"))
+            .await
+            .expect("best-effort delete of v1's blob must succeed (no dangling row to block it)");
+        assert!(
+            !backend
+                .exists(&format!("/{file_id}/{v1}"))
+                .await
+                .expect("exists"),
+            "v1's blob must be gone -- no leaked backend storage"
+        );
+    }
+}
+
+/// (b) `Store::delete_version_or_whole_file` (deleting the file's ONLY
+/// version, so the whole-file branch fires) vs a concurrent
+/// `insert_pending_version` for a second version of the same file.
+///
+/// Two clean outcomes:
+/// - the insert commits before the delete's lock -- the delete's fresh,
+///   post-lock re-list then sees two versions, so only `v1` is removed
+///   (`VersionRemoved`) and the file, with `v2`, survives;
+/// - the insert loses the lock race -- the delete's re-list still shows only
+///   `v1`, so the whole file is removed (`FileRemoved`), and the insert then
+///   fails FK against the now-deleted file (`FileNotFound`).
+///
+/// The dangerous, pre-fix outcome this test rejects: `FileRemoved` (the
+/// whole file including `v1` gone) while the insert also reports `Ok(())` --
+/// meaning `v2` was cascade-removed along with the file the instant after
+/// its own caller was told it had been created.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delete_last_version_vs_concurrent_insert_second_version_has_no_silent_loss() {
+    let (db, _pg_guard) = pg_db_or_skip!();
+    let store = Store::new(Arc::clone(&db));
+
+    for iteration in 0..RACE_ITERATIONS {
+        let tenant_id = Uuid::now_v7();
+        let owner_id = Uuid::now_v7();
+        let file_id = Uuid::now_v7();
+        let v1 = Uuid::now_v7();
+        let now = OffsetDateTime::now_utc();
+
+        store
+            .create_file_with_pending_version(
+                &new_file(),
+                file_id,
+                v1,
+                tenant_id,
+                "mem",
+                &format!("/{file_id}/{v1}"),
+                now,
+                race_audit(
+                    tenant_id,
+                    file_id,
+                    file_storage::domain::audit::AuditOperation::Create,
+                    serde_json::json!({}),
+                ),
+            )
+            .await
+            .expect("create file + v1");
+
+        let v2 = Uuid::now_v7();
+        let store_del = store.clone();
+        let store_ins = store.clone();
+        let del_task = tokio::spawn(async move {
+            store_del
+                .delete_version_or_whole_file(
+                    file_id,
+                    v1,
+                    race_audit(
+                        tenant_id,
+                        file_id,
+                        file_storage::domain::audit::AuditOperation::DeleteVersion,
+                        serde_json::json!({ "version_id": v1 }),
+                    ),
+                    race_audit(
+                        tenant_id,
+                        file_id,
+                        file_storage::domain::audit::AuditOperation::DeleteFile,
+                        serde_json::json!({ "version_count": 1 }),
+                    ),
+                    Some(race_event(tenant_id, owner_id, file_id)),
+                )
+                .await
+        });
+        let ins_task = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_micros(150)).await;
+            store_ins
+                .insert_pending_version(
+                    file_id,
+                    v2,
+                    "application/octet-stream",
+                    "mem",
+                    &format!("/{file_id}/{v2}"),
+                    now,
+                )
+                .await
+        });
+        let del_res = del_task.await.expect("delete task panicked");
+        let ins_res = ins_task.await.expect("insert task panicked");
+
+        eprintln!(
+            "delete_last_version_vs_concurrent_insert_second_version[{iteration}]: delete={} insert={}",
+            describe_result(&del_res),
+            describe_result(&ins_res)
+        );
+
+        match (del_res, ins_res) {
+            (Ok(DeleteVersionOutcome::VersionRemoved(removed)), Ok(())) => {
+                assert_eq!(removed.version_id, v1, "the removed version must be v1");
+                let file = store
+                    .get_file(&AccessScope::allow_all(), file_id)
+                    .await
+                    .expect("get_file");
+                assert!(
+                    file.is_some(),
+                    "insert won the race -- the file must survive (v1 was not its only \
+                 version by delete time)"
+                );
+                assert!(
+                    store
+                        .get_version(file_id, v2)
+                        .await
+                        .expect("get_version v2")
+                        .is_some(),
+                    "v2 (the race version, never asked to be deleted) must still exist"
+                );
+                assert!(
+                    store
+                        .get_version(file_id, v1)
+                        .await
+                        .expect("get_version v1")
+                        .is_none(),
+                    "v1 (the requested version) must be gone"
+                );
+            }
+            (Ok(DeleteVersionOutcome::FileRemoved(removed)), Err(e)) => {
+                assert_eq!(removed.version_id, v1, "the removed version must be v1");
+                assert!(
+                    store
+                        .get_file(&AccessScope::allow_all(), file_id)
+                        .await
+                        .expect("get_file")
+                        .is_none(),
+                    "delete won the race -- the whole file must be gone"
+                );
+                assert!(
+                    store
+                        .get_version(file_id, v2)
+                        .await
+                        .expect("get_version v2")
+                        .is_none(),
+                    "the losing insert must not have left a v2 row behind"
+                );
+                assert!(
+                    matches!(&e, DomainError::FileNotFound { id } if *id == file_id),
+                    "insert lost the race -- expected FileNotFound, got: {e}"
+                );
+            }
+            (Ok(DeleteVersionOutcome::FileRemoved(_)), Ok(())) => panic!(
+                "SILENT DATA LOSS: the whole file (and v1) was deleted while the \
+             concurrent insert of v2 reported success -- v2 must have been \
+             cascade-removed without its own caller ever being told"
+            ),
+            (del_res, ins_res) => panic!(
+                "unexpected outcome combination: delete={del_res:?} insert={}",
+                describe_result(&ins_res)
+            ),
+        }
+
+        // Whichever branch fired, leave no residue in the shared PostgreSQL
+        // fixture: the `VersionRemoved` branch survives with `v2` still
+        // `pending` (never finalized), which -- unlike this test's own
+        // assertions -- other scenarios in this file that run a real
+        // `orphan_grace_secs = 0` sweep would otherwise pick up as extra,
+        // unrelated abandoned-pending/orphan-file counts. Best-effort,
+        // unconditional: a no-op if the file is already gone.
+        store
+            .delete_file_collecting_versions(
+                &AccessScope::allow_all(),
+                file_id,
+                race_audit(
+                    tenant_id,
+                    file_id,
+                    file_storage::domain::audit::AuditOperation::DeleteFile,
+                    serde_json::json!({ "reason": "test_cleanup" }),
+                ),
+                None,
+            )
+            .await
+            .ok();
+    }
+}
+
+/// (c) `Store::delete_orphan_file_with_event` (reclaiming a version-less
+/// orphan `files` row) vs a concurrent `insert_pending_version` for a first
+/// version of that same file.
+///
+/// Two clean outcomes:
+/// - the insert commits before the reclaim's lock -- the reclaim's fresh,
+///   post-lock "no versions" check then sees one version and declines
+///   (`Ok(false)`), leaving the file (with its new version) untouched;
+/// - the insert loses the lock race -- the reclaim's checks still see zero
+///   versions, so it removes the file (`Ok(true)`), and the insert then
+///   fails FK against the now-deleted file (`FileNotFound`).
+///
+/// The dangerous, pre-fix outcome this test rejects (see
+/// `FileRepo::delete_if_orphan`'s doc comment for the exact `PostgreSQL`
+/// `READ COMMITTED` mechanics): the reclaim reports `Ok(true)` (file
+/// removed) while the insert also reports `Ok(())` -- meaning the freshly
+/// inserted version was cascade-removed along with the file it was just
+/// attached to, with its own caller never told.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn orphan_reclaim_vs_concurrent_insert_version_has_no_silent_loss() {
+    let (db, _pg_guard) = pg_db_or_skip!();
+    let store = Store::new(Arc::clone(&db));
+    let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let backends = BackendRegistry::new(vec![Arc::clone(&backend)], "mem").expect("registry");
+    let svc = make_file_service(store.clone(), backends);
+
+    for iteration in 0..RACE_ITERATIONS {
+        let tenant_id = Uuid::now_v7();
+        let ctx = make_ctx(tenant_id);
+        let file_id = svc
+            .create_file_bare(&ctx, new_file())
+            .await
+            .expect("create_file_bare (version-less orphan)");
+        assert!(
+            is_versionless_orphan(&db, file_id).await,
+            "the freshly-created bare file must start out as a version-less orphan"
+        );
+
+        let now = OffsetDateTime::now_utc();
+        let v1 = Uuid::now_v7();
+        let store_del = store.clone();
+        let store_ins = store.clone();
+        let del_task = tokio::spawn(async move {
+            store_del
+                .delete_orphan_file_with_event(
+                    file_id,
+                    race_audit(
+                        tenant_id,
+                        file_id,
+                        file_storage::domain::audit::AuditOperation::OrphanReconcile,
+                        serde_json::json!({ "reason": "test" }),
+                    ),
+                    None,
+                )
+                .await
+        });
+        let ins_task = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_micros(150)).await;
+            store_ins
+                .insert_pending_version(
+                    file_id,
+                    v1,
+                    "application/octet-stream",
+                    "mem",
+                    &format!("/{file_id}/{v1}"),
+                    now,
+                )
+                .await
+        });
+        let del_res = del_task.await.expect("delete task panicked");
+        let ins_res = ins_task.await.expect("insert task panicked");
+
+        eprintln!(
+            "orphan_reclaim_vs_concurrent_insert_version[{iteration}]: reclaim={} insert={}",
+            describe_result(&del_res),
+            describe_result(&ins_res)
+        );
+
+        match (del_res, ins_res) {
+            (Ok(false), Ok(())) => {
+                // Insert won the lock race -- the reclaim's fresh check saw the
+                // new version and correctly declined.
+                let file = store
+                    .get_file(&AccessScope::allow_all(), file_id)
+                    .await
+                    .expect("get_file");
+                assert!(file.is_some(), "the file must survive");
+                assert!(
+                    store
+                        .get_version(file_id, v1)
+                        .await
+                        .expect("get_version v1")
+                        .is_some(),
+                    "v1 (the race version) must still exist"
+                );
+            }
+            (Ok(true), Err(e)) => {
+                // Reclaim won the lock race -- the insert must have failed on
+                // the now-deleted parent.
+                assert!(
+                    store
+                        .get_file(&AccessScope::allow_all(), file_id)
+                        .await
+                        .expect("get_file")
+                        .is_none(),
+                    "the file must be gone"
+                );
+                assert!(
+                    store
+                        .get_version(file_id, v1)
+                        .await
+                        .expect("get_version v1")
+                        .is_none(),
+                    "the losing insert must not have left a v1 row behind"
+                );
+                assert!(
+                    matches!(&e, DomainError::FileNotFound { id } if *id == file_id),
+                    "insert lost the race -- expected FileNotFound, got: {e}"
+                );
+            }
+            (Ok(true), Ok(())) => panic!(
+                "SILENT DATA LOSS: the orphan file was reclaimed while the concurrent \
+             insert of v1 reported success -- v1 must have been cascade-removed \
+             without its own caller ever being told"
+            ),
+            (del_res, ins_res) => panic!(
+                "unexpected outcome combination: reclaim={del_res:?} insert={}",
+                describe_result(&ins_res)
+            ),
+        }
+
+        // See test (b)'s own cleanup comment: the insert-won branch survives
+        // with `v1` still `pending`, which must not leak into a later
+        // `orphan_grace_secs = 0` scenario's sweep counts. Best-effort,
+        // unconditional: a no-op if the file is already gone.
+        store
+            .delete_file_collecting_versions(
+                &AccessScope::allow_all(),
+                file_id,
+                race_audit(
+                    tenant_id,
+                    file_id,
+                    file_storage::domain::audit::AuditOperation::DeleteFile,
+                    serde_json::json!({ "reason": "test_cleanup" }),
+                ),
+                None,
+            )
+            .await
+            .ok();
+    }
 }

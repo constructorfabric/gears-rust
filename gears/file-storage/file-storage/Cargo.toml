@@ -117,6 +117,12 @@ gts = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 tower = { workspace = true }
+# "test-util" enables `#[tokio::test(start_paused = true)]` / `tokio::time::advance`
+# (used by `sidecar_tests.rs`'s idle-timeout tests to avoid real sleeps) --
+# a test-only addition on top of the `[dependencies]` tokio above (which stays
+# on plain `workspace = true`/"full", never pulling test-only APIs into the
+# production binary).
+tokio = { workspace = true, features = ["test-util"] }
 
 # S3 backend test double (Stage 1+): an in-process, filesystem-backed S3-compatible
 # HTTP server. Versions re-verified against crates.io in Stage 0 (matched pair).

@@ -220,6 +220,37 @@ pub struct FileStorageConfig {
     /// migration-path note in the ADR).
     #[serde(default)]
     pub require_finalize_internal_secret: bool,
+
+    /// Public keys of previously-active `signing_key_seed`s that the s2s
+    /// finalize/report-part callback routes still accept, on top of the
+    /// current seed's key (`FileService::verifier`,
+    /// `Verifier::verify_with_grace`). Each entry is a base64url-encoded
+    /// (`URL_SAFE_NO_PAD`) raw Ed25519 public key — the same wire format as
+    /// one element of the sidecar's `FS_SIDECAR_PREVIOUS_PUBLIC_KEYS` list.
+    /// Empty by default: absent an in-progress `signing_key_seed` rotation
+    /// there is no previous key to accept.
+    ///
+    /// This exists because the sidecar's own multi-key
+    /// `FS_SIDECAR_PUBLIC_KEY`/`FS_SIDECAR_PREVIOUS_PUBLIC_KEYS` mechanism
+    /// only widens what the **sidecar** accepts for the PUT/GET/part-upload
+    /// requests it verifies itself; it does nothing for the control plane's
+    /// OWN verification of the sidecar's finalize/report-part callbacks,
+    /// which — absent this field — only ever accepted the single key
+    /// `signing_key_seed` currently derives. Without it, restarting the
+    /// control plane on a new seed (`signing_key_seed`'s **Rotation**
+    /// procedure, step 3, below) fails the callback for every upload started
+    /// before the restart, even though its signed URL (issued by the OLD
+    /// seed, and still being honoured by the sidecar fleet per step 2) is
+    /// otherwise perfectly valid.
+    ///
+    /// `validate()` fails gear init on a malformed entry (bad base64, or the
+    /// wrong decoded length); harmless duplicates (of the current key, or
+    /// within this list) are silently deduped with a startup warning once
+    /// the current key is actually known — see
+    /// `FileService::with_previous_signing_public_keys` and
+    /// `infra::signed_url::dedupe_public_keys`.
+    #[serde(default)]
+    pub previous_signing_public_keys: Vec<String>,
 }
 
 /// One S3-compatible backend entry (`FileStorageConfig::s3_backends`).
@@ -441,6 +472,32 @@ impl FileStorageConfig {
                  at least max_url_ttl_secs to close this window."
             );
         }
+        // Each entry must be a validly-formed (base64url, 32-byte) Ed25519
+        // public key -- fail gear init on a malformed one rather than
+        // surfacing it lazily at the first finalize/report-part callback
+        // that happens to try it. The dedupe-against-the-actual-current-key
+        // step (harmless duplicates -> warn, not reject) happens in
+        // `gear.rs`/`FileService::with_previous_signing_public_keys`, once
+        // the current key is actually derived from `signing_key_seed` --
+        // unlike the sidecar's `FS_SIDECAR_PUBLIC_KEY`, this config never
+        // carries the primary key as a literal value for `validate()` to
+        // compare against.
+        if !self.previous_signing_public_keys.is_empty() {
+            let decoded = self
+                .previous_signing_public_keys
+                .iter()
+                .enumerate()
+                .map(|(i, k)| crate::infra::signed_url::decode_public_key_entry(k, i))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "invalid file-storage config: previous_signing_public_keys: {e}"
+                    )
+                })?;
+            crate::infra::signed_url::Verifier::from_public_keys(decoded).map_err(|e| {
+                anyhow::anyhow!("invalid file-storage config: previous_signing_public_keys: {e}")
+            })?;
+        }
         Ok(())
     }
 }
@@ -490,6 +547,12 @@ impl fmt::Debug for FileStorageConfig {
                 "require_finalize_internal_secret",
                 &self.require_finalize_internal_secret,
             )
+            // An Ed25519 public key is not secret -- safe to print in full,
+            // unlike `signing_key_seed`/`finalize_internal_secret` above.
+            .field(
+                "previous_signing_public_keys",
+                &self.previous_signing_public_keys,
+            )
             .finish()
     }
 }
@@ -517,6 +580,7 @@ impl Default for FileStorageConfig {
             default_backend_id: None,
             finalize_internal_secret: None,
             require_finalize_internal_secret: false,
+            previous_signing_public_keys: Vec::new(),
         }
     }
 }

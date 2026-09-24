@@ -80,6 +80,27 @@ fn new_version(file_id: Uuid, version_id: Uuid, size: i64) -> FileVersion {
     }
 }
 
+/// A `pending` version row with an explicit `created_at`, for the
+/// `list_pending_older_than` batch-cap test below (needs precise control
+/// over ordering, unlike [`new_version`]'s always-`now` `Available` row).
+fn new_pending_version(file_id: Uuid, version_id: Uuid, created_at: OffsetDateTime) -> FileVersion {
+    FileVersion {
+        file_id,
+        version_id,
+        mime_type: "text/plain".to_owned(),
+        size: 0,
+        hash_algorithm: "SHA-256".to_owned(),
+        hash_value: vec![0u8; 32],
+        hash_mode: "whole-sha256".to_owned(),
+        part_count: None,
+        status: VersionStatus::Pending,
+        is_current: false,
+        backend_id: "mem".to_owned(),
+        backend_path: format!("/{file_id}/{version_id}"),
+        created_at,
+    }
+}
+
 /// `VersionRepo::get(file_id, version_id)` must resolve exactly the target
 /// row among many versions seeded across two different files, and must never
 /// resolve a version under a `file_id` it does not belong to.
@@ -265,5 +286,217 @@ async fn get_manifests_returns_all_results_across_multiple_chunks() {
             Some(&format!("{{\"version_id\":\"{version_id}\"}}")),
             "manifest content must round-trip for {version_id}"
         );
+    }
+}
+
+/// `VersionRepo::list_by_file` must order `(created_at, version_id)`
+/// descending, not `created_at` alone -- otherwise two versions of
+/// the same file sharing a `created_at` instant have no defined relative
+/// order across two separate `OFFSET` queries, and an `OFFSET`-paginated page
+/// boundary drawn through such a run can skip or repeat a row.
+///
+/// Seeds four versions of one file, all sharing the SAME `created_at`
+/// (`version_id`s built via `Uuid::from_u128`, not `Uuid::now_v7`, so the
+/// tiebreak assertion does not depend on wall-clock generation order), then
+/// walks `limit = 2` pages via `offset` and asserts the concatenated pages
+/// are exactly the four `version_id`s, each exactly once, in
+/// `version_id`-descending order.
+#[tokio::test]
+async fn list_by_file_orders_by_created_at_then_version_id_so_paged_offsets_do_not_skip_or_repeat()
+{
+    let db = db().await;
+    let conn = db.conn().expect("conn");
+    let scope = AccessScope::allow_all();
+    let files = FileRepo::new();
+    let versions = VersionRepo::new();
+
+    let file_id = Uuid::now_v7();
+    let tenant = Uuid::now_v7();
+    files
+        .create(&conn, &scope, &new_file(file_id, tenant))
+        .await
+        .expect("create file");
+
+    let same_instant = OffsetDateTime::now_utc();
+    let ids = [
+        Uuid::from_u128(1),
+        Uuid::from_u128(2),
+        Uuid::from_u128(3),
+        Uuid::from_u128(4),
+    ];
+    for &version_id in &ids {
+        versions
+            .insert(
+                &conn,
+                &scope,
+                &new_pending_version(file_id, version_id, same_instant),
+            )
+            .await
+            .expect("insert version");
+    }
+
+    let page1 = versions
+        .list_by_file(&conn, &scope, file_id, 2, 0)
+        .await
+        .expect("page 1");
+    let page2 = versions
+        .list_by_file(&conn, &scope, file_id, 2, 2)
+        .await
+        .expect("page 2");
+
+    let mut seen: Vec<Uuid> = page1
+        .iter()
+        .chain(page2.iter())
+        .map(|v| v.version_id)
+        .collect();
+    let mut expected = ids.to_vec();
+    expected.sort_unstable_by(|a, b| b.cmp(a)); // version_id descending
+    assert_eq!(
+        seen, expected,
+        "two OFFSET pages over four equal-created_at rows must together cover \
+         every version_id exactly once, in version_id-descending order"
+    );
+    seen.dedup();
+    assert_eq!(
+        seen.len(),
+        4,
+        "no version_id may be repeated across the two pages"
+    );
+}
+
+/// `VersionRepo::list_pending_older_than` must cap its result at `limit` rows
+/// -- the cleanup sweep's abandoned-pending-version phase used to run this
+/// query with no bound at all, materializing an entire backlog in one sweep
+/// pass -- and must order deterministically: `(created_at, version_id)`
+/// ascending, not merely `created_at` (which alone leaves ties unordered).
+///
+/// Seeds four pending versions under one file, one more than `limit = 3`:
+/// `a` strictly oldest, `d` strictly newest (must be excluded), and `b`/`c`
+/// sharing `a`'s successor timestamp with `b`'s `version_id` numerically
+/// below `c`'s (constructed via `Uuid::from_u128`, not `Uuid::now_v7`, so the
+/// tiebreak assertion does not depend on wall-clock generation order).
+#[tokio::test]
+async fn list_pending_older_than_caps_at_limit_and_orders_deterministically() {
+    let db = db().await;
+    let conn = db.conn().expect("conn");
+    let scope = AccessScope::allow_all();
+    let files = FileRepo::new();
+    let versions = VersionRepo::new();
+
+    let file_id = Uuid::now_v7();
+    let tenant = Uuid::now_v7();
+    files
+        .create(&conn, &scope, &new_file(file_id, tenant))
+        .await
+        .expect("create file");
+
+    let base = OffsetDateTime::now_utc() - time::Duration::hours(10);
+    let id_a = Uuid::from_u128(1);
+    let id_b = Uuid::from_u128(11);
+    let id_c = Uuid::from_u128(12);
+    let id_d = Uuid::from_u128(99);
+
+    versions
+        .insert(&conn, &scope, &new_pending_version(file_id, id_a, base))
+        .await
+        .expect("insert a");
+    versions
+        .insert(
+            &conn,
+            &scope,
+            &new_pending_version(file_id, id_c, base + time::Duration::seconds(1)),
+        )
+        .await
+        .expect("insert c");
+    versions
+        .insert(
+            &conn,
+            &scope,
+            &new_pending_version(file_id, id_b, base + time::Duration::seconds(1)),
+        )
+        .await
+        .expect("insert b");
+    versions
+        .insert(
+            &conn,
+            &scope,
+            &new_pending_version(file_id, id_d, base + time::Duration::seconds(2)),
+        )
+        .await
+        .expect("insert d (newest, must be excluded by the limit)");
+
+    let now = OffsetDateTime::now_utc();
+    let older_than = now;
+    let rows = versions
+        .list_pending_older_than(&conn, &scope, older_than, now, 3)
+        .await
+        .expect("list_pending_older_than must not error");
+
+    assert_eq!(
+        rows.len(),
+        3,
+        "limit = 3 over 4 eligible candidates must return exactly 3 rows"
+    );
+    assert_eq!(
+        rows.iter().map(|r| r.version_id).collect::<Vec<_>>(),
+        vec![id_a, id_b, id_c],
+        "rows must be ordered (created_at, version_id) ascending -- a first \
+         (oldest), then b before c (same created_at, b's version_id is \
+         smaller), and d (strictly newest) excluded by the limit"
+    );
+}
+
+/// `VersionRepo::insert` against a `file_id` whose `files` row is already
+/// gone must surface `DomainError::FileNotFound` (HTTP 404), not the
+/// untyped `Database` shape (HTTP 500) a bare `db_err`-mapped FK violation
+/// would have produced.
+///
+/// This is the deleted-parent half of the delete-vs-insert-version race
+/// (`docs/concurrency-and-failure-model.md` race #9/#10): on real
+/// `PostgreSQL`, `FileRepo::lock_for_update` makes a losing
+/// `insert_pending_version` block until the delete's transaction commits,
+/// then fail exactly this FK check. `SQLite` needs no lock to reproduce the
+/// FK failure itself (`sqlx`'s `PRAGMA foreign_keys = ON` enforces it
+/// unconditionally) -- this test pins the error-mapping half of the fix
+/// deterministically, without needing real concurrency or `PostgreSQL`; see
+/// `tests/pg_concurrency_test.rs` for the concurrency half.
+#[tokio::test]
+async fn insert_against_a_deleted_file_maps_foreign_key_violation_to_file_not_found() {
+    let db = db().await;
+    let conn = db.conn().expect("conn");
+    let scope = AccessScope::allow_all();
+    let files = FileRepo::new();
+    let versions = VersionRepo::new();
+
+    let file_id = Uuid::now_v7();
+    let tenant = Uuid::now_v7();
+    files
+        .create(&conn, &scope, &new_file(file_id, tenant))
+        .await
+        .expect("create file");
+
+    let removed = files
+        .delete(&conn, &scope, file_id)
+        .await
+        .expect("delete must not error");
+    assert!(removed, "the file row must have been removed");
+
+    let version_id = Uuid::now_v7();
+    let err = versions
+        .insert(&conn, &scope, &new_version(file_id, version_id, 0))
+        .await
+        .expect_err("insert against a deleted file's file_id must fail");
+
+    match err {
+        file_storage::domain::error::DomainError::FileNotFound { id } => {
+            assert_eq!(
+                id, file_id,
+                "the FileNotFound error must name the file_id the FK check failed against"
+            );
+        }
+        other => panic!(
+            "expected DomainError::FileNotFound (mapped from the foreign-key \
+             violation), got: {other}"
+        ),
     }
 }

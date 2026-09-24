@@ -126,6 +126,14 @@ pub struct FileService {
     /// (see [`Self::new`]); `gear.rs` opts into the real OTel-backed meter via
     /// [`Self::with_metrics`].
     pub(super) metrics: Arc<dyn FileStorageMetricsPort>,
+    /// The verifier the s2s finalize/report-part callback routes use (see
+    /// [`Self::verifier`]). Defaults in [`Self::new`] to `issuer.verifier()`
+    /// — a single key, the issuer's current one; `gear.rs` extends it via
+    /// [`Self::with_previous_signing_public_keys`] with
+    /// `FileStorageConfig::previous_signing_public_keys` so a
+    /// `signing_key_seed` rotation doesn't reject an in-flight upload's
+    /// callback the moment the control plane restarts on the new seed.
+    pub(super) callback_verifier: crate::infra::signed_url::Verifier,
 }
 
 impl FileService {
@@ -138,6 +146,7 @@ impl FileService {
         quota_client: Option<Arc<dyn QuotaClient>>,
         usage_reporter: Option<Arc<dyn UsageReporter>>,
     ) -> Self {
+        let callback_verifier = issuer.verifier();
         Self {
             store,
             backends,
@@ -147,6 +156,7 @@ impl FileService {
             quota_client,
             usage_reporter,
             metrics: Arc::new(NoopMetrics),
+            callback_verifier,
         }
     }
 
@@ -158,6 +168,52 @@ impl FileService {
     pub fn with_metrics(mut self, metrics: Arc<dyn FileStorageMetricsPort>) -> Self {
         self.metrics = metrics;
         self
+    }
+
+    /// Extend the finalize/report-part callback verifier (returned by
+    /// [`Self::verifier`]) to additionally accept `previous_keys` — raw
+    /// public-key bytes of `signing_key_seed`s that used to be current — on
+    /// top of the issuer's own current key. A no-op when `previous_keys` is
+    /// empty, so every existing call site that doesn't care keeps the
+    /// `new()` default (the issuer's single current key) unchanged.
+    ///
+    /// This only widens what the control plane still **accepts** on those
+    /// two callback routes — minting is unaffected: `Issuer::issue` always
+    /// signs a fresh token with the current key only. See
+    /// `FileStorageConfig::previous_signing_public_keys` and
+    /// `docs/operations.md`'s `signing_key_seed` → Rotation procedure for
+    /// why this exists.
+    ///
+    /// A duplicate of the current key (or within `previous_keys` itself) is
+    /// silently deduped with a `tracing::warn!` — see
+    /// `infra::signed_url::dedupe_public_keys` — rather than rejected;
+    /// `gear.rs` calls this only after `FileStorageConfig::validate()` has
+    /// already rejected a malformed entry, so the only error this can
+    /// plausibly return here is defense in depth, not the primary place a
+    /// misconfiguration is expected to be caught.
+    ///
+    /// # Errors
+    /// Returns an error if any key in `previous_keys` is not a valid-length
+    /// Ed25519 public key (32 bytes).
+    pub fn with_previous_signing_public_keys(
+        mut self,
+        previous_keys: Vec<Vec<u8>>,
+    ) -> Result<Self, DomainError> {
+        if previous_keys.is_empty() {
+            return Ok(self);
+        }
+        let (keys, dropped) =
+            crate::infra::signed_url::dedupe_public_keys(self.issuer.public_key(), previous_keys);
+        if dropped > 0 {
+            tracing::warn!(
+                dropped_duplicates = dropped,
+                "file-storage: previous_signing_public_keys contains keys already accepted by \
+                 the current signing key; dropped \u{2014} a completed signing_key_seed rotation \
+                 usually means the list should be cleared"
+            );
+        }
+        self.callback_verifier = crate::infra::signed_url::Verifier::from_public_keys(keys)?;
+        Ok(self)
     }
 
     // ── helpers ─────────────────────────────────────────────────────────────
@@ -174,12 +230,17 @@ impl FileService {
         }
     }
 
-    /// Return the token verifier backed by the control plane's signing key.
-    /// The data-plane finalize handler uses this to validate the sidecar's
-    /// upload token without knowing the private key.
+    /// Return the token verifier the finalize/report-part callback routes
+    /// use to validate the sidecar's upload token without knowing the
+    /// private key. Accepts the issuer's current key plus, once
+    /// [`Self::with_previous_signing_public_keys`] has been called (as
+    /// `gear.rs` does from `FileStorageConfig::previous_signing_public_keys`),
+    /// any still-retained previous `signing_key_seed` keys — so a rotation
+    /// doesn't reject an in-flight upload's callback the moment the control
+    /// plane restarts on the new seed.
     #[must_use]
     pub fn verifier(&self) -> crate::infra::signed_url::Verifier {
-        self.issuer.verifier()
+        self.callback_verifier.clone()
     }
 
     /// Mint a signed URL for `op` against `v`.

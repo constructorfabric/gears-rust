@@ -4,7 +4,7 @@
 //! all queries use `AccessScope::allow_all()`. The tenant boundary is
 //! enforced through the parent `files` row before a session is created.
 
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set};
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set};
 use time::OffsetDateTime;
 use toolkit_db::secure::{
     DBRunner, SecureDeleteExt, SecureEntityExt, SecureInsertExt, SecureOnConflict, SecureUpdateExt,
@@ -275,13 +275,46 @@ impl MultipartRepo {
 
     /// Terminal transition `completing → completed`, persisting the response
     /// snapshot (`complete_result` JSON) and clearing the lease.
+    ///
+    /// `expected_owner`: when `Some`, the CAS additionally requires
+    /// `lease_owner = expected_owner` -- a *foreign* or *taken-over* lease
+    /// (one this specific caller no longer, or never, held) cannot flip the
+    /// session to `completed` (DBS-05 hardening: `release_complete_lease`/
+    /// `acquire_complete_lease` already fence this way; this predicate was
+    /// the one CAS in this state machine that didn't).
+    ///
+    /// `None` deliberately omits that predicate for exactly one caller:
+    /// `Store::finalize_multipart_version`'s own embedded call, made in the
+    /// SAME transaction as -- and immediately after -- that same caller's
+    /// own just-WON finalize CAS. That finalize CAS is itself fenced only by
+    /// `status = 'pending'`, never by lease ownership (see its own doc
+    /// comment) -- a completer whose lease has since been taken over can
+    /// still legitimately win it, and the resulting version/bind decision is
+    /// correct regardless of current lease ownership (deterministic
+    /// reassembly from the same persisted parts). Requiring THIS caller's
+    /// own (possibly since-superseded) owner to still match here would
+    /// re-strand exactly the race `f2_stale_completer_converges_instead_of_
+    /// stranding_after_owner_fencing_fix` exists to prevent, for no safety
+    /// benefit -- the finalize CAS it just won already proves it is the
+    /// unique, legitimate author of this completion. Every OTHER caller
+    /// (the standalone `Store::complete_multipart_upload`, used by
+    /// `MultipartService::finish_session`'s takeover-fastpath and
+    /// converge-after-lost-CAS paths -- decisions made independently of any
+    /// finalize this same transaction just won) always passes `Some`.
     pub async fn finish_complete<C: DBRunner>(
         &self,
         conn: &C,
         upload_id: Uuid,
+        expected_owner: Option<&str>,
         result_json: &str,
     ) -> Result<bool, DomainError> {
         use sea_orm::sea_query::Expr;
+        let mut condition = sea_orm::Condition::all()
+            .add(UploadColumn::UploadId.eq(upload_id))
+            .add(UploadColumn::State.eq("completing"));
+        if let Some(owner) = expected_owner {
+            condition = condition.add(UploadColumn::LeaseOwner.eq(owner));
+        }
         let res = UploadEntity::update_many()
             .col_expr(UploadColumn::State, Expr::value("completed"))
             .col_expr(UploadColumn::MimeValidated, Expr::value(true))
@@ -294,11 +327,7 @@ impl MultipartRepo {
                 UploadColumn::LeaseOwner,
                 Expr::value(Option::<String>::None),
             )
-            .filter(
-                sea_orm::Condition::all()
-                    .add(UploadColumn::UploadId.eq(upload_id))
-                    .add(UploadColumn::State.eq("completing")),
-            )
+            .filter(condition)
             .secure()
             .scope_with(&AccessScope::allow_all())
             .exec(conn)
@@ -493,12 +522,22 @@ impl MultipartRepo {
         rows.into_iter().map(part_from_model).collect()
     }
 
-    /// List all `in_progress` upload sessions whose `expires_at` is before `now`.
-    /// Used by the orphan-reconciliation sweep to clean up stale sessions.
+    /// List all `in_progress` (or lease-lapsed `completing`) upload sessions
+    /// whose `expires_at` is before `now`. Used by the orphan-reconciliation
+    /// sweep to clean up stale sessions.
+    ///
+    /// Ordered `(expires_at, upload_id)` ascending, up to `limit` rows -- one
+    /// batch per sweep pass, mirroring `VersionRepo::list_pending_older_than`.
+    /// No cursor is needed: the caller's own CAS moves every returned row's
+    /// `state` away from `in_progress`/`completing` before the next sweep
+    /// tick, so it falls out of this same query's next result set on its
+    /// own, and whatever this pass's `limit` left behind is simply picked up
+    /// then.
     pub async fn list_expired<C: DBRunner>(
         &self,
         conn: &C,
         now: OffsetDateTime,
+        limit: u64,
     ) -> Result<Vec<MultipartUploadSession>, DomainError> {
         let rows = UploadEntity::find()
             .filter(
@@ -520,6 +559,8 @@ impl MultipartRepo {
                     ),
             )
             .order_by_asc(UploadColumn::ExpiresAt)
+            .order_by_asc(UploadColumn::UploadId)
+            .limit(limit)
             .secure()
             .scope_with(&AccessScope::allow_all())
             .all(conn)

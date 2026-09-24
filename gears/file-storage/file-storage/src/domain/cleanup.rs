@@ -13,6 +13,7 @@
 
 #![allow(unknown_lints, de0309_must_have_domain_model)]
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use time::OffsetDateTime;
@@ -21,7 +22,7 @@ use uuid::Uuid;
 use crate::domain::audit::{AuditEntry, AuditOperation, AuditOutcome, FileEvent};
 use crate::domain::multipart::MultipartUploadSession;
 use crate::domain::policy::RetentionScope;
-use crate::domain::ports::CleanupStore;
+use crate::domain::ports::{CleanupStore, DeletedFile};
 use crate::domain::storage_layout;
 use crate::infra::backend::BackendRegistry;
 use crate::infra::external_clients::{UsageDelta, UsageReporter};
@@ -30,16 +31,43 @@ use crate::infra::external_clients::{UsageDelta, UsageReporter};
 /// `File` rows the sweep holds in memory at once, independent of total count.
 const RETENTION_SWEEP_BATCH: u64 = 500;
 
+/// Page size for [`CleanupEngine::sweep_abandoned_pending`] (sweep step 1,
+/// first phase): abandoned pending version rows reclaimed per sweep pass.
+/// One batch per pass, same as every other step-1/step-2 query -- none of
+/// them loop to exhaustion -- so a backlog built up during an outage or a
+/// run of repeated client failures cannot force a single sweep tick to
+/// materialize and process an unbounded candidate list; any remainder is
+/// left for the next scheduled sweep (see
+/// [`crate::domain::ports::CleanupStore::list_abandoned_pending_versions`]
+/// for why no cursor is needed to pick it up).
+const ABANDONED_PENDING_SWEEP_BATCH: u64 = 500;
+
 /// Page size for the second phase of sweep step 1
 /// ([`CleanupEngine::sweep_versionless_files`]): permanently versionless
 /// `files` rows reclaimed per sweep pass. One batch per pass, same as its
-/// step-1 sibling [`CleanupEngine::sweep_abandoned_pending`] (which has no
-/// limit at all) and step 2's `sweep_expired_multipart` -- neither loops to
-/// exhaustion, so this phase doesn't either; a bound is still applied here
-/// (rather than an unbounded scan) purely as a defensive cap against a
-/// pathological backlog, with any remainder left for the next scheduled
-/// sweep.
+/// step-1 sibling [`CleanupEngine::sweep_abandoned_pending`] and step 2's
+/// `sweep_expired_multipart` -- neither loops to exhaustion, so this phase
+/// doesn't either; a bound is still applied here (rather than an unbounded
+/// scan) purely as a defensive cap against a pathological backlog, with any
+/// remainder left for the next scheduled sweep.
 const VERSIONLESS_SWEEP_BATCH: u64 = 500;
+
+/// Page size for [`CleanupEngine::sweep_expired_multipart`] (sweep step 2):
+/// expired multipart sessions aborted per sweep pass. Same reasoning as
+/// [`ABANDONED_PENDING_SWEEP_BATCH`] above -- a backlog of unreconciled
+/// sessions (e.g. from a client that stopped uploading parts en masse)
+/// cannot force one sweep tick to abort an unbounded number of sessions in a
+/// single pass; the remainder is picked up by the next tick (see
+/// [`crate::domain::ports::CleanupStore::list_expired_multipart_uploads`]
+/// for why no cursor is needed).
+const EXPIRED_MULTIPART_SWEEP_BATCH: u64 = 500;
+
+/// Page size for sweep step 4 (expired `idempotency_keys` rows). Same
+/// reasoning as the other sweep phases above: a stalled sweep letting a
+/// large backlog accumulate must not turn the next tick into one unbounded
+/// `DELETE` (a long-held lock on `PostgreSQL`, one large single-writer
+/// transaction on `SQLite`); the remainder is picked up by the next tick.
+const EXPIRED_IDEMPOTENCY_SWEEP_BATCH: u64 = 500;
 
 /// Configuration knobs for the cleanup engine.
 #[derive(Debug, Clone)]
@@ -195,7 +223,7 @@ impl CleanupEngine {
         // that were never delivered.
         result.idempotency_keys_deleted += self
             .store
-            .delete_expired_idempotency_keys(now)
+            .delete_expired_idempotency_keys(now, EXPIRED_IDEMPOTENCY_SWEEP_BATCH)
             .await
             .unwrap_or_else(|e| {
                 tracing::warn!(error = ?e, "cleanup: failed to delete expired idempotency keys");
@@ -226,7 +254,7 @@ impl CleanupEngine {
     ) -> (usize, usize) {
         let versions = match self
             .store
-            .list_abandoned_pending_versions(grace_cutoff, now)
+            .list_abandoned_pending_versions(grace_cutoff, now, ABANDONED_PENDING_SWEEP_BATCH)
             .await
         {
             Ok(v) => v,
@@ -239,9 +267,24 @@ impl CleanupEngine {
             }
         };
 
+        // Resolve every candidate's parent file in ONE batch call, up front,
+        // instead of one `get_file` per candidate inside the loop below (up
+        // to `ABANDONED_PENDING_SWEEP_BATCH` round trips otherwise) -- see
+        // `load_files_by_ids_for_audit`'s doc comment.
+        let file_ids: Vec<Uuid> = {
+            let mut seen = std::collections::HashSet::new();
+            versions
+                .iter()
+                .map(|v| v.file_id)
+                .filter(|id| seen.insert(*id))
+                .collect()
+        };
+        let files_by_id = self.load_files_by_ids_for_audit(&file_ids).await;
+
         let mut pending_count = 0_usize;
         let mut files_count = 0_usize;
         for v in versions {
+            let prefetched_file = files_by_id.get(&v.file_id).cloned();
             let (pending, files) = self
                 .delete_abandoned_pending_version(
                     v.file_id,
@@ -249,6 +292,7 @@ impl CleanupEngine {
                     v.size,
                     &v.backend_id,
                     &v.backend_path,
+                    prefetched_file,
                 )
                 .await;
             pending_count += pending;
@@ -270,6 +314,38 @@ impl CleanupEngine {
                     "cleanup: failed to load file for audit tenant attribution"
                 );
                 None
+            }
+        }
+    }
+
+    /// Batched counterpart of [`Self::load_file_for_audit`]: resolves every
+    /// distinct file in `ids` in ONE round trip (`CleanupStore::list_files_by_ids`)
+    /// instead of one `get_file` per candidate, keyed by `file_id` for the
+    /// caller's loop to look up. Used by [`Self::sweep_abandoned_pending`] and
+    /// [`Self::sweep_expired_multipart`] to resolve a whole sweep batch's
+    /// (up to 500) candidates' audit `tenant_id`s up front.
+    ///
+    /// A failed batch read is logged once for the whole batch and treated as
+    /// "no files resolved" -- every candidate in this pass falls back to a
+    /// nil audit tenant, exactly as a single candidate would if its own
+    /// [`Self::load_file_for_audit`] call had failed. `ids` containing no
+    /// entries (an empty candidate batch) skips the call entirely.
+    async fn load_files_by_ids_for_audit(
+        &self,
+        ids: &[Uuid],
+    ) -> HashMap<Uuid, file_storage_sdk::File> {
+        if ids.is_empty() {
+            return HashMap::new();
+        }
+        match self.store.list_files_by_ids(ids).await {
+            Ok(files) => files.into_iter().map(|f| (f.file_id, f)).collect(),
+            Err(e) => {
+                tracing::warn!(
+                    error = ?e,
+                    file_ids = ?ids,
+                    "cleanup: failed to load files for audit tenant attribution"
+                );
+                HashMap::new()
             }
         }
     }
@@ -299,6 +375,16 @@ impl CleanupEngine {
     /// Returns `(pending_versions_deleted, orphan_files_deleted)`, each `0`
     /// or `1`.
     ///
+    /// `prefetched_file` is this candidate's parent `File`, if the caller
+    /// already resolved it (`sweep_abandoned_pending` batch-loads every
+    /// candidate's file in one round trip before its loop, instead of one
+    /// `get_file` per candidate here); `None` when the batch load did not
+    /// cover this `file_id` (e.g. it failed, or a direct unit-test call has
+    /// no snapshot to hand in). Reused below both for this function's own
+    /// audit row's `tenant_id` and, passed through unchanged, for
+    /// `maybe_delete_orphaned_file` -- same read-elimination as
+    /// `cleanup_expired_session_version_with_file`'s own `prefetched_file`.
+    ///
     /// `pub` (rather than private) solely so a unit test can invoke it
     /// directly to exercise the narrow mid-flight interleaving window
     /// deterministically, without real concurrency -- mirroring
@@ -312,8 +398,9 @@ impl CleanupEngine {
         size: i64,
         backend_id: &str,
         backend_path: &str,
+        prefetched_file: Option<file_storage_sdk::File>,
     ) -> (usize, usize) {
-        let file = self.load_file_for_audit(file_id).await;
+        let file = prefetched_file;
         let audit = AuditEntry {
             tenant_id: file.as_ref().map_or_else(Uuid::nil, |file| file.tenant_id),
             actor_kind: "system".to_owned(),
@@ -351,11 +438,10 @@ impl CleanupEngine {
                 // Best-effort blob cleanup -- a failure here leaves an unreachable
                 // orphan blob which is acceptable in P2.
                 self.best_effort_delete(backend_id, backend_path).await;
-                // Reuse the `file` snapshot already read (via
-                // `load_file_for_audit`) above for this function's own audit
-                // row, instead of letting `orphan_candidate_file` fetch it a
-                // second time -- same read-elimination as
-                // `cleanup_expired_session_version_with_file`'s.
+                // Reuse the caller-supplied `prefetched_file` snapshot for
+                // this function's own audit row, instead of letting
+                // `orphan_candidate_file` fetch it a second time -- same
+                // read-elimination as `cleanup_expired_session_version_with_file`'s.
                 let files_deleted = self
                     .maybe_delete_orphaned_file(
                         file_id,
@@ -451,12 +537,17 @@ impl CleanupEngine {
     /// The checks here are a cheap pre-filter run against a fresh (but
     /// pre-transaction) snapshot -- to skip the extra round-trip on the
     /// common case where the file still has other versions or content. The
-    /// authoritative guard re-runs the same two checks fresh **inside** the
-    /// same transaction as the file delete
+    /// authoritative guard locks the `files` row first and re-runs the same
+    /// checks (plus a fresh no-active-multipart-session check) fresh
+    /// **inside** that lock, in the same transaction as the file delete
     /// ([`crate::domain::ports::CleanupStore::delete_orphan_file_with_event`]),
-    /// so a version inserted or bound in the gap between this pre-check and
-    /// that call cannot cause data loss: the delete simply aborts and the
-    /// file (with its new version) is left untouched.
+    /// so a version inserted or a multipart session started in the gap
+    /// between this pre-check and that call cannot cause data loss: the
+    /// delete simply aborts and the file (with its new version/session) is
+    /// left untouched. This is a strict guarantee, not merely a narrowed
+    /// window -- see `FileRepo::lock_for_update`'s and
+    /// `Store::delete_orphan_file_with_event`'s doc comments for why the row
+    /// lock closes it fully rather than shrinking it.
     ///
     /// Returns `1` if the file row was deleted, `0` otherwise.
     ///
@@ -654,7 +745,11 @@ impl CleanupEngine {
     /// tally counts files reclaimed here, not only by step 1 (see
     /// `run_sweep`'s step 2 comment and `cleanup_expired_session_version`'s doc).
     async fn sweep_expired_multipart(&self, now: OffsetDateTime) -> (usize, usize) {
-        let sessions = match self.store.list_expired_multipart_uploads(now).await {
+        let sessions = match self
+            .store
+            .list_expired_multipart_uploads(now, EXPIRED_MULTIPART_SWEEP_BATCH)
+            .await
+        {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(
@@ -665,10 +760,26 @@ impl CleanupEngine {
             }
         };
 
+        // Same batch-first pattern as `sweep_abandoned_pending`: resolve
+        // every candidate session's parent file in ONE round trip instead of
+        // one `get_file` per session inside the loop below.
+        let file_ids: Vec<Uuid> = {
+            let mut seen = std::collections::HashSet::new();
+            sessions
+                .iter()
+                .map(|s| s.file_id)
+                .filter(|id| seen.insert(*id))
+                .collect()
+        };
+        let files_by_id = self.load_files_by_ids_for_audit(&file_ids).await;
+
         let mut aborted_count = 0_usize;
         let mut files_count = 0_usize;
         for session in sessions {
-            let (aborted, files) = self.abort_expired_multipart_session(session).await;
+            let prefetched_file = files_by_id.get(&session.file_id).cloned();
+            let (aborted, files) = self
+                .abort_expired_multipart_session(session, prefetched_file)
+                .await;
             aborted_count += aborted;
             files_count += files;
         }
@@ -690,15 +801,17 @@ impl CleanupEngine {
     async fn abort_expired_multipart_session(
         &self,
         session: MultipartUploadSession,
+        prefetched_file: Option<file_storage_sdk::File>,
     ) -> (usize, usize) {
-        // Read the parent `File` once, here, and thread it all the way down
+        // `prefetched_file` is this session's parent `File`, already
+        // resolved by `sweep_expired_multipart`'s batch load before its loop
+        // (`load_files_by_ids_for_audit`) -- thread it all the way down
         // through `cleanup_expired_session_version_with_file` to
         // `orphan_candidate_file`, instead of letting each of those three
-        // spots fetch it independently. `load_file_for_audit` folds a lookup
-        // error into "no file" (logging a `warn!` first): the audit tenant
-        // then falls back to `Uuid::nil()` below rather than blocking the
-        // abort on a failed read.
-        let file = self.load_file_for_audit(session.file_id).await;
+        // spots fetch it independently. `None` (batch load did not cover this
+        // `file_id`, e.g. it failed) falls back to `Uuid::nil()` below rather
+        // than blocking the abort.
+        let file = prefetched_file;
         let audit_tenant_id = file.as_ref().map_or_else(Uuid::nil, |file| file.tenant_id);
         let abort_audit = AuditEntry {
             tenant_id: audit_tenant_id,
@@ -1143,37 +1256,20 @@ impl CleanupEngine {
         self.expire_file(file, now).await
     }
 
-    /// Fetch a file's versions ahead of a retention deletion. Returns `None`
-    /// (after logging) if the store errors, so the caller can skip expiring
-    /// this file rather than treating the error as "zero versions" and
-    /// deleting it anyway.
-    ///
-    /// Extracted from `expire_file` to keep its cognitive complexity down.
-    async fn list_versions_for_expiry(
-        &self,
-        file_id: Uuid,
-    ) -> Option<Vec<file_storage_sdk::FileVersion>> {
-        match self.store.list_versions(file_id).await {
-            Ok(v) => Some(v),
-            Err(e) => {
-                tracing::warn!(
-                    error = ?e,
-                    file_id = %file_id,
-                    "cleanup: failed to list versions for retention-expired file; skipping expiry"
-                );
-                None
-            }
-        }
-    }
-
     /// Delete one retention-expired file (DB row + backend blobs). Returns 1 if deleted.
+    ///
+    /// The version list used for backend-blob cleanup is collected by
+    /// [`CleanupStore::delete_file_with_event_collecting_versions`] **inside
+    /// the same transaction** as the delete itself, not by a separate
+    /// pre-transaction `list_versions` call -- a version inserted
+    /// concurrently (e.g. a still-live `presign_version` on a file that
+    /// retention has just decided to expire) between an earlier read and
+    /// this delete's commit would otherwise be cascade-removed without ever
+    /// being queued for cleanup, permanently leaking its backend blob (the
+    /// cleanup engine only ever looks at rows still in the database, and by
+    /// then this one has none). See that method's doc comment for the full
+    /// mechanism.
     async fn expire_file(&self, file: &file_storage_sdk::File, now: OffsetDateTime) -> usize {
-        // Collect version blobs before deleting so we can clean them up
-        // after the DB row is gone.
-        let Some(versions) = self.list_versions_for_expiry(file.file_id).await else {
-            return 0;
-        };
-
         let audit = AuditEntry {
             tenant_id: file.tenant_id,
             actor_kind: "system".to_owned(),
@@ -1206,10 +1302,13 @@ impl CleanupEngine {
         let scope = toolkit_security::AccessScope::allow_all();
         match self
             .store
-            .delete_file_with_event(&scope, file.file_id, audit, event)
+            .delete_file_with_event_collecting_versions(&scope, file.file_id, audit, event)
             .await
         {
-            Ok(true) => {
+            Ok(DeletedFile {
+                removed: true,
+                versions,
+            }) => {
                 // Debit the file's total bytes and the file count -- a
                 // retention-expired delete removes the whole file (mirrors
                 // `FileService::delete_file_inner`'s debit for the
@@ -1228,7 +1327,7 @@ impl CleanupEngine {
                 }
                 1
             }
-            Ok(false) => {
+            Ok(DeletedFile { removed: false, .. }) => {
                 // Concurrent sweep already deleted it -- fine.
                 0
             }

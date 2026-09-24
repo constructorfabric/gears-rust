@@ -537,9 +537,10 @@ impl CleanupStore for FaultyCleanupStore {
         &self,
         older_than: OffsetDateTime,
         now: OffsetDateTime,
+        limit: u64,
     ) -> Result<Vec<FileVersion>, DomainError> {
         self.inner
-            .list_abandoned_pending_versions(older_than, now)
+            .list_abandoned_pending_versions(older_than, now, limit)
             .await
     }
 
@@ -576,11 +577,12 @@ impl CleanupStore for FaultyCleanupStore {
     async fn list_expired_multipart_uploads(
         &self,
         now: OffsetDateTime,
+        limit: u64,
     ) -> Result<Vec<MultipartUploadSession>, DomainError> {
         if self.faults.fault_list_expired_multipart {
             return Err(DomainError::InternalError);
         }
-        self.inner.list_expired_multipart_uploads(now).await
+        self.inner.list_expired_multipart_uploads(now, limit).await
     }
 
     async fn abort_multipart_upload(
@@ -644,19 +646,25 @@ impl CleanupStore for FaultyCleanupStore {
             .await
     }
 
+    async fn list_files_by_ids(&self, ids: &[Uuid]) -> Result<Vec<File>, DomainError> {
+        self.inner
+            .list_files_by_ids(&AccessScope::allow_all(), ids)
+            .await
+    }
+
     async fn has_active_multipart_for_file(&self, file_id: Uuid) -> Result<bool, DomainError> {
         self.inner.has_active_multipart_for_file(file_id).await
     }
 
-    async fn delete_file_with_event(
+    async fn delete_file_with_event_collecting_versions(
         &self,
         scope: &AccessScope,
         file_id: Uuid,
         audit: AuditEntry,
         event: Option<FileEvent>,
-    ) -> Result<bool, DomainError> {
+    ) -> Result<file_storage::domain::ports::DeletedFile, DomainError> {
         self.inner
-            .delete_file_with_event(scope, file_id, audit, event)
+            .delete_file_with_event_collecting_versions(scope, file_id, audit, event)
             .await
     }
 
@@ -674,8 +682,9 @@ impl CleanupStore for FaultyCleanupStore {
     async fn delete_expired_idempotency_keys(
         &self,
         now: OffsetDateTime,
+        limit: u64,
     ) -> Result<u64, DomainError> {
-        self.inner.delete_expired_idempotency_keys(now).await
+        self.inner.delete_expired_idempotency_keys(now, limit).await
     }
 }
 
@@ -963,8 +972,12 @@ async fn cleanup_reclaim_skips_orphan_check_when_file_lookup_fails() {
         },
     );
 
+    // `None`: simulates a candidate the caller's batch prefetch did not
+    // resolve (e.g. the batch load itself failed), forcing
+    // `orphan_candidate_file`'s own fallback `get_file` -- which is what
+    // `fault_get_file_for` targets -- to run and fail.
     let (pending_deleted, files_deleted) = engine
-        .delete_abandoned_pending_version(ticket.file_id, ticket.version_id, 0, "mem", "/x/y")
+        .delete_abandoned_pending_version(ticket.file_id, ticket.version_id, 0, "mem", "/x/y", None)
         .await;
     assert_eq!(
         pending_deleted, 1,

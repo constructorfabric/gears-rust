@@ -249,6 +249,28 @@ async fn null_complete_result(dsn: &str, upload_id: Uuid) {
     .await;
 }
 
+/// Force an already-`completed` session back to a fresh-looking
+/// `in_progress` row (no lease), leaving `complete_result` and the
+/// version's own `available` status untouched -- models
+/// `assemble_and_finish`'s error-path lease release firing even though the
+/// underlying finalize + terminal transition already committed for real
+/// (see multipart_service.rs's "already-finalized fast path" doc comment,
+/// and thread #37). There is no production path back from `completed` to
+/// `in_progress`, so this is the same "tamper via raw SQL" pattern
+/// `null_complete_result` above uses for its own otherwise-unreachable row
+/// shape.
+async fn reset_session_to_in_progress(dsn: &str, upload_id: Uuid) {
+    exec_expect_one_row(
+        dsn,
+        &format!(
+            "UPDATE multipart_uploads SET state = 'in_progress', lease_owner = NULL, \
+             lease_until = NULL WHERE upload_id = {}",
+            uuid_blob(upload_id)
+        ),
+    )
+    .await;
+}
+
 /// `file_versions.hash_mode` carries a DB `CHECK` constraint restricting it
 /// to the two real spellings, so a plain `UPDATE` to a bogus value is
 /// rejected by SQLite itself before `HashMode::parse` ever runs — which is
@@ -767,6 +789,131 @@ async fn replay_completed_fallback_reports_conflict_when_content_rebound_elsewhe
     );
 }
 
+/// #16: an idempotent re-complete's `bind_state`/`etag` must reflect the
+/// bind decision actually made AT COMPLETION TIME, even after a later,
+/// legitimate rebind moves the file's content pointer elsewhere -- NOT what
+/// `bind_state_for` would derive from the file's CURRENT pointer (that
+/// fallback derivation is correct only for a genuinely snapshot-less
+/// session; see the `_fallback_` tests above and their own doc comments).
+///
+/// Unlike those tests, this one does NOT tamper `complete_result` -- it is
+/// the direct behavioral consequence of `Store::finalize_multipart_version`
+/// persisting the snapshot in the SAME transaction as the finalize + bind
+/// CAS (see that method's doc): every session completed through the current
+/// code has a snapshot, so `replay_completed` always takes its
+/// persisted-snapshot branch, never the version-row fallback, regardless of
+/// what happens to the file afterward.
+#[tokio::test]
+async fn replay_completed_snapshot_survives_a_later_rebind_without_tampering() {
+    let (svc, msvc, multipart_store, backend, _store, ctx, _dsn) = build_env().await;
+    let file_id = svc.create_file_bare(&ctx, new_file()).await.unwrap();
+
+    // Session A: auto_bind, binds the file to version A.
+    let plan_a = msvc
+        .initiate_multipart_upload(
+            &ctx,
+            file_id,
+            "application/octet-stream",
+            5,
+            None,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+    let session_a = multipart_store
+        .get_multipart_upload(plan_a.upload_id)
+        .await
+        .unwrap()
+        .expect("session a");
+    let path_a = format!("/{file_id}/{}", plan_a.version_id);
+    simulate_sidecar_put_part(
+        &multipart_store,
+        &backend,
+        &plan_a,
+        &path_a,
+        &session_a.backend_upload_handle,
+        1,
+        Bytes::from_static(b"AAAAA"),
+    )
+    .await;
+    let completed_a = msvc
+        .complete_multipart_upload(&ctx, file_id, plan_a.upload_id, None)
+        .await
+        .unwrap()
+        .unwrap_completed();
+    assert_eq!(completed_a.bind_state, BindState::Bound);
+    let original_etag = completed_a
+        .etag
+        .clone()
+        .expect("a Bound completion must carry an etag");
+
+    // A second, independent (manual) upload on the same file, then an
+    // explicit rebind moves `files.content_id` to version B -- a completely
+    // legitimate, unrelated operation, not a crash or tamper.
+    let plan_b = msvc
+        .initiate_multipart_upload(
+            &ctx,
+            file_id,
+            "application/octet-stream",
+            5,
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    let session_b = multipart_store
+        .get_multipart_upload(plan_b.upload_id)
+        .await
+        .unwrap()
+        .expect("session b");
+    let path_b = format!("/{file_id}/{}", plan_b.version_id);
+    simulate_sidecar_put_part(
+        &multipart_store,
+        &backend,
+        &plan_b,
+        &path_b,
+        &session_b.backend_upload_handle,
+        1,
+        Bytes::from_static(b"BBBBB"),
+    )
+    .await;
+    msvc.complete_multipart_upload(&ctx, file_id, plan_b.upload_id, None)
+        .await
+        .unwrap();
+    svc.bind(&ctx, file_id, plan_b.version_id, Some("*"))
+        .await
+        .expect("rebind to version B");
+
+    // Idempotent re-complete of session A, untouched (no raw-SQL tamper):
+    // must still replay the ORIGINAL Bound decision and etag, exactly as
+    // completion A produced them, not a Conflict derived from B now being
+    // current.
+    let replay_a = msvc
+        .complete_multipart_upload(&ctx, file_id, plan_a.upload_id, None)
+        .await
+        .expect("idempotent re-complete after an unrelated later rebind must still succeed")
+        .unwrap_completed();
+    assert_eq!(
+        replay_a.bind_state,
+        BindState::Bound,
+        "the snapshot must report the historical Bound outcome, not today's Conflict"
+    );
+    assert_eq!(
+        replay_a.etag.as_deref(),
+        Some(original_etag.as_str()),
+        "the snapshot must report the ORIGINAL etag, not one derived from B's current bind"
+    );
+    assert_eq!(replay_a.version_id, plan_a.version_id);
+
+    // Sanity: the file itself really did move on to B -- this is a genuine
+    // divergence between "current state" and "this session's historical
+    // outcome", not a no-op rebind.
+    let file = svc.get_file(&ctx, file_id).await.expect("file");
+    assert_eq!(file.content_id, Some(plan_b.version_id));
+}
+
 // -- lease takeover fast path (multipart_service.rs 1088-1090) --------------------------
 
 /// Lease-takeover fast path in `assemble_and_finish_inner`: a completer that
@@ -900,4 +1047,110 @@ async fn complete_takeover_finishes_without_reassembly_when_version_already_avai
         .unwrap()
         .expect("version");
     assert_eq!(version.status, VersionStatus::Available);
+}
+
+// -- #37: already-finalized-but-looks-fresh retry must not re-invoke the ----
+// -- consumed backend handle (multipart_service.rs's "already-finalized ----
+// -- fast path", checked unconditionally, not just on `takeover`) ----------
+
+/// A completer whose own request never learns its work succeeded -- e.g.
+/// `assemble_and_finish`'s blanket error-path lease release fires for a
+/// transient reason unrelated to the finalize/finish transaction itself --
+/// leaves the session looking exactly like a fresh, never-attempted
+/// completion: `in_progress`, no live lease. But the version is ALREADY
+/// `available` and this backend's multipart handle has ALREADY been
+/// consumed for real (`InMemoryBackend::complete_multipart` removes the
+/// handle on success, so a second call fails with "multipart handle not
+/// found"). The next `complete` must converge -- replay the
+/// already-persisted snapshot -- instead of re-running the whole assembly
+/// and hitting that now-consumed handle.
+///
+/// This reproduces the bug directly rather than via a specific upstream
+/// trigger: run one REAL `complete` to completion (the backend handle is
+/// genuinely consumed, the version is genuinely `available`, the session is
+/// genuinely `completed` with a persisted snapshot), then reset the session
+/// row back to `in_progress` with no lease (raw SQL -- there is no
+/// production path back from `completed`, so this is the same "tamper via
+/// raw SQL" pattern the rest of this file uses for otherwise-unreachable
+/// row shapes) while leaving `complete_result` and the version's status
+/// untouched, modeling the end state the bug report describes regardless of
+/// which specific transient failure produced it.
+///
+/// Fails on the pre-fix code: the "already-finalized" fast path was gated
+/// on `if takeover && ...`, and `takeover` is derived from the session
+/// snapshot's state at the top of `complete_multipart_upload` -- here that
+/// snapshot reads `in_progress` (a fresh, not a takeover, lease acquire), so
+/// the pre-fix code skips the fast path entirely and falls through to
+/// re-running the whole assembly, which fails outright on the consumed
+/// backend handle instead of converging.
+#[tokio::test]
+async fn complete_converges_after_in_progress_reset_instead_of_reinvoking_consumed_backend_handle()
+{
+    let (svc, msvc, multipart_store, backend, _store, ctx, dsn) = build_env().await;
+    let file_id = svc.create_file_bare(&ctx, new_file()).await.unwrap();
+    let plan = msvc
+        .initiate_multipart_upload(
+            &ctx,
+            file_id,
+            "application/octet-stream",
+            5,
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    let session = multipart_store
+        .get_multipart_upload(plan.upload_id)
+        .await
+        .unwrap()
+        .expect("session");
+    let backend_path = format!("/{file_id}/{}", plan.version_id);
+    simulate_sidecar_put_part(
+        &multipart_store,
+        &backend,
+        &plan,
+        &backend_path,
+        &session.backend_upload_handle,
+        1,
+        Bytes::from_static(b"AAAAA"),
+    )
+    .await;
+
+    // Genuinely completes for real: the backend's multipart handle is
+    // actually consumed, the version becomes `available`, and the session
+    // reaches `completed` with a persisted snapshot.
+    let first = msvc
+        .complete_multipart_upload(&ctx, file_id, plan.upload_id, None)
+        .await
+        .unwrap()
+        .unwrap_completed();
+
+    // Model the bug's end state: the session looks like a never-attempted,
+    // fresh session, even though the work already happened for real.
+    reset_session_to_in_progress(&dsn, plan.upload_id).await;
+
+    let retried = msvc
+        .complete_multipart_upload(&ctx, file_id, plan.upload_id, None)
+        .await
+        .expect(
+            "a retry after an in_progress reset must converge to the already-finalized \
+             version instead of re-invoking the consumed backend handle",
+        )
+        .unwrap_completed();
+
+    assert_eq!(retried.version_id, first.version_id);
+    assert_eq!(retried.size, first.size);
+    assert_eq!(retried.content_hash, first.content_hash);
+
+    let finished_session = multipart_store
+        .get_multipart_upload(plan.upload_id)
+        .await
+        .unwrap()
+        .expect("session still exists");
+    assert_eq!(
+        finished_session.state,
+        file_storage::domain::multipart::MultipartUploadState::Completed,
+        "the retry must converge the session back to completed"
+    );
 }

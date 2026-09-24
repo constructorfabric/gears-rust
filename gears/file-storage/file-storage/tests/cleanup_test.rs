@@ -86,6 +86,27 @@ async fn build_all(
     CleanupEngine,
     Arc<dyn StorageBackend>,
 ) {
+    let (svc, psvc, msvc, dp, store, engine, backend, _db) = build_all_full(grace_secs).await;
+    (svc, psvc, msvc, dp, store, engine, backend)
+}
+
+/// Like [`build_all`], but also returns the raw `DBProvider` handle -- for
+/// tests that need both `DataPlaneService` (to `put_content`) AND direct
+/// entity-layer access (to backdate a `file_versions.created_at`/
+/// `files.created_at` row past the sweep's grace cutoff; see
+/// [`backdate_version_created_at`]).
+async fn build_all_full(
+    grace_secs: u64,
+) -> (
+    Arc<FileService>,
+    Arc<PolicyService>,
+    Arc<MultipartService>,
+    DataPlaneService,
+    Store,
+    CleanupEngine,
+    Arc<dyn StorageBackend>,
+    Arc<DBProvider<DbError>>,
+) {
     let db = build_db().await;
 
     let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
@@ -136,7 +157,44 @@ async fn build_all(
             orphan_grace_secs: grace_secs,
         },
     );
-    (svc, psvc, msvc, dp, store, engine, backend)
+    (svc, psvc, msvc, dp, store, engine, backend, db)
+}
+
+/// Backdate a `file_versions.created_at` row directly through the entity
+/// layer -- there is no public API to backdate an already-created version
+/// row (same mechanism `sweep_deletes_versionless_file_past_grace` and
+/// `sweep_aborts_expired_completing_session` already use for `files.created_at`
+/// / `multipart_uploads`). Used to make a pending version unambiguously
+/// older than the sweep's `grace_cutoff` by a wide, explicit margin, instead
+/// of relying on `orphan_grace_secs = 0` and a freshly-inserted row racing an
+/// exactly-equal-instant comparison against `now()` in the strict
+/// `created_at < cutoff` sweep query -- that race is real: on a slow/loaded
+/// CI runner (or a DB column that truncates timestamp precision), the two
+/// `now()` calls a few instructions apart can land on the same stored
+/// instant, and the row is then (correctly, per the strict `<`) not yet
+/// eligible, making the sweep-deletes-it assertion flaky.
+async fn backdate_version_created_at(
+    db: &DBProvider<DbError>,
+    version_id: Uuid,
+    when: time::OffsetDateTime,
+) {
+    use sea_orm::sea_query::Expr;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    use toolkit_db::secure::SecureUpdateExt;
+
+    use file_storage::infra::storage::entity::file_version::{
+        Column as VersionColumn, Entity as VersionEntity,
+    };
+
+    let conn = db.conn().expect("conn");
+    VersionEntity::update_many()
+        .col_expr(VersionColumn::CreatedAt, Expr::value(when))
+        .filter(VersionColumn::VersionId.eq(version_id))
+        .secure()
+        .scope_with(&toolkit_security::AccessScope::allow_all())
+        .exec(&conn)
+        .await
+        .expect("backdate file_versions.created_at");
 }
 
 /// Like [`build_all`], but also returns the sqlite DSN (see
@@ -355,15 +413,20 @@ fn new_file_owned_by(owner_id: Uuid) -> NewFile {
     }
 }
 
-/// A [`CleanupStore`] wrapper that makes `list_versions` fail for one
-/// specific `file_id` while delegating every other method to a real
-/// [`Store`]. `CleanupStore` is a narrow trait, so this is a small
+/// A [`CleanupStore`] wrapper that makes the version-collecting file delete
+/// fail for one specific `file_id` while delegating every other method to a
+/// real [`Store`]. `CleanupStore` is a narrow trait, so this is a small
 /// hand-written newtype rather than a mocking-framework fake (same shape as
 /// `enforce_test.rs`'s `ErroringQuota`/`CappedQuota`).
 ///
-/// Used to prove (P2 remediation 0.6) that a transient `list_versions`
+/// Used to prove (P2 remediation 0.6) that a transient version-listing
 /// failure during the retention sweep aborts that file's expiry instead of
-/// being swallowed as "zero versions" and deleting the file anyway.
+/// being swallowed as "zero versions" and deleting the file anyway. The
+/// fault sits on `delete_file_with_event_collecting_versions` (not a
+/// standalone `list_versions` call) because `expire_file` reads a file's
+/// versions **inside** that method's own transaction now, immediately
+/// before the delete -- see `Store::delete_file_collecting_versions`'s doc
+/// comment.
 struct FaultyListVersionsStore {
     inner: Store,
     fault_file_id: Uuid,
@@ -375,9 +438,10 @@ impl CleanupStore for FaultyListVersionsStore {
         &self,
         older_than: time::OffsetDateTime,
         now: time::OffsetDateTime,
+        limit: u64,
     ) -> Result<Vec<FileVersion>, DomainError> {
         self.inner
-            .list_abandoned_pending_versions(older_than, now)
+            .list_abandoned_pending_versions(older_than, now, limit)
             .await
     }
 
@@ -414,160 +478,9 @@ impl CleanupStore for FaultyListVersionsStore {
     async fn list_expired_multipart_uploads(
         &self,
         now: time::OffsetDateTime,
-    ) -> Result<Vec<MultipartUploadSession>, DomainError> {
-        self.inner.list_expired_multipart_uploads(now).await
-    }
-
-    async fn abort_multipart_upload(
-        &self,
-        upload_id: Uuid,
-        audit: AuditEntry,
-    ) -> Result<bool, DomainError> {
-        self.inner.abort_multipart_upload(upload_id, audit).await
-    }
-
-    async fn get_version(
-        &self,
-        file_id: Uuid,
-        version_id: Uuid,
-    ) -> Result<Option<FileVersion>, DomainError> {
-        self.inner.get_version(file_id, version_id).await
-    }
-
-    async fn list_all_retention_rules(&self) -> Result<Vec<StoredRetentionRule>, DomainError> {
-        self.inner.list_all_retention_rules().await
-    }
-
-    async fn list_all_files_for_sweep(
-        &self,
-        after: Option<Uuid>,
         limit: u64,
-    ) -> Result<Vec<File>, DomainError> {
-        self.inner.list_all_files_for_sweep(after, limit).await
-    }
-
-    async fn list_metadata(&self, file_id: Uuid) -> Result<Vec<CustomMetadataEntry>, DomainError> {
-        self.inner.list_metadata(file_id).await
-    }
-
-    async fn list_metadata_for_files(
-        &self,
-        file_ids: &[Uuid],
-    ) -> Result<std::collections::HashMap<Uuid, Vec<CustomMetadataEntry>>, DomainError> {
-        self.inner.list_metadata_for_files(file_ids).await
-    }
-
-    /// The one faulted method: errors for `fault_file_id`, delegates otherwise.
-    async fn list_versions(&self, file_id: Uuid) -> Result<Vec<FileVersion>, DomainError> {
-        if file_id == self.fault_file_id {
-            Err(DomainError::InternalError)
-        } else {
-            self.inner.list_versions(file_id).await
-        }
-    }
-
-    async fn get_file(&self, file_id: Uuid) -> Result<Option<File>, DomainError> {
-        self.inner
-            .get_file(&toolkit_security::AccessScope::allow_all(), file_id)
-            .await
-    }
-
-    async fn has_active_multipart_for_file(&self, file_id: Uuid) -> Result<bool, DomainError> {
-        self.inner.has_active_multipart_for_file(file_id).await
-    }
-
-    async fn delete_file_with_event(
-        &self,
-        scope: &toolkit_security::AccessScope,
-        file_id: Uuid,
-        audit: AuditEntry,
-        event: Option<FileEvent>,
-    ) -> Result<bool, DomainError> {
-        self.inner
-            .delete_file_with_event(scope, file_id, audit, event)
-            .await
-    }
-
-    async fn delete_orphan_file_with_event(
-        &self,
-        file_id: Uuid,
-        audit: AuditEntry,
-        event: Option<FileEvent>,
-    ) -> Result<bool, DomainError> {
-        self.inner
-            .delete_orphan_file_with_event(file_id, audit, event)
-            .await
-    }
-
-    async fn delete_expired_idempotency_keys(
-        &self,
-        now: time::OffsetDateTime,
-    ) -> Result<u64, DomainError> {
-        self.inner.delete_expired_idempotency_keys(now).await
-    }
-}
-
-/// A [`CleanupStore`] wrapper that makes `get_file` fail for one specific
-/// `file_id` while delegating every other method (including `get_file` for
-/// any other id) to a real [`Store`]. Same shape as
-/// `FaultyListVersionsStore` above.
-///
-/// Used to prove that a transient `get_file` failure during
-/// `CleanupEngine::abort_expired_multipart_session`'s audit-tenant lookup is
-/// logged (distinguishing it from a genuinely-absent file) rather than
-/// silently folded into the same `Uuid::nil()` fallback with no trace.
-struct FaultyGetFileStore {
-    inner: Store,
-    fault_file_id: Uuid,
-}
-
-#[async_trait]
-impl CleanupStore for FaultyGetFileStore {
-    async fn list_abandoned_pending_versions(
-        &self,
-        older_than: time::OffsetDateTime,
-        now: time::OffsetDateTime,
-    ) -> Result<Vec<FileVersion>, DomainError> {
-        self.inner
-            .list_abandoned_pending_versions(older_than, now)
-            .await
-    }
-
-    async fn list_versionless_orphan_files(
-        &self,
-        created_before: time::OffsetDateTime,
-        limit: u64,
-    ) -> Result<Vec<File>, DomainError> {
-        self.inner
-            .list_versionless_orphan_files(created_before, limit)
-            .await
-    }
-
-    async fn delete_version(
-        &self,
-        file_id: Uuid,
-        version_id: Uuid,
-        audit: AuditEntry,
-    ) -> Result<bool, DomainError> {
-        self.inner.delete_version(file_id, version_id, audit).await
-    }
-
-    async fn delete_pending_version(
-        &self,
-        file_id: Uuid,
-        version_id: Uuid,
-        audit: AuditEntry,
-    ) -> Result<bool, DomainError> {
-        self.inner
-            .delete_pending_version(file_id, version_id, audit)
-            .await
-    }
-
-    async fn list_expired_multipart_uploads(
-        &self,
-        now: time::OffsetDateTime,
     ) -> Result<Vec<MultipartUploadSession>, DomainError> {
-        self.inner.list_expired_multipart_uploads(now).await
+        self.inner.list_expired_multipart_uploads(now, limit).await
     }
 
     async fn abort_multipart_upload(
@@ -613,13 +526,188 @@ impl CleanupStore for FaultyGetFileStore {
         self.inner.list_versions(file_id).await
     }
 
-    /// The one faulted method: errors for `fault_file_id`, delegates otherwise.
     async fn get_file(&self, file_id: Uuid) -> Result<Option<File>, DomainError> {
+        self.inner
+            .get_file(&toolkit_security::AccessScope::allow_all(), file_id)
+            .await
+    }
+
+    async fn list_files_by_ids(&self, ids: &[Uuid]) -> Result<Vec<File>, DomainError> {
+        self.inner
+            .list_files_by_ids(&toolkit_security::AccessScope::allow_all(), ids)
+            .await
+    }
+
+    async fn has_active_multipart_for_file(&self, file_id: Uuid) -> Result<bool, DomainError> {
+        self.inner.has_active_multipart_for_file(file_id).await
+    }
+
+    /// The one faulted method: errors for `fault_file_id`, delegates
+    /// otherwise. This is where `expire_file` now reads a file's versions
+    /// (inside the same transaction as its delete), so this is the method a
+    /// transient version-listing failure surfaces through -- see this
+    /// struct's own doc comment.
+    async fn delete_file_with_event_collecting_versions(
+        &self,
+        scope: &toolkit_security::AccessScope,
+        file_id: Uuid,
+        audit: AuditEntry,
+        event: Option<FileEvent>,
+    ) -> Result<file_storage::domain::ports::DeletedFile, DomainError> {
         if file_id == self.fault_file_id {
             Err(DomainError::InternalError)
         } else {
             self.inner
-                .get_file(&toolkit_security::AccessScope::allow_all(), file_id)
+                .delete_file_with_event_collecting_versions(scope, file_id, audit, event)
+                .await
+        }
+    }
+
+    async fn delete_orphan_file_with_event(
+        &self,
+        file_id: Uuid,
+        audit: AuditEntry,
+        event: Option<FileEvent>,
+    ) -> Result<bool, DomainError> {
+        self.inner
+            .delete_orphan_file_with_event(file_id, audit, event)
+            .await
+    }
+
+    async fn delete_expired_idempotency_keys(
+        &self,
+        now: time::OffsetDateTime,
+        limit: u64,
+    ) -> Result<u64, DomainError> {
+        self.inner.delete_expired_idempotency_keys(now, limit).await
+    }
+}
+
+/// A [`CleanupStore`] wrapper that makes `list_files_by_ids` fail whenever
+/// the requested batch includes one specific `file_id`, while delegating
+/// every other method (including `get_file`, and `list_files_by_ids` for a
+/// batch that does not mention `fault_file_id`) to a real [`Store`]. Same
+/// shape as `FaultyListVersionsStore` above.
+///
+/// Used to prove that a transient batch-load failure during
+/// `CleanupEngine::abort_expired_multipart_session`'s audit-tenant lookup
+/// (`sweep_expired_multipart`'s `load_files_by_ids_for_audit` batch, run
+/// before its loop) is logged (distinguishing it from a genuinely-absent
+/// file) rather than silently folded into the same `Uuid::nil()` fallback
+/// with no trace.
+struct FaultyListFilesByIdsStore {
+    inner: Store,
+    fault_file_id: Uuid,
+}
+
+#[async_trait]
+impl CleanupStore for FaultyListFilesByIdsStore {
+    async fn list_abandoned_pending_versions(
+        &self,
+        older_than: time::OffsetDateTime,
+        now: time::OffsetDateTime,
+        limit: u64,
+    ) -> Result<Vec<FileVersion>, DomainError> {
+        self.inner
+            .list_abandoned_pending_versions(older_than, now, limit)
+            .await
+    }
+
+    async fn list_versionless_orphan_files(
+        &self,
+        created_before: time::OffsetDateTime,
+        limit: u64,
+    ) -> Result<Vec<File>, DomainError> {
+        self.inner
+            .list_versionless_orphan_files(created_before, limit)
+            .await
+    }
+
+    async fn delete_version(
+        &self,
+        file_id: Uuid,
+        version_id: Uuid,
+        audit: AuditEntry,
+    ) -> Result<bool, DomainError> {
+        self.inner.delete_version(file_id, version_id, audit).await
+    }
+
+    async fn delete_pending_version(
+        &self,
+        file_id: Uuid,
+        version_id: Uuid,
+        audit: AuditEntry,
+    ) -> Result<bool, DomainError> {
+        self.inner
+            .delete_pending_version(file_id, version_id, audit)
+            .await
+    }
+
+    async fn list_expired_multipart_uploads(
+        &self,
+        now: time::OffsetDateTime,
+        limit: u64,
+    ) -> Result<Vec<MultipartUploadSession>, DomainError> {
+        self.inner.list_expired_multipart_uploads(now, limit).await
+    }
+
+    async fn abort_multipart_upload(
+        &self,
+        upload_id: Uuid,
+        audit: AuditEntry,
+    ) -> Result<bool, DomainError> {
+        self.inner.abort_multipart_upload(upload_id, audit).await
+    }
+
+    async fn get_version(
+        &self,
+        file_id: Uuid,
+        version_id: Uuid,
+    ) -> Result<Option<FileVersion>, DomainError> {
+        self.inner.get_version(file_id, version_id).await
+    }
+
+    async fn list_all_retention_rules(&self) -> Result<Vec<StoredRetentionRule>, DomainError> {
+        self.inner.list_all_retention_rules().await
+    }
+
+    async fn list_all_files_for_sweep(
+        &self,
+        after: Option<Uuid>,
+        limit: u64,
+    ) -> Result<Vec<File>, DomainError> {
+        self.inner.list_all_files_for_sweep(after, limit).await
+    }
+
+    async fn list_metadata(&self, file_id: Uuid) -> Result<Vec<CustomMetadataEntry>, DomainError> {
+        self.inner.list_metadata(file_id).await
+    }
+
+    async fn list_metadata_for_files(
+        &self,
+        file_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<CustomMetadataEntry>>, DomainError> {
+        self.inner.list_metadata_for_files(file_ids).await
+    }
+
+    async fn list_versions(&self, file_id: Uuid) -> Result<Vec<FileVersion>, DomainError> {
+        self.inner.list_versions(file_id).await
+    }
+
+    async fn get_file(&self, file_id: Uuid) -> Result<Option<File>, DomainError> {
+        self.inner
+            .get_file(&toolkit_security::AccessScope::allow_all(), file_id)
+            .await
+    }
+
+    /// The one faulted method: errors whenever `ids` contains
+    /// `fault_file_id`, delegates otherwise.
+    async fn list_files_by_ids(&self, ids: &[Uuid]) -> Result<Vec<File>, DomainError> {
+        if ids.contains(&self.fault_file_id) {
+            Err(DomainError::InternalError)
+        } else {
+            self.inner
+                .list_files_by_ids(&toolkit_security::AccessScope::allow_all(), ids)
                 .await
         }
     }
@@ -628,15 +716,15 @@ impl CleanupStore for FaultyGetFileStore {
         self.inner.has_active_multipart_for_file(file_id).await
     }
 
-    async fn delete_file_with_event(
+    async fn delete_file_with_event_collecting_versions(
         &self,
         scope: &toolkit_security::AccessScope,
         file_id: Uuid,
         audit: AuditEntry,
         event: Option<FileEvent>,
-    ) -> Result<bool, DomainError> {
+    ) -> Result<file_storage::domain::ports::DeletedFile, DomainError> {
         self.inner
-            .delete_file_with_event(scope, file_id, audit, event)
+            .delete_file_with_event_collecting_versions(scope, file_id, audit, event)
             .await
     }
 
@@ -654,8 +742,173 @@ impl CleanupStore for FaultyGetFileStore {
     async fn delete_expired_idempotency_keys(
         &self,
         now: time::OffsetDateTime,
+        limit: u64,
     ) -> Result<u64, DomainError> {
-        self.inner.delete_expired_idempotency_keys(now).await
+        self.inner.delete_expired_idempotency_keys(now, limit).await
+    }
+}
+
+/// A [`CleanupStore`] wrapper that counts calls to `get_file` and
+/// `list_files_by_ids` (both delegated unchanged to a real [`Store`]) while
+/// passing every other method straight through. Used to prove the N+1 fix:
+/// a sweep batch of several candidates must resolve their audit-tenant files
+/// via exactly one `list_files_by_ids` call, never a per-candidate `get_file`.
+#[derive(Clone, Default)]
+struct CountingCleanupStore {
+    get_file_calls: Arc<std::sync::atomic::AtomicUsize>,
+    list_files_by_ids_calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+struct CountingCleanupStoreWrapper {
+    inner: Store,
+    counts: CountingCleanupStore,
+}
+
+#[async_trait]
+impl CleanupStore for CountingCleanupStoreWrapper {
+    async fn list_abandoned_pending_versions(
+        &self,
+        older_than: time::OffsetDateTime,
+        now: time::OffsetDateTime,
+        limit: u64,
+    ) -> Result<Vec<FileVersion>, DomainError> {
+        self.inner
+            .list_abandoned_pending_versions(older_than, now, limit)
+            .await
+    }
+
+    async fn list_versionless_orphan_files(
+        &self,
+        created_before: time::OffsetDateTime,
+        limit: u64,
+    ) -> Result<Vec<File>, DomainError> {
+        self.inner
+            .list_versionless_orphan_files(created_before, limit)
+            .await
+    }
+
+    async fn delete_version(
+        &self,
+        file_id: Uuid,
+        version_id: Uuid,
+        audit: AuditEntry,
+    ) -> Result<bool, DomainError> {
+        self.inner.delete_version(file_id, version_id, audit).await
+    }
+
+    async fn delete_pending_version(
+        &self,
+        file_id: Uuid,
+        version_id: Uuid,
+        audit: AuditEntry,
+    ) -> Result<bool, DomainError> {
+        self.inner
+            .delete_pending_version(file_id, version_id, audit)
+            .await
+    }
+
+    async fn list_expired_multipart_uploads(
+        &self,
+        now: time::OffsetDateTime,
+        limit: u64,
+    ) -> Result<Vec<MultipartUploadSession>, DomainError> {
+        self.inner.list_expired_multipart_uploads(now, limit).await
+    }
+
+    async fn abort_multipart_upload(
+        &self,
+        upload_id: Uuid,
+        audit: AuditEntry,
+    ) -> Result<bool, DomainError> {
+        self.inner.abort_multipart_upload(upload_id, audit).await
+    }
+
+    async fn get_version(
+        &self,
+        file_id: Uuid,
+        version_id: Uuid,
+    ) -> Result<Option<FileVersion>, DomainError> {
+        self.inner.get_version(file_id, version_id).await
+    }
+
+    async fn list_all_retention_rules(&self) -> Result<Vec<StoredRetentionRule>, DomainError> {
+        self.inner.list_all_retention_rules().await
+    }
+
+    async fn list_all_files_for_sweep(
+        &self,
+        after: Option<Uuid>,
+        limit: u64,
+    ) -> Result<Vec<File>, DomainError> {
+        self.inner.list_all_files_for_sweep(after, limit).await
+    }
+
+    async fn list_metadata(&self, file_id: Uuid) -> Result<Vec<CustomMetadataEntry>, DomainError> {
+        self.inner.list_metadata(file_id).await
+    }
+
+    async fn list_metadata_for_files(
+        &self,
+        file_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<CustomMetadataEntry>>, DomainError> {
+        self.inner.list_metadata_for_files(file_ids).await
+    }
+
+    async fn list_versions(&self, file_id: Uuid) -> Result<Vec<FileVersion>, DomainError> {
+        self.inner.list_versions(file_id).await
+    }
+
+    async fn get_file(&self, file_id: Uuid) -> Result<Option<File>, DomainError> {
+        self.counts
+            .get_file_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner
+            .get_file(&toolkit_security::AccessScope::allow_all(), file_id)
+            .await
+    }
+
+    async fn list_files_by_ids(&self, ids: &[Uuid]) -> Result<Vec<File>, DomainError> {
+        self.counts
+            .list_files_by_ids_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner
+            .list_files_by_ids(&toolkit_security::AccessScope::allow_all(), ids)
+            .await
+    }
+
+    async fn has_active_multipart_for_file(&self, file_id: Uuid) -> Result<bool, DomainError> {
+        self.inner.has_active_multipart_for_file(file_id).await
+    }
+
+    async fn delete_file_with_event_collecting_versions(
+        &self,
+        scope: &toolkit_security::AccessScope,
+        file_id: Uuid,
+        audit: AuditEntry,
+        event: Option<FileEvent>,
+    ) -> Result<file_storage::domain::ports::DeletedFile, DomainError> {
+        self.inner
+            .delete_file_with_event_collecting_versions(scope, file_id, audit, event)
+            .await
+    }
+
+    async fn delete_orphan_file_with_event(
+        &self,
+        file_id: Uuid,
+        audit: AuditEntry,
+        event: Option<FileEvent>,
+    ) -> Result<bool, DomainError> {
+        self.inner
+            .delete_orphan_file_with_event(file_id, audit, event)
+            .await
+    }
+
+    async fn delete_expired_idempotency_keys(
+        &self,
+        now: time::OffsetDateTime,
+        limit: u64,
+    ) -> Result<u64, DomainError> {
+        self.inner.delete_expired_idempotency_keys(now, limit).await
     }
 }
 
@@ -714,15 +967,17 @@ impl tracing::Subscriber for RecordingSubscriber {
 
 // ── test 1: abandoned pending version sweep ────────────────────────────────────
 
-/// A pending version (never finalised) is deleted when the grace period is 0.
+/// A pending version (never finalised) is deleted once it is older than the
+/// grace cutoff.
 ///
-/// With `orphan_grace_secs = 0` every pending version created before `now()` is
-/// immediately eligible; `run_sweep()` must delete it and return
-/// `abandoned_pending_deleted = 1`.
+/// Backdated 2h past a 1h grace window -- not `orphan_grace_secs = 0` against
+/// a freshly-inserted row, which races the strict `created_at < cutoff`
+/// sweep query against an equal-instant `now()` comparison (see
+/// `backdate_version_created_at`'s doc comment). `run_sweep()` must delete
+/// it and return `abandoned_pending_deleted = 1`.
 #[tokio::test]
 async fn abandoned_pending_version_is_deleted_by_sweep() {
-    // grace = 0 → any pre-existing pending version is eligible immediately.
-    let (svc, _psvc, _msvc, _dp, store, engine, _backend) = build_all(0).await;
+    let (svc, _msvc, store, engine, db, _backend) = build_all_with_db(3600).await;
     let tenant = Uuid::now_v7();
     let ctx = ctx(tenant);
 
@@ -731,6 +986,12 @@ async fn abandoned_pending_version_is_deleted_by_sweep() {
         .create_file(&ctx, new_file(), None, false)
         .await
         .unwrap();
+    backdate_version_created_at(
+        &db,
+        ticket.version_id,
+        time::OffsetDateTime::now_utc() - time::Duration::hours(2),
+    )
+    .await;
 
     // Verify the version exists before sweep.
     let before = store.list_versions(ticket.file_id).await.unwrap();
@@ -805,8 +1066,11 @@ async fn recent_pending_version_is_not_swept_within_grace_window() {
 /// lingers forever in `GET /files`, unable to ever serve content.
 #[tokio::test]
 async fn sweep_deletes_abandoned_zero_version_file() {
-    // grace = 0 → the file's only pending version is immediately eligible.
-    let (svc, _psvc, _msvc, _dp, store, engine, _backend) = build_all(0).await;
+    // Backdated 2h past a 1h grace window -- not `orphan_grace_secs = 0`
+    // against a freshly-inserted row, which races the strict
+    // `created_at < cutoff` sweep query against an equal-instant `now()`
+    // comparison (see `backdate_version_created_at`'s doc comment).
+    let (svc, _msvc, store, engine, db, _backend) = build_all_with_db(3600).await;
     let tenant = Uuid::now_v7();
     let ctx = ctx(tenant);
 
@@ -815,6 +1079,12 @@ async fn sweep_deletes_abandoned_zero_version_file() {
         .create_file(&ctx, new_file(), None, false)
         .await
         .unwrap();
+    backdate_version_created_at(
+        &db,
+        ticket.version_id,
+        time::OffsetDateTime::now_utc() - time::Duration::hours(2),
+    )
+    .await;
 
     let result = engine.run_sweep().await;
     assert_eq!(
@@ -861,7 +1131,11 @@ async fn sweep_deletes_abandoned_zero_version_file() {
 /// real content still exists.
 #[tokio::test]
 async fn sweep_keeps_file_with_other_versions() {
-    let (svc, _psvc, _msvc, dp, store, engine, _backend) = build_all(0).await;
+    // Backdated 2h past a 1h grace window -- not `orphan_grace_secs = 0`
+    // against a freshly-inserted row, which races the strict
+    // `created_at < cutoff` sweep query against an equal-instant `now()`
+    // comparison (see `backdate_version_created_at`'s doc comment).
+    let (svc, _psvc, _msvc, dp, store, engine, _backend, db) = build_all_full(3600).await;
     let tenant = Uuid::now_v7();
     let ctx = ctx(tenant);
 
@@ -870,6 +1144,12 @@ async fn sweep_keeps_file_with_other_versions() {
         .create_file(&ctx, new_file(), None, false)
         .await
         .unwrap();
+    backdate_version_created_at(
+        &db,
+        v1.version_id,
+        time::OffsetDateTime::now_utc() - time::Duration::hours(2),
+    )
+    .await;
 
     // v2: a second version on the same file, uploaded and bound as current.
     let v2 = svc.presign_version(&ctx, v1.file_id).await.unwrap();
@@ -1198,7 +1478,7 @@ async fn expired_multipart_session_is_aborted_by_sweep() {
     // Confirm the session is not yet expired from the sweep's perspective
     // (expires_at is 7 days in the future).
     let not_expired = store
-        .list_expired_multipart_uploads(time::OffsetDateTime::now_utc())
+        .list_expired_multipart_uploads(time::OffsetDateTime::now_utc(), 100)
         .await
         .unwrap();
     assert!(
@@ -1247,7 +1527,7 @@ async fn expired_multipart_session_is_aborted_by_sweep() {
 
     // Confirm this session shows up as expired.
     let expired = store
-        .list_expired_multipart_uploads(time::OffsetDateTime::now_utc())
+        .list_expired_multipart_uploads(time::OffsetDateTime::now_utc(), 100)
         .await
         .unwrap();
     assert!(
@@ -1366,7 +1646,7 @@ async fn sweep_aborts_expired_completing_session() {
     // Confirm it is actually picked up by the sweep's own listing query --
     // this is the index-hardening migration's `completing`-branch predicate.
     let expired = store
-        .list_expired_multipart_uploads(time::OffsetDateTime::now_utc())
+        .list_expired_multipart_uploads(time::OffsetDateTime::now_utc(), 100)
         .await
         .unwrap();
     assert!(
@@ -1475,24 +1755,24 @@ async fn delete_file_cascades_idempotency_keys() {
     );
 }
 
-/// Regression test: a transient `get_file` failure during the audit-tenant
-/// lookup in `abort_expired_multipart_session` must be **logged** (`warn!`),
-/// not silently folded into the same `Uuid::nil()` fallback used for a
-/// genuinely-missing file, with no trace of why. The fix reuses
-/// `load_file_for_audit` (already used elsewhere in the same file for this
-/// exact purpose) at this call site.
+/// Regression test: a transient batch-load failure while resolving expired
+/// multipart sessions' audit-tenant `File`s (`sweep_expired_multipart`'s
+/// `load_files_by_ids_for_audit` batch, run once before its loop) must be
+/// **logged** (`warn!`), not silently folded into the same `Uuid::nil()`
+/// fallback used for a genuinely-missing file, with no trace of why.
 ///
-/// Wires the sweep to `FaultyGetFileStore`, which fails `get_file` only for
-/// the one file this test cares about -- everything else (finding the
-/// expired session, aborting it, reclaiming the pending version) goes
-/// through the real `Store` unchanged. This proves two things at once: the
-/// sweep's own behavior is unaffected by the lookup failure (the session is
-/// still aborted, the version still reclaimed -- the fallback to a nil
-/// tenant is a pre-existing, intentional best-effort choice this fix does
-/// not change), while a warning naming the failing `file_id` is now emitted
-/// where none was before.
+/// Wires the sweep to `FaultyListFilesByIdsStore`, which fails
+/// `list_files_by_ids` only when the requested batch mentions the one file
+/// this test cares about -- everything else (finding the expired session,
+/// aborting it, reclaiming the pending version) goes through the real
+/// `Store` unchanged. This proves two things at once: the sweep's own
+/// behavior is unaffected by the lookup failure (the session is still
+/// aborted, the version still reclaimed -- the fallback to a nil tenant is a
+/// pre-existing, intentional best-effort choice this fix does not change),
+/// while a warning naming the failing `file_id` is now emitted where none
+/// was before.
 #[tokio::test]
-async fn abort_expired_session_logs_warning_on_transient_get_file_error() {
+async fn abort_expired_session_logs_warning_on_transient_file_batch_load_error() {
     let (svc, msvc, store, _default_engine, _db, backend) = build_all_with_db(0).await;
     let tenant = Uuid::now_v7();
     let ctx = ctx(tenant);
@@ -1543,11 +1823,12 @@ async fn abort_expired_session_logs_warning_on_transient_get_file_error() {
         .await
         .unwrap();
 
-    // An engine wired to the faulty store: `get_file(file_id2)` returns
-    // `Err(DomainError::InternalError)` -- a real, possibly-transient DB
-    // error, not the file being genuinely absent.
+    // An engine wired to the faulty store: `list_files_by_ids` returns
+    // `Err(DomainError::InternalError)` for any batch mentioning `file_id2`
+    // -- a real, possibly-transient DB error, not the file being genuinely
+    // absent.
     let backends = BackendRegistry::new(vec![Arc::clone(&backend)], "mem").expect("registry");
-    let faulty_store: Arc<dyn CleanupStore> = Arc::new(FaultyGetFileStore {
+    let faulty_store: Arc<dyn CleanupStore> = Arc::new(FaultyListFilesByIdsStore {
         inner: store.clone(),
         fault_file_id: file_id2,
     });
@@ -1587,9 +1868,203 @@ async fn abort_expired_session_logs_warning_on_transient_get_file_error() {
         captured.iter().any(|m| m.contains("WARN")
             && m.to_lowercase().contains("failed to load file")
             && m.contains(&file_id2.to_string())),
-        "a transient get_file failure during the audit-tenant lookup must be logged as a \
+        "a transient batch-load failure during the audit-tenant lookup must be logged as a \
          warning naming the file_id; captured events: {captured:?}"
     );
+}
+
+/// N+1 regression: sweeping several abandoned-pending-version candidates
+/// across distinct files must resolve every candidate's audit-tenant `File`
+/// via exactly ONE `list_files_by_ids` batch call, never a per-candidate
+/// `get_file` round trip -- see `CleanupEngine::sweep_abandoned_pending`'s
+/// batch-load-before-the-loop comment.
+#[tokio::test]
+async fn sweep_abandoned_pending_batch_loads_files_instead_of_per_candidate_get_file() {
+    // Three distinct files, each left with exactly one abandoned pending
+    // version (create_file's default create+plan path), under three
+    // distinct tenants -- so a wrong (e.g. nil, or cross-wired) tenant_id in
+    // any one candidate's audit row would be caught.
+    const N: usize = 3;
+
+    let (svc, _msvc, store, _default_engine, _db, backend) = build_all_with_db(0).await;
+    let backends = BackendRegistry::new(vec![Arc::clone(&backend)], "mem").expect("registry");
+
+    let mut file_ids_and_tenants = Vec::with_capacity(N);
+    for _ in 0..N {
+        let tenant = Uuid::now_v7();
+        let ctx = ctx(tenant);
+        let ticket = svc
+            .create_file(&ctx, new_file(), None, false)
+            .await
+            .unwrap();
+        file_ids_and_tenants.push((ticket.file_id, tenant));
+    }
+
+    let counts = CountingCleanupStore::default();
+    let counting_store: Arc<dyn CleanupStore> = Arc::new(CountingCleanupStoreWrapper {
+        inner: store.clone(),
+        counts: counts.clone(),
+    });
+    let engine = CleanupEngine::new(
+        counting_store,
+        backends,
+        CleanupConfig {
+            orphan_grace_secs: 0,
+        },
+    );
+
+    let result = engine.run_sweep().await;
+    assert_eq!(
+        result.abandoned_pending_deleted, N,
+        "all {N} candidates must be reclaimed"
+    );
+
+    assert_eq!(
+        counts
+            .list_files_by_ids_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "resolving {N} candidates' audit tenants must cost exactly ONE batch call"
+    );
+    assert_eq!(
+        counts
+            .get_file_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the batch prefetch must make the per-candidate get_file path entirely unused"
+    );
+
+    // Every candidate's own orphan_reconcile audit row must carry ITS OWN
+    // file's real tenant_id, not a nil fallback or another candidate's.
+    for (file_id, tenant) in file_ids_and_tenants {
+        let audit = store.list_audit(file_id).await.unwrap();
+        let reconcile = audit
+            .iter()
+            .find(|r| r.operation == "orphan_reconcile")
+            .unwrap_or_else(|| panic!("expected an orphan_reconcile audit row for {file_id}"));
+        assert_eq!(
+            reconcile.tenant_id, tenant,
+            "audit row for {file_id} must carry its own file's tenant_id, not nil or a \
+             different candidate's"
+        );
+    }
+}
+
+/// Same N+1 regression as the sibling test above, for step 2
+/// (`sweep_expired_multipart`/`abort_expired_multipart_session`): sweeping
+/// several expired multipart sessions across distinct files must resolve
+/// every candidate's audit-tenant `File` via exactly ONE `list_files_by_ids`
+/// batch call, never a per-candidate `get_file` round trip.
+#[tokio::test]
+async fn sweep_expired_multipart_batch_loads_files_instead_of_per_session_get_file() {
+    const N: usize = 3;
+
+    // A large orphan_grace_secs keeps step 1 (sweep_abandoned_pending) from
+    // ever touching these files' create-time pending versions (created
+    // "now", nowhere near this grace window's cutoff) -- so every
+    // list_files_by_ids/get_file call below is attributable to step 2 alone.
+    let (svc, _msvc, store, _default_engine, _db, backend) = build_all_with_db(86400).await;
+    let backends = BackendRegistry::new(vec![Arc::clone(&backend)], "mem").expect("registry");
+
+    let past_time = time::OffsetDateTime::now_utc() - time::Duration::hours(1);
+    let now_t = time::OffsetDateTime::now_utc();
+    let mut file_ids_and_tenants = Vec::with_capacity(N);
+    for _ in 0..N {
+        let tenant = Uuid::now_v7();
+        let ctx = ctx(tenant);
+        let ticket = svc
+            .create_file(&ctx, new_file(), None, false)
+            .await
+            .unwrap();
+
+        // A second, already-expired multipart session on the same file --
+        // mirrors `abort_expired_session_logs_warning_on_transient_file_batch_load_error`'s
+        // setup. The file's own create-time pending version is left alone by
+        // step 1 (see this test's large orphan_grace_secs above).
+        let upload_id = Uuid::now_v7();
+        let version_id = Uuid::now_v7();
+        store
+            .insert_pending_version(
+                ticket.file_id,
+                version_id,
+                "text/plain",
+                "mem",
+                &format!("/{}/{}", ticket.file_id, version_id),
+                now_t,
+            )
+            .await
+            .unwrap();
+        store
+            .create_multipart_upload(
+                upload_id,
+                ticket.file_id,
+                version_id,
+                "fake-backend-handle",
+                Some("mem"),
+                Some(&format!("/{}/{}", ticket.file_id, version_id)),
+                "text/plain",
+                0u64,
+                0u64,
+                false,
+                past_time,
+                now_t,
+            )
+            .await
+            .unwrap();
+        file_ids_and_tenants.push((ticket.file_id, tenant));
+    }
+
+    let counts = CountingCleanupStore::default();
+    let counting_store: Arc<dyn CleanupStore> = Arc::new(CountingCleanupStoreWrapper {
+        inner: store.clone(),
+        counts: counts.clone(),
+    });
+    let engine = CleanupEngine::new(
+        counting_store,
+        backends,
+        CleanupConfig {
+            orphan_grace_secs: 86400,
+        },
+    );
+
+    let result = engine.run_sweep().await;
+    assert_eq!(
+        result.expired_multipart_aborted, N,
+        "all {N} expired sessions must be aborted"
+    );
+    assert_eq!(
+        result.abandoned_pending_deleted, 0,
+        "step 1 must not have touched any of these files' pending versions \
+         (large orphan_grace_secs)"
+    );
+
+    assert_eq!(
+        counts
+            .list_files_by_ids_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "resolving {N} sessions' audit tenants must cost exactly ONE batch call"
+    );
+    assert_eq!(
+        counts
+            .get_file_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the batch prefetch must make the per-session get_file path entirely unused"
+    );
+
+    for (file_id, tenant) in file_ids_and_tenants {
+        let audit = store.list_audit(file_id).await.unwrap();
+        let abort_audit = audit
+            .iter()
+            .find(|r| r.operation == "multipart_abort")
+            .unwrap_or_else(|| panic!("expected a multipart_abort audit row for {file_id}"));
+        assert_eq!(
+            abort_audit.tenant_id, tenant,
+            "audit row for {file_id} must carry its own file's tenant_id, not nil or a \
+             different candidate's"
+        );
+    }
 }
 
 /// P2 remediation 2.8 (remaining): the abandoned-pending sweep must not
@@ -2969,7 +3444,7 @@ async fn sweep_after_complete_wins_does_not_delete_bound_version() {
 /// `MultipartUploadNotInProgress`.
 #[tokio::test]
 async fn sweep_before_complete_wins_cleans_up_expired_session() {
-    let (svc, _psvc, msvc, _dp, store, engine, _backend) = build_all(0).await;
+    let (svc, msvc, store, engine, db, _backend) = build_all_with_db(0).await;
     let tenant = Uuid::now_v7();
     let ctx = ctx(tenant);
 
@@ -2977,6 +3452,19 @@ async fn sweep_before_complete_wins_cleans_up_expired_session() {
         .create_file(&ctx, new_file(), None, false)
         .await
         .unwrap();
+    // Backdate `create_file`'s own pending version explicitly, rather than
+    // relying on `orphan_grace_secs = 0` against a freshly-inserted row,
+    // which races the strict `created_at < cutoff` sweep query against an
+    // equal-instant `now()` comparison (see `backdate_version_created_at`'s
+    // doc comment). The multipart session's own version below is reclaimed
+    // unconditionally by step 2's `cleanup_expired_session_version` once the
+    // session is aborted, so it needs no backdating.
+    backdate_version_created_at(
+        &db,
+        ticket.version_id,
+        time::OffsetDateTime::now_utc() - time::Duration::hours(2),
+    )
+    .await;
     let plan = msvc
         .initiate_multipart_upload(
             &ctx,
@@ -3283,6 +3771,7 @@ async fn sweep_step1_does_not_delete_version_finalized_between_list_and_delete()
             candidate.size,
             &candidate.backend_id,
             &candidate.backend_path,
+            None,
         )
         .await;
     assert_eq!(

@@ -16,8 +16,11 @@
 //! GCS/etc. remain deferred beyond that.
 
 mod in_memory;
+mod length_guard;
 mod local_fs;
 mod s3;
+
+pub(crate) use length_guard::length_guard;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

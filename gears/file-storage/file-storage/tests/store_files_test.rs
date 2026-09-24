@@ -5,7 +5,7 @@
 //! file_versions ...)` as one statement, per its own doc comment and
 //! `FileRepo::delete_if_orphan`'s), duplicate-key handling of a file's
 //! initial `custom_metadata` batch, and cascade-delete via
-//! `delete_file_with_event`.
+//! `delete_file_collecting_versions`.
 //!
 //! Uses a temp-file SQLite DB (mirrors `tests/version_repo_test.rs` /
 //! `tests/policy_test.rs`): a bare `sqlite::memory:` would give each pooled
@@ -31,7 +31,9 @@ use file_storage::infra::content::hash_mode::HashMode;
 use file_storage::infra::storage::Store;
 use file_storage::infra::storage::migrations::Migrator;
 use file_storage::infra::storage::repo::{FileRepo, MetadataRepo, VersionRepo};
-use file_storage_sdk::{CustomMetadataEntry, File, FileVersion, NewFile, OwnerKind, VersionStatus};
+use file_storage_sdk::{
+    CustomMetadataEntry, File, FileVersion, NewFile, OwnerFilter, OwnerKind, VersionStatus,
+};
 
 const GTS: &str = gts_id!("cf.fstorage.file.type.v1~x.test.file.type.v1~");
 
@@ -340,7 +342,7 @@ async fn files_create_dedups_duplicate_initial_metadata_keys_last_wins() {
     assert_eq!(entries[1].value, "only");
 }
 
-// -- delete_file_with_event ------------------------------------------------------
+// -- delete_file_collecting_versions -----------------------------------------
 
 /// Deleting a file removes the `files` row, cascades its version and
 /// metadata rows, and writes an audit row plus the given event -- all
@@ -396,16 +398,21 @@ async fn files_delete_with_event_cascades_versions_and_metadata() {
         1
     );
 
-    let removed = store
-        .delete_file_with_event(
+    let deleted = store
+        .delete_file_collecting_versions(
             &scope,
             file_id,
             audit_entry(tenant_id, file_id, AuditOperation::DeleteFile),
             Some(file_event(tenant_id, owner_id, file_id, "file.deleted")),
         )
         .await
-        .expect("delete_file_with_event must not error");
-    assert!(removed, "the file row must be found and removed");
+        .expect("delete_file_collecting_versions must not error");
+    assert!(deleted.removed, "the file row must be found and removed");
+    assert_eq!(
+        deleted.versions.len(),
+        1,
+        "the collected version list must include the one version this file has"
+    );
 
     assert!(
         files.get(&conn, &scope, file_id).await.unwrap().is_none(),
@@ -436,5 +443,86 @@ async fn files_delete_with_event_cascades_versions_and_metadata() {
     assert!(
         events.iter().any(|e| e.event_type == "file.deleted"),
         "expected a file.deleted event"
+    );
+}
+
+// -- FileRepo::list tie-breaker ----------------------------------------------
+
+/// `FileRepo::list` must order `(created_at, file_id)` descending, not
+/// `created_at` alone -- otherwise two files sharing a `created_at` instant
+/// have no defined relative order across two separate `OFFSET` queries, and
+/// an `OFFSET`-paginated page boundary drawn through such a run can skip or
+/// repeat a row.
+///
+/// Seeds four files under one owner, all sharing the SAME `created_at`
+/// (constructed via `Uuid::from_u128`, not `Uuid::now_v7`, so the tiebreak
+/// assertion does not depend on wall-clock generation order), then walks
+/// `limit = 2` pages via `offset` and asserts the concatenated pages are
+/// exactly the four `file_id`s, each exactly once, in `file_id` descending
+/// order.
+#[tokio::test]
+async fn list_orders_by_created_at_then_file_id_so_paged_offsets_do_not_skip_or_repeat() {
+    let (_store, db) = build_store().await;
+    let conn = db.conn().expect("conn");
+    let scope = AccessScope::allow_all();
+    let files = FileRepo::new();
+
+    let tenant_id = Uuid::now_v7();
+    let owner_id = Uuid::now_v7();
+    let same_instant = OffsetDateTime::now_utc();
+    let ids = [
+        Uuid::from_u128(1),
+        Uuid::from_u128(2),
+        Uuid::from_u128(3),
+        Uuid::from_u128(4),
+    ];
+    for &file_id in &ids {
+        let file = File {
+            file_id,
+            tenant_id,
+            owner_kind: OwnerKind::User,
+            owner_id,
+            name: "doc.bin".to_owned(),
+            gts_file_type: GTS.to_owned(),
+            content_id: None,
+            meta_version: 0,
+            created_at: same_instant,
+            last_modified_at: same_instant,
+        };
+        files.create(&conn, &scope, &file).await.expect("create");
+    }
+
+    let owner = OwnerFilter {
+        owner_kind: OwnerKind::User,
+        owner_id,
+    };
+    let page1 = files
+        .list(&conn, &scope, owner, 2, 0)
+        .await
+        .expect("page 1");
+    let page2 = files
+        .list(&conn, &scope, owner, 2, 2)
+        .await
+        .expect("page 2");
+
+    let mut seen: Vec<Uuid> = page1
+        .iter()
+        .chain(page2.iter())
+        .map(|f| f.file_id)
+        .collect();
+    let mut expected = ids.to_vec();
+    expected.sort_unstable_by(|a, b| b.cmp(a)); // file_id descending
+    assert_eq!(
+        seen, expected,
+        "two OFFSET pages over four equal-created_at rows must together cover \
+         every file_id exactly once, in file_id-descending order -- a bare \
+         `ORDER BY created_at` tie-breaks nondeterministically and can skip \
+         or repeat a row across pages"
+    );
+    seen.dedup();
+    assert_eq!(
+        seen.len(),
+        4,
+        "no file_id may be repeated across the two pages"
     );
 }

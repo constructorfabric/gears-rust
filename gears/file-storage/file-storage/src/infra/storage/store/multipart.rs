@@ -191,14 +191,26 @@ impl Store {
     /// bytes and validated them against `session.declared_mime` (bailing out
     /// with `DomainError::mime_mismatch` before ever reaching this call on a
     /// mismatch) — so reaching this point means the content is validated.
+    ///
+    /// `lease_owner`: this call's own completion-lease owner (from its own
+    /// `acquire_multipart_complete_lease` win), required to still match the
+    /// session's CURRENT lease owner (DBS-05 hardening -- see
+    /// `MultipartRepo::finish_complete`'s doc for why this standalone path
+    /// enforces it while `Store::finalize_multipart_version`'s embedded call
+    /// does not). Only reached via `MultipartService::finish_session`
+    /// (takeover-fastpath and converge-after-lost-finalize-CAS), never
+    /// immediately after this same request's own finalize -- so there is no
+    /// analogous "just proved it" exemption here.
     pub async fn complete_multipart_upload(
         &self,
         upload_id: Uuid,
+        lease_owner: &str,
         result_json: &str,
         audit: AuditEntry,
     ) -> Result<bool, DomainError> {
         let multipart = self.repos.multipart.clone();
         let audit_repo = self.repos.audit.clone();
+        let lease_owner = lease_owner.to_owned();
         let result_json = result_json.to_owned();
         self.db
             .db()
@@ -208,7 +220,7 @@ impl Store {
                     // completion lease), persisting the response snapshot
                     // for idempotent re-completes.
                     let updated = multipart
-                        .finish_complete(tx, upload_id, &result_json)
+                        .finish_complete(tx, upload_id, Some(&lease_owner), &result_json)
                         .await?;
                     if updated {
                         audit_repo.insert(tx, &audit).await?;

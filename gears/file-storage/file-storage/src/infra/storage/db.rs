@@ -15,6 +15,12 @@
 //!    falling back to the same shape `db_err` would have produced otherwise.
 //!    Used where a repository still holds the original typed error, i.e.
 //!    right at the `.map_err(..)` call site of the failing query.
+//!    [`file_not_found_on_foreign_key_violation`] is the same idea for a
+//!    foreign-key violation, mapped to `DomainError::FileNotFound` (HTTP
+//!    404) instead of `Conflict` -- see its own doc comment for why that is
+//!    the correct reading for this gear's one foreign key that can fail
+//!    under a race (`file_versions.file_id`/`multipart_uploads.file_id` ->
+//!    `files.file_id`).
 //! 3. [`transaction_with_bounded_retry`] -- retries a transaction body a
 //!    bounded number of times when it fails with a lock-contention error
 //!    (`PostgreSQL` serialization failure / deadlock, `MySQL` deadlock,
@@ -32,8 +38,10 @@ use sea_orm::{DbBackend, DbErr};
 use toolkit_db::contention::is_retryable_contention;
 use toolkit_db::secure::{
     DEFAULT_TX_RETRY_ATTEMPTS, Db, DbTx, ScopeError,
+    is_foreign_key_violation as toolkit_is_foreign_key_violation,
     is_unique_violation as toolkit_is_unique_violation,
 };
+use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 
@@ -69,11 +77,20 @@ pub trait ClassifiableDbError: Display {
     /// for the exact detection rules (SQLSTATE fast path + message
     /// fallback).
     fn is_unique_violation(&self) -> bool;
+
+    /// Returns `true` if `self` represents a foreign-key-constraint
+    /// violation. See `toolkit_db::secure::error::is_foreign_key_violation`
+    /// for the exact detection rules.
+    fn is_foreign_key_violation(&self) -> bool;
 }
 
 impl ClassifiableDbError for DbErr {
     fn is_unique_violation(&self) -> bool {
         toolkit_is_unique_violation(self)
+    }
+
+    fn is_foreign_key_violation(&self) -> bool {
+        toolkit_is_foreign_key_violation(self)
     }
 }
 
@@ -83,6 +100,15 @@ impl ClassifiableDbError for ScopeError {
         // other variant is a scope/validation error the database never saw.
         match self {
             Self::Db(db_err) => toolkit_is_unique_violation(db_err),
+            _ => false,
+        }
+    }
+
+    fn is_foreign_key_violation(&self) -> bool {
+        // Only the `Db` variant can be a foreign-key violation; every other
+        // variant is a scope/validation error the database never saw.
+        match self {
+            Self::Db(db_err) => toolkit_is_foreign_key_violation(db_err),
             _ => false,
         }
     }
@@ -119,6 +145,41 @@ pub fn conflict_on_unique_violation<E: ClassifiableDbError>(
             "database unique-constraint violation classified as a conflict"
         );
         DomainError::conflict(message)
+    } else {
+        db_err(e)
+    }
+}
+
+/// Classify a database error: a foreign-key-constraint violation becomes
+/// `DomainError::FileNotFound` (HTTP 404); anything else falls back to
+/// exactly the `DomainError::Database` shape [`db_err`] would have produced
+/// (HTTP 500).
+///
+/// This gear has exactly one foreign key that can fail under a race rather
+/// than a programming error: `file_versions.file_id` / `multipart_uploads.file_id`
+/// both `REFERENCES files (file_id)`, and the only rows ever inserted into
+/// either child table are written by `VersionRepo::insert`/`MultipartRepo::
+/// create` on a `file_id` the caller already read moments earlier
+/// (`require_file`/`get_file`). A violation there means the parent row was
+/// deleted concurrently between that read and this insert (see
+/// `FileRepo::lock_for_update`'s callers for the delete side of this race) --
+/// i.e. exactly the caller-facing meaning of `FileNotFound`, not an
+/// application bug and not a generic 500.
+///
+/// `file_id` is logged (`DEBUG`, only on the classified path) alongside the
+/// original error text for diagnosis; the returned `DomainError::FileNotFound`
+/// carries only `file_id`, same as every other `FileNotFound` call site.
+pub fn file_not_found_on_foreign_key_violation<E: ClassifiableDbError>(
+    e: E,
+    file_id: Uuid,
+) -> DomainError {
+    if e.is_foreign_key_violation() {
+        tracing::debug!(
+            error = %e,
+            %file_id,
+            "foreign-key violation against a deleted file classified as file-not-found"
+        );
+        DomainError::file_not_found(file_id)
     } else {
         db_err(e)
     }

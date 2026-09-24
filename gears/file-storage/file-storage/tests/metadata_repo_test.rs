@@ -60,7 +60,7 @@ async fn db() -> Arc<DBProvider<DbError>> {
 /// fails hard on the unchunked code, not just with a partial result.
 ///
 /// Rows are seeded directly via `secure_insert_many` (bypassing
-/// `MetadataRepo::upsert`'s one-file-at-a-time API and `FileRepo::create`'s)
+/// `MetadataRepo::insert_many`'s per-call overhead and `FileRepo::create`'s)
 /// so setup itself stays fast. A parent `files` row is seeded for every
 /// entry -- `sqlx`'s `SQLite` pool enables `PRAGMA foreign_keys = ON` by
 /// default, so `files_custom_metadata.file_id`'s FK is enforced even in this

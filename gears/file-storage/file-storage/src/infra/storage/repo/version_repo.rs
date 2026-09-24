@@ -12,7 +12,7 @@ use uuid::Uuid;
 use file_storage_sdk::{FileVersion, VersionStatus};
 
 use crate::domain::error::DomainError;
-use crate::infra::storage::db::db_err;
+use crate::infra::storage::db::{db_err, file_not_found_on_foreign_key_violation};
 use crate::infra::storage::entity::file_version::{ActiveModel, Column, Entity};
 use crate::infra::storage::entity::multipart_upload::{
     Column as MultipartUploadColumn, Entity as MultipartUploadEntity,
@@ -20,6 +20,7 @@ use crate::infra::storage::entity::multipart_upload::{
 use crate::infra::storage::entity::version_hash_manifest::{
     ActiveModel as ManifestActiveModel, Column as ManifestColumn, Entity as ManifestEntity,
 };
+use crate::infra::storage::mapper::file_version_from_model;
 
 /// Repository over the `file_versions` table.
 #[derive(Clone, Default)]
@@ -32,6 +33,16 @@ impl VersionRepo {
     }
 
     /// Pre-register a version row (typically `status = pending`).
+    ///
+    /// A foreign-key violation here means `v.file_id`'s `files` row was
+    /// deleted concurrently between the caller reading it and this insert
+    /// (see `FileRepo::lock_for_update`'s doc comment for the delete side of
+    /// this race) -- mapped to `DomainError::FileNotFound` rather than a
+    /// generic 500, via `file_not_found_on_foreign_key_violation`. Every
+    /// caller of this method (`presign_version`, multipart `initiate`, and
+    /// the file-create transactions that insert the file row in the very
+    /// same transaction moments earlier, where the FK can never actually
+    /// fail) is safe to map this way.
     pub async fn insert<C: DBRunner>(
         &self,
         conn: &C,
@@ -55,14 +66,14 @@ impl VersionRepo {
         };
         secure_insert::<Entity>(am, scope, conn)
             .await
-            .map_err(db_err)?;
+            .map_err(|e| file_not_found_on_foreign_key_violation(e, v.file_id))?;
         Ok(())
     }
 
     /// Fetch a single version by `(file_id, version_id)`.
     ///
     /// A direct two-column `Condition::all()` predicate on `find()` (the same
-    /// shape `mark_available`/`finalize`/`clear_current`/`set_current`/
+    /// shape `finalize`/`clear_current`/`set_current`/
     /// `delete`/`delete_if_status`/`rebind_backend` below use successfully on
     /// `update_many()`/`delete_many()`, via `SecureSelect::filter()` --
     /// see `toolkit_db::secure::select`) is verified against
@@ -89,10 +100,18 @@ impl VersionRepo {
             .one(conn)
             .await
             .map_err(db_err)?;
-        Ok(found.map(Into::into))
+        found.map(file_version_from_model).transpose()
     }
 
     /// List a page of a file's versions, newest first.
+    ///
+    /// Ordered `(created_at, version_id)` descending, not `created_at` alone:
+    /// several versions of the same file can share a `created_at` instant
+    /// (millisecond resolution), and without a unique tie-breaker an `OFFSET`
+    /// page boundary drawn through such a run is not reproducible across two
+    /// separate queries -- a row can be skipped or repeated across pages.
+    /// `version_id` is unique per row (part of the table's own PK), so adding
+    /// it makes the order -- and therefore the page boundary -- deterministic.
     pub async fn list_by_file<C: DBRunner>(
         &self,
         conn: &C,
@@ -104,6 +123,7 @@ impl VersionRepo {
         let rows = Entity::find()
             .filter(Column::FileId.eq(file_id))
             .order_by_desc(Column::CreatedAt)
+            .order_by_desc(Column::VersionId)
             .limit(limit)
             .offset(offset)
             .secure()
@@ -111,34 +131,7 @@ impl VersionRepo {
             .all(conn)
             .await
             .map_err(db_err)?;
-        Ok(rows.into_iter().map(Into::into).collect())
-    }
-
-    /// Mark a version `available` (after its bytes are durably written).
-    pub async fn mark_available<C: DBRunner>(
-        &self,
-        conn: &C,
-        scope: &AccessScope,
-        file_id: Uuid,
-        version_id: Uuid,
-    ) -> Result<(), DomainError> {
-        Entity::update_many()
-            .col_expr(
-                Column::Status,
-                Expr::value(file_storage_sdk::VersionStatus::Available.as_str()),
-            )
-            .filter(
-                Condition::all()
-                    .add(Column::FileId.eq(file_id))
-                    .add(Column::VersionId.eq(version_id))
-                    .add(Column::Status.eq(VersionStatus::Pending.as_str())),
-            )
-            .secure()
-            .scope_with(scope)
-            .exec(conn)
-            .await
-            .map_err(db_err)?;
-        Ok(())
+        rows.into_iter().map(file_version_from_model).collect()
     }
 
     /// Record the streamed content's size and hash and mark the version
@@ -462,12 +455,20 @@ impl VersionRepo {
     /// runs after this query in the same sweep pass; only once that CAS lands
     /// does the version stop being backed by an active session and become
     /// reclaimable on a later sweep.
+    ///
+    /// Ordered `(created_at, version_id)` ascending, up to `limit` rows -- one
+    /// batch per sweep pass, mirroring `FileRepo::list_versionless_orphan_files`.
+    /// No cursor is needed: every row returned here is either deleted or
+    /// flipped off `pending` by the caller before the next sweep tick, so it
+    /// falls out of this same query's next result set on its own, and
+    /// whatever this pass's `limit` left behind is simply picked up then.
     pub async fn list_pending_older_than<C: DBRunner>(
         &self,
         conn: &C,
         scope: &AccessScope,
         older_than: OffsetDateTime,
         now: OffsetDateTime,
+        limit: u64,
     ) -> Result<Vec<FileVersion>, DomainError> {
         let rows = Entity::find()
             .filter(
@@ -493,12 +494,14 @@ impl VersionRepo {
                     ),
             )
             .order_by_asc(Column::CreatedAt)
+            .order_by_asc(Column::VersionId)
+            .limit(limit)
             .secure()
             .scope_with(scope)
             .all(conn)
             .await
             .map_err(db_err)?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        rows.into_iter().map(file_version_from_model).collect()
     }
 
     /// Transactionally update `backend_id` and `backend_path` for a version row,

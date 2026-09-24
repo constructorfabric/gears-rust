@@ -11,7 +11,6 @@ mod m20260706_000003_policies_unique_scope;
 mod m20260707_000001_content_hash_modes;
 mod m20260722_000001_multipart_auto_bind;
 mod m20260902_000001_index_hardening;
-mod m20260923_000001_part_count_floor;
 
 /// File-storage migrator. `m20260624_000001_p1_initial` ships the initial
 /// control-plane metadata tables; `m20260701_000001_p2_initial` adds the
@@ -42,10 +41,6 @@ mod m20260923_000001_part_count_floor;
 /// `completing`-with-expired-lease branch the existing partial index misses),
 /// and `files_versionless_sweep_idx` (covers the versionless-orphan-file
 /// cleanup sweep's `content_id IS NULL AND created_at < cutoff` scan).
-/// `m20260923_000001_part_count_floor` tightens
-/// `file_versions_part_count_presence_check` (from `m20260707`) to also
-/// require `part_count >= 2` whenever it is present, as a new migration
-/// rather than an edit to the already-shipped `m20260707` SQL.
 pub struct Migrator;
 
 #[async_trait::async_trait]
@@ -61,7 +56,6 @@ impl MigratorTrait for Migrator {
             Box::new(m20260707_000001_content_hash_modes::Migration),
             Box::new(m20260722_000001_multipart_auto_bind::Migration),
             Box::new(m20260902_000001_index_hardening::Migration),
-            Box::new(m20260923_000001_part_count_floor::Migration),
         ]
     }
 }

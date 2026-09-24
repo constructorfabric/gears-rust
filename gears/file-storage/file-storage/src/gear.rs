@@ -28,7 +28,7 @@ use crate::infra::backend::{
     BackendRegistry, InMemoryBackend, LocalFsBackend, S3Backend, StorageBackend,
 };
 use crate::infra::metrics::FileStorageMetricsMeter;
-use crate::infra::signed_url::Issuer;
+use crate::infra::signed_url::{Issuer, decode_public_key_entry};
 use crate::infra::storage::Store;
 
 /// Default + in-memory backend ids configured in P1 (static).
@@ -151,6 +151,22 @@ impl Gear for FileStorageGear {
             "file-storage URL-signing public key (configure FS_SIDECAR_PUBLIC_KEY with this)"
         );
 
+        // signing_key_seed rotation without an outage for in-flight uploads'
+        // finalize/report-part callbacks (docs/operations.md's Rotation
+        // procedure): the sidecar's own FS_SIDECAR_PREVIOUS_PUBLIC_KEYS only
+        // widens what the SIDECAR accepts; this is what lets the control
+        // plane's OWN callback verification (`FileService::verifier`) keep
+        // accepting a token signed under a seed that was current before this
+        // restart. `cfg.validate()` above already rejected a malformed
+        // entry, so this decode cannot plausibly fail here.
+        let previous_signing_public_keys: Vec<Vec<u8>> = cfg
+            .previous_signing_public_keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| decode_public_key_entry(k, i))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| anyhow::anyhow!("previous_signing_public_keys: {e}"))?;
+
         // Per-type access decisions via the platform Authorization Service
         // (`cpt-cf-file-storage-fr-authorization`). Tenant-boundary enforcement
         // is independent of the PDP (point ops prefetch within the tenant;
@@ -226,7 +242,9 @@ impl Gear for FileStorageGear {
                 None, // quota_client
                 None, // usage_reporter -- see TODO above
             )
-            .with_metrics(Arc::clone(&metrics)),
+            .with_metrics(Arc::clone(&metrics))
+            .with_previous_signing_public_keys(previous_signing_public_keys)
+            .map_err(|e| anyhow::anyhow!("file-storage previous_signing_public_keys: {e}"))?,
         );
         self.service
             .set(Arc::clone(&service))

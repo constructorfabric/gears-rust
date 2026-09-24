@@ -20,8 +20,9 @@ impl CleanupStore for Store {
         &self,
         older_than: OffsetDateTime,
         now: OffsetDateTime,
+        limit: u64,
     ) -> Result<Vec<FileVersion>, DomainError> {
-        Store::list_abandoned_pending_versions(self, older_than, now).await
+        Store::list_abandoned_pending_versions(self, older_than, now, limit).await
     }
 
     async fn list_versionless_orphan_files(
@@ -53,8 +54,9 @@ impl CleanupStore for Store {
     async fn list_expired_multipart_uploads(
         &self,
         now: OffsetDateTime,
+        limit: u64,
     ) -> Result<Vec<crate::domain::multipart::MultipartUploadSession>, DomainError> {
-        Store::list_expired_multipart_uploads(self, now).await
+        Store::list_expired_multipart_uploads(self, now, limit).await
     }
 
     async fn abort_multipart_upload(
@@ -106,18 +108,22 @@ impl CleanupStore for Store {
         Store::get_file(self, &toolkit_security::AccessScope::allow_all(), file_id).await
     }
 
+    async fn list_files_by_ids(&self, ids: &[Uuid]) -> Result<Vec<File>, DomainError> {
+        Store::list_files_by_ids(self, &toolkit_security::AccessScope::allow_all(), ids).await
+    }
+
     async fn has_active_multipart_for_file(&self, file_id: Uuid) -> Result<bool, DomainError> {
         Store::has_active_multipart_for_file(self, file_id).await
     }
 
-    async fn delete_file_with_event(
+    async fn delete_file_with_event_collecting_versions(
         &self,
         scope: &toolkit_security::AccessScope,
         file_id: Uuid,
         audit: crate::domain::audit::AuditEntry,
         event: Option<crate::domain::audit::FileEvent>,
-    ) -> Result<bool, DomainError> {
-        Store::delete_file_with_event(self, scope, file_id, audit, event).await
+    ) -> Result<crate::domain::ports::DeletedFile, DomainError> {
+        Store::delete_file_collecting_versions(self, scope, file_id, audit, event).await
     }
 
     async fn delete_orphan_file_with_event(
@@ -132,8 +138,9 @@ impl CleanupStore for Store {
     async fn delete_expired_idempotency_keys(
         &self,
         now: OffsetDateTime,
+        limit: u64,
     ) -> Result<u64, DomainError> {
-        Store::delete_expired_idempotency_keys(self, now).await
+        Store::delete_expired_idempotency_keys(self, now, limit).await
     }
 }
 
@@ -292,13 +299,36 @@ impl MultipartStore for Store {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn finalize_multipart_version(
+        &self,
+        file_id: Uuid,
+        manifest: Option<String>,
+        validated_mime: Option<String>,
+        finalize_audit: crate::domain::audit::AuditEntry,
+        auto_bind: Option<crate::domain::ports::AutoBindOnFinalize>,
+        finish: crate::domain::ports::MultipartFinishSnapshot,
+    ) -> Result<crate::domain::ports::FinalizeMultipartOutcome, DomainError> {
+        Store::finalize_multipart_version(
+            self,
+            file_id,
+            manifest,
+            validated_mime,
+            finalize_audit,
+            auto_bind,
+            finish,
+        )
+        .await
+    }
+
     async fn complete_multipart_upload(
         &self,
         upload_id: Uuid,
+        lease_owner: &str,
         result_json: &str,
         audit: crate::domain::audit::AuditEntry,
     ) -> Result<bool, DomainError> {
-        Store::complete_multipart_upload(self, upload_id, result_json, audit).await
+        Store::complete_multipart_upload(self, upload_id, lease_owner, result_json, audit).await
     }
 
     async fn acquire_multipart_complete_lease(

@@ -634,3 +634,82 @@ fn validate_accepts_zero_finalize_token_grace() {
         "finalize_token_grace_secs == 0 (grace disabled) must be accepted"
     );
 }
+
+// ── previous_signing_public_keys (signing_key_seed rotation, thread #35) ───
+//
+// The finalize/report-part callback verifier's own dedupe-against-the-
+// current-key step lives in `FileService::with_previous_signing_public_keys`
+// (the current key isn't known here -- it's only derived from
+// `signing_key_seed` in `gear.rs`); `validate()` only checks that each entry
+// is well-formed.
+
+#[test]
+fn default_previous_signing_public_keys_is_empty() {
+    assert!(
+        FileStorageConfig::default()
+            .previous_signing_public_keys
+            .is_empty()
+    );
+}
+
+#[test]
+fn validate_accepts_empty_previous_signing_public_keys() {
+    let cfg = FileStorageConfig {
+        require_signing_key_seed: false,
+        previous_signing_public_keys: Vec::new(),
+        ..FileStorageConfig::default()
+    };
+    assert!(cfg.validate().is_ok());
+}
+
+#[test]
+fn validate_accepts_well_formed_previous_signing_public_keys() {
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+    let key = crate::infra::signed_url::Issuer::generate(60)
+        .expect("issuer")
+        .public_key();
+    let cfg = FileStorageConfig {
+        require_signing_key_seed: false,
+        previous_signing_public_keys: vec![URL_SAFE_NO_PAD.encode(key)],
+        ..FileStorageConfig::default()
+    };
+    assert!(
+        cfg.validate().is_ok(),
+        "a validly-formed (base64url, 32-byte) previous key must be accepted"
+    );
+}
+
+#[test]
+fn validate_rejects_non_base64_previous_signing_public_key() {
+    let cfg = FileStorageConfig {
+        require_signing_key_seed: false,
+        previous_signing_public_keys: vec!["not-valid-base64!!!".to_owned()],
+        ..FileStorageConfig::default()
+    };
+    assert!(
+        cfg.validate().is_err(),
+        "a non-base64url entry must fail gear init, not surface lazily at the first callback"
+    );
+}
+
+#[test]
+fn validate_rejects_wrong_length_previous_signing_public_key() {
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+    // 8 bytes -- well short of the 32 an Ed25519 public key requires.
+    let cfg = FileStorageConfig {
+        require_signing_key_seed: false,
+        previous_signing_public_keys: vec![URL_SAFE_NO_PAD.encode([1, 2, 3, 4, 5, 6, 7, 8])],
+        ..FileStorageConfig::default()
+    };
+    let err = cfg
+        .validate()
+        .expect_err("a wrong-length previous key must fail gear init");
+    assert!(
+        err.to_string().contains("length"),
+        "error should name the length mismatch: {err}"
+    );
+}

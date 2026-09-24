@@ -662,9 +662,12 @@ impl StorageBackend for S3Backend {
     /// means the object changed between the caller's earlier observation and
     /// this `GetObject`, and is refused rather than streamed. A response with
     /// no `Content-Length` (e.g. chunked transfer-encoding) cannot be checked
-    /// up front; a length disagreement in that case still surfaces once the
-    /// caller notices its own byte count is wrong, exactly as before this
-    /// check existed.
+    /// up front this way, so the returned stream is unconditionally wrapped
+    /// in [`length_guard`](super::length_guard), which enforces the same
+    /// `expected_len` contract against the actual streamed byte count
+    /// regardless of whether a `Content-Length` header was present at all --
+    /// the header check above remains only as a cheap up-front rejection for
+    /// the common case where one is.
     async fn get_stream(
         &self,
         path: &str,
@@ -699,7 +702,7 @@ impl StorageBackend for S3Backend {
         let stream = resp
             .bytes_stream()
             .map(|r| r.map_err(std::io::Error::other));
-        Ok(Box::pin(stream))
+        Ok(super::length_guard(Box::pin(stream), expected_len))
     }
 
     /// Native range read: signs a plain `GetObject` request and layers an
@@ -748,7 +751,11 @@ impl StorageBackend for S3Backend {
     /// range or an S3-side error surfaces from this call directly rather than
     /// from polling the returned stream. `expected_len` is checked against a
     /// present `Content-Length` exactly like `get_stream`'s own check — see
-    /// [`StorageBackend::get_range_stream`]'s doc comment.
+    /// [`StorageBackend::get_range_stream`]'s doc comment — and the returned
+    /// stream is unconditionally wrapped in
+    /// [`length_guard`](super::length_guard) exactly like `get_stream`'s own,
+    /// so a chunked (no `Content-Length`) response is still verified against
+    /// `expected_len` byte-for-byte.
     async fn get_range_stream(
         &self,
         path: &str,
@@ -811,7 +818,7 @@ impl StorageBackend for S3Backend {
         let stream = resp
             .bytes_stream()
             .map(|r| r.map_err(std::io::Error::other));
-        Ok(Box::pin(stream))
+        Ok(super::length_guard(Box::pin(stream), expected_len))
     }
 
     /// Cheap stat via `HeadObject`: reads only the `Content-Length` response

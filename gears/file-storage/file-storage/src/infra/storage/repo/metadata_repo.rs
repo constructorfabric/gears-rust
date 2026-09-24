@@ -5,8 +5,7 @@ use std::collections::HashMap;
 use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter, QueryOrder, Set};
 use time::OffsetDateTime;
 use toolkit_db::secure::{
-    DBRunner, SecureDeleteExt, SecureEntityExt, max_bind_params_for, secure_insert,
-    secure_insert_many,
+    DBRunner, SecureDeleteExt, SecureEntityExt, max_bind_params_for, secure_insert_many,
 };
 use toolkit_security::AccessScope;
 use uuid::Uuid;
@@ -103,31 +102,6 @@ impl MetadataRepo {
             }
         }
         Ok(grouped)
-    }
-
-    /// Upsert one key (delete-then-insert; merge-patch semantics live in the
-    /// service). Custom-metadata writes never carry tenant data of their own —
-    /// the parent file is already authorized.
-    pub async fn upsert<C: DBRunner>(
-        &self,
-        conn: &C,
-        scope: &AccessScope,
-        file_id: Uuid,
-        key: &str,
-        value: &str,
-        now: OffsetDateTime,
-    ) -> Result<(), DomainError> {
-        self.delete_key(conn, scope, file_id, key).await?;
-        let am = ActiveModel {
-            file_id: Set(file_id),
-            key: Set(key.to_owned()),
-            value: Set(value.to_owned()),
-            set_at: Set(now),
-        };
-        secure_insert::<Entity>(am, scope, conn)
-            .await
-            .map_err(db_err)?;
-        Ok(())
     }
 
     /// Delete one key. Returns `true` if a row was removed.
