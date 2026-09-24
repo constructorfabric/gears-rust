@@ -726,8 +726,7 @@ mod tests {
     /// The platform posture: base -> family -> producer type.
     const DEFAULT_DEPTH: usize = 3;
 
-    #[allow(clippy::needless_pass_by_value)]
-    fn owned_leaf(leaf: &str, traits: Value, payload_properties: Value) -> (String, Value) {
+    fn owned_leaf(leaf: &str, traits: &Value, payload_properties: &Value) -> (String, Value) {
         let id = format!("{}{leaf}", graph_storage_sdk::gts::OWNED_NODE_TYPE);
         let schema = serde_json::json!({
             "$id": format!("gts://{id}"),
@@ -766,8 +765,8 @@ mod tests {
         for spelling in ["Reference", "referense", "owned_node", ""] {
             let (id, schema) = owned_leaf(
                 "acme.dm._.mistyped.v1~",
-                serde_json::json!({ "family": spelling }),
-                serde_json::json!({}),
+                &serde_json::json!({ "family": spelling }),
+                &serde_json::json!({}),
             );
             let ancestors = owned_ancestors();
             let refs: Vec<&Value> = ancestors.iter().collect();
@@ -792,8 +791,8 @@ mod tests {
     fn a_family_that_contradicts_the_branch_is_refused() {
         let (id, schema) = owned_leaf(
             "acme.dm._.defector.v1~",
-            serde_json::json!({ "family": "reference" }),
-            serde_json::json!({}),
+            &serde_json::json!({ "family": "reference" }),
+            &serde_json::json!({}),
         );
         let ancestors = owned_ancestors();
         let refs: Vec<&Value> = ancestors.iter().collect();
@@ -811,8 +810,8 @@ mod tests {
     fn a_leaf_that_only_inherits_its_family_is_admitted() {
         let (id, schema) = owned_leaf(
             "acme.dm._.ordinary.v1~",
-            serde_json::json!({ "emit_events": true }),
-            serde_json::json!({}),
+            &serde_json::json!({ "emit_events": true }),
+            &serde_json::json!({}),
         );
         let ancestors = owned_ancestors();
         let refs: Vec<&Value> = ancestors.iter().collect();
@@ -826,10 +825,10 @@ mod tests {
     fn an_index_path_resolves_its_scalar_kind_from_the_schema() {
         let (id, schema) = owned_leaf(
             "acme.dm._.finding.v1~",
-            serde_json::json!({ "index": [
+            &serde_json::json!({ "index": [
                 "/payload/severity", "/payload/score", "/payload/count",
                 "/payload/open", "/payload/seen_at", "/payload/loc/line" ] }),
-            serde_json::json!({
+            &serde_json::json!({
                 "severity": { "enum": ["low", "high"] },
                 "score": { "type": "number" },
                 "count": { "type": ["integer", "null"] },
@@ -867,24 +866,24 @@ mod tests {
 
         let (id, schema) = owned_leaf(
             "acme.dm._.thing.v1~",
-            serde_json::json!({ "index": ["/payload/meta"] }),
-            serde_json::json!({ "meta": { "type": "object" } }),
+            &serde_json::json!({ "index": ["/payload/meta"] }),
+            &serde_json::json!({ "meta": { "type": "object" } }),
         );
         let error = analyze(&id, &schema, &refs, DEFAULT_DEPTH).expect_err("object refused");
         assert!(error.to_string().contains("not a scalar"), "{error}");
 
         let (id, schema) = owned_leaf(
             "acme.dm._.other.v1~",
-            serde_json::json!({ "index": ["/payload/ghost"] }),
-            serde_json::json!({ "real": { "type": "string" } }),
+            &serde_json::json!({ "index": ["/payload/ghost"] }),
+            &serde_json::json!({ "real": { "type": "string" } }),
         );
         let error = analyze(&id, &schema, &refs, DEFAULT_DEPTH).expect_err("undeclared refused");
         assert!(error.to_string().contains("does not resolve"), "{error}");
 
         let (id, schema) = owned_leaf(
             "acme.dm._.third.v1~",
-            serde_json::json!({ "index": ["/name"] }),
-            serde_json::json!({}),
+            &serde_json::json!({ "index": ["/name"] }),
+            &serde_json::json!({}),
         );
         let error =
             analyze(&id, &schema, &refs, DEFAULT_DEPTH).expect_err("outside payload refused");

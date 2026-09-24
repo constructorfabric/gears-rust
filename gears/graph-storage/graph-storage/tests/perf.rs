@@ -76,7 +76,13 @@ impl Shape {
             .and_then(|raw| raw.parse::<f64>().ok())
             .unwrap_or(1.0)
             .clamp(0.001, 10.0);
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "the scale is clamped to 0.001..=10 above, so both products lie in \
+                      100..=1_000_000 and are positive -- the cast is lossless over \
+                      exactly the range the clamp allows"
+        )]
         Self {
             nodes: (100_000.0 * scale) as usize,
             edges: (500_000.0 * scale) as usize,
