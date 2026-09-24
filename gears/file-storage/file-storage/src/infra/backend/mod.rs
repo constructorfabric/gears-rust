@@ -15,11 +15,13 @@
 //! branch regardless, but merging it to `main` is gated on that review.
 //! GCS/etc. remain deferred beyond that.
 
+mod hashing_length_guard;
 mod in_memory;
 mod length_guard;
 mod local_fs;
 mod s3;
 
+pub(crate) use hashing_length_guard::hashing_length_guard;
 pub(crate) use length_guard::length_guard;
 
 use std::collections::BTreeMap;
@@ -37,6 +39,32 @@ pub use local_fs::LocalFsBackend;
 pub use s3::S3Backend;
 
 use crate::infra::content::hash_mode::ManifestEntry;
+
+/// Hard ceiling on [`StorageBackend::read_prefix`]'s `max_bytes` argument.
+/// Every real caller only ever needs a small, fixed-size leading slice — a
+/// MIME-sniff prefix (`MIME_SNIFF_PREFIX_BYTES`, 8 KiB) is the largest one —
+/// never an arbitrary range (that is streamed only through
+/// [`StorageBackend::get_range_stream`]) and never a whole-object read.
+/// Set comfortably above every real caller's actual need so it never
+/// constrains legitimate use, while still making a whole-object
+/// `read_prefix` call impossible by construction: exceeding it is a caller
+/// bug, rejected as a validation error rather than silently clamped.
+pub(crate) const MAX_READ_PREFIX_BYTES: u64 = 64 * 1024;
+
+/// Shared budget check every [`StorageBackend::read_prefix`] implementation
+/// runs before touching its backend, so the ceiling is enforced identically
+/// (and the error shape is identical) regardless of which backend answers.
+pub(crate) fn check_read_prefix_budget(max_bytes: u64) -> Result<(), DomainError> {
+    if max_bytes > MAX_READ_PREFIX_BYTES {
+        return Err(DomainError::validation(
+            "max_bytes",
+            format!(
+                "read_prefix max_bytes {max_bytes} exceeds the {MAX_READ_PREFIX_BYTES}-byte ceiling"
+            ),
+        ));
+    }
+    Ok(())
+}
 
 /// One part of a multipart completion, as handed to `complete_multipart`:
 /// `(part_number, offset, part_hash, backend_etag)` (ADR-0006). Named to keep
@@ -120,45 +148,21 @@ pub trait StorageBackend: Send + Sync {
     /// The capabilities this backend advertises.
     fn capabilities(&self) -> BackendCapabilities;
 
-    /// Write a blob at `path`. Overwrites are allowed (each version is a fresh
-    /// path, so callers do not rely on write-once semantics here).
-    async fn put(&self, path: &str, bytes: Bytes) -> Result<(), DomainError>;
-
     /// Stream a blob into `path`, hashing incrementally and enforcing
     /// `max_size` as bytes arrive rather than buffering the whole body first
     /// (`cpt-cf-file-storage-fr-backend-abstraction`, memory-DoS fix). Returns
     /// `(bytes_written, sha256_digest)`.
     ///
-    /// The default implementation falls back to buffering the entire stream
-    /// in memory (still enforcing `max_size` as chunks arrive, so an
-    /// oversized upload is still rejected — just not memory-bounded) before
-    /// delegating to `put`. This keeps every backend that hasn't been
-    /// upgraded to a true streaming write correct; backends for which
-    /// unbounded memory use during upload is a real concern (e.g.
-    /// `LocalFsBackend`) should override this method.
+    /// No default: a buffering fallback here would defeat the whole point of
+    /// this trait having no whole-object `put` to fall back to. Every real
+    /// backend (`LocalFsBackend`, `S3Backend`, `InMemoryBackend`) implements
+    /// this natively.
     async fn put_stream(
         &self,
         path: &str,
         stream: futures::stream::BoxStream<'_, std::io::Result<Bytes>>,
         max_size: Option<u64>,
-    ) -> Result<(u64, [u8; 32]), DomainError> {
-        use futures::StreamExt;
-
-        let mut buf = Vec::new();
-        let mut stream = stream;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| DomainError::backend(self.id(), e.to_string()))?;
-            buf.extend_from_slice(&chunk);
-            if max_size.is_some_and(|m| buf.len() as u64 > m) {
-                return Err(DomainError::validation("size", "exceeds max_size"));
-            }
-        }
-        let bytes_written = buf.len() as u64;
-        let digest =
-            crate::infra::content::hash::digest_to_array(crate::infra::content::hash::sha256(&buf));
-        self.put(path, Bytes::from(buf)).await?;
-        Ok((bytes_written, digest))
-    }
+    ) -> Result<(u64, [u8; 32]), DomainError>;
 
     /// Publish a blob at `path`, but **only if nothing is stored there yet**
     /// (create-exclusive semantics) — unlike [`Self::put_stream`], which is
@@ -199,64 +203,30 @@ pub trait StorageBackend: Send + Sync {
     /// with a truly atomic implementation, closing the race for those two
     /// backends completely.
     ///
-    /// [`S3Backend`](super::backend::S3Backend) **overrides** this default with
-    /// an atomic conditional-write implementation (`If-None-Match: *` on the
-    /// terminal `PutObject`/`CompleteMultipartUpload`, mapping the resulting
-    /// `412 Precondition Failed` to `created: false` — the same outcome
-    /// `LocalFsBackend`/`InMemoryBackend` produce), so no shipping backend is
-    /// left on this racy default. That override's guarantee is
-    /// provider-dependent: it requires an endpoint that honours S3 conditional
-    /// writes (native AWS S3 since 2024-08, and S3-compatible stores that
-    /// implement it). S3 support is opt-in (`s3_backends` config) and
-    /// release-gated by [ADR-0005](../../../docs/ADR/0005-cpt-cf-file-storage-adr-s3-client-selection.md)
+    /// [`S3Backend`](super::backend::S3Backend) implements it with an atomic
+    /// conditional-write (`If-None-Match: *` on the terminal
+    /// `PutObject`/`CompleteMultipartUpload`, mapping the resulting `412
+    /// Precondition Failed` to `created: false` — the same outcome
+    /// `LocalFsBackend`/`InMemoryBackend` produce). That guarantee is
+    /// provider-dependent: it requires an endpoint that honours S3
+    /// conditional writes (native AWS S3 since 2024-08, and S3-compatible
+    /// stores that implement it). S3 support is opt-in (`s3_backends`
+    /// config) and release-gated by
+    /// [ADR-0005](../../../docs/ADR/0005-cpt-cf-file-storage-adr-s3-client-selection.md)
     /// (also see [ADR-0003](../../../docs/ADR/0003-cpt-cf-file-storage-adr-sidecar-data-plane.md)'s
     /// "Known gap" paragraph); validating a specific target deployment's
     /// conditional-write support is part of that gate.
     ///
-    /// This default therefore remains only as a backend-agnostic fallback for a
-    /// hypothetical future backend that cannot do better — every backend wired
-    /// today (`local-fs`, `in-memory`, `s3`) provides an atomic override.
+    /// No default: a backend-agnostic `exists`-then-write fallback would
+    /// necessarily be non-atomic (TOCTOU), reintroducing the exact race this
+    /// method exists to close. Every backend wired today (`local-fs`,
+    /// `in-memory`, `s3`) provides a genuinely atomic implementation.
     async fn publish_exclusive(
         &self,
         path: &str,
         stream: futures::stream::BoxStream<'_, std::io::Result<Bytes>>,
         max_size: Option<u64>,
-    ) -> Result<PublishOutcome, DomainError> {
-        use futures::StreamExt;
-
-        let mut buf = Vec::new();
-        let mut stream = stream;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| DomainError::backend(self.id(), e.to_string()))?;
-            buf.extend_from_slice(&chunk);
-            if max_size.is_some_and(|m| buf.len() as u64 > m) {
-                return Err(DomainError::validation("size", "exceeds max_size"));
-            }
-        }
-        let bytes_written = buf.len() as u64;
-        let digest =
-            crate::infra::content::hash::digest_to_array(crate::infra::content::hash::sha256(&buf));
-
-        // Non-atomic check-then-act: see this method's doc comment for the
-        // race this fallback accepts as the price of a backend-agnostic
-        // default.
-        if self.exists(path).await? {
-            return Ok(PublishOutcome {
-                bytes_written,
-                digest,
-                created: false,
-            });
-        }
-        self.put(path, Bytes::from(buf)).await?;
-        Ok(PublishOutcome {
-            bytes_written,
-            digest,
-            created: true,
-        })
-    }
-
-    /// Read the whole blob at `path`.
-    async fn get(&self, path: &str) -> Result<Bytes, DomainError>;
+    ) -> Result<PublishOutcome, DomainError>;
 
     /// Stream the blob at `path` in chunks, without necessarily buffering the
     /// whole object in memory at once. Used by `finalize_upload`'s read-back
@@ -280,63 +250,41 @@ pub trait StorageBackend: Send + Sync {
     /// [`LocalFsBackend::get_stream`] for the concrete race this closes).
     ///
     /// Declared `BoxStream<'static, _>` rather than borrowing `&self`'s
-    /// lifetime: every implementation below (and the default here) moves
-    /// fully-owned data into the returned stream (an owned file handle, an
-    /// owned `reqwest::Response`, an owned `Bytes` — never a reference back
-    /// into `self`), so nothing is actually lost by widening the bound, and
-    /// widening it is exactly what lets a caller hand the stream straight to
+    /// lifetime: every implementation below moves fully-owned data into the
+    /// returned stream (an owned file handle, an owned `reqwest::Response`,
+    /// an owned `Bytes` — never a reference back into `self`), which is
+    /// exactly what lets a caller hand the stream straight to
     /// `axum::body::Body::from_stream`, which requires a genuinely `'static`
     /// stream — a `BoxStream<'_, _>` tied to a short-lived `&Arc<dyn
     /// StorageBackend>` borrow could never satisfy that without an unsound
     /// lifetime cast, and this crate forbids `unsafe` outright
     /// (`unsafe_code = "forbid"` at the workspace level).
     ///
-    /// The default implementation falls back to `get`, yielding the whole
-    /// blob as a single chunk (`futures::stream::once`) — still correct, just
-    /// not memory-bounded — so every backend that hasn't been upgraded to a
-    /// true streaming read stays correct; backends for which unbounded memory
-    /// use during a read-back is a real concern (e.g. `LocalFsBackend`,
-    /// `S3Backend`) should override this method. It still enforces the
-    /// `expected_len` contract above: a mismatch is a
-    /// [`DomainError::conflict`], surfaced before the single chunk is ever
-    /// handed back.
+    /// No default: a single-chunk buffering fallback would defeat the point
+    /// of removing the whole-object `get` this used to fall back to. Every
+    /// real backend (`LocalFsBackend`, `S3Backend`, `InMemoryBackend`)
+    /// implements this natively.
     async fn get_stream(
         &self,
         path: &str,
         expected_len: u64,
-    ) -> Result<futures::stream::BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
-        let bytes = self.get(path).await?;
-        let actual_len = bytes.len() as u64;
-        if actual_len != expected_len {
-            return Err(DomainError::conflict(format!(
-                "object at '{path}' changed size before it could be read: expected {expected_len} byte(s), found {actual_len}"
-            )));
-        }
-        let stream: futures::stream::BoxStream<'static, std::io::Result<Bytes>> =
-            Box::pin(futures::stream::once(async move { Ok(bytes) }));
-        Ok(stream)
-    }
+    ) -> Result<futures::stream::BoxStream<'static, std::io::Result<Bytes>>, DomainError>;
 
-    /// Read a byte range of the blob at `path`. Default impl reads the whole
-    /// blob then slices; range-native backends should override.
+    /// Read up to `max_bytes` from the **start** of the blob at `path`,
+    /// without reading (or buffering) anything beyond that leading prefix —
+    /// hard-capped at [`MAX_READ_PREFIX_BYTES`] (every implementation must
+    /// enforce this via [`check_read_prefix_budget`] before touching its
+    /// backend). This — plus [`Self::stat`] for a pure existence check — is
+    /// the only way the *production control-plane* API can see any of an
+    /// object's bytes; an arbitrary range or a whole object is streamed only
+    /// through [`Self::get_range_stream`]/[`Self::get_stream`], which the
+    /// sidecar's data-plane download handlers use, never the control plane.
     ///
-    /// Still used directly (whole range materialized as `Bytes`) by
-    /// `domain::data_plane::DataPlaneService::read_content` and by
-    /// `domain::multipart_service`'s small (≤512-byte) MIME-sniff-prefix
-    /// reads — both read small, already-memory-appropriate spans, so they
-    /// keep using this rather than [`Self::get_range_stream`].
-    async fn get_range(&self, path: &str, range: ByteRange) -> Result<Bytes, DomainError> {
-        let full = self.get(path).await?;
-        let total = full.len() as u64;
-        match range.resolve(total) {
-            Some((start, end)) => {
-                let s = usize::try_from(start).unwrap_or(usize::MAX);
-                let e = usize::try_from(end).unwrap_or(usize::MAX);
-                Ok(full.slice(s..=e.min(full.len().saturating_sub(1))))
-            }
-            None => Err(DomainError::validation("range", "unsatisfiable byte range")),
-        }
-    }
+    /// `Ok(None)` mirrors [`Self::stat`]'s `Ok(None)`: nothing is stored at
+    /// `path`. `Ok(Some(bytes))` gives `bytes.len() == min(max_bytes, object
+    /// length)` — a caller asking for more than the object holds gets the
+    /// whole (short) object back, not an error.
+    async fn read_prefix(&self, path: &str, max_bytes: u64) -> Result<Option<Bytes>, DomainError>;
 
     /// Stream a byte range of the blob at `path`, without necessarily
     /// buffering the whole resolved range in memory at once — the
@@ -366,31 +314,18 @@ pub trait StorageBackend: Send + Sync {
     /// with what the caller already promised — see
     /// [`LocalFsBackend::get_range_stream`] for the concrete race this closes.
     ///
-    /// The default implementation falls back to `get_range`, yielding the
-    /// whole resolved range as a single chunk — still correct, just not
-    /// memory-bounded — so any backend that hasn't been upgraded to a true
-    /// streaming range read stays correct; `local-fs`, `s3`, and `in-memory`
-    /// all override this natively (see their own doc comments). It still
-    /// enforces the `expected_len` contract above: a mismatch is a
-    /// [`DomainError::conflict`], surfaced before the single chunk is ever
-    /// handed back.
+    /// No default: this used to fall back to `get_range` (whole resolved
+    /// range as a single chunk over a whole-object `get`), which no longer
+    /// exists. `local-fs`, `s3`, and `in-memory` all implement this natively
+    /// (see their own doc comments), each still enforcing the `expected_len`
+    /// contract above: a mismatch is a [`DomainError::conflict`], surfaced
+    /// before the single chunk is ever handed back.
     async fn get_range_stream(
         &self,
         path: &str,
         range: ByteRange,
         expected_len: u64,
-    ) -> Result<futures::stream::BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
-        let bytes = self.get_range(path, range).await?;
-        let actual_len = bytes.len() as u64;
-        if actual_len != expected_len {
-            return Err(DomainError::conflict(format!(
-                "object at '{path}' range changed before it could be read: expected {expected_len} byte(s), resolved {actual_len}"
-            )));
-        }
-        let stream: futures::stream::BoxStream<'static, std::io::Result<Bytes>> =
-            Box::pin(futures::stream::once(async move { Ok(bytes) }));
-        Ok(stream)
-    }
+    ) -> Result<futures::stream::BoxStream<'static, std::io::Result<Bytes>>, DomainError>;
 
     /// The total length in bytes of the blob at `path`, without necessarily
     /// reading its content. Range-aware callers (e.g. the sidecar's
@@ -398,12 +333,10 @@ pub trait StorageBackend: Send + Sync {
     /// against the actual blob length and to build a correct `Content-Range`
     /// header, without materializing the whole blob first.
     ///
-    /// The default implementation falls back to `get`, so only backends with
-    /// a cheaper standalone stat (e.g. `LocalFsBackend`'s filesystem
-    /// metadata) need to override it.
-    async fn size(&self, path: &str) -> Result<u64, DomainError> {
-        Ok(self.get(path).await?.len() as u64)
-    }
+    /// No default: this used to fall back to `get`, which no longer exists.
+    /// Every real backend implements a cheap standalone stat (e.g.
+    /// `LocalFsBackend`'s filesystem metadata, `S3Backend`'s `HeadObject`).
+    async fn size(&self, path: &str) -> Result<u64, DomainError>;
 
     /// Delete the blob at `path`. Missing blobs are treated as success
     /// (idempotent delete).
@@ -443,20 +376,43 @@ pub trait StorageBackend: Send + Sync {
         Err(DomainError::multipart_not_supported(self.id()))
     }
 
-    /// Upload one part. Returns `(backend_etag, part_hash_bytes)`.
+    /// Upload one part, streamed rather than buffered whole. Returns
+    /// `(backend_etag, part_hash_bytes)`.
     ///
     /// `part_offset` is the part's start byte offset within the assembled
     /// object (ADR-0006). It is not used to hash the part — `part_hash` is a
-    /// flat `sha256(data)` exactly as before — but is threaded through so the
-    /// backend can build the offset-manifest at `complete` time without
-    /// re-deriving it from a plan it may not retain.
-    async fn upload_part(
+    /// flat `sha256` over the streamed bytes exactly as before — but is
+    /// threaded through so the backend can build the offset-manifest at
+    /// `complete` time without re-deriving it from a plan it may not retain.
+    ///
+    /// `len` is the part's exact, authoritative expected size — for the
+    /// native multipart write path this is always the server-minted token
+    /// claim (`claims.multipart.size`), never a client-supplied header, since
+    /// a backend that needs the length up front to sign/send a single
+    /// request (S3's `UploadPart`) cannot treat it as a mere ceiling the way
+    /// [`Self::put_stream`]'s `max_size` is. An implementation MUST verify
+    /// `stream` yields exactly `len` bytes before treating the part as
+    /// uploaded — fewer or more is an error, and the part must not be
+    /// considered stored (see [`S3Backend`](super::S3Backend)'s
+    /// implementation, which enforces this on the same pass that computes
+    /// `part_hash`, via `hashing_length_guard`).
+    ///
+    /// Declared `BoxStream<'static, _>` for the same reason
+    /// [`Self::get_stream`] is: every real caller (the sidecar's
+    /// `write_multipart_part_native`, this trait's own S3 `put_stream`/
+    /// `publish_exclusive` multipart chunking) already owns fully-detached
+    /// data with no borrow back into a short-lived caller frame, and
+    /// `'static` is what lets an implementation hand the stream straight to
+    /// an HTTP client body (e.g. `reqwest::Body::wrap_stream`) without an
+    /// intermediate buffering copy.
+    async fn upload_part_stream(
         &self,
         _path: &str,
         _upload_handle: &str,
         _part_number: u32,
         _part_offset: u64,
-        _data: Bytes,
+        _stream: futures::stream::BoxStream<'static, std::io::Result<Bytes>>,
+        _len: u64,
     ) -> Result<(String, Vec<u8>), DomainError> {
         Err(DomainError::multipart_not_supported(self.id()))
     }

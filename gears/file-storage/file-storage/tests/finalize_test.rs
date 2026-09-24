@@ -40,6 +40,9 @@ use file_storage::infra::storage::migrations::Migrator;
 use file_storage::infra::storage::repo::VersionRepo;
 use file_storage_sdk::{FileVersion, NewFile, OwnerKind, VersionStatus};
 
+mod common;
+use common::write_all;
+
 const GTS: &str = gts_id!("cf.fstorage.file.type.v1~x.test.file.type.v1~");
 
 async fn build_db() -> Arc<DBProvider<DbError>> {
@@ -62,8 +65,8 @@ async fn build_db() -> Arc<DBProvider<DbError>> {
 }
 
 /// Build `FileService` plus the raw `InMemoryBackend` handle (so tests can
-/// directly control `backend.get`/`put`) and the `Store` (for direct DB
-/// assertions on the version row).
+/// directly control what's stored via `write_all`/`get_stream`) and the
+/// `Store` (for direct DB assertions on the version row).
 async fn build_service() -> (Arc<FileService>, Arc<dyn StorageBackend>, Store) {
     let db = build_db().await;
     let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
@@ -252,10 +255,7 @@ async fn finalize_size_mismatch_is_rejected() {
         .unwrap();
 
     let path = backend_path(ticket.file_id, ticket.version_id);
-    backend
-        .put(&path, Bytes::from_static(b"hello"))
-        .await
-        .unwrap();
+    write_all(&backend, &path, Bytes::from_static(b"hello")).await;
 
     let err = svc
         .finalize_upload(
@@ -292,10 +292,7 @@ async fn finalize_hash_mismatch_is_rejected() {
         .unwrap();
 
     let path = backend_path(ticket.file_id, ticket.version_id);
-    backend
-        .put(&path, Bytes::from_static(b"hello"))
-        .await
-        .unwrap();
+    write_all(&backend, &path, Bytes::from_static(b"hello")).await;
 
     let err = svc
         .finalize_upload(&ctx, ticket.file_id, ticket.version_id, 5, vec![0u8; 32])
@@ -327,7 +324,7 @@ async fn finalize_matching_size_and_hash_succeeds() {
 
     let known_bytes = Bytes::from_static(b"hello, world!");
     let path = backend_path(ticket.file_id, ticket.version_id);
-    backend.put(&path, known_bytes.clone()).await.unwrap();
+    write_all(&backend, &path, known_bytes.clone()).await;
 
     let true_size = i64::try_from(known_bytes.len()).unwrap();
     let true_hash = hash::sha256(&known_bytes);
@@ -349,10 +346,11 @@ async fn finalize_matching_size_and_hash_succeeds() {
         .expect("version row must exist");
     assert_eq!(version.status, VersionStatus::Available);
     // `finalize_upload` persists the caller's `hash_value` only after
-    // `Store::verify_content_hash` has proven it byte-for-byte equal to
-    // `sha256` of the read-back blob, so this independently recomputed hash
-    // must match the persisted value regardless of which of the two
-    // (guaranteed-identical) values the implementation happens to persist.
+    // streaming the backend's actual bytes back and recomputing `sha256`
+    // over them, rejecting a mismatch before anything is persisted, so this
+    // independently recomputed hash must match the persisted value
+    // regardless of which of the two (guaranteed-identical) values the
+    // implementation happens to persist.
     let independently_recomputed = hash::sha256(&known_bytes);
     assert_eq!(version.size, true_size);
     assert_eq!(version.hash_value, independently_recomputed);
@@ -525,7 +523,7 @@ async fn finalize_upload_after_already_available_returns_conflict() {
 
     let known_bytes = Bytes::from_static(b"hello, world!");
     let path = backend_path(ticket.file_id, ticket.version_id);
-    backend.put(&path, known_bytes.clone()).await.unwrap();
+    write_all(&backend, &path, known_bytes.clone()).await;
 
     let true_size = i64::try_from(known_bytes.len()).unwrap();
     let true_hash = hash::sha256(&known_bytes);
@@ -590,10 +588,7 @@ async fn finalize_rejects_content_not_matching_declared_mime() {
     // Presigned/declared as `image/png`, but the bytes actually uploaded are
     // a recognizably different signature (PDF) — a policy-bypass attempt.
     let path = backend_path(ticket.file_id, ticket.version_id);
-    backend
-        .put(&path, Bytes::from_static(PDF_MAGIC))
-        .await
-        .unwrap();
+    write_all(&backend, &path, Bytes::from_static(PDF_MAGIC)).await;
 
     let true_size = i64::try_from(PDF_MAGIC.len()).unwrap();
     let true_hash = hash::sha256(PDF_MAGIC);
@@ -648,10 +643,7 @@ async fn finalize_persists_validated_mime() {
         .unwrap();
 
     let path = backend_path(ticket.file_id, ticket.version_id);
-    backend
-        .put(&path, Bytes::from_static(PNG_MAGIC))
-        .await
-        .unwrap();
+    write_all(&backend, &path, Bytes::from_static(PNG_MAGIC)).await;
 
     let true_size = i64::try_from(PNG_MAGIC.len()).unwrap();
     let true_hash = hash::sha256(PNG_MAGIC);
@@ -704,7 +696,7 @@ async fn finalize_streams_readback_without_buffering_whole_blob() {
     let large_bytes = Bytes::from(large_bytes);
 
     let path = backend_path(ticket.file_id, ticket.version_id);
-    backend.put(&path, large_bytes.clone()).await.unwrap();
+    write_all(&backend, &path, large_bytes.clone()).await;
 
     let true_size = i64::try_from(large_bytes.len()).unwrap();
     let true_hash = hash::sha256(&large_bytes);
@@ -811,7 +803,7 @@ async fn finalize_with_internal_secret_required_accepts_matching_header() {
 
     let known_bytes = Bytes::from_static(b"hello, world!");
     let path = backend_path(ticket.file_id, ticket.version_id);
-    backend.put(&path, known_bytes.clone()).await.unwrap();
+    write_all(&backend, &path, known_bytes.clone()).await;
 
     let true_size = i64::try_from(known_bytes.len()).unwrap();
     let true_hash = hash::sha256(&known_bytes);
@@ -899,7 +891,7 @@ async fn finalize_with_expired_token_accepted_within_grace() {
 
     let known_bytes = Bytes::from_static(b"hello, world!");
     let path = backend_path(ticket.file_id, ticket.version_id);
-    backend.put(&path, known_bytes.clone()).await.unwrap();
+    write_all(&backend, &path, known_bytes.clone()).await;
 
     let true_size = i64::try_from(known_bytes.len()).unwrap();
     let true_hash = hash::sha256(&known_bytes);
@@ -1055,7 +1047,7 @@ async fn finalize_accepts_token_signed_by_previous_key_after_rotation() {
 
     let known_bytes = Bytes::from_static(b"hello, world!");
     let path = backend_path(ticket.file_id, ticket.version_id);
-    backend.put(&path, known_bytes.clone()).await.unwrap();
+    write_all(&backend, &path, known_bytes.clone()).await;
 
     let claims = Claims {
         op: Op::Put,
@@ -1243,7 +1235,7 @@ async fn finalize_accepts_expired_previous_key_token_within_grace_after_rotation
 
     let known_bytes = Bytes::from_static(b"hello, world!");
     let path = backend_path(ticket.file_id, ticket.version_id);
-    backend.put(&path, known_bytes.clone()).await.unwrap();
+    write_all(&backend, &path, known_bytes.clone()).await;
 
     let claims = Claims {
         op: Op::Put,
@@ -1607,7 +1599,7 @@ async fn finalize_with_bind_claim_binds_first_content() {
 
     let bytes = Bytes::from_static(b"auto-bind me");
     let path = backend_path(ticket.file_id, ticket.version_id);
-    backend.put(&path, bytes.clone()).await.unwrap();
+    write_all(&backend, &path, bytes.clone()).await;
 
     let claims = Claims {
         op: Op::Put,
@@ -1674,7 +1666,7 @@ async fn finalize_bind_claim_lost_cas_reports_conflict() {
     // Winner: ordinary finalize + bind (simulates the first token's flow).
     let winner_bytes = Bytes::from_static(b"winner");
     let path_a = backend_path(ticket.file_id, ticket.version_id);
-    backend.put(&path_a, winner_bytes.clone()).await.unwrap();
+    write_all(&backend, &path_a, winner_bytes.clone()).await;
     svc.finalize_upload(
         &ctx,
         ticket.file_id,
@@ -1693,7 +1685,7 @@ async fn finalize_bind_claim_lost_cas_reports_conflict() {
     let ticket2 = svc.presign_version(&ctx, ticket.file_id).await.unwrap();
     let loser_bytes = Bytes::from_static(b"loser!");
     let path_b = backend_path(ticket.file_id, ticket2.version_id);
-    backend.put(&path_b, loser_bytes.clone()).await.unwrap();
+    write_all(&backend, &path_b, loser_bytes.clone()).await;
     let claims = Claims {
         op: Op::Put,
         file_id: ticket.file_id,
@@ -1763,7 +1755,7 @@ async fn finalize_manual_token_converges_on_retry() {
 
     let bytes = Bytes::from_static(b"manual retry");
     let path = backend_path(ticket.file_id, ticket.version_id);
-    backend.put(&path, bytes.clone()).await.unwrap();
+    write_all(&backend, &path, bytes.clone()).await;
 
     let claims = Claims {
         op: Op::Put,
@@ -1836,7 +1828,7 @@ async fn finalize_manual_token_converges_to_bound_after_manual_bind() {
 
     let bytes = Bytes::from_static(b"manual then bound");
     let path = backend_path(ticket.file_id, ticket.version_id);
-    backend.put(&path, bytes.clone()).await.unwrap();
+    write_all(&backend, &path, bytes.clone()).await;
 
     let claims = Claims {
         op: Op::Put,
@@ -1896,7 +1888,7 @@ async fn finalize_manual_token_retry_with_mismatched_hash_is_rejected() {
 
     let bytes = Bytes::from_static(b"manual original");
     let path = backend_path(ticket.file_id, ticket.version_id);
-    backend.put(&path, bytes.clone()).await.unwrap();
+    write_all(&backend, &path, bytes.clone()).await;
 
     let claims = Claims {
         op: Op::Put,

@@ -25,18 +25,73 @@ use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use file_storage::domain::authz::TenantOnlyAuthorizer;
-use file_storage::domain::data_plane::DataPlaneService;
 use file_storage::domain::error::DomainError;
 use file_storage::domain::policy::{MetadataLimits, PolicyBody, PolicyScope, SizeLimits};
 use file_storage::domain::policy_service::PolicyService;
-use file_storage::domain::ports::{DataPlanePort, PolicyStore};
+use file_storage::domain::ports::PolicyStore;
 use file_storage::domain::service::{FileService, ServiceConfig};
 use file_storage::infra::backend::{BackendRegistry, InMemoryBackend, StorageBackend};
+use file_storage::infra::content::{hash, mime};
 use file_storage::infra::external_clients::{QuotaClient, QuotaDecision};
 use file_storage::infra::signed_url::Issuer;
 use file_storage::infra::storage::Store;
 use file_storage::infra::storage::migrations::Migrator;
 use file_storage_sdk::{CustomMetadataEntry, CustomMetadataPatch, NewFile, OwnerKind};
+
+/// Direct byte-path test double for what `DataPlaneService` used to provide
+/// (removed: production never constructed it — the sidecar is the only real
+/// byte path). Same steps `DataPlaneService::put_content` used to perform,
+/// but through `put_stream` rather than the whole-object `put` that no
+/// longer exists on `StorageBackend`.
+struct TestDataPlane {
+    svc: Arc<FileService>,
+    store: Store,
+    backends: BackendRegistry,
+}
+
+impl TestDataPlane {
+    fn new(svc: Arc<FileService>, store: Store, backends: BackendRegistry) -> Self {
+        Self {
+            svc,
+            store,
+            backends,
+        }
+    }
+
+    async fn put_content(
+        &self,
+        ctx: &SecurityContext,
+        file_id: Uuid,
+        version_id: Uuid,
+        declared_mime: &str,
+        bytes: Bytes,
+    ) -> Result<(), DomainError> {
+        mime::validate(declared_mime, &bytes)?;
+        self.svc.authorize_write(ctx, file_id).await?;
+        let version = self
+            .store
+            .get_version(file_id, version_id)
+            .await?
+            .ok_or_else(|| DomainError::version_not_found(file_id, version_id))?;
+        let backend = self.backends.get(&version.backend_id)?;
+        let len = bytes.len() as u64;
+        let digest = hash::sha256(&bytes);
+        let stream: futures::stream::BoxStream<'static, std::io::Result<Bytes>> =
+            Box::pin(futures::stream::once(async move { Ok(bytes) }));
+        backend
+            .put_stream(&version.backend_path, stream, Some(len))
+            .await?;
+        self.svc
+            .finalize_upload(
+                ctx,
+                file_id,
+                version_id,
+                i64::try_from(len).unwrap_or(i64::MAX),
+                digest,
+            )
+            .await
+    }
+}
 
 const GTS: &str = gts_id!("cf.fstorage.file.type.v1~x.test.file.type.v1~");
 
@@ -110,12 +165,7 @@ async fn build_db() -> Arc<DBProvider<DbError>> {
 
 async fn build_service(
     quota: Option<Arc<dyn QuotaClient>>,
-) -> (
-    Arc<FileService>,
-    Arc<PolicyService>,
-    DataPlaneService,
-    Store,
-) {
+) -> (Arc<FileService>, Arc<PolicyService>, TestDataPlane, Store) {
     let db = build_db().await;
     let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
     let backends = BackendRegistry::new(vec![backend], "mem").expect("registry");
@@ -133,15 +183,15 @@ async fn build_service(
     let policy_store: Arc<dyn PolicyStore> = Arc::new(store.clone());
     let store_handle = store.clone();
     let svc = Arc::new(FileService::new(
-        store,
-        backends,
+        store.clone(),
+        backends.clone(),
         issuer,
         Arc::clone(&authorizer),
         cfg,
         quota,
         None,
     ));
-    let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
+    let dp = TestDataPlane::new(Arc::clone(&svc), store, backends);
     let psvc = Arc::new(PolicyService::new(policy_store, authorizer));
     (svc, psvc, dp, store_handle)
 }

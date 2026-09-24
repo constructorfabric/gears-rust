@@ -17,11 +17,41 @@ fn unique_root() -> std::path::PathBuf {
     p
 }
 
+/// Write the whole of `bytes` to `path` via `put_stream` (a one-shot stream)
+/// — the test-only stand-in for the whole-object `put` the trait no longer
+/// has, kept here rather than per-test-site so every test that used to call
+/// `backend.put(...)` directly can just call this instead.
+pub async fn write_all(backend: &dyn StorageBackend, path: &str, bytes: Bytes) {
+    let len = bytes.len() as u64;
+    let stream: BoxStream<'_, std::io::Result<Bytes>> =
+        Box::pin(stream::once(async move { Ok(bytes) }));
+    backend
+        .put_stream(path, stream, Some(len))
+        .await
+        .expect("put_stream");
+}
+
+/// Read the whole blob at `path` back via `get_stream` (collecting every
+/// chunk) — the test-only stand-in for the whole-object `get` the trait no
+/// longer has. `expected_len` is `get_stream`'s own required commitment;
+/// callers that don't already know it pass `stat`'s result instead.
+pub async fn read_all(backend: &dyn StorageBackend, path: &str, expected_len: u64) -> Bytes {
+    let mut stream = backend
+        .get_stream(path, expected_len)
+        .await
+        .expect("get_stream");
+    let mut buf = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        buf.extend_from_slice(&chunk.expect("chunk"));
+    }
+    Bytes::from(buf)
+}
+
 /// Assert that `backend.get_stream(path)`'s concatenated chunks are
-/// byte-for-byte equal to `backend.get(path)`'s result — the `get_stream`
-/// contract every `StorageBackend` implementation (default-fallback or a true
-/// chunked override) must satisfy. Factored out of `assert_backend_contract`
-/// to keep that function's own cognitive complexity down.
+/// byte-for-byte equal to `expected` — the `get_stream` contract every
+/// `StorageBackend` implementation must satisfy. Factored out of
+/// `assert_backend_contract` to keep that function's own cognitive
+/// complexity down.
 async fn assert_get_stream_matches_get(backend: &dyn StorageBackend, path: &str, expected: &[u8]) {
     let mut stream = backend
         .get_stream(path, expected.len() as u64)
@@ -59,62 +89,74 @@ async fn assert_get_range_stream_matches_slice(
 /// Shared behavioral contract every `StorageBackend` implementation must
 /// satisfy, factored out of what used to be per-backend hand-written
 /// `put/get/delete/exists/get_range` assertions (`in_memory_*`/`local_fs_*`
-/// duplicated the same checks). Covers: put -> get round trip, `get_stream`
-/// (streamed chunks reassemble to the same bytes `get` returns), `get_range`
-/// correctness for both the `Inclusive` and `Suffix` variants (mirroring the
-/// former `default_get_range_slices_content`/`get_range_suffix_returns_tail`
+/// duplicated the same checks). Covers: write -> read round trip, `get_stream`
+/// (streamed chunks reassemble to the written bytes), `read_prefix`
+/// correctness (mirroring the former `get_range`-based
+/// `default_get_range_slices_content`/`get_range_suffix_returns_tail`
 /// assertions), idempotent `delete`, and `exists` distinguishing
 /// present/missing. Backend-specific behavior (atomicity, tmp-file cleanup,
 /// path-traversal rejection, etc.) stays in each backend's own tests.
 pub async fn assert_backend_contract(backend: &dyn StorageBackend) {
-    // put -> get round trip, and exists() reports present.
-    backend
-        .put("contract/put-get", Bytes::from_static(b"hello, contract"))
-        .await
-        .unwrap();
+    // write -> get_stream round trip, and exists() reports present.
+    write_all(
+        backend,
+        "contract/put-get",
+        Bytes::from_static(b"hello, contract"),
+    )
+    .await;
     assert_eq!(
-        backend.get("contract/put-get").await.unwrap(),
+        read_all(backend, "contract/put-get", 15).await,
         Bytes::from_static(b"hello, contract")
     );
     assert!(backend.exists("contract/put-get").await.unwrap());
 
-    // get_stream: concatenated chunks must equal get()'s bytes, for every
-    // backend regardless of whether it overrides the default single-chunk
-    // fallback with a true chunked read.
+    // get_stream: concatenated chunks must equal the written bytes, for
+    // every backend.
     assert_get_stream_matches_get(backend, "contract/put-get", b"hello, contract").await;
 
     // The remaining groups live in their own functions so each stays under
     // the crate's cognitive-complexity ceiling; all of them run for every
     // backend the contract is asserted against.
-    assert_range_and_delete_contract(backend).await;
+    assert_read_prefix_and_delete_contract(backend).await;
     assert_stat_contract(backend).await;
     assert_range_stream_contract(backend).await;
 }
 
-/// The buffered-`get_range`, `delete` and `exists` groups of
+/// The `read_prefix`, `delete` and `exists` groups of
 /// [`assert_backend_contract`].
-async fn assert_range_and_delete_contract(backend: &dyn StorageBackend) {
-    // get_range: Inclusive and Suffix variants.
-    backend
-        .put("contract/range", Bytes::from_static(b"0123456789"))
+async fn assert_read_prefix_and_delete_contract(backend: &dyn StorageBackend) {
+    // read_prefix: a prefix shorter than the object, and one longer than it
+    // (must return the whole, shorter object rather than erroring).
+    write_all(
+        backend,
+        "contract/prefix",
+        Bytes::from_static(b"0123456789"),
+    )
+    .await;
+    let short_prefix = backend
+        .read_prefix("contract/prefix", 3)
         .await
+        .unwrap()
         .unwrap();
-    let slice = backend
-        .get_range("contract/range", ByteRange::Inclusive { start: 2, end: 4 })
+    assert_eq!(short_prefix, Bytes::from_static(b"012"));
+    let over_long_prefix = backend
+        .read_prefix("contract/prefix", 100)
         .await
+        .unwrap()
         .unwrap();
-    assert_eq!(slice, Bytes::from_static(b"234"));
-    let tail = backend
-        .get_range("contract/range", ByteRange::Suffix { length: 3 })
-        .await
-        .unwrap();
-    assert_eq!(tail, Bytes::from_static(b"789"));
+    assert_eq!(over_long_prefix, Bytes::from_static(b"0123456789"));
+
+    // read_prefix of a missing object is Ok(None), never an error.
+    assert!(
+        backend
+            .read_prefix("contract/prefix-never-existed", 3)
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     // delete is idempotent.
-    backend
-        .put("contract/delete", Bytes::from_static(b"x"))
-        .await
-        .unwrap();
+    write_all(backend, "contract/delete", Bytes::from_static(b"x")).await;
     backend.delete("contract/delete").await.unwrap();
     backend.delete("contract/delete").await.unwrap();
     assert!(!backend.exists("contract/delete").await.unwrap());
@@ -134,13 +176,12 @@ async fn assert_range_and_delete_contract(backend: &dyn StorageBackend) {
 async fn assert_stat_contract(backend: &dyn StorageBackend) {
     // stat: an existing non-empty object returns Some(len) matching the
     // actual byte length written.
-    backend
-        .put(
-            "contract/stat-nonempty",
-            Bytes::from_static(b"twelve bytes"),
-        )
-        .await
-        .unwrap();
+    write_all(
+        backend,
+        "contract/stat-nonempty",
+        Bytes::from_static(b"twelve bytes"),
+    )
+    .await;
     assert_eq!(
         backend.stat("contract/stat-nonempty").await.unwrap(),
         Some(12),
@@ -149,10 +190,7 @@ async fn assert_stat_contract(backend: &dyn StorageBackend) {
 
     // stat: an existing EMPTY object still returns Some(0), never None --
     // "present with zero bytes" and "absent" must not collapse together.
-    backend
-        .put("contract/stat-empty", Bytes::new())
-        .await
-        .unwrap();
+    write_all(backend, "contract/stat-empty", Bytes::new()).await;
     assert_eq!(
         backend.stat("contract/stat-empty").await.unwrap(),
         Some(0),
@@ -195,10 +233,12 @@ async fn assert_range_stream_contract(backend: &dyn StorageBackend) {
     // get_range_stream: Inclusive (narrow), OpenEnded (tail), and Suffix
     // variants must each stream exactly the bytes get_range resolves for the
     // same ByteRange.
-    backend
-        .put("contract/range-stream", Bytes::from_static(b"0123456789"))
-        .await
-        .unwrap();
+    write_all(
+        backend,
+        "contract/range-stream",
+        Bytes::from_static(b"0123456789"),
+    )
+    .await;
     assert_get_range_stream_matches_slice(
         backend,
         "contract/range-stream",
@@ -248,9 +288,10 @@ async fn in_memory_satisfies_backend_contract() {
 }
 
 #[tokio::test]
-async fn in_memory_get_missing_errors() {
+async fn in_memory_read_prefix_and_stat_missing_report_absent() {
     let b = InMemoryBackend::new("mem");
-    assert!(b.get("nope").await.is_err());
+    assert!(b.read_prefix("nope", 1).await.unwrap().is_none());
+    assert_eq!(b.stat("nope").await.unwrap(), None);
     assert!(!b.exists("nope").await.unwrap());
 }
 
@@ -261,9 +302,7 @@ async fn in_memory_get_missing_errors() {
 #[tokio::test]
 async fn in_memory_get_stream_errors_when_expected_len_disagrees_with_stored_blob() {
     let b = InMemoryBackend::new("mem");
-    b.put("fid/vid", Bytes::from_static(b"twelve bytes"))
-        .await
-        .unwrap();
+    write_all(&b, "fid/vid", Bytes::from_static(b"twelve bytes")).await;
 
     // Caller already committed to a length (e.g. 5) that disagrees with what
     // is actually stored (12) -- as if the blob had been rewritten after the
@@ -282,9 +321,7 @@ async fn in_memory_get_stream_errors_when_expected_len_disagrees_with_stored_blo
 #[tokio::test]
 async fn in_memory_get_range_stream_errors_when_expected_len_disagrees_with_resolved_range() {
     let b = InMemoryBackend::new("mem");
-    b.put("fid/vid", Bytes::from_static(b"0123456789"))
-        .await
-        .unwrap();
+    write_all(&b, "fid/vid", Bytes::from_static(b"0123456789")).await;
 
     // `Inclusive { start: 2, end: 4 }` resolves to 3 bytes; the caller
     // claims it already committed to 10.
@@ -310,7 +347,9 @@ async fn local_fs_satisfies_backend_contract() {
 async fn local_fs_rejects_path_traversal() {
     let root = unique_root();
     let b = LocalFsBackend::new("fs", &root);
-    let res = b.put("../escape", Bytes::from_static(b"x")).await;
+    let stream: BoxStream<'_, std::io::Result<Bytes>> =
+        Box::pin(stream::once(async { Ok(Bytes::from_static(b"x")) }));
+    let res = b.put_stream("../escape", stream, None).await;
     assert!(res.is_err(), "path traversal must be rejected");
 }
 
@@ -331,7 +370,12 @@ async fn local_fs_put_is_atomic_under_concurrent_writers() {
         .cloned()
         .map(|payload| {
             let backend = Arc::clone(&backend);
-            tokio::spawn(async move { backend.put("fid/vid", payload).await })
+            tokio::spawn(async move {
+                let len = payload.len() as u64;
+                let stream: BoxStream<'_, std::io::Result<Bytes>> =
+                    Box::pin(stream::once(async move { Ok(payload) }));
+                backend.put_stream("fid/vid", stream, Some(len)).await
+            })
         })
         .collect();
 
@@ -339,7 +383,7 @@ async fn local_fs_put_is_atomic_under_concurrent_writers() {
         handle.await.unwrap().unwrap();
     }
 
-    let got = backend.get("fid/vid").await.unwrap();
+    let got = read_all(backend.as_ref(), "fid/vid", SIZE as u64).await;
     assert_eq!(got.len(), SIZE, "result must be a full, untorn write");
     assert!(
         payloads.iter().any(|p| p == &got),
@@ -353,9 +397,7 @@ async fn local_fs_put_is_atomic_under_concurrent_writers() {
 async fn local_fs_put_leaves_no_tmp_file_after_success() {
     let root = unique_root();
     let b = LocalFsBackend::new("fs", &root);
-    b.put("fid/vid", Bytes::from_static(b"hello"))
-        .await
-        .unwrap();
+    write_all(&b, "fid/vid", Bytes::from_static(b"hello")).await;
 
     let parent = root.join("fid");
     let mut entries = tokio::fs::read_dir(&parent).await.unwrap();
@@ -384,10 +426,12 @@ async fn local_fs_put_cleans_up_tmp_file_on_write_failure() {
     tokio::fs::create_dir_all(&parent).await.unwrap();
     std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o555)).unwrap();
 
-    let result = b.put("fid/vid", Bytes::from_static(b"data")).await;
+    let stream: BoxStream<'_, std::io::Result<Bytes>> =
+        Box::pin(stream::once(async { Ok(Bytes::from_static(b"data")) }));
+    let result = b.put_stream("fid/vid", stream, None).await;
     assert!(
         result.is_err(),
-        "put must fail when the temp-file create fails"
+        "put_stream must fail when the temp-file create fails"
     );
 
     let mut entries = tokio::fs::read_dir(&parent).await.unwrap();
@@ -474,7 +518,10 @@ async fn local_fs_put_stream_computes_hash_incrementally_matches_full_buffer_has
     assert_eq!(digest, expected_digest);
 
     // Sanity: the bytes actually landed at the target path too.
-    assert_eq!(b.get("fid2/vid2").await.unwrap(), Bytes::from(concatenated));
+    assert_eq!(
+        read_all(&b, "fid2/vid2", total_len).await,
+        Bytes::from(concatenated)
+    );
 
     drop(tokio::fs::remove_dir_all(&root).await);
 }
@@ -491,9 +538,7 @@ async fn local_fs_get_stream_reassembles_multi_chunk_blob() {
     let payload: Vec<u8> = (0..200_000)
         .map(|i| u8::try_from(i % 256).unwrap())
         .collect();
-    b.put("fid/vid", Bytes::from(payload.clone()))
-        .await
-        .unwrap();
+    write_all(&b, "fid/vid", Bytes::from(payload.clone())).await;
 
     let mut stream = b.get_stream("fid/vid", payload.len() as u64).await.unwrap();
     let mut collected = Vec::new();
@@ -540,7 +585,7 @@ async fn local_fs_publish_exclusive_rejects_second_write_to_same_path() {
         "first publish_exclusive call to a fresh path must create it"
     );
     assert_eq!(
-        b.get("fid/vid").await.unwrap(),
+        read_all(&b, "fid/vid", 5).await,
         Bytes::from_static(b"first")
     );
 
@@ -565,7 +610,7 @@ async fn local_fs_publish_exclusive_rejects_second_write_to_same_path() {
     // The backend must still hold the FIRST call's bytes, byte for byte —
     // this is the actual immutability guarantee under test.
     assert_eq!(
-        b.get("fid/vid").await.unwrap(),
+        read_all(&b, "fid/vid", 5).await,
         Bytes::from_static(b"first"),
         "an already-published blob must never be overwritten by publish_exclusive"
     );
@@ -604,7 +649,7 @@ async fn in_memory_publish_exclusive_rejects_second_write_to_same_path() {
     );
 
     assert_eq!(
-        b.get("fid/vid").await.unwrap(),
+        read_all(&b, "fid/vid", 5).await,
         Bytes::from_static(b"first"),
         "an already-published blob must never be overwritten by publish_exclusive"
     );
@@ -687,7 +732,7 @@ async fn local_fs_get_stream_errors_on_truncation_after_open() {
     let root = unique_root();
     let b = LocalFsBackend::new("fs", &root);
 
-    b.put("fid/vid", Bytes::from(vec![7u8; 100])).await.unwrap();
+    write_all(&b, "fid/vid", Bytes::from(vec![7u8; 100])).await;
 
     // Open the stream: the caller already committed to the 100-byte length
     // it observed itself (e.g. via an earlier `stat`), which matches the
@@ -741,7 +786,7 @@ async fn local_fs_get_stream_errors_before_first_byte_when_truncated_before_open
     let root = unique_root();
     let b = LocalFsBackend::new("fs", &root);
 
-    b.put("fid/vid", Bytes::from(vec![7u8; 100])).await.unwrap();
+    write_all(&b, "fid/vid", Bytes::from(vec![7u8; 100])).await;
 
     // The caller already observed 100 bytes (e.g. via an earlier `stat`) and
     // committed to that length -- but by the time `get_stream` is actually
@@ -774,7 +819,7 @@ async fn local_fs_get_stream_errors_before_first_byte_when_grown_before_open() {
     let root = unique_root();
     let b = LocalFsBackend::new("fs", &root);
 
-    b.put("fid/vid", Bytes::from(vec![7u8; 100])).await.unwrap();
+    write_all(&b, "fid/vid", Bytes::from(vec![7u8; 100])).await;
 
     // A concurrent writer appends to the file before get_stream opens it, so
     // by open time it is 150 bytes -- larger than the 100 the caller already
@@ -811,7 +856,7 @@ async fn local_fs_get_range_stream_errors_before_first_byte_when_resolved_length
 
     // 100 bytes; the caller resolves `OpenEnded { start: 0 }` against this
     // length and commits to a 100-byte `Content-Length`.
-    b.put("fid/vid", Bytes::from(vec![7u8; 100])).await.unwrap();
+    write_all(&b, "fid/vid", Bytes::from(vec![7u8; 100])).await;
 
     // Grown to 150 bytes before get_range_stream re-resolves the same
     // OpenEnded range -- it would now resolve to a 150-byte range, not 100.
@@ -852,223 +897,4 @@ async fn registry_resolves_default_and_unknown() {
 fn registry_rejects_absent_default() {
     let mem: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
     assert!(BackendRegistry::new(vec![mem], "other").is_err());
-}
-
-// --- StorageBackend trait defaults (mod.rs) ------------------------------
-//
-// `LocalFsBackend`, `InMemoryBackend` and `S3Backend` all override
-// `put_stream`, `publish_exclusive`, `get_stream`, `get_range_stream` and
-// `stat` with backend-native implementations, so nothing in this crate ever
-// runs the trait's own default bodies for those methods. `DefaultsOnlyBackend`
-// below implements only the methods `StorageBackend` has no default for
-// (`id`, `capabilities`, `put`, `get`, `delete`, `exists`) so the tests that
-// follow it can pin the default bodies' own behavior directly.
-
-use async_trait::async_trait;
-
-/// Minimal in-memory `StorageBackend` that deliberately overrides nothing
-/// beyond the methods the trait requires every implementor to supply. Used
-/// only to exercise `mod.rs`'s default `put_stream`/`publish_exclusive`/
-/// `get_stream`/`get_range`/`get_range_stream`/`size`/`stat` bodies, which no
-/// shipping backend leaves in place.
-struct DefaultsOnlyBackend {
-    id: String,
-    store: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
-}
-
-impl DefaultsOnlyBackend {
-    fn new(id: impl Into<String>) -> Self {
-        Self {
-            id: id.into(),
-            store: std::sync::Mutex::new(std::collections::HashMap::new()),
-        }
-    }
-}
-
-#[async_trait]
-impl StorageBackend for DefaultsOnlyBackend {
-    fn id(&self) -> &str {
-        &self.id
-    }
-
-    fn capabilities(&self) -> BackendCapabilities {
-        BackendCapabilities::default()
-    }
-
-    async fn put(&self, path: &str, bytes: Bytes) -> Result<(), DomainError> {
-        self.store
-            .lock()
-            .unwrap()
-            .insert(path.to_owned(), bytes.to_vec());
-        Ok(())
-    }
-
-    async fn get(&self, path: &str) -> Result<Bytes, DomainError> {
-        self.store
-            .lock()
-            .unwrap()
-            .get(path)
-            .cloned()
-            .map(Bytes::from)
-            .ok_or_else(|| DomainError::backend(self.id.clone(), format!("no such path: {path}")))
-    }
-
-    async fn delete(&self, path: &str) -> Result<(), DomainError> {
-        self.store.lock().unwrap().remove(path);
-        Ok(())
-    }
-
-    async fn exists(&self, path: &str) -> Result<bool, DomainError> {
-        Ok(self.store.lock().unwrap().contains_key(path))
-    }
-}
-
-/// The trait-default `publish_exclusive` (mod.rs), on a fresh path, must
-/// buffer the stream, report `created: true`, and compute the same sha256
-/// digest `hash::sha256` would compute over the fully concatenated bytes —
-/// mirroring `local_fs_put_stream_computes_hash_incrementally_matches_full_buffer_hash`
-/// for the default (non-incremental) buffering path.
-#[tokio::test]
-async fn defaults_only_publish_exclusive_creates_and_hashes_via_default_impl() {
-    let b = DefaultsOnlyBackend::new("defaults-only");
-    let payload: &[u8] = b"default publish_exclusive payload";
-    let stream: BoxStream<'_, std::io::Result<Bytes>> =
-        Box::pin(stream::iter(vec![Ok(Bytes::from_static(payload))]));
-
-    let outcome = b
-        .publish_exclusive("fid/vid", stream, None)
-        .await
-        .expect("the trait-default publish_exclusive must succeed for a fresh path");
-
-    assert!(
-        outcome.created,
-        "a fresh path must be reported as newly created"
-    );
-    assert_eq!(outcome.bytes_written, payload.len() as u64);
-    let expected_digest = hash::digest_to_array(hash::sha256(payload));
-    assert_eq!(outcome.digest, expected_digest);
-    assert_eq!(b.get("fid/vid").await.unwrap(), Bytes::from_static(payload));
-}
-
-/// The trait-default `publish_exclusive` must still enforce `max_size` as
-/// chunks arrive (it is only the memory-bounding that the default forgoes,
-/// not the limit itself) and must leave nothing published when the stream
-/// is rejected.
-#[tokio::test]
-async fn defaults_only_publish_exclusive_enforces_max_size_and_publishes_nothing() {
-    let b = DefaultsOnlyBackend::new("defaults-only");
-
-    // Two 10-byte chunks (20 bytes total) against a 15-byte max_size: the
-    // limit is crossed on the second chunk.
-    let chunks: Vec<std::io::Result<Bytes>> = vec![
-        Ok(Bytes::from_static(b"0123456789")),
-        Ok(Bytes::from_static(b"0123456789")),
-    ];
-    let stream: BoxStream<'_, std::io::Result<Bytes>> = Box::pin(stream::iter(chunks));
-
-    let result = b.publish_exclusive("fid/vid", stream, Some(15)).await;
-    match result {
-        Ok(_) => panic!("a stream exceeding max_size must be rejected, not published"),
-        Err(DomainError::Validation { field, .. }) => {
-            assert_eq!(
-                field, "size",
-                "the rejection must be attributed to the size field"
-            );
-        }
-        Err(e) => panic!("expected a DomainError::Validation, got {e:?}"),
-    }
-
-    assert!(
-        !b.exists("fid/vid").await.unwrap(),
-        "a rejected publish_exclusive must not leave a partial object behind"
-    );
-}
-
-/// The trait-default `get_stream` (a single-chunk fallback onto `get`) must
-/// still satisfy the same streamed-chunks-equal-`get`-bytes contract every
-/// native override satisfies.
-#[tokio::test]
-async fn defaults_only_get_stream_via_default_impl_matches_get() {
-    let b = DefaultsOnlyBackend::new("defaults-only");
-    let payload: &[u8] = b"default get_stream payload, unpinned by any override";
-    b.put("fid/vid", Bytes::copy_from_slice(payload))
-        .await
-        .unwrap();
-
-    assert_get_stream_matches_get(&b, "fid/vid", payload).await;
-}
-
-/// The trait-default `get_range_stream` (a single-chunk fallback onto
-/// `get_range`) must still stream exactly the requested slice.
-#[tokio::test]
-async fn defaults_only_get_range_stream_via_default_impl_matches_slice() {
-    let b = DefaultsOnlyBackend::new("defaults-only");
-    b.put("fid/vid", Bytes::from_static(b"0123456789"))
-        .await
-        .unwrap();
-
-    assert_get_range_stream_matches_slice(
-        &b,
-        "fid/vid",
-        ByteRange::Inclusive { start: 2, end: 4 },
-        b"234",
-    )
-    .await;
-}
-
-/// The trait-default `stat` (composed from `exists` + `size`) must report
-/// `None` for a path nothing was ever published to and `Some(len)` for a
-/// present one, matching the contract `assert_stat_contract` pins for every
-/// backend with a native override.
-#[tokio::test]
-async fn defaults_only_stat_via_default_impl_reports_presence_and_length() {
-    let b = DefaultsOnlyBackend::new("defaults-only");
-
-    assert_eq!(
-        b.stat("fid/missing").await.unwrap(),
-        None,
-        "stat of a path nothing was ever published to must be None"
-    );
-
-    b.put("fid/vid", Bytes::from_static(b"twelve bytes"))
-        .await
-        .unwrap();
-    assert_eq!(
-        b.stat("fid/vid").await.unwrap(),
-        Some(12),
-        "stat of a present object must report its real byte length"
-    );
-}
-
-/// The trait-default `publish_exclusive` must surface a chunk-level I/O error
-/// as `DomainError::Backend` (via the `map_err` closure on the failing
-/// chunk) rather than panicking, and must not publish anything when the
-/// stream fails partway through.
-#[tokio::test]
-async fn defaults_only_publish_exclusive_propagates_chunk_error_and_publishes_nothing() {
-    let b = DefaultsOnlyBackend::new("defaults-only");
-
-    let chunks: Vec<std::io::Result<Bytes>> = vec![
-        Ok(Bytes::from_static(b"good-chunk-1")),
-        Ok(Bytes::from_static(b"good-chunk-2")),
-        Err(std::io::Error::other("simulated stream failure")),
-    ];
-    let stream: BoxStream<'_, std::io::Result<Bytes>> = Box::pin(stream::iter(chunks));
-
-    let result = b.publish_exclusive("fid/vid", stream, None).await;
-    match result {
-        Ok(_) => panic!("a stream that errors partway through must not be published successfully"),
-        Err(DomainError::Backend { backend_id, .. }) => {
-            assert_eq!(
-                backend_id, "defaults-only",
-                "the backend error must be attributed to the failing backend's id"
-            );
-        }
-        Err(e) => panic!("expected a DomainError::Backend, got {e:?}"),
-    }
-
-    assert!(
-        !b.exists("fid/vid").await.unwrap(),
-        "a publish_exclusive call whose stream errors must not leave a partial object behind"
-    );
 }

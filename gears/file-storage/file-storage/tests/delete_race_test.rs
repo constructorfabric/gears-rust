@@ -50,6 +50,19 @@ use file_storage_sdk::NewFile;
 
 const GTS: &str = gts_id!("cf.fstorage.file.type.v1~x.test.file.type.v1~");
 
+/// Write the whole of `bytes` to `path` via `put_stream` (a one-shot
+/// stream) -- the test-only stand-in for the whole-object `put` the trait no
+/// longer has.
+async fn write_all(backend: &Arc<dyn StorageBackend>, path: &str, bytes: bytes::Bytes) {
+    let len = bytes.len() as u64;
+    let stream: futures::stream::BoxStream<'static, std::io::Result<bytes::Bytes>> =
+        Box::pin(futures::stream::once(async move { Ok(bytes) }));
+    backend
+        .put_stream(path, stream, Some(len))
+        .await
+        .expect("put_stream");
+}
+
 /// A unique temp-file SQLite DB, migrated (mirrors `tests/store_files_test.rs`).
 async fn build_store() -> (Store, Arc<DBProvider<DbError>>) {
     let mut path = std::env::temp_dir();
@@ -143,13 +156,12 @@ async fn delete_file_collecting_versions_does_not_leak_a_concurrently_added_vers
         )
         .await
         .expect("create file + v1");
-    backend
-        .put(
-            &format!("/{file_id}/{v1}"),
-            bytes::Bytes::from_static(b"v1"),
-        )
-        .await
-        .expect("seed v1 blob");
+    write_all(
+        &backend,
+        &format!("/{file_id}/{v1}"),
+        bytes::Bytes::from_static(b"v1"),
+    )
+    .await;
 
     // The old code's pre-transaction snapshot, captured at this exact point
     // -- before the race version exists -- is the stale input the pre-fix
@@ -176,13 +188,12 @@ async fn delete_file_collecting_versions_does_not_leak_a_concurrently_added_vers
         )
         .await
         .expect("insert v2 (the race)");
-    backend
-        .put(
-            &format!("/{file_id}/{v2}"),
-            bytes::Bytes::from_static(b"v2"),
-        )
-        .await
-        .expect("seed v2 blob");
+    write_all(
+        &backend,
+        &format!("/{file_id}/{v2}"),
+        bytes::Bytes::from_static(b"v2"),
+    )
+    .await;
 
     let deleted = store
         .delete_file_collecting_versions(

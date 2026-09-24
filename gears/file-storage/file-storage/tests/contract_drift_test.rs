@@ -49,6 +49,40 @@ mod common;
 use file_storage::domain::multipart::BindState;
 use uuid::Uuid;
 
+/// Direct byte-path test double for what `DataPlaneService::put_content`
+/// used to provide (removed: production never constructed it — the sidecar
+/// is the only real byte path). Writes straight to `backend` at the
+/// deterministic `/{file_id}/{version_id}` path (`storage_layout`'s
+/// convention — this harness only ever configures one backend, so there is
+/// no registry lookup to make), then finalizes exactly like the removed
+/// service did.
+async fn put_content(
+    svc: &file_storage::domain::service::FileService,
+    backend: &std::sync::Arc<dyn file_storage::infra::backend::StorageBackend>,
+    ctx: &toolkit_security::SecurityContext,
+    file_id: Uuid,
+    version_id: Uuid,
+    declared_mime: &str,
+    bytes: bytes::Bytes,
+) -> Result<(), file_storage::domain::error::DomainError> {
+    file_storage::infra::content::mime::validate(declared_mime, &bytes)?;
+    svc.authorize_write(ctx, file_id).await?;
+    let backend_path = format!("/{file_id}/{version_id}");
+    let len = bytes.len() as u64;
+    let digest = file_storage::infra::content::hash::sha256(&bytes);
+    let stream: futures::stream::BoxStream<'static, std::io::Result<bytes::Bytes>> =
+        Box::pin(futures::stream::once(async move { Ok(bytes) }));
+    backend.put_stream(&backend_path, stream, Some(len)).await?;
+    svc.finalize_upload(
+        ctx,
+        file_id,
+        version_id,
+        i64::try_from(len).unwrap_or(i64::MAX),
+        digest,
+    )
+    .await
+}
+
 // =========================================================================
 // A completed multipart upload's exact retry used to not always be
 // replayed -- a stale If-Match (valid at request time, no longer valid
@@ -63,8 +97,6 @@ use uuid::Uuid;
 async fn fs06_f4_completed_retry_with_stale_if_match_now_replays_instead_of_failing_precondition() {
     let (db, _rec) = common::test_db_with_recorder().await;
     let s = common::make_services_full(&db);
-    let dp = file_storage::domain::data_plane::DataPlaneService::new(std::sync::Arc::clone(&s.svc)
-        as std::sync::Arc<dyn file_storage::domain::ports::DataPlanePort>);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
@@ -77,7 +109,9 @@ async fn fs06_f4_completed_retry_with_stale_if_match_now_replays_instead_of_fail
         .create_file(&ctx, common::new_file(), None, false)
         .await
         .expect("create_file");
-    dp.put_content(
+    put_content(
+        &s.svc,
+        &s.backend,
         &ctx,
         ticket.file_id,
         ticket.version_id,

@@ -4,17 +4,18 @@
 //! Blobs are stored at `<root>/<sanitized-path>`. The opaque path
 //! (`/{file_id}/{version_id}`) is sanitized to prevent traversal outside root.
 //!
-//! `put` never writes directly to the target path. Instead it: (1) writes the
-//! bytes to a sibling temp file (`<target>.tmp.<uuid>`) in the same directory
-//! as `target`, so the final rename below is on the same filesystem; (2)
-//! fsyncs the temp file's data + metadata before the handle is dropped; (3)
-//! atomically renames the temp file onto `target` (a same-filesystem POSIX
-//! rename never exposes a torn/partial file to a concurrent reader); (4)
-//! best-effort fsyncs the parent directory so the rename's directory entry
-//! itself is durable (needed on some filesystems, e.g. ext4/xfs, to survive a
-//! crash). Step (4) is best-effort: if directory fsync is unsupported or
-//! fails, a warning is logged and `put` still returns `Ok`, since the blob
-//! itself is already durably in place after the rename.
+//! `put_stream` never writes directly to the target path. Instead it: (1)
+//! streams the bytes into a sibling temp file (`<target>.tmp.<uuid>`) in the
+//! same directory as `target`, so the final rename below is on the same
+//! filesystem; (2) fsyncs the temp file's data + metadata before the handle
+//! is dropped; (3) atomically renames the temp file onto `target` (a
+//! same-filesystem POSIX rename never exposes a torn/partial file to a
+//! concurrent reader); (4) best-effort fsyncs the parent directory so the
+//! rename's directory entry itself is durable (needed on some filesystems,
+//! e.g. ext4/xfs, to survive a crash). Step (4) is best-effort: if directory
+//! fsync is unsupported or fails, a warning is logged and `put_stream` still
+//! returns `Ok`, since the blob itself is already durably in place after the
+//! rename.
 //!
 //! `publish_exclusive` (the sidecar's single-shot upload path) follows the
 //! same write-to-temp-then-publish shape, but its publish step is a
@@ -35,7 +36,7 @@ use uuid::Uuid;
 use crate::domain::error::DomainError;
 use crate::infra::content::hash;
 
-use super::{BackendCapabilities, PublishOutcome, StorageBackend};
+use super::{BackendCapabilities, PublishOutcome, StorageBackend, check_read_prefix_budget};
 
 /// Filesystem-backed blob store rooted at a configured directory.
 pub struct LocalFsBackend {
@@ -55,7 +56,7 @@ impl LocalFsBackend {
     }
 
     /// Enable/disable the best-effort parent-directory fsync performed after
-    /// each successful `put`'s rename. Defaults to `true`.
+    /// each successful `put_stream`'s rename. Defaults to `true`.
     #[must_use]
     pub fn with_fsync_parent_dir(mut self, enabled: bool) -> Self {
         self.fsync_parent_dir = enabled;
@@ -92,9 +93,9 @@ impl LocalFsBackend {
     }
 
     /// Resolve `path` to its target file, ensuring the parent directory
-    /// exists. Shared setup step for both `put` (whole-buffer write) and
-    /// `put_stream` (chunked write) — both write into a sibling temp file
-    /// under the same parent before converging on `publish_tmp`.
+    /// exists. Shared setup step for `put_stream`'s chunked write, which
+    /// writes into a sibling temp file under the same parent before
+    /// converging on `publish_tmp`.
     async fn prepare_target(&self, path: &str) -> Result<(PathBuf, Option<PathBuf>), DomainError> {
         let target = self.resolve(path)?;
         let parent = target.parent().map(Path::to_path_buf);
@@ -114,8 +115,8 @@ impl LocalFsBackend {
     /// Atomically publish an already-written-and-fsynced temp file at
     /// `target`: rename it into place, then best-effort fsync the parent
     /// directory so the rename's directory entry is durable. Shared tail of
-    /// `put` and `put_stream` — see module docs for the full durability
-    /// rationale.
+    /// `put_stream` and `publish_exclusive`'s successful write — see module
+    /// docs for the full durability rationale.
     async fn publish_tmp(
         &self,
         tmp: &Path,
@@ -338,37 +339,13 @@ impl StorageBackend for LocalFsBackend {
         }
     }
 
-    async fn put(&self, path: &str, bytes: Bytes) -> Result<(), DomainError> {
-        let (target, parent) = self.prepare_target(path).await?;
-        let tmp = Self::tmp_path_for(&target);
-
-        // Write + fsync the temp file before it is ever visible at `target`.
-        let write_result = async {
-            let mut file = tokio::fs::File::create(&tmp)
-                .await
-                .map_err(|e| self.io_err(e))?;
-            file.write_all(&bytes).await.map_err(|e| self.io_err(e))?;
-            file.sync_all().await.map_err(|e| self.io_err(e))
-        }
-        .await;
-
-        if let Err(e) = write_result {
-            // Best-effort cleanup: never leave an orphaned `*.tmp.*` behind.
-            drop(tokio::fs::remove_file(&tmp).await);
-            return Err(e);
-        }
-
-        self.publish_tmp(&tmp, &target, parent.as_deref()).await
-    }
-
     /// Stream a blob into `path` without ever buffering the whole body in
     /// memory: chunks are written + hashed as they arrive, and the running
     /// byte count is checked against `max_size` after every chunk so an
     /// oversized upload is aborted mid-stream (the moment the limit is
     /// crossed) rather than after the full body has been received. The
     /// partial temp file is removed on any failure path (oversized, I/O
-    /// error, or a stream error), exactly like `put`'s cleanup-on-failure
-    /// behavior.
+    /// error, or a stream error).
     async fn put_stream(
         &self,
         path: &str,
@@ -446,10 +423,34 @@ impl StorageBackend for LocalFsBackend {
         }
     }
 
-    async fn get(&self, path: &str) -> Result<Bytes, DomainError> {
+    /// Read up to `max_bytes` from the start of `path` without reading past
+    /// it: opens the file and reads at most `max_bytes`, stopping at EOF if
+    /// the object is shorter. `NotFound` maps to `Ok(None)`, mirroring
+    /// `stat`'s presence contract; nothing here ever reads the file's own
+    /// metadata/length first, since the bound is on `max_bytes` alone.
+    async fn read_prefix(&self, path: &str, max_bytes: u64) -> Result<Option<Bytes>, DomainError> {
+        check_read_prefix_budget(max_bytes)?;
         let target = self.resolve(path)?;
-        let data = tokio::fs::read(&target).await.map_err(|e| self.io_err(e))?;
-        Ok(Bytes::from(data))
+        let mut file = match tokio::fs::File::open(&target).await {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(self.io_err(e)),
+        };
+        let want = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+        let mut buf = vec![0u8; want];
+        let mut filled = 0usize;
+        while filled < want {
+            let n = file
+                .read(&mut buf[filled..])
+                .await
+                .map_err(|e| self.io_err(e))?;
+            if n == 0 {
+                break;
+            }
+            filled += n;
+        }
+        buf.truncate(filled);
+        Ok(Some(Bytes::from(buf)))
     }
 
     /// Stream the blob at `path` from disk in fixed-size chunks, so a
@@ -489,41 +490,13 @@ impl StorageBackend for LocalFsBackend {
         Ok(Self::chunked_file_stream(file, Some(expected_len)))
     }
 
-    /// Native range read: seek to the requested offset and read only the
-    /// requested bytes, never materializing the whole blob.
-    async fn get_range(&self, path: &str, range: ByteRange) -> Result<Bytes, DomainError> {
-        let target = self.resolve(path)?;
-        let mut file = tokio::fs::File::open(&target)
-            .await
-            .map_err(|e| self.io_err(e))?;
-        let total = file.metadata().await.map_err(|e| self.io_err(e))?.len();
-        let Some((start, end)) = range.resolve(total) else {
-            return Err(DomainError::validation("range", "unsatisfiable byte range"));
-        };
-        // `resolve` yields an inclusive end; clamp defensively against `total`.
-        let end = end.min(total.saturating_sub(1));
-        // Fail cleanly on an oversized range instead of asking the allocator for
-        // `usize::MAX` (which would turn it into an OOM/panic path).
-        let len = usize::try_from(end - start + 1)
-            .map_err(|_| DomainError::validation("range", "requested byte range is too large"))?;
-        file.seek(std::io::SeekFrom::Start(start))
-            .await
-            .map_err(|e| self.io_err(e))?;
-        let mut buf = vec![0u8; len];
-        file.read_exact(&mut buf)
-            .await
-            .map_err(|e| self.io_err(e))?;
-        Ok(Bytes::from(buf))
-    }
-
     /// Native streaming range read: resolve the range against the file's
-    /// real length (identical to `get_range`'s own resolution/clamping), seek
-    /// once, then hand off to the same [`Self::chunked_file_stream`] core
-    /// `get_stream` uses — bounded this time by the range's length — so a
-    /// `Range` request (including `bytes=0-`, which resolves to the whole
-    /// object and is the very first request many media players issue) never
-    /// allocates a `len`-sized buffer up front the way the old
-    /// `get_range`-based response path did.
+    /// real length, seek once, then hand off to the same
+    /// [`Self::chunked_file_stream`] core `get_stream` uses — bounded this
+    /// time by the range's length — so a `Range` request (including
+    /// `bytes=0-`, which resolves to the whole object and is the very first
+    /// request many media players issue) never allocates a `len`-sized
+    /// buffer up front.
     ///
     /// `expected_len` is the resolved range length the caller already
     /// committed to (the sidecar resolves `range` itself first to build
@@ -550,8 +523,7 @@ impl StorageBackend for LocalFsBackend {
         let Some((start, end)) = range.resolve(total) else {
             return Err(DomainError::validation("range", "unsatisfiable byte range"));
         };
-        // `resolve` yields an inclusive end; clamp defensively against `total`
-        // exactly like `get_range` does.
+        // `resolve` yields an inclusive end; clamp defensively against `total`.
         let end = end.min(total.saturating_sub(1));
         let len = end - start + 1;
         if len != expected_len {

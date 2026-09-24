@@ -42,7 +42,7 @@ use crate::infra::content::hash_mode::Manifest;
 
 use super::{
     BackendCapabilities, MultipartCompletionPart, PublishOutcome, StorageBackend,
-    build_manifest_and_root,
+    build_manifest_and_root, check_read_prefix_budget,
 };
 
 /// Whether the terminal object-creating write of a streamed upload may
@@ -218,7 +218,7 @@ impl S3Backend {
     /// Convert an opaque backend path (e.g. `/{file_id}/{version_id}`) into
     /// the S3 object key used for every operation (S3 keys never start with
     /// `/`). This is the exact inverse of `key_to_path` — every path must
-    /// round-trip through `put` -> `list_paths` and compare equal.
+    /// round-trip through a write -> `list_paths` and compare equal.
     fn path_to_key(path: &str) -> &str {
         path.strip_prefix('/').unwrap_or(path)
     }
@@ -338,6 +338,24 @@ impl S3Backend {
         DomainError::backend(&self.id, format!("HEAD {path} failed: {status}"))
     }
 
+    /// Plain (overwrite-allowed) `PutObject`, buffering `bytes` whole. Not
+    /// part of the `StorageBackend` trait (which has no whole-object write
+    /// at all): this is `stream_upload`'s own terminal write for the
+    /// below-`multipart_threshold_bytes` case, where the object being
+    /// written is already fully buffered in memory by that point (it never
+    /// crossed the threshold that would have driven a native multipart
+    /// upload instead), so this is not an extra buffering step, just the
+    /// final HTTP call for bytes `stream_upload` already holds.
+    async fn put_whole(&self, path: &str, bytes: Bytes) -> Result<(), DomainError> {
+        let key = Self::path_to_key(path);
+        let url = self
+            .bucket
+            .put_object(Some(&self.credentials), key)
+            .sign(SIGN_DURATION);
+        self.send_and_check(self.http.put(url).body(bytes)).await?;
+        Ok(())
+    }
+
     /// POST a `CompleteMultipartUpload` request that assembles `parts`
     /// (defensively sorted ascending by part number) into the final object.
     /// This does **not** re-read the assembled object to hash it: both
@@ -440,8 +458,9 @@ impl S3Backend {
                     let part_size =
                         usize::try_from(self.multipart_threshold_bytes).unwrap_or(buf.len());
                     let part_bytes: Vec<u8> = buf.drain(..part_size).collect();
+                    let part_len = part_bytes.len() as u64;
                     let part_offset = next_part_offset;
-                    next_part_offset += part_bytes.len() as u64;
+                    next_part_offset += part_len;
                     let part_number = next_part_number;
                     next_part_number += 1;
                     let Some(handle) = upload_handle.as_deref() else {
@@ -453,13 +472,21 @@ impl S3Backend {
                             "multipart handle missing right after initiation",
                         ));
                     };
+                    // Already fully in memory (this internal chunker just
+                    // drained it out of `buf`), so a one-shot `stream::once`
+                    // is enough to satisfy `upload_part_stream`'s streaming
+                    // signature without a real re-buffering copy.
+                    let part_stream: BoxStream<'static, std::io::Result<Bytes>> = Box::pin(
+                        futures::stream::once(async move { Ok(Bytes::from(part_bytes)) }),
+                    );
                     let (etag, _part_hash) = self
-                        .upload_part(
+                        .upload_part_stream(
                             path,
                             handle,
                             part_number,
                             part_offset,
-                            Bytes::from(part_bytes),
+                            part_stream,
+                            part_len,
                         )
                         .await?;
                     parts.push((part_number, etag));
@@ -487,7 +514,7 @@ impl S3Backend {
                 // already buffered — issue one PutObject.
                 let created = match mode {
                     WriteMode::Overwrite => {
-                        self.put(path, Bytes::from(buf)).await?;
+                        self.put_whole(path, Bytes::from(buf)).await?;
                         true
                     }
                     WriteMode::CreateExclusive => {
@@ -504,8 +531,18 @@ impl S3Backend {
                 if !buf.is_empty() {
                     let part_number = next_part_number;
                     let part_offset = next_part_offset;
+                    let part_len = buf.len() as u64;
+                    let part_stream: BoxStream<'static, std::io::Result<Bytes>> =
+                        Box::pin(futures::stream::once(async move { Ok(Bytes::from(buf)) }));
                     match self
-                        .upload_part(path, &handle, part_number, part_offset, Bytes::from(buf))
+                        .upload_part_stream(
+                            path,
+                            &handle,
+                            part_number,
+                            part_offset,
+                            part_stream,
+                            part_len,
+                        )
                         .await
                     {
                         Ok((etag, _part_hash)) => parts.push((part_number, etag)),
@@ -579,16 +616,6 @@ impl StorageBackend for S3Backend {
         }
     }
 
-    async fn put(&self, path: &str, bytes: Bytes) -> Result<(), DomainError> {
-        let key = Self::path_to_key(path);
-        let url = self
-            .bucket
-            .put_object(Some(&self.credentials), key)
-            .sign(SIGN_DURATION);
-        self.send_and_check(self.http.put(url).body(bytes)).await?;
-        Ok(())
-    }
-
     /// Streams `stream` into `path` (overwrite-allowed), returning the total
     /// bytes written and the incrementally-computed SHA-256 digest. See
     /// [`stream_upload`](Self::stream_upload) for the streaming/multipart
@@ -606,8 +633,8 @@ impl StorageBackend for S3Backend {
     }
 
     /// Create-exclusive publish: streams `stream` into `path` but fails to
-    /// overwrite an existing object, closing the PUT-token-replay race the
-    /// trait's default (non-atomic `exists`-then-`put`) leaves open for S3.
+    /// overwrite an existing object, closing the PUT-token-replay race a
+    /// non-atomic `exists`-then-write fallback would otherwise leave open.
     ///
     /// Atomicity is delegated to S3 conditional writes (`If-None-Match: *` on
     /// the terminal `PutObject`/`CompleteMultipartUpload`): a `412 Precondition
@@ -639,13 +666,48 @@ impl StorageBackend for S3Backend {
         })
     }
 
-    async fn get(&self, path: &str) -> Result<Bytes, DomainError> {
+    /// Read up to `max_bytes` from the start of `path` via a single ranged
+    /// `GetObject` (`Range: bytes=0-{max_bytes-1}`) — the one-round-trip S3
+    /// mirror of `LocalFsBackend::read_prefix`'s bounded local read. Never
+    /// falls back to a whole-object `GetObject`: `max_bytes` is capped well
+    /// below any real object size a caller passes (see
+    /// `MAX_READ_PREFIX_BYTES`), so the response body is always small
+    /// regardless of the stored object's actual size.
+    ///
+    /// A `0-`-anchored range is unsatisfiable (`416`) against a
+    /// genuinely-empty object (there is no byte 0) — real S3 only ever
+    /// answers `416` in that case for this request shape, never for a
+    /// missing key (that's always `404`), so it is treated here as "present,
+    /// zero bytes" rather than an error.
+    async fn read_prefix(&self, path: &str, max_bytes: u64) -> Result<Option<Bytes>, DomainError> {
+        check_read_prefix_budget(max_bytes)?;
         let key = Self::path_to_key(path);
         let url = self
             .bucket
             .get_object(Some(&self.credentials), key)
             .sign(SIGN_DURATION);
-        self.send_and_check(self.http.get(url)).await
+        let end = max_bytes.saturating_sub(1);
+        let resp = self
+            .http
+            .get(url)
+            .header(RANGE, format!("bytes=0-{end}"))
+            .send()
+            .await
+            .map_err(|e| self.transport_err(&e))?;
+
+        let status = resp.status();
+        match status {
+            StatusCode::NOT_FOUND => Ok(None),
+            StatusCode::RANGE_NOT_SATISFIABLE => Ok(Some(Bytes::new())),
+            _ if status.is_success() => {
+                let body = resp.bytes().await.map_err(|e| self.transport_err(&e))?;
+                Ok(Some(body))
+            }
+            other => {
+                let body = resp.bytes().await.unwrap_or_default();
+                Err(self.s3_error(other, &body))
+            }
+        }
     }
 
     /// Presign and execute a `GetObject` for `path`, returning the response
@@ -707,44 +769,12 @@ impl StorageBackend for S3Backend {
         Ok(super::length_guard(Box::pin(stream), expected_len))
     }
 
-    /// Native range read: signs a plain `GetObject` request and layers an
-    /// **unsigned** `Range` header on top (valid because `Range` is not part
-    /// of `SigV4`'s signed canonical request — ADR-0005's Decision Outcome).
-    /// Builds the header directly from `range` without a prior `HEAD`, so a
-    /// range read never costs more than one round trip.
-    async fn get_range(&self, path: &str, range: ByteRange) -> Result<Bytes, DomainError> {
-        let header_value = Self::range_header_value(range)?;
-
-        let key = Self::path_to_key(path);
-        let url = self
-            .bucket
-            .get_object(Some(&self.credentials), key)
-            .sign(SIGN_DURATION);
-        let resp = self
-            .http
-            .get(url)
-            .header(RANGE, header_value)
-            .send()
-            .await
-            .map_err(|e| self.transport_err(&e))?;
-
-        let status = resp.status();
-        if status == StatusCode::RANGE_NOT_SATISFIABLE {
-            return Err(DomainError::validation("range", "unsatisfiable byte range"));
-        }
-        let body = resp.bytes().await.map_err(|e| self.transport_err(&e))?;
-        if status.is_success() {
-            Ok(body)
-        } else {
-            Err(self.s3_error(status, &body))
-        }
-    }
-
-    /// Native streaming range read: identical request shape to `get_range`
-    /// (same unsigned `Range` header, same one-round-trip contract), but
-    /// returns the response body as a `BoxStream` via `bytes_stream()`
-    /// instead of buffering it whole — mirrors `get_stream`'s relationship to
-    /// `get`, applied to a range. `Range: bytes=0-` (`ByteRange::OpenEnded`
+    /// Native streaming range read: signs a plain `GetObject` request and
+    /// layers an **unsigned** `Range` header on top (valid because `Range` is
+    /// not part of `SigV4`'s signed canonical request — ADR-0005's Decision
+    /// Outcome), same one-round-trip contract as `read_prefix`, but returns
+    /// the response body as a `BoxStream` via `bytes_stream()` instead of
+    /// buffering it whole. `Range: bytes=0-` (`ByteRange::OpenEnded`
     /// with `start: 0`) resolves to the entire object, so without this a
     /// player's very first range request would still pull the whole object
     /// into memory via `resp.bytes()` before the client had read a byte of
@@ -953,22 +983,41 @@ impl StorageBackend for S3Backend {
         })
     }
 
-    /// `UploadPart`: PUTs `data` as the request body. Returns `(backend_etag,
-    /// part_hash_bytes)` — `backend_etag` is S3's own `ETag` response header
-    /// (its surrounding quotes stripped), fed back verbatim into
-    /// `complete_multipart`; `part_hash_bytes` is **this gear's own**
-    /// SHA-256 of `data`, computed locally rather than derived from S3's
-    /// (MD5-based) `ETag`, per the trait's hash convention.
-    async fn upload_part(
+    /// `UploadPart`: PUTs `stream` as the request body, without ever
+    /// buffering the whole part in memory — the request body is
+    /// `reqwest::Body::wrap_stream(..)` over `stream` itself, wrapped in
+    /// [`hashing_length_guard`](super::hashing_length_guard) so the part's
+    /// SHA-256 is computed on the same pass that streams it out, and an
+    /// explicit `Content-Length: len` header is set because S3's `UploadPart`
+    /// requires the exact length up front — a presigned PUT with a
+    /// chunked-transfer-encoded (unknown-length) body is not accepted.
+    /// `Content-Length` is not part of the presigned URL's signed header set
+    /// (mirrors `read_prefix`/`get_range_stream`'s unsigned `Range` header —
+    /// see those methods' doc comments), so it is only ever added to the
+    /// actual request, never to
+    /// `action.headers_mut()`.
+    ///
+    /// Returns `(backend_etag, part_hash_bytes)` — `backend_etag` is S3's own
+    /// `ETag` response header (its surrounding quotes stripped), fed back
+    /// verbatim into `complete_multipart`; `part_hash_bytes` is **this gear's
+    /// own** SHA-256 over the streamed bytes, computed incrementally rather
+    /// than derived from S3's (MD5-based) `ETag`, per the trait's hash
+    /// convention. If `stream` did not yield exactly `len` bytes,
+    /// `hashing_length_guard` never publishes a digest and this call errors —
+    /// the request body itself fails to send correctly in that case (a
+    /// length mismatch against the request's own `Content-Length` ends the
+    /// stream on an `io::Error`, which `reqwest` surfaces as a transport
+    /// failure), so a part can never be reported "uploaded" off of an
+    /// unverified digest.
+    async fn upload_part_stream(
         &self,
         path: &str,
         upload_handle: &str,
         part_number: u32,
         _part_offset: u64,
-        data: Bytes,
+        stream: BoxStream<'static, std::io::Result<Bytes>>,
+        len: u64,
     ) -> Result<(String, Vec<u8>), DomainError> {
-        let part_hash = hash::sha256(&data);
-
         // S3's documented limit is 10,000 parts per upload (1..=10_000,
         // 1-indexed) — narrower than `u16::try_from`'s 65_535 ceiling, so that
         // conversion alone would silently accept out-of-range part numbers
@@ -989,10 +1038,12 @@ impl StorageBackend for S3Backend {
             .upload_part(Some(&self.credentials), key, part_number_u16, upload_handle)
             .sign(SIGN_DURATION);
 
+        let (guarded, digest_slot) = super::hashing_length_guard(stream, len);
         let resp = self
             .http
             .put(url)
-            .body(data)
+            .header(CONTENT_LENGTH, len.to_string())
+            .body(reqwest::Body::wrap_stream(guarded))
             .send()
             .await
             .map_err(|e| self.transport_err(&e))?;
@@ -1009,7 +1060,19 @@ impl StorageBackend for S3Backend {
         let etag = etag_header.ok_or_else(|| {
             DomainError::backend(&self.id, "UploadPart response missing ETag header")
         })?;
-        Ok((etag, part_hash))
+        let part_hash = digest_slot
+            .lock()
+            .map_err(|_| DomainError::backend(&self.id, "poisoned part-hash lock"))?
+            .take()
+            .ok_or_else(|| {
+                DomainError::backend(
+                    &self.id,
+                    "UploadPart reported success but the part body stream was never fully \
+                     verified against its declared length \u{2014} refusing to treat the part \
+                     as uploaded",
+                )
+            })?;
+        Ok((etag, part_hash.to_vec()))
     }
 
     /// `CompleteMultipartUpload`: builds the request XML body from `parts`'

@@ -148,13 +148,14 @@ use file_storage::domain::multipart::{BindState, MultipartPart};
 use file_storage::domain::multipart_service::MultipartService;
 use file_storage::domain::policy::{PolicyScope, StoredPolicy};
 use file_storage::domain::ports::{
-    AutoBindOnFinalize, CleanupStore, DataPlanePort, DeleteVersionOutcome,
-    FinalizeMultipartOutcome, FinalizeVersionOutcome, MultipartFinishSnapshot, MultipartStore,
+    AutoBindOnFinalize, CleanupStore, DeleteVersionOutcome, FinalizeMultipartOutcome,
+    FinalizeVersionOutcome, MultipartFinishSnapshot, MultipartStore,
 };
 use file_storage::domain::service::{FileService, ServiceConfig};
 use file_storage::infra::backend::{
     BackendRegistry, InMemoryBackend, LocalFsBackend, StorageBackend,
 };
+use file_storage::infra::content::{hash, mime};
 use file_storage::infra::signed_url::Issuer;
 use file_storage::infra::storage::Store;
 use file_storage::infra::storage::migrations::Migrator;
@@ -347,6 +348,61 @@ fn service_config() -> ServiceConfig {
     }
 }
 
+/// Direct byte-path test double for what `DataPlaneService` used to provide
+/// (removed: production never constructed it — the sidecar is the only real
+/// byte path). Same steps `DataPlaneService::put_content` used to perform,
+/// but through `put_stream` rather than the whole-object `put` that no
+/// longer exists on `StorageBackend`.
+struct TestDataPlane {
+    svc: Arc<FileService>,
+    store: Store,
+    backends: BackendRegistry,
+}
+
+impl TestDataPlane {
+    fn new(svc: Arc<FileService>, store: Store, backends: BackendRegistry) -> Self {
+        Self {
+            svc,
+            store,
+            backends,
+        }
+    }
+
+    async fn put_content(
+        &self,
+        ctx: &SecurityContext,
+        file_id: Uuid,
+        version_id: Uuid,
+        declared_mime: &str,
+        bytes: Bytes,
+    ) -> Result<(), DomainError> {
+        mime::validate(declared_mime, &bytes)?;
+        self.svc.authorize_write(ctx, file_id).await?;
+        let version = self
+            .store
+            .get_version(file_id, version_id)
+            .await?
+            .ok_or_else(|| DomainError::version_not_found(file_id, version_id))?;
+        let backend = self.backends.get(&version.backend_id)?;
+        let len = bytes.len() as u64;
+        let digest = hash::sha256(&bytes);
+        let stream: futures::stream::BoxStream<'static, std::io::Result<Bytes>> =
+            Box::pin(futures::stream::once(async move { Ok(bytes) }));
+        backend
+            .put_stream(&version.backend_path, stream, Some(len))
+            .await?;
+        self.svc
+            .finalize_upload(
+                ctx,
+                file_id,
+                version_id,
+                i64::try_from(len).unwrap_or(i64::MAX),
+                digest,
+            )
+            .await
+    }
+}
+
 fn make_file_service(store: Store, backends: BackendRegistry) -> Arc<FileService> {
     let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
     let authorizer: Arc<dyn file_storage::domain::authz::Authorizer> =
@@ -412,16 +468,20 @@ async fn simulate_all_parts(
             0u8;
             usize::try_from(part.size).expect("part size fits")
         ]);
+        let len = data.len() as u64;
+        let stream: futures::stream::BoxStream<'static, std::io::Result<Bytes>> =
+            Box::pin(futures::stream::once(async move { Ok(data) }));
         let (backend_etag, part_hash) = backend
-            .upload_part(
+            .upload_part_stream(
                 &backend_path,
                 &session.backend_upload_handle,
                 part.part_number,
                 part.offset,
-                data,
+                stream,
+                len,
             )
             .await
-            .expect("backend upload_part");
+            .expect("backend upload_part_stream");
         let size = i64::try_from(part.size).expect("part size fits in i64");
         let part_number_i32 = i32::try_from(part.part_number).expect("part_number fits in i32");
         multipart_store
@@ -575,11 +635,21 @@ impl StorageBackend for FailingInitiateBackend {
     fn capabilities(&self) -> file_storage::infra::backend::BackendCapabilities {
         self.inner.capabilities()
     }
-    async fn put(&self, path: &str, bytes: Bytes) -> Result<(), DomainError> {
-        self.inner.put(path, bytes).await
+    async fn put_stream(
+        &self,
+        path: &str,
+        stream: futures::stream::BoxStream<'_, std::io::Result<Bytes>>,
+        max_size: Option<u64>,
+    ) -> Result<(u64, [u8; 32]), DomainError> {
+        self.inner.put_stream(path, stream, max_size).await
     }
-    async fn get(&self, path: &str) -> Result<Bytes, DomainError> {
-        self.inner.get(path).await
+    async fn publish_exclusive(
+        &self,
+        path: &str,
+        stream: futures::stream::BoxStream<'_, std::io::Result<Bytes>>,
+        max_size: Option<u64>,
+    ) -> Result<file_storage::infra::backend::PublishOutcome, DomainError> {
+        self.inner.publish_exclusive(path, stream, max_size).await
     }
     async fn get_stream(
         &self,
@@ -588,12 +658,19 @@ impl StorageBackend for FailingInitiateBackend {
     ) -> Result<futures::stream::BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
         self.inner.get_stream(path, expected_len).await
     }
-    async fn get_range(
+    async fn read_prefix(&self, path: &str, max_bytes: u64) -> Result<Option<Bytes>, DomainError> {
+        self.inner.read_prefix(path, max_bytes).await
+    }
+    async fn get_range_stream(
         &self,
         path: &str,
         range: file_storage_sdk::ByteRange,
-    ) -> Result<Bytes, DomainError> {
-        self.inner.get_range(path, range).await
+        expected_len: u64,
+    ) -> Result<futures::stream::BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
+        self.inner.get_range_stream(path, range, expected_len).await
+    }
+    async fn size(&self, path: &str) -> Result<u64, DomainError> {
+        self.inner.size(path).await
     }
     async fn delete(&self, path: &str) -> Result<(), DomainError> {
         self.inner.delete(path).await
@@ -606,16 +683,17 @@ impl StorageBackend for FailingInitiateBackend {
             "simulated backend-initiation failure (e.g. an S3 CreateMultipartUpload error)",
         ))
     }
-    async fn upload_part(
+    async fn upload_part_stream(
         &self,
         path: &str,
         upload_handle: &str,
         part_number: u32,
         part_offset: u64,
-        data: Bytes,
+        stream: futures::stream::BoxStream<'static, std::io::Result<Bytes>>,
+        len: u64,
     ) -> Result<(String, Vec<u8>), DomainError> {
         self.inner
-            .upload_part(path, upload_handle, part_number, part_offset, data)
+            .upload_part_stream(path, upload_handle, part_number, part_offset, stream, len)
             .await
     }
     async fn complete_multipart(
@@ -1269,9 +1347,7 @@ async fn f9_autobind_no_if_match_no_longer_clobbers_prior_rebind() {
     let multipart_store: Arc<dyn MultipartStore> = Arc::new(store.clone());
     let svc = make_file_service(store.clone(), backends.clone());
     let msvc = make_multipart_service(multipart_store.clone(), backends.clone(), 120);
-    let dp = file_storage::domain::data_plane::DataPlaneService::new(
-        Arc::clone(&svc) as Arc<dyn DataPlanePort>
-    );
+    let dp = TestDataPlane::new(Arc::clone(&svc), store.clone(), backends.clone());
 
     let tenant_id = Uuid::now_v7();
     let ctx = make_ctx(tenant_id);
@@ -1385,9 +1461,7 @@ async fn negative_control_f9_autobind_with_correct_if_match_rejects_stale_rebind
     let multipart_store: Arc<dyn MultipartStore> = Arc::new(store.clone());
     let svc = make_file_service(store.clone(), backends.clone());
     let msvc = make_multipart_service(multipart_store.clone(), backends.clone(), 120);
-    let dp = file_storage::domain::data_plane::DataPlaneService::new(
-        Arc::clone(&svc) as Arc<dyn DataPlanePort>
-    );
+    let dp = TestDataPlane::new(Arc::clone(&svc), store.clone(), backends.clone());
 
     let tenant_id = Uuid::now_v7();
     let ctx = make_ctx(tenant_id);
@@ -1672,9 +1746,7 @@ async fn invariant_checker_distinguishes_healthy_file_from_known_orphan() {
     let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
     let backends = BackendRegistry::new(vec![Arc::clone(&backend)], "mem").expect("registry");
     let svc = make_file_service(store.clone(), backends.clone());
-    let dp = file_storage::domain::data_plane::DataPlaneService::new(
-        Arc::clone(&svc) as Arc<dyn DataPlanePort>
-    );
+    let dp = TestDataPlane::new(Arc::clone(&svc), store.clone(), backends.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = make_ctx(tenant_id);
 
@@ -1871,10 +1943,12 @@ async fn delete_file_vs_concurrent_insert_version_has_no_silent_loss() {
             )
             .await
             .expect("create file + v1");
-        backend
-            .put(&format!("/{file_id}/{v1}"), Bytes::from_static(b"v1"))
-            .await
-            .expect("seed v1 blob");
+        common::write_all(
+            &backend,
+            &format!("/{file_id}/{v1}"),
+            Bytes::from_static(b"v1"),
+        )
+        .await;
 
         let v2 = Uuid::now_v7();
         let store_del = store.clone();

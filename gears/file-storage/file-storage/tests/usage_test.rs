@@ -30,15 +30,15 @@ use uuid::Uuid;
 
 use file_storage::domain::authz::TenantOnlyAuthorizer;
 use file_storage::domain::cleanup::{CleanupConfig, CleanupEngine};
-use file_storage::domain::data_plane::DataPlaneService;
+use file_storage::domain::error::DomainError;
 use file_storage::domain::etag;
 use file_storage::domain::multipart::MultipartPlan;
 use file_storage::domain::multipart_service::MultipartService;
 use file_storage::domain::policy::{AgeRetention, RetentionRuleBody, RetentionScope};
-use file_storage::domain::ports::{CleanupStore, DataPlanePort, MultipartStore};
+use file_storage::domain::ports::{CleanupStore, MultipartStore};
 use file_storage::domain::service::{FileService, ServiceConfig};
 use file_storage::infra::backend::{BackendRegistry, InMemoryBackend, StorageBackend};
-use file_storage::infra::content::hash;
+use file_storage::infra::content::{hash, mime};
 use file_storage::infra::external_clients::{UsageDelta, UsageReporter};
 use file_storage::infra::signed_url::{Claims, Issuer, MultipartClaims, Op, UploadConstraints};
 use file_storage::infra::storage::Store;
@@ -46,6 +46,61 @@ use file_storage::infra::storage::migrations::Migrator;
 use file_storage_sdk::{NewFile, OwnerKind};
 
 const GTS: &str = gts_id!("cf.fstorage.file.type.v1~x.usage_test.file.type.v1~");
+
+/// Direct byte-path test double for what `DataPlaneService` used to provide
+/// (removed: production never constructed it — the sidecar is the only real
+/// byte path). Same steps `DataPlaneService::put_content` used to perform,
+/// but through `put_stream` rather than the whole-object `put` that no
+/// longer exists on `StorageBackend`.
+struct TestDataPlane {
+    svc: Arc<FileService>,
+    store: Store,
+    backends: BackendRegistry,
+}
+
+impl TestDataPlane {
+    fn new(svc: Arc<FileService>, store: Store, backends: BackendRegistry) -> Self {
+        Self {
+            svc,
+            store,
+            backends,
+        }
+    }
+
+    async fn put_content(
+        &self,
+        ctx: &SecurityContext,
+        file_id: Uuid,
+        version_id: Uuid,
+        declared_mime: &str,
+        bytes: Bytes,
+    ) -> Result<(), DomainError> {
+        mime::validate(declared_mime, &bytes)?;
+        self.svc.authorize_write(ctx, file_id).await?;
+        let version = self
+            .store
+            .get_version(file_id, version_id)
+            .await?
+            .ok_or_else(|| DomainError::version_not_found(file_id, version_id))?;
+        let backend = self.backends.get(&version.backend_id)?;
+        let len = bytes.len() as u64;
+        let digest = hash::sha256(&bytes);
+        let stream: futures::stream::BoxStream<'static, std::io::Result<Bytes>> =
+            Box::pin(futures::stream::once(async move { Ok(bytes) }));
+        backend
+            .put_stream(&version.backend_path, stream, Some(len))
+            .await?;
+        self.svc
+            .finalize_upload(
+                ctx,
+                file_id,
+                version_id,
+                i64::try_from(len).unwrap_or(i64::MAX),
+                digest,
+            )
+            .await
+    }
+}
 
 // ── fake usage reporter ─────────────────────────────────────────────────────
 
@@ -103,7 +158,7 @@ async fn build_db() -> Arc<DBProvider<DbError>> {
     Arc::new(DBProvider::new(db))
 }
 
-/// Build `FileService`, `MultipartService`, `DataPlaneService`, the raw
+/// Build `FileService`, `MultipartService`, `TestDataPlane`, the raw
 /// `Store`, and a `CleanupEngine`, ALL wired to report through the same
 /// `fake` reporter -- so every `report_usage` call site added by this
 /// remediation is reachable from a single harness.
@@ -112,7 +167,7 @@ async fn build_all(
 ) -> (
     Arc<FileService>,
     Arc<MultipartService>,
-    DataPlaneService,
+    TestDataPlane,
     Store,
     CleanupEngine,
     Arc<dyn StorageBackend>,
@@ -157,7 +212,7 @@ async fn build_all(
         )
         .with_usage_reporter(Some(Arc::clone(&reporter))),
     );
-    let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
+    let dp = TestDataPlane::new(Arc::clone(&svc), store.clone(), backends.clone());
     let engine = CleanupEngine::new(
         sweep_store,
         backends,
@@ -227,10 +282,20 @@ async fn drive_multipart_upload(
         .expect("session must exist");
     let backend_path = format!("/{file_id}/{}", plan.version_id);
 
+    let data_len = data.len() as u64;
+    let data_stream: futures::stream::BoxStream<'static, std::io::Result<bytes::Bytes>> =
+        Box::pin(futures::stream::once(async move { Ok(data) }));
     let (backend_etag, part_hash) = backend
-        .upload_part(&backend_path, &session.backend_upload_handle, 1, 0, data)
+        .upload_part_stream(
+            &backend_path,
+            &session.backend_upload_handle,
+            1,
+            0,
+            data_stream,
+            data_len,
+        )
         .await
-        .expect("backend upload_part");
+        .expect("backend upload_part_stream");
 
     multipart_store
         .upsert_multipart_part(
@@ -308,7 +373,7 @@ async fn finalize_reports_positive_byte_delta() {
 }
 
 /// Same credit, exercised through the token-authenticated
-/// `finalize_upload_by_token` sidecar-callback path (`DataPlaneService::put_content`
+/// `finalize_upload_by_token` sidecar-callback path (`TestDataPlane::put_content`
 /// drives the user-context `finalize_upload` instead -- see its doc comment
 /// -- so this test constructs `Claims` directly and writes the blob straight
 /// to the backend, the way `enforce_test.rs`'s
@@ -331,10 +396,16 @@ async fn finalize_by_token_reports_positive_byte_delta() {
 
     let payload = Bytes::from_static(b"token-path payload bytes");
     let backend_path = format!("/{}/{}", ticket.file_id, ticket.version_id);
+    let payload_len = payload.len() as u64;
+    let payload_stream: futures::stream::BoxStream<'static, std::io::Result<Bytes>> =
+        Box::pin(futures::stream::once({
+            let payload = payload.clone();
+            async move { Ok(payload) }
+        }));
     backend
-        .put(&backend_path, payload.clone())
+        .put_stream(&backend_path, payload_stream, Some(payload_len))
         .await
-        .expect("backend put");
+        .expect("backend put_stream");
     let size = i64::try_from(payload.len()).unwrap();
     let digest = hash::sha256(&payload);
 

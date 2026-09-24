@@ -36,6 +36,7 @@ use file_storage::infra::signed_url::Issuer;
 use file_storage::infra::storage::Store;
 use file_storage::infra::storage::migrations::Migrator;
 use file_storage_sdk::{NewFile, OwnerKind};
+use futures::stream::{self, BoxStream};
 use sea_orm_migration::MigratorTrait;
 use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
@@ -198,12 +199,57 @@ pub fn make_services_with_backends(
     }
 }
 
+/// Read the whole blob at `path` back via `get_stream` (collecting every
+/// chunk), for tests that used to call the whole-object `backend.get(...)`
+/// directly (removed from `StorageBackend` — a production backend must not
+/// expose a whole-object read at all). `expected_len` is `get_stream`'s own
+/// required commitment; callers that don't already know it can get it from
+/// `backend.stat(path)` first.
+pub async fn read_all(backend: &Arc<dyn StorageBackend>, path: &str, expected_len: u64) -> Bytes {
+    use futures::StreamExt;
+
+    let mut stream = backend
+        .get_stream(path, expected_len)
+        .await
+        .expect("get_stream");
+    let mut buf = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        buf.extend_from_slice(&chunk.expect("chunk"));
+    }
+    Bytes::from(buf)
+}
+
+/// Write the whole of `bytes` to `path` via `put_stream` (a one-shot
+/// stream), for tests that used to call the whole-object `backend.put(...)`
+/// directly (removed from `StorageBackend` for the same reason as
+/// [`read_all`] above).
+pub async fn write_all(backend: &Arc<dyn StorageBackend>, path: &str, bytes: Bytes) {
+    let len = bytes.len() as u64;
+    let stream: BoxStream<'static, std::io::Result<Bytes>> =
+        Box::pin(stream::once(async move { Ok(bytes) }));
+    backend
+        .put_stream(path, stream, Some(len))
+        .await
+        .expect("put_stream");
+}
+
+/// Box `data` into the one-shot `BoxStream` shape `upload_part_stream` now
+/// expects, alongside its exact length -- `data` is already fully in memory
+/// at every call site here (test fixtures build small parts directly), so a
+/// one-shot `stream::once` is enough; nothing about this helper exercises the
+/// streaming path's chunking, which `s3_tests.rs`'s own backend-level tests
+/// cover directly.
+fn one_shot_part_stream(data: Bytes) -> (BoxStream<'static, std::io::Result<Bytes>>, u64) {
+    let len = data.len() as u64;
+    (Box::pin(stream::once(async move { Ok(data) })), len)
+}
+
 /// Simulate the sidecar writing one part of a multipart upload: writes
 /// `data` through the backend's native multipart path
-/// (`backend.upload_part`), then persists the part row via
+/// (`backend.upload_part_stream`), then persists the part row via
 /// `MultipartStore::upsert_multipart_part` -- exactly the two steps a real
-/// sidecar performs (`backend.upload_part` then an SDK callback), mirroring
-/// `tests/multipart_test.rs::simulate_sidecar_put_part`.
+/// sidecar performs (`backend.upload_part_stream` then an SDK callback),
+/// mirroring `tests/multipart_test.rs::simulate_sidecar_put_part`.
 pub async fn simulate_sidecar_put_part(
     multipart_store: &Arc<dyn MultipartStore>,
     backend: &Arc<dyn StorageBackend>,
@@ -224,16 +270,18 @@ pub async fn simulate_sidecar_put_part(
         .expect("session must exist");
     let backend_path = format!("/{file_id}/{}", plan.version_id);
 
+    let (stream, len) = one_shot_part_stream(data);
     let (backend_etag, part_hash) = backend
-        .upload_part(
+        .upload_part_stream(
             &backend_path,
             &session.backend_upload_handle,
             part_number,
             part.offset,
-            data,
+            stream,
+            len,
         )
         .await
-        .expect("backend upload_part");
+        .expect("backend upload_part_stream");
 
     let size = i64::try_from(part.size).expect("part size fits in i64");
     let now = time::OffsetDateTime::now_utc();

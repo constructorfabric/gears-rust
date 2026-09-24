@@ -33,22 +33,45 @@ use file_storage::infra::metrics::NoopMetrics;
 use file_storage::infra::signed_url::{Claims, Issuer, MultipartClaims, Op, UploadConstraints};
 
 use super::{
-    DEFAULT_MAX_BODY_BYTES, DEFAULT_MAX_CONCURRENT_PART_UPLOADS, MAX_PREVIOUS_SIGNING_PUBLIC_KEYS,
-    SidecarState, TokenQuery, build_config, build_router, check_part_buffer_budget,
-    dedupe_public_keys, extract_token, finalize_with_control_plane, idle_timeout_stream,
-    interpret_finalize_response, parse_optional, parse_public_key_list,
+    DEFAULT_MAX_BODY_BYTES, MAX_PREVIOUS_SIGNING_PUBLIC_KEYS, SidecarState, TokenQuery,
+    build_config, build_router, dedupe_public_keys, extract_token, finalize_with_control_plane,
+    idle_timeout_stream, interpret_finalize_response, parse_optional, parse_public_key_list,
     report_part_with_control_plane, write_multipart_part_native,
     write_multipart_part_offset_object,
 };
 
-/// A part-upload concurrency semaphore sized at the production default
-/// -- every `SidecarState` literal below needs this field, and most
-/// tests don't care about its value, only the concurrency-limiter tests
-/// further down do (they build their own with a size of `1`).
-fn test_part_upload_semaphore() -> Arc<tokio::sync::Semaphore> {
-    Arc::new(tokio::sync::Semaphore::new(
-        DEFAULT_MAX_CONCURRENT_PART_UPLOADS,
-    ))
+/// Write the whole of `bytes` to `path` via `put_stream` (a one-shot
+/// stream) -- the test-only stand-in for the whole-object `put` the trait no
+/// longer has.
+async fn write_all(backend: &dyn StorageBackend, path: &str, bytes: Bytes) {
+    let len = bytes.len() as u64;
+    let stream: futures::stream::BoxStream<'static, std::io::Result<Bytes>> =
+        Box::pin(futures::stream::once(async move { Ok(bytes) }));
+    backend
+        .put_stream(path, stream, Some(len))
+        .await
+        .expect("put_stream");
+}
+
+/// Read the whole blob at `path` back via `get_stream` (collecting every
+/// chunk) -- the test-only stand-in for the whole-object `get` the trait no
+/// longer has. `expected_len` is `get_stream`'s own required commitment;
+/// callers that don't already know it get it from `stat` first.
+async fn read_all(backend: &dyn StorageBackend, path: &str) -> Bytes {
+    let expected_len = backend
+        .stat(path)
+        .await
+        .expect("stat")
+        .expect("blob must exist");
+    let mut stream = backend
+        .get_stream(path, expected_len)
+        .await
+        .expect("get_stream");
+    let mut buf = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        buf.extend_from_slice(&chunk.expect("chunk"));
+    }
+    Bytes::from(buf)
 }
 
 fn test_state() -> SidecarState {
@@ -65,7 +88,6 @@ fn test_state() -> SidecarState {
         internal_token: None,
         http: reqwest::Client::new(),
         metrics: Arc::new(NoopMetrics),
-        part_upload_semaphore: test_part_upload_semaphore(),
         body_idle_timeout: None,
         callback_retry_budget: Duration::from_secs(10),
     }
@@ -242,7 +264,6 @@ async fn sidecar_readyz_returns_200_when_backends_ready() {
         internal_token: None,
         http: reqwest::Client::new(),
         metrics: Arc::new(NoopMetrics),
-        part_upload_semaphore: test_part_upload_semaphore(),
         body_idle_timeout: None,
         callback_retry_budget: Duration::from_secs(10),
     };
@@ -289,7 +310,6 @@ async fn sidecar_readyz_returns_503_when_backend_root_missing() {
         internal_token: None,
         http: reqwest::Client::new(),
         metrics: Arc::new(NoopMetrics),
-        part_upload_semaphore: test_part_upload_semaphore(),
         body_idle_timeout: None,
         callback_retry_budget: Duration::from_secs(10),
     };
@@ -496,7 +516,6 @@ fn test_download_state() -> (SidecarState, Issuer, Arc<InMemoryBackend>) {
         internal_token: None,
         http: reqwest::Client::new(),
         metrics: Arc::new(NoopMetrics),
-        part_upload_semaphore: test_part_upload_semaphore(),
         body_idle_timeout: None,
         callback_retry_budget: Duration::from_secs(10),
     };
@@ -586,12 +605,30 @@ impl StorageBackend for FaultyReadBackend {
         self.inner.capabilities()
     }
 
-    async fn put(&self, path: &str, bytes: Bytes) -> Result<(), DomainError> {
-        self.inner.put(path, bytes).await
+    async fn put_stream(
+        &self,
+        path: &str,
+        stream: futures::stream::BoxStream<'_, std::io::Result<Bytes>>,
+        max_size: Option<u64>,
+    ) -> Result<(u64, [u8; 32]), DomainError> {
+        self.inner.put_stream(path, stream, max_size).await
     }
 
-    async fn get(&self, path: &str) -> Result<Bytes, DomainError> {
-        self.inner.get(path).await
+    async fn publish_exclusive(
+        &self,
+        path: &str,
+        stream: futures::stream::BoxStream<'_, std::io::Result<Bytes>>,
+        max_size: Option<u64>,
+    ) -> Result<file_storage::infra::backend::PublishOutcome, DomainError> {
+        self.inner.publish_exclusive(path, stream, max_size).await
+    }
+
+    async fn read_prefix(&self, path: &str, max_bytes: u64) -> Result<Option<Bytes>, DomainError> {
+        self.inner.read_prefix(path, max_bytes).await
+    }
+
+    async fn size(&self, path: &str) -> Result<u64, DomainError> {
+        self.inner.size(path).await
     }
 
     async fn delete(&self, path: &str) -> Result<(), DomainError> {
@@ -635,10 +672,7 @@ async fn test_faulty_download_state(
 ) -> (SidecarState, Issuer) {
     let issuer = Issuer::generate(60).expect("issuer generation");
     let inner = InMemoryBackend::new("test");
-    inner
-        .put(path, Bytes::from_static(body))
-        .await
-        .expect("seed blob into inner backend");
+    write_all(&inner, path, Bytes::from_static(body)).await;
     let backend: Arc<dyn StorageBackend> = Arc::new(FaultyReadBackend { inner, fault });
     let backends =
         BackendRegistry::new(vec![backend], "test").expect("build test backend registry");
@@ -649,7 +683,6 @@ async fn test_faulty_download_state(
         internal_token: None,
         http: reqwest::Client::new(),
         metrics: Arc::new(NoopMetrics),
-        part_upload_semaphore: test_part_upload_semaphore(),
         body_idle_timeout: None,
         callback_retry_budget: Duration::from_secs(10),
     };
@@ -769,10 +802,12 @@ async fn download_range_response_includes_content_range() {
     let file_id = Uuid::now_v7();
     let version_id = Uuid::now_v7();
     let path = format!("/{file_id}/{version_id}");
-    backend
-        .put(&path, bytes::Bytes::from_static(b"hello world"))
-        .await
-        .expect("seed blob");
+    write_all(
+        backend.as_ref(),
+        &path,
+        bytes::Bytes::from_static(b"hello world"),
+    )
+    .await;
     let token = download_token(&issuer, file_id, version_id, &path);
 
     let router = build_router(state, DEFAULT_MAX_BODY_BYTES);
@@ -815,10 +850,7 @@ async fn download_whole_content_length_matches_actual_body_length() {
     let version_id = Uuid::now_v7();
     let path = format!("/{file_id}/{version_id}");
     let content = b"whole-object download body used to check Content-Length";
-    backend
-        .put(&path, bytes::Bytes::from_static(content))
-        .await
-        .expect("seed blob");
+    write_all(backend.as_ref(), &path, bytes::Bytes::from_static(content)).await;
     let token = download_token(&issuer, file_id, version_id, &path);
 
     let router = build_router(state, DEFAULT_MAX_BODY_BYTES);
@@ -896,10 +928,12 @@ async fn download_unsatisfiable_range_returns_416_with_content_range() {
     let file_id = Uuid::now_v7();
     let version_id = Uuid::now_v7();
     let path = format!("/{file_id}/{version_id}");
-    backend
-        .put(&path, bytes::Bytes::from_static(b"hello world")) // 11 bytes
-        .await
-        .expect("seed blob");
+    write_all(
+        backend.as_ref(),
+        &path,
+        bytes::Bytes::from_static(b"hello world"),
+    )
+    .await; // 11 bytes
     let token = download_token(&issuer, file_id, version_id, &path);
 
     let router = build_router(state, DEFAULT_MAX_BODY_BYTES);
@@ -943,10 +977,12 @@ async fn download_inverted_range_is_ignored_and_returns_full_body() {
     let file_id = Uuid::now_v7();
     let version_id = Uuid::now_v7();
     let path = format!("/{file_id}/{version_id}");
-    backend
-        .put(&path, bytes::Bytes::from_static(b"hello world")) // 11 bytes
-        .await
-        .expect("seed blob");
+    write_all(
+        backend.as_ref(),
+        &path,
+        bytes::Bytes::from_static(b"hello world"),
+    )
+    .await; // 11 bytes
     let token = download_token(&issuer, file_id, version_id, &path);
 
     let router = build_router(state, DEFAULT_MAX_BODY_BYTES);
@@ -979,10 +1015,12 @@ async fn download_sets_content_type_and_etag_from_claims() {
     let file_id = Uuid::now_v7();
     let version_id = Uuid::now_v7();
     let path = format!("/{file_id}/{version_id}");
-    backend
-        .put(&path, bytes::Bytes::from_static(b"hello world"))
-        .await
-        .expect("seed blob");
+    write_all(
+        backend.as_ref(),
+        &path,
+        bytes::Bytes::from_static(b"hello world"),
+    )
+    .await;
     let token = download_token_with_meta(
         &issuer,
         file_id,
@@ -1034,10 +1072,12 @@ async fn download_range_sets_content_type_and_etag_from_claims() {
     let file_id = Uuid::now_v7();
     let version_id = Uuid::now_v7();
     let path = format!("/{file_id}/{version_id}");
-    backend
-        .put(&path, bytes::Bytes::from_static(b"hello world"))
-        .await
-        .expect("seed blob");
+    write_all(
+        backend.as_ref(),
+        &path,
+        bytes::Bytes::from_static(b"hello world"),
+    )
+    .await;
     let token = download_token_with_meta(
         &issuer,
         file_id,
@@ -1091,10 +1131,12 @@ async fn download_without_meta_claims_falls_back_to_octet_stream_and_no_etag() {
     let file_id = Uuid::now_v7();
     let version_id = Uuid::now_v7();
     let path = format!("/{file_id}/{version_id}");
-    backend
-        .put(&path, bytes::Bytes::from_static(b"hello world"))
-        .await
-        .expect("seed blob");
+    write_all(
+        backend.as_ref(),
+        &path,
+        bytes::Bytes::from_static(b"hello world"),
+    )
+    .await;
     let token = download_token(&issuer, file_id, version_id, &path);
 
     let router = build_router(state, DEFAULT_MAX_BODY_BYTES);
@@ -1843,7 +1885,6 @@ async fn sidecar_multipart_native_backend_dispatches_to_upload_part() {
         internal_token: None,
         http: reqwest::Client::new(),
         metrics: Arc::new(NoopMetrics),
-        part_upload_semaphore: test_part_upload_semaphore(),
         body_idle_timeout: None,
         callback_retry_budget: Duration::from_secs(10),
     };
@@ -1955,10 +1996,7 @@ async fn sidecar_multipart_native_backend_dispatches_to_upload_part() {
         .await
         .expect("complete native multipart session - both parts must be real");
 
-    let assembled = backend
-        .get(&backend_path)
-        .await
-        .expect("read assembled object");
+    let assembled = read_all(backend.as_ref(), &backend_path).await;
     let mut expected = part1.clone();
     expected.extend_from_slice(&part2);
     assert_eq!(
@@ -2108,7 +2146,6 @@ async fn upload_replay_after_publish_is_rejected_with_409() {
         internal_token: None,
         http: reqwest::Client::new(),
         metrics: Arc::new(NoopMetrics),
-        part_upload_semaphore: test_part_upload_semaphore(),
         body_idle_timeout: None,
         callback_retry_budget: Duration::from_secs(10),
     };
@@ -2156,7 +2193,7 @@ async fn upload_replay_after_publish_is_rejected_with_409() {
     );
 
     // The backend must still hold the FIRST attempt's bytes, untouched.
-    let stored = backend.get(&path).await.expect("blob must still exist");
+    let stored = read_all(backend.as_ref(), &path).await;
     assert_eq!(
         &stored[..],
         b"original-bytes",
@@ -2190,7 +2227,6 @@ async fn sidecar_resolves_backend_by_claims_backend_id() {
         internal_token: None,
         http: reqwest::Client::new(),
         metrics: Arc::new(NoopMetrics),
-        part_upload_semaphore: test_part_upload_semaphore(),
         body_idle_timeout: None,
         callback_retry_budget: Duration::from_secs(10),
     };
@@ -2243,10 +2279,7 @@ async fn sidecar_resolves_backend_by_claims_backend_id() {
         !a_paths.contains(&path_b),
         "path_b must not land in local-fs backend, got {a_paths:?}"
     );
-    let got_a = backend_a
-        .get(&path_a)
-        .await
-        .expect("get from local-fs backend");
+    let got_a = read_all(backend_a.as_ref(), &path_a).await;
     assert_eq!(&got_a[..], b"bytes-for-local-fs");
 
     let b_paths = backend_b.list_paths().await.expect("list other paths");
@@ -2258,10 +2291,7 @@ async fn sidecar_resolves_backend_by_claims_backend_id() {
         !b_paths.contains(&path_a),
         "path_a must not land in other backend, got {b_paths:?}"
     );
-    let got_b = backend_b
-        .get(&path_b)
-        .await
-        .expect("get from other backend");
+    let got_b = read_all(backend_b.as_ref(), &path_b).await;
     assert_eq!(&got_b[..], b"bytes-for-other");
 }
 
@@ -2574,23 +2604,6 @@ fn build_config_nonzero_idle_timeout_is_some_duration() {
     assert_eq!(config.body_idle_timeout, Some(Duration::from_secs(5)));
 }
 
-/// `FS_SIDECAR_MAX_CONCURRENT_PART_UPLOADS=0` must fail sidecar startup
-/// outright -- left to build a zero-permit semaphore, it would silently turn
-/// every multipart part upload into an unconditional `503`.
-#[test]
-fn build_config_zero_concurrency_is_rejected() {
-    let (mut env, _issuer) = base_config_env();
-    env.insert("FS_SIDECAR_MAX_CONCURRENT_PART_UPLOADS", "0".to_owned());
-
-    let err = build_config(lookup_fn(env))
-        .expect_err("zero concurrency must fail startup, not silently reject every request");
-    assert!(
-        err.to_string()
-            .contains("FS_SIDECAR_MAX_CONCURRENT_PART_UPLOADS"),
-        "error should name the offending variable: {err}"
-    );
-}
-
 /// A `FS_SIDECAR_PREVIOUS_PUBLIC_KEYS` entry that decodes to the wrong
 /// length must fail startup with an understandable error -- `Verifier`'s own
 /// length check, reached through `build_config`, not a silently-dropped or
@@ -2737,65 +2750,6 @@ fn build_config_previous_keys_above_max_is_rejected() {
     );
 }
 
-// ── `check_part_buffer_budget` (T-worst-case-memory-vs-cgroup-limit) ────────
-
-/// A limit comfortably above the worst case passes.
-#[test]
-fn check_part_buffer_budget_accepts_limit_above_worst_case() {
-    // 2 * 5 GiB = 10 GiB worst case, 32 GiB limit.
-    let result = check_part_buffer_budget(2, 5 * 1024 * 1024 * 1024, Some(32 * 1024 * 1024 * 1024));
-    assert!(result.is_ok(), "expected Ok, got {result:?}");
-}
-
-/// The exact boundary (`worst_case == limit`) must be accepted, not rejected
-/// — only a strict excess is a real overcommit.
-#[test]
-fn check_part_buffer_budget_accepts_limit_equal_to_worst_case() {
-    let result = check_part_buffer_budget(2, 5 * 1024 * 1024 * 1024, Some(10 * 1024 * 1024 * 1024));
-    assert!(result.is_ok(), "expected Ok, got {result:?}");
-}
-
-/// A limit below the worst case (the documented default: 2 * 5 GiB = 10 GiB
-/// against a modest 4 GiB sidecar container) must be rejected with a message
-/// naming both the worst case and the limit.
-#[test]
-fn check_part_buffer_budget_rejects_limit_below_worst_case() {
-    let result = check_part_buffer_budget(2, 5 * 1024 * 1024 * 1024, Some(4 * 1024 * 1024 * 1024));
-    let err = result.expect_err("expected Err for a 10 GiB worst case against a 4 GiB limit");
-    assert!(
-        err.contains("10737418240"),
-        "message should carry the worst-case byte count: {err}"
-    );
-    assert!(
-        err.contains("4294967296"),
-        "message should carry the limit byte count: {err}"
-    );
-}
-
-/// `limit: None` (no cgroup limit could be read, or it reported unlimited)
-/// never fails the check, however large the worst case is — this is a
-/// best-effort guard, not an authoritative one.
-#[test]
-fn check_part_buffer_budget_never_fails_with_no_known_limit() {
-    let result = check_part_buffer_budget(1000, u64::MAX, None);
-    assert!(result.is_ok(), "expected Ok, got {result:?}");
-}
-
-/// `max_concurrent * part_size` must not silently wrap on overflow (a
-/// pathological configuration, e.g. an operator-supplied huge
-/// `FS_SIDECAR_MAX_CONCURRENT_PART_UPLOADS`) — it must saturate instead, so
-/// an absurdly large product still compares as "exceeds any real limit"
-/// rather than wrapping around to a small, falsely-passing value.
-#[test]
-fn check_part_buffer_budget_saturates_instead_of_overflowing() {
-    let result = check_part_buffer_budget(usize::MAX, u64::MAX, Some(1));
-    assert!(
-        result.is_err(),
-        "an overflowing worst case must saturate to u64::MAX and still exceed any real limit, \
-         not wrap around to something that passes"
-    );
-}
-
 // -- HEAD download ---------------------------------------------------------
 
 /// `HEAD` on an existing object must answer `200` with
@@ -2808,10 +2762,12 @@ async fn download_head_existing_object_returns_200_with_empty_body() {
     let file_id = Uuid::now_v7();
     let version_id = Uuid::now_v7();
     let path = format!("/{file_id}/{version_id}");
-    backend
-        .put(&path, bytes::Bytes::from_static(b"hello world")) // 11 bytes
-        .await
-        .expect("seed blob");
+    write_all(
+        backend.as_ref(),
+        &path,
+        bytes::Bytes::from_static(b"hello world"),
+    )
+    .await; // 11 bytes
     let token = download_token_with_meta(
         &issuer,
         file_id,
@@ -2899,177 +2855,6 @@ async fn download_head_missing_object_returns_404() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
-// -- part-upload concurrency limiter ---------------------------------------
-
-/// Build a `SidecarState` wired to a fresh `InMemoryBackend` (`multipart_native`,
-/// so `write_multipart_part` takes the permit-guarded branch) with its
-/// `part_upload_semaphore` sized at `limit` -- used by the concurrency
-/// tests below, which need a small, explicit limit rather than the
-/// production default.
-fn test_multipart_state_with_limit(limit: usize) -> (SidecarState, Issuer, Arc<InMemoryBackend>) {
-    let issuer = Issuer::generate(60).expect("issuer generation");
-    let backend = Arc::new(InMemoryBackend::new("mem"));
-    let backends =
-        BackendRegistry::new(vec![Arc::clone(&backend) as Arc<dyn StorageBackend>], "mem")
-            .expect("build test backend registry");
-    let state = SidecarState {
-        verifier: Arc::new(issuer.verifier()),
-        backends,
-        control_base_url: String::new(),
-        internal_token: None,
-        http: reqwest::Client::new(),
-        metrics: Arc::new(NoopMetrics),
-        part_upload_semaphore: Arc::new(tokio::sync::Semaphore::new(limit)),
-        body_idle_timeout: None,
-        callback_retry_budget: Duration::from_secs(10),
-    };
-    (state, issuer, backend)
-}
-
-/// With `part_upload_semaphore` exhausted (limit `1`, and
-/// the single permit held externally for the duration of this request), a
-/// `multipart_native` part-upload request must fail with `503` and a
-/// `Retry-After` header rather than hang or silently proceed unbounded.
-#[tokio::test]
-async fn upload_multipart_part_returns_503_when_semaphore_exhausted() {
-    let (state, issuer, backend) = test_multipart_state_with_limit(1);
-    let semaphore = Arc::clone(&state.part_upload_semaphore);
-
-    let file_id = Uuid::now_v7();
-    let version_id = Uuid::now_v7();
-    let backend_path = format!("/{file_id}/{version_id}");
-    let backend_handle = backend
-        .initiate_multipart(&backend_path)
-        .await
-        .expect("initiate native multipart session");
-    let part = b"exhausted-slot-part".to_vec();
-    let token = multipart_part_token(
-        &issuer,
-        file_id,
-        version_id,
-        "mem",
-        &backend_path,
-        Uuid::now_v7(),
-        1,
-        0,
-        part.len() as u64,
-        &backend_handle,
-    );
-
-    // Hold the only permit so the request below can never acquire one --
-    // exercises the `PART_UPLOAD_ACQUIRE_TIMEOUT` bounded-wait-then-503 path.
-    let held_permit = Arc::clone(&semaphore)
-        .try_acquire_owned()
-        .expect("acquire the single permit for the test to hold");
-
-    let router = build_router(state, DEFAULT_MAX_BODY_BYTES);
-    let response = router
-        .oneshot(
-            Request::put(format!(
-                "/api/file-storage-data/v1/multipart/{file_id}/{version_id}/parts/1?fs-token={token}"
-            ))
-            .body(Body::from(part))
-            .expect("valid request"),
-        )
-        .await
-        .expect("router call succeeds");
-
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(
-        response
-            .headers()
-            .get(header::RETRY_AFTER)
-            .expect("Retry-After header present on 503")
-            .to_str()
-            .expect("valid header value"),
-        "1"
-    );
-
-    drop(held_permit);
-}
-
-/// Once a `multipart_native` part write completes, its
-/// permit must be released before the handler returns -- a second part
-/// upload against a `part_upload_semaphore` sized at `1` must succeed right
-/// after the first, not wait out `PART_UPLOAD_ACQUIRE_TIMEOUT` and fail.
-#[tokio::test]
-async fn upload_multipart_part_releases_permit_after_write() {
-    let (state, issuer, backend) = test_multipart_state_with_limit(1);
-
-    let file_id = Uuid::now_v7();
-    let version_id = Uuid::now_v7();
-    let backend_path = format!("/{file_id}/{version_id}");
-    let upload_id = Uuid::now_v7();
-    let backend_handle = backend
-        .initiate_multipart(&backend_path)
-        .await
-        .expect("initiate native multipart session");
-
-    let part1 = b"first-part".to_vec();
-    let part2 = b"second-part".to_vec();
-    let token1 = multipart_part_token(
-        &issuer,
-        file_id,
-        version_id,
-        "mem",
-        &backend_path,
-        upload_id,
-        1,
-        0,
-        part1.len() as u64,
-        &backend_handle,
-    );
-    let token2 = multipart_part_token(
-        &issuer,
-        file_id,
-        version_id,
-        "mem",
-        &backend_path,
-        upload_id,
-        2,
-        part1.len() as u64,
-        part2.len() as u64,
-        &backend_handle,
-    );
-
-    let router = build_router(state, DEFAULT_MAX_BODY_BYTES);
-
-    let resp1 = router
-        .clone()
-        .oneshot(
-            Request::put(format!(
-                "/api/file-storage-data/v1/multipart/{file_id}/{version_id}/parts/1?fs-token={token1}"
-            ))
-            .body(Body::from(part1))
-            .expect("valid request"),
-        )
-        .await
-        .expect("router call succeeds");
-    assert_eq!(
-        resp1.status(),
-        StatusCode::OK,
-        "first part upload must succeed"
-    );
-
-    // With the semaphore still sized at 1, this only succeeds immediately if
-    // the first write's permit was actually released rather than leaked.
-    let resp2 = router
-        .oneshot(
-            Request::put(format!(
-                "/api/file-storage-data/v1/multipart/{file_id}/{version_id}/parts/2?fs-token={token2}"
-            ))
-            .body(Body::from(part2))
-            .expect("valid request"),
-        )
-        .await
-        .expect("router call succeeds");
-    assert_eq!(
-        resp2.status(),
-        StatusCode::OK,
-        "second part upload must succeed once the first write released its permit"
-    );
-}
-
 // -- post-validation cleanup on a rejected PUT ------------------------------
 
 /// Immutable-path-poisoning fix (`reject_upload_bad_content`): a
@@ -3095,7 +2880,6 @@ async fn upload_exact_size_mismatch_returns_400_and_deletes_created_object() {
         internal_token: None,
         http: reqwest::Client::new(),
         metrics: Arc::new(NoopMetrics),
-        part_upload_semaphore: test_part_upload_semaphore(),
         body_idle_timeout: None,
         callback_retry_budget: Duration::from_secs(10),
     };
@@ -3383,6 +3167,141 @@ async fn upload_multipart_part_offset_object_oversized_returns_413_and_leaves_no
     );
 }
 
+/// Route-level counterpart to the unit-tested
+/// `write_multipart_part_native_undersized_returns_400`, at the *oversized*
+/// end: a `multipart_native` backend part write must answer `413` when the
+/// streamed body exceeds the token's declared `size` claim -- exactly like
+/// the offset-object path above, but enforced by `part_size_guard`
+/// (`sidecar.rs`) on the sidecar's own side of the call, since the streaming
+/// backend contract (`upload_part_stream`) takes an exact declared length up
+/// front, not a flexible ceiling the backend itself can reject mid-stream.
+#[tokio::test]
+async fn upload_multipart_part_native_oversized_returns_413() {
+    let backend = Arc::new(InMemoryBackend::new("mem"));
+    let backends =
+        BackendRegistry::new(vec![Arc::clone(&backend) as Arc<dyn StorageBackend>], "mem")
+            .expect("build test backend registry");
+    let issuer = Issuer::generate(60).expect("issuer generation");
+    let mut state = test_state();
+    state.verifier = Arc::new(issuer.verifier());
+    state.backends = backends;
+
+    let file_id = Uuid::now_v7();
+    let version_id = Uuid::now_v7();
+    let upload_id = Uuid::now_v7();
+    let backend_path = format!("/{file_id}/{version_id}");
+    let backend_handle = backend
+        .initiate_multipart(&backend_path)
+        .await
+        .expect("initiate native multipart session");
+    // Declared part size (10 bytes) is far smaller than the body actually
+    // sent below.
+    let token = multipart_part_token(
+        &issuer,
+        file_id,
+        version_id,
+        "mem",
+        &backend_path,
+        upload_id,
+        1,
+        0,
+        10,
+        &backend_handle,
+    );
+
+    let router = build_router(state, DEFAULT_MAX_BODY_BYTES);
+    let response = router
+        .oneshot(
+            Request::put(format!(
+                "/api/file-storage-data/v1/multipart/{file_id}/{version_id}/parts/1?fs-token={token}"
+            ))
+            .body(Body::from(Bytes::from_static(
+                b"this part body is far longer than the declared size claim",
+            )))
+            .expect("valid request"),
+        )
+        .await
+        .expect("router call succeeds");
+
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+/// Route-level counterpart to
+/// `upload_body_idle_timeout_returns_408_and_publishes_nothing`, for the
+/// `multipart_native` write path: a part body that stalls past
+/// `FS_SIDECAR_BODY_IDLE_TIMEOUT_SECS` must answer `408`, proving
+/// `write_multipart_part_native`'s streaming rewrite still honours the idle
+/// guard exactly like the (removed) whole-part-buffering version did.
+///
+/// `start_paused = true` for the same reason as the single-part counterpart:
+/// the 50ms idle timeout and the second chunk's 2s stall are both
+/// `tokio::time`, so virtual time resolves this without a real wait.
+#[tokio::test(start_paused = true)]
+async fn upload_multipart_part_native_idle_timeout_returns_408() {
+    let backend = Arc::new(InMemoryBackend::new("mem"));
+    let backends =
+        BackendRegistry::new(vec![Arc::clone(&backend) as Arc<dyn StorageBackend>], "mem")
+            .expect("build test backend registry");
+    let issuer = Issuer::generate(60).expect("issuer generation");
+    let mut state = test_state();
+    state.verifier = Arc::new(issuer.verifier());
+    state.backends = backends;
+    state.body_idle_timeout = Some(Duration::from_millis(50));
+
+    let file_id = Uuid::now_v7();
+    let version_id = Uuid::now_v7();
+    let upload_id = Uuid::now_v7();
+    let backend_path = format!("/{file_id}/{version_id}");
+    let backend_handle = backend
+        .initiate_multipart(&backend_path)
+        .await
+        .expect("initiate native multipart session");
+    // Declared size is larger than what the stream ever delivers -- the idle
+    // timeout must fire well before an undersized-part rejection would.
+    let token = multipart_part_token(
+        &issuer,
+        file_id,
+        version_id,
+        "mem",
+        &backend_path,
+        upload_id,
+        1,
+        0,
+        1024,
+        &backend_handle,
+    );
+
+    // Yields one chunk immediately, then goes silent well past the 50ms
+    // idle timeout configured above.
+    let body_stream = futures::stream::unfold(0u8, |i| async move {
+        match i {
+            0 => Some((
+                Ok::<_, std::io::Error>(Bytes::from_static(b"first-chunk")),
+                1,
+            )),
+            1 => {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                Some((Ok(Bytes::from_static(b"never-sent")), 2))
+            }
+            _ => None,
+        }
+    });
+
+    let router = build_router(state, DEFAULT_MAX_BODY_BYTES);
+    let response = router
+        .oneshot(
+            Request::put(format!(
+                "/api/file-storage-data/v1/multipart/{file_id}/{version_id}/parts/1?fs-token={token}"
+            ))
+            .body(Body::from_stream(body_stream))
+            .expect("valid request"),
+        )
+        .await
+        .expect("router call succeeds");
+
+    assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+}
+
 // ── observable metrics + download Content-Length (T12) ─────────────────────
 
 /// Test double for `FileStorageMetricsPort` with observable state -- unlike
@@ -3446,10 +3365,7 @@ async fn download_range_content_length_matches_actual_body_length() {
     let version_id = Uuid::now_v7();
     let path = format!("/{file_id}/{version_id}");
     let content = b"range download body used to check Content-Length exactly";
-    backend
-        .put(&path, Bytes::from_static(content))
-        .await
-        .expect("seed blob");
+    write_all(backend.as_ref(), &path, Bytes::from_static(content)).await;
     let token = download_token(&issuer, file_id, version_id, &path);
 
     let router = build_router(state, DEFAULT_MAX_BODY_BYTES);
@@ -3499,10 +3415,7 @@ async fn download_whole_get_records_egress_bytes_equal_to_body_length() {
     let version_id = Uuid::now_v7();
     let path = format!("/{file_id}/{version_id}");
     let content = b"whole-object body used to check the egress metric";
-    backend
-        .put(&path, Bytes::from_static(content))
-        .await
-        .expect("seed blob");
+    write_all(backend.as_ref(), &path, Bytes::from_static(content)).await;
     let token = download_token(&issuer, file_id, version_id, &path);
 
     let router = build_router(state, DEFAULT_MAX_BODY_BYTES);
@@ -3548,10 +3461,7 @@ async fn download_range_get_records_egress_bytes_equal_to_range_length() {
     let version_id = Uuid::now_v7();
     let path = format!("/{file_id}/{version_id}");
     let content = b"range body used to check the egress metric records only the span";
-    backend
-        .put(&path, Bytes::from_static(content))
-        .await
-        .expect("seed blob");
+    write_all(backend.as_ref(), &path, Bytes::from_static(content)).await;
     let token = download_token(&issuer, file_id, version_id, &path);
 
     let router = build_router(state, DEFAULT_MAX_BODY_BYTES);
@@ -3593,13 +3503,12 @@ async fn download_head_records_zero_egress_bytes() {
     let file_id = Uuid::now_v7();
     let version_id = Uuid::now_v7();
     let path = format!("/{file_id}/{version_id}");
-    backend
-        .put(
-            &path,
-            Bytes::from_static(b"content that HEAD must never account as egress"),
-        )
-        .await
-        .expect("seed blob");
+    write_all(
+        backend.as_ref(),
+        &path,
+        Bytes::from_static(b"content that HEAD must never account as egress"),
+    )
+    .await;
     let token = download_token(&issuer, file_id, version_id, &path);
 
     let router = build_router(state, DEFAULT_MAX_BODY_BYTES);

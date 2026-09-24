@@ -38,7 +38,6 @@ use file_storage::api::rest::handlers;
 use file_storage::domain::audit::{AuditEntry, FileEvent};
 use file_storage::domain::authz::{Authorizer, TenantOnlyAuthorizer, actions};
 use file_storage::domain::cleanup::{CleanupConfig, CleanupEngine};
-use file_storage::domain::data_plane::DataPlaneService;
 use file_storage::domain::error::DomainError;
 use file_storage::domain::multipart::{
     DEFAULT_MIN_PART_SIZE, MultipartCompleteOutcome, MultipartUploadSession, MultipartUploadState,
@@ -50,9 +49,10 @@ use file_storage::domain::policy::{
     StoredPolicy, StoredRetentionRule,
 };
 use file_storage::domain::policy_service::PolicyService;
-use file_storage::domain::ports::{CleanupStore, DataPlanePort, MultipartStore, PolicyStore};
+use file_storage::domain::ports::{CleanupStore, MultipartStore, PolicyStore};
 use file_storage::domain::service::{FileService, ServiceConfig};
 use file_storage::infra::backend::{BackendRegistry, InMemoryBackend, StorageBackend};
+use file_storage::infra::content::{hash, mime};
 use file_storage::infra::signed_url::Issuer;
 use file_storage::infra::storage::Store;
 use file_storage::infra::storage::migrations::Migrator;
@@ -60,6 +60,61 @@ use file_storage_sdk::{CustomMetadataEntry, File, FileVersion, NewFile, OwnerKin
 
 const GTS: &str = gts_id!("cf.fstorage.file.type.v1~x.domain_coverage_test.file.type.v1~");
 const BASE: &str = "/api/file-storage/v1";
+
+/// Direct byte-path test double for what `DataPlaneService` used to provide
+/// (removed: production never constructed it — the sidecar is the only real
+/// byte path). Same steps `DataPlaneService::put_content` used to perform,
+/// but through `put_stream` rather than the whole-object `put` that no
+/// longer exists on `StorageBackend`.
+struct TestDataPlane {
+    svc: Arc<FileService>,
+    store: Store,
+    backends: BackendRegistry,
+}
+
+impl TestDataPlane {
+    fn new(svc: Arc<FileService>, store: Store, backends: BackendRegistry) -> Self {
+        Self {
+            svc,
+            store,
+            backends,
+        }
+    }
+
+    async fn put_content(
+        &self,
+        ctx: &SecurityContext,
+        file_id: Uuid,
+        version_id: Uuid,
+        declared_mime: &str,
+        bytes: Bytes,
+    ) -> Result<(), DomainError> {
+        mime::validate(declared_mime, &bytes)?;
+        self.svc.authorize_write(ctx, file_id).await?;
+        let version = self
+            .store
+            .get_version(file_id, version_id)
+            .await?
+            .ok_or_else(|| DomainError::version_not_found(file_id, version_id))?;
+        let backend = self.backends.get(&version.backend_id)?;
+        let len = bytes.len() as u64;
+        let digest = hash::sha256(&bytes);
+        let stream: futures::stream::BoxStream<'static, std::io::Result<Bytes>> =
+            Box::pin(futures::stream::once(async move { Ok(bytes) }));
+        backend
+            .put_stream(&version.backend_path, stream, Some(len))
+            .await?;
+        self.svc
+            .finalize_upload(
+                ctx,
+                file_id,
+                version_id,
+                i64::try_from(len).unwrap_or(i64::MAX),
+                digest,
+            )
+            .await
+    }
+}
 
 // ── shared test harness helpers ─────────────────────────────────────────────
 
@@ -1863,15 +1918,15 @@ async fn list_versions_endpoint_batches_manifest_lookup_and_serializes_versions(
     let authorizer: Arc<dyn Authorizer> = Arc::new(TenantOnlyAuthorizer);
     let store = Store::new(Arc::clone(&db));
     let svc = Arc::new(FileService::new(
-        store,
-        backends,
+        store.clone(),
+        backends.clone(),
         issuer,
         authorizer,
         base_config(),
         None,
         None,
     ));
-    let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
+    let dp = TestDataPlane::new(Arc::clone(&svc), store, backends);
 
     let tenant = Uuid::now_v7();
     let owner = Uuid::now_v7();
@@ -1942,15 +1997,15 @@ async fn list_versions_endpoint_returns_full_page_for_whole_sha256_versions() {
     let authorizer: Arc<dyn Authorizer> = Arc::new(TenantOnlyAuthorizer);
     let store = Store::new(Arc::clone(&db));
     let svc = Arc::new(FileService::new(
-        store,
-        backends,
+        store.clone(),
+        backends.clone(),
         issuer,
         authorizer,
         base_config(),
         None,
         None,
     ));
-    let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
+    let dp = TestDataPlane::new(Arc::clone(&svc), store, backends);
 
     let tenant = Uuid::now_v7();
     let owner = Uuid::now_v7();
@@ -2105,16 +2160,20 @@ async fn list_versions_endpoint_returns_composite_version_with_manifest() {
             usize::try_from(part.size)
                 .expect("part size fits usize")
         ]);
+        let len = data.len() as u64;
+        let stream: futures::stream::BoxStream<'static, std::io::Result<Bytes>> =
+            Box::pin(futures::stream::once(async move { Ok(data) }));
         let (backend_etag, part_hash) = backend
-            .upload_part(
+            .upload_part_stream(
                 &backend_path,
                 &session.backend_upload_handle,
                 part.part_number,
                 part.offset,
-                data,
+                stream,
+                len,
             )
             .await
-            .expect("backend upload_part");
+            .expect("backend upload_part_stream");
         multipart_store
             .upsert_multipart_part(
                 plan.upload_id,

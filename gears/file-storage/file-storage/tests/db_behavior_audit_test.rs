@@ -63,12 +63,45 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use common::query_recorder::QueryKind;
-use file_storage::domain::data_plane::DataPlaneService;
 use file_storage::domain::error::DomainError;
-use file_storage::domain::ports::DataPlanePort;
+use file_storage::domain::service::FileService;
 use file_storage::infra::backend::{LocalFsBackend, StorageBackend};
 use file_storage_sdk::CustomMetadataPatch;
 use uuid::Uuid;
+
+/// Direct byte-path test double for what `DataPlaneService::put_content`
+/// used to provide (removed: production never constructed it — the sidecar
+/// is the only real byte path). Writes straight to `backend` at the
+/// deterministic `/{file_id}/{version_id}` path (`storage_layout`'s
+/// convention — every harness here only ever configures one default
+/// backend, so there is no registry lookup to make), then finalizes exactly
+/// like the removed service did.
+async fn put_content(
+    svc: &FileService,
+    backend: &Arc<dyn StorageBackend>,
+    ctx: &toolkit_security::SecurityContext,
+    file_id: Uuid,
+    version_id: Uuid,
+    declared_mime: &str,
+    bytes: Bytes,
+) -> Result<(), DomainError> {
+    file_storage::infra::content::mime::validate(declared_mime, &bytes)?;
+    svc.authorize_write(ctx, file_id).await?;
+    let backend_path = format!("/{file_id}/{version_id}");
+    let len = bytes.len() as u64;
+    let digest = file_storage::infra::content::hash::sha256(&bytes);
+    let stream: futures::stream::BoxStream<'static, std::io::Result<Bytes>> =
+        Box::pin(futures::stream::once(async move { Ok(bytes) }));
+    backend.put_stream(&backend_path, stream, Some(len)).await?;
+    svc.finalize_upload(
+        ctx,
+        file_id,
+        version_id,
+        i64::try_from(len).unwrap_or(i64::MAX),
+        digest,
+    )
+    .await
+}
 
 // =========================================================================
 // Section 1 -- dynamic trace snapshots + writes-in-tx assertions
@@ -98,8 +131,8 @@ async fn trace_create_file() {
 #[tokio::test]
 async fn trace_full_upload_finalize_and_bind() {
     let (db, rec) = common::test_db_with_recorder().await;
-    let (svc, _msvc) = common::make_services(&db);
-    let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
+    let s = common::make_services_full(&db);
+    let svc = &s.svc;
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
@@ -109,7 +142,9 @@ async fn trace_full_upload_finalize_and_bind() {
         .expect("create_file");
 
     rec.clear();
-    dp.put_content(
+    put_content(
+        svc,
+        &s.backend,
         &ctx,
         ticket.file_id,
         ticket.version_id,
@@ -508,7 +543,6 @@ async fn multipart_complete_auto_bind_no_if_match_cas_now_requires_content_id_is
     let (svc, msvc) = (s.svc.clone(), s.msvc.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
-    let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
 
     // First, bind some content via the ordinary single-part path so
     // file.content_id is non-NULL going into the multipart complete below.
@@ -516,7 +550,9 @@ async fn multipart_complete_auto_bind_no_if_match_cas_now_requires_content_id_is
         .create_file(&ctx, common::new_file(), None, false)
         .await
         .expect("create_file");
-    dp.put_content(
+    put_content(
+        &svc,
+        &s.backend,
         &ctx,
         ticket.file_id,
         ticket.version_id,
@@ -606,13 +642,14 @@ async fn negative_control_multipart_complete_auto_bind_with_if_match_still_binds
     let (svc, msvc) = (s.svc.clone(), s.msvc.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
-    let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
 
     let ticket = svc
         .create_file(&ctx, common::new_file(), None, false)
         .await
         .expect("create_file");
-    dp.put_content(
+    put_content(
+        &svc,
+        &s.backend,
         &ctx,
         ticket.file_id,
         ticket.version_id,

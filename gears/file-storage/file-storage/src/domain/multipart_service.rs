@@ -49,7 +49,6 @@ use crate::infra::content::mime::{
 use crate::infra::external_clients::{QuotaClient, QuotaDecision, UsageDelta, UsageReporter};
 use crate::infra::metrics::NoopMetrics;
 use crate::infra::signed_url::{Claims, Issuer, MultipartClaims, Op, UploadConstraints};
-use file_storage_sdk::ByteRange;
 
 /// Quota metric name (duplicated from service.rs; both refer to the same
 /// platform metric — no abstraction needed here).
@@ -1296,10 +1295,7 @@ impl MultipartService {
                 // If the object is really there, derive the same
                 // (manifest, root) locally from the persisted part rows —
                 // deterministic, byte-identical to what the backend built.
-                let object_exists = backend
-                    .get_range(&backend_path, ByteRange::Inclusive { start: 0, end: 0 })
-                    .await
-                    .is_ok();
+                let object_exists = backend.stat(&backend_path).await.ok().flatten().is_some();
                 if !object_exists {
                     return Err(assemble_err);
                 }
@@ -1364,13 +1360,11 @@ impl MultipartService {
             Vec::new()
         } else {
             let sniff_len = u64::try_from(MIME_SNIFF_PREFIX_BYTES).unwrap_or(u64::MAX);
-            let end = sniff_len
-                .saturating_sub(1)
-                .min(total_size.cast_unsigned().saturating_sub(1));
             backend
-                .get_range(&backend_path, ByteRange::Inclusive { start: 0, end })
+                .read_prefix(&backend_path, sniff_len)
                 .await?
-                .to_vec()
+                .map(|b| b.to_vec())
+                .unwrap_or_default()
         };
         // On mismatch this fails **before** any DB finalize -- the assembled
         // blob at `backend_path` becomes an orphan reclaimed by the

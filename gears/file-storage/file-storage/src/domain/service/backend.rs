@@ -1,4 +1,4 @@
-//! Backend migration, backend discovery, and `DataPlanePort` implementation.
+//! Backend migration and backend discovery.
 
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
@@ -6,12 +6,11 @@ use uuid::Uuid;
 use crate::domain::audit::AuditOperation;
 use crate::domain::authz::actions;
 use crate::domain::error::DomainError;
-use crate::domain::ports::DataPlanePort;
 use crate::domain::service::FileService;
 use crate::domain::storage_layout;
 use crate::infra::backend::BackendCapabilities;
-use crate::infra::backend::BackendRegistry;
-use crate::infra::storage::Store;
+use crate::infra::content::hash_mode::{HashMode, Manifest};
+use crate::infra::content::stream_verify;
 
 // ── backend migration (P2-M4) ──────────────────────────────────────────────────
 
@@ -22,12 +21,15 @@ impl FileService {
     ///
     /// Steps:
     /// 1. Verify the file has exactly 1 version (non-versioned files only).
-    /// 2. Read the blob from the source backend.
-    /// 3. Write the blob to the destination backend at the canonical path.
-    /// 4. Verify the content hash matches the stored version hash (SHA-256).
-    /// 5. Transactionally update `backend_id` + `backend_path` and emit a
+    /// 2. Stream the blob from the source backend into the destination
+    ///    backend at the canonical path, verifying its content hash (SHA-256,
+    ///    mode-aware per ADR-0006) incrementally on the same pass.
+    /// 3. If verification fails (or the source stream breaks mid-read), fail
+    ///    without committing the CAS below, and best-effort delete the
+    ///    destination object if this call is the one that created it.
+    /// 4. Transactionally update `backend_id` + `backend_path` and emit a
     ///    `BackendMigrate` audit row.
-    /// 6. Best-effort delete the source blob (orphan cleanup if this fails).
+    /// 5. Best-effort delete the source blob (orphan cleanup if this fails).
     ///
     /// Returns `Ok(())` when the file already lives on the target backend
     /// (no-op), or after the migration completes successfully.
@@ -82,43 +84,93 @@ impl FileService {
                 .await?;
         }
 
-        // Read the blob from the source backend.
-        let bytes = source.get(&version.backend_path).await?;
-
-        // Verify content hash before writing to destination — mode-aware
-        // (ADR-0006). For `whole-sha256` this is the unchanged whole-object
-        // re-hash. For `multipart-composite-sha256` it fetches the version's
-        // `version_hash_manifest` row and verifies from the object bytes +
-        // that manifest ALONE (split-rehash-rebuild-compare), with no
-        // dependency on `multipart_upload_parts` still existing — the manifest
-        // is the durable, self-contained record.
-        // Hash computation stays in `Store` (which already owns the SHA-256
-        // allow-list import), so `FileService` needs no direct `hash` edge.
-        let hash_mode = crate::infra::content::hash_mode::HashMode::parse(&version.hash_mode)
-            .ok_or_else(|| {
-                DomainError::database(format!(
-                    "version {} has an unrecognized hash_mode {:?}",
-                    version.version_id, version.hash_mode
-                ))
-            })?;
+        // Stream the blob from the source backend straight into the
+        // destination, verifying its content hash incrementally on the same
+        // pass (mode-aware, ADR-0006) instead of materializing the whole
+        // object in memory. For `whole-sha256` this hashes the object as it
+        // streams through. For `multipart-composite-sha256` it fetches the
+        // version's `version_hash_manifest` row up front and hashes each part
+        // against that manifest ALONE (split-rehash-rebuild-compare) as the
+        // corresponding bytes stream past, with no dependency on
+        // `multipart_upload_parts` still existing — the manifest is the
+        // durable, self-contained record. Either way, the verdict is only
+        // known once the destination write below has fully drained the
+        // stream — see `infra::content::stream_verify`'s doc comment.
+        let expected_len = u64::try_from(version.size).unwrap_or(0);
+        let hash_mode = HashMode::parse(&version.hash_mode).ok_or_else(|| {
+            DomainError::database(format!(
+                "version {} has an unrecognized hash_mode {:?}",
+                version.version_id, version.hash_mode
+            ))
+        })?;
         let manifest = match hash_mode {
-            crate::infra::content::hash_mode::HashMode::WholeSha256 => None,
-            crate::infra::content::hash_mode::HashMode::MultipartCompositeSha256 => {
-                Some(self.store.get_version_manifest(version.version_id).await?.ok_or_else(
-                    || {
+            HashMode::WholeSha256 => None,
+            HashMode::MultipartCompositeSha256 => {
+                let raw = self
+                    .store
+                    .get_version_manifest(version.version_id)
+                    .await?
+                    .ok_or_else(|| {
                         DomainError::database(format!(
                             "multipart-composite version {} is missing its version_hash_manifest row",
                             version.version_id
                         ))
-                    },
-                )?)
+                    })?;
+                Some(Manifest::from_wire_string(&raw)?)
             }
         };
-        Store::verify_content_hash(&bytes, hash_mode, &version.hash_value, manifest.as_deref())?;
 
-        // Write to the destination at the canonical path.
+        let source_stream = source
+            .get_stream(&version.backend_path, expected_len)
+            .await?;
+        let (verified_stream, verify_slot) = stream_verify::verify_stream(
+            source_stream,
+            expected_len,
+            hash_mode,
+            version.hash_value.clone(),
+            manifest,
+        )?;
+
+        // Write to the destination at the canonical path. Create-exclusive
+        // (`publish_exclusive`, not `put_stream`): `dest_path` is
+        // deterministic (`/{file_id}/{version_id}`), so two concurrent
+        // migrations to the SAME target both attempt to write here — with a
+        // plain overwriting write the second writer to land always wins
+        // physically, which only stays harmless as long as both writers'
+        // content is identical. `publish_exclusive` keeps that true even when
+        // it might not otherwise be: once the first writer's (verified, or
+        // about to be verified) bytes are in place, a second writer whose own
+        // read from the source turned out corrupted can never clobber them —
+        // it observes `created: false` and its own bytes are simply
+        // discarded. `created` below is what decides whether a failed
+        // verification may delete the object this call just wrote (see
+        // `features/backend-migration.md`).
         let dest_path = storage_layout::backend_path(file_id, version.version_id);
-        dest.put(&dest_path, bytes).await?;
+        let outcome = dest
+            .publish_exclusive(&dest_path, verified_stream, Some(expected_len))
+            .await?;
+
+        let verify_result = verify_slot
+            .lock()
+            .map_err(|_| DomainError::backend(dest.id(), "poisoned content-verification lock"))?
+            .take()
+            .unwrap_or_else(|| {
+                Err(DomainError::backend(
+                    dest.id(),
+                    "destination write completed without fully draining the verified source stream",
+                ))
+            });
+        if let Err(verify_err) = verify_result {
+            // Only clean up the destination if THIS call actually created the
+            // object there: `created: false` means something else (a
+            // concurrent migration, or an earlier attempt) already put
+            // verified content at this exact path, and it is not this call's
+            // to delete.
+            if outcome.created {
+                self.best_effort_blob_delete(dest.id(), &dest_path).await;
+            }
+            return Err(verify_err);
+        }
 
         // Transactionally update the version row and emit the audit row. The
         // CAS predicate is the pre-migration snapshot captured above (before
@@ -206,41 +258,5 @@ impl FileService {
     pub fn get_backend(&self, id: &str) -> Result<(String, BackendCapabilities), DomainError> {
         let b = self.backends.get(id)?;
         Ok((b.id().to_owned(), b.capabilities()))
-    }
-}
-
-// ── DataPlanePort implementation ──────────────────────────────────────────────
-
-#[async_trait::async_trait]
-impl DataPlanePort for FileService {
-    fn backends(&self) -> &BackendRegistry {
-        &self.backends
-    }
-
-    async fn authorize_write(
-        &self,
-        ctx: &SecurityContext,
-        file_id: Uuid,
-    ) -> Result<(), DomainError> {
-        FileService::authorize_write(self, ctx, file_id).await
-    }
-
-    async fn get_version(
-        &self,
-        file_id: Uuid,
-        version_id: Uuid,
-    ) -> Result<Option<file_storage_sdk::FileVersion>, DomainError> {
-        FileService::get_version(self, file_id, version_id).await
-    }
-
-    async fn finalize_upload(
-        &self,
-        ctx: &SecurityContext,
-        file_id: Uuid,
-        version_id: Uuid,
-        size: i64,
-        hash_value: Vec<u8>,
-    ) -> Result<(), DomainError> {
-        FileService::finalize_upload(self, ctx, file_id, version_id, size, hash_value).await
     }
 }

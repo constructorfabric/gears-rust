@@ -7,8 +7,9 @@
 //!
 //!   1. Getting the plan from `initiate_multipart_upload`.
 //!   2. Fetching the backend upload handle from the session row.
-//!   3. Writing part bytes via `backend.upload_part(path, handle, n, data)` —
-//!      the path a production sidecar would take for a `multipart_native` backend.
+//!   3. Writing part bytes via `backend.upload_part_stream(path, handle, n,
+//!      stream, len)` — the path a production sidecar would take for a
+//!      `multipart_native` backend.
 //!   4. Persisting the part row via `MultipartStore::upsert_multipart_part`
 //!      (simulating the sidecar's SDK callback to the control plane).
 //!   5. Calling `complete_multipart_upload`.
@@ -29,14 +30,13 @@ use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use file_storage::domain::authz::TenantOnlyAuthorizer;
-use file_storage::domain::data_plane::DataPlaneService;
 use file_storage::domain::error::DomainError;
 use file_storage::domain::idempotency::compute_request_hash;
 use file_storage::domain::multipart::{MultipartPlan, MultipartUploadState};
 use file_storage::domain::multipart_service::MultipartService;
 use file_storage::domain::policy::{PolicyBody, PolicyScope, SizeLimits};
 use file_storage::domain::policy_service::PolicyService;
-use file_storage::domain::ports::{DataPlanePort, MultipartStore, PolicyStore};
+use file_storage::domain::ports::{MultipartStore, PolicyStore};
 use file_storage::domain::service::{FileService, ServiceConfig};
 use file_storage::infra::backend::{
     BackendCapabilities, BackendRegistry, InMemoryBackend, LocalFsBackend, MultipartCompletionPart,
@@ -44,12 +44,112 @@ use file_storage::infra::backend::{
 };
 use file_storage::infra::content::hash;
 use file_storage::infra::content::hash_mode::{HashMode, Manifest};
+use file_storage::infra::content::mime;
 use file_storage::infra::signed_url::Issuer;
 use file_storage::infra::storage::Store;
 use file_storage::infra::storage::migrations::Migrator;
 use file_storage_sdk::{ByteRange, CustomMetadataEntry, NewFile, OwnerKind};
 
 const GTS: &str = gts_id!("cf.fstorage.file.type.v1~x.test.file.type.v1~");
+
+/// Direct byte-path test double for what `DataPlaneService` used to provide
+/// (removed: production never constructed it — the sidecar is the only real
+/// byte path). Same steps `DataPlaneService::put_content`/`read_content`
+/// used to perform, but through `put_stream`/`get_stream` rather than the
+/// whole-object `put`/`get` that no longer exist on `StorageBackend`. This
+/// file only ever drives byte content through the real multipart/native
+/// backend paths, and reads it back via `read_content` (`svc`/`put_content`
+/// stay unused here but are kept for parity with every other test file's
+/// copy of this same double).
+#[allow(dead_code)]
+struct TestDataPlane {
+    svc: Arc<FileService>,
+    store: Store,
+    backends: BackendRegistry,
+}
+
+#[allow(dead_code)]
+impl TestDataPlane {
+    fn new(svc: Arc<FileService>, store: Store, backends: BackendRegistry) -> Self {
+        Self {
+            svc,
+            store,
+            backends,
+        }
+    }
+
+    async fn put_content(
+        &self,
+        ctx: &SecurityContext,
+        file_id: Uuid,
+        version_id: Uuid,
+        declared_mime: &str,
+        bytes: Bytes,
+    ) -> Result<(), DomainError> {
+        mime::validate(declared_mime, &bytes)?;
+        self.svc.authorize_write(ctx, file_id).await?;
+        let version = self
+            .store
+            .get_version(file_id, version_id)
+            .await?
+            .ok_or_else(|| DomainError::version_not_found(file_id, version_id))?;
+        let backend = self.backends.get(&version.backend_id)?;
+        let len = bytes.len() as u64;
+        let digest = hash::sha256(&bytes);
+        let stream: futures::stream::BoxStream<'static, std::io::Result<Bytes>> =
+            Box::pin(futures::stream::once(async move { Ok(bytes) }));
+        backend
+            .put_stream(&version.backend_path, stream, Some(len))
+            .await?;
+        self.svc
+            .finalize_upload(
+                ctx,
+                file_id,
+                version_id,
+                i64::try_from(len).unwrap_or(i64::MAX),
+                digest,
+            )
+            .await
+    }
+
+    async fn read_content(
+        &self,
+        _ctx: &SecurityContext,
+        file_id: Uuid,
+        version_id: Uuid,
+        range: Option<ByteRange>,
+    ) -> Result<Bytes, DomainError> {
+        use futures::StreamExt;
+
+        let version = self
+            .store
+            .get_version(file_id, version_id)
+            .await?
+            .ok_or_else(|| DomainError::version_not_found(file_id, version_id))?;
+        let backend = self.backends.get(&version.backend_id)?;
+        let total = u64::try_from(version.size).unwrap_or(0);
+
+        let mut stream = match range {
+            Some(r) => {
+                let (start, end) = r
+                    .resolve(total)
+                    .ok_or_else(|| DomainError::validation("range", "unsatisfiable byte range"))?;
+                let len = end - start + 1;
+                backend
+                    .get_range_stream(&version.backend_path, r, len)
+                    .await?
+            }
+            None => backend.get_stream(&version.backend_path, total).await?,
+        };
+
+        let mut buf = bytes::BytesMut::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| DomainError::backend(backend.id(), e.to_string()))?;
+            buf.extend_from_slice(&chunk);
+        }
+        Ok(buf.freeze())
+    }
+}
 
 /// Build a fresh migrated SQLite DB, returning both the pooled `DBProvider`
 /// (for the service under test) and the raw DSN (for the idempotency
@@ -81,7 +181,7 @@ async fn build_db() -> Arc<DBProvider<DbError>> {
 /// backends, and authorizer.
 async fn build_service_with_config(
     idempotency_ttl_secs: u64,
-) -> (Arc<FileService>, Arc<MultipartService>, DataPlaneService) {
+) -> (Arc<FileService>, Arc<MultipartService>, TestDataPlane) {
     let db = build_db().await;
     let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
     let backends = BackendRegistry::new(vec![backend], "mem").expect("registry");
@@ -105,6 +205,7 @@ async fn build_service_with_config(
         None,
         None,
     ));
+    let dp = TestDataPlane::new(Arc::clone(&svc), store.clone(), backends.clone());
     let msvc = Arc::new(MultipartService::new(
         Arc::new(store) as Arc<dyn MultipartStore>,
         backends,
@@ -114,11 +215,10 @@ async fn build_service_with_config(
         "http://sidecar.test".to_owned(),
         3600,
     ));
-    let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
     (svc, msvc, dp)
 }
 
-async fn build_service() -> (Arc<FileService>, Arc<MultipartService>, DataPlaneService) {
+async fn build_service() -> (Arc<FileService>, Arc<MultipartService>, TestDataPlane) {
     build_service_with_config(86400).await
 }
 
@@ -129,7 +229,7 @@ async fn build_service() -> (Arc<FileService>, Arc<MultipartService>, DataPlaneS
 async fn build_service_with_store() -> (
     Arc<FileService>,
     Arc<MultipartService>,
-    DataPlaneService,
+    TestDataPlane,
     Store,
 ) {
     let db = build_db().await;
@@ -155,6 +255,7 @@ async fn build_service_with_store() -> (
         None,
         None,
     ));
+    let dp = TestDataPlane::new(Arc::clone(&svc), store.clone(), backends.clone());
     let msvc = Arc::new(MultipartService::new(
         Arc::new(store.clone()) as Arc<dyn MultipartStore>,
         backends,
@@ -164,7 +265,6 @@ async fn build_service_with_store() -> (
         "http://sidecar.test".to_owned(),
         3600,
     ));
-    let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
     (svc, msvc, dp, store)
 }
 
@@ -266,7 +366,7 @@ async fn build_service_with_policy() -> (
     Arc<FileService>,
     Arc<MultipartService>,
     Arc<PolicyService>,
-    DataPlaneService,
+    TestDataPlane,
 ) {
     let db = build_db().await;
     let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
@@ -292,6 +392,7 @@ async fn build_service_with_policy() -> (
         None,
         None,
     ));
+    let dp = TestDataPlane::new(Arc::clone(&svc), store.clone(), backends.clone());
     let msvc = Arc::new(MultipartService::new(
         Arc::new(store) as Arc<dyn MultipartStore>,
         backends,
@@ -301,7 +402,6 @@ async fn build_service_with_policy() -> (
         "http://sidecar.test".to_owned(),
         3600,
     ));
-    let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
     let psvc = Arc::new(PolicyService::new(policy_store, authorizer));
     (svc, msvc, psvc, dp)
 }
@@ -325,11 +425,29 @@ fn new_file() -> NewFile {
     }
 }
 
+/// Box `data` into the one-shot `BoxStream` shape `upload_part_stream` now
+/// expects, alongside its exact length. Every call site in this file already
+/// builds its part bytes fully in memory (placeholder/filler content), so a
+/// one-shot `stream::once` is enough -- the streaming/chunking path itself is
+/// exercised directly in `s3_tests.rs`.
+fn one_shot_part_stream(
+    data: Bytes,
+) -> (
+    futures::stream::BoxStream<'static, std::io::Result<Bytes>>,
+    u64,
+) {
+    let len = data.len() as u64;
+    (
+        Box::pin(futures::stream::once(async move { Ok(data) })),
+        len,
+    )
+}
+
 /// Simulate the sidecar writing a part for a `multipart_native` backend.
 ///
 /// The production sidecar for a native-multipart backend calls:
-///   1. `backend.upload_part(path, handle, part_number, data)` — stores part
-///      bytes in the backend's native multipart state.
+///   1. `backend.upload_part_stream(path, handle, part_number, stream, len)` —
+///      stores part bytes in the backend's native multipart state.
 ///   2. `store.upsert_multipart_part(...)` — records the part row (ETag, hash,
 ///      size) in the control-plane DB so `complete` can assemble correctly.
 ///
@@ -358,12 +476,21 @@ async fn simulate_sidecar_put_part(
         part.size,
     );
 
-    // Upload through the backend's native multipart path (upload_part => keyed
-    // by the upload handle for later assembly in complete_multipart).
+    // Upload through the backend's native multipart path
+    // (upload_part_stream => keyed by the upload handle for later assembly
+    // in complete_multipart).
+    let (stream, len) = one_shot_part_stream(data);
     let (backend_etag, part_hash) = backend
-        .upload_part(backend_path, backend_handle, part_number, part.offset, data)
+        .upload_part_stream(
+            backend_path,
+            backend_handle,
+            part_number,
+            part.offset,
+            stream,
+            len,
+        )
         .await
-        .expect("backend upload_part");
+        .expect("backend upload_part_stream");
 
     let size = i64::try_from(part.size).unwrap();
     let now = time::OffsetDateTime::now_utc();
@@ -413,6 +540,7 @@ async fn multipart_happy_path_in_memory() {
         None,
         None,
     ));
+    let dp = TestDataPlane::new(Arc::clone(&svc), store.clone(), backends.clone());
     let msvc = Arc::new(MultipartService::new(
         Arc::clone(&multipart_store),
         backends,
@@ -422,7 +550,6 @@ async fn multipart_happy_path_in_memory() {
         "http://sidecar.test".to_owned(),
         3600,
     ));
-    let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
     let ctx = ctx(Uuid::now_v7());
 
     // Create the file (pending, no content yet).
@@ -2059,16 +2186,19 @@ async fn multipart_complete_uses_reported_parts_not_empty_list() {
         let size = i64::try_from(part.size).unwrap();
         expected_total += size;
 
+        let (stream, len) =
+            one_shot_part_stream(Bytes::from(vec![b'x'; usize::try_from(part.size).unwrap()]));
         backend
-            .upload_part(
+            .upload_part_stream(
                 &backend_path,
                 &session.backend_upload_handle,
                 part.part_number,
                 part.offset,
-                Bytes::from(vec![b'x'; usize::try_from(part.size).unwrap()]),
+                stream,
+                len,
             )
             .await
-            .expect("backend upload_part");
+            .expect("backend upload_part_stream");
 
         let body = serde_json::json!({
             "backend_etag": format!("etag-{}", part.part_number),
@@ -2552,11 +2682,21 @@ impl StorageBackend for CompleteCallCountingBackend {
     fn capabilities(&self) -> BackendCapabilities {
         self.inner.capabilities()
     }
-    async fn put(&self, path: &str, bytes: Bytes) -> Result<(), DomainError> {
-        self.inner.put(path, bytes).await
+    async fn put_stream(
+        &self,
+        path: &str,
+        stream: futures::stream::BoxStream<'_, std::io::Result<Bytes>>,
+        max_size: Option<u64>,
+    ) -> Result<(u64, [u8; 32]), DomainError> {
+        self.inner.put_stream(path, stream, max_size).await
     }
-    async fn get(&self, path: &str) -> Result<Bytes, DomainError> {
-        self.inner.get(path).await
+    async fn publish_exclusive(
+        &self,
+        path: &str,
+        stream: futures::stream::BoxStream<'_, std::io::Result<Bytes>>,
+        max_size: Option<u64>,
+    ) -> Result<file_storage::infra::backend::PublishOutcome, DomainError> {
+        self.inner.publish_exclusive(path, stream, max_size).await
     }
     async fn get_stream(
         &self,
@@ -2565,8 +2705,19 @@ impl StorageBackend for CompleteCallCountingBackend {
     ) -> Result<futures::stream::BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
         self.inner.get_stream(path, expected_len).await
     }
-    async fn get_range(&self, path: &str, range: ByteRange) -> Result<Bytes, DomainError> {
-        self.inner.get_range(path, range).await
+    async fn read_prefix(&self, path: &str, max_bytes: u64) -> Result<Option<Bytes>, DomainError> {
+        self.inner.read_prefix(path, max_bytes).await
+    }
+    async fn get_range_stream(
+        &self,
+        path: &str,
+        range: ByteRange,
+        expected_len: u64,
+    ) -> Result<futures::stream::BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
+        self.inner.get_range_stream(path, range, expected_len).await
+    }
+    async fn size(&self, path: &str) -> Result<u64, DomainError> {
+        self.inner.size(path).await
     }
     async fn delete(&self, path: &str) -> Result<(), DomainError> {
         self.inner.delete(path).await
@@ -2577,16 +2728,17 @@ impl StorageBackend for CompleteCallCountingBackend {
     async fn initiate_multipart(&self, path: &str) -> Result<String, DomainError> {
         self.inner.initiate_multipart(path).await
     }
-    async fn upload_part(
+    async fn upload_part_stream(
         &self,
         path: &str,
         upload_handle: &str,
         part_number: u32,
         part_offset: u64,
-        data: Bytes,
+        stream: futures::stream::BoxStream<'static, std::io::Result<Bytes>>,
+        len: u64,
     ) -> Result<(String, Vec<u8>), DomainError> {
         self.inner
-            .upload_part(path, upload_handle, part_number, part_offset, data)
+            .upload_part_stream(path, upload_handle, part_number, part_offset, stream, len)
             .await
     }
     async fn complete_multipart(
@@ -4403,14 +4555,9 @@ async fn abort_multipart_upload_uses_the_sessions_own_backend_when_version_is_al
     // accept another `upload_part` call; an aborted one reports "handle not
     // found". On the old (buggy) fallback, this call would have SUCCEEDED --
     // the abort would have silently no-op'd against "mem" instead.
+    let (stream, len) = one_shot_part_stream(Bytes::from_static(b"x"));
     let after_abort = alt_backend
-        .upload_part(
-            &backend_path,
-            &backend_handle,
-            1,
-            0,
-            Bytes::from_static(b"x"),
-        )
+        .upload_part_stream(&backend_path, &backend_handle, 1, 0, stream, len)
         .await;
     assert!(
         after_abort.is_err(),

@@ -57,36 +57,13 @@
 //!     unset expects. Must match the control plane's configured secret once it
 //!     flips `require_finalize_internal_secret` on (see the migration-path note
 //!     in `docs/ADR/0003-…-sidecar-data-plane.md`).
-//!   - `FS_SIDECAR_MAX_CONCURRENT_PART_UPLOADS` -- caps how many
-//!     `upload_multipart_part` requests against a `multipart_native` backend
-//!     (e.g. `S3Backend`) this sidecar processes at once (default `2`; must
-//!     be at least `1` -- `0` fails sidecar startup rather than silently
-//!     rejecting every part upload). Each such request buffers up to one
-//!     whole part (`write_multipart_part_native`, bounded by `MAX_PART_SIZE`,
-//!     currently 5 GiB, the same as `DEFAULT_MAX_BODY_BYTES`) in memory
-//!     before writing it, since S3's `UploadPart` needs the whole part up
-//!     front to sign and send. Without a cap on concurrent in-flight part
-//!     uploads, N simultaneous large parts from ordinary authorized traffic
-//!     (not an attack) can OOM the sidecar process; this bounds worst-case
-//!     buffered memory from this path to exactly `N * MAX_PART_SIZE` --
-//!     `2 * 5 GiB = 10 GiB` at the default -- so raising it is a direct,
-//!     linear tradeoff against the sidecar's available memory, not a knob to
-//!     turn without doing that arithmetic first. The non-native
-//!     (offset-object, e.g. `LocalFsBackend`) write path streams each part
-//!     straight to the backend without buffering it whole and is therefore
-//!     NOT gated by this limiter at all -- see `write_multipart_part`'s doc
-//!     comment. A request that cannot acquire a slot within
-//!     `PART_UPLOAD_ACQUIRE_TIMEOUT` (200ms) gets `503` with `Retry-After`
-//!     rather than queuing indefinitely -- see `upload_multipart_part`'s doc
-//!     comment. At startup, `main` checks this worst case
-//!     (`max_concurrent_part_uploads * MAX_PART_SIZE`) against a process
-//!     memory limit read from the cgroup filesystem (v2 `memory.max`, falling
-//!     back to v1 `memory.limit_in_bytes`): if a limit is known and the
-//!     configured worst case exceeds it, the sidecar refuses to start rather
-//!     than risk exactly the OOM this paragraph describes; if no limit can be
-//!     read (not Linux, or unbounded), it only logs a warning with the
-//!     computed worst case. See `check_part_buffer_budget`/
-//!     `read_cgroup_memory_limit_bytes`.
+//!   - `upload_multipart_part` against a `multipart_native` backend (e.g.
+//!     `S3Backend`) streams the part body straight through to the backend
+//!     (`write_multipart_part_native`) rather than buffering it in memory —
+//!     see that function's doc comment. There is deliberately no
+//!     concurrency limiter or cgroup memory-budget check on this path any
+//!     more: neither buffers a whole part, so neither has a worst-case
+//!     buffered-memory footprint to bound.
 //!   - `FS_SIDECAR_S3_BACKENDS` — an optional JSON array of
 //!     `file_storage::config::S3BackendConfig` entries, e.g. a single entry
 //!     `{"id":"s3-primary","endpoint":"http://127.0.0.1:9000","region":"us-east-1",
@@ -122,8 +99,8 @@
 //!    retry/replay decision table.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::Router;
@@ -142,7 +119,6 @@ use toolkit_utils::SecretString;
 use uuid::Uuid;
 
 use file_storage::domain::error::DomainError;
-use file_storage::domain::multipart::MAX_PART_SIZE;
 use file_storage::domain::ports::FileStorageMetricsPort;
 use file_storage::infra::backend::{BackendRegistry, LocalFsBackend, S3Backend, StorageBackend};
 use file_storage::infra::content::{hash, range};
@@ -179,18 +155,6 @@ struct SidecarState {
     /// middleware; this process is never proxied by it, so it owns its own
     /// `OTel` `Meter` instance.
     metrics: Arc<dyn FileStorageMetricsPort>,
-    /// Concurrency limiter for `upload_multipart_part` requests that take the
-    /// `multipart_native` write path, sized by
-    /// `FS_SIDECAR_MAX_CONCURRENT_PART_UPLOADS`. Lives on `SidecarState`
-    /// rather than as a process-wide `static` so that (a) `main()`'s
-    /// fail-fast-parsed configured value is never silently shadowed by a
-    /// lazily-initialized default racing ahead of it, and (b) two
-    /// independently configured `SidecarState`s (e.g. two routers under test,
-    /// or a future multi-listener deployment) can each carry their own limit
-    /// instead of sharing one process-global choke point. See
-    /// [`acquire_part_upload_slot`] for how a request acquires a permit from
-    /// this field.
-    part_upload_semaphore: Arc<tokio::sync::Semaphore>,
     /// Maximum pause allowed between two consecutive body chunks (and before
     /// the first one) on `upload`/`upload_multipart_part`, from
     /// `FS_SIDECAR_BODY_IDLE_TIMEOUT_SECS` (default 60s; `None` when set to
@@ -220,11 +184,6 @@ struct TokenQuery {
 /// this constant only bounds axum's blanket request-body floor (2 MiB default).
 const DEFAULT_MAX_BODY_BYTES: usize = 5_368_709_120;
 
-/// Default value for `FS_SIDECAR_MAX_CONCURRENT_PART_UPLOADS` -- see the
-/// module doc comment for the worst-case-memory arithmetic this default is
-/// chosen against.
-const DEFAULT_MAX_CONCURRENT_PART_UPLOADS: usize = 2;
-
 /// Parse an optional environment variable's raw value (already fetched by
 /// the caller, so this half is a pure function and unit-testable without
 /// touching real process env) as `T`, falling back to `default` when unset
@@ -243,70 +202,6 @@ where
             .parse::<T>()
             .map_err(|e| anyhow::anyhow!("invalid {name}={raw:?}: {e}")),
         None => Ok(default),
-    }
-}
-
-/// Cgroup v1's "no limit configured" sentinel for `memory.limit_in_bytes` is
-/// a page-aligned value near `i64::MAX` (commonly
-/// `9223372036854771712`) rather than a real ceiling -- several orders of
-/// magnitude above any real container memory limit (which tops out in the
-/// TiB range at most). A v1 reading at or above this threshold is treated
-/// the same as cgroup v2's explicit `"max"`: no usable limit.
-const CGROUP_V1_UNLIMITED_THRESHOLD: u64 = 1 << 62;
-
-/// Best-effort read of this process's memory limit from the cgroup
-/// filesystem: cgroup v2's `memory.max` first, falling back to cgroup v1's
-/// `memory.limit_in_bytes`. Returns `None` when no usable limit could be
-/// determined -- not Linux, neither file exists, or the file reports "no
-/// limit" (`"max"` on v2, or a reading at/above
-/// [`CGROUP_V1_UNLIMITED_THRESHOLD`] on v1) -- so the caller falls back to a
-/// warning instead of a hard startup failure; see
-/// [`check_part_buffer_budget`].
-fn read_cgroup_memory_limit_bytes() -> Option<u64> {
-    if let Ok(raw) = std::fs::read_to_string("/sys/fs/cgroup/memory.max") {
-        let raw = raw.trim();
-        return if raw == "max" {
-            None
-        } else {
-            raw.parse::<u64>().ok()
-        };
-    }
-    if let Ok(raw) = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes")
-        && let Ok(limit) = raw.trim().parse::<u64>()
-        && limit < CGROUP_V1_UNLIMITED_THRESHOLD
-    {
-        return Some(limit);
-    }
-    None
-}
-
-/// Checks the worst-case buffered memory footprint of native multipart part
-/// uploads (`max_concurrent * part_size` -- see the module doc comment on
-/// `FS_SIDECAR_MAX_CONCURRENT_PART_UPLOADS`) against a process memory limit,
-/// when one is known.
-///
-/// `limit: None` (no limit could be read, or the cgroup reports unlimited)
-/// never fails the check -- the caller logs a warning instead, since this is
-/// a best-effort guard, not an authoritative one (a limit enforced some
-/// other way, e.g. by an orchestrator watching RSS out-of-process, is
-/// invisible here). A pure function so the arithmetic is unit-testable
-/// without a real cgroup filesystem; [`read_cgroup_memory_limit_bytes`]
-/// handles the (untestable-in-CI) file reads.
-fn check_part_buffer_budget(
-    max_concurrent: usize,
-    part_size: u64,
-    limit: Option<u64>,
-) -> Result<(), String> {
-    let worst_case = (max_concurrent as u64).saturating_mul(part_size);
-    match limit {
-        Some(limit) if worst_case > limit => Err(format!(
-            "worst-case native multipart part-buffer memory ({worst_case} bytes = \
-             {max_concurrent} concurrent part(s) * {part_size} bytes) exceeds the detected \
-             process memory limit ({limit} bytes); lower FS_SIDECAR_MAX_CONCURRENT_PART_UPLOADS \
-             (currently {max_concurrent}) so that {max_concurrent} * {part_size} <= {limit}, or \
-             raise the container's memory limit"
-        )),
-        _ => Ok(()),
     }
 }
 
@@ -339,7 +234,6 @@ struct SidecarConfig {
     finalize_timeout_secs: u64,
     finalize_connect_timeout_secs: u64,
     body_idle_timeout: Option<Duration>,
-    max_concurrent_part_uploads: usize,
     internal_token: Option<String>,
 }
 
@@ -359,10 +253,6 @@ impl std::fmt::Debug for SidecarConfig {
                 &self.finalize_connect_timeout_secs,
             )
             .field("body_idle_timeout", &self.body_idle_timeout)
-            .field(
-                "max_concurrent_part_uploads",
-                &self.max_concurrent_part_uploads,
-            )
             .field("internal_token", &self.internal_token)
             .finish()
     }
@@ -377,9 +267,8 @@ impl std::fmt::Debug for SidecarConfig {
 ///
 /// Fails fast — mirroring each constituent parse's own contract — on a
 /// missing `FS_SIDECAR_PUBLIC_KEY`, a malformed key of either kind (bad
-/// base64, or the wrong decoded length), a
-/// `FS_SIDECAR_MAX_CONCURRENT_PART_UPLOADS` of `0`, or any other value that
-/// fails to parse.
+/// base64, or the wrong decoded length), or any other value that fails to
+/// parse.
 fn build_config(lookup: impl Fn(&str) -> Option<String>) -> anyhow::Result<SidecarConfig> {
     let addr: SocketAddr = lookup("FS_SIDECAR_ADDR")
         .unwrap_or_else(|| "0.0.0.0:8087".to_owned())
@@ -474,26 +363,6 @@ fn build_config(lookup: impl Fn(&str) -> Option<String>) -> anyhow::Result<Sidec
         Some(Duration::from_secs(body_idle_timeout_secs))
     };
 
-    // See the module doc comment and `DEFAULT_MAX_CONCURRENT_PART_UPLOADS` for
-    // the memory rationale and worst-case arithmetic. `0` is rejected
-    // explicitly below: `Semaphore::new(0)` would not panic, but it would
-    // silently turn every `multipart_native` part-upload request into an
-    // unconditional `503` -- a configuration mistake, not a legitimate
-    // "disable part uploads" knob, so it must fail sidecar startup instead of
-    // failing quietly at request time.
-    let max_concurrent_part_uploads: usize = parse_optional(
-        "FS_SIDECAR_MAX_CONCURRENT_PART_UPLOADS",
-        lookup("FS_SIDECAR_MAX_CONCURRENT_PART_UPLOADS"),
-        DEFAULT_MAX_CONCURRENT_PART_UPLOADS,
-    )?;
-    if max_concurrent_part_uploads == 0 {
-        return Err(anyhow::anyhow!(
-            "FS_SIDECAR_MAX_CONCURRENT_PART_UPLOADS=0 would reject every multipart part \
-             upload with 503; unset it to use the default of \
-             {DEFAULT_MAX_CONCURRENT_PART_UPLOADS} or set it to a value >= 1"
-        ));
-    }
-
     // Attached as `x-fs-internal-token` on both callbacks below. Unset/empty
     // = not sent.
     let internal_token = lookup("FS_SIDECAR_INTERNAL_TOKEN").filter(|s| !s.is_empty());
@@ -509,7 +378,6 @@ fn build_config(lookup: impl Fn(&str) -> Option<String>) -> anyhow::Result<Sidec
         finalize_timeout_secs,
         finalize_connect_timeout_secs,
         body_idle_timeout,
-        max_concurrent_part_uploads,
         internal_token,
     })
 }
@@ -540,42 +408,6 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!(
             control_base_url = %config.control_base_url,
             "sidecar finalize callback enabled"
-        );
-    }
-
-    // Worst-case buffered memory for the native multipart part-upload path is
-    // `max_concurrent_part_uploads * MAX_PART_SIZE` (module doc comment).
-    // When a process memory limit can be read from the cgroup filesystem,
-    // reject a configuration that would clearly exceed it outright rather
-    // than let ordinary, non-adversarial concurrent large-part traffic OOM
-    // the process later. When no limit could be read (not Linux, no cgroup
-    // limit configured, or an unbounded one), this is only a warning: the
-    // limit may still be enforced some other way (e.g. by an orchestrator
-    // watching RSS out-of-process) that isn't visible here.
-    let part_buffer_memory_limit = read_cgroup_memory_limit_bytes();
-    check_part_buffer_budget(
-        config.max_concurrent_part_uploads,
-        MAX_PART_SIZE,
-        part_buffer_memory_limit,
-    )
-    .map_err(|msg| anyhow::anyhow!(msg))?;
-    if let Some(limit) = part_buffer_memory_limit {
-        tracing::info!(
-            max_concurrent_part_uploads = config.max_concurrent_part_uploads,
-            max_part_size = MAX_PART_SIZE,
-            memory_limit_bytes = limit,
-            "native multipart part-buffer worst-case memory fits within the detected process \
-             memory limit"
-        );
-    } else {
-        tracing::warn!(
-            max_concurrent_part_uploads = config.max_concurrent_part_uploads,
-            max_part_size = MAX_PART_SIZE,
-            worst_case_bytes =
-                (config.max_concurrent_part_uploads as u64).saturating_mul(MAX_PART_SIZE),
-            "could not detect a process memory limit (not Linux cgroups, or unlimited) -- \
-             unable to verify FS_SIDECAR_MAX_CONCURRENT_PART_UPLOADS's worst-case native \
-             multipart part-buffer memory footprint stays within it"
         );
     }
 
@@ -650,11 +482,6 @@ async fn main() -> anyhow::Result<()> {
         internal_token: config.internal_token,
         http,
         metrics,
-        // See `SidecarState::part_upload_semaphore`'s doc comment for why it
-        // lives here rather than as a process-wide static.
-        part_upload_semaphore: Arc::new(tokio::sync::Semaphore::new(
-            config.max_concurrent_part_uploads,
-        )),
         body_idle_timeout: config.body_idle_timeout,
         callback_retry_budget: Duration::from_secs(config.finalize_timeout_secs),
     };
@@ -1531,47 +1358,110 @@ async fn report_part_with_control_plane(
 /// error.
 ///
 /// Two write models, chosen by the backend's own capabilities:
-/// * `multipart_native` (e.g. `S3Backend`): call the backend's own
-///   `upload_part` against its native multipart session
+/// * `multipart_native` (e.g. `S3Backend`): stream the part straight into the
+///   backend's own `upload_part_stream` against its native multipart session
 ///   (`claims.multipart.backend_handle`, minted by `initiate_multipart_upload`
-///   at plan time). `upload_part`'s trait signature takes the whole part as
-///   one `Bytes` — S3's `UploadPart` needs the full body up front to sign and
-///   send in a single request — so the part is buffered here, bounded by the
-///   token's exact `size` claim (the same bound the non-native path enforces
-///   via `put_stream`'s `max_size`), so this never buffers more than one
-///   part's worth of bytes.
+///   at plan time) — see `write_multipart_part_native`'s own doc comment.
 /// * otherwise (e.g. `LocalFsBackend`, which has no native multipart): each
 ///   part is written as its own backend object at `{backend_path}.part.{n}`
 ///   via `put_stream`, and `complete_multipart_upload`'s local-fs fallback
 ///   assembles them.
 ///
-/// `semaphore` (`SidecarState::part_upload_semaphore`) is only ever acquired
-/// around the `multipart_native` branch, since only that branch buffers a
-/// whole part in memory; the offset-object branch streams straight to the
-/// backend via `put_stream` and would gain nothing from the same limiter.
+/// Neither path buffers a whole part in memory any more, so there is no
+/// concurrency limiter here — both stream straight through to the backend
+/// regardless of `multipart_native`.
 async fn write_multipart_part(
     backend: &dyn StorageBackend,
     claims: &Claims,
     part_number: u32,
     body: Body,
-    semaphore: &Arc<tokio::sync::Semaphore>,
     idle: Option<Duration>,
 ) -> Result<(u64, String, String), Response> {
     if backend.capabilities().multipart_native {
-        // The permit is held only for the duration of the buffering write
-        // below, released right after it completes and before the
-        // report-part callback -- see `upload_multipart_part`'s doc comment.
-        let permit = acquire_part_upload_slot(semaphore).await?;
-        let result = write_multipart_part_native(backend, claims, part_number, body, idle).await;
-        drop(permit);
-        result
+        write_multipart_part_native(backend, claims, part_number, body, idle).await
     } else {
         write_multipart_part_offset_object(backend, claims, part_number, body, idle).await
     }
 }
 
+/// Wraps `stream` (already passed through [`idle_timeout_stream`]) so it
+/// never forwards more than `max_size` bytes total: the moment a chunk would
+/// push the running total past it, `oversized` is set to `true` and the
+/// stream ends with one `Err(io::Error::new(ErrorKind::InvalidData, _))` in
+/// place of that chunk — mirrors `StorageBackend::put_stream`'s default
+/// ceiling enforcement, applied here on the sidecar side of a
+/// `multipart_native` backend, since that backend's own
+/// `upload_part_stream` needs an exact declared length up front (S3's
+/// `UploadPart`) rather than a flexible ceiling the way the offset-object
+/// path's `put_stream` call gets one.
+///
+/// Also publishes into `observed_len` the exact number of bytes actually
+/// seen the instant the wrapped stream ends — cleanly or on the oversize
+/// error above — so `write_multipart_part_native` can read it back after the
+/// backend call returns and tell an undersized part (client sent fewer bytes
+/// than `claims.multipart.size`) apart from a genuine backend fault, neither
+/// of which the backend's own error alone distinguishes once buffering is
+/// gone.
+fn part_size_guard(
+    stream: futures::stream::BoxStream<'static, std::io::Result<bytes::Bytes>>,
+    max_size: u64,
+    oversized: Arc<AtomicBool>,
+    observed_len: Arc<Mutex<Option<u64>>>,
+) -> futures::stream::BoxStream<'static, std::io::Result<bytes::Bytes>> {
+    Box::pin(futures::stream::unfold(
+        (stream, 0u64, false),
+        move |(mut stream, seen, done)| {
+            let oversized = Arc::clone(&oversized);
+            let observed_len = Arc::clone(&observed_len);
+            async move {
+                if done {
+                    return None;
+                }
+                match stream.next().await {
+                    None => {
+                        if let Ok(mut slot) = observed_len.lock() {
+                            *slot = Some(seen);
+                        }
+                        None
+                    }
+                    Some(Err(e)) => Some((Err(e), (stream, seen, true))),
+                    Some(Ok(chunk)) => {
+                        let new_seen = seen + chunk.len() as u64;
+                        if new_seen > max_size {
+                            if let Ok(mut slot) = observed_len.lock() {
+                                *slot = Some(new_seen);
+                            }
+                            oversized.store(true, Ordering::SeqCst);
+                            let e = std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!("part body length exceeds token size claim {max_size}"),
+                            );
+                            Some((Err(e), (stream, new_seen, true)))
+                        } else {
+                            Some((Ok(chunk), (stream, new_seen, false)))
+                        }
+                    }
+                }
+            }
+        },
+    ))
+}
+
 /// `multipart_native` backend write path — see `write_multipart_part`'s doc
 /// comment.
+///
+/// The part is streamed straight into `backend.upload_part_stream` — never
+/// buffered whole here. `claims.multipart.size` is the part's exact,
+/// server-authoritative expected length (the same source `MultipartPlan`
+/// minted the part with at plan time), passed to the backend as `len`: it is
+/// what a native backend needs up front (S3's `UploadPart` requires an exact
+/// `Content-Length`), not merely a ceiling. [`part_size_guard`] enforces the
+/// ceiling side of that on the sidecar's side of the call (so an oversized
+/// part is rejected without ever reaching the backend's own exact-length
+/// check) and separately publishes the exact byte count observed, so an
+/// *undersized* part (client sent fewer bytes than claimed) can still be
+/// told apart from a genuine backend fault after `upload_part_stream`
+/// returns — see that function's doc comment.
 async fn write_multipart_part_native(
     backend: &dyn StorageBackend,
     claims: &Claims,
@@ -1581,74 +1471,76 @@ async fn write_multipart_part_native(
 ) -> Result<(u64, String, String), Response> {
     let max_size = claims.multipart.size;
     let timed_out = Arc::new(AtomicBool::new(false));
-    let mut stream = idle_timeout_stream(
+    let byte_stream = idle_timeout_stream(
         body.into_data_stream()
             .map(|r| r.map_err(std::io::Error::other)),
         idle,
         Arc::clone(&timed_out),
     );
-    let mut buf = bytes::BytesMut::new();
-    loop {
-        match stream.next().await {
-            Some(Ok(chunk)) => {
-                if (buf.len() as u64).saturating_add(chunk.len() as u64) > max_size {
-                    return Err((
-                        StatusCode::PAYLOAD_TOO_LARGE,
-                        format!("part body length exceeds token size claim {max_size}"),
-                    )
-                        .into_response());
-                }
-                buf.extend_from_slice(&chunk);
-            }
-            Some(Err(e)) => {
-                // Cheap here (unlike the other two call sites): the part is
-                // buffered locally, so `buf.len()` is exactly how much of
-                // this part had arrived when the client went idle.
-                if let Some(resp) = idle_timeout_response(
-                    &timed_out,
-                    &format!("{} (part {part_number})", claims.backend_path),
-                    Some(buf.len() as u64),
-                ) {
-                    return Err(resp);
-                }
-                tracing::error!(error = %e, part_number, "part body stream read failed");
-                return Err((StatusCode::BAD_REQUEST, "body read error").into_response());
-            }
-            None => break,
-        }
-    }
-    let body_len = buf.len() as u64;
-    // FEATURE §4, point 2: reject if body length ≠ size claim. Checked here
-    // (before the backend call) rather than after, since the whole part is
-    // already buffered — no partial native upload to clean up.
-    //
-    // The mid-stream guard above already rejects any chunk that would push
-    // `buf` past `max_size`, so the only way to reach this check with a
-    // mismatch is an *undersized* part (client sent fewer bytes than
-    // claimed) — a client error, not a body exceeding a size limit, hence
-    // `400 Bad Request` rather than `413 Payload Too Large`.
-    if body_len != max_size {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("part body length {body_len} does not match token size claim {max_size}"),
-        )
-            .into_response());
-    }
-    match backend
-        .upload_part(
+
+    let oversized = Arc::new(AtomicBool::new(false));
+    let observed_len: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
+    let guarded_stream = part_size_guard(
+        byte_stream,
+        max_size,
+        Arc::clone(&oversized),
+        Arc::clone(&observed_len),
+    );
+
+    let upload_result = backend
+        .upload_part_stream(
             &claims.backend_path,
             &claims.multipart.backend_handle,
             part_number,
             // ADR-0006: the part's byte offset within the assembled object,
             // authoritatively minted into the token at initiate time.
             claims.multipart.offset,
-            buf.freeze(),
+            guarded_stream,
+            max_size,
         )
-        .await
-    {
-        Ok((etag, hash)) => Ok((body_len, etag, hex::encode(hash))),
+        .await;
+
+    match upload_result {
+        // The backend only reports success once `guarded_stream` yielded
+        // exactly `max_size` bytes (its own exact-length contract — see
+        // `StorageBackend::upload_part_stream`'s doc comment), so `body_len`
+        // here is always `max_size`.
+        Ok((etag, hash)) => Ok((max_size, etag, hex::encode(hash))),
         Err(e) => {
-            tracing::error!(error = %e, part_number, "backend native upload_part failed");
+            if oversized.load(Ordering::SeqCst) {
+                return Err((
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    format!("part body length exceeds token size claim {max_size}"),
+                )
+                    .into_response());
+            }
+            let observed = observed_len.lock().ok().and_then(|g| *g);
+            if let Some(resp) = idle_timeout_response(
+                &timed_out,
+                &format!("{} (part {part_number})", claims.backend_path),
+                observed,
+            ) {
+                return Err(resp);
+            }
+            // Neither oversize nor an idle timeout: the only remaining way
+            // `part_size_guard` published a byte count short of `max_size`
+            // is an undersized part (client sent fewer bytes than claimed,
+            // and its stream ended on its own) — FEATURE §4, point 2, a
+            // client error rather than a body exceeding a size limit, hence
+            // `400 Bad Request` rather than `413`/`500`. Anything else is a
+            // genuine backend fault.
+            if let Some(observed) = observed
+                && observed != max_size
+            {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "part body length {observed} does not match token size claim {max_size}"
+                    ),
+                )
+                    .into_response());
+            }
+            tracing::error!(error = %e, part_number, "backend native upload_part_stream failed");
             Err((StatusCode::INTERNAL_SERVER_ERROR, "backend error").into_response())
         }
     }
@@ -1720,95 +1612,21 @@ async fn write_multipart_part_offset_object(
     Ok((body_len, part_etag.clone(), part_etag))
 }
 
-/// How long `upload_multipart_part` will wait for a concurrency-limit permit
-/// once the semaphore is observed exhausted, before giving up and
-/// answering `503`/`Retry-After` instead. Short by design: this is meant to
-/// smooth over a slot freeing up moments later (a part write finishing), not
-/// to let requests queue behind a sustained overload — a sidecar at its
-/// concurrency ceiling should shed load quickly so clients back off and
-/// retry, rather than accumulating held-open connections.
-const PART_UPLOAD_ACQUIRE_TIMEOUT: Duration = Duration::from_millis(200);
-
-/// Build the `503 Service Unavailable` response `upload_multipart_part`
-/// returns when it cannot acquire a concurrency-limit permit within
-/// `PART_UPLOAD_ACQUIRE_TIMEOUT`. `Retry-After: 1` is a deliberately
-/// short, fixed hint — a part write is typically fast, so a slot is likely to
-/// free up well within a second — not a promise, just a cheap nudge for a
-/// well-behaved retrying client.
-fn part_upload_busy_response() -> Response {
-    let mut resp = (
-        StatusCode::SERVICE_UNAVAILABLE,
-        "sidecar is at its concurrent-part-upload limit, retry shortly",
-    )
-        .into_response();
-    resp.headers_mut()
-        .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
-    resp
-}
-
-/// Acquire one part-upload slot from `semaphore`
-/// ([`SidecarState::part_upload_semaphore`]), or hand back the response to
-/// return.
-///
-/// Split out of [`upload_multipart_part`] so that handler stays under the
-/// crate's cognitive-complexity ceiling; the policy itself is described at
-/// the call site. `Err` carries a ready-made response -- `503` +
-/// `Retry-After` when the sidecar is simply busy, `500` for the
-/// never-closed-in-practice closed-semaphore case.
-async fn acquire_part_upload_slot(
-    semaphore: &Arc<tokio::sync::Semaphore>,
-) -> Result<tokio::sync::OwnedSemaphorePermit, Response> {
-    match Arc::clone(semaphore).try_acquire_owned() {
-        Ok(permit) => return Ok(permit),
-        Err(tokio::sync::TryAcquireError::NoPermits) => {}
-        Err(tokio::sync::TryAcquireError::Closed) => {
-            tracing::error!("part-upload semaphore unexpectedly closed");
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response());
-        }
-    }
-
-    match tokio::time::timeout(
-        PART_UPLOAD_ACQUIRE_TIMEOUT,
-        Arc::clone(semaphore).acquire_owned(),
-    )
-    .await
-    {
-        Ok(Ok(permit)) => Ok(permit),
-        // The semaphore is never `close()`d anywhere in this process, so this
-        // is unreachable in practice; treated as a hard failure rather than
-        // silently proceeding unbounded.
-        Ok(Err(_)) => {
-            tracing::error!("part-upload semaphore unexpectedly closed");
-            Err((StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response())
-        }
-        Err(_) => Err(part_upload_busy_response()),
-    }
-}
-
 /// `PUT` multipart part: verify `op=multipart_part` token, stream the part
 /// straight to the backend, enforce the exact `size` claim, compute and
 /// return the part hash.
 ///
-/// Concurrency limit: [`write_multipart_part`] acquires a permit from
-/// `state.part_upload_semaphore` (sized by
-/// `FS_SIDECAR_MAX_CONCURRENT_PART_UPLOADS`) around its `multipart_native`
-/// branch only, held until that write completes. See
-/// [`acquire_part_upload_slot`]'s own inline comment for the
-/// try-then-bounded-wait contract, and [`part_upload_busy_response`] for the
-/// `503` a caller gets when no slot is available in time.
-///
-/// On the offset-object path the part body is never buffered whole here —
-/// like `upload`, it streams through `StorageBackend::put_stream`, which
+/// Neither write path buffers a whole part in memory any more: the
+/// offset-object path streams through `StorageBackend::put_stream`, which
 /// enforces the token's declared `size` as an upper bound (`max_size`) while
 /// bytes arrive, aborting mid-stream on an oversized part instead of
-/// buffering it first. An *undersized* part can only be detected once the
+/// buffering it first; an *undersized* part can only be detected once the
 /// stream is fully drained, so the exact-length check (FEATURE §4, point 2)
 /// runs after the write completes, comparing against the streamed
-/// `bytes_written`. The *native* multipart path is the exception: S3's
-/// `UploadPart` needs the part's full length up front, so
-/// `write_multipart_part_native` does buffer one whole part in memory (see
-/// its own doc comment) — that is what the permit bounds, since the per-part
-/// size ceiling alone does not cap how many such buffers can exist at once.
+/// `bytes_written`. The native multipart path streams straight into the
+/// backend's `upload_part_stream` — see `write_multipart_part_native`'s own
+/// doc comment for how it gets the same oversized/undersized split without
+/// buffering.
 ///
 /// This is the sidecar half of the server-authoritative multipart model. The
 /// control plane mints the token (sole minter, ADR-0004); the sidecar only
@@ -1871,24 +1689,13 @@ async fn upload_multipart_part(
     };
 
     // Write the part -- see `write_multipart_part`'s doc comment for the two
-    // models this dispatches between and the concurrency-limit permit it
-    // acquires around only the `multipart_native` branch: `try_acquire_owned`
-    // is checked first so a request never even starts waiting once the
-    // semaphore is provably exhausted; `PART_UPLOAD_ACQUIRE_TIMEOUT` then
-    // bounds how long a request that arrives just as capacity frees up will
-    // wait for a slot, rather than letting client connections pile up
-    // indefinitely behind a busy sidecar. Either way, a request that can't
-    // get a slot promptly gets `503`/`Retry-After` -- cheap for the client to
-    // retry -- instead of buffering that part's body. The permit is released
-    // as soon as the write completes, before the report-part callback below
-    // (pure network I/O with no bearing on the memory this semaphore
-    // guards).
+    // models this dispatches between. Neither buffers a whole part in memory,
+    // so there is nothing to bound with a concurrency limiter here any more.
     let (body_len, backend_etag, hash_hex) = match write_multipart_part(
         backend.as_ref(),
         &claims,
         part_number,
         body,
-        &state.part_upload_semaphore,
         state.body_idle_timeout,
     )
     .await

@@ -44,6 +44,9 @@ use file_storage::infra::storage::Store;
 use file_storage::infra::storage::migrations::Migrator;
 use file_storage_sdk::{NewFile, OwnerKind};
 
+mod common;
+use common::write_all;
+
 const GTS: &str = gts_id!("cf.fstorage.file.type.v1~x.test.file.type.v1~");
 
 // -- shared test harness (copied/trimmed from api_handlers_test.rs / multipart_test.rs) --
@@ -161,10 +164,20 @@ async fn simulate_sidecar_put_part(
         "part {part_number}: size mismatch"
     );
 
+    let len = data.len() as u64;
+    let stream: futures::stream::BoxStream<'static, std::io::Result<Bytes>> =
+        Box::pin(futures::stream::once(async move { Ok(data) }));
     let (backend_etag, part_hash) = backend
-        .upload_part(backend_path, backend_handle, part_number, part.offset, data)
+        .upload_part_stream(
+            backend_path,
+            backend_handle,
+            part_number,
+            part.offset,
+            stream,
+            len,
+        )
         .await
-        .expect("backend upload_part");
+        .expect("backend upload_part_stream");
 
     let size = i64::try_from(part.size).unwrap();
     let now = time::OffsetDateTime::now_utc();
@@ -404,7 +417,7 @@ async fn finalize_version_bind_claim_won_sets_bound_header_and_etag() {
     let ticket = svc.create_file(&ctx, new_file(), None, true).await.unwrap();
     let bytes = Bytes::from_static(b"auto-bind me");
     let path = backend_path(ticket.file_id, ticket.version_id);
-    backend.put(&path, bytes.clone()).await.unwrap();
+    write_all(&backend, &path, bytes.clone()).await;
 
     let claims = Claims {
         op: Op::Put,
@@ -492,10 +505,7 @@ async fn finalize_version_bind_claim_lost_cas_reports_conflict_header() {
     // token's flow already having landed).
     let winner_bytes = Bytes::from_static(b"winner");
     let winner_path = backend_path(ticket.file_id, ticket.version_id);
-    backend
-        .put(&winner_path, winner_bytes.clone())
-        .await
-        .unwrap();
+    write_all(&backend, &winner_path, winner_bytes.clone()).await;
     svc.finalize_upload(
         &ctx,
         ticket.file_id,
@@ -515,7 +525,7 @@ async fn finalize_version_bind_claim_lost_cas_reports_conflict_header() {
     let ticket2 = svc.presign_version(&ctx, ticket.file_id).await.unwrap();
     let loser_bytes = Bytes::from_static(b"loser!");
     let loser_path = backend_path(ticket.file_id, ticket2.version_id);
-    backend.put(&loser_path, loser_bytes.clone()).await.unwrap();
+    write_all(&backend, &loser_path, loser_bytes.clone()).await;
 
     let claims = Claims {
         op: Op::Put,
