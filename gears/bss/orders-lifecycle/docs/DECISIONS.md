@@ -3045,8 +3045,8 @@ step 1 and its no-op note; D-142.
 
 ## High-register reconciliation (2026-09-23)
 
-The [High-finding disposition](./reviews/2026-09-23-high-register-disposition.md) maps all 33
-High entries in the external review register to the current design. It supersedes conflicting
+The 2026-09-23 High-finding disposition maps all 33
+High entries in the external review register to the current design, as recorded below. It supersedes conflicting
 older narrative on these specific points; it does not assert runtime implementation or upstream
 owner agreement.
 
@@ -3086,8 +3086,8 @@ is deliberate: recording a prerequisite does not make the dependency available.
 
 ## Medium-register reconciliation (2026-09-23)
 
-The [Medium disposition](./reviews/2026-09-23-medium-register-disposition.md) records the
-remaining review corrections. These are design changes and required tests, not runtime delivery.
+The 2026-09-23 Medium disposition records the
+remaining review corrections below. These are design changes and required tests, not runtime delivery.
 
 - **Schema/writers:** category is the same GTS text in aggregate and version; amendment explanation
   has its own bounded column. Engine alone assigns version links/pointers. Category admission is

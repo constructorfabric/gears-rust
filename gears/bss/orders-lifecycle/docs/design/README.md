@@ -107,13 +107,6 @@ pinned, audited order. Phase 2 completes the commercial lifecycle and the siblin
 
 ## Authoring status
 
-The [2026-09-23 High-register disposition](../reviews/2026-09-23-high-register-disposition.md)
-maps all 33 High findings to design corrections and separates remaining implementation/platform
-prerequisites. It is the current handoff for that review, not evidence of runtime test coverage.
-
-The [Medium disposition](../reviews/2026-09-23-medium-register-disposition.md) accounts for all
-28 Medium findings, including the local replacement PR-description draft awaiting publication.
-
 **The design set is complete: all eight slices are authored, and five review waves have been
 remediated.** Together with [`../DESIGN.md`](../DESIGN.md), this index, **seven ADRs**, the
 decisions register and the upstream-requirements register, that is **nineteen artifacts**
