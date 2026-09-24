@@ -1073,7 +1073,7 @@ async fn a_debit_that_waits_out_a_boundary_charges_the_period_it_commits_in() {
 // --- lease accounting (I4, I5) ---------------------------------------------
 
 /// One hour, comfortably inside the platform's TTL window.
-const TTL: std::time::Duration = std::time::Duration::from_secs(3600);
+const TTL: std::time::Duration = std::time::Duration::from_hours(1);
 
 #[tokio::test]
 async fn an_expired_hold_stops_counting_against_capacity_before_any_sweep() {

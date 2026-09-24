@@ -356,7 +356,7 @@ impl PgHarness {
                         authorized: AttributionDigest::from_bytes([7; 32]),
                         evaluate: evaluator(),
                     },
-                    Duration::from_secs(60),
+                    Duration::from_mins(1),
                 )
                 .await
         })
@@ -430,7 +430,7 @@ fn token_of(outcome: &Acquired) -> Option<LeaseToken> {
 }
 
 /// A whole test body must finish in this time; a deadlock would not.
-const NO_DEADLOCK: Duration = Duration::from_secs(60);
+const NO_DEADLOCK: Duration = Duration::from_mins(1);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_acquisition_and_a_commit_on_one_quota_serialize() {

@@ -48,7 +48,7 @@ impl Default for LeaseLimits {
     fn default() -> Self {
         Self {
             min_ttl: Duration::from_secs(1),
-            max_ttl: Duration::from_secs(3_600),
+            max_ttl: Duration::from_hours(1),
         }
     }
 }

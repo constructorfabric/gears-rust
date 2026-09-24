@@ -565,7 +565,7 @@ async fn the_budget_bounds_a_wait_on_the_same_key() {
         "it waited within its budget first: {waited:?}"
     );
     assert!(
-        waited < Duration::from_millis(1000),
+        waited < Duration::from_secs(1),
         "the budget, not the holder, ended the wait: {waited:?}"
     );
 

@@ -429,10 +429,10 @@ fn the_lease_section_defaults_to_the_platform_window_and_rejects_a_bad_one() {
     section.validate().expect("defaults are valid");
     let limits = section.to_limits();
     assert_eq!(limits.min_ttl, Duration::from_secs(1));
-    assert_eq!(limits.max_ttl, Duration::from_secs(3_600));
+    assert_eq!(limits.max_ttl, Duration::from_hours(1));
     assert_eq!(
         section.to_sweep_timing().expect("timing").interval,
-        Duration::from_secs(60)
+        Duration::from_mins(1)
     );
 
     for bad in [
