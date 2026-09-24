@@ -300,10 +300,22 @@ pub fn admit_neighborhood(
     cfg: &GraphStorageConfig,
     request: &NeighborhoodRequest,
 ) -> Result<(), DomainError> {
-    if request.depth == 0 || request.depth > 3 {
+    // The same ceiling bounded walks use, and for the same reason: both drive
+    // one BFS, differing only in which nodes truncation keeps. A literal `3`
+    // here made the operator's knob mean less than it says -- raising
+    // `traversal_max_depth` loosened traversal and left neighborhood where it
+    // was, and lowering it did not tighten neighborhood at all, which is the
+    // direction that matters. The node budget beside it was already read from
+    // configuration, so the two halves of this same function disagreed about
+    // whether the deployment gets a say.
+    //
+    // The PRD's depth-3 reference scenario is a performance target, not a
+    // cap: the NFR is that depth 3 answers within a second, and nothing in it
+    // says depth 4 is refused.
+    if request.depth == 0 || request.depth > cfg.traversal_max_depth {
         return Err(exceeded(format!(
-            "neighborhood depth {} is outside 1..=3",
-            request.depth
+            "neighborhood depth {} is outside 1..={}",
+            request.depth, cfg.traversal_max_depth
         )));
     }
     let budget = request.node_budget.unwrap_or(cfg.traversal_max_nodes);
@@ -346,4 +358,80 @@ pub fn admit_adjacency_limit(
         )));
     }
     Ok(limit)
+}
+
+#[cfg(test)]
+mod tests {
+    use graph_storage_sdk::models::NeighborhoodRequest;
+
+    use super::{GraphStorageConfig, admit_neighborhood, admit_traverse};
+
+    fn neighborhood(depth: u8) -> NeighborhoodRequest {
+        NeighborhoodRequest {
+            root: "root".to_owned(),
+            depth,
+            node_budget: None,
+            include_phantoms: true,
+        }
+    }
+
+    /// The operator's depth ceiling governs both bounded walks.
+    ///
+    /// Neighborhood and traversal drive one BFS, differing only in which
+    /// nodes truncation keeps, and the knob is documented as *the* traversal
+    /// depth ceiling. A literal cap in one of them made the setting mean less
+    /// than it says in the direction that matters: an operator lowering it to
+    /// contain load left neighborhood answering as deep as before.
+    #[test]
+    fn the_configured_depth_ceiling_governs_neighborhood_too() {
+        let tightened = GraphStorageConfig {
+            traversal_max_depth: 2,
+            ..GraphStorageConfig::default()
+        };
+        admit_neighborhood(&tightened, &neighborhood(2)).expect("at the ceiling is admitted");
+        let refused = admit_neighborhood(&tightened, &neighborhood(3))
+            .expect_err("a lowered ceiling has to bind neighborhood as well");
+        assert!(
+            refused.to_string().contains("1..=2"),
+            "the refusal names the configured ceiling: {refused}"
+        );
+
+        // And the other direction, which is the one a reader assumes works:
+        // raising it loosens both.
+        let loosened = GraphStorageConfig {
+            traversal_max_depth: 6,
+            ..GraphStorageConfig::default()
+        };
+        admit_neighborhood(&loosened, &neighborhood(6))
+            .expect("a raised ceiling admits what it says it admits");
+        admit_neighborhood(&loosened, &neighborhood(7)).expect_err("and still refuses past it");
+
+        // Zero is not a depth, whatever the ceiling.
+        admit_neighborhood(&loosened, &neighborhood(0)).expect_err("depth 0 is not a walk");
+    }
+
+    /// The two endpoints answer the same question the same way.
+    #[test]
+    fn neighborhood_and_traversal_refuse_the_same_depths() {
+        use graph_storage_sdk::models::TraverseRequest;
+
+        let cfg = GraphStorageConfig {
+            traversal_max_depth: 4,
+            ..GraphStorageConfig::default()
+        };
+        let walk = |depth: u8| TraverseRequest {
+            seeds: vec!["root".to_owned()],
+            depth,
+            edge_type_patterns: Vec::new(),
+            node_type_patterns: Vec::new(),
+            max_nodes: None,
+        };
+        for depth in 0..=8u8 {
+            assert_eq!(
+                admit_traverse(&cfg, &walk(depth)).is_ok(),
+                admit_neighborhood(&cfg, &neighborhood(depth)).is_ok(),
+                "depth {depth} is admitted by one and not the other"
+            );
+        }
+    }
 }

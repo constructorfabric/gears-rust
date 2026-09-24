@@ -251,7 +251,7 @@ mod tests {
             ),
             (
                 DomainError::LimitExceeded {
-                    what: "depth 9 is outside 1..=3".to_owned(),
+                    what: "depth 9 is outside 1..=5".to_owned(),
                 },
                 400,
             ),

@@ -2907,7 +2907,7 @@ Every bound the gear enforces is a named configuration key with a safe default a
 | Adjacency returned on node read, **per direction** (outgoing and incoming are bounded separately, so one read returns at most twice this) | `node_read_max_adjacency` | 100 | 1 – 1,000 | Admission |
 | Labels attached to one node or edge | `labels_max_per_object` | 32 | 1 – 256 | Admission |
 | Labels in a tenant's registry | `labels_max_per_tenant` | 1,000 | 10 – 100,000 | Admission |
-| Traversal depth | `traversal_max_depth` | 5 | 1 – 8 | Admission |
+| Traversal depth, and neighborhood depth with it — one ceiling for both bounded walks | `traversal_max_depth` | 5 | 1 – 8 | Admission |
 | Traversal node budget | `traversal_max_nodes` | 1,000 per request, 10,000 hard | 1 – 10,000 | Admission + per hop |
 | Traversal frontier per hop | `traversal_max_frontier` | 10,000 | 100 – 100,000 | Engine, per hop |
 | Traversal edges scanned | `traversal_max_edges_scanned` | 100,000 | 1 – 10,000,000 | Engine, **per hop** (see below) |
