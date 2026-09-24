@@ -186,10 +186,20 @@ async fn simulate_sidecar_put_part(
         "test data must match the plan"
     );
 
+    let len = data.len() as u64;
+    let stream: futures::stream::BoxStream<'static, std::io::Result<Bytes>> =
+        Box::pin(futures::stream::once(async move { Ok(data) }));
     let (backend_etag, part_hash) = backend
-        .upload_part(backend_path, backend_handle, part_number, part.offset, data)
+        .upload_part_stream(
+            backend_path,
+            backend_handle,
+            part_number,
+            part.offset,
+            stream,
+            len,
+        )
         .await
-        .expect("backend upload_part");
+        .expect("backend upload_part_stream");
 
     let size = i64::try_from(part.size).unwrap();
     let now = time::OffsetDateTime::now_utc();

@@ -370,11 +370,21 @@ pub async fn list_files(
 }
 
 /// Aggregate manifest-byte budget for one `list_versions` response page.
-/// Applied *after* the page is fetched, against the manifests it actually
-/// turned out to carry (see [`manifest_budget_cutoff`]) -- not as an
-/// up-front cap on `?limit` itself, which would shrink every page
-/// regardless of `hash_mode` (a real regression: see `docs/api.md`).
+/// Enforced *while* manifests are being fetched (see
+/// [`fetch_manifests_within_budget`]), against the manifests that actually
+/// make the cut -- not as an up-front cap on `?limit` itself, which would
+/// shrink every page regardless of `hash_mode` (a real regression: see
+/// `docs/api.md`).
 const LIST_VERSIONS_MANIFEST_BUDGET_BYTES: u64 = 4 * 1024 * 1024;
+
+/// How many composite versions' manifests to fetch per DB round trip while
+/// walking a page in order (see [`fetch_manifests_within_budget`]). Small
+/// enough that a page whose budget is exhausted early (say, at the 3rd
+/// composite version) never pulls more than one extra batch's worth of
+/// manifests past the cutoff; large enough that a page that fits entirely
+/// within budget (the common case) still costs only a handful of queries,
+/// not one per version.
+const MANIFEST_FETCH_BATCH_SIZE: usize = 8;
 
 /// How many of `versions` (already offset/limit-paginated in the service's
 /// return order, newest first) to keep so the summed byte length of their
@@ -418,6 +428,66 @@ fn manifest_budget_cutoff(
     versions.len()
 }
 
+/// Fetch every multipart-composite version's manifest for one
+/// `list_versions` page, in page order and in [`MANIFEST_FETCH_BATCH_SIZE`]-sized
+/// batches, stopping (and truncating `versions` in place via
+/// [`manifest_budget_cutoff`]) the moment the running manifest byte total
+/// would cross `budget_bytes` -- so a page whose budget is exhausted at the
+/// k-th version never fetches manifests beyond (at most one batch past)
+/// that cutoff. The previous implementation fetched every composite
+/// version's manifest on the page unconditionally in one query, then
+/// truncated the response after the fact -- correct output, but the DB
+/// round trip (and the allocated manifest strings) already paid for
+/// whatever `manifest_budget_cutoff` was about to throw away.
+///
+/// After each batch, [`manifest_budget_cutoff`] runs only over the *safe
+/// prefix* of `versions` whose composite manifests are now all known
+/// (`composite_positions[..fetched]`'s last entry, plus any trailing
+/// whole-sha256 versions that consume no budget either way) -- never over
+/// the whole page, which would otherwise treat a composite version whose
+/// manifest hasn't been fetched *yet* the same as one with no manifest row
+/// at all (free, no budget consumed) and silently admit it.
+async fn fetch_manifests_within_budget(
+    svc: &FileService,
+    versions: &mut Vec<FileVersion>,
+    budget_bytes: u64,
+) -> Result<std::collections::HashMap<Uuid, String>, DomainError> {
+    // Every composite version's id and its position within `versions`, in
+    // page order.
+    let mut composite_ids: Vec<Uuid> = Vec::new();
+    let mut composite_positions: Vec<usize> = Vec::new();
+    for (i, v) in versions.iter().enumerate() {
+        if v.hash_mode == HashMode::MULTIPART_COMPOSITE_SHA256 {
+            composite_ids.push(v.version_id);
+            composite_positions.push(i);
+        }
+    }
+
+    let mut manifests: std::collections::HashMap<Uuid, String> = std::collections::HashMap::new();
+    let mut fetched = 0usize;
+
+    for chunk in composite_ids.chunks(MANIFEST_FETCH_BATCH_SIZE) {
+        let batch = svc.manifests_for_versions(chunk).await?;
+        manifests.extend(batch);
+        fetched += chunk.len();
+
+        let safe_upto = composite_positions
+            .get(fetched)
+            .copied()
+            .unwrap_or(versions.len());
+        let cutoff = manifest_budget_cutoff(&versions[..safe_upto], &manifests, budget_bytes);
+        if cutoff < safe_upto {
+            versions.truncate(cutoff);
+            return Ok(manifests);
+        }
+        if safe_upto == versions.len() {
+            // Reached the end of the page without ever exceeding budget.
+            return Ok(manifests);
+        }
+    }
+    Ok(manifests)
+}
+
 pub async fn list_versions(
     Extension(ctx): Ctx,
     Extension(svc): Svc,
@@ -428,21 +498,14 @@ pub async fn list_versions(
         .list_versions(&ctx, file_id, q.limit, q.offset.unwrap_or(0))
         .await?;
     // Attach the stored ADR-0006 offset-manifest to every
-    // multipart-composite version on the page, fetched in one batched query
-    // (mirrors list_files's list_metadata_for_files N+1 avoidance).
-    let composite_ids: Vec<Uuid> = versions
-        .iter()
-        .filter(|v| v.hash_mode == HashMode::MULTIPART_COMPOSITE_SHA256)
-        .map(|v| v.version_id)
-        .collect();
-    let mut manifests = svc.manifests_for_versions(&composite_ids).await?;
-    // Trim the page in place (no extra query) rather than reject or shrink
-    // `?limit` up front -- see `manifest_budget_cutoff`.
-    versions.truncate(manifest_budget_cutoff(
-        &versions,
-        &manifests,
-        LIST_VERSIONS_MANIFEST_BUDGET_BYTES,
-    ));
+    // multipart-composite version on the page -- fetched (and the page
+    // truncated to the manifest byte budget) by
+    // `fetch_manifests_within_budget`, in page order, in small batches, so
+    // a budget-truncated page never pays for manifests beyond its own
+    // cutoff.
+    let mut manifests =
+        fetch_manifests_within_budget(&svc, &mut versions, LIST_VERSIONS_MANIFEST_BUDGET_BYTES)
+            .await?;
     Ok(Json(VersionDtoList(
         versions
             .into_iter()
@@ -583,6 +646,283 @@ mod list_versions_manifest_budget_tests {
         let mut expected: Vec<Uuid> = all.iter().map(|v| v.version_id).collect();
         expected.sort();
         assert_eq!(seen, expected, "every version must appear exactly once");
+    }
+}
+
+/// DB-backed tests for `fetch_manifests_within_budget` (the batched-fetch
+/// wrapper around `manifest_budget_cutoff`, above). Living in-crate (not
+/// under `tests/`) is what lets these reach the private `fetch_manifests_within_budget`
+/// directly, mirroring `domain/service/read_ops_tests.rs`'s own
+/// real-temp-file-SQLite harness pattern.
+#[cfg(test)]
+mod fetch_manifests_within_budget_tests {
+    use std::sync::Arc;
+
+    use sea_orm::Set;
+    use sea_orm_migration::MigratorTrait;
+    use time::OffsetDateTime;
+    use toolkit_db::migration_runner::run_migrations_for_testing;
+    use toolkit_db::secure::secure_insert_many;
+    use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
+    use toolkit_gts::gts_id;
+    use toolkit_security::AccessScope;
+    use uuid::Uuid;
+
+    use super::{FileVersion, MANIFEST_FETCH_BATCH_SIZE, fetch_manifests_within_budget};
+    use crate::domain::authz::TenantOnlyAuthorizer;
+    use crate::domain::service::{FileService, ServiceConfig};
+    use crate::infra::backend::{BackendRegistry, InMemoryBackend, StorageBackend};
+    use crate::infra::signed_url::Issuer;
+    use crate::infra::storage::Store;
+    use crate::infra::storage::entity::file::{
+        ActiveModel as FileActiveModel, Entity as FileEntity,
+    };
+    use crate::infra::storage::entity::file_version::{
+        ActiveModel as VersionActiveModel, Entity as VersionEntity,
+    };
+    use crate::infra::storage::entity::version_hash_manifest::{
+        ActiveModel as ManifestActiveModel, Entity as ManifestEntity,
+    };
+    use crate::infra::storage::migrations::Migrator;
+    use file_storage_sdk::VersionStatus;
+
+    const GTS: &str = gts_id!("cf.fstorage.file.type.v1~x.test.file.type.v1~");
+
+    async fn build_service() -> (Arc<FileService>, Arc<DBProvider<DbError>>) {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "cf-fs-lv-budget-test-{}.db",
+            Uuid::now_v7().simple()
+        ));
+        let dsn = format!("sqlite://{}?mode=rwc", path.display());
+        let opts = ConnectOpts {
+            max_conns: Some(1),
+            min_conns: Some(1),
+            ..Default::default()
+        };
+        let conn = connect_db(&dsn, opts).await.expect("connect sqlite");
+        run_migrations_for_testing(&conn, Migrator::migrations())
+            .await
+            .expect("migrations");
+        let db: Arc<DBProvider<DbError>> = Arc::new(DBProvider::new(conn));
+
+        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+        let backends = BackendRegistry::new(vec![backend], "mem").expect("registry");
+        let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+        let authorizer = Arc::new(TenantOnlyAuthorizer);
+        let cfg = ServiceConfig {
+            default_url_ttl_secs: 3600,
+            sidecar_base_url: "http://sidecar.test".to_owned(),
+            default_page_size: 50,
+            max_page_size: 1000,
+            idempotency_ttl_secs: 86400,
+        };
+        let store = Store::new(Arc::clone(&db));
+        let svc = Arc::new(FileService::new(
+            store, backends, issuer, authorizer, cfg, None, None,
+        ));
+        (svc, db)
+    }
+
+    /// Seed one parent `files` row plus `n` `multipart-composite-sha256`
+    /// `file_versions` rows (newest first: `created_at` strictly decreasing
+    /// with `i`, matching `list_versions`' own page order) and their
+    /// `version_hash_manifest` rows, each exactly `manifest_len` bytes --
+    /// direct entity inserts (mirrors `tests/version_repo_test.rs`'s own
+    /// `get_manifests_returns_all_results_across_multiple_chunks` seeding),
+    /// bypassing the real multipart-upload machinery so a many-version page
+    /// is cheap to build. Returns the version rows in page order, as plain
+    /// `FileVersion` SDK values (`fetch_manifests_within_budget` never reads
+    /// the DB for anything but the manifest text itself).
+    async fn seed_composite_page(
+        db: &Arc<DBProvider<DbError>>,
+        n: usize,
+        manifest_len: usize,
+    ) -> Vec<FileVersion> {
+        let conn = db.conn().expect("conn");
+        let scope = AccessScope::allow_all();
+        let now = OffsetDateTime::now_utc();
+        let tenant_id = Uuid::now_v7();
+        let file_id = Uuid::now_v7();
+
+        secure_insert_many::<FileEntity>(
+            vec![FileActiveModel {
+                file_id: Set(file_id),
+                tenant_id: Set(tenant_id),
+                owner_kind: Set("user".to_owned()),
+                owner_id: Set(Uuid::now_v7()),
+                name: Set("f.bin".to_owned()),
+                gts_file_type: Set(GTS.to_owned()),
+                content_id: Set(None),
+                meta_version: Set(0),
+                created_at: Set(now),
+                last_modified_at: Set(now),
+            }],
+            &scope,
+            &conn,
+        )
+        .await
+        .expect("seed parent file row");
+
+        let versions: Vec<FileVersion> = (0..n)
+            .map(|i| FileVersion {
+                file_id,
+                version_id: Uuid::now_v7(),
+                mime_type: "application/octet-stream".to_owned(),
+                size: 1024,
+                hash_algorithm: "SHA-256".to_owned(),
+                hash_value: vec![0u8; 32],
+                hash_mode: "multipart-composite-sha256".to_owned(),
+                part_count: Some(2),
+                status: VersionStatus::Available,
+                is_current: false,
+                backend_id: "mem".to_owned(),
+                backend_path: format!("/{file_id}/{i}"),
+                // Strictly decreasing so version 0 is newest -- matches the
+                // order this vec is already built in.
+                created_at: now - time::Duration::seconds(i64::try_from(i).unwrap_or(i64::MAX)),
+            })
+            .collect();
+
+        let version_models: Vec<VersionActiveModel> = versions
+            .iter()
+            .map(|v| VersionActiveModel {
+                file_id: Set(v.file_id),
+                version_id: Set(v.version_id),
+                mime_type: Set(v.mime_type.clone()),
+                size: Set(v.size),
+                hash_algorithm: Set(v.hash_algorithm.clone()),
+                hash_value: Set(v.hash_value.clone()),
+                hash_mode: Set(v.hash_mode.clone()),
+                part_count: Set(v.part_count),
+                status: Set("available".to_owned()),
+                is_current: Set(false),
+                backend_id: Set(v.backend_id.clone()),
+                backend_path: Set(v.backend_path.clone()),
+                created_at: Set(v.created_at),
+            })
+            .collect();
+        secure_insert_many::<VersionEntity>(version_models, &scope, &conn)
+            .await
+            .expect("seed file_versions rows");
+
+        let manifest_models: Vec<ManifestActiveModel> = versions
+            .iter()
+            .map(|v| ManifestActiveModel {
+                version_id: Set(v.version_id),
+                manifest: Set("m".repeat(manifest_len)),
+                created_at: Set(now),
+            })
+            .collect();
+        secure_insert_many::<ManifestEntity>(manifest_models, &scope, &conn)
+            .await
+            .expect("seed version_hash_manifest rows");
+
+        versions
+    }
+
+    /// A page whose manifest budget is exhausted partway through (well past
+    /// the first `MANIFEST_FETCH_BATCH_SIZE`-sized fetch batch, so this
+    /// exercises the "stop before the next batch" path, not just "the
+    /// cutoff happens to land in the first batch"): the truncated page must
+    /// match exactly what the old unconditional-fetch-then-truncate code
+    /// would have produced, while loading strictly fewer manifest rows than
+    /// the full page holds.
+    #[tokio::test]
+    async fn stops_fetching_once_budget_is_exceeded_and_matches_full_fetch_truncation() {
+        let (svc, db) = build_service().await;
+
+        // 20 composite versions, comfortably more than one fetch batch
+        // (MANIFEST_FETCH_BATCH_SIZE == 8); ~350 KiB manifests so the 4 MiB
+        // budget is exhausted a little past the 11th version (used bytes
+        // stay in the low single-digit MiB range for 11-12 versions), i.e.
+        // partway through the *second* fetch batch (versions 8..16).
+        let manifest_len = 350 * 1024;
+        let n = 20;
+        let versions = seed_composite_page(&db, n, manifest_len).await;
+
+        // Ground truth: fetch every manifest in one unrestricted call (the
+        // old code's own shape) and compute the cutoff via the unchanged
+        // pure `manifest_budget_cutoff`.
+        let all_ids: Vec<Uuid> = versions.iter().map(|v| v.version_id).collect();
+        let all_manifests = svc
+            .manifests_for_versions(&all_ids)
+            .await
+            .expect("fetch all manifests");
+        let expected_cutoff = super::manifest_budget_cutoff(
+            &versions,
+            &all_manifests,
+            super::LIST_VERSIONS_MANIFEST_BUDGET_BYTES,
+        );
+        assert!(
+            expected_cutoff > 1 && expected_cutoff < n,
+            "test setup must actually exercise a mid-page cutoff, got {expected_cutoff} of {n}"
+        );
+        assert!(
+            expected_cutoff > MANIFEST_FETCH_BATCH_SIZE,
+            "test setup must exercise more than one fetch batch, got cutoff {expected_cutoff}"
+        );
+
+        let mut budgeted_versions = versions.clone();
+        let budgeted_manifests = fetch_manifests_within_budget(
+            &svc,
+            &mut budgeted_versions,
+            super::LIST_VERSIONS_MANIFEST_BUDGET_BYTES,
+        )
+        .await
+        .expect("fetch_manifests_within_budget");
+
+        assert_eq!(
+            budgeted_versions.len(),
+            expected_cutoff,
+            "the batched fetch must truncate to exactly the same cutoff the \
+             old fetch-everything-then-truncate code would have produced"
+        );
+        for v in &budgeted_versions {
+            assert_eq!(
+                budgeted_manifests.get(&v.version_id),
+                all_manifests.get(&v.version_id),
+                "every surviving version's manifest text must be unchanged"
+            );
+        }
+
+        assert!(
+            budgeted_manifests.len() < all_manifests.len(),
+            "the batched fetch must load strictly fewer manifest rows ({}) \
+             than the full page holds ({}) once the budget is exhausted \
+             before the last version",
+            budgeted_manifests.len(),
+            all_manifests.len()
+        );
+        assert!(
+            budgeted_manifests.len() < expected_cutoff + MANIFEST_FETCH_BATCH_SIZE,
+            "over-fetch past the cutoff must be bounded by one batch, got {} \
+             manifests loaded for a cutoff at {}",
+            budgeted_manifests.len(),
+            expected_cutoff
+        );
+    }
+
+    /// A page that fits entirely within budget must load every manifest and
+    /// keep every version -- the batching must never truncate a page that
+    /// never actually exceeds the budget.
+    #[tokio::test]
+    async fn keeps_the_whole_page_when_it_fits_within_budget() {
+        let (svc, db) = build_service().await;
+        let n = 5;
+        let versions = seed_composite_page(&db, n, 1024).await;
+
+        let mut budgeted_versions = versions.clone();
+        let budgeted_manifests = fetch_manifests_within_budget(
+            &svc,
+            &mut budgeted_versions,
+            super::LIST_VERSIONS_MANIFEST_BUDGET_BYTES,
+        )
+        .await
+        .expect("fetch_manifests_within_budget");
+
+        assert_eq!(budgeted_versions.len(), n);
+        assert_eq!(budgeted_manifests.len(), n);
     }
 }
 

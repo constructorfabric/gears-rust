@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::StreamExt;
 use sea_orm::{ConnectionTrait, Database, Statement};
 use sea_orm_migration::MigratorTrait;
 use toolkit_db::migration_runner::run_migrations_for_testing;
@@ -41,16 +42,53 @@ use file_storage::infra::backend::{
 };
 use file_storage::infra::content::hash;
 use file_storage::infra::content::hash_mode::{HashMode, Manifest};
+use file_storage::infra::content::stream_verify::verify_stream;
 use file_storage::infra::signed_url::Issuer;
 use file_storage::infra::storage::Store;
 use file_storage::infra::storage::migrations::Migrator;
 use file_storage_sdk::{ByteRange, NewFile, OwnerKind};
 
+mod common;
+use common::read_all;
+
 const GTS: &str = gts_id!("cf.fstorage.file.type.v1~x.test.file.type.v1~");
 
-/// A `StorageBackend` decorator that counts whole-object reads (`get` /
-/// `get_stream`) so a test can assert the ADR-0006 "no re-read at complete"
-/// invariant. Every other method delegates unchanged to the inner backend.
+/// Run `infra::content::stream_verify::verify_stream` over a fully
+/// in-memory buffer, draining the wrapped stream and returning its verdict —
+/// this test's stand-in for the removed `Store::verify_content_hash`
+/// synchronous whole-buffer helper (client-side re-verification, AC3, does
+/// not have a real backend stream to hand `verify_stream` the way
+/// `migrate_backend` does, so this wraps `content` as a one-shot stream
+/// instead).
+async fn verify_content_hash(
+    content: &[u8],
+    hash_mode: HashMode,
+    hash_value: &[u8],
+    manifest: Option<&Manifest>,
+) -> Result<(), DomainError> {
+    let bytes = Bytes::copy_from_slice(content);
+    let len = bytes.len() as u64;
+    let inner: futures::stream::BoxStream<'static, std::io::Result<Bytes>> =
+        Box::pin(futures::stream::once(async move { Ok(bytes) }));
+    let (mut stream, slot) = verify_stream(
+        inner,
+        len,
+        hash_mode,
+        hash_value.to_vec(),
+        manifest.cloned(),
+    )?;
+    while let Some(chunk) = stream.next().await {
+        chunk.map_err(|e| DomainError::backend("test", e.to_string()))?;
+    }
+    slot.lock()
+        .unwrap()
+        .take()
+        .expect("verify_stream must publish a verdict once fully drained")
+}
+
+/// A `StorageBackend` decorator that counts whole-object reads (`get_stream`)
+/// so a test can assert the ADR-0006 "no re-read at complete" invariant.
+/// Every other method delegates unchanged to the inner backend.
 struct CountingBackend {
     inner: Arc<dyn StorageBackend>,
     reads: Arc<AtomicUsize>,
@@ -75,12 +113,21 @@ impl StorageBackend for CountingBackend {
     fn capabilities(&self) -> BackendCapabilities {
         self.inner.capabilities()
     }
-    async fn put(&self, path: &str, bytes: Bytes) -> Result<(), DomainError> {
-        self.inner.put(path, bytes).await
+    async fn put_stream(
+        &self,
+        path: &str,
+        stream: futures::stream::BoxStream<'_, std::io::Result<Bytes>>,
+        max_size: Option<u64>,
+    ) -> Result<(u64, [u8; 32]), DomainError> {
+        self.inner.put_stream(path, stream, max_size).await
     }
-    async fn get(&self, path: &str) -> Result<Bytes, DomainError> {
-        self.reads.fetch_add(1, Ordering::SeqCst);
-        self.inner.get(path).await
+    async fn publish_exclusive(
+        &self,
+        path: &str,
+        stream: futures::stream::BoxStream<'_, std::io::Result<Bytes>>,
+        max_size: Option<u64>,
+    ) -> Result<file_storage::infra::backend::PublishOutcome, DomainError> {
+        self.inner.publish_exclusive(path, stream, max_size).await
     }
     async fn get_stream(
         &self,
@@ -90,18 +137,26 @@ impl StorageBackend for CountingBackend {
         self.reads.fetch_add(1, Ordering::SeqCst);
         self.inner.get_stream(path, expected_len).await
     }
-    // Not counted: a bounded range read is not a "whole-object read" (see the
-    // struct doc comment above) -- unlike `get`/`get_stream`, it never
+    // Not counted: a bounded prefix/range read is not a "whole-object read"
+    // (see the struct doc comment above) -- unlike `get_stream`, it never
     // re-reads the entire assembled object, so it is not what AC2 guards
-    // against. Without this override the trait's *default* `get_range`
-    // (`full = self.get(path).await?`) would dispatch back through this
-    // wrapper's counted `get` and inflate the counter for what is, on every
-    // real backend (`LocalFsBackend`, `S3Backend`), a small native
-    // range-limited fetch. P2 remediation item 1.10 added exactly this call
-    // (a bounded MIME-sniff prefix read) to `complete_multipart_upload`,
-    // after this file's AC2 was written to prove "no whole-object re-read".
-    async fn get_range(&self, path: &str, range: ByteRange) -> Result<Bytes, DomainError> {
-        self.inner.get_range(path, range).await
+    // against. P2 remediation item 1.10 added exactly this kind of call (a
+    // bounded MIME-sniff prefix read, now `read_prefix`) to
+    // `complete_multipart_upload`, after this file's AC2 was written to prove
+    // "no whole-object re-read".
+    async fn read_prefix(&self, path: &str, max_bytes: u64) -> Result<Option<Bytes>, DomainError> {
+        self.inner.read_prefix(path, max_bytes).await
+    }
+    async fn get_range_stream(
+        &self,
+        path: &str,
+        range: ByteRange,
+        expected_len: u64,
+    ) -> Result<futures::stream::BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
+        self.inner.get_range_stream(path, range, expected_len).await
+    }
+    async fn size(&self, path: &str) -> Result<u64, DomainError> {
+        self.inner.size(path).await
     }
     async fn delete(&self, path: &str) -> Result<(), DomainError> {
         self.inner.delete(path).await
@@ -109,19 +164,23 @@ impl StorageBackend for CountingBackend {
     async fn exists(&self, path: &str) -> Result<bool, DomainError> {
         self.inner.exists(path).await
     }
+    async fn stat(&self, path: &str) -> Result<Option<u64>, DomainError> {
+        self.inner.stat(path).await
+    }
     async fn initiate_multipart(&self, path: &str) -> Result<String, DomainError> {
         self.inner.initiate_multipart(path).await
     }
-    async fn upload_part(
+    async fn upload_part_stream(
         &self,
         path: &str,
         upload_handle: &str,
         part_number: u32,
         part_offset: u64,
-        data: Bytes,
+        stream: futures::stream::BoxStream<'static, std::io::Result<Bytes>>,
+        len: u64,
     ) -> Result<(String, Vec<u8>), DomainError> {
         self.inner
-            .upload_part(path, upload_handle, part_number, part_offset, data)
+            .upload_part_stream(path, upload_handle, part_number, part_offset, stream, len)
             .await
     }
     async fn complete_multipart(
@@ -268,13 +327,17 @@ async fn drive_multipart(
             2 => Bytes::from(part2.clone()),
             _ => Bytes::from(part3.clone()),
         };
+        let len = data.len() as u64;
+        let stream: futures::stream::BoxStream<'static, std::io::Result<Bytes>> =
+            Box::pin(futures::stream::once(async move { Ok(data) }));
         let (etag, part_hash) = backend
-            .upload_part(
+            .upload_part_stream(
                 &backend_path,
                 &session.backend_upload_handle,
                 part.part_number,
                 part.offset,
-                data,
+                stream,
+                len,
             )
             .await
             .unwrap();
@@ -370,25 +433,29 @@ async fn client_reverification_succeeds_and_detects_tampering() {
         .unwrap()
         .unwrap();
 
+    let parsed_manifest = Manifest::from_wire_string(&manifest).unwrap();
+
     // Independent client re-verification: split at manifest offsets, rehash,
     // rebuild, compare to root — succeeds against the real content.
-    Store::verify_content_hash(
+    verify_content_hash(
         &full,
         HashMode::MultipartCompositeSha256,
         &version.hash_value,
-        Some(&manifest),
+        Some(&parsed_manifest),
     )
+    .await
     .expect("re-verification must succeed on untampered content");
 
     // Flip a single byte in the FIRST part — verification must now fail.
     let mut tampered = full.clone();
     tampered[10] ^= 0xff;
-    let err = Store::verify_content_hash(
+    let err = verify_content_hash(
         &tampered,
         HashMode::MultipartCompositeSha256,
         &version.hash_value,
-        Some(&manifest),
+        Some(&parsed_manifest),
     )
+    .await
     .expect_err("a tampered first part must fail re-verification");
     assert!(matches!(err, DomainError::HashMismatch { .. }));
 
@@ -397,19 +464,22 @@ async fn client_reverification_succeeds_and_detects_tampering() {
     let last = tampered_tail.len() - 1;
     tampered_tail[last] ^= 0xff;
     assert!(
-        Store::verify_content_hash(
+        verify_content_hash(
             &tampered_tail,
             HashMode::MultipartCompositeSha256,
             &version.hash_value,
-            Some(&manifest),
+            Some(&parsed_manifest),
         )
+        .await
         .is_err(),
         "a tampered tail part must fail re-verification"
     );
 
     // Independent cross-check that root == sha256(manifest) using the parser.
-    let parsed = Manifest::from_wire_string(&manifest).unwrap();
-    assert_eq!(parsed.root().as_slice(), version.hash_value.as_slice());
+    assert_eq!(
+        parsed_manifest.root().as_slice(),
+        version.hash_value.as_slice()
+    );
     assert_eq!(hash::sha256(manifest.as_bytes()), version.hash_value);
 }
 
@@ -479,13 +549,16 @@ async fn migrate_backend_verifies_multipart_composite_without_parts_rows() {
         .await
         .unwrap()
         .unwrap();
-    let moved = dst.get(&version.backend_path).await.unwrap();
-    Store::verify_content_hash(
+    let moved_len = dst.stat(&version.backend_path).await.unwrap().unwrap();
+    let moved = read_all(&dst, &version.backend_path, moved_len).await;
+    let parsed_manifest = Manifest::from_wire_string(&manifest).unwrap();
+    verify_content_hash(
         &moved,
         HashMode::MultipartCompositeSha256,
         &version.hash_value,
-        Some(&manifest),
+        Some(&parsed_manifest),
     )
+    .await
     .expect("destination copy must still verify against the manifest");
 }
 

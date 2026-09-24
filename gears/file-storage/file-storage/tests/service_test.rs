@@ -19,20 +19,114 @@ use uuid::Uuid;
 
 use file_storage::domain::audit::{AuditEntry, AuditOperation};
 use file_storage::domain::authz::TenantOnlyAuthorizer;
-use file_storage::domain::data_plane::DataPlaneService;
 use file_storage::domain::error::DomainError;
 use file_storage::domain::etag;
-use file_storage::domain::ports::DataPlanePort;
 use file_storage::domain::service::{FileService, ServiceConfig};
 use file_storage::infra::backend::{BackendRegistry, InMemoryBackend, StorageBackend};
+use file_storage::infra::content::{hash, mime};
 use file_storage::infra::signed_url::{Claims, Issuer};
 use file_storage::infra::storage::Store;
 use file_storage::infra::storage::migrations::Migrator;
-use file_storage_sdk::{CustomMetadataEntry, CustomMetadataPatch, NewFile, OwnerFilter, OwnerKind};
+use file_storage_sdk::{
+    ByteRange, CustomMetadataEntry, CustomMetadataPatch, NewFile, OwnerFilter, OwnerKind,
+};
 
 const GTS: &str = gts_id!("cf.fstorage.file.type.v1~x.test.file.type.v1~");
 
-async fn build_service() -> (Arc<FileService>, DataPlaneService) {
+/// Direct byte-path test double for what `DataPlaneService` used to provide
+/// (removed: production never constructed it — the sidecar is the only real
+/// byte path). Same steps `DataPlaneService::put_content`/`read_content`
+/// used to perform, but through `put_stream`/`get_stream` rather than the
+/// whole-object `put`/`get` that no longer exist on `StorageBackend`.
+struct TestDataPlane {
+    svc: Arc<FileService>,
+    store: Store,
+    backends: BackendRegistry,
+}
+
+impl TestDataPlane {
+    fn new(svc: Arc<FileService>, store: Store, backends: BackendRegistry) -> Self {
+        Self {
+            svc,
+            store,
+            backends,
+        }
+    }
+
+    async fn put_content(
+        &self,
+        ctx: &SecurityContext,
+        file_id: Uuid,
+        version_id: Uuid,
+        declared_mime: &str,
+        bytes: Bytes,
+    ) -> Result<(), DomainError> {
+        mime::validate(declared_mime, &bytes)?;
+        self.svc.authorize_write(ctx, file_id).await?;
+        let version = self
+            .store
+            .get_version(file_id, version_id)
+            .await?
+            .ok_or_else(|| DomainError::version_not_found(file_id, version_id))?;
+        let backend = self.backends.get(&version.backend_id)?;
+        let len = bytes.len() as u64;
+        let digest = hash::sha256(&bytes);
+        let stream: futures::stream::BoxStream<'static, std::io::Result<Bytes>> =
+            Box::pin(futures::stream::once(async move { Ok(bytes) }));
+        backend
+            .put_stream(&version.backend_path, stream, Some(len))
+            .await?;
+        self.svc
+            .finalize_upload(
+                ctx,
+                file_id,
+                version_id,
+                i64::try_from(len).unwrap_or(i64::MAX),
+                digest,
+            )
+            .await
+    }
+
+    async fn read_content(
+        &self,
+        _ctx: &SecurityContext,
+        file_id: Uuid,
+        version_id: Uuid,
+        range: Option<ByteRange>,
+    ) -> Result<Bytes, DomainError> {
+        use futures::StreamExt;
+
+        let version = self
+            .store
+            .get_version(file_id, version_id)
+            .await?
+            .ok_or_else(|| DomainError::version_not_found(file_id, version_id))?;
+        let backend = self.backends.get(&version.backend_id)?;
+        let total = u64::try_from(version.size).unwrap_or(0);
+
+        let mut stream = match range {
+            Some(r) => {
+                let (start, end) = r
+                    .resolve(total)
+                    .ok_or_else(|| DomainError::validation("range", "unsatisfiable byte range"))?;
+                let len = end - start + 1;
+                backend
+                    .get_range_stream(&version.backend_path, r, len)
+                    .await?
+            }
+            None => backend.get_stream(&version.backend_path, total).await?,
+        };
+
+        let mut buf = bytes::BytesMut::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| DomainError::backend(backend.id(), e.to_string()))?;
+            buf.extend_from_slice(&chunk);
+        }
+        Ok(buf.freeze())
+    }
+}
+
+async fn build_service() -> (Arc<FileService>, TestDataPlane) {
     let (svc, dp, _store) = build_service_with_page_sizes(50, 1000).await;
     (svc, dp)
 }
@@ -47,7 +141,7 @@ async fn build_service() -> (Arc<FileService>, DataPlaneService) {
 async fn build_service_with_page_sizes(
     default_page_size: u64,
     max_page_size: u64,
-) -> (Arc<FileService>, DataPlaneService, Store) {
+) -> (Arc<FileService>, TestDataPlane, Store) {
     // A unique temp *file* DB: the service opens a connection per call, so every
     // connection must see the same database. A bare `sqlite::memory:` gives each
     // pooled connection its own empty DB; a temp file is shared by construction.
@@ -79,14 +173,14 @@ async fn build_service_with_page_sizes(
     let store = Store::new(Arc::clone(&db));
     let svc = Arc::new(FileService::new(
         store.clone(),
-        backends,
+        backends.clone(),
         issuer,
         authorizer,
         cfg,
         None,
         None,
     ));
-    let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
+    let dp = TestDataPlane::new(Arc::clone(&svc), store.clone(), backends);
     (svc, dp, store)
 }
 

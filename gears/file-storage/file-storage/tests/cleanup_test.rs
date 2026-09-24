@@ -26,7 +26,6 @@ use uuid::Uuid;
 use file_storage::domain::audit::{AuditEntry, AuditOperation, FileEvent};
 use file_storage::domain::authz::TenantOnlyAuthorizer;
 use file_storage::domain::cleanup::{CleanupConfig, CleanupEngine};
-use file_storage::domain::data_plane::DataPlaneService;
 use file_storage::domain::error::DomainError;
 use file_storage::domain::multipart::MultipartUploadSession;
 use file_storage::domain::multipart_service::MultipartService;
@@ -34,15 +33,101 @@ use file_storage::domain::policy::{
     AgeRetention, RetentionRuleBody, RetentionScope, StoredRetentionRule,
 };
 use file_storage::domain::policy_service::PolicyService;
-use file_storage::domain::ports::{CleanupStore, DataPlanePort, MultipartStore, PolicyStore};
+use file_storage::domain::ports::{CleanupStore, MultipartStore, PolicyStore};
 use file_storage::domain::service::{FileService, ServiceConfig};
 use file_storage::infra::backend::{BackendRegistry, InMemoryBackend, StorageBackend};
+use file_storage::infra::content::{hash, mime};
 use file_storage::infra::signed_url::Issuer;
 use file_storage::infra::storage::Store;
 use file_storage::infra::storage::migrations::Migrator;
 use file_storage_sdk::{CustomMetadataEntry, File, FileVersion, NewFile, OwnerKind, VersionStatus};
 
 const GTS: &str = gts_id!("cf.fstorage.file.type.v1~x.cleanup_test.file.type.v1~");
+
+/// Direct byte-path test double for what `DataPlaneService` used to provide
+/// (removed: production never constructed it — the sidecar is the only real
+/// byte path). Same steps `DataPlaneService::put_content` used to perform,
+/// but through `put_stream` rather than the whole-object `put` that no
+/// longer exists on `StorageBackend`.
+struct TestDataPlane {
+    svc: Arc<FileService>,
+    store: Store,
+    backends: BackendRegistry,
+}
+
+impl TestDataPlane {
+    fn new(svc: Arc<FileService>, store: Store, backends: BackendRegistry) -> Self {
+        Self {
+            svc,
+            store,
+            backends,
+        }
+    }
+
+    async fn put_content(
+        &self,
+        ctx: &SecurityContext,
+        file_id: Uuid,
+        version_id: Uuid,
+        declared_mime: &str,
+        bytes: Bytes,
+    ) -> Result<(), DomainError> {
+        mime::validate(declared_mime, &bytes)?;
+        self.svc.authorize_write(ctx, file_id).await?;
+        let version = self
+            .store
+            .get_version(file_id, version_id)
+            .await?
+            .ok_or_else(|| DomainError::version_not_found(file_id, version_id))?;
+        let backend = self.backends.get(&version.backend_id)?;
+        let len = bytes.len() as u64;
+        let digest = hash::sha256(&bytes);
+        let stream: futures::stream::BoxStream<'static, std::io::Result<Bytes>> =
+            Box::pin(futures::stream::once(async move { Ok(bytes) }));
+        backend
+            .put_stream(&version.backend_path, stream, Some(len))
+            .await?;
+        self.svc
+            .finalize_upload(
+                ctx,
+                file_id,
+                version_id,
+                i64::try_from(len).unwrap_or(i64::MAX),
+                digest,
+            )
+            .await
+    }
+}
+
+/// Write the whole of `bytes` to `path` via `put_stream` (a one-shot
+/// stream) -- the test-only stand-in for the whole-object `put` the trait no
+/// longer has.
+async fn write_all(backend: &Arc<dyn StorageBackend>, path: &str, bytes: Bytes) {
+    let len = bytes.len() as u64;
+    let stream: futures::stream::BoxStream<'static, std::io::Result<Bytes>> =
+        Box::pin(futures::stream::once(async move { Ok(bytes) }));
+    backend
+        .put_stream(path, stream, Some(len))
+        .await
+        .expect("put_stream");
+}
+
+/// Read the whole blob at `path` back via `get_stream` (collecting every
+/// chunk) -- the test-only stand-in for the whole-object `get` the trait no
+/// longer has.
+async fn read_all(backend: &Arc<dyn StorageBackend>, path: &str, expected_len: u64) -> Bytes {
+    use futures::StreamExt;
+
+    let mut stream = backend
+        .get_stream(path, expected_len)
+        .await
+        .expect("get_stream");
+    let mut buf = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        buf.extend_from_slice(&chunk.expect("chunk"));
+    }
+    Bytes::from(buf)
+}
 
 // ── test harness ──────────────────────────────────────────────────────────────
 
@@ -81,7 +166,7 @@ async fn build_all(
     Arc<FileService>,
     Arc<PolicyService>,
     Arc<MultipartService>,
-    DataPlaneService,
+    TestDataPlane,
     Store,
     CleanupEngine,
     Arc<dyn StorageBackend>,
@@ -101,7 +186,7 @@ async fn build_all_full(
     Arc<FileService>,
     Arc<PolicyService>,
     Arc<MultipartService>,
-    DataPlaneService,
+    TestDataPlane,
     Store,
     CleanupEngine,
     Arc<dyn StorageBackend>,
@@ -141,7 +226,7 @@ async fn build_all_full(
     ));
     let msvc = Arc::new(MultipartService::new(
         multipart_store,
-        backends,
+        backends.clone(),
         Arc::clone(&authorizer),
         None,
         Arc::new(Issuer::generate(3600).expect("issuer")),
@@ -149,7 +234,7 @@ async fn build_all_full(
         3600,
     ));
     let psvc = Arc::new(PolicyService::new(policy_store, authorizer));
-    let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
+    let dp = TestDataPlane::new(Arc::clone(&svc), store.clone(), backends);
     let engine = CleanupEngine::new(
         sweep_store,
         sweep_backends,
@@ -207,7 +292,7 @@ async fn build_all_with_dsn(
     Arc<FileService>,
     Arc<PolicyService>,
     Arc<MultipartService>,
-    DataPlaneService,
+    TestDataPlane,
     Store,
     CleanupEngine,
     Arc<dyn StorageBackend>,
@@ -246,7 +331,7 @@ async fn build_all_with_dsn(
     ));
     let msvc = Arc::new(MultipartService::new(
         multipart_store,
-        backends,
+        backends.clone(),
         Arc::clone(&authorizer),
         None,
         Arc::new(Issuer::generate(3600).expect("issuer")),
@@ -254,7 +339,7 @@ async fn build_all_with_dsn(
         3600,
     ));
     let psvc = Arc::new(PolicyService::new(policy_store, authorizer));
-    let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
+    let dp = TestDataPlane::new(Arc::clone(&svc), store.clone(), backends);
     let engine = CleanupEngine::new(
         sweep_store,
         sweep_backends,
@@ -332,7 +417,7 @@ async fn build_all_with_db(
 /// Build a service + cleanup engine with TWO in-memory backends ("mem" and "alt").
 async fn build_all_dual_backend(
     grace_secs: u64,
-) -> (Arc<FileService>, DataPlaneService, Store, CleanupEngine) {
+) -> (Arc<FileService>, TestDataPlane, Store, CleanupEngine) {
     let db = build_db().await;
 
     let mem_backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
@@ -358,14 +443,14 @@ async fn build_all_dual_backend(
 
     let svc = Arc::new(FileService::new(
         store.clone(),
-        backends,
+        backends.clone(),
         issuer,
         authorizer,
         cfg,
         None,
         None,
     ));
-    let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
+    let dp = TestDataPlane::new(Arc::clone(&svc), store.clone(), backends);
     let engine = CleanupEngine::new(
         sweep_store,
         sweep_backends,
@@ -393,6 +478,23 @@ fn new_file() -> NewFile {
         mime_type: "text/plain".to_owned(),
         custom_metadata: vec![],
     }
+}
+
+/// Box `data` into the one-shot `BoxStream` shape `upload_part_stream` now
+/// expects, alongside its exact length. Every call site in this file already
+/// builds its part bytes fully in memory (small fixed test payloads), so a
+/// one-shot `stream::once` is enough.
+fn one_shot_part_stream(
+    data: Bytes,
+) -> (
+    futures::stream::BoxStream<'static, std::io::Result<Bytes>>,
+    u64,
+) {
+    let len = data.len() as u64;
+    (
+        Box::pin(futures::stream::once(async move { Ok(data) })),
+        len,
+    )
 }
 
 /// [`new_file`] with the owner set explicitly, for tests whose authorizer
@@ -2391,13 +2493,15 @@ async fn sweep_reclaims_version_after_session_expires_still_aborts_backend_and_d
     let part = plan.parts.first().expect("declared_size fits in one part");
     let part_bytes = Bytes::from_static(b"partial-part-data-before-expiry");
     let part_size = i64::try_from(part_bytes.len()).unwrap();
+    let (stream, len) = one_shot_part_stream(part_bytes);
     let (etag, part_hash) = backend
-        .upload_part(
+        .upload_part_stream(
             &backend_path,
             &session.backend_upload_handle,
             part.part_number,
             part.offset,
-            part_bytes,
+            stream,
+            len,
         )
         .await
         .expect("simulated sidecar part upload");
@@ -2490,13 +2594,15 @@ async fn sweep_reclaims_version_after_session_expires_still_aborts_backend_and_d
     // `abort_multipart` call. Prove it indirectly: a still-live (non-aborted)
     // handle would accept another `upload_part` call; an aborted one reports
     // "handle not found".
+    let (stream, len) = one_shot_part_stream(Bytes::from_static(b"x"));
     let upload_after_abort = backend
-        .upload_part(
+        .upload_part_stream(
             &backend_path,
             &session.backend_upload_handle,
             2,
             0,
-            Bytes::from_static(b"x"),
+            stream,
+            len,
         )
         .await;
     assert!(
@@ -2611,14 +2717,9 @@ async fn cleanup_aborts_on_the_sessions_own_backend_when_version_is_already_gone
     // accept another `upload_part` call; an aborted one reports "handle not
     // found". On the old (buggy) fallback, this call would have SUCCEEDED --
     // the abort would have silently no-op'd against "mem" instead.
+    let (stream, len) = one_shot_part_stream(Bytes::from_static(b"x"));
     let after_abort = alt_backend
-        .upload_part(
-            &backend_path,
-            &backend_handle,
-            1,
-            0,
-            Bytes::from_static(b"x"),
-        )
+        .upload_part_stream(&backend_path, &backend_handle, 1, 0, stream, len)
         .await;
     assert!(
         after_abort.is_err(),
@@ -3157,7 +3258,7 @@ async fn build_all_dual_backend_scoped(
     grace_secs: u64,
 ) -> (
     Arc<FileService>,
-    DataPlaneService,
+    TestDataPlane,
     Store,
     Arc<ScopedTestAuthorizer>,
 ) {
@@ -3180,14 +3281,14 @@ async fn build_all_dual_backend_scoped(
 
     let svc = Arc::new(FileService::new(
         store.clone(),
-        backends,
+        backends.clone(),
         issuer,
         Arc::clone(&authorizer) as Arc<dyn file_storage::domain::authz::Authorizer>,
         cfg,
         None,
         None,
     ));
-    let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
+    let dp = TestDataPlane::new(Arc::clone(&svc), store.clone(), backends);
     // `grace_secs` is unused by these tests but kept for signature symmetry
     // with the other `build_all*` helpers.
     let _ = grace_secs;
@@ -3328,16 +3429,18 @@ async fn complete_one_part_multipart_upload(
     let backend_path = format!("/{file_id}/{}", plan.version_id);
     let part = plan.parts.first().expect("single-part plan");
 
+    let (stream, len) = one_shot_part_stream(Bytes::from_static(data));
     let (backend_etag, part_hash) = backend
-        .upload_part(
+        .upload_part_stream(
             &backend_path,
             &session.backend_upload_handle,
             part.part_number,
             part.offset,
-            Bytes::from_static(data),
+            stream,
+            len,
         )
         .await
-        .expect("backend upload_part");
+        .expect("backend upload_part_stream");
     store
         .upsert_multipart_part(
             plan.upload_id,
@@ -3722,13 +3825,16 @@ async fn sweep_step1_does_not_delete_version_finalized_between_list_and_delete()
 
     // Put real content at the version's backend path so a wrongful blob
     // delete would be observable.
-    backend
-        .put(
-            &candidate.backend_path,
-            Bytes::from_static(b"finalized content"),
-        )
-        .await
-        .unwrap();
+    {
+        let content = Bytes::from_static(b"finalized content");
+        let len = content.len() as u64;
+        let stream: futures::stream::BoxStream<'static, std::io::Result<Bytes>> =
+            Box::pin(futures::stream::once(async move { Ok(content) }));
+        backend
+            .put_stream(&candidate.backend_path, stream, Some(len))
+            .await
+            .unwrap();
+    }
 
     // Simulate the race: a client's `finalize_upload` wins between the list
     // query and step 1's per-row delete, flipping the version
@@ -3792,9 +3898,9 @@ async fn sweep_step1_does_not_delete_version_finalized_between_list_and_delete()
     // The backend blob must survive too -- proving `best_effort_delete` was
     // never reached (it lives inside the `Ok(true)` branch of the guarded
     // delete, which this race never takes).
-    let blob = backend.get(&candidate.backend_path).await;
+    let blob = backend.stat(&candidate.backend_path).await;
     assert!(
-        blob.is_ok(),
+        matches!(blob, Ok(Some(_))),
         "the just-finalized backend blob must not be deleted, got {blob:?}"
     );
 }
@@ -3848,7 +3954,7 @@ async fn run_sweep_deletes_expired_idempotency_rows() {
         Arc::new(TenantOnlyAuthorizer);
     let svc = FileService::new(
         store.clone(),
-        backends,
+        backends.clone(),
         issuer,
         authorizer,
         ServiceConfig {
@@ -4154,17 +4260,23 @@ async fn concurrent_migrate_backend_second_racer_is_rejected() {
 /// `RacingBackend` below).
 type RaceIds = Arc<std::sync::Mutex<Option<(Uuid, Uuid, String, String)>>>;
 
-/// A `StorageBackend` wrapper whose `put` runs a caller-supplied `FnOnce`
-/// hook exactly once -- immediately before delegating to the real backend --
-/// then never fires again. Used to model a second `migrate_backend` racer
-/// committing its own CAS write in the narrow real-world window between this
-/// call's destination `put()` and its own CAS attempt, deterministically and
-/// in-process: the "other racer" runs synchronously as a side effect of this
-/// call's own backend write, with no `sleep`/real concurrency involved.
+/// A `StorageBackend` wrapper whose `publish_exclusive` runs a
+/// caller-supplied `FnOnce` hook exactly once -- immediately before
+/// delegating to the real backend -- then never fires again. Used to model
+/// a second `migrate_backend` racer committing its own CAS write in the
+/// narrow real-world window between this call's destination write and its
+/// own CAS attempt, deterministically and in-process: the "other racer" runs
+/// synchronously as a side effect of this call's own backend write, with no
+/// `sleep`/real concurrency involved.
+///
+/// The hook fires on `publish_exclusive`, not `put_stream`: `migrate_backend`
+/// writes its destination object via `publish_exclusive` specifically (see
+/// its own doc comment), never `put_stream` -- hooking the wrong method would
+/// silently never fire on the real write path.
 struct RacingBackend {
     inner: Arc<dyn StorageBackend>,
     #[allow(clippy::type_complexity)]
-    on_put: std::sync::Mutex<
+    on_publish: std::sync::Mutex<
         Option<Box<dyn FnOnce() -> futures::future::BoxFuture<'static, ()> + Send>>,
     >,
 }
@@ -4179,16 +4291,51 @@ impl StorageBackend for RacingBackend {
         self.inner.capabilities()
     }
 
-    async fn put(&self, path: &str, bytes: Bytes) -> Result<(), DomainError> {
-        let hook = self.on_put.lock().expect("on_put mutex").take();
+    async fn put_stream(
+        &self,
+        path: &str,
+        stream: futures::stream::BoxStream<'_, std::io::Result<Bytes>>,
+        max_size: Option<u64>,
+    ) -> Result<(u64, [u8; 32]), DomainError> {
+        self.inner.put_stream(path, stream, max_size).await
+    }
+
+    async fn publish_exclusive(
+        &self,
+        path: &str,
+        stream: futures::stream::BoxStream<'_, std::io::Result<Bytes>>,
+        max_size: Option<u64>,
+    ) -> Result<file_storage::infra::backend::PublishOutcome, DomainError> {
+        let hook = self.on_publish.lock().expect("on_publish mutex").take();
         if let Some(hook) = hook {
             hook().await;
         }
-        self.inner.put(path, bytes).await
+        self.inner.publish_exclusive(path, stream, max_size).await
     }
 
-    async fn get(&self, path: &str) -> Result<Bytes, DomainError> {
-        self.inner.get(path).await
+    async fn get_stream(
+        &self,
+        path: &str,
+        expected_len: u64,
+    ) -> Result<futures::stream::BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
+        self.inner.get_stream(path, expected_len).await
+    }
+
+    async fn read_prefix(&self, path: &str, max_bytes: u64) -> Result<Option<Bytes>, DomainError> {
+        self.inner.read_prefix(path, max_bytes).await
+    }
+
+    async fn get_range_stream(
+        &self,
+        path: &str,
+        range: file_storage_sdk::ByteRange,
+        expected_len: u64,
+    ) -> Result<futures::stream::BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
+        self.inner.get_range_stream(path, range, expected_len).await
+    }
+
+    async fn size(&self, path: &str) -> Result<u64, DomainError> {
+        self.inner.size(path).await
     }
 
     async fn delete(&self, path: &str) -> Result<(), DomainError> {
@@ -4197,6 +4344,10 @@ impl StorageBackend for RacingBackend {
 
     async fn exists(&self, path: &str) -> Result<bool, DomainError> {
         self.inner.exists(path).await
+    }
+
+    async fn stat(&self, path: &str) -> Result<Option<u64>, DomainError> {
+        self.inner.stat(path).await
     }
 }
 
@@ -4241,10 +4392,7 @@ async fn migrate_backend_loser_target_blob_cleaned_up() {
                     .clone()
                     .expect("ids must be set before migrate_backend runs");
                 let dest_path = format!("/{file_id}/{version_id}");
-                hook_alt2
-                    .put(&dest_path, hook_bytes.clone())
-                    .await
-                    .expect("racer's own blob write");
+                write_all(&hook_alt2, &dest_path, hook_bytes.clone()).await;
                 let audit = AuditEntry::success(
                     tenant,
                     "system",
@@ -4274,7 +4422,7 @@ async fn migrate_backend_loser_target_blob_cleaned_up() {
 
     let racing_alt1: Arc<dyn StorageBackend> = Arc::new(RacingBackend {
         inner: alt1_inner.clone(),
-        on_put: std::sync::Mutex::new(Some(hook)),
+        on_publish: std::sync::Mutex::new(Some(hook)),
     });
 
     let backends = BackendRegistry::new(
@@ -4299,14 +4447,14 @@ async fn migrate_backend_loser_target_blob_cleaned_up() {
     };
     let svc = Arc::new(FileService::new(
         store.clone(),
-        backends,
+        backends.clone(),
         issuer,
         authorizer,
         cfg,
         None,
         None,
     ));
-    let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
+    let dp = TestDataPlane::new(Arc::clone(&svc), store.clone(), backends);
 
     let ctx = ctx(tenant);
     let ticket = svc
@@ -4366,7 +4514,7 @@ async fn migrate_backend_loser_target_blob_cleaned_up() {
         .expect("version must still exist");
     assert_eq!(after.backend_id, "alt2");
     assert_eq!(after.backend_path, expected_dest_path);
-    let winner_bytes = alt2_backend.get(&expected_dest_path).await.unwrap();
+    let winner_bytes = read_all(&alt2_backend, &expected_dest_path, content.len() as u64).await;
     assert_eq!(winner_bytes, content, "winner's blob must be untouched");
 }
 
@@ -4411,10 +4559,7 @@ async fn migrate_backend_same_target_race_preserves_winner_blob() {
                 let dest_path = format!("/{file_id}/{version_id}");
                 // The winner commits its own blob to the SAME path/backend
                 // the monitored call is about to write to.
-                hook_alt1
-                    .put(&dest_path, hook_bytes.clone())
-                    .await
-                    .expect("racer's own blob write");
+                write_all(&hook_alt1, &dest_path, hook_bytes.clone()).await;
                 let audit = AuditEntry::success(
                     tenant,
                     "system",
@@ -4444,7 +4589,7 @@ async fn migrate_backend_same_target_race_preserves_winner_blob() {
 
     let racing_alt1: Arc<dyn StorageBackend> = Arc::new(RacingBackend {
         inner: alt1_inner.clone(),
-        on_put: std::sync::Mutex::new(Some(hook)),
+        on_publish: std::sync::Mutex::new(Some(hook)),
     });
 
     let backends = BackendRegistry::new(
@@ -4465,14 +4610,14 @@ async fn migrate_backend_same_target_race_preserves_winner_blob() {
     };
     let svc = Arc::new(FileService::new(
         store.clone(),
-        backends,
+        backends.clone(),
         issuer,
         authorizer,
         cfg,
         None,
         None,
     ));
-    let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
+    let dp = TestDataPlane::new(Arc::clone(&svc), store.clone(), backends);
 
     let ctx = ctx(tenant);
     let ticket = svc
@@ -4530,7 +4675,7 @@ async fn migrate_backend_same_target_race_preserves_winner_blob() {
         alt1_inner.exists(&expected_dest_path).await.unwrap(),
         "winner's destination blob must NOT be deleted by the loser's cleanup"
     );
-    let stored_bytes = alt1_inner.get(&expected_dest_path).await.unwrap();
+    let stored_bytes = read_all(&alt1_inner, &expected_dest_path, content.len() as u64).await;
     assert_eq!(
         stored_bytes, content,
         "surviving blob must match the winner's bytes"

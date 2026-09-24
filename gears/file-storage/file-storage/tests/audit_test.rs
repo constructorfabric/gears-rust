@@ -20,16 +20,71 @@ use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use file_storage::domain::authz::TenantOnlyAuthorizer;
-use file_storage::domain::data_plane::DataPlaneService;
 use file_storage::domain::error::DomainError;
 use file_storage::domain::multipart_service::MultipartService;
-use file_storage::domain::ports::{DataPlanePort, MultipartStore};
+use file_storage::domain::ports::MultipartStore;
 use file_storage::domain::service::{FileService, ServiceConfig};
 use file_storage::infra::backend::{BackendRegistry, InMemoryBackend, StorageBackend};
+use file_storage::infra::content::{hash, mime};
 use file_storage::infra::signed_url::Issuer;
 use file_storage::infra::storage::Store;
 use file_storage::infra::storage::migrations::Migrator;
 use file_storage_sdk::{CustomMetadataPatch, NewFile, OwnerKind};
+
+/// Direct byte-path test double for what `DataPlaneService` used to provide
+/// (removed: production never constructed it — the sidecar is the only real
+/// byte path). Same steps `DataPlaneService::put_content` used to perform,
+/// but through `put_stream` rather than the whole-object `put` that no
+/// longer exists on `StorageBackend`.
+struct TestDataPlane {
+    svc: Arc<FileService>,
+    store: Store,
+    backends: BackendRegistry,
+}
+
+impl TestDataPlane {
+    fn new(svc: Arc<FileService>, store: Store, backends: BackendRegistry) -> Self {
+        Self {
+            svc,
+            store,
+            backends,
+        }
+    }
+
+    async fn put_content(
+        &self,
+        ctx: &SecurityContext,
+        file_id: Uuid,
+        version_id: Uuid,
+        declared_mime: &str,
+        bytes: Bytes,
+    ) -> Result<(), DomainError> {
+        mime::validate(declared_mime, &bytes)?;
+        self.svc.authorize_write(ctx, file_id).await?;
+        let version = self
+            .store
+            .get_version(file_id, version_id)
+            .await?
+            .ok_or_else(|| DomainError::version_not_found(file_id, version_id))?;
+        let backend = self.backends.get(&version.backend_id)?;
+        let len = bytes.len() as u64;
+        let digest = hash::sha256(&bytes);
+        let stream: futures::stream::BoxStream<'static, std::io::Result<Bytes>> =
+            Box::pin(futures::stream::once(async move { Ok(bytes) }));
+        backend
+            .put_stream(&version.backend_path, stream, Some(len))
+            .await?;
+        self.svc
+            .finalize_upload(
+                ctx,
+                file_id,
+                version_id,
+                i64::try_from(len).unwrap_or(i64::MAX),
+                digest,
+            )
+            .await
+    }
+}
 
 const GTS: &str = gts_id!("cf.fstorage.file.type.v1~x.test.file.type.v1~");
 
@@ -52,7 +107,7 @@ async fn build_db() -> Arc<DBProvider<DbError>> {
 async fn build_service() -> (
     Arc<FileService>,
     Arc<MultipartService>,
-    DataPlaneService,
+    TestDataPlane,
     Store,
 ) {
     let db = build_db().await;
@@ -78,6 +133,7 @@ async fn build_service() -> (
         None,
         None,
     ));
+    let dp = TestDataPlane::new(Arc::clone(&svc), store.clone(), backends.clone());
     let msvc = Arc::new(MultipartService::new(
         Arc::new(store.clone()) as Arc<dyn MultipartStore>,
         backends,
@@ -87,7 +143,6 @@ async fn build_service() -> (
         "http://sidecar.test".to_owned(),
         3600,
     ));
-    let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
     (svc, msvc, dp, store)
 }
 
@@ -544,7 +599,7 @@ async fn multipart_complete_leaves_audit_rows() {
         "http://sidecar.test".to_owned(),
         3600,
     ));
-    let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
+    let dp = TestDataPlane::new(Arc::clone(&svc), store.clone(), backends.clone());
 
     let ctx = ctx(Uuid::now_v7());
     let ticket = svc
@@ -577,13 +632,17 @@ async fn multipart_complete_leaves_audit_rows() {
         .expect("session must exist");
     let backend_path = format!("/{}/{}", ticket.file_id, plan.version_id);
 
+    let part_data_len = part_data.len() as u64;
+    let part_data_stream: futures::stream::BoxStream<'static, std::io::Result<bytes::Bytes>> =
+        Box::pin(futures::stream::once(async move { Ok(part_data) }));
     let (backend_etag, part_hash) = backend
-        .upload_part(
+        .upload_part_stream(
             &backend_path,
             &session.backend_upload_handle,
             1,
             0,
-            part_data,
+            part_data_stream,
+            part_data_len,
         )
         .await
         .unwrap();

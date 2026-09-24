@@ -6,3 +6,4 @@ pub mod hash;
 pub mod hash_mode;
 pub mod mime;
 pub mod range;
+pub mod stream_verify;

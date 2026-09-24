@@ -19,7 +19,7 @@ use crate::infra::content::hash_mode::Manifest;
 
 use super::{
     BackendCapabilities, MultipartCompletionPart, PublishOutcome, StorageBackend,
-    build_manifest_and_root,
+    build_manifest_and_root, check_read_prefix_budget,
 };
 
 /// In-progress multipart state per handle: (blob path, ordered parts).
@@ -54,6 +54,35 @@ impl InMemoryBackend {
             .lock()
             .map_err(|_| DomainError::backend("in-memory", "poisoned lock (multipart)"))
     }
+
+    /// Private whole-object read helper. `get`/`put` no longer exist on
+    /// `StorageBackend` (production backends must not read/write whole
+    /// objects), but this backend is explicitly non-durable, in-process
+    /// storage for tests/dev deployments, not a memory-DoS surface worth
+    /// hardening: the whole object already lives in memory as one `Bytes`
+    /// under `self.blobs`, so this helper "buffers" nothing that isn't
+    /// already sitting there.
+    fn get_whole(&self, path: &str) -> Result<Bytes, DomainError> {
+        self.lock_blobs()?
+            .get(path)
+            .cloned()
+            .ok_or_else(|| DomainError::backend(&self.id, format!("blob not found: {path}")))
+    }
+
+    /// Private whole-object range-slice helper, built on [`Self::get_whole`]
+    /// for the same non-hardening reason.
+    fn get_range_whole(&self, path: &str, range: ByteRange) -> Result<Bytes, DomainError> {
+        let full = self.get_whole(path)?;
+        let total = full.len() as u64;
+        match range.resolve(total) {
+            Some((start, end)) => {
+                let s = usize::try_from(start).unwrap_or(usize::MAX);
+                let e = usize::try_from(end).unwrap_or(usize::MAX);
+                Ok(full.slice(s..=e.min(full.len().saturating_sub(1))))
+            }
+            None => Err(DomainError::validation("range", "unsatisfiable byte range")),
+        }
+    }
 }
 
 #[async_trait]
@@ -72,11 +101,6 @@ impl StorageBackend for InMemoryBackend {
             // non-durable.
             ..BackendCapabilities::default()
         }
-    }
-
-    async fn put(&self, path: &str, bytes: Bytes) -> Result<(), DomainError> {
-        self.lock_blobs()?.insert(path.to_owned(), bytes);
-        Ok(())
     }
 
     /// Collecting into a `Bytes` buffer is acceptable here: this backend is
@@ -142,11 +166,20 @@ impl StorageBackend for InMemoryBackend {
         })
     }
 
-    async fn get(&self, path: &str) -> Result<Bytes, DomainError> {
-        self.lock_blobs()?
-            .get(path)
-            .cloned()
-            .ok_or_else(|| DomainError::backend(&self.id, format!("blob not found: {path}")))
+    /// Read up to `max_bytes` from the start of the stored blob, if any.
+    /// This backend already holds the whole object in memory as one
+    /// `Bytes`, so slicing its prefix costs nothing extra beyond what
+    /// `get_whole` itself already holds -- see its own doc comment for why
+    /// that's an acceptable non-hardened shortcut for this specific backend.
+    async fn read_prefix(&self, path: &str, max_bytes: u64) -> Result<Option<Bytes>, DomainError> {
+        check_read_prefix_budget(max_bytes)?;
+        let blobs = self.lock_blobs()?;
+        Ok(blobs.get(path).map(|b| {
+            let n = usize::try_from(max_bytes)
+                .unwrap_or(usize::MAX)
+                .min(b.len());
+            b.slice(0..n)
+        }))
     }
 
     /// Yields the stored `Bytes` as a single chunk: this backend is
@@ -162,7 +195,7 @@ impl StorageBackend for InMemoryBackend {
         path: &str,
         expected_len: u64,
     ) -> Result<BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
-        let bytes = self.get(path).await?;
+        let bytes = self.get_whole(path)?;
         let actual_len = bytes.len() as u64;
         if actual_len != expected_len {
             return Err(DomainError::conflict(format!(
@@ -186,7 +219,7 @@ impl StorageBackend for InMemoryBackend {
         range: ByteRange,
         expected_len: u64,
     ) -> Result<BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
-        let bytes = self.get_range(path, range).await?;
+        let bytes = self.get_range_whole(path, range)?;
         let actual_len = bytes.len() as u64;
         if actual_len != expected_len {
             return Err(DomainError::conflict(format!(
@@ -205,6 +238,13 @@ impl StorageBackend for InMemoryBackend {
         Ok(self.lock_blobs()?.contains_key(path))
     }
 
+    async fn size(&self, path: &str) -> Result<u64, DomainError> {
+        self.lock_blobs()?
+            .get(path)
+            .map(|b| b.len() as u64)
+            .ok_or_else(|| DomainError::backend(&self.id, format!("blob not found: {path}")))
+    }
+
     /// Native combined stat: one lock acquisition instead of the
     /// default's `exists` (lock + lookup) followed by `size` (another lock +
     /// `get`, which for this backend would otherwise clone the whole blob
@@ -220,14 +260,44 @@ impl StorageBackend for InMemoryBackend {
         Ok(handle)
     }
 
-    async fn upload_part(
+    /// Collects the stream into a single buffer before storing it: this
+    /// backend is explicitly non-durable, in-process storage for tests/dev
+    /// deployments, not a memory-DoS surface worth hardening (same rationale
+    /// as this backend's `put_stream`/`publish_exclusive` overrides above).
+    /// Still enforces the trait's exact-length contract on `len` — an
+    /// implementation is required to, regardless of durability — so tests
+    /// exercising a short/long part stream get the same rejection shape a
+    /// real backend (`S3Backend`) would give.
+    async fn upload_part_stream(
         &self,
         _path: &str,
         upload_handle: &str,
         part_number: u32,
         _part_offset: u64,
-        data: Bytes,
+        mut stream: BoxStream<'static, std::io::Result<Bytes>>,
+        len: u64,
     ) -> Result<(String, Vec<u8>), DomainError> {
+        let mut buf = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| DomainError::backend(&self.id, e.to_string()))?;
+            buf.extend_from_slice(&chunk);
+            if buf.len() as u64 > len {
+                return Err(DomainError::validation(
+                    "size",
+                    format!("part stream exceeded the declared length {len}"),
+                ));
+            }
+        }
+        if buf.len() as u64 != len {
+            return Err(DomainError::validation(
+                "size",
+                format!(
+                    "part stream yielded {} byte(s), expected exactly {len}",
+                    buf.len()
+                ),
+            ));
+        }
+        let data = Bytes::from(buf);
         let hash_bytes = hash::sha256(&data);
         let etag = hex::encode(&hash_bytes);
 

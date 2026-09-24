@@ -39,15 +39,70 @@ use uuid::Uuid;
 use file_storage::api::rest::dto::TransferOwnershipReq;
 use file_storage::api::rest::handlers;
 use file_storage::domain::authz::{Authorizer, TenantOnlyAuthorizer, actions};
-use file_storage::domain::data_plane::DataPlaneService;
 use file_storage::domain::error::DomainError;
 use file_storage::domain::multipart::{DEFAULT_MIN_PART_SIZE, MultipartPlan};
 use file_storage::domain::multipart_service::MultipartService;
-use file_storage::domain::ports::{DataPlanePort, MultipartStore};
+use file_storage::domain::ports::MultipartStore;
 use file_storage::domain::service::{FileService, ServiceConfig};
 use file_storage::infra::backend::{BackendRegistry, InMemoryBackend, StorageBackend};
+use file_storage::infra::content::{hash, mime};
 use file_storage::infra::signed_url::{Issuer, Verifier};
 use file_storage::infra::storage::Store;
+
+/// Direct byte-path test double for what `DataPlaneService` used to provide
+/// (removed: production never constructed it — the sidecar is the only real
+/// byte path). Same steps `DataPlaneService::put_content` used to perform,
+/// but through `put_stream` rather than the whole-object `put` that no
+/// longer exists on `StorageBackend`.
+struct TestDataPlane {
+    svc: Arc<FileService>,
+    store: Store,
+    backends: BackendRegistry,
+}
+
+impl TestDataPlane {
+    fn new(svc: Arc<FileService>, store: Store, backends: BackendRegistry) -> Self {
+        Self {
+            svc,
+            store,
+            backends,
+        }
+    }
+
+    async fn put_content(
+        &self,
+        ctx: &SecurityContext,
+        file_id: Uuid,
+        version_id: Uuid,
+        declared_mime: &str,
+        bytes: Bytes,
+    ) -> Result<(), DomainError> {
+        mime::validate(declared_mime, &bytes)?;
+        self.svc.authorize_write(ctx, file_id).await?;
+        let version = self
+            .store
+            .get_version(file_id, version_id)
+            .await?
+            .ok_or_else(|| DomainError::version_not_found(file_id, version_id))?;
+        let backend = self.backends.get(&version.backend_id)?;
+        let len = bytes.len() as u64;
+        let digest = hash::sha256(&bytes);
+        let stream: futures::stream::BoxStream<'static, std::io::Result<Bytes>> =
+            Box::pin(futures::stream::once(async move { Ok(bytes) }));
+        backend
+            .put_stream(&version.backend_path, stream, Some(len))
+            .await?;
+        self.svc
+            .finalize_upload(
+                ctx,
+                file_id,
+                version_id,
+                i64::try_from(len).unwrap_or(i64::MAX),
+                digest,
+            )
+            .await
+    }
+}
 use file_storage::infra::storage::migrations::Migrator;
 use file_storage_sdk::{CustomMetadataPatch, NewFile, OwnerKind};
 
@@ -426,7 +481,7 @@ async fn update_metadata_absent_if_match_applies_unconditionally() {
 
 // -- 3. bind: success + rebind-without-If-Match conflict ---------------------
 
-async fn build_bind_harness() -> (Arc<FileService>, DataPlaneService, SecurityContext) {
+async fn build_bind_harness() -> (Arc<FileService>, TestDataPlane, SecurityContext) {
     let db = build_db().await;
     let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
     let backends = BackendRegistry::new(vec![backend], "mem").expect("registry");
@@ -434,15 +489,15 @@ async fn build_bind_harness() -> (Arc<FileService>, DataPlaneService, SecurityCo
     let authorizer: Arc<dyn Authorizer> = Arc::new(TenantOnlyAuthorizer);
     let store = Store::new(Arc::clone(&db));
     let svc = Arc::new(FileService::new(
-        store,
-        backends,
+        store.clone(),
+        backends.clone(),
         issuer,
         authorizer,
         base_config(),
         None,
         None,
     ));
-    let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
+    let dp = TestDataPlane::new(Arc::clone(&svc), store, backends);
     let subject = ctx(Uuid::now_v7());
     (svc, dp, subject)
 }
