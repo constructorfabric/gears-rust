@@ -336,12 +336,14 @@ This gear takes the unified-system security posture as written — gateway-termi
 authentication, every authorization decision through `PolicyEnforcer` from `authz-resolver-sdk`,
 every sensitive database access covered by a PDP decision compiled to an `AccessScope` and
 applied by `SecureConn`, fail closed on denial, outage or missing constraints — and requests
-**one** deviation, declared here and in `ADR/0010`: a PDP denial of a **targeted** request is
+**two** deviations, declared here and in `ADR/0010`. First, a PDP denial of a **targeted** request is
 answered `not-found` (404) rather than the platform default 403, unless a follow-up `read`
 decision on the same target allows, in which case it is `not-authorized` (403). A 403 on a row
 the caller cannot read is an existence oracle over other sellers' orders; this is Orders
 Lifecycle's D-114 and D-141 applied unchanged, so the two Orders gears answer identically
-(`design/09-read-and-authz.md` §4.4). Nothing else deviates: there is no gear-local evaluator,
+(`design/09-read-and-authz.md` §4.4). Second, a PDP timeout or outage on a request path is answered
+with a sanitized, retryable 503 and no mutation rather than the platform rule's 403, again as
+Lifecycle 08 §3.5 does (§4.2). Nothing else deviates: there is no gear-local evaluator,
 no permission table, no invented `SecurityContext` claim and no envelope-signature control.
 
 ## 3. Technical Architecture
@@ -753,7 +755,7 @@ or remediation path. **Column-level definitions, keys, constraints, indexes and 
 specified normatively in the slice named in the "Specified in" column, and are not restated here.**
 A schema stated twice is a schema that will disagree with itself, which is exactly what this
 registry exists to prevent. Mutability is declared **per table** rather than globally, because
-seventeen of the twenty-five are deliberately mutable; the platform producer-outbox tables are not in this inventory (`design/01-foundation.md` §3.7 *Platform-managed producer persistence*).
+sixteen of the twenty-five are deliberately mutable; the platform producer-outbox tables are not in this inventory (`design/01-foundation.md` §3.7 *Platform-managed producer persistence*).
 
 Every table carries `resource_tenant_id` NOT NULL; tables backing an operator- or seller-scoped
 surface additionally carry `seller_tenant_id`, and per-tenant fairness and back-pressure key on
@@ -769,7 +771,7 @@ surface additionally carry `seller_tenant_id`, and per-tenant fairness and back-
 | `owf_audit_entry` | `01 §3.7` | foundation — audit writer | append-only, hash-chained, trigger-protected — no UPDATE/DELETE grant to any role and triggers rejecting both (D-59) |
 | `owf_audit_checkpoint` | `01 §3.7` | foundation — audit writer, checkpoint phase | append-only, trigger-protected — per-namespace roll-up headers chained under `01 §4.17` (D-59) |
 | `owf_audit_checkpoint_member` | `01 §3.7` | foundation — audit writer, checkpoint phase | append-only, trigger-protected — the chain heads a checkpoint captured |
-| `owf_dead_letter_record` | `01 §3.7` | foundation — step executor, on delivery-cap exhaustion | **mutable** — only to record redrive or resolution; an entry is never deleted |
+| `owf_dead_letter_record` | `01 §3.7` | foundation — step executor, on delivery-cap exhaustion | append-only — triage and redrive state live in `owf_dead_letter_triage` (`07 §3.7`); the only DELETE grant is the retention purge's, past the ≥ 400-day floor |
 | `owf_approval_verdict_cache` | `03 §3.7` | approval-execution — verdict gateway | append-only — one row per order version, authoritative once present |
 | `owf_approval_gate` | `03 §3.7` | approval-execution — approval gate manager | **mutable** — gate state settles through `open / approved / rejected / cancelled` |
 | `owf_approval_request` | `03 §3.7` | approval-execution — approval gate manager | append-only — one request row per gate under the composed key |

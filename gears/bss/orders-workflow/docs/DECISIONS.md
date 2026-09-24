@@ -1394,7 +1394,7 @@ resource-ownership check. Service principals are `subject_type` plus `token_scop
 gear; event handlers trust the broker's produce grant and platform-root tenancy. The five
 Workflow-owned workers run under configured system authority as the bounded exception Lifecycle
 `08 §3.5` states. A targeted PDP denial answers `not-found` (404) unless a follow-up `read`
-allows (`not-authorized`, 403); this is the gear's single declared deviation from the platform's
+allows (`not-authorized`, 403); this and the 503 on PDP outage are the gear's two declared deviations from the platform's
 403 default. PDP outage fails closed with a sanitized 503 and no key settlement; workers
 continue. The apply-time re-check of a long-running command re-runs the same PDP decision and
 routes a refusal to one `authority-withdrawn` manual task with the process phase unchanged, never
@@ -1424,7 +1424,7 @@ and OW-111.
 posture*, §3.2, §3.3, §3.4, §3.5, §3.7 (registry row removed; twenty-five tables), §4.2, §4.8,
 §5; `design/09-read-and-authz.md` §1, §2.1, §2.2, §3.1, §3.2, §3.3, §3.4, §3.5, §3.6, §3.7, §3.8,
 §4.1, §4.2, §4.4, §4.5, §5; `design/03-approval-execution.md` §3.2, §3.3;
-`design/07-manual-tasks.md` §1.2, §3.2, §3.3; `UPSTREAM_REQS.md` §1.1, §1.2, §2.1 (`AUTH-O1`
+`design/07-manual-tasks.md` §1.2, §3.2, §3.3; `UPSTREAM_REQS.md` §1.1, §1.2, §2.8 (`AUTH-O1`
 withdrawn), §2.8 (new), §3, §5; D-37 (amended).
 
 **ADR**: `cpt-cf-bss-orders-workflow-adr-platform-pdp-authorization`.

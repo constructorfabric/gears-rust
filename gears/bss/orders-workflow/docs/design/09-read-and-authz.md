@@ -880,7 +880,7 @@ A read is a single indexed row read on `order_id`, with no chain walk, no event 
 cross-gear call. Ownership: **written only by the Progress Projection Writer**
 (`cpt-cf-bss-orders-workflow-component-progress-projection-writer`), which upserts in the same
 transaction as any change this gear commits, and within ≤ 5 s for changes it merely observes
-through the outbox — that bound is the row's stated staleness and `source_max_committed_at` lets a
+through its inbound subscriptions — that bound is the row's stated staleness and `source_max_committed_at` lets a
 caller verify it. Invalidation is by upsert on `order_id`; there is no TTL and no cache to evict.
 
 The jsonb aggregates are **bounded, not open-ended**: `fulfillment_task_states` is capped by the
@@ -891,9 +891,10 @@ caller who needs the full list pages the operator task queue or the dead-letter 
 paged for exactly this reason.
 
 Tenant axes are all three; `seller_tenant_id` is the one every seller-scoped read predicate uses.
-Carries no payment-card data. Retention follows the order's own process record — the row is
-deleted when the process instance's audit record ages out of the ≥ 400-day floor, never before,
-since a progress read on a retained process must not 404. Monthly range partition on `updated_at`
+Carries no payment-card data. Retention follows the order's own process record: committed audit
+evidence is never purged (`01 §3.7`), so the row is removed only when the process record itself
+is archived under the program retention policy, never before, since a progress read on a
+retained process must not 404. Monthly range partition on `updated_at`
 is deliberately **not** applied: this table is one mutable row per order, not a growth log.
 
 **Example**:
@@ -1043,12 +1044,9 @@ grants, never content-authoring grants, which remain exclusively Orders Lifecycl
 may drive an order state transition directly: no pair a service principal holds writes order
 state, and no code path in this gear writes order state at all.
 
-**One PRD grant has no operation yet**: PRD §6.7 lets the Seller Operator *cancel* a manual task
-as well as resolve one. It is declared here as a resolution action of
-`POST /bss-orders-workflow/v1/workflows/{orderId}/tasks/{taskId}/resolve` under the Seller Operator's existing `S`
-`+own+aud+ver` arm; the resolution-action enum that carries it is owned by the manual-task slice,
-and until that enum contains it the grant is unreachable — stated openly rather than left as a
-matrix row pointing at nothing.
+**The Seller Operator's task-cancel grant** (PRD §6.7) is realised by
+`POST /bss-orders-workflow/v1/fulfillment-operator/tasks/{taskId}/cancel` (`07 §3.3`,
+`manual_task × cancel`), Seller Operator only; it is not a resolution action of `/resolve`.
 
 ### 4.2 The service-principal requirement for system actors (normative)
 

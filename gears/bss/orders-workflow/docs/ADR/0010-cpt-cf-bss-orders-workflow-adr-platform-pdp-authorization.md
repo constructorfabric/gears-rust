@@ -121,7 +121,7 @@ already taken, so the two Orders gears share one authorization contract. Concret
   (403); an untargeted denial (list, start) is 403. This is Lifecycle D-114 and D-141 applied
   unchanged: a 403 on a row the caller cannot read is an existence oracle over other sellers'
   orders, and the follow-up read discloses nothing the caller could not learn by reading. It is
-  recorded as this gear's single declared deviation from the platform default (`DESIGN.md` §2.2).
+  recorded as one of this gear's two declared deviations from the platform default (`DESIGN.md` §2.2); the other is the sanitized, retryable 503 on a PDP timeout or outage in place of the rule's 403, which follows Lifecycle 08 §3.5.
 * **PDP outage fails closed; workers continue.** A timeout or unavailable PDP on a request path
   returns a sanitized 503, performs no mutation, settles no idempotency key and never falls back
   to a local decision; the workers continue because their authority is configured, not obtained
@@ -138,7 +138,7 @@ already taken, so the two Orders gears share one authorization contract. Concret
 * The decision endpoint's out-of-assignment refusal becomes 404 (`03 §3.3`), aligning with the targeted-denial rule; the separation-of-duties refusal stays a distinct 403 (`submitter-barred`, D-56).
 * Delegation proof is forwarded to the PDP as request context and never validated locally (Lifecycle D-111 by reference); the `delegation_proof` claim is deleted.
 * Provisioning of roles, the approver grant and the service-principal grants, and their verification against the deployed provider, are release prerequisites owned by the platform policy owner (`UPSTREAM_REQS.md` §2.8).
-* Two Workflow controls the local evaluator carried are kept as local guards, because the PDP has no input for them: separation of duties at the decision endpoint (D-56) and the rule that no service principal drives an order state transition (the R1 seam, enforced by the catalogue: no `(resource, action)` pair a service principal holds writes order state).
+* Three Workflow controls the local evaluator carried are kept as local guards, because the PDP has no input for them: separation of duties at the decision endpoint (D-56), the gateway's pre-PDP refusal of a service `subject_type` on a human-actor arm and of a human subject on a service arm (`design/09-read-and-authz.md` §3.6), and the rule that no service principal drives an order state transition (the R1 seam, enforced by the catalogue: no `(resource, action)` pair a service principal holds writes order state).
 
 ### Confirmation
 

@@ -512,6 +512,12 @@ records.
 
 ### 2.8 Platform authorization policy
 
+**Withdrawn ask.** An earlier revision carried `AUTH-O1`, a request that the platform auth
+gateway resolve an approver principal to its assigned gate set. D-63 withdraws it: approver
+assignment is a property of the gate row (`assigned_principal`, `design/03-approval-execution.md`
+§3.7) evaluated by the PDP as an own-resource constraint, so no token claim and no gateway
+capability is needed. Nothing replaces it here; the provisioning of that grant is item 1 below.
+
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-upreq-pdp-policy-integration`
 
 **Owner**: platform authorization and deployment owners — the `authz-resolver` PDP provider and
