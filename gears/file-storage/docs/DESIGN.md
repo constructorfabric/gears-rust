@@ -28,6 +28,7 @@
   - [4.6 Worked example (LMS image upload and display)](#46-worked-example-lms-image-upload-and-display)
   - [4.7 Worked example (multipart upload and resume)](#47-worked-example-multipart-upload-and-resume)
   - [4.8 P1 implementation notes & decisions](#48-p1-implementation-notes--decisions)
+  - [4.9 Testing](#49-testing)
 - [5. Traceability](#5-traceability)
 
 <!-- /toc -->
@@ -1161,6 +1162,16 @@ sequenceDiagram
     Note over CTL,BA: Metadata-row-first: rows removed and 204 returned before the sidecar backend deletes.<br/>A failed backend delete leaves unreferenced objects (swept by the P2 cleanup engine),<br/>never a row pointing at missing bytes. Re-DELETE of an already-deleted id → 404 (idempotent).
 ```
 
+The transaction backing step 7's `DELETE` locks the `files` row first (`SELECT ... FOR UPDATE`), then re-reads
+the version list this diagram's step 5 shows as the next statement, immediately before the `DELETE` itself —
+not from an earlier, separate read — so a version a concurrent `presign_version` commits in between is either
+already visible to that re-read or blocked entirely by the lock until this transaction ends (and then fails
+with `404` on its own now-missing parent, rather than being silently cascade-removed with no DB row left to
+find it by). `DELETE /files/{id}/versions/{vid}` (§3.3) applies the same lock-then-re-list rule to its own "is
+`vid` the file's only version?" decision when that delete is equivalent to deleting the whole file, and the
+orphan-reclaim sweep (`cleanup-engine`, above) applies it to its own zero-version check before reclaiming a
+versionless `files` row.
+
 #### List files (P1)
 
 **ID**: `cpt-cf-file-storage-seq-list-files`
@@ -1268,7 +1279,12 @@ The file row holds **no bytes and no per-content fields** (mime, size, hash, bac
 
 **Indexes**:
 - `PRIMARY KEY (file_id)`
-- `(tenant_id, owner_kind, owner_id, created_at DESC)` — covers `GET /files` listing
+- `(tenant_id, owner_kind, owner_id, created_at DESC, file_id DESC)` — covers `GET /files` listing
+  (`FileRepo::list` sorts `ORDER BY created_at DESC, file_id DESC`; the `file_id` tie-breaker keeps two
+  `OFFSET`-paginated pages from skipping or repeating a row when they share a `created_at` instant).
+  `files_owner_listing_v2_idx` in `docs/migration.sql`, shipped in `m20260902_000001_index_hardening`,
+  superseding the released `files_owner_listing_idx (tenant_id, owner_kind, owner_id, created_at DESC)`
+  (`m20260624_000001_p1_initial`), dropped in the same migration
 - `(tenant_id, gts_file_type)` — supports per-type queries
 - partial index on `(created_at, file_id) WHERE content_id IS NULL` — supports the cleanup engine's
   versionless-orphan-file sweep (a `POST /files` multipart create that crashed between the bare file insert and the
@@ -1291,7 +1307,7 @@ and is immutable.
 | `hash_algorithm`  | `text`                                | Always `'SHA-256'` — a single hard-coded algorithm, no algorithm widening     |
 | `hash_value`      | `bytea`                               | Content digest (32 bytes): `sha256(object bytes)` for `whole-sha256`, or `sha256(manifest)` (the ADR-0006 composite root) for `multipart-composite-sha256` |
 | `hash_mode`       | `text` (`'whole-sha256'` \| `'multipart-composite-sha256'`) | ADR-0006 discriminator: which of the two hash modes produced `hash_value` (§4.2) |
-| `part_count`      | `integer`, nullable                   | Number of parts; set only for `multipart-composite-sha256`, `NULL` for `whole-sha256`. When set, always `>= 2` — a one-part plan degenerates to `whole-sha256` instead (ADR-0006 single-part amendment); enforced by a `CHECK` constraint on Postgres and by `BEFORE INSERT`/`BEFORE UPDATE OF part_count` triggers on SQLite (`m20260923_000001_part_count_floor`, see `docs/migration.sql`) |
+| `part_count`      | `integer`, nullable                   | Number of parts; set only for `multipart-composite-sha256`, `NULL` for `whole-sha256`. The application never writes `part_count = 1` — a one-part plan degenerates to `whole-sha256` instead (ADR-0006 single-part amendment) — but the schema does not forbid it: versions finalized before that change legitimately carry `part_count = 1` (ADR-0006, Compatibility) |
 | `status`          | `text` (`'pending'` \| `'available'`) | `'pending'` from pre-register until **finalize** (sidecar's post-`PUT` callback), then `'available'`. `bind` is a separate step (swaps `content_id`) and does not gate this column |
 | `is_current`      | `boolean`                             | Whether this version is the file's current content (matches `files.content_id`) |
 | `backend_id`      | `text`                                | `BackendConfig` that holds the bytes (platform YAML config in P1)            |
@@ -1305,6 +1321,10 @@ and is immutable.
 - unique partial index on `(file_id) WHERE is_current` — at most one current version per file
 - partial index on `(created_at) WHERE status = 'pending'` — supports time-ordered cleanup of abandoned
   pre-registered versions (P2); matches `file_versions_pending_idx` in migration.sql
+- `(file_id, created_at, version_id)` — covers `VersionRepo::list_by_file`'s `file_id = ?` filter plus its
+  `created_at DESC` sort (the composite PK alone serves the filter but not the sort, and versions are never
+  pruned in P1/P2, so a long-lived file's version count is unbounded); `file_versions_file_created_idx` in
+  migration.sql, shipped in `m20260902_000001_index_hardening`
 
 **Constraints**: `backend_id`/`backend_path` immutable per version (a content write makes a **new** version; the P2
 `backend-migrator` may relocate a version's bytes after a verified copy). The ETag is derived from
@@ -1388,7 +1408,10 @@ and the sidecar (a separate data-plane deployable on its own domain). The releva
   control plane signs with one active keypair (`signing_key_seed`) distributed by configuration; the sidecar accepts
   a small ordered **set** of public keys (active + previously-active, `FS_SIDECAR_PREVIOUS_PUBLIC_KEYS`), which is
   how a seed rotation happens without an outage — see `docs/operations.md`'s `signing_key_seed` → Rotation section.
-  No `kid` claim is used to select among them
+  The control plane needs the SAME ordered-set treatment for its OWN verification of the sidecar's finalize/
+  report-part callbacks (`previous_signing_public_keys`, public keys only — never the retired seed itself): the
+  sidecar's set only widens what the sidecar accepts, not what the control plane accepts on those two callback
+  routes. No `kid` claim is used to select among them, on either side
 - **Metadata DB**: shared Postgres cluster with the platform; `file_storage` schema; migrations applied at startup by
   one elected replica (`db-runner` handles election). Connection pooling per replica via SeaORM defaults
 - **CDN offload**: download egress, the dominant cost, is offloaded to the API-Gateway/CDN layer keyed on the
@@ -1891,9 +1914,34 @@ The control plane and the data-plane sidecar are implemented under `gears/file-s
   small ordered set of previously-active keys (`FS_SIDECAR_PREVIOUS_PUBLIC_KEYS`), which is what makes a
   `signing_key_seed` rotation a zero-outage operation (`docs/operations.md`'s `signing_key_seed` → Rotation section)
   without needing a `kid` set — key *selection* by `kid` (an optimization, not a correctness gap) remains deferred.
+  The control plane's OWN verification of the sidecar's finalize/report-part callbacks (`FileService::verifier`)
+  is a second, independent acceptance point that needs the same treatment — `FileStorageConfig`'s
+  `previous_signing_public_keys` (public keys only) — since the sidecar-side set above does not cover it.
 - **Direct-DB co-location** for the sidecar — an alternative to today's token-carried `backend_id`/`backend_path`
   model (§3.8) that would let a co-located sidecar read the metadata DB directly instead — remains a deferred,
   unscheduled optimization, not on the P1/P2 critical path.
+
+### 4.9 Testing
+
+**Deviation from the unit/E2E testing guide** (pattern:
+[`resource-group`'s `db-behavior-audit.md`](../../system/resource-group/docs/db-behavior-audit.md) §"Deviation from
+the unit/E2E testing guide"). `testing/e2e/suites/file_storage/` is split into three pytest packages, not the single
+file the [E2E guide](../../../docs/toolkit_unified_system/13_e2e_testing.md) §"File Layout" prefers:
+`test_file_storage_seams.py` (route/AuthN smoke, shared SQLite-backed CI server), `lifecycle/` (LocalFs byte-level
+lifecycle, own server+sidecar, bytes verified on disk) and `lifecycle_s3/` (same, against MinIO/`s3s-fs`) — the
+shared server has no hook to verify bytes on a filesystem or bucket, so a byte-level test needs its own pinned
+server+sidecar, same reason `resource-group` runs its PostgreSQL suite outside pytest.
+
+PostgreSQL-specific concurrency (e.g. the auto-bind CAS race behind `X-FS-Bound: conflict`) is exercised by
+`tests/pg_concurrency_test.rs` (`make test-fs-pg`, real PostgreSQL via `testcontainers`, fail-closed
+`FS_PG_REQUIRE_DOCKER=1` in CI), not E2E: the shared server is SQLite, and the race is not reproducible through
+sequential pytest calls without a synchronization point E2E has no mechanism for.
+
+Much of the control-plane's HTTP surface (`docs/api.md` §"P1 — Control plane") is instead exercised at the crate
+level, no HTTP/live AuthZ wiring: `tests/list_authz_test.rs`, `policy_authz_test.rs`, `idempotency_authz_test.rs`,
+`api_multipart_intent_test.rs`, `migration_test.rs`, `ownership_test.rs`, `api_handlers_test.rs`. This leaves E2E
+coverage thinner than the guide's "one call per route" goal for several P2 routes (list/patch/policy/retention/
+migrate/transfer/versions) — an inherited gap, tracked rather than silently left undocumented.
 
 ## 5. Traceability
 

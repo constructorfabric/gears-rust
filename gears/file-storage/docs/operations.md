@@ -26,14 +26,15 @@ gear started with no `file-storage` config section at all gets every default bel
 actually boot**: `require_signing_key_seed` defaults to `true` with `signing_key_seed` unset, and
 `FileStorageConfig::validate()` fails gear init on exactly that combination (see `require_signing_key_seed` below).
 A genuinely zero-config deployment is dev/test-only (set `require_signing_key_seed: false` there).
-`FileStorageConfig::validate()` (called at gear init, before anything is wired up) rejects **eight**
+`FileStorageConfig::validate()` (called at gear init, before anything is wired up) rejects **nine**
 invalid configurations — three missing-secret/zero-interval guards (`sweep_interval_secs == 0` with the sweep
 enabled; `signing_key_seed` absent while required; `finalize_internal_secret` absent while required); one absolute
-ceiling (`finalize_token_grace_secs` above `MAX_FINALIZE_TOKEN_GRACE_SECS`, 7 days — see that field below); and four
+ceiling (`finalize_token_grace_secs` above `MAX_FINALIZE_TOKEN_GRACE_SECS`, 7 days — see that field below); four
 cross-field ordering invariants (`default_url_ttl_secs` vs. `max_url_ttl_secs`; `default_page_size` vs.
 `max_page_size`; `default_url_ttl_secs` vs. `orphan_grace_secs`; `multipart_session_ttl_secs` vs.
-`default_url_ttl_secs`) — noted inline below. Function names (rather than line numbers) are used as source pointers
-throughout this table since line numbers drift with every edit.
+`default_url_ttl_secs`); and one per-entry format check (each `previous_signing_public_keys` entry must be a
+validly-formed, 32-byte Ed25519 public key — see that field below) — noted inline below. Function names (rather
+than line numbers) are used as source pointers throughout this table since line numbers drift with every edit.
 
 Config for this gear (like every gear on this platform) is loaded from its own platform YAML configuration section —
 there is no standalone TOML/JSON file of its own.
@@ -60,6 +61,7 @@ there is no standalone TOML/JSON file of its own.
 | `default_backend_id` | `None` (bare `#[serde(default)]`) | struct field default |
 | `finalize_internal_secret` | `None` (bare `#[serde(default)]`) | struct field default |
 | `require_finalize_internal_secret` | `false` (bare `#[serde(default)]`) | struct field default |
+| `previous_signing_public_keys` | `[]` (empty, bare `#[serde(default)]`) | struct field default |
 
 ### `default_url_ttl_secs`
 Default TTL (seconds) baked into every signed URL the control plane mints (`900` = 15 minutes), unless the caller's
@@ -159,32 +161,45 @@ is configured with only one public key via `FS_SIDECAR_PUBLIC_KEY`) — this loo
 upload/download failures. `require_signing_key_seed` (below) exists specifically to fail fast on this misconfiguration
 instead of degrading silently into that failure mode.
 
-**Rotation is zero-outage**, unlike `finalize_internal_secret`'s rotation below: the sidecar verifies a token
-against a small ordered set of public keys (`FS_SIDECAR_PUBLIC_KEY` plus, optionally,
-`FS_SIDECAR_PREVIOUS_PUBLIC_KEYS`), trying each in turn, so it can accept tokens from an old and a new seed at the
-same time. Procedure:
+**Rotation is zero-outage** if BOTH of the platform's independent acceptance points are given the old key during the
+rotation window, not just one of them: the sidecar verifies a token against its own small ordered set of public
+keys (`FS_SIDECAR_PUBLIC_KEY` plus, optionally, `FS_SIDECAR_PREVIOUS_PUBLIC_KEYS`), and — separately — the control
+plane verifies the sidecar's finalize/report-part callbacks against its OWN small ordered set (the current seed's
+key plus, optionally, `previous_signing_public_keys` below). The sidecar's set does nothing for the control plane's
+own callback verification; each side needs the old key configured on its own terms. Procedure:
 
-1. Generate the new seed and get its public key **before** touching the control plane. The reliable way to do this
+1. Generate the new seed and get its public key **before** touching anything else. The reliable way to do this
    without a dedicated derivation utility: start (or restart, in staging) one control-plane replica with the new
    seed and read its own startup log — `gear.rs::init` always logs
    `sidecar_public_key = <base64url>` (`"file-storage URL-signing public key (configure FS_SIDECAR_PUBLIC_KEY with
    this)"`) derived from whichever seed it booted with, precisely so this key never has to be computed by hand.
-2. Roll out the sidecar fleet with the new key added to its set — either as the new `FS_SIDECAR_PUBLIC_KEY` with the
+2. Roll out the sidecar fleet with the NEW key added to its set — either as the new `FS_SIDECAR_PUBLIC_KEY` with the
    old key moved into `FS_SIDECAR_PREVIOUS_PUBLIC_KEYS`, or left as `FS_SIDECAR_PREVIOUS_PUBLIC_KEYS` alongside the
    still-current primary. Order only changes verification cost (the primary is tried first), never correctness —
-   every sidecar now accepts tokens signed by either key.
+   every sidecar now accepts tokens signed by either key. This must complete before step 3: the control plane must
+   never sign with a key no sidecar accepts yet.
 3. Restart the control plane on the new seed — **every replica at once** (see the multi-replica warning above: a
-   mixed-seed control-plane fleet is exactly the failure mode that warns about). Tokens already issued under the old
-   seed keep verifying, because step 2 already taught the sidecars the old key too. This is the invariant that makes
-   the whole procedure safe: **the control plane must never sign with a key no sidecar accepts**, which is why the
-   sidecar fleet is always updated first, never the other way round.
-4. Once `max_url_ttl_secs` (default 7 days) has passed since step 3, no token signed with the old seed can still be
-   unexpired — remove the old key from every sidecar's `FS_SIDECAR_PREVIOUS_PUBLIC_KEYS`/`FS_SIDECAR_PUBLIC_KEY`.
+   mixed-seed control-plane fleet is exactly the failure mode that warns about) — with the OLD seed's public key set
+   in `previous_signing_public_keys`. Tokens already issued under the old seed keep verifying at the sidecar,
+   because step 2 already taught the sidecars the old key too; their finalize/report-part callbacks keep verifying
+   at the control plane too, because this step's `previous_signing_public_keys` now teaches the control plane the
+   old key. Skipping `previous_signing_public_keys` here reproduces exactly the bug this field exists to close:
+   every upload started before the restart would fail its finalize/report-part callback the instant the control
+   plane comes back up, even though the sidecar fleet still honours its signed URL.
+4. Only once `max_url_ttl_secs + finalize_token_grace_secs` (default 7 days + 1h) has passed since step 3, remove
+   the old key from every sidecar's `FS_SIDECAR_PREVIOUS_PUBLIC_KEYS`/`FS_SIDECAR_PUBLIC_KEY` **and** from the
+   control plane's `previous_signing_public_keys`. This is longer than the sidecar-only bound an earlier version of
+   this procedure used (`max_url_ttl_secs` alone): a token minted under the OLD seed right up until this restart can
+   carry an `exp` up to `max_url_ttl_secs` after it, and the control plane's finalize/report-part routes then accept
+   that same token up to `finalize_token_grace_secs` *past* that `exp` (`Verifier::verify_with_grace` — the same
+   slack that lets an ordinary slow-but-live upload finalize after its token's nominal TTL). Removing the old key
+   any earlier can reject the finalize/report-part callback of a legitimate, still-in-flight upload that happened to
+   straddle both its own token's TTL and this rotation window.
 
 **Compromise** follows the same four steps, except step 4 happens immediately, as a deliberate invalidation of every
-URL the old key could still authorize rather than something to wait out: a holder of the private key can mint a
-token for *any* `file_id`/`op`/`backend_path`, so containing that risk outweighs preserving in-flight URLs signed
-under it. Concretely:
+URL the old key could still authorize (including its finalize/report-part callback) rather than something to wait
+out: a holder of the private key can mint a token for *any* `file_id`/`op`/`backend_path`, so containing that risk
+outweighs preserving in-flight URLs — and their callbacks — signed under it. Concretely:
 - Outstanding **download** URLs simply get re-issued (a fresh `GET`/`HEAD` against the control plane mints a new one
   under the new key).
 - An in-flight **single-part upload** resumes via a repeat `POST /files` with the same `idempotency_key` — the
@@ -193,6 +208,25 @@ under it. Concretely:
 - An in-flight **multipart session** survives the rotation through its existing resume path: `GET
   /files/{id}/multipart/{upload_id}` re-signs the remaining parts' URLs under the current key, still capped by the
   session's own `expires_at` — no special-casing needed for a key rotation specifically.
+
+### `previous_signing_public_keys`
+Public keys of previously-active `signing_key_seed`s that the control plane's OWN finalize/report-part callback
+verification (`FileService::verifier`, `Verifier::verify_with_grace`) still accepts, on top of the current seed's
+key. Empty (`[]`) by default. Each entry is a base64url-encoded (`URL_SAFE_NO_PAD`) raw Ed25519 **public** key — the
+same wire format as one element of the sidecar's `FS_SIDECAR_PREVIOUS_PUBLIC_KEYS` list — never a seed or any other
+private key material; the control plane only ever needs to hold retired *public* keys, never the retired seed
+itself. This is a second, independent acceptance point from the sidecar's own `FS_SIDECAR_PUBLIC_KEY`/
+`FS_SIDECAR_PREVIOUS_PUBLIC_KEYS`: that set only widens what the *sidecar* accepts for PUT/GET/part-upload requests,
+and does nothing for the control plane's own verification of the sidecar's finalize/report-part callbacks — see
+`signing_key_seed`'s **Rotation** procedure above, which this field is a step of. **Production recommendation**:
+leave empty outside an active rotation window; populate it with exactly the retiring seed's public key per step 3
+of the **Rotation** procedure, and clear it again once step 4 completes. **Misconfiguration risk**: leaving it unset
+during a rotation reproduces the bug this field exists to close — every upload started before the control-plane
+restart fails its finalize/report-part callback the instant the restart happens, even though the sidecar fleet
+still honours the client's in-flight signed URL. `validate()` fails gear init on a malformed entry (bad base64, or
+the wrong decoded length); harmless duplicates (of the current key, or within this list) are silently deduped with
+a startup warning once the current key is actually known — see `FileService::with_previous_signing_public_keys`
+and `infra::signed_url::dedupe_public_keys`.
 
 ### `require_signing_key_seed`
 When `true` (the default), `FileStorageConfig::validate()` makes gear init **fail fast** if `signing_key_seed` is

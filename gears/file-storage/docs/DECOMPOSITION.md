@@ -88,6 +88,19 @@ content-hash-modes design — formalized in ADR-0006 and implemented alongside t
   non-primary key). Acceptance criterion: the token carries a key identifier, the sidecar selects the verifier in
   O(1), the keyset size is bounded by configuration, and a PASETO wrapper sits on the same `SignatureProvider` seam
   without changing the Token Opacity Contract (ADR-0004). Phase: P3.
+- **Schema-level `part_count >= 2` floor on `file_versions`** — deliberately not implemented. The application never
+  writes `part_count = 1` (a one-part multipart plan degenerates to `whole-sha256` instead, ADR-0006 single-part
+  amendment), but versions finalized by releases before that amendment legitimately persisted one-part multipart
+  completions as `multipart-composite-sha256` with `part_count = 1` (ADR-0006, Compatibility). A `CHECK`/trigger
+  floor added now would reject those legacy rows outright, and, worse, would reject any write from an
+  old-version instance still serving traffic against an already-migrated database during a rolling deploy. Add
+  the floor as its own, later release once every instance is confirmed running the degenerating code — an
+  expand/contract rollout: PostgreSQL — `ALTER TABLE ... ADD CONSTRAINT ... NOT VALID` (does not validate
+  existing rows, so legacy `part_count = 1` rows are left alone) followed by a separate `VALIDATE CONSTRAINT`
+  once no instance can write `part_count = 1` anymore; SQLite — `BEFORE INSERT`/`BEFORE UPDATE OF part_count`
+  triggers (guard only future writes, the same as Postgres's `NOT VALID` window). Acceptance criterion: no
+  instance older than the single-part amendment is still writing to the database (verified operationally, e.g. a
+  deploy-generation check), then the floor migration ships.
 
 ## 2. Entries
 

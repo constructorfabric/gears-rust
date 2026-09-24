@@ -111,9 +111,14 @@ COMMENT ON COLUMN file_storage.files.meta_version   IS 'Monotonic counter; bumpe
 -- Indexes on files -----------------------------------------------------------
 
 -- Covers the primary `GET /files` listing query: tenant + owner_kind + owner_id
--- with created_at descending for stable cursor pagination.
-CREATE INDEX files_owner_listing_idx
-    ON file_storage.files (tenant_id, owner_kind, owner_id, created_at DESC);
+-- with created_at descending, file_id descending as a tie-breaker for stable
+-- OFFSET pagination when two rows share a created_at instant (FileRepo::list
+-- sorts ORDER BY created_at DESC, file_id DESC). Supersedes
+-- files_owner_listing_idx (created_at DESC only, m20260624_000001_p1_initial),
+-- dropped in the same migration that adds this one (shipped,
+-- m20260902_000001_index_hardening).
+CREATE INDEX files_owner_listing_v2_idx
+    ON file_storage.files (tenant_id, owner_kind, owner_id, created_at DESC, file_id DESC);
 
 -- Per-tenant per-type queries (used by authorization audit, P2 policy checks).
 CREATE INDEX files_tenant_gts_idx
@@ -191,23 +196,14 @@ COMMENT ON TABLE file_storage.file_versions IS
     'Immutable content versions. Backend object /{file_id}/{version_id} is never mutated; a content write is a new version + a pointer swap (files.content_id).';
 
 -- ADR-0006: hash_mode = 'multipart-composite-sha256' <=> part_count IS NOT NULL (shipped, m20260707_000001_content_hash_modes).
+-- The application never writes part_count = 1 (a one-part plan degenerates to
+-- whole-sha256 instead, ADR-0006 single-part amendment), but this CHECK does
+-- not enforce a >= 2 floor: versions finalized before that amendment
+-- legitimately carry part_count = 1 (ADR-0006, Compatibility), and this
+-- presence-only CHECK is what still accepts them.
 ALTER TABLE file_storage.file_versions
     ADD CONSTRAINT file_versions_part_count_presence_check
         CHECK ((hash_mode = 'multipart-composite-sha256') = (part_count IS NOT NULL));
-
--- A composite row always has >= 2 parts (a one-part plan degenerates to whole-sha256
--- with part_count = NULL) -- pinned by a later migration, not folded into the CHECK
--- above, since m20260707 had already applied and cannot be edited in place
--- (m20260923_000001_part_count_floor). One atomic DROP+ADD CONSTRAINT on Postgres;
--- SQLite cannot alter a CHECK in place and file_versions cannot safely be rebuilt
--- (version_hash_manifest's ON DELETE CASCADE FK into it -- see that migration's doc
--- comment), so on SQLite the floor is two BEFORE INSERT / BEFORE UPDATE OF part_count
--- triggers with a fixed RAISE(ABORT, ...) instead.
-ALTER TABLE file_storage.file_versions
-    DROP CONSTRAINT file_versions_part_count_presence_check,
-    ADD CONSTRAINT file_versions_part_count_presence_check
-        CHECK ((hash_mode = 'multipart-composite-sha256') = (part_count IS NOT NULL)
-               AND (part_count IS NULL OR part_count >= 2));
 
 -- At most one current version per file.
 CREATE UNIQUE INDEX file_versions_current_idx
@@ -222,6 +218,16 @@ CREATE INDEX file_versions_pending_idx
 -- Recovery / debugging index on backend pointer ("which versions live on backend X?").
 CREATE INDEX file_versions_backend_idx
     ON file_storage.file_versions (backend_id);
+
+-- Covers VersionRepo::list_by_file (GET /files/{id}/versions, and the
+-- unbounded Store::list_versions used by delete/expiry blob accounting,
+-- backend migration and the sweep engine): filters file_id = ?, sorts
+-- created_at DESC. The composite PK (file_id, version_id) serves the filter
+-- but not the sort, and versions are never pruned in P1/P2, so this was a
+-- full per-file scan + sort with no supporting index (shipped,
+-- m20260902_000001_index_hardening).
+CREATE INDEX file_versions_file_created_idx
+    ON file_storage.file_versions (file_id, created_at, version_id);
 
 -- version_id is globally unique in practice (assigned via gen_random_uuid());
 -- this index makes that a DB-enforced fact so version_hash_manifest below can
