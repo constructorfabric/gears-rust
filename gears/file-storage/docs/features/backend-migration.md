@@ -133,7 +133,7 @@ apply to it)
 5. [x] - `p1` - **IF** the target backend's capabilities report `durable == false`: additionally authorize `ADMIN_POLICY` on the file - `inst-migrate-nondurable-gate`
 6. [x] - `p1` - Read the full blob from the source backend at the version's `backend_path` - `inst-migrate-read-source`
 7. [x] - `p1` - Algorithm: verify the blob's hash using `cpt-cf-file-storage-algo-content-hash-modes-verify` (mode-aware per ADR-0006) using `cpt-cf-file-storage-algo-backend-migration-verify` below - `inst-migrate-verify`
-8. [x] - `p1` - Write the verified blob to the destination backend at the canonical path `Self::backend_path(file_id, version_id)` - `inst-migrate-write-dest`
+8. [x] - `p1` - Write the verified blob to the destination backend at the canonical path `/{file_id}/{version_id}` - `inst-migrate-write-dest`
 9. [x] - `p1` - DB: `rebind_version_backend` — CAS the version row's `(backend_id, backend_path)` from the pre-migration snapshot to the destination, in the same transaction as a `BackendMigrate` audit row - `inst-migrate-cas-rebind`
 10. [x] - `p1` - **IF** the CAS lost: resolve using `cpt-cf-file-storage-algo-backend-migration-race-resolve` (below) — RETURN `404`/`409`/success-as-no-op depending on what actually happened - `inst-migrate-cas-race`
 11. [x] - `p1` - **IF** the CAS won: best-effort delete the source blob (failures logged, not surfaced to the caller — an orphan-cleanup concern, not a migration-correctness one) - `inst-migrate-cleanup-source`
@@ -158,7 +158,7 @@ aborts the migration before the destination write
 2. [x] - `p1` - **IF** `HashMode::WholeSha256`: no manifest needed - `inst-verify-migrate-whole`
 3. [x] - `p1` - **IF** `HashMode::MultipartCompositeSha256`: fetch the version's `version_hash_manifest` row; its absence is a database-consistency error (every `multipart-composite-sha256` version has exactly one such row by construction — ADR-0006 §5's `1:1` FK) - `inst-verify-migrate-fetch-manifest`
 4. [x] - `p1` - Call the shared `cpt-cf-file-storage-algo-content-hash-modes-verify` algorithm (owned by [Content-Hash Modes](content-hash-modes.md)) with the blob, mode, `hash_value`, and manifest (`None` for whole-object mode) - `inst-verify-migrate-shared-algo`
-5. [x] - `p1` - For `multipart-composite-sha256`, this verification is **fully self-contained from the object bytes + the stored manifest row alone** — it has no dependency on the multipart session's `multipart_upload_parts` rows still existing (proven by `tests/content_hash_modes_test.rs::migrate_backend_verifies_multipart_composite_without_parts_rows`, which deletes those rows before migrating) - `inst-verify-migrate-no-parts-dependency`
+5. [x] - `p1` - For `multipart-composite-sha256`, this verification is **fully self-contained from the object bytes + the stored manifest row alone** — it has no dependency on the multipart session's `multipart_upload_parts` rows still existing - `inst-verify-migrate-no-parts-dependency`
 6. [x] - `p1` - **RETURN** `Ok(())` if the (re-derived) hash matches; `HashMismatch` otherwise, aborting before any destination write - `inst-verify-migrate-return`
 
 ### Concurrent-Migration CAS Resolution
@@ -232,13 +232,13 @@ implicitly.
 
 ## 6. Acceptance Criteria
 
-- [x] Migrating a non-versioned file's content to a different backend updates the version row's `backend_id` and writes a `backend_migrate` audit row (`tests/cleanup_test.rs::migrate_backend_moves_content_and_updates_version_row`)
-- [x] Migrating to the backend the file is already on is a no-op: no audit row is written (`::migrate_backend_to_same_backend_is_noop`)
-- [x] A versioned file (more than 1 version) is rejected with `VersionedFileMigrationNotSupported` (`::migrate_backend_rejects_versioned_file`)
-- [x] A non-admin caller is rejected with `Forbidden` when the target backend is non-durable, and the version row is left unchanged (`::migrate_backend_rejects_non_durable_target_for_non_admin`)
-- [x] An admin-scoped caller may migrate onto a non-durable target (`::migrate_backend_allows_non_durable_target_for_admin_scope`)
-- [x] A concurrent migration to a **different** target correctly loses the CAS, gets `Conflict`, and has its own orphaned destination blob cleaned up, while the winner's blob is untouched (`tests/cleanup_test.rs::migrate_backend_loser_target_blob_cleaned_up`)
-- [x] A concurrent migration to the **same** target resolves as a successful no-op and does **not** delete the winning blob (`::migrate_backend_same_target_race_preserves_winner_blob`)
-- [x] For a `multipart-composite-sha256` version, `migrate_backend` verifies using only the object bytes and the stored `version_hash_manifest` row — with the multipart session's `multipart_upload_parts` rows already deleted (`tests/content_hash_modes_test.rs::migrate_backend_verifies_multipart_composite_without_parts_rows`)
+- [x] Migrating a non-versioned file's content to a different backend updates the version row's `backend_id` and writes a `backend_migrate` audit row
+- [x] Migrating to the backend the file is already on is a no-op: no audit row is written
+- [x] A versioned file (more than 1 version) is rejected with `VersionedFileMigrationNotSupported`
+- [x] A non-admin caller is rejected with `Forbidden` when the target backend is non-durable, and the version row is left unchanged
+- [x] An admin-scoped caller may migrate onto a non-durable target
+- [x] A concurrent migration to a **different** target correctly loses the CAS, gets `Conflict`, and has its own orphaned destination blob cleaned up, while the winner's blob is untouched
+- [x] A concurrent migration to the **same** target resolves as a successful no-op and does **not** delete the winning blob
+- [x] For a `multipart-composite-sha256` version, `migrate_backend` verifies using only the object bytes and the stored `version_hash_manifest` row — with the multipart session's `multipart_upload_parts` rows already deleted
 - [x] `migrate_backend`'s hash check is mode-aware (ADR-0006): whole-object re-hash for `whole-sha256`, split-rehash-rebuild-compare against the stored manifest for `multipart-composite-sha256` — it never hard-codes a whole-object-only comparison
 - [x] The migrate endpoint is restricted to non-versioned files by design — this is a permanent scope boundary (see §1.1), not a tracked gap

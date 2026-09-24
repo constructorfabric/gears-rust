@@ -120,7 +120,7 @@ Gears security and governance model.
 |---------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | File                | Binary content stored in FileStorage with associated metadata                                                                                                                                                                                                                           |
 | Control Plane       | The FileStorage API/SDK. Owns metadata, authorization, versioning, and conditional-request semantics; issues signed URLs. Its REST surface never carries file content                                                                                                                    |
-| Sidecar (Data Plane)| The only component that moves user bytes. Has its own domain/URL, is connected to the storage backends, validates platform auth tokens and signed-URL signatures, and reaches the control plane via the FS SDK. Serves content only through signed URLs                                  |
+| Sidecar (Data Plane)| The only component that moves user bytes. Has its own domain/URL, is connected to the storage backends, and verifies signed-URL signatures — it has no DB connection of its own and makes no platform-JWT call of any kind. Reports back to the control plane (finalize, per-part hash) over a plain, token-authenticated HTTP callback, never an SDK call. Serves content only through signed URLs |
 | Signed URL          | A short-lived, control-minted **codec-equivalent Ed25519-signed token** (bespoke `base64url(json).base64url(ed25519_signature)` in P1 -- opaque and codec-evolvable per ADR-0004's Implementation note, not a literal PASETO library) pointing at the sidecar that authorizes one content operation (`GET`/`PUT`/part) on a specific object, subject to AND-combined claims (`exp`, optional `ip`, optional token-claim predicates, upload size/hash). Carried in the query (`?fs-token=`) or a header; **opaque** to all but control+sidecar (`cpt-cf-file-storage-fr-signed-urls`) |
 | File ID             | The immutable uuid identity of a logical file. The current content is reached by resolving the file's content pointer (`content_id`)                                                                                                                                                     |
 | Version ID          | A uuid assigned by FileStorage (control plane) identifying one immutable content blob; the backend object lives at `/{file_id}/{version_id}` and is never mutated in place                                                                                                                |
@@ -333,17 +333,18 @@ every upload (all upload traffic transits the sidecar). If the declared type doe
 system **MUST** reject the upload with an error indicating the mismatch.
 
 For multipart uploads (`cpt-cf-file-storage-fr-multipart-upload`), the system **MUST** validate the declared mime_type
-against the content of the **first uploaded part**, which contains the file's magic bytes / file signature. Validation
-**MUST** occur when the first part is received — before subsequent parts are accepted. If the detected type does not
-match the declared mime_type, the system **MUST** abort the multipart upload and reject all subsequent parts.
+against the assembled object's leading bytes, which contain the file's magic bytes / file signature. Validation
+**MUST** occur after all parts are assembled and before the upload is finalized (i.e. before the version is ever
+marked available) — not deferred to a later read. If the detected type does not match the declared mime_type, the
+system **MUST** reject the completion request and **MUST NOT** finalize the version; the assembled-but-unfinalized
+content is orphaned content reclaimed by the same mechanism as any other orphan
+(`cpt-cf-file-storage-fr-orphan-reconciliation`).
 
 **Rationale**: Without content inspection, a client can declare `image/png` but upload an executable, trivially
 bypassing file type policies. Content-type validation ensures declared types are trustworthy for downstream consumers
-and policy enforcement. First-part validation for multipart uploads provides the same level of guarantee as single-part
-validation — magic bytes reside at the start of the file and are always contained in the first part because backends
-that support multipart upload (`cpt-cf-file-storage-fr-backend-capabilities`) enforce a minimum part size (e.g., 5 MB
-for S3) that far exceeds the longest magic-byte sequence (~12 bytes). Backends without native multipart support reject
-multipart uploads entirely, so no fallback is needed.
+and policy enforcement. Validating the assembled object once, at completion, rather than the first part in isolation,
+gives the same guarantee without requiring every backend's minimum part size to exceed the longest magic-byte
+sequence, and it reuses the identical bounded-prefix sniff the single-part path already performs on read-back.
 **Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-gears`
 
 ### 5.2 Ownership & Access Control
@@ -375,14 +376,20 @@ the context of the requesting user. Authorization requests **MUST** include the 
 (`cpt-cf-file-storage-fr-file-type-classification`) in the resource context to enable per-type access decisions.
 
 For content operations the read/write decision is made by the **control plane** when it issues the signed URL, and
-the signed URL's constraints carry that authorization to the **sidecar**. When the sidecar must write metadata on the
-user's behalf (e.g. binding an uploaded version), it calls the control plane under its **own app-token plus an
-on-behalf-of `<user>`** claim, and the access decision is made against the **delegated user**, not the sidecar
-identity.
+the signed URL's constraints carry that authorization to the **sidecar**. When the sidecar reports back to the
+control plane (finalizing an upload, reporting a multipart part), it does **not** call under an app-token or any
+other delegated-user identity: the verified signed token itself — issued at the moment the original authorization
+decision was made — is the sidecar's sole authorization for that one `(file_id, version_id)` operation, with no
+fresh access-control check on the callback (see [ADR-0003](./ADR/0003-cpt-cf-file-storage-adr-sidecar-data-plane.md)).
+The sidecar never performs the **bind** (swapping a file's live content pointer) on the user's behalf; binding is a
+separate, later request the client issues to the control plane directly, under its own authorization, except for a
+narrow first-content case where the control plane's own finalize handler performs the pointer swap inline under the
+same signed token (see `cpt-cf-file-storage-fr-conditional-requests`'s bind-on-finalize note).
 
 **Rationale**: All file access must be governed by the platform's centralized authorization model to enforce role-based,
-tenant-scoped, and type-scoped permissions. Delegation lets the sidecar act in the data path without becoming an
-authorization principal in its own right.
+tenant-scoped, and type-scoped permissions. Carrying the authorization decision inside the signed token lets the
+sidecar act in the data path without becoming an authorization principal, or needing a delegated identity, in its own
+right.
 **Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-gears`
 
 #### Tenant Boundary Enforcement
@@ -1247,8 +1254,10 @@ deployment. `file-storage`'s side is implemented and ready. See [DESIGN.md](./DE
 3. *(Phase 2)* Control plane validates against policies (type, size); in phase 1 all uploads are accepted
 4. Control plane returns a **signed upload URL** to the sidecar (`cpt-cf-file-storage-fr-signed-urls`)
 5. User transfers the bytes to the **sidecar** at that URL; the sidecar streams to the backend object
-   `/{file_id}/{version_id}`, computes the hash, and (on behalf of the user) **binds** the new version as current
-   under optimistic CAS
+   `/{file_id}/{version_id}`, computes the hash, and calls the control plane's token-authenticated finalize
+   callback, which independently re-verifies the bytes and flips the version to available; for the common
+   auto-bind case that same finalize call also **binds** the new version as current under optimistic CAS, in the
+   same transaction — the sidecar itself never binds and holds no delegated identity of its own
 6. *(Phase 2)* Audit record emitted for the upload
 7. The client holds the `file_id` and the bound `version_id`; on a bind conflict (`400 failed_precondition`) it re-binds without
    re-uploading
@@ -1519,8 +1528,10 @@ deployment. `file-storage`'s side is implemented and ready. See [DESIGN.md](./DE
 - Initial storage backend is configured at deployment time; runtime backend switching is phase 2
 - The control-plane API requires platform JWT in P1; content is reached only via short-lived signed URLs against the
   sidecar, which carry their own AND-combined constraints. Any external/anonymous sharing is deferred to P3 (see `§5.3`)
-- The control plane and the sidecar share the metadata DB (the sidecar reaches it via the FS SDK) and a signing
-  keypair (private on control, public on the sidecar)
+- The sidecar has **no** metadata-DB connection of its own — it resolves everything it needs from the verified
+  signed token's claims and reports back to the control plane over a token-authenticated HTTP callback, never a
+  direct DB write. The two planes' only shared state is the signing keypair (private on the control plane, public
+  on the sidecar) and the token format they agree on
 - Policy configuration is available to tenant administrators and users through the platform
 
 ## 12. Risks

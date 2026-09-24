@@ -134,10 +134,9 @@ content-hash-modes design — formalized in ADR-0006 and implemented alongside t
 
   - [ ] `p2` - `cpt-cf-file-storage-fr-multipart-upload`
   - [ ] `p2` - `cpt-cf-file-storage-fr-size-limits-policy`
-  - [ ] `p2` - `cpt-cf-file-storage-fr-storage-quota` — the `check_quota_bytes` call site exists in
-    `multipart_service.rs`, but `gear.rs` wires `quota_client: None`, so quota is not enforced on multipart
-    initiate — permissive/fail-open, blocked on a Quota Enforcement SDK crate (`gears/system/quota-enforcement/`
-    is docs-only)
+  - [ ] `p2` - `cpt-cf-file-storage-fr-storage-quota` — the quota check runs at multipart initiate, but no quota
+    client is configured, so quota is not enforced on multipart initiate — permissive/fail-open, blocked on a
+    Quota Enforcement SDK crate (docs-only today)
 
 - **Design Principles Covered**:
 
@@ -166,7 +165,7 @@ content-hash-modes design — formalized in ADR-0006 and implemented alongside t
 
 - **Data**:
 
-  - None (tables multipart_uploads and multipart_upload_parts are created by the foundational upload/versioning migration; this feature extends multipart_uploads via migration m20260701_000002_multipart_plan_columns)
+  - None (tables multipart_uploads and multipart_upload_parts are created by the foundational upload/versioning migration; this feature extends multipart_uploads with `version_id`/`declared_size`/`part_size` columns)
 
 
 ### 2.2 [Content-Hash Modes](features/content-hash-modes.md) - MEDIUM
@@ -241,19 +240,19 @@ content-hash-modes design — formalized in ADR-0006 and implemented alongside t
   `presign_version`, `update_metadata`) call into `PolicyResolver`'s enforcement helpers
 
 - **Scope**:
-  - `PolicyBody`/`SizeLimits`/`MimeSizeOverride`/`MetadataLimits` domain types and the `PolicyResolver`
-    most-restrictive-wins merge algorithm (`src/domain/policy.rs`)
+  - `PolicyBody`/`SizeLimits`/`MimeSizeOverride`/`MetadataLimits` domain types and the most-restrictive-wins
+    merge algorithm that resolves them into one effective policy
   - `GET`/`PUT /policy` (tenant or user scope) and `GET /policy/effective` (the resolved effective policy for the
     caller's context)
   - Enforcement call sites: allowed-MIME check, effective size-limit check, metadata-limit check, wired into
-    `domain/service/create.rs` and the multipart-initiate path
+    the create-file and multipart-initiate paths
 
 - **Out of scope**:
   - Storage quota enforcement (a related but separate control -- `cpt-cf-file-storage-fr-storage-quota`, not
     enforced in any deployment today, see [multipart-coordinator.md](features/multipart-coordinator.md)'s quota
     caveat)
-  - Retention policies (a distinct policy *type*, owned by §2.4 despite living in the same `policy.rs` module and
-    sharing the tenant/user/file scope model)
+  - Retention policies (a distinct policy *type*, owned by §2.4 despite sharing the same domain module and
+    the tenant/user/file scope model)
 
 - **Requirements Covered**:
 
@@ -280,7 +279,7 @@ content-hash-modes design — formalized in ADR-0006 and implemented alongside t
 
 - **Sequences**:
 
-  - None (resolution documented inline in `src/domain/policy.rs::PolicyResolver::resolve`)
+  - None (resolution algorithm documented inline in [features/policy-engine.md](features/policy-engine.md))
 
 - **Data**:
 
@@ -305,10 +304,10 @@ content-hash-modes design — formalized in ADR-0006 and implemented alongside t
   or `OrphanReconcile` audit row through the same transactional-outbox mechanism)
 
 - **Scope**:
-  - `RetentionRuleBody`/`AgeRetention`/`InactivityRetention`/`MetadataRetention` domain types (`src/domain/policy.rs`)
+  - `RetentionRuleBody`/`AgeRetention`/`InactivityRetention`/`MetadataRetention` domain types
   - `GET`/`POST /retention-rules`, `DELETE /retention-rules/{rule_id}`
-  - `CleanupEngine::run_sweep` (`src/domain/cleanup.rs`): abandoned-pending-version reclamation (skips versions still
-    backing a live in-progress multipart session), expired-multipart-session abort,
+  - The background cleanup sweep: abandoned-pending-version reclamation (skips versions still
+    backing a live in-progress or any completing multipart session), expired-multipart-session abort,
     retention-policy expiry (keyset-paginated file scan), expired idempotency-key purge
   - Per-instance sweep scheduling; cross-instance coordination is not implemented
 
@@ -342,7 +341,7 @@ content-hash-modes design — formalized in ADR-0006 and implemented alongside t
 
 - **Sequences**:
 
-  - None (sweep order documented inline in `src/domain/cleanup.rs::CleanupEngine::run_sweep`)
+  - None (sweep order documented inline in [features/retention-cleanup.md](features/retention-cleanup.md))
 
 - **Data**:
 
@@ -369,9 +368,9 @@ content-hash-modes design — formalized in ADR-0006 and implemented alongside t
   than depending on any one of them
 
 - **Scope**:
-  - `AuditEntry`/`AuditOperation`/`AuditOutcome` domain types (`src/domain/audit.rs`)
-  - `AuditRepo::insert`, called inside the same transaction as every audited mutation across
-    `domain/service/{write,create,read_ops,backend}.rs`, `domain/multipart_service.rs`, and `domain/cleanup.rs`
+  - `AuditEntry`/`AuditOperation`/`AuditOutcome` domain types
+  - One audit-outbox row insert, in the same transaction as every audited mutation, across every write path
+    (create, single-shot upload, read/metadata, backend migration, multipart, and the cleanup sweep)
 
 - **Out of scope**:
   - Draining/relaying `audit_outbox` rows to any downstream sink -- **not implemented**
@@ -429,7 +428,7 @@ content-hash-modes design — formalized in ADR-0006 and implemented alongside t
 
 - **Scope**:
   - `POST /files/{id}/transfer`: nil-UUID rejection, atomic `owner_kind`/`owner_id` swap, audit row, file event,
-    post-commit usage-delta debit/credit (`src/domain/service/write.rs::transfer_ownership`)
+    post-commit usage-delta debit/credit
 
 - **Out of scope**:
   - Full target-owner existence/tenant-membership validation -- **NOT IMPLEMENTED**, blocked on an
@@ -481,7 +480,7 @@ content-hash-modes design — formalized in ADR-0006 and implemented alongside t
 - **Scope**:
   - `POST /files/{id}/migrate`: single-version-only guard, non-durable-target admin gate, source read + mode-aware
     hash verify + destination write, CAS-guarded version-row rebind, concurrent-migration race resolution,
-    best-effort source cleanup (`src/domain/service/backend.rs::migrate_backend`)
+    best-effort source cleanup
 
 - **Out of scope**:
   - Versioned files (more than 1 version) -- migration is restricted to non-versioned files by design, a permanent

@@ -341,8 +341,8 @@ tooling is a P3 deliverable (`cpt-cf-file-storage-fr-runtime-backends`).
 **Technology**: Rust structs (`file-storage-sdk` crate) backed by SeaORM entities (`file-storage` crate's infra layer)
 per the [ToolKit SDK layering guide](../../../docs/toolkit_unified_system/02_gear_layout_and_sdk_pattern.md).
 
-**Location**: `gears/file-storage/file-storage-sdk/src/models.rs` for public types;
-`gears/file-storage/file-storage/src/infra/storage/entity/*.rs` for SeaORM entities.
+**Location**: the SDK crate's public model types, backed by SeaORM entities in the gear's storage
+infrastructure layer.
 
 **Core Entities**:
 
@@ -557,6 +557,11 @@ component clients hit for content.
   errors and the size/hash constraint checks — there is no in-sidecar `415` magic-bytes abort, see
   `content-pipeline` above), delete the partially-written object; a hard crash leaves an orphan swept by the P2
   cleanup engine
+- **CORS is not implemented.** The sidecar emits no `Access-Control-*` response headers and answers no preflight
+  `OPTIONS` request. A browser issuing the signed-URL `PUT`/`GET`/part-upload directly against the sidecar from a
+  different origin than the sidecar's own will have the request blocked by the browser itself before it ever
+  reaches the token-verification step above. Deployments that serve browser clients from a different origin than
+  `sidecar_base_url` must front the sidecar with a CORS-terminating proxy/gateway until this is implemented.
 
 ##### Auth model (exception to gateway-auth)
 
@@ -673,9 +678,12 @@ and `meta_version`. (The pointer-swap CAS itself is driven by `bind-service`; th
   writes do **not** bump `meta_version`; metadata-only updates bump `meta_version` and `last_modified_at`
 - Enforce tenant boundary via SecureConn — every query/mutation passes through the request's `SecurityContext`
 - Tenant + mandatory owner filter on `GET /files`; offset pagination (`limit`/`offset` query params, capped by
-  `FileStorageConfig::max_page_size`); index-backed by `(tenant_id, owner_kind, owner_id, created_at)`. `GET /files`
+  `FileStorageConfig::max_page_size`); ordered `created_at DESC, file_id DESC` (the `file_id` tie-breaker keeps
+  offset pagination stable across rows sharing a `created_at` instant), index-backed by
+  `(tenant_id, owner_kind, owner_id, created_at DESC, file_id DESC)`. `GET /files`
   and `GET /files/{id}/versions` both return a bare JSON array, not an `{items, next_cursor}` envelope. OData
-  `$filter`/`$orderby` is not implemented. List a file's versions ordered by `created_at`, same offset model
+  `$filter`/`$orderby` is not implemented. List a file's versions ordered by `created_at DESC, version_id DESC`
+  (same tie-breaker reasoning), same offset model
 - Reject PRD-defined constraints at this layer when they are not enforceable as DB constraints (e.g., GTS format
   validation regex, tenant policy delta in P2)
 
@@ -767,6 +775,13 @@ scope directly — so a cross-tenant file is invisible before authorization is e
 
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-component-sdk-facade`
 
+> **Status: registered, not implemented.** The in-process client trait exists only as a placeholder (a single
+> `module_name` accessor) and its only implementation is a trivial stub — the wiring for other Gears to resolve a
+> client is in place, but none of the operations below have landed. The SDK facade lags the control API: multipart
+> upload, ownership transfer, policy, retention-rule, and backend-migration operations have no in-process client
+> surface at all, on top of the placeholder P1 operations below. Consuming Gears wanting any of this today must call
+> the HTTP control API directly.
+
 ##### Why this component exists
 
 In-process SDK trait for other Gears (LLM Gateway, Reporting, etc.). Mirrors the control API one-to-one in domain
@@ -776,7 +791,7 @@ control-plane service never streams bytes for it.
 
 ##### Responsibility scope
 
-- Expose a Rust trait (`FileStorageClient`) in `file-storage-sdk` covering: `create_file`, `open_read` (a **seekable**
+- Expose a Rust trait (`FileStorageClientV1`) in `file-storage-sdk` covering: `create_file`, `open_read` (a **seekable**
   reader supporting reads at an arbitrary offset/length), `download_file` (whole-object `Stream<Bytes>`), `head_file`,
   `update_metadata`, `delete_file`, `list_files`, `list_versions`, `restore_version`, `list_storages`, `get_storage`
 - For content: call control `metadata-service`/`signed-url-issuer` directly (in-process, no HTTP), obtain a signed URL,
@@ -815,8 +830,8 @@ intended decomposition. Several already have a dedicated FEATURE artifact under 
 
 > **Quota is not enforced.** The quota half of `quota-adapter` is consumer scaffolding only:
 > `file-storage` defines the `QuotaClient` port and calls it (fail-closed on client error) from every
-> storage-increasing operation, but `gear.rs` wires `quota_client: None` — no client is
-> configured in any deployment, so the check is a permissive/fail-**open** no-op. It is blocked on a Quota
+> storage-increasing operation, but no client is configured in any deployment (`quota_client: None`),
+> so the check is a permissive/fail-**open** no-op. It is blocked on a Quota
 > Enforcement SDK crate; `gears/system/quota-enforcement/` is docs-only (no Rust crate). The usage-reporting half is
 > further along — a `usage-collector-sdk` crate exists — though `usage_reporter` is also still `None` pending
 > integration (P2 1.12). See [../README.md](../README.md)'s Implementation status section and
@@ -1241,8 +1256,8 @@ sequenceDiagram
 
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-db-overview`
 
-**Schema**: `file_storage` in the shared Postgres cluster (`migration.sql`'s canonical target). SeaORM entities under
-`gears/file-storage/file-storage/src/infra/storage/entity/`; migrations run through `db-runner` per
+**Schema**: `file_storage` in the shared Postgres cluster (`migration.sql`'s canonical target). Entities are backed
+by SeaORM; migrations run through `db-runner` per
 `docs/toolkit_unified_system/11_database_patterns.md`. The gear's own migrations use **flat, unqualified table
 names** on both Postgres and SQLite (each SeaORM entity declares a static `table_name`; SQLite has no schemas).
 
@@ -1280,7 +1295,7 @@ The file row holds **no bytes and no per-content fields** (mime, size, hash, bac
 **Indexes**:
 - `PRIMARY KEY (file_id)`
 - `(tenant_id, owner_kind, owner_id, created_at DESC, file_id DESC)` — covers `GET /files` listing
-  (`FileRepo::list` sorts `ORDER BY created_at DESC, file_id DESC`; the `file_id` tie-breaker keeps two
+  (sorted `ORDER BY created_at DESC, file_id DESC`; the `file_id` tie-breaker keeps two
   `OFFSET`-paginated pages from skipping or repeating a row when they share a `created_at` instant).
   `files_owner_listing_v2_idx` in `docs/migration.sql`, shipped in `m20260902_000001_index_hardening`,
   superseding the released `files_owner_listing_idx (tenant_id, owner_kind, owner_id, created_at DESC)`
@@ -1321,7 +1336,7 @@ and is immutable.
 - unique partial index on `(file_id) WHERE is_current` — at most one current version per file
 - partial index on `(created_at) WHERE status = 'pending'` — supports time-ordered cleanup of abandoned
   pre-registered versions (P2); matches `file_versions_pending_idx` in migration.sql
-- `(file_id, created_at, version_id)` — covers `VersionRepo::list_by_file`'s `file_id = ?` filter plus its
+- `(file_id, created_at, version_id)` — covers `GET /files/{id}/versions`'s `file_id = ?` filter plus its
   `created_at DESC` sort (the composite PK alone serves the filter but not the sort, and versions are never
   pruned in P1/P2, so a long-lived file's version count is unbounded); `file_versions_file_created_idx` in
   migration.sql, shipped in `m20260902_000001_index_hardening`
@@ -1552,8 +1567,6 @@ digest      = sha256("fs-etag-v1" || file_id_bytes (16 bytes) || content_id_byte
 etag_header = '"' || hex(digest[..16]) || '"'   # quoted, lowercase hex of the truncated (128-bit) digest
 ```
 
-(`domain::etag::content_etag`, `file-storage/src/domain/etag.rs`.)
-
 Properties:
 
 - Deterministic across both planes — the same `(file_id, content_id)` yields the same string everywhere (control plane
@@ -1744,8 +1757,8 @@ aggregate-owner-quota gap across many concurrent presigns — reserve-at-presign
 a **P2 control-plane** concern, detailed in the P2 `cpt-cf-file-storage-fr-storage-quota` FEATURE.
 
 **Current limitation: quota is not enforced.** The paragraph above describes intended behavior once quota is active;
-today the basic per-request quota check itself is not active either — no `QuotaClient` is wired (`gear.rs`'s
-`quota_client: None`) — so no `max_size` is ever derived from a remaining quota; see [operations.md](./operations.md)'s
+today the basic per-request quota check itself is not active either — no `QuotaClient` is configured
+(`quota_client: None`) — so no `max_size` is ever derived from a remaining quota; see [operations.md](./operations.md)'s
 "Storage quota (not enforced)" section.
 
 **Token opacity (recap).** Only the control plane (minter) and the sidecar (verifier) know the token's claim-set and
@@ -1932,14 +1945,14 @@ lifecycle, own server+sidecar, bytes verified on disk) and `lifecycle_s3/` (same
 shared server has no hook to verify bytes on a filesystem or bucket, so a byte-level test needs its own pinned
 server+sidecar, same reason `resource-group` runs its PostgreSQL suite outside pytest.
 
-PostgreSQL-specific concurrency (e.g. the auto-bind CAS race behind `X-FS-Bound: conflict`) is exercised by
-`tests/pg_concurrency_test.rs` (`make test-fs-pg`, real PostgreSQL via `testcontainers`, fail-closed
+PostgreSQL-specific concurrency (e.g. the auto-bind CAS race behind `X-FS-Bound: conflict`) is exercised by a
+dedicated real-PostgreSQL integration suite (`make test-fs-pg`, via `testcontainers`, fail-closed
 `FS_PG_REQUIRE_DOCKER=1` in CI), not E2E: the shared server is SQLite, and the race is not reproducible through
 sequential pytest calls without a synchronization point E2E has no mechanism for.
 
 Much of the control-plane's HTTP surface (`docs/api.md` §"P1 — Control plane") is instead exercised at the crate
-level, no HTTP/live AuthZ wiring: `tests/list_authz_test.rs`, `policy_authz_test.rs`, `idempotency_authz_test.rs`,
-`api_multipart_intent_test.rs`, `migration_test.rs`, `ownership_test.rs`, `api_handlers_test.rs`. This leaves E2E
+level, no HTTP/live AuthZ wiring: dedicated authorization and handler-level integration suites cover listing,
+policy, idempotency, multipart-intent, migration, ownership-transfer, and generic handler behavior. This leaves E2E
 coverage thinner than the guide's "one call per route" goal for several P2 routes (list/patch/policy/retention/
 migrate/transfer/versions) — an inherited gap, tracked rather than silently left undocumented.
 
