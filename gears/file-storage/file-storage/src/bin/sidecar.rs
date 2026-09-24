@@ -147,7 +147,9 @@ use file_storage::domain::ports::FileStorageMetricsPort;
 use file_storage::infra::backend::{BackendRegistry, LocalFsBackend, S3Backend, StorageBackend};
 use file_storage::infra::content::{hash, range};
 use file_storage::infra::metrics::FileStorageMetricsMeter;
-use file_storage::infra::signed_url::{Claims, Op, Verifier};
+use file_storage::infra::signed_url::{
+    Claims, Op, Verifier, dedupe_public_keys, parse_public_key_list,
+};
 
 /// Id of the local-fs backend, and the sidecar's `BackendRegistry` default id.
 /// The default is never actually consulted by request dispatch (every request
@@ -241,56 +243,6 @@ where
             .map_err(|e| anyhow::anyhow!("invalid {name}={raw:?}: {e}")),
         None => Ok(default),
     }
-}
-
-/// Parse `FS_SIDECAR_PREVIOUS_PUBLIC_KEYS`'s raw value: a comma-separated
-/// list of base64url Ed25519 public keys, decoded the same way the primary
-/// `FS_SIDECAR_PUBLIC_KEY` is. See `docs/operations.md`'s `signing_key_seed`
-/// → **Rotation** section and this module's doc comment for why the sidecar
-/// accepts more than one key at all.
-///
-/// Each element is trimmed; an empty element (e.g. a stray trailing comma)
-/// is silently skipped rather than rejected — unlike a genuinely malformed
-/// key, it carries no ambiguity about operator intent. A key that fails to
-/// base64url-decode fails the whole parse — and therefore sidecar startup,
-/// exactly like an invalid primary key — naming its 0-based position in the
-/// list so a misconfiguration is easy to locate.
-fn parse_public_key_list(raw: &str) -> anyhow::Result<Vec<Vec<u8>>> {
-    raw.split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .enumerate()
-        .map(|(i, s)| {
-            URL_SAFE_NO_PAD.decode(s).map_err(|e| {
-                anyhow::anyhow!("invalid FS_SIDECAR_PREVIOUS_PUBLIC_KEYS entry #{i}: {e}")
-            })
-        })
-        .collect()
-}
-
-/// De-duplicate the sidecar's accepted-verifier-key set: `primary` always
-/// leads, followed by `previous` in order, with any repeat -- of `primary`,
-/// or of an entry already kept from `previous` -- dropped. Order is
-/// preserved among the survivors. Returns `(deduped_keys, dropped_count)`.
-///
-/// A duplicate key is a harmless no-op here: [`Verifier::verify`] already
-/// tries each key in the set in order and stops at the first match, so a
-/// repeated key only costs one wasted comparison in the rare case where
-/// every other key fails to verify -- never a correctness issue. That is why
-/// this silently drops duplicates (with a startup warning, at the call site
-/// in `main`) instead of rejecting them as a configuration error.
-fn dedupe_public_keys(primary: Vec<u8>, previous: Vec<Vec<u8>>) -> (Vec<Vec<u8>>, usize) {
-    let mut deduped = Vec::with_capacity(previous.len() + 1);
-    deduped.push(primary);
-    let mut dropped = 0_usize;
-    for key in previous {
-        if deduped.contains(&key) {
-            dropped += 1;
-        } else {
-            deduped.push(key);
-        }
-    }
-    (deduped, dropped)
 }
 
 /// Cgroup v1's "no limit configured" sentinel for `memory.limit_in_bytes` is
@@ -444,7 +396,8 @@ fn build_config(lookup: impl Fn(&str) -> Option<String>) -> anyhow::Result<Sidec
     // `signing_key_seed` → Rotation section, and this module's doc comment).
     // Unset/empty = no previous keys, matching pre-rotation behaviour.
     let previous_public_keys: Vec<Vec<u8>> = match lookup("FS_SIDECAR_PREVIOUS_PUBLIC_KEYS") {
-        Some(raw) if !raw.trim().is_empty() => parse_public_key_list(&raw)?,
+        Some(raw) if !raw.trim().is_empty() => parse_public_key_list(&raw)
+            .map_err(|e| anyhow::anyhow!("invalid FS_SIDECAR_PREVIOUS_PUBLIC_KEYS: {e}"))?,
         _ => Vec::new(),
     };
     // Primary always leads the set (`Verifier::verify` tries keys in

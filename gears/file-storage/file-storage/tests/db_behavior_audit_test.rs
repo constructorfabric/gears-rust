@@ -233,12 +233,16 @@ async fn trace_multipart_complete() {
     // regardless of an enclosing transaction, so this specific statement's
     // *own* correctness doesn't depend on being wrapped -- but it does mean
     // the lease is acquired as an independent step from everything that
-    // follows (the backend assembly, then the finalize transaction, then
-    // `finish_complete`), with no overarching transaction tying the whole
-    // workflow together. This is mechanical evidence for the owner-fencing
-    // gap covered by `pg_concurrency_test.rs`'s `f2_*` scenarios: the gap
-    // isn't "no transaction anywhere", it's "several independently-atomic
-    // steps with no cross-step ownership fence". Pinned directly (not
+    // follows (the backend assembly, then
+    // `Store::finalize_multipart_version`'s own transaction, which now folds
+    // the finalize + auto-bind CAS + the terminal `finish_complete`
+    // transition into ONE transaction -- see that method's doc), with no
+    // overarching transaction tying the *lease acquisition itself* to the
+    // rest of the workflow. This is mechanical evidence for the
+    // owner-fencing gap covered by `pg_concurrency_test.rs`'s `f2_*`
+    // scenarios: the gap isn't "no transaction anywhere", it's "lease
+    // acquisition is a step apart from everything that follows it, with no
+    // cross-step ownership fence tying them together". Pinned directly (not
     // ignored, since it's the intentional/expected shape, not a regression
     // target) so a future change that adds a *second* untransacted write
     // here would still be caught.
@@ -394,15 +398,27 @@ async fn multipart_initiate_capability_reject_with_compensation_reclaims_orphan(
 // into.
 
 #[tokio::test]
-async fn multipart_finish_complete_cas_omits_lease_owner() {
-    // Known defect (worst case: session stranded until expiry -- see
-    // `pg_concurrency_test.rs`'s `f2_*` scenarios for the full stranding
-    // mechanism). `finish_complete`'s UPDATE filters on
-    // `state = 'completing'` only; unlike
-    // `release_complete_lease`/`abort_expired_completing`, it has no
-    // `lease_owner` predicate. This pins the *current* (defective) SQL
-    // shape directly -- if `lease_owner` is added to the WHERE clause, this
-    // test starts failing, signaling the defect is fixed.
+async fn multipart_finish_complete_cas_omits_lease_owner_for_embedded_call() {
+    // FS-02/DBS-05 update: `finish_complete` NOW takes an
+    // `expected_owner: Option<&str>` and filters on `lease_owner` when it is
+    // `Some` (see its doc comment, and
+    // `multipart_repo_test.rs::finish_complete_rejects_foreign_lease_owner`/
+    // `finish_complete_accepts_matching_lease_owner` for direct coverage of
+    // that predicate). This test now pins the ONE deliberate exception
+    // rather than a defect: the ordinary, uncontested completion this test
+    // drives goes entirely through `Store::finalize_multipart_version`'s
+    // OWN embedded `finish_complete` call, made in the SAME transaction as
+    // -- immediately after -- that same call's own just-won finalize CAS.
+    // That embedded call intentionally passes `None` (no owner predicate):
+    // the finalize CAS it just won is itself fenced only by
+    // `status = 'pending'`, never by lease ownership, so a caller reaching
+    // this point has already independently proven unique, legitimate
+    // authorship regardless of who currently holds the lease -- requiring
+    // an owner match here too would re-strand exactly the race
+    // `pg_concurrency_test.rs`'s
+    // `f2_stale_completer_converges_instead_of_stranding_after_owner_fencing_fix`
+    // exists to prevent. If this embedded call ever starts passing `Some`,
+    // this test starts failing -- re-check that reasoning before "fixing" it.
     let (db, rec) = common::test_db_with_recorder().await;
     let s = common::make_services_full(&db);
     let tenant_id = Uuid::now_v7();
@@ -457,8 +473,7 @@ async fn multipart_finish_complete_cas_omits_lease_owner() {
         rec.dump()
     );
     // `lease_owner` legitimately appears in the SET list (finish_complete
-    // clears the lease on success) -- the defect is its *absence* from the
-    // WHERE predicate specifically, so check only the clause after WHERE.
+    // clears the lease on success) -- check only the clause after WHERE.
     let sql = &finish_complete_updates[0].sql;
     let where_clause = sql
         .split_once(" WHERE ")
@@ -466,9 +481,10 @@ async fn multipart_finish_complete_cas_omits_lease_owner() {
         .to_ascii_lowercase();
     assert!(
         !where_clause.contains("lease_owner"),
-        "known defect FS-02 regression: finish_complete's UPDATE now filters \
-         its WHERE clause on lease_owner -- FS-02 may be fixed, update the \
-         report. Full SQL: {sql}"
+        "the embedded finish_complete call (ordinary, uncontested completion) \
+         must keep passing `None` for its owner predicate -- if this now \
+         filters on lease_owner, re-check the f2 stranding-race reasoning in \
+         this test's doc comment before treating that as a fix. Full SQL: {sql}"
     );
 }
 

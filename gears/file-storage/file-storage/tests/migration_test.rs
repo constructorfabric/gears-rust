@@ -157,13 +157,13 @@ async fn multipart_auto_bind_down_actually_drops_the_new_columns() {
         "backend_id/backend_path must exist after the full up(): {backend_cols_before:?}"
     );
 
-    // Roll back only the three most-recently-registered migrations
-    // (part_count_floor, index_hardening, then multipart_auto_bind) rather
-    // than the whole history, so this test is independent of how many
-    // migrations precede multipart_auto_bind.
-    Migrator::down(&db, Some(3))
+    // Roll back only the two most-recently-registered migrations
+    // (index_hardening, then multipart_auto_bind) rather than the whole
+    // history, so this test is independent of how many migrations precede
+    // multipart_auto_bind.
+    Migrator::down(&db, Some(2))
         .await
-        .expect("roll back part_count_floor, index_hardening, and multipart_auto_bind");
+        .expect("roll back index_hardening and multipart_auto_bind");
 
     let after_down = db
         .execute_raw(stmt(&db, "SELECT auto_bind FROM multipart_uploads LIMIT 0"))
@@ -184,9 +184,9 @@ async fn multipart_auto_bind_down_actually_drops_the_new_columns() {
          {backend_cols_after_down:?}"
     );
 
-    Migrator::up(&db, Some(3))
+    Migrator::up(&db, Some(2))
         .await
-        .expect("re-apply multipart_auto_bind, index_hardening, and part_count_floor");
+        .expect("re-apply multipart_auto_bind and index_hardening");
     let after_up = db
         .execute_raw(stmt(&db, "SELECT auto_bind FROM multipart_uploads LIMIT 0"))
         .await;
@@ -268,9 +268,9 @@ async fn multipart_auto_bind_backfills_backend_id_and_path_from_matching_version
     .await
     .expect("insert multipart session with no matching version, before the backfill migration");
 
-    Migrator::up(&db, None).await.expect(
-        "apply the remaining migrations (multipart_auto_bind, index_hardening, part_count_floor)",
-    );
+    Migrator::up(&db, None)
+        .await
+        .expect("apply the remaining migrations (multipart_auto_bind, index_hardening)");
 
     let row = db
         .query_one_raw(stmt(
@@ -338,11 +338,11 @@ async fn index_exists(db: &DatabaseConnection, name: &str) -> bool {
 /// either.
 ///
 /// This test applies every migration up to (but not including)
-/// `multipart_auto_bind` — the 8th of 10 registered migrations, so `Some(7)`
+/// `multipart_auto_bind` — the 8th of 9 registered migrations, so `Some(7)`
 /// pending migrations — inserts a file, a multipart session, and two parts
-/// referencing it, then applies the remaining migrations (`multipart_auto_bind`,
-/// `index_hardening`, and `part_count_floor`) and asserts the parts and the
-/// session are both still there, and both indexes exist.
+/// referencing it, then applies the remaining migrations (`multipart_auto_bind`
+/// and `index_hardening`) and asserts the parts and the session are both
+/// still there, and both indexes exist.
 #[tokio::test]
 async fn multipart_data_and_indexes_survive_auto_bind_rebuild() {
     let db = Database::connect("sqlite::memory:")
@@ -415,8 +415,10 @@ async fn multipart_data_and_indexes_survive_auto_bind_rebuild() {
 
 // ── index_hardening ───────────────────────────────────────────────────────────
 
-/// All three covering indexes from `m20260902_000001_index_hardening` must
-/// exist after a full `up()`.
+/// All covering indexes from `m20260902_000001_index_hardening` must exist
+/// after a full `up()`, and the superseded `files_owner_listing_idx` (from
+/// `m20260624_000001_p1_initial`, replaced by `files_owner_listing_v2_idx`)
+/// must be gone.
 #[tokio::test]
 async fn index_hardening_indexes_exist_after_up() {
     let db = migrated_db().await;
@@ -432,6 +434,46 @@ async fn index_hardening_indexes_exist_after_up() {
         index_exists(&db, "files_versionless_sweep_idx").await,
         "files_versionless_sweep_idx must exist after up()"
     );
+    assert!(
+        index_exists(&db, "file_versions_file_created_idx").await,
+        "file_versions_file_created_idx must exist after up()"
+    );
+    assert!(
+        index_exists(&db, "files_owner_listing_v2_idx").await,
+        "files_owner_listing_v2_idx must exist after up()"
+    );
+    assert!(
+        !index_exists(&db, "files_owner_listing_idx").await,
+        "files_owner_listing_idx must be dropped after up() -- superseded by \
+         files_owner_listing_v2_idx"
+    );
+}
+
+/// `down()` must reverse exactly that: drop `files_owner_listing_v2_idx` and
+/// recreate the original `files_owner_listing_idx`, alongside dropping the
+/// other three indexes this migration added.
+#[tokio::test]
+async fn index_hardening_down_restores_the_original_owner_listing_index() {
+    let db = migrated_db().await;
+    assert!(index_exists(&db, "files_owner_listing_v2_idx").await);
+    assert!(!index_exists(&db, "files_owner_listing_idx").await);
+
+    Migrator::down(&db, Some(1))
+        .await
+        .expect("roll back index_hardening");
+
+    assert!(
+        !index_exists(&db, "files_owner_listing_v2_idx").await,
+        "files_owner_listing_v2_idx must be dropped by down()"
+    );
+    assert!(
+        index_exists(&db, "files_owner_listing_idx").await,
+        "files_owner_listing_idx must be recreated by down()"
+    );
+    assert!(!index_exists(&db, "idempotency_keys_file_idx").await);
+    assert!(!index_exists(&db, "multipart_uploads_sweep_idx").await);
+    assert!(!index_exists(&db, "files_versionless_sweep_idx").await);
+    assert!(!index_exists(&db, "file_versions_file_created_idx").await);
 }
 
 // ── files CHECK constraints ──────────────────────────────────────────────────
@@ -1108,31 +1150,34 @@ async fn content_hash_modes_rejects_whole_with_part_count() {
     );
 }
 
-/// The presence CHECK's `part_count >= 2` clause rejects a
-/// `multipart-composite-sha256` row with `part_count = 1`. ADR-0006's
-/// single-part amendment degenerates a one-part multipart plan to
+/// The presence CHECK alone does not pin a `>= 2` floor on `part_count`: a
+/// `multipart-composite-sha256` row with `part_count = 1` satisfies it.
+/// ADR-0006's single-part amendment degenerates a one-part multipart plan to
 /// `whole-sha256` instead (`multipart_service.rs::assemble_and_finish_inner`,
-/// `single_part`/`WholeSha256` branch), so a composite row must never carry
-/// fewer than 2 parts.
+/// `single_part`/`WholeSha256` branch), so the application itself never
+/// writes such a row going forward — but ADR-0006's Compatibility note
+/// records that releases before that amendment legitimately persisted
+/// one-part multipart completions this way, so the schema must keep
+/// accepting the shape already sitting in production, not just the shape new
+/// writes take.
 #[tokio::test]
-async fn content_hash_modes_rejects_multipart_with_single_part_count() {
+async fn content_hash_modes_accepts_legacy_single_part_composite() {
     let db = migrated_db().await;
     insert_file(&db, FILE).await;
-    let res = db
-        .execute_raw(stmt(
-            &db,
-            format!(
-                "INSERT INTO file_versions \
-                 (file_id, version_id, mime_type, size, hash_value, hash_mode, part_count, \
-                  status, is_current, backend_id, backend_path) \
-                 VALUES ('{FILE}', '{VERSION}', 'text/plain', 0, X'{HASH32}', \
-                 'multipart-composite-sha256', 1, 'available', 0, 'local', '/x')"
-            ),
-        ))
-        .await;
-    assert!(
-        res.is_err(),
-        "multipart-composite-sha256 with part_count = 1 must violate the >= 2 CHECK: {res:?}"
+    db.execute_raw(stmt(
+        &db,
+        format!(
+            "INSERT INTO file_versions \
+             (file_id, version_id, mime_type, size, hash_value, hash_mode, part_count, \
+              status, is_current, backend_id, backend_path) \
+             VALUES ('{FILE}', '{VERSION}', 'text/plain', 0, X'{HASH32}', \
+             'multipart-composite-sha256', 1, 'available', 0, 'local', '/x')"
+        ),
+    ))
+    .await
+    .expect(
+        "multipart-composite-sha256 with part_count = 1 must satisfy the CHECK \
+         (legacy pre-amendment rows, ADR-0006)",
     );
 }
 
@@ -1232,137 +1277,5 @@ async fn content_hash_modes_leaves_hash_algorithm_check_intact() {
     assert!(
         res.is_err(),
         "hash_algorithm CHECK must still reject any non-SHA-256 value"
-    );
-}
-
-// ── part_count_floor ─────────────────────────────────────────────────────────
-
-/// Before `m20260923_000001_part_count_floor` runs, the presence CHECK
-/// `m20260707` shipped only enforces presence, not the `>= 2` floor — a
-/// `multipart-composite-sha256` row with `part_count = 1` is accepted on that
-/// "old" schema. Applying `m20260923` on top then rejects the same shape for
-/// any *new* write, without needing to touch the row already there. This is
-/// the regression the floor must guard against for an already-migrated
-/// database (`m20260707` cannot be edited in place — see that migration's
-/// module doc — so the floor has to come from a later migration that
-/// actually runs against such a database).
-#[tokio::test]
-async fn part_count_floor_rejects_single_part_only_after_its_migration_applies() {
-    let db = Database::connect("sqlite::memory:")
-        .await
-        .expect("connect in-memory sqlite");
-    db.execute_raw(stmt(&db, "PRAGMA foreign_keys = ON;"))
-        .await
-        .expect("enable foreign keys");
-
-    // Every migration up to and including `index_hardening` (9 of the 10
-    // registered migrations) — the "old" schema, one migration short of
-    // `part_count_floor`.
-    Migrator::up(&db, Some(9))
-        .await
-        .expect("apply every migration through index_hardening");
-    insert_file(&db, FILE).await;
-
-    db.execute_raw(stmt(
-        &db,
-        format!(
-            "INSERT INTO file_versions \
-             (file_id, version_id, mime_type, size, hash_value, hash_mode, part_count, \
-              status, is_current, backend_id, backend_path) \
-             VALUES ('{FILE}', '00000000-0000-0000-0000-0000000000d5', 'text/plain', 0, \
-             X'{HASH32}', 'multipart-composite-sha256', 1, 'available', 0, 'local', '/x')"
-        ),
-    ))
-    .await
-    .expect(
-        "part_count = 1 must still be accepted on the pre-part_count_floor schema \
-         (the presence CHECK alone does not pin the floor)",
-    );
-
-    Migrator::up(&db, None)
-        .await
-        .expect("apply the remaining migration (part_count_floor)");
-
-    let res = db
-        .execute_raw(stmt(
-            &db,
-            format!(
-                "INSERT INTO file_versions \
-                 (file_id, version_id, mime_type, size, hash_value, hash_mode, part_count, \
-                  status, is_current, backend_id, backend_path) \
-                 VALUES ('{FILE}', '00000000-0000-0000-0000-0000000000d6', 'text/plain', 0, \
-                 X'{HASH32}', 'multipart-composite-sha256', 1, 'available', 0, 'local', '/x')"
-            ),
-        ))
-        .await;
-    assert!(
-        res.is_err(),
-        "part_count = 1 must be rejected once part_count_floor has applied: {res:?}"
-    );
-}
-
-/// `part_count_floor`'s `down()` must be a real rollback -- not a `SELECT 1`
-/// no-op -- on both dialects: after rolling it back, a `part_count = 1`
-/// composite row must be accepted again (the pre-floor presence-only CHECK on
-/// Postgres, no floor triggers on SQLite), and re-applying `up()` must reject
-/// it again.
-#[tokio::test]
-async fn part_count_floor_down_actually_restores_the_permissive_check() {
-    let db = migrated_db().await;
-    insert_file(&db, FILE).await;
-
-    let before_down = db
-        .execute_raw(stmt(
-            &db,
-            format!(
-                "INSERT INTO file_versions \
-                 (file_id, version_id, mime_type, size, hash_value, hash_mode, part_count, \
-                  status, is_current, backend_id, backend_path) \
-                 VALUES ('{FILE}', '00000000-0000-0000-0000-0000000000d7', 'text/plain', 0, \
-                 X'{HASH32}', 'multipart-composite-sha256', 1, 'available', 0, 'local', '/x')"
-            ),
-        ))
-        .await;
-    assert!(
-        before_down.is_err(),
-        "sanity: part_count = 1 must be rejected on the fully-migrated schema: {before_down:?}"
-    );
-
-    Migrator::down(&db, Some(1))
-        .await
-        .expect("roll back only part_count_floor");
-
-    db.execute_raw(stmt(
-        &db,
-        format!(
-            "INSERT INTO file_versions \
-             (file_id, version_id, mime_type, size, hash_value, hash_mode, part_count, \
-              status, is_current, backend_id, backend_path) \
-             VALUES ('{FILE}', '00000000-0000-0000-0000-0000000000d8', 'text/plain', 0, \
-             X'{HASH32}', 'multipart-composite-sha256', 1, 'available', 0, 'local', '/x')"
-        ),
-    ))
-    .await
-    .expect("part_count = 1 must be accepted again after a real (non-no-op) down()");
-
-    Migrator::up(&db, Some(1))
-        .await
-        .expect("re-apply part_count_floor");
-
-    let after_up = db
-        .execute_raw(stmt(
-            &db,
-            format!(
-                "INSERT INTO file_versions \
-                 (file_id, version_id, mime_type, size, hash_value, hash_mode, part_count, \
-                  status, is_current, backend_id, backend_path) \
-                 VALUES ('{FILE}', '00000000-0000-0000-0000-0000000000d9', 'text/plain', 0, \
-                 X'{HASH32}', 'multipart-composite-sha256', 1, 'available', 0, 'local', '/x')"
-            ),
-        ))
-        .await;
-    assert!(
-        after_up.is_err(),
-        "part_count = 1 must be rejected again after re-up(): {after_up:?}"
     );
 }

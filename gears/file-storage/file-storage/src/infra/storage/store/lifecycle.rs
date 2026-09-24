@@ -61,16 +61,18 @@ impl Store {
     /// `in_progress` one with `expires_at > now`, or any `completing` one) --
     /// see
     /// [`VersionRepo::list_pending_older_than`][crate::infra::storage::repo::VersionRepo::list_pending_older_than]
-    /// for the invariant this protects.
+    /// for the invariant this protects. Bounded to `limit` rows -- see that
+    /// method's doc comment.
     pub async fn list_abandoned_pending_versions(
         &self,
         older_than: OffsetDateTime,
         now: OffsetDateTime,
+        limit: u64,
     ) -> Result<Vec<FileVersion>, DomainError> {
         let conn = self.db.conn().map_err(db_err)?;
         self.repos
             .versions
-            .list_pending_older_than(&conn, &AccessScope::allow_all(), older_than, now)
+            .list_pending_older_than(&conn, &AccessScope::allow_all(), older_than, now, limit)
             .await
     }
 
@@ -92,13 +94,17 @@ impl Store {
             .await
     }
 
-    /// List all `in_progress` multipart sessions whose `expires_at` is before `now`.
+    /// List all `in_progress` multipart sessions whose `expires_at` is before
+    /// `now`, bounded to `limit` rows -- see
+    /// [`MultipartRepo::list_expired`][crate::infra::storage::repo::MultipartRepo::list_expired]'s
+    /// doc comment.
     pub async fn list_expired_multipart_uploads(
         &self,
         now: OffsetDateTime,
+        limit: u64,
     ) -> Result<Vec<MultipartUploadSession>, DomainError> {
         let conn = self.db.conn().map_err(db_err)?;
-        self.repos.multipart.list_expired(&conn, now).await
+        self.repos.multipart.list_expired(&conn, now, limit).await
     }
 
     /// List files across all tenants for the retention sweep, keyset-paginated
@@ -139,13 +145,20 @@ impl Store {
             .await
     }
 
-    /// Bulk-delete all `idempotency_keys` rows whose `expires_at` is at or
-    /// before `now`. Returns the number of rows removed.
+    /// Delete at most `limit` expired `idempotency_keys` rows (`expires_at <=
+    /// now`), oldest-expired first -- see
+    /// [`IdempotencyRepo::delete_expired`][crate::infra::storage::repo::IdempotencyRepo::delete_expired]'s
+    /// doc comment for why this is batched like every other sweep phase.
+    /// Returns the number of rows removed.
     pub async fn delete_expired_idempotency_keys(
         &self,
         now: OffsetDateTime,
+        limit: u64,
     ) -> Result<u64, DomainError> {
         let conn = self.db.conn().map_err(db_err)?;
-        self.repos.idempotency_keys.delete_expired(&conn, now).await
+        self.repos
+            .idempotency_keys
+            .delete_expired(&conn, now, limit)
+            .await
     }
 }

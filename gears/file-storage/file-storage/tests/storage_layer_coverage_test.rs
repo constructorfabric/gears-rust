@@ -565,7 +565,7 @@ async fn upsert_multipart_part_rejects_when_session_not_in_progress() {
         .expect("acquire_complete_lease must not error");
     assert!(acquired, "setup: must acquire lease before completing");
     multipart
-        .finish_complete(&conn, upload_id, "{}")
+        .finish_complete(&conn, upload_id, Some("completer-a"), "{}")
         .await
         .expect("finish_complete must not error");
 
@@ -866,80 +866,33 @@ async fn bind_atomic_with_event_returns_false_on_cas_mismatch_enqueues_no_event(
 // store/files.rs
 // ===========================================================================
 
-/// The plain (non-event) `delete_file` removes the file row, cascades its
-/// version, and writes an audit row -- exercised directly since every
-/// domain-layer caller currently goes through `delete_file_with_event`
-/// instead, leaving this variant itself unexercised.
+/// `delete_file_collecting_versions` on a `file_id` that does not exist
+/// reports `removed: false`, an empty collected-versions list, and writes no
+/// audit row -- the guard on the transaction's `if removed` branch. The
+/// cascading-delete/audit-row case is already covered by
+/// `files_delete_with_event_cascades_versions_and_metadata` in
+/// `store_files_test.rs`.
 #[tokio::test]
-async fn delete_file_plain_removes_row_cascades_version_and_audits() {
-    let (store, db) = build_store().await;
-    let conn = db.conn().expect("conn");
-    let scope = AccessScope::allow_all();
-    let files = FileRepo::new();
-    let versions = VersionRepo::new();
-
-    let tenant_id = Uuid::now_v7();
-    let file_id = Uuid::now_v7();
-    let version_id = Uuid::now_v7();
-    files
-        .create(&conn, &scope, &new_file(file_id, tenant_id, None))
-        .await
-        .expect("create file");
-    versions
-        .insert(
-            &conn,
-            &scope,
-            &new_version(file_id, version_id, VersionStatus::Available, false),
-        )
-        .await
-        .expect("insert version");
-
-    let removed = store
-        .delete_file(
-            &scope,
-            file_id,
-            audit_entry(tenant_id, file_id, AuditOperation::DeleteFile),
-        )
-        .await
-        .expect("delete_file must not error");
-    assert!(removed, "the file row must be found and removed");
-
-    assert!(files.get(&conn, &scope, file_id).await.unwrap().is_none());
-    assert!(
-        versions
-            .get(&conn, &scope, file_id, version_id)
-            .await
-            .unwrap()
-            .is_none(),
-        "the version must cascade-delete with its parent file"
-    );
-
-    let audit_rows = store.list_audit(file_id).await.unwrap();
-    assert_eq!(
-        audit_rows.len(),
-        1,
-        "the delete must write exactly one audit row"
-    );
-}
-
-/// `delete_file` on a `file_id` that does not exist reports `false` and
-/// writes no audit row -- the guard on the transaction's `if removed` branch.
-#[tokio::test]
-async fn delete_file_plain_returns_false_for_missing_file() {
+async fn delete_file_collecting_versions_returns_false_for_missing_file() {
     let (store, _db) = build_store().await;
     let scope = AccessScope::allow_all();
     let file_id = Uuid::now_v7();
     let tenant_id = Uuid::now_v7();
 
-    let removed = store
-        .delete_file(
+    let deleted = store
+        .delete_file_collecting_versions(
             &scope,
             file_id,
             audit_entry(tenant_id, file_id, AuditOperation::DeleteFile),
+            None,
         )
         .await
-        .expect("delete_file must not error on a missing file");
-    assert!(!removed);
+        .expect("delete_file_collecting_versions must not error on a missing file");
+    assert!(!deleted.removed);
+    assert!(
+        deleted.versions.is_empty(),
+        "nothing to collect for a file that was never there"
+    );
 
     let audit_rows = store.list_audit(file_id).await.unwrap();
     assert!(audit_rows.is_empty(), "no audit row for a no-op delete");

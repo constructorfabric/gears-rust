@@ -1,5 +1,5 @@
-//! Index hardening: cover three hot predicates that currently force a full
-//! table scan.
+//! Index hardening: cover hot predicates that currently force a full table
+//! scan, plus one tie-breaker fix on an existing covering index.
 //!
 //! 1. `idempotency_keys_file_idx` on `idempotency_keys (file_id)`.
 //!    `idempotency_keys.file_id` carries `REFERENCES files (file_id) ON
@@ -35,7 +35,39 @@
 //!    since 3.8.0, so this is a partial index on both dialects, same as
 //!    `multipart_uploads_expired_idx`.
 //!
-//! `down()` drops all three indexes on both dialects.
+//! 4. `file_versions_file_created_idx` on `file_versions (file_id, created_at,
+//!    version_id)`. `VersionRepo::list_by_file` (`GET /files/{id}/versions`,
+//!    and the unbounded `Store::list_versions` used by backend migration,
+//!    delete/expiry blob accounting, and the sweep engine) filters `file_id =
+//!    ?` and sorts `created_at DESC`. The table's only index touching
+//!    `file_id` is the composite primary key `(file_id, version_id)`, which
+//!    serves the filter but not the sort -- versions are never pruned in P1/
+//!    P2 (`docs/migration.sql`), so a long-lived file's version count grows
+//!    without bound and every one of those callers pays a full per-file scan
+//!    + sort with no supporting index.
+//!
+//!    Leading with `file_id` (not `created_at`) keeps the composite usable
+//!    for the equality filter same as the PK; trailing with `version_id`
+//!    also gives `list_by_file`'s own `ORDER BY (created_at, version_id)`
+//!    a covering sort order.
+//!
+//! 5. `files_owner_listing_v2_idx` on `files (tenant_id, owner_kind,
+//!    owner_id, created_at DESC, file_id DESC)`, replacing
+//!    `files_owner_listing_idx (tenant_id, owner_kind, owner_id, created_at
+//!    DESC)` from `m20260624_000001_p1_initial` (already released -- left
+//!    untouched, dropped here instead). `FileRepo::list` (`GET /files`) sorts
+//!    `ORDER BY created_at DESC, file_id DESC` (the tie-breaker so two
+//!    `OFFSET`-paginated pages over rows sharing a `created_at` instant never
+//!    skip or repeat a row -- see `tests/store_files_test.rs`'s
+//!    `list_orders_by_created_at_then_file_id_so_paged_offsets_do_not_skip_or_repeat`).
+//!    The old index's trailing column is only `created_at DESC`, so it serves
+//!    the filter and the primary sort key but leaves the `file_id` tie-break
+//!    to an extra in-memory sort of every row sharing a `created_at` value;
+//!    appending `file_id DESC` makes the index itself already return rows in
+//!    exactly `FileRepo::list`'s order.
+//!
+//! `down()` drops all five new indexes and recreates `files_owner_listing_idx`
+//! on both dialects.
 
 use sea_orm_migration::prelude::*;
 use sea_orm_migration::sea_orm::ConnectionTrait;
@@ -50,6 +82,11 @@ CREATE INDEX IF NOT EXISTS multipart_uploads_sweep_idx
     ON multipart_uploads (state, expires_at, lease_until);
 CREATE INDEX IF NOT EXISTS files_versionless_sweep_idx
     ON files (created_at, file_id) WHERE content_id IS NULL;
+CREATE INDEX IF NOT EXISTS file_versions_file_created_idx
+    ON file_versions (file_id, created_at, version_id);
+CREATE INDEX IF NOT EXISTS files_owner_listing_v2_idx
+    ON files (tenant_id, owner_kind, owner_id, created_at DESC, file_id DESC);
+DROP INDEX IF EXISTS files_owner_listing_idx;
 ";
 
 const SQLITE_UP: &str = r"
@@ -59,9 +96,18 @@ CREATE INDEX IF NOT EXISTS multipart_uploads_sweep_idx
     ON multipart_uploads (state, expires_at, lease_until);
 CREATE INDEX IF NOT EXISTS files_versionless_sweep_idx
     ON files (created_at, file_id) WHERE content_id IS NULL;
+CREATE INDEX IF NOT EXISTS file_versions_file_created_idx
+    ON file_versions (file_id, created_at, version_id);
+CREATE INDEX IF NOT EXISTS files_owner_listing_v2_idx
+    ON files (tenant_id, owner_kind, owner_id, created_at DESC, file_id DESC);
+DROP INDEX IF EXISTS files_owner_listing_idx;
 ";
 
 const DOWN: &str = r"
+DROP INDEX IF EXISTS files_owner_listing_v2_idx;
+CREATE INDEX IF NOT EXISTS files_owner_listing_idx
+    ON files (tenant_id, owner_kind, owner_id, created_at DESC);
+DROP INDEX IF EXISTS file_versions_file_created_idx;
 DROP INDEX IF EXISTS files_versionless_sweep_idx;
 DROP INDEX IF EXISTS multipart_uploads_sweep_idx;
 DROP INDEX IF EXISTS idempotency_keys_file_idx;

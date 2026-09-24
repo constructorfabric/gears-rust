@@ -77,8 +77,8 @@ impl Store {
         // Retryable: this transaction touches `files` (the `meta_version`
         // CAS) and `files_custom_metadata`, and shares the `files` row with
         // both `finalize_version`'s auto-bind branch and
-        // `delete_file`/`delete_file_with_event` -- either of which can
-        // invert the lock order relative to this one under concurrent
+        // `delete_file`/`delete_file_collecting_versions` -- either of which
+        // can invert the lock order relative to this one under concurrent
         // writers on the same file. See `db::transaction_with_bounded_retry`
         // for the retry contract and per-attempt cloning (`patch` is
         // `CustomMetadataPatch`, `#[derive(Clone)]` in `file-storage-sdk`).

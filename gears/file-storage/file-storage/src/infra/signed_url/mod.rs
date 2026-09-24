@@ -205,7 +205,19 @@ impl Issuer {
         self.provider.public_key()
     }
 
-    /// The verifier the sidecar uses (public key only).
+    /// A single-key verifier bound to this issuer's current public key.
+    ///
+    /// The sidecar never calls this -- it builds its own `Verifier` directly
+    /// from `FS_SIDECAR_PUBLIC_KEY`/`FS_SIDECAR_PREVIOUS_PUBLIC_KEYS` (see
+    /// `bin/sidecar.rs`). This is instead the control plane's OWN default
+    /// verifier for the s2s finalize/report-part callbacks
+    /// (`FileService::verifier`, `domain::service::mod`), i.e. what the
+    /// control plane itself still accepts, not what it hands anyone else.
+    /// `FileService::with_previous_signing_public_keys` extends it with
+    /// `FileStorageConfig::previous_signing_public_keys` so a
+    /// `signing_key_seed` rotation doesn't reject an in-flight upload's
+    /// callback the moment the control plane restarts on the new seed --
+    /// see `docs/operations.md`'s `signing_key_seed` -> Rotation procedure.
     #[must_use]
     pub fn verifier(&self) -> Verifier {
         Verifier::with_verifier(self.provider.verifier())
@@ -240,6 +252,16 @@ impl Issuer {
 /// (primary + at most a couple of retained previous keys), so trying each
 /// verifier in turn is cheap, and it avoids a claim that would otherwise let
 /// a token name which key to check.
+///
+/// The same type, and the same [`dedupe_public_keys`]/[`parse_public_key_list`]
+/// helpers, back the control plane's OWN verifier for the s2s finalize/
+/// report-part callbacks (`FileService::verifier`,
+/// `FileService::with_previous_signing_public_keys`,
+/// `FileStorageConfig::previous_signing_public_keys`) — a second, independent
+/// place a `signing_key_seed` rotation needs multi-key acceptance, since the
+/// sidecar's own multi-key set only widens what the *sidecar* accepts for
+/// PUT/GET/part-upload requests, not what the control plane itself accepts
+/// on those two callback routes.
 #[derive(Clone)]
 pub struct Verifier {
     /// Verifiers to try, in order. `verifiers[0]` is the current primary key
@@ -386,6 +408,73 @@ impl Verifier {
         }
         Ok(claims)
     }
+}
+
+/// Decode one base64url-encoded (`URL_SAFE_NO_PAD`) Ed25519 public key.
+///
+/// Shared by the sidecar's `FS_SIDECAR_PREVIOUS_PUBLIC_KEYS` parsing
+/// ([`parse_public_key_list`]) and the control plane's
+/// `FileStorageConfig::previous_signing_public_keys` (`config::validate`,
+/// `gear.rs`) so a malformed entry is decoded — and reported — identically
+/// regardless of which side is parsing it. `index` is the entry's 0-based
+/// position in whatever list the caller is decoding, named in the error so a
+/// misconfiguration is easy to locate; this function does no length check —
+/// callers get that for free from [`Verifier::from_public_keys`], which every
+/// caller of this function goes on to call with the decoded bytes.
+pub fn decode_public_key_entry(raw: &str, index: usize) -> Result<Vec<u8>, DomainError> {
+    URL_SAFE_NO_PAD
+        .decode(raw.trim())
+        .map_err(|e| DomainError::token_invalid(format!("invalid public key entry #{index}: {e}")))
+}
+
+/// Parse a comma-separated list of base64url-encoded Ed25519 public keys —
+/// the `FS_SIDECAR_PREVIOUS_PUBLIC_KEYS` wire format (`bin/sidecar.rs`'s
+/// module doc comment).
+///
+/// Each element is trimmed; an empty element (e.g. a stray trailing comma)
+/// is silently skipped rather than rejected — unlike a genuinely malformed
+/// key, it carries no ambiguity about operator intent. A key that fails to
+/// decode fails the whole parse, via [`decode_public_key_entry`].
+pub fn parse_public_key_list(raw: &str) -> Result<Vec<Vec<u8>>, DomainError> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .enumerate()
+        .map(|(i, s)| decode_public_key_entry(s, i))
+        .collect()
+}
+
+/// De-duplicate an ordered public-key set: `primary` always leads, followed
+/// by `previous` in order, with any repeat — of `primary`, or of an entry
+/// already kept from `previous` — dropped. Order is preserved among the
+/// survivors. Returns `(deduped_keys, dropped_count)`.
+///
+/// Shared by the sidecar's `FS_SIDECAR_PUBLIC_KEY`/
+/// `FS_SIDECAR_PREVIOUS_PUBLIC_KEYS` wiring (`bin/sidecar.rs::main`) and the
+/// control plane's `signing_key_seed`/`previous_signing_public_keys` wiring
+/// (`FileService::with_previous_signing_public_keys`) — both accept a small
+/// ordered key set for the same reason (see this module's doc comment on
+/// [`Verifier`]).
+///
+/// A duplicate key is a harmless no-op here: [`Verifier::verify`] already
+/// tries each key in the set in order and stops at the first match, so a
+/// repeated key only costs one wasted comparison in the rare case where
+/// every other key fails to verify — never a correctness issue. That is why
+/// this silently drops duplicates (leaving a startup warning to the call
+/// site) instead of rejecting them as a configuration error.
+#[must_use]
+pub fn dedupe_public_keys(primary: Vec<u8>, previous: Vec<Vec<u8>>) -> (Vec<Vec<u8>>, usize) {
+    let mut deduped = Vec::with_capacity(previous.len() + 1);
+    deduped.push(primary);
+    let mut dropped = 0_usize;
+    for key in previous {
+        if deduped.contains(&key) {
+            dropped += 1;
+        } else {
+            deduped.push(key);
+        }
+    }
+    (deduped, dropped)
 }
 
 #[cfg(test)]

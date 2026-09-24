@@ -34,8 +34,8 @@ use file_storage::infra::signed_url::{Claims, Issuer, MultipartClaims, Op, Uploa
 use super::{
     DEFAULT_MAX_BODY_BYTES, DEFAULT_MAX_CONCURRENT_PART_UPLOADS, SidecarState, TokenQuery,
     build_config, build_router, check_part_buffer_budget, dedupe_public_keys, extract_token,
-    finalize_with_control_plane, idle_timeout_stream, parse_optional, parse_public_key_list,
-    write_multipart_part_native, write_multipart_part_offset_object,
+    finalize_with_control_plane, idle_timeout_stream, interpret_finalize_response, parse_optional,
+    parse_public_key_list, write_multipart_part_native, write_multipart_part_offset_object,
 };
 
 /// A part-upload concurrency semaphore sized at the production default
@@ -1356,6 +1356,226 @@ async fn finalize_callback_total_time_bounded_by_retry_budget() {
     );
 }
 
+// ── `interpret_finalize_response` (E2E-02: X-FS-Bound/ETag echo contract) ──
+//
+// `docs/api.md` §"Single-part bind outcome headers": the sidecar's `200`
+// `PUT` response must forward the control plane's finalize-callback outcome
+// verbatim as `X-FS-Bound`/`ETag` (bound) or `X-FS-Bound`/`X-FS-Current-ETag`
+// (conflict) headers, or no bind headers at all (`bind: "manual"`). Nothing
+// exercised this before: `finalize_test.rs`/`api_complete_bind_test.rs` call
+// the control-plane handler directly (never through the sidecar), and no
+// sidecar test read `upload_resp.headers()` on a successful `PUT`. Covered
+// here at two levels: `interpret_finalize_response` in isolation (below,
+// against a real `reqwest::Response` off a mock control plane, since the
+// function takes one by value and there is no other way to construct one),
+// and the full route in `upload_forwards_bind_conflict_headers_from_finalize_callback`
+// further down.
+
+/// Spin up a one-shot mock HTTP server that writes `raw_response` verbatim to
+/// the first connection it accepts, then issue a real request against it and
+/// return the resulting `reqwest::Response` -- the cheapest way to get a
+/// genuine `reqwest::Response` (headers parsed by a real HTTP/1 parser, not
+/// hand-built) to feed `interpret_finalize_response`, which has no other
+/// constructor.
+async fn mock_http_response(raw_response: &'static [u8]) -> reqwest::Response {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock server");
+    let addr = listener.local_addr().expect("local addr");
+
+    tokio::spawn(async move {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            let mut buf = [0u8; 1024];
+            let _n = stream.read(&mut buf).await;
+            stream.write_all(raw_response).await.ok();
+        }
+    });
+
+    reqwest::Client::new()
+        .get(format!("http://{addr}"))
+        .send()
+        .await
+        .expect("mock server responds")
+}
+
+/// Won auto-bind CAS: `x-fs-bound: true` + `etag` must both be echoed onto
+/// the returned [`FinalizeEcho`], with `current_etag` left `None`.
+#[tokio::test]
+async fn interpret_finalize_response_bound_forwards_bound_and_etag() {
+    let resp = mock_http_response(
+        b"HTTP/1.1 204 No Content\r\nx-fs-bound: true\r\netag: \"abc123\"\r\ncontent-length: 0\r\n\r\n",
+    )
+    .await;
+
+    let echo = interpret_finalize_response(resp, Uuid::nil(), Uuid::nil())
+        .await
+        .expect("a success status must be interpreted as Ok");
+    assert_eq!(echo.bound.as_deref(), Some("true"));
+    assert_eq!(echo.etag.as_deref(), Some("\"abc123\""));
+    assert_eq!(
+        echo.current_etag, None,
+        "a won bind carries no current_etag"
+    );
+}
+
+/// Lost auto-bind CAS: `x-fs-bound: conflict` + `x-fs-current-etag` must
+/// both be echoed, with `etag` left `None` (no new content was bound).
+#[tokio::test]
+async fn interpret_finalize_response_conflict_forwards_current_etag() {
+    let resp = mock_http_response(
+        b"HTTP/1.1 204 No Content\r\nx-fs-bound: conflict\r\nx-fs-current-etag: \"xyz789\"\r\n\
+          content-length: 0\r\n\r\n",
+    )
+    .await;
+
+    let echo = interpret_finalize_response(resp, Uuid::nil(), Uuid::nil())
+        .await
+        .expect("a success status must be interpreted as Ok");
+    assert_eq!(echo.bound.as_deref(), Some("conflict"));
+    assert_eq!(echo.current_etag.as_deref(), Some("\"xyz789\""));
+    assert_eq!(echo.etag, None, "a lost CAS carries no new etag");
+}
+
+/// `bind: "manual"` tokens: the control plane's finalize response carries
+/// none of the three bind-outcome headers at all -- every field must come
+/// back `None`, not an empty string or an error.
+#[tokio::test]
+async fn interpret_finalize_response_manual_mode_has_no_bind_headers() {
+    let resp = mock_http_response(b"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\n\r\n").await;
+
+    let echo = interpret_finalize_response(resp, Uuid::nil(), Uuid::nil())
+        .await
+        .expect("a success status must be interpreted as Ok");
+    assert_eq!(echo.bound, None);
+    assert_eq!(echo.etag, None);
+    assert_eq!(echo.current_etag, None);
+}
+
+/// A non-2xx control-plane status (any of them -- this function does not
+/// distinguish 4xx from 5xx) must map to `Err(502 Bad Gateway)`, never
+/// forwarding the upstream status/body (see the sibling
+/// `finalize_failure_does_not_leak_control_plane_url`, which asserts the
+/// no-leak half of this contract at the `finalize_with_control_plane`
+/// level).
+#[tokio::test]
+async fn interpret_finalize_response_error_status_maps_to_bad_gateway() {
+    let resp =
+        mock_http_response(b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 5\r\n\r\noops!")
+            .await;
+
+    let err = interpret_finalize_response(resp, Uuid::nil(), Uuid::nil())
+        .await
+        .expect_err("a non-success status must be interpreted as Err");
+    assert_eq!(err.status(), StatusCode::BAD_GATEWAY);
+}
+
+/// A header value that is present but fails `HeaderValue::to_str()` (not
+/// valid UTF-8 -- legal on the wire as HTTP header values are opaque bytes)
+/// must be treated as absent (`None`), matching `hdr`'s `.and_then(|v|
+/// v.to_str().ok())` -- never panic and never let non-UTF-8 bytes leak into
+/// the `FinalizeEcho` the client-facing response is built from.
+#[tokio::test]
+async fn interpret_finalize_response_non_utf8_header_value_is_treated_as_absent() {
+    let mut raw = b"HTTP/1.1 204 No Content\r\nx-fs-bound: ".to_vec();
+    raw.extend_from_slice(&[0xFF, 0xFE]); // not valid UTF-8
+    raw.extend_from_slice(b"\r\ncontent-length: 0\r\n\r\n");
+
+    let resp = mock_http_response(Box::leak(raw.into_boxed_slice())).await;
+
+    let echo = interpret_finalize_response(resp, Uuid::nil(), Uuid::nil())
+        .await
+        .expect("a success status must be interpreted as Ok");
+    assert_eq!(
+        echo.bound, None,
+        "a header value that fails to_str() must read as absent, not propagate garbage"
+    );
+}
+
+// ── route-level: sidecar forwards X-FS-Bound/ETag from finalize (E2E-02) ──
+
+/// End-to-end (within the sidecar process) proof of the contract
+/// `docs/api.md` §"Single-part bind outcome headers" describes: a real
+/// `PUT /upload` through the router, whose finalize callback to a mock
+/// control plane reports a lost auto-bind CAS, must forward
+/// `X-FS-Bound: conflict` and `X-FS-Current-ETag` verbatim on the sidecar's
+/// own `200` response -- not just on the control plane's own response to
+/// the finalize callback (already covered by
+/// `api_complete_bind_test.rs`/`finalize_test.rs`, which call the handler
+/// directly and never prove the sidecar itself echoes the headers to the
+/// uploading client).
+#[tokio::test]
+async fn upload_forwards_bind_conflict_headers_from_finalize_callback() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock control plane");
+    let addr = listener.local_addr().expect("local addr");
+
+    tokio::spawn(async move {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            let mut buf = [0u8; 4096];
+            let _n = stream.read(&mut buf).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 204 No Content\r\nx-fs-bound: conflict\r\n\
+                      x-fs-current-etag: \"current-etag-value\"\r\ncontent-length: 0\r\n\r\n",
+                )
+                .await
+                .ok();
+        }
+    });
+
+    let issuer = Issuer::generate(60).expect("issuer generation");
+    let mut state = test_state();
+    state.verifier = Arc::new(issuer.verifier());
+    state.control_base_url = format!("http://{addr}");
+
+    let file_id = Uuid::now_v7();
+    let version_id = Uuid::now_v7();
+    let backend_path = format!("/{file_id}/{version_id}");
+    let token = upload_token(&issuer, file_id, version_id, "test", &backend_path);
+
+    let router = build_router(state, DEFAULT_MAX_BODY_BYTES);
+    let response = router
+        .oneshot(
+            Request::put(format!(
+                "/api/file-storage-data/v1/upload/{file_id}/{version_id}?fs-token={token}"
+            ))
+            .body(Body::from(b"hello world".to_vec()))
+            .expect("valid request"),
+        )
+        .await
+        .expect("router call succeeds");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the upload itself succeeds even when the auto-bind CAS is lost -- only the bind, \
+         not the upload, conflicted"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-fs-bound")
+            .expect("X-FS-Bound header present")
+            .to_str()
+            .expect("valid header value"),
+        "conflict"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-fs-current-etag")
+            .expect("X-FS-Current-ETag header present")
+            .to_str()
+            .expect("valid header value"),
+        "\"current-etag-value\""
+    );
+    assert!(
+        response.headers().get(header::ETAG).is_none(),
+        "a lost CAS carries no new ETag -- only X-FS-Current-ETag"
+    );
+}
+
 /// Mint a signed `op = put` upload token for `(file_id, version_id, backend_id, backend_path)`.
 fn upload_token(
     issuer: &Issuer,
@@ -1920,7 +2140,12 @@ fn parse_optional_empty_string_errors() {
 /// the *next* poll once no further chunk arrives within `idle` — the
 /// wrapper hands back exactly one `Err(ErrorKind::TimedOut)` and sets the
 /// `timed_out` flag, then ends.
-#[tokio::test]
+///
+/// `start_paused = true`: `idle_timeout_stream` is pure `tokio::time::timeout`
+/// logic over an in-memory stream (no real sockets), so the 50ms deadline
+/// below is virtual time that tokio auto-advances to instantly instead of a
+/// real wall-clock wait.
+#[tokio::test(start_paused = true)]
 async fn idle_timeout_stream_times_out_when_the_stream_goes_quiet() {
     let chunk = bytes::Bytes::from_static(b"hello");
     let stream = futures::stream::once(async move { Ok::<_, std::io::Error>(chunk) })
@@ -1989,7 +2214,13 @@ async fn idle_timeout_stream_disabled_passes_stream_through_unchanged() {
 /// must run to completion with every chunk delivered and no error at all --
 /// this is the "slow but alive" case the design deliberately protects (no
 /// absolute deadline on the whole stream, only on the gap between chunks).
-#[tokio::test]
+///
+/// `start_paused = true`: same reasoning as
+/// `idle_timeout_stream_times_out_when_the_stream_goes_quiet` -- every delay
+/// here is `tokio::time::sleep` over an in-memory stream, so tokio
+/// auto-advances virtual time instead of this test spending real wall-clock
+/// time on three real 10ms sleeps.
+#[tokio::test(start_paused = true)]
 async fn idle_timeout_stream_tolerates_pauses_under_the_limit() {
     let stream = futures::stream::unfold(0u8, |i| async move {
         if i >= 3 {
@@ -2699,7 +2930,13 @@ async fn upload_exact_size_mismatch_returns_400_and_deletes_created_object() {
 /// visible -- `InMemoryBackend::publish_exclusive` only inserts into its
 /// blob map after the whole stream drains successfully, which the
 /// idle-timeout error path never reaches.
-#[tokio::test]
+///
+/// `start_paused = true`: the whole route (an in-process `Router::oneshot`
+/// call, no real sockets) plus the 50ms idle timeout and the second chunk's
+/// 2s stall are all `tokio::time`, so virtual time lets this resolve without
+/// a real wait; the token's `exp` check (`OffsetDateTime::now_utc`, real
+/// wall-clock) runs once up front and is unaffected either way.
+#[tokio::test(start_paused = true)]
 async fn upload_body_idle_timeout_returns_408_and_publishes_nothing() {
     let issuer = Issuer::generate(60).expect("issuer generation");
     let mut state = test_state();
@@ -2768,6 +3005,21 @@ async fn upload_body_idle_timeout_returns_408_and_publishes_nothing() {
 /// `finalize_with_expired_token_accepted_within_grace` /
 /// `finalize_with_expired_token_rejected_beyond_grace` and their
 /// `report_part_with_expired_token_*` counterparts.
+///
+/// Deliberately NOT `#[tokio::test(start_paused = true)]`: the property this
+/// test proves only holds if wall-clock time genuinely crosses `claims.exp`
+/// between issuance and the body finishing, but `exp` is checked against
+/// `OffsetDateTime::now_utc()` (the real system clock) inside `verify()`,
+/// which tokio's virtual clock does not move -- pausing time here would let
+/// the body "stream" instantly while `now_utc()` stayed put, so the request
+/// would finish *before* `exp` and this test would stop testing anything.
+/// The real sleep below is kept, just shortened to the minimum reliably
+/// over the exp margin: each sleep is a lower bound on elapsed real time
+/// (a timer never fires early, only late under scheduler jitter), so
+/// 3 * 700ms = 2100ms is guaranteed to clear the 2000ms `exp` margin
+/// regardless of how loaded the test runner is; only the `exp` margin itself
+/// stays at 2s (not 1s) to keep the whole-second-boundary-race protection
+/// explained in the comment below.
 #[tokio::test]
 async fn upload_succeeds_when_token_expires_after_verification_while_body_still_streaming() {
     let issuer = Issuer::generate(60).expect("issuer generation");
@@ -2803,12 +3055,15 @@ async fn upload_succeeds_when_token_expires_after_verification_while_body_still_
 
     // Three chunks, each comfortably spaced under any idle-timeout concern
     // (there is none configured here -- `test_state()`'s default is `None`),
-    // whose combined delay pushes well past the token's 2-second `exp`.
+    // whose combined delay (2100ms) clears the token's 2000ms `exp` margin
+    // with 100ms to spare -- see this test's doc comment for why that
+    // margin is safe despite scheduler jitter, and why `exp`'s own 2s
+    // margin (not 1s) is kept as-is.
     let body_stream = futures::stream::unfold(0u8, |i| async move {
         if i >= 3 {
             return None;
         }
-        tokio::time::sleep(Duration::from_millis(900)).await;
+        tokio::time::sleep(Duration::from_millis(700)).await;
         Some((
             Ok::<_, std::io::Error>(Bytes::from_static(b"slow-chunk")),
             i + 1,

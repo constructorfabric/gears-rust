@@ -59,6 +59,107 @@ pub struct FinalizeVersionOutcome {
     pub bound: bool,
 }
 
+/// Everything [`MultipartStore::finalize_multipart_version`] already knows
+/// about the completion before the bind outcome is decided inside its
+/// transaction -- every `StoredCompleteResult` field except
+/// `bind_state`/`etag`/`current_etag`, which depend on `bound` (and, on a
+/// lost auto-bind CAS, a same-transaction fresh read of the file's current
+/// pointer) and so can only be resolved once the finalize step itself has
+/// run.
+#[derive(Debug, Clone)]
+pub struct MultipartFinishSnapshot {
+    pub upload_id: Uuid,
+    pub version_id: Uuid,
+    pub size: i64,
+    /// Raw (not hex-encoded) content hash -- mirrors
+    /// `CompletedMultipartUpload::content_hash`.
+    pub content_hash: Vec<u8>,
+    pub hash_mode: crate::infra::content::hash_mode::HashMode,
+    /// `None` for the degenerate one-part plan (`whole-sha256` versions carry
+    /// no `part_count` column) -- the persisted `StoredCompleteResult`'s own
+    /// `part_count` still reports the true count (1) in that case; see its
+    /// construction in `Store::finalize_multipart_version`.
+    pub part_count: Option<i32>,
+    /// The `MultipartComplete` audit row, written in the same transaction
+    /// as the finalize iff the terminal `completing -> completed` CAS wins
+    /// (see [`FinalizeMultipartOutcome::session_completed`]).
+    pub session_audit: AuditEntry,
+}
+
+/// Result of [`MultipartStore::finalize_multipart_version`].
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone)]
+pub struct FinalizeMultipartOutcome {
+    /// The version row existed, was `pending`, and is now `available`.
+    pub updated: bool,
+    /// The auto-bind CAS was requested and won (always `false` when no
+    /// [`AutoBindOnFinalize`] was passed, or when `updated` is `false`).
+    pub bound: bool,
+    /// The session's terminal `completing -> completed` CAS won in this SAME
+    /// transaction, persisting the `complete_result` snapshot alongside the
+    /// finalize -- always `false` when `updated` is `false` (nothing to
+    /// finish). Also `false` in the rare case where this call's own
+    /// completion lease was raced away between the finalize and the
+    /// terminal CAS (mirrors the old, separately-transacted
+    /// `finish_session`'s `finished == false` branch): the caller must fall
+    /// back to that same re-check-and-converge handling.
+    pub session_completed: bool,
+    /// The file's CURRENT content `ETag`, read INSIDE this same transaction,
+    /// when an auto-bind was requested but its CAS lost (`Some` only in that
+    /// case). The caller must use this value (rather than a second,
+    /// post-transaction read) to build the `BindState::Conflict` response it
+    /// returns to the client -- otherwise a rebind landing in the gap
+    /// between this transaction's commit and that second read would make the
+    /// live response disagree with the `complete_result` snapshot this same
+    /// transaction just persisted (the exact divergence this method exists
+    /// to close).
+    pub current_etag: Option<String>,
+}
+
+/// Result of `Store::delete_file_collecting_versions` /
+/// [`CleanupStore::delete_file_with_event_collecting_versions`].
+///
+/// The version list is collected **inside the same transaction** as the
+/// delete itself (see that method's doc comment) so a version inserted
+/// concurrently, anywhere between an old pre-transaction snapshot and this
+/// transaction's commit, cannot be cascade-removed without ever being seen
+/// by the caller's backend-blob cleanup.
+#[derive(Debug, Clone)]
+pub struct DeletedFile {
+    /// Whether the `files` row (and its cascaded `file_versions` rows) was
+    /// actually removed. `false` means the file was already gone (a
+    /// concurrent delete/expiry won the race) -- `versions` is empty in
+    /// that case, and no audit/event was written.
+    pub removed: bool,
+    /// Every version row that existed for this file at the moment of
+    /// deletion, for the caller's best-effort backend-blob cleanup and usage
+    /// accounting.
+    pub versions: Vec<FileVersion>,
+}
+
+/// Result of `Store::delete_version_or_whole_file`.
+///
+/// The version-count decision ("is `version_id` the file's only version?")
+/// is made **inside the transaction** that performs whichever delete it
+/// implies, instead of from a pre-transaction snapshot -- see that method's
+/// doc comment for the race this closes.
+#[derive(Debug, Clone)]
+pub enum DeleteVersionOutcome {
+    /// `version_id` does not exist for this file (or the file itself is
+    /// already gone).
+    NotFound,
+    /// `version_id` is the file's current content; the caller must bind
+    /// another version before it can be deleted.
+    IsCurrent,
+    /// Just `version_id` was removed; the file and its other versions are
+    /// untouched.
+    VersionRemoved(FileVersion),
+    /// `version_id` was the file's only version, so the whole file (and
+    /// this, its one version) was removed too -- mirrors
+    /// `FileService::delete_file_inner`'s unconditional whole-file delete.
+    FileRemoved(FileVersion),
+}
+
 // ── CleanupStore ──────────────────────────────────────────────────────────────
 
 /// Narrow persistence port for the cleanup engine.
@@ -75,10 +176,19 @@ pub trait CleanupStore: Send + Sync {
     /// excluded: it is aborted by the next sweep step
     /// (`sweep_expired_multipart`) and its version becomes reclaimable on a
     /// later sweep.
+    ///
+    /// Ordered `(created_at, version_id)` ascending, up to `limit` rows --
+    /// one batch per sweep pass, same as
+    /// [`Self::list_versionless_orphan_files`]. No cursor is threaded through:
+    /// every row this query returns is either deleted or moved off `pending`
+    /// by the caller, so it drops out of the next pass's result set on its
+    /// own: a plain re-run of the same query, not a resumed scan, picks up
+    /// whatever this pass's batch cap left behind.
     async fn list_abandoned_pending_versions(
         &self,
         older_than: OffsetDateTime,
         now: OffsetDateTime,
+        limit: u64,
     ) -> Result<Vec<FileVersion>, DomainError>;
 
     /// List `files` rows that never received **any** version at all --
@@ -126,10 +236,18 @@ pub trait CleanupStore: Send + Sync {
         audit: AuditEntry,
     ) -> Result<bool, DomainError>;
 
-    /// List `in_progress` multipart sessions whose `expires_at` is before `now`.
+    /// List `in_progress` (or lease-lapsed `completing`) multipart sessions
+    /// whose `expires_at` is before `now`, ordered `(expires_at, upload_id)`
+    /// ascending, up to `limit` rows -- one batch per sweep pass, same as
+    /// [`Self::list_abandoned_pending_versions`]. No cursor is threaded
+    /// through here either: the caller CASes each returned session's `state`
+    /// away from `in_progress`/`completing`, so it drops out of the next
+    /// pass's result set on its own, and a plain re-run of the same query
+    /// picks up whatever this pass's batch cap left behind.
     async fn list_expired_multipart_uploads(
         &self,
         now: OffsetDateTime,
+        limit: u64,
     ) -> Result<Vec<MultipartUploadSession>, DomainError>;
 
     /// Mark a multipart session as `aborted` + audit in one transaction.
@@ -180,6 +298,13 @@ pub trait CleanupStore: Send + Sync {
     /// Fetch a file by id (unscoped -- the sweep runs across all tenants).
     async fn get_file(&self, file_id: Uuid) -> Result<Option<File>, DomainError>;
 
+    /// Batched counterpart of [`Self::get_file`] (unscoped, same reason):
+    /// fetch every file in `ids` that exists in one query instead of one
+    /// round trip per id. Used by the abandoned-pending-version and
+    /// expired-multipart-session sweeps to resolve a whole candidate batch's
+    /// audit `tenant_id`s up front, rather than one `get_file` per candidate.
+    async fn list_files_by_ids(&self, ids: &[Uuid]) -> Result<Vec<File>, DomainError>;
+
     /// Whether `file_id` currently has at least one *active* (`in_progress`
     /// or `completing`) multipart upload session, regardless of
     /// `expires_at`/`lease_until`. Guards the P2 2.8 orphan-file delete
@@ -193,15 +318,19 @@ pub trait CleanupStore: Send + Sync {
     /// gets to decide a stuck lease is actually abandoned.
     async fn has_active_multipart_for_file(&self, file_id: Uuid) -> Result<bool, DomainError>;
 
-    /// Delete a file row, optionally enqueue a file-event, and audit — all in
-    /// one transaction. Returns `true` if a row was removed.
-    async fn delete_file_with_event(
+    /// Delete a file row, collecting its version rows for backend-blob
+    /// cleanup **inside the same transaction** as the delete, optionally
+    /// enqueue a file-event, and audit — all atomically. See
+    /// `Store::delete_file_collecting_versions`'s doc comment for why the
+    /// version list must be read inside this transaction, not by the caller
+    /// beforehand.
+    async fn delete_file_with_event_collecting_versions(
         &self,
         scope: &AccessScope,
         file_id: Uuid,
         audit: AuditEntry,
         event: Option<FileEvent>,
-    ) -> Result<bool, DomainError>;
+    ) -> Result<DeletedFile, DomainError>;
 
     /// Delete the parent `files` row of an abandoned-pending-version orphan
     /// (P2 2.8), re-verifying **inside the same transaction** that the file
@@ -214,11 +343,16 @@ pub trait CleanupStore: Send + Sync {
         event: Option<FileEvent>,
     ) -> Result<bool, DomainError>;
 
-    /// Bulk-delete all `idempotency_keys` rows whose `expires_at` is at or
-    /// before `now`. Returns the number of rows removed.
+    /// Delete at most `limit` `idempotency_keys` rows whose `expires_at` is
+    /// at or before `now`, oldest-expired first -- batched like every other
+    /// sweep phase in this trait (`list_abandoned_pending_versions`,
+    /// `list_versionless_orphan_files`, `list_expired_multipart_uploads`),
+    /// so a stalled sweep's backlog cannot turn the next tick into one
+    /// unbounded `DELETE`. Returns the number of rows removed.
     async fn delete_expired_idempotency_keys(
         &self,
         now: OffsetDateTime,
+        limit: u64,
     ) -> Result<u64, DomainError>;
 }
 
@@ -352,11 +486,47 @@ pub trait MultipartStore: Send + Sync {
         auto_bind: Option<AutoBindOnFinalize>,
     ) -> Result<FinalizeVersionOutcome, DomainError>;
 
+    /// Finalize a multipart completion's version AND transition its session
+    /// `completing → completed` (persisting the `complete_result` snapshot),
+    /// in the SAME transaction as the finalize + auto-bind CAS.
+    ///
+    /// Closes the gap the separate `finalize_version` + `complete_multipart_upload`
+    /// pair used to leave open: a crash between the two committed the version
+    /// as `available` (bind decided) while the session's snapshot was never
+    /// written, so an idempotent re-complete's `replay_completed` fell back to
+    /// re-deriving `bind_state` from the file's CURRENT (possibly since
+    /// legitimately rebound) content pointer instead of the historical one.
+    /// See [`MultipartFinishSnapshot`]/[`FinalizeMultipartOutcome`] for what
+    /// crosses the transaction boundary in each direction.
+    #[allow(clippy::too_many_arguments)]
+    async fn finalize_multipart_version(
+        &self,
+        file_id: Uuid,
+        manifest: Option<String>,
+        validated_mime: Option<String>,
+        finalize_audit: AuditEntry,
+        auto_bind: Option<AutoBindOnFinalize>,
+        finish: MultipartFinishSnapshot,
+    ) -> Result<FinalizeMultipartOutcome, DomainError>;
+
     /// Terminal transition `completing → completed` + persist the response
     /// snapshot (`result_json`) + audit, in one (fast) transaction.
+    ///
+    /// Used only by the takeover/converge recovery paths
+    /// (`MultipartService::finish_session`'s remaining callers), which
+    /// re-derive the response from already-committed state rather than
+    /// building a fresh `complete_result` snapshot inline — the main
+    /// first-attempt completion path uses
+    /// [`Self::finalize_multipart_version`] instead, which folds this same
+    /// transition into the finalize transaction itself.
+    ///
+    /// `lease_owner`: this call's own completion-lease owner, required to
+    /// still match the session's current lease owner (DBS-05 hardening) --
+    /// see `MultipartRepo::finish_complete`'s doc comment.
     async fn complete_multipart_upload(
         &self,
         upload_id: Uuid,
+        lease_owner: &str,
         result_json: &str,
         audit: AuditEntry,
     ) -> Result<bool, DomainError>;

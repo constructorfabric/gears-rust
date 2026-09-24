@@ -140,6 +140,31 @@ async fn build_full_service_with_issuer(
     (svc, msvc, backend, store)
 }
 
+/// Build a bare `FileService` over a caller-supplied `Store`/`BackendRegistry`
+/// and `issuer`, with no previous-signing-key configuration (`verifier()`
+/// defaults to the issuer's own single current key). Used by the
+/// `signing_key_seed` rotation tests below, which need TWO `FileService`
+/// instances sharing the same store/backend (one "before rotation", one
+/// "after") but each with its own issuer -- unlike
+/// `build_full_service_with_issuer`, which always creates a brand-new DB.
+fn service_over(
+    store: Store,
+    backends: BackendRegistry,
+    authorizer: Arc<dyn file_storage::domain::authz::Authorizer>,
+    issuer: Arc<Issuer>,
+) -> Arc<FileService> {
+    let cfg = ServiceConfig {
+        default_url_ttl_secs: 3600,
+        sidecar_base_url: "http://sidecar.test".to_owned(),
+        default_page_size: 50,
+        max_page_size: 1000,
+        idempotency_ttl_secs: 86400,
+    };
+    Arc::new(FileService::new(
+        store, backends, issuer, authorizer, cfg, None, None,
+    ))
+}
+
 /// Build an `x-fs-token`-only `HeaderMap` (no `x-fs-internal-token`).
 fn headers_with_token(token: &str) -> HeaderMap {
     let mut headers = HeaderMap::new();
@@ -992,6 +1017,366 @@ async fn finalize_with_expired_token_rejected_beyond_grace() {
         err.status_code(),
         403,
         "an expired-beyond-grace token must map to 403, same as any other invalid token"
+    );
+}
+
+// -- signing_key_seed rotation (thread #35): `FileService::verifier()` must
+// keep accepting a token signed under a PREVIOUS seed once the control plane
+// has restarted on a new one and `previous_signing_public_keys` names the old
+// seed's public key -- otherwise every upload started before the restart
+// fails its finalize/report-part callback the instant the control plane
+// comes back up, even though the sidecar fleet (rolled out first, per
+// docs/operations.md's Rotation procedure) still honours the client's
+// in-flight signed URL.
+
+#[tokio::test]
+async fn finalize_accepts_token_signed_by_previous_key_after_rotation() {
+    let db = build_db().await;
+    let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let backends = BackendRegistry::new(vec![Arc::clone(&backend)], "mem").expect("registry");
+    let authorizer: Arc<dyn file_storage::domain::authz::Authorizer> =
+        Arc::new(TenantOnlyAuthorizer);
+    let store = Store::new(Arc::clone(&db));
+
+    // "Before rotation": the control plane is running on the OLD seed, and a
+    // client starts an upload against it.
+    let old_issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let svc_before = service_over(
+        store.clone(),
+        backends.clone(),
+        Arc::clone(&authorizer),
+        Arc::clone(&old_issuer),
+    );
+    let ctx = ctx(Uuid::now_v7());
+    let ticket = svc_before
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+
+    let known_bytes = Bytes::from_static(b"hello, world!");
+    let path = backend_path(ticket.file_id, ticket.version_id);
+    backend.put(&path, known_bytes.clone()).await.unwrap();
+
+    let claims = Claims {
+        op: Op::Put,
+        file_id: ticket.file_id,
+        version_id: ticket.version_id,
+        backend_id: "mem".to_owned(),
+        backend_path: path,
+        exp: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
+        upload: UploadConstraints::default(),
+        multipart: MultipartClaims::default(),
+        request_id: "test-request-id".to_owned(),
+        content_type: String::new(),
+        etag: String::new(),
+        bind_on_finalize: false,
+    };
+    // Minted under the OLD seed -- exactly what a real client's in-flight
+    // upload would carry into the callback below.
+    let token = old_issuer
+        .issue(claims, time::OffsetDateTime::now_utc())
+        .expect("issue token");
+
+    // "After rotation": a fresh control-plane instance on a NEW seed, with
+    // the old seed's public key retained via `previous_signing_public_keys`
+    // (docs/operations.md's Rotation procedure, step 3).
+    let new_issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let svc_after = Arc::new(
+        FileService::new(
+            store.clone(),
+            backends.clone(),
+            Arc::clone(&new_issuer),
+            authorizer,
+            ServiceConfig {
+                default_url_ttl_secs: 3600,
+                sidecar_base_url: "http://sidecar.test".to_owned(),
+                default_page_size: 50,
+                max_page_size: 1000,
+                idempotency_ttl_secs: 86400,
+            },
+            None,
+            None,
+        )
+        .with_previous_signing_public_keys(vec![old_issuer.public_key()])
+        .expect("a valid-length previous key must be accepted"),
+    );
+
+    let verifier = Arc::new(svc_after.verifier());
+    let finalize_auth = Arc::new(FinalizeAuth::new(None, time::Duration::ZERO));
+    let headers = headers_with_token(&token);
+    let req = FinalizeUploadReq {
+        size: i64::try_from(known_bytes.len()).unwrap(),
+        hash_hex: hex::encode(hash::sha256(&known_bytes)),
+    };
+
+    let result = finalize_version(
+        Extension(Arc::clone(&svc_after)),
+        Extension(verifier),
+        Extension(finalize_auth),
+        Path((ticket.file_id, ticket.version_id)),
+        headers,
+        Json(req),
+    )
+    .await;
+
+    let response = result
+        .expect(
+            "a finalize callback signed under a retained previous signing key must still verify",
+        )
+        .into_response();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let version = store
+        .get_version(ticket.file_id, ticket.version_id)
+        .await
+        .unwrap()
+        .expect("version row must exist");
+    assert_eq!(
+        version.status,
+        VersionStatus::Available,
+        "finalize must have actually gone through for the previous-key-signed token"
+    );
+}
+
+/// The mirror-image negative case: without configuring
+/// `previous_signing_public_keys`, the exact same old-seed-signed token must
+/// still be rejected after rotation -- proving the acceptance above comes
+/// from the configured previous key, not from some accidental widening of
+/// what `verify` accepts.
+#[tokio::test]
+async fn finalize_rejects_token_signed_by_previous_key_without_rotation_config() {
+    let db = build_db().await;
+    let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let backends = BackendRegistry::new(vec![Arc::clone(&backend)], "mem").expect("registry");
+    let authorizer: Arc<dyn file_storage::domain::authz::Authorizer> =
+        Arc::new(TenantOnlyAuthorizer);
+    let store = Store::new(Arc::clone(&db));
+
+    let old_issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let svc_before = service_over(
+        store.clone(),
+        backends.clone(),
+        Arc::clone(&authorizer),
+        Arc::clone(&old_issuer),
+    );
+    let ctx = ctx(Uuid::now_v7());
+    let ticket = svc_before
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+
+    let claims = Claims {
+        op: Op::Put,
+        file_id: ticket.file_id,
+        version_id: ticket.version_id,
+        backend_id: "mem".to_owned(),
+        backend_path: backend_path(ticket.file_id, ticket.version_id),
+        exp: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
+        upload: UploadConstraints::default(),
+        multipart: MultipartClaims::default(),
+        request_id: "test-request-id".to_owned(),
+        content_type: String::new(),
+        etag: String::new(),
+        bind_on_finalize: false,
+    };
+    let token = old_issuer
+        .issue(claims, time::OffsetDateTime::now_utc())
+        .expect("issue token");
+
+    // Same rotation, but `previous_signing_public_keys` is left empty --
+    // `svc_after.verifier()` accepts only the new issuer's current key.
+    let new_issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let svc_after = service_over(store, backends, authorizer, new_issuer);
+
+    let verifier = Arc::new(svc_after.verifier());
+    let finalize_auth = Arc::new(FinalizeAuth::new(None, time::Duration::ZERO));
+    let headers = headers_with_token(&token);
+    let req = FinalizeUploadReq {
+        size: 5,
+        hash_hex: hex::encode(hash::sha256(b"hello")),
+    };
+
+    let result = finalize_version(
+        Extension(svc_after),
+        Extension(verifier),
+        Extension(finalize_auth),
+        Path((ticket.file_id, ticket.version_id)),
+        headers,
+        Json(req),
+    )
+    .await;
+
+    let Err(err) = result else {
+        panic!(
+            "an old-seed-signed token must be rejected once the control plane has rotated \
+             without retaining that key in previous_signing_public_keys"
+        );
+    };
+    assert_eq!(err.status_code(), 403);
+}
+
+/// The grace window (`finalize_token_grace_secs`) must apply on top of a
+/// previous-key acceptance too, not just on the current key: a slow-but-live
+/// upload that straddles BOTH the token's own `exp` and a `signing_key_seed`
+/// rotation must still finalize.
+#[tokio::test]
+async fn finalize_accepts_expired_previous_key_token_within_grace_after_rotation() {
+    let db = build_db().await;
+    let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let backends = BackendRegistry::new(vec![Arc::clone(&backend)], "mem").expect("registry");
+    let authorizer: Arc<dyn file_storage::domain::authz::Authorizer> =
+        Arc::new(TenantOnlyAuthorizer);
+    let store = Store::new(Arc::clone(&db));
+
+    let old_issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let svc_before = service_over(
+        store.clone(),
+        backends.clone(),
+        Arc::clone(&authorizer),
+        Arc::clone(&old_issuer),
+    );
+    let ctx = ctx(Uuid::now_v7());
+    let ticket = svc_before
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+
+    let known_bytes = Bytes::from_static(b"hello, world!");
+    let path = backend_path(ticket.file_id, ticket.version_id);
+    backend.put(&path, known_bytes.clone()).await.unwrap();
+
+    let claims = Claims {
+        op: Op::Put,
+        file_id: ticket.file_id,
+        version_id: ticket.version_id,
+        backend_id: "mem".to_owned(),
+        backend_path: path,
+        // Expired 2 minutes ago -- the same "slow-but-live upload" scenario
+        // as `finalize_with_expired_token_accepted_within_grace`, now
+        // combined with a rotation that has already happened by the time the
+        // callback lands.
+        exp: time::OffsetDateTime::now_utc().unix_timestamp() - 120,
+        upload: UploadConstraints::default(),
+        multipart: MultipartClaims::default(),
+        request_id: "test-request-id".to_owned(),
+        content_type: String::new(),
+        etag: String::new(),
+        bind_on_finalize: false,
+    };
+    let token = old_issuer
+        .issue(claims, time::OffsetDateTime::now_utc())
+        .expect("issue token");
+
+    let new_issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let svc_after = Arc::new(
+        FileService::new(
+            store.clone(),
+            backends,
+            Arc::clone(&new_issuer),
+            authorizer,
+            ServiceConfig {
+                default_url_ttl_secs: 3600,
+                sidecar_base_url: "http://sidecar.test".to_owned(),
+                default_page_size: 50,
+                max_page_size: 1000,
+                idempotency_ttl_secs: 86400,
+            },
+            None,
+            None,
+        )
+        .with_previous_signing_public_keys(vec![old_issuer.public_key()])
+        .expect("a valid-length previous key must be accepted"),
+    );
+
+    let verifier = Arc::new(svc_after.verifier());
+    // 1-hour grace comfortably covers the 2-minute-past-exp token above.
+    let finalize_auth = Arc::new(FinalizeAuth::new(None, time::Duration::seconds(3600)));
+    let headers = headers_with_token(&token);
+    let req = FinalizeUploadReq {
+        size: i64::try_from(known_bytes.len()).unwrap(),
+        hash_hex: hex::encode(hash::sha256(&known_bytes)),
+    };
+
+    let result = finalize_version(
+        Extension(Arc::clone(&svc_after)),
+        Extension(verifier),
+        Extension(finalize_auth),
+        Path((ticket.file_id, ticket.version_id)),
+        headers,
+        Json(req),
+    )
+    .await;
+
+    let response = result
+        .expect("an expired-but-within-grace previous-key token must still be accepted")
+        .into_response();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let version = store
+        .get_version(ticket.file_id, ticket.version_id)
+        .await
+        .unwrap()
+        .expect("version row must exist");
+    assert_eq!(version.status, VersionStatus::Available);
+}
+
+/// Minting is unaffected by a rotation's previous-key configuration: a fresh
+/// upload token issued AFTER `with_previous_signing_public_keys` is only ever
+/// signed with the current (new) key, never the retained old one.
+#[tokio::test]
+async fn signing_after_rotation_uses_current_key_only() {
+    let db = build_db().await;
+    let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let backends = BackendRegistry::new(vec![Arc::clone(&backend)], "mem").expect("registry");
+    let authorizer: Arc<dyn file_storage::domain::authz::Authorizer> =
+        Arc::new(TenantOnlyAuthorizer);
+    let store = Store::new(Arc::clone(&db));
+
+    let old_issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let new_issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let svc_after = Arc::new(
+        FileService::new(
+            store,
+            backends,
+            Arc::clone(&new_issuer),
+            authorizer,
+            ServiceConfig {
+                default_url_ttl_secs: 3600,
+                sidecar_base_url: "http://sidecar.test".to_owned(),
+                default_page_size: 50,
+                max_page_size: 1000,
+                idempotency_ttl_secs: 86400,
+            },
+            None,
+            None,
+        )
+        .with_previous_signing_public_keys(vec![old_issuer.public_key()])
+        .expect("a valid-length previous key must be accepted"),
+    );
+
+    let ctx = ctx(Uuid::now_v7());
+    let ticket = svc_after
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+    // Pull the freshly-minted PUT token back out of the upload URL's
+    // `fs-token` query parameter.
+    let token = ticket
+        .upload_url
+        .split("fs-token=")
+        .nth(1)
+        .expect("upload_url must carry an fs-token query parameter")
+        .to_owned();
+
+    let now = time::OffsetDateTime::now_utc();
+    assert!(
+        new_issuer.verifier().verify(&token, now).is_ok(),
+        "a token minted after rotation must verify against the NEW issuer's own key"
+    );
+    assert!(
+        old_issuer.verifier().verify(&token, now).is_err(),
+        "a token minted after rotation must NOT verify against the OLD issuer's key -- \
+         minting always uses the current key only, regardless of previous_signing_public_keys"
     );
 }
 

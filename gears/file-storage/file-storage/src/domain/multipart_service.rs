@@ -38,7 +38,9 @@ use crate::domain::multipart::{
 /// polling client re-issues the same idempotent `complete` after this delay.
 const COMPLETE_POLL_RETRY_SECS: u64 = 2;
 use crate::domain::policy::{PolicyResolver, PolicyScope};
-use crate::domain::ports::{AutoBindOnFinalize, FileStorageMetricsPort, MultipartStore};
+use crate::domain::ports::{
+    AutoBindOnFinalize, FileStorageMetricsPort, MultipartFinishSnapshot, MultipartStore,
+};
 use crate::domain::storage_layout;
 use crate::infra::backend::BackendRegistry;
 use crate::infra::content::mime::{
@@ -1046,7 +1048,14 @@ impl MultipartService {
     ) -> Result<CompletedMultipartUpload, DomainError> {
         let upload_id = session.upload_id;
         let result = self
-            .assemble_and_finish_inner(ctx, &file, &session, takeover, if_match_was_supplied)
+            .assemble_and_finish_inner(
+                ctx,
+                &file,
+                &session,
+                &lease_owner,
+                takeover,
+                if_match_was_supplied,
+            )
             .await;
         if result.is_err()
             && let Err(release_err) = self
@@ -1072,22 +1081,38 @@ impl MultipartService {
         ctx: &SecurityContext,
         file: &file_storage_sdk::File,
         session: &MultipartUploadSession,
+        lease_owner: &str,
         takeover: bool,
         if_match_was_supplied: bool,
     ) -> Result<CompletedMultipartUpload, DomainError> {
         let file_id = file.file_id;
         let upload_id = session.upload_id;
 
-        // Takeover fast-path: the previous completer may have died AFTER the
-        // finalize transaction (version available, bind decided) but BEFORE
-        // flipping the session to `completed`. Nothing is left to assemble —
-        // just finish the state machine and persist the snapshot.
-        if takeover
-            && let Some(v) = self.store.get_version(file_id, session.version_id).await?
+        // Already-finalized fast path: checked UNCONDITIONALLY, not just on
+        // `takeover`. The obvious case this covers is `takeover` itself (the
+        // previous completer died AFTER the finalize transaction -- version
+        // available, bind decided -- but BEFORE flipping the session to
+        // `completed`). But a non-takeover call can reach this exact same
+        // situation too: `assemble_and_finish`'s error path releases the
+        // completion lease back to `in_progress` on ANY error from this
+        // function, including one raised AFTER finalize already committed
+        // (e.g. a transient failure persisting the terminal
+        // `completing -> completed` transition). That release erases the
+        // `Completing`-derived `takeover` signal, so the retry reads
+        // `in_progress` -> `takeover = false` -- yet the version is already
+        // `Available`. Gating this check on `takeover` would send that retry
+        // straight into re-assembling an already-consumed backend handle
+        // instead of converging here, exactly like
+        // `converge_or_error_after_lost_finalize_cas` (which has the same
+        // "re-read the version, converge if Available" shape for its own,
+        // narrower race). Nothing is left to assemble either way -- just
+        // finish the state machine and persist the snapshot.
+        if let Some(v) = self.store.get_version(file_id, session.version_id).await?
             && v.status == file_storage_sdk::VersionStatus::Available
         {
             let completed = self.replay_completed(file_id, session).await?;
-            self.finish_session(ctx, session, &completed).await?;
+            self.finish_session(ctx, session, lease_owner, &completed)
+                .await?;
             return Ok(completed);
         }
 
@@ -1354,21 +1379,37 @@ impl MultipartService {
             }),
         });
 
+        // Upload-flow redesign (crash-consistency fix): the terminal session
+        // transition `completing -> completed` + the `complete_result`
+        // snapshot are written in the SAME transaction as this finalize +
+        // auto-bind CAS, via `finalize_multipart_version` -- not as a
+        // separate `finish_session` call afterwards. A crash (or any
+        // transient failure) between "version finalized" and "snapshot
+        // persisted" used to be possible because those were two independent
+        // transactions; now there is no gap for it to land in. See
+        // `ports::MultipartStore::finalize_multipart_version`'s doc.
+        let session_audit = Self::multipart_complete_audit(ctx, session);
         let finalize_outcome = self
             .store
-            .finalize_version(
+            .finalize_multipart_version(
                 file_id,
-                session.version_id,
-                total_size,
-                content_hash.clone(),
-                hash_mode,
-                // NULL for the degenerate one-part plan — matches the schema
-                // convention that `whole-sha256` versions carry no part_count.
-                (!single_part).then_some(part_count),
                 manifest_text.clone(),
                 Some(validated_mime),
                 finalize_audit,
                 auto_bind,
+                MultipartFinishSnapshot {
+                    upload_id,
+                    version_id: session.version_id,
+                    size: total_size,
+                    content_hash: content_hash.clone(),
+                    hash_mode,
+                    // NULL for the degenerate one-part plan — matches the
+                    // schema convention that `whole-sha256` versions carry no
+                    // part_count (the persisted `StoredCompleteResult` still
+                    // reports the true count via its own `unwrap_or(1)`).
+                    part_count: (!single_part).then_some(part_count),
+                    session_audit,
+                },
             )
             .await?;
         let finalized = finalize_outcome.updated;
@@ -1379,11 +1420,42 @@ impl MultipartService {
             // this correctly" (converge) or "the row is genuinely gone" (a
             // real error).
             return self
-                .converge_or_error_after_lost_finalize_cas(ctx, file_id, session, upload_id)
+                .converge_or_error_after_lost_finalize_cas(
+                    ctx,
+                    file_id,
+                    session,
+                    lease_owner,
+                    upload_id,
+                )
+                .await;
+        }
+        if !finalize_outcome.session_completed {
+            // The version this call just finalized is committed either way;
+            // only the session's OWN terminal CAS (inside that same
+            // transaction) lost its race -- this call's completion lease was
+            // taken over between the finalize and that CAS. Converge exactly
+            // like the finalize-side race above: re-read and replay rather
+            // than erroring, since the outcome (this exact version, now
+            // available) is the same no matter who's session-state CAS
+            // ultimately won.
+            return self
+                .converge_or_error_after_lost_finalize_cas(
+                    ctx,
+                    file_id,
+                    session,
+                    lease_owner,
+                    upload_id,
+                )
                 .await;
         }
 
-        // Same bind-state model as [`Self::bind_state_for`]'s doc.
+        // Same bind-state model as [`Self::bind_state_for`]'s doc — the
+        // decision itself was already made inside `finalize_multipart_version`'s
+        // transaction; `current_etag` comes back from there rather than a
+        // second, post-commit read (which could otherwise observe a
+        // legitimate rebind that landed after that transaction committed and
+        // report a live response that disagrees with the snapshot the same
+        // transaction just persisted).
         let (bind_state, bind_etag, current_etag) = if bound {
             (
                 BindState::Bound,
@@ -1391,12 +1463,7 @@ impl MultipartService {
                 None,
             )
         } else if session.auto_bind {
-            // Lost CAS — re-read the file for the pointer that won.
-            let fresh = self
-                .store
-                .require_file(&AccessScope::allow_all(), file_id)
-                .await?;
-            (BindState::Conflict, None, etag::etag_for(&fresh))
+            (BindState::Conflict, None, finalize_outcome.current_etag)
         } else {
             (BindState::Manual, None, None)
         };
@@ -1413,9 +1480,6 @@ impl MultipartService {
             etag: bind_etag,
             current_etag,
         };
-
-        // Terminal state transition + response snapshot + audit (fast tx).
-        self.finish_session(ctx, session, &result).await?;
 
         // Credit the assembled object's total bytes. Multipart finalize does
         // not go through `FileService::finalize_upload`, so it needs its own
@@ -1435,10 +1499,10 @@ impl MultipartService {
         Ok(result)
     }
 
-    /// `assemble_and_finish_inner`'s finalize CAS (`Store::finalize_version`,
-    /// fenced only by `status = 'pending'`, not by lease ownership) can lose
-    /// for two genuinely different reasons that a blanket hard error would
-    /// wrongly conflate:
+    /// `assemble_and_finish_inner`'s finalize CAS (inside
+    /// `Store::finalize_multipart_version`, fenced only by `status = 'pending'`,
+    /// not by lease ownership) can lose for two genuinely different reasons
+    /// that a blanket hard error would wrongly conflate:
     ///
     /// (a) A stale, lease-expired completer that was taken over by another
     /// caller can still reach this point and lose the race to that other
@@ -1469,11 +1533,20 @@ impl MultipartService {
     /// `finish_session`'s own pre-existing not-finished branch below --
     /// that branch did not need to change). Anything else (row gone, or
     /// genuinely still `pending`) keeps the original hard error.
+    ///
+    /// Also reused for a second, narrower race: `finalize_multipart_version`
+    /// itself WON its finalize CAS (nothing lost there) but its own,
+    /// same-transaction terminal session CAS lost
+    /// (`FinalizeMultipartOutcome::session_completed == false` -- this call's
+    /// lease was taken over between the two steps of that one transaction).
+    /// The version is unconditionally `Available` in that case (this call
+    /// just committed it), so this always takes the converge branch (a).
     async fn converge_or_error_after_lost_finalize_cas(
         &self,
         ctx: &SecurityContext,
         file_id: Uuid,
         session: &MultipartUploadSession,
+        lease_owner: &str,
         upload_id: Uuid,
     ) -> Result<CompletedMultipartUpload, DomainError> {
         let converged_version = self.store.get_version(file_id, session.version_id).await?;
@@ -1481,7 +1554,8 @@ impl MultipartService {
             && v.status == file_storage_sdk::VersionStatus::Available
         {
             let completed = self.replay_completed(file_id, session).await?;
-            self.finish_session(ctx, session, &completed).await?;
+            self.finish_session(ctx, session, lease_owner, &completed)
+                .await?;
             return Ok(completed);
         }
         Err(DomainError::conflict(format!(
@@ -1489,31 +1563,58 @@ impl MultipartService {
         )))
     }
 
+    /// The `MultipartComplete` audit row's shape, shared by
+    /// [`Self::finish_session`] (takeover/converge recovery paths) and the
+    /// main first-attempt path (which folds this same audit row into
+    /// [`Self::assemble_and_finish_inner`]'s `finalize_multipart_version`
+    /// transaction instead of writing it here) — both must record the
+    /// identical audit shape for the same logical event.
+    fn multipart_complete_audit(
+        ctx: &SecurityContext,
+        session: &MultipartUploadSession,
+    ) -> AuditEntry {
+        Self::audit_ok(
+            ctx,
+            Some(session.file_id),
+            AuditOperation::MultipartComplete,
+            serde_json::json!({ "upload_id": session.upload_id, "version_id": session.version_id }),
+        )
+    }
+
     /// Terminal `completing → completed` transition, persisting the response
     /// snapshot + the main audit row in one fast transaction.
+    ///
+    /// Only reached by the takeover/converge recovery paths, which rebuild
+    /// `result` from already-committed state (`replay_completed`) rather
+    /// than from a finalize this call just ran — the main first-attempt path
+    /// uses `finalize_multipart_version` instead, which performs this exact
+    /// transition inside the finalize transaction itself (see that method's
+    /// doc for why: it lets the `complete_result` snapshot always agree with
+    /// the bind decision, even under a crash between the two).
     async fn finish_session(
         &self,
         ctx: &SecurityContext,
         session: &MultipartUploadSession,
+        lease_owner: &str,
         result: &CompletedMultipartUpload,
     ) -> Result<(), DomainError> {
         let upload_id = session.upload_id;
-        let audit = Self::audit_ok(
-            ctx,
-            Some(session.file_id),
-            AuditOperation::MultipartComplete,
-            serde_json::json!({ "upload_id": upload_id, "version_id": session.version_id }),
-        );
+        let audit = Self::multipart_complete_audit(ctx, session);
         let result_json = serde_json::to_string(&StoredCompleteResult::from_completed(result))
             .map_err(|_| DomainError::database("failed to serialize complete result"))?;
         let finished = self
             .store
-            .complete_multipart_upload(upload_id, &result_json, audit)
+            .complete_multipart_upload(upload_id, lease_owner, &result_json, audit)
             .await?;
         if !finished {
-            // Our lease expired mid-flight and someone else moved the session
-            // on. If they finished it, the outcome converges (same parts, same
-            // deterministic result) — succeed; anything else is a real conflict.
+            // Either our lease expired mid-flight and someone else moved the
+            // session on, or (DBS-05 hardening) this specific `lease_owner`
+            // no longer matches the session's current one -- e.g. it was
+            // taken over by another completer before this call reached the
+            // CAS. Either way: if the session is already `Completed`
+            // (necessarily by that other, currently-legitimate owner), the
+            // outcome converges (same parts, same deterministic result) --
+            // succeed; anything else is a real conflict.
             let fresh = self
                 .store
                 .get_multipart_upload(upload_id)

@@ -190,6 +190,116 @@ async fn acquire_complete_lease_rejects_expired_session() {
     );
 }
 
+// -- finish_complete: lease_owner fencing (DBS-05) --------------------------
+
+/// A foreign/taken-over lease cannot transition the session to `completed`:
+/// once the lease is held under `"completer-a"`, a `finish_complete` call
+/// asserting a DIFFERENT owner (e.g. `"completer-b"`, representing a
+/// takeover that reassigned `lease_owner`) must lose its CAS -- the session
+/// stays `completing`, with no `complete_result` written and its lease
+/// untouched, exactly as if the call had never happened. Mirrors
+/// `release_complete_lease`'s and `acquire_complete_lease`'s own
+/// owner/expiry fencing -- `finish_complete` was the one CAS in this state
+/// machine missing an owner predicate (see its doc comment for the one
+/// deliberate exception: `Store::finalize_multipart_version`'s own embedded
+/// call passes `None` instead of a foreign owner, which is a different case
+/// from this test).
+#[tokio::test]
+async fn finish_complete_rejects_foreign_lease_owner() {
+    let db = db().await;
+    let conn = db.conn().expect("conn");
+    let multipart = MultipartRepo::new();
+    let now = OffsetDateTime::now_utc();
+    let expires_at = now + time::Duration::hours(1);
+
+    let (_file_id, upload_id) = seed_session(&conn, &multipart, expires_at, now).await;
+
+    let acquired = multipart
+        .acquire_complete_lease(
+            &conn,
+            upload_id,
+            "completer-a",
+            now + time::Duration::minutes(5),
+            now,
+        )
+        .await
+        .expect("acquire_complete_lease must not error");
+    assert!(acquired, "setup: must acquire the lease before completing");
+
+    let finished = multipart
+        .finish_complete(&conn, upload_id, Some("completer-b"), "{\"snapshot\":true}")
+        .await
+        .expect("finish_complete must not error even when its CAS loses");
+    assert!(
+        !finished,
+        "a foreign lease_owner must not be able to complete the session"
+    );
+
+    let session = multipart
+        .get(&conn, upload_id)
+        .await
+        .expect("get must not error")
+        .expect("session must still exist");
+    assert!(
+        matches!(session.state, MultipartUploadState::Completing),
+        "a rejected finish_complete must leave state untouched"
+    );
+    assert!(
+        session.complete_result.is_none(),
+        "a rejected finish_complete must not persist a complete_result snapshot"
+    );
+    assert!(
+        session.lease_until.is_some(),
+        "a rejected finish_complete must not clear the (still legitimately held) lease"
+    );
+}
+
+/// The positive counterpart: the CURRENT lease owner's own `finish_complete`
+/// call succeeds -- the `lease_owner` predicate added for DBS-05 only
+/// rejects a mismatched owner, never the legitimate holder.
+#[tokio::test]
+async fn finish_complete_accepts_matching_lease_owner() {
+    let db = db().await;
+    let conn = db.conn().expect("conn");
+    let multipart = MultipartRepo::new();
+    let now = OffsetDateTime::now_utc();
+    let expires_at = now + time::Duration::hours(1);
+
+    let (_file_id, upload_id) = seed_session(&conn, &multipart, expires_at, now).await;
+
+    let acquired = multipart
+        .acquire_complete_lease(
+            &conn,
+            upload_id,
+            "completer-a",
+            now + time::Duration::minutes(5),
+            now,
+        )
+        .await
+        .expect("acquire_complete_lease must not error");
+    assert!(acquired, "setup: must acquire the lease before completing");
+
+    let finished = multipart
+        .finish_complete(&conn, upload_id, Some("completer-a"), "{\"snapshot\":true}")
+        .await
+        .expect("finish_complete must not error");
+    assert!(
+        finished,
+        "the current, matching lease owner must be able to complete the session"
+    );
+
+    let session = multipart
+        .get(&conn, upload_id)
+        .await
+        .expect("get must not error")
+        .expect("session must still exist");
+    assert!(matches!(session.state, MultipartUploadState::Completed));
+    assert_eq!(
+        session.complete_result.as_deref(),
+        Some("{\"snapshot\":true}")
+    );
+}
+
 // -- upsert_part: on-conflict upsert + in_progress guard --------------------
 
 /// Reporting the same part number twice updates the existing row in place
@@ -272,7 +382,7 @@ async fn upsert_part_rejects_when_parent_not_in_progress() {
         .expect("acquire_complete_lease must not error");
     assert!(acquired, "setup: must acquire the lease before completing");
     let finished = multipart
-        .finish_complete(&conn, upload_id, "{}")
+        .finish_complete(&conn, upload_id, Some("completer-a"), "{}")
         .await
         .expect("finish_complete must not error");
     assert!(finished, "setup: session must reach completed");
@@ -365,7 +475,7 @@ async fn has_active_for_file_false_when_session_is_terminal() {
         .expect("acquire_complete_lease must not error");
     assert!(acquired, "setup: must acquire the lease before completing");
     let finished = multipart
-        .finish_complete(&conn, upload_id, "{}")
+        .finish_complete(&conn, upload_id, Some("completer-a"), "{}")
         .await
         .expect("finish_complete must not error");
     assert!(finished, "setup: session must reach completed");
@@ -456,5 +566,83 @@ async fn has_active_for_file_true_when_completing_with_expired_lease() {
         has_active,
         "a completing session with an expired lease still counts as active \
          until sweep_expired_multipart reaps it"
+    );
+}
+
+/// `MultipartRepo::list_expired` must cap its result at `limit` rows -- the
+/// cleanup sweep's expired-multipart phase used to run this query with no
+/// bound at all, materializing an entire backlog of stale sessions in one
+/// sweep pass -- and must order deterministically: `(expires_at, upload_id)`
+/// ascending, not merely `expires_at` (which alone leaves ties unordered).
+///
+/// Seeds four expired `in_progress` sessions under one file, one more than
+/// `limit = 3`: `a` strictly the longest-expired, `d` strictly the most
+/// recently expired (must be excluded), and `b`/`c` sharing `a`'s successor
+/// `expires_at` with `b`'s `upload_id` numerically below `c`'s (constructed
+/// via `Uuid::from_u128`, not `Uuid::now_v7`, so the tiebreak assertion does
+/// not depend on wall-clock generation order).
+#[tokio::test]
+async fn list_expired_caps_at_limit_and_orders_deterministically() {
+    let db = db().await;
+    let conn = db.conn().expect("conn");
+    let files = FileRepo::new();
+    let multipart = MultipartRepo::new();
+    let scope = AccessScope::allow_all();
+
+    let file_id = Uuid::now_v7();
+    let tenant_id = Uuid::now_v7();
+    files
+        .create(&conn, &scope, &new_file(file_id, tenant_id))
+        .await
+        .expect("create parent file");
+
+    let now = OffsetDateTime::now_utc();
+    let id_a = Uuid::from_u128(1);
+    let id_b = Uuid::from_u128(11);
+    let id_c = Uuid::from_u128(12);
+    let id_d = Uuid::from_u128(99);
+
+    for (upload_id, expires_at) in [
+        (id_a, now - time::Duration::hours(3)),
+        (id_c, now - time::Duration::hours(2)),
+        (id_b, now - time::Duration::hours(2)),
+        (id_d, now - time::Duration::hours(1)),
+    ] {
+        multipart
+            .create(
+                &conn,
+                upload_id,
+                file_id,
+                Uuid::now_v7(),
+                "backend-handle",
+                Some("mem"),
+                Some("/x"),
+                "application/octet-stream",
+                100,
+                50,
+                false,
+                expires_at,
+                now,
+            )
+            .await
+            .expect("create expired session");
+    }
+
+    let rows = multipart
+        .list_expired(&conn, now, 3)
+        .await
+        .expect("list_expired must not error");
+
+    assert_eq!(
+        rows.len(),
+        3,
+        "limit = 3 over 4 eligible candidates must return exactly 3 rows"
+    );
+    assert_eq!(
+        rows.iter().map(|s| s.upload_id).collect::<Vec<_>>(),
+        vec![id_a, id_b, id_c],
+        "rows must be ordered (expires_at, upload_id) ascending -- a first \
+         (longest-expired), then b before c (same expires_at, b's upload_id \
+         is smaller), and d (most recently expired) excluded by the limit"
     );
 }

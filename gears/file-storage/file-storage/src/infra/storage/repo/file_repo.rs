@@ -1,7 +1,7 @@
 //! Repository for the `files` table (logical file identity + content pointer).
 
 use sea_orm::ExprTrait;
-use sea_orm::sea_query::{Expr, Query};
+use sea_orm::sea_query::{Expr, LockType, Query};
 use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set};
 use time::OffsetDateTime;
 use toolkit_db::secure::{
@@ -14,10 +14,11 @@ use file_storage_sdk::{File, OwnerFilter};
 
 use crate::domain::error::DomainError;
 use crate::infra::storage::db::db_err;
-use crate::infra::storage::entity::file::{ActiveModel, Column, Entity};
+use crate::infra::storage::entity::file::{ActiveModel, Column, Entity, Model};
 use crate::infra::storage::entity::file_version::{
     Column as VersionColumn, Entity as VersionEntity,
 };
+use crate::infra::storage::mapper::file_from_model;
 
 /// Repository over the `files` table.
 #[derive(Clone, Default)]
@@ -68,7 +69,45 @@ impl FileRepo {
             .one(conn)
             .await
             .map_err(db_err)?;
-        Ok(found.map(Into::into))
+        found.map(file_from_model).transpose()
+    }
+
+    /// Lock a `files` row with `SELECT ... FOR UPDATE`, tenant-scoped.
+    ///
+    /// Call only with a transactional runner (`&SecureTx`), as the very
+    /// **first** statement of the transaction -- see
+    /// `docs/toolkit_unified_system/11_database_patterns.md`'s "Row locks"
+    /// section for the full rationale (parent-before-children ordering,
+    /// no external I/O while held). A concurrent `INSERT` into a child
+    /// table with a `REFERENCES files (file_id)` foreign key (`file_versions`,
+    /// `multipart_uploads`) takes `FOR KEY SHARE` on this row for its FK
+    /// check, which conflicts with `FOR UPDATE` -- so once this call
+    /// returns, no such insert can be in flight against `file_id` until this
+    /// transaction commits or rolls back, and any that raced in earlier is
+    /// already visible to a fresh read taken after this call.
+    ///
+    /// Returns the raw entity model (not the SDK [`File`]) since callers
+    /// that need the lock are check-then-act call sites deciding from
+    /// `content_id`/other raw columns, not API responses.
+    ///
+    /// On `SQLite`, `.lock(..)` renders nothing (`sea-query`'s
+    /// `prepare_select_lock` is a no-op there) -- correctness on that
+    /// backend instead comes from `SQLite`'s single-writer model, which
+    /// serializes every write regardless of what any `SELECT` asked for.
+    pub async fn lock_for_update<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        file_id: Uuid,
+    ) -> Result<Option<Model>, DomainError> {
+        Entity::find()
+            .filter(Column::FileId.eq(file_id))
+            .lock(LockType::Update)
+            .secure()
+            .scope_with(scope)
+            .one(conn)
+            .await
+            .map_err(db_err)
     }
 
     /// Bind parameters reserved out of the backend's `max_bind_params_for`
@@ -112,12 +151,23 @@ impl FileRepo {
                 .all(conn)
                 .await
                 .map_err(db_err)?;
-            files.extend(rows.into_iter().map(Into::into));
+            for row in rows {
+                files.push(file_from_model(row)?);
+            }
         }
         Ok(files)
     }
 
     /// List files for a mandatory owner filter, newest first, offset-paginated.
+    ///
+    /// Ordered `(created_at, file_id)` descending, not `created_at` alone:
+    /// `created_at` is not unique (several files created in the same
+    /// millisecond-resolution instant sort equal on it), and an `OFFSET`
+    /// page boundary drawn through a run of equal `created_at` values has no
+    /// defined relative order across two separate queries -- a row can be
+    /// skipped or repeated across pages. `file_id` is the primary key, so
+    /// adding it as a tie-breaker makes the order -- and therefore the page
+    /// boundary -- fully deterministic.
     pub async fn list<C: DBRunner>(
         &self,
         conn: &C,
@@ -133,6 +183,7 @@ impl FileRepo {
                     .add(Column::OwnerId.eq(owner.owner_id)),
             )
             .order_by_desc(Column::CreatedAt)
+            .order_by_desc(Column::FileId)
             .limit(limit)
             .offset(offset)
             .secure()
@@ -140,7 +191,7 @@ impl FileRepo {
             .all(conn)
             .await
             .map_err(db_err)?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        rows.into_iter().map(file_from_model).collect()
     }
 
     /// Optimistic compare-and-swap of the content pointer (the bind operation).
@@ -267,25 +318,34 @@ impl FileRepo {
     /// that window from "between two statements" to "inside one statement's
     /// execution", and removes the `content_id` half of the race outright.
     ///
-    /// It does **not** make the version half airtight on `PostgreSQL`. Under
+    /// On its own, evaluated in isolation, this single conditional `DELETE`
+    /// does **not** make the version half airtight on `PostgreSQL`. Under
     /// `READ COMMITTED` the `NOT EXISTS` subquery is evaluated against the
-    /// snapshot taken when
-    /// this statement began. A concurrent `insert_pending_version` that
-    /// commits after that snapshot is invisible to the subquery; the FK it
-    /// takes on the parent row (`FOR KEY SHARE`) does make this `DELETE`
-    /// wait for it, but once the inserter commits the parent tuple is only
-    /// *locked*, not updated, so `PostgreSQL` resumes without an `EvalPlanQual`
-    /// re-check and the stale `NOT EXISTS` verdict stands. The `ON DELETE
-    /// CASCADE` then removes the freshly inserted version.
+    /// snapshot taken when this statement began. A concurrent
+    /// `insert_pending_version` that commits after that snapshot is
+    /// invisible to the subquery; the FK it takes on the parent row (`FOR
+    /// KEY SHARE`) does make this `DELETE` wait for it, but once the
+    /// inserter commits the parent tuple is only *locked*, not updated, so
+    /// `PostgreSQL` resumes without an `EvalPlanQual` re-check and the stale
+    /// `NOT EXISTS` verdict stands. The `ON DELETE CASCADE` would then
+    /// remove the freshly inserted version.
     ///
-    /// Closing it properly needs the two sides to contend on the same parent
-    /// row: either a `SELECT ... FOR UPDATE` on `files` before the check
-    /// (`toolkit-db`'s secure ORM exposes no row-lock API today -- the
-    /// `DBRunner` traits are sealed), or `insert_pending_version` taking a
-    /// conflicting lock on the parent itself, which would add a write to the
-    /// hot upload path. Until one of those lands, this is a narrowed race,
-    /// not an eliminated one, and the residual loss is a pending version
-    /// created in the same instant an hour-old orphan is reclaimed.
+    /// This is **not** a gap left open in production: every caller of this
+    /// method (`Store::delete_orphan_file_with_event`) takes a `SELECT ...
+    /// FOR UPDATE` lock on the same `files` row first (`Self::
+    /// lock_for_update`, contradicting an older version of this comment that
+    /// claimed the secure ORM exposed no row-lock API -- it does, see
+    /// `docs/toolkit_unified_system/11_database_patterns.md`'s "Row locks"
+    /// section) and re-verifies "no versions"/"no active multipart session"
+    /// fresh, inside that same lock, before ever calling this method. A
+    /// racing `insert_pending_version` therefore either commits before that
+    /// lock (and is then visible to those fresh re-checks, correctly
+    /// aborting the reclaim before it ever reaches this `DELETE`) or blocks
+    /// until the reclaiming transaction ends. This method's own `NOT EXISTS`
+    /// guard is kept anyway as a second, redundant line of defense -- a
+    /// future caller that reaches this method without holding that lock
+    /// first would still be exposed to the single-statement snapshot race
+    /// described above, which is why this doc comment still spells it out.
     ///
     /// Returns the number of rows removed (0 or 1, keyed on `file_id`). `0`
     /// means the file is already gone, has content bound, or has at least
@@ -375,7 +435,7 @@ impl FileRepo {
             .all(conn)
             .await
             .map_err(db_err)?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        rows.into_iter().map(file_from_model).collect()
     }
 
     /// List files across all tenants for the retention sweep engine,
@@ -404,7 +464,7 @@ impl FileRepo {
             .all(conn)
             .await
             .map_err(db_err)?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        rows.into_iter().map(file_from_model).collect()
     }
 
     /// Update `owner_kind` and `owner_id` for a file row, and bump

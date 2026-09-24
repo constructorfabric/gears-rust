@@ -11,8 +11,24 @@ use file_storage_sdk::{File, NewFile, OwnerFilter};
 
 use crate::domain::audit::{AuditEntry, FileEvent};
 use crate::domain::error::DomainError;
+use crate::domain::ports::DeletedFile;
 use crate::infra::storage::db::{db_err, transaction_with_bounded_retry};
+use crate::infra::storage::store::versions::UNBOUNDED_VERSIONS;
 use crate::infra::storage::store::{IdempotencyInsert, Store, pending_version};
+
+/// Overwrite `detail`/`payload`'s top-level `"version_count"` key with the
+/// freshly-counted version list length, if that key is present -- see
+/// [`Store::delete_file_collecting_versions`]'s doc comment for why the
+/// caller cannot know the true count before this transaction runs. A no-op
+/// for a JSON value that carries no such key (e.g. the retention-sweep's
+/// `RetentionDelete` audit detail, which never included one).
+fn patch_version_count(value: &mut serde_json::Value, count: usize) {
+    if let serde_json::Value::Object(map) = value
+        && map.contains_key("version_count")
+    {
+        map.insert("version_count".to_owned(), serde_json::json!(count));
+    }
+}
 
 /// De-duplicate a new file's initial `custom_metadata` entries (last
 /// occurrence in the request wins) before batching them into one
@@ -83,41 +99,6 @@ impl Store {
             .files
             .list(&conn, scope, owner, limit, offset)
             .await
-    }
-
-    /// Delete a file row (FK cascade removes versions + custom metadata) and
-    /// write an audit row — both in a single transaction.
-    ///
-    /// Returns `true` if a row was removed.
-    pub async fn delete_file(
-        &self,
-        scope: &AccessScope,
-        file_id: Uuid,
-        audit: AuditEntry,
-    ) -> Result<bool, DomainError> {
-        let files = self.repos.files.clone();
-        let audit_repo = self.repos.audit.clone();
-        let del_scope = scope.clone();
-        let db = self.db.db();
-        // Retryable: `files.delete` cascades (FK `ON DELETE CASCADE`) into
-        // `file_versions`, i.e. this transaction locks `files` then
-        // `file_versions` -- the opposite order from `finalize_version`'s
-        // auto-bind branch (`file_versions` then `files`). See
-        // `db::transaction_with_bounded_retry` for the retry contract.
-        transaction_with_bounded_retry(&db, move |tx| {
-            let files = files.clone();
-            let audit_repo = audit_repo.clone();
-            let del_scope = del_scope.clone();
-            let audit = audit.clone();
-            Box::pin(async move {
-                let removed = files.delete(tx, &del_scope, file_id).await?;
-                if removed {
-                    audit_repo.insert(tx, &audit).await?;
-                }
-                Ok::<bool, DomainError>(removed)
-            })
-        })
-        .await
     }
 
     // ── create ───────────────────────────────────────────────────────────────
@@ -197,37 +178,107 @@ impl Store {
 
     // ── file-events variants ─────────────────────────────────────────────────
 
-    /// Delete a file row (FK cascade removes versions + custom metadata),
-    /// optionally enqueue a file-event, and write an audit row — all in a
-    /// single transaction.
+    /// Delete a file row, collecting the version rows for backend-blob
+    /// cleanup **inside the same transaction** as the delete, optionally
+    /// enqueue a file-event, and write an audit row -- all atomically.
     ///
-    /// Returns `true` if a row was removed.
+    /// # Why the versions are listed HERE, not by the caller beforehand
     ///
-    /// This is the events-aware variant of [`delete_file`]; the original method
-    /// is preserved for callers that do not need event enqueuing.
-    pub async fn delete_file_with_event(
+    /// The caller used to call `Store::list_versions` before ever opening a
+    /// transaction, build an audit/event payload from that list's length,
+    /// then delete unconditionally. A version inserted by a
+    /// concurrent `presign_version`/`initiate_multipart_upload` on this exact
+    /// `file_id`, any time between that early read and the delete
+    /// transaction's commit, was cascade-removed along with the file (`ON
+    /// DELETE CASCADE`) but never appeared in the pre-transaction list -- its
+    /// backend blob was never queued for the caller's best-effort cleanup,
+    /// and once the DB rows are gone, the cleanup engine (which only ever
+    /// looks at rows still in the database) can never find it either: a
+    /// permanent storage leak, not a temporary orphan with a backstop.
+    /// Re-reading the version list immediately before the `DELETE`, instead
+    /// of trusting a snapshot from arbitrarily earlier, used to only narrow
+    /// that gap to the width of this transaction -- see the "Row lock"
+    /// section below for why locking the parent row first closes it
+    /// completely instead: any insert that commits before this statement
+    /// runs is included in the returned list (and therefore in the caller's
+    /// cleanup/audit/usage accounting), and one that hasn't yet cannot land
+    /// unseen before the list is read.
+    ///
+    /// `audit.detail`/`event.payload`'s top-level `"version_count"` key, if
+    /// present, is overwritten with the freshly-counted length before either
+    /// row is persisted -- the caller cannot know the true count until this
+    /// transaction runs, so it must not bake a stale one into the JSON it
+    /// hands in.
+    ///
+    /// # Row lock closes the delete-vs-insert race
+    ///
+    /// The transaction's first statement locks the `files` row
+    /// (`FileRepo::lock_for_update`, `SELECT ... FOR UPDATE`) before the
+    /// version list is even read. A concurrent `presign_version`/
+    /// `initiate_multipart_upload` on this exact `file_id`
+    /// (`insert_pending_version`) takes `FOR KEY SHARE` on this same row for
+    /// its FK check, which conflicts with `FOR UPDATE` -- so that insert
+    /// either commits strictly before this lock is granted (and is then
+    /// necessarily visible to the fresh `list_by_file` read a few lines
+    /// below, since that read happens after the lock) or blocks until this
+    /// transaction ends and then fails its own FK check against the
+    /// now-deleted row (mapped to `FileNotFound` -- see
+    /// `VersionRepo::insert`). Either way there is no window left in which a
+    /// version can be inserted, committed, and cascade-removed without ever
+    /// appearing in `collected`. See
+    /// `docs/toolkit_unified_system/11_database_patterns.md`'s "Row locks"
+    /// section for the general pattern this follows.
+    pub async fn delete_file_collecting_versions(
         &self,
         scope: &AccessScope,
         file_id: Uuid,
         audit: AuditEntry,
         event: Option<FileEvent>,
-    ) -> Result<bool, DomainError> {
+    ) -> Result<DeletedFile, DomainError> {
         let files = self.repos.files.clone();
+        let versions = self.repos.versions.clone();
         let audit_repo = self.repos.audit.clone();
         let events_repo = self.repos.events_outbox.clone();
         let del_scope = scope.clone();
         let db = self.db.db();
         // Retryable for the same reason as `delete_file` (see its comment):
-        // `files` then cascaded `file_versions`, opposite `finalize_version`'s
-        // auto-bind order.
+        // `files` then cascaded `file_versions`, the opposite order from
+        // `finalize_version`'s auto-bind branch.
         transaction_with_bounded_retry(&db, move |tx| {
             let files = files.clone();
+            let versions = versions.clone();
             let audit_repo = audit_repo.clone();
             let events_repo = events_repo.clone();
             let del_scope = del_scope.clone();
-            let audit = audit.clone();
-            let event = event.clone();
+            let mut audit = audit.clone();
+            let mut event = event.clone();
             Box::pin(async move {
+                let scope_all = AccessScope::allow_all();
+                // First statement: lock the parent row -- see this method's
+                // doc comment. `None` means the file is already gone (a
+                // concurrent delete/expiry won outright); nothing left to
+                // collect or remove.
+                if files
+                    .lock_for_update(tx, &del_scope, file_id)
+                    .await?
+                    .is_none()
+                {
+                    return Ok::<DeletedFile, DomainError>(DeletedFile {
+                        removed: false,
+                        versions: Vec::new(),
+                    });
+                }
+
+                // Fresh, in-transaction snapshot -- see this method's doc
+                // comment for the race this closes.
+                let collected = versions
+                    .list_by_file(tx, &scope_all, file_id, UNBOUNDED_VERSIONS, 0)
+                    .await?;
+                patch_version_count(&mut audit.detail, collected.len());
+                if let Some(ev) = event.as_mut() {
+                    patch_version_count(&mut ev.payload, collected.len());
+                }
+
                 let removed = files.delete(tx, &del_scope, file_id).await?;
                 if removed {
                     audit_repo.insert(tx, &audit).await?;
@@ -235,7 +286,10 @@ impl Store {
                         events_repo.enqueue(tx, &ev).await?;
                     }
                 }
-                Ok::<bool, DomainError>(removed)
+                Ok::<DeletedFile, DomainError>(DeletedFile {
+                    removed,
+                    versions: if removed { collected } else { Vec::new() },
+                })
             })
         })
         .await
@@ -244,32 +298,46 @@ impl Store {
     /// Delete the parent `files` row left behind by an abandoned
     /// pending-version orphan.
     ///
-    /// Unlike [`Self::delete_file_with_event`] (unconditional -- used by the
-    /// retention-expiry sweep, which has already decided the file must go
-    /// regardless of its version count), this method re-verifies the orphan
-    /// condition (`content_id IS NULL` and zero version rows) as part of
-    /// **the same conditional `DELETE` statement** that removes the row --
-    /// see [`crate::infra::storage::repo::FileRepo::delete_if_orphan`]'s doc
-    /// comment for the full reasoning.
+    /// Unlike [`Self::delete_file_collecting_versions`] (unconditional -- used
+    /// by the retention-expiry sweep, which has already decided the file must
+    /// go regardless of its version count), this method re-verifies the
+    /// orphan condition -- `content_id IS NULL`, zero version rows, and no
+    /// active (`in_progress`/`completing`) multipart session -- fresh inside
+    /// this transaction before removing the row.
     ///
-    /// This used to re-read `files`/`versions` with two plain `SELECT`s
-    /// inside the transaction before an unconditional delete, on the theory
-    /// that a version inserted between the caller's pre-check and this call
-    /// was "guaranteed to be seen" -- that was **incorrect** under `READ
-    /// COMMITTED` (ordinary `SELECT`s take no locks and each is its own
-    /// snapshot, so a concurrently-inserted, autocommitted pending version
-    /// could be missed and then cascade-deleted along with the file; SQLite
-    /// does not reproduce this, which is why it went unnoticed). Delegating
-    /// the whole guard to `delete_if_orphan`'s single statement narrows that
-    /// window to the span of one statement and removes the `content_id` half
-    /// of it entirely -- but it does not eliminate the version half on
-    /// PostgreSQL, for the MVCC reason spelled out in that method's own doc
-    /// comment. Do not read this call as race-free; read it as "no longer
-    /// racy between two application-level reads".
+    /// # Row lock closes the reclaim-vs-insert race
     ///
-    /// Returns `true` if the file row was removed; `false` if the guard did
-    /// not match (a version now exists or content is bound) or the row was
-    /// already gone (e.g. a concurrent sweep).
+    /// The transaction's first statement locks the `files` row
+    /// (`FileRepo::lock_for_update`), exactly as
+    /// [`Self::delete_file_collecting_versions`] does, before any of the
+    /// three orphan checks run. This used to be guarded by
+    /// [`crate::infra::storage::repo::FileRepo::delete_if_orphan`] alone -- a
+    /// single conditional `DELETE` whose own `NOT EXISTS` subquery is
+    /// evaluated against the snapshot at the start of that statement. Under
+    /// `READ COMMITTED`, a concurrent `insert_pending_version` that commits
+    /// *after* that snapshot but *before* the `DELETE` actually runs is
+    /// invisible to the subquery; the FK it takes on the parent row (`FOR
+    /// KEY SHARE`) made the `DELETE` wait for it, but once the inserter
+    /// committed, PostgreSQL resumed without an `EvalPlanQual` re-check and
+    /// the stale `NOT EXISTS` verdict stood -- `ON DELETE CASCADE` then
+    /// removed the freshly-inserted version along with the file, and the
+    /// insert's own caller was never told. Locking the row first replaces
+    /// that single embedded check with separate, ordinary reads taken
+    /// *after* the lock is held: a racing insert either committed before the
+    /// lock (and is therefore visible to these reads, correctly aborting the
+    /// reclaim) or blocks until this transaction ends and then fails its own
+    /// FK check (mapped to `FileNotFound`). Either way the version half of
+    /// the race is closed the same way the delete-vs-insert race above is.
+    ///
+    /// `delete_if_orphan`'s own `content_id IS NULL` + `NOT EXISTS` guard is
+    /// kept as the actual `DELETE` statement -- a second, redundant line of
+    /// defense now that the three checks above have already made the
+    /// decision, not the sole guard.
+    ///
+    /// Returns `true` if the file row was removed; `false` if a check did
+    /// not pass (a version now exists, content is bound, or a multipart
+    /// session is active) or the row was already gone (e.g. a concurrent
+    /// sweep).
     pub async fn delete_orphan_file_with_event(
         &self,
         file_id: Uuid,
@@ -277,21 +345,46 @@ impl Store {
         event: Option<FileEvent>,
     ) -> Result<bool, DomainError> {
         let files = self.repos.files.clone();
+        let versions = self.repos.versions.clone();
+        let multipart = self.repos.multipart.clone();
         let audit_repo = self.repos.audit.clone();
         let events_repo = self.repos.events_outbox.clone();
         let db = self.db.db();
-        // Retryable: `delete_if_orphan` still touches `files` first (its
-        // guard re-reads `content_id`/version count before deleting), the
-        // same exposure as `delete_file`/`delete_file_with_event` against
-        // `finalize_version`'s reversed lock order.
+        // Retryable: `lock_for_update` now takes `files` as the very first
+        // statement, the same exposure as `delete_file`/
+        // `delete_file_collecting_versions` against `finalize_version`'s
+        // reversed lock order.
         transaction_with_bounded_retry(&db, move |tx| {
             let files = files.clone();
+            let versions = versions.clone();
+            let multipart = multipart.clone();
             let audit_repo = audit_repo.clone();
             let events_repo = events_repo.clone();
             let audit = audit.clone();
             let event = event.clone();
             Box::pin(async move {
                 let scope = AccessScope::allow_all();
+                // First statement: lock the parent row -- see this method's
+                // doc comment.
+                let Some(locked) = files.lock_for_update(tx, &scope, file_id).await? else {
+                    return Ok::<bool, DomainError>(false); // already gone
+                };
+                if locked.content_id.is_some() {
+                    return Ok(false); // content bound concurrently -- not an orphan
+                }
+                // `LIMIT 1`: existence, not a count -- same reasoning as
+                // `MultipartRepo::has_active_for_file`'s own doc comment.
+                let has_version = !versions
+                    .list_by_file(tx, &scope, file_id, 1, 0)
+                    .await?
+                    .is_empty();
+                if has_version {
+                    return Ok(false);
+                }
+                if multipart.has_active_for_file(tx, file_id).await? {
+                    return Ok(false);
+                }
+
                 let removed = files.delete_if_orphan(tx, &scope, file_id).await? > 0;
                 if removed {
                     audit_repo.insert(tx, &audit).await?;

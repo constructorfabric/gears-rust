@@ -15,7 +15,12 @@ use file_storage_sdk::{File, FileVersion, VersionStatus};
 
 use crate::domain::audit::{AuditEntry, FileEvent};
 use crate::domain::error::DomainError;
-use crate::domain::ports::{AutoBindOnFinalize, FinalizeVersionOutcome};
+use crate::domain::etag;
+use crate::domain::multipart::{BindState, StoredCompleteResult};
+use crate::domain::ports::{
+    AutoBindOnFinalize, DeleteVersionOutcome, FinalizeMultipartOutcome, FinalizeVersionOutcome,
+    MultipartFinishSnapshot,
+};
 use crate::infra::content::hash_mode::HashMode;
 use crate::infra::storage::db::{db_err, transaction_with_bounded_retry};
 use crate::infra::storage::store::{Store, pending_version};
@@ -31,7 +36,11 @@ use crate::infra::storage::store::{Store, pending_version};
 /// Kept within `i64::MAX` (rather than `u64::MAX`) so it binds safely as a
 /// SQL `LIMIT` literal on every backend — `LIMIT`/`OFFSET` are signed 64-bit
 /// on SQLite and Postgres, and a `u64::MAX` literal overflows that.
-const UNBOUNDED_VERSIONS: u64 = i64::MAX as u64;
+///
+/// `pub(super)`: also used by `store::files::delete_file_collecting_versions`,
+/// which needs the same "give me every version, no page cap" read inside its
+/// own transaction.
+pub(super) const UNBOUNDED_VERSIONS: u64 = i64::MAX as u64;
 
 impl Store {
     // ── version management ───────────────────────────────────────────────────
@@ -259,6 +268,191 @@ impl Store {
         .await
     }
 
+    /// Multipart-completion counterpart of [`Self::finalize_version`]: the
+    /// same finalize + auto-bind-CAS transaction, but also transitions the
+    /// session `completing → completed` and persists the `complete_result`
+    /// snapshot in that SAME transaction (see
+    /// [`crate::domain::ports::MultipartStore::finalize_multipart_version`]'s
+    /// doc for why this closes the crash gap the old two-transaction
+    /// sequence left open).
+    ///
+    /// `bind_state`/`etag`/`current_etag` cannot be supplied by the caller up
+    /// front -- they depend on whether the auto-bind CAS (run inside this
+    /// same transaction, moments earlier) won, and, on a lost CAS, on a
+    /// fresh read of the file's pointer that must itself happen inside this
+    /// transaction to observe exactly what this transaction committed,
+    /// never a later racing rebind. So they are derived here, mirroring
+    /// `MultipartService::bind_state_for`'s model exactly, instead of being
+    /// passed in via [`MultipartFinishSnapshot`].
+    pub async fn finalize_multipart_version(
+        &self,
+        file_id: Uuid,
+        manifest: Option<String>,
+        mime_type: Option<String>,
+        finalize_audit: AuditEntry,
+        auto_bind: Option<AutoBindOnFinalize>,
+        finish: MultipartFinishSnapshot,
+    ) -> Result<FinalizeMultipartOutcome, DomainError> {
+        let files = self.repos.files.clone();
+        let versions = self.repos.versions.clone();
+        let audit_repo = self.repos.audit.clone();
+        let events_repo = self.repos.events_outbox.clone();
+        let multipart = self.repos.multipart.clone();
+        let hash_mode_str = finish.hash_mode.as_str();
+        let auto_bind_requested = auto_bind.is_some();
+        let now = OffsetDateTime::now_utc();
+        let db = self.db.db();
+        // Retryable for the same cross-transaction lock-order reason
+        // `finalize_version` documents (this is the same transaction body,
+        // with the terminal session CAS appended).
+        transaction_with_bounded_retry(&db, move |tx| {
+            let files = files.clone();
+            let versions = versions.clone();
+            let audit_repo = audit_repo.clone();
+            let events_repo = events_repo.clone();
+            let multipart = multipart.clone();
+            let manifest = manifest.clone();
+            let mime_type = mime_type.clone();
+            let finalize_audit = finalize_audit.clone();
+            let auto_bind = auto_bind.clone();
+            let finish = finish.clone();
+            Box::pin(async move {
+                let scope = AccessScope::allow_all();
+                let updated = versions
+                    .finalize(
+                        tx,
+                        &scope,
+                        file_id,
+                        finish.version_id,
+                        finish.size,
+                        finish.content_hash.clone(),
+                        hash_mode_str,
+                        finish.part_count,
+                        mime_type,
+                    )
+                    .await?;
+                if !updated {
+                    // Nothing to finish -- the caller's own `!updated` branch
+                    // (lost finalize CAS) handles this exactly as before this
+                    // method existed (`converge_or_error_after_lost_finalize_cas`).
+                    return Ok::<FinalizeMultipartOutcome, DomainError>(FinalizeMultipartOutcome {
+                        updated: false,
+                        bound: false,
+                        session_completed: false,
+                        current_etag: None,
+                    });
+                }
+
+                if let Some(manifest) = manifest {
+                    versions
+                        .insert_manifest(tx, &scope, finish.version_id, &manifest, now)
+                        .await?;
+                }
+                audit_repo.insert(tx, &finalize_audit).await?;
+
+                let bound = if let Some(ab) = auto_bind {
+                    let swapped = files
+                        .bind_content_cas(
+                            tx,
+                            &scope,
+                            file_id,
+                            ab.expected_content_id,
+                            finish.version_id,
+                            now,
+                        )
+                        .await?;
+                    if swapped {
+                        versions.clear_current(tx, &scope, file_id).await?;
+                        // Same guard as `finalize_version`'s own auto-bind
+                        // branch: abort rather than commit a dangling
+                        // `files.content_id` if the version was deleted
+                        // concurrently.
+                        let promoted = versions
+                            .set_current(tx, &scope, file_id, finish.version_id)
+                            .await?;
+                        if promoted == 0 {
+                            return Err(DomainError::conflict(
+                                "target version no longer exists -- it was deleted concurrently",
+                            ));
+                        }
+                        audit_repo.insert(tx, &ab.audit).await?;
+                        if let Some(ev) = ab.event {
+                            events_repo.enqueue(tx, &ev).await?;
+                        }
+                    }
+                    swapped
+                } else {
+                    false
+                };
+
+                // Same bind-state model as `MultipartService::bind_state_for`,
+                // computed here (inside this transaction) instead of by the
+                // caller after it returns -- see this method's doc comment.
+                let (bind_state, result_etag, current_etag) = if bound {
+                    (
+                        BindState::Bound,
+                        Some(etag::content_etag(file_id, finish.version_id)),
+                        None,
+                    )
+                } else if auto_bind_requested {
+                    let fresh = files.get(tx, &scope, file_id).await?.ok_or_else(|| {
+                        DomainError::database(
+                            "file row missing during multipart finalize's fresh-etag read",
+                        )
+                    })?;
+                    (BindState::Conflict, None, etag::etag_for(&fresh))
+                } else {
+                    (BindState::Manual, None, None)
+                };
+
+                let stored = StoredCompleteResult {
+                    version_id: finish.version_id,
+                    size: finish.size,
+                    content_hash: hex::encode(&finish.content_hash),
+                    hash_mode: hash_mode_str.to_owned(),
+                    part_count: finish.part_count.unwrap_or(1),
+                    bind_state: bind_state.as_str().to_owned(),
+                    etag: result_etag,
+                    current_etag: current_etag.clone(),
+                };
+                let result_json = serde_json::to_string(&stored)
+                    .map_err(|_| DomainError::database("failed to serialize complete result"))?;
+
+                // `None`: this call is made in the SAME transaction as --
+                // immediately after -- this same call's own just-WON
+                // finalize CAS above, which is itself deliberately
+                // owner-blind (fenced only by `status = 'pending'`). See
+                // `MultipartRepo::finish_complete`'s doc for why that makes
+                // an owner check here both unnecessary (the finalize CAS
+                // already proves unique, legitimate authorship) and unsafe
+                // (it would re-strand the exact race
+                // `f2_stale_completer_converges_instead_of_stranding_after_
+                // owner_fencing_fix` exists to prevent).
+                let session_completed = multipart
+                    .finish_complete(tx, finish.upload_id, None, &result_json)
+                    .await?;
+                if session_completed {
+                    audit_repo.insert(tx, &finish.session_audit).await?;
+                }
+
+                // `current_etag` is handed back to the caller too (not just
+                // persisted in `stored`/`result_json`) so it can build the
+                // SAME live response it returns to the client from this
+                // transaction's own in-flight decision, instead of a second,
+                // post-commit read that could race a legitimate concurrent
+                // rebind -- see `FinalizeMultipartOutcome::current_etag`'s
+                // doc comment.
+                Ok(FinalizeMultipartOutcome {
+                    updated,
+                    bound,
+                    session_completed,
+                    current_etag,
+                })
+            })
+        })
+        .await
+    }
+
     /// Fetch the `version_hash_manifest` text for a version, if one exists
     /// (`multipart-composite-sha256` versions only). Backs mode-aware
     /// re-verification in `migrate_backend`.
@@ -382,6 +576,147 @@ impl Store {
                 })
             })
             .await
+    }
+
+    /// Delete `version_id`, or -- if it is the file's only version -- delete
+    /// the whole file, deciding which **inside one transaction**.
+    ///
+    /// # Why the version count is re-read here, not trusted from the caller
+    ///
+    /// The caller used to decide "last version -> delete the whole file" from
+    /// a `list_versions` snapshot taken before opening any transaction, then
+    /// either delegate to a whole-file delete or to [`Self::delete_version`]
+    /// based on that stale count. A version inserted by a concurrent
+    /// `presign_version`/`initiate_multipart_upload` on this exact `file_id`,
+    /// any time between that read and the eventual `DELETE`, was invisible to
+    /// the snapshot: the whole-file branch would still fire, cascade-removing
+    /// the new version along with the file even though the caller only ever
+    /// asked to delete one specific, different version. Re-listing the
+    /// file's versions immediately before whichever delete the count
+    /// implies, instead of trusting the caller's entire pre-transaction call
+    /// chain, used to only narrow that gap to the width of this
+    /// transaction -- a concurrent insert could still land between the list
+    /// and the delete statement inside this same transaction, on
+    /// `PostgreSQL`'s `READ COMMITTED`. Locking the `files` row first (see
+    /// the "Row lock" section below) closes that remaining gap too: the
+    /// version list is now read only after the lock is held, so nothing can
+    /// commit into it unseen between the list and the delete.
+    ///
+    /// Returns [`DeleteVersionOutcome::FileRemoved`] when `version_id` turns
+    /// out (inside this transaction) to be the file's only version --
+    /// mirroring `FileService::delete_file_inner`'s existing whole-file
+    /// audit/event shape, via `file_audit`/`file_event` -- or
+    /// [`DeleteVersionOutcome::VersionRemoved`] via `version_audit` when
+    /// other versions remain. [`DeleteVersionOutcome::IsCurrent`] covers both
+    /// "was already current when read" and "a concurrent bind promoted it to
+    /// current between this read and the delete statement" (the latter
+    /// caught by [`crate::infra::storage::repo::VersionRepo::delete`]'s own
+    /// `is_current = false` guard, same as plain [`Self::delete_version`]).
+    ///
+    /// # Row lock closes the whole-file-delete-vs-insert race
+    ///
+    /// The transaction's first statement locks the `files` row
+    /// (`FileRepo::lock_for_update`) before the version list is read, for
+    /// the same reason as [`Self::delete_file_collecting_versions`]: a
+    /// concurrent `insert_pending_version` on this `file_id` either commits
+    /// before this lock (and is then visible to the fresh `list_by_file`
+    /// read that follows, so the "is this the only version?" decision below
+    /// sees it and takes the `VersionRemoved` branch instead of
+    /// `FileRemoved`) or blocks until this transaction ends and then fails
+    /// its own FK check once the whole-file branch actually removes the row
+    /// (mapped to `FileNotFound`). This closes the gap even on the
+    /// single-version-remaining branch, which previously never touched
+    /// `files` at all -- see `docs/toolkit_unified_system/11_database_patterns.md`'s
+    /// "Row locks" section.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn delete_version_or_whole_file(
+        &self,
+        file_id: Uuid,
+        version_id: Uuid,
+        version_audit: AuditEntry,
+        file_audit: AuditEntry,
+        file_event: Option<FileEvent>,
+    ) -> Result<DeleteVersionOutcome, DomainError> {
+        let files = self.repos.files.clone();
+        let versions = self.repos.versions.clone();
+        let audit_repo = self.repos.audit.clone();
+        let events_repo = self.repos.events_outbox.clone();
+        let db = self.db.db();
+        // Retryable: the `FileRemoved` branch takes `files` then cascades
+        // into `file_versions`, the same lock order (and the same
+        // cross-transaction deadlock exposure against `finalize_version`'s
+        // auto-bind branch) as `delete_file_collecting_versions` -- see that
+        // method's comment and `db::transaction_with_bounded_retry`'s doc
+        // comment for the retry contract.
+        transaction_with_bounded_retry(&db, move |tx| {
+            let files = files.clone();
+            let versions = versions.clone();
+            let audit_repo = audit_repo.clone();
+            let events_repo = events_repo.clone();
+            let version_audit = version_audit.clone();
+            let file_audit = file_audit.clone();
+            let file_event = file_event.clone();
+            Box::pin(async move {
+                let scope = AccessScope::allow_all();
+                // First statement: lock the parent row -- see this method's
+                // doc comment. `None` means the file is already gone.
+                if files.lock_for_update(tx, &scope, file_id).await?.is_none() {
+                    return Ok(DeleteVersionOutcome::NotFound);
+                }
+
+                // Fresh, in-transaction snapshot -- see this method's doc
+                // comment for the race this closes.
+                let all = versions
+                    .list_by_file(tx, &scope, file_id, UNBOUNDED_VERSIONS, 0)
+                    .await?;
+                let Some(target) = all.iter().find(|v| v.version_id == version_id).cloned() else {
+                    return Ok(DeleteVersionOutcome::NotFound);
+                };
+
+                if all.len() == 1 {
+                    // `target` is the file's only version (confirmed by the
+                    // `find` above) -- delete the whole file in this same
+                    // transaction/snapshot.
+                    let removed = files.delete(tx, &scope, file_id).await?;
+                    if !removed {
+                        // Already gone -- a concurrent delete/expiry won
+                        // this race between the list above and this
+                        // statement.
+                        return Ok(DeleteVersionOutcome::NotFound);
+                    }
+                    audit_repo.insert(tx, &file_audit).await?;
+                    if let Some(ev) = file_event {
+                        events_repo.enqueue(tx, &ev).await?;
+                    }
+                    return Ok(DeleteVersionOutcome::FileRemoved(target));
+                }
+
+                if target.is_current {
+                    return Ok(DeleteVersionOutcome::IsCurrent);
+                }
+                let rows_affected = versions.delete(tx, &scope, file_id, version_id).await?;
+                if rows_affected == 0 {
+                    // Raced, in the tiny window between the list above and
+                    // this delete statement (still inside one transaction):
+                    // either a concurrent bind promoted this version to
+                    // current (`VersionRepo::delete`'s own `is_current =
+                    // false` guard caught it) or a concurrent delete already
+                    // removed it outright. Re-check inside this same
+                    // transaction to tell them apart, exactly as the old
+                    // two-call version of this decision used to
+                    // re-fetch post-transaction -- except this re-check
+                    // cannot itself be raced any further, since it runs
+                    // inside the same still-open transaction.
+                    return Ok(match versions.get(tx, &scope, file_id, version_id).await? {
+                        Some(_) => DeleteVersionOutcome::IsCurrent,
+                        None => DeleteVersionOutcome::NotFound,
+                    });
+                }
+                audit_repo.insert(tx, &version_audit).await?;
+                Ok(DeleteVersionOutcome::VersionRemoved(target))
+            })
+        })
+        .await
     }
 
     // ── atomic multi-step operations ─────────────────────────────────────────
