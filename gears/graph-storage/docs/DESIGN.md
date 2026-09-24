@@ -2315,24 +2315,32 @@ and none of those need to block v1.
 
 ### Closed Enum Contract
 
-Several values cross both the storage boundary and the wire as short lowercase
-strings: `gts_type.kind` (`node` / `edge` / `attribute`), readiness states, item
-and type outcomes, truncation reasons, search arms and modes, adjacency sides
-and directions. In the database they are `TEXT` under a `CHECK`; in the SDK they
-are Rust enums; over REST they are plain strings. Three rules apply to all of
-them, and a fourth to none of them.
+Several values cross the wire as short lowercase strings: `gts_type.kind`
+(`node` / `edge` / `attribute`), readiness states, item and type outcomes,
+truncation reasons, search arms and modes, adjacency sides and directions. In
+the SDK they are Rust enums; over REST they are plain strings. Three rules
+apply to all of them, and a fourth to none of them.
+
+One of them also crosses the storage boundary, and only that one has a
+database guardrail: `gts_type.kind` is `TEXT` under a `CHECK` that names the
+three spellings. The other five families are never persisted — they are
+computed per response and serialized fresh, so what holds their sets closed is
+the exhaustive match over a Rust enum and nothing else. The difference matters
+when one of these rules asks for a migration: widening the `CHECK` is a step
+for `kind` alone, and there is no stored row to migrate for the rest.
 
 **1. A spelling is permanent.** Once a variant has been written to a database or
 returned over the wire, its string never changes meaning and is never reused for
 a different one. Renaming `attribute` is not a rename, it is a new variant plus
 a migration of every stored row; reusing a retired spelling is prohibited
-outright, because a row written years earlier carries no version to disambiguate
-it. There is no numeric form and none will be added: the storage form is the
+outright, because a row written years earlier -- or a response an integration
+recorded years earlier -- carries no version to disambiguate it. There is no numeric form and none will be added: the storage form is the
 wire form, so there is nothing to renumber.
 
 **2. Adding a variant is a compatible change; removing or renaming one is
-breaking.** An addition needs a migration to widen the `CHECK` and it may make a
-server return a value an older client has never seen, which rule 3 covers. A
+breaking.** An addition to `kind` needs a migration to widen its `CHECK`;
+elsewhere there is no schema to widen. Either way it may make a server return a
+value an older client has never seen, which rule 3 covers. A
 removal or a rename invalidates stored rows and is a breaking change to both the
 schema and the API, handled as a version bump rather than a migration.
 
@@ -2355,8 +2363,9 @@ refusal naming the enum and the offending value is what a decode of an
 unrecognized spelling returns, and a test per family holds it.
 
 **4. These are not extension points.** A deployment does not add its own
-variants, and a producer cannot introduce one through a payload. The set is
-closed by the `CHECK` constraint and by the gear's own mapping, deliberately: an
+variants, and a producer cannot introduce one through a payload. Each set is
+closed by the gear's own mapping -- and, for `kind`, by the `CHECK` as well --
+deliberately: an
 open set would have to be carried through every comparison, index and decision
 in this document with no way to say what the new value means.
 
