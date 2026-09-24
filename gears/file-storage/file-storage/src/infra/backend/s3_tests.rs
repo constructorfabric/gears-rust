@@ -121,7 +121,10 @@ async fn s3_backend_get_stream_reassembles_large_object() {
         .await
         .unwrap();
 
-    let mut stream = backend.get_stream("large/obj").await.unwrap();
+    let mut stream = backend
+        .get_stream("large/obj", payload.len() as u64)
+        .await
+        .unwrap();
     let mut collected = Vec::new();
     while let Some(chunk) = stream.next().await {
         collected.extend_from_slice(&chunk.unwrap());
@@ -135,7 +138,7 @@ async fn s3_backend_get_stream_missing_object_errors() {
     let bucket = unique_bucket();
     let backend = make_backend(addr, &dir, &bucket).await;
 
-    assert!(backend.get_stream("nope/nope").await.is_err());
+    assert!(backend.get_stream("nope/nope", 0).await.is_err());
 }
 
 #[tokio::test]

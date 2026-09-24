@@ -290,3 +290,32 @@ fn sign_url_rejects_or_correctly_maps_multipart_part() {
     assert_eq!(content_verb(Op::Get).unwrap(), "download");
     assert_eq!(content_verb(Op::Put).unwrap(), "upload");
 }
+
+// ── `IdempotencyTicket::auto_bind` backward compatibility ───────────────────
+
+/// A ticket persisted before `auto_bind` existed has no such field in its
+/// stored JSON. `#[serde(default)]` must deserialize it as `false` — the
+/// historically correct value, since auto-bind did not exist when that
+/// record was written, not merely a fallback guess.
+#[test]
+fn idempotency_ticket_missing_auto_bind_defaults_to_false() {
+    use crate::domain::service::IdempotencyTicket;
+
+    let file_id = uuid::Uuid::now_v7();
+    let version_id = uuid::Uuid::now_v7();
+    let legacy_json = serde_json::json!({
+        "file_id": file_id,
+        "version_id": version_id,
+        "upload_url": "https://sidecar.test/upload/x/y?fs-token=t",
+    })
+    .to_string();
+
+    let ticket: IdempotencyTicket =
+        serde_json::from_str(&legacy_json).expect("legacy ticket without auto_bind must parse");
+    assert_eq!(ticket.file_id, file_id);
+    assert_eq!(ticket.version_id, version_id);
+    assert!(
+        !ticket.auto_bind,
+        "pre-auto_bind tickets must default to false"
+    );
+}

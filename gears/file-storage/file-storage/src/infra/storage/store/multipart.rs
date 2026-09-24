@@ -12,7 +12,9 @@ use crate::infra::storage::store::Store;
 impl Store {
     // ── multipart uploads ─────────────────────────────────────────────────────
 
-    /// Create a multipart upload session row.
+    /// Create a multipart upload session row. `backend_id`/`backend_path`
+    /// are the backend and object path the pending version this session
+    /// finalizes into was just given — see `MultipartRepo::create`.
     #[allow(clippy::too_many_arguments)]
     pub async fn create_multipart_upload(
         &self,
@@ -20,6 +22,8 @@ impl Store {
         file_id: Uuid,
         version_id: Uuid,
         backend_upload_handle: &str,
+        backend_id: Option<&str>,
+        backend_path: Option<&str>,
         declared_mime: &str,
         declared_size: u64,
         part_size: u64,
@@ -36,6 +40,8 @@ impl Store {
                 file_id,
                 version_id,
                 backend_upload_handle,
+                backend_id,
+                backend_path,
                 declared_mime,
                 declared_size,
                 part_size,
@@ -135,19 +141,17 @@ impl Store {
             .await
     }
 
-    /// Whether `file_id` currently has at least one `in_progress` multipart
-    /// upload session (regardless of `expires_at`).
+    /// Whether `file_id` currently has at least one *active* (`in_progress`
+    /// or `completing`) multipart upload session, regardless of
+    /// `expires_at`/`lease_until`.
     ///
     /// Orphan-file-reconciliation guard -- see
-    /// `MultipartRepo::has_in_progress_for_file`.
-    pub async fn has_in_progress_multipart_for_file(
-        &self,
-        file_id: Uuid,
-    ) -> Result<bool, DomainError> {
+    /// `MultipartRepo::has_active_for_file`.
+    pub async fn has_active_multipart_for_file(&self, file_id: Uuid) -> Result<bool, DomainError> {
         let conn = self.db.conn().map_err(db_err)?;
         self.repos
             .multipart
-            .has_in_progress_for_file(&conn, file_id)
+            .has_active_for_file(&conn, file_id)
             .await
     }
 

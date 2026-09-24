@@ -263,18 +263,24 @@ impl LocalFsBackend {
     /// Reaching EOF (`read` returns `Ok(0)`) while `remaining` still
     /// names an outstanding byte count (i.e. the file turned out shorter
     /// than the length the caller committed to -- `get_range_stream`'s
-    /// resolved range length, or `get_stream`'s already-observed
-    /// `Content-Length`) is a genuine short-read: the caller already told an
-    /// HTTP client how many bytes to expect, so silently ending the stream
-    /// here would just hand back a body shorter than its own
-    /// `Content-Length` with no diagnostic. That case yields an
-    /// `UnexpectedEof` error instead of ending the stream cleanly.
+    /// resolved range length, or `get_stream`'s `expected_len`) is a genuine
+    /// short-read: the caller already told an HTTP client how many bytes to
+    /// expect, so silently ending the stream here would just hand back a
+    /// body shorter than its own `Content-Length` with no diagnostic. That
+    /// case yields an `UnexpectedEof` error instead of ending the stream
+    /// cleanly. This is the *second* line of defense against a file changing
+    /// underneath a read: `get_stream`/`get_range_stream` already refuse a
+    /// length mismatch observed at open time before returning any stream at
+    /// all (see their own doc comments); this bound additionally catches a
+    /// change landing *after* that check but before (or during) the read
+    /// loop itself.
     ///
     /// Both of this module's callers pass a length: `get_range_stream` its
-    /// resolved range, `get_stream` the size it observed when it opened the
-    /// handle. `remaining: None` therefore means only "read to EOF, no
-    /// length was ever promised" -- kept for callers that legitimately do not
-    /// know the size up front, where an `Ok(0)` simply ends the stream.
+    /// resolved (and already-verified-equal-to-`expected_len`) range length,
+    /// `get_stream` its own `expected_len` directly. `remaining: None`
+    /// therefore means only "read to EOF, no length was ever promised" --
+    /// kept for callers that legitimately do not know the size up front,
+    /// where an `Ok(0)` simply ends the stream.
     fn chunked_file_stream(
         file: tokio::fs::File,
         remaining: Option<u64>,
@@ -449,26 +455,38 @@ impl StorageBackend for LocalFsBackend {
     /// Stream the blob at `path` from disk in fixed-size chunks, so a
     /// read-back (e.g. finalize's) or a whole-object download never
     /// materializes more than one chunk of the file in memory regardless of
-    /// its size. Delegates to [`Self::chunked_file_stream`] with no length
-    /// cap (`remaining: None`, i.e. read to EOF) — see that method's doc
-    /// comment for the shared chunking mechanics it and
-    /// [`Self::get_range_stream`] both build on.
+    /// its size. Delegates to [`Self::chunked_file_stream`], bounded by
+    /// `expected_len` — see that method's doc comment for the shared chunking
+    /// mechanics it and [`Self::get_range_stream`] both build on.
+    ///
+    /// `expected_len` is the length the caller already committed to
+    /// elsewhere (e.g. the sidecar's `Content-Length`, set from a `stat`
+    /// taken *before* this call). This method's own `file.metadata()` call is
+    /// a second, independent observation of the same file — a write landing
+    /// strictly between the caller's `stat` and this call's `open` would
+    /// otherwise go undetected, since the two observations never get
+    /// compared. Checking `metadata().len() == expected_len` here, before any
+    /// byte is ever read, closes that gap: a file that changed size in that
+    /// window is refused up front rather than silently streamed at its new
+    /// (wrong) length. A change happening *after* this check — inside the
+    /// read loop itself — is still caught by `chunked_file_stream`'s own
+    /// short-read detection, bounded by this same `expected_len`.
     async fn get_stream(
         &self,
         path: &str,
+        expected_len: u64,
     ) -> Result<BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
         let target = self.resolve(path)?;
         let file = tokio::fs::File::open(&target)
             .await
             .map_err(|e| self.io_err(e))?;
-        // Bound the stream by the length observed at open time rather than
-        // reading to EOF. The sidecar declares `Content-Length` from a `stat`
-        // taken just before this call, so a file truncated in between would
-        // otherwise end the body early and leave the client with a response
-        // shorter than its own header and no diagnostic. With the length
-        // passed in, `chunked_file_stream` surfaces `UnexpectedEof` instead.
         let len = file.metadata().await.map_err(|e| self.io_err(e))?.len();
-        Ok(Self::chunked_file_stream(file, Some(len)))
+        if len != expected_len {
+            return Err(DomainError::conflict(format!(
+                "object at '{path}' changed size before it could be read: expected {expected_len} byte(s), found {len}"
+            )));
+        }
+        Ok(Self::chunked_file_stream(file, Some(expected_len)))
     }
 
     /// Native range read: seek to the requested offset and read only the
@@ -506,10 +524,23 @@ impl StorageBackend for LocalFsBackend {
     /// object and is the very first request many media players issue) never
     /// allocates a `len`-sized buffer up front the way the old
     /// `get_range`-based response path did.
+    ///
+    /// `expected_len` is the resolved range length the caller already
+    /// committed to (the sidecar resolves `range` itself first to build
+    /// `Content-Range`/`Content-Length`, then calls this with the same
+    /// `range`). This method re-resolves `range` against its own, independent
+    /// `file.metadata()` observation — a file that grew or shrank strictly
+    /// between the caller's resolution and this one can make that
+    /// re-resolution land on a different length for the *same* `range` value
+    /// (e.g. `OpenEnded { start: 0 }` against a bigger or smaller `total`).
+    /// Comparing the freshly resolved length to `expected_len` before seeking
+    /// or reading a single byte catches that: a mismatch is refused up front
+    /// rather than silently streamed at the wrong length.
     async fn get_range_stream(
         &self,
         path: &str,
         range: ByteRange,
+        expected_len: u64,
     ) -> Result<BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
         let target = self.resolve(path)?;
         let mut file = tokio::fs::File::open(&target)
@@ -523,10 +554,15 @@ impl StorageBackend for LocalFsBackend {
         // exactly like `get_range` does.
         let end = end.min(total.saturating_sub(1));
         let len = end - start + 1;
+        if len != expected_len {
+            return Err(DomainError::conflict(format!(
+                "object at '{path}' range changed before it could be read: expected {expected_len} byte(s), resolved {len}"
+            )));
+        }
         file.seek(std::io::SeekFrom::Start(start))
             .await
             .map_err(|e| self.io_err(e))?;
-        Ok(Self::chunked_file_stream(file, Some(len)))
+        Ok(Self::chunked_file_stream(file, Some(expected_len)))
     }
 
     /// Cheap stat: reads only the file's metadata, never its content, so

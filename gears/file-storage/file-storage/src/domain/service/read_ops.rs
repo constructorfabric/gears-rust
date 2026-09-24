@@ -83,11 +83,21 @@ impl FileService {
         // the request query), so without this gate any tenant member could
         // enumerate another subject's file listing via
         // `?owner_kind=user&owner_id=<victim>`. A caller listing their own
-        // files (`owner.owner_id == ctx.subject_id()`, whether `owner_kind`
-        // is `user` or another kind the caller itself holds) proceeds
-        // unconditionally; any other owner requires `ADMIN_POLICY` — on
-        // `Forbidden` this propagates via `?` instead of listing.
-        if owner.owner_id != ctx.subject_id() {
+        // files (the `(owner_kind, owner_id)` pair matching the caller's own
+        // kind and id) proceeds unconditionally; any other owner requires
+        // `ADMIN_POLICY` — on `Forbidden` this propagates via `?` instead of
+        // listing.
+        //
+        // Checking `owner_id` alone is not enough: `owner_kind` picks between
+        // two *disjoint* owner spaces (`OwnerKind::User` / `OwnerKind::App`),
+        // so a caller whose own subject id happens to equal some app's id
+        // could pass `owner_kind=app&owner_id=<self>` and have the
+        // `owner_id == ctx.subject_id()` comparison alone pass while actually
+        // listing the *app* owner space's files instead of their own. Mirrors
+        // the symmetric write-side guard `create.rs::create_file`/
+        // `create_file_bare` already apply via `Self::actor_kind(ctx)`.
+        if owner.owner_id != ctx.subject_id() || owner.owner_kind.as_str() != Self::actor_kind(ctx)
+        {
             self.authorizer
                 .authorize(ctx, actions::ADMIN_POLICY, "", None)
                 .await?;

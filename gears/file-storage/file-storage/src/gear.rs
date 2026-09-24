@@ -98,8 +98,12 @@ impl Gear for FileStorageGear {
         // is set, so this is a plain construction.
         // The grace absorbs a slow-but-live upload that legitimately outlasts
         // the signed token's TTL before reaching finalize/report-part -- see
-        // `FileStorageConfig::finalize_token_grace_secs`. Saturating
-        // conversion, as for every other `*_secs` field below.
+        // `FileStorageConfig::finalize_token_grace_secs`. `cfg.validate()`
+        // above already rejected anything past `MAX_FINALIZE_TOKEN_GRACE_SECS`
+        // (7 days), which fits `i64` with room to spare, so `unwrap_or` never
+        // actually saturates here; kept (rather than `.expect(..)`, which
+        // `clippy::expect_used` denies workspace-wide) as a defensive
+        // fallback, consistent with every other `*_secs` field below.
         let finalize_token_grace = time::Duration::seconds(
             i64::try_from(cfg.finalize_token_grace_secs).unwrap_or(i64::MAX),
         );

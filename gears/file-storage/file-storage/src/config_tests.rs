@@ -537,3 +537,100 @@ fn validate_accepts_default_config_page_size_pair() {
     );
     assert!(cfg.validate().is_ok());
 }
+
+// ── max_page_size absolute ceiling ──────────────────────────────────────────
+//
+// `max_page_size` otherwise has no ceiling of its own: an operator could
+// configure it arbitrarily large, and `MetadataRepo::list_for_files`/
+// `VersionRepo::get_manifests`'s own chunking only prevents a hard driver
+// failure -- it does not prevent every listing request from directly
+// inflating its row count, chunk count, response size, and latency by
+// whatever `max_page_size` is set to.
+
+#[test]
+fn validate_accepts_max_page_size_at_ceiling() {
+    let cfg = FileStorageConfig {
+        default_page_size: MAX_PAGE_SIZE_CEILING,
+        max_page_size: MAX_PAGE_SIZE_CEILING,
+        require_signing_key_seed: false,
+        ..FileStorageConfig::default()
+    };
+    assert!(
+        cfg.validate().is_ok(),
+        "max_page_size == MAX_PAGE_SIZE_CEILING must be accepted"
+    );
+}
+
+#[test]
+fn validate_rejects_max_page_size_above_ceiling() {
+    let cfg = FileStorageConfig {
+        default_page_size: MAX_PAGE_SIZE_CEILING,
+        max_page_size: MAX_PAGE_SIZE_CEILING + 1,
+        require_signing_key_seed: false,
+        ..FileStorageConfig::default()
+    };
+    assert!(
+        cfg.validate().is_err(),
+        "max_page_size exceeding MAX_PAGE_SIZE_CEILING must be rejected regardless of what an \
+         operator configures"
+    );
+}
+
+#[test]
+fn validate_accepts_default_config_max_page_size() {
+    let cfg = FileStorageConfig {
+        require_signing_key_seed: false,
+        ..FileStorageConfig::default()
+    };
+    assert!(
+        cfg.max_page_size <= MAX_PAGE_SIZE_CEILING,
+        "sanity: the shipped default_max_page_size must not itself exceed the ceiling"
+    );
+    assert!(cfg.validate().is_ok());
+}
+
+// ── finalize_token_grace_secs upper bound ───────────────────────────────────
+//
+// `gear.rs` converts `finalize_token_grace_secs` to `i64` via a saturating
+// `unwrap_or(i64::MAX)`; without a ceiling here an oversized value would
+// silently become `i64::MAX` seconds of grace, making the s2s finalize/
+// report-part callbacks' `exp` check a de-facto no-op.
+
+#[test]
+fn validate_accepts_finalize_token_grace_at_max() {
+    let cfg = FileStorageConfig {
+        finalize_token_grace_secs: MAX_FINALIZE_TOKEN_GRACE_SECS,
+        require_signing_key_seed: false,
+        ..FileStorageConfig::default()
+    };
+    assert!(
+        cfg.validate().is_ok(),
+        "finalize_token_grace_secs == MAX_FINALIZE_TOKEN_GRACE_SECS must be accepted"
+    );
+}
+
+#[test]
+fn validate_rejects_finalize_token_grace_above_max() {
+    let cfg = FileStorageConfig {
+        finalize_token_grace_secs: MAX_FINALIZE_TOKEN_GRACE_SECS + 1,
+        require_signing_key_seed: false,
+        ..FileStorageConfig::default()
+    };
+    assert!(
+        cfg.validate().is_err(),
+        "finalize_token_grace_secs exceeding MAX_FINALIZE_TOKEN_GRACE_SECS must be rejected"
+    );
+}
+
+#[test]
+fn validate_accepts_zero_finalize_token_grace() {
+    let cfg = FileStorageConfig {
+        finalize_token_grace_secs: 0,
+        require_signing_key_seed: false,
+        ..FileStorageConfig::default()
+    };
+    assert!(
+        cfg.validate().is_ok(),
+        "finalize_token_grace_secs == 0 (grace disabled) must be accepted"
+    );
+}

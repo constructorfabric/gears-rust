@@ -23,3 +23,4 @@ pub mod policy;
 pub mod policy_service;
 pub mod ports;
 pub mod service;
+pub(crate) mod storage_layout;

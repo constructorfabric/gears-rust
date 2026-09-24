@@ -1,4 +1,4 @@
-//! Index hardening: cover two hot predicates that currently force a full
+//! Index hardening: cover three hot predicates that currently force a full
 //! table scan.
 //!
 //! 1. `idempotency_keys_file_idx` on `idempotency_keys (file_id)`.
@@ -25,7 +25,17 @@
 //!    new index is deliberately non-partial and leads with `state` so both
 //!    branches of the OR can use it.
 //!
-//! `down()` drops both indexes on both dialects.
+//! 3. `files_versionless_sweep_idx` on `files (created_at, file_id) WHERE
+//!    content_id IS NULL`. The cleanup engine's versionless-orphan-file sweep
+//!    (`FileRepo::list_versionless_orphan_files`) filters `content_id IS NULL
+//!    AND created_at < cutoff`, ordered by `(created_at, file_id)`; `files`'s
+//!    existing indexes are owner/tenant-oriented (`files_owner_listing_idx`,
+//!    `files_tenant_gts_idx`) and do not serve this predicate, so the sweep
+//!    fell back to a full scan + sort. `SQLite` has supported partial indexes
+//!    since 3.8.0, so this is a partial index on both dialects, same as
+//!    `multipart_uploads_expired_idx`.
+//!
+//! `down()` drops all three indexes on both dialects.
 
 use sea_orm_migration::prelude::*;
 use sea_orm_migration::sea_orm::ConnectionTrait;
@@ -38,6 +48,8 @@ CREATE INDEX IF NOT EXISTS idempotency_keys_file_idx
     ON idempotency_keys (file_id);
 CREATE INDEX IF NOT EXISTS multipart_uploads_sweep_idx
     ON multipart_uploads (state, expires_at, lease_until);
+CREATE INDEX IF NOT EXISTS files_versionless_sweep_idx
+    ON files (created_at, file_id) WHERE content_id IS NULL;
 ";
 
 const SQLITE_UP: &str = r"
@@ -45,9 +57,12 @@ CREATE INDEX IF NOT EXISTS idempotency_keys_file_idx
     ON idempotency_keys (file_id);
 CREATE INDEX IF NOT EXISTS multipart_uploads_sweep_idx
     ON multipart_uploads (state, expires_at, lease_until);
+CREATE INDEX IF NOT EXISTS files_versionless_sweep_idx
+    ON files (created_at, file_id) WHERE content_id IS NULL;
 ";
 
 const DOWN: &str = r"
+DROP INDEX IF EXISTS files_versionless_sweep_idx;
 DROP INDEX IF EXISTS multipart_uploads_sweep_idx;
 DROP INDEX IF EXISTS idempotency_keys_file_idx;
 ";

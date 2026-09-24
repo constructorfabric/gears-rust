@@ -100,7 +100,7 @@
 //! - `f10_*` -- second path to the same orphan as `f1_*`: within a single
 //!   `run_sweep()` call, step 1 (`sweep_abandoned_pending`) reclaims an
 //!   abandoned pending version whose backing multipart session is
-//!   *expired-but-still-`in_progress`* -- `has_in_progress_for_file` blocks
+//!   *expired-but-still-`in_progress`* -- `has_active_for_file` blocks
 //!   the parent-file deletion at that moment (the session hasn't been
 //!   aborted by step 2 yet), but the version row is deleted anyway. Step 2
 //!   then aborts the session. The parent `files` row survives this sweep
@@ -583,8 +583,9 @@ impl StorageBackend for FailingInitiateBackend {
     async fn get_stream(
         &self,
         path: &str,
+        expected_len: u64,
     ) -> Result<futures::stream::BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
-        self.inner.get_stream(path).await
+        self.inner.get_stream(path, expected_len).await
     }
     async fn get_range(
         &self,
@@ -813,6 +814,8 @@ impl MultipartStore for GatedMultipartStore {
         file_id: Uuid,
         version_id: Uuid,
         backend_upload_handle: &str,
+        backend_id: Option<&str>,
+        backend_path: Option<&str>,
         declared_mime: &str,
         declared_size: u64,
         part_size: u64,
@@ -826,6 +829,8 @@ impl MultipartStore for GatedMultipartStore {
                 file_id,
                 version_id,
                 backend_upload_handle,
+                backend_id,
+                backend_path,
                 declared_mime,
                 declared_size,
                 part_size,
@@ -1505,7 +1510,7 @@ async fn f10_expired_session_orphan_reclaimed_by_step2_in_same_sweep_pass() {
         result.abandoned_files_deleted, 1,
         "FS-05/F10 fix: the parent file must now ALSO be reclaimed in this same pass -- step 2's \
          own cleanup_expired_session_version runs its own orphan-file check after the session \
-         is already aborted, so has_in_progress_for_file no longer blocks it"
+         is already aborted, so has_active_for_file no longer blocks it"
     );
 
     let version_after = store
@@ -1515,7 +1520,7 @@ async fn f10_expired_session_orphan_reclaimed_by_step2_in_same_sweep_pass() {
     assert!(
         version_after.is_none(),
         "the pending version row must be gone -- step 1 deletes it regardless of the \
-         now-stale has_in_progress_for_file snapshot"
+         now-stale has_active_for_file snapshot"
     );
     let file_after = svc.get_file(&ctx, file_id).await;
     assert!(

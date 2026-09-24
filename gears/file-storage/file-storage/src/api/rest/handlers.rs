@@ -15,7 +15,7 @@ use uuid::Uuid;
 use toolkit::api::canonical_prelude::*;
 use toolkit_security::SecurityContext;
 
-use file_storage_sdk::{CustomMetadataPatch, NewFile, OwnerFilter, OwnerKind};
+use file_storage_sdk::{CustomMetadataPatch, FileVersion, NewFile, OwnerFilter, OwnerKind};
 
 use super::dto::{
     BindReq, CreateFileReq, CreateRetentionRuleReq, DownloadTicketDto, EffectivePolicyDto, FileDto,
@@ -369,13 +369,62 @@ pub async fn list_files(
     Ok(Json(FileDtoList(items)))
 }
 
+/// Aggregate manifest-byte budget for one `list_versions` response page.
+/// Applied *after* the page is fetched, against the manifests it actually
+/// turned out to carry (see [`manifest_budget_cutoff`]) -- not as an
+/// up-front cap on `?limit` itself, which would shrink every page
+/// regardless of `hash_mode` (a real regression: see `docs/api.md`).
+const LIST_VERSIONS_MANIFEST_BUDGET_BYTES: u64 = 4 * 1024 * 1024;
+
+/// How many of `versions` (already offset/limit-paginated in the service's
+/// return order, newest first) to keep so the summed byte length of their
+/// `manifests` entries never exceeds `budget_bytes`.
+///
+/// The first version is always kept, even if its own manifest alone exceeds
+/// the budget: a single manifest is already bounded to roughly `MAX_PART_COUNT`
+/// (10 000) parts (~1 MiB, see [`crate::domain::multipart::CompletedMultipartUpload`]'s
+/// doc comment), so this never admits an unbounded response, and keeping it
+/// unconditionally guarantees forward progress -- a client resuming right
+/// after this version can never have its whole next page truncated to
+/// nothing by the same oversized manifest.
+///
+/// `VersionDtoList` serializes as a bare JSON array (see `docs/api.md`), so
+/// there is no `has_more`/`next_offset`/cursor field available to signal an
+/// early truncation without changing the wire format. Continuing correctly
+/// after a truncated page therefore relies on the client resuming at
+/// `offset + <number of versions actually received>` rather than
+/// `offset + limit` -- already the correct, general offset-pagination
+/// client contract (it is exactly how a short *final* page had to be
+/// handled even before this budget existed), so an early-truncated page
+/// composes with it with no special case. A client that instead always
+/// advances by `limit` risks skipping the remainder after a
+/// budget-truncated page.
+fn manifest_budget_cutoff(
+    versions: &[FileVersion],
+    manifests: &std::collections::HashMap<Uuid, String>,
+    budget_bytes: u64,
+) -> usize {
+    let mut used_bytes: u64 = 0;
+    for (i, v) in versions.iter().enumerate() {
+        let Some(manifest) = manifests.get(&v.version_id) else {
+            continue; // whole-sha256 (or no manifest found): no budget consumed
+        };
+        let size = manifest.len() as u64;
+        if i > 0 && used_bytes.saturating_add(size) > budget_bytes {
+            return i;
+        }
+        used_bytes = used_bytes.saturating_add(size);
+    }
+    versions.len()
+}
+
 pub async fn list_versions(
     Extension(ctx): Ctx,
     Extension(svc): Svc,
     Path(file_id): Path<Uuid>,
     Query(q): Query<ListVersionsQuery>,
 ) -> ApiResult<JsonBody<VersionDtoList>> {
-    let versions = svc
+    let mut versions = svc
         .list_versions(&ctx, file_id, q.limit, q.offset.unwrap_or(0))
         .await?;
     // Attach the stored ADR-0006 offset-manifest to every
@@ -387,6 +436,13 @@ pub async fn list_versions(
         .map(|v| v.version_id)
         .collect();
     let mut manifests = svc.manifests_for_versions(&composite_ids).await?;
+    // Trim the page in place (no extra query) rather than reject or shrink
+    // `?limit` up front -- see `manifest_budget_cutoff`.
+    versions.truncate(manifest_budget_cutoff(
+        &versions,
+        &manifests,
+        LIST_VERSIONS_MANIFEST_BUDGET_BYTES,
+    ));
     Ok(Json(VersionDtoList(
         versions
             .into_iter()
@@ -396,6 +452,138 @@ pub async fn list_versions(
             })
             .collect(),
     )))
+}
+
+#[cfg(test)]
+mod list_versions_manifest_budget_tests {
+    use std::collections::HashMap;
+
+    use file_storage_sdk::VersionStatus;
+    use time::OffsetDateTime;
+
+    use super::{FileVersion, Uuid, manifest_budget_cutoff};
+
+    fn whole_version() -> FileVersion {
+        FileVersion {
+            file_id: Uuid::now_v7(),
+            version_id: Uuid::now_v7(),
+            mime_type: "application/octet-stream".to_owned(),
+            size: 2,
+            hash_algorithm: "sha256".to_owned(),
+            hash_value: vec![0u8; 32],
+            hash_mode: "whole-sha256".to_owned(),
+            part_count: None,
+            status: VersionStatus::Available,
+            is_current: false,
+            backend_id: "mem".to_owned(),
+            backend_path: "path".to_owned(),
+            created_at: OffsetDateTime::now_utc(),
+        }
+    }
+
+    fn composite_version() -> FileVersion {
+        FileVersion {
+            hash_mode: "multipart-composite-sha256".to_owned(),
+            part_count: Some(2),
+            ..whole_version()
+        }
+    }
+
+    /// No composite versions on the page -- the manifest budget never
+    /// applies, no matter how many whole-sha256 versions there are (the
+    /// regression this whole change reverts: an unconditional page-size cap
+    /// that clamped every `list_versions` call, composite or not).
+    #[test]
+    fn keeps_the_whole_page_when_no_manifests_are_attached() {
+        let versions: Vec<FileVersion> = (0..8).map(|_| whole_version()).collect();
+        let manifests = HashMap::new();
+        assert_eq!(
+            manifest_budget_cutoff(&versions, &manifests, 4 * 1024 * 1024),
+            8
+        );
+    }
+
+    /// Composite versions whose manifests sum past the budget get cut
+    /// *before* the version that would push the total over -- the cutoff
+    /// index is exactly that version's position, so a client resuming at
+    /// `offset + cutoff` starts there next time (nothing skipped, nothing
+    /// duplicated).
+    #[test]
+    fn cuts_the_page_right_before_the_version_that_would_exceed_budget() {
+        let v0 = composite_version();
+        let v1 = composite_version();
+        let v2 = composite_version();
+        let mut manifests = HashMap::new();
+        manifests.insert(v0.version_id, "m".repeat(3));
+        manifests.insert(v1.version_id, "m".repeat(3));
+        manifests.insert(v2.version_id, "m".repeat(3));
+        let versions = vec![v0, v1, v2];
+
+        // Budget covers exactly 2 manifests (3 bytes each) but not a 3rd.
+        assert_eq!(manifest_budget_cutoff(&versions, &manifests, 6), 2);
+    }
+
+    /// The first version on the page is always kept, even alone against an
+    /// oversized manifest -- otherwise a client resuming right at it would
+    /// be handed an empty page forever (the listing would never progress).
+    #[test]
+    fn always_keeps_the_first_version_even_if_its_manifest_alone_exceeds_budget() {
+        let v0 = composite_version();
+        let mut manifests = HashMap::new();
+        manifests.insert(v0.version_id, "m".repeat(10));
+        let versions = vec![v0];
+
+        assert_eq!(manifest_budget_cutoff(&versions, &manifests, 1), 1);
+    }
+
+    /// A single oversized-manifest version followed by others: the first is
+    /// kept (previous test), but the budget is already exhausted, so
+    /// everything after it is cut -- the *next* page then starts exactly at
+    /// the still-untruncated second version.
+    #[test]
+    fn cuts_everything_after_an_oversized_first_manifest() {
+        let v0 = composite_version();
+        let v1 = composite_version();
+        let mut manifests = HashMap::new();
+        manifests.insert(v0.version_id, "m".repeat(10));
+        manifests.insert(v1.version_id, "m".to_owned());
+        let versions = vec![v0, v1];
+
+        assert_eq!(manifest_budget_cutoff(&versions, &manifests, 1), 1);
+    }
+
+    /// Pagination composes: simulate a client that (correctly) resumes at
+    /// `offset + <versions received>` across a truncated page and a
+    /// follow-up page, and check every version is seen exactly once.
+    #[test]
+    fn truncated_page_plus_follow_up_covers_every_version_exactly_once() {
+        let all: Vec<FileVersion> = (0..5).map(|_| composite_version()).collect();
+        let manifests: HashMap<Uuid, String> =
+            all.iter().map(|v| (v.version_id, "m".repeat(3))).collect();
+        let budget = 6; // exactly 2 manifests per page
+
+        let page1_len = manifest_budget_cutoff(&all, &manifests, budget);
+        assert_eq!(page1_len, 2, "first page must stop before the 3rd version");
+
+        let remaining = &all[page1_len..];
+        let page2_len = manifest_budget_cutoff(remaining, &manifests, budget);
+        assert_eq!(page2_len, 2);
+
+        let remaining2 = &remaining[page2_len..];
+        let page3_len = manifest_budget_cutoff(remaining2, &manifests, budget);
+        assert_eq!(page3_len, 1, "last page holds the one leftover version");
+
+        let mut seen: Vec<Uuid> = all[..page1_len]
+            .iter()
+            .chain(&remaining[..page2_len])
+            .chain(&remaining2[..page3_len])
+            .map(|v| v.version_id)
+            .collect();
+        seen.sort();
+        let mut expected: Vec<Uuid> = all.iter().map(|v| v.version_id).collect();
+        expected.sort();
+        assert_eq!(seen, expected, "every version must appear exactly once");
+    }
 }
 
 pub async fn download_url(

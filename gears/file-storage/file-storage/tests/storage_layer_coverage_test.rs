@@ -167,6 +167,8 @@ async fn seed_session<C: toolkit_db::secure::DBRunner>(
             file_id,
             version_id,
             "backend-handle",
+            Some("mem"),
+            Some(&format!("/{file_id}/{version_id}")),
             "application/octet-stream",
             100,
             50,

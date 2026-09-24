@@ -245,23 +245,52 @@ impl PolicyService {
                     _ => "user",
                 };
                 let tenant_scope = Self::tenant_scope(ctx);
-                // `PolicyStore` (`domain/ports.rs`, this service's only
-                // store port) exposes just `require_file(scope, file_id)` —
-                // one id at a time, no batched-by-ids fetch — so a page of
-                // `File`-scope rules cannot be resolved in a single query
-                // the way an ideal fix would. `ports.rs` is out of scope
-                // for this change, so this dedupes by `file_id` instead of
-                // adding a batch port method: several rules commonly target
-                // the same file (e.g. an age rule and a metadata rule on
-                // one upload), and this cache ensures each distinct target
-                // is still only fetched once per listing rather than once
-                // per rule. Worst case (every rule targets a different
-                // file) this is still up to N extra round-trips for a page
-                // of N `File`-scope rules — strictly more than the single
-                // extra query a real batch fetch would cost, but paid only
-                // on this already-more-expensive non-admin branch, and only
-                // for the `File`-scope subset of the page.
-                let mut owner_by_file: HashMap<Uuid, Option<(String, Uuid)>> = HashMap::new();
+                // Resolve every distinct `File`-scope target on this page in
+                // ONE batched query (`PolicyStore::list_files_by_ids`,
+                // chunked against the bind-parameter budget like every other
+                // batch read in this gear) instead of one `require_file`
+                // round trip per rule -- several rules commonly target the
+                // same file (e.g. an age rule and a metadata rule on one
+                // upload), so `scope_target_id`s are deduped before the
+                // fetch too.
+                let file_ids: Vec<Uuid> = {
+                    let mut ids: Vec<Uuid> = rules
+                        .iter()
+                        .filter(|r| r.scope == RetentionScope::File)
+                        .filter_map(|r| r.scope_target_id)
+                        .collect();
+                    ids.sort_unstable();
+                    ids.dedup();
+                    ids
+                };
+                // A `file_id` absent from the result (in particular, one
+                // whose target file has since been deleted -- no FK ties
+                // `retention_rules.scope_target_id` to `files.file_id`, see
+                // `delete_retention_rule`'s comment on the same migration)
+                // simply has no entry here, exactly like a `FileNotFound`
+                // from `require_file` used to. `StoredRetentionRule` carries
+                // no creator/`subject_id` column, so once the file is gone
+                // there is no stored fact left to tell who may still see the
+                // rule -- unlike `delete_retention_rule` (which only needs to
+                // know *that* the target is gone to fall back to a coarser
+                // check), this listing would need to know *who created it*,
+                // which was never recorded. Not expressible without a schema
+                // change, so the rule is dropped for every non-admin caller
+                // here; an admin can still reach it via the `Ok` arm above,
+                // or remove it via `delete_retention_rule`'s own
+                // dangling-target fallback.
+                let owner_by_file: HashMap<Uuid, (String, Uuid)> = self
+                    .store
+                    .list_files_by_ids(&tenant_scope, &file_ids)
+                    .await?
+                    .into_iter()
+                    .map(|file| {
+                        (
+                            file.file_id,
+                            (file.owner_kind.as_str().to_owned(), file.owner_id),
+                        )
+                    })
+                    .collect();
                 let mut visible = Vec::with_capacity(rules.len());
                 for rule in rules {
                     let keep = match rule.scope {
@@ -276,61 +305,25 @@ impl PolicyService {
                             let Some(file_id) = rule.scope_target_id else {
                                 continue;
                             };
-                            let owner = if let Some(cached) = owner_by_file.get(&file_id) {
-                                cached.clone()
-                            } else {
-                                // A `File`-scope rule can be created by
-                                // anyone holding per-file `WRITE`, not only
-                                // the file's owner (`authorize_retention_scope`'s
-                                // `File` arm checks `WRITE`, not ownership) —
-                                // so comparing `owner_id` here is an
-                                // under-approximation of "created by /
-                                // reachable by this caller". It is the same
-                                // approximation `create.rs`'s cross-owner
-                                // guards and `read_ops::list_files` already
-                                // make elsewhere in this gear (comparing
-                                // `owner_id` directly rather than re-running
-                                // a full per-file `WRITE` authorization
-                                // decision for every rule on the page, which
-                                // would turn this into up to N *authorizer*
-                                // round-trips on top of the N store fetches
-                                // above). A rule whose target file this
-                                // caller can `WRITE` but does not own stays
-                                // invisible here -- an under-approximation,
-                                // but cheaper than the exact check.
-                                //
-                                // `FileNotFound` means the target file has
-                                // since been deleted (no FK ties
-                                // `retention_rules.scope_target_id` to
-                                // `files.file_id`, see
-                                // `delete_retention_rule`'s comment on the
-                                // same migration). `StoredRetentionRule`
-                                // carries no creator/`subject_id` column, so
-                                // once the file is gone there is no stored
-                                // fact left to tell who may still see the
-                                // rule — unlike `delete_retention_rule`
-                                // (which only needs to know *that* the
-                                // target is gone to fall back to a coarser
-                                // check), this listing would need to know
-                                // *who created it*, which was never
-                                // recorded. Not expressible without a schema
-                                // change, so the rule is dropped for every
-                                // non-admin caller here; an admin can still
-                                // reach it via the `Ok` arm above, or remove
-                                // it via `delete_retention_rule`'s own
-                                // dangling-target fallback.
-                                let owner =
-                                    match self.store.require_file(&tenant_scope, file_id).await {
-                                        Ok(file) => Some((
-                                            file.owner_kind.as_str().to_owned(),
-                                            file.owner_id,
-                                        )),
-                                        Err(DomainError::FileNotFound { .. }) => None,
-                                        Err(err) => return Err(err),
-                                    };
-                                owner_by_file.insert(file_id, owner.clone());
-                                owner
-                            };
+                            // A `File`-scope rule can be created by anyone
+                            // holding per-file `WRITE`, not only the file's
+                            // owner (`authorize_retention_scope`'s `File` arm
+                            // checks `WRITE`, not ownership) -- so comparing
+                            // `owner_id` here is an under-approximation of
+                            // "created by / reachable by this caller". It is
+                            // the same approximation `create.rs`'s
+                            // cross-owner guards and `read_ops::list_files`
+                            // already make elsewhere in this gear (comparing
+                            // `owner_id` directly rather than re-running a
+                            // full per-file `WRITE` authorization decision
+                            // for every rule on the page, which would turn
+                            // this into up to N *authorizer* round-trips on
+                            // top of the batch fetch above). A rule whose
+                            // target file this caller can `WRITE` but does
+                            // not own stays invisible here -- an
+                            // under-approximation, but cheaper than the
+                            // exact check.
+                            //
                             // Compare the owner PAIR, not just the id: `user`
                             // and `app` are disjoint owner spaces that can
                             // legitimately carry the same UUID, so matching on
@@ -339,8 +332,8 @@ impl PolicyService {
                             // id (and vice versa). Same reasoning as
                             // `create.rs`'s cross-owner guard, which already
                             // compares kind and id together.
-                            owner
-                                .as_ref()
+                            owner_by_file
+                                .get(&file_id)
                                 .is_some_and(|(kind, id)| *id == subject_id && kind == subject_kind)
                         }
                     };

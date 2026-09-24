@@ -57,8 +57,9 @@ impl Store {
     // ── cleanup engine ────────────────────────────────────────────────────────
 
     /// List all `pending` version rows older than `older_than` (system scope),
-    /// excluding versions still backing a live `in_progress` multipart session
-    /// (`expires_at > now`) -- see
+    /// excluding versions still backing an active multipart session (a live
+    /// `in_progress` one with `expires_at > now`, or any `completing` one) --
+    /// see
     /// [`VersionRepo::list_pending_older_than`][crate::infra::storage::repo::VersionRepo::list_pending_older_than]
     /// for the invariant this protects.
     pub async fn list_abandoned_pending_versions(

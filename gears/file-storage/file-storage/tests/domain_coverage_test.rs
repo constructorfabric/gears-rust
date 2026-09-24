@@ -8,7 +8,7 @@
 //! exercises `manifests_for_versions`/`VersionDto`.
 //!
 //! Each `tests/*.rs` file is its own integration-test crate, so the small
-//! test doubles below (`TestAuthorizer`, `FaultyRequireFileStore`,
+//! test doubles below (`TestAuthorizer`, `FaultyListFilesByIdsStore`,
 //! `FaultyCleanupStore`) are self-contained copies of the patterns already
 //! established in `tests/policy_authz_test.rs` / `tests/cleanup_test.rs`
 //! rather than shared code.
@@ -41,14 +41,16 @@ use file_storage::domain::cleanup::{CleanupConfig, CleanupEngine};
 use file_storage::domain::data_plane::DataPlaneService;
 use file_storage::domain::error::DomainError;
 use file_storage::domain::multipart::{
-    MultipartCompleteOutcome, MultipartUploadSession, MultipartUploadState, StoredCompleteResult,
+    DEFAULT_MIN_PART_SIZE, MultipartCompleteOutcome, MultipartUploadSession, MultipartUploadState,
+    StoredCompleteResult,
 };
+use file_storage::domain::multipart_service::MultipartService;
 use file_storage::domain::policy::{
     AgeRetention, MetadataRetention, PolicyBody, PolicyScope, RetentionRuleBody, RetentionScope,
     StoredPolicy, StoredRetentionRule,
 };
 use file_storage::domain::policy_service::PolicyService;
-use file_storage::domain::ports::{CleanupStore, DataPlanePort, PolicyStore};
+use file_storage::domain::ports::{CleanupStore, DataPlanePort, MultipartStore, PolicyStore};
 use file_storage::domain::service::{FileService, ServiceConfig};
 use file_storage::infra::backend::{BackendRegistry, InMemoryBackend, StorageBackend};
 use file_storage::infra::signed_url::Issuer;
@@ -180,26 +182,35 @@ impl Authorizer for TestAuthorizer {
     }
 }
 
-// ── FaultyRequireFileStore (PolicyStore test double) ────────────────────────
+// ── FaultyListFilesByIdsStore (PolicyStore test double) ─────────────────────
 
-/// A [`PolicyStore`] wrapper that makes `require_file` fail for one specific
-/// `file_id` with an error OTHER than `FileNotFound`, delegating every other
-/// method (and every other `file_id`) to a real [`Store`]. Used to prove
-/// `PolicyService::list_retention_rules`'s per-rule `File`-scope resolution
+/// A [`PolicyStore`] wrapper that makes `list_files_by_ids` fail with an
+/// error OTHER than a partial/absent result whenever the requested id list
+/// contains one specific `file_id`, delegating every other method (and every
+/// call not naming that id) to a real [`Store`]. Used to prove
+/// `PolicyService::list_retention_rules`'s batched `File`-scope resolution
 /// propagates an unexpected store error instead of silently treating it like
 /// a dangling target.
-struct FaultyRequireFileStore {
+struct FaultyListFilesByIdsStore {
     inner: Store,
     fault_file_id: Uuid,
 }
 
 #[async_trait]
-impl PolicyStore for FaultyRequireFileStore {
+impl PolicyStore for FaultyListFilesByIdsStore {
     async fn require_file(&self, scope: &AccessScope, file_id: Uuid) -> Result<File, DomainError> {
-        if file_id == self.fault_file_id {
+        self.inner.require_file(scope, file_id).await
+    }
+
+    async fn list_files_by_ids(
+        &self,
+        scope: &AccessScope,
+        ids: &[Uuid],
+    ) -> Result<Vec<File>, DomainError> {
+        if ids.contains(&self.fault_file_id) {
             Err(DomainError::InternalError)
         } else {
-            self.inner.require_file(scope, file_id).await
+            self.inner.list_files_by_ids(scope, ids).await
         }
     }
 
@@ -273,6 +284,223 @@ impl PolicyStore for FaultyRequireFileStore {
     ) -> Result<Option<StoredRetentionRule>, DomainError> {
         self.inner.get_retention_rule(scope, rule_id).await
     }
+}
+
+// ── CountingPolicyStore (PolicyStore test double) ───────────────────────────
+
+/// A [`PolicyStore`] wrapper that counts calls to `require_file` and
+/// `list_files_by_ids`, delegating every method to a real [`Store`]. Proves
+/// `PolicyService::list_retention_rules`'s non-admin `File`-scope resolution
+/// costs one batched `list_files_by_ids` call per listing, never one
+/// `require_file` round trip per distinct target (t26).
+#[derive(Clone)]
+struct CountingPolicyStore {
+    inner: Store,
+    require_file_calls: Arc<std::sync::atomic::AtomicUsize>,
+    list_files_by_ids_calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl CountingPolicyStore {
+    fn new(inner: Store) -> Self {
+        Self {
+            inner,
+            require_file_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            list_files_by_ids_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+}
+
+#[async_trait]
+impl PolicyStore for CountingPolicyStore {
+    async fn require_file(&self, scope: &AccessScope, file_id: Uuid) -> Result<File, DomainError> {
+        self.require_file_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.require_file(scope, file_id).await
+    }
+
+    async fn list_files_by_ids(
+        &self,
+        scope: &AccessScope,
+        ids: &[Uuid],
+    ) -> Result<Vec<File>, DomainError> {
+        self.list_files_by_ids_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.list_files_by_ids(scope, ids).await
+    }
+
+    async fn get_policy(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        policy_scope: &PolicyScope,
+        scope_owner_id: Option<Uuid>,
+    ) -> Result<Option<StoredPolicy>, DomainError> {
+        self.inner
+            .get_policy(scope, tenant_id, policy_scope, scope_owner_id)
+            .await
+    }
+
+    async fn upsert_policy(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        policy_scope: &PolicyScope,
+        scope_owner_id: Option<Uuid>,
+        body: &PolicyBody,
+        now: OffsetDateTime,
+    ) -> Result<Uuid, DomainError> {
+        self.inner
+            .upsert_policy(scope, tenant_id, policy_scope, scope_owner_id, body, now)
+            .await
+    }
+
+    async fn list_retention_rules(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+    ) -> Result<Vec<StoredRetentionRule>, DomainError> {
+        self.inner.list_retention_rules(scope, tenant_id).await
+    }
+
+    async fn insert_retention_rule(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        retention_scope: &RetentionScope,
+        scope_target_id: Option<Uuid>,
+        body: &RetentionRuleBody,
+        now: OffsetDateTime,
+    ) -> Result<Uuid, DomainError> {
+        self.inner
+            .insert_retention_rule(
+                scope,
+                tenant_id,
+                retention_scope,
+                scope_target_id,
+                body,
+                now,
+            )
+            .await
+    }
+
+    async fn delete_retention_rule(
+        &self,
+        scope: &AccessScope,
+        rule_id: Uuid,
+    ) -> Result<bool, DomainError> {
+        self.inner.delete_retention_rule(scope, rule_id).await
+    }
+
+    async fn get_retention_rule(
+        &self,
+        scope: &AccessScope,
+        rule_id: Uuid,
+    ) -> Result<Option<StoredRetentionRule>, DomainError> {
+        self.inner.get_retention_rule(scope, rule_id).await
+    }
+}
+
+/// Regression (t26): several `File`-scope retention rules spread across
+/// several distinct files -- some owned by the listing caller, some owned by
+/// someone else -- a non-admin caller must see only the rules on files they
+/// own themselves, and resolving all of those distinct targets must cost
+/// exactly one batched `list_files_by_ids` call, never one `require_file`
+/// round trip per target.
+#[tokio::test]
+async fn list_retention_rules_file_scope_many_targets_regression() {
+    let db = build_db().await;
+    let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let backends = BackendRegistry::new(vec![backend], "mem").expect("registry");
+    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let authz = Arc::new(TestAuthorizer::new());
+    let authorizer: Arc<dyn Authorizer> = Arc::clone(&authz) as Arc<dyn Authorizer>;
+    let store = Store::new(Arc::clone(&db));
+    let counting_store = CountingPolicyStore::new(store.clone());
+    let require_file_calls = Arc::clone(&counting_store.require_file_calls);
+    let list_files_by_ids_calls = Arc::clone(&counting_store.list_files_by_ids_calls);
+    let policy_store: Arc<dyn PolicyStore> = Arc::new(counting_store);
+    let svc = FileService::new(
+        store,
+        backends,
+        issuer,
+        Arc::clone(&authorizer),
+        base_config(),
+        None,
+        None,
+    );
+    let policy_svc = PolicyService::new(Arc::clone(&policy_store), Arc::clone(&authorizer));
+
+    let tenant = Uuid::now_v7();
+    let self_id = Uuid::now_v7();
+    let other_id = Uuid::now_v7();
+    let ctx_self = ctx(tenant, self_id);
+
+    // Admin creates 3 files owned by `self_id` and 2 owned by `other_id`,
+    // plus one File-scope retention rule on each of the 5 files.
+    authz.set_admin(true);
+    let mut own_file_ids = Vec::new();
+    for _ in 0..3 {
+        let file_id = svc
+            .create_file_bare(&ctx_self, new_file(self_id, OwnerKind::User))
+            .await
+            .expect("create own file");
+        policy_svc
+            .create_retention_rule(
+                &ctx_self,
+                RetentionScope::File,
+                Some(file_id),
+                valid_rule_body(),
+            )
+            .await
+            .expect("create rule on own file");
+        own_file_ids.push(file_id);
+    }
+    for _ in 0..2 {
+        let file_id = svc
+            .create_file_bare(&ctx_self, new_file(other_id, OwnerKind::User))
+            .await
+            .expect("create other's file");
+        policy_svc
+            .create_retention_rule(
+                &ctx_self,
+                RetentionScope::File,
+                Some(file_id),
+                valid_rule_body(),
+            )
+            .await
+            .expect("create rule on other's file");
+    }
+
+    // Reset counters and list as the same subject, now non-admin.
+    require_file_calls.store(0, Ordering::SeqCst);
+    list_files_by_ids_calls.store(0, Ordering::SeqCst);
+    authz.set_admin(false);
+
+    let visible = policy_svc
+        .list_retention_rules(&ctx_self)
+        .await
+        .expect("list_retention_rules");
+
+    assert_eq!(
+        visible.len(),
+        3,
+        "only the 3 rules on self-owned files must be visible, got {visible:?}"
+    );
+    for rule in &visible {
+        assert!(
+            rule.scope_target_id
+                .is_some_and(|id| own_file_ids.contains(&id)),
+            "every visible rule must target a file self_id owns, got {rule:?}"
+        );
+    }
+    assert_eq!(
+        require_file_calls.load(Ordering::SeqCst),
+        0,
+        "the non-admin File-scope resolution path must never call require_file"
+    );
+    assert_eq!(
+        list_files_by_ids_calls.load(Ordering::SeqCst),
+        1,
+        "resolving 5 distinct File-scope targets must cost exactly one batched call, not N"
+    );
 }
 
 // ── FaultyCleanupStore (CleanupStore test double) ───────────────────────────
@@ -416,8 +644,8 @@ impl CleanupStore for FaultyCleanupStore {
             .await
     }
 
-    async fn has_in_progress_multipart_for_file(&self, file_id: Uuid) -> Result<bool, DomainError> {
-        self.inner.has_in_progress_multipart_for_file(file_id).await
+    async fn has_active_multipart_for_file(&self, file_id: Uuid) -> Result<bool, DomainError> {
+        self.inner.has_active_multipart_for_file(file_id).await
     }
 
     async fn delete_file_with_event(
@@ -461,8 +689,9 @@ impl CleanupStore for FaultyCleanupStore {
 /// `Self::actor_kind`-style `"app"` subject-kind normalization, a
 /// `File`-scope rule with no `scope_target_id` (skipped via `continue`,
 /// reachable only by bypassing `create_retention_rule`'s validation), and
-/// the per-listing owner-lookup cache (two rules on the same file: the
-/// second hits the cache instead of re-querying).
+/// the batched `list_files_by_ids` owner resolution (two rules on the same
+/// file: both resolve from the one batched fetch's result, deduped before
+/// the call rather than fetched twice).
 #[tokio::test]
 async fn list_retention_rules_file_scope_visible_only_when_owner_kind_and_id_both_match() {
     let db = build_db().await;
@@ -612,9 +841,9 @@ async fn list_retention_rules_file_scope_deleted_target_is_invisible_for_nonadmi
     );
 }
 
-/// A `require_file` failure OTHER than `FileNotFound` (e.g. a transient
-/// store error) must propagate as-is, not be swallowed the same way a
-/// dangling target is.
+/// A `list_files_by_ids` failure OTHER than a partial/absent result (e.g. a
+/// transient store error) must propagate as-is, not be swallowed the same
+/// way a dangling target is.
 #[tokio::test]
 async fn list_retention_rules_require_file_error_other_than_not_found_propagates() {
     let db = build_db().await;
@@ -622,7 +851,7 @@ async fn list_retention_rules_require_file_error_other_than_not_found_propagates
 
     let tenant = Uuid::now_v7();
     let subject = Uuid::now_v7();
-    // Never actually created as a file -- `FaultyRequireFileStore` always
+    // Never actually created as a file -- `FaultyListFilesByIdsStore` always
     // errors for it regardless, so its non-existence is irrelevant.
     let fault_file_id = Uuid::now_v7();
 
@@ -639,7 +868,7 @@ async fn list_retention_rules_require_file_error_other_than_not_found_propagates
         .await
         .expect("insert rule directly, bypassing PolicyService");
 
-    let faulty_store: Arc<dyn PolicyStore> = Arc::new(FaultyRequireFileStore {
+    let faulty_store: Arc<dyn PolicyStore> = Arc::new(FaultyListFilesByIdsStore {
         inner: store,
         fault_file_id,
     });
@@ -790,6 +1019,8 @@ async fn cleanup_expired_session_version_with_nonexistent_file_is_noop() {
         auto_bind: false,
         lease_until: None,
         complete_result: None,
+        backend_id: None,
+        backend_path: None,
         created_at: now,
         expires_at: now,
     };
@@ -840,6 +1071,8 @@ async fn sweep_skips_expired_multipart_step_when_listing_fails() {
             ticket.file_id,
             ticket.version_id,
             "fake-backend-handle",
+            Some("mem"),
+            Some(&format!("/{}/{}", ticket.file_id, ticket.version_id)),
             "application/octet-stream",
             0u64,
             0u64,
@@ -922,6 +1155,8 @@ async fn sweep_leaves_session_untouched_when_abort_cas_loses_race() {
             ticket.file_id,
             ticket.version_id,
             "fake-backend-handle",
+            Some("mem"),
+            Some(&format!("/{}/{}", ticket.file_id, ticket.version_id)),
             "application/octet-stream",
             0u64,
             0u64,
@@ -1002,6 +1237,8 @@ async fn sweep_leaves_session_untouched_when_abort_errors() {
             ticket.file_id,
             ticket.version_id,
             "fake-backend-handle",
+            Some("mem"),
+            Some(&format!("/{}/{}", ticket.file_id, ticket.version_id)),
             "application/octet-stream",
             0u64,
             0u64,
@@ -1556,13 +1793,12 @@ fn stored_complete_result_with_unknown_bind_state_fails_to_rehydrate() {
         content_hash: "00".repeat(32),
         hash_mode: "whole-sha256".to_owned(),
         part_count: 1,
-        manifest: None,
         bind_state: "not-a-real-state".to_owned(),
         etag: None,
         current_etag: None,
     };
     assert!(
-        stored.into_completed().is_none(),
+        stored.into_completed(None).is_none(),
         "an unrecognized bind_state must fail to rehydrate rather than silently default"
     );
 }
@@ -1677,4 +1913,244 @@ async fn list_versions_endpoint_batches_manifest_lookup_and_serializes_versions(
         items[0].get("manifest").is_none() || items[0]["manifest"].is_null(),
         "a whole-sha256 version must carry no manifest"
     );
+}
+
+/// Regression test for the reverted `LIST_VERSIONS_MAX_PAGE_SIZE` cap: a
+/// page of ordinary `whole-sha256` versions (no manifests attached at all)
+/// must come back at its full requested `?limit`, not silently clamped to
+/// some small constant. Before the fix under test, this endpoint
+/// unconditionally capped every page at 4 regardless of `hash_mode`.
+#[tokio::test]
+async fn list_versions_endpoint_returns_full_page_for_whole_sha256_versions() {
+    let db = build_db().await;
+    let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let backends = BackendRegistry::new(vec![backend], "mem").expect("registry");
+    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let authorizer: Arc<dyn Authorizer> = Arc::new(TenantOnlyAuthorizer);
+    let store = Store::new(Arc::clone(&db));
+    let svc = Arc::new(FileService::new(
+        store,
+        backends,
+        issuer,
+        authorizer,
+        base_config(),
+        None,
+        None,
+    ));
+    let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
+
+    let tenant = Uuid::now_v7();
+    let owner = Uuid::now_v7();
+    let subject_ctx = ctx(tenant, owner);
+
+    let ticket = svc
+        .create_file(&subject_ctx, new_file(owner, OwnerKind::User), None, false)
+        .await
+        .expect("create_file");
+    dp.put_content(
+        &subject_ctx,
+        ticket.file_id,
+        ticket.version_id,
+        "application/octet-stream",
+        Bytes::from_static(b"v0"),
+    )
+    .await
+    .expect("put_content v0");
+
+    // 8 versions total -- comfortably more than the old (wrong) cap of 4,
+    // well under `base_config()`'s `max_page_size` (1000).
+    for i in 1..8u32 {
+        let t = svc
+            .presign_version(&subject_ctx, ticket.file_id)
+            .await
+            .expect("presign_version");
+        dp.put_content(
+            &subject_ctx,
+            ticket.file_id,
+            t.version_id,
+            "application/octet-stream",
+            Bytes::from(format!("v{i}")),
+        )
+        .await
+        .expect("put_content");
+    }
+
+    let router = Router::new()
+        .route(
+            &format!("{BASE}/files/{{id}}/versions"),
+            get(handlers::list_versions),
+        )
+        .layer(axum::Extension(subject_ctx.clone()))
+        .layer(axum::Extension(Arc::clone(&svc)));
+
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("{BASE}/files/{}/versions?limit=8", ticket.file_id))
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("dispatch");
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("valid JSON body");
+    let items = body.as_array().expect("array body");
+    assert_eq!(
+        items.len(),
+        8,
+        "a page of whole-sha256 versions (no manifests) must never be capped below ?limit"
+    );
+}
+
+/// A single `multipart-composite-sha256` version (real two-part upload, so a
+/// real `version_hash_manifest` row exists) must come back from
+/// `list_versions` with its manifest attached intact -- the manifest-byte
+/// budget must never zero out the one version that carries it, and the
+/// batched `manifests_for_versions` lookup must actually wire the manifest
+/// through to the DTO for a composite version (the existing coverage test
+/// above this one only exercises the whole-sha256, no-manifest path).
+#[tokio::test]
+async fn list_versions_endpoint_returns_composite_version_with_manifest() {
+    let db = build_db().await;
+    let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let backends = BackendRegistry::new(vec![Arc::clone(&backend)], "mem").expect("registry");
+    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let authorizer: Arc<dyn Authorizer> = Arc::new(TenantOnlyAuthorizer);
+    let store = Store::new(Arc::clone(&db));
+    let multipart_store: Arc<dyn MultipartStore> = Arc::new(store.clone());
+    let svc = Arc::new(FileService::new(
+        store,
+        backends.clone(),
+        Arc::clone(&issuer),
+        Arc::clone(&authorizer),
+        base_config(),
+        None,
+        None,
+    ));
+    let msvc = Arc::new(MultipartService::new(
+        Arc::clone(&multipart_store),
+        backends,
+        Arc::clone(&authorizer),
+        None,
+        issuer,
+        "http://sidecar.test".to_owned(),
+        3600,
+    ));
+
+    let tenant = Uuid::now_v7();
+    let owner = Uuid::now_v7();
+    let subject_ctx = ctx(tenant, owner);
+
+    // `create_file_bare` (no pending single-part version) rather than
+    // `create_file`: the latter pre-registers a first version that would
+    // sit alongside the composite one below, forever `pending` (this test
+    // never uploads to it), throwing off the "exactly one version" count.
+    let file_id = svc
+        .create_file_bare(&subject_ctx, new_file(owner, OwnerKind::User))
+        .await
+        .expect("create_file_bare");
+
+    // `declared_size` just over one `DEFAULT_MIN_PART_SIZE` (5 MiB) forces a
+    // real 2-part plan (no `preferred_part_size` hint needed) -- a one-part
+    // plan would degenerate to `whole-sha256` (ADR-0006 single-part
+    // amendment) and never carry a manifest at all.
+    let part_size = DEFAULT_MIN_PART_SIZE;
+    let declared_size = part_size + 3;
+    let plan = msvc
+        .initiate_multipart_upload(
+            &subject_ctx,
+            file_id,
+            "application/octet-stream",
+            declared_size,
+            None,
+            None,
+            false,
+        )
+        .await
+        .expect("initiate_multipart_upload");
+    assert_eq!(
+        plan.parts.len(),
+        2,
+        "declared_size must plan exactly 2 parts"
+    );
+
+    let session = multipart_store
+        .get_multipart_upload(plan.upload_id)
+        .await
+        .expect("get_multipart_upload")
+        .expect("session must exist");
+    let backend_path = format!("/{}/{}", file_id, plan.version_id);
+
+    for part in &plan.parts {
+        let data = Bytes::from(vec![
+            b'x';
+            usize::try_from(part.size)
+                .expect("part size fits usize")
+        ]);
+        let (backend_etag, part_hash) = backend
+            .upload_part(
+                &backend_path,
+                &session.backend_upload_handle,
+                part.part_number,
+                part.offset,
+                data,
+            )
+            .await
+            .expect("backend upload_part");
+        multipart_store
+            .upsert_multipart_part(
+                plan.upload_id,
+                i32::try_from(part.part_number).expect("part_number fits i32"),
+                &backend_etag,
+                part_hash,
+                i64::try_from(part.size).expect("part size fits i64"),
+                OffsetDateTime::now_utc(),
+            )
+            .await
+            .expect("upsert_multipart_part");
+    }
+
+    msvc.complete_multipart_upload(&subject_ctx, file_id, plan.upload_id, None)
+        .await
+        .expect("complete_multipart_upload");
+    svc.bind(&subject_ctx, file_id, plan.version_id, None)
+        .await
+        .expect("bind");
+
+    let router = Router::new()
+        .route(
+            &format!("{BASE}/files/{{id}}/versions"),
+            get(handlers::list_versions),
+        )
+        .layer(axum::Extension(subject_ctx.clone()))
+        .layer(axum::Extension(Arc::clone(&svc)));
+
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("{BASE}/files/{file_id}/versions"))
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("dispatch");
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("valid JSON body");
+    let items = body.as_array().expect("array body");
+    assert_eq!(items.len(), 1, "expected exactly the one composite version");
+    assert_eq!(items[0]["hash_mode"], "multipart-composite-sha256");
+    let manifest = items[0]["manifest"]
+        .as_str()
+        .expect("composite version must carry a non-null manifest string");
+    assert!(!manifest.is_empty(), "manifest must not be empty");
 }

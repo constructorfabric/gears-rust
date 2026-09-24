@@ -34,7 +34,11 @@ impl MultipartRepo {
         Self
     }
 
-    /// Insert a new multipart upload session row.
+    /// Insert a new multipart upload session row. `backend_id`/`backend_path`
+    /// are the backend and object path the pending version this session
+    /// finalizes into was just given -- always `Some` for a session created
+    /// through the real initiate flow; only ever absent for a hand-built test
+    /// row exercising the pre-migration legacy shape.
     #[allow(clippy::too_many_arguments)]
     pub async fn create<C: DBRunner>(
         &self,
@@ -43,6 +47,8 @@ impl MultipartRepo {
         file_id: Uuid,
         version_id: Uuid,
         backend_upload_handle: &str,
+        backend_id: Option<&str>,
+        backend_path: Option<&str>,
         declared_mime: &str,
         declared_size: u64,
         part_size: u64,
@@ -68,6 +74,8 @@ impl MultipartRepo {
             lease_until: Set(None),
             lease_owner: Set(None),
             complete_result: Set(None),
+            backend_id: Set(backend_id.map(str::to_owned)),
+            backend_path: Set(backend_path.map(str::to_owned)),
             created_at: Set(now),
             expires_at: Set(expires_at),
         };
@@ -520,22 +528,29 @@ impl MultipartRepo {
         rows.into_iter().map(session_from_model).collect()
     }
 
-    /// Whether `file_id` has at least one `in_progress` multipart upload
-    /// session, regardless of its `expires_at`.
+    /// Whether `file_id` has at least one *active* multipart upload session --
+    /// `in_progress` or `completing` -- regardless of `expires_at`/`lease_until`.
     ///
     /// Used by the orphan-file-reconciliation guard: a file's pending
     /// version can look "abandoned" to [`Self::list_expired`]'s sibling sweep
     /// step (`sweep_abandoned_pending`, keyed only on the version's age) even
-    /// while it is the live target of a *not-yet-expired* multipart session --
+    /// while it is the live target of a session that has not been reaped yet --
     /// deleting the parent `files` row in that window would `ON DELETE
-    /// CASCADE` the still-`in_progress` session out from under the upload.
+    /// CASCADE` the still-active session out from under the upload.
+    /// `completing` counts too: that state means a completer currently holds
+    /// the lease and is assembling the final object, which is exactly the
+    /// moment the guard must not let the file disappear underneath it. A
+    /// `completing` session whose lease has *expired* is not treated
+    /// differently here -- it is still being reaped (state flip to `aborted`)
+    /// by `sweep_expired_multipart`, so it remains "active" from this guard's
+    /// point of view until that reap actually lands.
     ///
     /// Existence via `LIMIT 1` + `one()` rather than `COUNT(*)`: this project
     /// forbids `COUNT` queries for existence checks (a full/partial scan just
     /// to throw the number away) -- `LIMIT 1` lets the planner stop at the
-    /// first matching row instead of counting every `in_progress` session for
+    /// first matching row instead of counting every active session for
     /// the file.
-    pub async fn has_in_progress_for_file<C: DBRunner>(
+    pub async fn has_active_for_file<C: DBRunner>(
         &self,
         conn: &C,
         file_id: Uuid,
@@ -544,7 +559,11 @@ impl MultipartRepo {
             .filter(
                 sea_orm::Condition::all()
                     .add(UploadColumn::FileId.eq(file_id))
-                    .add(UploadColumn::State.eq("in_progress")),
+                    .add(
+                        sea_orm::Condition::any()
+                            .add(UploadColumn::State.eq("in_progress"))
+                            .add(UploadColumn::State.eq("completing")),
+                    ),
             )
             .secure()
             .scope_with(&AccessScope::allow_all())
@@ -581,6 +600,8 @@ fn session_from_model(m: UploadModel) -> Result<MultipartUploadSession, DomainEr
         auto_bind: m.auto_bind,
         lease_until: m.lease_until,
         complete_result: m.complete_result,
+        backend_id: m.backend_id,
+        backend_path: m.backend_path,
         created_at: m.created_at,
         expires_at: m.expires_at,
     })

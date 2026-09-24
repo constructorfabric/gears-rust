@@ -46,6 +46,19 @@ impl Store {
         self.repos.files.get(&conn, scope, file_id).await
     }
 
+    /// Batched counterpart of [`Self::get_file`]/[`Self::require_file`]:
+    /// fetch every file in `ids` that exists (and is visible under `scope`)
+    /// in one query (chunked against the bind-parameter budget, see
+    /// `FileRepo::list_by_ids`) instead of one round trip per id.
+    pub async fn list_files_by_ids(
+        &self,
+        scope: &AccessScope,
+        ids: &[Uuid],
+    ) -> Result<Vec<File>, DomainError> {
+        let conn = self.db.conn().map_err(db_err)?;
+        self.repos.files.list_by_ids(&conn, scope, ids).await
+    }
+
     /// Like [`get_file`] but errors with `FileNotFound` when absent.
     pub async fn require_file(
         &self,

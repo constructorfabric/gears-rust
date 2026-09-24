@@ -253,6 +253,17 @@ impl S3Backend {
         }
     }
 
+    /// Parse the `Content-Length` response header, if present and
+    /// well-formed. Shared by `get_stream`/`get_range_stream`'s
+    /// `expected_len` check and `size`/`stat`'s own required-header parse
+    /// below, so the header-extraction logic lives in exactly one place.
+    fn parse_content_length(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+        headers
+            .get(CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+    }
+
     fn transport_err(&self, e: &reqwest::Error) -> DomainError {
         DomainError::backend(&self.id, e.to_string())
     }
@@ -642,9 +653,22 @@ impl StorageBackend for S3Backend {
     /// and its status checked eagerly (before returning), so a missing object
     /// or an S3 error surfaces from this call directly rather than from
     /// polling the returned stream.
+    ///
+    /// `expected_len` is the length the caller already committed to elsewhere
+    /// (see [`StorageBackend::get_stream`]'s doc comment). When the response
+    /// carries a `Content-Length` header it is checked against `expected_len`
+    /// before the stream is ever returned, mirroring
+    /// [`LocalFsBackend::get_stream`]'s open-time length check -- a mismatch
+    /// means the object changed between the caller's earlier observation and
+    /// this `GetObject`, and is refused rather than streamed. A response with
+    /// no `Content-Length` (e.g. chunked transfer-encoding) cannot be checked
+    /// up front; a length disagreement in that case still surfaces once the
+    /// caller notices its own byte count is wrong, exactly as before this
+    /// check existed.
     async fn get_stream(
         &self,
         path: &str,
+        expected_len: u64,
     ) -> Result<BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
         let key = Self::path_to_key(path);
         let url = self
@@ -662,6 +686,14 @@ impl StorageBackend for S3Backend {
         if !status.is_success() {
             let body = resp.bytes().await.map_err(|e| self.transport_err(&e))?;
             return Err(self.s3_error(status, &body));
+        }
+
+        if let Some(content_len) = Self::parse_content_length(resp.headers())
+            && content_len != expected_len
+        {
+            return Err(DomainError::conflict(format!(
+                "object at '{path}' changed size before it could be read: expected {expected_len} byte(s), found {content_len}"
+            )));
         }
 
         let stream = resp
@@ -714,11 +746,14 @@ impl StorageBackend for S3Backend {
     /// it — this streams it instead. Status handling (416 / non-2xx) is
     /// checked eagerly before returning, exactly like `get_stream`, so a bad
     /// range or an S3-side error surfaces from this call directly rather than
-    /// from polling the returned stream.
+    /// from polling the returned stream. `expected_len` is checked against a
+    /// present `Content-Length` exactly like `get_stream`'s own check — see
+    /// [`StorageBackend::get_range_stream`]'s doc comment.
     async fn get_range_stream(
         &self,
         path: &str,
         range: ByteRange,
+        expected_len: u64,
     ) -> Result<BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
         let header_value = Self::range_header_value(range)?;
 
@@ -755,6 +790,22 @@ impl StorageBackend for S3Backend {
                 &self.id,
                 format!("backend ignored the Range header (answered {status}, expected 206)"),
             ));
+        }
+
+        // Mirrors `get_stream`'s `expected_len` check: the sidecar already
+        // resolved `range` itself (against its own, earlier observation of
+        // the object) to build `Content-Range`/`Content-Length`, and passes
+        // this call the length it already committed to. A `Content-Length`
+        // here that disagrees means the object changed between that
+        // observation and this `GetObject` -- refuse before streaming rather
+        // than hand back a body whose length contradicts the headers already
+        // sent.
+        if let Some(content_len) = Self::parse_content_length(resp.headers())
+            && content_len != expected_len
+        {
+            return Err(DomainError::conflict(format!(
+                "object at '{path}' range changed before it could be read: expected {expected_len} byte(s), found {content_len}"
+            )));
         }
 
         let stream = resp

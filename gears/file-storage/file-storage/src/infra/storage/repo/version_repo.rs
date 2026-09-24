@@ -4,7 +4,7 @@ use sea_orm::sea_query::{Expr, Query};
 use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set};
 use time::OffsetDateTime;
 use toolkit_db::secure::{
-    DBRunner, SecureDeleteExt, SecureEntityExt, SecureUpdateExt, secure_insert,
+    DBRunner, SecureDeleteExt, SecureEntityExt, SecureUpdateExt, max_bind_params_for, secure_insert,
 };
 use toolkit_security::AccessScope;
 use uuid::Uuid;
@@ -240,9 +240,20 @@ impl VersionRepo {
     /// Batched counterpart of [`Self::get_manifest`]: fetch the manifest text
     /// for many versions in a single `IN (...)` query, keyed by `version_id`.
     /// Used by `GET /files/{id}/versions` so that rendering a page of `N`
-    /// versions' manifests costs one query instead of `N` (mirrors
+    /// versions' manifests costs a handful of queries instead of `N` (mirrors
     /// `MetadataRepo::list_for_files`'s N+1 avoidance). A version with no
     /// manifest row (`whole-sha256`) simply has no entry in the returned map.
+    ///
+    /// `version_ids` is chunked to [`max_bind_params_for`] minus
+    /// [`Self::GET_MANIFESTS_RESERVED_PARAMS`] before building each `IN
+    /// (...)` list, one `SELECT` per chunk -- same reasoning as
+    /// `MetadataRepo::list_for_files`'s chunking: `max_page_size` otherwise
+    /// bounds this query's bind-parameter count directly, and an unusually
+    /// large page size would reach the driver's own bind-parameter ceiling
+    /// (65535 on `PostgreSQL`, 32766 on `SQLite`) and fail the whole listing
+    /// outright.
+    const GET_MANIFESTS_RESERVED_PARAMS: usize = 16;
+
     pub async fn get_manifests<C: DBRunner>(
         &self,
         conn: &C,
@@ -252,17 +263,21 @@ impl VersionRepo {
         if version_ids.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
-        let rows = ManifestEntity::find()
-            .filter(ManifestColumn::VersionId.is_in(version_ids.iter().copied()))
-            .secure()
-            .scope_with(scope)
-            .all(conn)
-            .await
-            .map_err(db_err)?;
-        Ok(rows
-            .into_iter()
-            .map(|m| (m.version_id, m.manifest))
-            .collect())
+        let chunk_size = max_bind_params_for(conn)
+            .saturating_sub(Self::GET_MANIFESTS_RESERVED_PARAMS)
+            .max(1);
+        let mut manifests = std::collections::HashMap::new();
+        for chunk in version_ids.chunks(chunk_size) {
+            let rows = ManifestEntity::find()
+                .filter(ManifestColumn::VersionId.is_in(chunk.iter().copied()))
+                .secure()
+                .scope_with(scope)
+                .all(conn)
+                .await
+                .map_err(db_err)?;
+            manifests.extend(rows.into_iter().map(|m| (m.version_id, m.manifest)));
+        }
+        Ok(manifests)
     }
 
     /// Clear the `is_current` flag on all versions of a file (used before
@@ -423,17 +438,30 @@ impl VersionRepo {
 
     /// List all `pending` version rows whose `created_at` is older than
     /// `older_than`, **excluding** any version that is still the backing
-    /// version of a live `in_progress` multipart session (`expires_at >
-    /// now`). Used by the orphan-reconciliation sweep.
+    /// version of an active multipart session: a live `in_progress` one
+    /// (`expires_at > now`), or one that is `completing`. Used by the
+    /// orphan-reconciliation sweep.
     ///
     /// A long-running multipart upload (big file, generous URL TTL) keeps its
     /// backing version `pending` for the whole session, which can outlive
     /// `orphan_grace_secs`; without this guard the sweep would delete the
     /// version out from under the in-progress upload. A session whose
-    /// `expires_at` has *already* passed is deliberately NOT excluded here --
-    /// it is aborted by the next sweep step (`sweep_expired_multipart`), and
-    /// its version becomes reclaimable on a later sweep once the session row
-    /// itself transitions out of `in_progress`.
+    /// `expires_at` has *already* passed is deliberately NOT excluded here
+    /// while still `in_progress` -- it is aborted by the next sweep step
+    /// (`sweep_expired_multipart`), and its version becomes reclaimable on a
+    /// later sweep once the session row itself transitions out of
+    /// `in_progress`.
+    ///
+    /// `completing` is excluded unconditionally, with no `expires_at`/
+    /// `lease_until` check at all: that state means a completer currently
+    /// holds the lease and is assembling the final object out of this exact
+    /// pending version, so this query must never delete it out from under
+    /// that assembly -- even once the session's own lease or `expires_at` has
+    /// lapsed. A stuck `completing` session is reaped by
+    /// `sweep_expired_multipart`'s own CAS (`completing -> aborted`), which
+    /// runs after this query in the same sweep pass; only once that CAS lands
+    /// does the version stop being backed by an active session and become
+    /// reclaimable on a later sweep.
     pub async fn list_pending_older_than<C: DBRunner>(
         &self,
         conn: &C,
@@ -451,8 +479,15 @@ impl VersionRepo {
                             Query::select()
                                 .column(MultipartUploadColumn::VersionId)
                                 .from(MultipartUploadEntity)
-                                .and_where(MultipartUploadColumn::State.eq("in_progress"))
-                                .and_where(MultipartUploadColumn::ExpiresAt.gt(now))
+                                .cond_where(
+                                    Condition::any()
+                                        .add(
+                                            Condition::all()
+                                                .add(MultipartUploadColumn::State.eq("in_progress"))
+                                                .add(MultipartUploadColumn::ExpiresAt.gt(now)),
+                                        )
+                                        .add(MultipartUploadColumn::State.eq("completing")),
+                                )
                                 .to_owned(),
                         ),
                     ),

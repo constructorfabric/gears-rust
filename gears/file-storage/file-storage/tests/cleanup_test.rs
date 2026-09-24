@@ -47,6 +47,17 @@ const GTS: &str = gts_id!("cf.fstorage.file.type.v1~x.cleanup_test.file.type.v1~
 // ── test harness ──────────────────────────────────────────────────────────────
 
 async fn build_db() -> Arc<DBProvider<DbError>> {
+    build_db_with_dsn().await.0
+}
+
+/// Like [`build_db`], but also returns the sqlite DSN -- needed by tests that
+/// open a second, independent raw `sea_orm` connection (via
+/// `Database::connect(&dsn)`, the pattern `tests/multipart_test.rs`'s
+/// `count_files_rows`/`tamper_request_hash` and
+/// `tests/content_hash_modes_test.rs` already use) to assert on rows the
+/// `Store`/`CleanupStore` API surface has no getter for, e.g. a raw
+/// `idempotency_keys` row count.
+async fn build_db_with_dsn() -> (Arc<DBProvider<DbError>>, String) {
     let mut path = std::env::temp_dir();
     path.push(format!("cf-fs-cleanup-test-{}.db", Uuid::now_v7().simple()));
     let dsn = format!("sqlite://{}?mode=rwc", path.display());
@@ -59,7 +70,7 @@ async fn build_db() -> Arc<DBProvider<DbError>> {
     run_migrations_for_testing(&db, Migrator::migrations())
         .await
         .expect("migrations");
-    Arc::new(DBProvider::new(db))
+    (Arc::new(DBProvider::new(db)), dsn)
 }
 
 /// Build a service + cleanup engine sharing the same Store and BackendRegistry.
@@ -126,6 +137,74 @@ async fn build_all(
         },
     );
     (svc, psvc, msvc, dp, store, engine, backend)
+}
+
+/// Like [`build_all`], but also returns the sqlite DSN (see
+/// [`build_db_with_dsn`]) -- used by the idempotency-keys cascade-delete
+/// test below, which asserts on a raw row count `Store`/`CleanupStore` has no
+/// getter for.
+async fn build_all_with_dsn(
+    grace_secs: u64,
+) -> (
+    Arc<FileService>,
+    Arc<PolicyService>,
+    Arc<MultipartService>,
+    DataPlaneService,
+    Store,
+    CleanupEngine,
+    Arc<dyn StorageBackend>,
+    String,
+) {
+    let (db, dsn) = build_db_with_dsn().await;
+
+    let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let backends = BackendRegistry::new(vec![Arc::clone(&backend)], "mem").expect("registry");
+
+    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let authorizer: Arc<dyn file_storage::domain::authz::Authorizer> =
+        Arc::new(TenantOnlyAuthorizer);
+    let cfg = ServiceConfig {
+        default_url_ttl_secs: 3600,
+        sidecar_base_url: "http://sidecar.test".to_owned(),
+        default_page_size: 50,
+        max_page_size: 1000,
+        idempotency_ttl_secs: 86400,
+    };
+    let store = Store::new(Arc::clone(&db));
+
+    let sweep_store: Arc<dyn CleanupStore> = Arc::new(store.clone());
+    let multipart_store: Arc<dyn MultipartStore> = Arc::new(store.clone());
+    let policy_store: Arc<dyn PolicyStore> = Arc::new(store.clone());
+    let sweep_backends = backends.clone();
+
+    let svc = Arc::new(FileService::new(
+        store.clone(),
+        backends.clone(),
+        issuer,
+        Arc::clone(&authorizer),
+        cfg,
+        None,
+        None,
+    ));
+    let msvc = Arc::new(MultipartService::new(
+        multipart_store,
+        backends,
+        Arc::clone(&authorizer),
+        None,
+        Arc::new(Issuer::generate(3600).expect("issuer")),
+        "http://sidecar.test".to_owned(),
+        3600,
+    ));
+    let psvc = Arc::new(PolicyService::new(policy_store, authorizer));
+    let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
+    let engine = CleanupEngine::new(
+        sweep_store,
+        sweep_backends,
+        CleanupConfig {
+            orphan_grace_secs: grace_secs,
+        },
+    );
+    (svc, psvc, msvc, dp, store, engine, backend, dsn)
 }
 
 /// Like [`build_all`], but also returns the raw `DBProvider` handle. Used by
@@ -393,8 +472,8 @@ impl CleanupStore for FaultyListVersionsStore {
             .await
     }
 
-    async fn has_in_progress_multipart_for_file(&self, file_id: Uuid) -> Result<bool, DomainError> {
-        self.inner.has_in_progress_multipart_for_file(file_id).await
+    async fn has_active_multipart_for_file(&self, file_id: Uuid) -> Result<bool, DomainError> {
+        self.inner.has_active_multipart_for_file(file_id).await
     }
 
     async fn delete_file_with_event(
@@ -426,6 +505,211 @@ impl CleanupStore for FaultyListVersionsStore {
     ) -> Result<u64, DomainError> {
         self.inner.delete_expired_idempotency_keys(now).await
     }
+}
+
+/// A [`CleanupStore`] wrapper that makes `get_file` fail for one specific
+/// `file_id` while delegating every other method (including `get_file` for
+/// any other id) to a real [`Store`]. Same shape as
+/// `FaultyListVersionsStore` above.
+///
+/// Used to prove that a transient `get_file` failure during
+/// `CleanupEngine::abort_expired_multipart_session`'s audit-tenant lookup is
+/// logged (distinguishing it from a genuinely-absent file) rather than
+/// silently folded into the same `Uuid::nil()` fallback with no trace.
+struct FaultyGetFileStore {
+    inner: Store,
+    fault_file_id: Uuid,
+}
+
+#[async_trait]
+impl CleanupStore for FaultyGetFileStore {
+    async fn list_abandoned_pending_versions(
+        &self,
+        older_than: time::OffsetDateTime,
+        now: time::OffsetDateTime,
+    ) -> Result<Vec<FileVersion>, DomainError> {
+        self.inner
+            .list_abandoned_pending_versions(older_than, now)
+            .await
+    }
+
+    async fn list_versionless_orphan_files(
+        &self,
+        created_before: time::OffsetDateTime,
+        limit: u64,
+    ) -> Result<Vec<File>, DomainError> {
+        self.inner
+            .list_versionless_orphan_files(created_before, limit)
+            .await
+    }
+
+    async fn delete_version(
+        &self,
+        file_id: Uuid,
+        version_id: Uuid,
+        audit: AuditEntry,
+    ) -> Result<bool, DomainError> {
+        self.inner.delete_version(file_id, version_id, audit).await
+    }
+
+    async fn delete_pending_version(
+        &self,
+        file_id: Uuid,
+        version_id: Uuid,
+        audit: AuditEntry,
+    ) -> Result<bool, DomainError> {
+        self.inner
+            .delete_pending_version(file_id, version_id, audit)
+            .await
+    }
+
+    async fn list_expired_multipart_uploads(
+        &self,
+        now: time::OffsetDateTime,
+    ) -> Result<Vec<MultipartUploadSession>, DomainError> {
+        self.inner.list_expired_multipart_uploads(now).await
+    }
+
+    async fn abort_multipart_upload(
+        &self,
+        upload_id: Uuid,
+        audit: AuditEntry,
+    ) -> Result<bool, DomainError> {
+        self.inner.abort_multipart_upload(upload_id, audit).await
+    }
+
+    async fn get_version(
+        &self,
+        file_id: Uuid,
+        version_id: Uuid,
+    ) -> Result<Option<FileVersion>, DomainError> {
+        self.inner.get_version(file_id, version_id).await
+    }
+
+    async fn list_all_retention_rules(&self) -> Result<Vec<StoredRetentionRule>, DomainError> {
+        self.inner.list_all_retention_rules().await
+    }
+
+    async fn list_all_files_for_sweep(
+        &self,
+        after: Option<Uuid>,
+        limit: u64,
+    ) -> Result<Vec<File>, DomainError> {
+        self.inner.list_all_files_for_sweep(after, limit).await
+    }
+
+    async fn list_metadata(&self, file_id: Uuid) -> Result<Vec<CustomMetadataEntry>, DomainError> {
+        self.inner.list_metadata(file_id).await
+    }
+
+    async fn list_metadata_for_files(
+        &self,
+        file_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<CustomMetadataEntry>>, DomainError> {
+        self.inner.list_metadata_for_files(file_ids).await
+    }
+
+    async fn list_versions(&self, file_id: Uuid) -> Result<Vec<FileVersion>, DomainError> {
+        self.inner.list_versions(file_id).await
+    }
+
+    /// The one faulted method: errors for `fault_file_id`, delegates otherwise.
+    async fn get_file(&self, file_id: Uuid) -> Result<Option<File>, DomainError> {
+        if file_id == self.fault_file_id {
+            Err(DomainError::InternalError)
+        } else {
+            self.inner
+                .get_file(&toolkit_security::AccessScope::allow_all(), file_id)
+                .await
+        }
+    }
+
+    async fn has_active_multipart_for_file(&self, file_id: Uuid) -> Result<bool, DomainError> {
+        self.inner.has_active_multipart_for_file(file_id).await
+    }
+
+    async fn delete_file_with_event(
+        &self,
+        scope: &toolkit_security::AccessScope,
+        file_id: Uuid,
+        audit: AuditEntry,
+        event: Option<FileEvent>,
+    ) -> Result<bool, DomainError> {
+        self.inner
+            .delete_file_with_event(scope, file_id, audit, event)
+            .await
+    }
+
+    async fn delete_orphan_file_with_event(
+        &self,
+        file_id: Uuid,
+        audit: AuditEntry,
+        event: Option<FileEvent>,
+    ) -> Result<bool, DomainError> {
+        self.inner
+            .delete_orphan_file_with_event(file_id, audit, event)
+            .await
+    }
+
+    async fn delete_expired_idempotency_keys(
+        &self,
+        now: time::OffsetDateTime,
+    ) -> Result<u64, DomainError> {
+        self.inner.delete_expired_idempotency_keys(now).await
+    }
+}
+
+/// Minimal hand-rolled `tracing::Subscriber` that records every event's
+/// formatted `message` field plus its level, so a test can assert a specific
+/// log line was emitted without pulling in a log-capturing crate. Installed
+/// per-test via `tracing::subscriber::set_default`, which is thread-local --
+/// safe here because `#[tokio::test]` defaults to a current-thread runtime,
+/// so the awaited call under test never hops to another OS thread.
+#[derive(Clone, Default)]
+struct RecordingSubscriber {
+    messages: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl tracing::Subscriber for RecordingSubscriber {
+    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        struct MessageVisitor(String);
+        impl tracing::field::Visit for MessageVisitor {
+            // The trait only ever hands back `&dyn Debug` (there is no
+            // `Display`-based visitor method), so `{value:?}` here is the
+            // API's own contract, not a debug-print left in by accident.
+            #[allow(clippy::use_debug)]
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                use std::fmt::Write as _;
+                // `write!` to a `String` cannot fail (`fmt::Write`'s only
+                // error variant a `String` sink can never produce) -- `.ok()`
+                // discards the always-`Ok` result explicitly rather than a
+                // bare `let _ =` on a `#[must_use]` `Result`.
+                write!(self.0, " {}={value:?}", field.name()).ok();
+            }
+        }
+        let mut visitor = MessageVisitor(String::new());
+        event.record(&mut visitor);
+        self.messages
+            .lock()
+            .expect("recording subscriber mutex")
+            .push(format!("{}:{}", event.metadata().level(), visitor.0));
+    }
+
+    fn enter(&self, _span: &tracing::span::Id) {}
+
+    fn exit(&self, _span: &tracing::span::Id) {}
 }
 
 // ── test 1: abandoned pending version sweep ────────────────────────────────────
@@ -794,6 +1078,8 @@ async fn sweep_versionless_file_blocked_by_in_progress_multipart_session() {
             file_id,
             Uuid::now_v7(),
             "backend-handle",
+            None,
+            None,
             "text/plain",
             1024,
             1024,
@@ -947,6 +1233,8 @@ async fn expired_multipart_session_is_aborted_by_sweep() {
             file_id2,
             version_id2,
             "fake-backend-handle",
+            Some("mem"),
+            Some(&format!("/{file_id2}/{version_id2}")),
             "text/plain",
             0u64,      // declared_size (not relevant for sweep test)
             0u64,      // part_size (not relevant for sweep test)
@@ -996,6 +1284,311 @@ async fn expired_multipart_session_is_aborted_by_sweep() {
         aborted_session.state,
         file_storage::domain::multipart::MultipartUploadState::Aborted,
         "backdated session must be aborted after sweep"
+    );
+}
+
+/// `m20260902_000001_index_hardening`'s `multipart_uploads_sweep_idx` exists
+/// specifically to serve the OR's `completing AND lease_until < now` branch
+/// (see that migration's own doc comment) -- everything above only exercises
+/// the `in_progress` branch. A `completing` session is left behind when its
+/// completer dies mid-assembly (after acquiring the completion lease, before
+/// `finish_complete`); `abort_multipart_upload`'s `abort_expired_completing`
+/// CAS (`state = 'completing' AND lease_until < now`) is what reclaims it.
+///
+/// There is no public API path that leaves a session `completing` with an
+/// already-expired lease (acquiring the lease requires `expires_at > now`,
+/// and normally the completer finishes well within its own lease), so this
+/// backdates both columns directly through the entity layer -- same
+/// mechanism as `sweep_deletes_versionless_file_past_grace`'s `created_at`
+/// backdate above.
+#[tokio::test]
+async fn sweep_aborts_expired_completing_session() {
+    use sea_orm::sea_query::Expr;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    use toolkit_db::secure::SecureUpdateExt;
+
+    use file_storage::infra::storage::entity::multipart_upload::{
+        Column as UploadColumn, Entity as UploadEntity,
+    };
+
+    // grace = 1h is still needed here, but no longer for the reason this
+    // comment used to give: `list_pending_older_than` now excludes a
+    // `completing` session's own backing version unconditionally (regardless
+    // of lease or `expires_at`), so step 1 can no longer race *that* version
+    // out from under step 2 no matter the grace setting. What still needs a
+    // non-zero grace is `create_file`'s OWN pending version (`ticket`,
+    // separate from the multipart session's `plan.version_id`) -- it is not
+    // tied to any multipart session, so nothing but its wall-clock age keeps
+    // step 1 from reclaiming it at `grace_secs = 0`, which would delete it
+    // and (once step 2 later reclaims the multipart version too) leave the
+    // file with zero versions -- cascading away this very session row before
+    // this test gets to assert on its `Aborted` state. A 1h grace keeps that
+    // unrelated fresh version out of step 1's reach, isolating this test to
+    // step 2's own behavior.
+    let (svc, msvc, store, engine, db, _backend) = build_all_with_db(3600).await;
+    let tenant = Uuid::now_v7();
+    let ctx = ctx(tenant);
+
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+    let session = msvc
+        .initiate_multipart_upload(&ctx, ticket.file_id, "text/plain", 1024, None, None, false)
+        .await
+        .unwrap();
+
+    // Move the session straight to an expired-completing state: `completing`
+    // with a `lease_until` in the past, and `expires_at` in the past too --
+    // `list_expired`'s predicate requires `expires_at < now` regardless of
+    // which half of its `state` OR matched.
+    let conn = db.conn().expect("conn");
+    let past = time::OffsetDateTime::now_utc() - time::Duration::hours(1);
+    let rows_updated = UploadEntity::update_many()
+        .col_expr(UploadColumn::State, Expr::value("completing"))
+        .col_expr(UploadColumn::LeaseUntil, Expr::value(Some(past)))
+        .col_expr(
+            UploadColumn::LeaseOwner,
+            Expr::value(Some("stale-completer".to_owned())),
+        )
+        .col_expr(UploadColumn::ExpiresAt, Expr::value(past))
+        .filter(UploadColumn::UploadId.eq(session.upload_id))
+        .secure()
+        .scope_with(&toolkit_security::AccessScope::allow_all())
+        .exec(&conn)
+        .await
+        .expect("backdate session into expired completing state");
+    assert_eq!(
+        rows_updated.rows_affected, 1,
+        "the backdate must hit exactly the session row created above"
+    );
+
+    // Confirm it is actually picked up by the sweep's own listing query --
+    // this is the index-hardening migration's `completing`-branch predicate.
+    let expired = store
+        .list_expired_multipart_uploads(time::OffsetDateTime::now_utc())
+        .await
+        .unwrap();
+    assert!(
+        expired.iter().any(|s| s.upload_id == session.upload_id),
+        "an expired-lease completing session must appear in the sweep's expired list"
+    );
+
+    let result = engine.run_sweep().await;
+    assert!(
+        result.expired_multipart_aborted >= 1,
+        "sweep must report the completing session as aborted"
+    );
+
+    let after = store
+        .get_multipart_upload(session.upload_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after.state,
+        file_storage::domain::multipart::MultipartUploadState::Aborted,
+        "an expired-lease completing session must be aborted by the sweep, not left dangling"
+    );
+    assert!(
+        after.lease_until.is_none(),
+        "abort_expired_completing clears the lease alongside the state transition"
+    );
+}
+
+/// End-to-end regression for `m20260902_000001_index_hardening`'s
+/// `idempotency_keys_file_idx`: `idempotency_keys.file_id` carries `ON DELETE
+/// CASCADE` back to `files`, so deleting a file through the real service path
+/// must leave no `idempotency_keys` row behind for it. Asserted via a raw
+/// row count against a second, independent connection to the same sqlite
+/// file (the `Store`/`CleanupStore` API surface has no getter for this
+/// table) -- same technique as `tests/multipart_test.rs`'s
+/// `count_files_rows`.
+#[tokio::test]
+async fn delete_file_cascades_idempotency_keys() {
+    use sea_orm::{ConnectionTrait, Database, Statement};
+
+    let (svc, _psvc, _msvc, _dp, _store, _engine, _backend, dsn) = build_all_with_dsn(0).await;
+    let tenant = Uuid::now_v7();
+    let ctx = ctx(tenant);
+
+    let ticket = svc
+        .create_file(
+            &ctx,
+            new_file(),
+            Some("cascade-test-idem-key".to_owned()),
+            false,
+        )
+        .await
+        .unwrap();
+
+    // `sea_orm`'s sqlite driver binds a `Uuid` column as a raw 16-byte BLOB
+    // (not a hyphenated TEXT string) -- see `tests/multipart_test.rs`'s
+    // `tamper_request_hash` for the same caveat -- so the raw query below
+    // must match via an `X'...'` blob literal, not a quoted string.
+    let file_hex = ticket
+        .file_id
+        .as_bytes()
+        .iter()
+        .fold(String::new(), |mut acc, b| {
+            use std::fmt::Write;
+            write!(acc, "{b:02x}").expect("writing to a String cannot fail");
+            acc
+        });
+    let count_sql =
+        format!("SELECT COUNT(*) AS c FROM idempotency_keys WHERE file_id = X'{file_hex}'");
+
+    let conn = Database::connect(&dsn).await.expect("raw connect");
+    let before = conn
+        .query_one_raw(Statement::from_string(
+            conn.get_database_backend(),
+            count_sql.clone(),
+        ))
+        .await
+        .expect("count query")
+        .expect("one row")
+        .try_get::<i64>("", "c")
+        .expect("i64 column c");
+    assert_eq!(
+        before, 1,
+        "create_file with an idempotency_key must have inserted exactly one row"
+    );
+
+    svc.delete_file(&ctx, ticket.file_id, Some("*"))
+        .await
+        .expect("delete_file must succeed");
+
+    let after = conn
+        .query_one_raw(Statement::from_string(
+            conn.get_database_backend(),
+            count_sql,
+        ))
+        .await
+        .expect("count query")
+        .expect("one row")
+        .try_get::<i64>("", "c")
+        .expect("i64 column c");
+    assert_eq!(
+        after, 0,
+        "deleting the file must cascade-delete its idempotency_keys rows via \
+         idempotency_keys_file_idx's FK ON DELETE CASCADE"
+    );
+}
+
+/// Regression test: a transient `get_file` failure during the audit-tenant
+/// lookup in `abort_expired_multipart_session` must be **logged** (`warn!`),
+/// not silently folded into the same `Uuid::nil()` fallback used for a
+/// genuinely-missing file, with no trace of why. The fix reuses
+/// `load_file_for_audit` (already used elsewhere in the same file for this
+/// exact purpose) at this call site.
+///
+/// Wires the sweep to `FaultyGetFileStore`, which fails `get_file` only for
+/// the one file this test cares about -- everything else (finding the
+/// expired session, aborting it, reclaiming the pending version) goes
+/// through the real `Store` unchanged. This proves two things at once: the
+/// sweep's own behavior is unaffected by the lookup failure (the session is
+/// still aborted, the version still reclaimed -- the fallback to a nil
+/// tenant is a pre-existing, intentional best-effort choice this fix does
+/// not change), while a warning naming the failing `file_id` is now emitted
+/// where none was before.
+#[tokio::test]
+async fn abort_expired_session_logs_warning_on_transient_get_file_error() {
+    let (svc, msvc, store, _default_engine, _db, backend) = build_all_with_db(0).await;
+    let tenant = Uuid::now_v7();
+    let ctx = ctx(tenant);
+
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+    let _live_session = msvc
+        .initiate_multipart_upload(&ctx, ticket.file_id, "text/plain", 1024, None, None, false)
+        .await
+        .unwrap();
+
+    // Backdate a second multipart session so the sweep has something to
+    // abort (same setup as `expired_multipart_session_is_aborted_by_sweep`).
+    let upload_id2 = Uuid::now_v7();
+    let file_id2 = ticket.file_id;
+    let version_id2 = Uuid::now_v7();
+    let past_time = time::OffsetDateTime::now_utc() - time::Duration::hours(1);
+    let now_t = time::OffsetDateTime::now_utc();
+
+    store
+        .insert_pending_version(
+            file_id2,
+            version_id2,
+            "text/plain",
+            "mem",
+            &format!("/{file_id2}/{version_id2}"),
+            now_t,
+        )
+        .await
+        .unwrap();
+    store
+        .create_multipart_upload(
+            upload_id2,
+            file_id2,
+            version_id2,
+            "fake-backend-handle",
+            Some("mem"),
+            Some(&format!("/{file_id2}/{version_id2}")),
+            "text/plain",
+            0u64,
+            0u64,
+            false,
+            past_time,
+            now_t,
+        )
+        .await
+        .unwrap();
+
+    // An engine wired to the faulty store: `get_file(file_id2)` returns
+    // `Err(DomainError::InternalError)` -- a real, possibly-transient DB
+    // error, not the file being genuinely absent.
+    let backends = BackendRegistry::new(vec![Arc::clone(&backend)], "mem").expect("registry");
+    let faulty_store: Arc<dyn CleanupStore> = Arc::new(FaultyGetFileStore {
+        inner: store.clone(),
+        fault_file_id: file_id2,
+    });
+    let engine = CleanupEngine::new(
+        faulty_store,
+        backends,
+        CleanupConfig {
+            orphan_grace_secs: 0,
+        },
+    );
+
+    let subscriber = RecordingSubscriber::default();
+    let messages = Arc::clone(&subscriber.messages);
+    // Thread-local default -- see `RecordingSubscriber`'s doc comment for why
+    // this is safe to hold across the `.await` below.
+    let tracing_guard = tracing::subscriber::set_default(subscriber);
+    let result = engine.run_sweep().await;
+    drop(tracing_guard);
+
+    assert!(
+        result.expired_multipart_aborted >= 1,
+        "sweep must still abort the backdated session despite the get_file failure"
+    );
+    let aborted_session = store
+        .get_multipart_upload(upload_id2)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        aborted_session.state,
+        file_storage::domain::multipart::MultipartUploadState::Aborted,
+        "session must still be aborted even though the audit-tenant lookup failed"
+    );
+
+    let captured = messages.lock().expect("recording subscriber mutex");
+    assert!(
+        captured.iter().any(|m| m.contains("WARN")
+            && m.to_lowercase().contains("failed to load file")
+            && m.contains(&file_id2.to_string())),
+        "a transient get_file failure during the audit-tenant lookup must be logged as a \
+         warning naming the file_id; captured events: {captured:?}"
     );
 }
 
@@ -1072,6 +1665,113 @@ async fn sweep_skips_pending_version_of_active_multipart_session() {
         session_after.state,
         file_storage::domain::multipart::MultipartUploadState::InProgress,
         "the live session must survive the sweep untouched"
+    );
+}
+
+/// A `completing` session under a live completion lease must block step 1
+/// exactly like a live `in_progress` one, even once its backing pending
+/// version is older than `orphan_grace_secs` -- a client's `complete` call
+/// that takes longer than the grace window to assemble the object (a large
+/// file) must not have its pending version (and, transitively, its parent
+/// `files` row) deleted out from under the in-flight assembly.
+///
+/// Before this fix, `list_pending_older_than`'s exclusion subquery only
+/// matched `state = 'in_progress' AND expires_at > now`; a `completing`
+/// session (`has_active_for_file`/`has_active_multipart_for_file`, née
+/// `has_in_progress_*`, had the same narrowing) fell through it entirely,
+/// so step 1 would reclaim the version -- and the file, once it became a
+/// zero-version orphan -- while the completer still held a live lease.
+#[tokio::test]
+async fn sweep_skips_pending_version_of_completing_session() {
+    use sea_orm::sea_query::Expr;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    use toolkit_db::secure::SecureUpdateExt;
+
+    use file_storage::infra::storage::entity::file_version::{
+        Column as FileVersionColumn, Entity as FileVersionEntity,
+    };
+
+    // grace = 1 hour, same as the sibling `in_progress` test above -- only
+    // the deliberately backdated multipart-session version should ever be a
+    // sweep candidate.
+    let (svc, msvc, store, engine, db, _backend) = build_all_with_db(3600).await;
+    let tenant = Uuid::now_v7();
+    let ctx = ctx(tenant);
+
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+    let plan = msvc
+        .initiate_multipart_upload(&ctx, ticket.file_id, "text/plain", 1024, None, None, false)
+        .await
+        .unwrap();
+
+    // Move the session to `completing` under a live lease -- the state a
+    // real `complete_multipart_upload` call leaves it in while it assembles
+    // the final object.
+    let now = time::OffsetDateTime::now_utc();
+    let acquired = store
+        .acquire_multipart_complete_lease(
+            plan.upload_id,
+            "completer-a",
+            now + time::Duration::minutes(5),
+            now,
+        )
+        .await
+        .unwrap();
+    assert!(acquired, "setup: must acquire the lease before completing");
+
+    // Backdate the backing pending version's `created_at` well past the
+    // grace cutoff -- simulating an assembly that started long after the
+    // upload session itself, or simply a slow completer -- while the lease
+    // above stays live.
+    let conn = db.conn().expect("conn");
+    let backdated = now - time::Duration::hours(2);
+    FileVersionEntity::update_many()
+        .col_expr(FileVersionColumn::CreatedAt, Expr::value(backdated))
+        .filter(FileVersionColumn::VersionId.eq(plan.version_id))
+        .secure()
+        .scope_with(&toolkit_security::AccessScope::allow_all())
+        .exec(&conn)
+        .await
+        .expect("backdate version created_at");
+
+    let result = engine.run_sweep().await;
+    assert_eq!(
+        result.abandoned_pending_deleted, 0,
+        "a pending version backing a live completing session must not be reclaimed"
+    );
+    assert_eq!(
+        result.abandoned_files_deleted, 0,
+        "the parent file must not be reclaimed while its only version is still \
+         backing a live completing session"
+    );
+
+    let version_after = store
+        .get_version(ticket.file_id, plan.version_id)
+        .await
+        .unwrap();
+    assert!(
+        version_after.is_some(),
+        "the completing session's backing version must survive the sweep"
+    );
+
+    let file_after = svc.get_file(&ctx, ticket.file_id).await;
+    assert!(
+        file_after.is_ok(),
+        "the parent file must survive the sweep untouched -- got: {file_after:?}"
+    );
+
+    let session_after = store
+        .get_multipart_upload(plan.upload_id)
+        .await
+        .unwrap()
+        .expect("session must still exist");
+    assert_eq!(
+        session_after.state,
+        file_storage::domain::multipart::MultipartUploadState::Completing,
+        "the live completing session must survive the sweep untouched"
     );
 }
 
@@ -1339,6 +2039,116 @@ async fn sweep_reclaims_version_after_session_expires_still_aborts_backend_and_d
         session_after.state,
         file_storage::domain::multipart::MultipartUploadState::Aborted,
         "the session must be aborted"
+    );
+}
+
+/// Regression (`m20260722_000001_multipart_auto_bind`'s `backend_id`/
+/// `backend_path` columns): when the `file_versions` row backing an expired
+/// session is already gone, cleanup must abort the backend upload on the
+/// session's OWN backend/path -- read from the session row itself -- not
+/// silently fall back to the *default* backend plus a recomputed
+/// default-shaped path. Before those columns existed, a session whose
+/// upload was never on the default backend would have its abort call
+/// harmlessly no-op against the wrong (default) backend, leaking the real
+/// handle on the backend the upload actually used.
+#[tokio::test]
+async fn cleanup_aborts_on_the_sessions_own_backend_when_version_is_already_gone() {
+    let db = build_db().await;
+    let mem_backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let alt_backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("alt"));
+    let backends = BackendRegistry::new(
+        vec![Arc::clone(&mem_backend), Arc::clone(&alt_backend)],
+        "mem",
+    )
+    .expect("registry");
+
+    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let authorizer: Arc<dyn file_storage::domain::authz::Authorizer> =
+        Arc::new(TenantOnlyAuthorizer);
+    let store = Store::new(Arc::clone(&db));
+    let svc = Arc::new(FileService::new(
+        store.clone(),
+        backends.clone(),
+        issuer,
+        authorizer,
+        ServiceConfig {
+            default_url_ttl_secs: 3600,
+            sidecar_base_url: "http://sidecar.test".to_owned(),
+            default_page_size: 50,
+            max_page_size: 1000,
+            idempotency_ttl_secs: 86400,
+        },
+        None,
+        None,
+    ));
+    let sweep_store: Arc<dyn CleanupStore> = Arc::new(store.clone());
+    let engine = CleanupEngine::new(
+        sweep_store,
+        backends,
+        CleanupConfig {
+            orphan_grace_secs: 3600,
+        },
+    );
+
+    let tenant = Uuid::now_v7();
+    let ctx = ctx(tenant);
+    let file_id = svc.create_file_bare(&ctx, new_file()).await.unwrap();
+
+    // A real in-progress multipart upload against the NON-default "alt"
+    // backend -- the actual backend-side handle this test proves gets
+    // aborted (or leaked, on the old code).
+    let version_id = Uuid::now_v7();
+    let backend_path = format!("/{file_id}/{version_id}");
+    let backend_handle = alt_backend
+        .initiate_multipart(&backend_path)
+        .await
+        .expect("initiate on the alt backend");
+
+    // No `file_versions` row is ever inserted for this `version_id` -- models
+    // the version having already been reclaimed by a racing sweep step by the
+    // time cleanup gets to this session (see
+    // `cleanup_expired_session_version_with_file`'s doc comment). The session
+    // itself carries its own `backend_id`/`backend_path`, exactly as
+    // `initiate_multipart_upload` persists them.
+    let now = time::OffsetDateTime::now_utc();
+    let session = MultipartUploadSession {
+        upload_id: Uuid::now_v7(),
+        file_id,
+        version_id,
+        backend_upload_handle: backend_handle.clone(),
+        state: file_storage::domain::multipart::MultipartUploadState::InProgress,
+        declared_mime: "application/octet-stream".to_owned(),
+        mime_validated: false,
+        declared_size: 0,
+        part_size: 0,
+        auto_bind: false,
+        lease_until: None,
+        complete_result: None,
+        backend_id: Some("alt".to_owned()),
+        backend_path: Some(backend_path.clone()),
+        created_at: now,
+        expires_at: now - time::Duration::hours(1),
+    };
+
+    engine.cleanup_expired_session_version(&session).await;
+
+    // Prove the abort landed on "alt", not "mem": a still-live handle would
+    // accept another `upload_part` call; an aborted one reports "handle not
+    // found". On the old (buggy) fallback, this call would have SUCCEEDED --
+    // the abort would have silently no-op'd against "mem" instead.
+    let after_abort = alt_backend
+        .upload_part(
+            &backend_path,
+            &backend_handle,
+            1,
+            0,
+            Bytes::from_static(b"x"),
+        )
+        .await;
+    assert!(
+        after_abort.is_err(),
+        "the multipart handle on the session's OWN backend (\"alt\") must have been \
+         aborted, but it is still live: {after_abort:?}"
     );
 }
 

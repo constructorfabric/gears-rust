@@ -54,6 +54,16 @@ pub struct Model {
     /// Same migration as `auto_bind`.
     #[sea_orm(nullable)]
     pub complete_result: Option<String>,
+    /// The backend this session's upload actually targets, set once at
+    /// initiate time. `NULL` only for a session created before
+    /// `m20260722_000001_multipart_auto_bind` added this column (backfilled
+    /// from `file_versions` where a matching row still existed).
+    #[sea_orm(nullable)]
+    pub backend_id: Option<String>,
+    /// The backend object path this session's upload actually targets, same
+    /// provenance as `backend_id`.
+    #[sea_orm(nullable)]
+    pub backend_path: Option<String>,
     pub created_at: OffsetDateTime,
     pub expires_at: OffsetDateTime,
 }

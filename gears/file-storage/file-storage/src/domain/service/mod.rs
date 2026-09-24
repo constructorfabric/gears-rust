@@ -78,9 +78,13 @@ pub struct UploadTicket {
 #[allow(unknown_lints, de0309_must_have_domain_model)]
 #[derive(Debug, Clone)]
 pub struct FinalizeByTokenOutcome {
-    /// `None` — the token did not request a bind (staged/manual mode).
-    /// `Some(Bound)` / `Some(Conflict)` otherwise (`Manual` is never
-    /// produced here — a manual-mode token simply has no bind claim).
+    /// `None` — the token did not request a bind (staged/manual mode) and
+    /// this is that finalize's first, non-retried call. `Some(Bound)` /
+    /// `Some(Conflict)` for an auto-bind token (a won or lost
+    /// `content_id IS NULL` CAS). `Some(Manual)` only from the
+    /// idempotent-retry convergence path: a manual-mode token's finalize
+    /// retried against an already-`Available`, still-unbound version —
+    /// the handler treats it the same as `None` (no bind headers).
     pub bind_state: Option<crate::domain::multipart::BindState>,
     /// Content ETag after a successful bind (`Bound` only).
     pub etag: Option<String>,
@@ -160,10 +164,6 @@ impl FileService {
 
     pub(super) fn tenant_scope(ctx: &SecurityContext) -> AccessScope {
         AccessScope::for_tenant(ctx.subject_tenant_id())
-    }
-
-    pub(super) fn backend_path(file_id: Uuid, version_id: Uuid) -> String {
-        format!("/{file_id}/{version_id}")
     }
 
     pub(super) fn validate_gts_type(t: &str) -> Result<(), DomainError> {
@@ -344,6 +344,16 @@ pub(super) struct IdempotencyTicket {
     pub(super) file_id: Uuid,
     pub(super) version_id: Uuid,
     pub(super) upload_url: String,
+    /// The `bind` mode actually minted into `upload_url`'s token at the
+    /// original `create_file` call. A replay re-mints the URL with THIS
+    /// value, never with whatever `bind` the retry supplies — see
+    /// `create_file`'s doc comment and its idempotency-replay branch.
+    /// `#[serde(default)]` so a ticket stored before this field existed
+    /// deserializes as `false`: auto-bind did not exist yet when it was
+    /// written, so `false` is the correct historical value, not a
+    /// best-effort guess.
+    #[serde(default)]
+    pub(super) auto_bind: bool,
 }
 
 impl From<IdempotencyTicket> for UploadTicket {

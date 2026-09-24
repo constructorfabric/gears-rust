@@ -1355,3 +1355,199 @@ async fn finalize_bind_claim_lost_cas_reports_conflict() {
     .await
     .expect("manual rebind with the conflict-reported ETag");
 }
+
+// ── t22: manual-mode (`bind_on_finalize: false`) retry convergence ──────────
+//
+// The sidecar publishes every single-part upload — auto-bind AND manual —
+// through the same replay-safe `publish_exclusive`. A lost finalize response
+// can therefore retry into an already-`Available` version regardless of bind
+// mode, and the retry must converge to the same success, never a 409.
+
+/// (a) A manual token's finalize, replayed with the same size/hash after the
+/// version is already `Available`, converges to the same success instead of
+/// falling into `finalize_version`'s CAS (which would 409 as "already
+/// finalized"). `bind_state` is `Manual` (never bound), no `content_id`.
+#[tokio::test]
+async fn finalize_manual_token_converges_on_retry() {
+    let (svc, backend, store) = build_service().await;
+    let ctx = ctx(Uuid::now_v7());
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+
+    let bytes = Bytes::from_static(b"manual retry");
+    let path = backend_path(ticket.file_id, ticket.version_id);
+    backend.put(&path, bytes.clone()).await.unwrap();
+
+    let claims = Claims {
+        op: Op::Put,
+        file_id: ticket.file_id,
+        version_id: ticket.version_id,
+        backend_id: "mem".to_owned(),
+        backend_path: path,
+        exp: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
+        upload: UploadConstraints::default(),
+        multipart: MultipartClaims::default(),
+        request_id: "test-request-id".to_owned(),
+        content_type: String::new(),
+        etag: String::new(),
+        bind_on_finalize: false,
+    };
+
+    let outcome = svc
+        .finalize_upload_by_token(
+            &claims,
+            i64::try_from(bytes.len()).unwrap(),
+            hash::sha256(&bytes),
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome.bind_state, None, "manual mode requests no bind");
+
+    // Simulate the finalize response getting lost: the sidecar retries with
+    // the identical claims/size/hash.
+    let retry = svc
+        .finalize_upload_by_token(
+            &claims,
+            i64::try_from(bytes.len()).unwrap(),
+            hash::sha256(&bytes),
+        )
+        .await
+        .expect("honest manual-mode PUT retry must converge to success, not 409");
+    assert_eq!(retry.bind_state, Some(BindState::Manual));
+    assert_eq!(retry.etag, None);
+    assert_eq!(retry.current_etag, None);
+
+    let versions = store.list_versions(ticket.file_id).await.unwrap();
+    assert_eq!(
+        versions.len(),
+        1,
+        "the retry must not create or touch a second version row"
+    );
+    let file = store
+        .get_file(&toolkit_security::AccessScope::allow_all(), ticket.file_id)
+        .await
+        .unwrap()
+        .expect("file");
+    assert_eq!(
+        file.content_id, None,
+        "manual mode must never auto-bind, even on retry"
+    );
+}
+
+/// (b) A manual token's version, explicitly bound via `POST /files/{id}/bind`
+/// after the first finalize, then retried: the retry must report the
+/// now-current `Bound` state (not fall back to `Manual`), with the content
+/// ETag and no new CAS.
+#[tokio::test]
+async fn finalize_manual_token_converges_to_bound_after_manual_bind() {
+    let (svc, backend, _store) = build_service().await;
+    let ctx = ctx(Uuid::now_v7());
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+
+    let bytes = Bytes::from_static(b"manual then bound");
+    let path = backend_path(ticket.file_id, ticket.version_id);
+    backend.put(&path, bytes.clone()).await.unwrap();
+
+    let claims = Claims {
+        op: Op::Put,
+        file_id: ticket.file_id,
+        version_id: ticket.version_id,
+        backend_id: "mem".to_owned(),
+        backend_path: path,
+        exp: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
+        upload: UploadConstraints::default(),
+        multipart: MultipartClaims::default(),
+        request_id: "test-request-id".to_owned(),
+        content_type: String::new(),
+        etag: String::new(),
+        bind_on_finalize: false,
+    };
+
+    svc.finalize_upload_by_token(
+        &claims,
+        i64::try_from(bytes.len()).unwrap(),
+        hash::sha256(&bytes),
+    )
+    .await
+    .unwrap();
+
+    svc.bind(&ctx, ticket.file_id, ticket.version_id, None)
+        .await
+        .expect("manual bind after finalize");
+
+    // Lost finalize response, retried after the manual bind landed.
+    let retry = svc
+        .finalize_upload_by_token(
+            &claims,
+            i64::try_from(bytes.len()).unwrap(),
+            hash::sha256(&bytes),
+        )
+        .await
+        .expect("retry after manual bind must converge to success");
+    assert_eq!(retry.bind_state, Some(BindState::Bound));
+    assert!(
+        retry.etag.is_some(),
+        "bound retry must report the content ETag"
+    );
+    assert_eq!(retry.current_etag, None);
+}
+
+/// (c) A manual token's finalize retried with a mismatched size/hash (a
+/// corrupted or forged replay, not an honest retry) must stay rejected, same
+/// as the auto-bind fast path.
+#[tokio::test]
+async fn finalize_manual_token_retry_with_mismatched_hash_is_rejected() {
+    let (svc, backend, _store) = build_service().await;
+    let ctx = ctx(Uuid::now_v7());
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+
+    let bytes = Bytes::from_static(b"manual original");
+    let path = backend_path(ticket.file_id, ticket.version_id);
+    backend.put(&path, bytes.clone()).await.unwrap();
+
+    let claims = Claims {
+        op: Op::Put,
+        file_id: ticket.file_id,
+        version_id: ticket.version_id,
+        backend_id: "mem".to_owned(),
+        backend_path: path,
+        exp: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
+        upload: UploadConstraints::default(),
+        multipart: MultipartClaims::default(),
+        request_id: "test-request-id".to_owned(),
+        content_type: String::new(),
+        etag: String::new(),
+        bind_on_finalize: false,
+    };
+
+    svc.finalize_upload_by_token(
+        &claims,
+        i64::try_from(bytes.len()).unwrap(),
+        hash::sha256(&bytes),
+    )
+    .await
+    .unwrap();
+
+    // Retry claims different bytes than what was actually stored/verified.
+    let mismatched = Bytes::from_static(b"forged replay!!!");
+    let err = svc
+        .finalize_upload_by_token(
+            &claims,
+            i64::try_from(mismatched.len()).unwrap(),
+            hash::sha256(&mismatched),
+        )
+        .await
+        .expect_err("a mismatched replay must not converge to success");
+    assert!(
+        matches!(err, DomainError::HashMismatch { .. }),
+        "expected a hash-mismatch rejection, got {err:?}"
+    );
+}
