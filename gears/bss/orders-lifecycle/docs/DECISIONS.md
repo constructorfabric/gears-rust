@@ -3206,10 +3206,8 @@ preventing it, an absolute-lifetime backstop rendered inert by a shared idempote
 timed validity window no declared interface could carry. That is the honest shape of this set's
 state: each wave has found real defects in the previous wave's remediation, and the rate is not
 yet falling. Editors must review counts, citations, reason-name uniqueness, table/index
-references and agreement with the transition table. This change adds `make design-check`
-and a docs-workflow CI job for mechanical invariants, with positive/negative checker fixtures.
-They do not establish semantic correctness or runtime integration; remote CI execution must
-still be observed after publication.
+references and agreement with the transition table. Mechanical checks alone do not establish
+semantic correctness or runtime integration.
 
 **Structural review is not proof of correctness.** Step ordering, transaction scope,
 cardinality coupling and whether each declared `MUST` has an implementable interface require

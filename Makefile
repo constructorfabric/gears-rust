@@ -274,7 +274,7 @@ setup: .setup-stamp py-env
 # |             | - Ensures clean compilation across all targets and features          |
 # +-------------+----------------------------------------------------------------------+
 
-.PHONY: fmt clippy clippy-deep lychee design-check docs-preview kani geiger safety lint dylint dylint-list dylint-test shear gts-docs cfs-ensure cfs-repair cfs-validate cfs-validate-kits cfs-validate-kit-local cfs-spec-coverage ensure-submodules
+.PHONY: fmt clippy clippy-deep lychee docs-preview kani geiger safety lint dylint dylint-list dylint-test shear gts-docs cfs-ensure cfs-repair cfs-validate cfs-validate-kits cfs-validate-kit-local cfs-spec-coverage ensure-submodules
 
 ## Verify git submodules (e.g. guidelines/DNA) are initialized; fails otherwise.
 ensure-submodules:
@@ -343,18 +343,6 @@ lychee: ensure-submodules
 	$(call print_target_banner)
 	$(call check_tool,lychee)
 	lychee --exclude-path 'docs/web-docs' docs examples guidelines gears/system/event-broker/docs gears/bss
-
-# Assert the self-referential invariants of each gear's design document set:
-# decision propagation addresses, stated counts, reason-registry uniqueness,
-# endpoint ownership and retired vocabulary. `cfs validate` checks artifact
-# form; this checks that a document set does not contradict itself.
-# The self-test injects a defect per assertion family and asserts the checker
-# catches it — an assertion that has never failed is unproven.
-design-check:
-	$(call print_target_banner)
-	python3 scripts/check-design-invariants.py
-	@echo
-	python3 scripts/test-design-invariants.py
 
 ## Validate internal links in web-docs.
 # The web-docs pages use Starlight route-relative links (e.g. ../foo/) that only

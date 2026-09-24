@@ -907,7 +907,6 @@ Stable contract namespaces `01`–`08` retain the source section addresses used 
 propagation and algorithm citations. The table resolves each address to its current canonical
 section. A bare section reference inside a detailed contract uses that contract’s namespace;
 explicit cross-contract citations name their namespace. These addresses are not file paths.
-The machine-readable map in [scripts/orders-lifecycle-doc-map.json](../../../../scripts/orders-lifecycle-doc-map.json) drives the invariant checks.
 
 | Contract address | Canonical section |
 |------------------|-------------------|
