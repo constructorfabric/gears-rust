@@ -192,7 +192,7 @@ pub async fn get_setting(
     let dto: EffectiveValueDto = render(&effective, pii);
     let etag = dto.etag.clone();
     // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-source-trail:p1:inst-vr-trail-9
-    Ok(([(header::ETAG, etag)], Json(dto)))
+    Ok(([(header::ETAG, super::etag_header(&etag))], Json(dto)))
     // @cpt-end:cpt-cf-settings-service-flow-value-resolution-source-trail:p1:inst-vr-trail-9
 }
 

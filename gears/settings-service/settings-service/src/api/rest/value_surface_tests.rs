@@ -336,8 +336,10 @@ async fn a_committed_write_carries_its_tag_in_the_etag_header() {
             h.inner.tree.root,
         )
         .await;
+    // The header is the body's tag as an HTTP entity tag: quoted, strong.
     let header = answer.etag.as_deref().expect("an ETag header");
-    assert_eq!(Some(header), answer.body["etag"].as_str());
+    let body_tag = answer.body["etag"].as_str().expect("a body tag");
+    assert_eq!(header, format!("\"{body_tag}\""));
 
     // And it is the tag the next write presents.
     let next = h

@@ -1671,7 +1671,7 @@ Two things follow from the shape of this flow. An orphan is possible by construc
 
 ### 4.7 Database schemas & tables
 
-> **Timestamps:** all timestamp columns use `TIMESTAMPTZ`; REST serializes ISO-8601 UTC with milliseconds. Tables exposed via `PATCH` set `updated_at = NOW` on every write; the `If-Match`/ETag precondition (§4.3) is derived from the normalized UTC `updated_at`.
+> **Timestamps:** all timestamp columns use `TIMESTAMPTZ`; REST serializes ISO-8601 UTC with milliseconds. Tables exposed via `PATCH` set `updated_at = NOW` on every write; the `If-Match`/ETag precondition (§4.3) is derived from the normalized UTC `updated_at`. The `ETag` header sends that tag as a strong entity tag, in double quotes (RFC 9110); a body's `etag` field carries it bare, and `If-Match` accepts either.
 
 #### Table: `categories`
 

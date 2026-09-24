@@ -75,7 +75,7 @@ fn conn_error(err: &toolkit_db::DbError) -> DomainError {
 
 fn with_etag(readout: &AccessReadout) -> ([(header::HeaderName, String); 1], Json<AccessReadDto>) {
     let dto = render_readout(readout);
-    ([(header::ETAG, dto.etag.clone())], Json(dto))
+    ([(header::ETAG, super::etag_header(&dto.etag))], Json(dto))
 }
 
 /// `GET /settings-service/v1/settings/{key}/permissions?tenant={tenant_id}`

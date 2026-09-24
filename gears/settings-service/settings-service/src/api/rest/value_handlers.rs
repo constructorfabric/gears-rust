@@ -186,7 +186,7 @@ pub async fn set_value(
     let pii = may_read_pii(&enforcer, &ctx).await;
     respond(outcome.map(|committed| {
         let dto = render_committed(&committed, pii);
-        ([(header::ETAG, dto.etag.clone())], Json(dto))
+        ([(header::ETAG, super::etag_header(&dto.etag))], Json(dto))
     }))
     // @cpt-end:cpt-cf-settings-service-flow-value-writes-set:p1:inst-vw-set-6
 }
@@ -324,7 +324,7 @@ pub async fn clone_value(
     let pii = may_read_pii(&enforcer, &ctx).await;
     respond(outcome.map(|committed| {
         let dto = render_committed(&committed, pii);
-        ([(header::ETAG, dto.etag.clone())], Json(dto))
+        ([(header::ETAG, super::etag_header(&dto.etag))], Json(dto))
     }))
     // @cpt-end:cpt-cf-settings-service-flow-value-writes-clone:p1:inst-vw-clone-7
 }

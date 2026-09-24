@@ -71,7 +71,7 @@ pub async fn get_category<R: CategoryRepository + 'static, S: AuditSink + 'stati
     // cannot echo back a stale copy it read from the wrong place.
     let etag = category.etag.as_str().to_owned();
     Ok((
-        [(axum::http::header::ETAG, etag)],
+        [(axum::http::header::ETAG, super::etag_header(&etag))],
         Json(CategoryDto::from(category)),
     ))
     // @cpt-end:cpt-cf-settings-service-flow-category-management-get:p1:inst-cat-get-8
@@ -182,7 +182,7 @@ pub async fn create_category<R: CategoryRepository + 'static, S: AuditSink + 'st
     Ok((
         StatusCode::CREATED,
         [
-            (axum::http::header::ETAG, etag),
+            (axum::http::header::ETAG, super::etag_header(&etag)),
             (axum::http::header::LOCATION, location),
         ],
         Json(CategoryDto::from(created)),
@@ -237,7 +237,7 @@ pub async fn update_category<R: CategoryRepository + 'static, S: AuditSink + 'st
     // @cpt-begin:cpt-cf-settings-service-flow-category-management-update:p1:inst-cat-update-15
     let etag = updated.etag.as_str().to_owned();
     Ok((
-        [(axum::http::header::ETAG, etag)],
+        [(axum::http::header::ETAG, super::etag_header(&etag))],
         Json(CategoryDto::from(updated)),
     ))
     // @cpt-end:cpt-cf-settings-service-flow-category-management-update:p1:inst-cat-update-15

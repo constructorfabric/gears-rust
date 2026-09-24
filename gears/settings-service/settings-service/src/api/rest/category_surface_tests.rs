@@ -59,9 +59,16 @@ async fn a_create_answers_201_with_the_location_and_the_state_tag() {
         Some(format!("{CATEGORIES}/{id}").as_str()),
         "the created resource names where it now lives"
     );
+    // And the tag the next write must present, as an HTTP entity tag:
+    // quoted and strong, per RFC 9110.
+    let header = answer.etag.expect("the tag the next write must present");
+    let inner = header
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .expect("a quoted entity tag");
     assert!(
-        answer.etag.is_some(),
-        "and the tag the next write must present"
+        !inner.is_empty() && !inner.contains('"'),
+        "a bare tag inside the quotes: {header}"
     );
 }
 

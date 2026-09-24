@@ -72,7 +72,8 @@ async fn a_pair_with_no_row_reads_overridable_and_carries_a_tag_a_write_can_pres
         body.get("stored").is_none(),
         "and reading created no row: {body}"
     );
-    assert_eq!(tag, "absent");
+    assert_eq!(tag, "\"absent\"", "the absent-state tag, as an entity tag");
+    assert_eq!(body["etag"], json!("absent"), "and bare in the body");
 
     // That tag is what a first write presents, and it is accepted.
     assert_eq!(

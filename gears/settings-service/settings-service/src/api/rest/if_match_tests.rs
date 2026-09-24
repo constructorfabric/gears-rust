@@ -3,7 +3,7 @@
 
 use axum::http::{HeaderMap, HeaderValue, header};
 
-use super::if_match;
+use super::{etag_header, if_match};
 
 fn headers(value: &str) -> HeaderMap {
     let mut h = HeaderMap::new();
@@ -46,4 +46,15 @@ fn a_weak_validator_is_not_the_tag() {
 #[test]
 fn an_absent_header_is_absent() {
     assert_eq!(if_match(&HeaderMap::new()), None);
+}
+
+#[test]
+fn a_tag_goes_out_as_a_strong_entity_tag_and_comes_back_as_itself() {
+    // Out in quotes, per the entity-tag grammar; back through `If-Match` as
+    // the bare tag the domain compares — whether the client echoes the header
+    // or copies the body's `etag`.
+    let out = etag_header("1789462318419665000");
+    assert_eq!(out, "\"1789462318419665000\"");
+    assert_eq!(if_match(&headers(&out)), Some("1789462318419665000"));
+    assert_eq!(etag_header("absent"), "\"absent\"");
 }

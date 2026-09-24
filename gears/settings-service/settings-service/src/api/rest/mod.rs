@@ -18,6 +18,16 @@ pub(crate) fn if_match(headers: &axum::http::HeaderMap) -> Option<&str> {
         .map(|v| v.trim().trim_matches('"'))
 }
 
+/// A state tag as the `ETag` header carries it: a strong entity tag, the
+/// tag in double quotes (RFC 9110 §8.8.3).
+///
+/// Only the header is framed. A body's `etag` field is the bare tag, and
+/// [`if_match`] takes either back — the quotes are HTTP's, not the tag's — so
+/// a client may echo the header or copy the field.
+pub(crate) fn etag_header(tag: &str) -> String {
+    format!("\"{tag}\"")
+}
+
 pub mod access_dto;
 pub mod access_handlers;
 pub mod access_routes;

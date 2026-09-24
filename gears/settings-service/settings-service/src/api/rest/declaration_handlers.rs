@@ -63,7 +63,10 @@ pub async fn get_declaration<R: DeclarationRepository>(
     // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-read:p1:inst-decl-read-9
     let dto = DeclarationDto::from(declaration);
     let etag = dto.etag.clone();
-    Ok(([(axum::http::header::ETAG, etag)], Json(dto)))
+    Ok((
+        [(axum::http::header::ETAG, super::etag_header(&etag))],
+        Json(dto),
+    ))
     // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-read:p1:inst-decl-read-9
 }
 
@@ -192,7 +195,7 @@ pub async fn create_declaration(
     Ok((
         status,
         [
-            (axum::http::header::ETAG, etag),
+            (axum::http::header::ETAG, super::etag_header(&etag)),
             (axum::http::header::LOCATION, location),
         ],
         Json(dto),
@@ -256,7 +259,11 @@ pub async fn update_declaration(
     admin.evict(&updated.key);
     let dto = DeclarationDto::from(svc.render_one(updated).await);
     let etag = dto.etag.clone();
-    Ok(([(axum::http::header::ETAG, etag)], Json(dto)).into_response())
+    Ok((
+        [(axum::http::header::ETAG, super::etag_header(&etag))],
+        Json(dto),
+    )
+        .into_response())
 }
 
 /// `DELETE /settings-service/v1/declarations/{id}`
@@ -311,5 +318,9 @@ pub async fn retire_declaration(
     admin.evict(&retired.key);
     let dto = DeclarationDto::from(svc.render_one(retired).await);
     let etag = dto.etag.clone();
-    Ok(([(axum::http::header::ETAG, etag)], Json(dto)).into_response())
+    Ok((
+        [(axum::http::header::ETAG, super::etag_header(&etag))],
+        Json(dto),
+    )
+        .into_response())
 }

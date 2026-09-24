@@ -131,7 +131,7 @@ GTS grammar is **not** re-implemented here. The platform GTS identifier library 
 1. [x] - `p1` - **IF** the operation is a mutating `PATCH` or `DELETE` and no `If-Match` header is present → **RETURN** `428` precondition required - `inst-gf-precond-1`
 2. [x] - `p1` - Compute the current ETag from the target's persisted representation - `inst-gf-precond-2`
 3. [x] - `p1` - **IF** the supplied `If-Match` — read the same way on every mutation handler: the header's surrounding whitespace and one pair of double quotes stripped, nothing else, a weak validator left as it is — does not equal the current ETag byte for byte → **RETURN** `412` precondition failed - `inst-gf-precond-3`
-4. [x] - `p1` - **RETURN** proceed, and carry the computed ETag forward so the handler can emit a refreshed value on success - `inst-gf-precond-4`
+4. [x] - `p1` - **RETURN** proceed, and carry the computed ETag forward so the handler can emit a refreshed value on success — in the `ETag` header as a strong entity tag, the tag in double quotes (RFC 9110), while a body's `etag` field carries the bare tag; `If-Match` takes either back - `inst-gf-precond-4`
 
 ### Domain Error to Problem Mapping
 
