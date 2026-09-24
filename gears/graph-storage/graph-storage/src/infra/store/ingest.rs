@@ -1320,8 +1320,10 @@ async fn upsert_edge(
     // Zero rows means the row this write was prepared against is gone, and
     // answering `Updated` would tell the caller its payload landed when
     // nothing holds it. A scope replacement removes an edge it no longer
-    // declares with a hard delete, not a tombstone, so under read-committed
-    // the row can disappear between the read above and this statement.
+    // declares with a hard delete, not a tombstone, and these transactions
+    // begin without setting an isolation level: at the server default the row
+    // can disappear between the read above and this statement rather than
+    // raising a serialization failure.
     //
     // Unlike a node, an edge has no tombstone conflict to report here: a
     // tombstoned edge is deliberately revived by this very statement, which
