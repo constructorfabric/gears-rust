@@ -34,22 +34,30 @@ DO:
   SET BASELINE_REF = origin/main or the prior release tag WHEN the user did not provide a baseline
   SET CURRENT_REF = HEAD WHEN the user did not provide a current ref
   EMIT_MENU ModeMenu WHEN MODE == unset
-  RUN ChangeImpactSubsteps
-  RUN report-render: aggregate the sub-step results and format them into `.change-impact/{UPSTREAM_ARTIFACT_ID}/report.md` with sections Summary, Cascade tree, Coverage gaps, Stale flags, Traceability evidence
-  EMIT the report path and a short findings summary
+  CONTINUE ChangeImpactRun WHEN MODE != unset
 RULES:
   ALWAYS resolve MODE, UPSTREAM_ARTIFACT_TYPE, UPSTREAM_ARTIFACT_ID, BASELINE_REF, and CURRENT_REF before running the sub-steps
   ALWAYS read every threshold from {change_impact_config}, never hard-code thresholds in this workflow
   ALWAYS use gears kit constraints and artifact autodetect paths when tracing downstream Gears artifacts and code
-  ALWAYS keep this workflow read-only - write only the report under `.change-impact/`, never edit artifacts or code
-  ALWAYS write the report under a dedicated `.change-impact/` namespace, never under `.prs/`
+  ALWAYS keep this workflow read-only - write only the report under the dedicated `.change-impact/` namespace (never under `.prs/`), never edit artifacts or code
   NEVER block a merge from this workflow; it reports impact, it does not gate
 MENU ModeMenu
 TITLE: Choose the analysis mode - cascade-tracking flags affected/stale artifacts; release-readiness-estimation scores impact and recommends a version bump.
 OPTIONS:
-  1 cascade-tracking -> SET MODE = cascade-tracking; CONTINUE ChangeImpactSubsteps
-  2 release-readiness-estimation -> SET MODE = release-readiness-estimation; CONTINUE ChangeImpactSubsteps
+  1 cascade-tracking -> SET MODE = cascade-tracking; CONTINUE ChangeImpactRun
+  2 release-readiness-estimation -> SET MODE = release-readiness-estimation; CONTINUE ChangeImpactRun
   INVALID -> EMIT_MENU ModeMenu
+```
+
+```pdsl
+UNIT ChangeImpactRun
+PURPOSE: Run the impact sub-steps and render the read-only report.
+WHEN:
+  REQUIRE MODE, UPSTREAM_ARTIFACT_TYPE, UPSTREAM_ARTIFACT_ID, BASELINE_REF, and CURRENT_REF are resolved
+DO:
+  RUN ChangeImpactSubsteps
+  RUN report-render: aggregate the sub-step results and format them into `.change-impact/{UPSTREAM_ARTIFACT_ID}/report.md` with sections Summary, Cascade tree, Coverage gaps, Stale flags, Traceability evidence
+  EMIT the report path and a short findings summary
 ```
 
 ```pdsl
