@@ -97,13 +97,9 @@ impl<R: TypeSchemaRegistry> SettingTypeRegistrar for TypesRegistryRegistrar<R> {
         // @cpt-begin:cpt-cf-settings-service-algo-module-contributions-type:p1:inst-mc-type-2
         // @cpt-begin:cpt-cf-settings-service-algo-module-contributions-type:p1:inst-mc-type-3
         // @cpt-begin:cpt-cf-settings-service-algo-module-contributions-type:p1:inst-mc-type-4
-        let results = self
-            .types
-            .register(schema)
-            .await
-            .map_err(|e| DomainError::Unavailable {
-                detail: format!("types registry: register_type_schemas: {e}"),
-            })?;
+        let results = self.types.register(schema).await.map_err(|e| {
+            DomainError::dependency_unavailable("types registry", "register the setting type", e)
+        })?;
         for result in results {
             if let RegisterResult::Err { error, .. } = result {
                 return Err(match error {
@@ -116,12 +112,15 @@ impl<R: TypeSchemaRegistry> SettingTypeRegistrar for TypesRegistryRegistrar<R> {
                     }
                     // The base is registered at this gear's init; its absence
                     // means the process is not the one that started.
-                    CanonicalError::FailedPrecondition { .. } => DomainError::Unavailable {
-                        detail: format!(
-                            "types registry refused `{key}`: the `{SETTING_TYPE_BASE}` base is \
-                             not registered — {error}"
-                        ),
-                    },
+                    CanonicalError::FailedPrecondition { .. } => {
+                        DomainError::dependency_unavailable(
+                            "types registry",
+                            &format!(
+                                "register `{key}`: the `{SETTING_TYPE_BASE}` base is not registered"
+                            ),
+                            error,
+                        )
+                    }
                     other => DomainError::Internal {
                         diagnostic: format!("types registry refused `{key}`: {other}"),
                     },
@@ -148,9 +147,11 @@ impl<R: TypeSchemaRegistry> TypesRegistryRegistrar<R> {
         value_type_id: &str,
     ) -> Result<(), DomainError> {
         let held = self.types.registered(&key.to_string()).await.map_err(|e| {
-            DomainError::Unavailable {
-                detail: format!("types registry: get_type_schema after already-exists: {e}"),
-            }
+            DomainError::dependency_unavailable(
+                "types registry",
+                "read back the already-registered setting type",
+                e,
+            )
         })?;
         let wanted = format!("gts://{value_type_id}");
         let registered = held

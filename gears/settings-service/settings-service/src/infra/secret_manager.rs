@@ -150,9 +150,7 @@ impl CredStoreSecretManager {
 }
 
 fn unavailable(operation: &str, err: &CredStoreError) -> DomainError {
-    DomainError::Unavailable {
-        detail: format!("the credential store could not {operation}: {err}"),
-    }
+    DomainError::dependency_unavailable("credential store", operation, err)
 }
 
 /// The bytes stored for a JSON plaintext: a string as itself, anything else

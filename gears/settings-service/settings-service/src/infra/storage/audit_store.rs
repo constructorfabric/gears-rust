@@ -33,9 +33,7 @@ const HISTORY_LIMIT_CFG: LimitCfg = LimitCfg {
 pub struct AuditStore;
 
 fn unavailable(err: impl std::fmt::Display) -> DomainError {
-    DomainError::Unavailable {
-        detail: format!("audit store: {err}"),
-    }
+    DomainError::dependency_unavailable("audit store", "complete the operation", err)
 }
 
 fn image_to_json(image: Option<&AuditValue>) -> Option<serde_json::Value> {

@@ -191,7 +191,13 @@ impl StepUpVerifier for AuthnStepUpVerifier {
                 | AuthNResolverError::ServiceUnavailable(_)
                 | AuthNResolverError::TokenAcquisitionFailed(_)
                 | AuthNResolverError::Internal(_)) => {
-                    StepUpRefusal::Unavailable(outage.to_string())
+                    // The resolver's own text goes to the log; the refusal —
+                    // which becomes a 503 detail — says only what failed.
+                    tracing::warn!(
+                        error = %crate::log_text::LogSafe(&outage),
+                        "step-up: the AuthN resolver could not be asked"
+                    );
+                    StepUpRefusal::Unavailable("the AuthN resolver could not be asked".to_owned())
                 }
             })?;
         // The resolver vouched for the signature over exactly these bytes, so

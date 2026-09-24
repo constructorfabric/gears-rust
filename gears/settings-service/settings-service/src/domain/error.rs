@@ -111,9 +111,15 @@ pub enum DomainError {
     },
 
     /// A dependency this service needs is unreachable. Renders as `503`.
+    ///
+    /// `detail` reaches the problem body verbatim, so it names the dependency
+    /// and the operation and nothing else — never the dependency's own error
+    /// text, which can carry hostnames, driver messages or DSN fragments. Build
+    /// it from such an error with [`Self::dependency_unavailable`], which logs
+    /// that text instead.
     #[error("settings unavailable: {detail}")]
     Unavailable {
-        /// What could not be reached.
+        /// What could not be reached, safe for the wire.
         detail: String,
     },
 
@@ -153,6 +159,29 @@ impl DomainError {
         match self {
             Self::Internal { diagnostic } => Some(diagnostic),
             _ => None,
+        }
+    }
+
+    /// A dependency outage, from the dependency's own error.
+    ///
+    /// The error's text is logged here, escaped, where the process can read
+    /// it; the returned detail — which a 503 body carries verbatim — says only
+    /// which dependency could not do what. The platform's problem-details
+    /// contract forbids raw vendor or driver text in that body.
+    #[must_use]
+    pub fn dependency_unavailable(
+        dependency: &'static str,
+        operation: &str,
+        err: impl std::fmt::Display,
+    ) -> Self {
+        tracing::warn!(
+            dependency,
+            operation,
+            error = %crate::log_text::LogSafe(&err),
+            "dependency unavailable"
+        );
+        Self::Unavailable {
+            detail: format!("the {dependency} could not {operation}"),
         }
     }
 

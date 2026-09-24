@@ -35,9 +35,7 @@ impl HubTenantHierarchy {
     fn client(&self) -> Result<Arc<dyn TenantResolverClient>, DomainError> {
         self.hub
             .get::<dyn TenantResolverClient>()
-            .map_err(|e| DomainError::Unavailable {
-                detail: format!("tenant resolver: {e}"),
-            })
+            .map_err(|e| DomainError::dependency_unavailable("tenant resolver", "be reached", e))
     }
 }
 
@@ -50,9 +48,7 @@ pub const SUBTREE_DEPTH_CEILING: u32 = 32;
 fn map(err: TenantResolverError) -> DomainError {
     match err {
         TenantResolverError::TenantNotFound { .. } => DomainError::NotFound { resource: "tenant" },
-        other => DomainError::Unavailable {
-            detail: format!("tenant resolver: {other}"),
-        },
+        other => DomainError::dependency_unavailable("tenant resolver", "answer", other),
     }
 }
 

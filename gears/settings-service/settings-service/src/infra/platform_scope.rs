@@ -46,17 +46,15 @@ impl PlatformScope for HubPlatformScope {
         if let Some(id) = self.root.get() {
             return Ok(*id);
         }
-        let tenants =
-            self.hub
-                .get::<dyn TenantResolverClient>()
-                .map_err(|e| DomainError::Unavailable {
-                    detail: format!("tenant resolver: {e}"),
-                })?;
+        let tenants = self
+            .hub
+            .get::<dyn TenantResolverClient>()
+            .map_err(|e| DomainError::dependency_unavailable("tenant resolver", "be reached", e))?;
         let root = tenants
             .get_root_tenant(&SecurityContext::anonymous())
             .await
-            .map_err(|e| DomainError::Unavailable {
-                detail: format!("root tenant: {e}"),
+            .map_err(|e| {
+                DomainError::dependency_unavailable("tenant resolver", "name the root tenant", e)
             })?;
         // Two first callers racing here both learned the same id, so whichever
         // stored it first is as right as the other; nothing to reconcile.

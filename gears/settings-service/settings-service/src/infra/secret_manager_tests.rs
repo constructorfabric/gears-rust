@@ -72,7 +72,9 @@ impl MemoryCredStore {
 
     fn check(&self) -> Result<(), CredStoreError> {
         if self.down.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err(CredStoreError::service_unavailable("down"));
+            return Err(CredStoreError::service_unavailable(
+                "credstore-db-7.internal:5432 refused",
+            ));
         }
         Ok(())
     }
@@ -409,5 +411,37 @@ fn the_store_context_names_the_gear_principal_the_value_s_tenant_and_the_first_p
     assert_eq!(
         ctx.subject_type(),
         Some("gts.cf.core.security.subject_service.v1~")
+    );
+}
+
+#[tokio::test]
+async fn a_down_store_answers_unavailable_without_the_stores_own_text() {
+    // The detail of an `Unavailable` reaches the 503 body verbatim, and the
+    // platform's contract forbids a dependency's own error text there: it can
+    // carry hostnames, DSN fragments, driver messages. The store's text goes to
+    // the log; the caller learns which dependency and which operation failed.
+    let (store, manager) = manager();
+    let tenant = Uuid::new_v4();
+    let reference = manager.reference(KEY, tenant);
+    store.down.store(true, std::sync::atomic::Ordering::SeqCst);
+    let err = manager
+        .resolve_plaintext(KEY, tenant, &reference)
+        .await
+        .expect_err("down");
+    let DomainError::Unavailable { detail } = &err else {
+        panic!("unavailable: {err:?}");
+    };
+    assert!(
+        !detail.contains("credstore-db-7") && !detail.contains("5432"),
+        "the store's own text stays out of the wire detail: {detail}"
+    );
+    assert!(
+        detail.contains("credential store"),
+        "names the dependency: {detail}"
+    );
+    assert!(
+        !err.wire_message().contains("5432"),
+        "nor through the wire message: {}",
+        err.wire_message()
     );
 }

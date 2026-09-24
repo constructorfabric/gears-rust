@@ -147,7 +147,7 @@ GTS grammar is **not** re-implemented here. The platform GTS identifier library 
 3. [ ] - `p1` - Populate the required members `type`, `title`, `status`, and `trace_id`, taking `trace_id` from the ambient request trace context - `inst-gf-problem-3`
 4. [x] - `p1` - **IF** the failure is a field-level validation rejection → attach one violation per offending field, each carrying the field, a stable machine-readable reason, and a human-readable description - `inst-gf-problem-4`
 5. [x] - `p1` - **IF** the error carries an authorization or entitlement denial → emit the denial without disclosing whether the target resource exists - `inst-gf-problem-5`
-6. [x] - `p1` - **IF** the variant is unrecognized → map to `500` with a generic title, never leaking an internal message into the response body - `inst-gf-problem-6`
+6. [x] - `p1` - **IF** the variant is unrecognized → map to `500` with a generic title, never leaking an internal message into the response body; **IF** a dependency is unavailable → map to `503` whose detail names the dependency and the operation only, the dependency's own error text going to the log, never to the body - `inst-gf-problem-6`
 7. [ ] - `p1` - **RETURN** the problem document and status - `inst-gf-problem-7`
 
 ### Authorization Enforcement and Credential Step-Up

@@ -70,9 +70,7 @@ pub trait SchemaSource: Send + Sync {
 }
 
 fn unavailable(what: &str, err: &CanonicalError) -> DomainError {
-    DomainError::Unavailable {
-        detail: format!("types registry: {what}: {err}"),
-    }
+    DomainError::dependency_unavailable("types registry", what, err)
 }
 
 #[async_trait]
