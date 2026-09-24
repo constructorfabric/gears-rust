@@ -142,4 +142,64 @@ mod already_registered {
             .expect_err("nothing to compare against");
         assert!(matches!(err, DomainError::Unavailable { .. }), "{err:?}");
     }
+
+    /// A registry that answers the registration with the given results.
+    struct Answering(Vec<RegisterResult>);
+
+    #[async_trait]
+    impl TypeSchemaRegistry for Answering {
+        async fn register(&self, _schema: Value) -> Result<Vec<RegisterResult>, CanonicalError> {
+            Ok(self.0.clone())
+        }
+
+        async fn registered(&self, _type_id: &str) -> Result<GtsTypeSchema, CanonicalError> {
+            unreachable!("only an already-exists answer reads back")
+        }
+    }
+
+    #[tokio::test]
+    async fn an_answer_that_is_not_one_ok_for_this_key_is_not_success() {
+        // One schema goes out, so one result comes back, and an `Ok` counts
+        // only for the setting's own key. Anything else is not a registration
+        // the declaration can be inserted against.
+        let own = key().to_string();
+        for (label, answer) in [
+            ("empty", vec![]),
+            (
+                "another id",
+                vec![RegisterResult::Ok {
+                    gts_id: "gts.cf.core.settings.setting_type.v1~acme.settings.network.other.v1~"
+                        .to_owned(),
+                }],
+            ),
+            (
+                "two results",
+                vec![
+                    RegisterResult::Ok {
+                        gts_id: own.clone(),
+                    },
+                    RegisterResult::Ok {
+                        gts_id: own.clone(),
+                    },
+                ],
+            ),
+        ] {
+            let err = TypesRegistryRegistrar::new(Answering(answer))
+                .register_setting_type(&key(), BOOL)
+                .await
+                .expect_err(label);
+            assert!(
+                matches!(err, DomainError::Internal { .. }),
+                "{label}: {err:?}"
+            );
+        }
+
+        // The one `Ok` for this key, spelled bare or as a `gts://` URI.
+        for gts_id in [own.clone(), format!("gts://{own}")] {
+            TypesRegistryRegistrar::new(Answering(vec![RegisterResult::Ok { gts_id }]))
+                .register_setting_type(&key(), BOOL)
+                .await
+                .expect("registered");
+        }
+    }
 }

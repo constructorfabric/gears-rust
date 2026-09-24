@@ -100,8 +100,29 @@ impl<R: TypeSchemaRegistry> SettingTypeRegistrar for TypesRegistryRegistrar<R> {
         let results = self.types.register(schema).await.map_err(|e| {
             DomainError::dependency_unavailable("types registry", "register the setting type", e)
         })?;
-        for result in results {
-            if let RegisterResult::Err { error, .. } = result {
+        // One schema went out, so one result comes back. An empty answer or a
+        // second result is not a registration of this type, whatever it says.
+        let [result] =
+            <[RegisterResult; 1]>::try_from(results).map_err(|results| DomainError::Internal {
+                diagnostic: format!(
+                    "types registry answered {} results for the one schema of `{key}`",
+                    results.len()
+                ),
+            })?;
+        match result {
+            // Success names the type it registered; only this key's counts.
+            RegisterResult::Ok { gts_id } => {
+                let own = key.to_string();
+                if gts_id.strip_prefix("gts://").unwrap_or(&gts_id) != own {
+                    return Err(DomainError::Internal {
+                        diagnostic: format!(
+                            "types registry reported `{gts_id}` registered for the schema of \
+                             `{own}`"
+                        ),
+                    });
+                }
+            }
+            RegisterResult::Err { error, .. } => {
                 return Err(match error {
                     // Idempotent: a retry after a failed insert reuses the type
                     // rather than minting a second one — provided it is the
