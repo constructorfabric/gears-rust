@@ -417,6 +417,18 @@ struct EndpointKey {
     node_key: String,
 }
 
+/// The narrowing itself, named so a test can render it.
+///
+/// Inline in the closure it compiled and ran whatever it selected: adding a
+/// column, or dropping one `EndpointKey` expects, fails only at run time or
+/// not at all, and the cost of the regression is invisible in a test suite.
+fn endpoint_columns(query: sea_orm::Select<node::Entity>) -> sea_orm::Select<node::Entity> {
+    query
+        .select_only()
+        .column(node::Column::Id)
+        .column(node::Column::NodeKey)
+}
+
 async fn live_edges(
     ctx: &StoreCtx<'_>,
     runner: &impl DBRunner,
@@ -496,11 +508,7 @@ async fn live_edges(
         .filter(Condition::all().add(node::Column::Id.is_in(endpoint_ids)))
         .filter(Condition::all().add(node::Column::DeletedAt.is_null()))
         .project_all(runner, |query| {
-            query
-                .select_only()
-                .column(node::Column::Id)
-                .column(node::Column::NodeKey)
-                .into_model::<EndpointKey>()
+            endpoint_columns(query).into_model::<EndpointKey>()
         })
         .await
         .map_err(scope_error)?;
@@ -666,4 +674,42 @@ fn hop_truncation(req: &ExpandRequest, incidence: &Incidence) -> Option<Truncati
     }
     (incidence.reached.len() as u64 > u64::from(req.budget.max_frontier))
         .then_some(TruncationReason::FrontierCap)
+}
+
+#[cfg(test)]
+mod tests {
+    use sea_orm::EntityTrait;
+
+    use super::{endpoint_columns, node};
+
+    /// The projection is a performance decision, and performance decisions
+    /// that live in a query builder regress silently.
+    ///
+    /// This runs once per hop for every distinct endpoint the hop touched.
+    /// Reading whole rows here answers correctly -- it just carries a payload
+    /// and a 384-lane embedding back per endpoint to build a map of two small
+    /// fields, at a cost that scales with how wide the tenant's payloads
+    /// happen to be rather than with the work. Nothing about that shows up as
+    /// a failure, so it is asserted rather than reviewed, the same way the
+    /// ranking projection is.
+    #[test]
+    fn the_endpoint_map_reads_two_columns_and_no_more() {
+        use sea_orm::QueryTrait;
+
+        let sql = endpoint_columns(node::Entity::find())
+            .build(sea_orm::DatabaseBackend::Postgres)
+            .to_string();
+        for wide in ["payload", "search_text", "embedding"] {
+            assert!(
+                !sql.contains(wide),
+                "the endpoint map must not read `{wide}`: {sql}"
+            );
+        }
+        for needed in ["id", "node_key"] {
+            assert!(
+                sql.contains(needed),
+                "the endpoint map needs `{needed}`: {sql}"
+            );
+        }
+    }
 }
