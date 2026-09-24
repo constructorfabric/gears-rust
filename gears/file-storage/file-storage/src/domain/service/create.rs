@@ -292,31 +292,48 @@ impl FileService {
         // Build the idempotency row so the create transaction persists it in the
         // same commit as the file — a committed create always leaves a replay
         // record behind, so a retry with the same key never creates a 2nd file.
-        let idempotency = idempotency_key.as_ref().map(|key| {
-            let response_body = serde_json::to_string(&IdempotencyTicket {
-                file_id: ticket.file_id,
-                version_id: ticket.version_id,
-                upload_url: ticket.upload_url.clone(),
-                auto_bind,
+        let idempotency = idempotency_key
+            .as_ref()
+            .map(|key| -> Result<IdempotencyInsert, DomainError> {
+                let response_body = serde_json::to_string(&IdempotencyTicket {
+                    file_id: ticket.file_id,
+                    version_id: ticket.version_id,
+                    upload_url: ticket.upload_url.clone(),
+                    auto_bind,
+                })
+                .unwrap_or_default();
+                // `FileStorageConfig::validate()` already rejects
+                // `idempotency_ttl_secs` past `MAX_IDEMPOTENCY_TTL_SECS` (30
+                // days), which fits `i64` with room to spare, so `unwrap_or`
+                // never actually saturates here; kept as a defensive
+                // fallback, same as the `*_ttl_secs` conversions in `gear.rs`.
+                // `checked_add` rather than a plain `+` turns a would-be
+                // overflow panic into a clean error -- see the same reasoning
+                // at `MultipartService::initiate_multipart_upload`.
+                let expires_at = now
+                    .checked_add(time::Duration::seconds(
+                        i64::try_from(self.cfg.idempotency_ttl_secs).unwrap_or(86400),
+                    ))
+                    .ok_or_else(|| {
+                        DomainError::database(
+                            "idempotency_ttl_secs overflowed computing the idempotency record's \
+                             expiry",
+                        )
+                    })?;
+                Ok(IdempotencyInsert {
+                    tenant_id,
+                    owner_kind: owner_kind_str.clone(),
+                    owner_id,
+                    key: key.clone(),
+                    subject_id: ctx.subject_id(),
+                    response_status: 201,
+                    response_body,
+                    response_etag: String::new(),
+                    request_hash: request_hash.clone(),
+                    expires_at,
+                })
             })
-            .unwrap_or_default();
-            let expires_at = now
-                + time::Duration::seconds(
-                    i64::try_from(self.cfg.idempotency_ttl_secs).unwrap_or(86400),
-                );
-            IdempotencyInsert {
-                tenant_id,
-                owner_kind: owner_kind_str.clone(),
-                owner_id,
-                key: key.clone(),
-                subject_id: ctx.subject_id(),
-                response_status: 201,
-                response_body,
-                response_etag: String::new(),
-                request_hash: request_hash.clone(),
-                expires_at,
-            }
-        });
+            .transpose()?;
 
         self.store
             .create_file_with_pending_version_and_event(

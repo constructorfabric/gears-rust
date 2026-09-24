@@ -283,13 +283,24 @@ impl FileService {
         // P2 1.8: mint a fresh correlation id per signed URL. The sidecar
         // echoes it back as `x-request-id` on its finalize callback so both
         // planes' logs can be joined on the same id.
+        // `checked_add`, not a plain `+`: `FileStorageConfig::validate()`
+        // already bounds `default_url_ttl_secs` (transitively, via
+        // `max_url_ttl_secs` <= `MAX_URL_TTL_CEILING`, 30 days), so this
+        // should never actually overflow `i64` -- defense in depth, same
+        // reasoning as `Issuer::issue`'s own `max_exp` computation.
+        let exp = now
+            .unix_timestamp()
+            .checked_add(self.cfg.default_url_ttl_secs)
+            .ok_or_else(|| {
+                DomainError::database("default_url_ttl_secs overflowed computing the token expiry")
+            })?;
         let claims = Claims {
             op,
             file_id: v.file_id,
             version_id: v.version_id,
             backend_id: v.backend_id.clone(),
             backend_path: v.backend_path.clone(),
-            exp: now.unix_timestamp() + self.cfg.default_url_ttl_secs,
+            exp,
             upload: constraints,
             multipart: MultipartClaims::default(),
             request_id: Uuid::now_v7().to_string(),

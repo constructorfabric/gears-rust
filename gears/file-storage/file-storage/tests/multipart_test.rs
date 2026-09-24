@@ -4418,3 +4418,72 @@ async fn abort_multipart_upload_uses_the_sessions_own_backend_when_version_is_al
          aborted, but it is still live: {after_abort:?}"
     );
 }
+
+/// Regression test (checked_add defense-in-depth): `FileStorageConfig::validate()`
+/// keeps an oversized `multipart_session_ttl_secs` out of a normally-loaded
+/// config, but `MultipartService::with_session_ttl_secs` itself takes a raw
+/// `i64` with no re-validation of its own — a config path that bypasses
+/// `validate()` (or a programming error) could still hand it `i64::MAX`. On
+/// the old code, `initiate_multipart_upload` computed
+/// `now + time::Duration::seconds(i64::MAX)` directly, which panics
+/// (`OffsetDateTime + Duration` overflow) instead of failing cleanly.
+#[tokio::test]
+async fn initiate_multipart_upload_rejects_overflowing_session_ttl_instead_of_panicking() {
+    let db = build_db().await;
+    let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let backends = BackendRegistry::new(vec![backend], "mem").expect("registry");
+    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let authorizer: Arc<dyn file_storage::domain::authz::Authorizer> =
+        Arc::new(TenantOnlyAuthorizer);
+    let cfg = ServiceConfig {
+        default_url_ttl_secs: 3600,
+        sidecar_base_url: "http://sidecar.test".to_owned(),
+        default_page_size: 50,
+        max_page_size: 1000,
+        idempotency_ttl_secs: 86400,
+    };
+    let store = Store::new(Arc::clone(&db));
+    let svc = Arc::new(FileService::new(
+        store.clone(),
+        backends.clone(),
+        Arc::clone(&issuer),
+        Arc::clone(&authorizer),
+        cfg,
+        None,
+        None,
+    ));
+    let msvc = MultipartService::new(
+        Arc::new(store) as Arc<dyn MultipartStore>,
+        backends,
+        authorizer,
+        None,
+        issuer,
+        "http://sidecar.test".to_owned(),
+        3600,
+    )
+    .with_session_ttl_secs(i64::MAX);
+
+    let ctx = ctx(Uuid::now_v7());
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .expect("create_file");
+
+    let result = msvc
+        .initiate_multipart_upload(
+            &ctx,
+            ticket.file_id,
+            "application/octet-stream",
+            13,
+            None,
+            None,
+            false,
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "an overflowing session_ttl_secs must be rejected with a DomainError, not panic: \
+         {result:?}"
+    );
+}

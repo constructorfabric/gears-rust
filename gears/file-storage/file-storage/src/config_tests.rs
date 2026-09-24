@@ -635,6 +635,245 @@ fn validate_accepts_zero_finalize_token_grace() {
     );
 }
 
+// ── max_url_ttl_secs absolute ceiling ───────────────────────────────────────
+//
+// `gear.rs` converts `max_url_ttl_secs` to `i64` via the same saturating
+// `unwrap_or(i64::MAX)` pattern as `finalize_token_grace_secs`, and
+// `Issuer::issue` then adds it directly to `now.unix_timestamp()` to compute
+// `max_exp`; without a ceiling here an oversized value would overflow that
+// addition instead of just clamping token lifetime as intended.
+
+#[test]
+fn validate_accepts_max_url_ttl_at_ceiling() {
+    let cfg = FileStorageConfig {
+        max_url_ttl_secs: MAX_URL_TTL_CEILING,
+        require_signing_key_seed: false,
+        ..FileStorageConfig::default()
+    };
+    assert!(
+        cfg.validate().is_ok(),
+        "max_url_ttl_secs == MAX_URL_TTL_CEILING must be accepted"
+    );
+}
+
+#[test]
+fn validate_rejects_max_url_ttl_above_ceiling() {
+    let cfg = FileStorageConfig {
+        max_url_ttl_secs: MAX_URL_TTL_CEILING + 1,
+        require_signing_key_seed: false,
+        ..FileStorageConfig::default()
+    };
+    assert!(
+        cfg.validate().is_err(),
+        "max_url_ttl_secs exceeding MAX_URL_TTL_CEILING must be rejected"
+    );
+}
+
+#[test]
+fn validate_accepts_default_config_max_url_ttl() {
+    let cfg = FileStorageConfig {
+        require_signing_key_seed: false,
+        ..FileStorageConfig::default()
+    };
+    assert!(
+        cfg.max_url_ttl_secs <= MAX_URL_TTL_CEILING,
+        "sanity: the shipped default_max_url_ttl_secs must not itself exceed the ceiling"
+    );
+    assert!(cfg.validate().is_ok());
+}
+
+// ── multipart_session_ttl_secs absolute ceiling ─────────────────────────────
+//
+// `gear.rs` converts `multipart_session_ttl_secs` to `i64` via the same
+// saturating `unwrap_or(i64::MAX)` pattern as `finalize_token_grace_secs`,
+// and `MultipartService::initiate_multipart_upload` then adds it directly to
+// `now` to compute the session's `expires_at`; without a ceiling here an
+// oversized (or corrupted/malicious) config value would overflow that
+// addition instead of just producing a long-lived session as intended.
+
+#[test]
+fn validate_accepts_multipart_session_ttl_at_ceiling() {
+    let cfg = FileStorageConfig {
+        multipart_session_ttl_secs: MAX_MULTIPART_SESSION_TTL_SECS,
+        require_signing_key_seed: false,
+        ..FileStorageConfig::default()
+    };
+    assert!(
+        cfg.validate().is_ok(),
+        "multipart_session_ttl_secs == MAX_MULTIPART_SESSION_TTL_SECS must be accepted"
+    );
+}
+
+#[test]
+fn validate_rejects_multipart_session_ttl_above_ceiling() {
+    let cfg = FileStorageConfig {
+        multipart_session_ttl_secs: MAX_MULTIPART_SESSION_TTL_SECS + 1,
+        require_signing_key_seed: false,
+        ..FileStorageConfig::default()
+    };
+    assert!(
+        cfg.validate().is_err(),
+        "multipart_session_ttl_secs exceeding MAX_MULTIPART_SESSION_TTL_SECS must be rejected"
+    );
+}
+
+#[test]
+fn validate_accepts_default_config_multipart_session_ttl_ceiling() {
+    let cfg = FileStorageConfig {
+        require_signing_key_seed: false,
+        ..FileStorageConfig::default()
+    };
+    assert!(
+        cfg.multipart_session_ttl_secs <= MAX_MULTIPART_SESSION_TTL_SECS,
+        "sanity: the shipped default_multipart_session_ttl_secs must not itself exceed the \
+         ceiling"
+    );
+    assert!(cfg.validate().is_ok());
+}
+
+// ── multipart_complete_lease_secs absolute ceiling ──────────────────────────
+//
+// Unlike the TTL/grace knobs above, `gear.rs` already falls back to a safe
+// finite default on conversion (`unwrap_or(120)`, not `i64::MAX`), so this
+// isn't the same silent-saturation overflow hazard -- but the lease bounds
+// how long one `complete` call may hold the `completing` state before
+// another caller can take it over after a crash, and nothing otherwise stops
+// an operator from configuring a value that defeats that purpose.
+
+#[test]
+fn validate_accepts_multipart_complete_lease_at_ceiling() {
+    let cfg = FileStorageConfig {
+        multipart_complete_lease_secs: MAX_MULTIPART_COMPLETE_LEASE_SECS,
+        require_signing_key_seed: false,
+        ..FileStorageConfig::default()
+    };
+    assert!(
+        cfg.validate().is_ok(),
+        "multipart_complete_lease_secs == MAX_MULTIPART_COMPLETE_LEASE_SECS must be accepted"
+    );
+}
+
+#[test]
+fn validate_rejects_multipart_complete_lease_above_ceiling() {
+    let cfg = FileStorageConfig {
+        multipart_complete_lease_secs: MAX_MULTIPART_COMPLETE_LEASE_SECS + 1,
+        require_signing_key_seed: false,
+        ..FileStorageConfig::default()
+    };
+    assert!(
+        cfg.validate().is_err(),
+        "multipart_complete_lease_secs exceeding MAX_MULTIPART_COMPLETE_LEASE_SECS must be \
+         rejected"
+    );
+}
+
+#[test]
+fn validate_accepts_default_config_multipart_complete_lease() {
+    let cfg = FileStorageConfig {
+        require_signing_key_seed: false,
+        ..FileStorageConfig::default()
+    };
+    assert!(
+        cfg.multipart_complete_lease_secs <= MAX_MULTIPART_COMPLETE_LEASE_SECS,
+        "sanity: the shipped default_multipart_complete_lease_secs must not itself exceed the \
+         ceiling"
+    );
+    assert!(cfg.validate().is_ok());
+}
+
+// ── orphan_grace_secs absolute ceiling ──────────────────────────────────────
+//
+// `domain::cleanup::CleanupEngine::run_sweep` subtracts it from `now` (via an
+// already-safe finite fallback, `unwrap_or(3600)`, not `i64::MAX`), so this
+// isn't an overflow hazard the way the addition sites above are -- but it
+// otherwise has no ceiling of its own.
+
+#[test]
+fn validate_accepts_orphan_grace_at_ceiling() {
+    let cfg = FileStorageConfig {
+        require_signing_key_seed: false,
+        orphan_grace_secs: MAX_ORPHAN_GRACE_SECS,
+        ..FileStorageConfig::default()
+    };
+    assert!(
+        cfg.validate().is_ok(),
+        "orphan_grace_secs == MAX_ORPHAN_GRACE_SECS must be accepted"
+    );
+}
+
+#[test]
+fn validate_rejects_orphan_grace_above_ceiling() {
+    let cfg = FileStorageConfig {
+        require_signing_key_seed: false,
+        orphan_grace_secs: MAX_ORPHAN_GRACE_SECS + 1,
+        ..FileStorageConfig::default()
+    };
+    assert!(
+        cfg.validate().is_err(),
+        "orphan_grace_secs exceeding MAX_ORPHAN_GRACE_SECS must be rejected"
+    );
+}
+
+#[test]
+fn validate_accepts_default_config_orphan_grace_ceiling() {
+    let cfg = FileStorageConfig {
+        require_signing_key_seed: false,
+        ..FileStorageConfig::default()
+    };
+    assert!(
+        cfg.orphan_grace_secs <= MAX_ORPHAN_GRACE_SECS,
+        "sanity: the shipped default_orphan_grace_secs must not itself exceed the ceiling"
+    );
+    assert!(cfg.validate().is_ok());
+}
+
+// ── idempotency_ttl_secs absolute ceiling ───────────────────────────────────
+//
+// `FileService::create_file` adds it directly to `now` to compute the stored
+// idempotency record's `expires_at` (via an already-safe finite fallback,
+// `unwrap_or(86400)`, not `i64::MAX`), so this isn't an overflow hazard the
+// way the `i64::MAX`-fallback sites above are -- but it otherwise has no
+// ceiling of its own.
+
+#[test]
+fn validate_accepts_idempotency_ttl_at_ceiling() {
+    let cfg = FileStorageConfig {
+        require_signing_key_seed: false,
+        idempotency_ttl_secs: MAX_IDEMPOTENCY_TTL_SECS,
+        ..FileStorageConfig::default()
+    };
+    assert!(
+        cfg.validate().is_ok(),
+        "idempotency_ttl_secs == MAX_IDEMPOTENCY_TTL_SECS must be accepted"
+    );
+}
+
+#[test]
+fn validate_rejects_idempotency_ttl_above_ceiling() {
+    let cfg = FileStorageConfig {
+        require_signing_key_seed: false,
+        idempotency_ttl_secs: MAX_IDEMPOTENCY_TTL_SECS + 1,
+        ..FileStorageConfig::default()
+    };
+    assert!(
+        cfg.validate().is_err(),
+        "idempotency_ttl_secs exceeding MAX_IDEMPOTENCY_TTL_SECS must be rejected"
+    );
+}
+
+#[test]
+fn validate_accepts_default_config_idempotency_ttl_ceiling() {
+    let cfg = FileStorageConfig {
+        require_signing_key_seed: false,
+        ..FileStorageConfig::default()
+    };
+    assert!(
+        cfg.idempotency_ttl_secs <= MAX_IDEMPOTENCY_TTL_SECS,
+        "sanity: the shipped default_idempotency_ttl_secs must not itself exceed the ceiling"
+    );
+    assert!(cfg.validate().is_ok());
+}
+
 // ── previous_signing_public_keys (signing_key_seed rotation, thread #35) ───
 //
 // The finalize/report-part callback verifier's own dedupe-against-the-

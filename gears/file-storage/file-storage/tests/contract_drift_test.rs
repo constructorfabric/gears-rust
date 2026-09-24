@@ -225,7 +225,7 @@ fn fs12_concurrency_doc_race_catalog_item_2_claim_holds_after_fs02_fix() {
     // under it), and exists specifically to point at the live,
     // real-PostgreSQL confirmation in tests/pg_concurrency_test.rs.
     let doc = include_str!("../../docs/concurrency-and-failure-model.md");
-    let claim = "finish converges via `replay_completed`";
+    let claim = "converges by replaying the persisted result";
     assert!(
         doc.contains(claim),
         "FS-12: expected concurrency-and-failure-model.md's Race Catalog item 2 to still \
@@ -235,11 +235,13 @@ fn fs12_concurrency_doc_race_catalog_item_2_claim_holds_after_fs02_fix() {
 
     // The claim, in full (Race Catalog item 2): "A slow-but-alive original
     // owner that finishes assembly after losing its lease cannot corrupt
-    // anything: its finish_complete CAS (WHERE state='completing') still
-    // succeeds only if no one else finished first, and VersionRepo::
-    // finalize's own status='pending' CAS makes the version flip
-    // once-only; a lost finish converges via replay_completed
-    // (finish_session's not-finished branch)."
+    // anything: the version's status='pending' CAS (inside the M5
+    // finalize+bind+finish transaction) makes the version flip once-only,
+    // so of the two racing owners at most one actually finalizes it; the
+    // other's own finalize CAS is lost, re-reads the version as already
+    // available, and converges by replaying the persisted result and
+    // running only its own session's completing -> completed transition
+    // (M6) instead of erroring."
     //
     // This was briefly false for a third interleaving the doc's own
     // two-case narrative didn't consider: a taken-over completer B could
