@@ -81,8 +81,8 @@ design rather than by the operator: init refuses a TTL above 30 or of zero (a de
 the backstop, never widen it), a cache of no entries, and a retention below twelve months. The optional `step_up` section carries
 policy only — `max_age_seconds` (300, and its ceiling), `issuer`, `audience`,
 `acr_values`, `amr_values` — and names no identity provider: the token is
-validated by the platform's AuthN resolver. A blank pin, or a blank or
-whitespace-padded assurance entry, is refused at init: no token could carry
+validated by the platform's AuthN resolver. A blank or whitespace-padded pin
+or assurance entry is refused at init: no token could carry
 it, and it would refuse every step-up-gated write with no sign at boot.
 
 ## Dependencies and capabilities
