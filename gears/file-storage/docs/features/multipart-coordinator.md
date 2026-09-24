@@ -228,7 +228,7 @@ returned.
 **Steps**:
 1. [x] - `p1` - Client: POST /api/file-storage/v1/files/{id}/multipart/{upload_id}/complete (no request body; optional `If-Match` header). Control plane: authorize `write` - `inst-complete-request`
 2. [x] - `p1` - Control plane: load the session by `upload_id`; verify it belongs to `file_id` - `inst-complete-load-session`
-3. [x] - `p1` - **IF** the session is already `completed`: RETURN **200** by replaying the persisted `complete_result` -- or, only for a session that predates the `complete_result`/`auto_bind` migration (`m20260722_000001_multipart_auto_bind`) and so has no such JSON to replay, rebuilding the response from the finalized version row instead -- idempotent convergence, no re-assembly, no DB write; this check runs **before** the `If-Match` precondition below - `inst-complete-replay`
+3. [x] - `p1` - **IF** the session is already `completed`: RETURN **200** by replaying the persisted `complete_result` -- or, only for a session that predates the `complete_result`/`auto_bind` migration (`m20260924_000001_upload_flow_redesign`) and so has no such JSON to replay, rebuilding the response from the finalized version row instead -- idempotent convergence, no re-assembly, no DB write; this check runs **before** the `If-Match` precondition below - `inst-complete-replay`
 4. [x] - `p1` - **ELSE IF** the session is `aborted`, or its `expires_at` has passed: RETURN `404`-shaped "not found" - `inst-complete-terminal-reject`
 5. [x] - `p1` - **ELSE**: if `If-Match` is present and not `*`, compare it against the file's current content ETag and reject on mismatch (`400`) - `inst-complete-ifmatch`
 6. [x] - `p1` - DB: attempt to win the completion lease via one conditional UPDATE -- `state='completing', lease_until=now+multipart_complete_lease_secs, lease_owner=:me WHERE state='in_progress' OR (state='completing' AND lease_until < now)` (the second arm is a takeover of a dead lease owner, the same operation as a fresh acquire); the read-only checks above (session lookup, terminal-state check, `If-Match`) run **before** this CAS so a deterministic rejection never occupies the lease - `inst-complete-lease-acquire`
@@ -459,7 +459,7 @@ releases the lease (`completing -> in_progress`) so the next `complete` retries 
 `{version_id, size, hash_algorithm, content_hash, hash_mode, part_count, manifest, bind_state, etag?,
 current_etag?}`. A retry against an already-`completed` session **converges**: it replays the persisted
 `complete_result` verbatim -- or, only for a session that predates the `complete_result`/`auto_bind` migration
-(`m20260722_000001_multipart_auto_bind`) and so never got one, rebuilds it from the finalized version row instead --
+(`m20260924_000001_upload_flow_redesign`) and so never got one, rebuilds it from the finalized version row instead --
 without re-running assembly or any CAS, and it never returns `409` (the audit row for this converge case is written
 via a separate step, not as part of a repeated finalize transaction). It accepts an **optional**
 `If-Match` header (a concrete value is checked against the file's current content ETag, `*`/absent is unconditional).

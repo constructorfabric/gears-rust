@@ -14,6 +14,7 @@ drift with every edit.
 - [Sidecar config: `FS_SIDECAR_*` environment variables](#sidecar-config-fs_sidecar_-environment-variables)
 - [The background cleanup sweep](#the-background-cleanup-sweep)
 - [Idempotent-create semantics](#idempotent-create-semantics)
+- [Upgrading from v0.2.x and rolling back](#upgrading-from-v02x-and-rolling-back)
 - [Storage quota (not enforced)](#storage-quota-not-enforced)
 - [The `SignatureProvider` / `SignatureVerifier` abstraction](#the-signatureprovider--signatureverifier-abstraction)
 
@@ -26,9 +27,11 @@ gear started with no `file-storage` config section at all gets every default bel
 actually boot**: `require_signing_key_seed` defaults to `true` with `signing_key_seed` unset, and
 `FileStorageConfig::validate()` fails gear init on exactly that combination (see `require_signing_key_seed` below).
 A genuinely zero-config deployment is dev/test-only (set `require_signing_key_seed: false` there).
-`FileStorageConfig::validate()` (called at gear init, before anything is wired up) rejects **fifteen**
-invalid configurations — three missing-secret/zero-interval guards (`sweep_interval_secs == 0` with the sweep
-enabled; `signing_key_seed` absent while required; `finalize_internal_secret` absent while required); seven absolute
+`FileStorageConfig::validate()` (called at gear init, before anything is wired up) rejects **eighteen**
+invalid configurations — six missing-secret/zero-value guards (`sweep_interval_secs == 0` with the sweep enabled;
+`default_url_ttl_secs`, `multipart_session_ttl_secs` or `multipart_complete_lease_secs` equal to `0`, instead of
+silently using one second; `signing_key_seed` absent while required; `finalize_internal_secret` absent while
+required); seven absolute
 ceilings (`finalize_token_grace_secs` above `MAX_FINALIZE_TOKEN_GRACE_SECS`, 7 days; `max_page_size` above
 `MAX_PAGE_SIZE_CEILING`, 1000; `max_url_ttl_secs` above `MAX_URL_TTL_CEILING`, 30 days; `multipart_session_ttl_secs`
 above `MAX_MULTIPART_SESSION_TTL_SECS`, 30 days; `multipart_complete_lease_secs` above
@@ -330,6 +333,35 @@ abort that fails after the session has already flipped to `aborted` is never ret
 incomplete multipart uploads. The sweep remains the primary reclamation path; the lifecycle rule is only the
 backstop for these two uncorrelated windows — see `concurrency-and-failure-model.md` §5.
 
+**The endpoint must honour conditional writes (`If-None-Match: *`)** — this is a **requirement** for any S3-compatible
+backend used here, not an optimisation. Publishing a version is create-exclusive: the single-part `PutObject` and
+the multipart `CompleteMultipartUpload` both carry `If-None-Match: *`, and the endpoint must answer `412 Precondition
+Failed` when the key already exists. That is what stops a replayed `PUT` on a still-valid signed URL from overwriting
+bytes that are already published. FileStorage does not probe for this at runtime: an endpoint that silently ignores
+the header degrades to last-write-wins with no error anywhere in the request path, so it **must not** be used with
+this gear. AWS S3 and MinIO (the CI test double) honour it; check any other endpoint before configuring it, with a
+recent AWS CLI v2 (one that accepts `--if-none-match`) and credentials for the target bucket:
+
+```bash
+EP=https://s3.example.com; B=my-bucket; K=fs-conditional-write-check-$(date +%s)
+printf x > /tmp/fs-check
+# 1. First conditional write — must succeed.
+aws --endpoint-url "$EP" s3api put-object --bucket "$B" --key "$K" --body /tmp/fs-check --if-none-match '*'
+# 2. Same key again — must fail with PreconditionFailed (412). Success here means the endpoint ignores the header.
+aws --endpoint-url "$EP" s3api put-object --bucket "$B" --key "$K" --body /tmp/fs-check --if-none-match '*'
+# 3. Multipart completion onto the existing key — must also fail with PreconditionFailed (412).
+U=$(aws --endpoint-url "$EP" s3api create-multipart-upload --bucket "$B" --key "$K" --query UploadId --output text)
+E=$(aws --endpoint-url "$EP" s3api upload-part --bucket "$B" --key "$K" --upload-id "$U" --part-number 1 \
+      --body /tmp/fs-check --query ETag --output text)
+aws --endpoint-url "$EP" s3api complete-multipart-upload --bucket "$B" --key "$K" --upload-id "$U" \
+    --multipart-upload "Parts=[{ETag=$E,PartNumber=1}]" --if-none-match '*'
+# Clean up.
+aws --endpoint-url "$EP" s3api abort-multipart-upload --bucket "$B" --key "$K" --upload-id "$U" 2>/dev/null
+aws --endpoint-url "$EP" s3api delete-object --bucket "$B" --key "$K"
+```
+
+The backend is usable only if step 1 succeeds and steps 2 and 3 both fail with `412`.
+
 ### `default_backend_id`
 Backend id `build_backend_registry` designates as the registry's default — the backend new `create`/
 `initiate_multipart` calls write to. `None` (the default) keeps `local-fs` as the default. Set this to one of
@@ -514,6 +546,28 @@ from `files`, so deleting a file also deletes its idempotency key. A subsequent 
 no stored ticket at all and creates a brand-new file, exactly as if the key had never been used — not a `409`.
 
 See `docs/migration.sql`'s `idempotency_keys` table and `docs/api.md`'s `409` summary for the wire-level contract.
+
+## Upgrading from v0.2.x and rolling back
+
+This release adds one additive migration, `m20260924_000001_upload_flow_redesign`: new `multipart_uploads` columns
+— `auto_bind`, `lease_until`, `lease_owner`, `complete_result`, `backend_id`, `backend_path` — and the `completing`
+state in its CHECK (on SQLite it rebuilds `multipart_uploads`, carrying rows and parts over), plus indexes only
+(`idempotency_keys_file_idx`, `multipart_uploads_sweep_idx`, `files_versionless_sweep_idx`,
+`file_versions_file_created_idx`, `files_owner_listing_v2_idx` superseding `files_owner_listing_idx`). Existing rows
+keep working: new columns are nullable or default to the old behaviour, and `backend_id`/`backend_path` are
+backfilled from the session's version. No released migration changes.
+
+**Mixed-version window.** Run the migration once, then roll the fleet. An older (v0.2.x) instance tolerates the new
+schema, with two exceptions to keep short: it rejects a multipart session in the new `completing` state as
+`invalid multipart upload state` (a `complete` in flight on a new instance), and it never auto-binds. Roll the
+control plane and the sidecars together — the sidecar forwards the new finalize headers and the control plane
+accepts the new token grace — and keep the window as short as a normal rolling restart.
+
+**Rolling back the binary.** An older binary refuses to start against a database that has migrations it does not
+know (sea-orm reports `Migration file of version '…' is missing`), so the order is: with the **new** binary, run
+`m20260924_000001_upload_flow_redesign` down, then deploy the old binary. Its `down()` drops the new columns, so
+sessions in `completing` and stored completion snapshots are lost; finish or abort in-flight multipart uploads
+before rolling back. Files and versions themselves are untouched by either direction.
 
 ## Storage quota (not enforced)
 
