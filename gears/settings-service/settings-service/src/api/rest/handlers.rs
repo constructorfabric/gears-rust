@@ -16,6 +16,7 @@ use uuid::Uuid;
 
 use crate::api::authz::{self, resource};
 use crate::api::rest::dto::CategoryDto;
+use crate::api::rest::if_match;
 use crate::audit::AuditSink;
 use crate::domain::category::service::Actor;
 use crate::domain::category::{CategoryRepository, CategoryService};
@@ -120,12 +121,6 @@ pub async fn list_categories<R: CategoryRepository + 'static, S: AuditSink + 'st
 /// Returned as `Option` rather than defaulted: an absent header and an empty
 /// one are different answers, and only the precondition evaluator may decide
 /// which is which.
-fn if_match(headers: &axum::http::HeaderMap) -> Option<&str> {
-    headers
-        .get(axum::http::header::IF_MATCH)
-        .and_then(|v| v.to_str().ok())
-}
-
 /// The id correlating a mutation's audit record with its problem document.
 ///
 /// Taken from the same headers the canonical error middleware reads, so an

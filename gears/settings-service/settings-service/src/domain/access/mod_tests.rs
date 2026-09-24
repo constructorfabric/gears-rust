@@ -121,12 +121,39 @@ async fn only_a_reachable_strict_descendant_may_be_restricted() {
 }
 
 #[tokio::test]
+async fn an_access_change_on_a_subtree_past_the_budget_evicts_the_setting_key_wide() {
+    // Naming the tenants of a cut subtree would leave the rest stale; the whole
+    // key goes instead, and other keys are untouched.
+    let tree = Tree::new();
+    let hierarchy = tree.hierarchy();
+    hierarchy
+        .truncate_subtrees
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let cache = EffectiveCache::new(Duration::from_secs(30));
+    for tenant in [tree.root, tree.child, tree.grandchild, tree.sibling] {
+        cache.seed(Arc::new(crate::domain::resolution::cache::tests_entry(
+            "k", tenant,
+        )));
+    }
+    cache.seed(Arc::new(crate::domain::resolution::cache::tests_entry(
+        "other", tree.root,
+    )));
+    evict_access_change(&cache, &hierarchy, "k", tree.child)
+        .await
+        .expect("evicts");
+    for tenant in [tree.root, tree.child, tree.grandchild, tree.sibling] {
+        assert!(cache.get("k", tenant).is_none(), "key-wide");
+    }
+    assert!(cache.get("other", tree.root).is_some(), "only the setting");
+}
+
+#[tokio::test]
 async fn an_access_change_evicts_the_tenant_and_its_descendants_only() {
     let tree = Tree::new();
     let hierarchy = tree.hierarchy();
     let cache = EffectiveCache::new(Duration::from_secs(30));
     for tenant in [tree.root, tree.child, tree.grandchild, tree.sibling] {
-        cache.populate(Arc::new(crate::domain::resolution::cache::tests_entry(
+        cache.seed(Arc::new(crate::domain::resolution::cache::tests_entry(
             "k", tenant,
         )));
     }

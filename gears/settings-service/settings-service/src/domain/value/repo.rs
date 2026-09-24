@@ -60,11 +60,28 @@ pub trait ValueRepository: Send + Sync {
         declaration_id: Uuid,
     ) -> Result<Vec<StoredValue>, DomainError>;
 
+    /// Every stored row of one declaration, locked for update for the rest of
+    /// the caller's transaction.
+    ///
+    /// What an upgrade copies to the successor: a locking read returns the
+    /// latest committed rows whatever snapshot the transaction started from,
+    /// and holds them against a concurrent writer until the copy commits.
+    ///
+    /// # Errors
+    /// [`DomainError`] when the database cannot answer.
+    async fn lock_all<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        declaration_id: Uuid,
+    ) -> Result<Vec<StoredValue>, DomainError>;
+
     /// Flag one row for review with the detail that explains it, or clear the
     /// flag when `detail` is `None`.
     ///
     /// The detail travels with the flag in both directions: a flagged row says
-    /// why, and clearing the flag clears the reason with it.
+    /// why, and clearing the flag clears the reason with it. No row at `id`
+    /// within `scope` is [`DomainError::NotFound`], never silent success.
     // @cpt-dod:cpt-cf-settings-service-dod-typed-value-validation-needs-review:p1
     ///
     /// # Errors
@@ -101,8 +118,10 @@ pub trait ValueRepository: Send + Sync {
     /// Insert a row.
     ///
     /// # Errors
-    /// [`DomainError::Conflict`] when a row already exists at the scope;
-    /// [`DomainError`] when the write fails.
+    /// [`DomainError::PreconditionFailed`] when a row already exists at the
+    /// scope — the caller compared the absent-state tag, and a row that
+    /// appeared since is the other writer's; [`DomainError`] when the write
+    /// fails.
     async fn insert<C: DBRunner>(
         &self,
         conn: &C,
@@ -114,9 +133,15 @@ pub trait ValueRepository: Send + Sync {
     /// and `updated_at` and clearing `needs_review`: a valid re-set is what
     /// clears the flag.
     ///
+    /// The write applies to the row at `expected` — the `last_change_at` the
+    /// caller compared the tag against — alone.
+    ///
     /// # Errors
-    /// [`DomainError::NotFound`] when the row is gone; [`DomainError`] when the
-    /// write fails.
+    /// [`DomainError::PreconditionFailed`] when no row is at that version any
+    /// more, moved or gone; [`DomainError`] when the write fails.
+    // The row's identity, what it takes, who set it and the version it must
+    // be at: a struct would only rename the same eight facts.
+    #[allow(clippy::too_many_arguments)]
     async fn update<C: DBRunner>(
         &self,
         conn: &C,
@@ -125,17 +150,21 @@ pub trait ValueRepository: Send + Sync {
         value: Option<serde_json::Value>,
         secret_ref: Option<String>,
         set_by: &str,
+        expected: time::OffsetDateTime,
     ) -> Result<StoredValue, DomainError>;
 
-    /// Delete the row of one pair, reporting whether one existed.
+    /// Delete the row of one pair at the version the caller compared the tag
+    /// against.
     ///
     /// # Errors
-    /// [`DomainError`] when the delete fails.
+    /// [`DomainError::PreconditionFailed`] when no row is at that version any
+    /// more; [`DomainError`] when the delete fails.
     async fn delete<C: DBRunner>(
         &self,
         conn: &C,
         scope: &AccessScope,
         declaration_id: Uuid,
         tenant_id: Uuid,
-    ) -> Result<bool, DomainError>;
+        expected: time::OffsetDateTime,
+    ) -> Result<(), DomainError>;
 }

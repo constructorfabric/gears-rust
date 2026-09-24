@@ -1,5 +1,5 @@
 <!-- Created: 2026-09-07 by Virtuozzo International GmbH -->
-<!-- Updated: 2026-09-15 by Virtuozzo International GmbH -->
+<!-- Updated: 2026-09-23 by Virtuozzo International GmbH -->
 
 # Feature: Secret Values
 
@@ -92,11 +92,11 @@ A `secret` declaration's default is a placeholder, an empty value of the type, e
 **Steps**:
 1. [x] - `p1` - Actor sends PUT /settings-service/v1/settings/{key}/value?tenant={tenant_id} with the plaintext as the value, through the Value Writer gate of entry 2.8 unchanged - `inst-sv-set-1`
 2. [x] - `p1` - Validate the plaintext against the declared type as any value is validated; a secret is still a typed value - `inst-sv-set-2`
-3. [x] - `p1` - Derive a reference unique to this write and the store principal for `(key, tenant)` through the reference process, before the row's transaction opens, since the store cannot join it - `inst-sv-set-3`
+3. [x] - `p1` - Derive a reference unique to this write and the store principal for `(key, tenant)` through the reference process, and DB: INSERT a `pending_secrets` row naming it — the write's intent, recorded before the entry exists — before the row's transaction opens, since the store cannot join it - `inst-sv-set-3`
 4. [x] - `p1` - Credential Store: create the entry under that reference, `private` to that principal in that tenant; create only, so nothing this write does touches the entry the row currently holds - `inst-sv-set-4`
-5. [x] - `p1` - **IF** the store refuses or cannot answer → **RETURN** rejected `503`; no row and no record are written, and the plaintext is dropped - `inst-sv-set-5`
-6. [x] - `p1` - DB: in the one transaction entry 2.8 commits, write the row with the new `secret_ref` and `value` NULL and its audit record with both images masked; **IF** the row held a reference before → carry it out as superseded - `inst-sv-set-6`
-7. [x] - `p1` - **IF** the transaction does not commit, the tag being stale or the database refusing → Credential Store: release the entry created in step 4, so a refused write leaves nothing behind and the live entry is untouched; **IF** the release fails → log the orphan - `inst-sv-set-7`
+5. [x] - `p1` - **IF** the store refuses or cannot answer → **RETURN** rejected `503`; no row and no record are written, and the plaintext is dropped; the intent row stays, since an unanswered create may have landed, and the sweep releases whatever it finds under that reference once the window has passed - `inst-sv-set-5`
+6. [x] - `p1` - DB: in the one transaction entry 2.8 commits, write the row with the new `secret_ref` and `value` NULL and its audit record with both images masked, and DELETE the intent row; **IF** the intent row is already gone → **RETURN** rejected `503`, the sweep having released the entry, so no row commits pointing at a released entry; **IF** the row held a reference before → carry it out as superseded - `inst-sv-set-6`
+7. [x] - `p1` - **IF** the transaction does not commit, the tag being stale or the database refusing → Credential Store: release the entry created in step 4, then DELETE its intent row once the release succeeded, so a refused write leaves nothing behind and the live entry is untouched; **IF** the release fails → keep the row for the sweep and log it - `inst-sv-set-7`
 8. [x] - `p1` - After the commit: Credential Store: release the superseded entry, once nothing can point at it any more; **IF** the release fails → log the orphan, the committed row being the truth - `inst-sv-set-8`
 9. [x] - `p1` - **RETURN** `200` with `old_value` and `new_value` carrying the mask token and `masked` true, so the response never echoes what was sent - `inst-sv-set-9`
 
@@ -181,12 +181,12 @@ A `secret` declaration's default is a placeholder, an empty value of the type, e
 1. [x] - `p1` - Actor sends POST /settings-service/v1/settings/{key}/secret-stage?tenant={tenant_id} with the plaintext as the value, before any step-up, through the Value Writer gate of entry 2.8 with step-up verification skipped: nothing live changes yet - `inst-sv-stage-1`
 2. [x] - `p1` - **IF** the declaration is not `secret`-trait → **RETURN** `400`; a staged reference is for a value that never travels inline - `inst-sv-stage-2`
 3. [x] - `p1` - Validate the plaintext against the declared type exactly as a set does - `inst-sv-stage-3`
-4. [x] - `p1` - Credential Store: create the entry under a reference of the reference process, `private` to this gear's principal in that tenant, as steps 3-5 of the set flow do; **IF** the store refuses or cannot answer → **RETURN** `503` and drop the plaintext - `inst-sv-stage-4`
-5. [x] - `p1` - DB: INSERT a `pending_secrets` row `(pending_id, declaration_id, tenant_id, subject_id, secret_ref, created_at, expires_at)` with `expires_at` a short window past now; write an audit record naming the stage, distinct from a commit - `inst-sv-stage-5`
+4. [x] - `p1` - Credential Store: create the entry under a reference of the reference process, `private` to this gear's principal in that tenant, as steps 3-5 of the set flow do, the intent row included; **IF** the store refuses or cannot answer → **RETURN** `503` and drop the plaintext - `inst-sv-stage-4`
+5. [x] - `p1` - The intent row of step 4 is the `pending_secrets` row the token names — `(pending_id, declaration_id, tenant_id, subject_id, secret_ref, created_at, expires_at)` with `expires_at` ten minutes past now; write an audit record naming the stage, distinct from a commit; **IF** the record cannot be written → release the entry and the row as a refused set does - `inst-sv-stage-5`
 6. [x] - `p1` - **RETURN** `200` with `pending_id` and `expires_at`, never the reference and never the plaintext - `inst-sv-stage-6`
 7. [x] - `p1` - On a later batch change whose value is `{ "pending_id": ... }` for a `secret`-trait declaration: DB: SELECT the row by `pending_id`; **IF** none, **OR** its `(declaration_id, tenant_id)` differs from the change's, **OR** its `subject_id` is not the batch's actor, **OR** `expires_at` has passed → reject that change `invalid`, the row untouched - `inst-sv-stage-7`
-8. [x] - `p1` - Otherwise adopt its `secret_ref` as the staged reference, skip the store leg, DELETE the row, and commit as steps 6-9 of the set flow commit; a commit that fails releases the entry as step 7 of that flow does - `inst-sv-stage-8`
-9. [x] - `p1` - A sweep on `expires_at`: DELETE each expired row and release its entry from the Credential Store together; **IF** the release fails → log the orphan - `inst-sv-stage-9`
+8. [x] - `p1` - Otherwise adopt its `secret_ref` as the staged reference, skip the store leg, and commit as steps 6-9 of the set flow commit, DELETEing the row inside that transaction with `expires_at` re-asserted in the same statement; a commit that fails leaves the row and the entry in place — the entry was the stage's to create, not the batch's to release — so the token stays claimable until it expires and is the sweep's after - `inst-sv-stage-8`
+9. [x] - `p1` - A sweep on `expires_at`: release each expired row's entry from the Credential Store, then DELETE the row; **IF** the release fails → keep the row and retry it on the next pass - `inst-sv-stage-9`
 
 ## 3. Processes / Business Logic (CDSL)
 
@@ -227,7 +227,7 @@ Not applicable. A secret setting has a row with a reference or has none; the ent
 
 - [x] `p1` - **ID**: `cpt-cf-settings-service-dod-secret-values-manager`
 
-The system **MUST** bind the Secret Manager port to the `credstore` gear's client, implementing `store_secret`, `resolve_plaintext` and `delete_secret`, **MUST** present a fixed settings-service principal in the target tenant with `private` sharing so that no administrative principal can read an entry back through the store, **MUST** present the first-party wildcard token scope on that context, because the call carries no bearer token and the platform refuses a scopeless one before authorization runs, **MUST** name the service-principal subject type on it, because an omitted type classifies the caller as a person and the gear's role assignment is a machine's, **MUST** store each write create-only under the reference of the reference process, unique to that write, and **MUST** report a store that cannot answer as unavailable rather than storing plaintext locally.
+The system **MUST** bind the Secret Manager port to the `credstore` gear's client, implementing `store_secret`, `resolve_plaintext` and `delete_secret`, **MUST** present a fixed settings-service principal in the target tenant with `private` sharing so that no administrative principal can read an entry back through the store, **MUST** present the first-party wildcard token scope on that context, because the call carries no bearer token and the platform refuses a scopeless one before authorization runs, **MUST** name the service-principal subject type on it, because an omitted type classifies the caller as a person and the gear's role assignment is a machine's, **MUST** store each write create-only under the reference of the reference process, unique to that write, and **MUST** report a store that cannot answer as unavailable rather than storing plaintext locally. Every entry about to be created **MUST** be recorded in `pending_secrets` under its minted reference before the create, and the record consumed inside the write's commit, so an entry whose answer was lost is the sweep's within the pending window rather than an orphan.
 
 **Implements**:
 - `cpt-cf-settings-service-flow-secret-values-set`
@@ -325,7 +325,7 @@ A `secret`-trait declaration **MUST** carry an empty placeholder default, refuse
 
 - [x] `p1` - **ID**: `cpt-cf-settings-service-dod-secret-values-stage`
 
-The system **MUST** let an interactive caller stage a `secret`-trait value ahead of step-up, storing it in the Credential Store under this gear's principal exactly as a set does and answering with an opaque `pending_id` and its expiry — never the reference and never the plaintext — **MUST** accept a `pending_id` in place of a value for that declaration in a later batch, adopting the staged entry only when the row exists, is unexpired, names the same `(setting, tenant)` and was staged by the batch's own subject, **MUST** consume the row on use whether the commit succeeds or fails, and **MUST** release expired rows and their entries together. Staging **MUST NOT** require step-up, since nothing live changes until the batch, and **MUST** be audited as a stage distinct from a commit.
+The system **MUST** let an interactive caller stage a `secret`-trait value ahead of step-up, storing it in the Credential Store under this gear's principal exactly as a set does and answering with an opaque `pending_id` and its expiry — never the reference and never the plaintext — **MUST** accept a `pending_id` in place of a value for that declaration in a later batch, adopting the staged entry only when the row exists, is unexpired, names the same `(setting, tenant)` and was staged by the batch's own subject, **MUST** consume the row inside the commit that adopts it, re-asserting its expiry in the same statement, so a commit that fails leaves the token claimable and the entry in place, and **MUST** release an expired row's entry before removing the row, keeping the row when the release fails so the next pass retries it. Staging **MUST NOT** require step-up, since nothing live changes until the batch, and **MUST** be audited as a stage distinct from a commit.
 
 **Implements**:
 - `cpt-cf-settings-service-flow-secret-values-stage`
@@ -343,6 +343,7 @@ The system **MUST** let an interactive caller stage a `secret`-trait value ahead
 - [x] The write response, the setting read, the category browse and the history all carry the mask token for that setting, and the audit record's images are masked
 - [x] Setting the same secret again creates a new entry, points the row at it and releases the previous entry after the commit, leaving one row and one live entry; a set refused on `If-Match` releases the entry it created and leaves the live one untouched
 - [x] With the Credential Store unavailable, a secret write is refused `503` and no row or record is written
+- [x] A secret write whose store create lands but whose answer is lost leaves a `pending_secrets` row naming the entry for the sweep to reclaim; a committed write leaves no such row, and a write refused on its tag releases the entry and the row together
 - [x] The SDK reader returns the opaque handle as the value of a `secret`-classified setting whether or not a credential is configured, and the handle contains neither the reference nor the winning tenant
 - [x] `resolve_secret` returns the plaintext to an authorized caller and stores one `secret_use` record with the value masked, whose actor is the caller's subject
 - [x] `resolve_secret` for a caller denied `read` on that declaration returns `Unauthorized` and touches neither the store nor the audit store
@@ -350,8 +351,10 @@ The system **MUST** let an interactive caller stage a `secret`-trait value ahead
 - [x] A malformed handle is refused as an invalid argument without echoing it
 - [x] Staging a `secret`-trait value before step-up creates a `private` entry under the gear's principal and a `pending_secrets` row, and answers with `pending_id` and `expires_at` only; the response carries neither the reference nor the plaintext
 - [x] A batch change carrying that `pending_id` commits the staged entry as the row's `secret_ref` with no second store leg, and the `pending_secrets` row is gone afterwards; a batch change carrying a `pending_id` staged by another subject, for another setting or tenant, or past its expiry is rejected `invalid` and the row is untouched
-- [x] Staging a non-secret declaration is refused `400`; staging with the Credential Store unavailable is refused `503` with no row written
-- [x] An expired, unclaimed stage is removed by the sweep together with its Credential Store entry
+- [x] Staging a non-secret declaration is refused `400`; staging with the Credential Store unavailable is refused `503` with no token handed out and no audit record, the intent row written before the create being left for the sweep
+- [x] An expired, unclaimed stage is removed by the sweep together with its Credential Store entry; when the store cannot release the entry the row is kept and the next pass retries
+- [x] A batch change adopting a `pending_id` whose commit is refused leaves the token claimable and the entry in place, and the same token buys the write on the retry
+- [x] A claim past the row's expiry is refused by the statement that would consume it, whatever a check a moment earlier saw
 - [x] Removing or reverting a secret row deletes the store entry after the commit, and the scope resolves to the placeholder afterwards
 - [x] No plaintext is ever present in the effective cache; the cached entry carries the reference only
 - [x] A `secret`-trait declaration with a non-empty default is refused at registration

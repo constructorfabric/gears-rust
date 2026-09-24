@@ -1,5 +1,5 @@
 <!-- Created: 2026-09-06 by Virtuozzo International GmbH -->
-<!-- Updated: 2026-09-09 by Virtuozzo International GmbH -->
+<!-- Updated: 2026-09-24 by Virtuozzo International GmbH -->
 
 # Feature: Validate and Set Values
 
@@ -54,7 +54,7 @@ Delivers the write path: a read-only check of what a value would do, and set, ba
 
 A change must not reach a live platform by accident. The guard is that the caller sets it on purpose, that the service validates it and refuses a stale write, and that where the declaration demands it a human has just proved they are present. There is no pending state and no separate activation step: a value operation takes effect when the caller sets it, and a client that lets an administrator collect several changes keeps that collection on its own side and sends it as one batch.
 
-Two gates are kept apart deliberately. Authorization asks *may this caller write this setting here* and applies to every caller. Elevated confirmation asks *has a human just proved they are present*, which only a human can answer, so a service principal is refused outright on a declaration that requires it rather than asked for a ceremony it cannot perform. Authorization is always decided first: an unauthorized caller is refused without step-up being consulted.
+Two gates are kept apart deliberately. Authorization asks *may this caller write this setting here* and applies to every caller. Elevated confirmation asks *has a human just proved they are present*, which only a human can answer, so a service principal is refused outright on a declaration that requires it rather than asked for a ceremony it cannot perform. Authorization is always decided first: an unauthorized caller is refused without step-up being consulted. That includes the target — whether it lies in the caller's subtree, whether a `global` setting admits a tenant-scoped value at all, and whether the caller's own access is `overridable` are decided before a challenge is issued, so a caller without rights on the target learns nothing about what the setting would have asked of it.
 
 The commit is per change, in one transaction with its audit record — a value live with no record of who set it is exactly the window that would open if the two were committed apart — and the order after the commit is fixed: commit, then evict the local cache, then publish. No consumer can observe an invalidation for a value that is not yet stored.
 
@@ -155,13 +155,13 @@ Throughout, `tenant` omitted means the caller's own tenant, which for a platform
 
 **Steps**:
 1. [x] - `p1` - Actor sends POST /settings-service/v1/settings/batch with a list of changes, each carrying `key`, optional `tenant`, an optional `op` — `set`, the default, or `revert` — a `value` for a set and none for a revert, and `if_match`, with the step-up token - `inst-vw-batch-1`
-2. [x] - `p1` - **IF** the list carries more than five hundred changes → **RETURN** `400` - `inst-vw-batch-2`
+2. [x] - `p1` - **IF** the list carries more than five hundred changes → **RETURN** `400`, decided on the deserialized list before any key is parsed, and again by the coordinator as the backstop for callers that do not come through REST - `inst-vw-batch-2`
 3. [x] - `p1` - Verify step-up **once** for the request when any target declaration requires it; **IF** it fails → **RETURN** the refusal with nothing evaluated - `inst-vw-batch-3`
 4. [x] - `p1` - Mint one change set id for the request - `inst-vw-batch-4`
 5. [x] - `p1` - **FOR EACH** change, in order - `inst-vw-batch-5`
-   1. [x] - `p1` - Read the operation the entry names: `set` carries a value and `revert` carries none; **IF** the value contradicts the operation, **OR** the word is not one of the two → reject this change alone as `invalid` and continue; a revert takes the same gates, tag check and commit a set does and parts from it only in the change handed on, which the commit records as `revert` — and a revert of a scope holding no override is rejected `not_found` alone - `inst-vw-batch-10`
+   1. [x] - `p1` - Read the operation the entry names: `set` carries a value and `revert` carries none — an explicit `null` is a value, only an absent `value` field is none; **IF** the value contradicts the operation, **OR** the word is not one of the two → reject this change alone as `invalid` and continue; a revert takes the same gates, tag check and commit a set does and parts from it only in the change handed on, which the commit records as `revert` — and a revert of a scope holding no override is rejected `not_found` alone - `inst-vw-batch-10`
    2. [x] - `p1` - Invoke the remaining write gates for its key and target, then commit one change; for a `secret`-trait target whose value is `{ "pending_id": … }`, the change adopts the entry staged earlier instead of carrying a value (the stage flow of entry 2.9) - `inst-vw-batch-6`
-   3. [x] - `p1` - Record its outcome: the old and new value, scope and operation on success, or the error that rejected it; a failing change stores nothing and does not stop the others - `inst-vw-batch-7`
+   3. [x] - `p1` - Record its outcome: the old and new value, scope and operation on success, or the error that rejected it; a failing change stores nothing and does not stop the others, and every rejected entry — at the gate, at validation or at commit — publishes `event_value_change_failed` under the batch's change set - `inst-vw-batch-7`
 6. [x] - `p1` - Evict the local cache for every committed change, then publish the committed keys under the change set id - `inst-vw-batch-8`
 7. [x] - `p1` - **RETURN** `200` with one entry per change; the status reflects that every item was answered, and the caller reads the outcomes - `inst-vw-batch-9`
 
@@ -259,11 +259,11 @@ Throughout, `tenant` omitted means the caller's own tenant, which for a platform
 1. [x] - `p1` - Authorize `write` on the setting's key through the `PolicyEnforcer` PEP; **IF** deny or cannot be obtained → **RETURN** `403` without consulting step-up - `inst-vw-gate-1`
 2. [x] - `p1` - DB: SELECT the declaration by key; **IF** none, **OR** the caller's effective access is `hidden` → **RETURN** `404` - `inst-vw-gate-2`
 3. [x] - `p1` - **IF** the declaration is retired → **RETURN** the distinct retired outcome; a retired setting takes no value - `inst-vw-gate-3`
-4. [x] - `p1` - **IF** the declaration requires step-up **AND** the caller is a service principal → **RETURN** `403` before any validation; a setting that needs a person to confirm it is by definition not one a machine may set - `inst-vw-gate-4`
-5. [x] - `p1` - **IF** the declaration requires step-up → invoke step-up verification; **IF** it fails → **RETURN** `401` carrying the RFC 9470 challenge, `WWW-Authenticate: Bearer error="insufficient_user_authentication"` with `max_age` set to the freshness window and `acr_values` where an assurance level is required, so the client learns what to ask the provider for - `inst-vw-gate-5`
-6. [x] - `p1` - Confirm through the tenant resolver that the target is the caller's own tenant or a descendant that is not standalone; **IF** not → **RETURN** `403` - `inst-vw-gate-6`
-7. [x] - `p1` - **IF** the scope class is `global` **AND** the target is not the root tenant → **RETURN** `409`; nobody, platform administrator included, writes a tenant-scoped value for a `global` setting - `inst-vw-gate-7`
-8. [x] - `p1` - **IF** the caller is a tenant caller **AND** its **own** effective access for the setting is not `overridable` → **RETURN** `403`; the target's access does not restrict an authorized ancestor writing there - `inst-vw-gate-8`
+4. [x] - `p1` - Confirm through the tenant resolver that the target is the caller's own tenant or a descendant that is not standalone; **IF** not → **RETURN** `403` - `inst-vw-gate-6`
+5. [x] - `p1` - **IF** the scope class is `global` **AND** the target is not the root tenant → **RETURN** `409`; nobody, platform administrator included, writes a tenant-scoped value for a `global` setting - `inst-vw-gate-7`
+6. [x] - `p1` - **IF** the caller is a tenant caller **AND** its **own** effective access for the setting is not `overridable` → **RETURN** `403`; the target's access does not restrict an authorized ancestor writing there - `inst-vw-gate-8`
+7. [x] - `p1` - **IF** the declaration requires step-up **AND** the caller is a service principal → **RETURN** `403` before any validation; a setting that needs a person to confirm it is by definition not one a machine may set - `inst-vw-gate-4`
+8. [x] - `p1` - **IF** the declaration requires step-up → invoke step-up verification; **IF** it fails → **RETURN** `401` carrying the RFC 9470 challenge, `WWW-Authenticate: Bearer error="insufficient_user_authentication"` with `max_age` set to the freshness window and `acr_values` where an assurance level is required, so the client learns what to ask the provider for; this gate is the last, so that a challenge is issued only for a write the caller is otherwise entitled to make and a caller without rights on the target learns nothing of it - `inst-vw-gate-5`
 9. [x] - `p1` - **RETURN** permission to commit - `inst-vw-gate-9`
 
 ### Step-Up Verification
@@ -294,12 +294,12 @@ Throughout, `tenant` omitted means the caller's own tenant, which for a platform
 1. [x] - `p1` - **IF** the change carries a value → validate it through the Type Validator against `value_type_id`, including the size cap and numeric canonicality; **IF** invalid → **RETURN** rejected with field-level detail, nothing stored - `inst-vw-commit-1`
 2. [x] - `p1` - **IF** the declaration has the `secret` trait **AND** the change carries a value → hand the plaintext to the Secret Manager port before the transaction opens, since the Credential Store cannot join it, and take back a `secret_ref` unique to this write; **IF** nothing is bound to the port or the store cannot answer → **RETURN** rejected `503`; plaintext is never written to `value`, and a transaction that then fails releases the entry again - `inst-vw-commit-4`
 3. [x] - `p1` - Begin one transaction for this change alone; a request of several changes never shares one - `inst-vw-commit-2`
-4. [x] - `p1` - DB: SELECT the scope's own row for the declaration, if any, and compute its value state tag; **IF** the presented tag does not match → **RETURN** rejected `412`, nothing stored, the stored value being the other writer's - `inst-vw-commit-3`
-5. [x] - `p1` - DB: INSERT or UPDATE setting_values for `(declaration_id, tenant_id)` with `value` or `secret_ref`, the denormalized `data_classification`, `set_by`, `last_change_at` now, and `needs_review` cleared — a valid re-set or a removal clears the flag — or DELETE the row for a removal; the unique index guards the insert of a first row so two first writers cannot both land - `inst-vw-commit-5`
+4. [x] - `p1` - DB: SELECT the declaration row again under a share lock held to the commit — a retire or a major upgrade already under way holds that row for update, so the read waits for it and sees the outcome, and one that starts later waits for this commit and retains or copies this value; **IF** its `status` is `retired` → **RETURN** rejected as retired, nothing stored; the row written below and its audit record take this read's `data_classification` and secret trait, never the gate's snapshot; the caller's own effective access is derived again from the restriction rows on the chain the gate resolved — a restriction change takes the declaration row for update, so one under way is seen once it commits and one that starts later waits for this commit — **IF** `hidden` → **RETURN** `404`, **IF** otherwise not `overridable` → **RETURN** `403`; **IF** the declaration came to require step-up since the gate and no verified step-up stands behind this write → **RETURN** the `401` challenge — then DB: SELECT the scope's own row for the declaration, if any, and compute its value state tag; **IF** the presented tag does not match → **RETURN** rejected `412`, nothing stored, the stored value being the other writer's - `inst-vw-commit-3`
+5. [x] - `p1` - DB: INSERT or UPDATE setting_values for `(declaration_id, tenant_id)` with `value` or `secret_ref`, the denormalized `data_classification`, `set_by`, `last_change_at` now, and `needs_review` cleared — a valid re-set or a removal clears the flag — or DELETE the row for a removal — either filtered on the `last_change_at` the tag was compared against; **IF** no row matched → **RETURN** rejected `412`; the unique index guards the insert of a first row so two first writers cannot both land, the second refused `412` - `inst-vw-commit-5`
 6. [x] - `p1` - Invoke the audit sink's append in the same transaction with the pre-image and post-image masked by classification, the operation — `create`, `change`, `revert` or `remove` — the actor, the request id and the change set id; **IF** the append fails → roll back and **RETURN** rejected `503` - `inst-vw-commit-6`
 7. [x] - `p1` - Commit; **IF** the commit fails → **RETURN** rejected `503` with nothing stored - `inst-vw-commit-7`
 8. [x] - `p1` - Evict the local cache for the key at the target, key-wide when the scope class is `cascading`, so descendants re-resolve lazily - `inst-vw-commit-8`
-9. [x] - `p1` - Publish `event_value_changed` through the Change Publisher port, and on a rejection `event_value_change_failed` with the reason, so a failed change is a durable notification; count the outcome on `settings_value_writes_total` - `inst-vw-commit-9`
+9. [x] - `p1` - Publish `event_value_changed` through the Change Publisher port, and on a rejection `event_value_change_failed` with the reason and the change set id — minted before the gate, so a refusal at the gate carries it too — so a failed change is a durable notification an operator can join to its request; count the outcome on `settings_value_writes_total` - `inst-vw-commit-9`
 10. [x] - `p1` - **RETURN** the old value, the new value, the scope and the new tag - `inst-vw-commit-10`
 
 ### Value State Tag
@@ -313,7 +313,7 @@ Throughout, `tenant` omitted means the caller's own tenant, which for a platform
 **Steps**:
 1. [x] - `p1` - **IF** the scope has its own row → derive the tag from the row's normalized UTC `last_change_at` - `inst-vw-etag-1`
 2. [x] - `p1` - **ELSE** derive an absent-state tag, stable for the pair and distinct from every row tag, so a write may create the first row only against the caller's knowledge that none existed - `inst-vw-etag-2`
-3. [x] - `p1` - **RETURN** the tag; the administrative read returns this same tag in `ETag` for the requested scope, distinct from the recency `last_change_at` in its body, which is the leak-safe maximum over the declaration and the resolved row and may belong to an ancestor - `inst-vw-etag-3`
+3. [x] - `p1` - **RETURN** the tag, minted once per mutation at microsecond precision — what the store keeps — and strictly after the version the write replaced, so it always moves with the row; the administrative read returns this same tag in `ETag` for the requested scope, distinct from the recency `last_change_at` in its body, which is the leak-safe maximum over the declaration and the resolved row and may belong to an ancestor - `inst-vw-etag-3`
 
 ### Bounded Impact Walk
 
@@ -325,7 +325,7 @@ Throughout, `tenant` omitted means the caller's own tenant, which for a platform
 
 **Steps**:
 1. [x] - `p1` - Clamp `limit` to its default of one hundred when absent and to five hundred at most - `inst-vw-imp-walk-1`
-2. [x] - `p1` - Walk the requesting scope's descendants breadth-first through the tenant resolver, stopping at a node budget of five thousand scanned - `inst-vw-imp-walk-2`
+2. [x] - `p1` - Walk the requesting scope's descendants breadth-first through the tenant resolver, each descendant once whatever duplicate or cyclic parent links the answer carries, stopping at a node budget of five thousand distinct scanned - `inst-vw-imp-walk-2`
 3. [x] - `p1` - **FOR EACH** descendant → **IF** it is standalone or below a standalone tenant → skip it, counting it neither in the list nor in the total, since a bare count still discloses that it exists and differs - `inst-vw-imp-walk-3`
 4. [x] - `p1` - Resolve the descendant's current effective value and the value it would have under the candidate; **IF** they differ → count it, and record it while the list holds fewer than `limit` entries - `inst-vw-imp-walk-4`
 5. [x] - `p1` - **RETURN** the list in traversal order without ranking, `total_changed`, `scanned`, and `truncated` when either the budget or `limit` was hit; a truncated report reads as "at least this many" and never blocks the write - `inst-vw-imp-walk-5`
@@ -367,7 +367,7 @@ The system **MUST** expose validate, set, batch, revert, clone, remove and impac
 
 - [x] `p1` - **ID**: `cpt-cf-settings-service-dod-value-writes-gates`
 
-Authorization **MUST** be decided before step-up is consulted, and an unauthorized caller **MUST** be refused without it. A declaration that requires step-up **MUST** refuse a service principal before validation, **MUST** require an interactive caller's fresh step-up token, and **MUST** answer a missing or stale token with `401` and the RFC 9470 challenge. A tenant-scoped write to a `global` setting **MUST** be refused, and a tenant caller **MUST** be refused unless its own effective access is `overridable`, the target's access never restricting an authorized ancestor.
+Authorization — the caller's right to write this setting at this target, including the target's place in its subtree, the `global` rule and the caller's own effective access — **MUST** be decided before step-up is consulted, and an unauthorized caller **MUST** be refused without it and without a challenge. A declaration that requires step-up **MUST** refuse a service principal before validation, **MUST** require an interactive caller's fresh step-up token, and **MUST** answer a missing or stale token with `401` and the RFC 9470 challenge. A tenant-scoped write to a `global` setting **MUST** be refused, and a tenant caller **MUST** be refused unless its own effective access is `overridable`, the target's access never restricting an authorized ancestor.
 
 **Implements**:
 - `cpt-cf-settings-service-algo-value-writes-gates`
@@ -410,7 +410,7 @@ Every change **MUST** commit in its own transaction together with its audit reco
 
 - [x] `p1` - **ID**: `cpt-cf-settings-service-dod-value-writes-stale`
 
-Every write **MUST** be guarded on the tag the caller presents: the target scope's own row `last_change_at` when a row exists, or the absent-state tag when none does. A value that moved in between **MUST** be refused `412` and store nothing, two writers racing to create a first row **MUST** leave exactly one row and one audit record, and a resubmission after a lost response **MUST** either land, because the first did not, or be refused `412`, because it did.
+Every write **MUST** be guarded on the tag the caller presents: the target scope's own row `last_change_at` when a row exists, or the absent-state tag when none does. A value that moved in between **MUST** be refused `412` and store nothing — the row write itself conditional on the version the tag was compared against, not the comparison alone — two writers racing to create a first row **MUST** leave exactly one row and one audit record, and a resubmission after a lost response **MUST** either land, because the first did not, or be refused `412`, because it did.
 
 **Implements**:
 - `cpt-cf-settings-service-algo-value-writes-etag`
@@ -480,7 +480,7 @@ A write to a `secret`-trait declaration **MUST** hand the plaintext to the Secre
 
 - [x] `p1` - **ID**: `cpt-cf-settings-service-dod-value-writes-observability`
 
-Every committed change **MUST** publish `event_value_changed` and every rejected one `event_value_change_failed` with its reason, and the service **MUST** expose `settings_value_writes_total` by result, `settings_value_write_failure_ratio` for the platform dashboards, and `settings_step_up_total` by operation and result.
+Every committed change **MUST** publish `event_value_changed` and every rejected one — at the gate, at validation or at commit — `event_value_change_failed` with its reason and its change set id, and the service **MUST** expose `settings_value_writes_total` by result, `settings_value_write_failure_ratio` for the platform dashboards, and `settings_step_up_total` by operation and result.
 
 **Implements**:
 - `cpt-cf-settings-service-algo-value-writes-commit`
@@ -496,6 +496,7 @@ Every committed change **MUST** publish `event_value_changed` and every rejected
 - [x] `validate` with an invalid value reports the violations with field-level detail, stores nothing, and emits no audit record; two identical calls return the same report
 - [x] `validate` reports the current effective value and its source, and for a `cascading` setting a paged list of affected descendants
 - [x] An unauthorized caller holding a valid step-up token is refused `403` without the token being verified
+- [x] A caller without rights on the target — outside its subtree, a tenant-scoped write to a `global` setting, or a `read_only` tenant — is refused before step-up is consulted and is not challenged
 - [x] An authorized caller without step-up on a declaration that requires it receives `401` with `WWW-Authenticate: Bearer error="insufficient_user_authentication"` and `max_age`, and nothing is stored
 - [x] A token whose `auth_time` is older than the freshness window, whose `sub` is another subject, or that the AuthN resolver does not authenticate is refused; a fresh token is accepted, and the identity provider is not called by this gear
 - [x] A service principal writing a declaration with `requires_step_up = true` is refused `403` before validation; on a declaration with the flag clear the value is committed with its audit record and no step-up is asked for

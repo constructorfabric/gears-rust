@@ -1,5 +1,5 @@
 <!-- Created: 2026-08-10 by Virtuozzo International GmbH -->
-<!-- Updated: 2026-08-10 by Virtuozzo International GmbH -->
+<!-- Updated: 2026-09-23 by Virtuozzo International GmbH -->
 
 # Feature: Category Management
 
@@ -131,7 +131,7 @@ The no-orphan rule protects the invariant that no declaration is ever left point
 9. [x] - `p1` - **IF** `If-Match` is stale → **RETURN** `412` - `inst-cat-update-9`
 10. [x] - `p1` - Validate the supplied updatable fields against their length bounds - `inst-cat-update-10`
 11. [x] - `p1` - **IF** field validation fails → **RETURN** `400` with field-level errors - `inst-cat-update-11`
-12. [x] - `p1` - DB: UPDATE categories SET {supplied fields}, updated_at = now() WHERE id = {id} - `inst-cat-update-12`
+12. [x] - `p1` - DB: UPDATE categories SET {supplied fields}, updated_at = now() WHERE id = {id} AND updated_at = {the version the tag was compared against}; **IF** no row matched → **RETURN** `412`, the row having moved between the comparison and the write - `inst-cat-update-12`
 13. [x] - `p1` - **IF** unique violation on `uq_category_name` → **RETURN** `409` - `inst-cat-update-13`
 14. [x] - `p1` - Emit a category-updated audit record carrying the changed field set with pre-image and post-image - `inst-cat-update-14`
 15. [x] - `p1` - **RETURN** `200` with the updated Category and its refreshed ETag - `inst-cat-update-15`
@@ -161,7 +161,7 @@ The no-orphan rule protects the invariant that no declaration is ever left point
 7. [x] - `p1` - **IF** `If-Match` is absent → **RETURN** `428`; **IF** stale → **RETURN** `412` - `inst-cat-delete-7`
 8. [x] - `p1` - Invoke the no-orphan deletion guard for this category - `inst-cat-delete-8`
 9. [x] - `p1` - **IF** the guard reports referencing declarations → **RETURN** `409 CategoryNotEmpty` - `inst-cat-delete-9`
-10. [x] - `p1` - DB: DELETE FROM categories WHERE id = {id} - `inst-cat-delete-10`
+10. [x] - `p1` - DB: DELETE FROM categories WHERE id = {id} AND updated_at = {the version the tag was compared against}; **IF** no row matched → **RETURN** `412` - `inst-cat-delete-10`
 11. [x] - `p1` - **IF** the declaration foreign key `ON DELETE RESTRICT` rejects the delete → **RETURN** `409 CategoryNotEmpty`, covering a declaration inserted between the guard and the delete - `inst-cat-delete-11`
 12. [x] - `p1` - Emit a category-deleted audit record carrying the pre-image - `inst-cat-delete-12`
 13. [x] - `p1` - **RETURN** `204` - `inst-cat-delete-13`
@@ -252,7 +252,7 @@ The no-orphan rule protects the invariant that no declaration is ever left point
 
 **Steps**:
 1. [x] - `p1` - Read the administrative-domain constraints carried on the caller's `AccessScope` - `inst-cat-visfilter-1`
-2. [x] - `p1` - **IF** the scope carries no domain restriction → **RETURN** the input unchanged - `inst-cat-visfilter-2`
+2. [x] - `p1` - **IF** the scope carries no domain restriction → **RETURN** the input unchanged; a domain constraint that is present but carries no usable domain name is not the absence of one, and restricts to undomained categories only - `inst-cat-visfilter-2`
 3. [x] - `p1` - Build a predicate matching categories whose `domain_affinity` is null or falls within the permitted domain set, so an undomained category stays universally visible - `inst-cat-visfilter-3`
 4. [x] - `p1` - Apply the predicate inside the query rather than as a post-filter, so pagination counts and cursors reflect only visible rows - `inst-cat-visfilter-4`
 5. [x] - `p1` - **RETURN** the filtered row or the augmented query predicate - `inst-cat-visfilter-5`
@@ -346,7 +346,7 @@ The system **MUST** authorize every category operation as per-resource-type CRUD
 
 - [x] `p1` - **ID**: `cpt-cf-settings-service-dod-category-management-concurrency`
 
-The system **MUST** require `If-Match` on `PATCH` and `DELETE`, returning `428` when the header is absent and `412` when it is stale, and **MUST** return a refreshed ETag on every successful read and update.
+The system **MUST** require `If-Match` on `PATCH` and `DELETE`, returning `428` when the header is absent and `412` when it is stale, and **MUST** return a refreshed ETag on every successful read and update. The write itself **MUST** be conditional on the version the tag was compared against, so two writers holding one tag cannot both land.
 
 **Implements**:
 - `cpt-cf-settings-service-flow-category-management-update`
@@ -398,6 +398,7 @@ The system **MUST** emit an audit record through the Audit Emitter for every suc
 - [ ] A database-level delete of a category holding any declaration is rejected by the foreign key `ON DELETE RESTRICT`, independently of the application pre-check
 - [ ] Getting a category outside the caller's permitted domain returns `404` rather than `403`
 - [ ] A category with null `domain_affinity` is visible to a caller whose `AccessScope` restricts domains
+- [ ] A domain constraint whose values cannot be read as domain names restricts the caller to undomained categories rather than lifting the restriction
 - [ ] Listing returns categories ordered by `sort_order` then `name`, and that order is reproduced across cursor pages
 - [ ] Listing applies the visibility predicate inside the query, so a page is never short by the number of rows filtered out afterwards
 - [ ] Listing with an OData filter on an unmapped field or an unsupported operator returns `400`

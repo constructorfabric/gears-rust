@@ -938,3 +938,128 @@ async fn a_batch_entry_whose_tag_is_stale_is_rejected_alone() {
     );
     assert_eq!(results[1]["outcome"], json!("committed"), "{}", results[1]);
 }
+
+// ── The text guard ───────────────────────────────────────────────────────────
+
+/// A literal a double cannot hold is refused as written, before the value is
+/// parsed, gated or validated against its type — so a `bool` setting reports
+/// `value_not_canonical`, not a type mismatch.
+#[tokio::test]
+async fn a_number_finer_than_a_double_is_refused_rather_than_rounded() {
+    let h = RestHarness::new().await;
+    h.inner.declare("ratio", "cascading", json!(true)).await;
+
+    for (method, uri) in [
+        ("PUT", value_of(&h, "ratio")),
+        ("POST", format!("{}/validate", setting(&h, "ratio"))),
+        ("POST", format!("{}/impact", setting(&h, "ratio"))),
+    ] {
+        let answer = h
+            .send_text(
+                method,
+                &uri,
+                r#"{"value": 0.10000000000000000555}"#,
+                Some("absent"),
+                h.inner.tree.root,
+            )
+            .await;
+        assert_eq!(answer.status, 400, "{method} {uri}: {}", answer.body);
+        assert!(
+            answer.body.to_string().contains("value_not_canonical"),
+            "{method} {uri}: {}",
+            answer.body
+        );
+    }
+
+    let (_, body) = h.get(&setting(&h, "ratio"), h.inner.tree.root).await;
+    assert_eq!(
+        body["source"],
+        json!("schema_default"),
+        "nothing was stored"
+    );
+}
+
+#[tokio::test]
+async fn a_batch_entry_the_text_guard_refuses_is_rejected_alone() {
+    let h = RestHarness::new().await;
+    h.inner.declare("first", "cascading", json!(true)).await;
+    h.inner.declare("second", "cascading", json!(true)).await;
+    let body = format!(
+        r#"{{"changes": [
+            {{"key": "{first}", "value": 9007199254740993.0, "if_match": "absent"}},
+            {{"key": "{second}", "value": false, "if_match": "absent"}}
+        ]}}"#,
+        first = h.inner.key("first"),
+        second = h.inner.key("second"),
+    );
+
+    let answer = h
+        .send_text("POST", BATCH, &body, None, h.inner.tree.root)
+        .await;
+    assert_eq!(answer.status, 200, "{}", answer.body);
+    let results = answer.body["results"].as_array().expect("results");
+    assert_eq!(results[0]["outcome"], json!("rejected"), "{}", results[0]);
+    assert_eq!(results[0]["error"], json!("invalid"), "{}", results[0]);
+    assert!(
+        results[0]["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("round trip")),
+        "{}",
+        results[0]
+    );
+    assert_eq!(results[1]["outcome"], json!("committed"), "{}", results[1]);
+}
+
+// ── The tenant boundary ──────────────────────────────────────────────────────
+
+/// The boundary a write may not cross is enforced by the gate, not by a PDP
+/// constraint on the value resource: `c` is the caller's sibling, `s` a
+/// standalone descendant, and every write form is refused for both.
+#[tokio::test]
+async fn a_target_outside_the_callers_subtree_is_refused_on_every_write() {
+    let h = RestHarness::new().await;
+    h.inner.declare("proxy", "cascading", json!(true)).await;
+    let caller = h.inner.tree.a;
+
+    for outside in [h.inner.tree.c, h.inner.tree.s] {
+        let value = format!("{}?tenant={outside}", value_of(&h, "proxy"));
+        let requests: [(&str, String, Option<Value>); 6] = [
+            ("PUT", value.clone(), Some(json!({ "value": false }))),
+            ("DELETE", value.clone(), None),
+            (
+                "POST",
+                format!(
+                    "{value_of}/revert?tenant={outside}",
+                    value_of = value_of(&h, "proxy")
+                ),
+                None,
+            ),
+            (
+                "POST",
+                format!("{}/clone?tenant={outside}", value_of(&h, "proxy")),
+                Some(json!({ "from": h.inner.tree.root })),
+            ),
+            (
+                "POST",
+                format!("{}/validate?tenant={outside}", setting(&h, "proxy")),
+                Some(json!({ "value": false })),
+            ),
+            (
+                "POST",
+                format!("{}/impact?tenant={outside}", setting(&h, "proxy")),
+                Some(json!({ "value": false })),
+            ),
+        ];
+        for (method, uri, body) in requests {
+            let answer = h.send(method, &uri, body, Some("absent"), caller).await;
+            assert_eq!(answer.status, 403, "{method} {uri}: {}", answer.body);
+        }
+    }
+
+    let (_, body) = h.get(&setting(&h, "proxy"), h.inner.tree.root).await;
+    assert_eq!(
+        body["source"],
+        json!("schema_default"),
+        "nothing was stored"
+    );
+}

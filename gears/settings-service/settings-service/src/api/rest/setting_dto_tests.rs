@@ -298,6 +298,16 @@ mod browse_entry {
     }
 
     #[test]
+    fn an_internal_fault_in_a_browse_entry_says_so_and_nothing_more() {
+        let err = DomainError::Internal {
+            diagnostic: "postgres at 10.0.0.5:5432 refused the connection".to_owned(),
+        };
+        let item = SettingItemDto::failed("k", &err);
+        assert_eq!(item.outcome, "error");
+        assert_eq!(item.detail.as_deref(), Some("internal error"));
+    }
+
+    #[test]
     fn a_requested_key_with_no_declaration_reads_as_not_found() {
         let item = SettingItemDto::not_found("absent.v1~");
         assert_eq!(item.outcome, "not_found");

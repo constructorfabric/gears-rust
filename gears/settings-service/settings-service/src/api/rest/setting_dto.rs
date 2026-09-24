@@ -333,7 +333,7 @@ impl SettingItemDto {
             outcome: outcome.to_owned(),
             effective: None,
             flagged: None,
-            detail: Some(err.to_string()),
+            detail: Some(err.wire_message()),
             mode: None,
         }
     }

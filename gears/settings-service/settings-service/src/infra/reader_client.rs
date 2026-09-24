@@ -10,8 +10,9 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use secrecy::SecretString;
 use serde_json::Value;
-use settings_service_sdk::api::{BulkOutcome, BulkSelector, SettingsReaderClient};
+use settings_service_sdk::api::{BULK_LIMIT, BulkOutcome, BulkSelector, SettingsReaderClient};
 use settings_service_sdk::models::{EffectiveValueResponse, GetEffectiveRequest, TrailEntry};
 use settings_service_sdk::{SecretHandle, SettingKey};
 use toolkit_canonical_errors::CanonicalError;
@@ -123,15 +124,53 @@ where
         selector: BulkSelector,
         scope: String,
     ) -> Vec<BulkOutcome> {
-        let keys: Vec<SettingKey> = match &selector {
-            BulkSelector::Keys(keys) => keys.clone(),
+        let (keys, over_bound): (Vec<SettingKey>, bool) = match &selector {
+            BulkSelector::Keys(keys) => (keys.clone(), keys.len() > BULK_LIMIT),
             BulkSelector::Category(category) => match self.keys_in_category(category).await {
-                Ok(keys) => keys,
+                Ok(mut keys) => {
+                    let over = keys.len() > BULK_LIMIT;
+                    keys.truncate(BULK_LIMIT);
+                    (keys, over)
+                }
                 // No key is known, so no per-key outcome can carry the failure;
-                // an empty batch is the only honest answer for a category.
-                Err(_) => return Vec::new(),
+                // an empty batch is the only honest answer for a category — and
+                // it is logged, so an outage or a broken row is not mistaken
+                // for a category that configures nothing.
+                Err(err) => {
+                    tracing::warn!(
+                        %category,
+                        error = %err,
+                        "bulk read by category could not enumerate the category; \
+                         answering an empty batch"
+                    );
+                    return Vec::new();
+                }
             },
         };
+        // Bounded, and never partial: past the bound every key the read does
+        // name carries the refusal, so no caller takes a truncated set for the
+        // whole list or the whole category.
+        if over_bound {
+            let field = match &selector {
+                BulkSelector::Keys(_) => "keys",
+                BulkSelector::Category(_) => "category",
+            };
+            let refusal = CanonicalError::from(DomainError::Validation {
+                field: field.to_owned(),
+                code: crate::field::BULK_TOO_LARGE,
+                message: format!(
+                    "a bulk read resolves at most {BULK_LIMIT} settings; ask for fewer keys or a \
+                     smaller category"
+                ),
+            });
+            return keys
+                .into_iter()
+                .map(|key| BulkOutcome {
+                    key,
+                    result: Err(refusal.clone()),
+                })
+                .collect();
+        }
         let target = match ScopeTarget::parse(&scope) {
             Ok(target) => target,
             Err(err) => {
@@ -175,7 +214,7 @@ where
         &self,
         ctx: &SecurityContext,
         handle: SecretHandle,
-    ) -> Result<String, CanonicalError> {
+    ) -> Result<SecretString, CanonicalError> {
         // @cpt-begin:cpt-cf-settings-service-flow-secret-values-resolve:p1:inst-sv-resolve-1
         // The one plaintext path. The domain decides; this adapter only
         // supplies the connection and projects the outcome.
@@ -208,10 +247,22 @@ where
             .resolver
             .declarations_in_category(&conn, &AccessScope::allow_all(), category_id)
             .await?;
-        Ok(declarations
+        // A stored key that does not parse is a broken row, not a setting to
+        // leave out: the category is refused whole rather than shortened by
+        // one, since no `SettingKey` exists to hang a per-key outcome on.
+        declarations
             .iter()
-            .filter_map(|d| SettingKey::parse(&d.key).ok())
-            .collect())
+            .map(|d| {
+                SettingKey::parse(&d.key).map_err(|err| {
+                    CanonicalError::from(DomainError::Internal {
+                        diagnostic: format!(
+                            "declaration {} carries a key that does not parse: {err}",
+                            d.id
+                        ),
+                    })
+                })
+            })
+            .collect()
     }
 }
 

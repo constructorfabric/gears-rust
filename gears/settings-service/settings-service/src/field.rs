@@ -46,6 +46,10 @@ pub const ODATA_UNSUPPORTED_OPTION: &str = "odata_unsupported_option";
 /// The named value type is not registered in the types registry.
 pub const VALUE_TYPE_UNKNOWN: &str = "value_type_unknown";
 
+/// The named value type is registered but its `x-gts-traits` spells a trait
+/// with the wrong type, so this service cannot classify values of it.
+pub const VALUE_TYPE_MALFORMED: &str = "value_type_malformed";
+
 /// The value violates its type's JSON Schema at the named path.
 pub const VALUE_SCHEMA: &str = "value_schema";
 
@@ -67,6 +71,18 @@ pub const TENANT_PARAM: &str = "tenant_param";
 /// The search query is absent, shorter than two characters after trimming,
 /// or longer than the bound.
 pub const SEARCH_QUERY: &str = "search_query";
+
+/// The subtree an administrative walk would enumerate exceeds the budget.
+pub const SUBTREE_TOO_LARGE: &str = "subtree_too_large";
+
+/// A search page's matching overrides exceed the bound a page fetches.
+pub const SEARCH_TOO_MANY_HITS: &str = "search_too_many_hits";
+
+/// A trait-checked value holds more string leaves than the leaf cap.
+pub const VALUE_TOO_MANY_LEAVES: &str = "value_too_many_leaves";
+
+/// A bulk read names, or expands to, more settings than the bulk bound.
+pub const BULK_TOO_LARGE: &str = "bulk_too_large";
 
 /// A clone of a secret-classified setting, which would couple the target to
 /// the source credential's lifecycle.

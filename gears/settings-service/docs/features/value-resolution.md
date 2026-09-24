@@ -1,5 +1,5 @@
 <!-- Created: 2026-08-10 by Virtuozzo International GmbH -->
-<!-- Updated: 2026-09-06 by Virtuozzo International GmbH -->
+<!-- Updated: 2026-09-23 by Virtuozzo International GmbH -->
 
 # Feature: Effective Value Resolution, Defaults and Cache
 
@@ -110,7 +110,7 @@ Three properties matter more than the walk itself.
 8. [x] - `p1` - **IF** a dependency needed for the walk is unavailable → **RETURN** the unavailable outcome rather than substituting the Schema Default, which lives in the same database and is equally unreachable - `inst-vr-resolve-8`
 9. [x] - `p1` - Resolve the declaration's trait set for rendering metadata - `inst-vr-resolve-9`
 10. [x] - `p1` - **IF** the setting is secret-backed → return the value in its masked handle form, never plaintext - `inst-vr-resolve-10`
-11. [x] - `p1` - Populate the cache entry for `(key, scope)` with the resolved value and its source trace - `inst-vr-resolve-11`
+11. [x] - `p1` - Populate the cache entry for `(key, scope)` with the resolved value and its source trace — only if no invalidation of the key or the scope has landed since the miss, compared by the generation captured then, so a read that began before a write does not resurrect the value it read for another time-to-live - `inst-vr-resolve-11`
 12. [x] - `p1` - **RETURN** the effective value carrying `key`, `scope`, `value`, `source`, `source_scope`, `traits`, the inheritance trail, and `fallback` with `fallback_source` and `fallback_scope` - `inst-vr-resolve-12`
 
 ### Resolve Effective Values in Bulk
@@ -126,7 +126,7 @@ Three properties matter more than the walk itself.
 - Individual keys fail without failing the batch
 
 **Steps**:
-1. [x] - `p1` - Caller requests effective values for a set of keys, or for a category, at one scope - `inst-vr-bulk-1`
+1. [x] - `p1` - Caller requests effective values for a set of keys, or for a category, at one scope; **IF** the key set, or the category's expansion, exceeds the bulk bound of five hundred → answer every named key with `bulk_too_large`, never a partial set - `inst-vr-bulk-1`
 2. [x] - `p1` - Obtain the ancestor chain for the scope once and share it across every key in the batch - `inst-vr-bulk-2`
 3. [x] - `p1` - **FOR EACH** requested key - `inst-vr-bulk-3`
    1. [x] - `p1` - Resolve it independently, reusing the shared ancestry - `inst-vr-bulk-4`
@@ -197,6 +197,7 @@ Three properties matter more than the walk itself.
 **Error Scenarios**:
 - An OData expression on an unmapped field or unsupported operator
 - The target outside the caller's subtree
+- The `needs_review` filter over a target whose subtree exceeds the subtree budget
 
 **Steps**:
 1. [x] - `p1` - Actor sends GET /settings-service/v1/settings with optional `tenant`, OData `$filter` over `category_id`, `key in (…)` or `needs_review eq true`, `$orderby`, and a pagination cursor; `tenant` and scope are resolution context, never filters - `inst-vr-browse-1`
@@ -204,8 +205,8 @@ Three properties matter more than the walk itself.
 3. [x] - `p1` - **ELSE** assemble the page under the narrowed grant: fetch a candidate batch wider than the page, evaluate the candidates in one batch decision, keep what is allowed, and refill until the page is full or the candidates run out; a setting the caller may not read is absent from the page and the count, never marked - `inst-vr-browse-3`
 4. [x] - `p1` - Confirm the target is within the caller's subtree and not standalone; **IF** not → **RETURN** `403` - `inst-vr-browse-4`
 5. [x] - `p1` - **IF** the OData expression references an unmapped field or an unsupported operator → **RETURN** `400` rather than ignoring it - `inst-vr-browse-5`
-6. [x] - `p1` - Exclude every setting whose effective tenant access for the caller is `hidden`, silently and from the count; an administrator above the target still sees what it restricted - `inst-vr-browse-6`
-7. [x] - `p1` - **IF** the filter asks for `needs_review` → DB: SELECT the flagged override rows for declarations in the page whose tenant lies in the caller's subtree, excluding standalone descendants, through `idx_values_needs_review`, and return them with their detail; this lists rows, not resolved values - `inst-vr-browse-7`
+6. [x] - `p1` - Exclude every setting whose effective tenant access for the caller is `hidden`, silently and from the count — in the page query itself, as `NOT IN` the declarations a `hidden` row on the caller's root-to-self chain names, so the page is cut and counted after the exclusion and comes back full rather than shortened; an administrator above the target still sees what it restricted - `inst-vr-browse-6`
+7. [x] - `p1` - **IF** the filter asks for `needs_review` → DB: SELECT the flagged override rows for declarations in the page whose tenant lies in the caller's subtree, excluding standalone descendants, through `idx_values_needs_review`, and return them with their detail; this lists rows, not resolved values; the subtree is obtained under the shared subtree budget, and **IF** the budget cuts it → **RETURN** `400` naming the bound rather than a silently partial listing - `inst-vr-browse-7`
 8. [x] - `p1` - **ELSE** obtain the ancestor chain once and resolve every item in the page against it, masking each value and its fallback by classification, so one page answers the whole table — the value a scope holds and what it would hold without it - `inst-vr-browse-8`
 9. [x] - `p1` - **IF** the filter named a key set → report a key the caller may not see or that does not exist in its own entry with its own outcome, never as a failure of the request - `inst-vr-browse-9`
 10. [x] - `p1` - **RETURN** `200` with the page and its cursors - `inst-vr-browse-10`
@@ -384,7 +385,7 @@ A retired declaration **MUST** resolve as a distinct retired outcome rather than
 
 - [x] `p1` - **ID**: `cpt-cf-settings-service-dod-value-resolution-cache`
 
-The system **MUST** provide a local in-process cache keyed by setting key and scope, storing the resolved value with its source trace, consulted before any database read and populated on miss. Eviction **MUST** be key-wide for a cascading declaration so descendants re-resolve lazily.
+The system **MUST** provide a local in-process cache keyed by setting key and scope, storing the resolved value with its source trace, consulted before any database read and populated on miss. Eviction **MUST** be key-wide for a cascading declaration so descendants re-resolve lazily. The cache **MUST** be bounded by a configurable capacity defaulting to the sizing anchor, evicting the entries nearest to expiry first, and **MUST** drop entries past the time-to-live on any store rather than only on their own lookup, so cold entries cannot accumulate. A store **MUST** be refused when an invalidation of the key or the scope has landed since the read's cache miss, so a read overtaken by a write cannot repopulate the cache with what it read.
 
 **Implements**:
 - `cpt-cf-settings-service-algo-value-resolution-cache-read`
@@ -476,6 +477,9 @@ The system **MUST** implement `SettingsReaderClient` over the resolver — `get_
 - [x] A second read of the same key and scope is served from cache without a database query
 - [x] Writing a value of a cascading declaration evicts every cached scope for that key
 - [x] A cache entry older than the configured time-to-live is treated as a miss and re-resolved
+- [x] A cache entry past its time-to-live is dropped by the next store into the cache, without a lookup of its own
+- [x] The cache never holds more than `cache_max_entries`; at capacity a new entry displaces the oldest stored one
+- [x] A read that began before an invalidation of its key or scope does not repopulate the cache with what it read, and the next read resolves afresh
 - [x] The inheritance trail contains only the caller's own ancestor chain, and never a sibling or descendant scope
 - [x] Setter identity appears on the administrative trail and is absent from the consumer result
 - [x] A tenant admin requesting a trail for a scope outside its subtree is denied
@@ -483,6 +487,8 @@ The system **MUST** implement `SettingsReaderClient` over the resolver — `get_
 - [x] The read's `last_change_at` never exceeds the greater of the declaration's and the resolved row's timestamps, and a sibling's later write leaves it unchanged
 - [x] A read whose own override is flagged returns the fallthrough value together with `needs_review` and its detail
 - [x] A read of a hidden setting returns `404`; a read for a tenant outside the subtree or a standalone descendant returns `403`
+- [x] A browse page is cut after the hidden exclusion: with a hidden setting among the candidates the page still holds `limit` visible settings and its cursor continues past the hidden one
+- [x] The `needs_review` browse over a target whose subtree exceeds the subtree budget is refused `400` naming the bound
 - [x] A read of a secret setting returns the mask token; a `pii` value is masked without the entitlement and unmasked with it
 - [x] A scope with its own override carries as `fallback` the nearest valid ancestor's value, `fallback_source` `inherited` and `fallback_scope` naming that ancestor; with no ancestor override, the Schema Default, `schema_default`, and no scope — and the fallback equals what the scope resolves to once its own row is gone
 - [x] A scope without its own override carries a `fallback` equal to its `value`, with the same source and scope

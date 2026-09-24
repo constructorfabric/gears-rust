@@ -23,9 +23,10 @@ use crate::api::rest::setting_dto::{
 };
 use crate::domain::category::visibility;
 use crate::domain::error::DomainError;
-use crate::domain::resolution::ScopeTarget;
+use crate::domain::resolution::{SUBTREE_BUDGET, ScopeTarget, subtree_too_large};
 use crate::field;
 use crate::gear::ConcreteResolver;
+use crate::log_text::LogSafe;
 
 const READ: &str = "read";
 /// The entitlement that unmasks `pii` values on the administrative surface.
@@ -337,17 +338,15 @@ pub async fn browse_settings(
         filter_hash: query.filter_hash.clone(),
         select: None,
     };
-    let mut page = resolver
-        .list_declarations(&conn, &scope, &declarations_query)
-        .await?;
     // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-6
-    // A setting hidden from the target tenant leaves the page silently — and
-    // the count with it, since the page is what is counted — never marked.
-    let ids: Vec<Uuid> = page.items.iter().map(|d| d.id).collect();
-    let caller = ScopeTarget::Tenant(ctx.subject_tenant_id()).normalize(root);
-    let access = resolver.effective_access_for(&conn, &ids, caller).await?;
-    page.items
-        .retain(|d| !access.get(&d.id).is_some_and(|a| a.is_hidden()));
+    // A setting hidden from the caller leaves the page silently, never
+    // marked — in the query, on the caller's own chain, so the page is cut
+    // and counted after the exclusion: a page shortened afterwards would tell
+    // the caller that something sits in the gap.
+    let caller_chain = resolver.chain_of(ctx.subject_tenant_id()).await?;
+    let page = resolver
+        .list_declarations(&conn, &scope, &caller_chain, &declarations_query)
+        .await?;
     // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-6
     let has_pii = page.items.iter().any(|d| d.data_classification == "pii");
     let pii = has_pii && may_read_pii(&enforcer, &ctx).await;
@@ -358,7 +357,15 @@ pub async fn browse_settings(
         // declarations whose tenant lies in the caller's subtree, standalone
         // descendants excluded by the hierarchy.
         let target_tenant = target.tenant_id(root);
-        let mut tenants = resolver.hierarchy().descendants(target_tenant).await?;
+        // Under the subtree budget: a listing the budget would cut is refused
+        // with the bound named, never answered partially.
+        let (mut tenants, truncated) = resolver
+            .hierarchy()
+            .descendants_bfs(target_tenant, SUBTREE_BUDGET)
+            .await?;
+        if truncated {
+            return Err(subtree_too_large("tenant", "target's").into());
+        }
         tenants.push(target_tenant);
         let ids: Vec<Uuid> = page.items.iter().map(|d| d.id).collect();
         let rows = resolver.flagged_overrides(&conn, &ids, &tenants).await?;
@@ -385,6 +392,13 @@ pub async fn browse_settings(
                     SettingItemDto::resolved(render(&effective, pii)).with_mode(&declaration.mode)
                 }
                 Err(err) => {
+                    if let Some(diagnostic) = err.internal_diagnostic() {
+                        tracing::error!(
+                            key = %declaration.key,
+                            diagnostic = %LogSafe(diagnostic),
+                            "a browse entry failed internally"
+                        );
+                    }
                     SettingItemDto::failed(&declaration.key, &err).with_mode(&declaration.mode)
                 }
             })

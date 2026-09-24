@@ -206,11 +206,19 @@ pub async fn evict_access_change(
     tenant: Uuid,
 ) -> Result<(), DomainError> {
     // @cpt-begin:cpt-cf-settings-service-algo-tenant-access-evict:p1:inst-ta-evict-1
-    let mut tenants = hierarchy.descendants(tenant).await?;
+    let (mut tenants, truncated) = hierarchy
+        .descendants_bfs(tenant, crate::domain::resolution::SUBTREE_BUDGET)
+        .await?;
     tenants.push(tenant);
     // @cpt-end:cpt-cf-settings-service-algo-tenant-access-evict:p1:inst-ta-evict-1
     // @cpt-begin:cpt-cf-settings-service-algo-tenant-access-evict:p1:inst-ta-evict-2
-    cache.invalidate_tenants(key, &tenants);
+    // A subtree the budget cut is evicted whole, by key: cheaper than naming
+    // its tenants, and nothing stale survives it.
+    if truncated {
+        cache.invalidate_key(key);
+    } else {
+        cache.invalidate_tenants(key, &tenants);
+    }
     // @cpt-end:cpt-cf-settings-service-algo-tenant-access-evict:p1:inst-ta-evict-2
     // @cpt-begin:cpt-cf-settings-service-algo-tenant-access-evict:p1:inst-ta-evict-3
     // Locally only; peer replicas converge through the R2 broadcast.

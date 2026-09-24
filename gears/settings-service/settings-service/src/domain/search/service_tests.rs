@@ -63,6 +63,7 @@ fn category(name: &str) -> Category {
         sort_order: 0,
         icon: None,
         etag: crate::domain::precondition::ETag::new("1"),
+        updated_at: time::OffsetDateTime::UNIX_EPOCH,
     }
 }
 
@@ -116,6 +117,7 @@ impl SearchRepository for Staged {
         _tenant_ids: &[Uuid],
         _needle: &Needle,
         _corpus: Corpus,
+        _limit: usize,
     ) -> Result<Vec<StoredValue>, DomainError> {
         self.asked_for
             .lock()
@@ -149,6 +151,8 @@ async fn run(service: &SearchService<Staged>, raw: &str, corpus: Corpus) -> Vec<
                 needle: &needle,
                 corpus,
                 tenant_ids: &[harness.tree.root],
+                hidden_for: &[],
+                override_limit: 1_000,
                 query: &query,
             },
         )
@@ -342,4 +346,56 @@ async fn the_overrides_are_asked_for_exactly_the_pages_declarations() {
             .unwrap_or_else(std::sync::PoisonError::into_inner),
         ids
     );
+}
+
+#[tokio::test]
+async fn a_page_whose_matching_overrides_exceed_the_bound_is_refused_not_cut() {
+    let d = declaration("motto", None, json!("nothing"), "public");
+    let id = d.id;
+    let rows: Vec<StoredValue> = (10..13)
+        .map(|n| override_row(id, Uuid::from_u128(n), json!("alpha")))
+        .collect();
+    let service = SearchService::new(Staged {
+        declarations: vec![d],
+        overrides: rows,
+        categories: vec![category("Network")],
+        ..Staged::default()
+    });
+    let harness = crate::test_support::ResolutionHarness::new().await;
+    let conn = harness.db.conn().expect("connection");
+    let all = AccessScope::allow_all();
+    let tenants = [harness.tree.root];
+    let needle = Needle::parse("alpha").expect("a needle");
+    let query = ODataQuery::default();
+    let request = |override_limit| SearchRequest {
+        scope: &all,
+        visibility: &DomainVisibility::Unrestricted,
+        needle: &needle,
+        corpus: Corpus::Public,
+        tenant_ids: &tenants,
+        hidden_for: &[],
+        override_limit,
+        query: &query,
+    };
+
+    // Three rows against a bound of two: the page would be cut short of a
+    // hit, so it is refused with the bound named.
+    let refused = service
+        .search(&conn, &request(2))
+        .await
+        .expect_err("over the bound");
+    assert!(
+        matches!(
+            &refused,
+            DomainError::Validation { code, .. } if *code == crate::field::SEARCH_TOO_MANY_HITS
+        ),
+        "{refused:?}"
+    );
+
+    // At the bound, every hit is there.
+    let page = service
+        .search(&conn, &request(3))
+        .await
+        .expect("within the bound");
+    assert_eq!(page.hits.len(), 3);
 }

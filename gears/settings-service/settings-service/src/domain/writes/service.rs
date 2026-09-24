@@ -11,8 +11,10 @@
 
 use std::sync::Arc;
 
+use secrecy::{ExposeSecret, SecretString};
 use serde_json::Value;
 use settings_service_sdk::SettingKey;
+use time::OffsetDateTime;
 use toolkit_db::secure::DBRunner;
 use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
@@ -25,11 +27,16 @@ use crate::domain::error::DomainError;
 use crate::domain::ports::{ChangePublisher, SecretManager, ValueEvent, WriteMetrics};
 use crate::domain::precondition;
 use crate::domain::resolution::{EffectiveValue, ScopeTarget, ValueResolver, scope_class};
+use crate::domain::secrets::pending::{
+    PENDING_SECRET_TTL, PendingSecretDraft, PendingSecretRepository, invalid_pending,
+};
+use crate::domain::stepup::StepUpRefusal;
 use crate::domain::stepup::{
     INTERACTIVE_SUBJECT_TYPES, StepUpSubject, StepUpVerifier, unverified_payload,
 };
 use crate::domain::validation::{FieldViolation, TypeValidator};
 use crate::domain::value::{ValueDraft, ValueRepository};
+use crate::log_text::LogSafe;
 
 /// Who is writing, with what proof.
 #[derive(Debug, Clone)]
@@ -38,8 +45,14 @@ pub struct WriteActor {
     pub ctx: SecurityContext,
     /// The request the write belongs to.
     pub request_id: String,
-    /// The step-up token presented, when any.
-    pub step_up_token: Option<String>,
+    /// The step-up token presented, when any — the `X-Step-Up-Token` header,
+    /// or the session's own bearer when it is fresh enough to serve. Kept
+    /// wrapped: a `{:?}` of the actor prints `[REDACTED]`, the bytes are
+    /// zeroed when the actor drops, and they are exposed in one place, the
+    /// call to the verifier. A live token replays an elevated action for the
+    /// length of its freshness window, so it never sits in a plain `String`
+    /// that a log line or a panic message could carry.
+    pub step_up_token: Option<SecretString>,
 }
 
 impl WriteActor {
@@ -67,7 +80,7 @@ impl WriteActor {
             session_sub: self
                 .ctx
                 .bearer_token()
-                .and_then(|t| session_sub(secrecy::ExposeSecret::expose_secret(t))),
+                .and_then(|t| session_sub(t.expose_secret())),
         }
     }
 }
@@ -89,7 +102,12 @@ pub enum Change {
     Set(Value),
     /// Adopt the entry a stage created earlier, by its reference: the plaintext
     /// was validated and stored then, and travels nowhere now.
-    AdoptSecret(String),
+    AdoptSecret {
+        /// The reference of the entry the stage created.
+        secret_ref: String,
+        /// The token's row, consumed inside the commit.
+        pending_id: Uuid,
+    },
     /// Clear the override so the scope falls back.
     Revert,
     /// Remove the scope's own row.
@@ -109,6 +127,13 @@ pub enum Staged {
         inline: Option<Value>,
         /// The reference of the entry created for this write; `None` inline.
         secret_ref: Option<String>,
+        /// The row consumed inside the commit: the intent recorded before
+        /// this write created its entry, or the token of the stage it adopts.
+        /// `None` inline.
+        pending_id: Option<Uuid>,
+        /// Whether the entry was adopted from an earlier stage rather than
+        /// created by this write — then it is not this write's to release.
+        adopted: bool,
     },
     /// Fall back to the inherited value.
     Revert,
@@ -137,6 +162,12 @@ pub struct Gated {
     pub tenant_id: Uuid,
     /// The root tenant.
     pub root: Uuid,
+    /// The caller's root-to-self chain as the gate resolved it, empty for the
+    /// platform caller: what the commit derives access from again.
+    pub caller_chain: Vec<Uuid>,
+    /// Whether a verified step-up stands behind this change — verified at the
+    /// gate, or once for the request by a caller that said so.
+    pub step_up_verified: bool,
 }
 
 /// A committed change.
@@ -218,18 +249,19 @@ impl ImpactReport {
     pub const DEFAULT_LIMIT: usize = 100;
     /// The largest page size.
     pub const MAX_LIMIT: usize = 500;
-    /// How many descendants a walk examines at most.
-    pub const NODE_BUDGET: usize = 5_000;
+    /// How many descendants a walk examines at most: the shared subtree budget.
+    pub const NODE_BUDGET: usize = crate::domain::resolution::SUBTREE_BUDGET;
 }
 
 /// The writer.
-pub struct ValueWriter<D, V, A, S> {
+pub struct ValueWriter<D, V, A, S, P> {
     values: V,
     resolver: Arc<ValueResolver<D, V, A>>,
     validator: Arc<dyn TypeValidator>,
     sink: S,
     step_up: Arc<dyn StepUpVerifier>,
     secrets: Arc<dyn SecretManager>,
+    pending: P,
     publisher: Arc<dyn ChangePublisher>,
     metrics: Arc<dyn WriteMetrics>,
 }
@@ -240,12 +272,13 @@ fn denied() -> DomainError {
     }
 }
 
-impl<D, V, A, S> ValueWriter<D, V, A, S>
+impl<D, V, A, S, P> ValueWriter<D, V, A, S, P>
 where
     D: DeclarationRepository,
     V: ValueRepository + Clone,
     A: AccessRepository,
     S: AuditSink,
+    P: PendingSecretRepository,
 {
     /// Build the writer over the resolver and its ports.
     #[allow(clippy::too_many_arguments)]
@@ -256,6 +289,7 @@ where
         sink: S,
         step_up: Arc<dyn StepUpVerifier>,
         secrets: Arc<dyn SecretManager>,
+        pending: P,
         publisher: Arc<dyn ChangePublisher>,
         metrics: Arc<dyn WriteMetrics>,
     ) -> Self {
@@ -266,6 +300,7 @@ where
             sink,
             step_up,
             secrets,
+            pending,
             publisher,
             metrics,
         }
@@ -332,7 +367,8 @@ where
     }
 
     /// The write gate order, after authorization — which the caller decided
-    /// first, without consulting step-up.
+    /// first, without consulting step-up: the declaration, the target, the
+    /// caller's own access, and step-up last.
     ///
     /// # Errors
     /// The first gate's refusal: not-found or retired for the declaration,
@@ -355,23 +391,6 @@ where
         let root = self.resolver.root_tenant().await?;
         // @cpt-end:cpt-cf-settings-service-algo-value-writes-gates:p1:inst-vw-gate-1
         let declaration = self.declaration_for_write(conn, actor, key, root).await?;
-        if declaration.requires_step_up {
-            // @cpt-begin:cpt-cf-settings-service-algo-value-writes-gates:p1:inst-vw-gate-4
-            // A setting that needs a person to confirm it is by definition not
-            // one a machine may set: refused before any validation.
-            if !actor.is_interactive() {
-                self.metrics.step_up(operation, "service_principal");
-                return Err(denied());
-            }
-            // @cpt-end:cpt-cf-settings-service-algo-value-writes-gates:p1:inst-vw-gate-4
-            // @cpt-begin:cpt-cf-settings-service-algo-value-writes-gates:p1:inst-vw-gate-5
-            // @cpt-begin:cpt-cf-settings-service-algo-gear-foundation-authz-stepup:p1:inst-gf-authz-6
-            if policy == StepUpPolicy::Verify {
-                self.verify_step_up(actor, operation).await?;
-            }
-            // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-authz-stepup:p1:inst-gf-authz-6
-            // @cpt-end:cpt-cf-settings-service-algo-value-writes-gates:p1:inst-vw-gate-5
-        }
         // @cpt-begin:cpt-cf-settings-service-algo-value-writes-gates:p1:inst-vw-gate-6
         let caller = actor.ctx.subject_tenant_id();
         let tenant_id = requested.unwrap_or(caller);
@@ -395,23 +414,56 @@ where
         // @cpt-end:cpt-cf-settings-service-algo-value-writes-gates:p1:inst-vw-gate-7
         // @cpt-begin:cpt-cf-settings-service-algo-value-writes-gates:p1:inst-vw-gate-8
         // The caller's own access, never the target's: an overridable ancestor
-        // manages a restricted descendant.
-        if caller != root {
+        // manages a restricted descendant. The chain is resolved once, here,
+        // and travels with the change: the commit reads the rows again over it.
+        let caller_chain = if caller == root {
+            Vec::new()
+        } else {
+            let chain = self.resolver.chain_of(caller).await?;
             let own = self
                 .resolver
-                .effective_access(conn, declaration.id, ScopeTarget::Tenant(caller))
+                .access_on_chain(conn, declaration.id, &chain)
                 .await?;
             if own.access != TenantAccess::Overridable {
                 return Err(denied());
             }
-        }
+            chain
+        };
         // @cpt-end:cpt-cf-settings-service-algo-value-writes-gates:p1:inst-vw-gate-8
+        // Step-up comes last, once the write is otherwise the caller's to
+        // make: a challenge is issued only for a write that would go through
+        // with it — authorize the action, then challenge (RFC 9470) — so a
+        // caller without rights on the target learns nothing about what the
+        // setting would have asked of it. When the declaration requires it, a
+        // verified step-up stands behind the change once this block is
+        // through: verified here, or once for the request by the caller that
+        // chose `AlreadyVerified`.
+        let step_up_verified = declaration.requires_step_up;
+        if declaration.requires_step_up {
+            // @cpt-begin:cpt-cf-settings-service-algo-value-writes-gates:p1:inst-vw-gate-4
+            // A setting that needs a person to confirm it is by definition not
+            // one a machine may set: refused before any validation.
+            if !actor.is_interactive() {
+                self.metrics.step_up(operation, "service_principal");
+                return Err(denied());
+            }
+            // @cpt-end:cpt-cf-settings-service-algo-value-writes-gates:p1:inst-vw-gate-4
+            // @cpt-begin:cpt-cf-settings-service-algo-value-writes-gates:p1:inst-vw-gate-5
+            // @cpt-begin:cpt-cf-settings-service-algo-gear-foundation-authz-stepup:p1:inst-gf-authz-6
+            if policy == StepUpPolicy::Verify {
+                self.verify_step_up(actor, operation).await?;
+            }
+            // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-authz-stepup:p1:inst-gf-authz-6
+            // @cpt-end:cpt-cf-settings-service-algo-value-writes-gates:p1:inst-vw-gate-5
+        }
         // @cpt-begin:cpt-cf-settings-service-algo-value-writes-gates:p1:inst-vw-gate-9
         Ok(Gated {
             declaration,
             target: ScopeTarget::Tenant(tenant_id).normalize(root),
             tenant_id,
             root,
+            caller_chain,
+            step_up_verified,
         })
         // @cpt-end:cpt-cf-settings-service-algo-value-writes-gates:p1:inst-vw-gate-9
     }
@@ -456,7 +508,13 @@ where
         let subject = actor.step_up_subject();
         match self
             .step_up
-            .verify(actor.step_up_token.as_deref(), &subject)
+            .verify(
+                actor
+                    .step_up_token
+                    .as_ref()
+                    .map(ExposeSecret::expose_secret),
+                &subject,
+            )
             .await
         {
             Ok(()) => {
@@ -467,13 +525,28 @@ where
             }
             Err(refusal) => {
                 self.metrics.step_up(operation, refusal.code());
-                let requirement = self.step_up.requirement();
-                Err(DomainError::StepUpRequired {
-                    reason: refusal.code(),
-                    max_age_seconds: requirement.max_age.as_secs(),
-                    acr_values: requirement.acr_values.clone(),
-                })
+                match refusal {
+                    // Not a verdict on the token: the platform's AuthN could
+                    // not be asked. Unavailable tells the client to retry; a
+                    // challenge would tell the person to re-authenticate
+                    // against a dependency that is down.
+                    StepUpRefusal::Unavailable(detail) => Err(DomainError::Unavailable {
+                        detail: format!("step-up could not be verified: {detail}"),
+                    }),
+                    refusal => Err(self.challenge(&refusal)),
+                }
             }
+        }
+    }
+
+    /// The challenge a write without a verified step-up behind it is answered
+    /// with: the deployment's freshness window and assurance levels.
+    fn challenge(&self, refusal: &StepUpRefusal) -> DomainError {
+        let requirement = self.step_up.requirement();
+        DomainError::StepUpRequired {
+            reason: refusal.code(),
+            max_age_seconds: requirement.max_age.as_secs(),
+            acr_values: requirement.acr_values.clone(),
         }
     }
 
@@ -485,24 +558,37 @@ where
     }
 
     /// Stage a change: validate the value and, for a secret, put the plaintext
-    /// in the store. Runs before the transaction, which the store cannot join.
+    /// in the store. Runs before the transaction, which the store cannot join;
+    /// `conn` is for the intent row a secret leaves behind first.
     ///
     /// # Errors
     /// [`DomainError::Validation`] for an invalid value;
-    /// [`DomainError::Unavailable`] when the store cannot answer, in which case
-    /// nothing was stored anywhere.
-    pub async fn stage(&self, gated: &Gated, change: Change) -> Result<Staged, DomainError> {
+    /// [`DomainError::Unavailable`] when the store cannot answer — the intent
+    /// row stays for the sweep, since the entry may exist without an answer;
+    /// [`DomainError`] when the row cannot be written, nothing stored anywhere.
+    pub async fn stage<C: DBRunner>(
+        &self,
+        conn: &C,
+        gated: &Gated,
+        actor: &WriteActor,
+        change: Change,
+    ) -> Result<Staged, DomainError> {
         let declaration = &gated.declaration;
         let value = match change {
             Change::Set(value) => value,
-            Change::AdoptSecret(secret_ref) => {
+            Change::AdoptSecret {
+                secret_ref,
+                pending_id,
+            } => {
                 // @cpt-begin:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-8
                 // Validated and stored when it was staged; the store leg is
                 // skipped and the reference goes on to the commit as any
-                // secret's would.
+                // secret's would, the token's row consumed there.
                 return Ok(Staged::Set {
                     inline: None,
                     secret_ref: Some(secret_ref),
+                    pending_id: Some(pending_id),
+                    adopted: true,
                 });
                 // @cpt-end:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-8
             }
@@ -522,46 +608,97 @@ where
         // @cpt-end:cpt-cf-settings-service-algo-value-writes-commit:p1:inst-vw-commit-1
         // @cpt-begin:cpt-cf-settings-service-algo-value-writes-commit:p1:inst-vw-commit-4
         // Plaintext never reaches `value` for a secret: the Secret Manager
-        // takes it and hands back a reference unique to this write, and with
-        // nothing bound the write is unavailable rather than stored in clear.
-        // The store cannot join the row's transaction, so this runs before it;
-        // a transaction that then fails releases the entry again.
+        // takes it under a reference unique to this write, and with nothing
+        // bound the write is unavailable rather than stored in clear. The
+        // store cannot join the row's transaction, so this runs before it.
+        //
+        // The intent first, durable, then the entry. The row names the
+        // reference the create is about to use, so a create whose answer never
+        // arrives — the entry may or may not exist — leaves the sweep
+        // something to reclaim within the pending window instead of an orphan
+        // nobody can find. A committed write deletes the row inside its
+        // transaction; a refused one deletes it with the entry.
         if declaration.has_secret_trait {
             let secret_ref = self
                 .secrets
-                .store_secret(&declaration.key, gated.tenant_id, &value)
+                .mint_reference(&declaration.key, gated.tenant_id);
+            let intent = self
+                .pending
+                .insert(
+                    conn,
+                    &AccessScope::allow_all(),
+                    PendingSecretDraft {
+                        declaration_id: declaration.id,
+                        tenant_id: gated.tenant_id,
+                        subject_id: actor.subject(),
+                        secret_ref: secret_ref.clone(),
+                        expires_at: OffsetDateTime::now_utc() + PENDING_SECRET_TTL,
+                    },
+                )
+                .await?;
+            self.secrets
+                .store_secret(&declaration.key, gated.tenant_id, &secret_ref, &value)
                 .await?;
             return Ok(Staged::Set {
                 inline: None,
                 secret_ref: Some(secret_ref),
+                pending_id: Some(intent.id),
+                adopted: false,
             });
         }
         Ok(Staged::Set {
             inline: Some(value),
             secret_ref: None,
+            pending_id: None,
+            adopted: false,
         })
         // @cpt-end:cpt-cf-settings-service-algo-value-writes-commit:p1:inst-vw-commit-4
         // @cpt-end:cpt-cf-settings-service-flow-secret-values-set:p1:inst-sv-set-1
     }
 
-    /// Release the entry a staged secret created, when its transaction did not
-    /// commit. Logged, never failed: the refusal already stands.
-    pub async fn discard(&self, gated: &Gated, staged: &Staged) {
+    /// Release the entry this write created, and the intent row that named
+    /// it, when its transaction did not commit. Logged, never failed: the
+    /// refusal already stands, and a row left behind is the sweep's.
+    ///
+    /// An adopted entry is left alone: the stage created it, the token still
+    /// names it, and a commit that failed left both in place for the retry —
+    /// or for the sweep, once the token expires.
+    pub async fn discard<C: DBRunner>(&self, conn: &C, gated: &Gated, staged: &Staged) {
         // @cpt-begin:cpt-cf-settings-service-flow-secret-values-set:p1:inst-sv-set-7
-        if let Staged::Set {
+        let Staged::Set {
             secret_ref: Some(reference),
+            pending_id,
+            adopted: false,
             ..
         } = staged
-            && let Err(err) = self
-                .secrets
-                .delete_secret(&gated.declaration.key, gated.tenant_id, reference)
-                .await
+        else {
+            return;
+        };
+        // The entry first, the row only once the entry is gone: a release
+        // that fails leaves the sweep its handle on the entry.
+        if let Err(err) = self
+            .secrets
+            .delete_secret(&gated.declaration.key, gated.tenant_id, reference)
+            .await
         {
             tracing::warn!(
                 key = %gated.declaration.key,
                 tenant = %gated.tenant_id,
-                %err,
-                "secret entry of a refused write not released; the reference is orphaned"
+                err = %LogSafe(&err),
+                "secret entry of a refused write not released; its intent row stays for the sweep"
+            );
+            return;
+        }
+        if let Some(id) = pending_id
+            && let Err(err) = self
+                .pending
+                .delete(conn, &AccessScope::allow_all(), *id)
+                .await
+        {
+            tracing::warn!(
+                pending_id = %id,
+                err = %LogSafe(&err),
+                "intent row of a refused write not removed; the sweep finds nothing to release"
             );
         }
         // @cpt-end:cpt-cf-settings-service-flow-secret-values-set:p1:inst-sv-set-7
@@ -571,6 +708,7 @@ where
     /// the row, and its audit record.
     ///
     /// # Errors
+    /// [`DomainError::Retired`] when the declaration retired since the gate,
     /// [`DomainError::PreconditionRequired`] / [`DomainError::PreconditionFailed`]
     /// on the tag, [`DomainError::NotFound`] removing a row that is not there,
     /// [`DomainError::Unavailable`] when the database or the audit sink cannot
@@ -584,12 +722,59 @@ where
         actor: &WriteActor,
         change_set_id: Uuid,
     ) -> Result<Committed, DomainError> {
-        let declaration = &gated.declaration;
         let scope = AccessScope::allow_all();
         // @cpt-begin:cpt-cf-settings-service-algo-value-writes-commit:p1:inst-vw-commit-2
         // @cpt-begin:cpt-cf-settings-service-algo-value-writes-commit:p1:inst-vw-commit-3
         // Inside the caller's transaction, which spans this change alone. The
-        // tag is compared here and the row written below in the same
+        // gate read the declaration outside it; it is read again here under a
+        // share lock held to the commit. A retire or a major upgrade already
+        // under way holds the row for update, so this read waits for it and
+        // sees `retired` — the write lands nowhere rather than on a retired
+        // declaration, where the upgrade's copy would never find it. One that
+        // starts later waits for this commit, and copies or retains this value.
+        let live = self
+            .resolver
+            .lock_declaration(conn, gated.declaration.id)
+            .await?
+            .ok_or(DomainError::NotFound {
+                resource: "declaration",
+            })?;
+        if live.status == "retired" {
+            return Err(DomainError::Retired { key: live.key });
+        }
+        // From here on the declaration is the row as it is inside this
+        // transaction, not the gate's snapshot. The classification stamped on
+        // the row and the secret trait that masks the audit images come from
+        // it: a reclassification committed between the gate and here resynced
+        // only the rows that existed then, and this row did not; one under way
+        // waits for this commit and resyncs it with the rest.
+        let declaration = &live;
+        // Two more decisions the gate took from outside the transaction are
+        // taken again here, under the same lock. A restriction set or cleared
+        // takes the declaration row for update, so one already under way is
+        // seen once it commits, and one that starts later waits for this
+        // commit: the caller's own access is derived again from the rows on
+        // the chain the gate resolved — hidden is absent, as at the gate. And
+        // a step-up requirement switched on since the gate finds no verified
+        // step-up behind this write; the retry meets the gate that sees it.
+        if !gated.caller_chain.is_empty() {
+            let own = self
+                .resolver
+                .access_on_chain(conn, declaration.id, &gated.caller_chain)
+                .await?;
+            if own.is_hidden() {
+                return Err(DomainError::NotFound {
+                    resource: "declaration",
+                });
+            }
+            if own.access != TenantAccess::Overridable {
+                return Err(denied());
+            }
+        }
+        if declaration.requires_step_up && !gated.step_up_verified {
+            return Err(self.challenge(&StepUpRefusal::Missing));
+        }
+        // The tag is compared here and the row written below in the same
         // transaction, so a value that moved in between is the other writer's.
         let current = self
             .values
@@ -601,9 +786,36 @@ where
         let old_value = current.as_ref().map(image_of);
         let mut released_secret = None;
         let (stored, operation) = match staged {
-            Staged::Set { inline, secret_ref } => {
+            Staged::Set {
+                inline,
+                secret_ref,
+                pending_id,
+                adopted,
+            } => {
                 // @cpt-begin:cpt-cf-settings-service-flow-secret-values-set:p1:inst-sv-set-6
                 // @cpt-dod:cpt-cf-settings-service-dod-secret-values-reference-only:p1
+                // The row behind the secret — the write's own intent, or the
+                // token of the stage it adopts — is consumed here, inside the
+                // transaction, by one statement that re-asserts its expiry: a
+                // commit that lands takes it with it, one that does not leaves
+                // it. A row gone or past its expiry is the sweep's, its entry
+                // released or about to be, and no row commits pointing at it.
+                if let Some(id) = pending_id
+                    && !self
+                        .pending
+                        .claim(conn, &scope, *id, OffsetDateTime::now_utc())
+                        .await?
+                {
+                    return Err(if *adopted {
+                        invalid_pending()
+                    } else {
+                        DomainError::Unavailable {
+                            detail: "the secret staged for this write expired before it \
+                                     committed; retry the write"
+                                .to_owned(),
+                        }
+                    });
+                }
                 // The row takes the reference of the entry created for this
                 // write; the entry it held before is released after the commit,
                 // once nothing can point at it any more.
@@ -626,7 +838,15 @@ where
                     Some(row) => (
                         Some(
                             self.values
-                                .update(conn, &scope, row.id, inline, secret_ref, &actor.subject())
+                                .update(
+                                    conn,
+                                    &scope,
+                                    row.id,
+                                    inline,
+                                    secret_ref,
+                                    &actor.subject(),
+                                    row.last_change_at,
+                                )
                                 .await?,
                         ),
                         AuditOperation::Change,
@@ -673,7 +893,13 @@ where
                 // @cpt-end:cpt-cf-settings-service-flow-secret-values-remove:p1:inst-sv-remove-2
                 // @cpt-end:cpt-cf-settings-service-flow-secret-values-remove:p1:inst-sv-remove-1
                 self.values
-                    .delete(conn, &scope, declaration.id, gated.tenant_id)
+                    .delete(
+                        conn,
+                        &scope,
+                        declaration.id,
+                        gated.tenant_id,
+                        row.last_change_at,
+                    )
                     .await?;
                 let operation = if matches!(staged, Staged::Revert) {
                     AuditOperation::Revert
@@ -766,7 +992,7 @@ where
             tracing::warn!(
                 key = %committed.key,
                 tenant = %committed.tenant_id,
-                %err,
+                err = %LogSafe(&err),
                 "secret entry not released after the change; the reference is orphaned"
             );
         }
@@ -781,13 +1007,25 @@ where
         tenant_id: Uuid,
         actor: &WriteActor,
         reason: &DomainError,
+        change_set_id: Uuid,
     ) {
+        // An internal fault's diagnostic stays in this process's log; the event
+        // may travel further than the log does.
+        if let Some(diagnostic) = reason.internal_diagnostic() {
+            tracing::error!(
+                %key,
+                %tenant_id,
+                diagnostic = %LogSafe(diagnostic),
+                "value change failed internally"
+            );
+        }
         self.publisher
             .publish(ValueEvent::ChangeFailed {
                 key: key.to_owned(),
                 tenant_id,
                 actor: actor.subject(),
-                reason: reason.to_string(),
+                reason: reason.wire_message(),
+                change_set_id,
             })
             .await;
         self.metrics.value_write("rejected");

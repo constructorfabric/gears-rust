@@ -1,5 +1,5 @@
 <!-- Created: 2026-08-10 by Virtuozzo International GmbH -->
-<!-- Updated: 2026-09-05 by Virtuozzo International GmbH -->
+<!-- Updated: 2026-09-23 by Virtuozzo International GmbH -->
 
 # Decomposition: Settings Service
 
@@ -335,6 +335,7 @@ One requirement is counted as covered while being split across releases: `cpt-cf
   - Revert-to-default resolution semantics, with the Schema Default independent of any override and never destroyed by setting or clearing one
   - Cache `get`, `populate`, and `invalidate` keyed by `(key, scope)`, with key-wide eviction for cascading declarations so descendants re-resolve lazily
   - `cache_ttl_seconds` backstop, default 30 s, owned by this cache
+  - `cache_max_entries` bound, default 500,000 — the sizing anchor — with the entries nearest to expiry evicted first and expired entries dropped on any store
   - Hierarchy-change eviction for cascading declarations, noting that the Tenant Resolver does not publish that signal today so the TTL is currently the only backstop after a re-parent
 
 - **Out of scope**:
@@ -445,7 +446,7 @@ One requirement is counted as covered while being split across releases: `cpt-cf
 - **Out of scope**:
   - Value writes and the write-side use of the caller's access, which is 2.8
   - Any per-setting flag on the declaration: `tenant_visible` and `tenant_overridable` no longer exist
-  - Search and its filters, which are R2
+  - Search and its filters, which are 2.11
 
 - **Requirements Covered**:
 

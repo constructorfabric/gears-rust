@@ -11,6 +11,7 @@ use credstore_sdk::{
     CredStoreClientV1, CredStoreError, GetSecretResponse, SecretRef, SecretValue, SharingMode,
     TenantId, WriteOptions, WritePrecondition,
 };
+use secrecy::ExposeSecret;
 use serde_json::json;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
@@ -168,12 +169,25 @@ fn manager() -> (Arc<MemoryCredStore>, CredStoreSecretManager) {
     (store, manager)
 }
 
+/// Mint and store in one step, as the writer does around its intent row.
+async fn store_new(
+    manager: &CredStoreSecretManager,
+    key: &str,
+    tenant: Uuid,
+    plaintext: &serde_json::Value,
+) -> Result<String, DomainError> {
+    let reference = manager.mint_reference(key, tenant);
+    manager
+        .store_secret(key, tenant, &reference, plaintext)
+        .await?;
+    Ok(reference)
+}
+
 #[tokio::test]
 async fn a_secret_is_stored_private_to_the_gear_principal_in_the_target_tenant() {
     let (store, manager) = manager();
     let tenant = Uuid::new_v4();
-    let reference = manager
-        .store_secret(KEY, tenant, &json!("hunter2"))
+    let reference = store_new(&manager, KEY, tenant, &json!("hunter2"))
         .await
         .expect("stored");
 
@@ -226,19 +240,21 @@ async fn a_secret_is_stored_private_to_the_gear_principal_in_the_target_tenant()
         .resolve_plaintext(KEY, tenant, &reference)
         .await
         .expect("resolved");
-    assert_eq!(plaintext, "hunter2");
+    assert_eq!(plaintext.expose_secret(), "hunter2");
+    assert!(
+        !format!("{plaintext:?}").contains("hunter2"),
+        "the wrapper redacts: {plaintext:?}"
+    );
 }
 
 #[tokio::test]
 async fn a_second_set_creates_a_new_entry_and_leaves_the_first_untouched() {
     let (store, manager) = manager();
     let tenant = Uuid::new_v4();
-    let first = manager
-        .store_secret(KEY, tenant, &json!("one"))
+    let first = store_new(&manager, KEY, tenant, &json!("one"))
         .await
         .expect("stored");
-    let second = manager
-        .store_secret(KEY, tenant, &json!("two"))
+    let second = store_new(&manager, KEY, tenant, &json!("two"))
         .await
         .expect("stored again");
     assert_ne!(first, second);
@@ -247,14 +263,16 @@ async fn a_second_set_creates_a_new_entry_and_leaves_the_first_untouched() {
         manager
             .resolve_plaintext(KEY, tenant, &first)
             .await
-            .expect("resolved"),
+            .expect("resolved")
+            .expose_secret(),
         "one"
     );
     assert_eq!(
         manager
             .resolve_plaintext(KEY, tenant, &second)
             .await
-            .expect("resolved"),
+            .expect("resolved")
+            .expose_secret(),
         "two"
     );
 }
@@ -264,16 +282,13 @@ async fn different_tenants_and_keys_get_different_entries() {
     let (store, manager) = manager();
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
-    manager
-        .store_secret(KEY, a, &json!("a"))
+    store_new(&manager, KEY, a, &json!("a"))
         .await
         .expect("stored");
-    manager
-        .store_secret(KEY, b, &json!("b"))
+    store_new(&manager, KEY, b, &json!("b"))
         .await
         .expect("stored");
-    manager
-        .store_secret("other.key~", a, &json!("c"))
+    store_new(&manager, "other.key~", a, &json!("c"))
         .await
         .expect("stored");
     assert_eq!(store.slots().len(), 3);
@@ -291,16 +306,16 @@ async fn different_tenants_and_keys_get_different_entries() {
 async fn a_non_string_plaintext_is_stored_as_its_json_text() {
     let (_store, manager) = manager();
     let tenant = Uuid::new_v4();
-    let reference = manager
-        .store_secret(KEY, tenant, &json!({"user": "u", "pass": "p"}))
+    let reference = store_new(&manager, KEY, tenant, &json!({"user": "u", "pass": "p"}))
         .await
         .expect("stored");
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(
-            &manager
+            manager
                 .resolve_plaintext(KEY, tenant, &reference)
                 .await
                 .expect("resolved")
+                .expose_secret()
         )
         .expect("valid json"),
         json!({"user": "u", "pass": "p"})
@@ -323,8 +338,7 @@ async fn an_absent_entry_is_not_found_on_the_value_and_a_down_store_is_unavailab
 
     store.down.store(true, std::sync::atomic::Ordering::SeqCst);
     for err in [
-        manager
-            .store_secret(KEY, tenant, &json!("x"))
+        store_new(&manager, KEY, tenant, &json!("x"))
             .await
             .expect_err("down"),
         manager
@@ -344,8 +358,7 @@ async fn an_absent_entry_is_not_found_on_the_value_and_a_down_store_is_unavailab
 async fn delete_releases_the_entry_and_an_absent_entry_is_already_done() {
     let (store, manager) = manager();
     let tenant = Uuid::new_v4();
-    let reference = manager
-        .store_secret(KEY, tenant, &json!("gone soon"))
+    let reference = store_new(&manager, KEY, tenant, &json!("gone soon"))
         .await
         .expect("stored");
     manager
@@ -365,8 +378,7 @@ async fn another_principal_in_the_same_tenant_reads_nothing_back() {
     // so a tenant user asking the store directly finds no entry.
     let (store, manager) = manager();
     let tenant = Uuid::new_v4();
-    let reference = manager
-        .store_secret(KEY, tenant, &json!("mine"))
+    let reference = store_new(&manager, KEY, tenant, &json!("mine"))
         .await
         .expect("stored");
     let user = SecurityContext::builder()

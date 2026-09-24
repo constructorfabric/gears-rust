@@ -52,11 +52,19 @@ pub struct SettingsServiceConfig {
     /// Upper bound on how long a cached effective value may be served after a
     /// missed invalidation broadcast, in seconds.
     ///
-    /// Defaults to 30. Unlike the two above, this is a design-fixed backstop
-    /// rather than a deployment decision, so a default is a real answer instead
-    /// of a guess.
+    /// Defaults to 30, which is also the ceiling: the backstop is the
+    /// design's, so a deployment may shorten it and never widen it, and init
+    /// refuses a longer value as it refuses a zero. A default is a real answer
+    /// here instead of a guess.
     #[serde(default = "default_cache_ttl_seconds")]
     pub cache_ttl_seconds: u64,
+
+    /// The most cached effective entries one instance holds — the design's
+    /// sizing anchor for the hot working set, not the cross-product of
+    /// settings and tenants. At capacity the entries nearest to expiry are
+    /// evicted first. Defaults to 500,000; a zero is refused at init.
+    #[serde(default = "default_cache_max_entries")]
+    pub cache_max_entries: usize,
 
     /// How long an audit record without an explicit `retain_until` stays in the
     /// online window. Twelve months by default, and never configurable below
@@ -141,15 +149,20 @@ pub struct StepUpConfig {
 
     /// The issuer the token must carry, when the deployment pins one; the
     /// resolver has its own opinion of the issuer, this one is additional.
+    /// A blank pin is refused at init: no token could carry it.
     pub issuer: Option<String>,
 
-    /// The audience the token must carry, when the deployment pins one.
+    /// The audience the token must carry, when the deployment pins one. A
+    /// blank pin is refused at init.
     pub audience: Option<String>,
 
-    /// Authentication context class references that satisfy the requirement.
+    /// Authentication context class references that satisfy the requirement,
+    /// compared exactly; a blank or whitespace-padded entry is refused at
+    /// init, since no claim could equal it.
     pub acr_values: Vec<String>,
 
-    /// Authentication methods that satisfy the requirement.
+    /// Authentication methods that satisfy the requirement, compared exactly;
+    /// a blank or padded entry is refused at init.
     pub amr_values: Vec<String>,
 }
 
@@ -169,6 +182,10 @@ impl Default for StepUpConfig {
 
 const fn default_cache_ttl_seconds() -> u64 {
     DEFAULT_CACHE_TTL_SECONDS
+}
+
+const fn default_cache_max_entries() -> usize {
+    crate::domain::resolution::EffectiveCache::DEFAULT_MAX_ENTRIES
 }
 
 const fn default_audit_retention_days() -> u32 {

@@ -286,6 +286,22 @@ where
                     .cloned();
                 match predecessor {
                     Some(predecessor) => {
+                        // An upgrade retires the predecessor and mints the
+                        // successor under the caller's name: a takeover of the
+                        // path unless the caller already owns it. The same rule
+                        // the same-major update and the retire path apply to a
+                        // row they touch; an administrator's declaration has no
+                        // owning module and is never a module's to upgrade.
+                        if predecessor.owner_module.as_deref() != Some(owner_module) {
+                            return Err(refused(
+                                reason::NOT_OWNER,
+                                format!(
+                                    "`{}` is owned by another module; a higher major does not \
+                                     take it over",
+                                    predecessor.key
+                                ),
+                            ));
+                        }
                         self.upgrade(
                             conn,
                             &scope,
@@ -365,7 +381,7 @@ where
         // resolution, and the type stays registered so a re-registration is a
         // lookup rather than a re-mint.
         self.declarations
-            .set_status(conn, &scope, existing.id, "retired")
+            .set_status(conn, &scope, existing.id, "retired", None)
             .await?;
         let retired = self.reload(conn, &scope, key).await?;
         self.record(
@@ -589,11 +605,12 @@ where
             // @cpt-begin:cpt-cf-settings-service-algo-module-contributions-reconcile:p1:inst-mc-rec-6
             // Revive in place: the row keeps its id and its values stay where
             // they are.
+            let redefines = metadata.redefines(&existing);
             self.declarations
-                .update_metadata(conn, scope, existing.id, metadata)
+                .update_metadata(conn, scope, existing.id, metadata, None, redefines)
                 .await?;
             self.declarations
-                .set_status(conn, scope, existing.id, "active")
+                .set_status(conn, scope, existing.id, "active", None)
                 .await?;
             if classification_changed {
                 self.values
@@ -630,8 +647,9 @@ where
             return Ok(Outcome::Unchanged);
         }
         // @cpt-begin:cpt-cf-settings-service-algo-module-contributions-reconcile:p1:inst-mc-rec-5
+        let redefines = metadata.redefines(&existing);
         self.declarations
-            .update_metadata(conn, scope, existing.id, metadata)
+            .update_metadata(conn, scope, existing.id, metadata, None, redefines)
             .await?;
         if classification_changed {
             // @cpt-begin:cpt-cf-settings-service-algo-typed-value-validation-classification-sync:p1:inst-tvv-sync-3
@@ -688,7 +706,7 @@ where
             })
         })?;
         self.declarations
-            .set_status(conn, scope, predecessor.id, "retired")
+            .set_status(conn, scope, predecessor.id, "retired", None)
             .await?;
         let retired = self.reload(conn, scope, &predecessor_key).await?;
         // @cpt-end:cpt-cf-settings-service-algo-module-contributions-upgrade:p1:inst-mc-up-1
@@ -718,8 +736,13 @@ where
         // Every value the predecessor holds moves to the successor at the same
         // scope. A copy that no longer validates is stored flagged, never
         // coerced and never dropped: an administrator sees it and the resolver
-        // falls through it.
-        let carried = self.values.find_all(conn, scope, predecessor.id).await?;
+        // falls through it. The rows are read under an update lock: the copy
+        // is of the latest committed rows whatever snapshot this transaction
+        // started from, and a write that was gated while the predecessor was
+        // still active either committed before the retirement above took the
+        // declaration's lock — and is copied here — or waits on that lock and
+        // is refused when it sees the row retired.
+        let carried = self.values.lock_all(conn, scope, predecessor.id).await?;
         for row in carried {
             let detail = self.revalidate(&contributed.value_type_id, &row).await?;
             self.values

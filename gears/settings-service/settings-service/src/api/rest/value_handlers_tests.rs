@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use super::{STEP_UP_HEADER, actor, if_match, parse_key, parse_tenant, respond, step_up_challenge};
 use crate::domain::error::DomainError;
+use crate::domain::writes::WriteActor;
 use crate::field;
 
 const KEY: &str = "gts.cf.core.settings.setting_type.v1~acme.billing.network.proxy.v1~";
@@ -71,16 +72,38 @@ fn the_step_up_header_is_preferred_and_the_session_token_is_the_fallback() {
         &context_with_bearer("session-token"),
         &headers(&[(STEP_UP_HEADER, "fresh-token")]),
     );
-    assert_eq!(with_both.step_up_token.as_deref(), Some("fresh-token"));
+    assert_eq!(exposed(&with_both), Some("fresh-token"));
 
     let header_only = actor(&context(), &headers(&[(STEP_UP_HEADER, "fresh-token")]));
-    assert_eq!(header_only.step_up_token.as_deref(), Some("fresh-token"));
+    assert_eq!(exposed(&header_only), Some("fresh-token"));
 
     let bearer_only = actor(&context_with_bearer("session-token"), &HeaderMap::new());
-    assert_eq!(bearer_only.step_up_token.as_deref(), Some("session-token"));
+    assert_eq!(exposed(&bearer_only), Some("session-token"));
 
     let neither = actor(&context(), &HeaderMap::new());
-    assert_eq!(neither.step_up_token, None);
+    assert!(neither.step_up_token.is_none());
+}
+
+/// The token's bytes, the way only the verifier reads them.
+fn exposed(actor: &WriteActor) -> Option<&str> {
+    actor
+        .step_up_token
+        .as_ref()
+        .map(secrecy::ExposeSecret::expose_secret)
+}
+
+#[test]
+fn the_actors_debug_form_never_carries_the_token() {
+    // The actor is cloned through several service layers; a `{:?}` anywhere
+    // along the way must not be a place a live step-up token can be read.
+    let with_token = actor(
+        &context_with_bearer("session-token"),
+        &headers(&[(STEP_UP_HEADER, "fresh-token")]),
+    );
+    let debug = format!("{with_token:?}");
+    assert!(!debug.contains("fresh-token"), "{debug}");
+    assert!(!debug.contains("session-token"), "{debug}");
+    assert!(debug.contains("REDACTED"), "{debug}");
 }
 
 #[test]

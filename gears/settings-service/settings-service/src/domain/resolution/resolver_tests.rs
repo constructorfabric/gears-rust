@@ -299,6 +299,38 @@ async fn a_secret_row_resolves_to_its_handle_never_plaintext() {
 }
 
 #[tokio::test]
+async fn a_read_that_began_before_an_invalidation_does_not_repopulate_the_cache() {
+    let h = Harness::new().await;
+    h.declare("strict", scope_class::CASCADING, json!(false))
+        .await;
+    let key = h.key("strict");
+
+    // A writer commits and evicts while this read is mid-walk: the hook fires
+    // from inside the ancestry lookup, after the read left the cache
+    // empty-handed and before it stores what it resolved.
+    let cache = Arc::clone(&h.cache);
+    let evicted = key.clone();
+    *h.hierarchy.on_chain.lock().expect("lock") = Some(Box::new(move || {
+        cache.invalidate_key(evicted.as_str());
+    }));
+    h.resolve("strict", tenant(h.tree.b))
+        .await
+        .expect("resolves");
+    // What the read brought back may predate the write; it is not served for
+    // another time-to-live.
+    assert!(
+        h.cache.get(key.as_str(), h.tree.b).is_none(),
+        "a read older than the eviction does not repopulate"
+    );
+
+    // The next read resolves afresh and is cached again.
+    h.resolve("strict", tenant(h.tree.b))
+        .await
+        .expect("resolves");
+    assert!(h.cache.get(key.as_str(), h.tree.b).is_some());
+}
+
+#[tokio::test]
 async fn a_second_read_is_served_from_cache_and_invalidation_re_resolves() {
     let h = Harness::new().await;
     let d = h
@@ -481,6 +513,7 @@ mod access {
                         access,
                         set_by: "root-admin".to_owned(),
                     },
+                    None,
                 )
                 .await
                 .expect("row");
@@ -543,7 +576,11 @@ async fn a_flagged_override_stays_in_storage_and_is_what_the_administrative_list
     // resolved values, so the flagged one is exactly what it reports, with the
     // detail that explains it.
     let conn = h.db.conn().expect("connection");
-    let mut tenants = h.hierarchy.descendants(t.root).await.expect("descendants");
+    let (mut tenants, _) = h
+        .hierarchy
+        .descendants_bfs(t.root, 100)
+        .await
+        .expect("descendants");
     tenants.push(t.root);
     let flagged = h
         .resolver
@@ -572,7 +609,11 @@ async fn the_flagged_listing_stops_at_a_standalone_descendant() {
     // The listing walks the caller's subtree as the hierarchy reports it, and
     // the hierarchy does not traverse into a standalone tenant from above.
     let conn = h.db.conn().expect("connection");
-    let mut tenants = h.hierarchy.descendants(t.root).await.expect("descendants");
+    let (mut tenants, _) = h
+        .hierarchy
+        .descendants_bfs(t.root, 100)
+        .await
+        .expect("descendants");
     tenants.push(t.root);
     assert!(!tenants.contains(&t.s), "the subtree stops at the seam");
     let flagged = h
@@ -655,8 +696,14 @@ async fn a_key_stale_after_a_category_rename_is_absent_exactly_as_one_never_decl
 async fn without_own_row(h: &Harness, d: Uuid, name: &str, at: Uuid) -> Arc<EffectiveValue> {
     use crate::domain::value::ValueRepository;
     let conn = h.db.conn().expect("connection");
+    let all = AccessScope::allow_all();
+    let own = crate::infra::storage::value_repo::ValueRepo
+        .find_one(&conn, &all, d, at)
+        .await
+        .expect("lookup")
+        .expect("own row");
     crate::infra::storage::value_repo::ValueRepo
-        .delete(&conn, &AccessScope::allow_all(), d, at)
+        .delete(&conn, &all, d, at, own.last_change_at)
         .await
         .expect("delete own row");
     h.cache.invalidate_key(h.key(name).as_str());

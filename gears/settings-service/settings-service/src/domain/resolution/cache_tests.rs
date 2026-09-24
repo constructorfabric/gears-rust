@@ -38,7 +38,7 @@ fn entry(key: &str, tenant: Uuid) -> Arc<EffectiveValue> {
 fn a_populated_entry_is_served_and_an_unknown_one_is_a_miss() {
     let cache = EffectiveCache::new(Duration::from_secs(30));
     let t = Uuid::new_v4();
-    cache.populate(entry("k", t));
+    cache.seed(entry("k", t));
     assert!(cache.get("k", t).is_some());
     assert!(
         cache.get("k", Uuid::new_v4()).is_none(),
@@ -51,7 +51,7 @@ fn a_populated_entry_is_served_and_an_unknown_one_is_a_miss() {
 fn an_entry_older_than_the_ttl_is_a_miss_and_is_evicted() {
     let cache = EffectiveCache::new(Duration::ZERO);
     let t = Uuid::new_v4();
-    cache.populate(entry("k", t));
+    cache.seed(entry("k", t));
     std::thread::sleep(Duration::from_millis(2));
     assert!(cache.get("k", t).is_none());
     assert!(
@@ -64,9 +64,9 @@ fn an_entry_older_than_the_ttl_is_a_miss_and_is_evicted() {
 fn a_cascading_change_evicts_every_scope_of_the_key_and_nothing_else() {
     let cache = EffectiveCache::new(Duration::from_secs(30));
     let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
-    cache.populate(entry("k", a));
-    cache.populate(entry("k", b));
-    cache.populate(entry("other", a));
+    cache.seed(entry("k", a));
+    cache.seed(entry("k", b));
+    cache.seed(entry("other", a));
 
     cache.invalidate("k", scope_class::CASCADING, Some(a));
 
@@ -79,8 +79,8 @@ fn a_cascading_change_evicts_every_scope_of_the_key_and_nothing_else() {
 fn a_local_change_evicts_only_the_named_scope() {
     let cache = EffectiveCache::new(Duration::from_secs(30));
     let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
-    cache.populate(entry("k", a));
-    cache.populate(entry("k", b));
+    cache.seed(entry("k", a));
+    cache.seed(entry("k", b));
 
     cache.invalidate("k", scope_class::LOCAL, Some(a));
 
@@ -92,8 +92,8 @@ fn a_local_change_evicts_only_the_named_scope() {
 fn a_declaration_change_evicts_the_whole_key() {
     let cache = EffectiveCache::new(Duration::from_secs(30));
     let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
-    cache.populate(entry("k", a));
-    cache.populate(entry("k", b));
+    cache.seed(entry("k", a));
+    cache.seed(entry("k", b));
     cache.invalidate_key("k");
     assert!(cache.is_empty());
 }
@@ -106,7 +106,7 @@ fn a_hierarchy_change_evicts_the_affected_subtree_across_every_setting() {
     let elsewhere = Uuid::new_v4();
     for tenant in [moved, below, elsewhere] {
         for key in ["one", "two"] {
-            cache.populate(Arc::new(tests_entry(key, tenant)));
+            cache.seed(Arc::new(tests_entry(key, tenant)));
         }
     }
     assert_eq!(cache.len(), 6);
@@ -123,4 +123,100 @@ fn a_hierarchy_change_evicts_the_affected_subtree_across_every_setting() {
     // An empty subtree is not an instruction to evict everything.
     cache.invalidate_subtree(&[]);
     assert_eq!(cache.len(), 2);
+}
+
+#[test]
+fn an_expired_entry_is_swept_by_the_next_store_not_only_by_its_own_lookup() {
+    // A zero time-to-live: everything stored is stale by the next instruction.
+    let cache = EffectiveCache::new(Duration::ZERO);
+    let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+    cache.seed(entry("one", a));
+    assert_eq!(cache.len(), 1);
+
+    // Nobody ever reads `a` again. Storing `b` still sweeps it: a cold entry
+    // past its time-to-live does not wait for its own lookup to be evicted.
+    cache.seed(entry("one", b));
+    assert_eq!(cache.len(), 1, "the stale entry went with the store");
+    assert!(cache.get("one", a).is_none());
+}
+
+#[test]
+fn the_cache_holds_no_more_than_its_capacity_and_lets_the_oldest_stored_go_first() {
+    let cache = EffectiveCache::bounded(Duration::from_secs(30), 3);
+    assert_eq!(cache.max_entries(), 3);
+    let t: Vec<Uuid> = (0..4).map(|_| Uuid::new_v4()).collect();
+    for tenant in &t[..3] {
+        cache.seed(entry("one", *tenant));
+    }
+    assert_eq!(cache.len(), 3);
+
+    // Re-storing a held slot replaces in place and grows nothing.
+    cache.seed(entry("one", t[1]));
+    assert_eq!(cache.len(), 3);
+
+    // A fourth slot displaces the oldest stored — the first — and nothing else.
+    cache.seed(entry("one", t[3]));
+    assert_eq!(cache.len(), 3);
+    assert!(cache.get("one", t[0]).is_none(), "the oldest went first");
+    for tenant in &t[1..] {
+        assert!(cache.get("one", *tenant).is_some());
+    }
+
+    // An invalidated slot leaves a stale record behind. It is skipped, and the
+    // next eviction still takes a held entry: the re-stored one, now the
+    // oldest of those left.
+    cache.invalidate("one", scope_class::LOCAL, Some(t[2]));
+    assert_eq!(cache.len(), 2);
+    cache.seed(entry("two", t[0]));
+    cache.seed(entry("two", t[1]));
+    assert_eq!(cache.len(), 3);
+    assert!(
+        cache.get("one", t[1]).is_none(),
+        "oldest of the held entries"
+    );
+    assert!(cache.get("one", t[3]).is_some());
+    assert!(cache.get("two", t[0]).is_some());
+    assert!(cache.get("two", t[1]).is_some());
+}
+
+#[test]
+fn the_default_bound_is_the_design_anchor() {
+    let cache = EffectiveCache::new(Duration::from_secs(30));
+    assert_eq!(cache.max_entries(), 500_000);
+    assert_eq!(cache.max_entries(), EffectiveCache::DEFAULT_MAX_ENTRIES);
+}
+
+#[test]
+fn a_store_whose_generation_an_invalidation_has_passed_is_dropped() {
+    let cache = EffectiveCache::new(Duration::from_secs(30));
+    let (t, other) = (Uuid::new_v4(), Uuid::new_v4());
+
+    // Captured on the miss, before the read; the key is evicted in between.
+    let seen = cache.generation("one", t);
+    let seen_other = cache.generation("one", other);
+    cache.invalidate_key("one");
+    assert!(
+        !cache.populate(entry("one", t), seen),
+        "the read may predate the write"
+    );
+    assert!(cache.get("one", t).is_none());
+    assert!(
+        !cache.populate(entry("one", other), seen_other),
+        "key-wide: every scope of the key"
+    );
+
+    // A subtree eviction moves the tenant's generation, and only that one's.
+    let seen = cache.generation("two", t);
+    let seen_other = cache.generation("two", other);
+    cache.invalidate_subtree(&[t]);
+    assert!(!cache.populate(entry("two", t), seen));
+    assert!(
+        cache.populate(entry("two", other), seen_other),
+        "another tenant's read stands"
+    );
+
+    // Captured after the eviction, the store lands.
+    let current = cache.generation("one", t);
+    assert!(cache.populate(entry("one", t), current));
+    assert!(cache.get("one", t).is_some());
 }

@@ -15,6 +15,7 @@ use authz_resolver_sdk::PolicyEnforcer;
 use credstore_sdk::{
     CredStoreClientV1, CredStoreError, SecretRef, SecretValue, SharingMode, WritePrecondition,
 };
+use secrecy::SecretString;
 use serde_json::Value;
 use settings_service_sdk::gts::VALUE_SCHEMA;
 use toolkit_security::SecurityContext;
@@ -165,21 +166,28 @@ fn bytes_of(plaintext: &Value) -> Vec<u8> {
 
 #[async_trait]
 impl SecretManager for CredStoreSecretManager {
+    fn mint_reference(&self, key: &str, tenant: Uuid) -> String {
+        // @cpt-begin:cpt-cf-settings-service-flow-secret-values-set:p1:inst-sv-set-3
+        // Apart from the store on purpose: the caller writes the reference
+        // down before the entry exists, so an answer that never arrives still
+        // leaves something to reclaim by.
+        self.reference(key, tenant)
+        // @cpt-end:cpt-cf-settings-service-flow-secret-values-set:p1:inst-sv-set-3
+    }
+
     async fn store_secret(
         &self,
-        key: &str,
+        _key: &str,
         tenant: Uuid,
+        secret_ref: &str,
         plaintext: &Value,
-    ) -> Result<String, DomainError> {
-        // @cpt-begin:cpt-cf-settings-service-flow-secret-values-set:p1:inst-sv-set-3
-        let reference = self.reference(key, tenant);
-        let secret_ref = Self::parse_ref(&reference)?;
+    ) -> Result<(), DomainError> {
+        let secret_ref = Self::parse_ref(secret_ref)?;
         let ctx = self.context(tenant)?;
-        // @cpt-end:cpt-cf-settings-service-flow-secret-values-set:p1:inst-sv-set-3
         // @cpt-begin:cpt-cf-settings-service-flow-secret-values-set:p1:inst-sv-set-4
         // @cpt-begin:cpt-cf-settings-service-flow-secret-values-set:p1:inst-sv-set-5
-        // Create-only under a fresh reference: nothing this write does can
-        // touch the entry the row currently holds.
+        // Create-only under the caller's fresh reference: nothing this write
+        // does can touch the entry the row currently holds.
         self.client
             .create(
                 &ctx,
@@ -189,7 +197,7 @@ impl SecretManager for CredStoreSecretManager {
             )
             .await
             .map_err(|err| unavailable("store the secret", &err))?;
-        Ok(reference)
+        Ok(())
         // @cpt-end:cpt-cf-settings-service-flow-secret-values-set:p1:inst-sv-set-5
         // @cpt-end:cpt-cf-settings-service-flow-secret-values-set:p1:inst-sv-set-4
     }
@@ -199,7 +207,7 @@ impl SecretManager for CredStoreSecretManager {
         _key: &str,
         tenant: Uuid,
         secret_ref: &str,
-    ) -> Result<String, DomainError> {
+    ) -> Result<SecretString, DomainError> {
         let reference = Self::parse_ref(secret_ref)?;
         let ctx = self.context(tenant)?;
         let found = match self.client.get(&ctx, &reference).await {
@@ -212,9 +220,14 @@ impl SecretManager for CredStoreSecretManager {
                 resource: VALUE_SCHEMA,
             });
         };
-        String::from_utf8(entry.value.as_bytes().to_vec()).map_err(|_| DomainError::Internal {
-            diagnostic: "the stored secret is not UTF-8 text".to_owned(),
-        })
+        // From the store's wrapper straight into ours: the exact-length copy
+        // becomes the boxed str without a second allocation, and the store's
+        // value zeroes itself when it drops at the end of this scope.
+        String::from_utf8(entry.value.as_bytes().to_vec())
+            .map(SecretString::from)
+            .map_err(|_| DomainError::Internal {
+                diagnostic: "the stored secret is not UTF-8 text".to_owned(),
+            })
     }
 
     async fn delete_secret(

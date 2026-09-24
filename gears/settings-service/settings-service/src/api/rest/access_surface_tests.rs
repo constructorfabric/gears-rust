@@ -271,6 +271,28 @@ async fn clearing_an_ancestor_lets_the_row_below_it_take_effect() {
 // ── The listing ──────────────────────────────────────────────────────────────
 
 #[tokio::test]
+async fn the_listing_refuses_a_subtree_past_the_budget_rather_than_answering_short() {
+    let h = RestHarness::new().await;
+    h.inner.declare("proxy", "cascading", json!(true)).await;
+    let root = h.inner.tree.root;
+    restrict(&h, "proxy", h.inner.tree.a, "hidden", "absent", root).await;
+    h.inner
+        .hierarchy
+        .truncate_subtrees
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let (status, body) = h
+        .get(&format!("{}/all", permissions(&h, "proxy")), root)
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(
+        body["context"]["field_violations"][0]["reason"],
+        json!("subtree_too_large"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
 async fn the_listing_carries_the_rows_recorded_for_the_setting() {
     let h = RestHarness::new().await;
     h.inner.declare("proxy", "cascading", json!(true)).await;
@@ -300,6 +322,13 @@ async fn the_listing_carries_the_rows_recorded_for_the_setting() {
     ];
     expected.sort();
     assert_eq!(rows, expected);
+    // One whole page, by design: nothing to continue from, and the envelope
+    // says so rather than hinting at a page that never comes.
+    assert!(
+        body["page_info"]["next_cursor"].is_null(),
+        "the listing is not paginated: {body}"
+    );
+    assert_eq!(body["page_info"]["limit"], json!(2), "{body}");
 }
 
 // ── What the surface refuses ─────────────────────────────────────────────────

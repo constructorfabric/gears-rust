@@ -23,8 +23,7 @@ use crate::domain::declaration::{Declaration, DeclarationRepository};
 use crate::domain::error::DomainError;
 use crate::domain::resolution::{EffectiveValue, ScopeTarget};
 use crate::domain::secrets::pending::{
-    self as pending, Claim, PENDING_SECRET_TTL, PendingSecret, PendingSecretDraft,
-    PendingSecretRepository,
+    self as pending, Claim, PendingSecret, PendingSecretRepository,
 };
 use crate::domain::writes::service::{ImpactReport, StepUpPolicy, ValidationReport};
 use crate::domain::writes::{Change, Committed, Gated, Staged, ValueWriter, WriteActor};
@@ -34,12 +33,25 @@ use crate::infra::storage::audit_store::AuditStore;
 use crate::infra::storage::declaration_repo::DeclarationRepo;
 use crate::infra::storage::pending_secret_repo::PendingSecretRepo;
 use crate::infra::storage::value_repo::ValueRepo;
+use crate::log_text::LogSafe;
 
 /// The writer over the concrete repositories and the audit store.
-pub type ConcreteWriter = ValueWriter<DeclarationRepo, ValueRepo, AccessRepo, AuditStore>;
+pub type ConcreteWriter =
+    ValueWriter<DeclarationRepo, ValueRepo, AccessRepo, AuditStore, PendingSecretRepo>;
 
 /// The most changes one batch may carry.
 pub const BATCH_LIMIT: usize = 500;
+
+/// The refusal a batch past [`BATCH_LIMIT`] is answered with — by the handler
+/// on the deserialized list, and by the coordinator as the backstop.
+#[must_use]
+pub fn batch_too_large() -> DomainError {
+    DomainError::Validation {
+        field: "changes".to_owned(),
+        code: field::VALIDATION,
+        message: format!("a batch carries at most {BATCH_LIMIT} changes"),
+    }
+}
 
 /// How many expired stages one sweep pass releases at most.
 pub const SWEEP_LIMIT: u64 = 200;
@@ -155,8 +167,14 @@ impl WriteCoordinator {
         operation: &'static str,
     ) -> Result<Committed, DomainError> {
         let conn = self.db.conn().map_err(|e| conn_error(&e))?;
+        // @cpt-begin:cpt-cf-settings-service-flow-value-writes-set:p1:inst-vw-set-5
+        // One change set per request, carried on the record — minted before
+        // the gate, so a refusal there is published under it like a refusal
+        // anywhere later.
+        let change_set_id = Uuid::new_v4();
+        // @cpt-end:cpt-cf-settings-service-flow-value-writes-set:p1:inst-vw-set-5
         // @cpt-begin:cpt-cf-settings-service-flow-value-writes-set:p1:inst-vw-set-2
-        let gated = self
+        let gated = match self
             .writer
             .gate(
                 &conn,
@@ -166,12 +184,20 @@ impl WriteCoordinator {
                 StepUpPolicy::Verify,
                 operation,
             )
-            .await?;
+            .await
+        {
+            Ok(gated) => gated,
+            Err(err) => {
+                // The target was not resolved: the scope is the one asked
+                // for, or the caller's own.
+                let tenant_id = requested.unwrap_or_else(|| actor.ctx.subject_tenant_id());
+                self.writer
+                    .after_rejection(key.as_str(), tenant_id, actor, &err, change_set_id)
+                    .await;
+                return Err(err);
+            }
+        };
         // @cpt-end:cpt-cf-settings-service-flow-value-writes-set:p1:inst-vw-set-2
-        // @cpt-begin:cpt-cf-settings-service-flow-value-writes-set:p1:inst-vw-set-5
-        // One change set per request, carried on the record.
-        let change_set_id = Uuid::new_v4();
-        // @cpt-end:cpt-cf-settings-service-flow-value-writes-set:p1:inst-vw-set-5
         self.commit(actor, gated, change, if_match, change_set_id)
             .await
     }
@@ -192,12 +218,14 @@ impl WriteCoordinator {
         let tenant_id = gated.tenant_id;
         // Validation and the store leg come first, outside the transaction: the
         // Credential Store cannot join it, and toolkit-db refuses a fresh
-        // connection while one is open on this task.
-        let staged = match self.writer.stage(&gated, change).await {
+        // connection while one is open on this task. The connection here is
+        // for the intent row a secret records before its entry exists.
+        let conn = self.db.conn().map_err(|e| conn_error(&e))?;
+        let staged = match self.writer.stage(&conn, &gated, actor, change).await {
             Ok(staged) => staged,
             Err(err) => {
                 self.writer
-                    .after_rejection(&key, tenant_id, actor, &err)
+                    .after_rejection(&key, tenant_id, actor, &err, change_set_id)
                     .await;
                 return Err(err);
             }
@@ -233,9 +261,9 @@ impl WriteCoordinator {
                 Ok(committed)
             }
             Err(err) => {
-                self.writer.discard(&gated, &staged).await;
+                self.writer.discard(&conn, &gated, &staged).await;
                 self.writer
-                    .after_rejection(&key, tenant_id, actor, &err)
+                    .after_rejection(&key, tenant_id, actor, &err, change_set_id)
                     .await;
                 Err(err)
             }
@@ -255,23 +283,40 @@ impl WriteCoordinator {
         actor: &WriteActor,
         changes: Vec<BatchChange>,
     ) -> Result<BatchOutcome, DomainError> {
+        self.batch_entries(actor, changes.into_iter().map(Ok).collect())
+            .await
+    }
+
+    /// [`Self::batch`] over entries the surface has already judged. An `Err`
+    /// entry is one refused on its text before it was a value — a number a
+    /// double cannot hold — and it is reported in its place, counts against
+    /// the limit, and is never gated or committed. The rest stand or fall
+    /// alone as before.
+    ///
+    /// # Errors
+    /// As [`Self::batch`].
+    pub async fn batch_entries(
+        &self,
+        actor: &WriteActor,
+        entries: Vec<Result<BatchChange, DomainError>>,
+    ) -> Result<BatchOutcome, DomainError> {
         // @cpt-begin:cpt-cf-settings-service-flow-value-writes-batch:p1:inst-vw-batch-2
-        if changes.len() > BATCH_LIMIT {
-            return Err(DomainError::Validation {
-                field: "changes".to_owned(),
-                code: field::VALIDATION,
-                message: format!("a batch carries at most {BATCH_LIMIT} changes"),
-            });
+        if entries.len() > BATCH_LIMIT {
+            return Err(batch_too_large());
         }
         // @cpt-end:cpt-cf-settings-service-flow-value-writes-batch:p1:inst-vw-batch-2
         let conn = self.db.conn().map_err(|e| conn_error(&e))?;
         // @cpt-begin:cpt-cf-settings-service-flow-value-writes-batch:p1:inst-vw-batch-3
         // Once for the request: the declarations that can be read decide
         // whether a person must have re-authenticated; a key that cannot is
-        // reported in its own entry below.
+        // reported in its own entry below. This pass only asks early. It is not
+        // what enforces the requirement: a declaration it failed to read — a
+        // tenant resolver that blinked, a policy point that did not answer —
+        // is missing here but gates normally in the loop, which therefore
+        // decides for itself whether step-up still has to be verified.
         let root = self.writer.resolver().root_tenant().await?;
         let mut declarations: Vec<Declaration> = Vec::new();
-        for change in &changes {
+        for change in entries.iter().filter_map(|entry| entry.as_ref().ok()) {
             if let Ok(declaration) = self
                 .writer
                 .declaration_for_write(&conn, actor, &change.key, root)
@@ -280,22 +325,32 @@ impl WriteCoordinator {
                 declarations.push(declaration);
             }
         }
-        if ConcreteWriter::any_requires_step_up(&declarations) {
+        let mut verified = if ConcreteWriter::any_requires_step_up(&declarations) {
             if !actor.is_interactive() {
                 return Err(DomainError::Unauthorized {
                     resource: settings_service_sdk::gts::VALUE_SCHEMA,
                 });
             }
             self.writer.verify_step_up(actor, "batch").await?;
-        }
+            true
+        } else {
+            false
+        };
         // @cpt-end:cpt-cf-settings-service-flow-value-writes-batch:p1:inst-vw-batch-3
         // @cpt-begin:cpt-cf-settings-service-flow-value-writes-batch:p1:inst-vw-batch-4
         let change_set_id = Uuid::new_v4();
         // @cpt-end:cpt-cf-settings-service-flow-value-writes-batch:p1:inst-vw-batch-4
-        let mut results = Vec::with_capacity(changes.len());
+        let mut results = Vec::with_capacity(entries.len());
         // @cpt-begin:cpt-cf-settings-service-flow-value-writes-batch:p1:inst-vw-batch-5
-        for change in changes {
+        for entry in entries {
             // @cpt-begin:cpt-cf-settings-service-flow-value-writes-batch:p1:inst-vw-batch-6
+            let change = match entry {
+                Ok(change) => change,
+                Err(err) => {
+                    results.push(Err(err));
+                    continue;
+                }
+            };
             let BatchChange {
                 key,
                 tenant,
@@ -314,6 +369,19 @@ impl WriteCoordinator {
                     "batch",
                 )
                 .await;
+            // The gate above trusts the up-front pass (`AlreadyVerified`), so
+            // a requirement that pass could not see is verified here, once: a
+            // success covers the rest of the request, a refusal is this
+            // entry's and a later gated entry asks again.
+            let gated = match gated {
+                Ok(gated) if gated.declaration.requires_step_up && !verified => {
+                    self.writer.verify_step_up(actor, "batch").await.map(|()| {
+                        verified = true;
+                        gated
+                    })
+                }
+                other => other,
+            };
             let outcome = match gated {
                 Ok(gated) => match self
                     .batch_change_for(&conn, &gated, actor, op.as_deref(), value)
@@ -325,12 +393,28 @@ impl WriteCoordinator {
                     }
                     Err(err) => {
                         self.writer
-                            .after_rejection(&gated.declaration.key, gated.tenant_id, actor, &err)
+                            .after_rejection(
+                                &gated.declaration.key,
+                                gated.tenant_id,
+                                actor,
+                                &err,
+                                change_set_id,
+                            )
                             .await;
                         Err(err)
                     }
                 },
-                Err(err) => Err(err),
+                // Refused at the gate: published like any other refusal, so
+                // the events alone tell the whole outcome of the batch. The
+                // target was not resolved, so the scope is the one asked for,
+                // or the caller's own.
+                Err(err) => {
+                    let tenant_id = tenant.unwrap_or_else(|| actor.ctx.subject_tenant_id());
+                    self.writer
+                        .after_rejection(key.as_str(), tenant_id, actor, &err, change_set_id)
+                        .await;
+                    Err(err)
+                }
             };
             // @cpt-end:cpt-cf-settings-service-flow-value-writes-batch:p1:inst-vw-batch-6
             // @cpt-begin:cpt-cf-settings-service-flow-value-writes-batch:p1:inst-vw-batch-7
@@ -378,26 +462,23 @@ impl WriteCoordinator {
         if gated.declaration.has_secret_trait
             && let Some(pending_id) = pending::pending_id_of(&value)
         {
-            return self
-                .claim_pending(conn, gated, actor, pending_id)
-                .await
-                .map(Change::AdoptSecret);
+            return self.claim_pending(conn, gated, actor, pending_id).await;
         }
         Ok(Change::Set(value))
     }
 
-    /// Claim a staged secret for a batch change: the row must exist, be
+    /// Check a staged secret for a batch change: the row must exist, be
     /// unexpired, and name this change's declaration, tenant and subject.
-    /// Single-use, consumed here before the commit: a commit that then fails
-    /// releases the entry through the ordinary discard path, so no token is
-    /// ever left pointing at nothing.
+    /// Nothing is consumed here — the commit consumes the row inside its own
+    /// transaction, re-asserting the expiry — so a commit that fails leaves
+    /// the token claimable and the entry, which the stage created, in place.
     async fn claim_pending<C: DBRunner>(
         &self,
         conn: &C,
         gated: &Gated,
         actor: &WriteActor,
         pending_id: Uuid,
-    ) -> Result<String, DomainError> {
+    ) -> Result<Change, DomainError> {
         let scope = AccessScope::allow_all();
         // @cpt-begin:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-7
         let Some(row) = self.pending.find(conn, &scope, pending_id).await? else {
@@ -415,13 +496,13 @@ impl WriteCoordinator {
         )?;
         // @cpt-end:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-7
         // @cpt-begin:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-8
-        // The row goes before the commit, whatever the commit does: a token is
-        // claimed once. A delete that finds nothing lost the race to another
-        // claim of the same token.
-        if !self.pending.delete(conn, &scope, pending_id).await? {
-            return Err(pending::invalid_pending());
-        }
-        Ok(row.secret_ref)
+        // The reference travels on to the commit with the token's row, which
+        // the commit consumes; two batches racing for one token part there,
+        // where only one delete can find the row.
+        Ok(Change::AdoptSecret {
+            secret_ref: row.secret_ref,
+            pending_id,
+        })
         // @cpt-end:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-8
     }
 
@@ -446,7 +527,10 @@ impl WriteCoordinator {
         // A stage is also the moment to let go of what nobody claimed; a sweep
         // that fails is logged and tried again by the next one.
         if let Err(err) = self.sweep_expired_in(&conn, SWEEP_LIMIT).await {
-            tracing::warn!(%err, "pending-secret sweep failed; expired stages wait for the next pass");
+            tracing::warn!(
+                err = %LogSafe(&err),
+                "pending-secret sweep failed; expired stages wait for the next pass"
+            );
         }
         // @cpt-begin:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-1
         // The value write gate with step-up skipped: authorization was decided
@@ -477,12 +561,17 @@ impl WriteCoordinator {
         // @cpt-end:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-2
         // @cpt-begin:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-3
         // @cpt-begin:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-4
-        // Exactly the set's own staging: validated against the type, then into
-        // the store under a reference unique to this stage; a store that
-        // cannot answer refuses here and nothing is kept.
-        let staged = self.writer.stage(&gated, Change::Set(value)).await?;
+        // Exactly the set's own staging: validated against the type, the
+        // intent row written, then into the store under a reference unique to
+        // this stage. That intent row is the token the caller takes away — a
+        // stage leaves nothing a set would not.
+        let staged = self
+            .writer
+            .stage(&conn, &gated, actor, Change::Set(value))
+            .await?;
         let Staged::Set {
-            secret_ref: Some(secret_ref),
+            secret_ref: Some(_),
+            pending_id: Some(pending_id),
             ..
         } = &staged
         else {
@@ -490,29 +579,21 @@ impl WriteCoordinator {
                 diagnostic: "staging a secret produced no store reference".to_owned(),
             });
         };
+        let pending_id = *pending_id;
         // @cpt-end:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-4
         // @cpt-end:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-3
         // @cpt-begin:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-5
-        // The row and its record in one transaction; a transaction that does
-        // not commit releases the entry, as a refused set does.
-        let draft = PendingSecretDraft {
-            declaration_id: gated.declaration.id,
-            tenant_id: gated.tenant_id,
-            subject_id: actor.subject(),
-            secret_ref: secret_ref.clone(),
-            expires_at: OffsetDateTime::now_utc() + PENDING_SECRET_TTL,
-        };
-        let pending = self.pending;
+        // The stage's record; a record that cannot be written releases the
+        // entry and its row, as a refused set does. The row itself was written
+        // by the stage, before the entry existed.
         let key_owned = gated.declaration.key.clone();
         let tenant_id = gated.tenant_id;
         let actor_owned = actor.clone();
         let outcome = self
             .db
             .db()
-            .transaction_ref_mapped::<_, PendingSecret, DomainError>(move |tx| {
+            .transaction_ref_mapped::<_, (), DomainError>(move |tx| {
                 Box::pin(async move {
-                    let scope = AccessScope::allow_all();
-                    let row = pending.insert(tx, &scope, draft).await?;
                     let record = AuditRecord::new(
                         key_owned.as_str(),
                         Some(tenant_id),
@@ -521,30 +602,35 @@ impl WriteCoordinator {
                         actor_owned.request_id.clone(),
                     )
                     .with_post_image(AuditValue::Masked);
-                    AuditStore.append(tx, &scope, record).await?;
-                    Ok(row)
+                    AuditStore
+                        .append(tx, &AccessScope::allow_all(), record)
+                        .await
                 })
             })
             .await;
-        match outcome {
-            Ok(row) => Ok(row),
-            Err(err) => {
-                self.writer.discard(&gated, &staged).await;
-                Err(err)
-            }
+        if let Err(err) = outcome {
+            self.writer.discard(&conn, &gated, &staged).await;
+            return Err(err);
         }
+        self.pending
+            .find(&conn, &AccessScope::allow_all(), pending_id)
+            .await?
+            .ok_or_else(|| DomainError::Internal {
+                diagnostic: "the intent row of a stage vanished before its answer".to_owned(),
+            })
         // @cpt-end:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-5
     }
 
-    /// Release the stages nobody claimed: each expired row is deleted and its
-    /// entry released, together. Returns how many rows went.
+    /// Release the stages nobody claimed: each expired row's entry is
+    /// released and the row deleted, together. Returns how many rows went.
+    /// `limit` is clamped to [`SWEEP_LIMIT`]: the bound holds whoever calls.
     ///
     /// # Errors
     /// [`DomainError`] when the database cannot list or delete; a store that
-    /// cannot release is logged per entry, the row already gone.
+    /// cannot release is logged per entry, the row kept for the next pass.
     pub async fn sweep_expired(&self, limit: u64) -> Result<usize, DomainError> {
         let conn = self.db.conn().map_err(|e| conn_error(&e))?;
-        self.sweep_expired_in(&conn, limit).await
+        self.sweep_expired_in(&conn, limit.min(SWEEP_LIMIT)).await
     }
 
     async fn sweep_expired_in<C: DBRunner>(
@@ -560,11 +646,6 @@ impl WriteCoordinator {
             .await?;
         let mut released = 0;
         for row in expired {
-            // Gone already: a claim got there first, and the entry is its.
-            if !self.pending.delete(conn, &scope, row.id).await? {
-                continue;
-            }
-            released += 1;
             let key = self
                 .declarations
                 .find(
@@ -576,6 +657,11 @@ impl WriteCoordinator {
                 .await?
                 .map(|d| d.key)
                 .unwrap_or_default();
+            // The entry first, the row after: a release that fails leaves the
+            // row as the durable handle on the entry, and the next pass tries
+            // again. This cannot release what a claim has just adopted — the
+            // sweep sees only rows past their expiry, and a claim consumes a
+            // row only while its expiry is still ahead.
             if let Err(err) = self
                 .writer
                 .secrets()
@@ -585,9 +671,14 @@ impl WriteCoordinator {
                 tracing::warn!(
                     pending_id = %row.id,
                     tenant = %row.tenant_id,
-                    %err,
-                    "expired staged secret not released from the store; the reference is orphaned"
+                    err = %LogSafe(&err),
+                    "expired staged secret not released from the store; kept for the next pass"
                 );
+                continue;
+            }
+            // Gone already: a concurrent pass got there first.
+            if self.pending.delete(conn, &scope, row.id).await? {
+                released += 1;
             }
         }
         Ok(released)

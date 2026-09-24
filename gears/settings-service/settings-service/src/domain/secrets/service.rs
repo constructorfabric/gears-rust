@@ -9,6 +9,7 @@
 
 use std::sync::Arc;
 
+use secrecy::SecretString;
 use settings_service_sdk::gts::VALUE_SCHEMA;
 use settings_service_sdk::{SecretHandle, SettingKey};
 use toolkit_db::secure::DBRunner;
@@ -71,7 +72,7 @@ where
         conn: &C,
         ctx: &SecurityContext,
         handle: &SecretHandle,
-    ) -> Result<String, DomainError> {
+    ) -> Result<SecretString, DomainError> {
         // @cpt-begin:cpt-cf-settings-service-flow-secret-values-resolve:p1:inst-sv-resolve-2
         let claims = decode_handle(handle)?;
         // @cpt-end:cpt-cf-settings-service-flow-secret-values-resolve:p1:inst-sv-resolve-2

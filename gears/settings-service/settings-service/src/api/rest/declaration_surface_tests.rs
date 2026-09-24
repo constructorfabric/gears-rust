@@ -466,3 +466,57 @@ async fn a_denied_caller_reaches_no_declaration_operation() {
         assert_eq!(answer.status, 403, "{method} {uri}: {}", answer.body);
     }
 }
+
+// ── Pagination ───────────────────────────────────────────────────────────────
+
+/// The leaf slugs on a page, in the order served.
+fn slugs(body: &Value) -> Vec<String> {
+    body["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .filter_map(|i| i["leaf_slug"].as_str())
+        .map(str::to_owned)
+        .collect()
+}
+
+#[tokio::test]
+async fn a_declaration_page_continues_from_its_cursor_without_a_gap_or_a_repeat() {
+    // The cursor is minted from the last row served, by the field the page is
+    // ordered on — the key, unique, so the boundary is exact. (Ordering by a
+    // nullable column and paging past a NULL is refused by the shared
+    // pagination library, whose cursor cannot carry a null; that is its
+    // follow-up, not this surface's, and is not exercised here.)
+    let h = RestHarness::new().await;
+    for name in ["alpha", "beta", "gamma"] {
+        create(&h, name).await;
+    }
+
+    let (status, first) = h
+        .get(&format!("{DECLARATIONS}?limit=2"), h.inner.tree.root)
+        .await;
+    assert_eq!(status, 200, "{first}");
+    let first_slugs = slugs(&first);
+    assert_eq!(
+        first_slugs,
+        vec!["alpha", "beta"],
+        "a full page in key order"
+    );
+    let cursor = first["page_info"]["next_cursor"]
+        .as_str()
+        .expect("a third row waits on the next page")
+        .to_owned();
+
+    let (status, second) = h
+        .get(
+            &format!("{DECLARATIONS}?limit=2&cursor={cursor}"),
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(status, 200, "{second}");
+    assert_eq!(slugs(&second), vec!["gamma"], "the remainder, once");
+    assert!(
+        second["page_info"]["next_cursor"].is_null(),
+        "nothing after the remainder: {second}"
+    );
+}

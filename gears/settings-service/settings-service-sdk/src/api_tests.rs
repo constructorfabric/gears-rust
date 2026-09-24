@@ -17,7 +17,7 @@ use toolkit_security::SecurityContext;
 
 use super::{BulkOutcome, BulkSelector, SettingsReaderClient};
 use crate::models::{EffectiveSource, EffectiveValueResponse, GetEffectiveRequest};
-use crate::{SecretHandle, SettingKey};
+use crate::{SecretHandle, SecretString, SettingKey};
 
 const BASE: &str = "gts.cf.core.settings.setting_type.v1~";
 
@@ -92,7 +92,7 @@ impl SettingsReaderClient for FakeReader {
         &self,
         _ctx: &SecurityContext,
         _handle: SecretHandle,
-    ) -> Result<String, CanonicalError> {
+    ) -> Result<SecretString, CanonicalError> {
         Err(CanonicalError::service_unavailable().create())
     }
 }

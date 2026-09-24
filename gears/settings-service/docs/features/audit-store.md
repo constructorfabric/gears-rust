@@ -1,5 +1,5 @@
 <!-- Created: 2026-09-06 by Virtuozzo International GmbH -->
-<!-- Updated: 2026-09-06 by Virtuozzo International GmbH -->
+<!-- Updated: 2026-09-24 by Virtuozzo International GmbH -->
 
 # Feature: Audit Store and History
 
@@ -152,7 +152,9 @@ Not applicable. An audit record is appended once and never transitions; its only
 
 - [x] `p1` - **ID**: `cpt-cf-settings-service-dod-audit-store-table`
 
-The system **MUST** persist audit records in an `audit_records` table carrying `resource`, `declaration_key`, a `tenant_id` that is set for a record about a scope and null for one about a definition, `operation`, `actor`, `actor_classification`, masked `pre_value` and `post_value`, `outcome`, `request_id`, a nullable `change_set_id`, `occurred_at` and a nullable `retain_until`, with check constraints on the `operation` and `outcome` vocabularies, `idx_audit_scoped` on `(declaration_key, tenant_id, occurred_at DESC)` and the partial `idx_audit_retention`. The table **MUST** be append-only: no code path issues an `UPDATE`, and the only `DELETE` is retention pruning.
+The system **MUST** persist audit records in an `audit_records` table carrying `resource`, `declaration_key`, a `tenant_id` that is set for a record about a scope and null for one about a definition, `operation`, `actor`, `actor_classification`, masked `pre_value` and `post_value`, `outcome`, `request_id`, a nullable `change_set_id`, `occurred_at` and a nullable `retain_until`, with check constraints on the `operation` and `outcome` vocabularies, `idx_audit_scoped` on `(declaration_key, tenant_id, occurred_at DESC)` and the partial `idx_audit_retention`. The table **MUST** be append-only, and the store **MUST** say so itself: no code path issues an `UPDATE`, the only `DELETE` is retention pruning, and a trigger carried by the gear's own migration refuses every `UPDATE` at the database — on PostgreSQL also a `DELETE` while an explicit `retain_until` hold is in force, the default retention window being configuration the trigger cannot know. Database roles stay with provisioning.
+
+The vocabularies of `operation`, `outcome` and `actor_classification` carry a compatibility contract. Their spellings are at once the stored form and the wire form of the history response, and are **permanent once shipped**. Adding a value is compatible: a migration widens the check constraint, and a reader **MUST** treat the field as an open set of strings, showing a value it does not know as it is rather than refusing the record. Renaming or removing a value is breaking. The service itself **MUST NOT** guess: a stored value it does not know is an integrity error on the read, never a record with a default.
 
 **Implements**:
 - `cpt-cf-settings-service-algo-audit-store-append`
@@ -239,6 +241,8 @@ Every record **MUST** carry `retain_until` or fall under the store's configured 
 - [x] A fault injected between the mutation's write and the record's insert leaves neither behind: no changed row, no record
 - [x] When the record cannot be inserted, the mutation is rejected as unavailable and the caller sees no change
 - [x] A `secret`-classified value appears in no record; its pre-image and post-image carry the mask token
+- [x] A stored pre-image or post-image that does not decode fails the history read as an integrity error, the same way an unknown operation or outcome does; it is never read as an absent image
+- [x] The spellings of `operation`, `outcome` and `actor_classification` are the stored and the wire form and never change once shipped; a reader treats each as an open set of strings, and the service fails the read on a stored value it does not know rather than defaulting it
 - [x] A record's `resource` equals the shared formatter's output for the same key and tenant, and the history read finds it by that pair
 - [x] A platform-level **value** record carries the root tenant's id, never a sentinel; a record about a **definition** — a category or a declaration — carries no tenant at all, so the write borrows no scope and asks the Tenant Resolver for nothing
 - [x] History for one setting at one scope returns only that pair's records, newest first, and a second page follows the cursor without duplicates

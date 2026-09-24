@@ -41,6 +41,12 @@ impl HubTenantHierarchy {
     }
 }
 
+/// The deepest level a descendants request asks the resolver for: well above
+/// the design's ten-level anchor, and the one bound the resolver's SDK offers
+/// on the request itself. A node found at this depth may have children below
+/// it, so a walk that reaches it reports itself cut.
+pub const SUBTREE_DEPTH_CEILING: u32 = 32;
+
 fn map(err: TenantResolverError) -> DomainError {
     match err {
         TenantResolverError::TenantNotFound { .. } => DomainError::NotFound { resource: "tenant" },
@@ -100,41 +106,32 @@ impl TenantHierarchy for HubTenantHierarchy {
             .map_err(map)
     }
 
-    async fn descendants(&self, tenant: Uuid) -> Result<Vec<Uuid>, DomainError> {
-        let client = self.client()?;
-        let response = client
-            .get_descendants(
-                &SecurityContext::anonymous(),
-                TenantId(tenant),
-                &GetDescendantsOptions {
-                    barrier_mode: BarrierMode::Respect,
-                    ..GetDescendantsOptions::default()
-                },
-            )
-            .await
-            .map_err(map)?;
-        Ok(response.descendants.iter().map(|r| r.id.0).collect())
-    }
-
     async fn descendants_bfs(
         &self,
         tenant: Uuid,
         budget: usize,
     ) -> Result<(Vec<Uuid>, bool), DomainError> {
         let client = self.client()?;
+        // Bounded on the request as far as the SDK allows — by depth. There is
+        // no count and no cursor on `get_descendants`, so a wide tree still
+        // comes back whole, and the budget is applied to what arrived.
         let response = client
             .get_descendants(
                 &SecurityContext::anonymous(),
                 TenantId(tenant),
                 &GetDescendantsOptions {
                     barrier_mode: BarrierMode::Respect,
+                    max_depth: Some(SUBTREE_DEPTH_CEILING),
                     ..GetDescendantsOptions::default()
                 },
             )
             .await
             .map_err(map)?;
         // The resolver answers a flat set; breadth-first order is rebuilt from
-        // the parent links it carries.
+        // the parent links it carries. The links are data, not a proof of a
+        // tree: a child named under two parents, or a pair naming each other,
+        // is walked once — the order holds distinct tenants and the budget
+        // counts distinct tenants, so a cycle does not read as truncation.
         let mut children: std::collections::HashMap<Uuid, Vec<Uuid>> =
             std::collections::HashMap::new();
         for r in &response.descendants {
@@ -143,19 +140,26 @@ impl TenantHierarchy for HubTenantHierarchy {
             }
         }
         let mut order = Vec::new();
-        let mut queue = std::collections::VecDeque::from([tenant]);
+        let mut seen: std::collections::HashSet<Uuid> = std::collections::HashSet::from([tenant]);
+        let mut queue = std::collections::VecDeque::from([(tenant, 0_u32)]);
         let mut truncated = false;
-        while let Some(next) = queue.pop_front() {
+        'walk: while let Some((next, depth)) = queue.pop_front() {
             for child in children.get(&next).into_iter().flatten() {
+                if !seen.insert(*child) {
+                    continue;
+                }
                 if order.len() >= budget {
                     truncated = true;
-                    break;
+                    break 'walk;
                 }
                 order.push(*child);
-                queue.push_back(*child);
-            }
-            if truncated {
-                break;
+                // A node at the ceiling was answered without its children: what
+                // lies below is unknown, and the walk says so.
+                if depth + 1 >= SUBTREE_DEPTH_CEILING {
+                    truncated = true;
+                } else {
+                    queue.push_back((*child, depth + 1));
+                }
             }
         }
         Ok((order, truncated))

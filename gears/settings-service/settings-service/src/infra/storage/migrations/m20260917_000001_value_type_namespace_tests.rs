@@ -56,6 +56,9 @@ async fn with_rows_written_before_the_move() -> DatabaseConnection {
         // A third-party value type that merely resembles ours: the rewrite is
         // anchored at the start of the id, so this must be left alone.
         ("foreign", "gts.acme.settings.type_bool_flag.v1~"),
+        // Our namespace, but not our catalogue: `_` is a LIKE wildcard, so a
+        // pattern that does not escape it would take `typeX` for `type_`.
+        ("look_alike", "gts.cf.toolkit.settings.typeXflag.v1~"),
     ] {
         exec(
             &db,
@@ -96,6 +99,10 @@ async fn a_row_written_before_the_move_points_at_the_gears_namespace_after_it() 
         after["foreign"], "gts.acme.settings.type_bool_flag.v1~",
         "another vendor's catalogue is not ours to rename"
     );
+    assert_eq!(
+        after["look_alike"], "gts.cf.toolkit.settings.typeXflag.v1~",
+        "the prefix is matched literally, not as a LIKE pattern"
+    );
 }
 
 #[tokio::test]
@@ -112,7 +119,9 @@ async fn rewriting_twice_changes_nothing_more() {
 
     assert_eq!(value_types(&db).await, once);
     assert!(
-        once.values().all(|id| !id.starts_with("gts.cf.toolkit.")),
+        once.iter()
+            .filter(|(slug, _)| *slug != "look_alike")
+            .all(|(_, id)| !id.starts_with("gts.cf.toolkit.")),
         "{once:?}"
     );
 }

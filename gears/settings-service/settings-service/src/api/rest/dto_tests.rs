@@ -21,6 +21,7 @@ fn category() -> Category {
         sort_order: 3,
         icon: None,
         etag: ETag::new("v1"),
+        updated_at: time::OffsetDateTime::UNIX_EPOCH,
     }
 }
 

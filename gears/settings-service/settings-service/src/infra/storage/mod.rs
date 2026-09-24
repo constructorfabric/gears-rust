@@ -11,6 +11,7 @@
 pub mod access_repo;
 pub mod audit_store;
 pub mod category_repo;
+pub mod clock;
 pub mod declaration_odata_mapper;
 pub mod declaration_repo;
 pub mod entity;

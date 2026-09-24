@@ -24,6 +24,7 @@
 //! refused rather than admitted. An uncheckable rule is not an absent one, and
 //! accepting silently is how a rule stops being a rule.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -33,7 +34,7 @@ use types_registry_sdk::{GtsTypeSchema, TypesRegistryClient};
 
 use crate::domain::error::DomainError;
 use crate::domain::validation::{
-    FieldViolation, TraitSet, TypeValidator, ValidationResult, cron, guards,
+    FieldViolation, MalformedTrait, TraitSet, TypeValidator, ValidationResult, cron, guards,
 };
 use crate::field;
 
@@ -49,41 +50,23 @@ pub trait SchemaSource: Send + Sync {
     /// [`DomainError::Unavailable`] when the registry cannot be reached.
     async fn type_schema(&self, type_id: &str) -> Result<Option<GtsTypeSchema>, DomainError>;
 
-    /// Whether a GTS instance with this id is registered.
+    /// Which of `instance_ids` are registered GTS instances, each with the
+    /// type id it is registered under, in one lookup.
+    ///
+    /// What both leaf-bound registry traits ask — an entity reference must
+    /// resolve to an instance of its target type, a dynamic-enum member is an
+    /// instance of its source — asked once per value over the distinct ids,
+    /// never once per leaf and never by listing a source's members. The type
+    /// comes back with the instance because the id's spelling is not the
+    /// boundary: a type derived from the target spells the target as its
+    /// prefix, and so does every instance of it.
     ///
     /// # Errors
     /// [`DomainError::Unavailable`] when the registry cannot be reached.
-    async fn instance_exists(&self, instance_id: &str) -> Result<bool, DomainError>;
-
-    /// The members of a dynamic enumeration, or `None` when the source is not
-    /// one this deployment knows.
-    ///
-    /// A source that does not resolve fails the value closed rather than
-    /// admitting it: an unknown membership is not an empty rule.
-    ///
-    /// # Errors
-    /// [`DomainError`] when the source cannot be consulted at all.
-    async fn enum_members(&self, source: &str) -> Result<Option<Vec<String>>, DomainError>;
-}
-
-/// A few members, for a message a reader can act on without printing a
-/// thousand of them.
-fn summarize(members: &[String]) -> String {
-    const SHOWN: usize = 8;
-    if members.is_empty() {
-        return "nothing".to_owned();
-    }
-    let head = members
-        .iter()
-        .take(SHOWN)
-        .map(|m| format!("`{m}`"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    if members.len() > SHOWN {
-        format!("{head} and {} more", members.len() - SHOWN)
-    } else {
-        head
-    }
+    async fn resolve_instances(
+        &self,
+        instance_ids: &[&str],
+    ) -> Result<HashMap<String, String>, DomainError>;
 }
 
 fn unavailable(what: &str, err: &CanonicalError) -> DomainError {
@@ -102,37 +85,27 @@ impl SchemaSource for Arc<dyn TypesRegistryClient> {
         }
     }
 
-    async fn instance_exists(&self, instance_id: &str) -> Result<bool, DomainError> {
-        match self.get_instance(instance_id).await {
-            Ok(_) => Ok(true),
-            Err(CanonicalError::NotFound { .. }) => Ok(false),
-            Err(err) => Err(unavailable("get_instance", &err)),
+    async fn resolve_instances(
+        &self,
+        instance_ids: &[&str],
+    ) -> Result<HashMap<String, String>, DomainError> {
+        if instance_ids.is_empty() {
+            return Ok(HashMap::new());
         }
-    }
-
-    async fn enum_members(&self, source: &str) -> Result<Option<Vec<String>>, DomainError> {
-        // A dynamic enumeration names a GTS type whose registered instances are
-        // its members, which is the one membership the registry can answer.
-        // Anything else a deployment might mean by a source is a binding this
-        // release does not have, and the caller refuses the value for it.
-        // The source names a GTS type; its registered instances are the
-        // members. The pattern is the source itself, so the query returns the
-        // instances derived from it and nothing else.
-        match self.get_type_schema(source).await {
-            Ok(_) => {}
-            Err(CanonicalError::NotFound { .. }) => return Ok(None),
-            Err(err) => return Err(unavailable("get_type_schema", &err)),
+        let ids: Vec<String> = instance_ids.iter().map(|id| (*id).to_owned()).collect();
+        let mut registered = HashMap::new();
+        for (id, outcome) in self.get_instances(ids).await {
+            match outcome {
+                Ok(instance) => {
+                    registered.insert(id, instance.type_id().to_string());
+                }
+                // Absent, or not an instance id at all: the answer is "no",
+                // not a failure of the lookup.
+                Err(CanonicalError::NotFound { .. } | CanonicalError::InvalidArgument { .. }) => {}
+                Err(err) => return Err(unavailable("get_instances", &err)),
+            }
         }
-        let query = types_registry_sdk::InstanceQuery::new().with_pattern(source);
-        match self.list_instances(query).await {
-            Ok(instances) => Ok(Some(
-                instances
-                    .into_iter()
-                    .map(|instance| instance.id.to_string())
-                    .collect(),
-            )),
-            Err(err) => Err(unavailable("list_instances", &err)),
-        }
+        Ok(registered)
     }
 }
 
@@ -141,10 +114,22 @@ pub struct GtsTypeValidator<S = Arc<dyn TypesRegistryClient>> {
     source: S,
 }
 
+/// The most string leaves a trait-checked value may hold. The byte cap bounds
+/// a value's size; this bounds the work a leaf-bound trait does on it — a
+/// parse or a compile per leaf, and a registry lookup per distinct id — so a
+/// value of thousands of two-byte strings is refused, not processed.
+pub const MAX_TRAIT_LEAVES: usize = 1_000;
+
 impl<S: SchemaSource> GtsTypeValidator<S> {
     /// Validate against the types this source resolves.
     pub fn new(source: S) -> Self {
         Self { source }
+    }
+
+    /// The source, for a test that counts what it was asked.
+    #[cfg(test)]
+    pub const fn source(&self) -> &S {
+        &self.source
     }
 
     /// Resolve a type, failing closed on an unknown id.
@@ -164,6 +149,20 @@ impl<S: SchemaSource> GtsTypeValidator<S> {
     }
 }
 
+/// The violation a type whose `x-gts-traits` is not well-formed produces.
+///
+/// Reported on `value_type_id`, as an unknown type is: the fault is the type's,
+/// and the declaration is what named it.
+fn malformed_trait(value_type_id: &str, malformed: &MalformedTrait) -> FieldViolation {
+    FieldViolation {
+        field: "value_type_id".to_owned(),
+        code: field::VALUE_TYPE_MALFORMED,
+        message: format!(
+            "`{value_type_id}` carries a malformed trait (catalogue drift): {malformed}"
+        ),
+    }
+}
+
 #[async_trait]
 impl<S: SchemaSource> TypeValidator for GtsTypeValidator<S> {
     async fn validate_value(
@@ -171,6 +170,18 @@ impl<S: SchemaSource> TypeValidator for GtsTypeValidator<S> {
         value_type_id: &str,
         value: &Value,
     ) -> Result<ValidationResult, DomainError> {
+        // @cpt-begin:cpt-cf-settings-service-algo-typed-value-validation-validate:p1:inst-tvv-val-3
+        // @cpt-begin:cpt-cf-settings-service-algo-typed-value-validation-validate:p1:inst-tvv-val-4
+        // The guards first, before anything is resolved: a value over the cap
+        // or carrying a non-canonical number is refused whatever shape it has,
+        // and asking the registry about it would only cost a round trip.
+        if let Err(violation) = guards::check(value) {
+            return Ok(ValidationResult {
+                violations: vec![violation],
+            });
+        }
+        // @cpt-end:cpt-cf-settings-service-algo-typed-value-validation-validate:p1:inst-tvv-val-4
+        // @cpt-end:cpt-cf-settings-service-algo-typed-value-validation-validate:p1:inst-tvv-val-3
         // @cpt-begin:cpt-cf-settings-service-algo-typed-value-validation-validate:p1:inst-tvv-val-1
         // @cpt-begin:cpt-cf-settings-service-algo-typed-value-validation-validate:p1:inst-tvv-val-2
         // An unresolvable type is a rejection, not a vacuous pass: a value nobody
@@ -192,22 +203,18 @@ impl<S: SchemaSource> TypeValidator for GtsTypeValidator<S> {
             }
             Err(other) => return Err(other),
         };
-        let traits = TraitSet::from_traits(schema.effective_traits());
+        // A trait spelled wrongly is the type's fault, reported like an unknown
+        // type: a value nobody can classify is not a value anybody has accepted.
+        let traits = match TraitSet::from_traits(schema.effective_traits()) {
+            Ok(traits) => traits,
+            Err(malformed) => {
+                return Ok(ValidationResult {
+                    violations: vec![malformed_trait(value_type_id, &malformed)],
+                });
+            }
+        };
         // @cpt-end:cpt-cf-settings-service-algo-typed-value-validation-validate:p1:inst-tvv-val-2
         // @cpt-end:cpt-cf-settings-service-algo-typed-value-validation-validate:p1:inst-tvv-val-1
-
-        // @cpt-begin:cpt-cf-settings-service-algo-typed-value-validation-validate:p1:inst-tvv-val-3
-        // @cpt-begin:cpt-cf-settings-service-algo-typed-value-validation-validate:p1:inst-tvv-val-4
-        // The guards run before the schema and stop on the first fault: a value
-        // over the cap or carrying a non-canonical number is refused whatever
-        // shape it has, and validating it structurally would only cost time.
-        if let Err(violation) = guards::check(value) {
-            return Ok(ValidationResult {
-                violations: vec![violation],
-            });
-        }
-        // @cpt-end:cpt-cf-settings-service-algo-typed-value-validation-validate:p1:inst-tvv-val-4
-        // @cpt-end:cpt-cf-settings-service-algo-typed-value-validation-validate:p1:inst-tvv-val-3
 
         // @cpt-begin:cpt-cf-settings-service-algo-typed-value-validation-validate:p1:inst-tvv-val-12
         let mut violations = Vec::new();
@@ -242,22 +249,46 @@ impl<S: SchemaSource> TypeValidator for GtsTypeValidator<S> {
 
         // @cpt-dod:cpt-cf-settings-service-dod-typed-value-validation-rules:p1
         // @cpt-begin:cpt-cf-settings-service-algo-typed-value-validation-validate:p1:inst-tvv-val-7
-        // Trait rules apply to the string leaves a trait describes. A structured
-        // value carrying such a trait on the whole is checked leaf by leaf.
+        // Trait rules apply to the string leaves a trait describes, collected
+        // once and only when a trait asks for them. Their count is bounded as
+        // the bytes are: each leaf costs a parse or a compile, and each distinct
+        // id a registry lookup, so a value of thousands of two-byte strings is
+        // refused rather than processed.
+        let leaf_bound = traits.cron_dialect.is_some()
+            || traits.regex
+            || traits.dynamic_enum_source.is_some()
+            || traits.entity_reference.is_some();
+        let leaves = if leaf_bound {
+            string_leaves(value, "value")
+        } else {
+            Vec::new()
+        };
+        if leaves.len() > MAX_TRAIT_LEAVES {
+            violations.push(FieldViolation {
+                field: "value".to_owned(),
+                code: field::VALUE_TOO_MANY_LEAVES,
+                message: format!(
+                    "a value of a trait-checked type holds at most {MAX_TRAIT_LEAVES} strings; this \
+                     one holds {}",
+                    leaves.len()
+                ),
+            });
+            return Ok(ValidationResult { violations });
+        }
         // @cpt-begin:cpt-cf-settings-service-algo-typed-value-validation-validate:p1:inst-tvv-val-8
         if let Some(dialect) = traits.cron_dialect.as_deref() {
-            for (path, text) in string_leaves(value, "value") {
+            for (path, text) in &leaves {
                 if cron::is_known(dialect) {
                     if let Err(reason) = cron::parse(text) {
                         violations.push(FieldViolation {
-                            field: path,
+                            field: path.clone(),
                             code: field::VALUE_CRON_INVALID,
                             message: format!("not a cron expression: {reason}"),
                         });
                     }
                 } else {
                     violations.push(FieldViolation {
-                        field: path,
+                        field: path.clone(),
                         code: field::VALUE_CRON_DIALECT_UNKNOWN,
                         message: format!(
                             "the type declares the cron dialect `{dialect}`, which this service \
@@ -270,10 +301,10 @@ impl<S: SchemaSource> TypeValidator for GtsTypeValidator<S> {
         // @cpt-end:cpt-cf-settings-service-algo-typed-value-validation-validate:p1:inst-tvv-val-8
         // @cpt-begin:cpt-cf-settings-service-algo-typed-value-validation-validate:p1:inst-tvv-val-9
         if traits.regex {
-            for (path, text) in string_leaves(value, "value") {
+            for (path, text) in &leaves {
                 if let Err(e) = regex::Regex::new(text) {
                     violations.push(FieldViolation {
-                        field: path,
+                        field: path.clone(),
                         code: field::VALUE_REGEX_INVALID,
                         message: format!("regular expression does not compile: {e}"),
                     });
@@ -282,39 +313,57 @@ impl<S: SchemaSource> TypeValidator for GtsTypeValidator<S> {
         }
         // @cpt-end:cpt-cf-settings-service-algo-typed-value-validation-validate:p1:inst-tvv-val-9
         // @cpt-begin:cpt-cf-settings-service-algo-typed-value-validation-validate:p1:inst-tvv-val-10
-        if let Some(source) = traits.dynamic_enum_source.as_deref() {
-            let members = self.source.enum_members(source).await?;
-            for (path, text) in string_leaves(value, "value") {
-                match &members {
-                    Some(members) if members.iter().any(|m| m == text) => {}
-                    Some(members) => violations.push(FieldViolation {
-                        field: path,
-                        code: field::VALUE_NOT_IN_ENUM,
-                        message: format!(
-                            "`{text}` is not a member of `{source}`, which offers {}",
-                            summarize(members)
-                        ),
-                    }),
-                    None => violations.push(FieldViolation {
-                        field: path,
+        // @cpt-begin:cpt-cf-settings-service-algo-typed-value-validation-validate:p1:inst-tvv-val-11
+        // Dynamic-enum membership and entity references both ask the registry
+        // whether an id is a registered instance: asked once, for every distinct
+        // id the value carries, whatever the number of leaves. A member of a
+        // dynamic enumeration is a registered instance derived from its source
+        // — its own id is looked up, the members are never listed. A source
+        // this deployment does not know refuses every leaf: an unknown
+        // membership is not an empty rule.
+        let enum_source = match traits.dynamic_enum_source.as_deref() {
+            Some(source) if self.source.type_schema(source).await?.is_some() => Some(source),
+            Some(source) => {
+                for (path, _) in &leaves {
+                    violations.push(FieldViolation {
+                        field: path.clone(),
                         code: field::VALUE_ENUM_SOURCE_UNKNOWN,
                         message: format!(
                             "the type draws its members from `{source}`, which this deployment \
                              does not know; the value is refused rather than admitted unchecked"
                         ),
-                    }),
+                    });
+                }
+                None
+            }
+            None => None,
+        };
+        // Each registered id with the type it is registered under: membership
+        // and reference are decided on that type, never on the id's spelling.
+        let registered = if enum_source.is_some() || traits.entity_reference.is_some() {
+            let mut ids: Vec<&str> = leaves.iter().map(|(_, text)| *text).collect();
+            ids.sort_unstable();
+            ids.dedup();
+            self.source.resolve_instances(&ids).await?
+        } else {
+            HashMap::new()
+        };
+        if let Some(source) = enum_source {
+            for (path, text) in &leaves {
+                if registered.get(*text).is_none_or(|of| of != source) {
+                    violations.push(FieldViolation {
+                        field: path.clone(),
+                        code: field::VALUE_NOT_IN_ENUM,
+                        message: format!("`{text}` is not a registered member of `{source}`"),
+                    });
                 }
             }
         }
-        // @cpt-end:cpt-cf-settings-service-algo-typed-value-validation-validate:p1:inst-tvv-val-10
-        // @cpt-begin:cpt-cf-settings-service-algo-typed-value-validation-validate:p1:inst-tvv-val-11
         if let Some(target_type) = traits.entity_reference.as_deref() {
-            for (path, id) in string_leaves(value, "value") {
-                let of_type = id.starts_with(target_type);
-                let resolves = of_type && self.source.instance_exists(id).await?;
-                if !resolves {
+            for (path, id) in &leaves {
+                if registered.get(*id).is_none_or(|of| of != target_type) {
                     violations.push(FieldViolation {
-                        field: path,
+                        field: path.clone(),
                         code: field::VALUE_REFERENCE_UNRESOLVED,
                         message: format!(
                             "`{id}` does not resolve to a registered instance of `{target_type}`"
@@ -324,6 +373,7 @@ impl<S: SchemaSource> TypeValidator for GtsTypeValidator<S> {
             }
         }
         // @cpt-end:cpt-cf-settings-service-algo-typed-value-validation-validate:p1:inst-tvv-val-11
+        // @cpt-end:cpt-cf-settings-service-algo-typed-value-validation-validate:p1:inst-tvv-val-10
         // @cpt-end:cpt-cf-settings-service-algo-typed-value-validation-validate:p1:inst-tvv-val-7
         // @cpt-end:cpt-cf-settings-service-algo-typed-value-validation-validate:p1:inst-tvv-val-12
 
@@ -345,7 +395,17 @@ impl<S: SchemaSource> TypeValidator for GtsTypeValidator<S> {
         // Merged across the inheritance chain, so a trait declared on a base
         // reaches every derived type; the raw object travels with the
         // interpreted flags for rendering.
-        Ok(TraitSet::from_traits(schema.effective_traits()))
+        // A misspelt trait fails here, never defaults: the caller of this port
+        // classifies a declaration on `secret`, and an empty or guessed answer
+        // would store a credential as public data.
+        TraitSet::from_traits(schema.effective_traits()).map_err(|malformed| {
+            let violation = malformed_trait(value_type_id, &malformed);
+            DomainError::Validation {
+                field: violation.field,
+                code: violation.code,
+                message: violation.message,
+            }
+        })
         // @cpt-end:cpt-cf-settings-service-algo-typed-value-validation-resolve-traits:p1:inst-tvv-traits-4
         // @cpt-end:cpt-cf-settings-service-algo-typed-value-validation-resolve-traits:p1:inst-tvv-traits-3
     }

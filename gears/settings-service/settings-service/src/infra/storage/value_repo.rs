@@ -3,13 +3,15 @@
 
 use async_trait::async_trait;
 use sea_orm::sea_query::Expr;
-use sea_orm::{ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter};
+use sea_orm::{ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
 use toolkit_db::secure::{DBRunner, SecureDeleteExt, SecureEntityExt, SecureUpdateExt};
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
+use crate::domain::precondition;
 use crate::domain::value::{StoredValue, ValueDraft, ValueRepository};
+use crate::infra::storage::clock::{now, stamp_after};
 use crate::infra::storage::entity::setting_value::{self, Entity as ValueEntity};
 
 /// The repository. Stateless: every operation takes its connection.
@@ -38,11 +40,14 @@ fn db_error(err: impl std::fmt::Display) -> DomainError {
     }
 }
 
+/// Project an insert failure.
+///
+/// The unique index on the pair guards the first row: the caller compared the
+/// absent-state tag, so a row that appeared between that comparison and this
+/// insert is the other writer's, and this write is the stale one.
 fn map_write_error(err: &toolkit_db::secure::ScopeError) -> DomainError {
     if err.is_unique_violation() {
-        DomainError::Conflict {
-            detail: "a value already exists for this setting at this scope".to_owned(),
-        }
+        precondition::stale()
     } else {
         db_error(err)
     }
@@ -127,6 +132,24 @@ impl ValueRepository for ValueRepo {
         Ok(rows.into_iter().map(to_domain).collect())
     }
 
+    async fn lock_all<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        declaration_id: Uuid,
+    ) -> Result<Vec<StoredValue>, DomainError> {
+        let rows = ValueEntity::find()
+            .filter(setting_value::Column::DeclarationId.eq(declaration_id))
+            .filter(subjectless())
+            .lock_exclusive()
+            .secure()
+            .scope_with(scope)
+            .all(conn)
+            .await
+            .map_err(db_error)?;
+        Ok(rows.into_iter().map(to_domain).collect())
+    }
+
     async fn flag<C: DBRunner>(
         &self,
         conn: &C,
@@ -134,7 +157,7 @@ impl ValueRepository for ValueRepo {
         id: Uuid,
         detail: Option<String>,
     ) -> Result<(), DomainError> {
-        ValueEntity::update_many()
+        let outcome = ValueEntity::update_many()
             .col_expr(
                 setting_value::Column::NeedsReview,
                 Expr::value(detail.is_some()),
@@ -143,16 +166,18 @@ impl ValueRepository for ValueRepo {
                 setting_value::Column::NeedsReviewDetail,
                 Expr::value(detail),
             )
-            .col_expr(
-                setting_value::Column::UpdatedAt,
-                Expr::value(time::OffsetDateTime::now_utc()),
-            )
+            .col_expr(setting_value::Column::UpdatedAt, Expr::value(now()))
             .filter(setting_value::Column::Id.eq(id))
             .secure()
             .scope_with(scope)
             .exec(conn)
             .await
             .map_err(|err| map_write_error(&err))?;
+        // A row that is gone, or outside the scope, matched nothing; the caller
+        // is told so rather than left believing the flag was applied.
+        if outcome.rows_affected == 0 {
+            return Err(DomainError::NotFound { resource: "value" });
+        }
         Ok(())
     }
 
@@ -204,7 +229,7 @@ impl ValueRepository for ValueRepo {
         scope: &AccessScope,
         draft: ValueDraft,
     ) -> Result<StoredValue, DomainError> {
-        let at = time::OffsetDateTime::now_utc();
+        let at = now();
         let active = setting_value::ActiveModel {
             id: Set(Uuid::new_v4()),
             declaration_id: Set(draft.declaration_id),
@@ -227,6 +252,7 @@ impl ValueRepository for ValueRepo {
         Ok(to_domain(model))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn update<C: DBRunner>(
         &self,
         conn: &C,
@@ -235,8 +261,11 @@ impl ValueRepository for ValueRepo {
         value: Option<serde_json::Value>,
         secret_ref: Option<String>,
         set_by: &str,
+        expected: time::OffsetDateTime,
     ) -> Result<StoredValue, DomainError> {
-        let at = time::OffsetDateTime::now_utc();
+        // Strictly after the version being replaced: the tag moves with the
+        // row even when two writes share a microsecond.
+        let at = stamp_after(Some(expected));
         let outcome = ValueEntity::update_many()
             .col_expr(setting_value::Column::Value, Expr::value(value))
             .col_expr(setting_value::Column::SecretRef, Expr::value(secret_ref))
@@ -249,13 +278,17 @@ impl ValueRepository for ValueRepo {
             .col_expr(setting_value::Column::UpdatedAt, Expr::value(at))
             .col_expr(setting_value::Column::SetBy, Expr::value(set_by.to_owned()))
             .filter(setting_value::Column::Id.eq(id))
+            // The row at the version the tag was compared against, and no
+            // other: two writers holding one tag both pass the comparison, and
+            // this is what keeps the second from landing on top of the first.
+            .filter(setting_value::Column::LastChangeAt.eq(expected))
             .secure()
             .scope_with(scope)
             .exec(conn)
             .await
             .map_err(db_error)?;
         if outcome.rows_affected == 0 {
-            return Err(DomainError::NotFound { resource: "value" });
+            return Err(precondition::stale());
         }
         let row = ValueEntity::find()
             .filter(setting_value::Column::Id.eq(id))
@@ -274,16 +307,25 @@ impl ValueRepository for ValueRepo {
         scope: &AccessScope,
         declaration_id: Uuid,
         tenant_id: Uuid,
-    ) -> Result<bool, DomainError> {
+        expected: time::OffsetDateTime,
+    ) -> Result<(), DomainError> {
         let outcome = ValueEntity::delete_many()
             .filter(setting_value::Column::DeclarationId.eq(declaration_id))
             .filter(setting_value::Column::TenantId.eq(tenant_id))
             .filter(subjectless())
+            .filter(setting_value::Column::LastChangeAt.eq(expected))
             .secure()
             .scope_with(scope)
             .exec(conn)
             .await
             .map_err(db_error)?;
-        Ok(outcome.rows_affected > 0)
+        if outcome.rows_affected == 0 {
+            return Err(precondition::stale());
+        }
+        Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "value_repo_tests.rs"]
+mod value_repo_tests;

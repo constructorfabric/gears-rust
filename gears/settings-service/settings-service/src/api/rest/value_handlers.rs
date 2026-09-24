@@ -8,6 +8,9 @@ use axum::extract::{Path, Query};
 use axum::http::{HeaderMap, HeaderValue, header};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
+use secrecy::SecretString;
+use serde_json::Value;
+use serde_json::value::RawValue;
 use settings_service_sdk::SettingKey;
 use toolkit::api::canonical_prelude::*;
 use toolkit_canonical_errors::CanonicalError;
@@ -15,17 +18,19 @@ use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use crate::api::authz::{self, resource};
+use crate::api::rest::if_match;
 use crate::api::rest::setting_dto::render;
 use crate::api::rest::setting_handlers::TenantParam;
 use crate::api::rest::value_dto::{
-    BatchRequest, BatchResultDto, CloneRequest, FallbackResultDto, ImpactRequest, SetValueRequest,
-    StageSecretRequest, ValidateRequest, render_batch_item, render_committed, render_impact,
-    render_pending, render_validation,
+    BatchChangeRequest, BatchRequest, BatchResultDto, CloneRequest, FallbackResultDto,
+    ImpactRequest, SetValueRequest, StageSecretRequest, ValidateRequest, render_batch_item,
+    render_committed, render_impact, render_pending, render_validation,
 };
 use crate::domain::error::DomainError;
+use crate::domain::validation::guards;
 use crate::domain::writes::{Change, WriteActor};
 use crate::field;
-use crate::infra::value_writes::{BatchChange, WriteCoordinator};
+use crate::infra::value_writes::{BATCH_LIMIT, BatchChange, WriteCoordinator, batch_too_large};
 
 const READ: &str = "read";
 const WRITE: &str = "write";
@@ -45,18 +50,14 @@ fn request_id(headers: &HeaderMap) -> String {
         .unwrap_or_else(|| Uuid::new_v4().to_string())
 }
 
-pub(crate) fn if_match(headers: &HeaderMap) -> Option<&str> {
-    header_str(headers, "if-match").map(|v| v.trim().trim_matches('"'))
-}
-
 pub(crate) fn actor(ctx: &SecurityContext, headers: &HeaderMap) -> WriteActor {
     // @cpt-begin:cpt-cf-settings-service-flow-value-writes-set:p1:inst-vw-set-1
+    // Wrapped from the first moment: the header's bytes go straight into a
+    // `SecretString`, and the session's bearer is cloned as the secret it
+    // already is rather than exposed and re-wrapped.
     let step_up_token = header_str(headers, STEP_UP_HEADER)
-        .map(str::to_owned)
-        .or_else(|| {
-            ctx.bearer_token()
-                .map(|t| secrecy::ExposeSecret::expose_secret(t).to_owned())
-        });
+        .map(|t| SecretString::from(t.to_owned()))
+        .or_else(|| ctx.bearer_token().cloned());
     WriteActor {
         ctx: ctx.clone(),
         request_id: request_id(headers),
@@ -169,7 +170,7 @@ pub async fn set_value(
             &actor,
             &key,
             tenant,
-            Change::Set(body.value),
+            Change::Set(checked_value(&body.value)?),
             if_match(&headers),
             "set",
         )
@@ -338,20 +339,41 @@ pub async fn batch_set(
 ) -> ApiResult<Response> {
     // @cpt-begin:cpt-cf-settings-service-flow-value-writes-batch:p1:inst-vw-batch-1
     authz::access_scope(&enforcer, &ctx, &resource::VALUE, WRITE, None).await?;
+    // The size first, on the deserialized list, before a key is cloned or
+    // parsed; the coordinator's own check stays as the backstop for callers
+    // that do not come through REST.
+    if body.changes.len() > BATCH_LIMIT {
+        return Err(batch_too_large().into());
+    }
     let actor = actor(&ctx, &headers);
     let keys: Vec<String> = body.changes.iter().map(|c| c.key.clone()).collect();
-    let mut changes = Vec::with_capacity(body.changes.len());
+    let mut entries = Vec::with_capacity(body.changes.len());
     for change in body.changes {
-        changes.push(BatchChange {
-            key: parse_key(&change.key)?,
-            tenant: change.tenant,
-            op: change.op,
-            value: change.value,
-            if_match: change.if_match,
-        });
+        let BatchChangeRequest {
+            key,
+            tenant,
+            op,
+            value,
+            if_match,
+        } = change;
+        let key = parse_key(&key)?;
+        // A value the text guard refuses is this entry's fault alone, like any
+        // other fault of one change: reported in its place, the rest proceeds.
+        entries.push(
+            value
+                .map(|raw| checked_value(&raw))
+                .transpose()
+                .map(|value| BatchChange {
+                    key,
+                    tenant,
+                    op,
+                    value,
+                    if_match,
+                }),
+        );
     }
     // @cpt-end:cpt-cf-settings-service-flow-value-writes-batch:p1:inst-vw-batch-1
-    let outcome = writes.batch(&actor, changes).await;
+    let outcome = writes.batch_entries(&actor, entries).await;
     // @cpt-begin:cpt-cf-settings-service-flow-value-writes-batch:p1:inst-vw-batch-9
     let pii = may_read_pii(&enforcer, &ctx).await;
     respond(outcome.map(|batch| {
@@ -395,7 +417,7 @@ pub async fn stage_secret(
     authz::access_scope(&enforcer, &ctx, &resource::VALUE, WRITE, None).await?;
     let actor = actor(&ctx, &headers);
     let pending = writes
-        .stage_secret(&actor, &key, tenant, body.value)
+        .stage_secret(&actor, &key, tenant, checked_value(&body.value)?)
         .await?;
     // @cpt-end:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-1
     // @cpt-begin:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-6
@@ -428,7 +450,13 @@ pub async fn validate_value(
     // @cpt-end:cpt-cf-settings-service-flow-value-writes-validate:p1:inst-vw-val-2
     let actor = actor(&ctx, &headers);
     let report = writes
-        .validate(&actor, &key, tenant, &body.value, body.limit)
+        .validate(
+            &actor,
+            &key,
+            tenant,
+            &checked_value(&body.value)?,
+            body.limit,
+        )
         .await?;
     // @cpt-begin:cpt-cf-settings-service-flow-value-writes-validate:p1:inst-vw-val-8
     let pii = may_read_pii(&enforcer, &ctx).await;
@@ -462,7 +490,13 @@ pub async fn impact(
     authz::access_scope(&enforcer, &ctx, &resource::VALUE, READ, None).await?;
     let actor = actor(&ctx, &headers);
     let outcome = writes
-        .impact(&actor, &key, tenant, &body.value, body.limit)
+        .impact(
+            &actor,
+            &key,
+            tenant,
+            &checked_value(&body.value)?,
+            body.limit,
+        )
         .await?;
     // @cpt-begin:cpt-cf-settings-service-flow-value-writes-impact:p1:inst-vw-imp-5
     // Each descendant's current value is masked by the declaration's own
@@ -480,3 +514,16 @@ pub async fn impact(
 #[cfg(test)]
 #[path = "value_handlers_tests.rs"]
 mod value_handlers_tests;
+
+/// The value a request carries, read from its text before it is parsed.
+///
+/// [`guards::check_text`] is the one place a decimal finer than a double
+/// resolves is still visible, so it runs on the raw field; the parsed value
+/// then takes the path every value takes.
+fn checked_value(raw: &RawValue) -> Result<Value, DomainError> {
+    guards::parse_checked(raw.get()).map_err(|violation| DomainError::Validation {
+        field: violation.field,
+        code: violation.code,
+        message: violation.message,
+    })
+}

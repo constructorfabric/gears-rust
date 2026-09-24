@@ -28,6 +28,8 @@ toolkit-odata = { workspace = true }
 async-trait = { workspace = true }
 toolkit-canonical-errors = { workspace = true }
 toolkit-security = { workspace = true }
+# The plaintext a secret resolves to is handed over wrapped, never as a bare string.
+secrecy = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]

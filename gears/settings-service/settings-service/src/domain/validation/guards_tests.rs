@@ -3,7 +3,7 @@
 
 use serde_json::json;
 
-use super::{MAX_SERIALIZED_BYTES, check, check_text};
+use super::{MAX_SERIALIZED_BYTES, check, check_text, parse_checked};
 use crate::field;
 
 #[test]
@@ -81,4 +81,34 @@ fn text_over_the_cap_is_too_large_before_any_number_is_read() {
         check_text(&text).expect_err("over the cap").code,
         field::VALUE_TOO_LARGE
     );
+}
+
+#[test]
+fn text_with_an_integer_beyond_u64_or_spelled_as_a_decimal_is_not_canonical() {
+    // Both parse to an f64 the parsed-value guard waves through: one because
+    // it overflows u64, the other because of the ".0".
+    for text in ["99999999999999999999", "9007199254740993.0"] {
+        let err = check_text(text).expect_err(text);
+        assert_eq!(err.code, field::VALUE_NOT_CANONICAL, "{text}");
+    }
+}
+
+#[test]
+fn a_huge_exponent_is_refused_without_being_expanded() {
+    // Fourteen bytes that once asked for two gigabytes of zero padding.
+    for text in ["1e-2147483647", "1e2147483647", "[1, 5e-1100000]"] {
+        let err = check_text(text).expect_err(text);
+        assert_eq!(err.code, field::VALUE_NOT_CANONICAL, "{text}");
+    }
+    // The bound sits beyond anything a double reaches, so ordinary exponents
+    // are untouched on either side of it.
+    assert!(check_text("[1e300, 1e-300, 2.5e-3]").is_ok());
+}
+
+#[test]
+fn parse_checked_yields_the_value_or_the_guards_fault() {
+    let value = parse_checked(r#"{"a": [1, 2.5, "x"]}"#).expect("ordinary JSON");
+    assert_eq!(value, json!({ "a": [1, 2.5, "x"] }));
+    let err = parse_checked("0.10000000000000000555").expect_err("finer than a double");
+    assert_eq!(err.code, field::VALUE_NOT_CANONICAL);
 }

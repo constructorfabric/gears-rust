@@ -10,6 +10,7 @@
 
 use std::sync::Arc;
 
+use secrecy::ExposeSecret;
 use serde_json::{Map, Value};
 use settings_service_sdk::{SettingKey, SettingKeyError};
 use toolkit_db::secure::DBRunner;
@@ -26,9 +27,9 @@ use crate::domain::declaration::{
 use crate::domain::error::DomainError;
 use crate::domain::precondition::{self, ETag};
 use crate::domain::resolution::EffectiveCache;
-use crate::domain::stepup::StepUpVerifier;
+use crate::domain::stepup::{StepUpRefusal, StepUpVerifier};
 use crate::domain::validation::{TraitSet, TypeValidator};
-use crate::domain::value::ValueRepository;
+use crate::domain::value::{StoredValue, ValueRepository};
 use crate::domain::writes::WriteActor;
 use crate::field;
 
@@ -40,12 +41,11 @@ pub mod conflict {
     pub const KEY_CONFLICT: &str = "declaration_key_conflict";
     /// An active declaration in the category already holds this leaf name.
     pub const LEAF_NAME_TAKEN: &str = "leaf_name_taken";
-    /// A revive names a different value type; that is a new major, not a revive.
-    pub const VALUE_TYPE_CHANGED: &str = "value_type_changed";
+    /// A revive names a value type on the other side of the secret boundary;
+    /// values stored one way are not re-interpreted as the other.
+    pub const SECRETNESS_CHANGED: &str = "secretness_changed";
     /// A revive changes the scope class; where a value may exist is not revived.
     pub const SCOPE_CLASS_CHANGED: &str = "scope_class_changed";
-    /// A revive changes the Schema Default; the declared floor rides a new major.
-    pub const DEFAULT_CHANGED: &str = "default_changed";
 }
 
 /// What an administrator supplies to declare a setting.
@@ -588,14 +588,17 @@ where
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-8
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-7
         // What a revive may not change, because it would move values rather
-        // than re-interpret them: the value type (and with it the secret
-        // boundary), the scope class, and the declared floor.
-        if retired.value_type_id != request.value_type_id {
+        // than re-interpret them: the secret boundary (a secret's values live
+        // by reference, everything else inline) and the scope class. The value
+        // type itself may change — that is how a setting is retyped — and every
+        // retained value is re-validated against it below.
+        if retired.has_secret_trait != derived.has_secret_trait {
             return Err(conflict(
-                conflict::VALUE_TYPE_CHANGED,
+                conflict::SECRETNESS_CHANGED,
                 format!(
-                    "`{}` is declared with `{}`; a revive keeps the value type",
-                    retired.key, retired.value_type_id
+                    "`{}` is declared with `{}`; `{}` is on the other side of the secret \
+                     boundary, and a revive does not move stored values across it",
+                    retired.key, retired.value_type_id, request.value_type_id
                 ),
             ));
         }
@@ -609,26 +612,46 @@ where
                 ),
             ));
         }
-        if retired.default_value != request.default_value {
-            return Err(conflict(
-                conflict::DEFAULT_CHANGED,
-                format!(
-                    "`{}` keeps its Schema Default on a revive; a new floor is a new major",
-                    retired.key
-                ),
-            ));
-        }
-        let _ = derived;
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-9
         // @cpt-begin:cpt-cf-settings-service-state-setting-declarations-lifecycle:p1:inst-decl-state-3
         let classification_changed = retired.data_classification != metadata.data_classification;
         let new_classification = metadata.data_classification.clone();
+        if retired.value_type_id != request.value_type_id
+            || retired.default_value != request.default_value
+        {
+            // Adopted as declared: the Schema Default was validated against the
+            // (possibly new) type on the way in. The setting's own GTS type,
+            // registered at create with its payload narrowed to the old value
+            // type, stays as registered — the registry answers a second
+            // registration with already-exists.
+            self.declarations
+                .set_definition(
+                    conn,
+                    scope,
+                    retired.id,
+                    &request.value_type_id,
+                    &request.default_value,
+                )
+                .await?;
+        }
+        let redefines = metadata.redefines(&retired);
         self.declarations
-            .update_metadata(conn, scope, retired.id, metadata)
+            .update_metadata(conn, scope, retired.id, metadata, None, redefines)
             .await?;
+        // Every retained value is re-validated against the type it goes live
+        // under — the new one, or the old one that may have gained a revision
+        // while the setting sat retired. What fails is flagged with its detail
+        // and falls through on read rather than being served or discarded;
+        // what validates again has its flag cleared.
+        for row in self.values.find_all(conn, scope, retired.id).await? {
+            let detail = self.revalidate(&request.value_type_id, &row).await?;
+            if detail.is_some() != row.needs_review {
+                self.values.flag(conn, scope, row.id, detail).await?;
+            }
+        }
         if let Err(err) = self
             .declarations
-            .set_status(conn, scope, retired.id, "active")
+            .set_status(conn, scope, retired.id, "active", None)
             .await
         {
             return Err(match err {
@@ -673,6 +696,24 @@ where
             reactivated: true,
         })
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-12
+    }
+
+    /// The first violation of a retained value against `value_type_id`, as
+    /// the detail a `needs_review` flag carries; `None` when it validates, and
+    /// for a secret row, whose plaintext is not here to validate.
+    async fn revalidate(
+        &self,
+        value_type_id: &str,
+        row: &StoredValue,
+    ) -> Result<Option<String>, DomainError> {
+        let Some(value) = &row.value else {
+            return Ok(None);
+        };
+        let result = self.validator.validate_value(value_type_id, value).await?;
+        Ok(result
+            .violations
+            .first()
+            .map(|first| format!("{} — {}", first.field, first.message)))
     }
 
     /// Edit a declaration's metadata under the mutation-class discipline.
@@ -773,8 +814,19 @@ where
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-update:p1:inst-decl-update-13
         let classification_changed = metadata.data_classification != current.data_classification;
         let new_classification = metadata.data_classification.clone();
+        // At the version the tag was compared against: a row that moved in
+        // between is changed by nobody twice. The definition recency moves
+        // only when what a reader is served changes — a description does not.
+        let redefines = metadata.redefines(&current);
         self.declarations
-            .update_metadata(conn, scope, id, metadata)
+            .update_metadata(
+                conn,
+                scope,
+                id,
+                metadata,
+                Some(current.updated_at),
+                redefines,
+            )
             .await?;
         if classification_changed {
             // The denormalized class on every stored value follows, so masking
@@ -784,6 +836,13 @@ where
                 .await?;
         }
         let updated = self.reload(conn, scope, &current.key).await?;
+        // The cached effective value is a function of the declaration — it
+        // carries the classification masking reads and the domain affinity
+        // the visibility rule applies — so the key is evicted with the change,
+        // here inside the transaction and again by the caller once it commits,
+        // exactly as a retire is. Unconditionally: choosing by field would be
+        // a fragile saving on a rare operation.
+        self.cache.invalidate_key(&updated.key);
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-update:p1:inst-decl-update-13
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-update:p1:inst-decl-update-14
         self.record(
@@ -844,7 +903,7 @@ where
         // excluded from resolution by the status alone and revived with it. A
         // retired declaration keeps occupying its category with them.
         self.declarations
-            .set_status(conn, scope, id, "retired")
+            .set_status(conn, scope, id, "retired", Some(current.updated_at))
             .await?;
         // @cpt-end:cpt-cf-settings-service-state-setting-declarations-lifecycle:p1:inst-decl-state-4
         // @cpt-end:cpt-cf-settings-service-state-setting-declarations-lifecycle:p1:inst-decl-state-2
@@ -934,10 +993,21 @@ where
         let subject = actor.step_up_subject();
         match self
             .step_up
-            .verify(actor.step_up_token.as_deref(), &subject)
+            .verify(
+                actor
+                    .step_up_token
+                    .as_ref()
+                    .map(ExposeSecret::expose_secret),
+                &subject,
+            )
             .await
         {
             Ok(()) => Ok(()),
+            // An outage of the platform's AuthN is not a verdict on the token:
+            // the client retries rather than re-authenticates.
+            Err(StepUpRefusal::Unavailable(detail)) => Err(DomainError::Unavailable {
+                detail: format!("step-up could not be verified: {detail}"),
+            }),
             Err(refusal) => {
                 let requirement = self.step_up.requirement();
                 Err(DomainError::StepUpRequired {

@@ -15,7 +15,9 @@ use toolkit_db::secure::DBRunner;
 use toolkit_odata::PageInfo;
 use uuid::Uuid;
 
-use super::{Corpus, MatchedField, Needle, SearchRepository, SearchRequest, text_projection};
+use super::{
+    Corpus, MatchedField, Needle, SearchRepository, SearchRequest, text_projection, too_many_hits,
+};
 use crate::domain::category::Category;
 use crate::domain::declaration::Declaration;
 use crate::domain::error::DomainError;
@@ -83,8 +85,14 @@ impl<R: SearchRepository> SearchService<R> {
                 request.tenant_ids,
                 request.needle,
                 request.corpus,
+                request.override_limit,
             )
             .await?;
+        // A page cut short of its hits would hide where a value is set;
+        // refused with the bound named instead, for the caller to narrow.
+        if overrides.len() > request.override_limit {
+            return Err(too_many_hits(request.override_limit));
+        }
         let mut category_ids: Vec<Uuid> = page.items.iter().map(|d| d.category_id).collect();
         category_ids.sort_unstable();
         category_ids.dedup();
@@ -97,14 +105,22 @@ impl<R: SearchRepository> SearchService<R> {
             .collect();
 
         // @cpt-begin:cpt-cf-settings-service-flow-search-discoverability-search:p2:inst-sd-search-9
+        // The overrides grouped by declaration once, in the order the
+        // repository answered them: a page of declarations against a bound of
+        // matching rows would otherwise rescan every row once per declaration.
+        let mut by_declaration: HashMap<Uuid, Vec<&StoredValue>> = HashMap::new();
+        for row in &overrides {
+            by_declaration
+                .entry(row.declaration_id)
+                .or_default()
+                .push(row);
+        }
         let mut hits = Vec::new();
         for declaration in page.items {
             let declaration = Arc::new(declaration);
             let category = categories.get(&declaration.category_id).cloned();
-            let own_rows: Vec<&StoredValue> = overrides
-                .iter()
-                .filter(|r| r.declaration_id == declaration.id)
-                .collect();
+            let own_rows: Vec<&StoredValue> =
+                by_declaration.remove(&declaration.id).unwrap_or_default();
             let matched = declaration_match(
                 &declaration,
                 category.as_deref(),

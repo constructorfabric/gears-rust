@@ -50,26 +50,38 @@ pub trait AccessRepository: Send + Sync {
         tenant_id: Uuid,
     ) -> Result<Option<Restriction>, DomainError>;
 
-    /// Insert or replace the pair's row, stamping `updated_at`.
+    /// Insert or replace the pair's row, stamping `updated_at`, at the state
+    /// the caller compared its tag against.
+    ///
+    /// `expected` is the stored row's `updated_at`, or `None` when the caller
+    /// saw no row. With a version the row at that version is replaced; without
+    /// one a row is inserted, and the unique index on the pair decides whether
+    /// "no row" still holds.
     ///
     /// # Errors
-    /// [`DomainError`] when the write fails.
+    /// [`DomainError::PreconditionFailed`] when no row is at the version, or
+    /// a row appeared where the caller saw none; [`DomainError`] when the
+    /// write fails.
     async fn upsert<C: DBRunner>(
         &self,
         conn: &C,
         scope: &AccessScope,
         draft: RestrictionDraft,
+        expected: Option<time::OffsetDateTime>,
     ) -> Result<Restriction, DomainError>;
 
-    /// Delete the pair's row, reporting whether one existed.
+    /// Delete the pair's row at the version the caller compared its tag
+    /// against.
     ///
     /// # Errors
-    /// [`DomainError`] when the delete fails.
+    /// [`DomainError::PreconditionFailed`] when no row is at that version any
+    /// more; [`DomainError`] when the delete fails.
     async fn delete<C: DBRunner>(
         &self,
         conn: &C,
         scope: &AccessScope,
         declaration_id: Uuid,
         tenant_id: Uuid,
-    ) -> Result<bool, DomainError>;
+        expected: time::OffsetDateTime,
+    ) -> Result<(), DomainError>;
 }

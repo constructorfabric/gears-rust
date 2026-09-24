@@ -230,3 +230,83 @@ async fn records_of_one_change_set_are_retrievable_together() {
     assert_eq!(together.len(), 2);
     assert!(together.iter().all(|r| r.change_set_id == Some(change_set)));
 }
+
+/// A stored row as the mapper sees it, with the given images.
+fn stored_row(
+    pre_value: Option<serde_json::Value>,
+) -> crate::infra::storage::entity::audit_record::Model {
+    crate::infra::storage::entity::audit_record::Model {
+        id: Uuid::new_v4(),
+        resource: format!("{KEY}#tenant"),
+        declaration_key: KEY.to_owned(),
+        tenant_id: Some(Uuid::new_v4()),
+        operation: "change".to_owned(),
+        actor: "admin".to_owned(),
+        actor_classification: "public".to_owned(),
+        pre_value,
+        post_value: Some(json!({ "kind": "clear", "value": true })),
+        outcome: "success".to_owned(),
+        request_id: "req".to_owned(),
+        change_set_id: None,
+        occurred_at: OffsetDateTime::now_utc(),
+        retain_until: None,
+    }
+}
+
+#[test]
+fn an_image_that_does_not_decode_is_an_integrity_error_not_an_absent_image() {
+    // The record's enum fields already refuse a value they cannot read; an
+    // image is evidence of what changed and gets the same treatment. Reading
+    // it as "no image" would erase the trace of a change without a sign.
+    let corrupt = super::to_domain(stored_row(Some(json!("garbage"))));
+    assert!(
+        matches!(corrupt, Err(DomainError::Internal { .. })),
+        "{corrupt:?}"
+    );
+
+    let intact = super::to_domain(stored_row(Some(json!({ "kind": "clear", "value": false }))))
+        .expect("an intact row maps");
+    assert_eq!(
+        intact.pre_image,
+        Some(AuditValue::record(json!(false), false))
+    );
+    let absent = super::to_domain(stored_row(None)).expect("an absent image is absent");
+    assert_eq!(absent.pre_image, None);
+}
+
+#[tokio::test]
+async fn the_store_itself_refuses_to_rewrite_a_record() {
+    // Append-only is a property of the table, not of call-site discipline: a
+    // future code path — or a misused one — that issues an `UPDATE` is refused
+    // by the trigger the migration carries, and the record reads back as it
+    // was written.
+    use sea_orm::sea_query::Expr;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    use toolkit_db::secure::SecureUpdateExt;
+
+    use crate::infra::storage::entity::audit_record::{Column, Entity as AuditEntity};
+
+    let db = db().await;
+    let tenant = Uuid::new_v4();
+    let conn = db.conn().expect("connection");
+    AuditStore
+        .append(&conn, &AccessScope::allow_all(), record(tenant, "once"))
+        .await
+        .expect("append");
+    let written = history(&db, tenant, None, None).await.items.remove(0);
+
+    let tampered = AuditEntity::update_many()
+        .col_expr(Column::Actor, Expr::value("someone else"))
+        .filter(Column::Id.eq(written.id))
+        .secure()
+        .scope_with(&AccessScope::allow_all())
+        .exec(&conn)
+        .await;
+    assert!(
+        tampered.is_err(),
+        "the store refuses the rewrite: {tampered:?}"
+    );
+
+    let read_back = history(&db, tenant, None, None).await.items.remove(0);
+    assert_eq!(read_back.actor, "admin", "the record is as it was written");
+}

@@ -10,6 +10,8 @@ use uuid::Uuid;
 
 use crate::domain::access::{AccessRepository, Restriction, RestrictionDraft, TenantAccess};
 use crate::domain::error::DomainError;
+use crate::domain::precondition;
+use crate::infra::storage::clock::stamp_after;
 use crate::infra::storage::entity::tenant_permission::{self, Entity as PermissionEntity};
 
 /// The repository. Stateless: every operation takes its connection.
@@ -99,45 +101,60 @@ impl AccessRepository for AccessRepo {
         conn: &C,
         scope: &AccessScope,
         draft: RestrictionDraft,
+        expected: Option<time::OffsetDateTime>,
     ) -> Result<Restriction, DomainError> {
-        let at = time::OffsetDateTime::now_utc();
-        if let Some(existing) = self
-            .find_one(conn, scope, draft.declaration_id, draft.tenant_id)
-            .await?
-        {
-            PermissionEntity::update_many()
-                .col_expr(
-                    tenant_permission::Column::Access,
-                    Expr::value(draft.access.as_str().to_owned()),
-                )
-                .col_expr(tenant_permission::Column::SetBy, Expr::value(draft.set_by))
-                .col_expr(tenant_permission::Column::UpdatedAt, Expr::value(at))
-                .filter(tenant_permission::Column::Id.eq(existing.id))
-                .secure()
-                .scope_with(scope)
-                .exec(conn)
+        let at = stamp_after(expected);
+        let Some(expected) = expected else {
+            // The caller compared the absent-state tag. Whether that still
+            // holds is the unique index's call, not a prior read's: a row that
+            // appeared since is another delegate's, and this write is the
+            // stale one — the same answer a stale tag gets.
+            let active = tenant_permission::ActiveModel {
+                id: Set(Uuid::new_v4()),
+                declaration_id: Set(draft.declaration_id),
+                tenant_id: Set(draft.tenant_id),
+                access: Set(draft.access.as_str().to_owned()),
+                set_by: Set(draft.set_by),
+                created_at: Set(at),
+                updated_at: Set(at),
+            };
+            let model = toolkit_db::secure::secure_insert::<PermissionEntity>(active, scope, conn)
                 .await
-                .map_err(db_error)?;
-            return self
-                .find_one(conn, scope, draft.declaration_id, draft.tenant_id)
-                .await?
-                .ok_or_else(|| DomainError::Internal {
-                    diagnostic: "restriction vanished inside its own transaction".to_owned(),
-                });
-        }
-        let active = tenant_permission::ActiveModel {
-            id: Set(Uuid::new_v4()),
-            declaration_id: Set(draft.declaration_id),
-            tenant_id: Set(draft.tenant_id),
-            access: Set(draft.access.as_str().to_owned()),
-            set_by: Set(draft.set_by),
-            created_at: Set(at),
-            updated_at: Set(at),
+                .map_err(|err| {
+                    if err.is_unique_violation() {
+                        precondition::stale()
+                    } else {
+                        db_error(err)
+                    }
+                })?;
+            return to_domain(model);
         };
-        let model = toolkit_db::secure::secure_insert::<PermissionEntity>(active, scope, conn)
+        // The caller compared a stored row's tag: the replacement applies to
+        // the row at that version alone, so one that moved since matches
+        // nothing and nobody's write lands on top of another's.
+        let outcome = PermissionEntity::update_many()
+            .col_expr(
+                tenant_permission::Column::Access,
+                Expr::value(draft.access.as_str().to_owned()),
+            )
+            .col_expr(tenant_permission::Column::SetBy, Expr::value(draft.set_by))
+            .col_expr(tenant_permission::Column::UpdatedAt, Expr::value(at))
+            .filter(tenant_permission::Column::DeclarationId.eq(draft.declaration_id))
+            .filter(tenant_permission::Column::TenantId.eq(draft.tenant_id))
+            .filter(tenant_permission::Column::UpdatedAt.eq(expected))
+            .secure()
+            .scope_with(scope)
+            .exec(conn)
             .await
             .map_err(db_error)?;
-        to_domain(model)
+        if outcome.rows_affected == 0 {
+            return Err(precondition::stale());
+        }
+        self.find_one(conn, scope, draft.declaration_id, draft.tenant_id)
+            .await?
+            .ok_or_else(|| DomainError::Internal {
+                diagnostic: "restriction vanished inside its own transaction".to_owned(),
+            })
     }
 
     async fn delete<C: DBRunner>(
@@ -146,16 +163,21 @@ impl AccessRepository for AccessRepo {
         scope: &AccessScope,
         declaration_id: Uuid,
         tenant_id: Uuid,
-    ) -> Result<bool, DomainError> {
+        expected: time::OffsetDateTime,
+    ) -> Result<(), DomainError> {
         let outcome = PermissionEntity::delete_many()
             .filter(tenant_permission::Column::DeclarationId.eq(declaration_id))
             .filter(tenant_permission::Column::TenantId.eq(tenant_id))
+            .filter(tenant_permission::Column::UpdatedAt.eq(expected))
             .secure()
             .scope_with(scope)
             .exec(conn)
             .await
             .map_err(db_error)?;
-        Ok(outcome.rows_affected > 0)
+        if outcome.rows_affected == 0 {
+            return Err(precondition::stale());
+        }
+        Ok(())
     }
 }
 

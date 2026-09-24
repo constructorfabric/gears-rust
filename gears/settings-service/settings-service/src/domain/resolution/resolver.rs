@@ -10,6 +10,7 @@ use toolkit_db::secure::DBRunner;
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
+use super::cache::Generation;
 use super::{
     EffectiveCache, EffectiveValue, OwnRow, ScopeTarget, TenantHierarchy, TrailEntry, scope_class,
     scope_path,
@@ -464,7 +465,10 @@ where
         let mut ancestry = Ancestry::new(root, target);
         let mut out = Vec::with_capacity(declarations.len());
         for declaration in declarations {
-            out.push(self.resolve_loaded(conn, declaration, &mut ancestry).await);
+            out.push(
+                self.resolve_loaded(conn, declaration, &mut ancestry, None)
+                    .await,
+            );
         }
         out
     }
@@ -480,6 +484,52 @@ where
     ) -> Result<Option<Declaration>, DomainError> {
         self.declarations
             .find_by_key(conn, &AccessScope::allow_all(), key.as_str())
+            .await
+    }
+
+    /// A tenant's root-to-self chain, as the access rules read it: the one
+    /// tenant-resolver call a write makes, at its gate.
+    ///
+    /// # Errors
+    /// [`DomainError`] when the chain cannot be read.
+    pub async fn chain_of(&self, tenant: Uuid) -> Result<Vec<Uuid>, DomainError> {
+        let root = self.platform.root_tenant().await?;
+        let mut ancestry = Ancestry::new(root, ScopeTarget::Tenant(tenant));
+        Ok(ancestry.chain(self.hierarchy.as_ref()).await?.to_vec())
+    }
+
+    /// Effective access for one declaration over a chain already resolved —
+    /// database rows only, so a commit can derive it again under its lock
+    /// without leaving the transaction.
+    ///
+    /// # Errors
+    /// [`DomainError`] when the rows cannot be read.
+    pub async fn access_on_chain<C: DBRunner>(
+        &self,
+        conn: &C,
+        declaration_id: Uuid,
+        chain: &[Uuid],
+    ) -> Result<EffectiveAccess, DomainError> {
+        let rows = self
+            .access
+            .find_in_tenants(conn, &AccessScope::allow_all(), declaration_id, chain)
+            .await?;
+        Ok(strictest(&rows))
+    }
+
+    /// The declaration by id, share-locked until the caller's transaction ends
+    /// — what a write reads again before it stores, so a retire cannot slip in
+    /// between the gate and the row.
+    ///
+    /// # Errors
+    /// [`DomainError`] when the read fails.
+    pub async fn lock_declaration<C: DBRunner>(
+        &self,
+        conn: &C,
+        id: Uuid,
+    ) -> Result<Option<Declaration>, DomainError> {
+        self.declarations
+            .find_locked(conn, &AccessScope::allow_all(), id)
             .await
     }
 
@@ -499,7 +549,9 @@ where
     }
 
     /// A page of declarations for the administrative browse, under the
-    /// caller's scope constraints and administrative-domain visibility.
+    /// caller's scope constraints and administrative-domain visibility, with
+    /// the settings `hidden` for the caller — whose root-to-self chain is
+    /// `hidden_for` — left out in the query, so the page comes back full.
     ///
     /// # Errors
     /// [`DomainError::Validation`] on an unmapped field or unsupported
@@ -508,10 +560,13 @@ where
         &self,
         conn: &C,
         scope: &AccessScope,
+        hidden_for: &[Uuid],
         query: &toolkit_odata::ODataQuery,
     ) -> Result<toolkit_odata::Page<Declaration>, DomainError> {
         let visible = crate::domain::category::visibility::domain_visibility(scope);
-        self.declarations.list(conn, scope, &visible, query).await
+        self.declarations
+            .list(conn, scope, &visible, hidden_for, query)
+            .await
     }
 
     /// The overrides flagged for review among `declaration_ids` at any of
@@ -561,8 +616,14 @@ where
         }
         // @cpt-end:cpt-cf-settings-service-flow-value-resolution-resolve:p1:inst-vr-resolve-3
         // @cpt-end:cpt-cf-settings-service-flow-value-resolution-resolve:p1:inst-vr-resolve-2
+        // Captured the moment the cache came up empty, before the first
+        // database read: the store at the end is refused if an invalidation
+        // of the key or the scope lands in between, since what this read
+        // brings back may predate the write that evicted the slot.
+        let seen = self.cache.generation(key.as_str(), ancestry.tenant);
         let declaration = self.declaration(conn, key).await?;
-        self.resolve_loaded(conn, &declaration, ancestry).await
+        self.resolve_loaded(conn, &declaration, ancestry, Some(seen))
+            .await
     }
 
     /// The declaration behind a key, or the outcome that stands in for it.
@@ -593,15 +654,20 @@ where
         Ok(declaration)
     }
 
+    /// `seen` is the generation the caller captured on its own cache miss;
+    /// a caller that loaded the declaration some other way captures it here,
+    /// on this miss, which is the earliest point it has.
     async fn resolve_loaded<C: DBRunner>(
         &self,
         conn: &C,
         declaration: &Declaration,
         ancestry: &mut Ancestry,
+        seen: Option<Generation>,
     ) -> Result<Arc<EffectiveValue>, DomainError> {
         if let Some(hit) = self.cache.get(&declaration.key, ancestry.tenant) {
             return Ok(hit);
         }
+        let seen = seen.unwrap_or_else(|| self.cache.generation(&declaration.key, ancestry.tenant));
         // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-resolve:p1:inst-vr-resolve-6
         // A positive fact, distinct from not-found; the retained values stay
         // in the table and are not returned.
@@ -645,7 +711,7 @@ where
             own_row: walk.own_row,
         });
         // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-resolve:p1:inst-vr-resolve-11
-        self.cache.populate(Arc::clone(&effective));
+        self.cache.populate(Arc::clone(&effective), seen);
         // @cpt-end:cpt-cf-settings-service-flow-value-resolution-resolve:p1:inst-vr-resolve-11
         // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-resolve:p1:inst-vr-resolve-12
         Ok(effective)

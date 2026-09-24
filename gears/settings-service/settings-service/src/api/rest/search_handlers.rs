@@ -11,7 +11,6 @@ use toolkit::api::canonical_prelude::*;
 use toolkit::api::odata::OData;
 use toolkit_odata::ODataQuery;
 use toolkit_security::{AccessScope, SecurityContext};
-use uuid::Uuid;
 
 use crate::api::authz::{self, resource};
 use crate::api::rest::search_dto::{SearchHitDto, render_hit};
@@ -19,9 +18,9 @@ use crate::api::rest::setting_handlers::{
     conn_error, gate_target, may_read_pii, parse_tenant, unsupported,
 };
 use crate::domain::category::visibility;
-use crate::domain::resolution::ScopeTarget;
+use crate::domain::resolution::{SUBTREE_BUDGET, subtree_too_large};
 use crate::domain::search::service::SearchService;
-use crate::domain::search::{Corpus, Needle, SearchRequest, cursor_binding};
+use crate::domain::search::{Corpus, Needle, SEARCH_OVERRIDE_LIMIT, SearchRequest, cursor_binding};
 use crate::gear::ConcreteResolver;
 use crate::infra::storage::search_repo::SearchRepo;
 
@@ -89,8 +88,16 @@ pub async fn search_settings(
 
     // @cpt-begin:cpt-cf-settings-service-flow-search-discoverability-search:p2:inst-sd-search-4
     // The override corpus: the target and its descendants, standalone ones
-    // excluded by the hierarchy — exactly the rows the caller could read.
-    let mut tenant_ids = resolver.hierarchy().descendants(target_tenant).await?;
+    // excluded by the hierarchy — exactly the rows the caller could read, and
+    // at most the subtree budget of them. A subtree the budget cuts would
+    // hide overrides silently, so the request is refused with the bound named.
+    let (mut tenant_ids, truncated) = resolver
+        .hierarchy()
+        .descendants_bfs(target_tenant, SUBTREE_BUDGET)
+        .await?;
+    if truncated {
+        return Err(subtree_too_large("tenant", "target's").into());
+    }
     tenant_ids.push(target_tenant);
     // @cpt-end:cpt-cf-settings-service-flow-search-discoverability-search:p2:inst-sd-search-4
 
@@ -109,6 +116,12 @@ pub async fn search_settings(
 
     let conn = db.conn().map_err(|e| conn_error(&e))?;
     let domain_visibility = visibility::domain_visibility(&scope);
+    // @cpt-begin:cpt-cf-settings-service-flow-search-discoverability-search:p2:inst-sd-search-10
+    // A setting hidden from the caller leaves silently, hits and all — never
+    // marked, exactly as browse drops it: in the page query, on the caller's
+    // own chain, so the page is cut and counted after the exclusion.
+    let caller_chain = resolver.chain_of(ctx.subject_tenant_id()).await?;
+    // @cpt-end:cpt-cf-settings-service-flow-search-discoverability-search:p2:inst-sd-search-10
     let page = search
         .search(
             &conn,
@@ -118,28 +131,15 @@ pub async fn search_settings(
                 needle: &needle,
                 corpus,
                 tenant_ids: &tenant_ids,
+                hidden_for: &caller_chain,
+                override_limit: SEARCH_OVERRIDE_LIMIT,
                 query: &query,
             },
         )
         .await?;
 
-    // @cpt-begin:cpt-cf-settings-service-flow-search-discoverability-search:p2:inst-sd-search-10
-    // A setting hidden from the caller leaves silently, hits and all — never
-    // marked, exactly as browse drops it.
-    let mut ids: Vec<Uuid> = page.hits.iter().map(|h| h.declaration.id).collect();
-    ids.sort_unstable();
-    ids.dedup();
-    let caller = ScopeTarget::Tenant(ctx.subject_tenant_id()).normalize(root);
-    let access = resolver.effective_access_for(&conn, &ids, caller).await?;
-    // @cpt-end:cpt-cf-settings-service-flow-search-discoverability-search:p2:inst-sd-search-10
-
     // @cpt-begin:cpt-cf-settings-service-flow-search-discoverability-search:p2:inst-sd-search-11
-    let items: Vec<SearchHitDto> = page
-        .hits
-        .iter()
-        .filter(|h| !access.get(&h.declaration.id).is_some_and(|a| a.is_hidden()))
-        .map(|h| render_hit(h, root, pii))
-        .collect();
+    let items: Vec<SearchHitDto> = page.hits.iter().map(|h| render_hit(h, root, pii)).collect();
     Ok(Json(toolkit_odata::Page {
         items,
         page_info: page.page_info,

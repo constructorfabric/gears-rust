@@ -2,21 +2,25 @@
 //! Persistence for declarations.
 
 use async_trait::async_trait;
-use sea_orm::sea_query::Expr;
-use sea_orm::{ActiveValue::Set, ColumnTrait, EntityTrait, ExprTrait, QueryFilter};
+use sea_orm::sea_query::{Expr, Query};
+use sea_orm::{ActiveValue::Set, ColumnTrait, EntityTrait, ExprTrait, QueryFilter, QuerySelect};
 use toolkit_db::odata::{LimitCfg, paginate_odata};
 use toolkit_db::secure::{DBRunner, SecureEntityExt, SecureUpdateExt};
 use toolkit_odata::{ODataQuery, Page, SortDir};
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
+use crate::domain::access::TenantAccess;
 use crate::domain::category::visibility::DomainVisibility;
 use crate::domain::declaration::{
     Declaration, DeclarationDraft, DeclarationMetadata, DeclarationRepository,
 };
 use crate::domain::error::DomainError;
+use crate::domain::precondition;
+use crate::infra::storage::clock::{now, stamp_after};
 use crate::infra::storage::declaration_odata_mapper::DeclarationODataMapper;
 use crate::infra::storage::entity::declaration::{self, Entity as DeclarationEntity};
+use crate::infra::storage::entity::tenant_permission;
 use settings_service_sdk::odata::DeclarationFilterField;
 
 /// Page bounds for declaration listings.
@@ -57,8 +61,19 @@ pub(crate) fn to_domain(model: declaration::Model) -> Declaration {
     }
 }
 
-fn now() -> time::OffsetDateTime {
-    time::OffsetDateTime::now_utc()
+/// Narrow an update to the row version the caller compared its tag against.
+///
+/// With a version, the update matches only the row still at it: a writer whose
+/// read went stale changes nothing and is told so. Without one — a caller that
+/// holds no tag and works under its own transaction — the update stands alone.
+fn at_version(
+    update: sea_orm::UpdateMany<DeclarationEntity>,
+    expected: Option<time::OffsetDateTime>,
+) -> sea_orm::UpdateMany<DeclarationEntity> {
+    match expected {
+        Some(expected) => update.filter(declaration::Column::UpdatedAt.eq(expected)),
+        None => update,
+    }
 }
 
 fn map_write_error(err: &toolkit_db::secure::ScopeError) -> DomainError {
@@ -98,6 +113,31 @@ pub(crate) fn apply_visibility(
                 .or(declaration::Column::DomainAffinity.is_in(domains.clone())),
         ),
     }
+}
+
+/// Leave out every declaration `hidden` for a caller whose root-to-self chain
+/// is `chain`.
+///
+/// A setting is hidden for a tenant exactly when a `hidden` restriction sits
+/// on any tenant of its chain — `hidden` is the strictest access, so one row
+/// decides — which is this one predicate. Applied to the page query itself,
+/// so the page is cut and counted after the exclusion and comes back full;
+/// a post-filter would shorten it and let the gap tell the caller something
+/// sits there. An empty chain excludes nothing.
+pub(crate) fn exclude_hidden_for(
+    select: sea_orm::Select<DeclarationEntity>,
+    chain: &[Uuid],
+) -> sea_orm::Select<DeclarationEntity> {
+    if chain.is_empty() {
+        return select;
+    }
+    let hidden = Query::select()
+        .column(tenant_permission::Column::DeclarationId)
+        .from(tenant_permission::Entity)
+        .and_where(tenant_permission::Column::TenantId.is_in(chain.iter().copied()))
+        .and_where(tenant_permission::Column::Access.eq(TenantAccess::Hidden.as_str()))
+        .to_owned();
+    select.filter(declaration::Column::Id.not_in_subquery(hidden))
 }
 
 #[async_trait]
@@ -180,11 +220,15 @@ impl DeclarationRepository for DeclarationRepo {
         scope: &AccessScope,
         id: Uuid,
         metadata: DeclarationMetadata,
+        expected: Option<time::OffsetDateTime>,
+        redefines: bool,
     ) -> Result<(), DomainError> {
-        // Metadata only: `last_change_at` is the definition arm of the
-        // effective recency and moves for the Schema Default and the type, not
-        // for a description.
-        DeclarationEntity::update_many()
+        // `last_change_at` is the definition arm of the effective recency: it
+        // moves when the change alters what a reader is served, which the
+        // caller decided from the row it holds; a description moves the tag
+        // alone.
+        let at = stamp_after(expected);
+        let mut update = DeclarationEntity::update_many()
             .col_expr(declaration::Column::Mode, Expr::value(metadata.mode))
             .col_expr(
                 declaration::Column::Description,
@@ -210,14 +254,20 @@ impl DeclarationRepository for DeclarationRepo {
                 declaration::Column::AnonymousExposable,
                 Expr::value(metadata.anonymous_exposable),
             )
-            .col_expr(declaration::Column::LastChangeAt, Expr::value(now()))
-            .col_expr(declaration::Column::UpdatedAt, Expr::value(now()))
-            .filter(declaration::Column::Id.eq(id))
+            .col_expr(declaration::Column::UpdatedAt, Expr::value(at))
+            .filter(declaration::Column::Id.eq(id));
+        if redefines {
+            update = update.col_expr(declaration::Column::LastChangeAt, Expr::value(at));
+        }
+        let outcome = at_version(update, expected)
             .secure()
             .scope_with(scope)
             .exec(conn)
             .await
             .map_err(|err| map_write_error(&err))?;
+        if expected.is_some() && outcome.rows_affected == 0 {
+            return Err(precondition::stale());
+        }
         Ok(())
     }
 
@@ -227,10 +277,87 @@ impl DeclarationRepository for DeclarationRepo {
         scope: &AccessScope,
         id: Uuid,
         status: &str,
+        expected: Option<time::OffsetDateTime>,
+    ) -> Result<(), DomainError> {
+        let at = stamp_after(expected);
+        let update = DeclarationEntity::update_many()
+            .col_expr(declaration::Column::Status, Expr::value(status.to_owned()))
+            .col_expr(declaration::Column::LastChangeAt, Expr::value(at))
+            .col_expr(declaration::Column::UpdatedAt, Expr::value(at))
+            .filter(declaration::Column::Id.eq(id));
+        let outcome = at_version(update, expected)
+            .secure()
+            .scope_with(scope)
+            .exec(conn)
+            .await
+            .map_err(|err| map_write_error(&err))?;
+        if expected.is_some() && outcome.rows_affected == 0 {
+            return Err(precondition::stale());
+        }
+        Ok(())
+    }
+
+    async fn find_locked<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        id: Uuid,
+    ) -> Result<Option<Declaration>, DomainError> {
+        // `FOR SHARE`: concurrent writes to the same setting share the row,
+        // while a status change — an `UPDATE`, which takes the row for update —
+        // has to wait for them and they for it. SQLite renders no lock clause
+        // and serializes writers itself.
+        let found = DeclarationEntity::find()
+            .filter(declaration::Column::Id.eq(id))
+            .lock_shared()
+            .secure()
+            .scope_with(scope)
+            .one(conn)
+            .await
+            .map_err(db_error)?;
+        Ok(found.map(to_domain))
+    }
+
+    async fn lock_for_update<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        id: Uuid,
+    ) -> Result<(), DomainError> {
+        // `FOR UPDATE` against the writes' `FOR SHARE`: the two conflict, so a
+        // restriction change and a value write on one setting take turns.
+        DeclarationEntity::find()
+            .filter(declaration::Column::Id.eq(id))
+            .lock_exclusive()
+            .secure()
+            .scope_with(scope)
+            .one(conn)
+            .await
+            .map_err(db_error)?
+            .ok_or(DomainError::NotFound {
+                resource: "declaration",
+            })?;
+        Ok(())
+    }
+
+    async fn set_definition<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        id: Uuid,
+        value_type_id: &str,
+        default_value: &serde_json::Value,
     ) -> Result<(), DomainError> {
         let at = now();
         DeclarationEntity::update_many()
-            .col_expr(declaration::Column::Status, Expr::value(status.to_owned()))
+            .col_expr(
+                declaration::Column::ValueTypeId,
+                Expr::value(value_type_id.to_owned()),
+            )
+            .col_expr(
+                declaration::Column::DefaultValue,
+                Expr::value(default_value.clone()),
+            )
             .col_expr(declaration::Column::LastChangeAt, Expr::value(at))
             .col_expr(declaration::Column::UpdatedAt, Expr::value(at))
             .filter(declaration::Column::Id.eq(id))
@@ -288,12 +415,16 @@ impl DeclarationRepository for DeclarationRepo {
         conn: &C,
         scope: &AccessScope,
         visibility: &DomainVisibility,
+        hidden_for: &[Uuid],
         query: &ODataQuery,
     ) -> Result<Page<Declaration>, DomainError> {
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-read:p1:inst-decl-read-6
-        let base = apply_visibility(DeclarationEntity::find(), visibility)
-            .secure()
-            .scope_with(scope);
+        let base = exclude_hidden_for(
+            apply_visibility(DeclarationEntity::find(), visibility),
+            hidden_for,
+        )
+        .secure()
+        .scope_with(scope);
 
         // Tiebreaker is `key`, which `uq_declaration_key` makes unique, so a
         // page boundary can neither repeat nor skip a row.

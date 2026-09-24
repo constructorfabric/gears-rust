@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use secrecy::SecretString;
 use serde_json::{Map, Value, json};
 use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
@@ -20,7 +21,7 @@ use crate::infra::storage::declaration_repo::DeclarationRepo;
 use crate::infra::storage::value_repo::ValueRepo;
 use crate::infra::type_validator::GtsTypeValidator;
 use crate::test_support::{
-    BOOL, FixedStepUp, RecordingAudit, RecordingRegistrar, ResolutionHarness, SECRET,
+    BOOL, FixedStepUp, RecordingAudit, RecordingRegistrar, ResolutionHarness, SECRET, TEXT,
     resolution_catalogue,
 };
 
@@ -147,7 +148,7 @@ fn admin_actor() -> WriteActor {
             .build()
             .expect("context"),
         request_id: "req".to_owned(),
-        step_up_token: Some("token".to_owned()),
+        step_up_token: Some(SecretString::from("token".to_owned())),
     }
 }
 
@@ -378,6 +379,67 @@ async fn a_patch_applies_descriptive_metadata_and_refuses_the_behaviour_affectin
         );
     }
     assert_eq!(h.load(id).await.default_value, json!(false));
+}
+
+#[tokio::test]
+async fn the_row_write_itself_is_conditional_on_the_version_the_tag_was_compared_against() {
+    use crate::domain::declaration::DeclarationMetadata;
+    let h = Harness::verified().await;
+    let current = h
+        .create(h.request("retry_policy"), &admin_actor())
+        .await
+        .expect("created")
+        .declaration;
+    let stale = current.updated_at - time::Duration::seconds(1);
+    let conn = h.base.db.conn().expect("connection");
+    let all = AccessScope::allow_all();
+    let metadata = || DeclarationMetadata {
+        mode: current.mode.clone(),
+        description: Some("moved".to_owned()),
+        domain_affinity: None,
+        licence_feature: None,
+        data_classification: current.data_classification.clone(),
+        requires_step_up: current.requires_step_up,
+        anonymous_exposable: current.anonymous_exposable,
+    };
+
+    // The comparison ran against a read; a row that moved since finds no
+    // match at the write, and the writer gets the same `412` a stale tag gets.
+    let refused = DeclarationRepo
+        .update_metadata(&conn, &all, current.id, metadata(), Some(stale), true)
+        .await
+        .expect_err("moved");
+    assert!(
+        matches!(refused, DomainError::PreconditionFailed { .. }),
+        "{refused:?}"
+    );
+    let refused = DeclarationRepo
+        .set_status(&conn, &all, current.id, "retired", Some(stale))
+        .await
+        .expect_err("moved");
+    assert!(
+        matches!(refused, DomainError::PreconditionFailed { .. }),
+        "{refused:?}"
+    );
+    let kept = h.load(current.id).await;
+    assert_eq!(kept.status, "active");
+    assert_eq!(kept.description.as_deref(), Some("a demo setting"));
+
+    // At the version read, the write lands; without a version — a caller
+    // under its own transaction, like a revive — it is unconditional.
+    DeclarationRepo
+        .set_status(&conn, &all, current.id, "retired", Some(current.updated_at))
+        .await
+        .expect("current version");
+    assert_eq!(h.load(current.id).await.status, "retired");
+    DeclarationRepo
+        .update_metadata(&conn, &all, current.id, metadata(), None, true)
+        .await
+        .expect("unconditional");
+    assert_eq!(
+        h.load(current.id).await.description.as_deref(),
+        Some("moved")
+    );
 }
 
 #[tokio::test]
@@ -651,24 +713,32 @@ async fn re_declaring_a_retired_key_revives_it_with_its_values() {
 }
 
 #[tokio::test]
-async fn a_revive_may_not_change_the_value_type_the_scope_class_or_the_default() {
+async fn a_revive_may_not_flip_the_secret_boundary_or_the_scope_class() {
     let h = Harness::verified().await;
     let created = h
         .create(h.request("retry_policy"), &admin_actor())
         .await
         .expect("created");
+    let id = created.declaration.id;
+    let tenant = h.base.tree.a;
+    h.base.set(id, tenant, json!(true)).await;
     let tag = etag_of(&created.declaration);
-    h.retire(created.declaration.id, Some(tag.as_str()), &admin_actor())
+    h.retire(id, Some(tag.as_str()), &admin_actor())
         .await
         .expect("retired");
 
-    let mut retyped = h.request("retry_policy");
-    retyped.value_type_id = SECRET.to_owned();
-    retyped.default_value = json!("");
-    let err = h.create(retyped, &admin_actor()).await.expect_err("retype");
+    // A secret type holds its values by reference; the inline `true` would be
+    // plaintext left under a secret setting, so the boundary is refused.
+    let mut secreted = h.request("retry_policy");
+    secreted.value_type_id = SECRET.to_owned();
+    secreted.default_value = json!("");
+    let err = h
+        .create(secreted, &admin_actor())
+        .await
+        .expect_err("secretness");
     match err {
         DomainError::Conflict { detail } => assert!(
-            detail.starts_with(super::conflict::VALUE_TYPE_CHANGED),
+            detail.starts_with(super::conflict::SECRETNESS_CHANGED),
             "{detail}"
         ),
         other => panic!("{other:?}"),
@@ -688,20 +758,66 @@ async fn a_revive_may_not_change_the_value_type_the_scope_class_or_the_default()
         other => panic!("{other:?}"),
     }
 
-    let mut refloored = h.request("retry_policy");
-    refloored.default_value = json!(true);
-    let err = h
-        .create(refloored, &admin_actor())
+    // Nothing was reactivated, and the retained value is as it was.
+    assert_eq!(h.load(id).await.status, "retired");
+    let conn = h.base.db.conn().expect("connection");
+    let row = ValueRepo
+        .find_one(&conn, &AccessScope::allow_all(), id, tenant)
         .await
-        .expect_err("refloor");
-    match err {
-        DomainError::Conflict { detail } => assert!(
-            detail.starts_with(super::conflict::DEFAULT_CHANGED),
-            "{detail}"
-        ),
-        other => panic!("{other:?}"),
-    }
-    assert_eq!(h.load(created.declaration.id).await.status, "retired");
+        .expect("lookup")
+        .expect("row");
+    assert_eq!(row.value, Some(json!(true)));
+    assert!(!row.needs_review);
+}
+
+#[tokio::test]
+async fn a_revive_may_retype_the_setting_and_re_validates_every_retained_value() {
+    let h = Harness::verified().await;
+    let created = h
+        .create(h.request("retry_policy"), &admin_actor())
+        .await
+        .expect("created");
+    let id = created.declaration.id;
+    let (a, b) = (h.base.tree.a, h.base.tree.b);
+    // A boolean that will not read as text, and a text flagged while the
+    // setting was boolean: the retype swaps which of the two is live.
+    h.base.set(id, a, json!(true)).await;
+    h.base.set_flagged(id, b, json!("aggressive")).await;
+    let tag = etag_of(&created.declaration);
+    h.retire(id, Some(tag.as_str()), &admin_actor())
+        .await
+        .expect("retired");
+
+    let mut retyped = h.request("retry_policy");
+    retyped.value_type_id = TEXT.to_owned();
+    retyped.default_value = json!("gentle");
+    let revived = h.create(retyped, &admin_actor()).await.expect("revived");
+    assert!(revived.reactivated);
+    assert_eq!(revived.declaration.id, id, "the row keeps its identity");
+    assert_eq!(revived.declaration.value_type_id, TEXT);
+    assert_eq!(revived.declaration.default_value, json!("gentle"));
+    assert_eq!(revived.declaration.status, "active");
+
+    let conn = h.base.db.conn().expect("connection");
+    let scope = AccessScope::allow_all();
+    let flagged = ValueRepo
+        .find_one(&conn, &scope, id, a)
+        .await
+        .expect("lookup")
+        .expect("row");
+    assert!(flagged.needs_review, "`true` is not text");
+    assert!(flagged.needs_review_detail.is_some(), "the flag says why");
+    assert_eq!(flagged.value, Some(json!(true)), "flagged, not discarded");
+    let cleared = ValueRepo
+        .find_one(&conn, &scope, id, b)
+        .await
+        .expect("lookup")
+        .expect("row");
+    assert!(!cleared.needs_review, "text validates under the new type");
+    assert_eq!(cleared.needs_review_detail, None);
+    // The setting's own type was registered at create; a revive mints no
+    // second one.
+    assert_eq!(h.registrar.registered.lock().expect("lock").len(), 1);
 }
 
 #[tokio::test]
@@ -761,7 +877,7 @@ async fn a_person_labelled_user_reaches_the_step_up_gate_of_a_declaration_action
         WriteActor {
             ctx: ctx.build().expect("context"),
             request_id: "req".to_owned(),
-            step_up_token: Some("token".to_owned()),
+            step_up_token: Some(SecretString::from("token".to_owned())),
         }
     };
     let err = refusing
@@ -781,6 +897,53 @@ async fn a_person_labelled_user_reaches_the_step_up_gate_of_a_declaration_action
 }
 
 #[tokio::test]
+async fn a_metadata_update_evicts_the_key_so_a_reclassification_masks_on_the_next_read() {
+    use crate::domain::resolution::ScopeTarget;
+    use settings_service_sdk::SettingKey;
+    let h = Harness::verified().await;
+    let created = h
+        .create(h.request("retry_policy"), &admin_actor())
+        .await
+        .expect("created");
+    let id = created.declaration.id;
+    let key = SettingKey::parse(&created.declaration.key).expect("key");
+    let tenant = h.base.tree.a;
+    h.base.set(id, tenant, json!(true)).await;
+
+    // A read warms the cache under the declaration's current class.
+    {
+        let conn = h.base.db.conn().expect("connection");
+        let warm = h
+            .base
+            .resolver
+            .resolve(&conn, &key, ScopeTarget::Tenant(tenant))
+            .await
+            .expect("resolves");
+        assert_eq!(warm.data_classification, "public");
+    }
+
+    // The administrator tightens the classification; the next read must
+    // mask by the new class at once, not when the TTL runs out.
+    let tag = etag_of(&created.declaration);
+    h.update(
+        id,
+        Some(tag.as_str()),
+        json!({"data_classification": "pii"}),
+        &admin_actor(),
+    )
+    .await
+    .expect("tightened");
+    let conn = h.base.db.conn().expect("connection");
+    let fresh = h
+        .base
+        .resolver
+        .resolve(&conn, &key, ScopeTarget::Tenant(tenant))
+        .await
+        .expect("resolves");
+    assert_eq!(fresh.data_classification, "pii", "the cache was evicted");
+}
+
+#[tokio::test]
 async fn retiring_evicts_the_key_so_a_cached_read_cannot_keep_serving_it() {
     let h = Harness::verified().await;
     let created = h
@@ -791,7 +954,7 @@ async fn retiring_evicts_the_key_so_a_cached_read_cannot_keep_serving_it() {
     let key = created.declaration.key.clone();
     h.base
         .cache
-        .populate(Arc::new(crate::domain::resolution::cache::tests_entry(
+        .seed(Arc::new(crate::domain::resolution::cache::tests_entry(
             &key,
             h.base.tree.a,
         )));
@@ -873,4 +1036,68 @@ fn every_field_falls_into_exactly_one_class() {
         classify_field("data_classification", &json!("public"), &secret).expect("classified"),
         FieldClass::Immutable
     );
+}
+
+#[tokio::test]
+async fn an_authn_resolver_outage_on_a_declaration_gate_is_unavailable_not_a_challenge() {
+    // The declaration path has its own step-up gate; it must tell an outage
+    // from a refused token the same way the value path does.
+    let down = Harness::with_step_up(Arc::new(FixedStepUp::refusing(StepUpRefusal::Unavailable(
+        "authn resolver down".to_owned(),
+    ))))
+    .await;
+    let created = down
+        .create(down.request("retry_policy"), &admin_actor())
+        .await
+        .expect("a new declaration asks no step-up");
+    let tag = etag_of(&created.declaration);
+    let err = down
+        .retire(created.declaration.id, Some(tag.as_str()), &admin_actor())
+        .await
+        .expect_err("refused");
+    assert!(matches!(err, DomainError::Unavailable { .. }), "{err:?}");
+}
+
+#[tokio::test]
+async fn a_descriptive_patch_leaves_the_definition_recency_alone_and_a_reclassification_moves_it() {
+    // `last_change_at` is the definition arm of the recency a reader sees. A
+    // description is not what a reader is served, so it moves only the tag;
+    // a classification is, so it moves both.
+    let h = Harness::new().await;
+    let created = h
+        .create(h.request("retry_policy"), &admin_actor())
+        .await
+        .expect("created");
+    let id = created.declaration.id;
+    let before = h.load(id).await;
+
+    let renamed = h
+        .update(
+            id,
+            Some(etag_of(&before).as_str()),
+            json!({ "description": "a better description", "mode": "advanced" }),
+            &admin_actor(),
+        )
+        .await
+        .expect("updated");
+    assert_eq!(
+        renamed.last_change_at, before.last_change_at,
+        "a description or a mode is not the definition"
+    );
+    assert!(renamed.updated_at > before.updated_at, "the tag moved");
+
+    let reclassified = h
+        .update(
+            id,
+            Some(etag_of(&renamed).as_str()),
+            json!({ "data_classification": "pii" }),
+            &admin_actor(),
+        )
+        .await
+        .expect("reclassified");
+    assert!(
+        reclassified.last_change_at > renamed.last_change_at,
+        "what a reader is served changed"
+    );
+    assert!(reclassified.updated_at > renamed.updated_at);
 }

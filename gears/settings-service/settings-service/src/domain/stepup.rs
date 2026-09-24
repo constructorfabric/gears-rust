@@ -65,6 +65,11 @@ pub enum StepUpRefusal {
     /// The platform's `AuthN` resolver could not be reached from the hub, so no
     /// token can be verified: every write that needs step-up refuses.
     NotConfigured,
+    /// The `AuthN` resolver was reached but could not answer — down, without a
+    /// plugin, or failing internally — so the token was never evaluated. Not
+    /// a verdict on the token: an outage, which the caller retries rather than
+    /// re-authenticates for.
+    Unavailable(String),
     /// The `AuthN` resolver did not authenticate the token: signature, expiry,
     /// issuer, or a token that is not one at all.
     Signature(String),
@@ -87,6 +92,7 @@ impl StepUpRefusal {
         match self {
             Self::Missing => "missing",
             Self::NotConfigured => "not_configured",
+            Self::Unavailable(_) => "unavailable",
             Self::Signature(_) => "signature",
             Self::SubjectMismatch => "subject_mismatch",
             Self::AuthTimeMissing => "auth_time_missing",
@@ -130,12 +136,41 @@ pub trait StepUpVerifier: Send + Sync {
 /// bytes, and binding a step-up token to the session by the `sub` that the
 /// session's own — already authenticated — token carried. Anything else is
 /// trusting input. `None` when the token is not a compact JWT at all.
+/// The most bytes a token this reader looks at may have: well above any
+/// session or step-up token the platform issues, and a bound on what an
+/// unverified header can make it decode.
+pub const MAX_TOKEN_BYTES: usize = 8 * 1024;
+
+/// The most bytes the payload segment may hold before it is decoded.
+pub const MAX_PAYLOAD_BYTES: usize = 4 * 1024;
+
 #[must_use]
 pub fn unverified_payload(token: &str) -> Option<serde_json::Value> {
     use base64::Engine as _;
-    let payload = token.split('.').nth(1)?;
+    // The compact shape and the size first, before anything is decoded:
+    // exactly three segments, a token under the cap, a payload under its
+    // own. Anything else is not a JWT this reader will look into.
+    if token.len() > MAX_TOKEN_BYTES {
+        return None;
+    }
+    let mut segments = token.split('.');
+    let (Some(_header), Some(payload), Some(_signature), None) = (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) else {
+        return None;
+    };
+    if payload.len() > MAX_PAYLOAD_BYTES {
+        return None;
+    }
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(payload)
         .ok()?;
     serde_json::from_slice(&bytes).ok()
 }
+
+#[cfg(test)]
+#[path = "stepup_tests.rs"]
+mod stepup_tests;

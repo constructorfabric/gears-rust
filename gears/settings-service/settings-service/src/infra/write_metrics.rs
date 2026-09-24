@@ -9,6 +9,7 @@ use opentelemetry::metrics::Counter;
 use tracing::info;
 
 use crate::domain::ports::{ChangePublisher, ValueEvent, WriteMetrics};
+use crate::log_text::LogSafe;
 
 /// `settings_value_writes_total` and `settings_step_up_total` on the
 /// process's meter. The failure ratio is a dashboard derivation of the first.
@@ -108,12 +109,15 @@ impl ChangePublisher for LoggingPublisher {
                 tenant_id,
                 actor,
                 reason,
+                change_set_id,
             } => info!(
                 event = "event_value_change_failed",
                 %key,
                 %tenant_id,
                 %actor,
-                %reason,
+                // The reason may quote a dependency's own text.
+                reason = %LogSafe(&reason),
+                %change_set_id,
                 "setting value change rejected"
             ),
         }

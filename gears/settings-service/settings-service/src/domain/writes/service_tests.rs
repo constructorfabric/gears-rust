@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use secrecy::SecretString;
 use serde_json::{Value, json};
 use settings_service_sdk::EffectiveSource;
 use toolkit_security::{AccessScope, SecurityContext};
@@ -18,6 +19,7 @@ use crate::domain::stepup::{StepUpRefusal, StepUpVerifier, USER_SUBJECT_TYPE};
 use crate::domain::value::ValueRepository;
 use crate::infra::storage::access_repo::AccessRepo;
 use crate::infra::storage::declaration_repo::DeclarationRepo;
+use crate::infra::storage::pending_secret_repo::PendingSecretRepo;
 use crate::infra::storage::value_repo::ValueRepo;
 use crate::infra::type_validator::GtsTypeValidator;
 use crate::test_support::{
@@ -25,7 +27,8 @@ use crate::test_support::{
     resolution_catalogue,
 };
 
-type Writer = ValueWriter<DeclarationRepo, ValueRepo, AccessRepo, Arc<RecordingAudit>>;
+type Writer =
+    ValueWriter<DeclarationRepo, ValueRepo, AccessRepo, Arc<RecordingAudit>, PendingSecretRepo>;
 
 struct WriteHarness {
     base: ResolutionHarness,
@@ -69,6 +72,7 @@ impl WriteHarness {
             Arc::clone(&audit),
             step_up,
             secrets,
+            PendingSecretRepo,
             Arc::clone(&published) as Arc<dyn crate::domain::ports::ChangePublisher>,
             Arc::new(NoMetrics),
         ));
@@ -90,7 +94,7 @@ fn actor(tenant: Uuid) -> WriteActor {
             .build()
             .expect("context"),
         request_id: "req".to_owned(),
-        step_up_token: Some("token".to_owned()),
+        step_up_token: Some(SecretString::from("token".to_owned())),
     }
 }
 
@@ -120,6 +124,12 @@ impl WriteHarness {
     }
 
     async fn clear_step_up_as(&self, id: Uuid, classification: &str) {
+        self.set_metadata(id, classification, false).await;
+    }
+
+    /// Rewrite the declaration's metadata as an administrator's PATCH would,
+    /// with no tag: what a concurrent edit leaves behind.
+    async fn set_metadata(&self, id: Uuid, classification: &str, requires_step_up: bool) {
         use crate::domain::declaration::{DeclarationMetadata, DeclarationRepository};
         let conn = self.base.db.conn().expect("connection");
         DeclarationRepo
@@ -133,9 +143,11 @@ impl WriteHarness {
                     domain_affinity: None,
                     licence_feature: None,
                     data_classification: classification.to_owned(),
-                    requires_step_up: false,
+                    requires_step_up,
                     anonymous_exposable: false,
                 },
+                None,
+                true,
             )
             .await
             .expect("metadata");
@@ -170,9 +182,23 @@ impl WriteHarness {
         if_match: Option<&str>,
     ) -> Result<Committed, DomainError> {
         let gated = self.gate(actor, name, target).await?;
-        // The coordinator's sequence: stage outside, commit inside, discard on
-        // a refusal so a staged secret never outlives its write.
-        let staged = self.writer.stage(&gated, change).await?;
+        self.commit_gated(actor, gated, change, if_match).await
+    }
+
+    /// The coordinator's sequence after the gate: stage outside, commit
+    /// inside one transaction, discard on a refusal so a staged secret never
+    /// outlives its write, the after-commit step on success.
+    async fn commit_gated(
+        &self,
+        actor: &WriteActor,
+        gated: Gated,
+        change: Change,
+        if_match: Option<&str>,
+    ) -> Result<Committed, DomainError> {
+        let staged = {
+            let conn = self.base.db.conn().expect("connection");
+            self.writer.stage(&conn, &gated, actor, change).await?
+        };
         let writer = Arc::clone(&self.writer);
         let actor_owned = actor.clone();
         let if_match = if_match.map(str::to_owned);
@@ -200,7 +226,8 @@ impl WriteHarness {
         let committed = match outcome {
             Ok(committed) => committed,
             Err(err) => {
-                self.writer.discard(&gated, &staged).await;
+                let conn = self.base.db.conn().expect("connection");
+                self.writer.discard(&conn, &gated, &staged).await;
                 return Err(err);
             }
         };
@@ -220,6 +247,7 @@ impl WriteHarness {
                     access,
                     set_by: "root-admin".to_owned(),
                 },
+                None,
             )
             .await
             .expect("row");
@@ -278,6 +306,261 @@ async fn a_set_creates_the_row_with_its_record_and_the_read_sees_it() {
     assert_eq!(again.operation, AuditOperation::Change);
     assert_eq!(again.old_value, Some(json!(true)));
     assert_eq!(h.audit.operations(), vec!["create", "change"]);
+}
+
+#[tokio::test]
+async fn the_row_takes_the_classification_of_the_declaration_as_it_is_at_commit() {
+    let h = WriteHarness::new().await;
+    let id = h
+        .declare("strict", scope_class::CASCADING, json!(false))
+        .await;
+    let admin = actor(h.base.tree.root);
+    let tenant = h.base.tree.a;
+    let gated = h
+        .gate(&admin, "strict", Some(tenant))
+        .await
+        .expect("gated while public");
+
+    // An administrator tightens the classification between the gate and the
+    // commit. The resync that rides with that change can only touch rows that
+    // exist at the time; this write's row does not yet.
+    h.clear_step_up_as(id, "pii").await;
+
+    let committed = h
+        .commit_gated(&admin, gated, Change::Set(json!(true)), Some("absent"))
+        .await
+        .expect("commits");
+    assert_eq!(committed.data_classification, "pii");
+    let conn = h.base.db.conn().expect("connection");
+    let row = ValueRepo
+        .find_one(&conn, &AccessScope::allow_all(), id, tenant)
+        .await
+        .expect("lookup")
+        .expect("row");
+    assert_eq!(
+        row.data_classification, "pii",
+        "stamped from the row as it is inside the transaction, not the gate's snapshot"
+    );
+}
+
+#[tokio::test]
+async fn a_write_gated_before_a_restriction_is_refused_at_commit_and_lands_nowhere() {
+    let h = WriteHarness::new().await;
+    let a = h.base.tree.a;
+    let delegate = actor(a);
+
+    // `read_only`: the writer is refused, as it would have been at the gate.
+    let strict = h
+        .declare("strict", scope_class::CASCADING, json!(false))
+        .await;
+    let gated = h
+        .gate(&delegate, "strict", None)
+        .await
+        .expect("overridable at the gate");
+    h.restrict(strict, a, TenantAccess::ReadOnly).await;
+    let err = h
+        .commit_gated(&delegate, gated, Change::Set(json!(true)), Some("absent"))
+        .await
+        .expect_err("refused at commit");
+    assert!(matches!(err, DomainError::Unauthorized { .. }), "{err:?}");
+    {
+        let conn = h.base.db.conn().expect("connection");
+        assert!(
+            ValueRepo
+                .find_one(&conn, &AccessScope::allow_all(), strict, a)
+                .await
+                .expect("lookup")
+                .is_none(),
+            "nothing lands past a restriction"
+        );
+    }
+
+    // `hidden`: absent, as at the gate — a writer learns nothing it may not see.
+    let quiet = h
+        .declare("quiet", scope_class::CASCADING, json!(false))
+        .await;
+    let gated = h
+        .gate(&delegate, "quiet", None)
+        .await
+        .expect("overridable at the gate");
+    h.restrict(quiet, a, TenantAccess::Hidden).await;
+    let err = h
+        .commit_gated(&delegate, gated, Change::Set(json!(true)), Some("absent"))
+        .await
+        .expect_err("refused at commit");
+    assert!(matches!(err, DomainError::NotFound { .. }), "{err:?}");
+    let conn = h.base.db.conn().expect("connection");
+    assert!(
+        ValueRepo
+            .find_one(&conn, &AccessScope::allow_all(), quiet, a)
+            .await
+            .expect("lookup")
+            .is_none()
+    );
+    assert!(h.audit.operations().is_empty(), "nothing to record");
+}
+
+#[tokio::test]
+async fn a_write_gated_before_step_up_became_required_is_refused_at_commit() {
+    // No verifier is configured: a write that needs step-up cannot get one.
+    let h = WriteHarness::new().await;
+    let id = h
+        .declare("strict", scope_class::CASCADING, json!(false))
+        .await;
+    let admin = actor(h.base.tree.root);
+    let tenant = h.base.tree.a;
+    let gated = h
+        .gate(&admin, "strict", Some(tenant))
+        .await
+        .expect("no step-up asked");
+
+    // An administrator switches the requirement on between the gate and the
+    // commit; no verified step-up stands behind this write.
+    h.set_metadata(id, "public", true).await;
+    let err = h
+        .commit_gated(&admin, gated, Change::Set(json!(true)), Some("absent"))
+        .await
+        .expect_err("refused at commit");
+    assert!(
+        matches!(
+            err,
+            DomainError::StepUpRequired {
+                reason: "missing",
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    let conn = h.base.db.conn().expect("connection");
+    assert!(
+        ValueRepo
+            .find_one(&conn, &AccessScope::allow_all(), id, tenant)
+            .await
+            .expect("lookup")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn a_write_gated_before_a_retire_is_refused_at_commit_and_lands_nowhere() {
+    let h = WriteHarness::new().await;
+    let id = h
+        .declare("strict", scope_class::CASCADING, json!(false))
+        .await;
+    let admin = actor(h.base.tree.root);
+    let gated = h
+        .gate(&admin, "strict", Some(h.base.tree.a))
+        .await
+        .expect("active at the gate");
+
+    // The declaration retires between the gate and the commit — an admin
+    // retire or a module's major upgrade; either way the row is not live.
+    {
+        use crate::domain::declaration::DeclarationRepository;
+        let conn = h.base.db.conn().expect("connection");
+        DeclarationRepo
+            .set_status(&conn, &AccessScope::allow_all(), id, "retired", None)
+            .await
+            .expect("retired");
+    }
+
+    let err = h
+        .commit_gated(&admin, gated, Change::Set(json!(true)), Some("absent"))
+        .await
+        .expect_err("refused at commit");
+    assert!(matches!(err, DomainError::Retired { .. }), "{err:?}");
+    let conn = h.base.db.conn().expect("connection");
+    assert!(
+        ValueRepo
+            .find_one(&conn, &AccessScope::allow_all(), id, h.base.tree.a)
+            .await
+            .expect("lookup")
+            .is_none(),
+        "nothing lands on a retired declaration"
+    );
+    assert!(h.audit.operations().is_empty(), "nothing to record");
+}
+
+#[tokio::test]
+async fn the_row_write_itself_is_conditional_on_the_version_the_tag_was_compared_against() {
+    use crate::domain::value::ValueDraft;
+    let h = WriteHarness::new().await;
+    let id = h
+        .declare("strict", scope_class::CASCADING, json!(false))
+        .await;
+    let tenant = h.base.tree.a;
+    h.base.set(id, tenant, json!(true)).await;
+    let conn = h.base.db.conn().expect("connection");
+    let all = AccessScope::allow_all();
+    let row = ValueRepo
+        .find_one(&conn, &all, id, tenant)
+        .await
+        .expect("lookup")
+        .expect("row");
+    let stale = row.last_change_at - time::Duration::seconds(1);
+
+    // The comparison ran against a read; a row that moved since finds no
+    // match at the write and the writer gets the same `412` a stale tag gets.
+    let refused = ValueRepo
+        .update(&conn, &all, row.id, Some(json!(false)), None, "b", stale)
+        .await
+        .expect_err("moved");
+    assert!(
+        matches!(refused, DomainError::PreconditionFailed { .. }),
+        "{refused:?}"
+    );
+    let refused = ValueRepo
+        .delete(&conn, &all, id, tenant, stale)
+        .await
+        .expect_err("moved");
+    assert!(
+        matches!(refused, DomainError::PreconditionFailed { .. }),
+        "{refused:?}"
+    );
+    let kept = ValueRepo
+        .find_one(&conn, &all, id, tenant)
+        .await
+        .expect("lookup")
+        .expect("row");
+    assert_eq!(kept.value, Some(json!(true)), "untouched");
+
+    // A first row is guarded by the unique index; the second first-writer
+    // compared the absent-state tag, so its collision is a stale precondition.
+    let duplicate = ValueRepo
+        .insert(
+            &conn,
+            &all,
+            ValueDraft {
+                declaration_id: id,
+                tenant_id: tenant,
+                value: Some(json!(false)),
+                secret_ref: None,
+                data_classification: "public".to_owned(),
+                needs_review: false,
+                needs_review_detail: None,
+                set_by: "b".to_owned(),
+            },
+        )
+        .await
+        .expect_err("second first writer");
+    assert!(
+        matches!(duplicate, DomainError::PreconditionFailed { .. }),
+        "{duplicate:?}"
+    );
+
+    // At the version it read, the write lands.
+    ValueRepo
+        .update(
+            &conn,
+            &all,
+            row.id,
+            Some(json!(false)),
+            None,
+            "b",
+            row.last_change_at,
+        )
+        .await
+        .expect("current version");
 }
 
 #[tokio::test]
@@ -424,6 +707,44 @@ async fn the_gates_refuse_in_order() {
 }
 
 #[tokio::test]
+async fn a_step_up_challenge_is_issued_only_for_a_write_the_caller_may_otherwise_make() {
+    // No verifier is bound, so any write that reaches the step-up gate is
+    // challenged; the question is which writes reach it.
+    let h = WriteHarness::new().await;
+    let guarded = h
+        .base
+        .declare("guarded", scope_class::CASCADING, json!(false))
+        .await;
+    h.base
+        .declare("gflag", scope_class::GLOBAL, json!(false))
+        .await;
+    let t = &h.base.tree;
+
+    // A target outside the caller's subtree: refused, not challenged — the
+    // caller learns nothing about what the setting would have asked of it.
+    assert!(matches!(
+        h.gate(&actor(t.a), "guarded", Some(t.c)).await,
+        Err(DomainError::Unauthorized { .. })
+    ));
+    // A tenant-scoped write to a global setting: the conflict, not the challenge.
+    assert!(matches!(
+        h.gate(&actor(t.root), "gflag", Some(t.a)).await,
+        Err(DomainError::Conflict { .. })
+    ));
+    // A read-only tenant: refused as a writer before anything is asked of it.
+    h.restrict(guarded, t.b, TenantAccess::ReadOnly).await;
+    assert!(matches!(
+        h.gate(&actor(t.b), "guarded", None).await,
+        Err(DomainError::Unauthorized { .. })
+    ));
+    // Only a caller entitled to the write is challenged for step-up.
+    assert!(matches!(
+        h.gate(&actor(t.a), "guarded", None).await,
+        Err(DomainError::StepUpRequired { .. })
+    ));
+}
+
+#[tokio::test]
 async fn step_up_is_asked_only_where_the_declaration_requires_it() {
     // No verifier bound: writes needing step-up refuse, others proceed.
     let h = WriteHarness::new().await;
@@ -499,7 +820,7 @@ fn actor_labelled(tenant: Uuid, subject_type: Option<&str>) -> WriteActor {
     WriteActor {
         ctx: ctx.build().expect("context"),
         request_id: "req".to_owned(),
-        step_up_token: Some("token".to_owned()),
+        step_up_token: Some(SecretString::from("token".to_owned())),
     }
 }
 
@@ -796,6 +1117,7 @@ async fn a_record_that_cannot_be_written_rolls_the_value_back() {
         ValueRepo,
         AccessRepo,
         crate::test_support::FailingSink,
+        PendingSecretRepo,
     > = ValueWriter::new(
         ValueRepo,
         Arc::clone(&base.resolver),
@@ -803,6 +1125,7 @@ async fn a_record_that_cannot_be_written_rolls_the_value_back() {
         crate::test_support::FailingSink,
         Arc::new(FixedStepUp::verified()),
         Arc::new(NoSecretManager),
+        PendingSecretRepo,
         Arc::new(RecordingPublisher::default()),
         Arc::new(NoMetrics),
     );
@@ -815,7 +1138,7 @@ async fn a_record_that_cannot_be_written_rolls_the_value_back() {
             .build()
             .expect("context"),
         request_id: "req".to_owned(),
-        step_up_token: Some("t".to_owned()),
+        step_up_token: Some(SecretString::from("t".to_owned())),
     };
     let conn = base.db.conn().expect("connection");
     let gated = writer
@@ -830,7 +1153,7 @@ async fn a_record_that_cannot_be_written_rolls_the_value_back() {
         .await
         .expect("gated");
     let staged = writer
-        .stage(&gated, Change::Set(json!(true)))
+        .stage(&conn, &gated, &actor, Change::Set(json!(true)))
         .await
         .expect("staged");
     let outcome = base
@@ -875,6 +1198,86 @@ async fn declare_secret(h: &WriteHarness) -> Uuid {
         .await;
     h.clear_step_up_as(d, "secret").await;
     d
+}
+
+/// Every pending row, whatever its expiry.
+async fn all_pending(h: &WriteHarness) -> Vec<crate::domain::secrets::pending::PendingSecret> {
+    use crate::domain::secrets::pending::PendingSecretRepository;
+    let conn = h.base.db.conn().expect("connection");
+    crate::infra::storage::pending_secret_repo::PendingSecretRepo
+        .list_expired(
+            &conn,
+            &AccessScope::allow_all(),
+            time::OffsetDateTime::now_utc() + time::Duration::days(1),
+            1_000,
+        )
+        .await
+        .expect("listing")
+}
+
+#[tokio::test]
+async fn a_store_that_lands_the_entry_and_loses_the_answer_leaves_a_row_the_sweep_reclaims() {
+    let (h, secrets) = WriteHarness::with_secrets().await;
+    let d = declare_secret(&h).await;
+    let root = h.base.tree.root;
+
+    // The create reaches the store; the answer does not reach us. The write
+    // is refused as unavailable — and the entry exists, unknown to anyone.
+    secrets.lose_next_answer();
+    let err = h
+        .write(
+            &actor(root),
+            "api_token",
+            None,
+            Change::Set(json!("hunter2")),
+            Some("absent"),
+        )
+        .await
+        .expect_err("the answer was lost");
+    assert!(matches!(err, DomainError::Unavailable { .. }), "{err:?}");
+    let held = secrets.held();
+    assert_eq!(held.len(), 1, "the entry landed");
+
+    // What makes it not an orphan: the intent was recorded before the create,
+    // as a pending row naming the very reference, for the sweep to reclaim.
+    let rows = all_pending(&h).await;
+    assert_eq!(rows.len(), 1, "one intent row");
+    assert_eq!(rows[0].secret_ref, held[0]);
+    assert_eq!((rows[0].declaration_id, rows[0].tenant_id), (d, root));
+
+    // A committed write consumes its row inside the transaction; a write
+    // refused on its tag releases both the entry and the row.
+    h.write(
+        &actor(root),
+        "api_token",
+        None,
+        Change::Set(json!("hunter3")),
+        Some("absent"),
+    )
+    .await
+    .expect("stored");
+    assert_eq!(all_pending(&h).await.len(), 1, "only the lost one remains");
+    let before = secrets.held().len();
+    let err = h
+        .write(
+            &actor(root),
+            "api_token",
+            None,
+            Change::Set(json!("hunter4")),
+            Some("stale"),
+        )
+        .await
+        .expect_err("stale tag");
+    assert!(
+        matches!(err, DomainError::PreconditionFailed { .. }),
+        "{err:?}"
+    );
+    assert_eq!(
+        secrets.held().len(),
+        before,
+        "the refused write's entry is released"
+    );
+    assert_eq!(all_pending(&h).await.len(), 1, "and its row went with it");
 }
 
 #[tokio::test]
@@ -1133,4 +1536,37 @@ async fn a_store_that_cannot_release_does_not_fail_the_removal() {
             .is_none()
     );
     assert!(secrets.deleted.lock().expect("lock").is_empty());
+}
+
+#[tokio::test]
+async fn a_rejection_event_carries_the_wire_message_and_the_diagnostic_stays_in_the_log() {
+    // The event may travel further than this process's log does.
+    let h = WriteHarness::new().await;
+    let internal = DomainError::Internal {
+        diagnostic: "postgres at 10.0.0.5:5432 refused the connection".to_owned(),
+    };
+    let change_set = Uuid::new_v4();
+    h.writer
+        .after_rejection(
+            "k",
+            h.base.tree.root,
+            &actor(h.base.tree.root),
+            &internal,
+            change_set,
+        )
+        .await;
+    let events = h.published.events.lock().expect("lock");
+    match events.as_slice() {
+        [
+            ValueEvent::ChangeFailed {
+                reason,
+                change_set_id,
+                ..
+            },
+        ] => {
+            assert_eq!(reason, "internal error");
+            assert_eq!(*change_set_id, change_set, "the event names its change set");
+        }
+        other => panic!("one rejection event expected, got {other:?}"),
+    }
 }

@@ -3,7 +3,7 @@
 
 use serde_json::json;
 
-use super::{FieldViolation, TraitSet, ValidationResult};
+use super::{FieldViolation, MalformedTrait, TraitSet, ValidationResult};
 use crate::domain::error::DomainError;
 use crate::field;
 
@@ -18,7 +18,7 @@ fn the_interpreted_traits_are_read_and_the_rest_kept_raw() {
         "regex": true,
         "unit": "ms"
     });
-    let traits = TraitSet::from_traits(raw.clone());
+    let traits = TraitSet::from_traits(raw.clone()).expect("well-formed");
     assert!(traits.secret);
     assert!(!traits.multiline);
     assert_eq!(traits.cron_dialect.as_deref(), Some("quartz"));
@@ -39,7 +39,7 @@ fn the_interpreted_traits_are_read_and_the_rest_kept_raw() {
 fn an_empty_trait_object_means_no_traits_not_a_failure() {
     // Distinct from a type that could not be resolved, which is an error at
     // the port: an empty object is a real answer.
-    let traits = TraitSet::from_traits(json!({}));
+    let traits = TraitSet::from_traits(json!({})).expect("an empty object is well-formed");
     assert_eq!(
         traits,
         TraitSet {
@@ -79,4 +79,69 @@ fn a_rejected_result_surfaces_its_first_violation_as_the_error() {
         }
         other => panic!("expected a validation error, got {other:?}"),
     }
+}
+
+#[test]
+fn a_trait_present_with_the_wrong_type_is_a_fault_not_a_default() {
+    // `"secret": "true"` is the case that matters: read as absent it would
+    // classify a credential as public. The rest follow the same rule.
+    for (raw, name, expected, found) in [
+        (
+            json!({ "secret": "true" }),
+            "secret",
+            "a boolean",
+            "a string",
+        ),
+        (json!({ "secret": 1 }), "secret", "a boolean", "a number"),
+        (json!({ "regex": null }), "regex", "a boolean", "null"),
+        (
+            json!({ "multiline": [true] }),
+            "multiline",
+            "a boolean",
+            "an array",
+        ),
+        (
+            json!({ "cron_dialect": 5 }),
+            "cron_dialect",
+            "a string",
+            "a number",
+        ),
+        (
+            json!({ "entity_reference": true }),
+            "entity_reference",
+            "a string",
+            "a boolean",
+        ),
+        (
+            json!({ "dynamic_enum_source": {} }),
+            "dynamic_enum_source",
+            "a string",
+            "an object",
+        ),
+    ] {
+        let err = TraitSet::from_traits(raw.clone()).expect_err(&raw.to_string());
+        assert_eq!(
+            err,
+            MalformedTrait {
+                name,
+                expected,
+                found
+            },
+            "{raw}"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!("trait `{name}` must be {expected}, found {found}")
+        );
+    }
+}
+
+#[test]
+fn a_well_formed_trait_beside_an_absent_one_reads_as_before() {
+    let traits = TraitSet::from_traits(json!({ "secret": false, "cron_dialect": "standard" }))
+        .expect("well-formed");
+    assert!(!traits.secret);
+    assert!(!traits.regex, "absent is false");
+    assert_eq!(traits.cron_dialect.as_deref(), Some("standard"));
+    assert_eq!(traits.entity_reference, None, "absent is None");
 }

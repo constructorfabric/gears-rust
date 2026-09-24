@@ -224,12 +224,14 @@ impl SearchRepository for SearchRepo {
             .add(default_matches)
             .add(declaration::Column::Id.in_subquery(overrides.into_query()));
 
-        let base =
-            declaration_repo::apply_visibility(DeclarationEntity::find(), request.visibility)
-                .filter(declaration::Column::Status.eq("active"))
-                .filter(matched)
-                .secure()
-                .scope_with(request.scope);
+        let base = declaration_repo::exclude_hidden_for(
+            declaration_repo::apply_visibility(DeclarationEntity::find(), request.visibility),
+            request.hidden_for,
+        )
+        .filter(declaration::Column::Status.eq("active"))
+        .filter(matched)
+        .secure()
+        .scope_with(request.scope);
 
         // Tiebreaker `key`, unique, so a page boundary neither repeats nor
         // skips a row. No OData filter: the query carries only the page and
@@ -267,6 +269,7 @@ impl SearchRepository for SearchRepo {
         tenant_ids: &[Uuid],
         needle: &Needle,
         corpus: Corpus,
+        limit: usize,
     ) -> Result<Vec<StoredValue>, DomainError> {
         // @cpt-begin:cpt-cf-settings-service-flow-search-discoverability-search:p2:inst-sd-search-8
         if declaration_ids.is_empty() || tenant_ids.is_empty() {
@@ -277,6 +280,8 @@ impl SearchRepository for SearchRepo {
             .filter(self.value_matches(corpus, tenant_ids, &needle.like_pattern()))
             .order_by_asc(setting_value::Column::DeclarationId)
             .order_by_asc(setting_value::Column::TenantId)
+            // One past the bound: the service tells a full answer from a cut one.
+            .limit(u64::try_from(limit.saturating_add(1)).unwrap_or(u64::MAX))
             // The subtree is the filter, as it is for the flagged listing.
             .secure()
             .scope_with(&AccessScope::allow_all())

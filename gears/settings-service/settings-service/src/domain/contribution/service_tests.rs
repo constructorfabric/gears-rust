@@ -960,3 +960,189 @@ async fn a_loosened_gate_leaves_a_record_naming_both_sides() {
     );
     assert!(change.tenant_id.is_none(), "still no borrowed scope");
 }
+
+#[tokio::test]
+async fn a_type_whose_secret_trait_is_misspelt_is_refused_not_classified_public() {
+    // The registry resolves the type; its `x-gts-traits` says `"secret": "true"`,
+    // a string. Read as absent, the setting would be declared public and its
+    // values stored in clear. It must be refused with nothing written.
+    const MISSPELT: &str = "gts.cf.core.settings.type_misspelt_secret.v1~";
+    let source = catalogue().with_type(
+        MISSPELT,
+        json!({
+            "$id": format!("gts://{MISSPELT}"),
+            "type": "string",
+            "x-gts-traits": { "secret": "true" }
+        }),
+    );
+    let h = Harness::build(
+        sqlite_provider().await,
+        RecordingRegistrar::default(),
+        source,
+    );
+    let token = ContributedDeclaration::new(
+        key("security", "misspelt_token", 1),
+        MISSPELT.to_owned(),
+        json!(""),
+        ScopeClass::Cascading,
+    );
+
+    let result = h.register(vec![token]).await;
+
+    assert_eq!(codes(&result), vec![reason::VALUE_TYPE_UNKNOWN]);
+    assert!(
+        result.errors[0].message.contains("malformed trait"),
+        "{:?}",
+        result.errors
+    );
+    assert!(
+        h.stored(&key("security", "misspelt_token", 1))
+            .await
+            .is_none(),
+        "nothing is written for a type this service cannot classify"
+    );
+}
+
+#[tokio::test]
+async fn another_module_cannot_take_over_a_path_by_shipping_a_higher_major() {
+    // The upgrade retires the predecessor and registers the successor under
+    // the caller's name. Without an ownership check, any co-located module
+    // could retire another module's live declaration by naming its path at a
+    // higher major, as the same-major update and the retire path already
+    // forbid.
+    let h = Harness::new().await;
+    h.register(vec![port("listen_port", json!(8080))]).await;
+    let v1 = key("network", "listen_port", 1);
+    let predecessor = h.stored(&v1).await.expect("v1");
+    let tenant = Uuid::new_v4();
+    h.set_value(predecessor.id, tenant, json!(9090)).await;
+
+    let theirs = ContributedDeclaration::new(
+        key("network", "listen_port", 2),
+        NARROW_PORT.to_owned(),
+        json!(8080),
+        ScopeClass::Global,
+    );
+    let result = h.register_as("someone-else", vec![theirs]).await;
+
+    assert_eq!(codes(&result), vec![reason::NOT_OWNER]);
+    assert_eq!(result.registered, 0);
+    assert!(
+        result.errors[0].message.contains("owned by another module"),
+        "{:?}",
+        result.errors
+    );
+    // The predecessor is untouched: still active, still owned, its value in place.
+    let still = h.stored(&v1).await.expect("v1");
+    assert_eq!(still.status, "active");
+    assert_eq!(still.owner_module.as_deref(), Some(MODULE));
+    assert_eq!(h.values_of(predecessor.id).await.len(), 1);
+    assert!(
+        h.stored(&key("network", "listen_port", 2)).await.is_none(),
+        "no successor was minted"
+    );
+    let events = h.published.events.lock().expect("lock");
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            crate::domain::ports::ValueEvent::DeclarationRetired { .. }
+        )),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_key_whose_category_segment_is_not_a_category_key_is_refused_and_nothing_is_created() {
+    // GTS admits a 129-character token; the category grammar stops at 128.
+    // The gate refuses the key as not namespaced — and before anything comes
+    // into being: no row, no category, no type registration, no event.
+    let h = Harness::new().await;
+    let too_long = "a".repeat(129);
+    let key = SettingKey::contributed(
+        "cf",
+        "settings_demo",
+        &too_long,
+        "flag",
+        NonZeroU32::new(1).expect("non-zero major"),
+    )
+    .expect("GTS admits the token");
+
+    let result = h
+        .register(vec![ContributedDeclaration::new(
+            key.clone(),
+            BOOL.to_owned(),
+            json!(false),
+            ScopeClass::Cascading,
+        )])
+        .await;
+
+    assert_eq!(codes(&result), vec![reason::KEY_NOT_NAMESPACED]);
+    assert_eq!(result.registered, 0);
+    assert!(h.stored(&key).await.is_none(), "no declaration row");
+    // No category either — by construction: the repository takes a
+    // `CategoryKey`, and this slug is not one.
+    assert!(CategoryKey::parse(&too_long).is_err());
+    assert!(
+        h.registrar.registered.lock().expect("lock").is_empty(),
+        "the type was never registered"
+    );
+    assert!(h.registered_events().is_empty(), "nothing was announced");
+}
+
+#[tokio::test]
+async fn an_upgrade_that_fails_at_its_last_step_leaves_the_predecessor_active_and_untouched() {
+    // The upgrade retires the predecessor, inserts the successor, copies every
+    // value, and records the retirement last. Failing that last step is the
+    // hardest case for the atomicity promise: everything else has already run
+    // inside the transaction, and all of it has to come undone.
+    let h = Harness::new().await;
+    h.register(vec![port("listen_port", json!(8080))]).await;
+    let v1 = key("network", "listen_port", 1);
+    let predecessor = h.stored(&v1).await.expect("v1");
+    let tenant_one = Uuid::new_v4();
+    let tenant_two = Uuid::new_v4();
+    h.set_value(predecessor.id, tenant_one, json!(9090)).await;
+    h.set_value(predecessor.id, tenant_two, json!(9091)).await;
+    let events_before = h.published.events.lock().expect("lock").len();
+
+    // The record about the predecessor's retirement is the one refused.
+    *h.audit.fail_on_key.lock().expect("lock") = Some(v1.to_string());
+    let v2 = key("network", "listen_port", 2);
+    let err = h
+        .client
+        .register_declarations(
+            &SecurityContext::anonymous(),
+            MODULE.to_owned(),
+            vec![ContributedDeclaration::new(
+                v2.clone(),
+                NARROW_PORT.to_owned(),
+                json!(8080),
+                ScopeClass::Global,
+            )],
+        )
+        .await
+        .expect_err("a store that cannot take the record fails the upgrade");
+    assert!(
+        matches!(
+            err,
+            toolkit_canonical_errors::CanonicalError::ServiceUnavailable { .. }
+        ),
+        "{err:?}"
+    );
+
+    // The predecessor: active, its two values where they were.
+    let kept = h.stored(&v1).await.expect("v1 is still there");
+    assert_eq!(kept.status, "active");
+    assert_eq!(kept.id, predecessor.id);
+    let values = h.values_of(predecessor.id).await;
+    assert_eq!(values.len(), 2);
+    assert!(values.iter().all(|r| !r.needs_review));
+    // The successor: never came to be, values and all.
+    assert!(h.stored(&v2).await.is_none(), "no successor row");
+    // Nothing announced: neither the registration nor the retirement.
+    assert_eq!(
+        h.published.events.lock().expect("lock").len(),
+        events_before,
+        "no event for a transaction that rolled back"
+    );
+}

@@ -2,6 +2,7 @@
 //! Wire shapes of the write surface.
 
 use serde_json::Value;
+use serde_json::value::RawValue;
 use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
@@ -15,8 +16,10 @@ use crate::domain::writes::service::{ImpactReport, ValidationReport};
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request)]
 pub struct SetValueRequest {
-    /// The new value, validated against the declaration's value type.
-    pub value: Value,
+    /// The new value, validated against the declaration's value type. Kept as
+    /// text until the guards have seen it: a number is refused, not rounded.
+    #[schema(value_type = Object)]
+    pub value: Box<RawValue>,
 }
 
 /// `POST /settings/{key}/validate`: the candidate to check.
@@ -24,7 +27,8 @@ pub struct SetValueRequest {
 #[toolkit_macros::api_dto(request)]
 pub struct ValidateRequest {
     /// The candidate value.
-    pub value: Value,
+    #[schema(value_type = Object)]
+    pub value: Box<RawValue>,
     /// Page size of the impact report, for a cascading setting.
     #[serde(default)]
     pub limit: Option<usize>,
@@ -37,7 +41,8 @@ pub struct ValidateRequest {
 #[toolkit_macros::api_dto(request)]
 pub struct ImpactRequest {
     /// The candidate value.
-    pub value: Value,
+    #[schema(value_type = Object)]
+    pub value: Box<RawValue>,
     /// Page size, one to five hundred; outside that band it is clamped.
     #[serde(default)]
     pub limit: Option<usize>,
@@ -50,7 +55,8 @@ pub struct ImpactRequest {
 pub struct StageSecretRequest {
     /// The secret value, validated against the declaration's type exactly as
     /// a set validates it.
-    pub value: Value,
+    #[schema(value_type = Object)]
+    pub value: Box<RawValue>,
 }
 
 /// The answer to staging a secret: a token that stands in for the value, and
@@ -109,9 +115,11 @@ pub struct BatchChangeRequest {
     /// `secret`-trait setting this may instead be `{ "pending_id": "…" }`,
     /// naming a secret staged earlier through `/secret-stage`: the staged
     /// entry is adopted and nothing is stored a second time. Any other shape
-    /// is a value and validates as one.
-    #[serde(default)]
-    pub value: Option<Value>,
+    /// is a value and validates as one — an explicit `null` included, which
+    /// is a value and not the field's absence.
+    #[serde(default, deserialize_with = "present_value")]
+    #[schema(value_type = Option<Object>)]
+    pub value: Option<Box<RawValue>>,
     /// The value state tag the caller last read for this scope — for a revert,
     /// the tag of the row being cleared — or the literal `absent` for a first
     /// write. Required in effect: a change that omits it is rejected on its
@@ -120,6 +128,19 @@ pub struct BatchChangeRequest {
     /// change instead of the whole request.
     #[serde(default)]
     pub if_match: Option<String>,
+}
+
+/// A `value` field that is present, whatever it holds.
+///
+/// Left to serde, an `Option` reads an explicit `null` as the field's absence,
+/// and a client could not set a nullable-typed setting to `null` through the
+/// batch — the single-item write, whose `value` is not optional, carries it.
+/// This reads a present field as the raw value it holds, `null` included;
+/// `default` still covers the field being omitted.
+fn present_value<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Box<RawValue>>, D::Error> {
+    <Box<RawValue> as serde::Deserialize>::deserialize(deserializer).map(Some)
 }
 
 /// `POST /settings/batch`.
@@ -263,7 +284,9 @@ pub fn render_batch_item(
             outcome: "rejected".to_owned(),
             change: None,
             error: Some(rejection_code(err).to_owned()),
-            detail: Some(err.to_string()),
+            // The wire form: an internal fault says so and nothing more, the
+            // same rule the top-level error path applies.
+            detail: Some(err.wire_message()),
         },
     }
 }

@@ -1,5 +1,5 @@
 <!-- Created: 2026-08-10 by Virtuozzo International GmbH -->
-<!-- Updated: 2026-08-10 by Virtuozzo International GmbH -->
+<!-- Updated: 2026-09-24 by Virtuozzo International GmbH -->
 
 # Feature: Gear Foundation, SDK Contracts and Cross-Cutting Infrastructure
 
@@ -130,7 +130,7 @@ GTS grammar is **not** re-implemented here. The platform GTS identifier library 
 **Steps**:
 1. [x] - `p1` - **IF** the operation is a mutating `PATCH` or `DELETE` and no `If-Match` header is present → **RETURN** `428` precondition required - `inst-gf-precond-1`
 2. [x] - `p1` - Compute the current ETag from the target's persisted representation - `inst-gf-precond-2`
-3. [x] - `p1` - **IF** the supplied `If-Match` does not equal the current ETag → **RETURN** `412` precondition failed - `inst-gf-precond-3`
+3. [x] - `p1` - **IF** the supplied `If-Match` — read the same way on every mutation handler: the header's surrounding whitespace and one pair of double quotes stripped, nothing else, a weak validator left as it is — does not equal the current ETag byte for byte → **RETURN** `412` precondition failed - `inst-gf-precond-3`
 4. [x] - `p1` - **RETURN** proceed, and carry the computed ETag forward so the handler can emit a refreshed value on success - `inst-gf-precond-4`
 
 ### Domain Error to Problem Mapping
@@ -342,6 +342,8 @@ The system **MUST** provide the shared Audit Emitter through which every mutatin
 - [ ] `SettingsReaderClient` and `SettingsContributionClient` resolve through `ClientHub` after initialization
 - [ ] The same consumer code compiles and runs against both the in-process and the REST binding of `SettingsReaderClient`
 - [x] `get_effective_bulk` returns an independent outcome per key, and one failing key does not fail the others in the batch
+- [x] A bulk read of more than `BULK_LIMIT` (500) keys, or of a category expanding past it, is answered with a `bulk_too_large` error on every key it names, never with a partial set
+- [x] A bulk read of a category whose enumeration fails — a malformed category id, the store unreachable, a stored key that does not parse — is answered with an empty batch and the failure is logged at `warn`; it is never shortened by the rows it could not name
 - [x] Every fallible trait method returns `CanonicalError`; no settings-specific error type appears in any trait signature
 - [x] `Unavailable`, `Retired`, and `NotFound` are distinguishable by a consumer without string matching
 - [x] The credential-absent outcome of `resolve_secret` is a different variant from the resolver's `NotFound`, so a placeholder can never be mistaken for a configured credential

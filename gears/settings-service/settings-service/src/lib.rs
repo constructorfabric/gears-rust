@@ -15,15 +15,19 @@
 //! deployment-owned configuration fail-closed and acquires the database
 //! capability.
 //!
-//! # `ClientHub` registration is not here yet
+//! # `ClientHub` registration
 //!
-//! `dod-gear-scaffold` also requires the client traits to be registered into
-//! `ClientHub`. That is deliberately absent: registration publishes a binding
-//! other gears resolve, and there is no implementation behind
-//! `SettingsReaderClient` until the persistence adapter and value resolver
-//! exist. Registering a stub would let a consumer bind successfully and fail on
-//! every call — worse than a resolution failure, which is at least honest about
-//! what is missing. Its checkbox stays unticked until the binding is real.
+//! `init` builds both SDK clients over real implementations and registers
+//! them into `ClientHub`: `SettingsReaderClient` over the value resolver and
+//! the secret resolver, `SettingsContributionClient` over the contribution
+//! service. Both are bound in process; a deployment that wires either one
+//! remotely is refused at boot, since this release publishes no remote
+//! contract for them (see `config::SettingsServiceConfig`).
+//!
+//! The `gear-scaffold` definition of done is still open for a different
+//! reason: it also asks for the remaining GTS control-plane schemas and the
+//! minimal category seed at init, which are not here yet. Its checkbox stays
+//! unticked for those, not for the bindings.
 
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]
@@ -35,6 +39,7 @@ pub mod domain;
 pub mod field;
 pub mod gear;
 pub mod infra;
+pub mod log_text;
 pub mod precondition;
 
 #[cfg(test)]

@@ -192,3 +192,129 @@ fn the_rendered_shape_diverges_from_design_4_3_as_adr_0005_requires() {
         "field detail lives under context.field_violations, not a top-level `errors`"
     );
 }
+
+#[test]
+fn every_arm_renders_the_exact_status_the_api_promises() {
+    // The overrides are what a client dispatches on: 428 rather than 400 for a
+    // missing tag, 412 for a stale one, 410 rather than 409 for a retired
+    // setting. Dropping any `with_override` must fail here, not in a client.
+    let cases: Vec<(DomainError, u64)> = vec![
+        (DomainError::validation("bad"), 400),
+        (
+            DomainError::PreconditionRequired {
+                detail: "no If-Match".to_owned(),
+            },
+            428,
+        ),
+        (
+            DomainError::PreconditionFailed {
+                detail: "etag moved".to_owned(),
+            },
+            412,
+        ),
+        (
+            DomainError::Retired {
+                key: "gts.cf.core.settings.setting_type.v1~acme.settings.network.old.v1~"
+                    .to_owned(),
+            },
+            410,
+        ),
+        (
+            DomainError::Conflict {
+                detail: "already there".to_owned(),
+            },
+            409,
+        ),
+        (
+            DomainError::Unauthorized {
+                resource: settings_service_sdk::gts::VALUE_SCHEMA,
+            },
+            403,
+        ),
+        (
+            DomainError::StepUpRequired {
+                reason: "missing",
+                max_age_seconds: 300,
+                acr_values: Vec::new(),
+            },
+            401,
+        ),
+        (
+            DomainError::NotFound {
+                resource: "declaration",
+            },
+            404,
+        ),
+        (
+            DomainError::NotFound {
+                resource: settings_service_sdk::gts::VALUE_SCHEMA,
+            },
+            404,
+        ),
+        (
+            DomainError::Unavailable {
+                detail: "database unreachable".to_owned(),
+            },
+            503,
+        ),
+        (
+            DomainError::Internal {
+                diagnostic: "boom".to_owned(),
+            },
+            500,
+        ),
+    ];
+    for (err, status) in cases {
+        let label = format!("{err:?}");
+        let doc = problem(err);
+        assert_eq!(doc["status"], serde_json::json!(status), "{label}: {doc}");
+    }
+}
+
+#[test]
+fn a_step_up_refusal_names_the_reason_a_client_dispatches_on() {
+    // RFC 9470: the 401 carries a stable reason, so a client knows to
+    // re-authenticate rather than to log in again.
+    let doc = problem(DomainError::StepUpRequired {
+        reason: "stale",
+        max_age_seconds: 300,
+        acr_values: vec!["urn:mace:incommon:iap:silver".to_owned()],
+    });
+    assert_eq!(doc["status"], 401);
+    let rendered = serde_json::to_string(&doc).expect("serializes");
+    assert!(
+        rendered.contains("INSUFFICIENT_USER_AUTHENTICATION"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn a_denial_names_the_resource_it_is_about_and_the_three_resources_differ() {
+    // A category, a value and a declaration are three resources with three
+    // GTS types; a denial on one must not read as a denial on another, while
+    // two denials on the same resource stay identical (see the test above).
+    let category = problem(DomainError::Unauthorized {
+        resource: settings_service_sdk::gts::CATEGORY_SCHEMA,
+    });
+    let value = problem(DomainError::Unauthorized {
+        resource: settings_service_sdk::gts::VALUE_SCHEMA,
+    });
+    let declaration = problem(DomainError::Unauthorized {
+        resource: "gts.cf.core.settings.declaration.v1~",
+    });
+    for (doc, resource) in [
+        (&category, settings_service_sdk::gts::CATEGORY_SCHEMA),
+        (&value, settings_service_sdk::gts::VALUE_SCHEMA),
+        (&declaration, "gts.cf.core.settings.declaration.v1~"),
+    ] {
+        assert_eq!(doc["status"], 403, "{doc}");
+        assert_eq!(
+            doc["context"]["resource_type"],
+            serde_json::json!(resource),
+            "{doc}"
+        );
+    }
+    assert_ne!(category, value);
+    assert_ne!(value, declaration);
+    assert_ne!(category, declaration);
+}

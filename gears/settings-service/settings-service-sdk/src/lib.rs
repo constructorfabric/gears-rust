@@ -50,3 +50,6 @@ pub use api::{BulkOutcome, BulkSelector, SettingsContributionClient, SettingsRea
 pub use error::SettingsError;
 pub use key::{SettingKey, SettingKeyError};
 pub use models::{EffectiveSource, SecretHandle, TrailEntry};
+// The wrapper `resolve_secret` returns, re-exported so a consumer reads the
+// plaintext with the same `secrecy` this crate compiled against.
+pub use secrecy::{ExposeSecret, SecretString};

@@ -105,17 +105,31 @@ pub async fn access_scope(
     // @cpt-begin:cpt-cf-settings-service-algo-gear-foundation-authz-stepup:p1:inst-gf-authz-3
     // @cpt-begin:cpt-cf-settings-service-algo-gear-foundation-authz-stepup:p1:inst-gf-authz-8
     // @cpt-begin:cpt-cf-settings-service-algo-gear-foundation-authz-stepup:p1:inst-gf-authz-9
-    // `require_constraints(false)`: these resources are platform-global. A
-    // category has no tenant column and declares no PEP property, so there is
-    // nothing a scope constraint could clamp to. Under the default the compiler
-    // fails such a request closed -- `ConstraintsRequiredButAbsent` -- and the
-    // static plugin logs exactly that: "PEP requires constraints but declares
-    // none of the properties this plugin constrains".
+    // `require_constraints(false)`, for every resource here, on purpose.
     //
-    // This does not widen anything. An unconstrained scope over a resource with
-    // no tenant dimension is the correct answer, and the decision itself is
-    // still the PDP's: a deny is still a deny. When `setting_values` arrives it
-    // *does* carry `tenant_id`, and that resource must keep the default.
+    // None of the three resources declares a PEP property (`resource::*` above
+    // are all `&[]`), so there is nothing a scope constraint could clamp to.
+    // Under the default the compiler fails such a request closed --
+    // `ConstraintsRequiredButAbsent` -- and the static plugin logs exactly
+    // that: "PEP requires constraints but declares none of the properties this
+    // plugin constrains". Category and declaration are platform-global rows
+    // with no tenant column, which is the whole story for them.
+    //
+    // A value row does carry `tenant_id`, and it still must not be clamped
+    // here. Resolving a `cascading` or `global` setting reads the rows of the
+    // caller's *ancestors* -- tenants outside any subtree a policy would clamp
+    // the caller to -- so a PDP constraint on `tenant_id` would break
+    // resolution rather than protect it (the resolver reads the chain under
+    // `AccessScope::allow_all()` for exactly this reason). The tenant boundary
+    // for values is enforced by the write and read gates instead:
+    // `ValueWriter::gate` refuses a target outside the caller's subtree, a
+    // standalone descendant, a tenant-scoped write to a `global` setting, and
+    // a caller whose own access is not overridable; the read surface applies
+    // the same subtree rule before it resolves. The domain-affinity filter this
+    // scope also feeds cannot receive a constraint on a resource that declares
+    // no domain property, so nothing is widened by leaving it unconstrained.
+    //
+    // The decision itself is still the PDP's: a deny is still a deny.
     let scope = enforcer
         .access_scope_with(
             ctx,

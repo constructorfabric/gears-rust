@@ -228,14 +228,15 @@ pub async fn update_declaration(
     // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-update:p1:inst-decl-update-3
     // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-update:p1:inst-decl-update-2
     let actor = crate::api::rest::value_handlers::actor(&ctx, &headers);
-    let if_match = crate::api::rest::value_handlers::if_match(&headers).map(str::to_owned);
+    let if_match = crate::api::rest::if_match(&headers).map(str::to_owned);
     // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-update:p1:inst-decl-update-1
+    let admin_for_tx = Arc::clone(&admin);
     let outcome = db
         .db()
         .transaction_ref_mapped::<_, crate::domain::declaration::Declaration, DomainError>(
             move |tx| {
                 Box::pin(async move {
-                    admin
+                    admin_for_tx
                         .update(tx, &scope, id, if_match.as_deref(), &body, &actor)
                         .await
                 })
@@ -249,6 +250,10 @@ pub async fn update_declaration(
         }
         Err(err) => return Err(err.into()),
     };
+    // Evicted again now the change is durable: a reader between the
+    // in-transaction eviction and the commit could have re-populated the entry
+    // under the old classification.
+    admin.evict(&updated.key);
     let dto = DeclarationDto::from(svc.render_one(updated).await);
     let etag = dto.etag.clone();
     Ok(([(axum::http::header::ETAG, etag)], Json(dto)).into_response())
@@ -279,7 +284,7 @@ pub async fn retire_declaration(
     // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-retire:p1:inst-decl-retire-3
     // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-retire:p1:inst-decl-retire-2
     let actor = crate::api::rest::value_handlers::actor(&ctx, &headers);
-    let if_match = crate::api::rest::value_handlers::if_match(&headers).map(str::to_owned);
+    let if_match = crate::api::rest::if_match(&headers).map(str::to_owned);
     // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-retire:p1:inst-decl-retire-1
     let admin_for_tx = Arc::clone(&admin);
     let outcome = db

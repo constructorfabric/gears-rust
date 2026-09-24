@@ -245,11 +245,11 @@ async fn a_sweep_pass_that_finds_nothing_is_not_an_event() {
 }
 
 #[tokio::test]
-async fn a_store_that_cannot_release_leaves_the_row_gone_and_the_pass_reporting_success() {
-    // The row and its entry are released together, but the store is a separate
-    // system: one that cannot answer orphans the entry. That is a warning and
-    // the pass goes on — a sweep that stopped on it would let the expired rows
-    // behind it pile up forever.
+async fn a_store_that_cannot_release_keeps_the_row_for_the_next_tick_which_releases_it() {
+    // The entry is released first and the row removed after: a store that
+    // cannot answer leaves the row as the durable handle on the entry, and
+    // the pass goes on — a sweep that stopped on it would let the expired
+    // rows behind it pile up forever. The next tick tries again.
     use crate::domain::secrets::pending::PendingSecretRepository as _;
 
     let inner = crate::test_support::ResolutionHarness::new().await;
@@ -281,17 +281,28 @@ async fn a_store_that_cannot_release_leaves_the_row_gone_and_the_pass_reporting_
             .find(&conn, &scope, pending_id)
             .await
             .expect("a readable table")
-            .is_none(),
-        "the row goes whatever the store does: nothing points at the entry any more"
+            .is_some(),
+        "the row stays while the entry is unreleased: it is what the next pass retries by"
     );
-    assert_eq!(
-        secrets.held(),
-        vec!["abandoned-ref".to_owned()],
-        "and the entry is orphaned rather than silently forgotten"
-    );
+    assert_eq!(secrets.held(), vec!["abandoned-ref".to_owned()]);
 
-    // The next tick still runs, and finds nothing left to do.
+    // The store is back: the next tick releases the entry and drops the row.
+    secrets
+        .unavailable
+        .store(false, std::sync::atomic::Ordering::SeqCst);
     SettingsService::sweep_once(&writes).await;
+    assert!(
+        crate::infra::storage::pending_secret_repo::PendingSecretRepo
+            .find(&conn, &scope, pending_id)
+            .await
+            .expect("a readable table")
+            .is_none()
+    );
+    assert!(secrets.held().is_empty());
+    assert_eq!(
+        secrets.deleted.lock().expect("lock").as_slice(),
+        ["abandoned-ref".to_owned()]
+    );
 }
 
 // ── Init, over a real context ────────────────────────────────────────────────
@@ -386,6 +397,7 @@ async fn init_takes_the_design_fixed_defaults_when_nothing_is_configured() {
     gear.init(&ctx).await.expect("init");
     let config = gear.config().expect("config");
     assert_eq!(config.cache_ttl_seconds, 30);
+    assert_eq!(config.cache_max_entries, 500_000);
     assert_eq!(config.audit_retention_days, 365);
     assert_eq!(config.step_up.max_age_seconds, 300);
 }
@@ -575,4 +587,42 @@ async fn the_rest_capability_refuses_before_init_and_names_what_is_missing() {
         err.to_string().contains("category service not initialized"),
         "got `{err}`"
     );
+}
+
+#[tokio::test]
+async fn init_refuses_a_cache_ttl_wider_than_the_design_backstop_or_zero() {
+    // Thirty seconds is the ceiling on how stale a replica may serve after a
+    // missed invalidation; a deployment may tighten it, never widen it. A
+    // zero would put every read on the database, like a cache of no entries.
+    let ctx = context_with(json!({ "cache_ttl_seconds": 999_999 }), wired_hub()).await;
+    let err = SettingsService::default()
+        .init(&ctx)
+        .await
+        .expect_err("a wider backstop");
+    let message = err.to_string();
+    assert!(
+        message.contains("cache_ttl_seconds") && message.contains("30"),
+        "the message names the field and the ceiling: `{message}`"
+    );
+
+    let ctx = context_with(json!({ "cache_ttl_seconds": 0 }), wired_hub()).await;
+    assert!(SettingsService::default().init(&ctx).await.is_err());
+
+    let ctx = context_with(json!({ "cache_ttl_seconds": 5 }), wired_hub()).await;
+    SettingsService::default()
+        .init(&ctx)
+        .await
+        .expect("a shorter backstop is the deployment's to choose");
+}
+
+#[tokio::test]
+async fn init_refuses_a_blank_step_up_pin() {
+    // An empty issuer is a templating mistake that would refuse every
+    // step-up-gated write at runtime; the boot is where it is caught.
+    let ctx = context_with(json!({ "step_up": { "issuer": "" } }), wired_hub()).await;
+    let err = SettingsService::default()
+        .init(&ctx)
+        .await
+        .expect_err("a blank issuer");
+    assert!(err.to_string().contains("step_up.issuer"), "got `{err}`");
 }

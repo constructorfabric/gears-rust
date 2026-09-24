@@ -46,6 +46,14 @@ fn the_cache_backstop_defaults_because_the_design_fixes_it() {
 }
 
 #[test]
+fn the_cache_bound_defaults_to_the_design_anchor_and_takes_an_override() {
+    let cfg = parse(serde_json::json!({})).expect("parses");
+    assert_eq!(cfg.cache_max_entries, 500_000);
+    let cfg = parse(serde_json::json!({ "cache_max_entries": 1000 })).expect("parses");
+    assert_eq!(cfg.cache_max_entries, 1000);
+}
+
+#[test]
 fn a_mistyped_key_is_refused_rather_than_ignored() {
     // Without `deny_unknown_fields` this would start the service with the
     // default TTL while the operator believed they had set 60.

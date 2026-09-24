@@ -307,3 +307,109 @@ fn a_window_above_five_minutes_is_refused_at_construction() {
     let v = AuthnStepUpVerifier::from_config(Arc::new(ClientHub::new()), &config).expect("bound");
     assert_eq!(v.requirement().max_age, Duration::from_secs(30));
 }
+
+#[test]
+fn a_blank_issuer_audience_or_assurance_entry_is_refused_at_construction() {
+    // A blank pin can never be carried by a token, so it would refuse every
+    // step-up-gated write at runtime with no sign at boot; a blank assurance
+    // entry can never be met and is silently useless. Both are a templating
+    // mistake, and the boot is where it is caught.
+    let refused = [
+        StepUpConfig {
+            issuer: Some(String::new()),
+            ..StepUpConfig::default()
+        },
+        StepUpConfig {
+            audience: Some("   ".to_owned()),
+            ..StepUpConfig::default()
+        },
+        StepUpConfig {
+            acr_values: vec!["urn:mace:incommon:iap:silver".to_owned(), String::new()],
+            ..StepUpConfig::default()
+        },
+        StepUpConfig {
+            amr_values: vec![" mfa".to_owned()],
+            ..StepUpConfig::default()
+        },
+    ];
+    for (i, config) in refused.iter().enumerate() {
+        let err = AuthnStepUpVerifier::from_config(Arc::new(ClientHub::new()), config)
+            .err()
+            .unwrap_or_else(|| panic!("config #{i} is refused"));
+        assert!(
+            err.to_string().contains("step_up."),
+            "names the field: `{err}`"
+        );
+    }
+
+    let config = StepUpConfig {
+        issuer: Some("https://idp.example".to_owned()),
+        audience: Some("settings".to_owned()),
+        acr_values: vec!["urn:mace:incommon:iap:silver".to_owned()],
+        amr_values: vec!["mfa".to_owned()],
+        ..StepUpConfig::default()
+    };
+    AuthnStepUpVerifier::from_config(Arc::new(ClientHub::new()), &config).expect("bound");
+}
+
+/// A resolver that cannot answer, failing every call the way the test says.
+struct DownResolver(fn() -> AuthNResolverError);
+
+#[async_trait]
+impl AuthNResolverClient for DownResolver {
+    async fn authenticate(
+        &self,
+        _bearer_token: &str,
+    ) -> Result<AuthenticationResult, AuthNResolverError> {
+        Err((self.0)())
+    }
+
+    async fn exchange_client_credentials(
+        &self,
+        _request: &ClientCredentialsRequest,
+    ) -> Result<AuthenticationResult, AuthNResolverError> {
+        unreachable!("not exercised")
+    }
+}
+
+fn hub_over(resolver: DownResolver) -> Arc<ClientHub> {
+    let hub = Arc::new(ClientHub::new());
+    hub.register::<dyn AuthNResolverClient>(Arc::new(resolver));
+    hub
+}
+
+#[tokio::test]
+async fn a_resolver_that_cannot_answer_is_unavailable_not_a_signature_refusal() {
+    // The token was never looked at. Telling the person to re-authenticate
+    // would name the wrong fault and could not succeed until AuthN is back.
+    let id = Uuid::new_v4();
+    let fresh = jwt(&json!({ "sub": id.to_string(), "auth_time": now() }));
+    let outages: [fn() -> AuthNResolverError; 4] = [
+        || AuthNResolverError::NoPluginAvailable,
+        || AuthNResolverError::ServiceUnavailable("plugin not ready".to_owned()),
+        || AuthNResolverError::TokenAcquisitionFailed("idp unreachable".to_owned()),
+        || AuthNResolverError::Internal("boom".to_owned()),
+    ];
+    for outage in outages {
+        let v = verifier(hub_over(DownResolver(outage)), requirement());
+        let refusal = v.verify(Some(&fresh), &subject(id)).await;
+        assert!(
+            matches!(refusal, Err(StepUpRefusal::Unavailable(_))),
+            "{refusal:?} for {}",
+            outage()
+        );
+        assert_eq!(refusal.unwrap_err().code(), "unavailable");
+    }
+
+    // The one verdict the resolver does pass stays a refusal of the token.
+    let v = verifier(
+        hub_over(DownResolver(|| {
+            AuthNResolverError::Unauthorized("bad signature".to_owned())
+        })),
+        requirement(),
+    );
+    assert!(matches!(
+        v.verify(Some(&fresh), &subject(id)).await,
+        Err(StepUpRefusal::Signature(detail)) if detail == "bad signature"
+    ));
+}

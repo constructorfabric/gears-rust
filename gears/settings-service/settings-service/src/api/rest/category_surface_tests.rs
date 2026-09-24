@@ -405,3 +405,57 @@ async fn a_denied_caller_reaches_no_category_operation() {
         assert_eq!(answer.status, 403, "{method} {uri}");
     }
 }
+
+#[tokio::test]
+async fn a_quoted_or_padded_tag_matches_here_as_on_every_other_surface() {
+    // RFC 7232 clients quote the validator they send back, and some pad it.
+    // The framing is the header's, not the tag's: one helper strips it on
+    // every mutation handler, so a spelling that matches on a declaration or
+    // a value matches on a category too, never a 412 for a state that agrees.
+    let h = RestHarness::new().await;
+    let (id, tag) = create(&h, "billing", "Invoices").await;
+    let uri = format!("{CATEGORIES}/{id}");
+
+    let quoted = format!("\"{tag}\"");
+    let answer = h
+        .send(
+            "PATCH",
+            &uri,
+            Some(json!({ "name": "Invoices (quoted)" })),
+            Some(quoted.as_str()),
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(answer.status, 200, "a quoted tag matches: {}", answer.body);
+    let tag = answer.etag.expect("a refreshed tag");
+
+    let padded = format!("  {tag} ");
+    let answer = h
+        .send(
+            "PATCH",
+            &uri,
+            Some(json!({ "name": "Invoices (padded)" })),
+            Some(padded.as_str()),
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(answer.status, 200, "a padded tag matches: {}", answer.body);
+    let tag = answer.etag.expect("a refreshed tag");
+
+    // A weak validator is not this tag: strong comparison, as If-Match asks.
+    let weak = format!("W/\"{tag}\"");
+    let answer = h
+        .send(
+            "PATCH",
+            &uri,
+            Some(json!({ "name": "Invoices (weak)" })),
+            Some(weak.as_str()),
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(
+        answer.status, 412,
+        "a weak validator never matches: {}",
+        answer.body
+    );
+}

@@ -56,6 +56,12 @@ cargo run --bin cf-gears-example-server --features settings-service -- \
     --config config/quickstart.yaml
 ```
 
+The end-to-end smoke lives in `testing/e2e/suites/settings_service` and runs
+against the shared e2e server — `make e2e-local SUITE=settings-service` —
+covering the gear's startup on its routes, the read surfaces, and the
+canonical refusals. Writes that need a declaration to reach their gates are
+covered by the crate's own surface tests until the fleet contributes one.
+
 ## Configuration
 
 Bootstrap values are deployment-owned and read fail-closed: the `config:`
@@ -70,11 +76,14 @@ settings-service:
   config: {}
 ```
 
-`cache_ttl_seconds` (30) and `audit_retention_days` (365) are fixed by the
-design rather than by the operator. The optional `step_up` section carries
+`cache_ttl_seconds` (30), `cache_max_entries` (500,000) and `audit_retention_days` (365) are fixed by the
+design rather than by the operator: init refuses a TTL above 30 or of zero (a deployment may shorten
+the backstop, never widen it), a cache of no entries, and a retention below twelve months. The optional `step_up` section carries
 policy only — `max_age_seconds` (300, and its ceiling), `issuer`, `audience`,
 `acr_values`, `amr_values` — and names no identity provider: the token is
-validated by the platform's AuthN resolver.
+validated by the platform's AuthN resolver. A blank pin, or a blank or
+whitespace-padded assurance entry, is refused at init: no token could carry
+it, and it would refuse every step-up-gated write with no sign at boot.
 
 ## Dependencies and capabilities
 

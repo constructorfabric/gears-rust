@@ -28,6 +28,7 @@ use crate::infra::type_validator::SchemaSource;
 use std::num::NonZeroU32;
 use std::time::Duration;
 
+use secrecy::SecretString;
 use serde_json::json;
 use toolkit_security::{AccessScope, SecurityContext};
 
@@ -46,18 +47,25 @@ use crate::infra::type_validator::GtsTypeValidator;
 pub struct FakeSource {
     pub schemas: HashMap<String, GtsTypeSchema>,
     pub instances: HashSet<String>,
-    pub enums: HashMap<String, Vec<String>>,
     pub unavailable: bool,
+    /// How many times a type schema was asked for.
+    pub schema_lookups: std::sync::atomic::AtomicUsize,
+    /// How many times instances were looked up, whatever the batch size.
+    pub instance_lookups: std::sync::atomic::AtomicUsize,
 }
 
 impl FakeSource {
-    /// A dynamic enumeration this source knows, and its members.
-    pub fn with_enum(mut self, source: &str, members: &[&str]) -> Self {
-        self.enums.insert(
-            source.to_owned(),
-            members.iter().map(|m| (*m).to_owned()).collect(),
+    /// A dynamic enumeration this source knows: the source as a registered
+    /// type, and its members as instances derived from it.
+    pub fn with_enum(self, source: &str, members: &[&str]) -> Self {
+        let mut with_source = self.with_type(
+            source,
+            json!({ "$id": format!("gts://{source}"), "type": "string" }),
         );
-        self
+        for member in members {
+            with_source.instances.insert(format!("{source}{member}"));
+        }
+        with_source
     }
 
     pub fn with_type(mut self, id: &str, schema: Value) -> Self {
@@ -76,6 +84,8 @@ impl FakeSource {
 #[async_trait]
 impl SchemaSource for FakeSource {
     async fn type_schema(&self, type_id: &str) -> Result<Option<GtsTypeSchema>, DomainError> {
+        self.schema_lookups
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if self.unavailable {
             return Err(DomainError::Unavailable {
                 detail: "registry down".to_owned(),
@@ -84,19 +94,33 @@ impl SchemaSource for FakeSource {
         Ok(self.schemas.get(type_id).cloned())
     }
 
-    async fn instance_exists(&self, instance_id: &str) -> Result<bool, DomainError> {
-        Ok(self.instances.contains(instance_id))
-    }
-
-    async fn enum_members(&self, source: &str) -> Result<Option<Vec<String>>, DomainError> {
-        Ok(self.enums.get(source).cloned())
+    async fn resolve_instances(
+        &self,
+        instance_ids: &[&str],
+    ) -> Result<HashMap<String, String>, DomainError> {
+        self.instance_lookups
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // As the registry answers: an instance with the type it is registered
+        // under — the id up to and including its last `~`.
+        Ok(instance_ids
+            .iter()
+            .filter(|id| self.instances.contains(**id))
+            .map(|id| {
+                let type_end = id.rfind('~').map_or(id.len(), |i| i + 1);
+                ((*id).to_owned(), id[..type_end].to_owned())
+            })
+            .collect())
     }
 }
 
-/// An audit sink that keeps what it was given.
+/// An audit sink that keeps what it was given — and, when told to, refuses
+/// the record about one key, standing in for a store that fails at exactly
+/// that point of a mutation.
 #[derive(Default)]
 pub struct RecordingAudit {
     pub records: Mutex<Vec<AuditRecord>>,
+    /// The declaration key whose record is refused; every other is kept.
+    pub fail_on_key: Mutex<Option<String>>,
 }
 
 impl RecordingAudit {
@@ -124,6 +148,17 @@ impl AuditSink for Arc<RecordingAudit> {
         _scope: &AccessScope,
         record: AuditRecord,
     ) -> Result<(), DomainError> {
+        let refused = self
+            .fail_on_key
+            .lock()
+            .expect("audit lock")
+            .as_deref()
+            .is_some_and(|key| key == record.declaration_key);
+        if refused {
+            return Err(DomainError::Unavailable {
+                detail: format!("audit store down for `{}`", record.declaration_key),
+            });
+        }
         self.records.lock().expect("audit lock").push(record);
         Ok(())
     }
@@ -219,7 +254,19 @@ pub struct FakeHierarchy {
     pub standalone: Mutex<HashSet<Uuid>>,
     pub chain_calls: std::sync::atomic::AtomicUsize,
     pub unavailable: std::sync::atomic::AtomicBool,
+    /// How many of the next `chain` calls fail as unavailable before the
+    /// resolver answers again: a transient outage, not a standing one.
+    pub failing_chains: std::sync::atomic::AtomicUsize,
+    /// Runs once, from inside the next `chain` lookup: what a test makes
+    /// happen while a resolve is mid-walk — a write that evicts, for one.
+    pub on_chain: Mutex<Option<ChainHook>>,
+    /// Report every bounded walk as cut short: a subtree larger than any
+    /// budget, without building one.
+    pub truncate_subtrees: std::sync::atomic::AtomicBool,
 }
+
+/// What [`FakeHierarchy::on_chain`] runs.
+pub type ChainHook = Box<dyn Fn() + Send + Sync>;
 
 impl FakeHierarchy {
     pub fn with_tenant(self, id: Uuid, parent: Option<Uuid>) -> Self {
@@ -237,8 +284,27 @@ impl FakeHierarchy {
             .store(unavailable, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Fail the next `n` `chain` calls, then answer normally.
+    pub fn fail_next_chains(&self, n: usize) {
+        self.failing_chains
+            .store(n, std::sync::atomic::Ordering::SeqCst);
+    }
+
     pub fn chain_calls(&self) -> usize {
         self.chain_calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Every tenant below `tenant` that administration from it can reach:
+    /// standalone subtrees left out.
+    async fn reachable(&self, tenant: Uuid) -> Result<Vec<Uuid>, DomainError> {
+        let ids: Vec<Uuid> = self.parents.lock().expect("lock").keys().copied().collect();
+        let mut out = Vec::new();
+        for candidate in ids {
+            if candidate != tenant && self.is_within_subtree(tenant, candidate).await? {
+                out.push(candidate);
+            }
+        }
+        Ok(out)
     }
 
     fn path_to_root(&self, tenant: Uuid) -> Result<Vec<Uuid>, DomainError> {
@@ -265,10 +331,21 @@ impl TenantHierarchy for FakeHierarchy {
     async fn chain(&self, tenant: Uuid) -> Result<Vec<Uuid>, DomainError> {
         self.chain_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if self.unavailable.load(std::sync::atomic::Ordering::SeqCst) {
+        let transient = self
+            .failing_chains
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |left| left.checked_sub(1),
+            )
+            .is_ok();
+        if transient || self.unavailable.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(DomainError::Unavailable {
                 detail: "tenant resolver down".to_owned(),
             });
+        }
+        if let Some(hook) = self.on_chain.lock().expect("lock").take() {
+            hook();
         }
         let mut path = self.path_to_root(tenant)?;
         path.reverse();
@@ -299,23 +376,12 @@ impl TenantHierarchy for FakeHierarchy {
         Ok(self.standalone.lock().expect("lock").contains(&tenant))
     }
 
-    async fn descendants(&self, tenant: Uuid) -> Result<Vec<Uuid>, DomainError> {
-        let ids: Vec<Uuid> = self.parents.lock().expect("lock").keys().copied().collect();
-        let mut out = Vec::new();
-        for candidate in ids {
-            if candidate != tenant && self.is_within_subtree(tenant, candidate).await? {
-                out.push(candidate);
-            }
-        }
-        Ok(out)
-    }
-
     async fn descendants_bfs(
         &self,
         tenant: Uuid,
         budget: usize,
     ) -> Result<(Vec<Uuid>, bool), DomainError> {
-        let reachable = self.descendants(tenant).await?;
+        let reachable = self.reachable(tenant).await?;
         let parents = self.parents.lock().expect("lock").clone();
         let mut order = Vec::new();
         let mut queue = std::collections::VecDeque::from([tenant]);
@@ -338,6 +404,12 @@ impl TenantHierarchy for FakeHierarchy {
             if truncated {
                 break;
             }
+        }
+        if self
+            .truncate_subtrees
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            truncated = true;
         }
         Ok((order, truncated))
     }
@@ -517,18 +589,45 @@ impl ResolutionHarness {
     pub async fn retire(&self, declaration_id: Uuid) {
         let conn = self.db.conn().expect("connection");
         DeclarationRepo
-            .set_status(&conn, &AccessScope::allow_all(), declaration_id, "retired")
+            .set_status(
+                &conn,
+                &AccessScope::allow_all(),
+                declaration_id,
+                "retired",
+                None,
+            )
             .await
             .expect("retire");
     }
 
     pub async fn set(&self, declaration_id: Uuid, tenant: Uuid, value: Value) {
-        self.write(declaration_id, tenant, Some(value), None, false)
+        self.write(declaration_id, tenant, Some(value), None, false, "public")
             .await;
     }
 
+    /// An override carrying the classification the writer would denormalize
+    /// from its declaration — `pii`, for a row the corpus rules must see as
+    /// personal data.
+    pub async fn set_classified(
+        &self,
+        declaration_id: Uuid,
+        tenant: Uuid,
+        value: Value,
+        classification: &str,
+    ) {
+        self.write(
+            declaration_id,
+            tenant,
+            Some(value),
+            None,
+            false,
+            classification,
+        )
+        .await;
+    }
+
     pub async fn set_flagged(&self, declaration_id: Uuid, tenant: Uuid, value: Value) {
-        self.write(declaration_id, tenant, Some(value), None, true)
+        self.write(declaration_id, tenant, Some(value), None, true, "public")
             .await;
     }
 
@@ -541,6 +640,7 @@ impl ResolutionHarness {
             None,
             Some(secret_ref.to_owned()),
             true,
+            "secret",
         )
         .await;
     }
@@ -552,10 +652,14 @@ impl ResolutionHarness {
             None,
             Some(secret_ref.to_owned()),
             false,
+            "secret",
         )
         .await;
     }
 
+    /// The row as the writer leaves it, `classification` denormalized from
+    /// the declaration onto it — the column the corpus and the masking rules
+    /// read.
     async fn write(
         &self,
         declaration_id: Uuid,
@@ -563,13 +667,9 @@ impl ResolutionHarness {
         value: Option<Value>,
         secret_ref: Option<String>,
         flagged: bool,
+        classification: &str,
     ) {
         let conn = self.db.conn().expect("connection");
-        let classification = if secret_ref.is_some() {
-            "secret"
-        } else {
-            "public"
-        };
         ValueRepo
             .insert(
                 &conn,
@@ -661,6 +761,9 @@ pub struct RecordingSecrets {
     pub deleted: Mutex<Vec<String>>,
     pub unavailable: std::sync::atomic::AtomicBool,
     pub stores: std::sync::atomic::AtomicUsize,
+    /// The next store lands in the store and answers with a failure: the
+    /// ambiguous outcome of a network that dropped the response.
+    pub lose_next_answer: std::sync::atomic::AtomicBool,
 }
 
 impl RecordingSecrets {
@@ -685,6 +788,12 @@ impl RecordingSecrets {
             .insert(reference.to_owned(), plaintext.to_owned());
     }
 
+    /// Make the next store land and lose its answer.
+    pub fn lose_next_answer(&self) {
+        self.lose_next_answer
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Make every operation fail as unavailable from now on.
     pub fn go_down(&self) {
         self.unavailable
@@ -703,23 +812,35 @@ impl RecordingSecrets {
 
 #[async_trait]
 impl crate::domain::ports::SecretManager for RecordingSecrets {
-    async fn store_secret(
-        &self,
-        key: &str,
-        tenant: Uuid,
-        plaintext: &Value,
-    ) -> Result<String, DomainError> {
-        self.check()?;
+    fn mint_reference(&self, key: &str, tenant: Uuid) -> String {
         let n = self
             .stores
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let reference = format!("fake-{}-{tenant}-{n}", key.len());
+        format!("fake-{}-{tenant}-{n}", key.len())
+    }
+
+    async fn store_secret(
+        &self,
+        _key: &str,
+        _tenant: Uuid,
+        secret_ref: &str,
+        plaintext: &Value,
+    ) -> Result<(), DomainError> {
+        self.check()?;
         let text = match plaintext {
             Value::String(s) => s.clone(),
             other => other.to_string(),
         };
-        self.seed(&reference, &text);
-        Ok(reference)
+        self.seed(secret_ref, &text);
+        if self
+            .lose_next_answer
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(DomainError::Unavailable {
+                detail: "the store's answer was lost".to_owned(),
+            });
+        }
+        Ok(())
     }
 
     async fn resolve_plaintext(
@@ -727,13 +848,14 @@ impl crate::domain::ports::SecretManager for RecordingSecrets {
         _key: &str,
         _tenant: Uuid,
         secret_ref: &str,
-    ) -> Result<String, DomainError> {
+    ) -> Result<SecretString, DomainError> {
         self.check()?;
         self.entries
             .lock()
             .expect("secrets lock")
             .get(secret_ref)
             .cloned()
+            .map(SecretString::from)
             .ok_or(DomainError::NotFound {
                 resource: settings_service_sdk::gts::VALUE_SCHEMA,
             })
@@ -1069,6 +1191,39 @@ impl RestHarness {
         if_match: Option<&str>,
         caller: SecurityContext,
     ) -> Answer {
+        let body = body.map(|json| serde_json::to_vec(&json).expect("serializes"));
+        self.dispatch(method, uri, body, if_match, caller).await
+    }
+
+    /// The same, with the body sent as the exact text given — for a request
+    /// whose literal spelling is the point, such as a number a double cannot
+    /// hold, which a `serde_json::Value` would already have rounded.
+    pub async fn send_text(
+        &self,
+        method: &str,
+        uri: &str,
+        body: &str,
+        if_match: Option<&str>,
+        caller: Uuid,
+    ) -> Answer {
+        self.dispatch(
+            method,
+            uri,
+            Some(body.as_bytes().to_vec()),
+            if_match,
+            context_for(caller),
+        )
+        .await
+    }
+
+    async fn dispatch(
+        &self,
+        method: &str,
+        uri: &str,
+        body: Option<Vec<u8>>,
+        if_match: Option<&str>,
+        caller: SecurityContext,
+    ) -> Answer {
         use tower::ServiceExt as _;
         let mut builder = axum::http::Request::builder().method(method).uri(uri);
         if body.is_some() {
@@ -1077,9 +1232,7 @@ impl RestHarness {
         if let Some(tag) = if_match {
             builder = builder.header("if-match", tag);
         }
-        let payload = body.map_or_else(axum::body::Body::empty, |json| {
-            axum::body::Body::from(serde_json::to_vec(&json).expect("serializes"))
-        });
+        let payload = body.map_or_else(axum::body::Body::empty, axum::body::Body::from);
         let mut request = builder.body(payload).expect("a well-formed request");
         request.extensions_mut().insert(caller);
         let response = self
@@ -1142,6 +1295,7 @@ impl RestHarness {
                     access,
                     set_by: "an ancestor's administrator".to_owned(),
                 },
+                None,
             )
             .await
             .expect("restriction");
@@ -1177,6 +1331,7 @@ pub fn write_coordinator(
         crate::infra::storage::audit_store::AuditStore,
         step_up,
         secrets as Arc<dyn crate::domain::ports::SecretManager>,
+        crate::infra::storage::pending_secret_repo::PendingSecretRepo,
         published as Arc<dyn crate::domain::ports::ChangePublisher>,
         Arc::new(crate::domain::ports::NoMetrics),
     ));

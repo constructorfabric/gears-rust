@@ -1,5 +1,5 @@
 <!-- Created: 2026-09-06 by Virtuozzo International GmbH -->
-<!-- Updated: 2026-09-06 by Virtuozzo International GmbH -->
+<!-- Updated: 2026-09-24 by Virtuozzo International GmbH -->
 
 # Feature: Tenant Access Restrictions
 
@@ -98,10 +98,10 @@ The standalone seam lives here too, because it is the same boundary drawn from t
 3. [x] - `p1` - **IF** the decision is deny or cannot be obtained → **RETURN** `403` - `inst-ta-set-3`
 4. [x] - `p1` - Invoke the strict-descendant target check for the caller and `tenant`; **IF** it fails → **RETURN** `403`, since a caller that could restrict itself could lift the restriction again - `inst-ta-set-4`
 5. [x] - `p1` - **IF** `access` is not `read_only` or `hidden` → **RETURN** `400`, because `overridable` is the absence of a row and is expressed by DELETE - `inst-ta-set-5`
-6. [x] - `p1` - DB: SELECT the declaration by key; **IF** none, **OR** the caller's own effective access for it is `hidden` → **RETURN** `404`, so a caller cannot restrict what it cannot see and cannot learn that it exists - `inst-ta-set-6`
+6. [x] - `p1` - DB: SELECT the declaration by key; **IF** none, **OR** the caller's own effective access for it is `hidden` → **RETURN** `404`, so a caller cannot restrict what it cannot see and cannot learn that it exists; then DB: SELECT that declaration row for update for the rest of the transaction, so a value write in flight — which holds it for share until its commit — either lands before this restriction or derives the writer's access again after it and is refused - `inst-ta-set-6`
 7. [x] - `p1` - DB: SELECT the row for `(declaration_id, tenant_id)`, and compute the restriction state tag for the stored row or for the absent state - `inst-ta-set-7`
 8. [x] - `p1` - Evaluate the `If-Match` precondition against that tag; **IF** absent → **RETURN** `428`; **IF** stale → **RETURN** `412` - `inst-ta-set-8`
-9. [x] - `p1` - DB: UPSERT tenant_permissions on `uq_tenant_permission` with `access`, `set_by` from the authenticated principal, and `updated_at` now, in one transaction with the audit record and with the comparison above, so concurrent delegates cannot silently overwrite each other - `inst-ta-set-9`
+9. [x] - `p1` - DB: UPSERT tenant_permissions on `uq_tenant_permission` with `access`, `set_by` from the authenticated principal, and `updated_at` now — the UPDATE filtered on the version the tag was compared against, the INSERT guarded by the unique index — in one transaction with the audit record and with the comparison above; **IF** no row matched or the insert collides → **RETURN** `412`, so concurrent delegates cannot silently overwrite each other - `inst-ta-set-9`
 10. [x] - `p1` - Record the row even when an ancestor already imposes a stricter access; it takes effect when that restriction is lifted - `inst-ta-set-10`
 11. [x] - `p1` - Emit an audit record for the restriction change with pre-image and post-image - `inst-ta-set-11`
 12. [x] - `p1` - Invoke eviction for the target tenant and every descendant, independent of the setting's scope class - `inst-ta-set-12`
@@ -124,9 +124,9 @@ The standalone seam lives here too, because it is the same boundary drawn from t
 1. [x] - `p1` - Actor sends DELETE /settings-service/v1/settings/{key}/permissions?tenant={tenant_id} with `If-Match` - `inst-ta-clear-1`
 2. [x] - `p1` - Authorize `delegate` on the setting's key; **IF** deny or cannot be obtained → **RETURN** `403` - `inst-ta-clear-2`
 3. [x] - `p1` - Invoke the strict-descendant target check; **IF** it fails → **RETURN** `403` - `inst-ta-clear-3`
-4. [x] - `p1` - DB: SELECT the declaration by key; **IF** none, **OR** hidden from the caller → **RETURN** `404` - `inst-ta-clear-4`
+4. [x] - `p1` - DB: SELECT the declaration by key; **IF** none, **OR** hidden from the caller → **RETURN** `404`; then DB: SELECT that declaration row for update for the rest of the transaction, serializing against value writes in flight as a set does - `inst-ta-clear-4`
 5. [x] - `p1` - DB: SELECT the row for the pair and compute the restriction state tag; evaluate `If-Match`; **IF** absent → **RETURN** `428`; **IF** stale → **RETURN** `412` - `inst-ta-clear-5`
-6. [x] - `p1` - DB: DELETE the row in one transaction with the audit record; clearing an already absent row is a no-op that still requires the absent-state tag - `inst-ta-clear-6`
+6. [x] - `p1` - DB: DELETE the row at the version the tag was compared against, in one transaction with the audit record; **IF** no row matched → **RETURN** `412`; clearing an already absent row is a no-op that still requires the absent-state tag - `inst-ta-clear-6`
 7. [x] - `p1` - Emit an audit record carrying the removed row as pre-image - `inst-ta-clear-7`
 8. [x] - `p1` - Invoke eviction for the target tenant and every descendant - `inst-ta-clear-8`
 9. [x] - `p1` - **RETURN** `200` with the tenant's resulting effective access, which an ancestor row may still narrow, and the absent-state ETag - `inst-ta-clear-9`
@@ -164,13 +164,14 @@ The standalone seam lives here too, because it is the same boundary drawn from t
 
 **Error Scenarios**:
 - The setting does not exist or is hidden from the caller
+- The caller's subtree exceeds the subtree budget
 
 **Steps**:
-1. [x] - `p1` - Actor sends GET /settings-service/v1/settings/{key}/permissions with a pagination cursor - `inst-ta-list-1`
+1. [x] - `p1` - Actor sends GET /settings-service/v1/settings/{key}/permissions/all; the listing takes no cursor — it is small by nature, at most one row per descendant tenant, and is returned whole - `inst-ta-list-1`
 2. [x] - `p1` - Authorize `read` on the setting's key; **IF** deny or cannot be obtained → **RETURN** `403` - `inst-ta-list-2`
 3. [x] - `p1` - DB: SELECT the declaration by key; **IF** none, **OR** hidden from the caller → **RETURN** `404` - `inst-ta-list-3`
-4. [x] - `p1` - DB: SELECT tenant_permissions for the declaration where the tenant lies inside the caller's subtree, as the `AccessScope` constrains it, excluding standalone descendants, through `idx_tenant_permission_tenant` - `inst-ta-list-4`
-5. [x] - `p1` - **RETURN** `200` with the page of rows, each carrying its tag - `inst-ta-list-5`
+4. [x] - `p1` - DB: SELECT tenant_permissions for the declaration where the tenant lies inside the caller's subtree, as the `AccessScope` constrains it, excluding standalone descendants, through `idx_tenant_permission_tenant`; the subtree is obtained under the shared subtree budget, and **IF** the budget cuts it → **RETURN** `400` naming the bound rather than a partial listing - `inst-ta-list-4`
+5. [x] - `p1` - **RETURN** `200` with every row in one page, each carrying its tag, in the shared `Page` envelope with `next_cursor` never set: the list is bounded by the subtree budget of step 4, not paginated - `inst-ta-list-5`
 
 ## 3. Processes / Business Logic (CDSL)
 
@@ -225,8 +226,8 @@ The standalone seam lives here too, because it is the same boundary drawn from t
 **Output**: Evicted cache entries
 
 **Steps**:
-1. [x] - `p1` - Obtain the tenant's descendants from the tenant resolver - `inst-ta-evict-1`
-2. [x] - `p1` - Evict the cached entries of the setting for the tenant and every descendant on this instance, regardless of scope class, because their effective access may have changed even where their effective value has not - `inst-ta-evict-2`
+1. [x] - `p1` - Obtain the tenant's descendants from the tenant resolver, under the shared subtree budget - `inst-ta-evict-1`
+2. [x] - `p1` - Evict the cached entries of the setting for the tenant and every descendant on this instance, regardless of scope class, because their effective access may have changed even where their effective value has not; **IF** the budget cut the subtree → evict every scope of the setting instead, so nothing stale survives - `inst-ta-evict-2`
 3. [x] - `p1` - **RETURN** having evicted locally only; peer replicas converge through the R2 `cache_invalidate` broadcast - `inst-ta-evict-3`
 
 ## 4. States (CDSL)
@@ -313,7 +314,7 @@ A tenant the tenant resolver marks standalone **MUST** remain an ordinary inheri
 
 - [x] `p1` - **ID**: `cpt-cf-settings-service-dod-tenant-access-concurrency`
 
-Set and clear **MUST** require `If-Match` against the stored row's tag or the absent-state tag the read returns — `428` when missing, `412` when stale — and the comparison and the mutation **MUST** happen in one transaction.
+Set and clear **MUST** require `If-Match` against the stored row's tag or the absent-state tag the read returns — `428` when missing, `412` when stale — and the comparison and the mutation **MUST** happen in one transaction. The mutation itself **MUST** be conditional on that version — filtered on it for an UPDATE or DELETE, guarded by the unique index for an INSERT — so two delegates holding one tag cannot both land.
 
 **Implements**:
 - `cpt-cf-settings-service-algo-tenant-access-etag`
@@ -344,6 +345,7 @@ An access change **MUST** evict the setting's cached entries for the target tena
 - [x] Targeting an ancestor, a sibling, a tenant outside the subtree, or a standalone descendant receives `403`
 - [x] A row set below an already `hidden` tenant is stored and becomes effective when the ancestor restriction is cleared
 - [x] A value set before its tenant became `read_only` still resolves and is inherited, and a write by that tenant is refused
+- [x] A write gated while its tenant was `overridable` and committed after the tenant became `read_only` or `hidden` is refused and stores nothing
 - [x] An `overridable` ancestor writes at a `read_only` descendant successfully, while the descendant's own write remains refused
 - [x] A gear reading through `SettingsReaderClient` receives the effective value of a `hidden` tenant unchanged
 - [x] `PUT` with `access=overridable` returns `400`
@@ -352,5 +354,6 @@ An access change **MUST** evict the setting's cached entries for the target tena
 - [x] `DELETE` clears one row, and the effective access afterwards reflects any ancestor row that remains
 - [x] Setting or clearing a restriction evicts the cached entries of the target tenant and its descendants
 - [x] Restriction rows survive a retire and revive of their declaration unchanged
+- [x] A restriction listing over a caller subtree past the subtree budget is refused `400` naming the bound; an access change on such a subtree evicts the setting key-wide
 - [x] Every restriction change leaves an audit record with the previous and the new row
 - [x] The root tenant never holds a restriction row

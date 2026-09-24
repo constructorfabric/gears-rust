@@ -128,6 +128,8 @@ async fn page_of(
                 needle: &n,
                 corpus,
                 tenant_ids: tenants,
+                hidden_for: &[],
+                override_limit: 1_000,
                 query: &q,
             },
         )
@@ -258,7 +260,14 @@ async fn an_override_is_matched_where_it_is_set_and_only_inside_the_bounded_tena
         vec!["motto"]
     );
     let rows = repo()
-        .overrides(&conn, &[id], subtree_of_a, &needle("omega"), Corpus::Public)
+        .overrides(
+            &conn,
+            &[id],
+            subtree_of_a,
+            &needle("omega"),
+            Corpus::Public,
+            100,
+        )
         .await
         .expect("overrides");
     assert_eq!(
@@ -311,6 +320,7 @@ async fn a_secret_is_never_matched_by_its_reference_or_by_anything() {
             all,
             &needle("def-ref"),
             Corpus::PublicAndPii,
+            100,
         )
         .await
         .expect("overrides");
@@ -345,7 +355,14 @@ async fn pii_content_enters_the_corpus_only_with_the_entitlement() {
     let conn = h.db.conn().expect("connection");
     assert!(
         repo()
-            .overrides(&conn, &[contact], all, &needle("oncall"), Corpus::Public)
+            .overrides(
+                &conn,
+                &[contact],
+                all,
+                &needle("oncall"),
+                Corpus::Public,
+                100,
+            )
             .await
             .expect("overrides")
             .is_empty()
@@ -357,7 +374,8 @@ async fn pii_content_enters_the_corpus_only_with_the_entitlement() {
                 &[contact],
                 all,
                 &needle("oncall"),
-                Corpus::PublicAndPii
+                Corpus::PublicAndPii,
+                100,
             )
             .await
             .expect("overrides")
@@ -476,4 +494,63 @@ async fn the_page_carries_its_categories_for_breadcrumbs() {
         .expect("categories");
     assert_eq!(categories.len(), 1);
     assert_eq!(categories[0].name, "network");
+}
+
+#[test]
+fn the_predicates_render_for_each_dialect_with_the_pattern_bound_in_place() {
+    // The tests above run on SQLite. The PostgreSQL branch is pinned by what
+    // it renders: the case-insensitive operator over the JSON text projection,
+    // the escape clause, and the pattern bound as a parameter at the index
+    // sea-query assigns it — not written into the SQL, and not `$1` by name
+    // when other values precede it.
+    use sea_orm::sea_query::{Expr, PostgresQueryBuilder, Query, SqliteQueryBuilder};
+
+    let tenants = [Uuid::new_v4(), Uuid::new_v4()];
+    let (sql, values) = Query::select()
+        .expr(Expr::val(1))
+        .cond_where(SearchRepo::new(DbBackend::Postgres).value_matches(
+            Corpus::PublicAndPii,
+            &tenants,
+            "%nee\\_dle%",
+        ))
+        .build(PostgresQueryBuilder);
+    let last = values.0.len();
+    assert!(
+        sql.contains(&format!(
+            "(setting_values.value #>> '{{}}') ILIKE ${last} ESCAPE '\\'"
+        )),
+        "{sql}"
+    );
+    assert_eq!(
+        values.0.last(),
+        Some(&sea_orm::Value::from("%nee\\_dle%".to_owned())),
+        "the pattern is the last bound value, never SQL text"
+    );
+
+    let (sql, values) = Query::select()
+        .expr(Expr::val(1))
+        .cond_where(SearchRepo::new(DbBackend::Sqlite).value_matches(
+            Corpus::PublicAndPii,
+            &tenants,
+            "%nee\\_dle%",
+        ))
+        .build(SqliteQueryBuilder);
+    assert!(
+        sql.contains("json_extract(setting_values.value, '$') LIKE ? ESCAPE '\\'"),
+        "{sql}"
+    );
+    assert_eq!(
+        values.0.last(),
+        Some(&sea_orm::Value::from("%nee\\_dle%".to_owned()))
+    );
+
+    // The JSON-null guard on the Schema Default, per dialect.
+    assert_eq!(
+        super::Dialect::Postgres.not_json_null("setting_declarations.default_value"),
+        "jsonb_typeof(setting_declarations.default_value) <> 'null'"
+    );
+    assert_eq!(
+        super::Dialect::Sqlite.not_json_null("setting_declarations.default_value"),
+        "json_type(setting_declarations.default_value) <> 'null'"
+    );
 }

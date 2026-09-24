@@ -68,7 +68,7 @@ fn a_malformed_key_is_refused_on_the_key_field() {
 fn the_tag_arrives_as_one_string_however_the_client_quoted_it() {
     for raw in ["\"absent\"", "absent", "  \"absent\"  "] {
         assert_eq!(
-            if_match(&headers(header::IF_MATCH, raw)).as_deref(),
+            if_match(&headers(header::IF_MATCH, raw)),
             Some("absent"),
             "{raw}"
         );

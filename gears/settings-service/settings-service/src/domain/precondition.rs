@@ -81,9 +81,7 @@ pub fn evaluate(supplied: Option<&str>, current: &ETag) -> Result<Proceed, Domai
     // make two spellings of one tag and admit a write the caller never based on
     // the state it thinks it read.
     if supplied != current.as_str() {
-        return Err(DomainError::PreconditionFailed {
-            detail: "the resource changed since it was read".to_owned(),
-        });
+        return Err(stale());
     }
     // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-precondition:p1:inst-gf-precond-3
 
@@ -92,6 +90,22 @@ pub fn evaluate(supplied: Option<&str>, current: &ETag) -> Result<Proceed, Domai
         current: current.clone(),
     })
     // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-precondition:p1:inst-gf-precond-4
+}
+
+/// The refusal a write raises when the row it was about to change is no longer
+/// at the version the tag was compared against.
+///
+/// [`evaluate`] compares against a read; the write itself is then filtered on
+/// that same version — `updated_at`, or `last_change_at` for a value — so a
+/// writer whose read went stale between the two changes no row, and gets the
+/// same `412` a stale tag gets, because that is what it is. Without the filter
+/// two writers holding one tag both pass the comparison and the second
+/// silently overwrites the first.
+#[must_use]
+pub fn stale() -> DomainError {
+    DomainError::PreconditionFailed {
+        detail: "the resource changed since it was read".to_owned(),
+    }
 }
 
 /// The header this check reads, named once so the violation and the docs agree.

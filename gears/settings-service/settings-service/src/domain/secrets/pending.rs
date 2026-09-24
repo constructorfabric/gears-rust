@@ -101,6 +101,21 @@ pub trait PendingSecretRepository: Send + Sync {
         id: Uuid,
     ) -> Result<bool, DomainError>;
 
+    /// Consume one row as a claim: gone only if it is still unexpired at
+    /// `now`, in the one statement — the expiry is re-asserted at the moment
+    /// of use, not only at the check before it. `false` when the row is
+    /// absent or past its expiry, and nothing was removed.
+    ///
+    /// # Errors
+    /// [`DomainError::Internal`] when the delete fails.
+    async fn claim<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        id: Uuid,
+        now: OffsetDateTime,
+    ) -> Result<bool, DomainError>;
+
     /// Up to `limit` rows whose `expires_at` lies behind `now`, oldest first.
     ///
     /// # Errors

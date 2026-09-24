@@ -55,6 +55,20 @@ impl AuditOutcome {
 }
 
 /// What kind of mutation a record describes — the table's closed vocabulary.
+///
+/// # Compatibility
+///
+/// The spelling [`Self::as_str`] gives is at once the stored form (the
+/// `operation` column, under its check constraint) and the wire form (the
+/// history response's `operation`). It is **permanent once shipped**: a
+/// reader may have stored it, and a consumer may have matched on it.
+/// **Adding** a variant is compatible — a migration widens the check
+/// constraint, and a reader treats `operation` as an open set of strings,
+/// showing a value it does not know as it is rather than refusing the record.
+/// **Renaming or removing** one is breaking. This service itself never
+/// guesses: a stored value [`Self::parse`] does not know is an integrity
+/// error on the read, not a record with a default operation. The same
+/// contract holds for [`AuditOutcome`] and [`ActorClassification`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditOperation {

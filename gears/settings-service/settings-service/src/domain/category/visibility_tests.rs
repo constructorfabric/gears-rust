@@ -4,7 +4,10 @@
 //! A wrong predicate here is a disclosure bug in one direction and an
 //! invisible-category bug in the other, so both arms are pinned.
 
-use toolkit_security::{AccessScope, EqScopeFilter, InScopeFilter, ScopeConstraint, ScopeFilter};
+use toolkit_security::{
+    AccessScope, EqScopeFilter, InScopeFilter, ScopeConstraint, ScopeFilter, ScopeValue,
+};
+use uuid::Uuid;
 
 use super::{DOMAIN_PROPERTY, DomainVisibility, domain_visibility, is_visible};
 
@@ -83,4 +86,48 @@ fn an_unrestricted_caller_sees_every_domain_and_the_undomained() {
     for domain in [Some("infra"), Some("billing"), None] {
         assert!(is_visible(&DomainVisibility::Unrestricted, domain));
     }
+}
+
+/// A domain constraint whose values are these, whatever their type.
+fn domain_constraint(values: Vec<ScopeValue>) -> AccessScope {
+    AccessScope::single(ScopeConstraint::new(vec![ScopeFilter::In(
+        InScopeFilter::new(DOMAIN_PROPERTY, values),
+    )]))
+}
+
+#[test]
+fn a_domain_constraint_with_no_usable_name_restricts_rather_than_lifting() {
+    // The policy point meant to narrow this caller. A uuid, an integer or a
+    // boolean where a domain name is due is a policy authoring error, and the
+    // narrowing must not evaporate into "every domain": what remains is the
+    // undomained categories, which every scoped caller sees anyway.
+    for scope in [
+        AccessScope::single(ScopeConstraint::new(vec![ScopeFilter::Eq(
+            EqScopeFilter::new(DOMAIN_PROPERTY, Uuid::nil()),
+        )])),
+        domain_constraint(vec![7_i64.into(), true.into()]),
+        domain_constraint(vec![Uuid::nil().into()]),
+    ] {
+        assert_eq!(
+            domain_visibility(&scope),
+            DomainVisibility::Restricted(Vec::new()),
+            "{scope:?}"
+        );
+    }
+}
+
+#[test]
+fn an_unusable_value_beside_a_domain_name_is_dropped_and_the_name_kept() {
+    assert_eq!(
+        domain_visibility(&domain_constraint(vec!["infra".into(), Uuid::nil().into()])),
+        DomainVisibility::Restricted(vec!["infra".to_owned()])
+    );
+}
+
+#[test]
+fn the_empty_restriction_shows_undomained_categories_and_nothing_else() {
+    let none = DomainVisibility::Restricted(Vec::new());
+    assert!(is_visible(&none, None), "the null arm still applies");
+    assert!(!is_visible(&none, Some("infra")));
+    assert!(!is_visible(&none, Some("")));
 }

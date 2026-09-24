@@ -1,5 +1,5 @@
 <!-- Created: 2026-08-10 by Virtuozzo International GmbH -->
-<!-- Updated: 2026-08-10 by Virtuozzo International GmbH -->
+<!-- Updated: 2026-09-24 by Virtuozzo International GmbH -->
 
 # Feature: Setting Declarations and Scope Class
 
@@ -151,7 +151,7 @@ The hardest constraint here is not any single field but the rule connecting them
 10. [x] - `p1` - **IF** any field resolves to the step-up class → require a valid credential step-up assertion - `inst-decl-update-10`
 11. [x] - `p1` - **IF** step-up is required and absent or invalid → **RETURN** `403` - `inst-decl-update-11`
 12. [x] - `p1` - **IF** the request enables `anonymous_exposable` on a declaration whose `data_classification` is `secret` or `pii` → **RETURN** `400`, preserving the database check as the backstop - `inst-decl-update-12`
-13. [x] - `p1` - DB: UPDATE setting_declarations SET {supplied metadata}, `last_change_at` = now(), `updated_at` = now() WHERE id = {id} - `inst-decl-update-13`
+13. [x] - `p1` - DB: UPDATE setting_declarations SET {supplied metadata}, `updated_at` = now(), and `last_change_at` = now() only when a field that changes what a reader is served changed — classification, step-up, anonymous exposure, licence feature, domain affinity; a description or mode edit leaves the definition recency alone — WHERE id = {id} AND `updated_at` = {the version the tag was compared against}; **IF** no row matched → **RETURN** `412`; invalidate the local cache for the key — inside the transaction and again once it commits, as retire does — since the cached effective value carries the declaration's classification and domain affinity - `inst-decl-update-13`
 14. [x] - `p1` - Emit a declaration-updated audit record with pre-image and post-image - `inst-decl-update-14`
 15. [x] - `p1` - **RETURN** `200` with the updated declaration and a refreshed ETag - `inst-decl-update-15`
 
@@ -179,7 +179,7 @@ The hardest constraint here is not any single field but the rule connecting them
 7. [x] - `p1` - **IF** not found → **RETURN** `404` - `inst-decl-retire-7`
 8. [x] - `p1` - **IF** `source` is `module_contributed` → **RETURN** `409 ContributedDeclarationImmutable` - `inst-decl-retire-8`
 9. [x] - `p1` - Evaluate the `If-Match` precondition; **IF** absent → **RETURN** `428`; **IF** stale → **RETURN** `412` - `inst-decl-retire-9`
-10. [x] - `p1` - DB: UPDATE setting_declarations SET `status` = 'retired' WHERE id = {id}, in one transaction with the invalidation below - `inst-decl-retire-10`
+10. [x] - `p1` - DB: UPDATE setting_declarations SET `status` = 'retired' WHERE id = {id} AND `updated_at` = {the version the tag was compared against}, in one transaction with the invalidation below; **IF** no row matched → **RETURN** `412` - `inst-decl-retire-10`
 11. [x] - `p1` - Retain every row in `setting_values` for this declaration; retire never deletes values - `inst-decl-retire-11`
 12. [x] - `p1` - Invalidate the local cache for the affected scopes and publish the cache-invalidation and declaration-retired signals - `inst-decl-retire-12`
 13. [x] - `p1` - Emit a declaration-retired audit record carrying pre-images - `inst-decl-retire-13`
@@ -192,10 +192,11 @@ The hardest constraint here is not any single field but the rule connecting them
 **Actor**: `cpt-cf-settings-service-actor-platform-admin`
 
 **Success Scenarios**:
-- A retired declaration is revived by re-declaring its key, and its retained values resume participating in resolution
+- A retired declaration is revived by re-declaring its key — with the same value type or a different one — and its retained values, re-validated against that type, resume participating in resolution
 
 **Error Scenarios**:
 - Credential step-up absent or invalid
+- The re-declaration names a value type on the other side of the secret boundary, or a different scope class: refused with `409`, because either would move stored values rather than re-interpret them
 - The re-declared key does not match an existing retired row, in which case the request is an ordinary create
 
 **Steps**:
@@ -207,7 +208,7 @@ The hardest constraint here is not any single field but the rule connecting them
 6. [x] - `p1` - **IF** a row exists with `status` = 'active' → **RETURN** `409` for the duplicate key - `inst-decl-react-6`
 7. [x] - `p1` - Require a valid credential step-up assertion, because reactivation changes whether a live setting resolves - `inst-decl-react-7`
 8. [x] - `p1` - **IF** step-up is absent or invalid → **RETURN** `403` - `inst-decl-react-8`
-9. [x] - `p1` - DB: UPDATE setting_declarations SET `status` = 'active' and the re-declared metadata WHERE key = {key} - `inst-decl-react-9`
+9. [x] - `p1` - DB: UPDATE setting_declarations SET `status` = 'active', the re-declared `value_type_id`, Schema Default and metadata WHERE key = {key}; re-validate every retained value against that value type, flagging what no longer validates `needs_review` with its detail and clearing the flag on what validates again - `inst-decl-react-9`
 10. [x] - `p1` - Invalidate the local cache for the affected scopes, since retained values re-enter resolution - `inst-decl-react-10`
 11. [x] - `p1` - Emit a declaration-reactivated audit record - `inst-decl-react-11`
 12. [x] - `p1` - **RETURN** `200` with the revived declaration - `inst-decl-react-12`
@@ -407,7 +408,7 @@ The system **MUST** derive `has_secret_trait` from the value type's resolved tra
 
 - [x] `p1` - **ID**: `cpt-cf-settings-service-dod-setting-declarations-mutation-classes`
 
-The system **MUST** partition declaration changes into descriptive metadata applied immediately under `update` permission plus `If-Match`, behavior-affecting fields rejected as immutable, and behavior-affecting actions gated by credential step-up. `data_classification` tightening **MUST** be immediate while loosening **MUST** require step-up. No declaration edit may change a live setting's effective resolution without a gate, and an unrecognized field **MUST** be treated as immutable rather than immediate.
+The system **MUST** partition declaration changes into descriptive metadata applied immediately under `update` permission plus `If-Match` — the write itself conditional on the version the tag was compared against — behavior-affecting fields rejected as immutable, and behavior-affecting actions gated by credential step-up. `data_classification` tightening **MUST** be immediate while loosening **MUST** require step-up. No declaration edit may change a live setting's effective resolution without a gate, and an unrecognized field **MUST** be treated as immutable rather than immediate. A metadata change **MUST** evict the key's cached effective values, so a reclassification masks on the next read rather than when the cache TTL runs out.
 
 **Implements**:
 - `cpt-cf-settings-service-algo-setting-declarations-mutation-class`
@@ -423,7 +424,7 @@ The system **MUST** partition declaration changes into descriptive metadata appl
 
 - [x] `p1` - **ID**: `cpt-cf-settings-service-dod-setting-declarations-lifecycle`
 
-Retire **MUST** be an immediate soft delete setting `status` to `retired` in one transaction with cache invalidation and signal publication, **MUST** require credential step-up, and **MUST** retain every stored value while excluding the declaration from resolution. Reactivation **MUST** be expressed as re-declaring the key, also step-up gated. Neither action goes through the value write path, and neither deletes values.
+Retire **MUST** be an immediate soft delete setting `status` to `retired` in one transaction with cache invalidation and signal publication, **MUST** require credential step-up, and **MUST** retain every stored value while excluding the declaration from resolution. Reactivation **MUST** be expressed as re-declaring the key, also step-up gated; the re-declaration **MAY** name a different value type, in which case the row adopts it and every retained value is re-validated against it, and it **MUST** be refused when it flips the secret trait or changes the Scope Class. Neither action goes through the value write path, and neither deletes values.
 
 **Implements**:
 - `cpt-cf-settings-service-flow-setting-declarations-retire`
@@ -517,6 +518,7 @@ The system **MUST** emit an audit record through the Audit Emitter for every dec
 - [x] A `PATCH` carrying `default_value`, the value type, or `scope_class` returns `400` and modifies no row
 - [x] A `PATCH` carrying an unrecognized field is rejected rather than silently applied
 - [x] A `PATCH` tightening `data_classification` from `public` to `pii` succeeds without step-up
+- [x] A `PATCH` changing `data_classification` evicts the key from the effective-value cache, and the next read masks by the new class without waiting for the TTL
 - [x] A `PATCH` loosening `data_classification` from `pii` to `public` without step-up returns `403`, and succeeds with a valid step-up assertion
 - [x] A `PATCH` clearing `requires_step_up` or enabling `anonymous_exposable` without step-up returns `403` and leaves the flag unchanged; the opposite edits apply immediately
 - [x] A `PATCH` on a `module_contributed` declaration returns a contributed-immutable conflict
@@ -526,6 +528,8 @@ The system **MUST** emit an audit record through the Audit Emitter for every dec
 - [x] Retiring a declaration invalidates the cache for the affected scopes in the same transaction that flips the status
 - [x] A retired declaration still blocks deletion of its category
 - [x] Re-declaring a retired key with step-up revives the row to `active` and its retained values participate in resolution again
+- [x] Re-declaring a retired key with a different value type revives it under that type: a retained value that validates goes live, one that does not is flagged `needs_review` with its detail
+- [x] Re-declaring a retired key with a type that flips the secret trait, or with a different scope class, returns `409` and leaves the row retired and its values untouched
 - [x] Re-declaring a key that is already `active` returns `409`
 - [ ] A Dependency Group naming a key that resolves to no active declaration returns `400`
 - [ ] An attempt to edit an existing Dependency Group or its constraint in place is rejected

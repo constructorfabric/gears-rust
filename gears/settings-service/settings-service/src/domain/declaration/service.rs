@@ -144,7 +144,9 @@ impl<R: DeclarationRepository> DeclarationService<R> {
     ) -> Result<Page<RenderedDeclaration>, DomainError> {
         crate::domain::odata::reject_unsupported_options(query, "declarations")?;
         let visible = visibility::domain_visibility(scope);
-        let page = self.repo.list(conn, scope, &visible, query).await?;
+        // The declaration surface is the platform administrator's; no tenant
+        // restriction hides a declaration from it, only the domain visibility.
+        let page = self.repo.list(conn, scope, &visible, &[], query).await?;
         Ok(Page {
             items: self.render(page.items).await,
             page_info: page.page_info,

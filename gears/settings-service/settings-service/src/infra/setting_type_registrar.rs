@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use settings_service_sdk::SettingKey;
 use settings_service_sdk::gts::SETTING_TYPE_BASE;
 use toolkit_canonical_errors::CanonicalError;
-use types_registry_sdk::{RegisterResult, TypesRegistryClient};
+use types_registry_sdk::{GtsTypeSchema, RegisterResult, TypesRegistryClient};
 
 use crate::domain::contribution::SettingTypeRegistrar;
 use crate::domain::error::DomainError;
@@ -39,20 +39,53 @@ pub fn setting_type_schema(key: &SettingKey, value_type_id: &str) -> Value {
     })
 }
 
-/// [`SettingTypeRegistrar`] over the types registry client.
-pub struct TypesRegistryRegistrar {
-    types: Arc<dyn TypesRegistryClient>,
+/// The registry as the registrar needs it: register a schema, and read back
+/// the one already there.
+///
+/// A narrower seam than the whole registry client, so the registrar's answer
+/// to "already registered" can be exercised without standing up the registry.
+#[async_trait]
+pub trait TypeSchemaRegistry: Send + Sync {
+    /// Register one type schema; the per-schema outcome as the registry
+    /// reports it.
+    ///
+    /// # Errors
+    /// The registry's own, when the call itself fails.
+    async fn register(&self, schema: Value) -> Result<Vec<RegisterResult>, CanonicalError>;
+
+    /// The schema registered under `type_id`.
+    ///
+    /// # Errors
+    /// The registry's own, including not-found.
+    async fn registered(&self, type_id: &str) -> Result<GtsTypeSchema, CanonicalError>;
 }
 
-impl TypesRegistryRegistrar {
-    /// Register through this client.
-    pub fn new(types: Arc<dyn TypesRegistryClient>) -> Self {
+#[async_trait]
+impl TypeSchemaRegistry for Arc<dyn TypesRegistryClient> {
+    async fn register(&self, schema: Value) -> Result<Vec<RegisterResult>, CanonicalError> {
+        self.register_type_schemas(vec![schema]).await
+    }
+
+    async fn registered(&self, type_id: &str) -> Result<GtsTypeSchema, CanonicalError> {
+        self.get_type_schema(type_id).await
+    }
+}
+
+/// [`SettingTypeRegistrar`] over a [`TypeSchemaRegistry`] — in production,
+/// the types registry client.
+pub struct TypesRegistryRegistrar<R = Arc<dyn TypesRegistryClient>> {
+    types: R,
+}
+
+impl<R: TypeSchemaRegistry> TypesRegistryRegistrar<R> {
+    /// Register through this registry.
+    pub const fn new(types: R) -> Self {
         Self { types }
     }
 }
 
 #[async_trait]
-impl SettingTypeRegistrar for TypesRegistryRegistrar {
+impl<R: TypeSchemaRegistry> SettingTypeRegistrar for TypesRegistryRegistrar<R> {
     async fn register_setting_type(
         &self,
         key: &SettingKey,
@@ -66,7 +99,7 @@ impl SettingTypeRegistrar for TypesRegistryRegistrar {
         // @cpt-begin:cpt-cf-settings-service-algo-module-contributions-type:p1:inst-mc-type-4
         let results = self
             .types
-            .register_type_schemas(vec![schema])
+            .register(schema)
             .await
             .map_err(|e| DomainError::Unavailable {
                 detail: format!("types registry: register_type_schemas: {e}"),
@@ -75,8 +108,12 @@ impl SettingTypeRegistrar for TypesRegistryRegistrar {
             if let RegisterResult::Err { error, .. } = result {
                 return Err(match error {
                     // Idempotent: a retry after a failed insert reuses the type
-                    // rather than minting a second one.
-                    CanonicalError::AlreadyExists { .. } => return Ok(()),
+                    // rather than minting a second one — provided it is the
+                    // same type. A schema that narrows its payload to another
+                    // value type is drift, not a retry.
+                    CanonicalError::AlreadyExists { .. } => {
+                        return self.confirm_same_type(key, value_type_id).await;
+                    }
                     // The base is registered at this gear's init; its absence
                     // means the process is not the one that started.
                     CanonicalError::FailedPrecondition { .. } => DomainError::Unavailable {
@@ -95,6 +132,41 @@ impl SettingTypeRegistrar for TypesRegistryRegistrar {
         // @cpt-end:cpt-cf-settings-service-algo-module-contributions-type:p1:inst-mc-type-4
         // @cpt-end:cpt-cf-settings-service-algo-module-contributions-type:p1:inst-mc-type-3
         // @cpt-end:cpt-cf-settings-service-algo-module-contributions-type:p1:inst-mc-type-2
+    }
+}
+
+impl<R: TypeSchemaRegistry> TypesRegistryRegistrar<R> {
+    /// "Already registered" is success only for the same type: the schema the
+    /// registry holds for `key` has to narrow its payload to `value_type_id`.
+    /// One that names another value type would leave the registered type
+    /// identity and the declaration's value shape disagreeing with no sign —
+    /// a partial failure retried under a changed contribution does exactly
+    /// that — so it is a conflict carrying both sides.
+    async fn confirm_same_type(
+        &self,
+        key: &SettingKey,
+        value_type_id: &str,
+    ) -> Result<(), DomainError> {
+        let held = self.types.registered(&key.to_string()).await.map_err(|e| {
+            DomainError::Unavailable {
+                detail: format!("types registry: get_type_schema after already-exists: {e}"),
+            }
+        })?;
+        let wanted = format!("gts://{value_type_id}");
+        let registered = held
+            .raw_schema
+            .pointer("/properties/payload/$ref")
+            .and_then(Value::as_str);
+        if registered == Some(wanted.as_str()) {
+            return Ok(());
+        }
+        Err(DomainError::Conflict {
+            detail: format!(
+                "the type registered for `{key}` narrows its payload to `{}`, not to `{wanted}`; \
+                 the declaration's value type and its registered type would disagree",
+                registered.unwrap_or("nothing")
+            ),
+        })
     }
 }
 

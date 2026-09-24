@@ -42,6 +42,9 @@ pub struct Category {
     pub icon: Option<String>,
     /// The entity tag derived from the row's last write, used by `If-Match`.
     pub etag: crate::domain::precondition::ETag,
+    /// Row version, which the tag is derived from: what a conditional write is
+    /// filtered on.
+    pub updated_at: time::OffsetDateTime,
 }
 
 /// What a caller may change on an existing category.
@@ -131,26 +134,33 @@ pub trait CategoryRepository: Send + Sync {
 
     /// Update an existing category, returning the refreshed row.
     ///
+    /// The write applies to the row at `expected` — the `updated_at` the
+    /// caller compared the tag against — alone.
+    ///
     /// # Errors
     /// [`DomainError::Conflict`] on a uniqueness collision;
-    /// [`DomainError::NotFound`] when the id no longer exists.
+    /// [`DomainError::PreconditionFailed`] when no row is at that version any
+    /// more, moved or gone.
     async fn update<C: DBRunner>(
         &self,
         conn: &C,
         scope: &AccessScope,
         id: Uuid,
         patch: CategoryPatch,
+        expected: time::OffsetDateTime,
     ) -> Result<Category, DomainError>;
 
-    /// Remove a category.
+    /// Remove a category, at the version the caller compared the tag against.
     ///
     /// # Errors
-    /// [`DomainError::NotFound`] when the id no longer exists.
+    /// [`DomainError::PreconditionFailed`] when no row is at that version any
+    /// more, moved or gone.
     async fn delete<C: DBRunner>(
         &self,
         conn: &C,
         scope: &AccessScope,
         id: Uuid,
+        expected: time::OffsetDateTime,
     ) -> Result<(), DomainError>;
 
     /// List categories, filtered and paginated.

@@ -54,7 +54,7 @@ mod transactional {
     use crate::audit::AuditOperation;
     use crate::domain::category::service::Actor;
     use crate::domain::category::{
-        CategoryDraft, CategoryKey, CategoryRepository, CategoryService,
+        CategoryDraft, CategoryKey, CategoryPatch, CategoryRepository, CategoryService,
     };
     use crate::domain::error::DomainError;
     use crate::infra::storage::audit_store::AuditStore;
@@ -70,6 +70,62 @@ mod transactional {
             sort_order: 0,
             icon: None,
         }
+    }
+
+    #[tokio::test]
+    async fn the_row_write_itself_is_conditional_on_the_version_the_tag_was_compared_against() {
+        let db = sqlite_provider().await;
+        let conn = db.conn().expect("connection");
+        let all = AccessScope::allow_all();
+        let created = CategoryRepo
+            .insert(&conn, &all, draft("network"))
+            .await
+            .expect("inserts");
+        let stale = created.updated_at - time::Duration::seconds(1);
+        let patch = || CategoryPatch {
+            name: "Networking".to_owned(),
+            description: None,
+            domain_affinity: None,
+            sort_order: 0,
+            icon: None,
+        };
+
+        // The comparison ran against a read; a row that moved since finds no
+        // match at the write, and the writer gets the same `412` a stale tag
+        // gets.
+        let refused = CategoryRepo
+            .update(&conn, &all, created.id, patch(), stale)
+            .await
+            .expect_err("moved");
+        assert!(
+            matches!(refused, DomainError::PreconditionFailed { .. }),
+            "{refused:?}"
+        );
+        let refused = CategoryRepo
+            .delete(&conn, &all, created.id, stale)
+            .await
+            .expect_err("moved");
+        assert!(
+            matches!(refused, DomainError::PreconditionFailed { .. }),
+            "{refused:?}"
+        );
+        let kept = CategoryRepo
+            .find(&conn, &all, created.id)
+            .await
+            .expect("lookup")
+            .expect("row");
+        assert_eq!(kept.name, "network", "untouched");
+
+        // At the version read, the write lands and the tag moves with it.
+        let updated = CategoryRepo
+            .update(&conn, &all, created.id, patch(), created.updated_at)
+            .await
+            .expect("current version");
+        assert_ne!(updated.etag, created.etag);
+        CategoryRepo
+            .delete(&conn, &all, updated.id, updated.updated_at)
+            .await
+            .expect("current version");
     }
 
     #[tokio::test]

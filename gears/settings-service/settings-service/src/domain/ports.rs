@@ -3,6 +3,7 @@
 //! infrastructure: the Secret Manager, the Change Publisher and the counters.
 
 use async_trait::async_trait;
+use secrecy::SecretString;
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -14,18 +15,29 @@ use crate::domain::error::DomainError;
 /// plaintext, and no handle resolves.
 #[async_trait]
 pub trait SecretManager: Send + Sync {
-    /// Store `plaintext` for the setting at `tenant`, returning its reference.
+    /// Mint the reference a store for the setting at `tenant` will use, unique
+    /// to that write. Minted apart from the store so the caller can record it
+    /// before the entry exists.
+    fn mint_reference(&self, key: &str, tenant: Uuid) -> String;
+
+    /// Store `plaintext` for the setting at `tenant` under `secret_ref`, a
+    /// reference from [`Self::mint_reference`].
     ///
     /// # Errors
-    /// [`DomainError::Unavailable`] when no store is bound or it cannot answer.
+    /// [`DomainError::Unavailable`] when no store is bound or it cannot answer
+    /// — which does not say whether the entry exists: the caller's record of
+    /// the reference is what reclaims it either way.
     async fn store_secret(
         &self,
         key: &str,
         tenant: Uuid,
+        secret_ref: &str,
         plaintext: &Value,
-    ) -> Result<String, DomainError>;
+    ) -> Result<(), DomainError>;
 
-    /// The plaintext behind `secret_ref`, stored for the setting at `tenant`.
+    /// The plaintext behind `secret_ref`, stored for the setting at `tenant`,
+    /// wrapped as the store hands it over: redacted in `Debug`, zeroed on drop,
+    /// read only through `expose_secret()`.
     ///
     /// # Errors
     /// [`DomainError::NotFound`] on the value when the store holds no entry,
@@ -35,7 +47,7 @@ pub trait SecretManager: Send + Sync {
         key: &str,
         tenant: Uuid,
         secret_ref: &str,
-    ) -> Result<String, DomainError>;
+    ) -> Result<SecretString, DomainError>;
 
     /// Release the entry behind `secret_ref`; an absent entry is already done.
     ///
@@ -56,12 +68,17 @@ const NO_STORE: &str = "secret values are not supported: no Secret Manager is bo
 
 #[async_trait]
 impl SecretManager for NoSecretManager {
+    fn mint_reference(&self, _key: &str, tenant: Uuid) -> String {
+        format!("unbound-{tenant}")
+    }
+
     async fn store_secret(
         &self,
         _key: &str,
         _tenant: Uuid,
+        _secret_ref: &str,
         _plaintext: &Value,
-    ) -> Result<String, DomainError> {
+    ) -> Result<(), DomainError> {
         Err(DomainError::Unavailable {
             detail: NO_STORE.to_owned(),
         })
@@ -72,7 +89,7 @@ impl SecretManager for NoSecretManager {
         _key: &str,
         _tenant: Uuid,
         _secret_ref: &str,
-    ) -> Result<String, DomainError> {
+    ) -> Result<SecretString, DomainError> {
         Err(DomainError::Unavailable {
             detail: NO_STORE.to_owned(),
         })
@@ -166,12 +183,18 @@ pub enum ValueEvent {
     ChangeFailed {
         /// The setting key.
         key: String,
-        /// The scope, as a tenant id.
+        /// The scope, as a tenant id — the one requested, or the caller's own
+        /// when the refusal came before the target was resolved.
         tenant_id: Uuid,
         /// Who tried.
         actor: String,
         /// Why.
         reason: String,
+        /// The change set the attempt belonged to: the batch's, or the single
+        /// write's own — minted before the gate, so a refusal anywhere carries
+        /// it and the whole outcome of one request can be read back from the
+        /// events alone.
+        change_set_id: Uuid,
     },
 }
 

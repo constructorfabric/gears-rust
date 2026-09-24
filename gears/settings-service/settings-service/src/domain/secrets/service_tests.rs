@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use secrecy::{ExposeSecret, SecretString};
 use serde_json::json;
 use settings_service_sdk::SecretHandle;
 use toolkit_security::SecurityContext;
@@ -19,7 +20,8 @@ use crate::infra::storage::access_repo::AccessRepo;
 use crate::infra::storage::declaration_repo::DeclarationRepo;
 use crate::infra::storage::value_repo::ValueRepo;
 use crate::test_support::{
-    AllowAllGate, DenyAllGate, RecordingAudit, RecordingSecrets, ResolutionHarness, SECRET,
+    AllowAllGate, DenyAllGate, FailingSink, RecordingAudit, RecordingSecrets, ResolutionHarness,
+    SECRET,
 };
 
 type Resolver = SecretResolver<DeclarationRepo, ValueRepo, AccessRepo, Arc<RecordingAudit>>;
@@ -69,7 +71,7 @@ impl Harness {
         issue_handle(self.base.key(name).as_str(), &format!("/tenants/{tenant}"))
     }
 
-    async fn resolve(&self, handle: &SecretHandle) -> Result<String, DomainError> {
+    async fn resolve(&self, handle: &SecretHandle) -> Result<SecretString, DomainError> {
         let conn = self.base.db.conn().expect("connection");
         self.resolver.resolve(&conn, &caller(), handle).await
     }
@@ -95,7 +97,7 @@ async fn an_authorized_caller_gets_the_plaintext_and_one_masked_secret_use_recor
         .resolve(&h.handle("api_token", t.b))
         .await
         .expect("resolved");
-    assert_eq!(plaintext, "hunter2");
+    assert_eq!(plaintext.expose_secret(), "hunter2");
 
     let records = h.audit.records.lock().expect("lock");
     assert_eq!(records.len(), 1);
@@ -241,4 +243,42 @@ async fn a_retired_secret_is_retired_not_resolved() {
         .await
         .expect_err("retired");
     assert!(matches!(err, DomainError::Retired { .. }), "{err:?}");
+}
+
+#[tokio::test]
+async fn a_resolution_whose_record_cannot_be_written_yields_no_plaintext() {
+    // The record is what makes a plaintext read accountable: a read that
+    // could not be recorded did not happen, whatever the store had already
+    // answered — the plaintext is fetched and then discarded with the error.
+    let base = ResolutionHarness::new().await;
+    let secrets = Arc::new(RecordingSecrets::default());
+    let resolver = SecretResolver::new(
+        Arc::clone(&base.resolver),
+        Arc::clone(&secrets) as Arc<dyn crate::domain::ports::SecretManager>,
+        Arc::new(AllowAllGate),
+        FailingSink,
+    );
+    let d = base
+        .declare_typed(
+            "api_token",
+            scope_class::CASCADING,
+            json!(""),
+            SECRET,
+            "secret",
+        )
+        .await;
+    let tenant = base.tree.a;
+    secrets.seed("seeded", "hunter2");
+    base.set_secret(d, tenant, "seeded").await;
+    let handle = issue_handle(
+        base.key("api_token").as_str(),
+        &format!("/tenants/{tenant}"),
+    );
+
+    let conn = base.db.conn().expect("connection");
+    let err = resolver
+        .resolve(&conn, &caller(), &handle)
+        .await
+        .expect_err("no record, no plaintext");
+    assert!(matches!(err, DomainError::Unavailable { .. }), "{err:?}");
 }

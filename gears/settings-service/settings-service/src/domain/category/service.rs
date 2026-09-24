@@ -254,7 +254,12 @@ impl<R: CategoryRepository, S: AuditSink> CategoryService<R, S> {
         // @cpt-end:cpt-cf-settings-service-flow-category-management-update:p1:inst-cat-update-8
         // @cpt-end:cpt-cf-settings-service-flow-category-management-update:p1:inst-cat-update-7
 
-        let updated = self.repo.update(conn, scope, id, patch).await?;
+        // At the version the tag was compared against: the repository writes
+        // nothing if the row moved in between, and answers as a stale tag does.
+        let updated = self
+            .repo
+            .update(conn, scope, id, patch, current.updated_at)
+            .await?;
         // @cpt-begin:cpt-cf-settings-service-flow-category-management-update:p1:inst-cat-update-14
         self.record(
             conn,
@@ -323,7 +328,9 @@ impl<R: CategoryRepository, S: AuditSink> CategoryService<R, S> {
         // @cpt-end:cpt-cf-settings-service-algo-category-management-no-orphan-guard:p1:inst-cat-orphan-3
         // @cpt-end:cpt-cf-settings-service-flow-category-management-delete:p1:inst-cat-delete-9
 
-        self.repo.delete(conn, scope, id).await?;
+        self.repo
+            .delete(conn, scope, id, current.updated_at)
+            .await?;
 
         // A delete has no post-image. The pre-image is what makes the trail
         // useful: after the row is gone it is the only record of what was

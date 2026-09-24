@@ -42,8 +42,25 @@ fn image_to_json(image: Option<&AuditValue>) -> Option<serde_json::Value> {
     image.map(|v| serde_json::to_value(v).unwrap_or(serde_json::Value::Null))
 }
 
-fn image_from_json(json: Option<serde_json::Value>) -> Option<AuditValue> {
-    json.and_then(|v| serde_json::from_value(v).ok())
+/// The stored image back into the domain. An absent column is an absent
+/// image; a column that holds something the domain cannot read is an
+/// integrity fault of the record, reported as such — an image is evidence of
+/// what changed, and reading it as "no image" would erase that evidence
+/// without a sign, the same way an unknown operation is refused rather than
+/// guessed.
+fn image_from_json(
+    record: Uuid,
+    which: &str,
+    json: Option<serde_json::Value>,
+) -> Result<Option<AuditValue>, DomainError> {
+    json.map(|v| {
+        serde_json::from_value(v).map_err(|err| DomainError::Internal {
+            diagnostic: format!(
+                "audit record {record} carries a {which} that does not decode: {err}"
+            ),
+        })
+    })
+    .transpose()
 }
 
 fn to_domain(model: audit_record::Model) -> Result<StoredAuditRecord, DomainError> {
@@ -62,8 +79,8 @@ fn to_domain(model: audit_record::Model) -> Result<StoredAuditRecord, DomainErro
         actor: model.actor,
         actor_classification: ActorClassification::parse(&model.actor_classification)
             .ok_or_else(|| corrupt("actor classification", &model.actor_classification))?,
-        pre_image: image_from_json(model.pre_value),
-        post_image: image_from_json(model.post_value),
+        pre_image: image_from_json(model.id, "pre-image", model.pre_value)?,
+        post_image: image_from_json(model.id, "post-image", model.post_value)?,
         outcome: AuditOutcome::parse(&model.outcome)
             .ok_or_else(|| corrupt("outcome", &model.outcome))?,
         request_id: model.request_id,

@@ -16,7 +16,9 @@ use crate::domain::category::{
     Category, CategoryDraft, CategoryKey, CategoryPatch, CategoryRepository,
 };
 use crate::domain::error::DomainError;
+use crate::domain::precondition;
 use crate::domain::precondition::ETag;
+use crate::infra::storage::clock::{now, stamp_after};
 use crate::infra::storage::entity::category::{self, Entity as CategoryEntity};
 use crate::infra::storage::entity::declaration::{self, Entity as DeclarationEntity};
 use crate::infra::storage::odata_mapper::CategoryODataMapper;
@@ -61,6 +63,7 @@ pub(crate) fn to_domain(model: category::Model) -> Result<Category, DomainError>
         sort_order: model.sort_order,
         icon: model.icon,
         etag,
+        updated_at: model.updated_at,
     })
 }
 
@@ -108,10 +111,6 @@ fn map_delete_error(err: &toolkit_db::secure::ScopeError) -> DomainError {
     }
 }
 // @cpt-end:cpt-cf-settings-service-flow-category-management-delete:p1:inst-cat-delete-11
-
-fn now() -> time::OffsetDateTime {
-    time::OffsetDateTime::now_utc()
-}
 
 fn active_from(draft: &CategoryDraft) -> category::ActiveModel {
     category::ActiveModel {
@@ -191,11 +190,15 @@ impl CategoryRepository for CategoryRepo {
         scope: &AccessScope,
         id: Uuid,
         patch: CategoryPatch,
+        expected: time::OffsetDateTime,
     ) -> Result<Category, DomainError> {
         // `update_many` rather than `update`: the secure extension scopes a
         // filtered update, and scoping is the point — an id the caller cannot
-        // see must not become an update they can perform. Filtered to one id,
-        // so it touches at most one row.
+        // see must not become an update they can perform. Filtered to one id
+        // at one version, so it touches at most one row, and only the row the
+        // caller's tag was compared against: a second writer holding the same
+        // tag passes that comparison too, and only this filter stops it from
+        // landing on top of the first.
         // @cpt-begin:cpt-cf-settings-service-flow-category-management-update:p1:inst-cat-update-12
         // @cpt-begin:cpt-cf-settings-service-flow-category-management-update:p1:inst-cat-update-13
         // Uniqueness on `name` is the index's call, surfaced by `map_write_error`
@@ -223,22 +226,20 @@ impl CategoryRepository for CategoryRepo {
             )
             .col_expr(
                 category::Column::UpdatedAt,
-                sea_orm::sea_query::Expr::value(now()),
+                sea_orm::sea_query::Expr::value(stamp_after(Some(expected))),
             )
             .filter(category::Column::Id.eq(id))
+            .filter(category::Column::UpdatedAt.eq(expected))
             .secure()
             .scope_with(scope)
             .exec(conn)
             .await
             .map_err(|err| map_write_error(&err))?;
+        if outcome.rows_affected == 0 {
+            return Err(precondition::stale());
+        }
         // @cpt-end:cpt-cf-settings-service-flow-category-management-update:p1:inst-cat-update-13
         // @cpt-end:cpt-cf-settings-service-flow-category-management-update:p1:inst-cat-update-12
-
-        if outcome.rows_affected == 0 {
-            return Err(DomainError::NotFound {
-                resource: "category",
-            });
-        }
 
         // Re-read so the caller receives the refreshed `updated_at`, and with it
         // the new ETag. Returning the draft instead would hand back a tag that
@@ -255,24 +256,26 @@ impl CategoryRepository for CategoryRepo {
         conn: &C,
         scope: &AccessScope,
         id: Uuid,
+        expected: time::OffsetDateTime,
     ) -> Result<(), DomainError> {
         // @cpt-begin:cpt-cf-settings-service-flow-category-management-delete:p1:inst-cat-delete-10
         // `delete_many` filtered to the id: sea-orm 2 hands back a validated
         // one-row delete from `delete_by_id`, which the secure extension does not
-        // wrap, and scoping is the point of the call.
+        // wrap, and scoping is the point of the call. Filtered to the version
+        // too, so the row deleted is the one the caller's tag was compared
+        // against and not whatever replaced it since.
         let outcome = CategoryEntity::delete_many()
             .filter(category::Column::Id.eq(id))
+            .filter(category::Column::UpdatedAt.eq(expected))
             .secure()
             .scope_with(scope)
             .exec(conn)
             .await
             .map_err(|err| map_delete_error(&err))?;
-        // @cpt-end:cpt-cf-settings-service-flow-category-management-delete:p1:inst-cat-delete-10
         if outcome.rows_affected == 0 {
-            return Err(DomainError::NotFound {
-                resource: "category",
-            });
+            return Err(precondition::stale());
         }
+        // @cpt-end:cpt-cf-settings-service-flow-category-management-delete:p1:inst-cat-delete-10
         Ok(())
     }
 

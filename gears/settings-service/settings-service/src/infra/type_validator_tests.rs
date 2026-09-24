@@ -179,6 +179,59 @@ async fn a_guard_fault_is_reported_alone_before_any_schema_check() {
 }
 
 #[tokio::test]
+async fn a_guard_fault_is_refused_before_the_registry_is_asked() {
+    // Over the byte cap, against a type nobody registered: the cheap guard
+    // answers, and the registry is never consulted for a value it would only
+    // have to refuse afterwards.
+    let v = GtsTypeValidator::new(catalogue());
+    let oversized = json!("x".repeat(crate::domain::validation::guards::MAX_SERIALIZED_BYTES));
+    let result = v
+        .validate_value(
+            "gts.cf.core.settings.type_nobody_registered.v1~",
+            &oversized,
+        )
+        .await
+        .expect("validates");
+    assert_eq!(codes(&result), vec![field::VALUE_TOO_LARGE]);
+    assert_eq!(
+        v.source()
+            .schema_lookups
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the guard decided; the registry was not asked"
+    );
+}
+
+#[tokio::test]
+async fn a_trait_checked_value_holds_at_most_the_leaf_cap_and_is_refused_above_it() {
+    // Under the byte cap and still thousands of strings: the trait check would
+    // compile or look up each one. The count is bounded like the bytes are.
+    let source = catalogue().with_type(
+        "gts.cf.core.settings.type_patterns.v1~",
+        json!({
+            "$id": "gts://gts.cf.core.settings.type_patterns.v1~",
+            "type": "array",
+            "items": { "type": "string" },
+            "x-gts-traits": { "regex": true }
+        }),
+    );
+    let v = GtsTypeValidator::new(source);
+    let over: Vec<&str> = std::iter::repeat_n("a", super::MAX_TRAIT_LEAVES + 1).collect();
+    let result = v
+        .validate_value("gts.cf.core.settings.type_patterns.v1~", &json!(over))
+        .await
+        .expect("validates");
+    assert_eq!(codes(&result), vec![field::VALUE_TOO_MANY_LEAVES]);
+
+    let at: Vec<&str> = std::iter::repeat_n("a", super::MAX_TRAIT_LEAVES).collect();
+    let result = v
+        .validate_value("gts.cf.core.settings.type_patterns.v1~", &json!(at))
+        .await
+        .expect("validates");
+    assert!(result.is_accepted(), "{result:?}");
+}
+
+#[tokio::test]
 async fn a_regex_trait_requires_the_value_to_compile() {
     let v = GtsTypeValidator::new(catalogue());
     let bad = v
@@ -331,24 +384,63 @@ async fn a_cron_dialect_this_service_cannot_check_refuses_the_value() {
 
 #[tokio::test]
 async fn a_dynamic_enum_value_must_be_a_member_of_its_source() {
+    // A member is a registered instance derived from the source: its own id
+    // is looked up, and the members are never listed.
     let v = GtsTypeValidator::new(catalogue());
     let accepted = v
-        .validate_value(REGION_TYPE, &json!("eu-west-1"))
+        .validate_value(REGION_TYPE, &json!(format!("{REGION_SOURCE}eu-west-1")))
         .await
         .expect("validates");
     assert!(accepted.violations.is_empty(), "{accepted:?}");
 
     let refused = v
-        .validate_value(REGION_TYPE, &json!("mars-north-2"))
+        .validate_value(REGION_TYPE, &json!(format!("{REGION_SOURCE}mars-north-2")))
         .await
         .expect("validates");
     assert_eq!(refused.violations.len(), 1);
     assert_eq!(refused.violations[0].code, field::VALUE_NOT_IN_ENUM);
-    // The message names what is on offer, so a client can correct it.
+    // The message names the source, so a client knows where to look.
     assert!(
-        refused.violations[0].message.contains("eu-west-1"),
+        refused.violations[0].message.contains(REGION_SOURCE),
         "{:?}",
         refused.violations[0]
+    );
+
+    // A registered instance of another type is not a member either.
+    let elsewhere = v
+        .validate_value(
+            REGION_TYPE,
+            &json!(format!("{TENANT_TYPE}acme.tenants.root.v1")),
+        )
+        .await
+        .expect("validates");
+    assert_eq!(codes(&elsewhere), vec![field::VALUE_NOT_IN_ENUM]);
+}
+
+#[tokio::test]
+async fn entity_references_are_resolved_in_one_lookup_whatever_their_number() {
+    let v = GtsTypeValidator::new(catalogue().with_type(
+        "gts.cf.core.settings.type_tenant_refs.v1~",
+        json!({
+            "$id": "gts://gts.cf.core.settings.type_tenant_refs.v1~",
+            "type": "array",
+            "items": { "type": "string" },
+            "x-gts-traits": { "entity_reference": TENANT_TYPE }
+        }),
+    ));
+    let known = format!("{TENANT_TYPE}acme.tenants.root.v1");
+    let refs: Vec<&str> = std::iter::repeat_n(known.as_str(), 50).collect();
+    let result = v
+        .validate_value("gts.cf.core.settings.type_tenant_refs.v1~", &json!(refs))
+        .await
+        .expect("validates");
+    assert!(result.is_accepted(), "{result:?}");
+    assert_eq!(
+        v.source()
+            .instance_lookups
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "fifty leaves, one lookup"
     );
 }
 
@@ -391,4 +483,79 @@ async fn every_trait_failure_is_collected_rather_than_only_the_first() {
         .map(|violation| violation.field.as_str())
         .collect();
     assert_eq!(fields, vec!["value/1", "value/2"]);
+}
+
+const MISSPELT_SECRET_TYPE: &str = "gts.cf.core.settings.type_misspelt_secret.v1~";
+
+fn catalogue_with_a_misspelt_secret() -> FakeSource {
+    catalogue().with_type(
+        MISSPELT_SECRET_TYPE,
+        json!({
+            "$id": format!("gts://{MISSPELT_SECRET_TYPE}"),
+            "type": "string",
+            "x-gts-traits": { "secret": "true" }
+        }),
+    )
+}
+
+#[tokio::test]
+async fn trait_resolution_of_a_type_with_a_misspelt_trait_fails_rather_than_defaulting() {
+    // Read as absent, `"secret": "true"` would classify a credential public.
+    let v = GtsTypeValidator::new(catalogue_with_a_misspelt_secret());
+    match v.resolve_traits(MISSPELT_SECRET_TYPE).await {
+        Err(DomainError::Validation {
+            field,
+            code,
+            message,
+        }) => {
+            assert_eq!(field, "value_type_id");
+            assert_eq!(code, field::VALUE_TYPE_MALFORMED);
+            assert!(
+                message.contains("`secret` must be a boolean, found a string"),
+                "{message}"
+            );
+        }
+        other => panic!("expected a validation fault on value_type_id, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_value_of_a_type_with_a_misspelt_trait_is_rejected_not_passed() {
+    let v = GtsTypeValidator::new(catalogue_with_a_misspelt_secret());
+    let result = v
+        .validate_value(MISSPELT_SECRET_TYPE, &json!("hunter2"))
+        .await
+        .expect("the registry answered");
+    assert!(!result.is_accepted());
+    assert_eq!(result.violations.len(), 1, "{result:?}");
+    assert_eq!(result.violations[0].field, "value_type_id");
+    assert_eq!(result.violations[0].code, field::VALUE_TYPE_MALFORMED);
+}
+
+#[tokio::test]
+async fn an_instance_of_a_derived_type_is_not_a_reference_to_the_base_type() {
+    // A type derived from the target spells the target as its prefix, and so
+    // does every instance of it. The prefix is not the boundary: the type the
+    // instance is registered under is, and it has to be the target itself.
+    let derived_instance = format!("{TENANT_TYPE}cf.core.am.derived.v1~acme.tenants.sub.v1");
+    let derived_member = format!("{REGION_SOURCE}cf.core.platform.derived.v1~eu-west-9");
+    let v = GtsTypeValidator::new(
+        catalogue()
+            .with_instance(&derived_instance)
+            .with_instance(&derived_member),
+    );
+
+    let reference = v
+        .validate_value(REF_TYPE, &json!(derived_instance))
+        .await
+        .expect("validates");
+    assert_eq!(codes(&reference), vec![field::VALUE_REFERENCE_UNRESOLVED]);
+
+    // The same boundary for a dynamic enum: a member is an instance of the
+    // source, not of a type that merely starts with it.
+    let member = v
+        .validate_value(REGION_TYPE, &json!(derived_member))
+        .await
+        .expect("validates");
+    assert_eq!(codes(&member), vec![field::VALUE_NOT_IN_ENUM]);
 }

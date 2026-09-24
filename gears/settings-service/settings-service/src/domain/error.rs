@@ -130,6 +130,32 @@ pub enum DomainError {
 }
 
 impl DomainError {
+    /// The error as text that may leave the process.
+    ///
+    /// Every variant renders its own message, except [`Self::Internal`], whose
+    /// `diagnostic` is in-process only: the top-level problem-details path
+    /// strips it, and anything that puts an error into a wire body, an event
+    /// or a log line by hand must strip it too, so it goes through here. The
+    /// diagnostic itself is available to the process via
+    /// [`Self::internal_diagnostic`], to be logged where the error is handled.
+    #[must_use]
+    pub fn wire_message(&self) -> String {
+        match self {
+            Self::Internal { .. } => "internal error".to_owned(),
+            other => other.to_string(),
+        }
+    }
+
+    /// The in-process diagnostic of an internal fault, for the log line the
+    /// handling site writes; `None` for every other variant.
+    #[must_use]
+    pub fn internal_diagnostic(&self) -> Option<&str> {
+        match self {
+            Self::Internal { diagnostic } => Some(diagnostic),
+            _ => None,
+        }
+    }
+
     /// A validation failure that could not be pinned to a single field.
     #[must_use]
     pub fn validation(message: impl Into<String>) -> Self {

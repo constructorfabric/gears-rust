@@ -243,6 +243,14 @@ where
         // @cpt-end:cpt-cf-settings-service-flow-tenant-access-set:p1:inst-ta-set-5
         // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-set:p1:inst-ta-set-6
         let declaration = self.visible_declaration(conn, caller, key).await?;
+        // The row is taken for update for the rest of this transaction. A
+        // value write in flight holds it for share until its commit and
+        // derives the writer's access again once the lock clears, so this
+        // restriction either follows a write that already landed or is what
+        // refuses the write — never a change that a gated write slips past.
+        self.declarations
+            .lock_for_update(conn, &AccessScope::allow_all(), declaration.id)
+            .await?;
         // @cpt-end:cpt-cf-settings-service-flow-tenant-access-set:p1:inst-ta-set-6
         // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-set:p1:inst-ta-set-7
         // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-set:p1:inst-ta-set-8
@@ -268,6 +276,7 @@ where
                     access,
                     set_by: actor.ctx.subject_id().to_string(),
                 },
+                current.as_ref().map(|row| row.updated_at),
             )
             .await?;
         // @cpt-end:cpt-cf-settings-service-flow-tenant-access-set:p1:inst-ta-set-10
@@ -318,6 +327,11 @@ where
         // @cpt-end:cpt-cf-settings-service-flow-tenant-access-clear:p1:inst-ta-clear-3
         // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-clear:p1:inst-ta-clear-4
         let declaration = self.visible_declaration(conn, caller, key).await?;
+        // Lifting a restriction serializes against writes in flight the same
+        // way setting one does; see `set`.
+        self.declarations
+            .lock_for_update(conn, &AccessScope::allow_all(), declaration.id)
+            .await?;
         // @cpt-end:cpt-cf-settings-service-flow-tenant-access-clear:p1:inst-ta-clear-4
         // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-clear:p1:inst-ta-clear-5
         let current = self
@@ -330,7 +344,13 @@ where
         // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-clear:p1:inst-ta-clear-7
         if let Some(previous) = &current {
             self.access
-                .delete(conn, &AccessScope::allow_all(), declaration.id, target)
+                .delete(
+                    conn,
+                    &AccessScope::allow_all(),
+                    declaration.id,
+                    target,
+                    previous.updated_at,
+                )
                 .await?;
             let record = AuditRecord::new(
                 key.as_str(),
@@ -380,7 +400,17 @@ where
         let declaration = self.visible_declaration(conn, caller, key).await?;
         // @cpt-end:cpt-cf-settings-service-flow-tenant-access-list:p1:inst-ta-list-3
         // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-list:p1:inst-ta-list-4
-        let mut tenants = self.hierarchy.descendants(caller).await?;
+        // Under the subtree budget: a listing the budget would cut is refused
+        // with the bound named, never answered partially.
+        let (mut tenants, truncated) = self
+            .hierarchy
+            .descendants_bfs(caller, crate::domain::resolution::SUBTREE_BUDGET)
+            .await?;
+        if truncated {
+            return Err(crate::domain::resolution::subtree_too_large(
+                "tenant", "caller's",
+            ));
+        }
         tenants.push(caller);
         let mut rows = self
             .access

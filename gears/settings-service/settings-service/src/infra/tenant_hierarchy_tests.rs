@@ -53,6 +53,9 @@ struct FakeResolver {
     is_ancestor: bool,
     knows: Knows,
     asked: AtomicUsize,
+    /// The `max_depth` the last descendants request carried; `None` when it
+    /// asked for the whole tree.
+    depth_asked: std::sync::Mutex<Option<u32>>,
 }
 
 fn not_found() -> TenantResolverError {
@@ -136,6 +139,7 @@ impl TenantResolverClient for FakeResolver {
             ),
             "administration stops at a barrier"
         );
+        *self.depth_asked.lock().expect("lock") = options.max_depth;
         if self.knows == Knows::Nothing {
             return Err(not_found());
         }
@@ -263,7 +267,7 @@ async fn a_barrier_is_the_resolvers_self_managed_flag() {
 }
 
 #[tokio::test]
-async fn the_descendants_are_the_flat_set_the_resolver_answers() {
+async fn the_descendants_are_the_set_the_resolver_answers_in_breadth_first_order() {
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
     let parent = Uuid::new_v4();
@@ -272,10 +276,12 @@ async fn the_descendants_are_the_flat_set_the_resolver_answers() {
         ..FakeResolver::default()
     });
 
-    assert_eq!(
-        hierarchy.descendants(parent).await.expect("descendants"),
-        vec![a, b]
-    );
+    let (order, truncated) = hierarchy
+        .descendants_bfs(parent, 100)
+        .await
+        .expect("descendants");
+    assert_eq!(order, vec![a, b]);
+    assert!(!truncated, "well within the budget and the ceiling");
 }
 
 #[tokio::test]
@@ -333,6 +339,48 @@ async fn the_walk_stops_at_its_budget_and_says_so() {
 }
 
 #[tokio::test]
+async fn the_resolver_is_asked_for_a_bounded_depth_and_the_ceiling_marks_truncation() {
+    // The SDK bounds depth, not count: the request carries the ceiling, and a
+    // node found at the ceiling may have children below it, so the walk says
+    // it was cut.
+    let root = Uuid::new_v4();
+    let mut chain = Vec::new();
+    let mut parent = root;
+    for _ in 0..super::SUBTREE_DEPTH_CEILING {
+        let next = Uuid::new_v4();
+        chain.push(tenant_ref(next, Some(parent)));
+        parent = next;
+    }
+    let (hierarchy, resolver) = over(FakeResolver {
+        descendants: chain,
+        ..FakeResolver::default()
+    });
+
+    let (order, truncated) = hierarchy
+        .descendants_bfs(root, 10_000)
+        .await
+        .expect("a walk order");
+    assert_eq!(
+        *resolver.depth_asked.lock().expect("lock"),
+        Some(super::SUBTREE_DEPTH_CEILING),
+        "the request itself is bounded"
+    );
+    assert_eq!(order.len(), super::SUBTREE_DEPTH_CEILING as usize);
+    assert!(truncated, "a node at the ceiling may hide children");
+
+    // A tree shallower than the ceiling is whole, and says so.
+    let (hierarchy, _) = over(FakeResolver {
+        descendants: vec![tenant_ref(Uuid::new_v4(), Some(root))],
+        ..FakeResolver::default()
+    });
+    let (_, truncated) = hierarchy
+        .descendants_bfs(root, 10_000)
+        .await
+        .expect("a walk order");
+    assert!(!truncated);
+}
+
+#[tokio::test]
 async fn a_tenant_the_resolver_does_not_know_is_absent_not_unavailable() {
     // The two are read differently upstream: absence is the caller's problem,
     // unavailability is the platform's.
@@ -360,7 +408,6 @@ async fn an_unwired_resolver_is_unavailable_on_every_question() {
             .await
             .err(),
         hierarchy.is_standalone(tenant).await.err(),
-        hierarchy.descendants(tenant).await.err(),
         hierarchy.descendants_bfs(tenant, 10).await.err(),
     ];
     for refusal in refusals {
@@ -371,4 +418,33 @@ async fn an_unwired_resolver_is_unavailable_on_every_question() {
             other => panic!("expected Unavailable, got {other:?}"),
         }
     }
+}
+
+#[tokio::test]
+async fn a_duplicate_or_cyclic_parent_link_is_walked_once() {
+    // Malformed hierarchy data — a child named under two parents, a pair
+    // naming each other — must not fill the order with repeats up to the
+    // budget: the walk emits distinct tenants, and a cycle is not truncation.
+    let root = Uuid::new_v4();
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    let (hierarchy, _) = over(FakeResolver {
+        descendants: vec![
+            tenant_ref(a, Some(root)),
+            tenant_ref(b, Some(a)),
+            tenant_ref(a, Some(b)),
+            tenant_ref(b, Some(root)),
+        ],
+        ..FakeResolver::default()
+    });
+
+    let (order, truncated) = hierarchy
+        .descendants_bfs(root, 100)
+        .await
+        .expect("descendants");
+    assert_eq!(order, vec![a, b], "each tenant once, nearest level first");
+    assert!(
+        !truncated,
+        "two distinct tenants are well within the budget"
+    );
 }

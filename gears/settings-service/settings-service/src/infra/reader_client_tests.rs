@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use secrecy::ExposeSecret;
 use serde_json::json;
 use settings_service_sdk::api::{BulkSelector, SettingsReaderClient};
 use settings_service_sdk::models::GetEffectiveRequest;
@@ -196,6 +197,41 @@ async fn outcomes_project_to_the_typed_errors_and_never_to_a_default() {
 }
 
 #[tokio::test]
+async fn a_bulk_read_past_the_bound_is_refused_per_key_never_answered_partially() {
+    use settings_service_sdk::api::BULK_LIMIT;
+    let h = ResolutionHarness::new().await;
+    h.declare("one", scope_class::LOCAL, json!(1)).await;
+    let keys = vec![h.key("one"); BULK_LIMIT + 1];
+
+    let outcomes = reader(&h)
+        .get_effective_bulk(
+            &SecurityContext::anonymous(),
+            BulkSelector::Keys(keys),
+            scope_of(h.tree.a),
+        )
+        .await;
+    assert_eq!(outcomes.len(), BULK_LIMIT + 1, "one answer per key, still");
+    assert!(
+        outcomes.iter().all(|o| matches!(
+            o.result,
+            Err(toolkit_canonical_errors::CanonicalError::InvalidArgument { .. })
+        )),
+        "every key carries the refusal, none a value"
+    );
+
+    // At the bound, every key resolves.
+    let keys = vec![h.key("one"); BULK_LIMIT];
+    let outcomes = reader(&h)
+        .get_effective_bulk(
+            &SecurityContext::anonymous(),
+            BulkSelector::Keys(keys),
+            scope_of(h.tree.a),
+        )
+        .await;
+    assert!(outcomes.iter().all(|o| o.result.is_ok()));
+}
+
+#[tokio::test]
 async fn a_bulk_read_answers_every_key_independently() {
     let h = ResolutionHarness::new().await;
     let good = h.declare("good", scope_class::LOCAL, json!(1)).await;
@@ -231,6 +267,63 @@ async fn a_bulk_read_answers_every_key_independently() {
         h.hierarchy.chain_calls(),
         0,
         "local settings never ask for ancestry"
+    );
+}
+
+#[tokio::test]
+async fn a_category_holding_a_row_whose_key_does_not_parse_is_refused_whole_not_shrunk() {
+    use toolkit_security::AccessScope;
+
+    use crate::domain::declaration::{DeclarationDraft, DeclarationRepository};
+    use crate::infra::storage::declaration_repo::DeclarationRepo;
+    use crate::test_support::BOOL;
+
+    let h = ResolutionHarness::new().await;
+    h.declare("good", scope_class::LOCAL, json!(1)).await;
+    // A row no write path produces — the repository takes the key as text.
+    {
+        let conn = h.db.conn().expect("connection");
+        DeclarationRepo
+            .insert(
+                &conn,
+                &AccessScope::allow_all(),
+                DeclarationDraft {
+                    key: "not a key".to_owned(),
+                    leaf_slug: "broken".to_owned(),
+                    value_type_id: BOOL.to_owned(),
+                    category_id: h.category_id(),
+                    default_value: json!(false),
+                    scope_class: scope_class::LOCAL.to_owned(),
+                    mode: "standard".to_owned(),
+                    requires_step_up: false,
+                    anonymous_exposable: false,
+                    domain_affinity: None,
+                    has_secret_trait: false,
+                    data_classification: "public".to_owned(),
+                    source: "admin_authored".to_owned(),
+                    owner_module: None,
+                    licence_feature: None,
+                    description: None,
+                    created_by: "test".to_owned(),
+                },
+            )
+            .await
+            .expect("the row is stored as given");
+    }
+
+    let outcomes = reader(&h)
+        .get_effective_bulk(
+            &SecurityContext::anonymous(),
+            BulkSelector::Category(h.category_id().to_string()),
+            scope_of(h.tree.a),
+        )
+        .await;
+    // Not one outcome short: a category that cannot be enumerated honestly is
+    // refused whole (and logged), never answered as if the broken row were
+    // not filed under it.
+    assert!(
+        outcomes.is_empty(),
+        "refused whole, not shortened by one: {outcomes:?}"
     );
 }
 
@@ -340,7 +433,13 @@ async fn a_secret_setting_reads_as_an_opaque_handle_that_resolves_only_through_t
         )
         .await
         .expect("resolved");
-    assert_eq!(plaintext, "hunter2");
+    assert_eq!(plaintext.expose_secret(), "hunter2");
+    // The SDK hands the plaintext over wrapped: a consumer's `{:?}` shows
+    // nothing, and the bytes are read only where they are meant to be.
+    assert!(
+        !format!("{plaintext:?}").contains("hunter2"),
+        "{plaintext:?}"
+    );
     assert_eq!(audit.operations(), vec!["secret_use"]);
 }
 
@@ -358,4 +457,61 @@ async fn a_malformed_handle_projects_to_an_invalid_argument() {
         SettingsError::from(err),
         SettingsError::Other { .. }
     ));
+}
+
+#[tokio::test]
+async fn a_handle_issued_before_the_secret_was_configured_resolves_to_whatever_is_current() {
+    // A handle encodes the key and the scope, nothing about the credential:
+    // the same handle, kept across configuration and a later change, always
+    // resolves to what is current at that scope.
+    let h = ResolutionHarness::new().await;
+    let (reader, secrets, _audit) = reader_with(&h);
+    let d = h
+        .declare_typed(
+            "api_token",
+            crate::domain::resolution::scope_class::CASCADING,
+            json!(""),
+            SECRET,
+            "secret",
+        )
+        .await;
+    let key = h.key("api_token");
+    let issued = reader
+        .get_effective(
+            &SecurityContext::anonymous(),
+            GetEffectiveRequest {
+                key: key.clone(),
+                scope: scope_of(h.tree.b),
+            },
+        )
+        .await
+        .expect("resolves");
+    let token = issued.value.as_str().expect("a handle string").to_owned();
+    let same_handle = || settings_service_sdk::SecretHandle::new(&token);
+
+    reader
+        .resolve_secret(&SecurityContext::anonymous(), same_handle())
+        .await
+        .expect_err("unconfigured at issue time");
+
+    // Configured at `a` after the handle was issued: the handle for `b`
+    // resolves to the inherited credential.
+    secrets.seed("first", "hunter2");
+    h.set_secret(d, h.tree.a, "first").await;
+    h.cache.invalidate_key(key.as_str());
+    let plaintext = reader
+        .resolve_secret(&SecurityContext::anonymous(), same_handle())
+        .await
+        .expect("resolved");
+    assert_eq!(plaintext.expose_secret(), "hunter2");
+
+    // A closer override appears at `b`: the same handle now resolves to it.
+    secrets.seed("second", "s3cret");
+    h.set_secret(d, h.tree.b, "second").await;
+    h.cache.invalidate_key(key.as_str());
+    let plaintext = reader
+        .resolve_secret(&SecurityContext::anonymous(), same_handle())
+        .await
+        .expect("resolved");
+    assert_eq!(plaintext.expose_secret(), "s3cret");
 }

@@ -210,8 +210,34 @@ pub struct SearchRequest<'a> {
     /// The target and its non-standalone descendants: where an override may
     /// be matched.
     pub tenant_ids: &'a [Uuid],
+    /// The caller's root-to-self chain: a declaration `hidden` on it is left
+    /// out in the page query, so the page comes back full.
+    pub hidden_for: &'a [Uuid],
+    /// The most matching override rows a page fetches; more than that and the
+    /// search is refused rather than cut short of its hits.
+    pub override_limit: usize,
     /// Page size, cursor and the binding the cursor must carry.
     pub query: &'a ODataQuery,
+}
+
+/// The most matching override rows one page fetches. A page of settings is
+/// bounded by `limit`; its override hits were not, and a broad needle over a
+/// wide subtree could return thousands of rows for one page. Past this bound
+/// the search is refused with the bound named: a client lowers `limit`,
+/// narrows the needle or the target.
+pub const SEARCH_OVERRIDE_LIMIT: usize = 1_000;
+
+/// The refusal a page answers when its matching overrides exceed `limit`.
+#[must_use]
+pub fn too_many_hits(limit: usize) -> DomainError {
+    DomainError::Validation {
+        field: "limit".to_owned(),
+        code: crate::field::SEARCH_TOO_MANY_HITS,
+        message: format!(
+            "more than {limit} overrides match on this page; lower `limit`, or narrow `q` or \
+             `tenant`"
+        ),
+    }
 }
 
 /// The port the search runs through. The binding owns the SQL dialect; the
@@ -238,7 +264,9 @@ pub trait SearchRepository: Send + Sync {
 
     /// The overrides of `declaration_ids` set at `tenant_ids` whose text
     /// projection matches `needle`, within `corpus`; never a secret row and
-    /// never a subject-scoped row. Ordered by declaration, then tenant.
+    /// never a subject-scoped row. Ordered by declaration, then tenant, and at
+    /// most `limit + 1` rows — one past the bound, so the caller can tell a
+    /// full answer from a cut one.
     ///
     /// # Errors
     /// [`DomainError::Internal`] when the database fails.
@@ -249,6 +277,7 @@ pub trait SearchRepository: Send + Sync {
         tenant_ids: &[Uuid],
         needle: &Needle,
         corpus: Corpus,
+        limit: usize,
     ) -> Result<Vec<StoredValue>, DomainError>;
 
     /// The categories with these ids, for breadcrumbs.

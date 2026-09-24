@@ -1,5 +1,5 @@
 <!-- Created: 2026-09-17 by Virtuozzo International GmbH -->
-<!-- Updated: 2026-09-17 by Virtuozzo International GmbH -->
+<!-- Updated: 2026-09-23 by Virtuozzo International GmbH -->
 
 # Feature: Search & Discoverability
 
@@ -79,18 +79,19 @@ Search runs over stored rows, not resolved values. An inherited value is a hit a
 - An OData `$filter`, `$orderby` or `$select`, which the resource does not take
 - The target outside the caller's subtree, or a standalone descendant
 - A cursor minted for a different query, target or corpus
+- The target's subtree exceeds the subtree budget, or the page's matching overrides exceed the override bound: refused with the bound named, never answered incomplete
 
 **Steps**:
 1. [x] - `p2` - Actor sends GET /settings-service/v1/search with `q`, optional `tenant`, `limit` and `cursor`; **IF** `q` trimmed is shorter than two characters or longer than two hundred → **RETURN** `400`, since below two characters every row matches and above two hundred a trigram scan stops being cheap - `inst-sd-search-1`
 2. [x] - `p2` - Authorize `read` on the value resource once for the request; its constraints are the secure scope of the declarations query, so a setting the caller may not read is absent from the results and from the count - `inst-sd-search-2`
 3. [x] - `p2` - Confirm the target is the caller's own tenant or a descendant that is not standalone; **IF** not → **RETURN** `403` - `inst-sd-search-3`
-4. [x] - `p2` - Bound the override corpus to the target and its non-standalone descendants, obtained from the tenant resolver: an override the caller could not read is never matched - `inst-sd-search-4`
+4. [x] - `p2` - Bound the override corpus to the target and its non-standalone descendants, obtained from the tenant resolver under the shared subtree budget; **IF** the budget cuts the subtree → **RETURN** `400` naming the bound, since a silently incomplete corpus would hide overrides: an override the caller could not read is never matched - `inst-sd-search-4`
 5. [x] - `p2` - Decide the classification corpus once, before any match: `public`, and `pii` only for a caller holding `read_unmasked` on the value resource; `secret` never - `inst-sd-search-5`
 6. [x] - `p2` - Bind the pagination cursor to the query text, the target and the corpus, so a cursor minted for one search is refused for another - `inst-sd-search-6`
 7. [x] - `p2` - DB: SELECT a page of active declarations, ordered by key, that match on key, description, the name of their category, their Schema Default within the corpus, or an override set at one of the bounded tenants within the corpus; domain visibility and the secure scope apply in the same query - `inst-sd-search-7`
-8. [x] - `p2` - DB: SELECT the overrides of the page's declarations at the bounded tenants whose text projection matches, within the corpus and never a secret row - `inst-sd-search-8`
+8. [x] - `p2` - DB: SELECT the overrides of the page's declarations at the bounded tenants whose text projection matches, within the corpus and never a secret row, one row past the override bound; **IF** more than the bound matched → **RETURN** `400` naming the bound, so a page is never cut short of its hits - `inst-sd-search-8`
 9. [x] - `p2` - Attribute each declaration-level match to the first field that matched — key, description, category name, Schema Default — and emit one hit per matching override naming the tenant and scope where it is set - `inst-sd-search-9`
-10. [x] - `p2` - Exclude every hit whose declaration is `hidden` for the caller, silently, exactly as browse excludes it - `inst-sd-search-10`
+10. [x] - `p2` - Exclude every hit whose declaration is `hidden` for the caller, silently, exactly as browse excludes it — in the page query, on the caller's root-to-self chain, so the page is cut after the exclusion and comes back full - `inst-sd-search-10`
 11. [x] - `p2` - **RETURN** `200` with the flat list — each hit carrying its category, its matched field, its declaration's `mode` as a tag, and, where a value matched, that value masked by classification — and the page cursors - `inst-sd-search-11`
 
 ## 3. Processes / Business Logic (CDSL)
@@ -145,7 +146,7 @@ No stateful entity: search reads and stores nothing.
 
 - [x] `p2` - **ID**: `cpt-cf-settings-service-dod-search-discoverability-surface`
 
-`GET /settings-service/v1/search` **MUST** be served authenticated, take `q`, `tenant`, `limit` and `cursor`, refuse OData options, and answer a cursor-paginated flat list of hits under the same authorization, target, visibility and `hidden` rules as browsing.
+`GET /settings-service/v1/search` **MUST** be served authenticated, take `q`, `tenant`, `limit` and `cursor`, refuse OData options, and answer a cursor-paginated flat list of hits under the same authorization, target, visibility and `hidden` rules as browsing. Both fan-outs **MUST** be bounded — the corpus by the subtree budget, a page by the override bound — and a request past either **MUST** be refused with the bound named rather than answered incomplete.
 
 **Implements**:
 - `cpt-cf-settings-service-flow-search-discoverability-search`
@@ -203,7 +204,8 @@ On PostgreSQL the predicates **MUST** use `ILIKE` over the exact indexed express
 - [x] A `pii` default or override is matched only for a caller holding `read_unmasked`; without it neither a hit nor a count reveals it
 - [x] `%`, `_` and `\` in the needle match literally
 - [x] A retired declaration is not matched
-- [x] A declaration `hidden` for the caller is absent from the results
+- [x] A declaration `hidden` for the caller is absent from the results, and the page is still full: the exclusion happens before the page is cut, not after
+- [x] A search whose target subtree exceeds the subtree budget, or whose page would carry more matching overrides than the override bound, is refused `400` naming the bound
 - [x] `q` of one character, or of two hundred and one, is refused `400` on field `q`
 - [x] `$filter`, `$orderby` or `$select` on the resource is refused `400`
 - [x] A page holds at most `limit` settings, ordered by key, and the cursor continues from the last one; a cursor from a different needle, target or corpus is refused

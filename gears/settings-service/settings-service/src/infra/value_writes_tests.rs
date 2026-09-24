@@ -13,6 +13,7 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use secrecy::SecretString;
 use serde_json::json;
 use time::{Duration, OffsetDateTime};
 use toolkit_security::{AccessScope, SecurityContext};
@@ -36,6 +37,7 @@ use crate::infra::storage::declaration_repo::DeclarationRepo;
 use crate::infra::storage::pending_secret_repo::PendingSecretRepo;
 use crate::infra::storage::value_repo::ValueRepo;
 use crate::infra::type_validator::GtsTypeValidator;
+use crate::infra::value_writes::SWEEP_LIMIT;
 use crate::test_support::{
     BOOL, FixedStepUp, RecordingPublisher, RecordingSecrets, ResolutionHarness, SECRET,
     resolution_catalogue,
@@ -67,6 +69,7 @@ impl Harness {
             crate::infra::storage::audit_store::AuditStore,
             step_up,
             Arc::clone(&secrets) as Arc<dyn crate::domain::ports::SecretManager>,
+            PendingSecretRepo,
             Arc::clone(&published) as Arc<dyn crate::domain::ports::ChangePublisher>,
             Arc::new(NoMetrics),
         ));
@@ -188,6 +191,8 @@ impl Harness {
                     requires_step_up: false,
                     anonymous_exposable: false,
                 },
+                None,
+                true,
             )
             .await
             .expect("metadata");
@@ -280,7 +285,7 @@ fn actor(tenant: Uuid) -> WriteActor {
             .build()
             .expect("context"),
         request_id: "req".to_owned(),
-        step_up_token: Some("token".to_owned()),
+        step_up_token: Some(SecretString::from("token".to_owned())),
     }
 }
 
@@ -453,7 +458,7 @@ fn actor_labelled(tenant: Uuid, subject_type: Option<&str>) -> WriteActor {
     WriteActor {
         ctx: ctx.build().expect("context"),
         request_id: "req".to_owned(),
-        step_up_token: Some("token".to_owned()),
+        step_up_token: Some(SecretString::from("token".to_owned())),
     }
 }
 
@@ -568,6 +573,13 @@ impl CountingStepUp {
     fn verified() -> Arc<Self> {
         Arc::new(Self {
             inner: FixedStepUp::verified(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    fn refusing() -> Arc<Self> {
+        Arc::new(Self {
+            inner: FixedStepUp::refusing(StepUpRefusal::Missing),
             calls: std::sync::atomic::AtomicUsize::new(0),
         })
     }
@@ -1172,6 +1184,132 @@ async fn a_batch_change_naming_the_token_adopts_the_staged_entry_without_a_secon
 }
 
 #[tokio::test]
+async fn a_token_whose_commit_fails_is_still_there_and_still_buys_the_write() {
+    let h = Harness::with_step_up(Arc::new(FixedStepUp::verified())).await;
+    let d = h.declare_secret("api_token").await;
+    let root = h.base.tree.root;
+    let admin = actor(root);
+    let pending = h
+        .stage(&admin, "api_token", None, json!("hunter2"))
+        .await
+        .expect("staged");
+
+    // The batch adopts the token but its commit is refused on the tag. The
+    // row is consumed inside that commit, so a commit that fails leaves it;
+    // and the entry was never this write's to release.
+    let refused = h
+        .coordinator
+        .batch(
+            &admin,
+            vec![BatchChange {
+                key: h.base.key("api_token"),
+                tenant: None,
+                op: None,
+                value: Some(pending_value(&pending)),
+                if_match: Some("stale".to_owned()),
+            }],
+        )
+        .await
+        .expect("the batch runs");
+    let err = refused.results[0].as_ref().expect_err("stale tag");
+    assert!(
+        matches!(err, DomainError::PreconditionFailed { .. }),
+        "{err:?}"
+    );
+    assert!(h.pending(pending.id).await.is_some(), "the token survives");
+    assert_eq!(h.secrets.held(), vec![pending.secret_ref.clone()]);
+    assert!(h.deleted().is_empty(), "the staged entry was not released");
+    assert!(h.rows(d).await.is_empty(), "nothing live changed");
+
+    // The same token, with the right tag: the write lands and the token is spent.
+    let outcome = h
+        .coordinator
+        .batch(
+            &admin,
+            one_change(h.base.key("api_token"), None, pending_value(&pending)),
+        )
+        .await
+        .expect("the batch runs");
+    let committed = outcome.results[0].as_ref().expect("committed");
+    assert_eq!(committed.new_value, Some(json!(pending.secret_ref)));
+    assert!(
+        h.pending(pending.id).await.is_none(),
+        "single-use, once it landed"
+    );
+    assert_eq!(h.secrets.held(), vec![pending.secret_ref.clone()]);
+}
+
+#[tokio::test]
+async fn the_sweep_keeps_a_row_whose_entry_it_could_not_release_and_retries_it() {
+    let h = Harness::new().await;
+    let d = h.declare_secret("api_token").await;
+    let root = h.base.tree.root;
+    let subject = actor(root).subject();
+    let stale = h
+        .insert_pending(
+            d,
+            root,
+            &subject,
+            "stale-ref",
+            OffsetDateTime::now_utc() - Duration::minutes(1),
+        )
+        .await;
+
+    // The store is down: the release fails, and the row stays as the durable
+    // handle on the entry for the next pass.
+    h.secrets.go_down();
+    assert_eq!(h.coordinator.sweep_expired(100).await.expect("sweep"), 0);
+    assert!(h.pending(stale.id).await.is_some(), "kept for the retry");
+    assert_eq!(h.secrets.held(), vec!["stale-ref".to_owned()]);
+
+    // The store is back: the next pass releases the entry, then drops the row.
+    h.secrets
+        .unavailable
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(h.coordinator.sweep_expired(100).await.expect("sweep"), 1);
+    assert!(h.pending(stale.id).await.is_none());
+    assert_eq!(h.deleted(), vec!["stale-ref".to_owned()]);
+    assert!(h.secrets.held().is_empty());
+}
+
+#[tokio::test]
+async fn a_claim_re_asserts_the_expiry_in_the_statement_that_consumes_the_row() {
+    let h = Harness::new().await;
+    let d = h.declare_secret("api_token").await;
+    let root = h.base.tree.root;
+    let subject = actor(root).subject();
+    let now = OffsetDateTime::now_utc();
+    let row = h
+        .insert_pending(d, root, &subject, "ref", now + Duration::seconds(30))
+        .await;
+    let conn = h.base.db.conn().expect("connection");
+    let all = AccessScope::allow_all();
+
+    // Past the expiry the statement matches nothing, and the row stays.
+    assert!(
+        !PendingSecretRepo
+            .claim(&conn, &all, row.id, now + Duration::minutes(1))
+            .await
+            .expect("claim")
+    );
+    assert!(h.pending(row.id).await.is_some());
+
+    // Ahead of it, the claim consumes the row — once.
+    assert!(
+        PendingSecretRepo
+            .claim(&conn, &all, row.id, now)
+            .await
+            .expect("claim")
+    );
+    assert!(
+        !PendingSecretRepo
+            .claim(&conn, &all, row.id, now)
+            .await
+            .expect("claim")
+    );
+}
+
+#[tokio::test]
 async fn a_token_of_another_subject_setting_tenant_or_past_expiry_is_rejected_and_the_row_kept() {
     let h = Harness::with_step_up(Arc::new(FixedStepUp::verified())).await;
     let d = h.declare_secret("api_token").await;
@@ -1246,40 +1384,6 @@ async fn a_token_of_another_subject_setting_tenant_or_past_expiry_is_rejected_an
 }
 
 #[tokio::test]
-async fn a_claimed_token_whose_commit_fails_is_spent_and_its_entry_released() {
-    let h = Harness::with_step_up(Arc::new(FixedStepUp::verified())).await;
-    let d = h.declare_secret("api_token").await;
-    let root = h.base.tree.root;
-    let admin = actor(root);
-    let pending = h
-        .stage(&admin, "api_token", None, json!("hunter2"))
-        .await
-        .expect("staged");
-
-    // A tag no row ever had: the commit is refused after the claim.
-    let outcome = h
-        .coordinator
-        .batch(
-            &admin,
-            vec![BatchChange {
-                key: h.base.key("api_token"),
-                tenant: None,
-                op: None,
-                value: Some(pending_value(&pending)),
-                if_match: Some("moved".to_owned()),
-            }],
-        )
-        .await
-        .expect("the batch runs");
-    let err = outcome.results[0].as_ref().expect_err("refused");
-    assert_eq!(rejection_code(err), "stale", "{err:?}");
-    assert!(h.pending(pending.id).await.is_none(), "consumed on use");
-    assert_eq!(h.deleted(), vec![pending.secret_ref.clone()]);
-    assert!(h.secrets.held().is_empty());
-    assert!(h.rows(d).await.is_empty());
-}
-
-#[tokio::test]
 async fn staging_a_non_secret_declaration_is_refused_and_nothing_is_stored() {
     let h = Harness::new().await;
     h.declare("flag", scope_class::CASCADING).await;
@@ -1298,7 +1402,7 @@ async fn staging_a_non_secret_declaration_is_refused_and_nothing_is_stored() {
 }
 
 #[tokio::test]
-async fn staging_with_the_store_down_is_refused_and_no_row_is_written() {
+async fn staging_with_the_store_down_is_refused_and_leaves_only_the_intent_for_the_sweep() {
     let h = Harness::new().await;
     h.declare_secret("api_token").await;
     let root = h.base.tree.root;
@@ -1310,8 +1414,34 @@ async fn staging_with_the_store_down_is_refused_and_no_row_is_written() {
         matches!(refused, Err(DomainError::Unavailable { .. })),
         "{refused:?}"
     );
-    assert!(h.all_pending().await.is_empty());
+    // A store that cannot answer does not say whether the entry exists, so
+    // the intent row written before the create stays for the sweep; no token
+    // was handed out, nothing live changed, and nothing was recorded.
+    let rows = h.all_pending().await;
+    assert_eq!(rows.len(), 1, "the intent row is the sweep's now");
+    assert!(h.secrets.held().is_empty(), "nothing landed in the store");
     assert!(h.history("api_token").await.is_empty());
+}
+
+#[tokio::test]
+async fn the_sweep_clamps_its_limit_to_the_bound_whoever_calls_it() {
+    let h = Harness::new().await;
+    let d = h.declare_secret("api_token").await;
+    let root = h.base.tree.root;
+    let subject = actor(root).subject();
+    let expired = OffsetDateTime::now_utc() - Duration::minutes(1);
+    let over = usize::try_from(SWEEP_LIMIT).expect("fits") + 1;
+    for i in 0..over {
+        h.insert_pending(d, root, &subject, &format!("ref-{i}"), expired)
+            .await;
+    }
+
+    // A caller asking for ten thousand gets the bound, and the rest waits
+    // for the next pass.
+    let released = h.coordinator.sweep_expired(10_000).await.expect("sweep");
+    assert_eq!(released, usize::try_from(SWEEP_LIMIT).expect("fits"));
+    assert_eq!(h.all_pending().await.len(), 1);
+    assert_eq!(h.coordinator.sweep_expired(10_000).await.expect("sweep"), 1);
 }
 
 #[tokio::test]
@@ -1337,4 +1467,154 @@ async fn the_sweep_releases_expired_stages_with_their_entries_and_keeps_live_one
 
     // Nothing left to sweep, and a second pass says so.
     assert_eq!(h.coordinator.sweep_expired(100).await.expect("sweep"), 0);
+}
+
+/// Two step-up-gated `set`s at tenant `a`, whose effective access consults the
+/// tenant chain — so a transient resolver outage can hit the up-front pass.
+async fn two_gated_sets(h: &Harness) -> (Uuid, Uuid, Vec<BatchChange>) {
+    let one = h
+        .base
+        .declare_typed("one", scope_class::CASCADING, json!(false), BOOL, "public")
+        .await;
+    let two = h
+        .base
+        .declare_typed("two", scope_class::CASCADING, json!(false), BOOL, "public")
+        .await;
+    let changes = ["one", "two"]
+        .into_iter()
+        .map(|name| BatchChange {
+            key: h.base.key(name),
+            tenant: None,
+            op: None,
+            value: Some(json!(true)),
+            if_match: Some("absent".to_owned()),
+        })
+        .collect();
+    (one, two, changes)
+}
+
+#[tokio::test]
+async fn a_transient_failure_before_the_loop_cannot_skip_step_up() {
+    // The up-front pass reads both declarations while the tenant resolver is
+    // briefly down, so it sees no step-up requirement; by the loop the
+    // resolver is back and each gate passes. The requirement must still hold.
+    let verifier = CountingStepUp::refusing();
+    let h = Harness::with_step_up(Arc::clone(&verifier) as Arc<dyn StepUpVerifier>).await;
+    let (one, two, changes) = two_gated_sets(&h).await;
+    h.base.hierarchy.fail_next_chains(2);
+
+    let outcome = h
+        .coordinator
+        .batch(&actor(h.base.tree.a), changes)
+        .await
+        .expect("the batch runs; each entry reports its own refusal");
+
+    assert!(verifier.calls() >= 1, "step-up was never asked");
+    assert!(
+        outcome
+            .results
+            .iter()
+            .all(|r| matches!(r, Err(DomainError::StepUpRequired { .. }))),
+        "{:?}",
+        outcome.results
+    );
+    assert!(h.rows(one).await.is_empty());
+    assert!(h.rows(two).await.is_empty());
+}
+
+#[tokio::test]
+async fn after_a_transient_failure_step_up_is_still_asked_once_per_request() {
+    let verifier = CountingStepUp::verified();
+    let h = Harness::with_step_up(Arc::clone(&verifier) as Arc<dyn StepUpVerifier>).await;
+    let (one, two, changes) = two_gated_sets(&h).await;
+    h.base.hierarchy.fail_next_chains(2);
+
+    let outcome = h
+        .coordinator
+        .batch(&actor(h.base.tree.a), changes)
+        .await
+        .expect("the batch runs");
+
+    assert!(
+        outcome.results.iter().all(Result::is_ok),
+        "{:?}",
+        outcome.results
+    );
+    assert_eq!(
+        verifier.calls(),
+        1,
+        "one successful verification covers the request"
+    );
+    assert_eq!(h.rows(one).await.len(), 1);
+    assert_eq!(h.rows(two).await.len(), 1);
+}
+
+#[tokio::test]
+async fn an_authn_resolver_outage_is_unavailable_not_a_challenge_and_stores_nothing() {
+    // Unavailable says retry; a challenge would send the person to
+    // re-authenticate against a dependency that is down.
+    let h = Harness::with_step_up(Arc::new(FixedStepUp::refusing(StepUpRefusal::Unavailable(
+        "authn resolver down".to_owned(),
+    ))))
+    .await;
+    let (one, two, changes) = two_gated_sets(&h).await;
+
+    let outcome = h.coordinator.batch(&actor(h.base.tree.root), changes).await;
+
+    assert!(
+        matches!(outcome, Err(DomainError::Unavailable { .. })),
+        "{outcome:?}"
+    );
+    assert!(h.rows(one).await.is_empty());
+    assert!(h.rows(two).await.is_empty());
+}
+
+#[tokio::test]
+async fn every_rejected_batch_entry_is_published_under_the_batchs_change_set() {
+    // An operator reading the events back has to see the whole outcome of one
+    // press: the entries that landed and the ones that did not, under one
+    // change set — including an entry refused at the gate, before anything
+    // about it was resolved.
+    let h = Harness::new().await;
+    h.declare("edited", scope_class::CASCADING).await;
+    let root = h.base.tree.root;
+    let nowhere = h.base.key("nowhere");
+    let outcome = h
+        .coordinator
+        .batch(
+            &actor(root),
+            vec![
+                entry(h.base.key("edited"), None, Some(json!(true)), "absent"),
+                entry(nowhere.clone(), None, Some(json!(true)), "absent"),
+            ],
+        )
+        .await
+        .expect("the batch runs");
+    assert!(outcome.results[0].is_ok(), "{:?}", outcome.results[0]);
+    assert!(
+        outcome.results[1].is_err(),
+        "no declaration, refused at the gate"
+    );
+
+    let events = h.published.events.lock().expect("lock");
+    let changed = events.iter().find_map(|e| match e {
+        crate::domain::ports::ValueEvent::Changed { change_set_id, .. } => Some(*change_set_id),
+        _ => None,
+    });
+    let failed = events.iter().find_map(|e| match e {
+        crate::domain::ports::ValueEvent::ChangeFailed {
+            key,
+            tenant_id,
+            change_set_id,
+            ..
+        } if key == nowhere.as_str() => Some((*tenant_id, *change_set_id)),
+        _ => None,
+    });
+    assert_eq!(changed, Some(outcome.change_set_id), "{events:?}");
+    assert_eq!(
+        failed,
+        Some((root, outcome.change_set_id)),
+        "the gate refusal is published under the same change set, at the caller's own scope: \
+         {events:?}"
+    );
 }

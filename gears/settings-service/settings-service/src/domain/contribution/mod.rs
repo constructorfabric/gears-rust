@@ -58,7 +58,9 @@ pub trait SettingTypeRegistrar: Send + Sync {
     /// # Errors
     /// [`DomainError::Unavailable`] when the registry cannot be reached or the
     /// base is absent; [`DomainError::Internal`] on any other refusal. An
-    /// already-registered type is success.
+    /// already-registered type is success when it narrows its payload to the
+    /// same `value_type_id`, and [`DomainError::Conflict`] when it names
+    /// another: the registered identity and the value shape must not drift.
     async fn register_setting_type(
         &self,
         key: &SettingKey,

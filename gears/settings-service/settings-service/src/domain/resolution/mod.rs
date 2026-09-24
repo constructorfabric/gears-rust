@@ -90,10 +90,29 @@ pub fn scope_path(tenant: Uuid, root: Uuid) -> String {
     }
 }
 
+/// The most descendants any administrative walk of a subtree enumerates —
+/// the search corpus, the needs-review browse, the restriction listing, the
+/// eviction on an access change, the impact report: the design's node budget.
+pub const SUBTREE_BUDGET: usize = 5_000;
+
+/// The refusal a surface answers when the subtree it would walk is cut by
+/// [`SUBTREE_BUDGET`]: an incomplete answer is not given silently.
+#[must_use]
+pub fn subtree_too_large(field: &str, whose: &str) -> DomainError {
+    DomainError::Validation {
+        field: field.to_owned(),
+        code: crate::field::SUBTREE_TOO_LARGE,
+        message: format!(
+            "the {whose} subtree exceeds {SUBTREE_BUDGET} tenants; address a smaller subtree"
+        ),
+    }
+}
+
 /// The tenant hierarchy, as the resolver needs it.
 ///
 /// A port over the tenant resolver: ancestry is owned there and is never
-/// reconstructed from stored scope values here.
+/// reconstructed from stored scope values here. Every walk of a subtree it
+/// offers is bounded; there is no unbounded descendants call.
 #[async_trait]
 pub trait TenantHierarchy: Send + Sync {
     /// The ancestor ids of `tenant`, ordered root to self and including both.
@@ -120,13 +139,6 @@ pub trait TenantHierarchy: Send + Sync {
     /// # Errors
     /// As [`Self::chain`].
     async fn is_standalone(&self, tenant: Uuid) -> Result<bool, DomainError>;
-
-    /// The descendants of `tenant`, excluding it, with standalone subtrees
-    /// left out.
-    ///
-    /// # Errors
-    /// As [`Self::chain`].
-    async fn descendants(&self, tenant: Uuid) -> Result<Vec<Uuid>, DomainError>;
 
     /// The descendants of `tenant` in breadth-first order, at most `budget` of
     /// them, standalone subtrees left out; the flag says whether the budget

@@ -8,7 +8,8 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::{
-    render_batch_item, render_committed, render_impact, render_pending, render_validation,
+    BatchChangeRequest, render_batch_item, render_committed, render_impact, render_pending,
+    render_validation,
 };
 use crate::audit::AuditOperation;
 use crate::domain::error::DomainError;
@@ -345,4 +346,36 @@ fn the_report_masks_its_impact_by_the_same_classification_as_its_value() {
         dto.impact.expect("impact").changed[0].current,
         json!(MASK_TOKEN)
     );
+}
+
+#[test]
+fn an_internal_fault_in_a_batch_entry_says_so_and_nothing_more() {
+    // The page is a 200, so this detail never meets the top-level mapper that
+    // strips diagnostics; the renderer has to hold the same line itself.
+    let err = DomainError::Internal {
+        diagnostic: "postgres at 10.0.0.5:5432 refused the connection".to_owned(),
+    };
+    let item = render_batch_item("k", &Err(err), false);
+    assert_eq!(item.error.as_deref(), Some("error"));
+    assert_eq!(item.detail.as_deref(), Some("internal error"));
+}
+
+#[test]
+fn a_batch_entry_tells_an_explicit_null_from_an_omitted_value() {
+    // The single-item write carries `null` as a value; the batch must not
+    // collapse it into "no value" and refuse the `set` for want of one.
+    let explicit: BatchChangeRequest =
+        serde_json::from_str(r#"{ "key": "k", "value": null }"#).expect("deserializes");
+    assert_eq!(
+        explicit
+            .value
+            .as_deref()
+            .map(serde_json::value::RawValue::get),
+        Some("null"),
+        "an explicit null is a value"
+    );
+
+    let omitted: BatchChangeRequest =
+        serde_json::from_str(r#"{ "key": "k" }"#).expect("deserializes");
+    assert!(omitted.value.is_none(), "no field, no value");
 }

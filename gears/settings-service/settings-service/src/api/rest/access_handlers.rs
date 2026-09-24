@@ -15,6 +15,7 @@ use crate::api::authz::{self, resource};
 use crate::api::rest::access_dto::{
     AccessReadDto, RestrictionDto, SetRestrictionRequest, render_readout, render_restriction,
 };
+use crate::api::rest::if_match;
 use crate::api::rest::setting_handlers::TenantParam;
 use crate::domain::access::{AccessActor, AccessReadout, TenantAccess};
 use crate::domain::error::DomainError;
@@ -64,13 +65,6 @@ fn actor(ctx: &SecurityContext, headers: &HeaderMap) -> AccessActor {
         request_id: toolkit::api::error_layer::extract_trace_id(headers)
             .unwrap_or_else(|| Uuid::new_v4().to_string()),
     }
-}
-
-fn if_match(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get(header::IF_MATCH)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.trim().trim_matches('"').to_owned())
 }
 
 fn conn_error(err: &toolkit_db::DbError) -> DomainError {
@@ -148,7 +142,7 @@ pub async fn set_access(
     // @cpt-end:cpt-cf-settings-service-flow-tenant-access-set:p1:inst-ta-set-3
     // @cpt-end:cpt-cf-settings-service-flow-tenant-access-set:p1:inst-ta-set-2
     let actor = actor(&ctx, &headers);
-    let if_match = if_match(&headers);
+    let if_match = if_match(&headers).map(str::to_owned);
     let readout = {
         let service = Arc::clone(&service);
         let actor = actor.clone();
@@ -190,7 +184,7 @@ pub async fn clear_access(
     authz::access_scope(&enforcer, &ctx, &resource::VALUE, DELEGATE, None).await?;
     // @cpt-end:cpt-cf-settings-service-flow-tenant-access-clear:p1:inst-ta-clear-2
     let actor = actor(&ctx, &headers);
-    let if_match = if_match(&headers);
+    let if_match = if_match(&headers).map(str::to_owned);
     let readout = {
         let service = Arc::clone(&service);
         let actor = actor.clone();
@@ -234,6 +228,10 @@ pub async fn list_access(
     let rows = service.list(&conn, &actor(&ctx, &headers), &key).await?;
     // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-list:p1:inst-ta-list-5
     let items: Vec<RestrictionDto> = rows.iter().map(render_restriction).collect();
+    // The whole list in one page, by design: at most one row per descendant
+    // tenant, the subtree walked under the shared budget and refused past it,
+    // so there is nothing to continue from. The `Page` envelope is the
+    // published contract; its cursor is never set here.
     let limit = u64::try_from(items.len()).unwrap_or(u64::MAX).max(1);
     Ok(Json(toolkit_odata::Page {
         items,

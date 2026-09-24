@@ -1,9 +1,14 @@
 // Created: 2026-08-12 by Virtuozzo International GmbH
 //! The gear scaffold and its initialization.
 //!
-//! No `@cpt-dod` marker for `dod-gear-foundation-gear-scaffold` yet: it
-//! also requires the client traits to be registered into `ClientHub`, which
-//! waits on an implementation to register. The marker lands with the tick.
+//! `init` validates the deployment configuration fail-closed, acquires the
+//! database, registers the setting-type base with the types registry, builds
+//! every service, and registers `SettingsReaderClient` and
+//! `SettingsContributionClient` into `ClientHub` for the gears that consume
+//! them. No `@cpt-dod` marker for `dod-gear-foundation-gear-scaffold` yet:
+//! that definition of done also asks for the remaining GTS control-plane
+//! schemas and the category seed at init, which are still open. The marker
+//! lands with the tick.
 
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -24,6 +29,7 @@ use crate::domain::validation::TypeValidator;
 use settings_service_sdk::api::{SettingsContributionClient, SettingsReaderClient};
 
 use crate::config::SettingsServiceConfig;
+use crate::log_text::LogSafe;
 
 /// The Settings Service gear.
 ///
@@ -147,7 +153,10 @@ impl SettingsService {
         {
             Ok(0) => {}
             Ok(released) => info!(released, "expired staged secrets released"),
-            Err(err) => tracing::warn!(%err, "pending-secret sweep failed; retried next tick"),
+            Err(err) => tracing::warn!(
+                err = %LogSafe(&err),
+                "pending-secret sweep failed; retried next tick"
+            ),
         }
         // @cpt-end:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-9
     }
@@ -362,11 +371,33 @@ impl Gear for SettingsService {
         // trait from their own init, so it is bound into the hub here and each
         // caller names `settings-service` in its `deps` to initialize after us.
         // The read path: the local effective-value cache — this gear's
-        // `cache_ttl_seconds` is its knob — the tenant hierarchy port over the
-        // tenant resolver, the resolver over both repositories, and the
-        // in-process reader bound into the hub for every consuming gear.
-        let cache = Arc::new(crate::domain::resolution::EffectiveCache::new(
-            std::time::Duration::from_secs(self.config()?.cache_ttl_seconds),
+        // `cache_ttl_seconds` and `cache_max_entries` are its knobs — the
+        // tenant hierarchy port over the tenant resolver, the resolver over
+        // both repositories, and the in-process reader bound into the hub for
+        // every consuming gear.
+        let config = self.config()?;
+        if config.cache_max_entries == 0 {
+            return Err(anyhow::anyhow!(
+                "cache_max_entries must be at least 1: a cache that holds nothing puts every read \
+                 on the database"
+            ));
+        }
+        // The TTL is the design's ceiling on staleness, not the operator's:
+        // a deployment may shorten the backstop, never widen it, and a zero
+        // would put every read on the database like a cache of no entries.
+        let ttl_ceiling = crate::domain::resolution::EffectiveCache::TTL_CEILING.as_secs();
+        if config.cache_ttl_seconds == 0 || config.cache_ttl_seconds > ttl_ceiling {
+            anyhow::bail!(
+                "{}: cache_ttl_seconds is {} but must be between 1 and {}, the design's backstop \
+                 on how stale a replica may serve after a missed invalidation",
+                Self::MODULE_NAME,
+                config.cache_ttl_seconds,
+                ttl_ceiling
+            );
+        }
+        let cache = Arc::new(crate::domain::resolution::EffectiveCache::bounded(
+            std::time::Duration::from_secs(config.cache_ttl_seconds),
+            config.cache_max_entries,
         ));
         let hierarchy: Arc<dyn crate::domain::resolution::TenantHierarchy> = Arc::new(
             crate::infra::tenant_hierarchy::HubTenantHierarchy::new(ctx.client_hub()),
@@ -427,6 +458,7 @@ impl Gear for SettingsService {
             crate::infra::storage::audit_store::AuditStore,
             step_up,
             Arc::clone(&secrets),
+            crate::infra::storage::pending_secret_repo::PendingSecretRepo,
             Arc::new(crate::infra::write_metrics::LoggingPublisher),
             Arc::new(crate::infra::write_metrics::OtelWriteMetrics::new()),
         ));

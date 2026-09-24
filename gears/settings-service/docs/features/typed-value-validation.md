@@ -1,5 +1,5 @@
 <!-- Created: 2026-08-10 by Virtuozzo International GmbH -->
-<!-- Updated: 2026-08-10 by Virtuozzo International GmbH -->
+<!-- Updated: 2026-09-24 by Virtuozzo International GmbH -->
 
 # Feature: Typed Value Validation
 
@@ -85,18 +85,18 @@ Not applicable. Validation is an internal service invoked by other features rath
 **Output**: A validation result that is either accepted, or a list of field-level errors
 
 **Steps**:
-1. [x] - `p1` - Resolve the type's JSON Schema and its trait annotations through the types registry client - `inst-tvv-val-1`
-2. [x] - `p1` - **IF** the type cannot be resolved → **RETURN** a validation failure rather than accepting the value, so an unresolvable type fails closed - `inst-tvv-val-2`
-3. [x] - `p1` - Invoke the value size and canonicality guards on the candidate - `inst-tvv-val-3`
-4. [x] - `p1` - **IF** a guard rejects the value → **RETURN** its error without attempting schema validation - `inst-tvv-val-4`
+1. [x] - `p1` - Invoke the value size and canonicality guards on the candidate, before the type is resolved: a value the guards refuse costs no registry round trip - `inst-tvv-val-3`
+2. [x] - `p1` - **IF** a guard rejects the value → **RETURN** its error without resolving the type or attempting schema validation - `inst-tvv-val-4`
+3. [x] - `p1` - Resolve the type's JSON Schema and its trait annotations through the types registry client - `inst-tvv-val-1`
+4. [x] - `p1` - **IF** the type cannot be resolved → **RETURN** a validation failure rather than accepting the value, so an unresolvable type fails closed - `inst-tvv-val-2`
 5. [x] - `p1` - Validate the value structurally against the JSON Schema dialect the registry publishes - `inst-tvv-val-5`
 6. [x] - `p1` - Assert every `format` keyword the schema declares, such as URI and IP address forms, as a hard check rather than an annotation - `inst-tvv-val-6`
-7. [x] - `p1` - **FOR EACH** trait-driven rule on the resolved trait set - `inst-tvv-val-7`
+7. [x] - `p1` - **FOR EACH** trait-driven rule on the resolved trait set, over the value's string leaves collected once; **IF** a leaf-bound trait is declared and the value holds more than the leaf cap of strings → **RETURN** a too-many-leaves error before any rule runs, since each leaf costs a parse, a compile or a lookup - `inst-tvv-val-7`
    1. [x] - `p1` - Assert a cron-dialect value parses under its declared dialect - `inst-tvv-val-8`
    2. [x] - `p1` - Assert a regex-bearing value compiles - `inst-tvv-val-9`
-   3. [x] - `p1` - Assert a dynamic-enum value is a member of its declared source - `inst-tvv-val-10`
-   4. [x] - `p1` - Assert an entity reference resolves - `inst-tvv-val-11`
-8. [x] - `p1` - Collect every failure as a field-level error carrying the field path, a stable code, and a message, rather than stopping at the first - `inst-tvv-val-12`
+   3. [x] - `p1` - Assert a dynamic-enum value is a member of its declared source — a registered instance whose registered type is the source itself, looked up by its own id, never by listing the members and never by the id's prefix; a source the deployment does not know refuses the value - `inst-tvv-val-10`
+   4. [x] - `p1` - Assert an entity reference resolves to an instance registered under exactly the target type — an instance of a type derived from it is not one, and the id's prefix is not the boundary — every distinct id of the value in one registry lookup, the same lookup the dynamic-enum check uses - `inst-tvv-val-11`
+8. [x] - `p1` - Collect every failure of the rules that ran as a field-level error carrying the field path, a stable code, and a message, rather than stopping at the first — the guards (steps 1-2) and the leaf cap (step 7) are the two checks that end the run early, by design - `inst-tvv-val-12`
 9. [x] - `p1` - **RETURN** accepted when no error was collected, otherwise the collected errors - `inst-tvv-val-13`
 
 ### Value Size and Canonicality Guards
@@ -126,7 +126,7 @@ Not applicable. Validation is an internal service invoked by other features rath
 **Steps**:
 1. [x] - `p1` - Resolve the type through the types registry client - `inst-tvv-traits-1`
 2. [x] - `p1` - **IF** the type cannot be resolved → **RETURN** a resolution failure; callers treat this as fail-closed rather than as an empty trait set - `inst-tvv-traits-2`
-3. [x] - `p1` - Collect the trait set, including the secret marker, multiline rendering, cron dialect, dynamic-enum source, and entity-reference target - `inst-tvv-traits-3`
+3. [x] - `p1` - Collect the trait set, including the secret marker, multiline rendering, cron dialect, dynamic-enum source, and entity-reference target; a trait that is present but not of its declared type is a resolution failure, never a default, because the secret marker decides whether a value is stored in clear - `inst-tvv-traits-3`
 4. [x] - `p1` - **RETURN** the trait set, which serves two distinct callers: client rendering metadata, and create-time classification in entry 2.3 where the secret marker decides whether values route through the Secret Manager - `inst-tvv-traits-4`
 
 ### Classification Denormalization Sync
@@ -138,7 +138,7 @@ Not applicable. Validation is an internal service invoked by other features rath
 **Output**: Value rows whose denormalized classification matches their declaration
 
 **Steps**:
-1. [x] - `p1` - Copy the declaration's `data_classification` onto every `setting_values` row written for that declaration - `inst-tvv-sync-1`
+1. [x] - `p1` - Copy the declaration's `data_classification` onto every `setting_values` row written for that declaration, read inside the writing transaction rather than carried from the gate, so a classification changed between the two lands on the new row as well - `inst-tvv-sync-1`
 2. [x] - `p1` - **WHEN** a declaration's classification changes → re-sync the denormalized column on every existing value row for that declaration - `inst-tvv-sync-2`
 3. [x] - `p1` - Perform the re-sync in the same transaction as the declaration change, so no window exists in which the two disagree - `inst-tvv-sync-3`
 4. [x] - `p1` - **RETURN** having preserved the table check tying a `secret` classification to the presence of `secret_ref` - `inst-tvv-sync-4`
@@ -180,7 +180,7 @@ The system **MUST** provide a Type Validator resolving GTS types through the typ
 
 - [x] `p1` - **ID**: `cpt-cf-settings-service-dod-typed-value-validation-rules`
 
-The system **MUST** validate a value structurally against the type's JSON Schema, **MUST** assert declared `format` keywords, and **MUST** enforce trait-driven rules — cron dialect parsing, regex compilation, dynamic-enum membership, and entity-reference resolution — as hard checks that reject the value, never as advisory annotations. Failures **MUST** be reported as a field-level array rather than a single first error.
+The system **MUST** validate a value structurally against the type's JSON Schema, **MUST** assert declared `format` keywords, and **MUST** enforce trait-driven rules — cron dialect parsing, regex compilation, dynamic-enum membership, and entity-reference resolution — as hard checks that reject the value, never as advisory annotations. Failures **MUST** be reported as a field-level array rather than a single first error. The guards **MUST** run before the type is resolved, a trait-checked value **MUST** hold at most the leaf cap of strings, and the registry lookups behind dynamic-enum membership and entity references **MUST** be one batch per value over its distinct ids, never one per leaf and never a listing of a source's members.
 
 **Implements**:
 - `cpt-cf-settings-service-algo-typed-value-validation-validate`
@@ -216,7 +216,7 @@ The system **MUST** reject any number, at any nesting depth, that a round trip t
 
 - [x] `p1` - **ID**: `cpt-cf-settings-service-dod-typed-value-validation-traits`
 
-The system **MUST** resolve and expose a type's trait set covering the secret marker, multiline rendering, cron dialect, dynamic-enum source, and entity-reference target, and **MUST** make it available both as rendering metadata on reads and as the create-time input that decides whether a declaration is secret-backed.
+The system **MUST** resolve and expose a type's trait set covering the secret marker, multiline rendering, cron dialect, dynamic-enum source, and entity-reference target, and **MUST** make it available both as rendering metadata on reads and as the create-time input that decides whether a declaration is secret-backed. A trait present with a value of the wrong type **MUST** fail resolution rather than read as absent.
 
 **Implements**:
 - `cpt-cf-settings-service-algo-typed-value-validation-resolve-traits`
@@ -282,7 +282,10 @@ The system **MUST** copy the owning declaration's `data_classification` onto eac
 - [x] A declared `format` keyword such as a URI or IP address form is enforced, and a malformed instance is rejected
 - [x] A cron-dialect value that does not parse under its declared dialect is rejected
 - [x] A regex-bearing value that does not compile is rejected
-- [x] A dynamic-enum value outside its declared source is rejected
+- [x] A dynamic-enum value outside its declared source is rejected, by a lookup of its own id rather than a listing of the members
+- [x] A value the guards refuse is answered without the registry being asked
+- [x] A trait-checked value holding more strings than the leaf cap is refused, and one at the cap is checked
+- [x] Fifty entity references in one value cost one registry lookup
 - [x] An entity reference that does not resolve is rejected
 - [x] A value whose serialized JSON is just under 64 KiB is accepted, and one just over is rejected as too large
 - [x] An integer beyond the double-precision integer range is rejected as not canonical
@@ -291,6 +294,7 @@ The system **MUST** copy the owning declaration's `data_classification` onto eac
 - [x] A GTS type that cannot be resolved causes validation to fail rather than pass vacuously
 - [x] Trait resolution returns the secret marker, and a type carrying it is reported as secret-backed
 - [x] Trait resolution failure is reported as a failure rather than as an empty trait set
+- [x] A trait present with a value of the wrong type fails resolution and refuses the declaration, rather than defaulting to non-secret
 - [x] A `setting_values` row with both `value` and `secret_ref` set is rejected by the exactly-one check
 - [x] A `setting_values` row with neither `value` nor `secret_ref` set is rejected by the same check
 - [x] A setting whose type admits `null` stores JSON `null` in a non-`NULL` column and satisfies the exactly-one check

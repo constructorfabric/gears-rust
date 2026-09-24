@@ -18,8 +18,9 @@
 //! **integer** beyond the range a double represents exactly — the decimal
 //! `0.30000000000000004440892098500626` has become `0.30000000000000004` before
 //! this code sees it. [`check_text`] inspects the JSON **text** instead and sees
-//! every literal as the caller wrote it; the write path runs it on the request
-//! body before parsing, which is what closes that gap.
+//! every literal as the caller wrote it; the write surface runs it on the
+//! value's text before parsing ([`parse_checked`]), which is what closes that
+//! gap.
 
 use serde_json::Value;
 
@@ -31,6 +32,12 @@ pub const MAX_SERIALIZED_BYTES: usize = 64 * 1024;
 
 /// The largest integer a binary64 double represents exactly, `2^53`.
 const MAX_EXACT_INTEGER: u64 = 1 << 53;
+
+/// The widest exponent a literal may carry and still be compared. A double's
+/// own range ends near `1e308` and `5e-324`, so a literal past this bound
+/// cannot round-trip anyway, and normalizing it would pad `|exponent|` zero
+/// bytes for a literal a few bytes long.
+const MAX_EXPONENT_MAGNITUDE: u32 = 1_100;
 
 /// Guard a parsed value: the size cap, then every number at every depth.
 ///
@@ -86,6 +93,20 @@ pub fn check_text(text: &str) -> Result<(), FieldViolation> {
         }
     }
     Ok(())
+}
+
+/// Read a value from its JSON text, guarded: [`check_text`] first, then the
+/// parse, so a literal the guard refuses is never rounded into a value.
+///
+/// # Errors
+/// The guard's fault, or a validation fault for text that is not JSON.
+pub fn parse_checked(text: &str) -> Result<Value, FieldViolation> {
+    check_text(text)?;
+    serde_json::from_str(text).map_err(|e| FieldViolation {
+        field: "value".to_owned(),
+        code: field::VALIDATION,
+        message: format!("value is not valid JSON: {e}"),
+    })
 }
 
 fn check_size(bytes: usize) -> Result<(), FieldViolation> {
@@ -181,6 +202,9 @@ fn normalize_decimal(literal: &str) -> Option<(bool, String, String)> {
         Some(i) => (&rest[..i], rest[i + 1..].parse::<i32>().ok()?),
         None => (rest, 0),
     };
+    if exponent.unsigned_abs() > MAX_EXPONENT_MAGNITUDE {
+        return None;
+    }
     let (int_part, frac_part) = match mantissa.find('.') {
         Some(i) => (&mantissa[..i], &mantissa[i + 1..]),
         None => (mantissa, ""),

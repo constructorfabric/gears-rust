@@ -1,5 +1,5 @@
 <!-- Created: 2026-09-06 by Virtuozzo International GmbH -->
-<!-- Updated: 2026-09-06 by Virtuozzo International GmbH -->
+<!-- Updated: 2026-09-24 by Virtuozzo International GmbH -->
 
 # Feature: Module-Contributed Declarations
 
@@ -149,8 +149,8 @@ The key is the module's own: `gts.cf.core.settings.setting_type.v1~<vendor>.<pac
 3. [x] - `p1` - **IF** no declaration exists on the stripped path → invoke setting type registration, then DB: INSERT the row with `source = module_contributed`, the `owner_module`, `status = active`, the classification, `requires_step_up` as supplied or `true`, and `anonymous_exposable` as supplied or `false`, refusing the latter on `secret` or `pii`; **RETURN** registered - `inst-mc-rec-3`
 4. [x] - `p1` - **IF** a declaration exists at the same major **AND** its `value_type_id` differs → **RETURN** refused as `ValueTypeChanged`, whatever its status: a retype is a new major, and this path runs with nobody watching - `inst-mc-rec-4`
 5. [x] - `p1` - **IF** a declaration exists at the same major **AND** is active → DB: UPDATE its descriptive metadata and classification in place, preserving every administrator-set value; **IF** the classification changed → re-sync the denormalized copy on the setting's value rows in the same transaction; **RETURN** updated - `inst-mc-rec-5`
-6. [x] - `p1` - **IF** a declaration exists at the same major **AND** is retired → DB: UPDATE status = 'active' and its metadata, re-validate every retained value against the type and flag what fails with `needs_review` and its detail, evict the cache, and **RETURN** reactivated - `inst-mc-rec-6`
-7. [x] - `p1` - **IF** the contributed major is higher than the highest stored → invoke the upgrade migration and **RETURN** registered - `inst-mc-rec-7`
+6. [x] - `p1` - **IF** a declaration exists at the same major **AND** is retired → DB: UPDATE status = 'active' and its metadata, re-validate every retained value against the type and flag what fails with `needs_review` and its detail — a row the flag no longer reaches fails the reconcile rather than being reported flagged — evict the cache, and **RETURN** reactivated - `inst-mc-rec-6`
+7. [x] - `p1` - **IF** the contributed major is higher than the highest stored → **IF** the active predecessor on the path is owned by another module, or by an administrator → **RETURN** refused `not_owner`, since the upgrade would retire that row and take over the path; otherwise invoke the upgrade migration and **RETURN** registered - `inst-mc-rec-7`
 8. [x] - `p1` - **IF** the contributed major is lower than the active one → **RETURN** refused; a gear does not roll a setting back by re-registering an older major - `inst-mc-rec-8`
 
 ### Upgrade Migration to a New Major
@@ -164,7 +164,7 @@ The key is the module's own: `gts.cf.core.settings.setting_type.v1~<vendor>.<pac
 **Steps**:
 1. [x] - `p1` - DB: UPDATE the predecessor SET status = 'retired', its values retained, so exactly one major on the path is active — and first, because the two majors share a leaf name in one category and `uq_declaration_category_slug` admits one active row for that pair; the whole migration is one transaction, so nothing outside it observes the moment the path has no active major - `inst-mc-up-1`
 2. [x] - `p1` - Invoke setting type registration for the successor's key, then DB: INSERT the successor row, its default validated against its own value type - `inst-mc-up-2`
-3. [x] - `p1` - **FOR EACH** value row of the predecessor → copy it to the successor at the same scope; validate the copy against the successor's value type; **IF** it fails → insert it flagged `needs_review` with the validator's detail, excluded from resolution until an administrator corrects it, never coerced - `inst-mc-up-3`
+3. [x] - `p1` - **FOR EACH** value row of the predecessor, read under an update lock so the copy is of the latest committed rows and a write gated while the predecessor was active is either copied or, waiting on the retirement, refused → copy it to the successor at the same scope; validate the copy against the successor's value type; **IF** it fails → insert it flagged `needs_review` with the validator's detail, excluded from resolution until an administrator corrects it, never coerced - `inst-mc-up-3`
 4. [x] - `p1` - Commit the successor, the copies and the retirement in one transaction with the audit records, so a failure leaves the predecessor active and untouched - `inst-mc-up-4`
 5. [x] - `p1` - Evict the cache for both keys at every scope; succession stays derivable from the keys alone — the same stripped path, the highest major below — and no pointer is stored - `inst-mc-up-5`
 6. [x] - `p1` - **RETURN** with the successor active; readers of the old key receive the distinct retired outcome and drop the dependency - `inst-mc-up-6`
@@ -180,7 +180,7 @@ The key is the module's own: `gts.cf.core.settings.setting_type.v1~<vendor>.<pac
 **Steps**:
 1. [x] - `p1` - Compose the setting's type schema: identified by the key, deriving from the abstract `gts.cf.core.settings.setting_type.v1~` base this gear registered at init, and composed with the value type the declaration names — carrying **no** `default`, since the Schema Default lives in `default_value` alone - `inst-mc-type-1`
 2. [x] - `p1` - Call the types registry's type-schema registration before the row is inserted; **IF** the registry reports the base absent → **RETURN** unavailable, since the base is registered at this gear's init and its absence means the gear is not the one that started - `inst-mc-type-2`
-3. [x] - `p1` - **IF** the type is already registered → treat it as success: registration is idempotent, so a retry after a failed insert reuses the type rather than minting a second one, and a type with no declaration resolves but names nothing - `inst-mc-type-3`
+3. [x] - `p1` - **IF** the type is already registered → read the registered schema back; **IF** its payload names the same value type → treat it as success: registration is idempotent, so a retry after a failed insert reuses the type rather than minting a second one, and a type with no declaration resolves but names nothing; **IF** it names another value type → **RETURN** conflict carrying both, since the registered identity and the declaration's value shape must not drift; **IF** the schema cannot be read back → **RETURN** unavailable - `inst-mc-type-3`
 4. [x] - `p1` - **RETURN** registered; a later retirement of the declaration leaves the type in place - `inst-mc-type-4`
 
 ## 4. States (CDSL)
@@ -253,7 +253,7 @@ Matched by version-stripped path, the reconciler **MUST** insert a new setting w
 
 - [x] `p1` - **ID**: `cpt-cf-settings-service-dod-module-contributions-upgrade`
 
-A higher major on the same path **MUST** insert the successor, copy every predecessor value to it and re-validate each copy against the successor's value type, flag a failing copy `needs_review` with its detail rather than coerce it, retire the predecessor so exactly one major is active, and commit all of it in one transaction. Succession **MUST** be derived from the keys and never stored.
+A higher major on the same path **MUST** insert the successor, copy every predecessor value to it and re-validate each copy against the successor's value type, flag a failing copy `needs_review` with its detail rather than coerce it, retire the predecessor so exactly one major is active, and commit all of it in one transaction. It **MUST** refuse, with `not_owner` and nothing written, when the active predecessor is not the caller's: the migration retires that row and re-registers the path under the caller's name, which is a takeover unless the caller already owns it. Succession **MUST** be derived from the keys and never stored.
 
 **Implements**:
 - `cpt-cf-settings-service-algo-module-contributions-upgrade`

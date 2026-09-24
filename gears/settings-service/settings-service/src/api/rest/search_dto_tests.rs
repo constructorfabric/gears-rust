@@ -56,6 +56,7 @@ fn category() -> Arc<Category> {
         sort_order: 0,
         icon: None,
         etag: crate::domain::precondition::ETag::new("1"),
+        updated_at: time::OffsetDateTime::UNIX_EPOCH,
     })
 }
 

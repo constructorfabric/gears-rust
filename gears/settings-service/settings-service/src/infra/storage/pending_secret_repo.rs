@@ -89,6 +89,24 @@ impl PendingSecretRepository for PendingSecretRepo {
         Ok(outcome.rows_affected > 0)
     }
 
+    async fn claim<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        id: Uuid,
+        now: OffsetDateTime,
+    ) -> Result<bool, DomainError> {
+        let outcome = PendingEntity::delete_many()
+            .filter(pending_secret::Column::Id.eq(id))
+            .filter(pending_secret::Column::ExpiresAt.gt(now))
+            .secure()
+            .scope_with(scope)
+            .exec(conn)
+            .await
+            .map_err(db_error)?;
+        Ok(outcome.rows_affected > 0)
+    }
+
     async fn list_expired<C: DBRunner>(
         &self,
         conn: &C,

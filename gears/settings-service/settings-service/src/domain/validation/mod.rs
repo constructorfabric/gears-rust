@@ -35,8 +35,14 @@ pub struct FieldViolation {
     pub message: String,
 }
 
-/// The outcome of validating a value against a type: accepted, or every fault
-/// that was found rather than only the first.
+/// The outcome of validating a value against a type: accepted, or the faults
+/// that were found — every fault of the rules that ran, not only the first.
+///
+/// Two checks end the run early, by design. The guards (the byte cap, the
+/// canonical-number rule) refuse alone, before the type is even resolved: a
+/// value that could not be cached or audited has no shape worth checking.
+/// And a value past the leaf cap is answered with the faults found so far,
+/// the leaf-bound trait rules not run.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ValidationResult {
     /// Empty when the value was accepted.
@@ -103,21 +109,80 @@ pub struct TraitSet {
     pub raw: Value,
 }
 
+/// A trait that is present on a type but not of the type the vocabulary gives
+/// it — `"secret": "true"` where a boolean is due.
+///
+/// Distinct from an absent trait, which reads as `false` or `None`. A type that
+/// spells a trait wrongly must not be read as if it had left it out: `secret`
+/// decides whether a value is stored in clear, and a misspelt `true` would
+/// store a credential as public data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MalformedTrait {
+    /// The trait's name in `x-gts-traits`.
+    pub name: &'static str,
+    /// What the vocabulary expects there.
+    pub expected: &'static str,
+    /// The JSON type found instead.
+    pub found: &'static str,
+}
+
+impl std::fmt::Display for MalformedTrait {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "trait `{}` must be {}, found {}",
+            self.name, self.expected, self.found
+        )
+    }
+}
+
+impl std::error::Error for MalformedTrait {}
+
 impl TraitSet {
     /// Read the interpreted traits off a merged `x-gts-traits` object.
-    #[must_use]
-    pub fn from_traits(raw: Value) -> Self {
-        let flag = |name: &str| raw.get(name).and_then(Value::as_bool).unwrap_or(false);
-        let text = |name: &str| raw.get(name).and_then(Value::as_str).map(ToOwned::to_owned);
-        Self {
-            secret: flag("secret"),
-            multiline: flag("multiline"),
-            cron_dialect: text("cron_dialect"),
-            dynamic_enum_source: text("dynamic_enum_source"),
-            entity_reference: text("entity_reference"),
-            regex: flag("regex"),
-            raw,
+    ///
+    /// # Errors
+    /// [`MalformedTrait`] for a trait that is present but not of its type. An
+    /// absent trait is `false` or `None`, never an error: an empty object is a
+    /// real answer.
+    pub fn from_traits(raw: Value) -> Result<Self, MalformedTrait> {
+        fn kind(value: &Value) -> &'static str {
+            match value {
+                Value::Null => "null",
+                Value::Bool(_) => "a boolean",
+                Value::Number(_) => "a number",
+                Value::String(_) => "a string",
+                Value::Array(_) => "an array",
+                Value::Object(_) => "an object",
+            }
         }
+        let flag = |name: &'static str| match raw.get(name) {
+            None => Ok(false),
+            Some(Value::Bool(b)) => Ok(*b),
+            Some(other) => Err(MalformedTrait {
+                name,
+                expected: "a boolean",
+                found: kind(other),
+            }),
+        };
+        let text = |name: &'static str| match raw.get(name) {
+            None => Ok(None),
+            Some(Value::String(s)) => Ok(Some(s.clone())),
+            Some(other) => Err(MalformedTrait {
+                name,
+                expected: "a string",
+                found: kind(other),
+            }),
+        };
+        Ok(Self {
+            secret: flag("secret")?,
+            multiline: flag("multiline")?,
+            cron_dialect: text("cron_dialect")?,
+            dynamic_enum_source: text("dynamic_enum_source")?,
+            entity_reference: text("entity_reference")?,
+            regex: flag("regex")?,
+            raw,
+        })
     }
 }
 
@@ -126,7 +191,9 @@ impl TraitSet {
 pub trait TypeValidator: Send + Sync {
     /// Validate `value` against the type `value_type_id` names.
     ///
-    /// Every rule is a hard check and every fault is collected. A type that
+    /// Every rule is a hard check, and every fault of the rules that ran is
+    /// collected; the guards refuse alone and first, and the leaf cap ends the
+    /// rules with what was found (see [`ValidationResult`]). A type that
     /// cannot be resolved is a rejection, never an acceptance.
     ///
     /// # Errors

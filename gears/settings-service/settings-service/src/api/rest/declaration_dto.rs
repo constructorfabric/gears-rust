@@ -75,7 +75,9 @@ pub struct DeclarationDto {
 }
 
 /// The declaration's state tag: its normalized UTC `updated_at`, as every
-/// other tag in this service.
+/// other tag in this service — minted at microsecond precision, what the
+/// store keeps, and strictly after the version a conditional write replaced
+/// (see [`crate::infra::storage::clock`]).
 #[must_use]
 pub fn declaration_etag(declaration: &crate::domain::declaration::Declaration) -> String {
     declaration.updated_at.unix_timestamp_nanos().to_string()

@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use authn_resolver_sdk::AuthNResolverClient;
+use authn_resolver_sdk::AuthNResolverError;
 use serde_json::Value;
 use toolkit::ClientHub;
 
@@ -60,7 +61,11 @@ impl AuthnStepUpVerifier {
     /// From the gear's configuration.
     ///
     /// # Errors
-    /// When the window exceeds five minutes.
+    /// When the window exceeds five minutes; when a pinned `issuer` or
+    /// `audience` is blank, or an `acr_values` / `amr_values` entry is blank
+    /// or padded with whitespace — a pin no token can carry would refuse every
+    /// step-up-gated write at runtime with no sign at boot, and an entry no
+    /// claim can equal is silently useless, so both are caught here.
     pub fn from_config(hub: Arc<ClientHub>, config: &StepUpConfig) -> anyhow::Result<Self> {
         let max_age = Duration::from_secs(config.max_age_seconds);
         if max_age > StepUpRequirement::MAX_AGE_CEILING {
@@ -69,6 +74,31 @@ impl AuthnStepUpVerifier {
                 config.max_age_seconds,
                 StepUpRequirement::MAX_AGE_CEILING.as_secs()
             );
+        }
+        for (field, pinned) in [
+            ("step_up.issuer", config.issuer.as_deref()),
+            ("step_up.audience", config.audience.as_deref()),
+        ] {
+            if pinned.is_some_and(|p| p.trim().is_empty()) {
+                anyhow::bail!(
+                    "{field} is blank: a pin no token can carry would refuse every step-up-gated \
+                     write; pin a value or leave the field out"
+                );
+            }
+        }
+        for (field, values) in [
+            ("step_up.acr_values", &config.acr_values),
+            ("step_up.amr_values", &config.amr_values),
+        ] {
+            if let Some(entry) = values
+                .iter()
+                .find(|v| v.trim().is_empty() || v.trim() != *v)
+            {
+                anyhow::bail!(
+                    "{field} holds the entry `{entry}`, which no claim can equal: entries are \
+                     compared exactly, so each must be non-blank and carry no surrounding whitespace"
+                );
+            }
         }
         Ok(Self::new(
             hub,
@@ -150,7 +180,20 @@ impl StepUpVerifier for AuthnStepUpVerifier {
             .resolver()?
             .authenticate(token)
             .await
-            .map_err(|e| StepUpRefusal::Signature(e.to_string()))?;
+            .map_err(|e| match e {
+                // The resolver looked at the token and said no.
+                AuthNResolverError::Unauthorized(detail) => StepUpRefusal::Signature(detail),
+                // The resolver could not look. That is an outage of the
+                // platform's AuthN, not a verdict on the token; a challenge
+                // here would send the person to re-authenticate against a
+                // dependency that is down.
+                outage @ (AuthNResolverError::NoPluginAvailable
+                | AuthNResolverError::ServiceUnavailable(_)
+                | AuthNResolverError::TokenAcquisitionFailed(_)
+                | AuthNResolverError::Internal(_)) => {
+                    StepUpRefusal::Unavailable(outage.to_string())
+                }
+            })?;
         // The resolver vouched for the signature over exactly these bytes, so
         // the payload may now be read for what a `SecurityContext` does not
         // carry. Not a JWT, or not readable: no claim it names is present.

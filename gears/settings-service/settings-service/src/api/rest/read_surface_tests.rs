@@ -57,6 +57,121 @@ async fn a_hidden_setting_is_absent_from_the_browse_page() {
 }
 
 #[tokio::test]
+async fn a_page_is_cut_after_the_hidden_exclusion_so_it_comes_back_full() {
+    // Four settings, one hidden from `a`. A page of two must hold two of the
+    // visible ones and point at the third — not come back short, which would
+    // tell the caller something sits in the gap. By key: alpha, beta (hidden),
+    // delta, gamma — all under one `px_` prefix the search can ask for.
+    let h = RestHarness::new().await;
+    for name in ["px_alpha", "px_gamma", "px_delta"] {
+        h.inner.declare(name, "cascading", json!(true)).await;
+    }
+    let concealed = h.inner.declare("px_beta", "cascading", json!(true)).await;
+    h.restrict(concealed, h.inner.tree.a, TenantAccess::Hidden)
+        .await;
+
+    let (status, body) = h
+        .get("/settings-service/v1/settings?limit=2", h.inner.tree.a)
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let slugs: Vec<&str> = body["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .filter_map(|i| i["key"].as_str())
+        .filter_map(|k| k.rsplit('.').nth(1))
+        .collect();
+    assert_eq!(
+        slugs,
+        vec!["px_alpha", "px_delta"],
+        "full page, hidden one skipped"
+    );
+    let cursor = body["page_info"]["next_cursor"]
+        .as_str()
+        .expect("the third visible setting is on the next page: {body}")
+        .to_owned();
+
+    let (status, body) = h
+        .get(
+            &format!("/settings-service/v1/settings?limit=2&cursor={cursor}"),
+            h.inner.tree.a,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let slugs: Vec<&str> = body["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .filter_map(|i| i["key"].as_str())
+        .filter_map(|k| k.rsplit('.').nth(1))
+        .collect();
+    assert_eq!(
+        slugs,
+        vec!["px_gamma"],
+        "the rest, hidden one still skipped"
+    );
+
+    // Search pages the same way.
+    let (status, body) = h
+        .get("/settings-service/v1/search?q=px_&limit=2", h.inner.tree.a)
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let hits: Vec<&str> = body["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .filter_map(|i| i["leaf_slug"].as_str())
+        .collect();
+    assert_eq!(
+        hits,
+        vec!["px_alpha", "px_delta"],
+        "full page of hits, hidden one skipped"
+    );
+}
+
+#[tokio::test]
+async fn a_subtree_past_the_budget_is_refused_by_search_and_the_needs_review_browse() {
+    // The corpus of overrides is the target's subtree. A subtree the budget
+    // cuts would make the answer silently incomplete, so the surface refuses
+    // and names the bound instead.
+    let h = RestHarness::new().await;
+    h.inner.declare("proxy", "cascading", json!(true)).await;
+    h.inner
+        .hierarchy
+        .truncate_subtrees
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let (status, body) = h
+        .get("/settings-service/v1/search?q=proxy", h.inner.tree.root)
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(
+        body["context"]["field_violations"][0]["reason"],
+        json!("subtree_too_large"),
+        "{body}"
+    );
+
+    let (status, body) = h
+        .get(
+            "/settings-service/v1/settings?$filter=needs_review%20eq%20true",
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(
+        body["context"]["field_violations"][0]["reason"],
+        json!("subtree_too_large"),
+        "{body}"
+    );
+
+    // The plain browse never walks the subtree and is untouched.
+    let (status, _) = h
+        .get("/settings-service/v1/settings", h.inner.tree.root)
+        .await;
+    assert_eq!(status, 200);
+}
+
+#[tokio::test]
 async fn a_hidden_setting_reads_as_absent_rather_than_forbidden() {
     // 404, never 403: a distinct denial would confirm that a setting the
     // caller may not see exists.
@@ -178,6 +293,53 @@ async fn browse_refuses_a_filter_on_a_field_it_does_not_map() {
         status, 400,
         "an unmapped field is refused, never silently ignored"
     );
+}
+
+#[tokio::test]
+async fn browse_refuses_the_filter_operators_it_does_not_take_and_serves_the_ones_it_does() {
+    // The generated `$filter` parameter text lists every operator the parser
+    // knows for a field's kind; this handler takes a narrower, deliberate set
+    // and says so in its description. What it does not take is a `400` with
+    // a problem document, never a silently ignored clause.
+    let h = RestHarness::new().await;
+    h.inner.declare("proxy", "cascading", json!(true)).await;
+    let key = h.inner.key("proxy");
+    // A UUID literal is bare in OData; a quoted one is a type mismatch, which
+    // is a different refusal from the operator's and not what is pinned here.
+    let category = h.inner.category_id();
+
+    for filter in [
+        format!("key ne '{key}'"),
+        "key contains 'proxy'".to_owned(),
+        "key startswith 'gts'".to_owned(),
+        "key endswith 'v1~'".to_owned(),
+        format!("category_id ne {category}"),
+        format!("category_id in ({category})"),
+        "needs_review ne true".to_owned(),
+    ] {
+        let uri = format!(
+            "/settings-service/v1/settings?$filter={}",
+            urlencoding(&filter)
+        );
+        let (status, body) = h.get(&uri, h.inner.tree.root).await;
+        assert_eq!(status, 400, "`{filter}` is not taken: {body}");
+        assert_eq!(body["status"], json!(400), "a problem document: {body}");
+    }
+
+    // The forms the handler takes, served.
+    for filter in [
+        format!("key eq '{key}'"),
+        format!("key in ('{key}')"),
+        format!("category_id eq {category}"),
+        "needs_review eq true".to_owned(),
+    ] {
+        let uri = format!(
+            "/settings-service/v1/settings?$filter={}",
+            urlencoding(&filter)
+        );
+        let (status, body) = h.get(&uri, h.inner.tree.root).await;
+        assert_eq!(status, 200, "`{filter}` is taken: {body}");
+    }
 }
 
 // ── The target check ─────────────────────────────────────────────────────────
@@ -888,4 +1050,66 @@ async fn a_setting_that_cannot_be_resolved_carries_its_own_outcome_on_the_page()
         .find(|i| i["key"].as_str().is_some_and(|k| k.contains("live")))
         .expect("the live setting is listed");
     assert_eq!(live["outcome"], json!("resolved"));
+}
+
+#[tokio::test]
+async fn the_search_corpus_follows_the_callers_entitlement_through_the_enforcer() {
+    // The handler decides the corpus from the authorization decision on
+    // `read_unmasked`, before the query runs. Driven through the real
+    // enforcer wiring: a needle present only in the overrides — one `pii`,
+    // one `public`, one `secret` — is found where the caller may look, and is
+    // neither matched nor counted where they may not.
+    for (h, entitled) in [
+        (RestHarness::without_pii_entitlement().await, false),
+        (RestHarness::new().await, true),
+    ] {
+        let root = h.inner.tree.root;
+        let pii = h
+            .inner
+            .declare_typed("contact_email", "cascading", json!(""), TEXT, "pii")
+            .await;
+        let public = h
+            .inner
+            .declare_typed("support_email", "cascading", json!(""), TEXT, "public")
+            .await;
+        let secret = h
+            .inner
+            .declare_typed(
+                "api_token",
+                "cascading",
+                json!(""),
+                crate::test_support::SECRET,
+                "secret",
+            )
+            .await;
+        // The rows as the writer leaves them: the classification denormalized
+        // from the declaration, which is the column the corpus reads.
+        h.inner
+            .set_classified(pii, root, json!("ops@needle.example"), "pii")
+            .await;
+        h.inner
+            .set(public, root, json!("help@needle.example"))
+            .await;
+        h.inner.set_secret(secret, root, "needle-reference").await;
+
+        let items = h.items("/settings-service/v1/search?q=needle", root).await;
+        let mut slugs: Vec<&str> = items
+            .iter()
+            .filter_map(|i| i["leaf_slug"].as_str())
+            .collect();
+        slugs.sort_unstable();
+        if entitled {
+            assert_eq!(
+                slugs,
+                vec!["contact_email", "support_email"],
+                "with `read_unmasked`, pii is in the corpus; the secret never is"
+            );
+        } else {
+            assert_eq!(
+                slugs,
+                vec!["support_email"],
+                "without it, the pii override is neither matched nor counted"
+            );
+        }
+    }
 }

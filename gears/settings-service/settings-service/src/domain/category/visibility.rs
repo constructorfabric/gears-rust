@@ -19,6 +19,13 @@
 //! cursor still points at row 25. The caller gets short pages, wrong counts,
 //! and a next-page link that skips rows it *was* entitled to. That leaks the
 //! shape of what it cannot see without ever showing the content.
+//!
+//! **A constraint that names no usable domain is still a constraint.** The
+//! policy decision point meant to narrow this caller; if what it sent cannot be
+//! read as domain names — uuids, integers, booleans where names are due — the
+//! narrowing must not evaporate into "see everything". It narrows to the
+//! undomained categories, which every scoped caller sees anyway, until the
+//! policy is fixed. Only the *absence* of a domain constraint means unrestricted.
 
 use toolkit_security::{AccessScope, ScopeFilter, ScopeValue};
 
@@ -33,7 +40,9 @@ pub const DOMAIN_PROPERTY: &str = "domain_affinity";
 pub enum DomainVisibility {
     /// No domain restriction — every category is visible.
     Unrestricted,
-    /// Only categories in these domains, plus every undomained one.
+    /// Only categories in these domains, plus every undomained one. An empty
+    /// list is the fail-closed reading of a domain constraint that carried no
+    /// usable domain name: the undomained categories and nothing else.
     Restricted(Vec<String>),
 }
 
@@ -42,7 +51,8 @@ pub enum DomainVisibility {
 /// Returns [`DomainVisibility::Unrestricted`] when the scope carries no domain
 /// constraint, which is step 2 of the algorithm: an unconstrained caller's
 /// query is returned unchanged rather than augmented with a predicate matching
-/// everything.
+/// everything. A domain constraint that is present but yields no usable name is
+/// the opposite case and restricts to the undomained categories alone.
 #[must_use]
 pub fn domain_visibility(scope: &AccessScope) -> DomainVisibility {
     // @cpt-begin:cpt-cf-settings-service-algo-category-management-visibility-filter:p1:inst-cat-visfilter-1
@@ -51,6 +61,7 @@ pub fn domain_visibility(scope: &AccessScope) -> DomainVisibility {
     }
 
     let mut domains: Vec<String> = Vec::new();
+    let mut constrained = false;
     for constraint in scope.constraints() {
         for filter in constraint.filters() {
             let (property, values) = match filter {
@@ -63,6 +74,7 @@ pub fn domain_visibility(scope: &AccessScope) -> DomainVisibility {
                 _ => continue,
             };
             if property == DOMAIN_PROPERTY {
+                constrained = true;
                 domains.extend(values.iter().filter_map(|v| match v {
                     ScopeValue::String(s) => Some(s.clone()),
                     // A domain is a name. A uuid, integer or boolean in this
@@ -77,10 +89,14 @@ pub fn domain_visibility(scope: &AccessScope) -> DomainVisibility {
     // @cpt-end:cpt-cf-settings-service-algo-category-management-visibility-filter:p1:inst-cat-visfilter-1
 
     // @cpt-begin:cpt-cf-settings-service-algo-category-management-visibility-filter:p1:inst-cat-visfilter-2
-    if domains.is_empty() {
+    if !constrained {
         return DomainVisibility::Unrestricted;
     }
     // @cpt-end:cpt-cf-settings-service-algo-category-management-visibility-filter:p1:inst-cat-visfilter-2
+    // A constraint was there but none of its values named a domain: the
+    // policy is broken, not absent. Restricting to the undomained categories
+    // is what the caller would see under any domain list; widening to every
+    // domain is what the policy set out to prevent.
 
     // @cpt-begin:cpt-cf-settings-service-algo-category-management-visibility-filter:p1:inst-cat-visfilter-5
     DomainVisibility::Restricted(domains)
