@@ -105,8 +105,15 @@ pub(crate) fn step_up_challenge(err: DomainError) -> Response {
          max_age={max_age}"
     );
     if !acr.is_empty() {
+        // An RFC 9110 quoted-string: a quote or a backslash inside a configured
+        // value is escaped, so no value closes the parameter or opens another.
         challenge.push_str(", acr_values=\"");
-        challenge.push_str(&acr.join(" "));
+        for c in acr.join(" ").chars() {
+            if matches!(c, '"' | '\\') {
+                challenge.push('\\');
+            }
+            challenge.push(c);
+        }
         challenge.push('"');
     }
     let mut response = CanonicalError::from(err).into_response();

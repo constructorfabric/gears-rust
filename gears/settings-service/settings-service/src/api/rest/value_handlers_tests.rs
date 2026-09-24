@@ -257,3 +257,24 @@ fn only_a_step_up_refusal_becomes_a_response_every_other_stays_an_error() {
     .expect_err("an error");
     assert_eq!(err.into_response().status(), StatusCode::GONE);
 }
+
+#[test]
+fn an_assurance_value_is_escaped_inside_the_challenge_quoted_string() {
+    // `acr_values` is an RFC 9110 quoted-string: a configured value carrying a
+    // quote or a backslash must not close the parameter or open another one.
+    let response = step_up_challenge(DomainError::StepUpRequired {
+        reason: "missing",
+        max_age_seconds: 300,
+        acr_values: vec!["urn:\"x\"".to_owned(), "a\\b".to_owned()],
+    });
+    let challenge = response
+        .headers()
+        .get(axum::http::header::WWW_AUTHENTICATE)
+        .expect("a challenge")
+        .to_str()
+        .expect("ascii");
+    assert!(
+        challenge.ends_with(r#"acr_values="urn:\"x\" a\\b""#),
+        "quote and backslash escaped: {challenge}"
+    );
+}
