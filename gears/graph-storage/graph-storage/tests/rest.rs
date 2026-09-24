@@ -452,6 +452,22 @@ async fn the_remaining_endpoints_answer_too() {
             .is_some_and(|rows| rows.iter().all(|row| row["kind"] == "node")),
         "the filter is applied, not ignored: {page}"
     );
+
+    // A kind the server does not know is refused by name, never quietly
+    // read as one it does: a catalog filtered by the wrong kind answers
+    // confidently with the wrong rows, and the caller cannot tell.
+    for unknown in ["nodes", "Node", "relation", ""] {
+        let (status, refused) = stand.get(&format!("/types?kind={unknown}")).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "`{unknown}` is not a type kind: {refused}"
+        );
+        assert!(
+            refused.to_string().contains(unknown) || unknown.is_empty(),
+            "the refusal names the value it was given: {refused}"
+        );
+    }
 }
 
 /// Registering a changed schema under a registered identifier: refused by

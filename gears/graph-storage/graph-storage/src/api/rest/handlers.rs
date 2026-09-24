@@ -246,15 +246,17 @@ pub async fn list_types(
         ))
         .into());
     }
-    let kind = match params.kind.as_deref() {
-        None => None,
-        Some("node") => Some(m::TypeKind::Node),
-        Some("edge") => Some(m::TypeKind::Edge),
-        Some("attribute") => Some(m::TypeKind::Attribute),
-        Some(other) => {
-            return Err(DomainError::invalid(format!("unknown type kind `{other}`")).into());
-        }
-    };
+    // Through the SDK, like every other closed enum on this surface: a match
+    // written out here is one a maintainer can give a default arm, and the
+    // spelling would be free to drift from the encoder that produced it.
+    let kind = params
+        .kind
+        .as_deref()
+        .map(str::parse::<m::TypeKind>)
+        .transpose()
+        .map_err(|unknown| {
+            DomainError::invalid(format!("{unknown}; expected node, edge or attribute"))
+        })?;
     let page = services
         .list_types(
             &ctx,
