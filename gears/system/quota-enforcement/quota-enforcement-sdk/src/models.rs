@@ -579,6 +579,35 @@ impl OperationType {
     }
 }
 
+/// Which kind of operation a rollback reverses.
+///
+/// [`OperationType::Debit`] and [`OperationType::Commit`] are separate
+/// idempotency namespaces, so one caller may legitimately hold a debit and a
+/// lease commit under the same key, subjects and tenant. The rollback names
+/// which of the two it means; there is no fallback lookup that could reverse
+/// the wrong one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RollbackableOperation {
+    /// A direct debit, recorded under [`OperationType::Debit`]. The default, so
+    /// a request written before leases existed keeps its meaning.
+    #[default]
+    Debit,
+    /// A lease commit, recorded under [`OperationType::Commit`].
+    LeaseCommit,
+}
+
+impl RollbackableOperation {
+    /// The idempotency operation type the original was recorded under.
+    #[must_use]
+    pub const fn operation_type(self) -> OperationType {
+        match self {
+            Self::Debit => OperationType::Debit,
+            Self::LeaseCommit => OperationType::Commit,
+        }
+    }
+}
+
 /// Closed notification event catalog (PRD section 5.15).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -1377,6 +1406,10 @@ pub struct CreditRequest {
 pub struct RollbackRequest {
     /// Attribution of the debit being reversed.
     pub attribution: EvaluationAttribution,
+    /// Which kind of operation the original key names. Defaults to a direct
+    /// debit, so a request that predates leases keeps its meaning.
+    #[serde(default)]
+    pub original_operation: RollbackableOperation,
     /// Idempotency key the original debit was committed under.
     pub original_idempotency_key: String,
     /// Client-supplied key of this rollback.
@@ -1390,6 +1423,54 @@ pub struct PreviewRequest {
     pub attribution: EvaluationAttribution,
     /// Amount to test. See [`DebitRequest::amount`] for the signedness.
     pub amount: i64,
+}
+
+/// Hold capacity against every applicable Quota for a bounded TTL.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcquireLeaseRequest {
+    /// Who and what is being held.
+    pub attribution: EvaluationAttribution,
+    /// Amount to hold. See [`DebitRequest::amount`] for the signedness.
+    pub amount: i64,
+    /// Requested lifetime. Absent or outside the operator's
+    /// `[min_lease_ttl, max_lease_ttl]` window is `TTL_OUT_OF_BOUNDS`; the
+    /// value is never clamped, because the holder is entitled to exactly the
+    /// TTL it reserved.
+    #[serde(default)]
+    pub ttl_secs: Option<u64>,
+    /// Client-supplied idempotency key.
+    pub idempotency_key: String,
+}
+
+/// Convert an active lease into a debit for what was actually used.
+///
+/// The tenant is carried explicitly, as [`CreditRequest`] does, so the
+/// authenticated principal is authorized before the token is ever read: a token
+/// outside the caller's authorized tenant is simply absent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitLeaseRequest {
+    /// Authorized target tenant.
+    pub tenant_id: TenantId,
+    /// The lease to settle.
+    pub token: LeaseToken,
+    /// What was actually used, defaulting to the full reserved amount. Zero
+    /// commits nothing and returns every hold; negative is `INVALID_AMOUNT`;
+    /// above the reserved amount is `OVER_COMMIT_NOT_AUTHORIZED`.
+    #[serde(default)]
+    pub actual_amount: Option<i64>,
+    /// Client-supplied idempotency key of this commit.
+    pub idempotency_key: String,
+}
+
+/// Return an active lease's held capacity without committing a debit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseLeaseRequest {
+    /// Authorized target tenant. See [`CommitLeaseRequest::tenant_id`].
+    pub tenant_id: TenantId,
+    /// The lease to release.
+    pub token: LeaseToken,
+    /// Client-supplied idempotency key of this release.
+    pub idempotency_key: String,
 }
 
 /// A decision that was never applied. Structurally a [`Decision`] plus the flag
@@ -1545,8 +1626,10 @@ impl PartialIdempotencyWrite {
 /// the same subjects. A record whose stored digest differs is reported absent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RollbackTarget {
-    /// Full scope of the original debit, with operation type
-    /// [`OperationType::Debit`].
+    /// Full scope of the original operation. Its `operation_type` is
+    /// [`OperationType::Debit`] or [`OperationType::Commit`], as the caller's
+    /// [`RollbackableOperation`] named it; the plugin looks up that one scope
+    /// and never falls back to the other.
     pub original: IdempotencyScope,
     /// The attribution the rollback caller was authorized under, which must
     /// equal the original debit's.
@@ -1750,6 +1833,138 @@ pub struct EvaluatedLease {
     pub decision: Decision,
     /// The acquired lease, absent when the decision denied the operation.
     pub token: Option<LeaseToken>,
+    /// When the acquired lease expires. Present exactly when `token` is.
+    #[serde(default, with = "rfc3339::option")]
+    pub expires_at: Option<OffsetDateTime>,
+}
+
+/// What an acquisition returned to its caller: a held lease, or the verdict
+/// that refused to hold one.
+///
+/// A denial is a successful call carrying a [`Decision`], not an error
+/// (PRD section 3.4), which a bare token could not express.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[must_use]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum AcquireLeaseOutcome {
+    /// Capacity is held on every Quota of the plan until `expires_at`.
+    Acquired {
+        /// Opaque, server-issued lease token.
+        token: LeaseToken,
+        /// When the hold lapses without a commit or release.
+        #[serde(with = "rfc3339")]
+        expires_at: OffsetDateTime,
+    },
+    /// No capacity was held on any Quota.
+    Denied {
+        /// The verdict, with the reason and the violated Quotas.
+        decision: Decision,
+    },
+}
+
+impl AcquireLeaseOutcome {
+    /// Read the storage outcome as the caller-facing answer.
+    ///
+    /// # Errors
+    ///
+    /// Returns the evaluated lease back when it allowed the acquisition but
+    /// carries no token or no expiry, which no implementation may produce.
+    pub fn of(evaluated: EvaluatedLease) -> Result<Self, Box<EvaluatedLease>> {
+        match (evaluated.token, evaluated.expires_at) {
+            (Some(token), Some(expires_at)) => Ok(Self::Acquired { token, expires_at }),
+            (None, _) if !matches!(evaluated.decision.result, DecisionResult::Allowed) => {
+                Ok(Self::Denied {
+                    decision: evaluated.decision,
+                })
+            }
+            _ => Err(Box::new(evaluated)),
+        }
+    }
+}
+
+/// Split `actual` across the holds of a lease, proportionally to what each one
+/// holds, rounding the charged total **up**.
+///
+/// The total charged is `ceil(sum(held) * actual / reserved)`; each hold takes
+/// its floor share and the units left over go to the largest fractional
+/// remainders, ties to the earlier hold. So the amounts sum to exactly that
+/// total, no hold is charged more than it held, and any positive `actual`
+/// charges at least one unit — the engine contract does not promise that the
+/// holds sum to the reserved amount, so a plan holding `[1]` of a reserved `10`
+/// still charges `1` when `1` was used.
+///
+/// # Errors
+///
+/// [`ApportionError::Overflow`] when the held amounts cannot be summed or
+/// scaled within `u128`, and [`ApportionError::OverCommit`] when `actual`
+/// exceeds `reserved`.
+pub fn apportion(
+    holds: &[u64],
+    actual: u64,
+    reserved: std::num::NonZeroU64,
+) -> Result<Vec<u64>, ApportionError> {
+    let reserved_u128 = u128::from(reserved.get());
+    if u128::from(actual) > reserved_u128 {
+        return Err(ApportionError::OverCommit);
+    }
+    let actual = u128::from(actual);
+    let mut total_held: u128 = 0;
+    for held in holds {
+        total_held = total_held
+            .checked_add(u128::from(*held))
+            .ok_or(ApportionError::Overflow)?;
+    }
+    let scaled = total_held
+        .checked_mul(actual)
+        .ok_or(ApportionError::Overflow)?;
+    // Ceiling of `scaled / reserved`, which never exceeds `total_held` because
+    // `actual <= reserved` and `total_held` is an integer.
+    let target = scaled.div_ceil(reserved_u128);
+    let mut kept = Vec::with_capacity(holds.len());
+    let mut assigned: u128 = 0;
+    // (remainder, index), so the largest remainder wins and an earlier hold
+    // wins a tie.
+    let mut remainders = Vec::with_capacity(holds.len());
+    for (index, held) in holds.iter().enumerate() {
+        let scaled_hold = u128::from(*held)
+            .checked_mul(actual)
+            .ok_or(ApportionError::Overflow)?;
+        // Floor division by a non-zero divisor, so `checked_div` never
+        // refuses; it spells the intent the lint asks for.
+        let share = scaled_hold
+            .checked_div(reserved_u128)
+            .ok_or(ApportionError::Overflow)?;
+        assigned += share;
+        remainders.push((scaled_hold % reserved_u128, index));
+        kept.push(share);
+    }
+    remainders.sort_by(|(left, left_index), (right, right_index)| {
+        right.cmp(left).then(left_index.cmp(right_index))
+    });
+    for (_, index) in remainders {
+        if assigned >= target {
+            break;
+        }
+        // A hold can only take a further unit while it still holds one.
+        if kept[index] < u128::from(holds[index]) {
+            kept[index] += 1;
+            assigned += 1;
+        }
+    }
+    kept.iter()
+        .map(|share| u64::try_from(*share).map_err(|_| ApportionError::Overflow))
+        .collect()
+}
+
+/// Why a commit's holds could not be split.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ApportionError {
+    /// The held amounts cannot be summed or scaled within `u128`.
+    #[error("the held amounts overflow the apportionment arithmetic")]
+    Overflow,
+    /// `actual` exceeds the reserved amount.
+    #[error("the committed amount exceeds the reserved amount")]
+    OverCommit,
 }
 
 // ---------------------------------------------------------------------------

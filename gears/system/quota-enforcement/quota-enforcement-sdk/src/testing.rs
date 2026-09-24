@@ -16,7 +16,7 @@
     reason = "test support: fixtures are built from constant, well-formed inputs"
 )]
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -124,9 +124,27 @@ struct LeaseRow {
     tenant_id: TenantId,
     metric: MetricId,
     subject_key: crate::models::IdempotencySubjectKey,
-    holds: Vec<LeaseHold>,
+    /// The attribution the acquisition was authorized under, so a rollback of
+    /// this lease's commit can prove it reverses its own operation.
+    authorized: AttributionDigest,
+    /// What the acquisition asked for, which the commit's share is measured
+    /// against. The plan's holds need not sum to it.
+    reserved_amount: u64,
+    holds: Vec<HeldRow>,
     state: LeaseState,
     expires_at: OffsetDateTime,
+}
+
+/// One hold, and whether its capacity has already been given back.
+///
+/// An expired lease is released the moment its TTL passes (I4), but its
+/// capacity sits in the counter until someone returns it. Whoever touches the
+/// counter first does that and marks the hold, so the sweeper that arrives
+/// later moves nothing a second time.
+#[derive(Clone)]
+struct HeldRow {
+    hold: LeaseHold,
+    returned: bool,
 }
 
 /// One `(Quota, period)` counter row. Consumption Quotas accumulate here;
@@ -546,20 +564,76 @@ impl InMemoryStorage {
     }
 
     /// The counter a Quota currently reads: the in-flight amount of an
-    /// allocation Quota, or the consumed amount of the current period row.
+    /// allocation Quota, or the consumed amount of the current period row,
+    /// in both cases less the expired holds nobody has returned yet (I4).
+    ///
+    /// The stored value and the correction are read from one borrow of the
+    /// state, so no concurrent return can be observed by half of this.
     fn counter_value(st: &StorageState, quota_id: QuotaId) -> u64 {
-        if st
+        let now = Self::now(st);
+        let (stored, period_id) = if st
             .quotas
             .get(&quota_id)
             .is_some_and(|quota| quota.quota_type == QuotaType::Consumption)
         {
-            st.current_period
-                .get(&quota_id)
-                .and_then(|id| st.periods.get(id))
-                .filter(|row| !row.window.has_elapsed(Self::now(st)))
-                .map_or(0, |row| row.consumed)
+            let current = st.current_period.get(&quota_id).copied().filter(|id| {
+                st.periods
+                    .get(id)
+                    .is_some_and(|row| !row.window.has_elapsed(now))
+            });
+            let stored = current
+                .and_then(|id| st.periods.get(&id))
+                .map_or(0, |row| row.consumed);
+            (stored, current)
         } else {
-            st.in_flight.get(&quota_id).copied().unwrap_or(0)
+            (st.in_flight.get(&quota_id).copied().unwrap_or(0), None)
+        };
+        stored.saturating_sub(Self::unreturned_expired(st, quota_id, period_id, now))
+    }
+
+    /// What expired, unreturned holds still occupy on one counter row.
+    fn unreturned_expired(
+        st: &StorageState,
+        quota_id: QuotaId,
+        period_id: Option<PeriodId>,
+        now: OffsetDateTime,
+    ) -> u64 {
+        st.leases
+            .values()
+            .filter(|lease| lease.state == LeaseState::Active && lease.expires_at <= now)
+            .flat_map(|lease| &lease.holds)
+            .filter(|held| {
+                !held.returned && held.hold.quota_id == quota_id && held.hold.period_id == period_id
+            })
+            .map(|held| held.hold.held_amount)
+            .sum()
+    }
+
+    /// Give back every expired hold on `quota_id` that nobody has returned yet,
+    /// each against the period it was acquired on (I5), and mark it returned.
+    ///
+    /// Every writer runs this before its own arithmetic, so the stored counter
+    /// equals the logical one from there on and a later sweep moves nothing.
+    fn return_expired_holds(st: &mut StorageState, quota_id: QuotaId, now: OffsetDateTime) {
+        let mut returned = Vec::new();
+        for lease in st.leases.values_mut() {
+            if lease.state != LeaseState::Active || lease.expires_at > now {
+                continue;
+            }
+            for held in &mut lease.holds {
+                if held.returned || held.hold.quota_id != quota_id {
+                    continue;
+                }
+                held.returned = true;
+                returned.push(AppliedEntry {
+                    quota_id,
+                    period_id: held.hold.period_id,
+                    amount: held.hold.held_amount,
+                });
+            }
+        }
+        for entry in &returned {
+            Self::lower_counter(st, entry);
         }
     }
 
@@ -575,6 +649,9 @@ impl InMemoryStorage {
         now: OffsetDateTime,
     ) -> Result<AppliedEntry, StorageError> {
         let quota = Self::active_quota(st, quota_id)?.clone();
+        // This writer holds the row, so it is the one that reconciles the
+        // expired holds still sitting in it (I4) before adding its own.
+        Self::return_expired_holds(st, quota_id, now);
         let consumption = quota.quota_type == QuotaType::Consumption;
         let period_id = consumption.then(|| Self::ensure_current_row(st, quota_id, now));
         let (pre, post, silent) = if let Some(period_id) = period_id {
@@ -645,7 +722,18 @@ impl InMemoryStorage {
     /// Lower a counter, flooring at zero. Downward moves never emit a
     /// threshold: the marker only advances, so a threshold crossed once stays
     /// crossed until the period rolls over.
-    fn credit_counter(st: &mut StorageState, entry: &AppliedEntry) {
+    ///
+    /// Like every writer this first returns the row's expired holds, so a
+    /// credit cannot floor away capacity that a later sweep still owes back.
+    fn credit_counter(st: &mut StorageState, entry: &AppliedEntry, now: OffsetDateTime) {
+        Self::return_expired_holds(st, entry.quota_id, now);
+        Self::lower_counter(st, entry);
+    }
+
+    /// The raw downward move, with no expired-hold reconciliation: used by
+    /// [`Self::return_expired_holds`] itself and by the callers that have
+    /// already run it.
+    fn lower_counter(st: &mut StorageState, entry: &AppliedEntry) {
         if let Some(period_id) = entry.period_id {
             if let Some(row) = st.periods.get_mut(&period_id) {
                 row.consumed = row.consumed.saturating_sub(entry.amount);
@@ -972,6 +1060,140 @@ impl InMemoryStorage {
             .iter()
             .find(|v| v.state == PolicyVersionState::Active)
     }
+
+    /// Settle a lease: commit keeps its apportioned share and returns the rest,
+    /// release keeps nothing. The two differ only in what they keep and in the
+    /// terminal state they leave behind, so they share one body.
+    ///
+    /// The idempotency scope is completed from the key the acquisition
+    /// persisted, never from caller input, and the replay check runs before the
+    /// lease-state guards, so a settlement that already succeeded replays even
+    /// though its lease is no longer active.
+    fn settle(
+        &self,
+        token: LeaseToken,
+        actual_amount: Option<u64>,
+        idempotency: &PartialIdempotencyWrite,
+        events: &[NotificationEvent],
+        operation: OperationType,
+    ) -> Result<TransitionOutcome<AppliedMutation>, StorageError> {
+        self.transact(|st| {
+            let lease = st
+                .leases
+                .get(&token)
+                .filter(|lease| lease.tenant_id == idempotency.tenant_id)
+                .cloned()
+                .ok_or(StorageError::LeaseNotFound { token })?;
+            let write = idempotency.clone().complete(lease.subject_key, operation);
+            if let Some(blob) = Self::replayed(st, &write)? {
+                let expires_at = Self::retention_of(st, &write.scope)
+                    .expires_at()
+                    .unwrap_or_else(|| Self::now(st));
+                return Ok(TransitionOutcome::NoOp(AppliedMutation {
+                    decision: Self::decision_from(blob)?,
+                    mutation: MutationResult::default(),
+                    expires_at,
+                }));
+            }
+            let now = Self::now(st);
+            if lease.state != LeaseState::Active || lease.expires_at <= now {
+                return Err(StorageError::LeaseNotActive { token });
+            }
+            let amounts: Vec<u64> = lease.holds.iter().map(|h| h.hold.held_amount).collect();
+            let reserved = std::num::NonZeroU64::new(lease.reserved_amount);
+            let actual = actual_amount.unwrap_or(lease.reserved_amount);
+            let kept =
+                match reserved {
+                    Some(reserved) => crate::models::apportion(&amounts, actual, reserved)
+                        .map_err(|error| match error {
+                            crate::models::ApportionError::OverCommit => {
+                                StorageError::OverCommitNotAuthorized {
+                                    reserved: reserved.get(),
+                                    actual,
+                                }
+                            }
+                            crate::models::ApportionError::Overflow => {
+                                StorageError::Internal(error.to_string())
+                            }
+                        })?,
+                    // An acquisition never reserves zero, so this is unreachable;
+                    // returning everything is the safe reading of "kept nothing".
+                    None => vec![0; amounts.len()],
+                };
+            let mut entries = Vec::with_capacity(amounts.len());
+            for (held_row, kept) in lease.holds.iter().zip(&kept) {
+                let hold = &held_row.hold;
+                let returned = hold.held_amount.saturating_sub(*kept);
+                let entry = AppliedEntry {
+                    quota_id: hold.quota_id,
+                    period_id: hold.period_id,
+                    amount: returned,
+                };
+                // Against the acquisition period, whatever period the wall
+                // clock is in now (I5).
+                Self::credit_counter(st, &entry, now);
+                if *kept > 0 {
+                    entries.push(AppliedEntry {
+                        quota_id: hold.quota_id,
+                        period_id: hold.period_id,
+                        amount: *kept,
+                    });
+                }
+            }
+            if let Some(row) = st.leases.get_mut(&token) {
+                row.state = match operation {
+                    OperationType::Release => LeaseState::Released,
+                    _ => LeaseState::Committed,
+                };
+                for held in &mut row.holds {
+                    held.returned = true;
+                }
+            }
+            let plan: DebitPlan = entries
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.quota_id,
+                        crate::models::QuotaDebitPlan {
+                            amount: entry.amount,
+                        },
+                    )
+                })
+                .collect();
+            // Settling evaluates nothing: the plan was fixed at acquisition.
+            let decision = Self::applied(plan);
+            let mut result = Self::counters_of(st, &entries);
+            let blob = Self::versioned_blob(&decision)?;
+            let expires_at = Self::remember(st, &write, blob, None, None);
+            if operation == OperationType::Commit {
+                // A commit produces a debit addressable by this call's key, so
+                // a rollback can reverse exactly what it kept. A zero commit
+                // records no movement and reverses as a successful no-op.
+                st.applied.insert(
+                    write.scope.clone(),
+                    AppliedDebit {
+                        authorized: lease.authorized,
+                        entries: entries.clone(),
+                        reversed_by_key: None,
+                    },
+                );
+            }
+            result.event_ids = Self::push_events_for(
+                st,
+                events,
+                match operation {
+                    OperationType::Release => "lease_release",
+                    _ => "lease_commit",
+                },
+                entries.iter().map(|entry| entry.quota_id).collect(),
+            );
+            Ok(TransitionOutcome::Applied(AppliedMutation {
+                decision,
+                mutation: result,
+                expires_at,
+            }))
+        })
+    }
 }
 
 #[async_trait]
@@ -1171,21 +1393,32 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
         quota.record_version += 1;
         quota.updated_at = now;
         // Resolve live leases and return their held capacity; expired leases
-        // have already been released (I4).
+        // have already been released (I4) and are left to the sweeper.
         let mut resolved = Vec::new();
-        let mut returned: Vec<LeaseHold> = Vec::new();
+        let mut returned: Vec<(LeaseToken, TenantId, SubjectRef, LeaseHold)> = Vec::new();
+        let subject = st.quotas.get(&quota_id).map(|quota| quota.subject.clone());
         for (token, lease) in &mut st.leases {
-            if lease.state == LeaseState::Active
-                && lease.expires_at > now
-                && lease.holds.iter().any(|h| h.quota_id == quota_id)
+            if lease.state != LeaseState::Active
+                || lease.expires_at <= now
+                || !lease.holds.iter().any(|h| h.hold.quota_id == quota_id)
             {
-                lease.state = LeaseState::ResolvedByDeactivation;
-                resolved.push(*token);
-                returned.extend(lease.holds.iter().cloned());
+                continue;
+            }
+            lease.state = LeaseState::ResolvedByDeactivation;
+            resolved.push(*token);
+            let tenant_id = lease.tenant_id;
+            for held in &mut lease.holds {
+                if held.returned {
+                    continue;
+                }
+                held.returned = true;
+                if let Some(subject) = subject.clone() {
+                    returned.push((*token, tenant_id, subject, held.hold.clone()));
+                }
             }
         }
-        for hold in &returned {
-            Self::credit_counter(
+        for (_, _, _, hold) in &returned {
+            Self::lower_counter(
                 &mut st,
                 &AppliedEntry {
                     quota_id: hold.quota_id,
@@ -1193,6 +1426,37 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
                     amount: hold.held_amount,
                 },
             );
+        }
+        // One event per resolved lease, built here because only the
+        // transaction knows which leases it resolved (I11).
+        let mut seen = BTreeSet::new();
+        for (token, tenant_id, subject, hold) in &returned {
+            if !seen.insert(*token) {
+                continue;
+            }
+            let held: u64 = returned
+                .iter()
+                .filter(|(other, _, _, _)| other == token)
+                .map(|(_, _, _, hold)| hold.held_amount)
+                .sum();
+            let _ = hold;
+            let event = NotificationEvent {
+                event_id: EventId::generate(),
+                kind: NotificationEventKind::LeaseResolvedByDeactivation,
+                scope: NotificationScope::Tenant {
+                    tenant_id: *tenant_id,
+                },
+                quota_id: Some(quota_id),
+                policy_id: None,
+                subject: Some(subject.clone()),
+                payload: serde_json::json!({
+                    "lease_token": token,
+                    "held_amount": held,
+                    "quota_id": quota_id,
+                }),
+                emitted_at: now,
+            };
+            st.events.push(event);
         }
         Self::push_events(&mut st, events);
         Ok(DeactivateOutcome {
@@ -1418,7 +1682,7 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
                     .filter(|_| true),
                 amount,
             };
-            Self::credit_counter(st, &entry);
+            Self::credit_counter(st, &entry, now);
             let entries = [entry];
             let mut result = Self::counters_of(st, &entries);
             let plan: DebitPlan =
@@ -1483,6 +1747,15 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
             if committed.authorized != target.authorized {
                 return Err(unknown());
             }
+            // A debit that moved nothing is not a committed debit: a denial
+            // records no movement either, and must stay irreversible. A lease
+            // commit of zero is a real operation that kept nothing, so it
+            // reverses as a successful no-op.
+            if committed.entries.is_empty()
+                && target.original.operation_type != crate::models::OperationType::Commit
+            {
+                return Err(unknown());
+            }
             for entry in &committed.entries {
                 if entry
                     .period_id
@@ -1512,8 +1785,9 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
                 // an idempotent no-op that still records its own outcome.
                 Vec::new()
             } else {
+                let now = Self::now(st);
                 for entry in &committed.entries {
-                    Self::credit_counter(st, entry);
+                    Self::credit_counter(st, entry, now);
                 }
                 committed.entries.clone()
             };
@@ -1570,70 +1844,90 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
         mutation: &EvaluatedMutation<'_>,
         ttl: Duration,
     ) -> Result<TransitionOutcome<EvaluatedLease>, StorageError> {
-        let mut st = self.state.lock();
-        Self::check(&st)?;
-        if let Some(blob) = Self::replayed(&st, mutation.idempotency)? {
-            // Persist the acquisition outcome because subjects may hold several
-            // leases and a replay must return the original token or denial.
-            let acquired: EvaluatedLease =
-                serde_json::from_value(blob).map_err(|e| StorageError::Internal(e.to_string()))?;
-            return Ok(TransitionOutcome::NoOp(acquired));
-        }
-        let now = OffsetDateTime::now_utc();
-        let cap = st.defaults.map_or(1000, |d| d.max_active_leases) as usize;
-        let live = st
-            .leases
-            .values()
-            .filter(|l| {
-                l.state == LeaseState::Active
-                    && l.expires_at > now
-                    && l.tenant_id == mutation.applicable.tenant_id
-                    && l.metric == mutation.applicable.metric
-            })
-            .count();
-        if live >= cap {
-            return Err(StorageError::LeaseInflightLimitExceeded);
-        }
-        let (policy, decision) = Self::evaluated(&st, mutation)?;
-        // A denied acquisition holds nothing, and still occupies the key: the
-        // replay of a denial is a denial, not a second evaluation.
-        let token = if decision.debit_plan.is_empty() {
-            None
-        } else {
-            let entries = Self::debit(&mut st, &decision.debit_plan, now)?;
-            let token = LeaseToken::generate();
-            st.leases.insert(
+        self.transact(|st| {
+            if let Some(blob) = Self::replayed(st, mutation.idempotency)? {
+                // Persist the acquisition outcome because subjects may hold
+                // several leases and a replay must return the original token or
+                // denial.
+                let acquired: EvaluatedLease = serde_json::from_value(blob)
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                return Ok(TransitionOutcome::NoOp(acquired));
+            }
+            // One instant for the whole transaction, taken once every row this
+            // acquisition needs is held: the live count, the period the holds
+            // are attributed to, and the expiry all agree by construction.
+            let now = Self::now(st);
+            let (policy, decision) = Self::evaluated(st, mutation)?;
+            // A denied acquisition holds nothing and still occupies the key, so
+            // its replay denies again. The cap is not consulted: a verdict the
+            // engine refused is returned whether or not the cap is full.
+            let (token, expires_at) = if matches!(decision.result, DecisionResult::Allowed)
+                && !decision.debit_plan.is_empty()
+            {
+                let cap = st.defaults.map_or(1000, |d| d.max_active_leases) as usize;
+                // Expired leases never count (I4): the live count is what
+                // admits, never a maintained total.
+                let live = st
+                    .leases
+                    .values()
+                    .filter(|l| {
+                        l.state == LeaseState::Active
+                            && l.expires_at > now
+                            && l.tenant_id == mutation.applicable.tenant_id
+                            && l.metric == mutation.applicable.metric
+                    })
+                    .count();
+                if live >= cap {
+                    return Err(StorageError::LeaseInflightLimitExceeded);
+                }
+                let entries = Self::debit(st, &decision.debit_plan, now)?;
+                let token = LeaseToken::generate();
+                let expires_at = now + ttl;
+                st.leases.insert(
+                    token,
+                    LeaseRow {
+                        tenant_id: mutation.applicable.tenant_id,
+                        metric: mutation.applicable.metric.clone(),
+                        subject_key: mutation.idempotency.scope.subject_key,
+                        authorized: mutation.authorized,
+                        reserved_amount: mutation.amount,
+                        // The acquisition period is fixed here; commit and
+                        // release settle against it, never against the current
+                        // period (I5).
+                        holds: entries
+                            .iter()
+                            .map(|entry| HeldRow {
+                                hold: LeaseHold {
+                                    quota_id: entry.quota_id,
+                                    held_amount: entry.amount,
+                                    period_id: entry.period_id,
+                                },
+                                returned: false,
+                            })
+                            .collect(),
+                        state: LeaseState::Active,
+                        expires_at,
+                    },
+                );
+                (Some(token), Some(expires_at))
+            } else {
+                (None, None)
+            };
+            let acquired = EvaluatedLease {
+                decision,
                 token,
-                LeaseRow {
-                    tenant_id: mutation.applicable.tenant_id,
-                    metric: mutation.applicable.metric.clone(),
-                    subject_key: mutation.idempotency.scope.subject_key,
-                    // The acquisition period is fixed here; commit and release
-                    // settle against it, never against the current period (I5).
-                    holds: entries
-                        .iter()
-                        .map(|entry| LeaseHold {
-                            quota_id: entry.quota_id,
-                            held_amount: entry.amount,
-                            period_id: entry.period_id,
-                        })
-                        .collect(),
-                    state: LeaseState::Active,
-                    expires_at: now + ttl,
-                },
+                expires_at,
+            };
+            let blob = Self::blob(&acquired)?;
+            Self::remember(
+                st,
+                mutation.idempotency,
+                blob,
+                Some(&policy),
+                Some(mutation.authorized),
             );
-            Some(token)
-        };
-        let acquired = EvaluatedLease { decision, token };
-        let blob = Self::blob(&acquired)?;
-        Self::remember(
-            &mut st,
-            mutation.idempotency,
-            blob,
-            Some(&policy),
-            Some(mutation.authorized),
-        );
-        Ok(TransitionOutcome::Applied(acquired))
+            Ok(TransitionOutcome::Applied(acquired))
+        })
     }
 
     async fn commit_lease(
@@ -1642,64 +1936,16 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
         _scope: &AccessScope,
         token: LeaseToken,
         actual_amount: Option<u64>,
-        idempotency: &IdempotencyWrite,
+        idempotency: &PartialIdempotencyWrite,
         events: &[NotificationEvent],
-    ) -> Result<MutationResult, StorageError> {
-        let mut st = self.state.lock();
-        Self::check(&st)?;
-        if Self::replayed(&st, idempotency)?.is_some() {
-            return Ok(MutationResult::default());
-        }
-        let now = OffsetDateTime::now_utc();
-        let holds = {
-            let lease = st
-                .leases
-                .get_mut(&token)
-                .filter(|l| l.state == LeaseState::Active && l.expires_at > now)
-                .ok_or(StorageError::LeaseNotActive { token })?;
-            let reserved: u64 = lease.holds.iter().map(|h| h.held_amount).sum();
-            let actual = actual_amount.unwrap_or(reserved);
-            if actual > reserved {
-                return Err(StorageError::OverCommitNotAuthorized { reserved, actual });
-            }
-            lease.state = LeaseState::Committed;
-            let unused = reserved - actual;
-            let holds = lease.holds.clone();
-            (holds, unused)
-        };
-        let (holds, mut unused) = holds;
-        let mut entries = Vec::with_capacity(holds.len());
-        for hold in &holds {
-            let give_back = unused.min(hold.held_amount);
-            unused -= give_back;
-            let entry = AppliedEntry {
-                quota_id: hold.quota_id,
-                period_id: hold.period_id,
-                amount: give_back,
-            };
-            Self::credit_counter(&mut st, &entry);
-            entries.push(AppliedEntry {
-                amount: hold.held_amount,
-                ..entry
-            });
-        }
-        let plan: DebitPlan = holds
-            .iter()
-            .map(|h| {
-                (
-                    h.quota_id,
-                    crate::models::QuotaDebitPlan {
-                        amount: h.held_amount,
-                    },
-                )
-            })
-            .collect();
-        let mut result = Self::counters_of(&st, &entries);
-        // Settling a lease evaluates nothing: the plan was fixed at acquisition.
-        let blob = Self::blob(&Self::applied(plan))?;
-        Self::remember(&mut st, idempotency, blob, None, None);
-        result.event_ids = Self::push_events(&mut st, events);
-        Ok(result)
+    ) -> Result<TransitionOutcome<AppliedMutation>, StorageError> {
+        self.settle(
+            token,
+            actual_amount,
+            idempotency,
+            events,
+            OperationType::Commit,
+        )
     }
 
     async fn release_lease(
@@ -1707,51 +1953,10 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
         _ctx: &SecurityContext,
         _scope: &AccessScope,
         token: LeaseToken,
-        idempotency: &IdempotencyWrite,
+        idempotency: &PartialIdempotencyWrite,
         events: &[NotificationEvent],
-    ) -> Result<MutationResult, StorageError> {
-        let mut st = self.state.lock();
-        Self::check(&st)?;
-        if Self::replayed(&st, idempotency)?.is_some() {
-            return Ok(MutationResult::default());
-        }
-        let now = OffsetDateTime::now_utc();
-        let holds = {
-            let lease = st
-                .leases
-                .get_mut(&token)
-                .filter(|l| l.state == LeaseState::Active && l.expires_at > now)
-                .ok_or(StorageError::LeaseNotActive { token })?;
-            lease.state = LeaseState::Released;
-            lease.holds.clone()
-        };
-        let entries: Vec<AppliedEntry> = holds
-            .iter()
-            .map(|hold| AppliedEntry {
-                quota_id: hold.quota_id,
-                period_id: hold.period_id,
-                amount: hold.held_amount,
-            })
-            .collect();
-        for entry in &entries {
-            Self::credit_counter(&mut st, entry);
-        }
-        let plan: DebitPlan = holds
-            .iter()
-            .map(|h| {
-                (
-                    h.quota_id,
-                    crate::models::QuotaDebitPlan {
-                        amount: h.held_amount,
-                    },
-                )
-            })
-            .collect();
-        let mut result = Self::counters_of(&st, &entries);
-        let blob = Self::blob(&Self::applied(plan))?;
-        Self::remember(&mut st, idempotency, blob, None, None);
-        result.event_ids = Self::push_events(&mut st, events);
-        Ok(result)
+    ) -> Result<TransitionOutcome<AppliedMutation>, StorageError> {
+        self.settle(token, Some(0), idempotency, events, OperationType::Release)
     }
 
     async fn read_quota_snapshot(
@@ -2096,42 +2301,101 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
         Ok(st.idempotency.get(scope).cloned())
     }
 
+    async fn count_expired_unreclaimed_leases(
+        &self,
+        before: OffsetDateTime,
+    ) -> Result<Vec<(MetricId, u64)>, StorageError> {
+        let st = self.state.lock();
+        Self::check(&st)?;
+        // `MetricId` is not `Ord`, and a backlog spans few metrics, so a linear
+        // tally is both correct and cheap enough for a double.
+        let mut by_metric: Vec<(MetricId, u64)> = Vec::new();
+        for lease in st.leases.values() {
+            if lease.state != LeaseState::Active || lease.expires_at > before {
+                continue;
+            }
+            match by_metric.iter_mut().find(|(m, _)| *m == lease.metric) {
+                Some((_, count)) => *count += 1,
+                None => by_metric.push((lease.metric.clone(), 1)),
+            }
+        }
+        Ok(by_metric)
+    }
+
     async fn reclaim_expired_leases(
         &self,
         batch_size: u32,
         before: OffsetDateTime,
     ) -> Result<Vec<ExpiredLease>, StorageError> {
-        let mut st = self.state.lock();
-        Self::check(&st)?;
-        let mut reclaimed = Vec::new();
-        for (token, lease) in &mut st.leases {
-            if reclaimed.len() >= batch_size as usize {
-                break;
-            }
-            if lease.state == LeaseState::Active && lease.expires_at <= before {
+        self.transact(|st| {
+            let mut reclaimed = Vec::new();
+            let mut returns = Vec::new();
+            for (token, lease) in &mut st.leases {
+                if reclaimed.len() >= batch_size as usize {
+                    break;
+                }
+                if lease.state != LeaseState::Active || lease.expires_at > before {
+                    continue;
+                }
                 lease.state = LeaseState::AutoReleased;
+                // Only what nobody has given back yet: a writer that met this
+                // hold first already returned it, and returning it twice would
+                // credit capacity that was never held.
+                for held in &mut lease.holds {
+                    if held.returned {
+                        continue;
+                    }
+                    held.returned = true;
+                    returns.push(AppliedEntry {
+                        quota_id: held.hold.quota_id,
+                        period_id: held.hold.period_id,
+                        amount: held.hold.held_amount,
+                    });
+                }
                 reclaimed.push(ExpiredLease {
                     token: *token,
                     tenant_id: lease.tenant_id,
                     subject_key: lease.subject_key,
-                    holds: lease.holds.clone(),
+                    holds: lease.holds.iter().map(|held| held.hold.clone()).collect(),
                     expired_at: lease.expires_at,
                 });
             }
-        }
-        for lease in &reclaimed {
-            for hold in &lease.holds.clone() {
-                Self::credit_counter(
-                    &mut st,
-                    &AppliedEntry {
-                        quota_id: hold.quota_id,
-                        period_id: hold.period_id,
-                        amount: hold.held_amount,
-                    },
-                );
+            for entry in &returns {
+                Self::lower_counter(st, entry);
             }
-        }
-        Ok(reclaimed)
+            // The sweeper is the canonical emission point for the
+            // auto-release event, whichever writer returned the capacity.
+            for lease in &reclaimed {
+                let held: u64 = lease.holds.iter().map(|hold| hold.held_amount).sum();
+                let quota_id = lease.holds.first().map(|hold| hold.quota_id);
+                let subject = quota_id
+                    .and_then(|id| st.quotas.get(&id))
+                    .map(|quota| quota.subject.clone());
+                let event = NotificationEvent {
+                    event_id: EventId::generate(),
+                    kind: NotificationEventKind::LeaseAutoReleased,
+                    scope: NotificationScope::Tenant {
+                        tenant_id: lease.tenant_id,
+                    },
+                    quota_id,
+                    policy_id: None,
+                    subject,
+                    payload: serde_json::json!({
+                        "lease_token": lease.token,
+                        "held_amount": held,
+                        "affected_quotas": lease
+                            .holds
+                            .iter()
+                            .map(|hold| hold.quota_id)
+                            .collect::<Vec<_>>(),
+                        "expired_at": lease.expired_at,
+                    }),
+                    emitted_at: lease.expired_at,
+                };
+                st.events.push(event);
+            }
+            Ok(reclaimed)
+        })
     }
 
     async fn reclaim_expired_idempotency(

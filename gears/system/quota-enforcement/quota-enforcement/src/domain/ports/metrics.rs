@@ -7,12 +7,15 @@
 //! instruments to this port; none of them leaves the catalogue.
 //!
 //! Cardinality rule (`cpt-cf-quota-enforcement-constraint-bounded-cardinality`):
-//! every label value is a `&'static str` from a closed enum. `tenant_id`,
+//! every label value is a `&'static str` from a closed enum, or a
+//! [`MetricLabel`], whose values are the metrics the catalogue admitted when
+//! the gear started — a set closed at bootstrap. `tenant_id`,
 //! `subject_id`, `quota_id`, `policy_id`, idempotency keys, lease tokens,
 //! projection types, caller attribution, and raw metric input never appear as
 //! labels. They belong to spans and structured logs.
 
 use std::fmt;
+use std::sync::Arc;
 
 use toolkit_macros::domain_model;
 
@@ -21,6 +24,39 @@ pub const REASON_LABEL: &str = "reason";
 
 /// Label key of the contract-validation counters.
 pub const SURFACE_LABEL: &str = "surface";
+
+/// Label key of the lease instruments.
+pub const METRIC_LABEL: &str = "metric";
+
+/// A `metric` label value: the canonical id of a metric the catalogue admitted
+/// at bootstrap.
+///
+/// Only [`MetricClassifications`](crate::domain::catalog::MetricClassifications)
+/// makes one, from its frozen snapshot, so the values an instrument can carry
+/// are exactly the admitted metrics and never raw caller input.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MetricLabel(Arc<str>);
+
+impl MetricLabel {
+    /// The label of an admitted metric. Crate-private: the classification
+    /// snapshot is the only caller.
+    pub(crate) fn admitted(metric: &quota_enforcement_sdk::MetricId) -> Self {
+        Self(Arc::from(metric.as_str()))
+    }
+
+    /// The label value.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The label value, shared rather than copied.
+    #[must_use]
+    pub fn shared(&self) -> Arc<str> {
+        Arc::clone(&self.0)
+    }
+}
 
 /// Closed `reason` set of `denial_total`.
 // @cpt-dod:cpt-cf-quota-enforcement-dod-telemetry-conventions:p1
@@ -99,11 +135,25 @@ pub enum OperationKind {
     Rollback,
     /// Evaluate without mutating.
     Preview,
+    /// Acquire a lease.
+    Reserve,
+    /// Commit a lease.
+    Commit,
+    /// Release a lease.
+    Release,
 }
 
 impl OperationKind {
     /// Every value, for conformance tests.
-    pub const ALL: [Self; 4] = [Self::Debit, Self::Credit, Self::Rollback, Self::Preview];
+    pub const ALL: [Self; 7] = [
+        Self::Debit,
+        Self::Credit,
+        Self::Rollback,
+        Self::Preview,
+        Self::Reserve,
+        Self::Commit,
+        Self::Release,
+    ];
 
     /// Stable label value.
     #[must_use]
@@ -113,6 +163,9 @@ impl OperationKind {
             Self::Credit => "credit",
             Self::Rollback => "rollback",
             Self::Preview => "preview",
+            Self::Reserve => "reserve",
+            Self::Commit => "commit",
+            Self::Release => "release",
         }
     }
 }
@@ -340,6 +393,37 @@ pub trait QeMetrics: Send + Sync {
 
     /// `retention_sweep_failures_total{table}` += 1.
     fn record_retention_failure(&self, table: RetentionTable);
+
+    /// `lease_acquisition_wait_seconds{metric}` observes one acquisition,
+    /// from the storage call to its answer: admitted, denied, or refused on
+    /// the cap or on contention.
+    fn record_lease_acquisition_wait(&self, metric: &MetricLabel, elapsed: std::time::Duration);
+
+    /// `lease_contention_rejected_total{metric}` += 1.
+    fn record_lease_contention_rejected(&self, metric: &MetricLabel);
+
+    /// `lease_inflight_limit_exceeded_total{metric}` += 1.
+    fn record_lease_inflight_limit_exceeded(&self, metric: &MetricLabel);
+}
+
+/// One backlog sample: expired, unreclaimed leases per admitted metric.
+pub type LeaseBacklog = Vec<(MetricLabel, u64)>;
+
+/// Where the lease sweeper publishes the expired-but-unreclaimed backlog that
+/// `lease_unreclaimed_expired{metric}` observes. `None` withdraws the sample:
+/// a replica that does not lead has nothing to report.
+pub trait LeaseBacklogSink: Send + Sync {
+    /// Replace the published sample.
+    fn publish(&self, backlog: Option<LeaseBacklog>);
+}
+
+/// Publishes nothing. For tests and pre-init contexts.
+#[domain_model]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoopLeaseBacklog;
+
+impl LeaseBacklogSink for NoopLeaseBacklog {
+    fn publish(&self, _backlog: Option<LeaseBacklog>) {}
 }
 
 /// Records nothing. For tests and pre-init contexts.
@@ -373,6 +457,9 @@ impl QeMetrics for NoopMetrics {
     fn record_idempotency_replay(&self, _operation: OperationKind) {}
     fn record_retention_reclaimed(&self, _table: RetentionTable, _rows: u64) {}
     fn record_retention_failure(&self, _table: RetentionTable) {}
+    fn record_lease_acquisition_wait(&self, _: &MetricLabel, _: std::time::Duration) {}
+    fn record_lease_contention_rejected(&self, _: &MetricLabel) {}
+    fn record_lease_inflight_limit_exceeded(&self, _: &MetricLabel) {}
 }
 
 /// Bounded deployment engine labels; unknown submitted strings cannot enter metrics.

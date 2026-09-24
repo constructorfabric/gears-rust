@@ -64,6 +64,8 @@ pub struct Operations<'a> {
     pub evaluation: quota_enforcement_sdk::engine::EvaluationLimits,
     /// How many preparations one operation may trigger.
     pub preparation_max_attempts: std::num::NonZeroU32,
+    /// The TTL window lease acquisitions are checked against.
+    pub leases: super::leases::LeaseLimits,
 }
 
 /// What a dry run evaluates: the read snapshot and the documents the policy
@@ -378,7 +380,9 @@ impl Operations<'_> {
             original: IdempotencyScope {
                 tenant_id: admitted.attribution.tenant_id,
                 subject_key: IdempotencySubjectKey::of(&admitted.attribution.subjects),
-                operation_type: OperationType::Debit,
+                // A debit and a lease commit are separate namespaces under the
+                // same key; the caller says which one it reverses.
+                operation_type: request.original_operation.operation_type(),
                 key: request.original_idempotency_key,
             },
             authorized: admitted.authorized,
@@ -555,7 +559,7 @@ impl Operations<'_> {
     // --- shared steps -------------------------------------------------------
 
     /// A positive amount, or the closed token that says why not.
-    fn validate_amount(&self, amount: i64) -> Result<u64, DomainError> {
+    pub(super) fn validate_amount(&self, amount: i64) -> Result<u64, DomainError> {
         positive_amount(amount).ok_or_else(|| {
             self.metrics.record_denial(DenialReason::InvalidArgument);
             DomainError::InvalidArgument {
@@ -567,7 +571,7 @@ impl Operations<'_> {
 
     /// Every write carries a key. An empty one would make the scope
     /// meaningless rather than absent.
-    fn validate_key(&self, key: &str) -> Result<(), DomainError> {
+    pub(super) fn validate_key(&self, key: &str) -> Result<(), DomainError> {
         if key.trim().is_empty() {
             self.metrics.record_denial(DenialReason::InvalidArgument);
             return Err(DomainError::InvalidArgument {
@@ -585,14 +589,14 @@ impl Operations<'_> {
     /// deployment whose metric has no user projection simply has one tier. A
     /// catalogue miss is not an error here: ingress already proved the metric
     /// is admitted, and a metric admitted only at tenant scope is ordinary.
-    fn user_projection(&self, metric: &MetricId) -> Option<gts::GtsTypeId> {
+    pub(super) fn user_projection(&self, metric: &MetricId) -> Option<gts::GtsTypeId> {
         self.catalog
             .map_subject(metric, &quota_enforcement_sdk::SubjectScope::user())
             .ok()
             .cloned()
     }
 
-    fn scope_of(
+    pub(super) fn scope_of(
         admitted: &AdmittedEvaluation,
         operation_type: OperationType,
         key: String,
@@ -640,7 +644,7 @@ impl Operations<'_> {
         Ok(Some(replay.decision))
     }
 
-    fn applied(
+    pub(super) fn applied(
         &self,
         outcome: TransitionOutcome<AppliedMutation>,
         operation: OperationKind,
@@ -674,7 +678,7 @@ impl Operations<'_> {
         applied.decision
     }
 
-    fn count_denial(&self, decision: &Decision) {
+    pub(super) fn count_denial(&self, decision: &Decision) {
         if let DecisionResult::Denied { reason, .. } = &decision.result {
             self.metrics
                 .record_denial(DenialReason::from_decision_reason(reason));
@@ -682,7 +686,9 @@ impl Operations<'_> {
     }
 }
 
-fn applicable_of(admitted: &AdmittedEvaluation) -> quota_enforcement_sdk::ApplicableQuotas {
+pub(super) fn applicable_of(
+    admitted: &AdmittedEvaluation,
+) -> quota_enforcement_sdk::ApplicableQuotas {
     quota_enforcement_sdk::ApplicableQuotas {
         tenant_id: admitted.attribution.tenant_id,
         subjects: admitted.attribution.subjects.clone(),
@@ -691,7 +697,7 @@ fn applicable_of(admitted: &AdmittedEvaluation) -> quota_enforcement_sdk::Applic
 }
 
 /// The two Policy-visible documents, as the engine sees them.
-fn policy_values(admitted: &AdmittedEvaluation) -> (Value, Value) {
+pub(super) fn policy_values(admitted: &AdmittedEvaluation) -> (Value, Value) {
     let request = Value::Object(admitted.input.request.clone());
     let resource = admitted
         .input
@@ -720,7 +726,7 @@ fn storage_failure(
     }
 }
 
-fn digest<T: Serialize>(payload: &T) -> Result<PayloadHash, DomainError> {
+pub(super) fn digest<T: Serialize>(payload: &T) -> Result<PayloadHash, DomainError> {
     PayloadHash::of_canonical(payload).map_err(|error| DomainError::Internal(error.to_string()))
 }
 

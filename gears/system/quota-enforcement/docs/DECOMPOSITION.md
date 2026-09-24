@@ -441,9 +441,11 @@ not here.
   - Lazy semantic release on every read/write path; `LeaseSweeper` physical reclamation under the `lease-sweeper`
     cluster election
   - Contention timeout and active-lease-cap enforcement with their telemetry
+  - The lease half of the Quota deactivation cascade: resolving the deactivated Quota's active leases in the
+    deactivation transaction (the flow and its state belong to feature `quota-lifecycle`; they close here)
 
 - **Out of scope**:
-  - Lease-resolution behavior of Quota deactivation (owned by feature `quota-lifecycle`)
+  - Physical deletion of terminal lease rows after a grace period (optional; not built)
 
 - **Requirements Covered**:
 

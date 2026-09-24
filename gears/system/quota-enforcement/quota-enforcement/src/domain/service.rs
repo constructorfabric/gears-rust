@@ -26,6 +26,8 @@ pub struct OperationsRuntime {
     pub cache_ttl: std::time::Duration,
     /// How many preparations one operation may trigger.
     pub preparation_max_attempts: std::num::NonZeroU32,
+    /// The TTL window lease acquisitions are checked against.
+    pub leases: super::operations::LeaseLimits,
 }
 
 /// Composition root of the domain. Handlers and the in-process client reach
@@ -41,6 +43,7 @@ pub struct Service {
     operations: super::operations::IdempotencyCache,
     evaluation: quota_enforcement_sdk::engine::EvaluationLimits,
     preparation_max_attempts: std::num::NonZeroU32,
+    leases: super::operations::LeaseLimits,
 }
 
 impl Service {
@@ -66,6 +69,7 @@ impl Service {
             ),
             evaluation: policy_limits.evaluation,
             preparation_max_attempts: operations.preparation_max_attempts,
+            leases: operations.leases,
         }
     }
 
@@ -180,7 +184,7 @@ impl Service {
         })
     }
 
-    /// The consumption hot path: debit, credit, rollback, preview.
+    /// The consumption hot path: debit, credit, rollback, preview, and leases.
     ///
     /// # Errors
     ///
@@ -205,6 +209,7 @@ impl Service {
             metrics: self.admission.metrics_handle(),
             evaluation: self.evaluation,
             preparation_max_attempts: self.preparation_max_attempts,
+            leases: self.leases,
         })
     }
 

@@ -16,7 +16,7 @@
 //! Requires Docker. Run with
 //! `cargo test -p cf-gears-quota-enforcement-storage-plugin --features postgres --test consumption_store_integration_pg`.
 
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use gts::GtsTypeId;
@@ -123,19 +123,8 @@ fn limits() -> EvaluationLimits {
 
 /// Allow the requested amount against every applicable Quota with room, deny
 /// otherwise. Deterministic, so a race's outcome is the backend's doing.
-///
-/// `gate`, when given, blocks here until every party arrives. The callback runs
-/// inside the transaction, after its replay check and after its Quota rows are
-/// locked, so a barrier here holds every writer in exactly the window the
-/// record's primary key has to arbitrate. Without it the tasks may simply run
-/// one after the other and the test would pass while proving nothing.
-fn evaluator(gate: Option<Arc<Barrier>>) -> Arc<TransactionEvaluator> {
+fn evaluator() -> Arc<TransactionEvaluator> {
     Arc::new(move |context: &EvaluationContext<'_>| {
-        if let Some(gate) = &gate {
-            // A blocking wait on a Tokio worker: the suite runs multi-threaded
-            // with more workers than parties, so this cannot starve.
-            gate.wait();
-        }
         let exceeded: Vec<QuotaId> = context
             .quotas
             .iter()
@@ -190,7 +179,17 @@ async fn wait_for_tcp(port: u16) {
     }
 }
 
+/// What a debit task answers.
+type DebitResult = Result<TransitionOutcome<quota_enforcement_sdk::EvaluatedDebit>, StorageError>;
+
+/// A debit stopped inside its transaction, and the sender that lets it go on.
+type HeldDebit = (
+    tokio::task::JoinHandle<DebitResult>,
+    std::sync::mpsc::SyncSender<()>,
+);
+
 struct PgHarness {
+    db: toolkit_db::Db,
     store: Arc<SqlConsumptionStore>,
     quotas: SqlQuotaStore,
     /// The consumption store's clock, so a test can move a period boundary.
@@ -258,6 +257,7 @@ impl PgHarness {
         let store_reader = Arc::clone(&clock);
         let update_reader = Arc::clone(&update_clock);
         Self {
+            db: db.clone(),
             store: Arc::new(SqlConsumptionStore::with_clock(
                 db.clone(),
                 Arc::clone(&enqueuer),
@@ -277,6 +277,25 @@ impl PgHarness {
 
     fn set_now(&self, now: OffsetDateTime) {
         *self.clock.lock().expect("clock") = now;
+    }
+
+    /// Give `metric` a contention budget (I8). Without one the platform default
+    /// applies: 0 ms, fail fast.
+    async fn set_contention_timeout(&self, metric: &str, timeout: Duration) {
+        use quota_enforcement_storage_plugin::infra::storage::entity::contention_timeout_config;
+        use sea_orm::ActiveValue::Set;
+        let conn = self.db.conn().expect("conn");
+        toolkit_db::secure::secure_insert::<contention_timeout_config::Entity>(
+            contention_timeout_config::ActiveModel {
+                metric_key: Set(metric.to_owned()),
+                timeout_ms: Set(i64::try_from(timeout.as_millis()).expect("fits")),
+                updated_at: Set(OffsetDateTime::now_utc()),
+            },
+            &AccessScope::allow_all(),
+            &conn,
+        )
+        .await
+        .expect("configure the contention budget");
     }
 
     fn set_update_now(&self, now: OffsetDateTime) {
@@ -312,12 +331,11 @@ impl PgHarness {
         metric: &'static str,
         amount: u64,
         idempotency: IdempotencyWrite,
-        gate: Option<Arc<Barrier>>,
     ) -> tokio::task::JoinHandle<
         Result<TransitionOutcome<quota_enforcement_sdk::EvaluatedDebit>, StorageError>,
     > {
         let store = Arc::clone(&self.store);
-        let evaluate = evaluator(gate);
+        let evaluate = evaluator();
         tokio::spawn(async move {
             let applicable = applicable(subject_id, metric);
             let null = serde_json::Value::Null;
@@ -356,11 +374,12 @@ impl PgHarness {
         Result<TransitionOutcome<quota_enforcement_sdk::EvaluatedDebit>, StorageError>,
     > {
         let store = Arc::clone(&self.store);
-        let inner = evaluator(None);
+        let inner = evaluator();
         let release = Mutex::new(release);
         let evaluate: Arc<TransactionEvaluator> = Arc::new(move |context| {
             locked.send(()).ok();
-            release.lock().expect("release").recv().ok();
+            // Blocking, so it gives up its worker first (see `evaluator`).
+            tokio::task::block_in_place(|| release.lock().expect("release").recv().ok());
             inner(context)
         });
         tokio::spawn(async move {
@@ -402,12 +421,17 @@ impl PgHarness {
 async fn concurrent_debits_never_exceed_the_cap() {
     let h = PgHarness::up().await;
     let id = h.quota("u1", METRIC_TOKENS, Some(10)).await;
+    // Twenty writers on one row need a budget to take turns; at the 0 ms
+    // default all but the first would be refused, which the fail-fast test
+    // below asserts on its own.
+    h.set_contention_timeout(METRIC_TOKENS, Duration::from_secs(10))
+        .await;
 
     // Twenty writers of one unit each against a cap of ten. The row lock is
     // what makes exactly ten of them win.
     let mut tasks = Vec::new();
     for i in 0..20 {
-        tasks.push(h.debit("u1", METRIC_TOKENS, 1, write(&format!("k{i}"), 1), None));
+        tasks.push(h.debit("u1", METRIC_TOKENS, 1, write(&format!("k{i}"), 1)));
     }
     let mut allowed = 0;
     for task in tasks {
@@ -423,23 +447,22 @@ async fn concurrent_debits_never_exceed_the_cap() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn one_scope_over_disjoint_quota_rows_is_arbitrated_by_the_record() {
+async fn one_scope_over_disjoint_quota_rows_is_serialized_by_the_scope_lock() {
     let h = PgHarness::up().await;
     // Two metrics, so the two writers lock different Quota rows and the row
     // locks cannot serialize them. Their idempotency scope is identical, and
     // the metric is part of the hashed payload, so their payloads differ.
     let tokens = h.quota("u1", METRIC_TOKENS, Some(100)).await;
     let other = h.quota("u1", METRIC_OTHER, Some(100)).await;
+    // The second writer waits out the first on the scope lock; at the 0 ms
+    // default it is refused instead (tested below).
+    for metric in [METRIC_TOKENS, METRIC_OTHER] {
+        h.set_contention_timeout(metric, Duration::from_secs(10))
+            .await;
+    }
 
-    let gate = Arc::new(Barrier::new(2));
-    let first = h.debit(
-        "u1",
-        METRIC_TOKENS,
-        5,
-        write("shared", 1),
-        Some(Arc::clone(&gate)),
-    );
-    let second = h.debit("u1", METRIC_OTHER, 5, write("shared", 2), Some(gate));
+    let first = h.debit("u1", METRIC_TOKENS, 5, write("shared", 1));
+    let second = h.debit("u1", METRIC_OTHER, 5, write("shared", 2));
     let (first, second) = (first.await.expect("join"), second.await.expect("join"));
 
     let mut applied = 0;
@@ -459,7 +482,98 @@ async fn one_scope_over_disjoint_quota_rows_is_arbitrated_by_the_record() {
 
     let moved =
         h.consumed("u1", METRIC_TOKENS, tokens).await + h.consumed("u1", METRIC_OTHER, other).await;
-    assert_eq!(moved, 5, "the loser rolled back completely");
+    assert_eq!(moved, 5, "the loser moved nothing");
+    h.down().await;
+}
+
+/// Start a debit of `shared` on `u1`'s tokens Quota that stops inside its
+/// transaction, holding its scope lock, and wait until it is there.
+fn hold_the_scope(h: &PgHarness) -> HeldDebit {
+    let (locked_tx, locked_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let holder = h.debit_held(
+        "u1",
+        METRIC_TOKENS,
+        5,
+        write("shared", 1),
+        locked_tx,
+        release_rx,
+    );
+    locked_rx
+        .recv()
+        .expect("the holder is inside its transaction");
+    (holder, release_tx)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn at_the_default_budget_a_writer_of_the_same_key_over_other_quotas_fails_fast() {
+    let h = PgHarness::up().await;
+    let tokens = h.quota("u1", METRIC_TOKENS, Some(100)).await;
+    let other = h.quota("u1", METRIC_OTHER, Some(100)).await;
+    let (holder, release) = hold_the_scope(&h);
+
+    // No row lock is shared, so only the scope lock can stop this writer
+    // before it meets the holder's record.
+    let started = std::time::Instant::now();
+    let refused = h
+        .debit("u1", METRIC_OTHER, 5, write("shared", 2))
+        .await
+        .expect("join");
+    let waited = started.elapsed();
+    assert!(
+        matches!(refused, Err(StorageError::LeaseContentionTimeout)),
+        "the scope is held: refused at 0 ms, got {refused:?}"
+    );
+    assert!(waited < Duration::from_secs(1), "no queueing: {waited:?}");
+
+    release.send(()).expect("release");
+    assert!(matches!(
+        holder.await.expect("join"),
+        Ok(TransitionOutcome::Applied(_))
+    ));
+    assert_eq!(h.consumed("u1", METRIC_TOKENS, tokens).await, 5);
+    assert_eq!(h.consumed("u1", METRIC_OTHER, other).await, 0);
+    h.down().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_budget_bounds_a_wait_on_the_same_key() {
+    let h = PgHarness::up().await;
+    h.quota("u1", METRIC_TOKENS, Some(100)).await;
+    h.quota("u1", METRIC_OTHER, Some(100)).await;
+    h.set_contention_timeout(METRIC_OTHER, Duration::from_millis(200))
+        .await;
+    let (holder, release) = hold_the_scope(&h);
+    // The holder outlasts the contender's budget several times over.
+    let releaser = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        release.send(()).expect("release");
+    });
+
+    let started = std::time::Instant::now();
+    let refused = h
+        .debit("u1", METRIC_OTHER, 5, write("shared", 2))
+        .await
+        .expect("join");
+    let waited = started.elapsed();
+    assert!(
+        matches!(refused, Err(StorageError::LeaseContentionTimeout)),
+        "got {refused:?}"
+    );
+    assert!(
+        waited >= Duration::from_millis(150),
+        "it waited within its budget first: {waited:?}"
+    );
+    assert!(
+        waited < Duration::from_millis(1000),
+        "the budget, not the holder, ended the wait: {waited:?}"
+    );
+
+    releaser.await.expect("join");
+    assert!(matches!(
+        holder.await.expect("join"),
+        Ok(TransitionOutcome::Applied(_))
+    ));
     h.down().await;
 }
 
@@ -467,14 +581,13 @@ async fn one_scope_over_disjoint_quota_rows_is_arbitrated_by_the_record() {
 async fn identical_concurrent_debits_commit_once_and_replay_once() {
     let h = PgHarness::up().await;
     let id = h.quota("u1", METRIC_TOKENS, Some(100)).await;
+    // The second writer has to wait out the first to replay its record; at
+    // the 0 ms default it is refused instead (the fail-fast test's subject).
+    h.set_contention_timeout(METRIC_TOKENS, Duration::from_secs(10))
+        .await;
 
-    // Both writers lock the same Quota row, so the barrier has to sit where
-    // only one of them can be: the second reaches its evaluation only after the
-    // first commits and releases the row. Two parties with one arrival each
-    // would deadlock, so the gate admits a single party and simply proves the
-    // evaluation ran inside the transaction.
-    let first = h.debit("u1", METRIC_TOKENS, 7, write("same", 1), None);
-    let second = h.debit("u1", METRIC_TOKENS, 7, write("same", 1), None);
+    let first = h.debit("u1", METRIC_TOKENS, 7, write("same", 1));
+    let second = h.debit("u1", METRIC_TOKENS, 7, write("same", 1));
     let outcomes = [
         first.await.expect("join").expect("debit"),
         second.await.expect("join").expect("debit"),
@@ -504,7 +617,7 @@ async fn a_cap_update_that_waits_out_a_boundary_sees_the_successor_period() {
 
     // Day one: the current period holds 10.
     h.set_now(DAY_ONE);
-    h.debit("u1", METRIC_TOKENS, 10, write("k1", 1), None)
+    h.debit("u1", METRIC_TOKENS, 10, write("k1", 1))
         .await
         .expect("join")
         .expect("first debit");
@@ -555,5 +668,273 @@ async fn a_cap_update_that_waits_out_a_boundary_sees_the_successor_period() {
         "the successor period had already consumed 60, got {refused:?}"
     );
     assert_eq!(h.consumed("u1", METRIC_TOKENS, id).await, 60);
+    h.down().await;
+}
+
+// ---------------------------------------------------------------------------
+// The contention budget (I8): NOWAIT locks and a deadline-bound retry
+// ---------------------------------------------------------------------------
+
+/// Start a debit that holds the Quota row of `u1` until released, and wait
+/// until it has the lock.
+fn hold_the_row(h: &PgHarness, key: &str) -> HeldDebit {
+    let (locked_tx, locked_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let holder = h.debit_held("u1", METRIC_TOKENS, 1, write(key, 1), locked_tx, release_rx);
+    locked_rx.recv().expect("the holder locks the row");
+    (holder, release_tx)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn at_the_default_budget_a_contended_debit_fails_fast() {
+    let h = PgHarness::up().await;
+    h.quota("u1", METRIC_TOKENS, Some(100)).await;
+    let (holder, release) = hold_the_row(&h, "held");
+
+    let started = std::time::Instant::now();
+    let refused = h
+        .debit("u1", METRIC_TOKENS, 1, write("contender", 2))
+        .await
+        .expect("join");
+    let waited = started.elapsed();
+    assert!(
+        matches!(refused, Err(StorageError::LeaseContentionTimeout)),
+        "the default budget is 0 ms: a held row is refused, got {refused:?}"
+    );
+    assert!(
+        waited < Duration::from_secs(1),
+        "fail fast means no queueing behind the holder: {waited:?}"
+    );
+
+    release.send(()).expect("release");
+    holder.await.expect("join").expect("the holder commits");
+    h.down().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_positive_budget_waits_out_the_holder_and_then_succeeds() {
+    let h = PgHarness::up().await;
+    let id = h.quota("u1", METRIC_TOKENS, Some(100)).await;
+    h.set_contention_timeout(METRIC_TOKENS, Duration::from_secs(5))
+        .await;
+    let (holder, release) = hold_the_row(&h, "held");
+
+    let started = std::time::Instant::now();
+    let contender = h.debit("u1", METRIC_TOKENS, 1, write("contender", 2));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    release.send(()).expect("release");
+    holder.await.expect("join").expect("the holder commits");
+
+    let admitted = contender
+        .await
+        .expect("join")
+        .expect("the retry takes the row");
+    let waited = started.elapsed();
+    assert_eq!(admitted.get().decision.result, DecisionResult::Allowed);
+    assert!(
+        waited >= Duration::from_millis(250),
+        "it could only proceed once the holder let go: {waited:?}"
+    );
+    assert_eq!(
+        h.consumed("u1", METRIC_TOKENS, id).await,
+        2,
+        "both debits landed"
+    );
+    h.down().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_budget_bounds_the_whole_wait_not_each_retry() {
+    let h = PgHarness::up().await;
+    let id = h.quota("u1", METRIC_TOKENS, Some(100)).await;
+    h.set_contention_timeout(METRIC_TOKENS, Duration::from_millis(300))
+        .await;
+    let (holder, release) = hold_the_row(&h, "held");
+
+    let started = std::time::Instant::now();
+    let refused = h
+        .debit("u1", METRIC_TOKENS, 1, write("contender", 2))
+        .await
+        .expect("join");
+    let waited = started.elapsed();
+    assert!(
+        matches!(refused, Err(StorageError::LeaseContentionTimeout)),
+        "a holder that outlasts the budget is a contention timeout, got {refused:?}"
+    );
+    assert!(
+        waited >= Duration::from_millis(250),
+        "it retried for the budget: {waited:?}"
+    );
+    assert!(
+        waited < Duration::from_millis(1500),
+        "the budget is a deadline across every retry: {waited:?}"
+    );
+
+    release.send(()).expect("release");
+    holder.await.expect("join").expect("the holder commits");
+    assert_eq!(
+        h.consumed("u1", METRIC_TOKENS, id).await,
+        1,
+        "the refused debit held nothing"
+    );
+    h.down().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rollback_racing_replays_of_its_debit_never_deadlocks() {
+    // A replaying debit locks the Quota, then the record; a rollback of the
+    // same key used to lock the record, then the Quota. Under one lock order,
+    // and with every lock NOWAIT, neither can wait on the other in a cycle.
+    let h = PgHarness::up().await;
+    let id = h.quota("u1", METRIC_TOKENS, Some(100)).await;
+    h.set_contention_timeout(METRIC_TOKENS, Duration::from_secs(10))
+        .await;
+    h.debit("u1", METRIC_TOKENS, 3, write("original", 1))
+        .await
+        .expect("join")
+        .expect("the debit commits");
+    assert_eq!(h.consumed("u1", METRIC_TOKENS, id).await, 3);
+
+    let target = quota_enforcement_sdk::RollbackTarget {
+        original: write("original", 1).scope,
+        authorized: AttributionDigest::from_bytes([7; 32]),
+    };
+    let mut rollbacks = Vec::new();
+    let mut replays = Vec::new();
+    for i in 0..6_u8 {
+        let store = Arc::clone(&h.store);
+        let target = target.clone();
+        rollbacks.push(tokio::spawn(async move {
+            let own = IdempotencyWrite {
+                scope: IdempotencyScope {
+                    operation_type: OperationType::Rollback,
+                    key: format!("rollback-{i}"),
+                    ..write("unused", 0).scope
+                },
+                payload_hash: PayloadHash::from_bytes([100 + i; 32]),
+            };
+            store
+                .apply_rollback(&ctx(), &scope(), &target, &own, &[])
+                .await
+        }));
+        replays.push(h.debit("u1", METRIC_TOKENS, 3, write("original", 1)));
+    }
+    for task in rollbacks {
+        task.await
+            .expect("join")
+            .expect("a rollback completes; a deadlock would abort one");
+    }
+    for task in replays {
+        let replayed = task
+            .await
+            .expect("join")
+            .expect("a replay completes; a deadlock would abort one");
+        assert!(
+            matches!(replayed, TransitionOutcome::NoOp(_)),
+            "the same key and payload replays"
+        );
+    }
+    assert_eq!(
+        h.consumed("u1", METRIC_TOKENS, id).await,
+        0,
+        "reversed exactly once, whichever rollback got there first"
+    );
+    h.down().await;
+}
+
+// ---------------------------------------------------------------------------
+// Idempotency stripes: a fixed set of rows, so unrelated scopes can collide
+// ---------------------------------------------------------------------------
+
+/// A debit key other than `key` whose scope maps to the same stripe.
+fn colliding_key(key: &str) -> String {
+    use quota_enforcement_storage_plugin::infra::storage::repo::idempotency_repo::{
+        ScopeKey, stripe_of,
+    };
+    let stripe = |key: &str| {
+        let scope = write(key, 0).scope;
+        stripe_of(&ScopeKey {
+            tenant_id: scope.tenant_id.as_uuid(),
+            subject_key: scope.subject_key.as_bytes(),
+            operation_type: scope.operation_type.as_str(),
+            idem_key: &scope.key,
+        })
+    };
+    let target = stripe(key);
+    (0..u32::MAX)
+        .map(|n| format!("collide-{n}"))
+        .find(|candidate| stripe(candidate) == target)
+        .expect("some key shares the stripe")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unrelated_scope_on_a_held_stripe_is_refused_at_the_default_budget_and_waits_with_one() {
+    let h = PgHarness::up().await;
+    h.quota("u1", METRIC_TOKENS, Some(100)).await;
+    let other = h.quota("u1", METRIC_OTHER, Some(100)).await;
+    let (holder, release) = hold_the_scope(&h);
+    // Another key over another Quota: nothing it touches is contended except
+    // the stripe it shares with the holder's scope.
+    let unrelated = colliding_key("shared");
+
+    let refused = h
+        .debit("u1", METRIC_OTHER, 5, write(&unrelated, 2))
+        .await
+        .expect("join");
+    assert!(
+        matches!(refused, Err(StorageError::LeaseContentionTimeout)),
+        "a shared stripe is refused at 0 ms like a shared scope, got {refused:?}"
+    );
+
+    // With a budget it waits for the holder instead, and then goes through.
+    h.set_contention_timeout(METRIC_OTHER, Duration::from_secs(10))
+        .await;
+    let waiting = h.debit("u1", METRIC_OTHER, 5, write(&unrelated, 2));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!waiting.is_finished(), "it waits on the held stripe");
+    release.send(()).expect("release");
+    assert!(matches!(
+        holder.await.expect("join"),
+        Ok(TransitionOutcome::Applied(_))
+    ));
+    assert!(matches!(
+        waiting.await.expect("join"),
+        Ok(TransitionOutcome::Applied(_))
+    ));
+    assert_eq!(h.consumed("u1", METRIC_OTHER, other).await, 5);
+    h.down().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retention_skips_a_record_whose_stripe_a_writer_holds() {
+    let h = PgHarness::up().await;
+    h.quota("u1", METRIC_TOKENS, Some(100)).await;
+    h.quota("u1", METRIC_OTHER, Some(100)).await;
+    // A record that expires, keyed so its stripe is the holder's.
+    let expiring = colliding_key("shared");
+    h.set_now(DAY_ONE);
+    h.debit("u1", METRIC_OTHER, 1, write(&expiring, 1))
+        .await
+        .expect("join")
+        .expect("the debit commits");
+    let long_after = DAY_ONE + time::Duration::days(400);
+    h.set_now(long_after);
+
+    let (holder, release) = hold_the_scope(&h);
+    let skipped = h
+        .store
+        .reclaim_expired_idempotency(100, long_after)
+        .await
+        .expect("reclaim");
+    assert_eq!(skipped, 0, "the held stripe is skipped, not waited on");
+
+    release.send(()).expect("release");
+    holder.await.expect("join").expect("the holder commits");
+    let reclaimed = h
+        .store
+        .reclaim_expired_idempotency(100, long_after)
+        .await
+        .expect("reclaim");
+    assert_eq!(reclaimed, 1, "once the stripe is free the record goes");
     h.down().await;
 }

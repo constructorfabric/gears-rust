@@ -219,7 +219,12 @@ fn every_reason_label_is_a_distinct_snake_case_token() {
     // the cardinality of an instrument.
     let operations: Vec<&str> = OperationKind::ALL.iter().map(|o| o.as_label()).collect();
     assert_distinct_snake_case(&operations);
-    assert_eq!(operations, ["debit", "credit", "rollback", "preview"]);
+    assert_eq!(
+        operations,
+        [
+            "debit", "credit", "rollback", "preview", "reserve", "commit", "release"
+        ]
+    );
     let tables: Vec<&str> = RetentionTable::ALL.iter().map(|t| t.as_str()).collect();
     assert_distinct_snake_case(&tables);
     assert_eq!(tables, ["idempotency", "operation_log"]);
@@ -232,7 +237,7 @@ fn every_reason_label_is_a_distinct_snake_case_token() {
 
 #[test]
 fn the_default_adapter_builds_on_the_global_provider_without_panicking() {
-    let adapter = build_default_adapter(&MetricsConfig::default(), cell());
+    let adapter = build_default_adapter(&MetricsConfig::default(), cell(), Arc::default());
     adapter.record_denial(DenialReason::NotReady);
 }
 
@@ -400,4 +405,52 @@ fn policy_engine_instruments_use_only_documented_labels() {
             }
         }
     }
+}
+
+#[test]
+fn lease_instruments_carry_only_the_admitted_metric_label() {
+    use crate::domain::ports::metrics::{LeaseBacklogSink, METRIC_LABEL, MetricLabel};
+    use crate::infra::lease_backlog::{LEASE_UNRECLAIMED_EXPIRED, LeaseBacklogCell};
+    let (provider, exporter) = local_provider();
+    let backlog = Arc::new(LeaseBacklogCell::default());
+    let adapter = QeMetricsMeter::with_lease_backlog(
+        &provider.meter("quota-enforcement"),
+        &MetricsConfig::default(),
+        cell(),
+        backlog.clone(),
+    );
+    let tokens = MetricLabel::admitted(
+        &quota_enforcement_sdk::MetricId::parse(crate::test_support::METRIC_TOKENS)
+            .expect("metric"),
+    );
+
+    adapter.record_lease_contention_rejected(&tokens);
+    adapter.record_lease_inflight_limit_exceeded(&tokens);
+    adapter.record_lease_inflight_limit_exceeded(&tokens);
+    adapter.record_lease_acquisition_wait(&tokens, std::time::Duration::from_millis(3));
+    backlog.publish(Some(vec![(tokens.clone(), 4)]));
+    provider.force_flush().expect("flush");
+
+    let label = Some((METRIC_LABEL, tokens.as_str()));
+    assert_eq!(
+        counter_sum(&exporter, super::LEASE_CONTENTION_REJECTED_TOTAL, label),
+        Some(1)
+    );
+    assert_eq!(
+        counter_sum(&exporter, super::LEASE_INFLIGHT_LIMIT_EXCEEDED_TOTAL, label),
+        Some(2)
+    );
+    assert_eq!(
+        gauge_last_u64(&exporter, LEASE_UNRECLAIMED_EXPIRED),
+        Some(4)
+    );
+
+    backlog.publish(None);
+    exporter.reset();
+    provider.force_flush().expect("flush");
+    assert_eq!(
+        gauge_last_u64(&exporter, LEASE_UNRECLAIMED_EXPIRED),
+        None,
+        "a withdrawn backlog is absent, never zero"
+    );
 }

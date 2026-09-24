@@ -42,11 +42,10 @@ use crate::engine::{EvaluationFailure, EvaluationLimits, TransactionEvaluator};
 use crate::models::{
     ActiveQuotaCounts, ApplicableQuotas, AppliedMutation, AttributionDigest, BatchDebitItem,
     BootstrapBundle, ConfigDefaults, DeactivateOutcome, EvaluatedDebit, EvaluatedLease,
-    ExpiredLease, IdempotencyRecord, IdempotencyScope, IdempotencyWrite, LeaseToken,
-    MutationResult, NotificationEvent, PageRequest, PageResult, PartialIdempotencyWrite,
-    PolicyDraft, PolicyId, PolicyScope, PolicyUpdate, PolicyVersion, PolicyVersionMeta,
-    ProjectionBinding, Quota, QuotaDraft, QuotaFilter, QuotaId, QuotaPatch, QuotaSnapshot,
-    RollbackTarget, TransitionOutcome,
+    ExpiredLease, IdempotencyRecord, IdempotencyScope, IdempotencyWrite, LeaseToken, MetricId,
+    NotificationEvent, PageRequest, PageResult, PartialIdempotencyWrite, PolicyDraft, PolicyId,
+    PolicyScope, PolicyUpdate, PolicyVersion, PolicyVersionMeta, ProjectionBinding, Quota,
+    QuotaDraft, QuotaFilter, QuotaId, QuotaPatch, QuotaSnapshot, RollbackTarget, TransitionOutcome,
 };
 
 /// Major version of this contract. Coupled to the gear's major version. A
@@ -83,7 +82,16 @@ pub enum StorageError {
         /// The original idempotency key the caller named.
         key: String,
     },
-    /// Commit or release against a lease that is not active.
+    /// No lease with this token exists inside the caller's authorized scope.
+    /// A token belonging to another tenant is reported the same way, so the
+    /// error reveals nothing about tokens the caller may not address.
+    #[error("no lease {token} exists")]
+    LeaseNotFound {
+        /// The lease token.
+        token: LeaseToken,
+    },
+    /// Commit or release against a lease that exists but is expired or already
+    /// resolved.
     #[error("lease {token} is not active")]
     LeaseNotActive {
         /// The lease token.
@@ -527,6 +535,10 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
     /// Evaluate the applicable policy and hold the resulting plan atomically
     /// (I5, I7, I8). A denied acquisition holds nothing and returns no token.
     ///
+    /// The active-lease cap is checked only once the decision allowed the
+    /// acquisition, so a denial is returned as its verdict whether or not the
+    /// cap is full. Expired leases never count toward it (I4).
+    ///
     /// # Errors
     ///
     /// The variants of [`QuotaEnforcementStoragePluginV1::apply_debit_plan`],
@@ -541,26 +553,53 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
     ) -> Result<TransitionOutcome<EvaluatedLease>, StorageError>;
 
     /// Convert an active lease into a debit. `actual_amount` defaults to the
-    /// reserved amount.
+    /// reserved amount; `Some(0)` returns every hold and commits nothing.
+    ///
+    /// The caller cannot know the lease's subject key, so it passes the partial
+    /// write and storage completes the scope from the key the acquisition
+    /// persisted (never from caller input), under the lease row lock. Replay is
+    /// checked before the lease-state guards, so a commit that succeeded before
+    /// its lease was resolved still replays.
+    ///
+    /// What is kept per hold is [`crate::models::apportion`]: proportional to
+    /// each hold, with the charged total rounded up.
+    ///
+    /// # Errors
+    ///
+    /// - [`StorageError::LeaseNotFound`] when no such lease lies inside `scope`.
+    /// - [`StorageError::LeaseNotActive`] when it is expired (I4) or terminal.
+    /// - [`StorageError::OverCommitNotAuthorized`] when `actual_amount` exceeds
+    ///   the reserved amount.
+    /// - [`StorageError::IdempotencyPayloadMismatch`] for a replay with a
+    ///   different payload (I2).
+    /// - [`StorageError::LeaseContentionTimeout`] when the wait on a contended
+    ///   row exceeds the configured budget (I8).
+    /// - [`StorageError::Unavailable`] when the backend cannot answer.
     async fn commit_lease(
         &self,
         ctx: &SecurityContext,
         scope: &AccessScope,
         token: LeaseToken,
         actual_amount: Option<u64>,
-        idempotency: &IdempotencyWrite,
+        idempotency: &PartialIdempotencyWrite,
         events: &[NotificationEvent],
-    ) -> Result<MutationResult, StorageError>;
+    ) -> Result<TransitionOutcome<AppliedMutation>, StorageError>;
 
-    /// Return the held amount of an active lease.
+    /// Return the full held amount of an active lease to the acquisition
+    /// period (I5), committing no debit.
+    ///
+    /// # Errors
+    ///
+    /// The variants of [`QuotaEnforcementStoragePluginV1::commit_lease`],
+    /// minus the over-commit.
     async fn release_lease(
         &self,
         ctx: &SecurityContext,
         scope: &AccessScope,
         token: LeaseToken,
-        idempotency: &IdempotencyWrite,
+        idempotency: &PartialIdempotencyWrite,
         events: &[NotificationEvent],
-    ) -> Result<MutationResult, StorageError>;
+    ) -> Result<TransitionOutcome<AppliedMutation>, StorageError>;
 
     // --- snapshot reads ---
 
@@ -691,6 +730,18 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
     // --- sweeper and reclamation ---
 
     /// Physically reclaim up to `batch_size` leases expired before `before`.
+    /// How many expired leases are still unreclaimed, by metric, behind the
+    /// `lease_unreclaimed_expired` gauge. Counts rows, so it stays cheap while
+    /// the sweeper is down and the backlog is what an operator needs to see.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::Unavailable`] when the backend cannot answer.
+    async fn count_expired_unreclaimed_leases(
+        &self,
+        before: OffsetDateTime,
+    ) -> Result<Vec<(MetricId, u64)>, StorageError>;
+
     async fn reclaim_expired_leases(
         &self,
         batch_size: u32,

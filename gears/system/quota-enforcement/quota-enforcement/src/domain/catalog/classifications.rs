@@ -21,12 +21,15 @@ use toolkit_macros::domain_model;
 
 use crate::domain::error::DomainError;
 use crate::domain::ports::metric_registry::{MetricDescriptor, MetricMode, MetricRegistry};
+use crate::domain::ports::metrics::MetricLabel;
 
 /// Classification of every metric the catalogue admits, frozen at bootstrap.
 #[domain_model]
 #[derive(Debug, Clone, Default)]
 pub struct MetricClassifications {
     by_metric: HashMap<MetricId, MetricDescriptor>,
+    /// The telemetry label of each classified metric, built once.
+    labels: HashMap<MetricId, MetricLabel>,
 }
 
 impl MetricClassifications {
@@ -59,22 +62,47 @@ impl MetricClassifications {
                 absent.push(metric);
             }
         }
-        Ok(Self { by_metric })
+        Ok(Self::of(by_metric))
+    }
+
+    fn of(by_metric: HashMap<MetricId, MetricDescriptor>) -> Self {
+        let labels = by_metric
+            .keys()
+            .map(|metric| (metric.clone(), MetricLabel::admitted(metric)))
+            .collect();
+        Self { by_metric, labels }
     }
 
     /// A snapshot built from known classifications, for tests and for the
     /// in-memory composition the bench harness uses.
     #[must_use]
     pub fn from_pairs(pairs: impl IntoIterator<Item = (MetricId, MetricDescriptor)>) -> Self {
-        Self {
-            by_metric: pairs.into_iter().collect(),
-        }
+        Self::of(pairs.into_iter().collect())
     }
 
     /// The classification of `metric`, if the catalogue admits it.
     #[must_use]
     pub fn describe(&self, metric: &MetricId) -> Option<MetricDescriptor> {
         self.by_metric.get(metric).copied()
+    }
+
+    /// The telemetry label of `metric`, if the snapshot classified it. The
+    /// label set is closed at bootstrap, so a metric outside it has none and
+    /// is left out of the metric-labelled instruments.
+    #[must_use]
+    pub fn label(&self, metric: &MetricId) -> Option<MetricLabel> {
+        self.labels.get(metric).cloned()
+    }
+
+    /// The labels of every quota-gated metric in the snapshot: the metrics a
+    /// lease can be held on, which a backlog gauge reports even at zero.
+    pub fn quota_gated_labels(&self) -> impl Iterator<Item = &MetricLabel> {
+        self.labels.iter().filter_map(|(metric, label)| {
+            self.by_metric
+                .get(metric)
+                .filter(|descriptor| descriptor.mode != MetricMode::Direct)
+                .map(|_| label)
+        })
     }
 
     /// Refuse a metric whose usage does not flow through Quota Enforcement.

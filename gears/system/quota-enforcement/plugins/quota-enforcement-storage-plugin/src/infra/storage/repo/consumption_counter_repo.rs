@@ -6,13 +6,13 @@
 //! on `record_version`, so a row that moved between the read and the write
 //! reports it instead of silently overwriting.
 
-use sea_orm::sea_query::LockType;
-use sea_orm::{ActiveValue, ColumnTrait, EntityTrait, Order, QueryFilter, QueryOrder, QuerySelect};
+use sea_orm::{ActiveValue, ColumnTrait, EntityTrait, Order, QueryFilter, QueryOrder};
 use time::OffsetDateTime;
 use toolkit_db::secure::{DBRunner, ScopeError, SecureEntityExt, SecureUpdateExt, secure_insert};
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
+use super::RowWait;
 use crate::infra::storage::entity::quota_consumption_counter::{self, Column, Entity};
 
 /// The Quota's most recent period row, locked for update. `None` when the
@@ -29,15 +29,17 @@ pub async fn find_latest_for_update(
     runner: &impl DBRunner,
     scope: &AccessScope,
     quota_id: Uuid,
+    wait: RowWait,
 ) -> Result<Option<quota_consumption_counter::Model>, ScopeError> {
-    Entity::find()
-        .filter(Column::QuotaId.eq(quota_id))
-        .order_by(Column::PeriodStart, Order::Desc)
-        .lock(LockType::Update)
-        .secure()
-        .scope_with(scope)
-        .one(runner)
-        .await
+    wait.apply(
+        Entity::find()
+            .filter(Column::QuotaId.eq(quota_id))
+            .order_by(Column::PeriodStart, Order::Desc),
+    )
+    .secure()
+    .scope_with(scope)
+    .one(runner)
+    .await
 }
 
 /// The Quota's most recent period row, unlocked, for a snapshot read.
@@ -69,10 +71,9 @@ pub async fn find_by_period_id_for_update(
     runner: &impl DBRunner,
     scope: &AccessScope,
     period_id: Uuid,
+    wait: RowWait,
 ) -> Result<Option<quota_consumption_counter::Model>, ScopeError> {
-    Entity::find()
-        .filter(Column::PeriodId.eq(period_id))
-        .lock(LockType::Update)
+    wait.apply(Entity::find().filter(Column::PeriodId.eq(period_id)))
         .secure()
         .scope_with(scope)
         .one(runner)
@@ -89,17 +90,19 @@ pub async fn find_elapsed_unsettled_for_update(
     scope: &AccessScope,
     quota_id: Uuid,
     now: OffsetDateTime,
+    wait: RowWait,
 ) -> Result<Vec<quota_consumption_counter::Model>, ScopeError> {
-    Entity::find()
-        .filter(Column::QuotaId.eq(quota_id))
-        .filter(Column::IsSettled.eq(false))
-        .filter(Column::PeriodEnd.lte(now))
-        .order_by(Column::PeriodStart, Order::Asc)
-        .lock(LockType::Update)
-        .secure()
-        .scope_with(scope)
-        .all(runner)
-        .await
+    wait.apply(
+        Entity::find()
+            .filter(Column::QuotaId.eq(quota_id))
+            .filter(Column::IsSettled.eq(false))
+            .filter(Column::PeriodEnd.lte(now))
+            .order_by(Column::PeriodStart, Order::Asc),
+    )
+    .secure()
+    .scope_with(scope)
+    .all(runner)
+    .await
 }
 
 /// Parameters of a materialized period row.
@@ -217,11 +220,10 @@ pub async fn find_allocation_for_update(
     runner: &impl DBRunner,
     scope: &AccessScope,
     quota_id: Uuid,
+    wait: RowWait,
 ) -> Result<Option<crate::infra::storage::entity::quota_allocation_counter::Model>, ScopeError> {
     use crate::infra::storage::entity::quota_allocation_counter as alloc;
-    alloc::Entity::find()
-        .filter(alloc::Column::QuotaId.eq(quota_id))
-        .lock(LockType::Update)
+    wait.apply(alloc::Entity::find().filter(alloc::Column::QuotaId.eq(quota_id)))
         .secure()
         .scope_with(scope)
         .one(runner)

@@ -32,7 +32,8 @@ pub fn register_routes(
 ) -> Router {
     let router = register_quota_routes(router, openapi);
     let router = super::policies::register(router, openapi);
-    super::operations::register(router, openapi).layer(Extension(service))
+    let router = super::operations::register(router, openapi);
+    super::leases::register(router, openapi).layer(Extension(service))
 }
 // @cpt-end:cpt-cf-quota-enforcement-flow-owner-projection-publication:p1:inst-pub-registry
 
@@ -40,6 +41,7 @@ pub fn register_routes(
 // @cpt-flow:cpt-cf-quota-enforcement-flow-quota-create:p1
 // @cpt-flow:cpt-cf-quota-enforcement-flow-quota-update:p1
 // @cpt-flow:cpt-cf-quota-enforcement-flow-quota-read:p1
+// @cpt-flow:cpt-cf-quota-enforcement-flow-quota-deactivate:p1
 // @cpt-dod:cpt-cf-quota-enforcement-dod-quota-crud:p1
 fn register_quota_routes(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
     // @cpt-begin:cpt-cf-quota-enforcement-flow-quota-create:p1:inst-qcr-request
@@ -125,6 +127,7 @@ fn register_quota_routes(mut router: Router, openapi: &dyn OpenApiRegistry) -> R
         .register(router, openapi);
     // @cpt-end:cpt-cf-quota-enforcement-flow-quota-update:p1:inst-qup-request
 
+    // @cpt-begin:cpt-cf-quota-enforcement-flow-quota-deactivate:p1:inst-qde-request
     router = OperationBuilder::post(format!("{PATH_PREFIX}/quotas/{{id}}/deactivate"))
         .operation_id("quota_enforcement.deactivate_quota")
         .summary("Deactivate a Quota")
@@ -144,6 +147,7 @@ fn register_quota_routes(mut router: Router, openapi: &dyn OpenApiRegistry) -> R
         )
         .standard_errors(openapi)
         .register(router, openapi);
+    // @cpt-end:cpt-cf-quota-enforcement-flow-quota-deactivate:p1:inst-qde-request
 
     router
 }

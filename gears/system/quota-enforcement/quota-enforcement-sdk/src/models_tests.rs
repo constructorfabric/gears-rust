@@ -12,8 +12,9 @@ use super::{
     MetricId, MetricKind, NO_APPLICABLE_QUOTA, NotificationEventKind, OperationType, PageRequest,
     PageResult, PartialIdempotencyWrite, PayloadHash, PeriodType, PolicyId, PolicyScope,
     ProjectionBinding, Quota, QuotaDebitPlan, QuotaDraft, QuotaId, QuotaPatch, QuotaSource,
-    QuotaSpec, QuotaStatus, QuotaType, QuotaView, ResourceProjection, Retention, ScopeError,
-    SubjectRef, SubjectScope, TenantId, UnknownValue, ValidityWindow, positive_amount,
+    QuotaSpec, QuotaStatus, QuotaType, QuotaView, ResourceProjection, Retention,
+    RollbackableOperation, ScopeError, SubjectRef, SubjectScope, TenantId, UnknownValue,
+    ValidityWindow, apportion, positive_amount,
 };
 use crate::gts::{SCOPE_TENANT, SCOPE_TYPE, SCOPE_USER};
 
@@ -985,4 +986,120 @@ fn retention_reports_the_deadline_only_when_something_was_recorded() {
         Some(ts(86_400))
     );
     assert_eq!(Retention::Unrecorded.expires_at(), None);
+}
+
+// --- commit apportionment --------------------------------------------------
+
+/// The reserved amount a plan was acquired under. Never zero: an acquisition
+/// rejects a non-positive amount long before it reaches storage.
+fn reserved(amount: u64) -> std::num::NonZeroU64 {
+    std::num::NonZeroU64::new(amount).expect("a lease reserves a positive amount")
+}
+
+#[test]
+fn a_commit_charges_the_ceiling_of_its_share_and_never_more_than_a_hold_holds() {
+    // A plan need not hold the reserved amount on every Quota, and may hold
+    // less than it in total; using one unit still charges one.
+    assert_eq!(apportion(&[1], 1, reserved(10)), Ok(vec![1]));
+    // Rounding up rather than to nearest: half a unit used is a unit charged.
+    assert_eq!(apportion(&[3], 1, reserved(2)), Ok(vec![2]));
+    // Whole units split exactly, so no remainder is handed out.
+    assert_eq!(apportion(&[10, 10], 6, reserved(10)), Ok(vec![6, 6]));
+    assert_eq!(apportion(&[10, 5, 5], 6, reserved(10)), Ok(vec![6, 3, 3]));
+    // The unit that rounding creates goes to one hold, not to every hold: the
+    // charged total is the ceiling of the whole, not the sum of ceilings.
+    assert_eq!(apportion(&[1, 1], 1, reserved(2)), Ok(vec![1, 0]));
+    assert_eq!(apportion(&[1, 1, 1], 1, reserved(3)), Ok(vec![1, 0, 0]));
+    // Committing everything keeps every hold whole, and committing nothing
+    // returns every hold.
+    assert_eq!(apportion(&[7, 2], 9, reserved(9)), Ok(vec![7, 2]));
+    assert_eq!(apportion(&[7, 2], 0, reserved(9)), Ok(vec![0, 0]));
+    assert_eq!(apportion(&[], 5, reserved(5)), Ok(Vec::new()));
+}
+
+#[test]
+fn the_apportioned_shares_conserve_the_charged_total_for_every_plan() {
+    // Exhaustive over small plans: the three invariants the commit path relies
+    // on hold for every shape the engine contract permits, not only the ones
+    // spelled out above.
+    for reserved_amount in 1_u64..8 {
+        for actual in 0..=reserved_amount {
+            for first in 0_u64..6 {
+                for second in 0_u64..6 {
+                    for third in 0_u64..6 {
+                        let holds = [first, second, third];
+                        let kept =
+                            apportion(&holds, actual, reserved(reserved_amount)).expect("in range");
+                        let total_held: u64 = holds.iter().sum();
+                        let expected = u64::try_from(
+                            (u128::from(total_held) * u128::from(actual))
+                                .div_ceil(u128::from(reserved_amount)),
+                        )
+                        .expect("a share of the held total fits");
+                        assert_eq!(
+                            kept.iter().sum::<u64>(),
+                            expected,
+                            "holds {holds:?} of {reserved_amount}, committing {actual}"
+                        );
+                        for (kept, held) in kept.iter().zip(&holds) {
+                            assert!(
+                                kept <= held,
+                                "a hold is never charged more than it holds: {holds:?}"
+                            );
+                        }
+                        assert_eq!(
+                            actual > 0 && total_held > 0,
+                            kept.iter().sum::<u64>() > 0,
+                            "any use charges a unit, and no use charges none: {holds:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn apportionment_refuses_an_over_commit_and_reports_overflow_instead_of_panicking() {
+    assert_eq!(
+        apportion(&[10], 11, reserved(10)),
+        Err(crate::models::ApportionError::OverCommit)
+    );
+    // The product of two `u64::MAX`-sized values leaves `u128`; the caller
+    // learns that rather than losing the transaction to a panic.
+    assert_eq!(
+        apportion(&[u64::MAX, u64::MAX], u64::MAX, reserved(u64::MAX)),
+        Err(crate::models::ApportionError::Overflow)
+    );
+}
+
+#[test]
+fn a_rollback_names_the_namespace_of_the_operation_it_reverses() {
+    // A debit and a lease commit can hold the same key over the same subjects,
+    // so the selector is what tells them apart.
+    assert_eq!(
+        RollbackableOperation::Debit.operation_type(),
+        OperationType::Debit
+    );
+    assert_eq!(
+        RollbackableOperation::LeaseCommit.operation_type(),
+        OperationType::Commit
+    );
+    assert_eq!(
+        RollbackableOperation::default(),
+        RollbackableOperation::Debit
+    );
+    // A request written before leases existed still means a debit.
+    let legacy: crate::models::RollbackRequest = serde_json::from_value(json!({
+        "attribution": {
+            "tenant_id": "00000000-0000-0000-0000-000000000001",
+            "metric": "gts.cf.qe.metric.type.v1~acme.tokens.v1",
+            "subjects": [],
+            "metadata": {}
+        },
+        "original_idempotency_key": "k-0",
+        "idempotency_key": "k-1"
+    }))
+    .expect("the selector defaults");
+    assert_eq!(legacy.original_operation, RollbackableOperation::Debit);
 }

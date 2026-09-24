@@ -38,6 +38,7 @@ use crate::domain::{
     LifecycleGaugeRefresher, PluginBinding, Readiness, Service, SingletonScope,
 };
 use crate::infra::cluster_coordination::{ClusterCoordinationBinding, ElectionTiming};
+use crate::infra::lease_backlog::LeaseBacklogCell;
 use crate::infra::lifecycle_gauges::LifecycleGaugeCell;
 use crate::infra::metric_registry::CachedMetricRegistry;
 use crate::infra::metrics;
@@ -74,6 +75,10 @@ struct GaugeWiring {
     metrics: Arc<dyn QeMetrics>,
     /// Timing of the retention sweeper.
     retention: crate::domain::operations::RetentionTiming,
+    /// The sample cell of `lease_unreclaimed_expired`.
+    lease_backlog: Arc<LeaseBacklogCell>,
+    /// Timing of the lease sweeper.
+    lease_sweep: crate::domain::operations::LeaseSweepTiming,
 }
 
 impl Default for QuotaEnforcementGear {
@@ -99,6 +104,13 @@ impl QuotaEnforcementGear {
     #[must_use]
     pub fn lifecycle_gauges(&self) -> Option<Arc<LifecycleGaugeCell>> {
         self.gauges.get().map(|wiring| wiring.cell.clone())
+    }
+
+    /// The lease backlog sample cell, once `init` ran. Holds a sample only
+    /// while this replica leads the lease sweeper.
+    #[must_use]
+    pub fn lease_backlog(&self) -> Option<Arc<LeaseBacklogCell>> {
+        self.gauges.get().map(|wiring| wiring.lease_backlog.clone())
     }
 
     /// Lifecycle entry: bootstrap, signal ready, host the leader-only gauge
@@ -132,6 +144,12 @@ impl QuotaEnforcementGear {
             Arc::clone(&gauges.metrics),
             gauges.retention,
         ));
+        let lease_sweeper = Arc::new(crate::domain::operations::LeaseSweeper::new(
+            bound.storage.clone(),
+            Arc::clone(&bound.classifications),
+            gauges.lease_backlog.clone() as Arc<dyn crate::domain::ports::LeaseBacklogSink>,
+            gauges.lease_sweep,
+        ));
         let coordinator = bound.coordinator.clone();
         service
             .bind(bound)
@@ -148,16 +166,25 @@ impl QuotaEnforcementGear {
         );
         // @cpt-begin:cpt-cf-quota-enforcement-algo-retention-sweep:p1:inst-ret-elect
         let retention_task = spawn_leader_task(
-            coordinator,
+            coordinator.clone(),
             SingletonScope::RetentionSweeper,
             sweeper.leader_work(),
             cancel.child_token(),
         );
         // @cpt-end:cpt-cf-quota-enforcement-algo-retention-sweep:p1:inst-ret-elect
+        // @cpt-begin:cpt-cf-quota-enforcement-algo-lease-sweep:p1:inst-swp-elect
+        let lease_task = spawn_leader_task(
+            coordinator,
+            SingletonScope::LeaseSweeper,
+            lease_sweeper.leader_work(),
+            cancel.child_token(),
+        );
+        // @cpt-end:cpt-cf-quota-enforcement-algo-lease-sweep:p1:inst-swp-elect
         cancel.cancelled().await;
         info!(target: LOG_TARGET, "quota-enforcement is stopping");
         join_leader_task("lifecycle gauge", gauge_task, gauges.stop_timeout).await;
         join_leader_task("retention sweeper", retention_task, gauges.stop_timeout).await;
+        join_leader_task("lease sweeper", lease_task, gauges.stop_timeout).await;
         Ok(())
     }
 }
@@ -254,8 +281,9 @@ impl Gear for QuotaEnforcementGear {
         ));
 
         let gauge_cell = Arc::new(LifecycleGaugeCell::default());
+        let lease_backlog = Arc::new(LeaseBacklogCell::default());
         let metrics: Arc<dyn QeMetrics> =
-            metrics::build_default_adapter(&cfg.metrics, gauge_cell.clone());
+            metrics::build_default_adapter(&cfg.metrics, gauge_cell.clone(), lease_backlog.clone());
         let readiness = Arc::new(Readiness::new());
         let admission = Admission::new(enforcer, metrics.clone());
         let policy_limits = cfg
@@ -271,6 +299,7 @@ impl Gear for QuotaEnforcementGear {
                 cache_entries: cfg.operations.idempotency_cache_entries,
                 cache_ttl: cfg.operations.idempotency_cache_ttl(),
                 preparation_max_attempts: policy_limits.preparation_max_attempts,
+                leases: cfg.leases.to_limits(),
             },
         ));
         // In-process clients share the REST domain boundary.
@@ -314,6 +343,11 @@ impl Gear for QuotaEnforcementGear {
                 .retention
                 .to_timing()
                 .context("[quota-enforcement.retention] is not a valid sweeper timing")?,
+            lease_backlog,
+            lease_sweep: cfg
+                .leases
+                .to_sweep_timing()
+                .context("[quota-enforcement.leases] is not a valid sweeper timing")?,
         };
         set_once(&self.gauges, gauges)?;
         set_once(&self.hub, hub)?;

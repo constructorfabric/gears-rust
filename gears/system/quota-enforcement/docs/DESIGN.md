@@ -1150,16 +1150,17 @@ read likewise receives the `AccessScope` — no scoped operation executes withou
 | **Lifecycle**                          | `bootstrap(defaults: BootstrapBundle)` (idempotent: schema-version check, default Policy seed, projection-catalogue consistency checks, default config-table rows, static built-in Engine registration).                                                                                                                                                                                                                                      |
 | **Quota CRUD**                         | `create_quota(draft: QuotaDraft, events)` → `QuotaId` (the plugin fills `quota_id` on events passed without one); `update_quota(quota_id, patch: QuotaPatch, events)` → `Quota` (the committed row; I6 and I14 evaluated on the merged row in-tx under the row lock); `deactivate_quota(quota_id, events)` → `DeactivateOutcome { resolved_leases }` (atomic cascade resolves active leases per `cpt-cf-quota-enforcement-fr-quota-lifecycle`; the plugin constructs the per-lease events); `read_quotas(filter: QuotaFilter, page: PageRequest)` → `PageResult<Quota>` ordered by `quota_id` ascending with an opaque, position-only cursor; tenant and PDP scope are re-applied on every page. |
 | **Platform-plane reads (caller-less)** | `read_active_projection_bindings()` → `HashSet<ProjectionBinding>` (distinct `(metric, projection_type)` of active Quotas; bootstrap compatibility check); `read_active_quota_counts()` → `ActiveQuotaCounts { cap_zero, cap_unbounded, by_metric }` (lifecycle status `active` only, window-independent; read periodically by the elected replica's gauge refresh). Neither takes a `SecurityContext` or an `AccessScope`; both are read-only (I3) and fail only with `Unavailable`. |
-| **Counter mutation (transactional)**   | `apply_debit_plan(mutation: EvaluatedMutation, events)` (the plugin selects the Policy and evaluates it through the caller's `TransactionEvaluator` callback, then applies the resulting Debit Plan atomically across N Quotas, persists idempotency with that decision, enqueues events, writes op-log entry — all in a single backend transaction; a compiled artifact the transaction cannot find rolls it back with `PreparationRequired`, writing nothing); `apply_batch_debit(batch: EvaluatedBatch, events)` (envelope batch per `cpt-cf-quota-enforcement-fr-batch-debit`); `apply_credit(quota_id, amount, partial_idem_write, events)` (the scope is completed inside the transaction: its subject key fingerprints the locked Quota row's own subject pair, which a caller may neither know nor supply); `apply_rollback(target, idem_write, events)`, where the target carries the original debit's full `IdempotencyScope` and the digest of the attribution it was authorized under, so a caller admitted for another metric or resource over the same subjects cannot reverse it and is answered `OperationNotFound`. |
-| **Lease (two-phase)**                  | `acquire_lease(mutation: EvaluatedMutation, ttl)` → `TransitionOutcome<EvaluatedLease>` under the same evaluation convention (atomic: lease + per-Quota holds, persist the acquisition subject key, increment active-lease counter — I7, capture acquisition_period_id — I5; a denied acquisition holds nothing and carries no token); `commit_lease(token, actual_amount, idem_scope, events)` (reuses the persisted acquisition subject key and rejects `OverCommitNotAuthorized` if `actual > reserved`); `release_lease(token, idem_scope, events)` (also reuses the acquisition key). |
+| **Counter mutation (transactional)**   | `apply_debit_plan(mutation: EvaluatedMutation, events)` (the plugin selects the Policy and evaluates it through the caller's `TransactionEvaluator` callback, then applies the resulting Debit Plan atomically across N Quotas, persists idempotency with that decision, enqueues events, writes op-log entry — all in a single backend transaction; a compiled artifact the transaction cannot find rolls it back with `PreparationRequired`, writing nothing); `apply_batch_debit(batch: EvaluatedBatch, events)` (envelope batch per `cpt-cf-quota-enforcement-fr-batch-debit`); `apply_credit(quota_id, amount, partial_idem_write, events)` (the scope is completed inside the transaction: its subject key fingerprints the locked Quota row's own subject pair, which a caller may neither know nor supply); `apply_rollback(target, idem_write, events)`, where the target carries the original debit's full `IdempotencyScope` and the digest of the attribution it was authorized under, so a caller admitted for another metric or resource over the same subjects cannot reverse it and is answered `OperationNotFound`; the scope's operation type is the one the request names (`debit` by default, or `lease_commit`), because the two are separate namespaces under the same key. The Quotas the original moved are locked before its record, and a record whose key was reused between discovery and lock is rediscovered, never reversed. |
+| **Lease (two-phase)**                  | `acquire_lease(mutation: EvaluatedMutation, ttl)` → `TransitionOutcome<EvaluatedLease>` under the same evaluation convention (atomic: lease + per-Quota holds, persist the acquisition subject key, increment active-lease counter — I7, capture acquisition_period_id — I5; a denied acquisition holds nothing and carries no token); `commit_lease(token, actual_amount, partial_idem_write, events)` → `TransitionOutcome<AppliedMutation>` (the token is looked up inside the caller's authorized scope — a token the tenant does not hold is `LeaseNotFound`; the scope is completed from the persisted acquisition subject key; an exact replay is answered before the `LeaseNotActive` guard; rejects `OverCommitNotAuthorized` if `actual > reserved`; records the kept amounts so a rollback naming `lease_commit` can reverse them); `release_lease(token, partial_idem_write, events)` → `TransitionOutcome<AppliedMutation>` (same lookup, scope, and replay order). |
 | **Snapshot read**                      | `read_quota_snapshot(applicable, metric)` → `Vec<QuotaSnapshot>` (lazy period-row materialisation is the single I3 exception); `bulk_read_quota_snapshot(pairs, page)` → `PageResult<QuotaSnapshot>` (`cpt-cf-quota-enforcement-fr-bulk-quota-snapshot-read`).                                                                                                                                                                                   |
 | **Policy CRUD (immutable versioning)** | `create_policy / update_policy / rollback_policy / delete_policy` (all events-emitting); `read_policy(scope)` returns latest active version; `read_policy_version(policy_id, version)`; `list_policy_versions(scope, page)`.                                                                                                                    |
 | **Idempotency**                        | `lookup_idempotency(scope: &IdempotencyScope)` → `Option<IdempotencyRecord>` (typed full-scope key; gateway entry-point check; persist is implicit-in-`apply_*`).                                                                                                                                                                                                                                                                                                                      |
-| **Sweeper / reclamation**              | `reclaim_expired_leases(batch_size, before)` → `Vec<ExpiredLease>` (physical reclamation tier of `cpt-cf-quota-enforcement-fr-lease-timeout`); `reclaim_expired_idempotency`; `reclaim_operation_log`.                                                                                                                                                                                                                                           |
+| **Sweeper / reclamation**              | `reclaim_expired_leases(batch_size, before)` → `Vec<ExpiredLease>` (physical reclamation tier of `cpt-cf-quota-enforcement-fr-lease-timeout`); `count_expired_unreclaimed_leases(before)` → `Vec<(MetricId, u64)>` (the `lease_unreclaimed_expired` gauge); `reclaim_expired_idempotency`; `reclaim_operation_log`.                                                                                                                                                                                                                                           |
 | **Outbox dispatch**                    | No plugin-level consumer primitives: mutating primitives enqueue via the `toolkit-db` Outbox inside their transaction (I11); consumption, retries, acks, and dead-letters are owned by the Outbox framework's leased-handler pipeline.                                                                                                                                                                                                                                                                               |
 
 **`StorageError`** — closed enum returned by every plugin method. Variants grouped by concern: lease state
-(`LeaseNotActive`, `LeaseInflightLimitExceeded`, `LeaseContentionTimeout`, `OverCommitNotAuthorized`); idempotency /
+(`LeaseNotFound`, `LeaseNotActive`, `LeaseInflightLimitExceeded`, `LeaseContentionTimeout`,
+`OverCommitNotAuthorized`); idempotency /
 versioning (`IdempotencyPayloadMismatch`, `VersionConflict`, `UnknownPolicyVersion`, `VersionRolledBack`); Quota
 lifecycle (`CapBelowConsumed`, `QuotaNotFound`, `QuotaDeactivated`, `ThresholdsRequireBoundedCap` per I14,
 `PeriodClosed`); metric / contract registry (`MetricNotRegistered`, `MetricNotQuotaGated`,
@@ -1168,7 +1169,8 @@ continuation cursor the plugin did not issue, lifted to `InvalidArgument` / 400 
 operational (`Unavailable`, `SchemaVersionMismatch` per I12, `Internal(String)`).
 
 `From<StorageError> for DomainError` is a 1:1 lift for most variants (`LeaseNotActive`, `IdempotencyPayloadMismatch`,
-`CapBelowConsumed`, etc.). Two special cases: `QuotaNotFound` → `NotFound { kind: "quota", id }`; `SubjectOutOfScope` →
+`CapBelowConsumed`, etc.). Three special cases: `QuotaNotFound` → `NotFound { kind: "quota", id }`; `LeaseNotFound` →
+`NotFound { kind: "lease", id }` (a token the authorized tenant does not hold, its own or not, is 404); `SubjectOutOfScope` →
 `PdpDenied` (storage-layer defense-in-depth catches what PDP should have denied first). `SchemaVersionMismatch` is
 detected at `bootstrap()` and aborts the gear fail-fast (I12 invariant); per the same invariant it MUST NOT surface at
 runtime, so it has no `DomainError` lift target. The full `DomainError` enum lives in
@@ -1184,19 +1186,43 @@ runtime, so it has no `DomainError` lift target. The full `DomainError` enum liv
 - **I3. Read-only** — `read_*`, `list_*`, `lookup_idempotency` MUST NOT write persistent state.
   **Lazy period-row creation in `read_quota_snapshot`** is the single permitted exception.
 - **I4. Lease lazy expiry** — read and write paths treat any lease with `expiry_at <= now()` as released regardless of
-  physical row presence.
+  physical row presence. An acquisition's holds sit in the counters, so an expired hold is **returned exactly once, by
+  the first party that sees it**: every writer that locks a counter row first returns that Quota's expired, unreturned
+  holds (stamping each hold's `returned_at`, under the counter row's lock) and folds the return into its own write;
+  readers subtract the unreturned expired holds without writing; the sweeper credits only holds still unreturned.
+  Period settlement returns the closing period's expired holds before computing the closing figure, and skips a period
+  row while an active, unexpired lease was acquired against it.
 - **I5. Period attribution** — lease `commit` / `release` (and TTL auto-release) attribute counter mutation to the
-  lease's `acquisition_period_id`, not the wall-clock current period.
+  lease's `acquisition_period_id`, not the wall-clock current period. A commit keeps `actual_amount` of the reserved
+  amount, split across the holds by **conserving apportionment**: the total kept is
+  `ceil(sum(held) * actual / reserved)` (a positive `actual` always keeps at least one unit, and the total never exceeds
+  what was held); each hold keeps its floor share, the remaining units go to the largest fractional remainders, ties to
+  the earlier hold; each hold returns `held - kept`. Arithmetic is checked. `actual_amount = 0` keeps nothing, returns
+  every hold, and commits the lease; its rollback is a successful no-op. A negative `actual_amount` is refused.
 - **I6. Cap-vs-consumed** — `update_quota` with reduced `cap` returns `CapBelowConsumed` if any active period's
   `consumed > new_cap`; check is in-tx with row-level lock.
 - **I7. Active-lease cap** — `acquire_lease` returns `LeaseInflightLimitExceeded` when the per-`(tenant, metric)`
-  active-lease counter would exceed the operator-configured cap (default **1000** per PRD §5.6 /
-  `cpt-cf-quota-enforcement-fr-lease-timeout`), atomically same-tx with the lease insert. The cap is sourced from
+  count of live leases would exceed the operator-configured cap (default **1000** per PRD §5.6 /
+  `cpt-cf-quota-enforcement-fr-lease-timeout`), atomically same-tx with the lease insert. The
+  `lease_capacity_counters` row is the serialization lock; under it, with the clock read after the lock, the live
+  leases (`state = 'active' AND expiry_at > now`) are counted on every acquisition, and that count is authoritative
+  (`active_count` is maintained for diagnostics only). The check runs after an `Allowed` evaluation: a denial is
+  returned whether or not the cap is full. The cap is sourced from
   `lease_capacity_config(tenant_id, metric, max_active_leases)` (sparse override table; `tenant_id IS NULL` and
   `metric IS NULL` row = platform default; in-process LRU cache with operator-tunable TTL (P1 reference default: 60 s),
   same pattern as the contention-timeout config in I8).
-- **I8. Acquisition contention timeout** — `apply_*` and `acquire_lease` respect the operator-configured **per-metric**
-  contention timeout; on timeout, return `LeaseContentionTimeout`. Mechanism is plugin-internal.
+- **I8. Acquisition contention timeout** — `apply_*`, `acquire_lease`, `commit_lease`, and `release_lease` respect the
+  operator-configured **per-metric** contention timeout (platform default 0 ms, fail-fast); on timeout, return
+  `LeaseContentionTimeout`. The timeout is a budget for the whole call, not for each lock: it bounds the total wait
+  across every lock and every retry. Mechanism is plugin-internal. The reference plugin takes every row lock of these
+  primitives `NOWAIT`, rolls the transaction back on a refused lock, and retries within the budget, starting no attempt
+  once it is spent; a retrying call holds no row while it waits. Waits `NOWAIT` cannot express — an insert or delete
+  meeting another transaction's uncommitted idempotency record — are excluded by a **stripe lock**: each idempotency
+  scope maps to one row of a fixed, migration-created stripe table, locked `NOWAIT` inside the transaction before the
+  record is read. Unrelated scopes that share a stripe serialize like one scope, so at the 0 ms default the second is
+  refused with `LeaseContentionTimeout` although nothing it touches is contended; with 65 536 stripes that is about one
+  pair in 65 536 of concurrent writers. The retention sweeper takes a stripe `SKIP LOCKED` and deletes only a record
+  still expired. SQLite serializes writers on its database lock and cannot bound a wait below its busy timeout.
 - **I9. Isolation** — backend MUST provide isolation sufficient to serialize concurrent row mutations under the
   deterministic acquisition ordering of `cpt-cf-quota-enforcement-adr-acquisition-ordering`, with no dirty reads inside
   a transaction. Concrete isolation level and mutation-serialization mechanism (pessimistic row locks, optimistic CAS,
@@ -2354,7 +2380,9 @@ Label cardinality is bounded at compile time (`cpt-cf-quota-enforcement-constrai
 High/unbounded-cardinality identifiers (`tenant_id`, `subject_id`, `quota_id`, `policy_id`, `idempotency_key`,
 `lease_token`), projection type, caller attribution, and raw/unregistered metric input appear only on traces and
 structured log fields, never on metric labels. Canonical registered `metric` labels are used only by instruments that
-declare them in the catalogue above and are populated only after registry/catalogue validation.
+declare them in the catalogue above and are populated only after registry/catalogue validation: their values are the
+metrics the catalogue admitted when the gear started, a set closed at bootstrap, and a metric outside that set is left
+out of the metric-labelled instruments rather than labelled.
 
 Caller attribution is intentionally not a metric dimension: although typed, the registry does not bound the number of
 service projection types across deployments. It is available on sampled traces and structured diagnostics instead.

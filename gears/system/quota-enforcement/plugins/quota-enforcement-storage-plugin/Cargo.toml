@@ -47,6 +47,8 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
+# The contention budget's backoff between refused-lock retries (I8).
+tokio = { workspace = true, features = ["time"] }
 
 # Required by the toolkit::gear macro.
 inventory = { workspace = true }

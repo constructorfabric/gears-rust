@@ -330,6 +330,7 @@ impl<'a> QuotaManagement<'a> {
     /// The PDP outcome, [`DomainError::NotFound`],
     /// [`DomainError::QuotaDeactivated`] on a second deactivation, or the
     /// storage error.
+    // @cpt-flow:cpt-cf-quota-enforcement-flow-quota-deactivate:p1
     pub async fn deactivate(
         &self,
         ctx: &SecurityContext,
@@ -350,10 +351,12 @@ impl<'a> QuotaManagement<'a> {
             ChangeKind::Deactivated,
             now,
         )];
+        // @cpt-begin:cpt-cf-quota-enforcement-flow-quota-deactivate:p1:inst-qde-return
         Ok(self
             .storage
             .deactivate_quota(ctx, &admitted.access_scope, quota_id, &events)
             .await?)
+        // @cpt-end:cpt-cf-quota-enforcement-flow-quota-deactivate:p1:inst-qde-return
     }
 
     /// Read one Quota.

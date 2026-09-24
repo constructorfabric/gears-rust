@@ -64,7 +64,9 @@ use crate::domain::ports::lifecycle_gauges::{LifecycleCounts, LifecycleGaugeSink
 use crate::domain::ports::metric_registry::{
     Classified, Freshness, MetricDescriptor, MetricMode, MetricRegistry,
 };
-use crate::domain::ports::metrics::{DenialReason, QeMetrics, ValidationReason, ValidationSurface};
+use crate::domain::ports::metrics::{
+    DenialReason, MetricLabel, QeMetrics, ValidationReason, ValidationSurface,
+};
 use crate::infra::cluster_coordination::QuotaEnforcementProfile;
 use crate::infra::metric_registry::contract as metric_contract;
 
@@ -338,9 +340,27 @@ pub struct RecordingMetrics {
     replays: Mutex<Vec<OperationKind>>,
     reclaimed: Mutex<Vec<(RetentionTable, u64)>>,
     retention_failures: Mutex<Vec<RetentionTable>>,
+    lease_waits: Mutex<Vec<String>>,
+    lease_contention: Mutex<Vec<String>>,
+    lease_cap: Mutex<Vec<String>>,
 }
 
 impl RecordingMetrics {
+    /// Metrics whose lease acquisition latency was observed, in order.
+    pub fn lease_waits(&self) -> Vec<String> {
+        self.lease_waits.lock().expect("lock").clone()
+    }
+
+    /// Metrics of lease operations refused on contention, in order.
+    pub fn lease_contention(&self) -> Vec<String> {
+        self.lease_contention.lock().expect("lock").clone()
+    }
+
+    /// Metrics of acquisitions refused on the active-lease cap, in order.
+    pub fn lease_cap(&self) -> Vec<String> {
+        self.lease_cap.lock().expect("lock").clone()
+    }
+
     pub fn denials(&self) -> Vec<DenialReason> {
         self.denials.lock().expect("lock").clone()
     }
@@ -438,6 +458,27 @@ impl QeMetrics for RecordingMetrics {
 
     fn record_retention_failure(&self, table: RetentionTable) {
         self.retention_failures.lock().expect("lock").push(table);
+    }
+
+    fn record_lease_acquisition_wait(&self, metric: &MetricLabel, _elapsed: std::time::Duration) {
+        self.lease_waits
+            .lock()
+            .expect("lock")
+            .push(metric.as_str().to_owned());
+    }
+
+    fn record_lease_contention_rejected(&self, metric: &MetricLabel) {
+        self.lease_contention
+            .lock()
+            .expect("lock")
+            .push(metric.as_str().to_owned());
+    }
+
+    fn record_lease_inflight_limit_exceeded(&self, metric: &MetricLabel) {
+        self.lease_cap
+            .lock()
+            .expect("lock")
+            .push(metric.as_str().to_owned());
     }
 }
 
@@ -1487,6 +1528,7 @@ pub fn unbound_service(pdp: Arc<dyn AuthZResolverApi>) -> Arc<crate::domain::Ser
             cache_entries: 16,
             cache_ttl: std::time::Duration::from_secs(5),
             preparation_max_attempts: std::num::NonZeroU32::new(3).expect("attempts"),
+            leases: crate::domain::operations::LeaseLimits::default(),
         },
     ))
 }

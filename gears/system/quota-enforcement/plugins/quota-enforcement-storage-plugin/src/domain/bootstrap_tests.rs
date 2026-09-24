@@ -59,6 +59,7 @@ fn sql_plugin(db: &Db) -> StoragePlugin {
         Arc::new(FakeQuotaStore::default()),
         Arc::new(FakePolicyStore::default()),
         Arc::new(crate::test_support::FakeConsumptionStore),
+        Arc::new(crate::test_support::FakeLeaseStore) as Arc<dyn crate::domain::ports::LeaseStore>,
     )
 }
 
@@ -68,6 +69,7 @@ fn fake_plugin(store: FakeStore) -> StoragePlugin {
         Arc::new(FakeQuotaStore::default()),
         Arc::new(FakePolicyStore::default()),
         Arc::new(crate::test_support::FakeConsumptionStore),
+        Arc::new(crate::test_support::FakeLeaseStore) as Arc<dyn crate::domain::ports::LeaseStore>,
     )
 }
 
@@ -319,6 +321,7 @@ async fn a_bundle_without_a_global_policy_seeds_none() {
         Arc::new(FakeQuotaStore::default()),
         Arc::clone(&policies) as Arc<dyn PolicyStore>,
         Arc::new(crate::test_support::FakeConsumptionStore),
+        Arc::new(crate::test_support::FakeLeaseStore) as Arc<dyn crate::domain::ports::LeaseStore>,
     );
     plugin
         .bootstrap(&BootstrapBundle::foundation())
@@ -339,6 +342,7 @@ async fn the_global_policy_is_seeded_once_and_never_reset() {
         Arc::new(FakeQuotaStore::default()),
         Arc::clone(&policies) as Arc<dyn PolicyStore>,
         Arc::new(crate::test_support::FakeConsumptionStore),
+        Arc::new(crate::test_support::FakeLeaseStore) as Arc<dyn crate::domain::ports::LeaseStore>,
     );
     plugin.bootstrap(&seeding_bundle()).await.expect("first");
     let seeded = policies.creates();
@@ -361,6 +365,7 @@ async fn the_global_policy_is_seeded_once_and_never_reset() {
         Arc::new(FakeQuotaStore::default()),
         Arc::clone(&occupied) as Arc<dyn PolicyStore>,
         Arc::new(crate::test_support::FakeConsumptionStore),
+        Arc::new(crate::test_support::FakeLeaseStore) as Arc<dyn crate::domain::ports::LeaseStore>,
     );
     plugin.bootstrap(&seeding_bundle()).await.expect("second");
     assert!(
@@ -382,6 +387,7 @@ async fn losing_the_seeding_race_is_success_and_any_other_failure_is_not() {
         Arc::new(FakeQuotaStore::default()),
         Arc::clone(&raced) as Arc<dyn PolicyStore>,
         Arc::new(crate::test_support::FakeConsumptionStore),
+        Arc::new(crate::test_support::FakeLeaseStore) as Arc<dyn crate::domain::ports::LeaseStore>,
     );
     // Two replicas both saw an empty scope. The live-scope unique index picks
     // one; the loser's policy is the winner's, so it is ready either way.
@@ -399,6 +405,7 @@ async fn losing_the_seeding_race_is_success_and_any_other_failure_is_not() {
         Arc::new(FakeQuotaStore::default()),
         broken,
         Arc::new(crate::test_support::FakeConsumptionStore),
+        Arc::new(crate::test_support::FakeLeaseStore) as Arc<dyn crate::domain::ports::LeaseStore>,
     );
     assert!(
         matches!(

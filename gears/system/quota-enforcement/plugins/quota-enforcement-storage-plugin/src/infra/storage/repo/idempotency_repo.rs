@@ -7,7 +7,7 @@
 //! Reads also filter on `expires_at`, so a row the sweeper has not reclaimed
 //! yet is already invisible and the same key is a new operation.
 
-use sea_orm::sea_query::LockType;
+use sea_orm::sea_query::{LockBehavior, LockType};
 use sea_orm::{ActiveValue, ColumnTrait, Condition, EntityTrait, QueryFilter, QuerySelect};
 use time::OffsetDateTime;
 use toolkit_db::secure::{
@@ -16,7 +16,9 @@ use toolkit_db::secure::{
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
+use super::RowWait;
 use crate::infra::storage::entity::idempotency_record::{self, Column, Entity};
+use crate::infra::storage::entity::idempotency_stripe::{self, STRIPES};
 
 /// The four components that address a record.
 pub struct ScopeKey<'a> {
@@ -38,7 +40,8 @@ fn addressed(key: &ScopeKey<'_>) -> Condition {
         .add(Column::IdemKey.eq(key.idem_key))
 }
 
-/// The unexpired record under `key`, optionally locked.
+/// The unexpired record under `key`: unlocked for `None`, otherwise locked for
+/// update with the given behaviour on a held row.
 ///
 /// # Errors
 ///
@@ -48,14 +51,15 @@ pub async fn find(
     scope: &AccessScope,
     key: &ScopeKey<'_>,
     now: OffsetDateTime,
-    lock: bool,
+    lock: Option<RowWait>,
 ) -> Result<Option<idempotency_record::Model>, ScopeError> {
-    let mut select = Entity::find()
+    let select = Entity::find()
         .filter(addressed(key))
         .filter(Column::ExpiresAt.gt(now));
-    if lock {
-        select = select.lock(LockType::Update);
-    }
+    let select = match lock {
+        Some(wait) => wait.apply(select),
+        None => select,
+    };
     select.secure().scope_with(scope).one(runner).await
 }
 
@@ -171,18 +175,86 @@ pub async fn mark_reversed(
     Ok(affected.rows_affected == 1)
 }
 
-/// Delete up to `batch_size` records that expired before `before`.
+/// The stripe that serializes writers of `key` (I8): every field of the
+/// record's primary key, length-prefixed so no two keys feed the same bytes,
+/// through 64-bit FNV-1a. The hash is fixed by its definition rather than by a
+/// library, so every process and every version maps a scope to the same row.
+#[must_use]
+pub fn stripe_of(key: &ScopeKey<'_>) -> i32 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET;
+    for field in [
+        key.tenant_id.as_bytes().as_slice(),
+        key.operation_type.as_bytes(),
+        key.subject_key,
+        key.idem_key.as_bytes(),
+    ] {
+        let length = u64::try_from(field.len()).unwrap_or(u64::MAX).to_le_bytes();
+        for byte in length.iter().chain(field) {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(PRIME);
+        }
+    }
+    // Below `STRIPES`, which fits an `i32`.
+    i32::try_from(hash % u64::from(STRIPES)).unwrap_or(0)
+}
+
+/// Lock the stripe `stripe` for update, refusing at once if another
+/// transaction holds it. `false` when the row does not exist, which only an
+/// unmigrated schema can produce.
 ///
 /// # Errors
 ///
-/// The scope or database error of the delete.
-pub async fn delete_expired(
+/// The scope or database error of the read; on `PostgreSQL` a held stripe is
+/// `lock_not_available`.
+pub async fn lock_stripe(runner: &impl DBRunner, stripe: i32) -> Result<bool, ScopeError> {
+    let select = RowWait::Nowait.apply(
+        idempotency_stripe::Entity::find().filter(idempotency_stripe::Column::Stripe.eq(stripe)),
+    );
+    Ok(select
+        .secure()
+        // A platform table: no tenant owns a stripe.
+        .scope_with(&AccessScope::allow_all())
+        .one(runner)
+        .await?
+        .is_some())
+}
+
+/// Lock the stripe `stripe` unless another transaction holds it: `false`
+/// when it is held (or absent), so a background pass skips the scope rather
+/// than wait on, or refuse, a writer.
+///
+/// # Errors
+///
+/// The scope or database error of the read.
+pub async fn try_lock_stripe(runner: &impl DBRunner, stripe: i32) -> Result<bool, ScopeError> {
+    Ok(idempotency_stripe::Entity::find()
+        .filter(idempotency_stripe::Column::Stripe.eq(stripe))
+        .lock_with_behavior(LockType::Update, LockBehavior::SkipLocked)
+        .secure()
+        // A platform table: no tenant owns a stripe.
+        .scope_with(&AccessScope::allow_all())
+        .one(runner)
+        .await?
+        .is_some())
+}
+
+/// A primary key of a stored record, owned.
+pub type OwnedKey = (Uuid, Vec<u8>, String, String);
+
+/// Up to `batch_size` keys whose records expired before `before`.
+///
+/// # Errors
+///
+/// The scope or database error of the read.
+pub async fn select_expired(
     runner: &impl DBRunner,
     scope: &AccessScope,
     batch_size: u32,
     before: OffsetDateTime,
-) -> Result<u64, ScopeError> {
-    let doomed: Vec<(Uuid, Vec<u8>, String, String)> = Entity::find()
+) -> Result<Vec<OwnedKey>, ScopeError> {
+    Ok(Entity::find()
         .filter(Column::ExpiresAt.lt(before))
         .limit(u64::from(batch_size))
         .secure()
@@ -198,22 +270,30 @@ pub async fn delete_expired(
                 row.idem_key,
             )
         })
-        .collect();
-    let mut deleted = 0;
-    for (tenant_id, subject_key, operation_type, idem_key) in &doomed {
-        let key = ScopeKey {
-            tenant_id: *tenant_id,
-            subject_key,
-            operation_type,
-            idem_key,
-        };
-        let affected = Entity::delete_many()
-            .filter(addressed(&key))
-            .secure()
-            .scope_with(scope)
-            .exec(runner)
-            .await?;
-        deleted += affected.rows_affected;
-    }
-    Ok(deleted)
+        .collect())
+}
+
+/// Delete the record under `key` if it is still expired before `before`.
+///
+/// The expiry is part of the delete, not only of the selection that found the
+/// key: a writer may have replaced the expired record since, and its fresh
+/// record must survive, or a replay of it would run a second time.
+///
+/// # Errors
+///
+/// The scope or database error of the delete.
+pub async fn delete_if_expired(
+    runner: &impl DBRunner,
+    scope: &AccessScope,
+    key: &ScopeKey<'_>,
+    before: OffsetDateTime,
+) -> Result<u64, ScopeError> {
+    let affected = Entity::delete_many()
+        .filter(addressed(key))
+        .filter(Column::ExpiresAt.lt(before))
+        .secure()
+        .scope_with(scope)
+        .exec(runner)
+        .await?;
+    Ok(affected.rows_affected)
 }

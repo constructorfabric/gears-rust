@@ -9,9 +9,9 @@ use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::SecurityContext;
 
 use crate::models::{
-    CreditRequest, DeactivateOutcome, DebitRequest, Decision, DecisionPreview, PageRequest,
-    PageResult, PreviewRequest, QuotaFilter, QuotaId, QuotaPatch, QuotaSpec, QuotaView,
-    RollbackRequest,
+    AcquireLeaseOutcome, AcquireLeaseRequest, CommitLeaseRequest, CreditRequest, DeactivateOutcome,
+    DebitRequest, Decision, DecisionPreview, PageRequest, PageResult, PreviewRequest, QuotaFilter,
+    QuotaId, QuotaPatch, QuotaSpec, QuotaView, ReleaseLeaseRequest, RollbackRequest,
 };
 
 /// Error of every client method: the platform canonical error.
@@ -145,6 +145,59 @@ pub trait QuotaEnforcementClientV1: Send + Sync + 'static {
         ctx: &SecurityContext,
         request: PreviewRequest,
     ) -> Result<DecisionPreview, QuotaEnforcementError>;
+
+    /// Hold capacity on every applicable Quota for the requested TTL, to be
+    /// settled later by [`Self::commit_lease`] or [`Self::release_lease`].
+    ///
+    /// A denied acquisition is a successful call carrying the verdict, not an
+    /// error; an expired lease is released semantically the moment its TTL
+    /// passes, whether or not a sweeper has reclaimed its row.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::debit`], plus `InvalidArgument`
+    /// (`TTL_OUT_OF_BOUNDS`) for a missing TTL or one outside the operator's
+    /// window, `ResourceExhausted` (`LEASE_INFLIGHT_LIMIT_EXCEEDED`) when the
+    /// `(tenant, metric)` active-lease cap is reached, and `Aborted`
+    /// (`LEASE_CONTENTION_TIMEOUT`) when the acquisition waited too long on a
+    /// contended row.
+    async fn acquire_lease(
+        &self,
+        ctx: &SecurityContext,
+        request: AcquireLeaseRequest,
+    ) -> Result<AcquireLeaseOutcome, QuotaEnforcementError>;
+
+    /// Settle a lease for what was actually used, charging the acquisition
+    /// period whatever the wall clock now says (I5) and returning the rest.
+    ///
+    /// The resulting debit is addressable by this call's idempotency key, so it
+    /// reverses through [`Self::rollback`] with `original_operation` set to
+    /// [`crate::models::RollbackableOperation::LeaseCommit`].
+    ///
+    /// # Errors
+    ///
+    /// `InvalidArgument` for a negative `actual_amount` or a missing key;
+    /// `NotFound` for a token outside the caller's tenant; `FailedPrecondition`
+    /// (`LEASE_NOT_ACTIVE`) for an expired or resolved lease, and
+    /// (`OVER_COMMIT_NOT_AUTHORIZED`) when more than the reserved amount is
+    /// committed; `Aborted` on a payload mismatch.
+    async fn commit_lease(
+        &self,
+        ctx: &SecurityContext,
+        request: CommitLeaseRequest,
+    ) -> Result<Decision, QuotaEnforcementError>;
+
+    /// Return a lease's full held capacity to the acquisition period, without
+    /// committing a debit.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::commit_lease`], minus the over-commit.
+    async fn release_lease(
+        &self,
+        ctx: &SecurityContext,
+        request: ReleaseLeaseRequest,
+    ) -> Result<Decision, QuotaEnforcementError>;
 }
 
 /// Platform operator policy surface. Every method requires explicit PDP admission.
