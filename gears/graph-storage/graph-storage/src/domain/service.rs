@@ -1145,6 +1145,14 @@ impl GraphServices {
         }
         let mut over_bytes = false;
         nodes.retain(|view| {
+            // A seed is already in `spent` from the precheck, and exempt from
+            // the cut by the rule stated above. Charging it again here spent
+            // the seeds' bytes twice over -- so a request whose seeds fit
+            // could still lose one, evicted from its own answer by an
+            // accounting error rather than by the budget.
+            if seed_keys.contains(view.node_key.as_str()) {
+                return true;
+            }
             if over_bytes {
                 return false;
             }

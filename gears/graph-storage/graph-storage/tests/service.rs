@@ -1377,6 +1377,75 @@ async fn seeds_that_cannot_fit_the_budget_are_refused() {
     );
 }
 
+/// Seeds that fit are not evicted by their own bytes counted twice.
+///
+/// The precheck sums the seeds into `spent` to decide whether the request is
+/// answerable at all, and the truncation pass then walked the whole node list
+/// -- seeds included -- adding every node's bytes to that same running total.
+/// Each seed was therefore charged twice, and a traversal whose seeds
+/// comfortably fit could still drop one: the response would name a seed it
+/// did not contain, which is exactly what the exemption exists to prevent.
+///
+/// Six fat seeds against a budget with room for all of them and no room for
+/// twice that. Under the double count the second pass is over budget before
+/// it has even finished the seeds.
+#[tokio::test]
+async fn a_seed_is_not_evicted_by_its_own_bytes_counted_twice() {
+    const SEEDS: usize = 6;
+
+    let measured = GraphStorageConfig {
+        response_max_bytes: 12 * 1024,
+        ..GraphStorageConfig::default()
+    };
+    let harness = Harness::configured(Arc::new(support::AllowInOwnTenant), measured);
+    let ctx = harness.ctx();
+    harness.seed_ontology(&ctx).await;
+
+    let filler = "z".repeat(1_500);
+    let fat = |key: &str| NodeSpec {
+        payload: Some(serde_json::json!({ "note": filler })),
+        ..conformance::node(key, key)
+    };
+    let keys: Vec<String> = (0..SEEDS).map(|index| format!("seed-{index}")).collect();
+    harness
+        .services
+        .ingest(
+            &ctx,
+            conformance::batch(keys.iter().map(|k| fat(k)).collect(), Vec::new()),
+        )
+        .await
+        .expect("the batch commits");
+
+    let walked = harness
+        .services
+        .traverse(
+            &ctx,
+            TraverseRequest {
+                seeds: keys.clone(),
+                depth: 1,
+                edge_type_patterns: Vec::new(),
+                node_type_patterns: Vec::new(),
+                max_nodes: Some(100),
+            },
+        )
+        .await
+        .expect("the seeds fit the budget, so the traversal answers");
+
+    let returned: std::collections::BTreeSet<&str> =
+        walked.nodes.iter().map(|n| n.node_key.as_str()).collect();
+    for seed in &keys {
+        assert!(
+            returned.contains(seed.as_str()),
+            "every seed that fit must be in the answer: {seed} missing from {returned:?}"
+        );
+    }
+    assert_eq!(
+        walked.nodes.len(),
+        SEEDS,
+        "the seeds are the whole answer here: {returned:?}"
+    );
+}
+
 /// A batch is bounded by its total size, not only by its counts.
 ///
 /// Every per-item check can pass for a request no process survives: fifty
