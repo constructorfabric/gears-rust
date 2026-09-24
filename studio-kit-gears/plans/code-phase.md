@@ -64,6 +64,6 @@ lint set, tests) and `make dylint`, and, for FEATURE-led work, `cfs validate`.
 
 - [ ] Tests for the slice's behavior exist and pass.
 - [ ] `make gear-ci GEAR=<gear>` and `make dylint` pass.
-- [ ] For FEATURE-led work: `cfs validate` reports zero errors, every implemented CDSL ID has `@cpt-*` markers, and the FEATURE checkboxes reflect what is implemented.
+- [ ] For FEATURE-led work: `cfs validate` reports zero errors and the FEATURE checkboxes reflect what is implemented; when the traceability mode is FULL, every implemented CDSL ID also has `@cpt-*` markers.
 - [ ] The latest code review against `docs/checklists/CODING.md` has no unresolved CRITICAL or MAJOR findings.
 - [ ] Remaining MINOR findings are listed in the close report.

@@ -59,7 +59,7 @@ Studio thin skill and pins itself with the next stage.
 
 - [ ] The artifact exists at the resolved path and follows the KIND template section order.
 - [ ] `cfs toc <path>` has been applied and `cfs validate-toc <path>` passes.
-- [ ] `cfs validate --artifact <path>` reports zero errors.
+- [ ] `cfs validate --artifact <path>` reports zero errors. The one exception is an ADR authored before the gear's DESIGN exists: its single `ref-target-not-in-scope` error for the DESIGN reference is expected, the phase closes as completed-with-assumptions, and close hands off to `cf-gears-doc-design`.
 - [ ] Every upstream ID the KIND must cover is covered (see the KIND `rules.md`).
 - [ ] The latest semantic review against the KIND checklist has no unresolved CRITICAL or MAJOR findings.
 - [ ] Any remaining MINOR findings are listed in the close report, not silently dropped.

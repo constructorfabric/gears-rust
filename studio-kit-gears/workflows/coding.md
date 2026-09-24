@@ -20,7 +20,7 @@ until the slice's definition of done holds.
 UNIT CodingPreset
 PURPOSE: Bind the gears code rules for design-led work and route the requested stage through the gears code stage router.
 DO:
-  SET GEARS_CODE_SKILL = cf-gears-coding, GEARS_CODE_MODE = design-led, GEARS_CODE_SOURCE_KIND = DESIGN
+  SET GEARS_CODE_SKILL = cf-gears-coding, GEARS_CODE_MODE = design-led, GEARS_CODE_SOURCE_KIND = DESIGN, or ADR, PRD, or UPSTREAM_REQS when the request names that document as the design context
   SET GEARS_CODE_RULES = {codebase_design_led_rules}, GEARS_CODE_CHECKLIST = {codebase_checklist}
   LOAD {gears_code_stage_router}
   CONTINUE GearsCodeStageEntry

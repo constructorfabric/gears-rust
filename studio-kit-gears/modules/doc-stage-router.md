@@ -148,5 +148,5 @@ DO:
   RUN NextActionsOffer
 RULES:
   ALWAYS list remaining MINOR review findings in the close report
-  NEVER mark the phase done while `cfs validate --artifact` reports errors or a CRITICAL or MAJOR finding is unresolved
+  NEVER mark the phase done while `cfs validate --artifact` reports errors beyond the exception the phase definition of done allows, or while a CRITICAL or MAJOR finding is unresolved
 ```

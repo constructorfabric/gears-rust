@@ -113,11 +113,11 @@ RULES:
 UNIT GearsCodeClose
 PURPOSE: Check the definition of done for the slice, report, and offer the next slice.
 DO:
-  RUN `make gear-ci GEAR=<GEARS_GEAR>` and `make dylint`, plus `cfs validate` WHEN GEARS_CODE_MODE == feature-led
-  RUN check every item of "{gears_code_phase}#definition-of-done" against those results and the review findings in GEARS_FORWARD_PAYLOAD
+  RUN `make gear-ci GEAR=<GEARS_GEAR>` and `make dylint` (plus `cfs validate` when GEARS_CODE_MODE == feature-led), then check every item of "{gears_code_phase}#definition-of-done" against those results and the review findings in GEARS_FORWARD_PAYLOAD
   EMIT a SKILL_RESULT envelope with skill = GEARS_CODE_SKILL, status = completed when every definition-of-done item holds else failed, produced_artifacts = code-changes and unit-tests for GEARS_SLICE plus phase-status, report_outputs = the gate result, missing_artifacts = [], assumptions = any recorded overrides, and suggested_next_skills = [GEARS_CODE_SKILL, cf-git-commit]
-  SET NEXT_ACTION_PINNED_SKILL = GEARS_CODE_SKILL and NEXT_ACTION_PAYLOAD = GEARS_STAGE tests, GEARS_GEAR, GEARS_SOURCE_PATH WHEN GEARS_SOURCE_PATH still has unimplemented slices
-  SET NEXT_ACTION_PINNED_SKILL = cf-git-commit WHEN every slice of GEARS_SOURCE_PATH is implemented
+  SET NEXT_ACTION_PINNED_SKILL = GEARS_CODE_SKILL and NEXT_ACTION_PAYLOAD = GEARS_STAGE fix when review findings remain else author, GEARS_GEAR, GEARS_SOURCE_PATH, GEARS_SLICE, plus the unresolved findings WHEN a definition-of-done item fails
+  SET NEXT_ACTION_PINNED_SKILL = GEARS_CODE_SKILL and NEXT_ACTION_PAYLOAD = GEARS_STAGE tests, GEARS_GEAR, GEARS_SOURCE_PATH WHEN every definition-of-done item holds AND GEARS_SOURCE_PATH still has unimplemented slices
+  SET NEXT_ACTION_PINNED_SKILL = cf-git-commit WHEN every definition-of-done item holds AND every slice of GEARS_SOURCE_PATH is implemented
   LOAD {cf-studio-path}/.core/skills/studio/modules/ui/next-actions.md
   RUN NextActionsOffer
 RULES:
