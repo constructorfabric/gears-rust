@@ -178,9 +178,9 @@ Success criteria: Message routing latency under 100ms p95; streaming first-byte 
 
 **Steps**:
 1. [ ] - `p1` - Assemble content array from accumulated StreamingChunkEvent payloads - `inst-pr-assemble`
-2. [ ] - `p1` - **IF** completion status == complete: set is_complete=true, include plugin metadata - `inst-pr-complete`
-3. [ ] - `p1` - **IF** completion status == cancelled: set is_complete=false, metadata={cancelled: true, partial: true} - `inst-pr-cancelled`
-4. [ ] - `p1` - **IF** completion status == error: set is_complete=false, metadata={error: error_details} - `inst-pr-error`
+2. [ ] - `p1` - **IF** the completion status is complete: mark the message as complete and include the plugin metadata - `inst-pr-complete`
+3. [ ] - `p1` - **IF** the completion status is cancelled: mark the message as incomplete and record in its metadata that it was cancelled and is partial - `inst-pr-cancelled`
+4. [ ] - `p1` - **IF** the completion status is error: mark the message as incomplete and store the error details in its metadata - `inst-pr-error`
 5. [ ] - `p1` - DB: Update message record by message_id, setting content, is_complete, metadata, and updated_at timestamp - `inst-pr-update`
 6. [ ] - `p1` - **RETURN** message_id - `inst-pr-return`
 

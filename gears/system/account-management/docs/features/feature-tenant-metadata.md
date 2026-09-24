@@ -227,17 +227,17 @@ Delivers PRD §5.7 (Extensible Tenant Metadata) by making every metadata categor
 1. [ ] - `p2` - Read the `tenant_id` row's direct entry at `(tenant_id, schema_uuid)` via MetadataRepository on `dbtable-tenant-metadata` - `inst-algo-walk-read-own`
 2. [ ] - `p2` - **IF** direct entry exists - `inst-algo-walk-own-found`
    1. [ ] - `p2` - **RETURN** the direct value (own values are always returned regardless of `self_managed` status — the barrier only blocks inheritance from ancestors) - `inst-algo-walk-own-return`
-3. [ ] - `p2` - **IF** `inheritance_policy == override_only` - `inst-algo-walk-override-only`
+3. [ ] - `p2` - **IF** the inheritance policy is override_only - `inst-algo-walk-override-only`
    1. [ ] - `p2` - **RETURN** empty (no ancestor walk for `override_only`) - `inst-algo-walk-override-return`
 4. [ ] - `p2` - Load `tenant_id` row's `(parent_id, self_managed, status)` via TenantRepository - `inst-algo-walk-load-start`
-5. [ ] - `p2` - **IF** `tenant_id` is self-managed (`tenants.self_managed == true`) - `inst-algo-walk-start-barrier`
+5. [ ] - `p2` - **IF** `tenant_id` is self-managed (its `self_managed` flag in `tenants` is true) - `inst-algo-walk-start-barrier`
    1. [ ] - `p2` - **RETURN** empty — a self-managed tenant never inherits from ancestors above its barrier per DESIGN §3.2.3 and `principle-barrier-as-data` - `inst-algo-walk-start-barrier-return`
 6. [ ] - `p2` - Set `current = tenant_id` - `inst-algo-walk-init`
 7. [ ] - `p2` - **IF** `current.parent_id IS NULL` (root reached without a value) - `inst-algo-walk-root-reached`
    1. [ ] - `p2` - **RETURN** empty — normal terminal state of an inheritance walk - `inst-algo-walk-root-return`
 8. [ ] - `p2` - Advance `current` to `current.parent_id`; load `(parent_id, self_managed, status)` for the new `current` via TenantRepository - `inst-algo-walk-advance`
-9. [ ] - `p2` - Classify `current` as the inheritance domain root: `is_domain_root = current.self_managed` (`tenants.self_managed == true`). A self-managed ancestor is the INCLUSIVE top of the descendant's inheritance domain per the `tenant_closure` barrier rule (`barrier(ancestor, descendant) = 0` for a self-managed ancestor of a non-self-managed descendant — ancestor excluded, descendant included) and `principle-barrier-as-data`: its own value IS inheritable, but the walk MUST stop AFTER it rather than crossing to its parent - `inst-algo-walk-ancestor-barrier`
-10. [ ] - `p2` - **IF** `current.status == suspended` - `inst-algo-walk-suspended-skip`
+9. [ ] - `p2` - Classify `current` as the inheritance domain root: the ancestor is a domain root exactly when its `self_managed` flag in `tenants` is true. A self-managed ancestor is the INCLUSIVE top of the descendant's inheritance domain per the `tenant_closure` barrier rule (the barrier between ancestor and descendant is 0 for a self-managed ancestor of a non-self-managed descendant — ancestor excluded, descendant included) and `principle-barrier-as-data`: its own value IS inheritable, but the walk MUST stop AFTER it rather than crossing to its parent - `inst-algo-walk-ancestor-barrier`
+10. [ ] - `p2` - **IF** the current tenant status is suspended - `inst-algo-walk-suspended-skip`
     1. [ ] - `p2` - Skip reading the suspended ancestor's value. **IF** `is_domain_root`, **RETURN** empty (the barrier above the self-managed domain root blocks crossing regardless of status); **ELSE** loop back to the root-reached check at step 7 with the new `current` — suspension is a lifecycle state, not a barrier per DESIGN §3.2.3 - `inst-algo-walk-suspended-continue`
 11. [ ] - `p2` - Read the direct entry at `(current, schema_uuid)` via MetadataRepository - `inst-algo-walk-read-ancestor`
 12. [ ] - `p2` - **IF** direct entry exists at `(current, schema_uuid)` - `inst-algo-walk-ancestor-found`

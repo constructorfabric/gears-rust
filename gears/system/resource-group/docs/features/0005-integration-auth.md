@@ -118,7 +118,7 @@ This feature bridges RG with the AuthZ ecosystem. The integration read port prov
 2. [x] - `p1` - Plugin invokes `list_group_depth(system_ctx, group_id, query)` - `inst-plugin-read-2`
 3. [x] - `p1` - `RgReadService` delegates to `GroupService` unscoped read methods (`AccessScope::allow_all()`) — no AuthZ evaluation - `inst-plugin-read-3`
 4. [x] - `p1` - `GroupService` executes the closure-table query against the RG database - `inst-plugin-read-4`
-5. [x] - `p1` - **RETURN** `Page<ResourceGroupWithDepth>` — hierarchy rows with `tenant_id` per group and `metadata` (including `self_managed`); the same narrow trait also exposes `get_group`, `list_groups`, and `list_memberships` for single-group and membership reads, all resolved unscoped (bypassing `PolicyEnforcer`) - `inst-plugin-read-5`
+5. [x] - `p1` - **RETURN** a page of resource groups with depth — hierarchy rows with `tenant_id` per group and `metadata` (including `self_managed`); the same narrow trait also exposes `get_group`, `list_groups`, and `list_memberships` for single-group and membership reads, all resolved unscoped (bypassing `PolicyEnforcer`) - `inst-plugin-read-5`
 
 ### MTLS Request from AuthZ Plugin (`p2` — deferred, not implemented yet)
 
@@ -149,7 +149,7 @@ This feature bridges RG with the AuthZ ecosystem. The integration read port prov
 7. [ ] - `p2` - **IF** endpoint not in allowlist → **RETURN** 403 Forbidden - `inst-mtls-7`
 8. [ ] - `p2` - Create system SecurityContext (no AuthZ evaluation — trusted system principal) - `inst-mtls-8`
 9. [ ] - `p2` - RG Hierarchy Service: execute list_group_depth(system_ctx, group_id, query) directly - `inst-mtls-9`
-10. [ ] - `p2` - **RETURN** Page<ResourceGroupWithDepth> — hierarchy data with tenant_id per group, metadata including `self_managed` - `inst-mtls-10`
+10. [ ] - `p2` - **RETURN** a page of resource groups with depth — hierarchy data with tenant_id per group, metadata including `self_managed` - `inst-mtls-10`
 
 ### Plugin Gateway Routing
 

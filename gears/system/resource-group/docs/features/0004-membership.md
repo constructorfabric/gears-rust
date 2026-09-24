@@ -135,7 +135,7 @@ Memberships link resources (users, courses, documents, etc.) to groups in the hi
 4. [x] - `p1` - DB: SELECT group_id, gts_type_id, resource_id FROM resource_group_membership WHERE {filter} ORDER BY {stable} LIMIT {limit+1} - `inst-list-memb-4`
 5. [x] - `p1` - Resolve surrogate IDs back to GTS type paths for response - `inst-list-memb-5`
 6. [x] - `p1` - Build Page response with items and cursor tokens - `inst-list-memb-6`
-7. [x] - `p1` - **RETURN** Page<ResourceGroupMembership> - `inst-list-memb-7`
+7. [x] - `p1` - **RETURN** a page of resource group memberships - `inst-list-memb-7`
 
 ## 3. Processes / Business Logic (CDSL)
 

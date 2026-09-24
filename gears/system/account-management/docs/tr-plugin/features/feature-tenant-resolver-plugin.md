@@ -166,7 +166,7 @@ This feature realizes the sole feature entry in the `cf-tr-plugin` sub-system DE
 5. [ ] - `p1` - Query AM `tenants` for the deduplicated identifier set via the read-only role, applying the effective status-filter predicate - `inst-flow-get-tenants-lookup`
 6. [ ] - `p1` - Invoke `algo-tenant-resolver-plugin-tenant-type-reverse-lookup` for each returned row's `tenant_type_uuid` in a single batched pass - `inst-flow-get-tenants-hydrate-types`
 7. [ ] - `p1` - Project each returned AM row onto `TenantInfo`; silently drop identifiers that did not match (absent or filtered out) - `inst-flow-get-tenants-project`
-8. [ ] - `p1` - **RETURN** the resulting `Vec<TenantInfo>` to the gateway - `inst-flow-get-tenants-return-vec`
+8. [ ] - `p1` - **RETURN** the resulting list of tenant info records to the gateway - `inst-flow-get-tenants-return-vec`
 9. [ ] - `p1` - **IF** any read step raised a transient DB or Types Registry failure - `inst-flow-get-tenants-error-branch`
    1. [ ] - `p1` - **RETURN** `TenantResolverError::Internal` to the gateway - `inst-flow-get-tenants-return-unavailable`
 

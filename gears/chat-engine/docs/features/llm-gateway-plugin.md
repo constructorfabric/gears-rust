@@ -116,7 +116,7 @@ Success criteria: LLM plugin registers GTS schemas at startup; capabilities are 
 1. [ ] - `p1` - Receive `on_session_type_configured(ctx)` call from Chat Engine - `inst-stc-receive`
 2. [ ] - `p1` - Validate `ctx.plugin_config.config` against `LlmPluginConfig` GTS schema - `inst-stc-validate`
 3. [ ] - `p1` - **IF** validation fails **RETURN** error (invalid plugin configuration) - `inst-stc-invalid`
-4. [ ] - `p1` - **RETURN** empty `Vec<Capability>` — capability resolution deferred to `on_session_created` - `inst-stc-return`
+4. [ ] - `p1` - **RETURN** an empty list of capabilities — capability resolution deferred to `on_session_created` - `inst-stc-return`
 
 ### On Session Created
 
@@ -134,7 +134,7 @@ Success criteria: LLM plugin registers GTS schemas at startup; capabilities are 
 **Steps**:
 1. [ ] - `p1` - Receive `on_session_created(ctx)` call from Chat Engine - `inst-sc-receive`
 2. [ ] - `p1` - Algorithm: resolve capabilities from Model Registry using `cpt-cf-chat-engine-algo-llm-gateway-plugin-resolve-capabilities` - `inst-sc-resolve`
-3. [ ] - `p1` - **RETURN** `Vec<Capability>` containing model selection and model-specific capabilities - `inst-sc-return`
+3. [ ] - `p1` - **RETURN** a list of capabilities containing model selection and model-specific capabilities - `inst-sc-return`
 
 ### On Session Updated
 
@@ -151,7 +151,7 @@ Success criteria: LLM plugin registers GTS schemas at startup; capabilities are 
 **Steps**:
 1. [ ] - `p1` - Receive `on_session_updated(ctx)` call from Chat Engine with updated `CapabilityValue[]` - `inst-su-receive`
 2. [ ] - `p1` - Algorithm: refresh capabilities from Model Registry using `cpt-cf-chat-engine-algo-llm-gateway-plugin-refresh-capabilities` - `inst-su-refresh`
-3. [ ] - `p1` - **RETURN** `Vec<Capability>` — Chat Engine overwrites `Session.enabled_capabilities` - `inst-su-return`
+3. [ ] - `p1` - **RETURN** the list of capabilities — Chat Engine overwrites `Session.enabled_capabilities` - `inst-su-return`
 
 ### On Message
 
@@ -226,7 +226,7 @@ Success criteria: LLM plugin registers GTS schemas at startup; capabilities are 
    2. [ ] - `p1` - Build `model` capability: `{ id: "model", type: "enum", enum_values: [models from registry], default_value: [default from registry] }` - `inst-rc-build-model-cap`
    3. [ ] - `p1` - HTTP: GET Model Registry — retrieve capabilities for the default model (temperature, max_tokens, web_search, etc.) - `inst-rc-get-model-caps`
    4. [ ] - `p1` - Map model-specific parameters to additional `Capability` entries (type, default_value, constraints per parameter) - `inst-rc-map-caps`
-   5. [ ] - `p1` - **RETURN** combined `Vec<Capability>` (model + model-specific capabilities) - `inst-rc-return`
+   5. [ ] - `p1` - **RETURN** the combined list of capabilities (model + model-specific capabilities) - `inst-rc-return`
 2. [ ] - `p1` - **CATCH** HTTP error (timeout, connection refused, non-2xx) - `inst-rc-catch`
    1. [ ] - `p1` - **RETURN** error (Model Registry unavailable) - `inst-rc-error`
 
@@ -244,7 +244,7 @@ Success criteria: LLM plugin registers GTS schemas at startup; capabilities are 
 4. [ ] - `p1` - **TRY** - `inst-ref-try`
    1. [ ] - `p1` - HTTP: GET Model Registry — retrieve capabilities for the newly selected model - `inst-ref-get-new-caps`
    2. [ ] - `p1` - Rebuild capabilities: preserve `model` capability with existing `enum_values`, update `default_value` to new model, replace model-specific capabilities with new model's parameters - `inst-ref-rebuild`
-   3. [ ] - `p1` - **RETURN** updated `Vec<Capability>` - `inst-ref-return`
+   3. [ ] - `p1` - **RETURN** the updated list of capabilities - `inst-ref-return`
 5. [ ] - `p1` - **CATCH** HTTP error - `inst-ref-catch`
    1. [ ] - `p1` - **RETURN** error (Model Registry unavailable) - `inst-ref-error`
 

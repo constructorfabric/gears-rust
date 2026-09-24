@@ -108,7 +108,7 @@ Success criteria: Sessions are created, retrieved, updated, and deleted within l
 3. [ ] - `p1` - DB: Load the session type record by session_type_id - `inst-create-get-type`
 4. [ ] - `p1` - **IF** session type not found **RETURN** 404 Not Found - `inst-create-not-found`
 5. [ ] - `p1` - DB: Create a new session record with session_type_id, tenant_id, user_id, client_id, metadata, and lifecycle_state=active - `inst-create-db-insert`
-6. [ ] - `p1` - Algorithm: resolve plugin and call `on_session_created` using `cpt-cf-chat-engine-algo-session-lifecycle-invoke-plugin` — plugin queries Model Registry for available models and default model capabilities, returns `Vec<Capability>` - `inst-create-notify`
+6. [ ] - `p1` - Algorithm: resolve plugin and call `on_session_created` using `cpt-cf-chat-engine-algo-session-lifecycle-invoke-plugin` — plugin queries Model Registry for available models and default model capabilities and returns a list of capabilities - `inst-create-notify`
 7. [ ] - `p1` - DB: Update the session's enabled_capabilities, identified by session_id - `inst-create-store-caps`
 8. [ ] - `p1` - **RETURN** 201 Created (session_id, lifecycle_state=active, enabled_capabilities) - `inst-create-return`
 
@@ -175,7 +175,7 @@ Success criteria: Sessions are created, retrieved, updated, and deleted within l
 3. [ ] - `p1` - Algorithm: validate ownership using `cpt-cf-chat-engine-algo-session-lifecycle-validate-ownership` - `inst-cap-ownership`
 4. [ ] - `p1` - **IF** session.lifecycle_state IN (soft_deleted, hard_deleted) **RETURN** 409 Conflict - `inst-cap-check-state`
 5. [ ] - `p1` - Resolve plugin by session_type.plugin_instance_id - `inst-cap-resolve-plugin`
-6. [ ] - `p1` - Call `plugin.on_session_updated(ctx)` with updated CapabilityValue[] — plugin queries Model Registry for capabilities of the newly selected model, returns `Vec<Capability>` - `inst-cap-call-plugin`
+6. [ ] - `p1` - Call the plugin's `on_session_updated` hook with the updated capability values — the plugin queries Model Registry for capabilities of the newly selected model and returns a list of capabilities - `inst-cap-call-plugin`
 7. [ ] - `p1` - DB: Update the session's enabled_capabilities and refresh updated_at, identified by session_id - `inst-cap-db`
 8. [ ] - `p1` - **RETURN** 200 (updated session with refreshed enabled_capabilities) - `inst-cap-return`
 
@@ -231,7 +231,7 @@ Success criteria: Sessions are created, retrieved, updated, and deleted within l
 **Steps**:
 1. [ ] - `p1` - DB: Load the session record (session_id, tenant_id, user_id, lifecycle_state) by session_id - `inst-own-db-get`
 2. [ ] - `p1` - **IF** no row returned **RETURN** 404 Not Found - `inst-own-not-found`
-3. [ ] - `p1` - **IF** session.lifecycle_state == 'hard_deleted' **RETURN** 404 Not Found (hard-deleted sessions are invisible) - `inst-own-hard-deleted`
+3. [ ] - `p1` - **IF** the session lifecycle state is hard_deleted **RETURN** 404 Not Found (hard-deleted sessions are invisible) - `inst-own-hard-deleted`
 4. [ ] - `p1` - **IF** session.tenant_id != request.tenant_id **RETURN** 403 Forbidden - `inst-own-check-tenant`
 5. [ ] - `p1` - **IF** session.user_id != request.user_id **RETURN** 403 Forbidden - `inst-own-check-user`
 6. [ ] - `p1` - **RETURN** session record for caller use - `inst-own-return`
@@ -248,11 +248,11 @@ Success criteria: Sessions are created, retrieved, updated, and deleted within l
 2. [ ] - `p1` - Resolve plugin: `hub.get_scoped::<dyn ChatEngineBackendPlugin>(ClientScope::gts_id(&plugin_instance_id))` - `inst-ntfy-resolve-plugin`
 3. [ ] - `p1` - Build ctx: {event_type, session_id, session_type_id, plugin_config, tenant_id, user_id, client_id, metadata, timestamp} - `inst-ntfy-build-ctx`
 4. [ ] - `p1` - **TRY** - `inst-ntfy-try`
-   1. [ ] - `p1` - Call `plugin.on_session_created(ctx)` — plugin queries Model Registry for available models list and default model capabilities, returns `Vec<Capability>` - `inst-ntfy-call`
+   1. [ ] - `p1` - Call the plugin's `on_session_created` hook — the plugin queries Model Registry for the available models list and default model capabilities and returns a list of capabilities - `inst-ntfy-call`
 5. [ ] - `p1` - **CATCH** plugin error - `inst-ntfy-catch`
-   1. [ ] - `p1` - **IF** event_type == on_session_created **RETURN** 502 Bad Gateway - `inst-ntfy-created-fail`
+   1. [ ] - `p1` - **IF** the event type is on_session_created **RETURN** 502 Bad Gateway - `inst-ntfy-created-fail`
    2. [ ] - `p2` - **IF** event_type != on_session_created: log warning and continue (fire-and-forget) - `inst-ntfy-other-fail`
-6. [ ] - `p1` - **IF** event_type == on_session_created **RETURN** `Vec<Capability>` from plugin response - `inst-ntfy-return-caps`
+6. [ ] - `p1` - **IF** the event type is on_session_created **RETURN** the list of capabilities from the plugin response - `inst-ntfy-return-caps`
 7. [ ] - `p1` - **RETURN** void for all other event types - `inst-ntfy-return-void`
 
 ## 4. States (CDSL)

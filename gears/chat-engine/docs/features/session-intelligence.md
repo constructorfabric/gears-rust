@@ -140,8 +140,8 @@ Success criteria: Summary streaming first-byte under 500ms; retention cleanup pr
 2. [ ] - `p2` - API: invoke update-retention-policy endpoint (defined in DESIGN) - `inst-ur-api`
 3. [ ] - `p2` - Algorithm: validate session ownership using `cpt-cf-chat-engine-algo-session-lifecycle-validate-ownership` - `inst-ur-ownership`
 4. [ ] - `p2` - **IF** retention_policy.type not IN (age_based, count_based, none) **RETURN** 400 Bad Request - `inst-ur-validate-type`
-5. [ ] - `p2` - **IF** type == age_based AND max_age_days < 1 **RETURN** 400 Bad Request - `inst-ur-validate-age`
-6. [ ] - `p2` - **IF** type == count_based AND max_message_count < 1 **RETURN** 400 Bad Request - `inst-ur-validate-count`
+5. [ ] - `p2` - **IF** the type is age_based AND max_age_days is less than 1 **RETURN** 400 Bad Request - `inst-ur-validate-age`
+6. [ ] - `p2` - **IF** the type is count_based AND max_message_count is less than 1 **RETURN** 400 Bad Request - `inst-ur-validate-count`
 7. [ ] - `p2` - DB: update session record with new retention_policy and updated_at timestamp - `inst-ur-db`
 8. [ ] - `p2` - **RETURN** 200 (updated retention_policy) - `inst-ur-return`
 
@@ -185,10 +185,10 @@ Success criteria: Summary streaming first-byte under 500ms; retention cleanup pr
 **Output**: List of message IDs eligible for deletion
 
 **Steps**:
-1. [ ] - `p2` - **IF** retention_policy.type == none **RETURN** empty list - `inst-er-skip-none`
-2. [ ] - `p2` - **IF** retention_policy.type == age_based - `inst-er-age`
+1. [ ] - `p2` - **IF** the retention policy type is none **RETURN** empty list - `inst-er-skip-none`
+2. [ ] - `p2` - **IF** the retention policy type is age_based - `inst-er-age`
    1. [ ] - `p2` - DB: load message IDs older than max_age_days with a parent (non-root), ordered chronologically. Root messages are excluded to preserve conversation anchors. - `inst-er-age-query`
-3. [ ] - `p2` - **IF** retention_policy.type == count_based - `inst-er-count`
+3. [ ] - `p2` - **IF** the retention policy type is count_based - `inst-er-count`
    1. [ ] - `p2` - DB: count total non-root messages in session - `inst-er-count-total`
    2. [ ] - `p2` - **IF** total <= retention_policy.max_message_count **RETURN** empty list - `inst-er-count-skip`
    3. [ ] - `p2` - DB: load oldest non-root message IDs exceeding max_message_count threshold. Root messages are excluded to preserve conversation anchors (consistent with age-based retention). - `inst-er-count-query`
