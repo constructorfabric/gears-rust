@@ -47,3 +47,26 @@ fn a_dependency_error_with_a_forged_line_stays_on_one_line() {
         "{rendered}"
     );
 }
+
+#[test]
+fn bidirectional_format_characters_are_escaped_too() {
+    // Not control characters (they are `Cf`, format), yet a terminal that
+    // honours them reorders what follows — a dependency's text could make a
+    // log line read differently from what it holds.
+    for c in [
+        '\u{061C}', '\u{200E}', '\u{200F}', '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}',
+        '\u{202E}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
+    ] {
+        let raw = format!("user{c}nimda");
+        let shown = super::LogSafe(&raw).to_string();
+        assert!(
+            !shown.contains(c),
+            "U+{:04X} is escaped: {shown:?}",
+            u32::from(c)
+        );
+        assert_eq!(shown, format!("user\\u{{{:x}}}nimda", u32::from(c)));
+    }
+    // Letters of right-to-left scripts themselves pass through unchanged.
+    let shalom = "\u{5e9}\u{5dc}\u{5d5}\u{5dd}";
+    assert_eq!(super::LogSafe(shalom).to_string(), shalom);
+}
