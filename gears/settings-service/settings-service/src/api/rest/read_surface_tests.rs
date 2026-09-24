@@ -1180,3 +1180,71 @@ async fn the_tag_a_flagged_row_is_listed_with_is_the_one_a_correcting_write_pres
         answer.body
     );
 }
+
+#[tokio::test]
+async fn history_shows_the_settings_definition_records_beside_the_scopes_and_tells_them_apart() {
+    // A scope's history is its own records plus the setting's definition
+    // records — the declaration created, changed, retired — which belong to no
+    // tenant: "the platform changed the default" is part of why a scope's
+    // effective value moved. Each item says which it is, so a caller can
+    // separate them.
+    let h = RestHarness::new().await;
+    let created = h
+        .send(
+            "POST",
+            "/settings-service/v1/declarations",
+            Some(json!({
+                "value_type_id": BOOL,
+                "vendor": "acme",
+                "name": "proxy",
+                "category_id": h.inner.category_id(),
+                "default_value": true,
+                "scope_class": "cascading",
+            })),
+            None,
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(created.status, 201, "{}", created.body);
+    let key = created.body["key"]
+        .as_str()
+        .expect("a key")
+        .replace('~', "%7E");
+    let a = h.inner.tree.a;
+    let written = h
+        .send(
+            "PUT",
+            &format!("/settings-service/v1/settings/{key}/value?tenant={a}"),
+            Some(json!({ "value": false })),
+            Some("absent"),
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(written.status, 200, "{}", written.body);
+
+    let items = h
+        .items(
+            &format!("/settings-service/v1/settings/{key}/history?tenant={a}"),
+            h.inner.tree.root,
+        )
+        .await;
+    let scoped = items
+        .iter()
+        .filter(|i| i["tenant_id"] == json!(a.to_string()))
+        .count();
+    let definition: Vec<_> = items.iter().filter(|i| i["tenant_id"].is_null()).collect();
+    assert_eq!(scoped, 1, "the value write at `a`: {items:?}");
+    assert_eq!(definition.len(), 1, "the declaration's creation: {items:?}");
+    assert_eq!(definition[0]["operation"], json!("create"));
+
+    // Another scope sees the same definition record and none of `a`'s.
+    let b = h.inner.tree.b;
+    let items = h
+        .items(
+            &format!("/settings-service/v1/settings/{key}/history?tenant={b}"),
+            h.inner.tree.root,
+        )
+        .await;
+    assert!(items.iter().all(|i| i["tenant_id"].is_null()), "{items:?}");
+    assert_eq!(items.len(), 1);
+}

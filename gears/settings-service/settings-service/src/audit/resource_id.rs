@@ -4,7 +4,8 @@
 //! Every audit record this service writes carries a `resource` field built
 //! here, so per-`(setting, scope)` history is a plain exact-match query against
 //! the gear's own `audit_records` table (R1) and, later, the platform Audit
-//! Subsystem the outbox forwards to (R2).
+//! Subsystem the outbox forwards to (R2) — over two resources: the scope's own
+//! and the setting's definition resource, whose records belong to no tenant.
 //!
 //! DESIGN.md §4.2 requires the **same formatter** on both sides — the audit
 //! write and the history read — because the format is a single point of truth.

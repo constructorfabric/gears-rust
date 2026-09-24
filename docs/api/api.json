@@ -1359,6 +1359,14 @@
             "description": "The request that produced the record.",
             "type": "string"
           },
+          "tenant_id": {
+            "description": "The scope the record is about, or `null` for a record about the\nsetting's definition — the declaration created, changed, retired —\nwhich belongs to no tenant and appears in every scope's history.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "values_masked": {
             "description": "Whether the recorded values were masked for this caller.",
             "type": "boolean"
@@ -6609,7 +6617,7 @@
         "description": "An override flagged for review, as the needs-review listing reports it.",
         "properties": {
           "etag": {
-            "description": "The override's value state tag.",
+            "description": "The override's value state tag — what a write correcting this row\npresents in `If-Match`.",
             "type": "string"
           },
           "key": {

@@ -92,9 +92,9 @@ Two things about the record itself are fixed before it is written. Masking happe
 4. [x] - `p1` - Confirm through the tenant resolver that the target tenant is the caller's own or a descendant, and not a standalone descendant; **IF** it is neither → **RETURN** `403`, since a caller that cannot read a tenant's values cannot read their history either - `inst-as-hist-4`
 5. [x] - `p1` - DB: SELECT the declaration by key; **IF** none → **RETURN** `404`; a retired declaration keeps its history and is read like an active one - `inst-as-hist-5`
 6. [x] - `p1` - Evaluate the caller's effective tenant access for the setting; **IF** `hidden` → **RETURN** `404` rather than `403`, so a hidden setting's existence is not disclosed through its history - `inst-as-hist-6`
-7. [x] - `p1` - Compose the canonical audit resource id for the key and the target tenant with the shared formatter, and DB: SELECT audit_records WHERE declaration_key = {key} AND tenant_id = {tenant} ORDER BY occurred_at DESC through `idx_audit_scoped`, cursor-paginated, on the caller's `AccessScope` - `inst-as-hist-7`
+7. [x] - `p1` - Compose the canonical audit resource id for the key and the target tenant with the shared formatter, and DB: SELECT audit_records WHERE declaration_key = {key} AND (tenant_id = {tenant} OR tenant_id IS NULL) ORDER BY occurred_at DESC through `idx_audit_scoped`, cursor-paginated and bound to the pair, on the caller's `AccessScope` — the scope's own records and the setting's definition records, which belong to no tenant and explain changes no scope made - `inst-as-hist-7`
 8. [x] - `p1` - **FOR EACH** record → **IF** its actor classification is `pii` **AND** the caller is not authorized for unmasked PII → mask the actor; **IF** a recorded value is `pii`-classified under the same condition → mask it; a `secret` value needs no decision here, since it was never recorded in plaintext - `inst-as-hist-8`
-9. [x] - `p1` - **RETURN** `200` with the page of records — `operation`, `actor`, `pre_value`, `post_value`, `outcome`, `request_id`, `change_set_id`, `occurred_at` — and its pagination cursors; an empty page is `200` with no items, never an error - `inst-as-hist-9`
+9. [x] - `p1` - **RETURN** `200` with the page of records — `tenant_id` (`null` for a definition record), `operation`, `actor`, `pre_value`, `post_value`, `outcome`, `request_id`, `change_set_id`, `occurred_at` — and its pagination cursors; an empty page is `200` with no items, never an error - `inst-as-hist-9`
 
 ## 3. Processes / Business Logic (CDSL)
 
@@ -245,7 +245,7 @@ Every record **MUST** carry `retain_until` or fall under the store's configured 
 - [x] The spellings of `operation`, `outcome` and `actor_classification` are the stored and the wire form and never change once shipped; a reader treats each as an open set of strings, and the service fails the read on a stored value it does not know rather than defaulting it
 - [x] A record's `resource` equals the shared formatter's output for the same key and tenant, and the history read finds it by that pair
 - [x] A platform-level **value** record carries the root tenant's id, never a sentinel; a record about a **definition** — a category or a declaration — carries no tenant at all, so the write borrows no scope and asks the Tenant Resolver for nothing
-- [x] History for one setting at one scope returns only that pair's records, newest first, and a second page follows the cursor without duplicates
+- [x] History for one setting at one scope returns that pair's records and the setting's definition records, each item's `tenant_id` telling them apart (`null` for a definition record), newest first, and a second page follows the cursor without duplicates; another scope's records never appear
 - [x] A `pii`-classified actor is masked for a caller without the PII entitlement and unmasked for one with it
 - [x] History of a hidden setting returns `404`, and history of a setting for a tenant outside the caller's subtree, or for a standalone descendant, returns `403`
 - [x] History of a retired declaration is readable

@@ -1156,7 +1156,7 @@ Unlike RBAC v1, audit is a **show-stopper** here and is always active.
 | `audit` | `AuditRecord` | — | Write actor, target (`category + key + scope`), pre/post values, timestamp, outcome, request id for every mutation (create/change/revert/remove/clone) and for every **machine secret-use** (§4.2 *Secret Manager*); secret-use records carry a masked value (`cpt-cf-settings-service-fr-audit-mutations`). Each record's audit **`resource`** field is set to the canonical resource id below so the history read path (§4.3) can retrieve it. **Synchronous, fail-closed** — see below. |
 | `emit` | `SettingsEvent` | — | Publish change-lifecycle and cache-invalidation events (§4.4) through the Event Broker. |
 
-**Canonical audit resource id.** Every audit record this service writes carries a `resource` field formed from the setting key and the scope, so that per-(setting, scope) history (§4.3) is a plain `resource ==`-filtered query against the platform Audit Subsystem — no local audit table is introduced. The format is:
+**Canonical audit resource id.** Every audit record this service writes carries a `resource` field formed from the setting key and the scope, so that per-(setting, scope) history (§4.3) is a plain `resource`-filtered query against the platform Audit Subsystem — over two resources: the scope's `cf.settings:{key}@{tenant_id}` and the setting's definition `cf.settings:{key}`, whose records (declaration created, changed, retired) belong to no tenant, appear in every scope's history, and carry a `null` `tenant_id` in the response — no local audit table is introduced. The format is:
 
 ```
 cf.settings:{key}@{tenant_id} # every scope — the root tenant's id is platform scope

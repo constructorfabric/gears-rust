@@ -365,6 +365,10 @@ mod setting_dto_tests;
 pub struct AuditRecordDto {
     /// Record identity.
     pub id: Uuid,
+    /// The scope the record is about, or `null` for a record about the
+    /// setting's definition — the declaration created, changed, retired —
+    /// which belongs to no tenant and appears in every scope's history.
+    pub tenant_id: Option<Uuid>,
     /// `create`, `change`, `revert`, `remove`, `clone`, `secret_use` or `stage`.
     pub operation: String,
     /// Who did it, masked when the identity is PII the caller may not see.
@@ -416,6 +420,7 @@ pub fn render_record(
     let values_masked = values_are_pii && !may_read_pii;
     AuditRecordDto {
         id: record.id,
+        tenant_id: record.tenant_id,
         operation: record.operation.as_str().to_owned(),
         actor: if actor_masked {
             MASK_TOKEN.to_owned()
