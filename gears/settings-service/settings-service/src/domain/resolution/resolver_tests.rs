@@ -411,7 +411,8 @@ async fn a_bulk_read_shares_one_ancestry_and_answers_every_key() {
     let outcomes = h
         .resolver
         .resolve_bulk(&conn, &keys, tenant(h.tree.b))
-        .await;
+        .await
+        .expect("the root is known");
 
     assert_eq!(outcomes.len(), 3);
     assert!(matches!(&outcomes[0].1, Ok(v) if v.value == json!(true)));
@@ -926,7 +927,8 @@ async fn the_bulk_read_carries_the_same_fallback_as_the_single_read() {
     let bulk = h
         .resolver
         .resolve_bulk(&conn, &[h.key("strict"), h.key("other")], tenant(t.b))
-        .await;
+        .await
+        .expect("the root is known");
     let by_key: std::collections::HashMap<String, Arc<EffectiveValue>> = bulk
         .into_iter()
         .map(|(k, r)| (k.to_string(), r.expect("resolves")))

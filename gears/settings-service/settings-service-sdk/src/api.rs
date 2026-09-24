@@ -98,18 +98,17 @@ pub trait SettingsReaderClient: Send + Sync {
     /// Every outcome names its own key — see [`BulkOutcome`] for why that is
     /// carried explicitly rather than left to positional correspondence.
     ///
-    /// Bounded at [`BULK_LIMIT`] settings: a longer key list, or a category
-    /// that expands past it, is answered with a `bulk_too_large` error on
-    /// every key it names — never a partial set.
+    /// Two levels of failure, kept apart. The outer `Err` is the request's:
+    /// no key could be attempted, so none is answered — a key list or a
+    /// category past [`BULK_LIMIT`] settings (`bulk_too_large`, never a
+    /// partial set), a scope that is not a path, a category that cannot be
+    /// enumerated (not a category id, a stored key that does not parse), or
+    /// the store unreachable. An inner `Err` is one key's own. A category that
+    /// exists and files nothing is `Ok` with an empty batch, so a failure is
+    /// never mistaken for a category that configures nothing.
     ///
-    /// A [`BulkSelector::Category`] whose enumeration fails — the id is not a
-    /// category id, the store is unreachable, a stored key does not parse —
-    /// is answered with an **empty** batch: there is no key to hang the
-    /// failure on, and a shortened batch would pass for a complete one. The
-    /// gear logs the failure at `warn`; a consumer that must tell "failed"
-    /// from "configures nothing" reads by explicit keys, and a top-level
-    /// result for the category selector is a follow-up revision of this
-    /// trait.
+    /// # Errors
+    /// The request-level failures above, as a [`CanonicalError`].
     ///
     /// See [`crate::SettingsError`] for typed dispatch over the failure cases.
     async fn get_effective_bulk(
@@ -117,7 +116,7 @@ pub trait SettingsReaderClient: Send + Sync {
         ctx: &SecurityContext,
         selector: BulkSelector,
         scope: String,
-    ) -> Vec<BulkOutcome>;
+    ) -> Result<Vec<BulkOutcome>, CanonicalError>;
 
     /// Resolve a secret-backed setting to plaintext.
     ///

@@ -407,25 +407,23 @@ where
 
     /// Resolve several settings at one target, sharing one ancestry walk.
     ///
-    /// One outcome per key: a key that fails leaves the others intact, and the
-    /// batch never collapses to a single failure.
+    /// One outcome per key: a key that fails leaves the others intact, and a
+    /// key's failure never collapses the batch. Only what no key can be
+    /// resolved without fails the whole of it.
+    ///
+    /// # Errors
+    /// The platform scope's own failure, when the root tenant cannot be read.
     pub async fn resolve_bulk<C: DBRunner>(
         &self,
         conn: &C,
         keys: &[SettingKey],
         target: ScopeTarget,
-    ) -> Vec<(SettingKey, Result<Arc<EffectiveValue>, DomainError>)> {
+    ) -> Result<Vec<(SettingKey, Result<Arc<EffectiveValue>, DomainError>)>, DomainError> {
         // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-resolve-bulk:p1:inst-vr-bulk-1
         // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-resolve-bulk:p1:inst-vr-bulk-2
-        let root = match self.platform.root_tenant().await {
-            Ok(root) => root,
-            Err(err) => {
-                return keys
-                    .iter()
-                    .map(|k| (k.clone(), Err(same_detail(&err))))
-                    .collect();
-            }
-        };
+        // Without the root no key can be resolved: the batch's failure, not
+        // each key's.
+        let root = self.platform.root_tenant().await?;
         let mut ancestry = Ancestry::new(root, target);
         // @cpt-end:cpt-cf-settings-service-flow-value-resolution-resolve-bulk:p1:inst-vr-bulk-2
         // @cpt-end:cpt-cf-settings-service-flow-value-resolution-resolve-bulk:p1:inst-vr-bulk-1
@@ -441,7 +439,7 @@ where
         }
         // @cpt-end:cpt-cf-settings-service-flow-value-resolution-resolve-bulk:p1:inst-vr-bulk-3
         // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-resolve-bulk:p1:inst-vr-bulk-6
-        out
+        Ok(out)
         // @cpt-end:cpt-cf-settings-service-flow-value-resolution-resolve-bulk:p1:inst-vr-bulk-6
     }
 

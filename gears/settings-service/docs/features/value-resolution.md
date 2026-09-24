@@ -124,9 +124,10 @@ Three properties matter more than the walk itself.
 
 **Error Scenarios**:
 - Individual keys fail without failing the batch
+- A failure no key can be attempted past fails the request once, rather than being copied onto each key
 
 **Steps**:
-1. [x] - `p1` - Caller requests effective values for a set of keys, or for a category, at one scope; **IF** the key set, or the category's expansion, exceeds the bulk bound of five hundred → answer every named key with `bulk_too_large`, never a partial set - `inst-vr-bulk-1`
+1. [x] - `p1` - Caller requests effective values for a set of keys, or for a category, at one scope; **IF** the key set, or the category's expansion, exceeds the bulk bound of five hundred, the scope is not a path, the category cannot be enumerated or the platform scope cannot be read → **RETURN** that failure once, as the request's, never a partial set - `inst-vr-bulk-1`
 2. [x] - `p1` - Obtain the ancestor chain for the scope once and share it across every key in the batch - `inst-vr-bulk-2`
 3. [x] - `p1` - **FOR EACH** requested key - `inst-vr-bulk-3`
    1. [x] - `p1` - Resolve it independently, reusing the shared ancestry - `inst-vr-bulk-4`

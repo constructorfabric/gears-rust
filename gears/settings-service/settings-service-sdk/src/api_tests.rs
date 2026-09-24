@@ -80,12 +80,12 @@ impl SettingsReaderClient for FakeReader {
         _ctx: &SecurityContext,
         selector: BulkSelector,
         _scope: String,
-    ) -> Vec<BulkOutcome> {
+    ) -> Result<Vec<BulkOutcome>, CanonicalError> {
         let keys = match selector {
             BulkSelector::Keys(keys) => keys,
             BulkSelector::Category(_) => self.category_keys.clone(),
         };
-        keys.into_iter().map(|k| self.outcome_for(k)).collect()
+        Ok(keys.into_iter().map(|k| self.outcome_for(k)).collect())
     }
 
     async fn resolve_secret(
@@ -112,7 +112,8 @@ async fn one_failing_key_does_not_fail_the_others() {
             BulkSelector::Keys(vec![key("timeout"), key("proxy"), key("retries")]),
             "tenant-a".to_owned(),
         )
-        .await;
+        .await
+        .expect("the request is served");
 
     assert_eq!(outcomes.len(), 3);
     let failed: Vec<&str> = outcomes
@@ -139,7 +140,8 @@ async fn every_outcome_names_its_own_key_on_both_sides() {
             BulkSelector::Keys(vec![key("proxy"), key("timeout")]),
             "tenant-a".to_owned(),
         )
-        .await;
+        .await
+        .expect("the request is served");
 
     for outcome in &outcomes {
         assert!(!outcome.key.leaf_slug().is_empty());
@@ -166,7 +168,8 @@ async fn a_category_read_identifies_keys_the_caller_never_supplied() {
             BulkSelector::Category("network".to_owned()),
             "tenant-a".to_owned(),
         )
-        .await;
+        .await
+        .expect("the request is served");
 
     let named: Vec<&str> = outcomes.iter().map(|o| o.key.leaf_slug()).collect();
     assert_eq!(named, ["timeout", "proxy"]);
@@ -181,7 +184,8 @@ async fn an_empty_key_set_yields_no_outcomes() {
             BulkSelector::Keys(Vec::new()),
             "tenant-a".to_owned(),
         )
-        .await;
+        .await
+        .expect("the request is served");
     assert!(outcomes.is_empty());
 }
 

@@ -123,83 +123,37 @@ where
         _ctx: &SecurityContext,
         selector: BulkSelector,
         scope: String,
-    ) -> Vec<BulkOutcome> {
-        let (keys, over_bound): (Vec<SettingKey>, bool) = match &selector {
-            BulkSelector::Keys(keys) => (keys.clone(), keys.len() > BULK_LIMIT),
-            BulkSelector::Category(category) => match self.keys_in_category(category).await {
-                Ok(mut keys) => {
-                    let over = keys.len() > BULK_LIMIT;
-                    keys.truncate(BULK_LIMIT);
-                    (keys, over)
-                }
-                // No key is known, so no per-key outcome can carry the failure;
-                // an empty batch is the only honest answer for a category — and
-                // it is logged, so an outage or a broken row is not mistaken
-                // for a category that configures nothing.
-                Err(err) => {
-                    tracing::warn!(
-                        %category,
-                        error = %err,
-                        "bulk read by category could not enumerate the category; \
-                         answering an empty batch"
-                    );
-                    return Vec::new();
-                }
-            },
+    ) -> Result<Vec<BulkOutcome>, CanonicalError> {
+        // Every failure before the first key is the request's, answered once
+        // at the top: no key could be attempted, and copying the refusal onto
+        // each key would leave nowhere to put it when there is no key — a
+        // category that cannot be enumerated — and would read as that many
+        // independent failures when there is.
+        let (keys, field) = match &selector {
+            BulkSelector::Keys(keys) => (keys.clone(), "keys"),
+            BulkSelector::Category(category) => {
+                (self.keys_in_category(category).await?, "category")
+            }
         };
-        // Bounded, and never partial: past the bound every key the read does
-        // name carries the refusal, so no caller takes a truncated set for the
-        // whole list or the whole category.
-        if over_bound {
-            let field = match &selector {
-                BulkSelector::Keys(_) => "keys",
-                BulkSelector::Category(_) => "category",
-            };
-            let refusal = CanonicalError::from(DomainError::Validation {
+        // Bounded, and never partial: past the bound nothing is resolved, so
+        // no caller takes a truncated set for the whole list or category.
+        if keys.len() > BULK_LIMIT {
+            return Err(CanonicalError::from(DomainError::Validation {
                 field: field.to_owned(),
                 code: crate::field::BULK_TOO_LARGE,
                 message: format!(
                     "a bulk read resolves at most {BULK_LIMIT} settings; ask for fewer keys or a \
                      smaller category"
                 ),
-            });
-            return keys
-                .into_iter()
-                .map(|key| BulkOutcome {
-                    key,
-                    result: Err(refusal.clone()),
-                })
-                .collect();
+            }));
         }
-        let target = match ScopeTarget::parse(&scope) {
-            Ok(target) => target,
-            Err(err) => {
-                let canonical = CanonicalError::from(err);
-                return keys
-                    .into_iter()
-                    .map(|key| BulkOutcome {
-                        key,
-                        result: Err(canonical.clone()),
-                    })
-                    .collect();
-            }
-        };
-        let conn = match self.db.conn() {
-            Ok(conn) => conn,
-            Err(err) => {
-                let canonical = conn_error(&err);
-                return keys
-                    .into_iter()
-                    .map(|key| BulkOutcome {
-                        key,
-                        result: Err(canonical.clone()),
-                    })
-                    .collect();
-            }
-        };
-        self.resolver
+        let target = ScopeTarget::parse(&scope)?;
+        let conn = self.db.conn().map_err(|e| conn_error(&e))?;
+        Ok(self
+            .resolver
             .resolve_bulk(&conn, &keys, target)
             .await
+            .map_err(CanonicalError::from)?
             .into_iter()
             .map(|(key, outcome)| BulkOutcome {
                 key,
@@ -207,7 +161,7 @@ where
                     .map_err(CanonicalError::from)
                     .and_then(|v| project(scope.clone(), &v)),
             })
-            .collect()
+            .collect())
     }
 
     async fn resolve_secret(

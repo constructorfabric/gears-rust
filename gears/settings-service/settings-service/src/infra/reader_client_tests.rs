@@ -197,26 +197,26 @@ async fn outcomes_project_to_the_typed_errors_and_never_to_a_default() {
 }
 
 #[tokio::test]
-async fn a_bulk_read_past_the_bound_is_refused_per_key_never_answered_partially() {
+async fn a_bulk_read_past_the_bound_is_refused_whole_never_answered_partially() {
     use settings_service_sdk::api::BULK_LIMIT;
     let h = ResolutionHarness::new().await;
     h.declare("one", scope_class::LOCAL, json!(1)).await;
     let keys = vec![h.key("one"); BULK_LIMIT + 1];
 
-    let outcomes = reader(&h)
+    let err = reader(&h)
         .get_effective_bulk(
             &SecurityContext::anonymous(),
             BulkSelector::Keys(keys),
             scope_of(h.tree.a),
         )
-        .await;
-    assert_eq!(outcomes.len(), BULK_LIMIT + 1, "one answer per key, still");
+        .await
+        .expect_err("the request as a whole is refused");
     assert!(
-        outcomes.iter().all(|o| matches!(
-            o.result,
-            Err(toolkit_canonical_errors::CanonicalError::InvalidArgument { .. })
-        )),
-        "every key carries the refusal, none a value"
+        matches!(
+            err,
+            toolkit_canonical_errors::CanonicalError::InvalidArgument { .. }
+        ) && format!("{err:?}").contains(crate::field::BULK_TOO_LARGE),
+        "{err:?}"
     );
 
     // At the bound, every key resolves.
@@ -227,8 +227,31 @@ async fn a_bulk_read_past_the_bound_is_refused_per_key_never_answered_partially(
             BulkSelector::Keys(keys),
             scope_of(h.tree.a),
         )
-        .await;
+        .await
+        .expect("within the bound");
+    assert_eq!(outcomes.len(), BULK_LIMIT);
     assert!(outcomes.iter().all(|o| o.result.is_ok()));
+}
+
+#[tokio::test]
+async fn a_bulk_read_at_a_scope_that_is_not_a_path_is_refused_whole() {
+    let h = ResolutionHarness::new().await;
+    h.declare("one", scope_class::LOCAL, json!(1)).await;
+    let err = reader(&h)
+        .get_effective_bulk(
+            &SecurityContext::anonymous(),
+            BulkSelector::Keys(vec![h.key("one")]),
+            "tenant-a".to_owned(),
+        )
+        .await
+        .expect_err("no key can be resolved at a scope that does not parse");
+    assert!(
+        matches!(
+            err,
+            toolkit_canonical_errors::CanonicalError::InvalidArgument { .. }
+        ),
+        "{err:?}"
+    );
 }
 
 #[tokio::test]
@@ -245,7 +268,8 @@ async fn a_bulk_read_answers_every_key_independently() {
             BulkSelector::Keys(vec![h.key("good"), h.key("gone"), h.key("ghost")]),
             scope_of(h.tree.b),
         )
-        .await;
+        .await
+        .expect("the request is served; each key answers for itself");
 
     assert_eq!(outcomes.len(), 3);
     assert!(matches!(&outcomes[0].result, Ok(v) if v.value == json!(2)));
@@ -311,19 +335,23 @@ async fn a_category_holding_a_row_whose_key_does_not_parse_is_refused_whole_not_
             .expect("the row is stored as given");
     }
 
-    let outcomes = reader(&h)
+    let err = reader(&h)
         .get_effective_bulk(
             &SecurityContext::anonymous(),
             BulkSelector::Category(h.category_id().to_string()),
             scope_of(h.tree.a),
         )
-        .await;
+        .await
+        .expect_err("refused whole, not shortened by one");
     // Not one outcome short: a category that cannot be enumerated honestly is
-    // refused whole (and logged), never answered as if the broken row were
-    // not filed under it.
+    // refused whole, never answered as if the broken row were not filed
+    // under it.
     assert!(
-        outcomes.is_empty(),
-        "refused whole, not shortened by one: {outcomes:?}"
+        matches!(
+            err,
+            toolkit_canonical_errors::CanonicalError::Internal { .. }
+        ),
+        "{err:?}"
     );
 }
 
@@ -339,7 +367,8 @@ async fn a_category_selector_resolves_every_declaration_filed_under_it() {
             BulkSelector::Category(h.category_id().to_string()),
             scope_of(h.tree.a),
         )
-        .await;
+        .await
+        .expect("the category enumerates");
 
     let mut keys: Vec<String> = outcomes.iter().map(|o| o.key.to_string()).collect();
     keys.sort();
@@ -349,17 +378,32 @@ async fn a_category_selector_resolves_every_declaration_filed_under_it() {
     );
     assert!(outcomes.iter().all(|o| o.result.is_ok()));
 
-    let none = reader(&h)
+    // A failure and a category that files nothing are now told apart: the
+    // first is the request's error, the second an empty batch.
+    let err = reader(&h)
         .get_effective_bulk(
             &SecurityContext::anonymous(),
             BulkSelector::Category("not-a-uuid".to_owned()),
             scope_of(h.tree.a),
         )
-        .await;
+        .await
+        .expect_err("not a category id");
     assert!(
-        none.is_empty(),
-        "no key is known, so no per-key outcome can carry the failure"
+        matches!(
+            err,
+            toolkit_canonical_errors::CanonicalError::InvalidArgument { .. }
+        ),
+        "{err:?}"
     );
+    let empty = reader(&h)
+        .get_effective_bulk(
+            &SecurityContext::anonymous(),
+            BulkSelector::Category(uuid::Uuid::now_v7().to_string()),
+            scope_of(h.tree.a),
+        )
+        .await
+        .expect("a category id that files nothing is not a failure");
+    assert!(empty.is_empty());
 }
 
 #[tokio::test]

@@ -207,7 +207,7 @@ The system **MUST** provide a `settings-service-sdk` crate carrying the domain m
 
 - [ ] `p1` - **ID**: `cpt-cf-settings-service-dod-gear-foundation-sdk-traits`
 
-The system **MUST** define `SettingsReaderClient` with `get_effective`, `get_effective_bulk`, and `resolve_secret`, and `SettingsContributionClient` with `register_declarations` and `retire_declarations`. `get_effective_bulk` **MUST** return an independent per-key outcome so a mixed batch never fails wholesale. The traits **MUST** facade local against remote so `ClientHub` can bind either without the consumer changing.
+The system **MUST** define `SettingsReaderClient` with `get_effective`, `get_effective_bulk`, and `resolve_secret`, and `SettingsContributionClient` with `register_declarations` and `retire_declarations`. `get_effective_bulk` **MUST** return an independent per-key outcome so a mixed batch never fails wholesale, and **MUST** answer a failure no key can be attempted past — the bound, the scope, the category's enumeration, the store — once, as the request's own error. The traits **MUST** facade local against remote so `ClientHub` can bind either without the consumer changing.
 
 Every fallible trait method **MUST** return `Result<_, CanonicalError>`, the platform-wide error type. No settings-specific error type may appear in a trait signature: the platform ADR on SDK error surfaces fixes the boundary at canonical precisely so that adding a failure mode later is not a breaking change for every consuming gear. The typed view lives beside the trait, never inside it.
 
@@ -342,8 +342,8 @@ The system **MUST** provide the shared Audit Emitter through which every mutatin
 - [ ] `SettingsReaderClient` and `SettingsContributionClient` resolve through `ClientHub` after initialization
 - [ ] The same consumer code compiles and runs against both the in-process and the REST binding of `SettingsReaderClient`
 - [x] `get_effective_bulk` returns an independent outcome per key, and one failing key does not fail the others in the batch
-- [x] A bulk read of more than `BULK_LIMIT` (500) keys, or of a category expanding past it, is answered with a `bulk_too_large` error on every key it names, never with a partial set
-- [x] A bulk read of a category whose enumeration fails — a malformed category id, the store unreachable, a stored key that does not parse — is answered with an empty batch and the failure is logged at `warn`; it is never shortened by the rows it could not name
+- [x] A bulk read of more than `BULK_LIMIT` (500) keys, or of a category expanding past it, is refused as a whole with `bulk_too_large`, never answered with a partial set
+- [x] A bulk read of a category whose enumeration fails — a malformed category id, the store unreachable, a stored key that does not parse — is refused as a whole with that failure, never shortened by the rows it could not name; a category that files nothing answers an empty batch
 - [x] Every fallible trait method returns `CanonicalError`; no settings-specific error type appears in any trait signature
 - [x] `Unavailable`, `Retired`, and `NotFound` are distinguishable by a consumer without string matching
 - [x] The credential-absent outcome of `resolve_secret` is a different variant from the resolver's `NotFound`, so a placeholder can never be mistaken for a configured credential
