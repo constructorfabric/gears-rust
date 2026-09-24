@@ -1036,13 +1036,18 @@ async fn upsert_node(
     // only a filter in the statement can be here to notice. Answering
     // `Updated` on zero rows would tell the caller its write landed.
     //
-    // Which filter missed is worth separating, because the two ask different
-    // things of the caller: a version that moved is retryable against the
-    // version the row has now, while a tombstone is not retryable at all
-    // before purge. The row is re-read to say which, and a row that has since
-    // vanished is reported as the tombstone case -- a delete is the only way
-    // it goes away, and saying "re-read and retry" about a row that is gone
-    // would send the caller in a circle.
+    // Which filter missed is worth separating, because the three ask
+    // different things of the caller. The row is re-read to say which.
+    //
+    // A row still there with `deleted_at` set is the tombstone: not
+    // retryable at all before purge. A row still there without it changed
+    // version under us: retryable against the version it has now. A row that
+    // has vanished entirely is neither -- a scope replacement removes what it
+    // no longer declares with a hard delete, so the row and its key are
+    // already gone and the key is free this instant. Reporting that as the
+    // tombstone told the caller to wait for a purge that had just happened,
+    // and a retry policy reading "not before purge" would back off instead of
+    // simply re-ingesting.
     if written.rows_affected == 0 {
         let settled = node::Entity::find()
             .filter(Condition::all().add(node::Column::Id.eq(id)))
@@ -1051,20 +1056,23 @@ async fn upsert_node(
             .one(tx)
             .await
             .map_err(map_scope_err)?;
-        let tombstoned = settled.as_ref().is_none_or(|row| row.deleted_at.is_some());
         return Err(GraphStoreError::Conflict {
-            reason: if tombstoned {
-                format!(
+            reason: match settled {
+                Some(row) if row.deleted_at.is_some() => format!(
                     "node key `{}` was tombstoned while this write was being prepared, and a \
                      tombstoned key cannot be re-ingested before purge",
                     spec.node_key
-                )
-            } else {
-                format!(
+                ),
+                Some(_) => format!(
                     "node `{}` changed between the check and the write; re-read it and retry \
                      with the version it has now",
                     spec.node_key
-                )
+                ),
+                None => format!(
+                    "node `{}` was removed while this write was being prepared; the key is \
+                     free again, so re-ingest it",
+                    spec.node_key
+                ),
             },
         });
     }
