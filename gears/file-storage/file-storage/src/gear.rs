@@ -131,6 +131,12 @@ impl Gear for FileStorageGear {
         // URL-signing key. A configured seed yields a keypair that is stable
         // across restarts (so the sidecar's public key keeps verifying issued
         // URLs); without one we fall back to an ephemeral key for local dev.
+        // `cfg.validate()` above already rejected anything past
+        // `MAX_URL_TTL_CEILING` (30 days), which fits `i64` with room to
+        // spare, so `unwrap_or` never actually saturates here; kept (rather
+        // than `.expect(..)`, which `clippy::expect_used` denies
+        // workspace-wide) as a defensive fallback, same as
+        // `finalize_token_grace` above.
         let max_ttl = i64::try_from(cfg.max_url_ttl_secs).unwrap_or(i64::MAX);
         let issuer = Arc::new(if let Some(seed_b64) = &cfg.signing_key_seed {
             let seed = URL_SAFE_NO_PAD
@@ -177,6 +183,10 @@ impl Gear for FileStorageGear {
             .map_err(|e| anyhow::anyhow!("failed to resolve AuthZ resolver: {e}"))?;
         let authorizer: Arc<dyn Authorizer> = Arc::new(PolicyEnforcerAuthorizer::new(authz));
 
+        // `cfg.validate()` above already rejected `default_url_ttl_secs` past
+        // `max_url_ttl_secs`, itself capped at `MAX_URL_TTL_CEILING` (30
+        // days), so `unwrap_or` never actually saturates here; kept as a
+        // defensive fallback, same as `finalize_token_grace` above.
         let svc_cfg = ServiceConfig {
             default_url_ttl_secs: i64::try_from(cfg.default_url_ttl_secs).unwrap_or(i64::MAX),
             sidecar_base_url: cfg.sidecar_base_url,
@@ -210,6 +220,12 @@ impl Gear for FileStorageGear {
         // Multipart sessions get their own, much longer-lived TTL, decoupled
         // from the short per-part signed-URL TTL above (`multipart-session-ttl`
         // remediation -- see `MultipartService::session_ttl_secs`'s doc).
+        // `cfg.validate()` above already rejected anything past
+        // `MAX_MULTIPART_SESSION_TTL_SECS` (30 days), which fits `i64` with
+        // room to spare, so `unwrap_or` never actually saturates here; kept
+        // (rather than `.expect(..)`, which `clippy::expect_used` denies
+        // workspace-wide) as a defensive fallback, same as
+        // `finalize_token_grace` above.
         let session_ttl_secs = i64::try_from(cfg.multipart_session_ttl_secs).unwrap_or(i64::MAX);
 
         // TODO(P2): wire the quota-enforcement client once the Quota Enforcement
@@ -263,6 +279,11 @@ impl Gear for FileStorageGear {
             .with_metrics(Arc::clone(&metrics))
             .with_usage_reporter(None) // see TODO above `service`
             .with_session_ttl_secs(session_ttl_secs)
+            // `cfg.validate()` above already rejected anything past
+            // `MAX_MULTIPART_COMPLETE_LEASE_SECS` (1 day), which fits `i64`
+            // with room to spare, so `unwrap_or` never actually saturates
+            // here; kept as a defensive fallback, same as
+            // `finalize_token_grace` above.
             .with_complete_lease_secs(
                 i64::try_from(cfg.multipart_complete_lease_secs).unwrap_or(120),
             ),

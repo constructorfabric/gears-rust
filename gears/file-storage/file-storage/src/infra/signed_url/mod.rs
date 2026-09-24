@@ -225,7 +225,21 @@ impl Issuer {
 
     /// Mint a token for `claims`, clamping its lifetime to `max_ttl`.
     pub fn issue(&self, mut claims: Claims, now: OffsetDateTime) -> Result<String, DomainError> {
-        let max_exp = now.unix_timestamp() + self.max_ttl_secs;
+        // `checked_add`, not a plain `+`: `FileStorageConfig::validate()`
+        // already bounds `max_url_ttl_secs` at `MAX_URL_TTL_CEILING` (30
+        // days), so this should never actually overflow `i64` -- but a
+        // config invariant living in a different module is exactly the kind
+        // of thing that can silently drift, and the fallout of an unchecked
+        // overflow here is a wraparound (or a debug-build panic), not a
+        // wrong-but-recoverable value. Defense in depth.
+        let max_exp = now
+            .unix_timestamp()
+            .checked_add(self.max_ttl_secs)
+            .ok_or_else(|| {
+                DomainError::database(
+                    "max_url_ttl_secs overflowed computing the token's max expiry",
+                )
+            })?;
         if claims.exp > max_exp {
             claims.exp = max_exp;
         }

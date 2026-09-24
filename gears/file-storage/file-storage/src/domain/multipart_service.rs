@@ -517,6 +517,33 @@ impl MultipartService {
         let backend_path = storage_layout::backend_path(file_id, version_id);
         let backend_id = backend.id().to_owned();
 
+        // Session lifetime is independent of the URL TTL -- see
+        // `session_ttl_secs`'s field doc for why -- so it can outlive several
+        // regenerated per-part URL batches; that is the whole point of the
+        // introspect/resume flow (`introspect_multipart_upload`). Computed up
+        // front, before the pending-version insert and the backend
+        // `initiate_multipart` call below, so a failure here never leaves
+        // either of those to be compensated.
+        //
+        // `checked_add` rather than a plain `+`: `FileStorageConfig::validate()`
+        // already bounds both `*_ttl_secs` fields well within `OffsetDateTime`'s
+        // range, so this should never actually overflow -- but a config
+        // invariant living in a different module is exactly the kind of thing
+        // that can silently drift, and the fallout of an unchecked overflow
+        // here is a panic, not a wrong-but-recoverable value. Defense in depth.
+        let session_expires_at = now
+            .checked_add(time::Duration::seconds(self.session_ttl_secs.max(1)))
+            .ok_or_else(|| {
+                DomainError::database(
+                    "multipart session TTL overflowed computing the session expiry",
+                )
+            })?;
+        let url_expires_at = now
+            .checked_add(time::Duration::seconds(self.url_ttl_secs.max(1)))
+            .ok_or_else(|| {
+                DomainError::database("signed-URL TTL overflowed computing the part URL expiry")
+            })?;
+
         // Compute the server-authoritative parts plan (FEATURE §3).
         // `backend_min_part_size` is not yet exposed by the BackendCapabilities
         // API so we fall back to the `DEFAULT_MIN_PART_SIZE` constant.
@@ -542,13 +569,6 @@ impl MultipartService {
 
         // Initiate the multipart upload on the backend.
         let backend_handle = backend.initiate_multipart(&backend_path).await?;
-
-        // Session lifetime is independent of the URL TTL -- see
-        // `session_ttl_secs`'s field doc for why -- so it can outlive several
-        // regenerated per-part URL batches; that is the whole point of the
-        // introspect/resume flow (`introspect_multipart_upload`).
-        let session_expires_at = now + time::Duration::seconds(self.session_ttl_secs.max(1));
-        let url_expires_at = now + time::Duration::seconds(self.url_ttl_secs.max(1));
 
         // Persist the session row. On failure, best-effort compensate to avoid
         // orphaning the backend handle and the pending version row.
@@ -853,7 +873,16 @@ impl MultipartService {
         // completing; answer 202 or replay accordingly.
         let now = OffsetDateTime::now_utc();
         let lease_owner = Uuid::now_v7().to_string();
-        let lease_until = now + time::Duration::seconds(self.complete_lease_secs.max(1));
+        // `checked_add`, not a plain `+` -- see the same reasoning at
+        // `initiate_multipart_upload`'s `session_expires_at`/`url_expires_at`
+        // above: `FileStorageConfig::validate()` already bounds
+        // `complete_lease_secs`, so this should never actually overflow, but
+        // defense in depth turns a would-be panic into a clean error.
+        let lease_until = now
+            .checked_add(time::Duration::seconds(self.complete_lease_secs.max(1)))
+            .ok_or_else(|| {
+                DomainError::database("complete lease TTL overflowed computing the lease expiry")
+            })?;
         let acquired = self
             .store
             .acquire_multipart_complete_lease(upload_id, &lease_owner, lease_until, now)
@@ -1703,7 +1732,18 @@ impl MultipartService {
         // early resume URL stay valid for the session's full lifetime (e.g.
         // ~24h), defeating the short-URL-TTL design (DESIGN §4.5). So:
         // `exp = min(session expiry, now + url_ttl_secs)`.
-        let url_ttl_cap = now + time::Duration::seconds(self.url_ttl_secs.max(1));
+        //
+        // `checked_add`, not a plain `+` -- see the same reasoning at
+        // `initiate_multipart_upload`'s `url_expires_at` above:
+        // `FileStorageConfig::validate()` already bounds `url_ttl_secs`
+        // (`default_url_ttl_secs`/`max_url_ttl_secs`), so this should never
+        // actually overflow, but defense in depth turns a would-be panic into
+        // a clean error.
+        let url_ttl_cap = now
+            .checked_add(time::Duration::seconds(self.url_ttl_secs.max(1)))
+            .ok_or_else(|| {
+                DomainError::database("signed-URL TTL overflowed computing the resume URL cap")
+            })?;
         let exp = session.expires_at.min(url_ttl_cap).unix_timestamp();
         let request_id = Uuid::now_v7().to_string();
         let backend_path = session.backend_path_or_default();

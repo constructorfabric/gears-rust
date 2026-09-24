@@ -34,6 +34,65 @@ pub const MAX_FINALIZE_TOKEN_GRACE_SECS: u64 = 7 * 24 * 3600;
 /// exactly at this ceiling, so the shipped default is never itself rejected.
 pub const MAX_PAGE_SIZE_CEILING: u64 = 1000;
 
+/// Upper bound (seconds) accepted for `max_url_ttl_secs`: 30 days.
+///
+/// `max_url_ttl_secs` becomes `Issuer::max_ttl_secs` (`gear.rs`, via the same
+/// saturating `i64::try_from(..).unwrap_or(i64::MAX)` conversion as
+/// `finalize_token_grace_secs`), which `Issuer::issue` then adds directly to
+/// `now.unix_timestamp()` to compute `max_exp`. Without a ceiling here, an
+/// oversized value would carry through as `i64::MAX` and overflow that
+/// addition; `validate()` rejects it up front instead. 30 days gives an
+/// operator room well past the 7-day recommended default without allowing an
+/// unbounded value.
+pub const MAX_URL_TTL_CEILING: u64 = 30 * 24 * 3600;
+
+/// Upper bound (seconds) accepted for `multipart_session_ttl_secs`: 30 days.
+///
+/// `gear.rs` converts the field to `i64` via the same saturating
+/// `unwrap_or(i64::MAX)` pattern as `finalize_token_grace_secs`, and
+/// `MultipartService::initiate_multipart_upload` then adds it directly to
+/// `now` to compute the session's `expires_at`. Without a ceiling here, an
+/// oversized (or corrupted/malicious) config value would silently become
+/// `i64::MAX` seconds, overflowing that addition instead of producing a
+/// usable expiry. 30 days comfortably covers even a very large multi-part
+/// upload's realistic time budget while the shipped default (24 hours) sits
+/// far below it.
+pub const MAX_MULTIPART_SESSION_TTL_SECS: u64 = 30 * 24 * 3600;
+
+/// Upper bound (seconds) accepted for `multipart_complete_lease_secs`: 1 day.
+///
+/// Unlike the TTL/grace knobs above, `gear.rs` already falls back to a safe
+/// finite default (`unwrap_or(120)`, not `i64::MAX`) on conversion, so this
+/// isn't the same silent-saturation hazard -- but the lease is meant to
+/// bound how long one `complete` call may hold the `completing` state before
+/// another caller can take it over after a crash (backend-assembly time
+/// budget), and nothing otherwise stops an operator from configuring a value
+/// that defeats that purpose. 1 day is generous for even a very slow backend
+/// assembly while the shipped default (120s) sits far below it.
+pub const MAX_MULTIPART_COMPLETE_LEASE_SECS: u64 = 24 * 3600;
+
+/// Upper bound (seconds) accepted for `orphan_grace_secs`: 30 days.
+///
+/// `domain::cleanup::CleanupEngine::run_sweep` subtracts it from `now` (via
+/// the same `i64::try_from(..).unwrap_or(3600)` pattern, already a safe
+/// finite fallback rather than `i64::MAX`), so this isn't an overflow hazard
+/// the way the addition sites above are -- but it otherwise has no ceiling of
+/// its own, and the recommended `max_url_ttl_secs` (7 days) already implies
+/// operators may reasonably want to raise `orphan_grace_secs` to match (see
+/// the `max_url_ttl_secs`-vs-`orphan_grace_secs` warning below). 30 days
+/// leaves room for that while still rejecting an unbounded value.
+pub const MAX_ORPHAN_GRACE_SECS: u64 = 30 * 24 * 3600;
+
+/// Upper bound (seconds) accepted for `idempotency_ttl_secs`: 30 days.
+///
+/// `FileService::create_file` adds it to `now` (via the same
+/// `i64::try_from(..).unwrap_or(86400)` pattern, already a safe finite
+/// fallback) to compute the stored idempotency record's `expires_at`. Not an
+/// overflow hazard given that fallback, but otherwise has no ceiling of its
+/// own; 30 days is well past any realistic retry window while the shipped
+/// default (24 hours) sits far below it.
+pub const MAX_IDEMPOTENCY_TTL_SECS: u64 = 30 * 24 * 3600;
+
 /// Configuration for the `file-storage` gear.
 ///
 /// `Debug` is implemented manually so the `signing_key_seed` private key is never
@@ -379,6 +438,20 @@ impl FileStorageConfig {
                 MAX_FINALIZE_TOKEN_GRACE_SECS
             );
         }
+        // `max_url_ttl_secs` otherwise has no ceiling of its own -- `gear.rs`
+        // converts it to `i64` via the same saturating `unwrap_or(i64::MAX)`
+        // pattern as `finalize_token_grace_secs`, and `Issuer::issue` then
+        // adds it directly to `now.unix_timestamp()`. Reject it up front, the
+        // same way MAX_FINALIZE_TOKEN_GRACE_SECS bounds
+        // finalize_token_grace_secs above.
+        if self.max_url_ttl_secs > MAX_URL_TTL_CEILING {
+            anyhow::bail!(
+                "invalid file-storage config: max_url_ttl_secs ({}) must not exceed \
+                 MAX_URL_TTL_CEILING ({})",
+                self.max_url_ttl_secs,
+                MAX_URL_TTL_CEILING
+            );
+        }
         // `default_url_ttl_secs` is what every mint uses absent a caller
         // override, so it must itself respect the ceiling the control plane
         // is supposed to enforce -- otherwise the very first signed URL
@@ -435,6 +508,17 @@ impl FileStorageConfig {
                 self.orphan_grace_secs
             );
         }
+        // `orphan_grace_secs` otherwise has no ceiling of its own -- reject it
+        // up front, the same way MAX_FINALIZE_TOKEN_GRACE_SECS bounds
+        // finalize_token_grace_secs above.
+        if self.orphan_grace_secs > MAX_ORPHAN_GRACE_SECS {
+            anyhow::bail!(
+                "invalid file-storage config: orphan_grace_secs ({}) must not exceed \
+                 MAX_ORPHAN_GRACE_SECS ({})",
+                self.orphan_grace_secs,
+                MAX_ORPHAN_GRACE_SECS
+            );
+        }
         // A multipart session must outlive (or at least match) the per-part
         // signed URLs minted at initiate time -- otherwise the very first
         // batch of upload URLs would carry an `exp` beyond the session's own
@@ -450,6 +534,47 @@ impl FileStorageConfig {
                  time could remain valid past the multipart session's own expiry",
                 self.multipart_session_ttl_secs,
                 self.default_url_ttl_secs
+            );
+        }
+        // `gear.rs` converts `multipart_session_ttl_secs` to `i64` via the
+        // same saturating `unwrap_or(i64::MAX)` pattern as
+        // `finalize_token_grace_secs`, and
+        // `MultipartService::initiate_multipart_upload` then adds it directly
+        // to `now` to compute the session's `expires_at`. Without a ceiling
+        // here an oversized (or corrupted/malicious) config value would
+        // silently become `i64::MAX` seconds and overflow that addition.
+        // Reject it up front instead.
+        if self.multipart_session_ttl_secs > MAX_MULTIPART_SESSION_TTL_SECS {
+            anyhow::bail!(
+                "invalid file-storage config: multipart_session_ttl_secs ({}) must not exceed \
+                 MAX_MULTIPART_SESSION_TTL_SECS ({})",
+                self.multipart_session_ttl_secs,
+                MAX_MULTIPART_SESSION_TTL_SECS
+            );
+        }
+        // `multipart_complete_lease_secs` otherwise has no ceiling of its own
+        // -- it bounds how long one `complete` call may hold the `completing`
+        // state before another caller can take it over after a crash
+        // (backend-assembly time budget), and an oversized value would defeat
+        // that purpose by letting a stuck/crashed completer block every other
+        // caller far longer than any real assembly could take.
+        if self.multipart_complete_lease_secs > MAX_MULTIPART_COMPLETE_LEASE_SECS {
+            anyhow::bail!(
+                "invalid file-storage config: multipart_complete_lease_secs ({}) must not exceed \
+                 MAX_MULTIPART_COMPLETE_LEASE_SECS ({})",
+                self.multipart_complete_lease_secs,
+                MAX_MULTIPART_COMPLETE_LEASE_SECS
+            );
+        }
+        // `idempotency_ttl_secs` otherwise has no ceiling of its own --
+        // `FileService::create_file` adds it directly to `now` to compute the
+        // stored idempotency record's `expires_at`.
+        if self.idempotency_ttl_secs > MAX_IDEMPOTENCY_TTL_SECS {
+            anyhow::bail!(
+                "invalid file-storage config: idempotency_ttl_secs ({}) must not exceed \
+                 MAX_IDEMPOTENCY_TTL_SECS ({})",
+                self.idempotency_ttl_secs,
+                MAX_IDEMPOTENCY_TTL_SECS
             );
         }
         // `max_url_ttl_secs` is deliberately NOT hard-bailed on the same
