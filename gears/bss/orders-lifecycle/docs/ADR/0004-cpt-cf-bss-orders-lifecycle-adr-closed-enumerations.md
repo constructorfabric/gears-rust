@@ -63,7 +63,7 @@ Chosen option: **keep both sets closed**. Concretely:
 ### Consequences
 
 * **The state machine stays at eleven and the event set at eleven**, so none of the four problems adds an enumeration value. That is the precise claim, and it is narrower than "no engine change and no PRD amendment": `01 §4.6` is explicit that adding a state or an event type requires **both**, and this decision avoids exactly that cost — but two consequences of it still land outside the slices. **D-15 changes the engine contract**: the in-code transition table gains a **nullable** `event_type` declaration so an event-less row can be expressed, which `01 §4.6` classifies as an engine change in its own right. **D-14 still needs a PRD acknowledgement**: the `draft → expired` auto-void edge (§4.3 row 6) is a transition row the PRD §6.1 normative state diagram does not contain, routed to Product as `DECISIONS.md` **Q-22**, whose answer is either amending that diagram or the twelfth state and event this ADR rejected. What this decision buys is therefore avoiding *enumeration* churn and the consumer forward-compatibility obligation that would ride with it — not avoiding engine propagation or PRD reconciliation altogether.
-* **The outbox cardinality rule stays enforceable.** An earlier draft of this ADR claimed `orders_event_outbox.event_type` is nullable and demoted the rule to a tested invariant on that basis. That was wrong twice: `01 §3.7` declares the column `text` with no nullable marker, and the enqueue is conditional — `01 §3.6` writes a row only *if the transition row declares an event type* — so an event-less transition produces **no** outbox row and no row can ever carry a null type. The rule is therefore "exactly one outbox row per **event-declaring** committed transition", and that remains a checkable cardinality property. The nullability that D-15 introduced is on the in-code transition table's `event_type` declaration, not on the outbox.
+* **The event cardinality rule stays enforceable.** The transition table's `event_type` declaration is nullable, and enqueue is conditional — `01 §3.6` calls the bound platform producer outbox only when the row declares an event type. The rule is therefore “exactly one producer message per **event-declaring** committed transition”. Platform envelope storage is opaque and has no Orders-owned nullable type column; the nullability D-15 introduced remains solely on the in-code transition declaration.
 * **The event-less justification depends on an external document.** "The caller caused the transition and already knows" is true because the sibling Orders Workflow PRD's trigger set contains neither `submitted → pending_approval` nor `approved → in_fulfillment`. If that trigger set changes, six rows silently need re-examination — so this ADR is a dependency of that PRD, not merely a reader of it.
 * **A future consumer that is not the caller cannot observe six transition classes at all**: order creation, draft mutation, the administrative edit, `submitted → pending_approval`, `approved → in_fulfillment`, and the spawn signal. Analytics, an operator timeline and a reconciliation job are all plausibly such consumers. Each would need an engine change plus a PRD amendment, which is the cost this decision defers rather than removes.
 * **`OrderExpired` carries two commercially different facts** — a committed order whose TTL lapsed, and a basket never submitted. Consumers must read the payload to tell them apart.
@@ -75,13 +75,10 @@ Chosen option: **keep both sets closed**. Concretely:
 verifiable today or planned.
 
 **Verifiable today.** `01 §4.4`'s event catalogue maps all eleven events to their emitting rows
-and names the six event-less row classes with a justification each; `01 §4.3` holds twenty-five
-rows across eleven states; and `01 §4.6` states what adding to either set would cost. The
-document-level invariant suite (`scripts/check-design-invariants.py`, run as `make design-check`
-in CI) mechanises the load-bearing part: its state-machine family asserts that §4.4's catalogue
-and §4.3's event-declaring rows are the **same set** in both directions, and that each catalogue
-entry names the event its cited row actually declares — so an event added to one and not the
-other fails the check rather than surviving review.
+and names the six event-less row classes with a justification each; `01 §4.3` holds twenty-seven
+rows across eleven states; and `01 §4.6` states what adding to either set would cost. Review must
+compare §4.4's catalogue and §4.3's event-declaring rows in both directions, including the event
+named by each cited row. No automated CI enforcement of this comparison is claimed here.
 
 **Planned, not yet written and not yet specified.** A runtime check asserting no transition is
 admissible outside the transition table has no home in the design set; `01 §1.2` is where it

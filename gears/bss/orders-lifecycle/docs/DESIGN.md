@@ -27,7 +27,7 @@
   - [4.2 Security posture](#42-security-posture)
   - [4.3 Data protection, residency and retention](#43-data-protection-residency-and-retention)
   - [4.4 Observability](#44-observability)
-  - [4.5 Error handling and the outbox failure posture](#45-error-handling-and-the-outbox-failure-posture)
+  - [4.5 Error handling and the platform outbox failure posture](#45-error-handling-and-the-platform-outbox-failure-posture)
   - [4.6 Testability](#46-testability)
   - [4.7 Accepted residual limits](#47-accepted-residual-limits)
   - [4.8 Extension and provenance](#48-extension-and-provenance)
@@ -51,11 +51,12 @@ Catalog's is *publish through the engine* (author draft, validate fail-closed, f
 this gear's contract is **transition through the engine**. One shared **Order Transition
 Engine** ([`design/01-foundation`](./design/01-foundation.md)) owns the order aggregate and
 its append-only version chain, the state-machine table and its guards, the idempotency
-registry, the optimistic version check, the transition audit log, and the event outbox. Every
+registry, the optimistic version check, the transition audit log, and the event contract. Every
 state change — a buyer submitting, an operator holding, the sibling Workflow gear reflecting an
 approval, the scheduler expiring a stale order — enters through the same engine call and leaves
-having done exactly four things atomically: the state or version change, one audit entry, one
-settled idempotency record, and one outbox row where the transition row declares an event type.
+having done three things atomically on every success — the state or version change, one audit entry
+(one per changed field for an administrative edit, D-117) and one settled idempotency record — plus one platform producer-outbox message where the transition
+row declares an event type.
 
 Each business capability is a **slice handler** that declares its guard predicates and its
 contribution to the order document, then transitions *through* the Engine under the invariants
@@ -89,7 +90,7 @@ Requirements that significantly influence architecture decisions.
 | `cpt-cf-bss-orders-lifecycle-fr-order-line-dates` | Line dates, term duration and billing cycle are line-level authored fields with cascading defaults; expected fulfillment time is derived, never stored as authority. |
 | `cpt-cf-bss-orders-lifecycle-fr-order-amendment` | Commercial content is immutable from `submitted`: an amendment appends a new version row with a `supersedesVersion` back-reference and re-runs the gate. Administrative content is a separate, non-versioned, audited edit path. |
 | `cpt-cf-bss-orders-lifecycle-fr-order-history` | Versions are append-only rows retained in-table, so any historical version is retrievable by order id and version number without reconstruction. |
-| `cpt-cf-bss-orders-lifecycle-fr-order-tenant-axes` | The three axes are validated at submit and then frozen by the Engine's guard set; only `payerTenantId` has an amendment path, and it carries the paired payer/seller rebinding predicate. |
+| `cpt-cf-bss-orders-lifecycle-fr-order-tenant-axes` | The three axes are validated at submit and then frozen by the Engine's guard set; only `payerTenantId` has an amendment path, while cross-seller transfer is refused: the explicit D-62/Q-28 PRD divergence. |
 | `cpt-cf-bss-orders-lifecycle-fr-order-acceptance` | The acceptance instant is a first-class recorded fact with its own transition and event, and a begin-fulfillment guard reads it. It has no default value at any layer. |
 | `cpt-cf-bss-orders-lifecycle-fr-order-payment-auth` | Payment authorization is consumed as a begin-fulfillment guard input supplied by Workflow, not as an order state; the tolerate-failure election is a seller policy read at guard time. |
 | `cpt-cf-bss-orders-lifecycle-fr-order-cancel` | The cancel guard is anchored on the recorded subscription-spawn signal, which is why begin-fulfillment must be durably committed before Workflow issues any activation intent. |
@@ -97,7 +98,7 @@ Requirements that significantly influence architecture decisions.
 | `cpt-cf-bss-orders-lifecycle-fr-order-expiry` | A coordinated scheduler drives per-state TTL expiry as an ordinary Engine transition; `in_fulfillment` and holds taken from it are excluded by the transition table itself, not by scheduler logic. |
 | `cpt-cf-bss-orders-lifecycle-fr-order-atomic-fulfillment` | The order carries no per-line fulfillment state machine. Terminals are order-level; per-line create/activate results are a read-only projection fed by Workflow acknowledgements. |
 | `cpt-cf-bss-orders-lifecycle-fr-order-subscription-linkage` | The per-line line→subscription mapping is persisted on acknowledgement and carried in `OrderCompleted`, so acquisition provenance is answerable from the order side. |
-| `cpt-cf-bss-orders-lifecycle-fr-order-events` | The eleven state events are enqueued from an Engine-owned outbox inside the transition commit, giving exactly one outbox row per committed transition **that declares an event type**, under at-least-once delivery with consumer de-duplication. Six row classes are deliberately event-less (D-15). |
+| `cpt-cf-bss-orders-lifecycle-fr-order-events` | The eleven typed state events are enqueued through `event-broker-sdk::DbProducer` backed by `toolkit_db::outbox` inside the transition commit, giving exactly one producer message per committed transition **that declares an event type**, under at-least-once delivery with consumer de-duplication. Six row classes are deliberately event-less (D-15). |
 | `cpt-cf-bss-orders-lifecycle-fr-order-authorization` | Per-actor permissions and the cross-tenant delegation-proof requirement are enforced as an Engine pre-guard, so no slice can widen scope. |
 | `cpt-cf-bss-orders-lifecycle-fr-orders-boundary-r1-state-sor` | Workflow-only operations are ordinary Engine transitions with the same idempotency and version-check contract as buyer operations; the gear exposes no path that lets a caller assert state without a guard. |
 | `cpt-cf-bss-orders-lifecycle-fr-orders-boundary-r2-approval` | The approval-requirement verdict and gate outcomes are stored as received values with their deciding authority recorded. The gear contains no policy evaluation and no threshold comparison. |
@@ -109,12 +110,12 @@ Requirements that significantly influence architecture decisions.
 
 | NFR ID | NFR Summary | Allocated To | Design Response | Verification Approach |
 |--------|-------------|--------------|-----------------|----------------------|
-| `cpt-cf-bss-orders-lifecycle-nfr-order-transition-latency` | Transition commit p95 < 1 s. **Two disclosed divergences**: the PRD's threshold reads "durable write **+ event publish**", and the outbox makes publication asynchronous by construction — delivery carries its own **30 s p95** budget (D-41), so the combined figure cannot hold as written; and port resolution adds up to 1.5 s ahead of the commit (1.75 s on Preview), leaving the caller-visible figure unbounded (Q-11). Both routed to Product as Q-16. | Order Transition Engine | Single-round-trip transition: guard evaluation, version/audit append and outbox enqueue in one database transaction; delivery is asynchronous from the outbox so publication never extends the commit path | Load test at production sizing asserting p95 on the commit path; outbox drain measured separately against the event-delivery budget |
+| `cpt-cf-bss-orders-lifecycle-nfr-order-transition-latency` | PRD §7.1 / AC-17 governs: durable write **and event publish** p95 < 1 s. Compliance is unverified; the former separate 30 s p95 delivery target is an unapproved proposal (D-41, Q-16). Guard-input resolution also affects caller latency (Q-11). | Order Transition Engine and platform producer integration | State, audit, idempotency and producer enqueue share one transaction; broker publication follows asynchronously. A successful commit alone does not prove publication. | Correlate operation start, commit and broker acknowledgement at production load; measure the complete write-plus-publish path against the PRD baseline and report component timings separately (§4.1) |
 | `cpt-cf-bss-orders-lifecycle-nfr-order-read-latency` | Order read and paginated list p95 < 200 ms | Read-and-authorization slice | Reads are served from a current-version projection carrying the denormalized state, tenant axes and per-line fulfillment status, so no read reconstructs the version chain | Read/list benchmarks at production row counts and page sizes, including the tenancy-scoped filter paths |
 | `cpt-cf-bss-orders-lifecycle-nfr-order-audit-completeness` | 100 % of transitions and amendments audited, zero silent drops | Order Transition Engine | The audit append is inside the same transaction as the state change, so an unaudited transition cannot commit; the audit store is append-only and the chain is verifiable | Structural test that every transition-table edge writes an audit row; negative test that a failed audit append aborts the transition |
 | `cpt-cf-bss-orders-lifecycle-nfr-order-idempotency` | Zero duplicate orders or duplicate transition effects, **per principal** (`design/01-foundation.md` §4.2 discloses the scope's one gap: create) | Order Transition Engine | Idempotency records are written in the transition transaction under a unique constraint on `(operation, principal_scope, idempotency_key)`, making duplicate effect impossible rather than unlikely; the in-flight state is explicit | Concurrency test firing the same key in parallel and asserting one durable effect; replay test asserting stored failures replay as failures; cross-principal test asserting one caller neither reads nor overwrites another's record |
 | `cpt-cf-bss-orders-lifecycle-nfr-order-snapshot-integrity` | 100 % of submitted lines carry a resolvable catalog price pin | Gate-and-pin slice | The pin is captured inside the submit transaction; a line without a resolvable pin fails the gate, so `submitted` and "pinned" are the same commit | Invariant test asserting no `submitted`-or-beyond line exists without a pin; re-pin asserted on every amendment |
-| `cpt-cf-bss-orders-lifecycle-nfr-order-recovery` | RPO zero for `submitted`+ orders, RTO ≤ 60 min, within residency-bound intra-cell failure domains | Persistence and deployment topology | Committed transitions are synchronously durable before acknowledgement; versions, audit rows and outbox entries share the transaction so a recovered database cannot hold a state change without its trail | DR exercise restoring to the declared RTO and asserting zero committed-transition loss including outbox entries |
+| `cpt-cf-bss-orders-lifecycle-nfr-order-recovery` | RPO zero for `submitted`+ orders, RTO ≤ 60 min, within residency-bound intra-cell failure domains | Persistence and deployment topology | Committed transitions are synchronously durable before acknowledgement; versions, audit rows and toolkit producer messages share the transaction so a recovered database cannot hold an event-declaring state change without its durable notification | DR exercise restoring to the declared RTO and asserting zero committed-transition loss including queued producer messages |
 | `cpt-cf-bss-orders-lifecycle-nfr-order-retention` | Retain all orders and versions per program policy; auto-void abandoned drafts | Persistence and the hold-and-expiry slice | Append-only retention with no destructive path for `submitted`+ orders; the draft auto-void TTL transitions to `expired` rather than deleting, preserving the audit trail | Retention test asserting no delete path reaches a `submitted`+ order; auto-void test asserting the draft remains readable, not removed |
 
 #### Key ADRs
@@ -126,7 +127,7 @@ Requirements that significantly influence architecture decisions.
 | `cpt-cf-bss-orders-lifecycle-adr-fail-closed-gate` | An unevaluable gate input is a refusal, not an admission under a tolerated risk — so no order is pinned against a predicate nobody checked |
 | `cpt-cf-bss-orders-lifecycle-adr-closed-enumerations` | The eleven states and eleven events stay closed; new distinctions are guards, recorded facts, reasons and event-less rows |
 | `cpt-cf-bss-orders-lifecycle-adr-refusals-commit` | A refused transition audits, settles and commits, which is what makes 100 % audit coverage a property rather than a discipline |
-| `cpt-cf-bss-orders-lifecycle-adr-outbox-publication` | Events publish asynchronously from a transactional outbox, which is why the PRD's combined "durable write + event publish" threshold cannot hold and delivery carries its own budget |
+| `cpt-cf-bss-orders-lifecycle-adr-outbox-publication` | Events publish asynchronously through the platform `DbProducer`/toolkit outbox path; meeting the PRD's write-plus-publish latency requires measurement of both stages, with target clarification tracked in Q-16 |
 | `cpt-cf-bss-orders-lifecycle-adr-in-transaction-concurrency` | The one-in-flight-order rule is a database constraint inside the transition transaction, not a gate predicate — the predicate is a pre-check that cannot enforce it |
 
 **Seven ADRs, and the reasoning for that number.** An ADR is written where a decision affects the
@@ -138,7 +139,7 @@ one to three because Orders is the only state-machine system of record among the
 with three consuming gears. The test above is applied rather than recited: the two added on
 2026-09-10 were found by asking which decisions the register was carrying that met all three
 conditions, and both did while being recorded as single table rows. **Asynchronous publication**
-(`ADR/0006`) makes a PRD acceptance criterion unsatisfiable by construction and binds three
+(`ADR/0006`) separates commit from publication, requires combined latency verification, and binds three
 consumer gears to at-least-once delivery. **In-transaction concurrency** (`ADR/0007`) is the gear's
 only concurrency-correctness mechanism, and a table row with no alternatives is exactly the shape a
 later author deletes as redundant with the gate predicate that does not enforce it. Every other call is in
@@ -155,11 +156,14 @@ Capability slices   capture · gate-and-pin · versioning · preconditions ·
        ▼            Engine API — own no state write, audit row, or event emission
 Order Transition    order aggregate · append-only version chain · state-machine table + guards ·
 Engine              idempotency registry · optimistic version check · transition audit ·
-(shared engine)     event outbox (11 state events) · machine-readable reason catalogue
+(shared engine)     typed event contract (11 state events) · machine-readable reason catalogue
        │            — owns no commercial policy
        ▼
+Platform egress     event-broker-sdk DbProducer · toolkit-db transactional outbox
+       │
+       ▼
 Persistence         toolkit-db backend (append-only version rows; current-version read
-                    projection; append-only audit store; idempotency registry; event outbox;
+                    projection; append-only audit store; idempotency registry;
                     resolved totals as integer minor units at ISO 4217 scale)
 ```
 
@@ -167,8 +171,8 @@ Persistence         toolkit-db backend (append-only version rows; current-versio
 |-------|---------------|------------|
 | Presentation | REST order authoring, transition, preview and read surfaces behind the inbound gateway; `OperationBuilder`-registered operations with explicit response metadata; RFC 9457 `application/problem+json` errors; ETag optimistic concurrency | Rust, REST/OpenAPI, inbound API gateway |
 | Application | Capability slices declaring guards and document contributions; each is a bounded feature owning its own validation and its own machine-readable reasons | Rust modules in the `orders-lifecycle` gear |
-| Domain | The Transition Engine: aggregate and version chain, transition table and guard evaluation, idempotency semantics, version check, audit and outbox contracts | Rust; GTS for the cross-gear contract surface (`01 §4.7`) + Rust domain structs |
-| Infrastructure | Append-only version and audit stores, current-version projection, idempotency registry, event outbox, expiry scheduler | PostgreSQL, SecureORM, coordination lease library |
+| Domain | The Transition Engine: aggregate and version chain, transition table and guard evaluation, idempotency semantics, version check, audit and event contracts | Rust; GTS for the cross-gear contract surface (`01 §4.7`) + Rust domain structs |
+| Infrastructure | Append-only version and audit stores, current-version projection, idempotency registry, platform producer outbox, expiry scheduler | PostgreSQL, SecureORM, `event-broker-sdk` (`outbox` feature), `toolkit_db::outbox`, `toolkit_db::Db::lock` (Foundation §3.8) |
 
 ## 2. Principles & Constraints
 
@@ -179,10 +183,10 @@ Persistence         toolkit-db backend (append-only version rows; current-versio
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-principle-transition-through-engine`
 
 Every order state change is a single Engine call that atomically evaluates the guard, appends
-the version or audit entry, commits, and enqueues one outbox row **where the transition row
+the version or audit entry, commits, and enqueues one platform producer-outbox message **where the transition row
 declares an event type** — six row classes are deliberately event-less (`01 §4.4`, D-15). No slice, migration,
 repair script or administrative surface writes order state directly. This is what allows audit
-completeness, idempotency and one-outbox-row-per-event-declaring-transition to be asserted once
+completeness, idempotency and one-producer-message-per-event-declaring-transition to be asserted once
 rather than per capability — delivery itself is **at-least-once** with consumer de-duplication
 (`01 §2.2`), never exactly-once
 — and it is the reason a new capability cannot regress the correctness core by construction.
@@ -249,7 +253,7 @@ local approval surfaces are not a precedent this gear may follow.
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-constraint-unagreed-subscription-seams`
 
-The overlap-presence read the submit gate needs, and the compensation cancel reason the failure
+The occupancy read (`SUB-O5`, amended by D-126) the submit gate needs, and the compensation cancel reason the failure
 path depends on, are asks on the Subscriptions gear that are registered but not agreed, and that
 gear has no implementation. The gate and the acknowledgement path are therefore designed against
 a specified contract rather than an observed one, and each dependency is isolated behind a port
@@ -278,7 +282,7 @@ no derivation, aggregation or currency conversion over it, and it is never a bil
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-constraint-data-residency`
 
 For residency-bound tenants every gear-owned store — tables, read projection, audit, idempotency
-registry, outbox, backups and the synchronous standby — is pinned to an in-jurisdiction deployment
+registry, platform producer queue, backups and the synchronous standby — is pinned to an in-jurisdiction deployment
 cell with **zero cross-boundary replication**. This is what forces the recovery standby to be a
 second failure domain rather than a second region, and it is the constraint the sibling catalog
 gear states in the same terms.
@@ -289,16 +293,17 @@ gear states in the same terms.
 
 Two checklist constraint categories are recorded as inapplicable rather than omitted. **Vendor and
 licensing**: the gear introduces no third-party dependency beyond the platform's own ToolKit,
-PostgreSQL and the coordination lease library, all already licensed platform-wide. **Resource
+PostgreSQL and toolkit-db advisory locking, all already licensed platform-wide. **Resource
 constraints** — budget, team size, delivery window: these are project-level facts owned outside
 the design set and would date immediately if restated here; the design's own sequencing
 constraint is the phased slice map in [`design/README.md`](./design/README.md).
 
-#### Platform baselines apply without deviation
+#### Platform baselines and explicit authorization boundary
 
 - [ ] `p3` - **ID**: `cpt-cf-bss-orders-lifecycle-constraint-platform-baselines`
 
-The gear takes the standard ToolKit posture with no requested deviations: SDK-first public
+The gear takes the standard ToolKit posture except for the explicit Pricing-style trusted
+internal-maintenance authorization boundary in `design/08-read-and-authz.md` §3.5: SDK-first public
 contracts in an `orders-lifecycle-sdk` crate with implementation internals private to the gear
 crate; `api` / `domain` / `infra` separation; `OperationBuilder` registration with explicit
 response metadata; canonical error mapping to RFC 9457 with no internal diagnostics on the wire;
@@ -350,10 +355,19 @@ refused.
 `AcceptanceRecord` — the customer-acceptance instant as a recorded fact, never defaulted, with its
 recording actor, path and requirement source.
 
+Acceptance is bound to `accepted_version`, not to the order for all time. Amendments preserve
+the earlier evidence but require acceptance of the new version wherever the fulfillment policy
+requires it; both sales paths can record that acceptance. Draft assent is not accepted.
+
 - [ ] `p2` - **ID**: `cpt-cf-bss-orders-lifecycle-entity-line-fulfillment`
 
 `LineFulfillment` — the read-only per-line projection of Workflow acknowledgements plus the
 spawned subscription identifier and the downstream correlation reference.
+
+It is not a live execution-progress feed. Intermediate steps are obtained from Workflow's
+already-specified progress read; absent Lifecycle projection rows mean not acknowledged.
+Availability and scoped SDK integration of that Workflow read remain prerequisites, not a new
+Lifecycle endpoint. See `UPSTREAM_REQS.md` §2.6.
 
 - [ ] `p2` - **ID**: `cpt-cf-bss-orders-lifecycle-entity-administrative-content-view`
 
@@ -365,7 +379,7 @@ external references, display labels and internal notes at order and line level.
 - `OrderVersion` → `OrderLine`: one-to-many; lines belong to a version, not to the order, which is what makes commercial content immutable without copying the aggregate.
 - `OrderVersion` → `ResolvedTotal`: one-to-many — one row per line per charge kind plus the order-level roll-up; captured at submit and recaptured on each amendment.
 - `Order` → `OrderTransition`: one-to-many, append-only; the audit trail is complete by construction because the append shares the transition's transaction.
-- `Order` → `AcceptanceRecord`: zero-or-one; present only where acceptance was required and recorded, and never defaulted.
+- `OrderVersion` → `AcceptanceRecord`: zero-or-one per immutable version, whether required or volunteered; never defaulted or copied across amendment.
 - `OrderLine` → `LineFulfillment`: one-to-one after fulfillment acknowledgement; carries the 1:1 line-to-subscription mapping.
 
 ### 3.2 Component Model
@@ -388,7 +402,7 @@ graph TB
     end
     ENG[Order Transition Engine]
     DB[(toolkit-db)]
-    OUT[Event outbox]
+    OUT[Platform event producer]
     CAP --> ENG
     GATE --> ENG
     VER --> ENG
@@ -417,8 +431,8 @@ The order aggregate and its append-only version chain; the declarative state-mac
 its guards, terminal set, hold/resume mapping and expiry eligibility; guard evaluation and
 ordering; the idempotency registry and its non-success outcomes; the optimistic version
 check and its `version-conflict` refusal — the single registered name D-38 consolidated the
-`stale-version` variants into; the append-only transition audit; the event outbox and the
-one-event-per-committed-transition rule; and the registry of machine-readable business reasons.
+`stale-version` variants into; the append-only transition audit; the typed event contract and the
+one-producer-message-per-event-declaring-transition rule; and the registry of machine-readable business reasons.
 
 ##### Responsibility boundaries
 
@@ -507,8 +521,9 @@ what it replaced, without mutating what a reviewer already saw.
 
 The amendment path from `submitted`, `pending_approval` and `approved`; the new-version append
 with its `supersedesVersion` reference; the gate re-run and re-pin trigger; historical version
-retrieval; the non-versioned audited administrative edit path; and the amendment-forbidden guard
-from `in_fulfillment` onward.
+retrieval; the non-versioned audited administrative edit path; and the absence of any amendment row
+from `in_fulfillment` onward (engine `not-admissible`;
+`cpt-cf-bss-orders-lifecycle-constraint-no-amendment-in-fulfillment`).
 
 ##### Responsibility boundaries
 
@@ -646,8 +661,8 @@ The PRD specifies thirteen business operations without transport detail
 per-operation payloads and the machine-readable reason catalogue are owned by the slice that
 raises each reason.
 
-**Endpoints Overview** — the union of the seven slice surfaces plus the engine's one operator
-surface, each owned by exactly one component:
+**Endpoints Overview** — the union of the seven slice surfaces, each owned by exactly one
+component:
 
 | Method | Path | Owner | Stability |
 |--------|------|-------|-----------|
@@ -675,9 +690,12 @@ surface, each owned by exactly one component:
 | `POST` | `/bss-orders-lifecycle/v1/orders/{orderId}/spawn-signal` | workflow-seam | unstable |
 | `POST` | `/bss-orders-lifecycle/v1/orders/{orderId}/fulfillment-acknowledgement` | workflow-seam | unstable |
 | `POST` | `/bss-orders-lifecycle/v1/orders/{orderId}/workflow-cancel` | workflow-seam | unstable |
-| `POST` | `/bss-orders-lifecycle/v1/outbox/dead-letters/{eventId}/re-drive` | foundation | unstable |
 
-Twenty-five endpoints against the PRD's thirteen business operations, and the gap divides in two.
+The line `PATCH` serves two operations: commercial line authoring in `draft`, and administrative
+line fields in every non-terminal state; a request naming a commercial field is `draft-mutate`
+and refuses `not-admissible` outside `draft` (D-117, D-145); the line `DELETE` is draft-only.
+
+Twenty-four endpoints against the PRD's thirteen business operations.
 **Eleven** are surfaces the PRD describes in §6 without listing in §9.1 — line authoring
 (three), the administrative edit, the acceptance write and read, the per-line read, the audit
 read, the **version list** (§9.1's *Get order version* covers the single-version read only), the
@@ -686,21 +704,23 @@ spawn-signal report and the workflow-mediated cancel. **Ten of the eleven have a
 `nfr-order-audit-completeness` requires complete logging, but both are obligations on writing, not
 on exposing, and §9.1 contains no audit-retrieval operation. It is grounded in a rationale — a
 complete audit nobody can read is not an audit — rather than a requirement, and it exposes actor
-identities, delegation-proof references and correlation identifiers, so it joins the re-drive as a
-design-introduced surface needing Product's acknowledgement ([`DECISIONS.md`](./DECISIONS.md)
-D-70). The other ten have an FR basis, so §9.1 needs a PRD amendment to remain the
-normative operation set. **One** has no PRD basis at all: the operator outbox re-drive, introduced
-by this design ([`DECISIONS.md`](./DECISIONS.md) D-17) because a parked dead-letter row **suspends its own order's event stream and no other** until re-drive republishes it in sequence order (D-87) — the re-drive may never be used to skip it — and because a parked row was
-otherwise unrecoverable and the PRD's zero-silent-drops NFR could not be met without it. It is
-recorded as a design-introduced operational surface rather than folded in as though the PRD asked
-for it, and it is the second endpoint whose addition needs Product's acknowledgement rather than
-merely §9.1's.
+identities, delegation-proof references and correlation identifiers, so it is a design-introduced
+surface needing Product's acknowledgement ([`DECISIONS.md`](./DECISIONS.md) D-70). The other ten
+have an FR basis, so §9.1 needs a PRD amendment to remain the normative operation set. Producer
+outbox dead letters are inspected and managed through platform `toolkit_db::outbox` operations;
+Orders adds no operational REST endpoint.
 
-Every mutating operation requires an idempotency key, except the re-drive, which is idempotent by
-construction because it republishes under the original event id. Submit, amendment, cancel and the
-five workflow-only operations additionally require the optimistic version check, carried as an
-ETag. State expiry and draft auto-void are scheduler-driven and deliberately absent from this
-surface.
+Every mutating operation requires an idempotency key. Existing-order transitions carry the
+engine's `expected_version`; create has its own no-existing-version branch. A missing or
+unparseable expected version is rejected by boundary input validation, before authorization,
+with `expected-version-required` (HTTP 428), unaudited and without touching idempotency
+(`design/01-foundation.md` §4.1, D-112). Draft commercial
+writes and submit additionally require `expected_draft_revision`, returned as `draftRevision`
+with a coherent draft read; on `draft-mutate` it is optional at the boundary and compared only after
+admissibility, so a commercial `PATCH` after `draft` refuses `not-admissible` (D-147). The commercial-version ETag alone cannot detect draft edits.
+Acceptance recording checks the current immutable version and never accepts a draft. State
+expiry and draft auto-void are scheduler-driven and deliberately absent from this surface;
+their complete internal engine inputs are specified in `design/07-hold-and-expiry.md` §3.6.
 
 #### API evolution and stability
 
@@ -727,9 +747,12 @@ have migrated.
 
 | Dependency Gear | Interface Used | Purpose |
 |-------------------|----------------|----------|
-| `toolkit-db` | Runtime-scoped database access | Transactional persistence for version rows, the read projection, the audit store, the idempotency registry and the event outbox |
-| Coordination lease library | SDK client | Singleton coordination for the per-state TTL expiry scheduler and the draft auto-void sweep |
-| `orders-workflow` | SDK client and published events | Bidirectional seam: Workflow calls the transition operations and consumes the state events. This gear makes no outbound call to Workflow |
+| `toolkit-db` | Runtime-scoped database access plus `outbox` | Transactional persistence for Orders stores and the platform-managed producer queue |
+| `authz-resolver-sdk` | Shared `PolicyEnforcer` adapter | PDP decisions and compiled AccessScopes for reads, transitions and service-owned operations |
+| `event-broker-sdk` | `EventBrokerApi`, `DbProducer`, `ProducerOutboxQueue` (`outbox` feature) | Typed event validation, managed chained producer registration, broker partitioning and asynchronous publication |
+| `toolkit-db` advisory locks | `Db::lock` / `Db::try_lock`, `DbLockGuard` | Session-bound coordination for the authoritative worker roster in Foundation §3.8; toolkit owns outbox coordination |
+| `types-registry` | SDK client | Register and resolve event, subject, refusal-reason and category types before readiness; registration failure prevents startup |
+| `orders-workflow` | SDK client and published events | Bidirectional seam: Workflow calls transition operations and consumes state notifications. This gear makes no call to Workflow |
 
 **Dependency Rules** (per project conventions):
 - No circular dependencies
@@ -744,21 +767,29 @@ These are integration boundaries defined in [`PRD.md`](./PRD.md) §3.2 and §13,
 owned here. Each is reached through a port so an unagreed or absent counterpart is a boundary
 concern rather than a core change.
 
+#### Platform event delivery
+
+| Dependency Gear | Interface Used | Purpose |
+|-----------------|----------------|---------|
+| `event-broker` | `EventBrokerApi` through `event-broker-sdk` | Receives the GTS-typed Orders notifications. Event types and managed producer registration are prepared before readiness; the transaction only enqueues locally. Runtime availability is a release gate because `docs/GEARS.md` currently records the implementation crate as TODO |
+
 #### Pricing and catalog
 
 | Dependency Gear | Interface Used | Purpose |
 |-------------------|---------------|---------|
-| `pricing` | SDK client | The published sellability predicates adopted by reference at submit, and the catalog price pin captured on every line |
-| `rating` | SDK client | The price-evaluation contract producing the non-authoritative resolved total, **including the named TCV figure computed there rather than here**; composition system of record for the full pricing snapshot, which this gear never stores |
-| Billing-chain tax owner | SDK client | The **indicative** tax figure Preview returns and never stores; the sixth outbound port, with its own unavailability reason |
+| `pricing` | SDK client | The seller's catalog frontier, the published sellability predicates adopted by reference at submit, and the catalog price pin captured on every line — each read against the seller's catalog named explicitly, not the caller's tenant (D-122); the explicit-tenant operations are unexposed today, raised in `UPSTREAM_REQS.md` §2.2 |
+| `rating` | SDK client — **unexposed today** (no Rating SDK crate exists) | The price-evaluation contract producing the non-authoritative resolved total, **including the named TCV figure computed there rather than here**; composition system of record for the full pricing snapshot, which this gear never stores. Raised as `cpt-cf-bss-orders-lifecycle-upreq-rating-evaluation` in `UPSTREAM_REQS.md` §2.2; until exposed the gate refuses `evaluation-unavailable` |
+| `products` (Catalog registry, Product & SKU) | SDK client | Each line's `catalogSubscriptionProductKey` at the submit's fixed catalog version — the product half of the overlap key (`design/03-gate-and-pin.md` §3.6, D-108); not yet exposed, raised in `UPSTREAM_REQS.md` §2.10 |
+| Billing-chain tax owner | SDK client | The **indicative** tax figure Preview returns and never stores; a Preview-only operation with its own unavailability reason |
 
 #### Identity, contracts and downstream fulfillment
 
 | Dependency Gear | Interface Used | Purpose |
 |-------------------|---------------|---------|
-| `account-management` | SDK client | Validation of the three tenant axes and party eligibility at submit |
-| `contracts` | SDK client | Contract status and terms where a `contractId` is referenced; platform defaults govern where none is. Party-eligibility policy is unimplemented there |
-| `subscriptions` | One **read-only** port, plus provisioning reached only through `orders-workflow` | Target of provisioning intents and system of record after spawn. This gear holds **no provisioning or state-mutating adapter** — that is the R3-relevant distinction — but `03` does hold a read-only overlap-presence port (`SUB-O5`, unagreed), which PRD §13 and §6.1 both anticipate. Fulfilment outcomes are learned only from Workflow acknowledgements |
+| `account-management` | SDK client (`AccountManagementClient::get_tenant`); commercial profile **unexposed today** | Validation of the three tenant axes at submit through the existing `get_tenant`; the payer's commercial profile behind the order market has no operation yet — `cpt-cf-bss-orders-lifecycle-upreq-payer-commercial-profile` (`UPSTREAM_REQS.md` §2.4), refusing `identity-party-unavailable` until exposed. Party eligibility is not asked of this gear |
+| `authz-resolver` | `AuthZResolverApi` through ClientHub; mandatory gear dependency | Platform PDP authorization; shared adapter wiring, registered resource/action catalog and three-axis scopes are authoritative in `design/08-read-and-authz.md` §3.5 and §4.3 |
+| `contracts` | SDK client — **unexposed today** | Contract status, terms and party eligibility where a `contractId` is referenced — the only source of party eligibility; platform defaults govern where none is. The same contract-resolution operation also returns the contract's `acceptance_required` declaration, which `design/05-preconditions` reads live at its acceptance guards outside the gate (D-132). Unimplemented there; raised as `cpt-cf-bss-orders-lifecycle-upreq-contract-party-eligibility` and `cpt-cf-bss-orders-lifecycle-upreq-contract-acceptance-declaration` in `UPSTREAM_REQS.md` §2.11 |
+| `subscriptions` | One **read-only** port, plus provisioning reached only through `orders-workflow` | Target of provisioning intents and system of record after spawn. This gear holds **no provisioning or state-mutating adapter** — that is the R3-relevant distinction — but `03` does hold a read-only occupancy-read port (`SUB-O5`, amended by D-126, unagreed), which PRD §13 and §6.1 both anticipate. Fulfilment outcomes are learned only from Workflow acknowledgements |
 | Generic Approval service | Reached only through `orders-workflow` | Owner of the approval-requirement verdict. Unspecified today; the verdict arrives as a stored fact with its decider recorded |
 | Payments | Reached only through `orders-workflow` | Authorization outcome consumed as a begin-fulfillment guard input. No owning capability exists in the platform |
 
@@ -792,7 +823,7 @@ sequenceDiagram
     G ->> P: adopted predicates + pin + resolved total
     P -->> G: pass, pin, total
     G -->> E: guard satisfied, document contribution
-    E ->> E: append version, audit, idempotency record, outbox entry
+    E ->> E: append version, audit, idempotency record, SDK outbox enqueue
     E -->> A: submitted
 ```
 
@@ -846,7 +877,7 @@ sequenceDiagram
     W ->> E: acknowledge fulfillment (subscription ids, version)
     E ->> S: evaluate acknowledgement guard
     S -->> E: outcome, per-line linkage
-    E ->> E: persist linkage, audit, outbox OrderCompleted
+    E ->> E: persist linkage, audit, enqueue OrderCompleted
     E -->> W: completed
 ```
 
@@ -894,7 +925,7 @@ sequenceDiagram
     participant W as Orders Workflow
     T ->> E: expire eligible orders (per-state TTL)
     E ->> E: guard excludes in_fulfillment and holds taken from it
-    E ->> E: append audit (actor - system), outbox OrderExpired
+    E ->> E: append audit (actor - system), enqueue OrderExpired
     E -->> T: expired
     E ->> W: OrderExpired - terminate process
 ```
@@ -911,39 +942,45 @@ subscriptions may be provisioning.
 schema and is the sole writer** of every table below; a **slice owns the content** it contributes
 and the guards that admit it. Column-level definitions, keys, constraints and indexes are
 specified normatively in [`design/01-foundation`](./design/01-foundation.md) §3.7 for the
-engine-owned tables, and in the introducing slice for the five it introduces. Resolved-total
+engine-owned tables, and in the introducing slice for the six it introduces. Resolved-total
 columns are integer minor units at the currency's ISO 4217 scale. Immutability is declared **per
-table** rather than globally, because ten of the nineteen are deliberately mutable.
+table** rather than globally; the inventory below is authoritative for the Orders-owned tables
+and their mutability. Platform producer/outbox tables are not Orders-owned tables.
 
 | Table | Specified in | Content owner | Mutability |
 |-------|--------------|---------------|------------|
 | `orders_order` | `01 §3.7` | engine | mutable — denormalized state, pointers, counters |
 | `orders_order_version` | `01 §3.7` | versioning | append-only |
-| `orders_order_line_identity` | `01 §3.7` | capture | append-only |
+| `orders_order_line_identity` | `01 §3.7` | capture | append-only; no application/operational UPDATE or DELETE grant |
 | `orders_order_line` | `01 §3.7` | capture | append-only |
 | `orders_draft_content` | `01 §3.7` | capture | **mutable** — the pre-submit working set |
 | `orders_order_admin` | `01 §3.7` | capture | **mutable** — administrative content |
 | `orders_order_line_admin` | `01 §3.7` | capture | **mutable** — administrative content |
 | `orders_resolved_total` | `01 §3.7` | gate-and-pin | append-only |
-| `orders_transition_audit` | `01 §3.7` | engine | append-only, hash-chained over committed entries; **no standing** UPDATE grant to any role (the erasure role's is time-boxed to one run, §4.3), DELETE only to the retention worker for expired refused rows — `01 §3.7` is the canonical grant and retention contract |
+| `orders_transition_audit` | `01 §3.7` | engine | append-only, hash-chained over committed entries; no application/operational UPDATE grant or erasure exception (D-96, §4.3), DELETE only to the retention worker for expired refused rows — `01 §3.7` is the canonical grant and retention contract |
+| `orders_audit_checkpoint` | `01 §3.7` | audit worker | append-only tenant roll-up headers; D-100 |
+| `orders_audit_checkpoint_member` | `01 §3.7` | audit worker | append-only expected order-chain heads; D-100 |
 | `orders_idempotency` | `01 §3.7` | engine | **mutable** — marker settles |
-| `orders_event_outbox` | `01 §3.7` | engine | **mutable** — delivery bookkeeping; delivered rows purged |
 | `orders_line_fulfillment` | `01 §3.7` | workflow-seam | **mutable** — projection advances |
 | `orders_inflight_overlap_claim` | `01 §3.7` | gate-and-pin | **mutable** — only to set `released_at`; claims are never deleted |
 | `orders_acceptance` | `01 §3.7` | preconditions | append-only |
 | `orders_gate_outcome` | `03 §3.7` | gate-and-pin | append-only; Preview rows bounded retention |
 | `orders_approval_reflection` | `06 §3.7` | workflow-seam | append-only |
 | `orders_state_ttl_policy` | `07 §3.7` | hold-and-expiry | mutable policy rows |
-| `orders_policy_election` | `05 §3.7` | preconditions | **mutable** — standing policy elections |
+| `orders_date_policy` | `02 §3.7` | capture | mutable policy rows; D-121 |
+| `orders_policy_election` | `05 §3.7` | preconditions | **mutable** — standing policy elections, changed only by deployment promotion (D-133) |
 | `orders_read_access_log` | `08 §3.7` | read-and-authz | append-only |
 
 There is no destructive path for any **order-linked commercial** row: an abandoned draft is
-auto-voided to `expired` and remains readable. Four stores carry bounded retention by design, each executed by the retention sweep of §4.2 and each specified in its owning slice rather than here:
-delivered outbox rows (30 days), Preview gate outcomes (7 days), refused-attempt audit rows
-(90 days), and read-access-log rows (90 days).
+auto-voided to `expired` and remains readable. Three stores carry bounded retention by design, each Orders-owned and executed by the retention sweep
+of §4.2 and specified in its owning slice rather than here: Preview gate outcomes (7 days),
+refused-attempt audit rows (90 days), and read-access-log rows (90 days). Platform producer-message
+and dead-letter retention follow `toolkit_db::outbox` operations and platform policy.
 
 **Migration and schema versioning.** Migrations are ordered by the phased slice map: the engine's
-fourteen tables land in phase 0/1 before any slice, and each slice's own table lands with it.
+Orders-owned Foundation tables in the inventory above land in phase 0/1 before any slice, and each slice's own table lands
+with it. Event Broker producer-registration and toolkit outbox migrations run explicitly in that
+phase but are platform-owned and excluded from the Orders table count.
 Append-only tables need no backfill because a correction is a new row; the two mutable
 administrative tables are additive. The gear exposes migrations and the runtime applies them, so
 the schema version is the migration set the deployed gear carries, and a rollback is a
@@ -957,16 +994,18 @@ The gear runs as a stateless transition and read service over a shared `toolkit-
 with database privilege runtime-owned and the gear exposing migrations only. The audit role is
 granted INSERT and SELECT only, which is half of what makes the trail tamper-evident.
 
-**Six background workers** are lease-coordinated so a multi-replica deployment cannot double-act:
-the **sharded outbox drain** — one lease per `order_id` hash shard, so event throughput scales
-with replicas while per-order ordering holds — the per-state TTL expiry sweep, the draft auto-void
-sweep, the idempotency-window sweep, the **retention purge sweep**, and the **audit-chain
-verifier**, which walks orders in a rolling pass and is what makes §4.2's tamper-evidence claim
-rest on an executor rather than on the chain alone (`design/01-foundation.md` §3.8). The outbox is
-the only asynchronous egress.
+**Orders-owned worker coordination** follows the authoritative roster and contract in
+[`Foundation §3.8`](./design/01-foundation.md#38-deployment-topology): toolkit-db session advisory
+locks, a direct/session-pooled lock connection, bounded passes and transaction-level rechecks
+that remain safe after lock-session loss. Lock ownership alone does not guarantee no duplicate
+execution. The audit worker verifies chains and appends checkpoints; it does not repair evidence.
+In addition, the process starts
+the library-managed `toolkit_db::outbox` sequencer, leased processors and vacuum for the
+`bss-orders-events` queue; these are platform workers, not Orders-owned coordination logic. The
+platform producer outbox is the only asynchronous egress.
 
-The retention purge sweep exists because three of the four declared retention windows previously
-had no executor: only delivered outbox rows were purged, by the drain. It runs singleton-leased on
+The retention purge sweep exists because the three declared Orders-owned bounded-retention stores
+need an executor. It runs under the Foundation §3.8 advisory-lock contract on
 a daily cadence with a bounded batch per store, and purges Preview gate-outcome rows past 7 days,
 refused-attempt audit rows past 90 days, and read-access-log rows past 90 days. It holds the only
 DELETE grant on the audit table and only for refused rows (`01 §3.7`). **A declared retention with
@@ -978,8 +1017,8 @@ acknowledgement, so the write path is served from a primary with **synchronous c
 including a standby in a second failure domain inside the residency boundary**, and never from an
 asynchronously replicated primary. Recovery promotes that standby within the 60-minute RTO;
 nightly base backups with continuous WAL archiving provide point-in-time recovery. A DR drill
-runs each release. For residency-bound tenants every gear-owned store — tables, audit, outbox,
-backups and the standby — is pinned in-jurisdiction with zero cross-boundary replication, which
+runs each release. For residency-bound tenants every gear-local store — Orders tables, audit,
+platform producer queue, backups and the standby — is pinned in-jurisdiction with zero cross-boundary replication, which
 is why the standby is a second failure domain rather than a second region. **The RPO-zero and
 RTO-60-minute claims are therefore scoped to intra-cell failure domains** for a residency-bound
 tenant: node and domain loss are covered, and loss of the whole jurisdictional cell has no
@@ -997,11 +1036,32 @@ gear declares no infrastructure of its own. The deliberately unchosen policy val
 [`design/07-hold-and-expiry`](./design/07-hold-and-expiry.md) §4.5 and
 [`design/08-read-and-authz`](./design/08-read-and-authz.md) §4.5 are delivered as
 `orders_state_ttl_policy` rows and gear configuration, promoted through environments with the
-deployment rather than edited at runtime.
+deployment rather than edited at runtime. The same **policy channel** carries the per-tenant date
+policy as `orders_date_policy` rows ([`design/02-capture`](./design/02-capture.md) §3.7, D-121)
+and the acceptance and tolerate-failure elections as `orders_policy_election` rows — no runtime
+endpoint writes them; a seller's election is requested through platform operations and its
+`elected_by`/`elected_at` record the promotion's change identity and instant (D-133); the line cap and order-number
+format are static gear configuration on the same promotion path.
 
 **Health reporting** distinguishes readiness from liveness: store unavailability makes the
 instance **not ready**, so it stops receiving traffic while remaining alive, rather than being
-killed and restarted into the same unavailable store.
+killed and restarted into the same unavailable store. Readiness additionally requires
+`EventBrokerApi`, eager preparation of all Orders event types, managed chained producer
+registration, declared broker-partition-count agreement and a running toolkit outbox handle. Since
+`docs/GEARS.md` currently says the Event Broker implementation crate is TODO, event-producing
+Orders deployment is blocked until that runtime and its integration tests exist.
+
+The event and assessment integration contracts are owned by Foundation §3.6/§3.7/§4.4.
+Settled responses bind replay to an immutable assessment when gate evaluation was reached;
+engine-only refusals expose none. Event payload completeness does not eliminate the mandatory
+consumer applicability read. Its PRD §9.2 departure is open under D-67/Q-25, with service read
+grants and durable unavailable-read recovery required by `UPSTREAM_REQS.md §2.7`. Pricing
+readiness is split in `design/README.md`: four predicate families exist internally, two lack
+inputs, and batched fixed-version predicate/pin-composition SDK publication remains pending.
+Bundle coverage additionally requires frozen component/key composition and conjunction execution;
+`UPSTREAM_REQS.md §2.2` registers that prerequisite and fail-closed behavior. Assessment identity
+includes component and scope key so a bundle's repeated predicate results remain distinct.
+These are documented contracts and prerequisites, not runtime verification results.
 
 ## 4. Additional context
 
@@ -1013,18 +1073,37 @@ blank because a threshold nobody set is a threshold nobody can verify against
 
 | Dimension | Baseline | Note |
 |-----------|----------|------|
-| Peak order transitions | **50 / second** | The load the p95 < 1 s commit budget is asserted at |
-| Outbox drain throughput | **200 events / second** | Across all shards; must exceed the transition rate because one transition can emit one event and re-drives add load |
-| Event-delivery budget | **30 s p95** from commit to bus | The target drain lag is verified and alerted against; matches the sibling gear's process-event latency class |
-| Row growth | **~12 rows** per order at version 1, **~6** per amendment | Aggregate, identity, lines, totals, audit, outbox |
+| Peak order transitions | **50 / second** | Working production load for validating the PRD's p95 < 1 s write-plus-publish baseline |
+| Platform producer throughput | **200 events / second** | Across the 16 toolkit queue partitions; must exceed the transition rate because one transition can emit one event |
+| Event-delivery budget | **Unresolved (Q-16)**; 30 s p95 is an unapproved proposal | Borrowed from Orders Workflow's process-event class, not validated for Lifecycle; the PRD's p95 < 1 s write-plus-publish baseline governs until an approved change |
+| Orders row growth | **~11 rows** per order at version 1, **~5** per amendment | Aggregate, identity, lines, totals and audit; platform outbox rows are measured separately |
 | Archival tier trigger | **24 months** past a terminal state | The append-only model permits it because nothing reads a terminal order's version chain on a hot path |
 | List page size | default **50**, maximum **200** | The 200 ms read budget is per page, so an unbounded page would make it meaningless |
 
 Cost is dominated by the shared `toolkit-db` backend and scales with retained order history. The
 gear is sized by transition rate rather than data volume: an order is a handful of small rows and
 the version chain grows only on amendment, which is rare relative to submit. Read load is absorbed
-by the aggregate row rather than the write path. The six background workers are lease-coordinated
-and idle-cheap.
+by the aggregate row rather than the write path. The Orders-owned workers are advisory-lock-coordinated and idle-cheap; toolkit outbox worker cost is
+included in the platform producer profile.
+
+**Latency measurement contract.** Record correlated operation-start, transaction-commit and
+broker-acknowledgement instants. Request-to-commit includes authorization, guard-input resolution
+and database work. Commit-to-broker acceptance includes queue wait and every retry; successful
+publish-call duration alone is insufficient. Request-to-broker acceptance measures the complete
+write-plus-publish path; separate stage p95 values **MUST NOT** be added to infer its p95.
+Downstream processing is a distinct consumer measurement and is not established by broker
+acknowledgement. Timestamp acquisition, clock alignment and any approximation error **MUST** be
+documented; an enqueue timestamp **MUST NOT** be silently labelled a commit timestamp.
+
+Product and Architecture own Q-16: confirm the PRD measurement boundary, the applicable population
+and observation window, and tail-delivery criteria, then approve any target change. Until that
+decision, report the complete operation-start-to-broker-acceptance measurement against the PRD's
+sub-second baseline, with no claim of compliance from commit latency alone. Capacity validation
+**MUST** cover expected production load, backlog, transient failures and recovery. Pending and
+dead-lettered events **MUST** remain visible as incomplete deliveries; a histogram of completed
+deliveries alone cannot establish compliance. The proposed 30-second target is not a replacement
+acceptance criterion. P-1/P-2 design work may continue; production acceptance requires evidence
+against the governing requirement or an approved revision.
 
 ### 4.2 Security posture
 
@@ -1032,16 +1111,34 @@ and idle-cheap.
 receives an authenticated `SecurityContext` propagated across every in-process call, never
 re-implementing token handling. **Service identity** is separate and explicit: the five
 workflow-only operations require a **gateway-asserted service principal plus a scope claim naming
-this gear**, checked by the pre-guard — actor class alone is insufficient, because on its own
-nothing would distinguish the sibling gear from any caller presenting that class.
+this gear**, checked by the pre-guard. The actor class is not a credential: it is derived from the
+authenticated context compared with configured identities (D-115), and there is no Workflow class
+— Workflow is one configured `service` principal, so the class adds nothing the principal check
+does not already establish.
 
-**Authorization** is deny-by-default, evaluated by **one** authorization evaluator invoked by both
-the engine pre-guard and the read paths, so there is a single model rather than two that drift.
-Cross-tenant action requires a **verifiable delegation proof** — a signed assertion from Account
+**Authorization** is deny-by-default and decided by platform PDP through **one shared
+PolicyEnforcer adapter** invoked by the engine pre-guard and read paths. Orders enforces the
+returned scopes and its business guards; it does not implement an independent permission
+evaluator. The wiring and resource/action contract lives in `design/08-read-and-authz.md` §3.5
+and §4.3; remaining write integration work is not implied complete. The five lifecycle-owned
+maintenance workers use the bounded trusted-system exception defined there: cross-tenant
+discovery, narrowly scoped operations and existing restricted database roles, with real service
+actor attribution and transactional audit retained. This does not exempt Workflow, REST or
+public SDK callers, and is not an outage fallback. Request-driven audit, idempotency and outbox
+persistence are private effects under restricted database authority, not separate PDP actions.
+Their scopes are bound to the operation and transaction; denial evidence may be recorded without
+granting the caller target access. Audit reads remain separately PDP-authorized (`08 §3.5`).
+Action through a delegated path requires a **verifiable delegation proof**; direct seller or
+current-payer access does not require resource-tenant delegation solely because the order spans
+different tenants (`08 §4.4`). The proof is a signed assertion from Account
 Management naming the delegating tenant, the delegated scope, the delegate, an issue instant and a
 finite expiry, verified against a published issuer key and revocable by the delegating tenant,
-aligned with BSS manifest §2.1.3. Its reference is recorded on the audit entry. Absence, expiry or
-revocation is a refusal.
+aligned with BSS manifest §2.1.3. The platform PDP evaluates it: Orders forwards the supplied proof
+reference as PolicyEnforcer request context on every read and write, maps PDP's missing/invalid
+deny reasons to `delegation-proof-required` / `delegation-proof-invalid` on untargeted requests
+(list, create, preview) and to `order-not-found` on targeted ones (D-141), and never classifies a
+path as delegated or verifies proof itself (D-111). Its reference is recorded on the audit entry.
+Absence, expiry or revocation is a refusal.
 
 The gear stores no cardholder data and holds no payment instrument, so PCI DSS is **not
 applicable**; it consumes an authorization *outcome* only.
@@ -1051,18 +1148,18 @@ applicable**; it consumes an authorization *outcome* only.
 | Threat | Vector | Boundary crossed | Mitigation | Residual risk |
 |--------|--------|------------------|------------|---------------|
 | Cross-tenant order disclosure | A caller reads or lists an order outside their relationship | Tenant boundary | Scope by relationship not tenant equality; not-found rather than forbidden; delegation proof required and audited | A compromised delegation credential reads within its granted scope until revoked |
-| A partner manufactures customer consent | The placing party records the acceptance instant themselves | Commercial-evidence boundary | The placing actor is normatively barred from recording acceptance for the order they placed | An offline collusion between partner and a customer principal is out of scope for a technical control |
+| A partner manufactures customer consent | The commercial placing party records the acceptance instant themselves | Commercial-evidence boundary | On partner-placed orders the placing/selling party cannot attest customer consent; acceptance requires the resource-tenant party. A self-service buyer may accept an amended version | An offline collusion between partner and a customer principal is out of scope for a technical control |
 | State asserted without a guard | A caller reaches a state-setting path directly | Engine boundary | There is no such path: every state change is a guarded transition and the engine is sole writer | A privileged database credential bypasses the engine; mitigated by runtime-owned privilege and the audit hash chain making it detectable |
-| Sibling-gear impersonation | Any caller presents the Workflow actor class | Service boundary | Gateway-asserted service principal plus a gear-scoped claim | A compromised platform gateway; out of this gear's control |
-| Audit tampering | A holder of database privilege edits or deletes trail rows | Data boundary | No standing UPDATE or DELETE grant on the audit role, plus a per-order predecessor-hash chain verified by the audit-chain verifier of `design/01-foundation.md` §3.8 | A holder of the migration role can drop the grant; detectable via the chain and the grant audit. The erasure role's time-boxed UPDATE (§4.3) is a deliberate, recorded window, and the verifier distinguishes a declared re-derivation from an undeclared one — an erasure run that wrote no record would alert exactly as tampering does |
-| Preview amplification | Unauthenticated-shaped basket calls fan out to six ports and write outcome rows | Cost and dependency boundary | Preview declares its actor classes, carries a rate limit, and its outcome rows have a bounded retention | A high-volume authorised caller can still consume port capacity, bounded by the per-port bulkhead |
+| Sibling-gear impersonation | A caller that is not the configured Workflow `service` principal attempts a workflow-only operation (the actor class is derived from the authenticated context against configured identities, D-115, and cannot be presented) | Service boundary | Gateway-asserted service principal plus a gear-scoped claim | A compromised platform gateway; out of this gear's control |
+| Audit tampering | A holder of database privilege edits or deletes trail rows | Data boundary | No UPDATE or DELETE grant on the audit role, plus a per-order predecessor-hash chain verified by the audit-chain verifier of `design/01-foundation.md` §3.8; identity removal never rewrites the trail (D-96) | A database owner/migration role can alter protections or rewrite a whole chain; local hashes alone do not prove completeness against that authority. Privileged changes require independent monitoring; identity removal grants no verification exemption |
+| Preview amplification | Basket calls fan out to nine operations and write outcome rows | Cost and dependency boundary | Preview authorizes resource/payer scope before commercial resolution, carries a rate limit, and its outcome rows have a bounded retention | A high-volume authorised caller can still consume port capacity, bounded by the per-port bulkhead |
 | Unbounded audit growth | Repeated refused attempts against one order | Availability boundary | Refusal rows carry 90-day retention and repeated refusals are rate-limited | A distributed low-rate refusal campaign remains possible and is a monitoring concern |
-| An order held in-flight indefinitely | An actor cycles the dwell before each TTL elapses — **hold/resume** with hold permission, or **amendment** with amend permission; both reset `state_entered_at` | Commercial-promise boundary | Two counters no transition resets, each with its own guard: `resume_count` (cap 5, `design/07-hold-and-expiry.md` §4.2) and `amendment_count` (cap 20, `design/04-versioning.md` §4.1). At most 26 state entries, so in-flight life is bounded at `26 × the largest configured TTL` | Where the states' TTLs are **unset** the caps bound nothing, because the dwell they multiply is itself unbounded; disclosed as [`DECISIONS.md`](./DECISIONS.md) Q-27 and alerted per `07 §3.8` |
+| An order held in-flight indefinitely | An actor cycles the dwell before each TTL elapses — **hold/resume** with hold permission, or **amendment** with amend permission; both reset `state_entered_at` | Commercial-promise boundary | Two counters no transition resets, each with its own guard: `resume_count` (cap 5, `design/07-hold-and-expiry.md` §4.2) and `amendment_count` (cap 20, `design/04-versioning.md` §4.1). At most 74 TTL-covered pre-fulfillment dwell entries; `74 × T_max` sums configured budgets under `07 §4.2`'s assumptions, plus scheduler delay—not an unconditional lifetime bound | Where the states' TTLs are **unset** the caps bound nothing, because the dwell they multiply is itself unbounded; disclosed as [`DECISIONS.md`](./DECISIONS.md) Q-27 and alerted per `07 §3.8` |
 
 ### 4.3 Data protection, residency and retention
 
 **Encryption**: at rest by the platform storage layer, TLS in transit on every hop including the
-six outbound ports and the event bus. **Key management** is the platform KMS; the gear holds no
+outbound SDK operations and the event bus. **Key management** is the platform KMS; the gear holds no
 key material.
 
 **Classification**: order content and its resolved totals are **commercial-confidential**; actor
@@ -1070,67 +1167,155 @@ and tenant identifiers in the audit trail are **personal-minimal**; the free-tex
 fields — display labels and internal notes — are **personal-minimal** and carry length bounds and
 input validation. No masking requirement arises, because no surface returns another tenant's data.
 
-**Erasure** is the one case that touches the immutable stores, and it needs a mechanism rather than
-a sentence. An erasure obligation is satisfied by **pseudonymising actor identifiers in place** —
-commercial content is not erased, because it is a financial record retained under the program
-retention policy. But "in place" on an append-only store with **no UPDATE grant to any role**
-(`design/01-foundation.md` §3.7) is not executable as stated, so five things are specified here.
+**Local audit ownership (D-97).** Orders retains its authoritative transactional audit store,
+aggregate-scoped hash chains and authorized local retrieval, following Pricing's implemented
+pattern rather than the event-only alternative. Toolkit outbox delivery does not replace that
+store. The verifier is Orders-owned work, not a supplied platform capability. D-97 records source
+evidence, deliberate differences and remaining hash/pagination/completeness issues; adopting the
+pattern does not close those issues.
 
-1. **It is a privileged procedure, not a transition.** It cannot be a transition: the table is closed at twenty-five rows, adding one is an engine change under `01 §4.6`, and no row exists. Erasure is an out-of-band operational procedure, run deliberately and rarely.
-2. **The grant is time-boxed, not standing.** `01 §3.7`'s rule becomes "**no standing UPDATE grant** to any role". A dedicated erasure role receives UPDATE on `orders_transition_audit` for the duration of one execution and holds none between executions, so the steady-state posture — the one the threat model rests on — is unchanged.
-3. **It records itself where it cannot reach.** Each execution writes a record — the requesting authority, the instant, the subject pseudonymised, and the orders whose entries were touched — to a store the erasure role has **no UPDATE or DELETE grant on**. An erasure that could edit its own record would defeat the purpose of having one.
-4. **Chain re-derivation is part of the procedure and is declared.** Pseudonymising a row changes its hash, so every later entry for that order must have its predecessor hash recomputed. The procedure re-derives forward from the mutated row and **records the re-derivation against those orders** in the same record as (3).
-5. **The verifier reads that record, or it reports erasure as tampering.** The audit-chain verifier (`design/01-foundation.md` §3.8) alerts on any mismatch and **cannot repair** — so without (4) every legitimate erasure would raise a tamper alert on the affected orders and the alert would be indistinguishable from an attack. The verifier **MUST** consult the erasure record and treat a re-derivation it names as expected. A mismatch on an order with **no** such record is a genuine finding and still alerts.
+**Completeness baseline (D-100).** As in Pricing's design, append-only tenant roll-ups capture
+committed order-chain heads locally; independent WORM/object-lock anchoring is optional. The
+audit worker reconciles snapshots against order counters and prior checkpoints on a 24-hour
+design baseline, with full historical verification within 30 days. `01 §3.7` owns checkpoint
+storage and `§4.4` defines capture, byte encoding, verification, anchoring and acceptance. This
+does not prove completeness before capture or against an administrator rewriting all local
+evidence; external protection applies only after a checkpoint is independently anchored.
+Implementation and capacity validation remain required, as does deployment approval for optional
+anchoring. No current platform service or completed Pricing roll-up is presumed.
 
-What is deliberately **not** claimed: that erasure leaves the trail cryptographically indistinguishable from one that was never erased. It does not — the record in (3) exists precisely so the change is visible and attributable, which is the correct trade for an audit store.
+**Audit ownership axes (D-104).** Immutable `audit_tenant_id`, captured at creation, groups
+chains/checkpoints independently of editable draft resource tenancy. Each audit row separately
+records the current resource tenant when known and the actor's trusted `subject_tenant_id`.
+Unresolved refusals are scoped by the latter through explicit internal append/operational-read
+permissions, not by guessed target IDs. Chain namespace is never a read authorization grant.
+Committed create uses NULL prior state; only the engine writes transition evidence, while the
+audit worker appends checkpoint evidence under its separate grants.
+
+**Immutable audit identity (D-96).** Orders follows Pricing's PII-minimized audit pattern:
+`orders_transition_audit.actor` and `orders_read_access_log.actor` store immutable, opaque,
+pseudonymous principal references from the trusted security context, never names, emails,
+credentials or caller-supplied identity labels. **D-103 reconciles the source with Pricing:**
+store `SecurityContext.subject_id()` as lowercase hyphenated UUID text in the existing `actor`
+column. Do not mint or concatenate a gear-local namespace. Platform identity stability/non-reuse
+is a shared assumption and open follow-up, not a guarantee proved by the UUID type.
+Service actors retain their service reference and actor class; they are not invented human identities.
+The identity platform owns identifying attributes and any reference-to-person mapping separately;
+Orders MUST NOT duplicate that mapping or resolve names into audit responses. Audit access remains
+subject to the existing tenant/delegation authorization, and identity resolution requires separate
+platform authorization. Resolution failure MUST NOT prevent reading or verifying retained evidence.
+
+**Erasure changes identity data, not audit history.** Subject to the approved retention and
+privacy policy, the identity owner removes or restricts identifying data and mappings, including
+their replicas, caches and backups under a documented lifecycle. It records the authorized action
+in separately protected evidence without copying the erased identity into that evidence. Orders
+MUST NOT update audit actors, recalculate historical hashes, grant an erasure role UPDATE, or
+exempt an order from verification because an identity was removed. The existing refusal/read-log
+retention remains unchanged. This supersedes D-44's in-place erasure exception and D-92's
+erasure-aware verifier exception; successful transitions still commit their audit atomically.
+
+**Minimization covers the whole record.** Audit reasons use registered codes; before/after
+values MUST use an allowlisted, minimized representation rather than copy unrestricted notes,
+names or emails. Proof references MUST NOT embed proof credentials. Other fields, including
+correlation and idempotency references, MUST be reviewed for identifying content; an opaque actor
+alone does not make the record anonymous. Pseudonymous evidence remains protected data wherever
+linkable, and account deletion alone is not proof that an erasure obligation has been satisfied.
+Privacy/Legal must approve the retained fields, linkage risks, retention and applicable exceptions.
+
+**Integration and acceptance (D-103).** SecurityContext's subject UUID and AM's IdP-owned
+lifecycle are the existing integration surfaces, as in Pricing. Cross-issuer uniqueness,
+non-reuse and full deletion lifecycle remain shared platform follow-ups under
+`cpt-cf-bss-orders-lifecycle-upreq-audit-identity-lifecycle` in
+[`UPSTREAM_REQS.md §2.8`](./UPSTREAM_REQS.md#28-identity-platform).
+This is no longer an Orders-only p1 identity-platform release gate or a reason to defer the actor
+format. Normal deployment security/privacy review remains required; a known identity collision
+or unsafe configuration cannot be waived by this alignment. Orders tests MUST demonstrate that
+the actor is the trusted subject, configured system transitions are attributed, and simulated
+profile removal leaves both audit stores unchanged with chain verification and authorized reads
+still working. Representative payloads must contain no prohibited identifying content, and a
+modified chain must still alert. Provider deletion/non-reuse/restore guarantees are tracked
+jointly with Pricing, not represented as Orders tests of an unimplemented identity service.
+No migration of
+existing personal data is presumed complete: any deployed legacy audit data requires a separately
+approved remediation plan before claiming this contract is satisfied.
 
 **Residency**: for residency-bound tenants every gear-owned store — tables, read projection,
-audit, idempotency registry, outbox, backups and the synchronous standby — is pinned to an
+audit, idempotency registry, platform producer queue, backups and the synchronous standby — is pinned to an
 in-jurisdiction deployment cell with zero cross-boundary replication (see
 `cpt-cf-bss-orders-lifecycle-constraint-data-residency`).
 
 **Retention**: append-only with no destructive path for any `submitted`-or-beyond order; an
-abandoned draft is auto-voided to `expired` and remains readable. Four stores carry bounded
-retention by design: delivered outbox rows (30 days), Preview gate outcomes (7 days),
-refused-attempt audit rows (90 days), and read-access-log rows (90 days). The commercial retention period itself is a PRD open
+abandoned draft is auto-voided to `expired` and remains readable. Three stores carry bounded
+retention by design, all Orders-owned: Preview gate outcomes (7 days), refused-attempt audit rows (90 days), and
+read-access-log rows (90 days). Platform outbox and dead-letter retention is platform policy. The commercial retention period itself is a PRD open
 question ([`DECISIONS.md`](./DECISIONS.md) Q-07).
 
 ### 4.4 Observability
 
 Signals are owned **per slice**, each declaring its own metrics, log fields and alerts in its
 `§3.8`; the engine's own are in [`design/01-foundation`](./design/01-foundation.md) §3.8. The
-`correlationId` supplied by the sibling gear is recorded on the audit row and propagated to logs
-and to every outbound port call, which is what makes an order's whole approval-to-fulfillment arc
+`correlationId` supplied by the sibling gear is recorded on the audit row, carried in every typed
+event, and propagated to logs and to every outbound port call, which is what makes an order's whole approval-to-fulfillment arc
 traceable across two gears — propagation onward through Subscriptions is the unagreed `SUB-O9`
 ask.
 
-**Alerting** covers both the invariant-bearing signals and the latency SLOs: commit-latency and
-read-latency SLO burn-rate alerts derived from the p95 budgets, drain lag beyond the 30-second
-event-delivery budget, any audit-append failure, any audit-chain verification mismatch, any
-non-zero unaudited-transition count, dead-letter arrivals, and orders held in `in_fulfillment`
+**Alerting** covers both the invariant-bearing signals and latency: write-plus-publish latency
+against the governing PRD baseline, read latency, delayed producer delivery, any audit-append
+failure, any audit-chain verification mismatch, any
+non-zero unaudited-transition count, any pending toolkit producer dead letter, and orders held in `in_fulfillment`
 past the overdue window. Health reporting distinguishes readiness from liveness (§3.8).
 
-### 4.5 Error handling and the outbox failure posture
+Delayed-delivery and dead-letter detection **MUST** remain enabled regardless of Q-16's numerical
+outcome. Orders owns the delivery objective, queue-specific alert configuration and recovery
+runbook; toolkit/SDK measurements and shared operations tooling supply the signals. Alert
+thresholds, evaluation windows and operational ownership **MUST** be defined and tested before
+production. Queue age is a stuck-delivery signal, not a substitute for delivery-latency percentiles.
+The open platform capability and production acceptance evidence are tracked as
+`cpt-cf-bss-orders-lifecycle-upreq-event-delivery-observability`
+([`UPSTREAM_REQS.md §2.7`](./UPSTREAM_REQS.md#27-event-broker)).
+
+### 4.5 Error handling and the platform outbox failure posture
 
 Errors classify three ways. A **guard refusal** is an expected business outcome carrying a stable
-machine-readable reason, mapped to an RFC 9457 problem with no internal diagnostics on the wire —
-and one name per condition, since callers key on the string. A **concurrency refusal** — payload
+machine-readable reason, mapped to an RFC 9457 problem with no internal diagnostics on the wire.
+the platform canonical category supplies `type`, HTTP status and title, while Orders-owned
+reasons use `error_domain: orders-lifecycle.v1` and explicit `error_code` values. The GTS reason
+key is registry metadata, not the wire `type`; Foundation §4.7 defines the complete mapping
+and one-name-per-condition rule. Callers key on domain/code, not free-text detail. A **concurrency refusal** — payload
 mismatch, still-processing, version conflict — is retryable under the rules in
 [`design/01-foundation`](./design/01-foundation.md) §4.2 and must never be read as success. An
-**infrastructure fault** aborts the transaction, so a failed audit or outbox append leaves no
-state change behind.
+**infrastructure fault** aborts the transaction, so a failed audit or platform outbox enqueue
+leaves no state change behind.
 
 Outbound port failures are bounded rather than merely reported: **per-port deadlines** inside a
 total request budget, bounded retry on transient failure only, a **circuit breaker** per port
 mapping to that port's existing fail-closed reason, and a **concurrency bulkhead** per port, all
 specified in [`design/03-gate-and-pin`](./design/03-gate-and-pin.md) §2.2.
 
-Outbox delivery is at-least-once with consumer de-duplication on event ID; a repeatedly failing
-entry is parked in an inspectable dead-letter record with an alert, and is recoverable by the
-**operator re-drive** which republishes under the original event id. A parked event is never an
-order state, and the order's own state is already committed and correct. Compensating-transaction
-patterns are deliberately absent: this gear holds no distributed saga, and every failure it can
-suffer is contained in one database transaction.
+Producer delivery is at-least-once with consumer de-duplication on event ID. Broker idempotency
+instead uses managed Chained producer metadata (`producer_id`, `previous`, `sequence`), not
+`event.id`; the SDK owns sequence assignment and cursor recovery as specified in Foundation §4.4.
+The Event Broker SDK
+retries transport and rate-limit failures without an Orders attempt cap; `toolkit_db::outbox`
+retains the whole queue-partition cursor while such a retry is pending. The SDK permanently rejects
+invalid data, unrecoverable producer identity and persistent chain divergence; toolkit-db parks an
+inspectable dead letter and advances the partition cursor, so later notifications may proceed. A
+dead letter is never an order state, and the committed Orders record remains authoritative.
+Operations use the shared operator interface and SDK republication required by
+`cpt-cf-bss-orders-lifecycle-upreq-event-broker-dead-letter-recovery`
+([`UPSTREAM_REQS.md §2.7`](./UPSTREAM_REQS.md#27-event-broker)); both remain open production
+release prerequisites. Recovery preserves event identity and business payload without a new
+Orders transition. There is no Orders re-drive endpoint.
+Orders publishes internal lifecycle events under explicit platform-root tenancy (D-95). The
+envelope tenancy and routing contract is defined in
+[`Foundation §4.7`](./design/01-foundation.md#47-gts-types-for-the-cross-gear-contract-surface-normative);
+it follows the SDK's `EventV1` envelope, uses `data` for business content and explicitly declares
+`partition_key: /subject` with the order UUID as subject. Foundation §4.4 maps the required
+envelope fields; §4.7 defines registration and SDK publication acceptance tests, still pending.
+The root identity source and broker grants remain an open integration dependency in
+[`UPSTREAM_REQS.md §2.7`](./UPSTREAM_REQS.md#27-event-broker).
+Compensating-transaction patterns are deliberately absent: this gear holds no distributed saga,
+and every failure it can suffer is contained in one database transaction.
 
 ### 4.6 Testability
 
@@ -1140,9 +1325,16 @@ an audit row on both outcomes and that no edge exists outside the table. Idempot
 version check are concurrency properties, verified by **parallel same-key execution** asserting
 one durable effect. A crash test asserting a lease-expired marker is recoverable is **planned and not yet written** — this gear has no implementation and no runtime tests, so a claim that one exists would be false. The
 unagreed downstream seams are behind ports, so the gate and acknowledgement paths are **testable
-against a contract double** before Subscriptions exists. The sibling gears' precedent of
-jointly-owned golden fixtures before implementation applies to the gate's adopted predicates,
-since forking them silently is exactly what a shared fixture catches.
+against a contract double** before Subscriptions exists. The sibling gears' precedent of jointly-owned golden fixtures before implementation applies to the
+gate's adopted predicates, since forking them silently is exactly what a shared fixture catches.
+
+The producer contract suite additionally proves: transition writes and the SDK enqueue commit or
+roll back together; accepted/persisted/duplicate outcomes acknowledge once; transport and
+rate-limit faults retain queue-partition FIFO; a permanent reject creates an inspectable dead
+letter without mutating order state and allows later messages to proceed; Workflow rejects stale or
+inapplicable notifications through an authoritative Orders state/version read; the largest
+200-line event envelope fits 64 KiB; and readiness fails when Event Broker, schema preparation,
+managed producer registration or partition-count configuration is unavailable.
 
 ### 4.7 Accepted residual limits
 
@@ -1155,7 +1347,7 @@ disclosure.
 | Accepted limit | Why it is accepted | Who acts when it bites |
 |----------------|--------------------|------------------------|
 | A **wedged `in_fulfillment` order holds its overlap key indefinitely**, blocking any new order on that key for that payer | `in_fulfillment` is expiry-exempt because a spawn signal may already have issued and expiry would orphan provisioned resources with no compensation path (`design/07-hold-and-expiry.md` §4.3). No transition in this gear can clear the claim, and ADR-0007 names this its sharpest residual cost | **Orders Workflow operations** — the escalation SLA on an overdue `in_fulfillment` order is the only route. If it proves too slow in practice the fix is an operator-initiated claim release, which is new scope and is not designed |
-| A **parked outbox row suspends its order's event stream for an unbounded duration** | Deliberate: the alternative is publishing `OrderCompleted` before `OrderSubmitted`, and a consumer cannot reconstruct a commercial trail from an out-of-order stream (D-87, ADR-0006). One order halts; no other order is affected | **Platform operations** — the dead-letter alert fires immediately and an operator re-drive is the close. Re-drive is refused while a lower undelivered sequence exists, so the order of repair is forced |
+| A **permanently rejected producer message may leave a gap before later events** | Deliberate platform ordering posture: transient retry preserves FIFO, but toolkit-db advances a queue-partition cursor after `Reject`. Orders is authoritative state, not an event-sourced ledger; blocking unrelated orders indefinitely on an invalid message is the worse failure mode (D-87, ADR-0006) | **Consumers and platform operations** — consumers de-duplicate and reconcile `orderVersion`/state against Orders; operations alert on and recover pending dead letters through the shared tooling and SDK mechanism required by `cpt-cf-bss-orders-lifecycle-upreq-event-broker-dead-letter-recovery` ([UPSTREAM_REQS §2.7](./UPSTREAM_REQS.md#27-event-broker)). This remains a production release prerequisite, including for terminal events |
 | **Two principals can each create a duplicate order** from the same request under the same key text | The idempotency key is scoped by principal to close an IDOR (D-88), which makes the same key text from a different principal a different key. For every operation but `create` the fingerprint's `order_id` and `expected_version` still catch the duplicate; on a create there is neither | **Product** — deciding whether a cross-principal create duplicate is a real commercial scenario. If it is, the answer is an upstream de-duplication key on the request, not a change to the registry's scoping |
 | The **stored resolved total is not the amount the customer will be invoiced** — non-authoritative, pre-tax, and excluding subscription-scoped overlays | Tax has no order-time owner and overlays need context a subscription has not yet created. Reporting a total that silently omitted them would be worse than declaring the omission (`design/03-gate-and-pin.md` §4.5) | **Every consumer surface** — a buyer portal, partner console or confirmation email. §4.2 of `design/08-read-and-authz.md` makes rendering the total without its declared exclusions prohibited on this gear's read, and the same obligation is stated as an expectation on surfaces this gear does not own |
 | **`new_sale` covers net-new acquisition only**; expansion has no order document, no gate at the point of change, no pin and none of this audit trail | Declared PRD phasing — `change` is modeled and refused at creation, with the enum left open (Q-01). Not a design gap | **Product** — "Orders is live" and "commercial changes are governed by Orders" become true at different times, and only the first is true at the end of this phase |
@@ -1168,7 +1360,7 @@ without touching the engine; a state, a transition row, an event type, an envelo
 an engine-owned column requires an engine change, and adding a state or event type is
 additionally a PRD question because both sets are enumerated there.
 
-**Decisions** are recorded in [`DECISIONS.md`](./DECISIONS.md) — **ninety-four** entries plus **thirty**
+**Decisions** are recorded in [`DECISIONS.md`](./DECISIONS.md) — **one hundred and forty-nine** entries plus **thirty-one**
 routed open questions, twenty-six of them still unanswered — with **seven** ADRs in [`ADR/`](./ADR/) carrying full alternatives
 analysis. **Upstream asks** are declared in [`UPSTREAM_REQS.md`](./UPSTREAM_REQS.md),
 including `SUB-O10`, which this design raises.
@@ -1204,13 +1396,13 @@ is live" and "commercial changes are governed by Orders" are different claims, a
 becomes true at the end of this phase.
 
 **Sibling-gear evidence base.** The engine-shaped core, the append-only history with in-table
-supersession, the transactional outbox, the integer-minor-unit money convention, the
-read-projection-for-latency pattern and lease-coordinated background work are all adopted from the
+supersession, the platform transactional producer outbox, the integer-minor-unit money convention, the
+read-projection-for-latency pattern and coordinated background work are all adopted from the
 two built BSS gears rather than invented here.
 
 ## 5. Traceability
 
 - **PRD**: [`PRD.md`](./PRD.md)
-- **ADRs**: [`ADR/0001`](./ADR/0001-cpt-cf-bss-orders-lifecycle-adr-transition-through-engine.md) transition through the engine; [`ADR/0002`](./ADR/0002-cpt-cf-bss-orders-lifecycle-adr-slice-decomposition.md) the foundation-plus-seven-slices decomposition; [`ADR/0003`](./ADR/0003-cpt-cf-bss-orders-lifecycle-adr-fail-closed-gate.md) fail closed on an unevaluable gate input; [`ADR/0004`](./ADR/0004-cpt-cf-bss-orders-lifecycle-adr-closed-enumerations.md) both enumerations stay closed; [`ADR/0005`](./ADR/0005-cpt-cf-bss-orders-lifecycle-adr-refusals-commit.md) a refused transition is a committed outcome; [`ADR/0006`](./ADR/0006-cpt-cf-bss-orders-lifecycle-adr-outbox-publication.md) events publish asynchronously from an outbox; [`ADR/0007`](./ADR/0007-cpt-cf-bss-orders-lifecycle-adr-in-transaction-concurrency.md) concurrency rules are in-transaction constraints. All seven `accepted`, all seven cited by ID in §1.2
+- **ADRs**: [`ADR/0001`](./ADR/0001-cpt-cf-bss-orders-lifecycle-adr-transition-through-engine.md) transition through the engine; [`ADR/0002`](./ADR/0002-cpt-cf-bss-orders-lifecycle-adr-slice-decomposition.md) the foundation-plus-seven-slices decomposition; [`ADR/0003`](./ADR/0003-cpt-cf-bss-orders-lifecycle-adr-fail-closed-gate.md) fail closed on an unevaluable gate input; [`ADR/0004`](./ADR/0004-cpt-cf-bss-orders-lifecycle-adr-closed-enumerations.md) both enumerations stay closed; [`ADR/0005`](./ADR/0005-cpt-cf-bss-orders-lifecycle-adr-refusals-commit.md) a refused transition is a committed outcome; [`ADR/0006`](./ADR/0006-cpt-cf-bss-orders-lifecycle-adr-outbox-publication.md) events publish asynchronously through the platform producer outbox; [`ADR/0007`](./ADR/0007-cpt-cf-bss-orders-lifecycle-adr-in-transaction-concurrency.md) concurrency rules are in-transaction constraints. All seven `accepted`, all seven cited by ID in §1.2
 - **Design set**: [`design/`](./design/) — the Transition Engine plus per-capability slice designs; the phased map and dependency order are in [`design/README.md`](./design/README.md), which is the build-order authority.
 - **Sibling gear**: [`../../orders-workflow/docs/PRD.md`](../../orders-workflow/docs/PRD.md) — process orchestration; the seam rules R1–R5 are normatively owned by [`PRD.md`](./PRD.md) §6.4 and are not restated here.

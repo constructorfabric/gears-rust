@@ -4,7 +4,7 @@ date: 2026-09-10
 decision-makers: BSS Orders team
 ---
 
-# ADR-0006: Events Are Published Asynchronously From An Outbox
+# ADR-0006: Events Use the Platform Transactional Producer Outbox
 
 <!-- toc -->
 
@@ -15,7 +15,8 @@ decision-makers: BSS Orders team
   - [Consequences](#consequences)
   - [Confirmation](#confirmation)
 - [Pros and Cons of the Options](#pros-and-cons-of-the-options)
-  - [Transactional outbox with an asynchronous drain (chosen)](#transactional-outbox-with-an-asynchronous-drain-chosen)
+  - [Platform DbProducer with toolkit outbox (chosen)](#platform-dbproducer-with-toolkit-outbox-chosen)
+  - [Orders-owned transactional outbox](#orders-owned-transactional-outbox)
   - [Synchronous publish inside the transaction](#synchronous-publish-inside-the-transaction)
   - [Publish after commit, in the same request](#publish-after-commit-in-the-same-request)
   - [Change data capture off the write-ahead log](#change-data-capture-off-the-write-ahead-log)
@@ -28,141 +29,197 @@ decision-makers: BSS Orders team
 
 ## Context and Problem Statement
 
-Eleven order events are a published contract consumed by three sibling gears. Every one of them
-originates in a transition that also writes the aggregate, a version row and an audit entry inside
-one database transaction.
+Eleven order events are a published contract consumed by three sibling gears. Every event
+originates in a transition that also writes Orders state, version, idempotency and audit data in
+one database transaction. The repository already provides the supported producer path:
+`event-broker-sdk::DbProducer` with its `outbox` feature, backed by `toolkit_db::outbox`.
 
-PRD §7.1 sets the transition threshold as `p95 < 1 s` and defines it as **"durable write + event
-publish"** — one budget covering both. So the question is not merely how events reach the bus, but
-whether publication is part of the commit the PRD is measuring.
-
-Publishing inside the transaction means a network call while a row lock is held. Publishing after
-it means a window in which the state changed and no consumer knows. Neither is free, and the
-choice determines the failure mode the whole seam inherits.
+PRD §7.1 sets transition latency at `p95 < 1 s` and describes it as **“durable write + event
+publish”**. A transactional producer outbox deliberately separates durable enqueue from broker
+publication. The decision must therefore address both atomicity and that explicit divergence,
+without duplicating platform sequencing, leasing, retry, dead-letter and vacuum machinery inside
+Orders.
 
 ## Decision Drivers
 
-* A transition holds the aggregate row lock, which also serialises audit-sequence allocation — anything slow inside that lock costs every concurrent caller on the same order.
-* "Zero silent drops" (PRD §7.1) has to survive a broker that is unavailable at commit time.
-* Per-order ordering is a contract consumers rely on; global ordering is explicitly not offered.
-* A consumer must be able to de-duplicate, because any at-least-once delivery will re-deliver.
-* Whatever is chosen is load-bearing for three gears and expensive to reverse once they have built against it.
+* An event-declaring state change and its durable producer message must commit atomically.
+* No Event Broker call may occur while the aggregate row lock is held.
+* Existing platform producer/outbox capabilities should be reused rather than forked.
+* Delivery is at-least-once, so event identity and consumer de-duplication are mandatory.
+* `orderId` must route one order's events to one broker partition.
+* Permanent bad messages must not block unrelated orders indefinitely.
+* Orders is authoritative state; its event stream is notification, not an event-sourced ledger.
+* The Event Broker runtime is not yet available even though its SDK has landed, so readiness must
+  expose that dependency honestly.
 
 ## Considered Options
 
-* **Transactional outbox with an asynchronous drain** — enqueue a row in the transition transaction, publish from a separate worker
-* **Synchronous publish inside the transaction** — call the broker before commit
-* **Publish after commit, in the same request** — commit, then publish, with a reconciliation sweep for the gap
-* **Change data capture off the write-ahead log** — derive events from the database's own replication stream
+* **Platform `DbProducer` with toolkit outbox** — enqueue a typed event in the transition
+  transaction and let the SDK/toolkit workers publish it
+* **Orders-owned transactional outbox** — own a table, shard leases, retry state, dead letters and
+  re-drive logic in this gear
+* **Synchronous publish inside the transaction** — call Event Broker before commit
+* **Publish after commit, in the same request** — commit, then publish, with reconciliation for the
+  gap
+* **Change data capture off the write-ahead log** — derive events from database replication
 
 ## Decision Outcome
 
-Chosen option: **transactional outbox with an asynchronous drain**. Exactly one outbox row is
-written per event-declaring committed transition, in the same transaction, and a sharded drain
-publishes it afterwards. `design/01-foundation.md` §4.4 is normative.
+Chosen option: **`event-broker-sdk::DbProducer` with feature `outbox`, backed by
+`toolkit_db::outbox`, in managed `ProducerMode::Chained`**. Orders constructs the typed event and
+calls the bound `ProducerOutbox::enqueue` with the active transition runner. The platform owns the
+producer registration, opaque producer envelope, local sequence, partition mapping, leases,
+processing, retry classification, dead-letter lifecycle and vacuum.
 
-**This decision is the reason PRD §7.1's threshold cannot hold as written**, and that is its most
-important consequence rather than an incidental detail. Publication is asynchronous by
-construction, so it cannot sit inside a `p95 < 1 s` commit budget; delivery carries its own
-**30 s p95** budget instead (`DECISIONS.md` D-41). The combined figure is not achievable by any
-implementation of this decision, which is why the divergence is routed to Product as `Q-16` rather
-than asserted away. Choosing synchronous publication *would* have satisfied the PRD's wording
-literally — at the cost below.
+The producer queue is `bss-orders-events`, configured with `Partitions::of(16)` and the toolkit
+high-throughput profile. `orderId` is the GTS event partition key. Event Broker topic partition
+count is explicit configuration and must match the deployed broker; the SDK's default of eight is
+used only when the deployment uses eight. Eager schema preparation, managed producer registration,
+queue registration and worker startup are readiness requirements.
 
-Synchronous publish is rejected because it puts a network call inside the row lock: broker latency
-becomes transition latency for every caller on that order, and a broker outage becomes an
-order-taking outage. It also cannot be made atomic — the commit and the publish are two systems,
-so a failure between them either loses the event or commits a transition nobody can see, which is
-the exact defect the outbox exists to remove.
-
-Publish-after-commit-in-request is rejected for the same atomicity gap in a smaller window, plus
-it makes every caller pay the publish latency while still needing the reconciliation sweep that
-the outbox drain already is.
-
-CDC is rejected because the event payloads are a curated contract, not a row image: `01 §4.4`
-requires each event to carry a summary block sufficient for a consumer to act without fetching the
-order back, and deriving that from WAL rows would put contract-shaping logic in a replication
-consumer outside this gear's boundary.
+**The PRD latency baseline remains governing and compliance requires verification.** PRD §7.1
+and AC-17 require durable write plus event publish at p95 < 1 s. Asynchronous publication does
+not inherently prevent meeting that target, but commit completion alone cannot prove it.
+The former separate **30 s p95** target was borrowed from Orders Workflow and is an unapproved
+proposal, reopened in `DECISIONS.md` D-41 / Q-16. Product and Architecture must confirm measurement
+boundaries and review load-test evidence before approving any relaxation. `DESIGN.md` §4.1
+defines request-to-commit, commit-to-broker acceptance and the full operation-to-broker path;
+downstream processing is separate.
 
 ### Consequences
 
-* **A consumer sees a state change after the commit, not at it.** The delay is *targeted* at the 30 s p95 delivery budget rather than bounded by it — a p95 is a target, so an event may exceed it and enter the retry and dead-letter paths below. Anything requiring read-your-write consistency must read the order, not wait for the event.
-* **Delivery is at-least-once**, so every consumer needs de-duplication. **The de-duplication key is `orders_event_outbox.event_id`**, which `01 §3.7` declares as the consumer de-duplication token, *stable across a re-drive* — stability under re-drive is precisely the property de-duplication needs, and §4.4 states the same contract ("consumer de-duplication by event ID"). `(order_id, sequence)` is a different key for a different job: it is the per-order **ordering** key, held by a UNIQUE constraint and allocated under the aggregate row lock, and the drain publishes in that order. A consumer that de-duplicated on it would be keying on ordering rather than identity.
-* **Per-order ordering holds along the delivery path, and only per-order — but the guarantee is conditional.** Sharding makes it *structurally possible*: `shard_key` is `hash(order_id) % 64` with a *fixed* bucket count and the drain leases contiguous bucket ranges, so re-tuning parallelism can never split one order across two leaseholders, and the drain selects and batches in `(order_id, sequence)` order. What sharding alone does **not** give is head-of-line behaviour across a failure: when sequence `n` is retrying with backoff, or has been parked as a dead-letter row and so left the drain's partial index, sequence `n+1` for the same order is still selectable and can publish ahead of it. **`01 §3.6` has since settled it, and per-order ordering now holds across a park as well.** The drain selects on `delivered_at IS NULL` alone — so a parked dead-letter row stays visible as its stream's blocked head — and takes only the **contiguous prefix** per `order_id`, stopping at the first parked or not-yet-due row; no higher sequence for that order publishes while the parked one is undelivered, and no other order is affected (`DECISIONS.md` D-87). `01 §4.4` remains the normative home of the ordering contract, and it carries the two properties that make the rule closed rather than nominal: an operator re-drive **MUST** republish the parked row before any later event for that order and **MUST NOT** be used to skip one, and the suspension is **unbounded in duration** — a blocked order's stream halts until an operator acts. That last point is this ADR's real cost, and it is the deliberate trade: an order's stream stops rather than arriving out of order.
-* **An undeliverable event becomes an operational object.** After a bounded attempt count a row is parked as an inspectable dead-letter record with an alert, and an operator re-drive endpoint exists to republish it. That endpoint has no PRD basis and is disclosed as a design-introduced surface (`Q-19`).
-* **The outbox is a traffic-driven table**, so it carries a 30-day retention on delivered rows — and it is **not partitioned**, which is a correctness consequence rather than a preference. PostgreSQL requires every unique constraint on a partitioned table to include the partition key, and this table's `(order_id, sequence)` UNIQUE — the constraint per-order ordering rests on — does not. Monthly partitioning and the ordering guarantee are mutually exclusive, and ordering wins, so retention is a purge through the partial index rather than a partition drop. That purge is a **separate worker** from the per-shard drain (`01 §3.8` counts six), so it cannot lengthen a drain batch. No table in the gear is partitioned (`DECISIONS.md` D-91).
-* **The audit trail and the event stream can disagree transiently.** An audited transition whose outbox row is undelivered is real and invisible; only the order read reflects it. This is acceptable and is why the read is never served from a replica.
+* **Atomic durable notification.** An event-declaring transition cannot commit without its toolkit
+  producer message, and an aborted transition cannot publish one.
+* **No custom Orders outbox.** There is no `orders_event_outbox`, Orders shard selector, lease
+  protocol, retry bookkeeping, delivered-row purge or Orders-owned dead-letter schema. Platform
+  migration families are not counted as Orders tables.
+* **At-least-once delivery.** Consumers de-duplicate by the event envelope ID. Accepted,
+  persisted and duplicate broker outcomes acknowledge the toolkit message.
+  Broker idempotency is separate: managed Chained mode uses producer ID, predecessor and
+  sequence within the topic/broker partition, not `event.id`. The SDK takes the sequence from
+  `OutboxMessage.seq` and manages the predecessor cursor; Orders supplies neither a custom
+  sequence nor an event-ID broker token. Foundation §4.4 requires lost-response/restart retry
+  tests and separate consumer de-duplication tests; these remain pending implementation.
+* **Availability-oriented ordering.** Events for one order route to the same broker partition and
+  remain FIFO during normal processing and transient retry. The SDK maps `(topic, broker
+  partition)` to one toolkit queue partition, so a transient retry blocks that whole toolkit
+  partition. Transport and rate-limit faults return `Retry` without an Orders attempt cap.
+* **Permanent rejection may create a gap.** Invalid envelopes/schema, unrecoverable producer
+  identity and persistent chained-sequence divergence return `Reject`; toolkit-db writes an
+  inspectable dead letter and advances the queue-partition cursor. Later events may proceed. A
+  strict per-order barrier was rejected because the platform outbox does not provide one and
+  recreating it would restore the custom implementation this decision removes.
+* **Consumers reconcile with authority.** Consumers must use event ID for de-duplication and
+  `orderVersion` plus resulting state with an authoritative Orders read to reject stale or
+  inapplicable work. They must not reconstruct order state or assume every prior event was seen.
+  This freshness read deliberately qualifies D-67's no-callback rationale; Product/Architecture
+  reconciliation of PRD §9.2 remains open under Q-25. Consumer services need target-scoped
+  `order × read` grants, not merely root-stream access. Foundation §4.4 requires durable
+  pending work on unavailable validation and event/action-specific applicability rules;
+  a different state or a failed read alone must not silently discard work.
+
+* **No Orders re-drive endpoint.** Its removal depends on shared platform recovery:
+  `cpt-cf-bss-orders-lifecycle-upreq-event-broker-dead-letter-recovery`
+  ([`UPSTREAM_REQS.md §2.7`](../UPSTREAM_REQS.md#27-event-broker)). The SDK must safely republish
+  the original event with unchanged event ID and business payload, handling producer identity and
+  chained sequencing; authenticated operator tooling must authorize and audit recovery. No new
+  Orders transition is required. Toolkit's claim operation alone is insufficient. Both SDK
+  recovery and the operator interface are open production release prerequisites.
+* **Payload bound.** The serialized producer envelope must fit toolkit-db's 64 KiB payload limit.
+  Capacity tests cover worst-case `OrderSubmitted` and `OrderCompleted` at the 200-line cap.
+* **Runtime gate.** `docs/GEARS.md` currently says “SDK landed — impl crate TODO”. Orders cannot be
+  ready for event-producing traffic until `EventBrokerApi` has a runtime implementation and the
+  producer integration gate passes.
+* **Audit and events can disagree transiently.** Committed Orders state and audit remain true while
+  a message waits, retries or is dead-lettered. Reads therefore use authoritative Orders state,
+  never event replay.
 
 ### Confirmation
 
-**This gear has no implementation and no runtime tests**, so the checks below are labelled either
-verifiable today or planned.
+**Verifiable today:** the SDK's producer outbox enqueues with a caller-supplied database runner;
+uses toolkit `OutboxMessage.seq`; recovers managed chained cursors from Event Broker; treats
+accepted, persisted and duplicate as success; returns `Retry` for transport/rate-limit errors; and
+returns `Reject` for permanent errors. Toolkit-db retains a partition cursor on `Retry` and writes a
+dead letter then advances it on `Reject`. Toolkit outbox rejects payloads above 64 KiB.
 
-**Verifiable today, by reading `design/01-foundation.md`.** §3.7 declares
-`orders_event_outbox.event_id` as the primary key and the consumer de-duplication token stable
-across a re-drive, `(order_id, sequence)` UNIQUE as what per-order ordering rests on, the
-`sequence` allocated from a per-order counter under the aggregate row lock of §3.6, and one row
-per event-declaring committed transition as an engine-enforced invariant. §4.4 states the
-at-least-once contract, de-duplication by event ID, and that a parked entry is not an order state
-and must not alter one. §3.6 *Attempt Transition* enqueues the row inside the transition
-transaction, which is what makes enqueue-or-nothing atomic with the commit.
+**Planned with the Orders implementation:**
 
-**Planned, not yet written.** A cross-table cardinality check for the one-outbox-row-per-
-event-declaring-transition invariant — `01 §3.7` asserts that invariant but does not, as an
-earlier draft of this section claimed, name a test for it; a check that a parked dead-letter row
-alters no order state;
-a check exercising sequence `n` failing before sequence `n+1` for the same order, which is what
-would pin down the ordering dependency named in the Consequences above; and the drain-lag metric
-measured against the 30 s budget separately from the commit budget, which is the measurement
-`Q-16` needs in order to be answered. `01 §1.2`'s Verification Approach column is the home for
-the first three; none is recorded there yet.
+1. fault injection proving state, audit, idempotency and producer enqueue commit or roll back
+   together;
+2. duplicate-delivery tests proving consumers key on event ID;
+3. transient-failure tests proving queue-partition FIFO and recovery;
+4. permanent-rejection tests proving a dead letter is visible, order state is unchanged and later
+   events may proceed;
+5. stale/out-of-order contract tests proving Workflow reads authoritative Orders state/version;
+6. largest-envelope tests at the 200-line cap;
+7. readiness tests for absent Event Broker runtime, schema preparation failure, producer
+   registration failure and broker-partition mismatch; and
+8. correlated full-path latency measurement against the governing PRD baseline at expected load,
+   with backlog/retries, visible incomplete deliveries and tested delayed-delivery/dead-letter
+   alerts; Q-16 confirms boundaries, observation window and tail criteria before production.
 
 ## Pros and Cons of the Options
 
-### Transactional outbox with an asynchronous drain (chosen)
+### Platform DbProducer with toolkit outbox (chosen)
 
-* Good, because enqueue and commit are one transaction, so an event can never be lost for a committed transition nor emitted for an uncommitted one.
-* Good, because no network call sits inside the row lock.
-* Good, because throughput scales with replicas up to the bucket count.
-* Bad, because it makes PRD §7.1's combined threshold unsatisfiable and requires a PRD amendment.
-* Bad, because consumers must de-duplicate and tolerate delay.
+* Good, because enqueue and business writes share one transaction.
+* Good, because it removes duplicated schema and worker logic.
+* Good, because typed validation, producer identity and chained cursor recovery are platform-owned.
+* Bad, because a transient failure blocks a whole toolkit queue partition.
+* Bad, because permanent rejection permits a notification gap and consumers must reconcile with
+  authoritative state.
+* Bad, because commit success alone cannot establish the PRD's write-plus-publish latency;
+  asynchronous delivery requires correlated measurement and operational monitoring.
+
+### Orders-owned transactional outbox
+
+* Good, because it could implement strict per-order head-of-line suspension and a bespoke REST
+  re-drive.
+* Bad, because it duplicates platform tables, leases, sequencing, retry, DLQ and vacuum behavior.
+* Bad, because Orders would own subtle distributed-delivery correctness outside its business
+  boundary.
 
 ### Synchronous publish inside the transaction
 
-* Good, because it satisfies the PRD's "durable write + event publish" wording literally.
-* Good, because a consumer sees the change with no added delay.
-* Bad, because broker latency becomes transition latency under the aggregate row lock.
-* Bad, because it is not atomic across two systems, so the failure between them either drops the event or hides a committed transition.
+* Good, because it matches the PRD's “durable write + event publish” wording literally.
+* Bad, because broker latency and outages become order-transition latency and outages.
+* Bad, because a database commit and remote publish still cannot be one atomic operation.
 
 ### Publish after commit, in the same request
 
-* Good, because the lock is released before the network call.
-* Bad, because the atomicity gap remains, just smaller.
-* Bad, because it still needs a reconciliation sweep, which is an outbox with extra steps.
+* Good, because the aggregate lock is released before the network call.
+* Bad, because the atomicity gap remains and still requires reconciliation.
+* Bad, because callers pay broker latency without gaining atomicity.
 
 ### Change data capture off the write-ahead log
 
-* Good, because it needs no application write path at all.
-* Bad, because the events are a curated contract, not row images, so payload shaping would move outside this gear.
-* Bad, because it couples three consumer gears to this gear's physical schema.
+* Good, because it adds no application write.
+* Bad, because curated GTS payload construction would move outside the gear boundary.
+* Bad, because it couples consumers to Orders physical schema.
 
 ## More Information
 
-Superseded by nothing. `DECISIONS.md` D-41 records the sharding and batching shape and the 30 s
-budget; D-42 records the per-port deadlines that bound the *other* asynchronous cost. This ADR
-exists because the 2026-09-10 review found the publication mode recorded only as a capacity-table
-row, with the alternatives argued nowhere — while being the decision that makes a PRD acceptance
-criterion unsatisfiable.
+Superseded by nothing. This revision replaces the earlier Orders-owned sharded drain with the
+platform producer outbox now present in the repository. `DECISIONS.md` D-41 records the capacity
+and delivery budgets; D-42 records synchronous port deadlines; D-87 records the revised ordering
+posture.
 
 ## Traceability
 
 - **PRD**: [`../PRD.md`](../PRD.md) — §7.1 transition latency and audit completeness, §12 AC-17
-- **DESIGN**: [`../design/01-foundation.md`](../design/01-foundation.md) §3.7 `orders_event_outbox`, §3.8, §4.4
+- **DESIGN**: [`../design/01-foundation.md`](../design/01-foundation.md) §3.6, §3.7
+  *Platform-managed producer persistence*, §3.8, §4.4
 
-This decision directly addresses the following requirements or design elements:
+This decision directly addresses:
 
-* `cpt-cf-bss-orders-lifecycle-fr-order-events` — the eleven events reach three consumer gears through the outbox; this decision fixes the delivery semantics as at-least-once with per-order ordering, and fixes the de-duplication key consumers must use
-* `cpt-cf-bss-orders-lifecycle-nfr-order-transition-latency` — the decision removes the publish from the commit path, which is what lets the commit meet its budget, and is simultaneously why the PRD's combined "durable write + event publish" threshold cannot hold (`Q-16`)
-* `cpt-cf-bss-orders-lifecycle-nfr-order-audit-completeness` — enqueue shares the transition transaction, so an event-declaring committed transition cannot exist without its outbox row; this is the "zero silent drops" guarantee at the egress boundary
-* `cpt-cf-bss-orders-lifecycle-component-transition-engine` — the engine writes the outbox row and allocates its sequence under the aggregate row lock; the drain is a separate worker that mutates no order state
-- **Decisions register**: [`../DECISIONS.md`](../DECISIONS.md) — D-41, D-42, Q-16, Q-19
+* `cpt-cf-bss-orders-lifecycle-fr-order-events` — eleven typed notifications use the supported
+  platform producer path with at-least-once delivery and event-ID de-duplication;
+* `cpt-cf-bss-orders-lifecycle-nfr-order-transition-latency` — publication is outside the commit
+  path; Q-16 requires boundary clarification and performance evidence, with a PRD amendment only
+  if Product and Architecture approve a changed requirement;
+* `cpt-cf-bss-orders-lifecycle-nfr-order-audit-completeness` — enqueue shares the transition
+  transaction, so an event-declaring transition cannot silently omit its durable producer message;
+* `cpt-cf-bss-orders-lifecycle-component-transition-engine` — the engine constructs and enqueues
+  event semantics, while platform workers own delivery state.
+- **Decisions register**: [`../DECISIONS.md`](../DECISIONS.md) — D-17, D-23, D-24, D-41, D-42,
+  D-58, D-87, D-91, Q-16, Q-19, Q-26

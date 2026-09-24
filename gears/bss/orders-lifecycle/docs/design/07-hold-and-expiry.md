@@ -55,8 +55,8 @@ Every state except one. `in_fulfillment` **must not** be auto-expired, because a
 spawn signal may already have been issued and expiring the order would orphan provisioned
 resources with nothing to compensate them. The same exemption covers a hold taken *from*
 `in_fulfillment`. This is the single place in the design where the bounded-lifetime rule is
-deliberately broken, and the exemption lives in the transition table rather than in scheduler
-logic — so a scheduler defect cannot expire such an order, and the bound becomes an operational
+deliberately broken, and the engine enforces the exemption through row admissibility and a
+registered guard — so a scheduler defect cannot expire such an order, and the bound becomes an operational
 SLA raised by the sibling gear instead of an automatic transition.
 
 The bound has **two layers**, and they answer different questions. The **per-state TTL** is
@@ -65,8 +65,8 @@ configured. The **re-entry caps** are design-owned baselines on how many times o
 restart a dwell — **5** resumes and **20** amendments, enforced as guards on those transitions
 themselves. They exist because a per-state TTL alone bounds nothing an actor can restart: both
 resume and amendment rewrite the dwell input, so either loop was an unbounded lifetime available
-to a permitted actor. With both caps in force an order makes at most **26** state entries, so its
-in-flight life is bounded by `26 × the largest configured TTL`. Where one is **not** configured, that state has no bound at all and the cap does not
+to a permitted actor. With both caps in force an order makes at most **74** TTL-covered pre-fulfillment dwell entries. Their configured budgets sum to at most
+`74 × T_max`, excluding scheduler delay and fulfillment-exempt states; §4.2 gives all assumptions. Where one is **not** configured, that state has no bound at all and the cap does not
 supply one — §4.2 states that residual gap rather than papering over it, which is the difference
 between these two layers and the absolute-lifetime backstop an earlier draft claimed.
 
@@ -82,8 +82,8 @@ compliance hold silently stop a customer's billing.
 
 | Requirement | Design Response |
 |-------------|------------------|
-| `cpt-cf-bss-orders-lifecycle-fr-order-hold` | Hold stores the outgoing state on the aggregate; resume reads it as the target. Resume is a lookup, not an inference, so a state added later cannot break resume. |
-| `cpt-cf-bss-orders-lifecycle-fr-order-expiry` | Expiry is an ordinary transition row with the system actor class, driven by one sweep pass over a per-state TTL that holds where configured. Restarting a dwell is bounded separately, by a cap on the resume transition rather than by a second sweep. The `in_fulfillment` exemption and the hold-taken-from-`in_fulfillment` exemption are table rows that do not exist, not scheduler conditions. Where a TTL is unset the state is unbounded, disclosed in §4.2 and alerted in §3.8. |
+| `cpt-cf-bss-orders-lifecycle-fr-order-hold` | Hold stores the outgoing state on the aggregate; resume reads it as the target. The actor, instant and optional reason live on the hold transition's audit entry, not in hold columns (D-138). Resume is a lookup, not an inference, so a state added later cannot break resume. |
+| `cpt-cf-bss-orders-lifecycle-fr-order-expiry` | Expiry is an ordinary transition row with the system actor class, driven by one sweep pass over a per-state TTL that holds where configured. Restarting a dwell is bounded separately, by a cap on the resume transition rather than by a second sweep. `in_fulfillment` has no expiry row; the existing `on_hold` expiry row has a mandatory pre-hold exemption guard. Where a TTL is unset the state is unbounded, disclosed in §4.2 and alerted in §3.8. |
 | `cpt-cf-bss-orders-lifecycle-fr-order-cancel` | Cancel from `on_hold` applies the **pre-hold** state's guards, so a hold cannot be used to widen what cancellation is permitted. |
 | `cpt-cf-bss-orders-lifecycle-nfr-order-retention` | The abandoned-draft sweep auto-voids to `expired` rather than deleting, preserving the audit trail. |
 | `cpt-cf-bss-orders-lifecycle-fr-order-events` | Expiry publishes `OrderExpired`; hold and resume publish `OrderHeld` and `OrderResumed`, which is how the sibling gear knows to suspend or resume its process. |
@@ -92,8 +92,8 @@ compliance hold silently stop a customer's billing.
 
 | NFR ID | NFR Summary | Allocated To | Design Response | Verification Approach |
 |--------|-------------|--------------|-----------------|----------------------|
-| `cpt-cf-bss-orders-lifecycle-nfr-order-audit-completeness` | 100 % of transitions audited | Expiry scheduler | An expiry is a normal transition, so it audits with `system` as actor class and the elapsed bound as reason, naming which of the two bounds of §4.2 elapsed | Test asserting every expired order carries an audit row with the system actor |
-| `cpt-cf-bss-orders-lifecycle-nfr-order-idempotency` | Zero duplicate effects | Expiry scheduler | The sweep runs under a singleton lease and each expiry uses a deterministic idempotency key derived from order and version, so a re-run is absorbed | Concurrency test running two sweep instances and asserting one expiry per order |
+| `cpt-cf-bss-orders-lifecycle-nfr-order-audit-completeness` | 100 % of transitions audited | Expiry scheduler | An expiry is a normal transition, so it audits with `system` as actor class and the elapsed per-state TTL of §4.2 Layer 1 (state, policy identity and revision) as reason — the Layer 2 caps refuse, they never expire | Test asserting every expired order carries an audit row with the system actor |
+| `cpt-cf-bss-orders-lifecycle-nfr-order-idempotency` | Zero duplicate effects | Expiry scheduler | The sweep uses Foundation §3.8 advisory locking; each expiry rechecks eligibility under the engine's row lock and uses a key bound to the observed committed generation and effective TTL policy revision (§3.6) | Concurrency test running two sweep instances, including lock-session loss and hold/resume races, and asserting one expiry per order |
 | `cpt-cf-bss-orders-lifecycle-nfr-order-retention` | Abandoned drafts auto-voided | Draft sweep | Auto-void is an ordinary transition to `expired`; there is no delete path | Test asserting an auto-voided draft and its audit trail remain readable |
 | `cpt-cf-bss-orders-lifecycle-nfr-order-transition-latency` | Commit p95 < 1 s | Hold and resume | Both resolve no external input; resume reads one stored column | Load test on hold and resume |
 
@@ -137,7 +137,9 @@ hold and resume.
 
 `in_fulfillment` is not expirable because no such transition row exists — not because the
 scheduler declines to select it. The distinction matters under defect: a scheduler bug can select
-the wrong orders, and the transition table is the thing that refuses them anyway.
+the wrong orders, and the engine refuses them anyway. For `on_hold` the row does exist: its
+mandatory guard rejects `pre_hold_state = in_fulfillment` as `expiry-exempt-prehold`, not
+`not-admissible`. Both checks run inside the engine; neither relies on scheduler filtering.
 
 #### A resume restarts the state clock, never the order's
 
@@ -197,7 +199,10 @@ otherwise.
 The per-state TTL defaults, the draft auto-void TTL and the override scope —
 platform versus seller — are all PRD open questions owned by Product. This slice specifies the
 **policy model** and leaves the numbers as configuration with no code default, because a code
-default would quietly become the answer.
+default would quietly become the answer. The override mechanism is specified and ready, but it
+ships disabled: the gear-level `ttl_seller_override_enabled` flag defaults to **off**, so only
+platform rows take effect until Product answers Q-06, and that answer becomes configuration
+rather than a design change ([`../DECISIONS.md`](../DECISIONS.md) D-137).
 
 The **two re-entry caps** are deliberately **not** in that group. Both are design-owned values
 with working baselines — the resume cap here (§4.5), the amendment cap in
@@ -210,7 +215,7 @@ is why `04 §4.1` owns and argues it rather than this section.
 
 **What remains unbounded, and it is a Product dependency and not a design gap to close here.**
 Where no TTL is configured for a state, that state has **no bound**: the per-state pass skips it
-(§3.6) and the re-entry caps bound restarts of a dwell that is itself unbounded, so `26 × ∞` is
+(§3.6) and the re-entry caps bound restarts of a dwell that is itself unbounded, so `74 × ∞` is
 still ∞. An earlier draft covered this with an absolute order lifetime measured from `created_at`;
 §4.2 records why that backstop was withdrawn rather than kept. Until PRD §15 row 7 is answered the
 gap is **disclosed** — surfaced as the no-configured-TTL metric and alert of §3.8 — rather than
@@ -222,9 +227,12 @@ claimed closed.
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-entity-hold-record`
 
-The pause: the outgoing state stored as the resume target, the holding actor, the instant, and
-the audited reason. It is a column set on the aggregate rather than a table, because at most one
-hold is ever in force.
+The pause. The hold record is `pre_hold_state` plus the hold transition's audit entry, which
+carries the actor, the instant and the reason; there is no separate hold column set
+([`../DECISIONS.md`](../DECISIONS.md) D-138). `pre_hold_state` is the one column, stored as the
+resume target, and it needs no table because at most one hold is ever in force. The hold reason is
+**optional**: it is recorded on the audit entry, as its `caller_reason` (D-143), and in `OrderHeld` when the caller supplies one,
+and no guard requires it, unlike the mandatory cancel reason of §4.6.
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-entity-state-ttl-policy`
 
@@ -264,7 +272,7 @@ and the alternative to a pause is cancelling an order the seller intends to keep
 ##### Responsibility scope
 
 Hold admissibility from `submitted`, `pending_approval`, `approved` and `in_fulfillment`;
-storage of the pre-hold state; resume to that stored state; and the cancel-from-`on_hold` path
+reliance on the engine's storage of the pre-hold state; resume to that stored state; and the cancel-from-`on_hold` path
 that applies the pre-hold state's guards.
 
 ##### Responsibility boundaries
@@ -287,13 +295,14 @@ concurrently would double-expire orders.
 
 ##### Responsibility scope
 
-The singleton-leased sweep; TTL policy resolution per state; selection of eligible orders;
+The advisory-lock-coordinated sweep (Foundation §3.8); TTL policy resolution per state; selection of eligible orders;
 deterministic idempotency keys per expiry; and the batch and cadence controls. It has **one**
 selection pass — the restart bound lives on the resume transition, not here (§4.2).
 
 ##### Responsibility boundaries
 
-It holds no exemption logic — the transition table refuses `in_fulfillment` regardless of what
+Its SQL excludes exempt holds before pagination to preserve progress, while the engine's
+admissibility check and pre-hold guard independently refuse exempt targets regardless of what
 the sweep selects. It raises no escalation; that is the sibling gear's.
 
 ##### Related components (by ID)
@@ -312,7 +321,7 @@ what a buyer nearly bought.
 
 ##### Responsibility scope
 
-The lease-coordinated sweep over `draft` orders past their auto-void TTL, and the auto-void
+The advisory-lock-coordinated sweep over `draft` orders past their auto-void TTL, and the auto-void
 transition to `expired` that keeps them readable. Where that TTL is unset the sweep does no work
 and `draft` accumulation is unbounded (§4.4).
 
@@ -341,9 +350,15 @@ It deletes nothing and touches no order past `draft`.
 as actor class, which is what makes "who expired this order" answerable as `system` rather than
 as whichever caller happened to trigger it.
 
-**Reasons contributed to the registry**: already-on-hold, resume-target-missing,
-**resume-cap-exhausted**, hold-cancel-refused-by-prehold-guard, **cancel-reason-required**,
-**direct-cancel-window-closed** (shared with the seam slice, defined once here).
+**Reasons contributed to the registry**: resume-target-missing,
+**resume-cap-exhausted**, **cancel-reason-required**,
+**direct-cancel-window-closed** (shared with the seam slice, defined once here),
+**expiry-exempt-prehold**, **expiry-not-due**, **expiry-candidate-stale**.
+`expiry-exempt-prehold` is the row-24 guard refusal for a hold from `in_fulfillment`.
+`expiry-not-due` means the current effective TTL is absent or has not elapsed.
+`expiry-candidate-stale` means the observed generation or effective policy identity/revision no
+longer matches the locked/current inputs. These are engine-evaluated business refusals, audited
+and settled under their attempt key; a later changed generation/policy gets a new key (§3.6).
 `resume-cap-exhausted` is registered **here and only here**: it is row 22's guard refusal when
 `orders_order.resume_count` has reached the cap of §4.5, and it names the cap and the count so the
 caller learns the order cannot re-enter its dwell again and must be cancelled or escalated. It is
@@ -362,8 +377,8 @@ last, in 2026-09-11: a resume against an order that is not `on_hold` is an inadm
 
 | Dependency Gear | Interface Used | Purpose |
 |-------------------|----------------|----------|
-| `toolkit-db` | Runtime-scoped access, via the engine | Hold columns and the sweep's selection queries |
-| Coordination lease library | SDK client | Singleton coordination for the expiry sweep and the draft-abandonment sweep |
+| `toolkit-db` | Runtime-scoped access, via the engine | The pre-hold column and the sweep's selection queries |
+| `toolkit-db` advisory locks | `Db::lock` / `Db::try_lock`, `DbLockGuard` | Expiry and draft-auto-void coordination under Foundation §3.8; correctness also requires transactional eligibility checks |
 
 ### 3.5 External Dependencies
 
@@ -387,13 +402,13 @@ Input: order_id, holding_actor, reason, security_context, idempotency_key, **exp
 one per request, since hold and resume are two calls and each carries its own
 Output: on_hold then the restored state, or a registered refusal
 
-1. [ ] - `p1` - Declare hold admissibility as an engine guard: the current state is `submitted`, `pending_approval`, `approved` or `in_fulfillment`; an inadmissible state refuses with the engine's `not-admissible` - `inst-hr-declare-admissibility-guard`
-2. [ ] - `p1` - Supply the current state as the **pre-hold contribution** to the hold transition; the engine writes the column inside the transition transaction (`01 §3.6` *Attempt Transition* step 20.2) - `inst-hr-store-prehold`
-3. [ ] - `p1` - Request the hold transition with the request's `expected_version`; the engine publishes OrderHeld - `inst-hr-request-hold`
+1. [ ] - `p1` - Declare no admissibility guard: hold is admissible only where `01 §4.3` has a hold row (`submitted`, `pending_approval`, `approved`, `in_fulfillment`), and the engine refuses any other state as `not-admissible` at `01 §3.6` *Attempt Transition* step 11 - `inst-hr-declare-admissibility-guard`
+2. [ ] - `p1` - Supply no pre-hold value; the engine records the outgoing state as `pre_hold_state` at `01 §3.6` *Attempt Transition* step 20.2, and this slice contributes nothing to the aggregate on hold - `inst-hr-store-prehold`
+3. [ ] - `p1` - Request the hold transition with the request's `expected_version`; the engine records the actor, the instant and the reason, if one was supplied, on the audit entry — the reason in its `caller_reason`, NULL when none was supplied (`01 §3.7`, D-143) — and publishes OrderHeld, which carries the reason only when present. No guard requires a hold reason (D-138) - `inst-hr-request-hold`
 4. [ ] - `p1` - **RETURN** on_hold - `inst-hr-return-on-hold`
 5. [ ] - `p1` - **WHEN** resume is later requested: - `inst-hr-when-resume`
    1. [ ] - `p1` - Declare the **resume-cap guard** on row 22, so the engine evaluates it under the aggregate row lock: it fails with `resume-cap-exhausted`, naming the cap and the count, when `orders_order.resume_count` is at or above the cap of §4.5 - `inst-hr-declare-resume-cap`
-   2. [ ] - `p1` - Request the resume transition with the request's `expected_version`, resolving no state and reading no column first — **an order that is not `on_hold` is refused by the engine as `not-admissible`, and one with no stored pre-hold state by `§3.6` step 15** - `inst-hr-request-resume`
+   2. [ ] - `p1` - Request the resume transition with the request's `expected_version`, resolving no state and reading no column first — **an order that is not `on_hold` is refused by the engine as `not-admissible`, and one with no stored pre-hold state by `01 §3.6` *Attempt Transition* step 15 (`resume-target-missing`)** - `inst-hr-request-resume`
    3. [ ] - `p1` - The engine reads the stored pre-hold state as the effective target, clears the pre-hold column, increments `resume_count` and publishes OrderResumed, all inside the transition transaction (`01 §3.6` *Attempt Transition* steps 14, 20.3 and 20.4) — both the target and the counter are engine-owned and this slice contributes neither - `inst-hr-engine-resolves-resume`
    4. [ ] - `p1` - **RETURN** the restored state - `inst-hr-return-restored`
 
@@ -430,34 +445,75 @@ idempotency record, which `01 §2.1` forbids for that reason.
 
 **Algorithm: Sweep Expired Orders**
 
-Input: current time
+Input: database time for the pass cutoff, configured internal worker SecurityContext and private
+maintenance capability (`08 §3.5`); effective policy identities and revisions
 Output: expired count
 
-1. [ ] - `p1` - Acquire the singleton sweep lease; **IF** not acquired, **RETURN** without work - `inst-es-acquire-lease`
+1. [ ] - `p1` - Acquire the sweep advisory lock through toolkit-db under Foundation §3.8; **IF** not acquired, **RETURN** without work. Release explicitly after the bounded pass; on observed session loss abandon the pass and reacquire before retrying - `inst-es-acquire-lease`
 2. [ ] - `p1` - **FOR EACH** expirable state — `submitted`, `pending_approval`, `approved`, `on_hold`: - `inst-es-for-each-state`
-   1. [ ] - `p1` - Resolve the TTL policy for that state at its configuration scope - `inst-es-resolve-ttl`
-   2. [ ] - `p1` - **IF** no TTL is configured: increment the no-configured-TTL gauge of `§3.8` and **SKIP TO** the next state (no code default); that state has **no bound at all** this cadence, which §4.2 discloses rather than covers - `inst-es-if-no-ttl`
-   3. [ ] - `p1` - **FOR EACH** seller scope with its own policy for this state: select orders in that state, for that seller, whose `state_entered_at` is older by that seller's TTL, up to the batch size, using the `(seller_tenant_id, state, state_entered_at)` index - `inst-es-select-eligible`
-   3a. [ ] - `p1` - Then, once for the platform fallback, select orders in that state whose `state_entered_at` is older by the **platform** TTL **and whose `seller_tenant_id` has no policy of its own for this state** — the exclusion is required, not an optimisation: without it an order whose seller configured a longer TTL is selected by the platform pass and expired under the shorter one, silently overriding the override `§3.7` grants - `inst-es-select-platform-fallback`
+   1. [ ] - `p1` - Resolve a consistent policy snapshot for that state at each configuration scope, including its permanent platform row's revision and the effective policy identity/revision/duration. Use §3.7's policy-row locking order in a short SecureTx and release after copying the snapshot - `inst-es-resolve-ttl`
+   2. [ ] - `p1` - **IF** the effective TTL is unset for a scope: set the no-configured-TTL gauge for this scope/state to 1 (set to 0 when configured) of `§3.8` and skip that scope (no code default). An unset platform duration skips fallback only, not configured seller overrides; skip the whole state only when every effective scope is unset - `inst-es-if-no-ttl`
+   3. [ ] - `p1` - **FOR EACH** seller scope with its own policy for this state (none while `ttl_seller_override_enabled` is off: effective-policy selection ignores every `scope = seller` row while the flag is off, whether or not such rows exist, so this pass then selects nothing, §3.7): select due orders for that seller, excluding `on_hold` rows with `pre_hold_state = in_fulfillment` **in SQL before ORDER BY/LIMIT**. Traverse batches of at most 500 by `(state_entered_at, order_id)` through the pass cutoff; carry the last scanned tuple to the next batch, including refused/skipped candidates. Use the seller/state/dwell index with `order_id` as its tie-breaker - `inst-es-select-eligible`
+   3a. [ ] - `p1` - Apply the same exclusion and keyset traversal to the platform fallback, selecting due orders **whose `seller_tenant_id` has no policy of its own for this state**; while `ttl_seller_override_enabled` is off no seller row counts as a policy of its own, so the fallback covers every seller. Resolve the policy identity/revision used for each candidate; an override must never also enter the fallback pass - `inst-es-select-platform-fallback`
    4. [ ] - `p1` - **FOR EACH** selected order: - `inst-es-for-each-order`
       1. [ ] - `p1` - **IF** the state is `on_hold` **AND** its pre-hold state is `in_fulfillment`: - `inst-es-if-hold-from-fulfillment`
          1. [ ] - `p1` - **SKIP TO** the next order; this case is escalated, never expired - `inst-es-skip-exempt-hold`
-      2. [ ] - `p1` - Derive a deterministic idempotency key from order and version - `inst-es-derive-key`
-      3. [ ] - `p1` - Request the expiry transition with actor class `system` - `inst-es-request-expiry`
-      4. [ ] - `p1` - **IF** the engine refuses as not-admissible: record and continue — the table is the authority - `inst-es-if-refused`
+      2. [ ] - `p1` - Capture `order_id`, `current_version`, `audit_sequence`, state, `state_entered_at`, effective `(policy_id, policy_revision, ttl_duration)` and `platform_policy_revision`. Derive the deterministic key from the canonical tuple defined below - `inst-es-derive-key`
+      3. [ ] - `p1` - Invoke the private engine entry with `order_id`, trigger `expire`, configured `security_context`, `idempotency_key`, `expected_version = selected.current_version`, deterministic attempt `correlation_id` and the expiry contribution below. Narrow internal target authority to this order; actor class `system` is derived from the authenticated context — the configured Orders worker identity (D-115) — never from the worker entry and never a replacement for SecurityContext - `inst-es-request-expiry`
+      4. [ ] - `p1` - On `not-admissible`, `expiry-exempt-prehold`, `expiry-not-due`, `expiry-candidate-stale` or the engine's expected-version conflict: record the outcome and continue past this scanned key. On `still-processing`, do not retry in-pass; leave the order for a later pass. On `idempotency-mismatch` or `authorization-context-changed`, record it as a worker defect, raise the sweep-error count of `§3.8` and continue, never retrying the same key. On infrastructure failure, retry the identical request within a bounded retry budget; if exhausted, record the failure and continue, leaving the order for a later pass. Never count a refusal/failure as expiry - `inst-es-if-refused`
 3. [ ] - `p1` - **RETURN** the expired count for the sweep metric - `inst-es-return-count`
 
 **Description**: The two selection steps are separate because **seller scope overrides platform
-scope** (`§3.7`), and a fallback that did not exclude seller-policied orders would not be a fallback
+scope** where Q-06 admits it and `ttl_seller_override_enabled` is on (`§3.7`, D-137), and a fallback that did not exclude seller-policied orders would not be a fallback
 — it would be a second, shorter, unconditional TTL applied behind the seller's back. Resolving the
 effective policy per order before selection is the equivalent formulation and is equally
 acceptable; what is not acceptable is two unqualified queries whose union is wider than either.
 
-Step 2.4.4 is deliberate. The sweep's own exemption check at 2.4.1 is a
-performance optimisation, not the safety mechanism — the safety mechanism is that no
-`in_fulfillment` expiry row exists, so a sweep defect produces a refusal rather than an orphaned
-order. The sweep therefore has **one pass**, over `state_entered_at`, and it bounds exactly what a
-configured TTL bounds.
+**Attempt identity and full engine input.** Use a versioned canonical encoding and hash of
+`(worker_kind, order_id, current_version, audit_sequence, state, dwell_started_at, policy_id,
+policy_revision, platform_policy_revision)` as the key, with `worker_kind = expiry` (or `draft-auto-void`). Here
+`dwell_started_at` is `state_entered_at` for expiry and `created_at` for draft auto-void. The monotonic
+committed `audit_sequence` already changes on hold, resume and every other committed transition;
+it disambiguates equal timestamps without adding a state-entry column. Commercial version alone
+does not identify a dwell. Retransmission retains the entire tuple, contribution, key and
+correlation; a newly observed generation or policy revision is a new attempt. A refused old
+candidate therefore cannot suppress expiry of a later hold/resume period for the registry's
+24-hour window. The configured service principal and tenant namespace must be stable across
+replicas/restarts so `principal_scope` is reproducible; another principal cannot replay it.
+
+The contribution carries observed generation/state/dwell, effective policy identity/revision and
+duration, and `platform_policy_revision`, which name the expired state and its TTL; they are not
+composed into the audit `reason`, which is the closed token `expire` (`auto-void` for a draft)
+(`01 §3.7` *Committed audit reason tokens*, D-148). It grants no authority and supplies no trusted target state. Under the aggregate lock the engine
+verifies the expected version, observed generation and state/dwell, then locks the state's
+permanent platform policy row and chosen seller override, if present, in that order (§3.7).
+Re-read effective policy selection, both revisions and duration while holding those locks through
+commit, reading the flag as step 2.3 does (seller rows ignored while it is off); then check expiry against fresh database time. A changed candidate refuses as
+`expiry-candidate-stale`; an unchanged candidate without an elapsed TTL refuses as
+`expiry-not-due`. The `on_hold` exemption guard always applies. The policy identity and both
+revisions participate in the fingerprint and are carried on the `OrderExpired` payload; the
+committed audit entry records the expired state as `from_state` and its `reason` stays the
+token (D-148). Fingerprint only the stable request
+contribution: exclude pass cutoff, fresh database time, measured elapsed age, retry count and
+other execution-time values. Derive the correlation deterministically from the attempt identity;
+fresh guard observations and audit timestamps are engine results, not changed retry input.
+
+**Progress.** The SQL exclusion prevents 500 old exempt holds from consuming a whole batch.
+Keyset traversal advances on every scanned candidate, so a refused row does not consume each
+following batch. Capture a finite high-water tuple for each scoped pass at its start and stop at
+that tuple; new or changed candidates beyond it enter the next pass. Transactions remain per
+order, not one transaction over 500 orders. Observe cancellation and coordination/database
+failures between batches; on observed loss abandon the pass and restart after reacquisition.
+The guard provides no fencing or guaranteed loss notification (Foundation §3.8). No custom
+durable scheduler checkpoint is introduced: committed expiries cease to be candidates, and
+unchanged refusals replay cheaply but do not prevent traversal to later keys. Liveness assumes
+workers get time to complete passes; sustained restarts/backlog are alerted, not described as a
+one-cadence guarantee. Test more than 500 exempt holds before an eligible order, more than one
+batch of mixed refusals/successes, identical timestamps, policy changes and interruption/restart.
+
+The sweep's checks reduce work; safety belongs to the engine's missing `in_fulfillment` row and
+registered `on_hold` guard. The sweep still has **one pass** over state dwell, not an additional
+absolute-lifetime pass.
 
 **There is deliberately no second pass.** An earlier draft added an absolute-lifetime pass
 selecting on `orders_order.created_at`; it shared one deterministic idempotency key with this pass,
@@ -509,7 +565,8 @@ relative to [`01-foundation`](./01-foundation.md) §3.7.
 | scope | enum | `platform` or `seller` |
 | seller_tenant_id | uuid, nullable | NULL for a platform-scope policy |
 | state | enum | The bounded state: `submitted`, `pending_approval`, `approved`, `on_hold`, or `draft` for the auto-void sweep |
-| ttl | interval | The bound |
+| ttl_duration | interval, nullable | Positive bound when present; NULL means unset for the permanent platform row. Seller override rows require a positive non-NULL duration; removing one restores platform fallback |
+| policy_revision | bigint | Positive revision. Increment a changed row's revision atomically; also increment the permanent platform row's revision on every seller override insertion, update or deletion for this state. Re-creating a deleted seller override uses a fresh `policy_id` |
 | updated_by, updated_at | text, timestamptz | Audit of the policy change itself |
 
 **PK**: policy_id
@@ -519,10 +576,46 @@ relative to [`01-foundation`](./01-foundation.md) §3.7.
 permitting duplicate platform policies ([`../DECISIONS.md`](../DECISIONS.md) D-28);
 `seller_tenant_id` NOT NULL exactly when `scope` is `seller`; `state` **MUST NOT** be
 `in_fulfillment` — the exemption is a schema constraint as well as a missing transition row, so a
-policy cannot be authored for it.
+policy cannot be authored for it. `policy_revision > 0`; `ttl_duration IS NULL` is permitted only
+for platform scope, and a non-NULL duration must be positive. The platform-scope row for each
+of the five admitted states is created by migration with an unset duration and revision 1;
+its identity/scope/state are immutable and it **MUST NOT** be deleted. Startup checks all five
+rows exist; a missing row is a configuration-integrity failure, not an unset TTL. Existing
+`NULLS NOT DISTINCT` uniqueness ensures exactly one platform row per state once seeded.
 
-**Additional info**: seller scope overrides platform scope for the same state. There is **no code
-default** for any per-state TTL; an unconfigured state is not swept, so the absence of a policy is
+**Transactional policy serialization.** The permanent platform row is also the serialization
+row for all policies of its state; no new table, lease or fence is required. Every policy writer
+first locks that row for update through SecureTx, then locks any existing seller override it
+changes. This includes inserting an override where no seller row yet exists and deleting an
+override. Increment the platform row's revision in the same transaction on every edit, even
+where the platform duration is unchanged. Editing its own duration increments that revision
+once; changing an existing seller row increments its revision as well. Thus override creation
+and removal cannot evade generation checks, and conservative invalidation of other sellers'
+candidates is acceptable. Configuration writers never acquire order aggregate locks. Multi-state
+configuration writes lock platform rows in ascending state-name order before any seller rows.
+
+An expiry/auto-void transaction locks its aggregate first, then its state's platform row, then
+the effective seller override if one exists; all are held until commit/rollback. Re-read the
+override after acquiring the platform row, so an absent override is protected against a concurrent
+insert by the same writer protocol. Policy writers cannot form an aggregate-policy lock cycle
+because they never lock aggregates. Use SeaORM's `QuerySelect::lock_exclusive()` **before**
+`.secure().scope_with(...)`, then execute `.one(&secure_tx)`; existing `SecureEntityExt` preserves
+the Select and SecureTx implements DBRunner. `SecureSelect` itself exposes no new locking method.
+All queries retain the configured narrow internal/configuration scope and execute on the same
+transaction connection. Session advisory locks coordinate sweeps only and are not involved in
+policy serialization. PostgreSQL race tests must cover platform TTL edits, override creation,
+update and deletion against expiry, rollback, and loss of the separate sweep lock session.
+
+**Additional info**: seller scope overrides platform scope for the same state **where Q-06 admits
+it and `ttl_seller_override_enabled` is on**; until then only platform rows are effective
+([`../DECISIONS.md`](../DECISIONS.md) D-137). The flag is static per-gear configuration on the same
+promotion path as this table, and it defaults to **off**. While it is off, the policy channel's
+validation rejects any `scope = seller` row at promotion, and effective-policy selection — the
+seller pass of §3.6 step 2.3, the fallback exclusion of step 2.3a, the draft pass and the engine's
+in-transaction re-read — ignores every `scope = seller` row, so the seller pass selects nothing and
+the platform rows are effective for every seller. Turning the flag off after seller rows were
+promoted therefore reverts to the platform rows without deleting them. There is **no code
+default** for any per-state TTL; an unconfigured effective scope is not swept, so an unset duration is
 visible as the no-configured-TTL gauge and alert of §3.8 rather than as a silently applied
 constant. It is **not** covered by a fallback duration — §4.2 states why the absolute-lifetime
 backstop that would have supplied one was withdrawn.
@@ -533,7 +626,7 @@ of operations on an order, not a dwell in a state. Its baseline lives in §4.5 a
 rule in §4.2, and the counter it reads is `orders_order.resume_count`
 ([`01-foundation`](./01-foundation.md) §3.7).
 
-**One dwell input.** The **per-state** bound is measured against
+**One dwell input per sweep.** The **per-state** bound (draft auto-void uses `created_at`, §4.4) is measured against
 `orders_order.state_entered_at`, maintained by the engine inside the transition that changes state
 — not derived from the audit trail, which would be an N+1 correlated subquery over the largest
 table in the gear on every sweep, and which would also contradict the rule that no read derives
@@ -545,24 +638,28 @@ no longer specify opposite sources for one fact ([`../DECISIONS.md`](../DECISION
 `amendment_count` ([`01-foundation`](./01-foundation.md) §3.7) are read by their guards on the
 aggregate row the transition has already loaded and locked, so the caps cost no scan, no second
 sweep pass and no composite index — unlike the withdrawn absolute bound, which needed a
-`(state, created_at)` composite that `01 §3.7` no longer carries (D-90).
+`(state, created_at)` scan across every non-terminal state (D-90); `01 §3.7`'s `(state, created_at, order_id)` index now serves draft auto-void only.
 
 ### 3.8 Deployment Topology
 
-Inherited from [`01-foundation`](./01-foundation.md) §3.8, with two of the gear's **six**
-lease-coordinated workers owned here: the **expiry sweep** and the **draft auto-void sweep**. Both
-take a lease, so a multi-replica deployment cannot double-expire. Both are idle-cheap: a sweep
+Inherited from [`01-foundation`](./01-foundation.md) §3.8, with two of the declared
+advisory-lock-coordinated workers owned here: the **expiry sweep** and the **draft auto-void sweep**. Both
+take session advisory locks to coordinate discovery. Engine row locks, guards and idempotency
+prevent duplicate effects even if a lock session is lost and passes overlap. Both are idle-cheap: a sweep
 with no configured TTL does no work at all.
 
-**Observability owned here**: expiry counts per state per sweep, sweep duration and batch
-saturation, the count of orders **skipped as exempt** (which should be non-zero only for holds
-taken from `in_fulfillment`), the number of states with **no configured TTL** — the signal that a
+**Observability owned here**: expiry counts per state per sweep, sweep duration, last completed
+pass, oldest due candidate and batch saturation, a **sweep-error count** of worker-defect refusals (`idempotency-mismatch`, `authorization-context-changed`) for both sweeps, plus separately scoped counts of **exempt holds**
+(excluded before the page limit, never counted as successful expiry) and guard-race refusals for holds
+taken from `in_fulfillment`, the number of states with **no configured TTL** — the signal that a
 Product-owned value is still unset and those orders are **unbounded**, which is the residual gap
-§4.2 discloses — cancel counts by actor class and reason, hold duration distribution, the **hold
+§4.2 discloses — cancel counts by actor class and reason, hold duration distribution (the hold instant read from
+the hold transition's audit entry, or from `state_entered_at` while the order is still `on_hold`;
+D-138), the **hold
 cycles per order** distribution, and the count of `resume` transitions **refused as
 `resume-cap-exhausted`**, which is how the restart bound firing becomes visible rather than
 inferred. Alerts fire on a sweep
-failing to acquire its lease for longer than two cadences, on batch saturation persisting (the
+failing to acquire its advisory lock for longer than two cadences, on batch saturation persisting (the
 sweep is falling behind), on any state having no configured TTL in a production environment, and
 on any **`resume-cap-exhausted` refusal** at all — because the cap is a backstop, so a non-zero rate
 means either a per-state TTL is missing or an order is being held and resumed in a loop, and both
@@ -593,9 +690,18 @@ intended, since the order has genuinely re-entered the state. What is bounded is
 resume transition ([`01-foundation`](./01-foundation.md) §4.3 row 22) **MUST** carry a registered
 guard that refuses with `resume-cap-exhausted` when that counter has already reached the cap of
 §4.5. No transition — hold, resume, cancel, amendment or administrative edit — **MAY** decrement or
-reset the counter. An order at the cap can still be cancelled, and its per-state TTL still
-elapses; what it cannot do is re-enter a dwell again. See §4.2 for why this is the enforcement
+reset the counter. An order at the cap always keeps a terminal exit, and what it cannot do is
+re-enter a dwell again. A hold taken from `submitted`, `pending_approval` or `approved` can still
+be cancelled through row 23 and its `on_hold` TTL still elapses (row 24). A hold taken from
+`in_fulfillment` is exempt from that TTL (§4.3), and once the spawn signal is recorded row 23's
+shared cancel guard admits no caller but Workflow; its exits are Workflow's failure acknowledgement
+(`acknowledge-failed`, row 26) and workflow-mediated cancel (`cancel-workflow-mediated`, row 27),
+admitted from `on_hold` only for that pre-hold state and under the evidence guards of rows 14 and 16
+([`06-workflow-seam`](./06-workflow-seam.md) §4.1). Completion is not among them: a held order is
+resumed before it completes ([`../DECISIONS.md`](../DECISIONS.md) D-109). See §4.2 for why this is the enforcement
 point and why the absolute-lifetime backstop was withdrawn.
+
+This qualifies PRD §6.3's resumability MUST and is routed as Q-31.
 
 ### 4.2 Bounded lifetime (normative)
 
@@ -629,14 +735,21 @@ cannot both observe a count below its cap. The two budgets are **separate on pur
 a seller-side operational act and an amendment a buyer-side commercial one, so a seller's
 compliance holds **MUST NOT** consume a buyer's ability to revise the order (`04 §4.1`).
 
-**What the caps actually bound, stated as arithmetic.** One state entry is bounded by that state's
-TTL, and the number of entries an order can make is bounded by `1 + 20 + 5 = 26` — the first entry
-plus the capped amendments plus the capped resumes. Therefore **an order's total in-flight life is
-at most 26 x the largest configured TTL among the expirable states.** An earlier version of this
-section claimed `(cap + 1) x TTL`, which bounded *one state's* repeated dwell and was not an upper
-bound on the order at all: an order traverses several states, each with its own TTL, and the number
-of traversals was itself unbounded while amendments were uncapped. The bound above is coarser and
-true.
+**What the caps bound, derived from the full graph.** With amendment cap A and resume cap R,
+the TTL-covered pre-fulfillment subgraph has at most `3 × (A + 1) + 2 × R + 1` dwell entries:
+three approval states per amendment epoch, hold/resume adds two per cycle, and one final
+unresumed hold adds one. Same-state amendments consume their cap without resetting the dwell.
+For A=20 and R=5 this is **74**, not 26. A maximizing path traverses submitted → pending_approval
+→ approved in each of 21 epochs, adds five hold/resume cycles, then a final hold. Read-only
+exhaustive traversal of states plus both counters confirmed 4/64/14/74 entries for caps
+(0,0)/(20,0)/(0,5)/(20,5). Tests must enumerate this graph when transitions or caps change.
+
+`74 × T_max` is a conservative sum of configured dwell budgets, not a hard wall-clock deadline:
+actual expiry includes discovery cadence, backlog, outages and transaction scheduling delay.
+It excludes draft lifetime, `in_fulfillment` and holds from fulfillment. Policy changes can extend
+TTLs, so the formula requires a finite upper bound T_max over policies effective during the
+order's lifetime. Without configured finite TTLs or bounded scheduler delay, no calendar bound
+is claimed. This design adds no new absolute-deadline mechanism.
 
 **What neither layer bounds, disclosed rather than covered.** Where a state's TTL is unset, that
 state has no bound, and the re-entry caps supply none — they multiply a dwell that is itself
@@ -658,8 +771,10 @@ amendment than its cap allows must be cancelled and re-placed, or the cap raised
 visible, audited refusal with a named reason — the property the absolute bound lacked.
 
 Expiry **MUST** be scheduler-driven and **MUST NOT** be a public operation. Its idempotency key
-**MUST** be deterministic from order and version so a re-run is absorbed rather than duplicated.
-There is **one** expiry pass, so no two passes can select one order and no key is shared.
+**MUST** follow §3.6's observed-generation and effective-policy-revision identity so a transport
+retry is absorbed without suppressing an attempt for a later dwell or policy.
+There is **one** expiry eligibility rule; retries and competing replicas observing the same
+candidate share its key, while changed candidates do not.
 
 A **fail-closed park does not suspend the clock**: where the sibling gear cannot obtain an
 approval-requirement verdict, the order remains `submitted` and the `submitted` TTL continues to
@@ -675,13 +790,19 @@ resume-cap guard unconditionally, so a hold taken from `in_fulfillment` and resu
 `resume_count` and still refuses at the cap like any other. An earlier version of this paragraph
 said the exemption covered "both layers alike", which would have left exactly one hold/resume cycle
 uncapped — the `in_fulfillment` one, which is the cycle an operator is most able to repeat and the
-one D-90 was written to close. The exemption is taken because a
+one D-90 was written to close. The cap can stay unconditional because a capped hold from
+`in_fulfillment` is never stranded: `01 §4.3` rows 26 and 27 let Workflow move it straight from
+`on_hold` to `fulfillment_failed` or `cancelled` with compensation evidence, without a resume, so
+exhausting the cap removes only the option of restarting fulfillment ([`../DECISIONS.md`](../DECISIONS.md) D-109). The exemption is taken because a
 subscription spawn signal may already have been issued and expiry would orphan provisioned
 resources with no compensation path.
 
-The exemption **MUST** be structural: no such transition row exists, and no TTL policy may be
-authored for the state. A sweep that selects such an order **MUST** receive a not-admissible
-refusal rather than succeeding.
+The exemption **MUST** be enforced in the engine. `in_fulfillment` has no expiry row and no TTL
+policy may be authored for that state: the policy table's CHECK on `state` rejects it (§3.7), so no such row can exist. The `on_hold`
+expiry row **does** exist; its mandatory guard checks `pre_hold_state` under the aggregate lock
+and returns the registered `expiry-exempt-prehold` refusal for a hold from `in_fulfillment`.
+A sweep defect therefore cannot expire either case. Scheduler exclusions do not replace either
+engine check, and refusal handling must distinguish these two classes.
 
 The bound for these cases is an **operational SLA** raised by the sibling gear: a configurable
 window with a business default of **24 hours past expected fulfillment time**, where expected
@@ -704,6 +825,29 @@ be singleton-coordinated and **MUST NOT** touch any order past `draft`.
 Dwell is measured from the order's creation instant for this sweep specifically, since a `draft`
 has had no state transition since creation.
 
+The draft worker follows §3.6's full engine-input, policy-revision, keyset and retry contract —
+including the refusal handling of `inst-es-if-refused` and its sweep-error count — using trigger `auto-void`, `worker_kind = draft-auto-void`, and `created_at` as its dwell input.
+It supplies the selected `current_version` and `audit_sequence` and a configured internal
+SecurityContext; it is not an actor-class-only call. The engine rechecks `draft` and its effective
+auto-void deadline under lock before committing.
+
+**Draft pass specialization:** on the shared five-minute working cadence, acquire
+`Db::try_lock("bss-orders-lifecycle", "draft-auto-void", LockConfig { max_wait: Some(Duration::ZERO), max_retries: Some(0), ..Default::default() })` — a single non-blocking attempt — using Foundation's session-pooling
+contract; a contended pass skips without mutating orders. Snapshot draft policy scopes using
+the shared row-lock protocol, choose a fixed pass cutoff, and scan due `state = draft` members
+by `(created_at, order_id)` in batches of 500. Process seller overrides (none while `ttl_seller_override_enabled` is off: seller rows are ignored, D-137) and platform
+fallback separately, excluding overrides from fallback. Carry the last scanned key past refusals; each
+candidate invokes the engine as specified above. Count committed expiries separately from
+refusals/infrastructure failures. A submit racing the pass wins or loses under the aggregate
+lock; the loser cannot expire a submitted order. Release the discovery lock at pass end.
+
+Both workers recompute the missing-TTL observation for **all five** policy states, including
+draft. Set each scope/state gauge to 1 when unset and 0 when configured, remove obsolete scope
+labels, and replace the aggregate count from the current snapshot; never accumulate it as a
+counter. Observe configuration even when no orders are due. An unknown configuration read is
+an error/health signal, not an unset value. Test draft-only missing TTL, configuring it later
+(alert clears), removed overrides, empty queues and restart.
+
 **Where the auto-void TTL is unset, `draft` is unbounded, and there is no fallback.** Neither
 re-entry cap applies — a `draft` is never held, resumed or amended — and the absolute-lifetime
 backstop that once covered this case is withdrawn (D-90). `draft` is therefore the state with the
@@ -722,7 +866,7 @@ Product**, each cited by its §15 row:
 | `pending_approval` TTL | row 7 | Should relate to the sibling gear's 72-hour default approval escalation window |
 | `approved` TTL | row 7 | The **ordinary** exit for a declined payment instrument, per [`05-preconditions`](./05-preconditions.md) §4.4 — and, while this value is unset, that order's **only** exit is a caller-driven cancel. The resume cap below stops a hold/resume cycle from restarting the TTL without limit, but it supplies no exit where the TTL itself is absent. This is the sharpest consequence of leaving this one value unset, and `05 §4.4` states it from the other side |
 | `on_hold` TTL | row 7 | The PRD names this the worst case, being deliberately open-ended in intent |
-| Override scope | row 7 | Whether seller scope may override platform scope per state |
+| Override scope | row 7 | Whether seller scope may override platform scope per state. The mechanism is specified (§3.6, §3.7) and ready; it ships behind `ttl_seller_override_enabled`, default **off**, so the open choice is answered by turning the flag on or leaving it off ([`../DECISIONS.md`](../DECISIONS.md) D-137, Q-06) |
 | `draft` auto-void TTL | row 5 | Bounds unbounded basket accumulation; the same row carries the program retention period, tracked as [`../DECISIONS.md`](../DECISIONS.md) Q-07. While unset, the draft sweep does no work and `draft` accumulation is **unbounded** — there is no fallback duration (§4.4) |
 
 Rows 5 and 7 are the two §15 questions this slice waits on. Nothing else here is open: the
@@ -735,11 +879,11 @@ idempotency-key window is **24 hours**, settled in [`01-foundation`](./01-founda
 
 | Value | Baseline | Note |
 |-------|----------|------|
-| Sweep cadence | every 5 minutes per worker | Bounds expiry latency to one cadence past the TTL |
-| Sweep batch size | 500 orders | Keeps a sweep transaction short enough not to hold the aggregate locks it takes |
+| Sweep cadence | every 5 minutes per worker | Starts the next pass; completion latency also depends on backlog, failures and pass duration |
+| Sweep batch size | 500 orders | Bounds each discovery page; keyset traversal continues within the pass, with one engine transaction per order |
 | Overdue window | **24 hours** past expected fulfillment time | **Not** an open question: the PRD commits this as a business default; it is recorded here as committed rather than as unchosen |
 | **Amendment cap** | **20** amendments per order | The other half of Layer 2, **owned and argued in [`04-versioning`](./04-versioning.md) §4.1** because its value is a commercial judgment about how often a buyer may revise an order, not an operational one. Listed here so both re-entry caps are visible in one place |
-| **Resume cap** | **5** resumes per order | Layer 2 of §4.2, enforced as a guard on `01 §4.3` row 22 against `orders_order.resume_count`, which no transition resets. It bounds a **count**, not a duration, so it pre-empts no per-state TTL Product later chooses whatever that value turns out to be — which is why this design can own it while the durations stay open. Five is set from the operational shape the loop has: a compliance or dispute hold that genuinely needs re-taking more than five times on one order is an escalation, not a workflow, and the sixth attempt refuses with `resume-cap-exhausted` and says so on the audit trail. A deployment **MAY** raise or lower it and **MUST NOT** unset it; there is no "unlimited" value |
+| **Resume cap** | **5** resumes per order | Layer 2 of §4.2, enforced as a guard on `01 §4.3` row 22 against `orders_order.resume_count`, which no transition resets. It bounds a **count**, not a duration, so it pre-empts no per-state TTL Product later chooses whatever that value turns out to be — which is why this design can own it while the durations stay open. Five is set from the operational shape the loop has: a compliance or dispute hold that genuinely needs re-taking more than five times on one order is an escalation, not a workflow, and the sixth attempt refuses with `resume-cap-exhausted` and says so on the audit trail. A deployment **MAY** raise or lower it and **MUST NOT** unset it; there is no "unlimited" value. This qualifies PRD §6.3's "A held order **MUST** be resumable", routed as [`../DECISIONS.md`](../DECISIONS.md) Q-31 (§4.1) |
 
 Leaving the Product-owned values unset means an unconfigured state is **not swept at all**, and
 orders in it **do not expire**. Stated without softening: the re-entry caps bound restarts of a
@@ -761,9 +905,9 @@ and no registered reasons ([`../DECISIONS.md`](../DECISIONS.md) D-36).
 Input: order_id, cancelling_actor, reason, security_context, idempotency_key, expected_version
 Output: cancelled, or a registered refusal
 
-1. [ ] - `p1` - Declare the guards the engine evaluates: non-terminal state, a **mandatory** cancel reason, and the pre-hold guard where the state is `on_hold` - `inst-co-declare-guards`
-2. [ ] - `p1` - **IF** the current state is `in_fulfillment`: defer to the spawn-signal guard owned by [`06-workflow-seam`](./06-workflow-seam.md) §3.6 *Evaluate Cancel From In-Fulfillment (shared guard)* — a guard **shared** with `/workflow-cancel`, not that operation's handler; who may call this `/cancel` is settled by the engine's authorization pre-guard against [`08-read-and-authz`](./08-read-and-authz.md) §4.3 before the guard runs (with `06 §4.3` for the write-once spawn-signal rule) - `inst-co-defer-spawn-guard`
-3. [ ] - `p1` - Request the cancel transition; the engine records the actor and the reason on the audit entry and publishes `OrderCancelled` - `inst-co-request-transition`
+1. [ ] - `p1` - Declare the guards the engine evaluates: a **mandatory** cancel reason, and the pre-hold guard where the state is `on_hold`. A terminal state is not a guard: it has no `cancel` row, so the engine's state-table lookup refuses it `not-admissible` (`01 §3.6` *Attempt Transition* step 11) - `inst-co-declare-guards`
+2. [ ] - `p1` - **IF** the effective cancel state is `in_fulfillment` (current state, or stored pre_hold_state when on_hold): defer to the spawn-signal guard owned by [`06-workflow-seam`](./06-workflow-seam.md) §3.6 *Evaluate Cancel From In-Fulfillment (shared guard)* — a guard **shared** with `/workflow-cancel`, not that operation's handler; who may call this `/cancel` is settled by the engine's authorization pre-guard against [`08-read-and-authz`](./08-read-and-authz.md) §4.3 before the guard runs (with `06 §4.3` for the write-once spawn-signal rule) - `inst-co-defer-spawn-guard`
+3. [ ] - `p1` - Request the cancel transition; the engine records the actor and the reason on the audit entry — the reason in its `caller_reason`, its `reason` being the registered machine reason (`01 §3.7`, D-143) — and publishes `OrderCancelled` carrying it - `inst-co-request-transition`
 4. [ ] - `p1` - **RETURN** cancelled - `inst-co-return-cancelled`
 
 A cancel reason is **mandatory** for every actor, not only the seller operator, because the audit

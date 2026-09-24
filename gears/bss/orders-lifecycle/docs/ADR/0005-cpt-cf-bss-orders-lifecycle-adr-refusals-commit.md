@@ -60,11 +60,11 @@ exception**. A failed audit append aborts the attempt.
 
 **Settlement is narrower than auditing, and deliberately so.** **Four of the seven classes settle**
 their idempotency record — unresolvable guard input (`§3.6` step 3.1), not-admissible (11.1),
-version conflict (12.1) and failed slice guard (13.2). The other three do not, and in each case
+version conflict (12.1, or 10.1.1 for a workflow-class trigger, whose version `01 §4.1` checks before admissibility — D-110) and failed slice guard (13.2). The other three do not, and in each case
 because there is no record it would be correct to settle:
 
 * **Authorization denial** refuses *before* the registry is read (step 1), so no caller-supplied key is consulted. This is the security carve-out: an unauthorized caller must not be able to learn a stored outcome, nor to squat a key ahead of the authorized one.
-* **Idempotency-fingerprint mismatch** (7.1.1) means a settled record already exists carrying a *different* request. Re-settling it would destroy the stored outcome the contract promises to replay.
+* **Idempotency-fingerprint mismatch** (7.1.1) means a record already exists carrying a *different* request, whether settled or in-flight. It must preserve both stored outcomes and another request's ownership marker.
 * **Still-processing** (8.1) means the record is in-flight and owned by another request. Settling it would steal that request's marker — and still-processing is not a final answer but "not yet decided", so the property below does not apply to it.
 
 An earlier statement of this decision claimed all seven settled "with one deliberate scoping
@@ -72,6 +72,14 @@ caveat", and `01 §4.1` propagated it as "six of the seven". Both overcounted: t
 four. The correction does not weaken the decision — every refusal is still audited and committed —
 but it matters, because the argument against the rejected third option below is a claim about
 *settled* refusals and must not be read as covering classes that have nothing to settle.
+
+**Assessment response persistence.** Foundation §3.6/§3.7 defines the diagnostic write on
+reached gate refusals and the immutable `settled_response` stored alongside the idempotency
+outcome. The same transaction stores the complete assessment vector and its run ID, audit
+and public failure response. Replay uses that response snapshot; it does not reconstruct a
+failure list from today's order or search diagnostics by correlation. Engine-only refusals
+carry no assessment. No commercial contribution is written by the diagnostic refusal path.
+Diagnostic or response-storage failure aborts the attempt just as audit failure does.
 
 The third option — audit but do not settle — was the closest call, and is rejected because it
 breaks the property the whole idempotency contract rests on **for the four classes that reach a
@@ -98,20 +106,28 @@ verifiable today or planned.
 **Verifiable today, by reading `design/01-foundation.md` §3.6 *Attempt Transition*.** Every one
 of the seven refusal branches carries an audit append and a commit — that half is uniform, and it
 is what "zero silent drops" rests on. **Settlement is not uniform, and the branches say which is
-which.** Four branches settle: unresolvable guard input, not-admissible, version conflict and
-failed slice guard. Three do not, and none of the three is an omission:
+which.** Four branches settle: unresolvable guard input, not-admissible, version conflict (reached
+at step 12, or at step 10.1 ahead of admissibility for a workflow-class trigger — the one declared
+exception to the guard order, D-110) and failed slice guard. Three do not, and none of the three is an omission:
 
 * **Authorization denial** is the deliberate pre-probe exception. It refuses at the algorithm's first step, before the registry is read, and opens its refusal transaction *without loading or locking the aggregate row* — so it consults and settles no caller-supplied key, and an unauthorized caller can neither learn a stored outcome nor squat a key ahead of the authorized one. This is the carve-out `01 §4.1` cites this section for.
-* **Idempotency-fingerprint mismatch** audits and commits against a settled record carrying a *different* request, and must leave that record's stored outcome intact.
+* **Idempotency-fingerprint mismatch** audits and commits against a record carrying a *different* request, and must leave its stored outcome or in-flight ownership intact.
 * **Still-processing** audits and commits against a live in-flight lease owned by another request, and must not steal its marker.
 
-An earlier statement of this section said settlement occurs "on every refusal reached after
-authoritative idempotency resolution". That was wrong in both directions: the unresolvable-input
-branch settles *before* the main transaction's resolution, by resolving or creating the record
-itself, while the mismatch and still-processing branches sit after resolution and settle nothing.
+**Settlement requires ownership, including on early input failure.** Foundation §3.6's common
+transactional idempotency gate runs before any new settlement. The unresolvable-input branch
+must first replay a matching settled outcome unchanged, reject a fingerprint mismatch without
+overwriting the record, or return still-processing without stealing a live lease. Only a new
+claim or an atomically reclaimed matching expired lease permits settlement with the unevaluable
+reason. A pre-transaction probe miss is not evidence that the key remains absent. A replay is
+not a new refusal and creates no additional refusal audit entry.
 The four-and-three split above is the contract, stated identically here, in the Decision Outcome
-and in `01 §4.1`; the invariant suite's settlement family asserts at document level that those
-statements do not drift apart.
+and in `01 §4.1`; review must verify that those statements do not drift apart.
+
+Foundation §4.2 requires concurrent-settlement regression tests: a missed probe followed by a
+port failure must not replace another request's stored success or refusal. The tests also cover
+mismatched fingerprints, live/expired leases, competing absent-key claims and audit rollback.
+These checks remain pending implementation.
 
 **Planned, not yet written.** A fault-injection check that a failed audit append aborts the
 transition (recorded as a verification approach under the audit-completeness NFR in `01 §1.2`); a

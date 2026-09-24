@@ -62,7 +62,7 @@ orders carrying identical content.
 ## Decision Outcome
 
 Chosen option: **a claim table with a partial unique index**. `orders_inflight_overlap_claim`
-carries one row per resolved line key, with `partial UNIQUE (payer_tenant_id, overlap_scope_key)
+carries one row per distinct resolved `(payer_tenant_id, overlap_scope_key)` tuple, with `partial UNIQUE (payer_tenant_id, overlap_scope_key)
 WHERE released_at IS NULL`, inserted inside the transition transaction. A collision maps to the
 registered `order-in-flight-for-key` refusal. The gate predicate remains as a **friendly
 pre-check** that produces a readable refusal in the common case; it is explicitly **not** the
@@ -78,12 +78,15 @@ violation has already aborted. Two things resolve it, both normative in
 (`DECISIONS.md` D-86). The claim is acquired with `ON CONFLICT … DO NOTHING` and the collision
 detected as a **row shortfall** rather than raised as an error, so the transaction is never
 aborted and stays usable for the audit append and the settle. And acquisition is **step 17**,
-ahead of the version append and every other contribution, so a refusal has nothing durable to
-unwind: had it run later, the refusal would have to discard a committed version row and a moved
-current-version pointer in tables that grant no DELETE. **There is consequently no savepoint
-anywhere in the algorithm** — an earlier version of this ADR pointed at one, and ordering replaced
-it. Three properties the acquisition depends on are stated with it: keys offered distinct, keys
-offered in a total order against deadlock, and READ COMMITTED isolation (under snapshot isolation
+ahead of the version append and every other contribution, so a refused acquisition cannot leave
+a new version or moved current-version pointer. It can, however, leave provisional claim inserts:
+Foundation §3.7 resolves this by releasing only this attempt's returned claim IDs before refusal
+commit, requiring an exact update count. Cleanup/audit failure aborts the transaction; otherwise
+the successful transaction result carries the business refusal. Released rows deliberately
+include unsuccessful reservation attempts, not proof of an admitted version. Existing scoped
+insert/update APIs suffice, without savepoints or DELETE grants. Acquisition compares
+full tuples using the proposed payer, offers distinct missing tuples in a common total order,
+and uses READ COMMITTED isolation (under snapshot isolation
 the insert raises a serialisation failure instead of reporting a shortfall). §3.7 declares the
 constraint itself, and carries **no foreign key** to `orders_order_version` for the same ordering
 reason.
@@ -113,7 +116,7 @@ it would make order submission depend on a second system's write availability.
 
 * **The enforcement is a constraint, so it cannot be bypassed by a code path.** This is the property the decision exists for: no slice, migration or admin surface can admit a second in-flight order on a key.
 * **The refusal is not free, and it is the sharp edge of this decision.** The collision is detected by the database mid-transaction, so it must be both *mapped* to `order-in-flight-for-key` and *observed without losing the transaction*. Two failures are possible and they are different: an unmapped violation surfaces as a 500 rather than one of the exhaustive outcomes, and a violation allowed to abort the transaction leaves the audit entry and the settled idempotency record unwritten — a silent drop of exactly the kind `ADR/0005` and the audit-completeness NFR forbid. `01 §3.6` *Attempt Transition* step 17 avoids both, by conflict-free insertion and by position.
-* **The gate predicate must exclude the requesting order.** An amendment is issued by an order that already holds its key, so a predicate counting all holders without excluding its own subject refuses every amendment against itself. The transaction avoids the same trap by **partitioning** the resolved keys and re-offering only the ones the order does not already hold — so its own keys are never candidates for conflict. Ordering is check-then-mutate (`01 §3.6` *Attempt Transition* step 17); the release-first form that preceded it worked for self-collision and surrendered the order's key on a refusal (`DECISIONS.md` D-86). This trap is recorded because it has already been introduced twice.
+* **The gate predicate must exclude the requesting order.** Partition full proposed `(payer_tenant_id, overlap_scope_key)` tuples against this order's held tuples. Retain matches, acquire missing tuples and only then release superseded tuples. An unchanged overlap key with a changed payer is a replacement, not a held match. A refused acquisition preserves old claims and releases only its returned provisional claim IDs under Foundation §3.7. Never release old claims first (D-86).
 * **Claims are never deleted, only released**, so the table grows with submit and amendment traffic and needs an index on `(order_id) WHERE released_at IS NULL` — the release path finds claims by order, and the unique index leads on `payer_tenant_id`.
 * **An order that never reaches a terminal state holds its key forever.** `in_fulfillment` is deliberately expiry-exempt, so a wedged fulfilment blocks that key indefinitely. The design's answer is an operational SLA raised by the sibling gear, which is a process answer to a data problem and is the sharpest residual cost of this decision.
 * **The cap is one, and this decision does not make it configurable.** D-83's first form added a slot column to express "at most N" so that raising `maxConcurrentActive` would admit concurrent in-flight orders. That overrode a PRD MUST without amendment, and is reversed: §6.1(f) and §6.1(g) are separate rules and only the former is configurable.
@@ -127,12 +130,10 @@ verifiable today or planned. Every behavioural check this decision needs is in t
 `(payer_tenant_id, overlap_scope_key) WHERE released_at IS NULL` — a UNIQUE index expresses
 *exactly one*, which is what PRD §6.1(g) fixes — declares the `(order_id) WHERE released_at IS
 NULL` index the release path needs, states that claims are released and never deleted, and names
-the terminal set of `§4.3` on whose transitions the release happens. That the release-before-
-insert ordering is what lets an amendment re-claim its own key is likewise readable there. The
-document-level invariant suite (`scripts/check-design-invariants.py`, run as `make design-check`
-in CI) asserts that every `orders_inflight_overlap_claim.<column>` reference across the set — this
-ADR included — names a real column, and that the index declarations name only that table's
-columns.
+the terminal set of `§4.3` on whose transitions the release happens. Full-tuple partitioning
+retains unchanged claims without self-collision and replaces claims on a payer change.
+Review must verify that overlap-claim column references and index declarations match the
+canonical table schema. No automated CI enforcement of that check is claimed here.
 
 **Planned, not yet written.** A concurrency check issuing two identical submits simultaneously
 and asserting exactly one commits while the other returns `order-in-flight-for-key`; a check that
@@ -196,6 +197,6 @@ This decision directly addresses the following requirements or design elements:
 
 * `cpt-cf-bss-orders-lifecycle-fr-order-submit` — the submit gate's ninth delta predicate is a pre-check over this constraint; the constraint, not the predicate, is what makes the requirement hold under concurrency
 * `cpt-cf-bss-orders-lifecycle-nfr-order-snapshot-integrity` — two concurrent submits on one key would each pin a price for a purchase the other invalidates; refusing the second inside the transaction is what keeps a pin bound to an admissible order
-* `cpt-cf-bss-orders-lifecycle-fr-order-amendment` — the release-before-insert ordering inside the transaction is what lets an amendment re-claim its own key rather than colliding with itself
+* `cpt-cf-bss-orders-lifecycle-fr-order-amendment` — tuple partitioning retains unchanged claims, acquires missing proposed tuples before releasing old ones, and releases exactly this attempt's provisional claims on refusal
 * `cpt-cf-bss-orders-lifecycle-component-transition-engine` — the claim insert and release are engine writes inside the transition transaction; no slice touches the table
 - **Decisions register**: [`../DECISIONS.md`](../DECISIONS.md) — D-26, D-83, Q-05

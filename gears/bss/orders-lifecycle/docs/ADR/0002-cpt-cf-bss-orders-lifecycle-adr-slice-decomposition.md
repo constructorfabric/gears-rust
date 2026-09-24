@@ -27,7 +27,7 @@ decision-makers: BSS Orders team
 **ID**: `cpt-cf-bss-orders-lifecycle-adr-slice-decomposition`
 ## Context and Problem Statement
 
-The order document has eleven states, twenty-five transitions, twenty-five endpoints and two
+The order document has eleven states, twenty-seven transitions, twenty-four endpoints and two
 callers, spanning six PRD capability areas. Every capability — draft authoring, the submit gate,
 amendment, preconditions, the workflow seam, hold and expiry, read and authorization — needs the
 same four guarantees over the same aggregate: authorization, idempotency, an audited transition and
@@ -61,8 +61,8 @@ here.
 
 Chosen option: **one transition engine plus seven capability handlers**. The engine
 (`01-foundation`) owns the aggregate, the version chain, the transition table, the idempotency
-registry, the audit trail and the outbox — and is the only component with a write grant on any of
-them. A handler (`02`–`08`) owns its predicate set, its reason names, its own tables where it
+registry, the audit trail and the typed event enqueue — and is the only Orders component with a
+write grant on those stores. Platform outbox workers alone mutate producer delivery bookkeeping. A handler (`02`–`08`) owns its predicate set, its reason names, its own tables where it
 introduces any, and the composition of its contribution; it owns no write to the order and reaches
 it only through the engine's transition operation.
 
@@ -83,7 +83,7 @@ makes the reader check two places for every question.
 * Template sections that belong to the gear rather than a capability (`§3.4`, `§3.5`, `§3.8`) are thin or inherited in most slices. This is accepted as the price of uniform structure rather than padded.
 * **A handler cannot be deployed independently of the engine.** It has no write path of its own, so the decomposition is a boundary inside one deployable, not a service split. Anything wanting independent deployment would need its own aggregate, which is `ADR/0001`'s decision to reverse rather than this one's.
 * **Seven handlers means seven guard sets registered against one table**, so the engine's startup registration is the integration point where a handler's mistake surfaces — a guard declared against a row that does not exist fails the boot rather than a request.
-* The layout consequence is **ten design documents** — `DESIGN.md`, `design/README.md` and the eight slices — inside a nineteen-artifact gear set that also carries seven ADRs, the decisions register and the upstream-requirements register. That matches the four sibling gears, so reviewers and tooling encounter a familiar shape; the recurring cost of the shape is derived facts drifting between documents, which is why the set is gated by a machine-checked invariant suite.
+* The layout consequence is **ten design documents** — `DESIGN.md`, `design/README.md` and the eight slices — inside a nineteen-artifact gear set that also carries seven ADRs, the decisions register and the upstream-requirements register. That matches the four sibling gears, so reviewers and tooling encounter a familiar shape; the recurring cost of the shape is derived facts drifting between documents, requiring explicit cross-document review.
 
 ### Confirmation
 
@@ -91,20 +91,18 @@ makes the reader check two places for every question.
 verifiable today or planned.
 
 **Verifiable today, with its two exceptions named.** No slice handler writes any of the seven
-table families `01 §2.2`'s single-writer constraint covers — aggregate, version, line,
-resolved-total, audit, idempotency and outbox — a property a reader can confirm by reading that
+Orders table families `01 §2.2`'s single-writer constraint covers — aggregate, version, line,
+resolved-total, audit and idempotency — a property a reader can confirm by reading that
 constraint against every slice's §3.7; nothing mechanises it, so it stays a review property. The
 broader claim that *no* handler writes *anything* would be false, and the two exceptions are
 deliberate rather than leaks: `orders_draft_content` is declared **mutable** and written by
 capture, because a basket is edited freely and versioning it would make every keystroke a version;
 and `orders_read_access_log` is written by the read surface itself (`08 §3.7`), because the fact it
 records is the read, which no transition causes. Both sit outside §2.2's list for those reasons,
-and neither carries commercial state the audit guarantee depends on. What *is* mechanised at document level is narrower: the invariant suite
-(`scripts/check-design-invariants.py`, run as `make design-check` in CI) asserts that no slice
-algorithm returns a refusal ahead of its engine call, that every table a slice defines appears in
-`DESIGN.md` §3.7's canonical inventory, and that every `orders_<table>.<column>` reference in the
-set — ADRs included — names a real column. Those are the families that catch decomposition drift
-today.
+and neither carries commercial state the audit guarantee depends on. Review must check that
+business refusals flow through the engine, that each slice-owned table appears in `DESIGN.md`
+§3.7's inventory, and that table/column references resolve against the declared schema.
+No automated CI enforcement of these document checks is claimed here.
 
 **Planned, not yet written.** Startup registration failing where a handler declares a guard
 against a transition row that does not exist is the runtime half of this decision's enforcement,
@@ -122,7 +120,7 @@ behaviour.
 * Good, because it matches `pricing`, `rating`, `subscriptions` and `ledger`, so reviewers and tooling encounter a familiar shape.
 * Bad, because a handler cannot be deployed or scaled independently — it has no write path, so this is a boundary inside one deployable, not a service split.
 * Bad, because seven handlers contributing to one transaction means the engine's contribution contract is wide, and every new handler widens it.
-* Bad, because the boundary produces ten design documents whose derived facts drift, which is why the set needs a machine-checked invariant suite to stay coherent.
+* Bad, because the boundary produces ten design documents whose derived facts can drift and must be checked together during review.
 
 ### A capability per service, each owning its own writes
 

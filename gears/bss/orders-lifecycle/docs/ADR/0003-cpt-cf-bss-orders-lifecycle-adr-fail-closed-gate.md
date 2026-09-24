@@ -30,7 +30,7 @@ decision-makers: BSS Orders team
 The submit gate adopts the published pricing sellability gate **by reference** (PRD §6.1) and adds
 the Orders delta. Two of its inputs are not available in the platform as it stands: three of the
 six adopted pricing predicates cannot be evaluated from the built read model, and the
-against-existing-subscriptions half of the overlap rule needs a presence read (`SUB-O5`) that
+against-existing-subscriptions half of the overlap rule needs an occupancy read (`SUB-O5`, amended by D-126) that
 Subscriptions does not expose.
 
 An input the gate cannot evaluate is not a rare fault — today it is the normal case. What should
@@ -83,13 +83,14 @@ provisioning compensation, which is the path the two-phase fulfilment barrier ex
 verifiable today or planned.
 
 **Verifiable today, by reading the design set.** The reason registry contains exactly one
-unavailable reason for each of the six ports — catalog predicates, identity and party, contract
-resolution, overlap presence, evaluation and indicative tax — in `design/03-gate-and-pin.md`
+unavailable reason for each of the nine operations — catalog predicates, catalog frontier,
+pin composition, catalog product key, identity, contract resolution, overlap presence, evaluation and
+indicative tax — in `design/03-gate-and-pin.md`
 §3.3; the gate algorithm collects unevaluable inputs into the same all-failures report as
-evaluated failures (§3.6 *Run Gate and Submit* step 9); and §4.1 carries the normative
-prohibition on treating unevaluable as passed. The invariant suite's reason-ownership family
-asserts at document level that each of those names has exactly one owning slice, so a second
-slice cannot quietly register a competing spelling of the same condition.
+evaluated failures (§3.6 *Run Gate and Submit* step 11); and §4.1 carries the normative
+prohibition on treating unevaluable as passed. Review must verify that each reason name has
+exactly one owning slice and that no second slice registers a competing spelling of the same
+condition.
 
 **Planned, not yet written.** A runtime check asserting that an unresolvable port produces a
 refusal rather than an admission is the behavioural half of this decision, and there is nothing
