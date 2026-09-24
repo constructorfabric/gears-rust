@@ -88,6 +88,15 @@ fn to_domain(model: audit_record::Model) -> Result<StoredAuditRecord, DomainErro
     })
 }
 
+/// The cursor binding of one history: the `(declaration_key, tenant)` pair.
+fn history_binding(declaration_key: &str, tenant_id: Uuid) -> String {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    declaration_key.hash(&mut hasher);
+    tenant_id.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
 /// The orderable surface of the history read: newest first, ties broken by id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AuditFilterField {
@@ -227,7 +236,10 @@ impl AuditStore {
             }]),
             limit: query.limit,
             cursor: query.cursor.clone(),
-            filter_hash: None,
+            // Bound to the pair this history pages: a cursor minted for another
+            // setting's or another scope's history carries another binding and
+            // is refused, instead of applying its boundary here.
+            filter_hash: Some(history_binding(declaration_key, tenant_id)),
             select: None,
         };
         let page = paginate_odata::<AuditFilterField, AuditODataMapper, _, _, _, _>(

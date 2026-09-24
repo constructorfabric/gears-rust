@@ -310,3 +310,53 @@ async fn the_store_itself_refuses_to_rewrite_a_record() {
     let read_back = history(&db, tenant, None, None).await.items.remove(0);
     assert_eq!(read_back.actor, "admin", "the record is as it was written");
 }
+
+#[tokio::test]
+async fn a_cursor_minted_for_one_history_is_refused_on_another() {
+    // A cursor carries a boundary in one result set. Applied to another
+    // setting's or another scope's history it would silently skip or repeat
+    // rows there, so it is refused as a cursor for a different query.
+    let db = db().await;
+    let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+    {
+        let conn = db.conn().expect("connection");
+        for (tenant, request) in [(a, "a1"), (a, "a2"), (b, "b1"), (b, "b2")] {
+            AuditStore
+                .append(&conn, &AccessScope::allow_all(), record(tenant, request))
+                .await
+                .expect("append");
+        }
+    }
+    let first = history(&db, a, Some(1), None).await;
+    let cursor = toolkit_odata::CursorV1::decode(
+        &first
+            .page_info
+            .next_cursor
+            .expect("a second page for tenant a"),
+    )
+    .expect("cursor decodes");
+
+    // Its own history continues with it.
+    let second = history(&db, a, Some(1), Some(cursor.clone())).await;
+    assert_eq!(second.items.len(), 1);
+
+    // Another scope's history refuses it.
+    let conn = db.conn().expect("connection");
+    let foreign = AuditStore
+        .history(
+            &conn,
+            &AccessScope::allow_all(),
+            KEY,
+            b,
+            &ODataQuery {
+                limit: Some(1),
+                cursor: Some(cursor),
+                ..ODataQuery::default()
+            },
+        )
+        .await;
+    assert!(
+        matches!(foreign, Err(DomainError::Validation { .. })),
+        "a cursor for tenant a's history is refused on tenant b's: {foreign:?}"
+    );
+}
