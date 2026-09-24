@@ -77,60 +77,10 @@ pub fn reference_key_complaint(node_key: &str, payload: Option<&Value>) -> Optio
     })
 }
 
-/// Recursively sort object keys and normalize numeric spelling so two
-/// semantically identical JSON values hash identically regardless of member
-/// order or of how a producer's serializer happened to render its numbers.
+/// The contract's one canonical rendering, so the request hash and the
+/// embedding-space identity cannot disagree about what "the same JSON" is.
 fn canonicalize(value: &Value) -> Value {
-    match value {
-        Value::Object(map) => {
-            let sorted: std::collections::BTreeMap<String, Value> = map
-                .iter()
-                .map(|(k, v)| (k.clone(), canonicalize(v)))
-                .collect();
-            Value::Object(sorted.into_iter().collect())
-        }
-        Value::Array(items) => Value::Array(items.iter().map(canonicalize).collect()),
-        Value::Number(number) => Value::Number(canonical_number(number)),
-        other => other.clone(),
-    }
-}
-
-/// The largest magnitude an `f64` represents without gaps between consecutive
-/// integers. Above it, a float's integral look says nothing about the integer
-/// a producer meant, so the number is left exactly as it was parsed.
-const EXACT_INTEGER_LIMIT: f64 = 9_007_199_254_740_992.0; // 2^53
-
-/// One spelling per value.
-///
-/// `serde_json` keeps the variant it parsed — `1`, `1.0` and `1e0` arrive as
-/// `PosInt(1)`, `Float(1.0)` and `Float(1.0)` — and `Display` renders the
-/// variant, not the value. Since the hash is taken over the rendered text,
-/// two retries of the same logical request hash differently whenever the
-/// producer's serializer changes how it writes a whole number, which is the
-/// one thing an idempotency key exists to survive. An integral float within
-/// the exactly-representable range therefore folds onto its integer form;
-/// everything else keeps its parsed spelling, which `ryu` already renders
-/// canonically for a given `f64`.
-///
-/// This deliberately makes request identity coarser than payload equality:
-/// `{"n": 1}` and `{"n": 1.0}` are one request, while the stored payloads
-/// would not compare equal. That is the intended direction — a replay answers
-/// with the original outcome and never applies the second body — but it means
-/// the first spelling to arrive is the one that persists.
-fn canonical_number(number: &serde_json::Number) -> serde_json::Number {
-    if number.is_f64()
-        && let Some(float) = number.as_f64()
-        && float.fract() == 0.0
-        && float.abs() < EXACT_INTEGER_LIMIT
-    {
-        // `fract() == 0.0` already excludes NaN and both infinities.
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "the magnitude bound above is exactly the range this cast is lossless over"
-        )]
-        return serde_json::Number::from(float as i64);
-    }
-    number.clone()
+    graph_storage_sdk::models::canonical_json(value)
 }
 
 fn node_value(node: &graph_storage_sdk::models::NodeSpec) -> Value {

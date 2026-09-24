@@ -1332,22 +1332,58 @@ impl EmbeddingSpaceId {
     }
 }
 
-/// Recursively sort object keys so two semantically identical configurations
-/// hash identically regardless of member order.
-fn canonical(value: &serde_json::Value) -> serde_json::Value {
+/// One rendering per JSON value, for everything in this contract that
+/// identifies something by hashing it.
+///
+/// Object keys are sorted, and a whole number is folded onto one spelling.
+/// Both exist because the hash is taken over rendered text: `serde_json` keeps
+/// the variant it parsed, so `1`, `1.0` and `1e0` arrive as `PosInt` and
+/// `Float` and `Display` renders the variant rather than the value. Two
+/// producers of the same logical configuration -- or two versions of one
+/// producer's serializer -- would otherwise hash differently.
+///
+/// Shared rather than copied: the embedding-space identity and the ingest
+/// request hash both do this, and the first version of this function lived in
+/// two places and was fixed in one.
+#[must_use]
+pub fn canonical_json(value: &serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Object(map) => serde_json::Value::Object(
             map.iter()
-                .map(|(key, inner)| (key.clone(), canonical(inner)))
+                .map(|(key, inner)| (key.clone(), canonical_json(inner)))
                 .collect::<std::collections::BTreeMap<_, _>>()
                 .into_iter()
                 .collect(),
         ),
         serde_json::Value::Array(items) => {
-            serde_json::Value::Array(items.iter().map(canonical).collect())
+            serde_json::Value::Array(items.iter().map(canonical_json).collect())
+        }
+        serde_json::Value::Number(number) => {
+            serde_json::Value::Number(canonical_number(number))
         }
         other => other.clone(),
     }
+}
+
+/// The largest magnitude an `f64` represents without gaps between consecutive
+/// integers. Above it, a float's integral look says nothing about the integer
+/// a producer meant, so the number is left exactly as it was parsed.
+const EXACT_INTEGER_LIMIT: f64 = 9_007_199_254_740_992.0; // 2^53
+
+fn canonical_number(number: &serde_json::Number) -> serde_json::Number {
+    if number.is_f64()
+        && let Some(float) = number.as_f64()
+        && float.fract() == 0.0
+        && float.abs() < EXACT_INTEGER_LIMIT
+    {
+        // `fract() == 0.0` already excludes NaN and both infinities.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the magnitude bound above is exactly the range this cast is lossless over"
+        )]
+        return serde_json::Number::from(float as i64);
+    }
+    number.clone()
 }
 
 fn identity_hash(
@@ -1362,9 +1398,9 @@ fn identity_hash(
     // is refused by the DE0708 lint. Field boundaries are length-prefixed so
     // no concatenation of distinct identities can collide.
     let mut hasher = aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256);
-    let preprocessing = canonical(preprocessing).to_string();
-    let pooling = canonical(pooling).to_string();
-    let normalization = canonical(normalization).to_string();
+    let preprocessing = canonical_json(preprocessing).to_string();
+    let pooling = canonical_json(pooling).to_string();
+    let normalization = canonical_json(normalization).to_string();
     for part in [
         model_artifact.as_bytes(),
         tokenizer_artifact.as_bytes(),
@@ -1392,6 +1428,37 @@ mod embedding_space_tests {
             serde_json::json!({ "l2": true }),
             dimension,
         )
+    }
+
+    /// The other half of "the same configuration". Two providers describing
+    /// one preprocessing step can write its numbers differently -- a config
+    /// round-tripped through a float-based representation renders `1` as
+    /// `1.0` -- and the identity is what readiness compares against the
+    /// identity the stored vectors were produced under. A spelling difference
+    /// there reports the embedding space `Unhealthy`, takes vector and hybrid
+    /// search out of service, and sends the operator to a re-embedding
+    /// lifecycle that would not have fixed anything.
+    #[test]
+    fn the_same_identity_hashes_the_same_however_its_numbers_are_written() {
+        let configured = |preprocessing: &str| {
+            EmbeddingSpaceId::new(
+                "all-MiniLM-L6-v2@sha256:abc",
+                "bert-wordpiece@sha256:def",
+                serde_json::from_str(preprocessing).expect("the fixture is JSON"),
+                serde_json::json!({ "strategy": "mean" }),
+                serde_json::json!({ "l2": true }),
+                384,
+            )
+        };
+        assert_eq!(
+            configured(r#"{"max_length": 512}"#).identity_hash,
+            configured(r#"{"max_length": 512.0}"#).identity_hash
+        );
+        assert_ne!(
+            configured(r#"{"max_length": 512}"#).identity_hash,
+            configured(r#"{"max_length": 256}"#).identity_hash,
+            "folding spellings together must not fold values together"
+        );
     }
 
     #[test]
