@@ -29,15 +29,14 @@ fn kind_to_str(kind: TypeKind) -> &'static str {
     kind.as_str()
 }
 
+/// The column is `TEXT` under a `CHECK`, so a value outside the set is drift
+/// or corruption. The SDK owns the spelling in both directions and refuses an
+/// unknown one by name; all this adds is what the offending value was found
+/// in.
 fn kind_from_str(value: &str) -> Result<TypeKind, GraphStoreError> {
-    match value {
-        "node" => Ok(TypeKind::Node),
-        "edge" => Ok(TypeKind::Edge),
-        "attribute" => Ok(TypeKind::Attribute),
-        other => Err(GraphStoreError::Corrupt {
-            reason: format!("gts_type.kind holds `{other}`"),
-        }),
-    }
+    value.parse().map_err(|_| GraphStoreError::Corrupt {
+        reason: format!("gts_type.kind holds `{value}`"),
+    })
 }
 
 /// Read the stored trait resolution back. Hand-written, like the write side:

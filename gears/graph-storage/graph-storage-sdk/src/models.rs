@@ -34,6 +34,86 @@ pub type GtsTypeId = String;
 pub type LabelId = i32;
 
 // ---------------------------------------------------------------------------
+// Closed enums
+// ---------------------------------------------------------------------------
+
+/// A wire or storage string that names no variant of a closed enum.
+///
+/// The Closed Enum Contract's third rule forbids mapping such a value onto a
+/// known variant, so every decoder in this crate refuses by name and hands
+/// the offending spelling back for the caller to report. An `Unknown(String)`
+/// variant would be the other permitted answer; a refusal is chosen because
+/// these values reach authorization and outcome reporting, where carrying an
+/// uninterpretable value forward is worse than stopping.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnknownVariant {
+    /// The enum the value was being decoded into.
+    pub expected: &'static str,
+    /// The value as it arrived, so the report names it.
+    pub found: String,
+}
+
+impl std::fmt::Display for UnknownVariant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "`{}` is not a known {} in this version",
+            self.found, self.expected
+        )
+    }
+}
+
+impl std::error::Error for UnknownVariant {}
+
+/// Both directions of one closed enum's single spelling, from one list.
+///
+/// The encoder and the decoder are generated from the same table, so they
+/// cannot drift apart, and the decoder has no default arm to acquire: there
+/// is nowhere in the generated code for a `_ =>` to be added. Rule 3 is then
+/// a property of this macro rather than a convention each call site keeps.
+macro_rules! closed_enum {
+    ($name:ident, $label:literal { $($variant:ident => $spelling:literal),+ $(,)? }) => {
+        impl $name {
+            /// The one spelling this variant has, in storage and on the wire.
+            #[must_use]
+            pub fn as_str(&self) -> &'static str {
+                match self {
+                    $(Self::$variant => $spelling,)+
+                }
+            }
+        }
+
+        impl std::str::FromStr for $name {
+            type Err = UnknownVariant;
+
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                match value {
+                    $($spelling => Ok(Self::$variant),)+
+                    other => Err(UnknownVariant {
+                        expected: $label,
+                        found: other.to_owned(),
+                    }),
+                }
+            }
+        }
+
+        impl TryFrom<&str> for $name {
+            type Error = UnknownVariant;
+
+            fn try_from(value: &str) -> Result<Self, Self::Error> {
+                value.parse()
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.as_str())
+            }
+        }
+    };
+}
+
+// ---------------------------------------------------------------------------
 // Ontology
 // ---------------------------------------------------------------------------
 
@@ -56,16 +136,11 @@ pub enum TypeKind {
     Attribute,
 }
 
-impl TypeKind {
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Node => "node",
-            Self::Edge => "edge",
-            Self::Attribute => "attribute",
-        }
-    }
-}
+closed_enum!(TypeKind, "type kind" {
+    Node => "node",
+    Edge => "edge",
+    Attribute => "attribute",
+});
 
 /// One type submitted for registration.
 #[derive(Clone, Debug, PartialEq)]
@@ -116,17 +191,12 @@ pub enum ReadinessState {
     NotImplemented,
 }
 
-impl ReadinessState {
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Healthy => "healthy",
-            Self::Degraded => "degraded",
-            Self::Unhealthy => "unhealthy",
-            Self::NotImplemented => "not_implemented",
-        }
-    }
-}
+closed_enum!(ReadinessState, "readiness state" {
+    Healthy => "healthy",
+    Degraded => "degraded",
+    Unhealthy => "unhealthy",
+    NotImplemented => "not_implemented",
+});
 
 /// One row of the readiness matrix, as the endpoint reports it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -400,18 +470,13 @@ pub enum TypeChangeState {
     Undecidable,
 }
 
-impl TypeChangeState {
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::New => "new",
-            Self::Unchanged => "unchanged",
-            Self::Compatible => "compatible",
-            Self::Incompatible => "incompatible",
-            Self::Undecidable => "undecidable",
-        }
-    }
-}
+closed_enum!(TypeChangeState, "type change state" {
+    New => "new",
+    Unchanged => "unchanged",
+    Compatible => "compatible",
+    Incompatible => "incompatible",
+    Undecidable => "undecidable",
+});
 
 /// One reason a directional verdict does not hold, with the schema location
 /// that carries it — so a refusal points at `$.payload` rather than saying
@@ -492,16 +557,11 @@ pub enum TypeOutcome {
     Updated,
 }
 
-impl TypeOutcome {
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Created => "created",
-            Self::Unchanged => "unchanged",
-            Self::Updated => "updated",
-        }
-    }
-}
+closed_enum!(TypeOutcome, "type outcome" {
+    Created => "created",
+    Unchanged => "unchanged",
+    Updated => "updated",
+});
 
 /// A registered type plus what this call did to it.
 #[derive(Clone, Debug, PartialEq)]
@@ -712,6 +772,13 @@ pub enum ItemOutcome {
     Materialized,
 }
 
+closed_enum!(ItemOutcome, "item outcome" {
+    Inserted => "inserted",
+    Updated => "updated",
+    Unchanged => "unchanged",
+    Materialized => "materialized",
+});
+
 /// One per-item validation failure. A batch with any of these commits nothing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ItemError {
@@ -764,6 +831,11 @@ pub enum AdjacencySide {
     Outgoing,
     Incoming,
 }
+
+closed_enum!(AdjacencySide, "adjacency side" {
+    Outgoing => "outgoing",
+    Incoming => "incoming",
+});
 
 /// One incident edge in a node read.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -882,6 +954,11 @@ pub enum SearchArm {
     Vector,
 }
 
+closed_enum!(SearchArm, "search arm" {
+    Lexical => "lexical",
+    Vector => "vector",
+});
+
 /// Search mode. Hybrid runs both arms independently and fuses them with RRF.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SearchMode {
@@ -889,6 +966,12 @@ pub enum SearchMode {
     Vector,
     Hybrid,
 }
+
+closed_enum!(SearchMode, "search mode" {
+    Lexical => "lexical",
+    Vector => "vector",
+    Hybrid => "hybrid",
+});
 
 /// One search request.
 #[derive(Clone, Debug, PartialEq)]
@@ -953,6 +1036,12 @@ pub enum Direction {
     Either,
 }
 
+closed_enum!(Direction, "direction" {
+    Outgoing => "outgoing",
+    Incoming => "incoming",
+    Either => "either",
+});
+
 /// Per-hop budget.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HopBudget {
@@ -974,6 +1063,13 @@ pub enum TruncationReason {
     /// set, is what helps.
     ResponseBytes,
 }
+
+closed_enum!(TruncationReason, "truncation reason" {
+    FrontierCap => "frontier_cap",
+    EdgeScanCap => "edge_scan_cap",
+    NodeBudget => "node_budget",
+    ResponseBytes => "response_bytes",
+});
 
 /// A traversed edge reference.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1336,4 +1432,137 @@ mod embedding_space_tests {
             space("mean", 768).identity_hash
         );
     }
+}
+
+#[cfg(test)]
+mod closed_enum_tests {
+    use super::*;
+
+
+    /// Rule 3 of the Closed Enum Contract, held by a test rather than by each
+    /// call site remembering it.
+    ///
+    /// Every family round-trips through its one spelling, and an
+    /// unrecognized value is refused by name rather than mapped onto a
+    /// variant. The danger the rule exists for is a decoder acquiring a
+    /// `_ =>` arm: an unknown outcome read as `unchanged`, or an unknown
+    /// readiness state read as `healthy`, turns a value the server chose
+    /// into one it did not.
+    macro_rules! contract_case {
+        ($case:ident, $name:ident, $label:literal, [$($variant:expr),+ $(,)?]) => {
+            #[test]
+            fn $case() {
+                let mut seen: Vec<&'static str> = Vec::new();
+                $(
+                    let spelling = $variant.as_str();
+                    assert!(
+                        !seen.contains(&spelling),
+                        "two {} variants share the spelling `{spelling}`",
+                        $label
+                    );
+                    seen.push(spelling);
+                    assert_eq!(
+                        spelling.parse::<$name>().expect("its own spelling decodes"),
+                        $variant,
+                        "{} does not round-trip through `{spelling}`",
+                        $label
+                    );
+                )+
+                for unknown in ["", "UNKNOWN", "healthy_", " node", "something_new"] {
+                    assert!(!seen.contains(&unknown), "the fixture must be unknown");
+                    let refused = unknown
+                        .parse::<$name>()
+                        .expect_err("an unknown value is never a known variant");
+                    assert_eq!(refused.found, unknown);
+                    assert_eq!(refused.expected, $label);
+                }
+            }
+        };
+    }
+
+    contract_case!(
+        a_type_kind,
+        TypeKind,
+        "type kind",
+        [TypeKind::Node, TypeKind::Edge, TypeKind::Attribute]
+    );
+    contract_case!(
+        a_readiness_state,
+        ReadinessState,
+        "readiness state",
+        [
+            ReadinessState::Healthy,
+            ReadinessState::Degraded,
+            ReadinessState::Unhealthy,
+            ReadinessState::NotImplemented,
+        ]
+    );
+    contract_case!(
+        a_type_change_state,
+        TypeChangeState,
+        "type change state",
+        [
+            TypeChangeState::New,
+            TypeChangeState::Unchanged,
+            TypeChangeState::Compatible,
+            TypeChangeState::Incompatible,
+            TypeChangeState::Undecidable,
+        ]
+    );
+    contract_case!(
+        a_type_outcome,
+        TypeOutcome,
+        "type outcome",
+        [
+            TypeOutcome::Created,
+            TypeOutcome::Unchanged,
+            TypeOutcome::Updated
+        ]
+    );
+    contract_case!(
+        an_item_outcome,
+        ItemOutcome,
+        "item outcome",
+        [
+            ItemOutcome::Inserted,
+            ItemOutcome::Updated,
+            ItemOutcome::Unchanged,
+            ItemOutcome::Materialized,
+        ]
+    );
+    contract_case!(
+        an_adjacency_side,
+        AdjacencySide,
+        "adjacency side",
+        [AdjacencySide::Outgoing, AdjacencySide::Incoming]
+    );
+    contract_case!(
+        a_search_arm,
+        SearchArm,
+        "search arm",
+        [SearchArm::Lexical, SearchArm::Vector]
+    );
+    contract_case!(
+        a_search_mode,
+        SearchMode,
+        "search mode",
+        [SearchMode::Lexical, SearchMode::Vector, SearchMode::Hybrid]
+    );
+    contract_case!(
+        a_direction,
+        Direction,
+        "direction",
+        [Direction::Outgoing, Direction::Incoming, Direction::Either]
+    );
+    contract_case!(
+        a_truncation_reason,
+        TruncationReason,
+        "truncation reason",
+        [
+            TruncationReason::FrontierCap,
+            TruncationReason::EdgeScanCap,
+            TruncationReason::NodeBudget,
+            TruncationReason::ResponseBytes,
+        ]
+    );
 }

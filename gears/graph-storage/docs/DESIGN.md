@@ -2346,6 +2346,14 @@ value the server denied. Where a strict decode is preferred, the failure has to
 name the field and the value rather than report a generic parse error, because
 the operator's next question is which variant arrived.
 
+The SDK owns both directions of every spelling in this list — one table per
+family generates the encoder and the decoder together, so they cannot drift
+apart and the decoder has no place for a default arm to be added. Anything
+that needs to read one of these strings, in this repository or in a client
+built on the SDK, decodes through that rather than hand-rolling a match: a
+refusal naming the enum and the offending value is what a decode of an
+unrecognized spelling returns, and a test per family holds it.
+
 **4. These are not extension points.** A deployment does not add its own
 variants, and a producer cannot introduce one through a payload. The set is
 closed by the `CHECK` constraint and by the gear's own mapping, deliberately: an

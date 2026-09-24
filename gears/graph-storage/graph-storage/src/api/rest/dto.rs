@@ -390,13 +390,7 @@ pub struct GraphIngestResultDto {
 }
 
 fn item_outcome_name(outcome: &m::ItemOutcome) -> String {
-    match outcome {
-        m::ItemOutcome::Inserted => "inserted",
-        m::ItemOutcome::Updated => "updated",
-        m::ItemOutcome::Unchanged => "unchanged",
-        m::ItemOutcome::Materialized => "materialized",
-    }
-    .to_owned()
+    outcome.as_str().to_owned()
 }
 
 #[derive(Debug)]
@@ -808,10 +802,7 @@ impl From<m::AdjacencyEntry> for GraphAdjacencyEntryDto {
         Self {
             edge_key: value.edge_key,
             edge_type_id: value.edge_type_id,
-            direction: match value.side {
-                m::AdjacencySide::Outgoing => "outgoing".to_owned(),
-                m::AdjacencySide::Incoming => "incoming".to_owned(),
-            },
+            direction: value.side.as_str().to_owned(),
             neighbor_key: value.neighbor_key,
             neighbor_type_id: value.neighbor_type_id,
         }
@@ -895,10 +886,7 @@ impl From<m::SearchHit> for GraphSearchHitDto {
                 .arms
                 .into_iter()
                 .map(|arm| GraphArmHitDto {
-                    arm: match arm.arm {
-                        m::SearchArm::Lexical => "lexical".to_owned(),
-                        m::SearchArm::Vector => "vector".to_owned(),
-                    },
+                    arm: arm.arm.as_str().to_owned(),
                     rank: arm.rank,
                 })
                 .collect(),
@@ -944,11 +932,5 @@ impl From<m::TraversalResponse> for GraphTraversalResponseDto {
 /// The wire name of a truncation reason, shared by every answer that can
 /// carry one so two surfaces cannot spell the same cause differently.
 fn truncation_name(reason: m::TruncationReason) -> String {
-    match reason {
-        m::TruncationReason::FrontierCap => "frontier_cap",
-        m::TruncationReason::EdgeScanCap => "edge_scan_cap",
-        m::TruncationReason::NodeBudget => "node_budget",
-        m::TruncationReason::ResponseBytes => "response_bytes",
-    }
-    .to_owned()
+    reason.as_str().to_owned()
 }

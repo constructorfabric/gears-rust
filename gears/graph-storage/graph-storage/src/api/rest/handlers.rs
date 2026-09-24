@@ -397,17 +397,13 @@ pub async fn search(
     Extension(services): Extension<Arc<GraphServices>>,
     Json(request): Json<dto::GraphSearchRequest>,
 ) -> ApiResult<Json<dto::GraphSearchResponseDto>> {
-    let mode = match request.mode.as_str() {
-        "lexical" => m::SearchMode::Lexical,
-        "vector" => m::SearchMode::Vector,
-        "hybrid" => m::SearchMode::Hybrid,
-        other => {
-            return Err(DomainError::invalid(format!(
-                "unknown search mode `{other}`; expected lexical, vector or hybrid"
-            ))
-            .into());
-        }
-    };
+    // The SDK owns both directions of this spelling, so a hand-rolled match
+    // here cannot drift from the encoder or acquire a default arm.
+    let mode: m::SearchMode = request.mode.parse().map_err(|unknown| {
+        DomainError::invalid(format!(
+            "{unknown}; expected lexical, vector or hybrid"
+        ))
+    })?;
     let arm_limit = request.arm_limit.unwrap_or(20);
     let response = services
         .search(
