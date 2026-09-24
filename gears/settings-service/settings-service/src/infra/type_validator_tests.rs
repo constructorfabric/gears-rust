@@ -559,3 +559,72 @@ async fn an_instance_of_a_derived_type_is_not_a_reference_to_the_base_type() {
         .expect("validates");
     assert_eq!(codes(&member), vec![field::VALUE_NOT_IN_ENUM]);
 }
+
+const REGION_TENANT_TYPE: &str = "gts.cf.core.settings.type_region_and_tenant.v1~";
+
+#[tokio::test]
+async fn both_registry_traits_on_one_type_share_a_lookup_and_neither_admits_the_others_instance() {
+    // One lookup answers both traits, each reading it against its own expected
+    // type: a region member is no tenant reference, a tenant is no region.
+    let v = GtsTypeValidator::new(catalogue().with_type(
+        REGION_TENANT_TYPE,
+        json!({
+            "$id": format!("gts://{REGION_TENANT_TYPE}"),
+            "type": "string",
+            "x-gts-traits": {
+                "dynamic_enum_source": REGION_SOURCE,
+                "entity_reference": TENANT_TYPE
+            }
+        }),
+    ));
+    let region = format!("{REGION_SOURCE}eu-west-1");
+    let tenant = format!("{TENANT_TYPE}acme.tenants.root.v1");
+
+    let as_region = v
+        .validate_value(REGION_TENANT_TYPE, &json!(region))
+        .await
+        .expect("validates");
+    assert_eq!(codes(&as_region), vec![field::VALUE_REFERENCE_UNRESOLVED]);
+
+    let as_tenant = v
+        .validate_value(REGION_TENANT_TYPE, &json!(tenant))
+        .await
+        .expect("validates");
+    assert_eq!(codes(&as_tenant), vec![field::VALUE_NOT_IN_ENUM]);
+
+    assert_eq!(
+        v.source()
+            .instance_lookups
+            .load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "one lookup per value, shared by both traits"
+    );
+}
+
+#[tokio::test]
+async fn dynamic_enum_members_are_resolved_in_one_lookup_whatever_their_number() {
+    let regions_type = "gts.cf.core.settings.type_regions.v1~";
+    let v = GtsTypeValidator::new(catalogue().with_type(
+        regions_type,
+        json!({
+            "$id": format!("gts://{regions_type}"),
+            "type": "array",
+            "items": { "type": "string" },
+            "x-gts-traits": { "dynamic_enum_source": REGION_SOURCE }
+        }),
+    ));
+    let member = format!("{REGION_SOURCE}eu-central-1");
+    let members: Vec<&str> = std::iter::repeat_n(member.as_str(), 50).collect();
+    let result = v
+        .validate_value(regions_type, &json!(members))
+        .await
+        .expect("validates");
+    assert!(result.is_accepted(), "{result:?}");
+    assert_eq!(
+        v.source()
+            .instance_lookups
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "fifty leaves, one lookup"
+    );
+}
