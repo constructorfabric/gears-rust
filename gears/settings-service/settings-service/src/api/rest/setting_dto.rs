@@ -9,6 +9,7 @@ use uuid::Uuid;
 use crate::domain::error::DomainError;
 use crate::domain::resolution::{EffectiveValue, MASK_TOKEN, scope_path};
 use crate::domain::value::StoredValue;
+use crate::domain::writes::value_state_tag;
 
 /// The value state tag of a scope that holds no row yet — the write path's
 /// absent-state tag, which the read returns for the same state.
@@ -229,7 +230,8 @@ pub struct FlaggedOverrideDto {
     pub last_change_at: String,
     /// Who set it.
     pub set_by: String,
-    /// The override's value state tag.
+    /// The override's value state tag — what a write correcting this row
+    /// presents in `If-Match`.
     pub etag: String,
 }
 
@@ -255,7 +257,9 @@ pub fn render_flagged(
         needs_review_detail: row.needs_review_detail.clone(),
         last_change_at: rfc3339(row.last_change_at),
         set_by: row.set_by.clone(),
-        etag: row.updated_at.unix_timestamp_nanos().to_string(),
+        // The value state tag a correcting write presents — the same definition
+        // the write path compares, never `updated_at`, which a flag moves alone.
+        etag: value_state_tag(Some(row)).as_str().to_owned(),
     }
 }
 

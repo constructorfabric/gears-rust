@@ -1113,3 +1113,70 @@ async fn the_search_corpus_follows_the_callers_entitlement_through_the_enforcer(
         }
     }
 }
+
+#[tokio::test]
+async fn the_tag_a_flagged_row_is_listed_with_is_the_one_a_correcting_write_presents() {
+    // The review listing exists so an administrator can fix what stopped
+    // validating. The tag it hands out must be the value state tag the write
+    // compares — the row's `last_change_at` — not its `updated_at`, which a
+    // flag moves on its own: otherwise the listed tag is stale the moment the
+    // row was flagged and the correction is refused 412 forever.
+    use crate::domain::value::ValueRepository;
+    use crate::infra::storage::value_repo::ValueRepo;
+    use toolkit_security::AccessScope;
+
+    let h = RestHarness::new().await;
+    let id = h.inner.declare("port_like", "cascading", json!(true)).await;
+    let root = h.inner.tree.root;
+    h.inner.set(id, root, json!(false)).await;
+    // Flag it the way a revalidation does: `updated_at` moves, the value and
+    // its `last_change_at` do not.
+    {
+        let conn = h.inner.db.conn().expect("connection");
+        let scope = AccessScope::allow_all();
+        let row = ValueRepo
+            .find_all(&conn, &scope, id)
+            .await
+            .expect("rows")
+            .remove(0);
+        ValueRepo
+            .flag(
+                &conn,
+                &scope,
+                row.id,
+                Some("no longer validates".to_owned()),
+            )
+            .await
+            .expect("flagged");
+    }
+
+    let items = h
+        .items(
+            "/settings-service/v1/settings?$filter=needs_review%20eq%20true",
+            root,
+        )
+        .await;
+    let tag = items[0]["flagged"]["etag"]
+        .as_str()
+        .expect("the listed tag")
+        .to_owned();
+
+    let uri = format!(
+        "/settings-service/v1/settings/{}/value",
+        h.inner.key("port_like").to_string().replace('~', "%7E")
+    );
+    let answer = h
+        .send(
+            "PUT",
+            &uri,
+            Some(json!({ "value": true })),
+            Some(&tag),
+            root,
+        )
+        .await;
+    assert_eq!(
+        answer.status, 200,
+        "the listed tag lets the correction through: {}",
+        answer.body
+    );
+}

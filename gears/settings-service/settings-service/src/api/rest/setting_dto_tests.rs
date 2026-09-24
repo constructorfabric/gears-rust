@@ -342,7 +342,9 @@ mod browse_entry {
         );
         assert_eq!(shown.set_by, "tenant-admin");
         assert_eq!(shown.last_change_at, "1970-01-01T00:03:20Z");
-        assert_eq!(shown.etag, at(300).unix_timestamp_nanos().to_string());
+        // The value state tag (`last_change_at`), not `updated_at`: a flag moves
+        // the latter alone, and a correction must pass the write's check.
+        assert_eq!(shown.etag, at(200).unix_timestamp_nanos().to_string());
 
         // A flagged secret is still a secret: the review listing shows that
         // one exists and needs attention, never what it holds.
