@@ -441,6 +441,22 @@ pub fn decode_public_key_entry(raw: &str, index: usize) -> Result<Vec<u8>, Domai
         .map_err(|e| DomainError::token_invalid(format!("invalid public key entry #{index}: {e}")))
 }
 
+/// Ceiling on how many entries either side's "previous keys" list may carry —
+/// `FS_SIDECAR_PREVIOUS_PUBLIC_KEYS` (parsed here by [`parse_public_key_list`])
+/// and `FileStorageConfig::previous_signing_public_keys` (`config::validate`).
+///
+/// Both lists back a [`Verifier`], which tries every configured key in turn on
+/// every verification (see [`Verifier`]'s doc comment on why there's no `kid`
+/// claim to skip straight to the right one) — so an unbounded list is an
+/// unbounded per-request cost, not just a config-hygiene concern. The set only
+/// ever needs to span keys retained during an in-progress `signing_key_seed`
+/// rotation window (this module's doc comment on [`Verifier`] already
+/// documents the set as "primary + at most a couple of retained previous
+/// keys"); 8 leaves generous headroom over that for a rotation that overlaps
+/// with a second, unrelated rotation, or one left stale for a while, without
+/// letting the list grow large enough for the linear scan to matter.
+pub const MAX_PREVIOUS_SIGNING_PUBLIC_KEYS: usize = 8;
+
 /// Parse a comma-separated list of base64url-encoded Ed25519 public keys —
 /// the `FS_SIDECAR_PREVIOUS_PUBLIC_KEYS` wire format (`bin/sidecar.rs`'s
 /// module doc comment).
@@ -448,7 +464,10 @@ pub fn decode_public_key_entry(raw: &str, index: usize) -> Result<Vec<u8>, Domai
 /// Each element is trimmed; an empty element (e.g. a stray trailing comma)
 /// is silently skipped rather than rejected — unlike a genuinely malformed
 /// key, it carries no ambiguity about operator intent. A key that fails to
-/// decode fails the whole parse, via [`decode_public_key_entry`].
+/// decode fails the whole parse, via [`decode_public_key_entry`]. Does **not**
+/// enforce [`MAX_PREVIOUS_SIGNING_PUBLIC_KEYS`] itself — the sidecar's
+/// `build_config` checks the parsed length, mirroring `config::validate`'s
+/// check on `FileStorageConfig::previous_signing_public_keys`.
 pub fn parse_public_key_list(raw: &str) -> Result<Vec<Vec<u8>>, DomainError> {
     raw.split(',')
         .map(str::trim)

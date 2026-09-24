@@ -303,10 +303,11 @@ pub struct FileStorageConfig {
     /// otherwise perfectly valid.
     ///
     /// `validate()` fails gear init on a malformed entry (bad base64, or the
-    /// wrong decoded length); harmless duplicates (of the current key, or
-    /// within this list) are silently deduped with a startup warning once
-    /// the current key is actually known — see
-    /// `FileService::with_previous_signing_public_keys` and
+    /// wrong decoded length), or on more than
+    /// `infra::signed_url::MAX_PREVIOUS_SIGNING_PUBLIC_KEYS` entries; harmless
+    /// duplicates (of the current key, or within this list) are silently
+    /// deduped with a startup warning once the current key is actually known
+    /// — see `FileService::with_previous_signing_public_keys` and
     /// `infra::signed_url::dedupe_public_keys`.
     #[serde(default)]
     pub previous_signing_public_keys: Vec<String>,
@@ -645,6 +646,20 @@ impl FileStorageConfig {
         // carries the primary key as a literal value for `validate()` to
         // compare against.
         if !self.previous_signing_public_keys.is_empty() {
+            // Checked before decoding: `Verifier` tries every key in the set
+            // in turn on every finalize/report-part callback it verifies
+            // (`Verifier::verify_with_grace`), so an unbounded list is an
+            // unbounded per-callback cost, not just config hygiene.
+            if self.previous_signing_public_keys.len()
+                > crate::infra::signed_url::MAX_PREVIOUS_SIGNING_PUBLIC_KEYS
+            {
+                anyhow::bail!(
+                    "invalid file-storage config: previous_signing_public_keys has {} entries, \
+                     exceeding MAX_PREVIOUS_SIGNING_PUBLIC_KEYS ({})",
+                    self.previous_signing_public_keys.len(),
+                    crate::infra::signed_url::MAX_PREVIOUS_SIGNING_PUBLIC_KEYS
+                );
+            }
             let decoded = self
                 .previous_signing_public_keys
                 .iter()

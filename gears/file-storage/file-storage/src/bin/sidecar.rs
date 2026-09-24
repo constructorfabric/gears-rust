@@ -148,7 +148,8 @@ use file_storage::infra::backend::{BackendRegistry, LocalFsBackend, S3Backend, S
 use file_storage::infra::content::{hash, range};
 use file_storage::infra::metrics::FileStorageMetricsMeter;
 use file_storage::infra::signed_url::{
-    Claims, Op, Verifier, dedupe_public_keys, parse_public_key_list,
+    Claims, MAX_PREVIOUS_SIGNING_PUBLIC_KEYS, Op, Verifier, dedupe_public_keys,
+    parse_public_key_list,
 };
 
 /// Id of the local-fs backend, and the sidecar's `BackendRegistry` default id.
@@ -400,6 +401,18 @@ fn build_config(lookup: impl Fn(&str) -> Option<String>) -> anyhow::Result<Sidec
             .map_err(|e| anyhow::anyhow!("invalid FS_SIDECAR_PREVIOUS_PUBLIC_KEYS: {e}"))?,
         _ => Vec::new(),
     };
+    // Checked before dedup, same as `FileStorageConfig::validate`'s mirror
+    // check on `previous_signing_public_keys`: `Verifier` tries every key in
+    // the set in turn on every request it verifies, so an unbounded list is
+    // an unbounded per-request cost.
+    if previous_public_keys.len() > MAX_PREVIOUS_SIGNING_PUBLIC_KEYS {
+        anyhow::bail!(
+            "invalid FS_SIDECAR_PREVIOUS_PUBLIC_KEYS: {} entries, exceeding \
+             MAX_PREVIOUS_SIGNING_PUBLIC_KEYS ({})",
+            previous_public_keys.len(),
+            MAX_PREVIOUS_SIGNING_PUBLIC_KEYS
+        );
+    }
     // Primary always leads the set (`Verifier::verify` tries keys in
     // order); a duplicate -- of the primary, or within `previous_public_keys`
     // itself -- is silently dropped rather than rejected: it's a harmless

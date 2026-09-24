@@ -1031,6 +1031,13 @@ impl MultipartService {
             if let Some(completed) = stored.into_completed(manifest) {
                 return Ok(completed);
             }
+            tracing::warn!(
+                upload_id = %session.upload_id,
+                "multipart complete_result snapshot failed to parse or is internally \
+                 inconsistent (unrecognized hash_mode/bind_state spelling, or a field \
+                 combination resolve_bind_state/complete_multipart_upload never actually \
+                 produces); falling back to rebuilding the response from the version row"
+            );
         }
         // Fallback: rebuild from the version row. Re-read the file for a
         // fresh content pointer (the caller's snapshot may be stale).
