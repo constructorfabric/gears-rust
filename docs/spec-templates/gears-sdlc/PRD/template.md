@@ -1,3 +1,7 @@
+---
+description: "{One sentence: what this PRD specifies and for which gear.}"
+---
+
 # PRD — {Gear/Feature Name}
 
 <!--

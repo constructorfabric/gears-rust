@@ -1,3 +1,7 @@
+---
+description: "{One sentence: how this decomposition splits which gear's design into features.}"
+---
+
 # Decomposition: {PROJECT_NAME}
 
 **Overall implementation status:**

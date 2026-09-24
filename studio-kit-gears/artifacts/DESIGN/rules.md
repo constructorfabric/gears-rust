@@ -22,6 +22,7 @@
 ## Requirements
 
 ### Structural
+- [ ] Fill the frontmatter `description` with one sentence naming what the document covers and for which gear; retrieval ranks documents on it
 - [ ] Follow `{design_template}` structure and section order
 - [ ] Keep an accurate Table of Contents that matches the final headings
 - [ ] Generate canonical CPT IDs from the template patterns: design, tech, principle, constraint, entity, component, interface, seq, db, dbtable, and topology

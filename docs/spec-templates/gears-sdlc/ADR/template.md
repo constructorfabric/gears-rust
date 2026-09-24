@@ -1,4 +1,5 @@
 ---
+description: "{One sentence: the decision this ADR records and the gear it applies to.}"
 status: accepted
 date: {YYYY-MM-DD}
 decision-makers: {optionally fill decision makers names, accounts or remove that field}

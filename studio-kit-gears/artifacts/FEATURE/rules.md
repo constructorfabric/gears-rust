@@ -23,6 +23,7 @@
 ## Requirements
 
 ### Structural
+- [ ] Fill the frontmatter `description` with one sentence naming what the document covers and for which gear; retrieval ranks documents on it
 - [ ] Follow `{feature_template}` structure and section order
 - [ ] Keep an accurate Table of Contents that matches the final headings
 - [ ] Generate canonical IDs from the template patterns: featstatus, feature, flow, algo, state, and dod

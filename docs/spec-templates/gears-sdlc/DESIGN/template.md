@@ -1,3 +1,7 @@
+---
+description: "{One sentence: what this design covers and for which gear.}"
+---
+
 # Technical Design — {Gear Name}
 
 <!--

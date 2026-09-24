@@ -22,6 +22,7 @@
 ## Requirements
 
 ### Structural
+- [ ] Fill the frontmatter `description` with one sentence naming what the document covers and for which gear; retrieval ranks documents on it
 - [ ] Follow `{adr_template}` structure and section order
 - [ ] Keep an accurate Table of Contents that matches the final headings
 - [ ] Generate the canonical ID as `cpt-{system}-adr-{slug}` and keep it stable

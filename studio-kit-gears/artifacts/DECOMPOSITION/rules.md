@@ -22,6 +22,7 @@
 ## Requirements
 
 ### Structural
+- [ ] Fill the frontmatter `description` with one sentence naming what the document covers and for which gear; retrieval ranks documents on it
 - [ ] Follow `{decomposition_template}` structure and section order
 - [ ] Keep an accurate Table of Contents that matches the final headings
 - [ ] Generate canonical IDs as `cpt-{system}-status-{slug}` and `cpt-{system}-feature-{slug}` for the decomposition status and feature entries

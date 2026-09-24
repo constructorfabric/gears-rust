@@ -22,6 +22,7 @@
 ## Requirements
 
 ### Structural
+- [ ] Fill the frontmatter `description` with one sentence naming what the document covers and for which gear; retrieval ranks documents on it
 - [ ] Follow `{prd_template}` structure and section order
 - [ ] Keep an accurate Table of Contents that matches the final headings
 - [ ] Give every requirement-like item a stable canonical CPT ID from the template patterns: actor, fr, nfr, interface, contract, and usecase

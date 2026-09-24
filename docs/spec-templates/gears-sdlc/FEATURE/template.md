@@ -1,3 +1,7 @@
+---
+description: "{One sentence: the behavior this feature specifies and the gear it belongs to.}"
+---
+
 # Feature: {Feature Name}
 
 - [ ] `p1` - **ID**: `cpt-{system}-featstatus-{feature-slug}-implemented`
