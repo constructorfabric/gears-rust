@@ -18,7 +18,7 @@ use crate::domain::writes::service::{ImpactReport, ValidationReport};
 pub struct SetValueRequest {
     /// The new value, validated against the declaration's value type. Kept as
     /// text until the guards have seen it: a number is refused, not rounded.
-    #[schema(value_type = Object)]
+    #[schema(value_type = Value)]
     pub value: Box<RawValue>,
 }
 
@@ -27,7 +27,7 @@ pub struct SetValueRequest {
 #[toolkit_macros::api_dto(request)]
 pub struct ValidateRequest {
     /// The candidate value.
-    #[schema(value_type = Object)]
+    #[schema(value_type = Value)]
     pub value: Box<RawValue>,
     /// Page size of the impact report, for a cascading setting.
     #[serde(default)]
@@ -41,7 +41,7 @@ pub struct ValidateRequest {
 #[toolkit_macros::api_dto(request)]
 pub struct ImpactRequest {
     /// The candidate value.
-    #[schema(value_type = Object)]
+    #[schema(value_type = Value)]
     pub value: Box<RawValue>,
     /// Page size, one to five hundred; outside that band it is clamped.
     #[serde(default)]
@@ -55,7 +55,7 @@ pub struct ImpactRequest {
 pub struct StageSecretRequest {
     /// The secret value, validated against the declaration's type exactly as
     /// a set validates it.
-    #[schema(value_type = Object)]
+    #[schema(value_type = Value)]
     pub value: Box<RawValue>,
 }
 
@@ -118,7 +118,7 @@ pub struct BatchChangeRequest {
     /// is a value and validates as one — an explicit `null` included, which
     /// is a value and not the field's absence.
     #[serde(default, deserialize_with = "present_value")]
-    #[schema(value_type = Option<Object>)]
+    #[schema(value_type = Option<Value>)]
     pub value: Option<Box<RawValue>>,
     /// The value state tag the caller last read for this scope — for a revert,
     /// the tag of the row being cleared — or the literal `absent` for a first

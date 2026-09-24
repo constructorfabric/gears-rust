@@ -50,11 +50,6 @@ pub struct DeclarationDto {
     /// Optional long-form description.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    /// The value type's effective traits, merged across its inheritance chain.
-    ///
-    /// An empty object when the registry could not answer. Always present so a
-    /// client renders the same shape either way rather than branching on
-    /// absence.
     /// The Schema Default every resolution chain ends in.
     pub default_value: Value,
     /// `public`, `pii` or `secret`; `secret` is derived from the value type.
@@ -71,6 +66,11 @@ pub struct DeclarationDto {
     pub last_change_at: String,
     /// The declaration's state tag, also sent as the `ETag` header.
     pub etag: String,
+    /// The value type's effective traits, merged across its inheritance chain.
+    ///
+    /// An empty object when the registry could not answer. Always present so a
+    /// client renders the same shape either way rather than branching on
+    /// absence.
     pub traits: Value,
 }
 
