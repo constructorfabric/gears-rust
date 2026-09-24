@@ -1187,8 +1187,9 @@ are rejected immediately. `orderId` is the typed event's broker partition key; a
 dead letter is operational evidence, not a process outcome and not an order state (§4.7).
 
 **Retired sequence.** `cpt-cf-bss-orders-workflow-seq-overdue-escalation-timer` — retired by
-ADR-0011; the overdue window is the competing `wait` arm of `10 §3.6` (b) and the lifetime
-ceiling the top-level arm of `10 §3.6` (e); Orders records the escalation through
+ADR-0011; the overdue window is the top-level `overdueMonitor` branch of `10 §3.6` (a) (its list
+in (b)) and the lifetime ceiling the top-level `lifetimeCeiling` branch of `10 §3.6` (a), whose
+escalation and park are the ceiling stage of (d); Orders records the escalation through
 `raise-overdue-escalation` (slice 07).
 
 ### 3.7 Database schemas & tables
@@ -1263,7 +1264,11 @@ is by reference only.
 and resumable by an operator, a park is the fail-closed consequence of an unobtainable verdict or
 an exhausted lifetime ceiling and clears only when an operation records that it may. There is no
 `suspended → terminated` edge: every unwind from a hold passes `compensating` (decision D-82: the lifetime-ceiling park is permitted from `suspended` and leaves the suspension
-open; a parked instance is unwound only through the fence). No transition leaves `terminated`. **The projection never drives the definition**: no task reads `phase` to
+open; a parked instance is unwound only through the fence). There is no `compensating → parked`
+edge: a lifetime ceiling that fires during an unwind does not park, and the unwind continues under
+the fresh ceiling of the re-entered `lifetime` fork (`10 §3.6` (a)). After an `unpark` from a
+lifetime-ceiling park the process resumes the stage and checkpoint the ceiling interrupted, under a
+fresh `P90D` ceiling (`10 §3.6` (d)). No transition leaves `terminated`. **The projection never drives the definition**: no task reads `phase` to
 choose a branch; the definition's own state does that, and the projection exists so an operator
 read and an audit trail can say where the definition has taken the instance.
 
@@ -1597,7 +1602,7 @@ Each responsibility a retired table carried has a named new owner:
   `owf_approval_gate.window_remaining_ms`, written only through slice 03's gate-window port
   ([`08 §3.7`](./08-hold-and-cancel.md#table-owf_timer_pause)); the sweep tick is the definition's
   reconcile arm plus the `reconciliation-sweep` worker; the overdue and lifetime windows are
-  arms of `10 §3.6` (b) and (e).
+  the top-level `overdueMonitor` and `lifetimeCeiling` branches of `10 §3.6` (a).
 - `cpt-cf-bss-orders-workflow-dbtable-owf-timer-pause` (`owf_timer_pause`, slice 08) — retired by
   ADR-0011. The hold pause is the `hold` member of `owf_approval_gate.pause_causes` and the
   remainder is `window_remaining_ms`, both through slice 03's gate-window port; the outage pause
@@ -1737,12 +1742,16 @@ against database time, which cuts a hanging effect and settles it `retryable-fai
 `per-attempt-timeout`. **Four are the definition's**, executed by the platform plugin
 (`10 §2`): the **task retry policy** — attempt count, backoff, jitter — which is the retry budget
 and applies only to operations registered `retryable-on: transient`; the **task timeout**, which
-bounds a whole step across its attempts; the **overdue window**, a `wait` arm competing with the
-fulfillment path that on completion calls `raise-overdue-escalation` and nothing else; and the
-**process-lifetime ceiling**, a top-level `wait` arm that on completion calls
-`raise-overdue-escalation` and `park`. The last two are distinct bounds on distinct clocks and
+bounds a whole step across its attempts; the **overdue window**, the top-level `overdueMonitor` branch, a
+`PT1H` re-check that calls `raise-overdue-escalation` and nothing else and is due only past the
+stored deadline; and the **process-lifetime ceiling**, the top-level literal `P90D` `wait` whose
+firing enters the ceiling stage, which calls `raise-overdue-escalation` and `park` — except during
+an unwind, which does not park (no `compensating → parked` edge) and continues under a fresh
+ceiling; after an operator unpark the process resumes its saved stage under a fresh `P90D`
+ceiling (`10 §3.6` (a), (d)). The last two are distinct bounds on distinct clocks and
 **MUST NOT** be one arm: the overdue window runs from expected fulfillment time and only while the
-order is in fulfillment, whereas the lifetime ceiling runs from process start regardless of phase,
+order is in fulfillment, whereas the lifetime ceiling runs from process start (and afresh from each unpark or unwind
+continuation) regardless of phase,
 is never cancelled by a hold, and is what bounds an order held and resumed indefinitely before it
 ever reaches fulfillment. Exhausting either **MUST NOT** mark a `FulfillmentTask` `failed` and
 **MUST NOT** auto-terminal the order; each raises an operational escalation
@@ -2275,8 +2284,9 @@ are **admission controls inside the dispatch operations** `dispatch-wave1-create
 rules stay stated here because the envelope depends on them: a line that cannot be admitted is
 **deferred**, and a deferral is a **settled success** — the operation settles its key and answers
 the line in `deferred[]` with a `deferReason` and a `retryAfterMs` hint, never a
-`retryable-failure` — so the definition's deferral arm waits and calls again under the next
-dispatch round without consuming the task retry budget
+`retryable-failure` — so the definition's deferral arm waits the fixed `PT1M` tick and calls again
+under the next dispatch round (`retryAfterMs` sets the deferral instant the operation records and
+is never a `wait` value, `10 §3.6` *Fixed waits and re-check loops*) without consuming the task retry budget
 (`cpt-cf-bss-orders-workflow-fr-owf-backpressure`; decision D-96: an
 admission deferral settles as success carrying `deferred[]` and `retryAfterMs`); and a
 throttle-induced delay inside an operation **MUST** stay inside the per-operation deadline — an

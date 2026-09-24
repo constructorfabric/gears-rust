@@ -680,13 +680,17 @@ callable declares `workflow_traits.max_suspension_days: 90` (`design/10-process-
 ([DESIGN_GTS_SCHEMAS.md](../../../serverless-runtime/docs/DESIGN_GTS_SCHEMAS.md) lines 520–529),
 because a suspension that outlives it moves the invocation `suspended → failed`
 ([DESIGN.md](../../../serverless-runtime/docs/DESIGN.md) line 455). What is asked is only
-**whether a tenant runtime policy may cap that value below 90** — the platform commits to
+**whether `max_suspension_days` measures one suspension or the suspended time accumulated over the
+invocation** — the re-check loops of `design/10-process-definition.md` §3.6 wake the invocation
+at least hourly, so a per-suspension measure is never approached, whereas a cumulative measure
+would reach 90 days on a long-lived instance — and **whether a tenant runtime policy may cap that
+value below 90** — the platform commits to
 suspension of at least 30 days with a tenant-configurable maximum
 ([serverless-runtime PRD.md](../../../serverless-runtime/docs/PRD.md) line 404; open as BR-009,
 [NEXT_ADR_SCOPE.md](../../../serverless-runtime/docs/NEXT_ADR_SCOPE.md) line 21) — and, if it may,
 that this gear's tenants are provisioned with a cap of at least 90 days, the `max_process_lifetime`
 of D-53. Delivery further includes (a) **a stated way for a Workflow to declare itself
-async-only**: the platform says `workflow_traits` SHOULD declare it and that a Workflow which
+async-only** (the ask is how to declare it): the platform says `workflow_traits` SHOULD declare it and that a Workflow which
 suspends MUST be marked (DESIGN.md line 653), but the `workflow_traits` schema holds only
 `compensation`, `checkpointing` and `max_suspension_days` (DESIGN_GTS_SCHEMAS.md lines 466–530),
 so the canonical definition declares no such trait until the field exists, and a synchronous start
@@ -705,7 +709,9 @@ rather than rebuilt here.
   definitions of `design/10-process-definition.md` are documentation, the event triggers are not
   enabled, and this gear **MUST NOT** report ready for the `platform` definition source. A
   tenant cap on `max_suspension_days` below 90 would move a held or long-running invocation
-  `suspended → failed` before the lifetime ceiling could park it, so such a cap fails the gate.
+  `suspended → failed` before the lifetime ceiling could park it, so such a cap fails the gate; a
+  cumulative measure would do the same to any instance that lives near 90 days, including one
+  unparked under a fresh ceiling.
 - **Source**: `ADR/0011` (*Runtime gate*); `design/01-foundation.md` §3.8; `design/10-process-definition.md` §1.1, §3.1, §4.5;
   `DECISIONS.md` D-70 (as amended), Q-11; serverless-runtime [ADR-0004](../../../serverless-runtime/docs/ADR/0004-cpt-cf-serverless-runtime-adr-temporal-workflow-engine.md),
   [ADR-0005](../../../serverless-runtime/docs/ADR/0005-cpt-cf-serverless-runtime-adr-thin-host.md) line 83 (plugin layout).
@@ -717,7 +723,11 @@ rather than rebuilt here.
 The event-trigger path and the plugin's `listen` **MUST** consume event-broker GTS events — the
 Orders Lifecycle state events, the Generic Approval decision event and the Subscriptions outcome
 events — under **platform-root tenancy** (Lifecycle D-95) with **per-order ordering** preserved
-(the broker partition key is `orderId`), correlate a `listen` on `orderId` and `orderVersion`, and
+(the broker partition key is `orderId`), correlate a `listen` on `orderId` and `orderVersion`, state **the input shape a trigger passes to
+the invocation it starts** (the definition's `input.from` reads the event envelope — `.id`,
+`.type`, `.data.<member>` — as that input, `design/10-process-definition.md` §3.6 (a), and no
+platform document states whether a trigger passes the envelope, its `data` only, or a mapped
+`params` object), and
 support two start triggers (`OrderSubmitted` filtered to `category = new_sale`, and
 `OrderAmended`) on one Workflow callable. One broker event **MUST** be able both to start an
 invocation through a trigger and to reach a running invocation's `listen` (an `OrderAmended` for a
@@ -732,8 +742,9 @@ matching is plugin-native (line 808).
   non-start Lifecycle triggers, the approval decision and the Subscriptions confirmations cannot
   reach a running instance, so the definition's arms fall back to its poll `wait`s where it has
   them and have no path at all where it does not (hold, resume, terminal events); supersession of
-  an amended order cannot start the new version's invocation; and the Subscriptions confirmation
-  arm is dropped for the poll arm (D-97).
+  an amended order cannot start the new version's invocation; the Subscriptions confirmation
+  arm is dropped for the poll arm (D-97); and if a trigger passes a shape other than the event
+  envelope, the definition's `input.from` must be rewritten to it before the first publish.
 - **Source**: `design/02-triggers-and-start.md` §2.2, §4.7; `design/10-process-definition.md` §2.2 *The closed trigger set*, §3.3, §3.6 (f); `design/05-provisioning-intents.md` §4.1.
 
 #### Member-only storage of trigger inputs and consumed events

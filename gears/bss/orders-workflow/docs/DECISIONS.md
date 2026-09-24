@@ -1985,7 +1985,23 @@ loop is flat: one `do` list whose tasks jump only to siblings. `returnToStage` i
 a shared path returns to the stage an arm left by `set`-ting `$context.nextStage` to that stage and
 exiting to the top level.
 
-**Propagated**: `design/10-process-definition.md` §3.6, §4.5; `design/08-hold-and-cancel.md` §3.3.
+**Amended (2026-09-24, dispatcher placement).** The dispatcher does not sit in the document's own
+`do` list but one level below it, in the `process` branch of the top-level `lifetime` fork
+(`compete: true`, beside the `lifetimeCeiling` and `overdueMonitor` branches), because the lifetime
+ceiling must compete with every stage and a `fork` branch is the only construct that races a
+`wait` against a `do` list. The `process` branch holds the stage tasks and `dispatch`; a stage's
+`then: exit` returns to that branch's list, and every stage task carries `then: dispatch`. When the
+ceiling wins, the document-level tasks after the fork (`afterLifetime`, `ceilingEntry`) record the
+interrupted stage and checkpoint and re-enter the fork at the ceiling stage, under a fresh `P90D`
+ceiling; an unwind interrupted by the ceiling re-enters the fork at the unwind without parking
+(no `compensating → parked` edge, `design/01-foundation.md` §3.7). Where the text above says "the
+top-level list", read "the `process` branch's list". The hold carries no remainder either: the
+escalation window is re-checked on a fixed `PT5M` tick and `apply-resume` answers the first `due`
+(D-70 as amended).
+
+**Propagated**: `design/10-process-definition.md` §3.6, §4.5; `design/08-hold-and-cancel.md` §3.3,
+§3.6, §4.7; `design/01-foundation.md` §3.7; `design/03-approval-execution.md` §4.5;
+`design/07-manual-tasks.md` §4.8.
 
 ### D-81 (M) One shared unwind path: fence, compensate, report, terminate
 

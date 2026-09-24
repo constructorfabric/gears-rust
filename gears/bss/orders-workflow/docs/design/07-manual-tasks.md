@@ -42,7 +42,7 @@
 
 This slice provides four **step operations** and sequences none of them. `create-manual-task`
 (protected) creates or reopens exactly one actionable task per failed subject — a line, the plan,
-or the order — and answers the SLA remainder the definition waits on; `resolve-manual-task`
+or the order — and answers the `slaRound` the definition's SLA re-check passes back; `resolve-manual-task`
 applies an operator's recorded resolution request (retry, override, cancel) or an SLA check to the
 task and answers the branch the definition takes; `verify-override` is the identity check through
 Subscriptions that alone may turn an operator's claim into fulfillment evidence; and
@@ -51,9 +51,13 @@ ceiling, a fail-closed park, an approval-service outage — and nothing else. Th
 they run, the `listen` arm that waits for a resolution, the SLA `wait` and the branch each returned
 enum selects are the definition fragment
 [`10 §3.6` (c) *Partial failure: manual task, resume or compensate*](./10-process-definition.md#c-partial-failure-manual-task-resume-or-compensate);
-the overdue arm that calls `raise-overdue-escalation` is in fragment
-[(b)](./10-process-definition.md#b-fulfillment-eligibility-plan-two-waves-and-the-barrier) and the
-lifetime and park arms in fragment [(a)](./10-process-definition.md#a-start-and-approval). The
+the overdue monitor that calls `raise-overdue-escalation` is the top-level `overdueMonitor`
+branch of fragment [(a)](./10-process-definition.md#a-start-and-approval), whose `do` list is
+shown in fragment
+[(b)](./10-process-definition.md#b-fulfillment-eligibility-plan-two-waves-and-the-barrier); the
+park loop is in fragment (a); the lifetime ceiling is the top-level `lifetimeCeiling` branch of
+fragment (a), and its escalation, park and operator wait are the ceiling stage of fragment
+[(d)](./10-process-definition.md#d-cancel). The
 protected position of `create-manual-task` is the *Failure* row of
 [`10 §4.1` *The fence*](./10-process-definition.md#41-the-fence). Each operation reads the
 commercial data it needs inside Orders under the PDP and receives only references
@@ -79,9 +83,10 @@ therefore a hard precondition and an **identity** check against the line's `bind
 and the operator who asserted it is the authenticated caller of the control endpoint, recorded on
 the request row before any signal reaches the definition.
 
-The overdue monitor's timer is retired (ADR-0011): the overdue window is a definition `wait` arm
-beside the waves that, on completion, calls `raise-overdue-escalation` and nothing else; the
-lifetime ceiling and the park escalation are `wait` arms of fragment (a). No task, escalation or
+The overdue monitor's timer is retired (ADR-0011): the overdue window is the top-level
+`overdueMonitor` branch of the definition, a `PT1H` re-check that calls `raise-overdue-escalation`
+and nothing else; the lifetime ceiling is the top-level `P90D` branch beside it, and the park
+escalation is the `PT5M` re-check of the park loop in fragment (a). No task, escalation or
 queue row in this slice is a new terminal state, and none competes with the dead-letter mechanism,
 which is the platform trigger path's (`01 §4.8`).
 
@@ -94,7 +99,7 @@ which is the platform trigger path's (`01 §4.8`).
 | `cpt-cf-bss-orders-workflow-fr-owf-manual-task` | `create-manual-task` (protected) is the definition's failure-arm call under `remediate`; its creation port is the in-process door for `compensate-order` (06), `raise-overdue-escalation` (`lifetime-ceiling`) and `authorize-cancel` (08). The Incident Recorder substitutes under fail-fast for **forward-execution** failures only — a compensation failure always produces an actionable task (§2.2). |
 | `cpt-cf-bss-orders-workflow-fr-owf-override-semantics` | `verify-override` calls Subscriptions inside Orders, binds the check to the line's `binding_reference`, takes the asserting operator from the request row the control endpoint wrote from `SecurityContext`, lands the line `activated` through slice 04's transition function with `provenance = operator-override`, and records the verified-override columns slice 06 freezes as a compensation subject. |
 | `cpt-cf-bss-orders-workflow-fr-owf-task-queue` | The Operator Task Queue projects manual tasks, incidents and escalations, seller-scoped and keyset-paginated, with the PDP-compiled scope applied inside every mutation; dead-letter rows are **pending** the platform's operator visibility (§3.7 `owf_dead_letter_triage`). |
-| `cpt-cf-bss-orders-workflow-fr-owf-overdue-escalation` | The overdue window is the `waitOverdue` arm of `10 §3.6` (b); `raise-overdue-escalation` records the escalation with order **and step** context and never touches order or line state. |
+| `cpt-cf-bss-orders-workflow-fr-owf-overdue-escalation` | The overdue window is the top-level `overdueMonitor` branch of `10 §3.6` (a), its `do` list in (b): every `PT1H` it calls `raise-overdue-escalation`, which is due only past `expected_fulfillment_at` + 24 h; `raise-overdue-escalation` records the escalation with order **and step** context and never touches order or line state. |
 | `cpt-cf-bss-orders-workflow-fr-owf-dead-letter` | The manual-task-vs-dead-letter boundary is unchanged: a step failure has the manual task; an inbound delivery past its cap is the platform's dead letter (`01 §4.8`). |
 
 #### NFR Allocation
@@ -608,13 +613,15 @@ whose only effect is an operator escalation. This component is the one recorder 
 ##### Responsibility scope
 
 Owns `raise-overdue-escalation` (§3.3). **It owns no timer** (retired by ADR-0011): the clocks
-are definition `wait` arms — `waitOverdue` on `expectedFulfillmentAt + 24 h` in fragment (b),
-`waitCeiling` in fragment (a), `waitTtlMargin` on the park's `escalation_due_at` in the park loop,
-and the outage threshold wait of `03 §4.5` — and each, on completion, calls this operation with
-its `escalationKind`. A 1.0.0 `wait` takes no runtime expression, so `waitCeiling` is a literal
-`P90D` and the three computed clocks are bounded re-check loops (`10 §3.6`): `waitOverdue` re-calls
-this operation, whose `due` answers against the stored deadline, and the park and outage clocks
-re-call the slice 03 operation that owns their deadline. The operation:
+are the definition's — the `overdueMonitor` branch (`PT1H` `waitOverdue`, against the stored
+`expected_fulfillment_at` + 24 h), the `lifetimeCeiling` branch (a literal `P90D` `waitCeiling`,
+whose firing enters the ceiling stage of fragment (d)), the park loop's `PT5M` `waitTtlMargin`
+against the park's `escalation_due_at`, and the outage arm's `PT30S` probe against the outage
+threshold of `03 §4.5` — and each calls this operation with its `escalationKind`. A 1.0.0 `wait`
+takes no runtime expression, so the three computed clocks are bounded re-check loops (`10 §3.6`
+*Fixed waits and re-check loops*): `waitOverdue` re-calls this operation, whose `due` answers
+against the stored deadline, and the park and outage clocks re-call the slice 03 operation that
+owns their deadline and call this one only once it answers `due`. The operation:
 
 - reads the **step context** from Orders' record, not from the definition: the last settled step
   operation of the instance, the wave, the lines not yet terminal, and the blocking object (the open
@@ -634,7 +641,7 @@ second fire is an absorbed duplicate.
 ##### Responsibility boundaries
 
 Never marks a line `failed`, never terminates, holds, parks or cancels anything itself — `park` is
-the definition's next call on the lifetime arm, and any abort is the operator's cancel. Is not the
+the definition's next call in the ceiling stage, and any abort is the operator's cancel. Is not the
 lifetime ceiling: the overdue window only runs from expected fulfillment time, and the unconditional
 ceiling is the top-level `wait` of fragment (a).
 
@@ -649,8 +656,8 @@ ceiling is the top-level `wait` of fragment (a).
 - `cpt-cf-bss-orders-workflow-component-activation-barrier-timer-owner` — the former "shares model
   with" relation is gone with it (retired by ADR-0011, slice 05).
 - The Overdue Escalation Monitor's **durable timer** (`owf_durable_timer`, `timer_kind =
-  overdue-fulfillment`) — retired by ADR-0011; responsibility now: the `waitOverdue` arm of
-  `10 §3.6` (b), executed by the plugin's durable timers.
+  overdue-fulfillment`) — retired by ADR-0011; responsibility now: the top-level `overdueMonitor`
+  branch of `10 §3.6` (a) (its list in (b)), executed by the plugin's durable timers.
 - The **dead-letter redrive path** through an Orders inbound handler — retired with
   `owf_dead_letter_record` (`01 §3.7` *Retired tables*); responsibility now: the platform trigger
   path's dead-letter handling, pending the operator-visibility ask (§3.7 `owf_dead_letter_triage`).
@@ -676,8 +683,8 @@ calls a downstream, 5 s for a record-only one.
 
 | `name` | `protection` | `input` | `output` | `idempotency_key` | `declared_event` | `compensation` | `reasons` | `audit_kind` | `retry_class` | `deadline` |
 |--------|--------------|---------|----------|-------------------|------------------|----------------|-----------|--------------|---------------|------------|
-| `create-manual-task` | `protected` | ref + `scope` ∈ `line` · `plan` · `order`; `subjects[]` (`subjectRef` — `lineRef`, `planRef` or `correlationId` — plus `reason`, the §3.7 enum); `failureCause` (§3.7 enum); `sourceStep` (operation name); `sourceAttempt` (that step's key `attempt` component) | `taskRefs[]`; `exhaustedTaskRefs[]` (tasks whose re-entrance was the third failed attempt, §4.2); `slaRemaining` (duration to the earliest open deadline); `slaRound` | instance-scoped `{tenant}:{correlationId}:create-manual-task:{sourceStep}:{sourceAttempt}`; a re-failure after a retry carries the new `attempt` and therefore a new key, which is what reaches the reopen branch | none | none | `idempotency-key-conflict`, `not-found` (a subject the record does not show failed), `version-mismatch` | `step-completion` | `retryable-on: transient` | 5 s |
-| `resolve-manual-task` | `composable` | ref + `trigger` ∈ `request` · `sla-check`; `taskRef` and `requestRef` (on `request`, from the signal's `data`); `slaRound` (on `sla-check`, as last returned) | `resolution` ∈ `retry` · `override` · `closed` · `escalated` · `exhausted` · `refused` · `none`; `resumeAt` ∈ `plan` · `barrier` · `compensation` · `stage` (on `retry`); `attemptKey` (on `retry`, from `retry-step`); `openTaskCount`; `slaRemaining`; `slaRound` | instance-scoped `{tenant}:{correlationId}:resolve-manual-task:{taskRef}:{requestRef}` on `request`; `{tenant}:{correlationId}:resolve-manual-task:sla:{slaRound}` on `sla-check` | none (`retry` of a line re-enters `failed` → prior state through slice 04's function, which emits nothing on a non-terminal entry) | none | `order-fenced`, `action-not-offered`, `poison-step` (from `retry-step`), `not-found`, `version-mismatch` | `step-completion`; `escalation` when an SLA breach escalates; `retry` (written by `retry-step`) | `retryable-on: transient` | 5 s |
+| `create-manual-task` | `protected` | ref + `scope` ∈ `line` · `plan` · `order`; `subjects[]` (`subjectRef` — `lineRef`, `planRef` or `correlationId` — plus `reason`, the §3.7 enum); `failureCause` (§3.7 enum); `sourceStep` (operation name); `sourceAttempt` (that step's key `attempt` component) | `taskRefs[]`; `exhaustedTaskRefs[]` (tasks whose re-entrance was the third failed attempt, §4.2); `slaRound` (the SLA deadline stays in the record; the definition carries no remainder) | instance-scoped `{tenant}:{correlationId}:create-manual-task:{sourceStep}:{sourceAttempt}`; a re-failure after a retry carries the new `attempt` and therefore a new key, which is what reaches the reopen branch | none | none | `idempotency-key-conflict`, `not-found` (a subject the record does not show failed), `version-mismatch` | `step-completion` | `retryable-on: transient` | 5 s |
+| `resolve-manual-task` | `composable` | ref + `trigger` ∈ `request` · `sla-check`; `taskRef` and `requestRef` (on `request`, from the signal's `data`); `slaRound` (on `sla-check`, as last returned) | `resolution` ∈ `retry` · `override` · `closed` · `escalated` · `exhausted` · `refused` · `none`; `resumeAt` ∈ `plan` · `barrier` · `compensation` · `stage` (on `retry`); `attemptKey` (on `retry`, from `retry-step`); `openTaskCount`; `slaRound` — on `sla-check` before any open task's stored `sla_deadline` has passed, the call records nothing, answers `none` with the same `slaRound` and leaves the registry record `open`, so the next `PT5M` tick calls the same key again | instance-scoped `{tenant}:{correlationId}:resolve-manual-task:{taskRef}:{requestRef}` on `request`; `{tenant}:{correlationId}:resolve-manual-task:sla:{slaRound}` on `sla-check` | none (`retry` of a line re-enters `failed` → prior state through slice 04's function, which emits nothing on a non-terminal entry) | none | `order-fenced`, `action-not-offered`, `poison-step` (from `retry-step`), `not-found`, `version-mismatch` | `step-completion`; `escalation` when an SLA breach escalates; `retry` (written by `retry-step`) | `retryable-on: transient` | 5 s |
 | `verify-override` | `composable` | ref + `taskRef`, `requestRef` | `verified` (bool); `rejection` ∈ `not-active` · `binding-mismatch` · `no-binding-reference` · `corroboration-divergent` · `not-found` · `order-fenced` · `null`; `exhausted` (bool) | instance-scoped `{tenant}:{correlationId}:verify-override:{taskRef}:{requestRef}`; the Subscriptions status read is a read and carries no key | `OrderFulfillmentStepCompleted` with `provenance = operator-override`, enqueued by slice 04's transition function in this settlement transaction, on `verified` only | none — an override-attached subscription is undone as a subject of `compensate-order`, not by a paired undo | `override-unverified`, `order-fenced`, `circuit-breaker-open`, `per-attempt-timeout`, `not-found`, `version-mismatch` | `step-completion` (justification in `owf_audit_entry.justification`) | `retryable-on: transient` | 10 s |
 | `raise-overdue-escalation` | `composable` | ref + `escalationKind` ∈ `overdue-fulfillment` · `lifetime-ceiling` · `park` · `approval-outage`; `subjectRef` (`parkRef` on `park`; the gate `position` on `approval-outage`; null otherwise); `stepRef` (the definition's position, nullable) | `due: true\|false` on `overdue-fulfillment` — database time against the stored `expected_fulfillment_at` + 24 h, the answer the overdue re-check loop switches on (`10 §3.6` (b)); `due: false` raises nothing and leaves the registry record `open`; `escalationRef`; `raised` (bool; false when absorbed, not due, or when the subject has already resolved); `taskRef` (on `lifetime-ceiling`) | instance-scoped `{tenant}:{correlationId}:raise-overdue-escalation:{escalationKind}:{orderVersion}:{subjectRef or "-"}` | none | none | `not-found` (unknown `parkRef` or position), `version-mismatch` | `escalation` | `retryable-on: transient` | 5 s |
 
@@ -698,7 +705,7 @@ failed-entrance route is a change to this table.
 | `admit-trigger` retry exhaustion on a `listen` arm (02 §4.6) | definition | `order` | `trigger-applicability-unverified` |
 | Compensation leg `failed-pending-escalation` (06) | `compensate-order`, creation port, **either policy** | `line` | `draft-void-failed`, `activated-cancel-failed` |
 | Apply-time authority re-check fails (08, `09 §4`) | `authorize-cancel`, creation port | `order` | `authority-withdrawn` |
-| Lifetime ceiling (fragment (a)) | `raise-overdue-escalation` `lifetime-ceiling`, creation port | `order` | `lifetime-ceiling-reached` |
+| Lifetime ceiling (ceiling stage, fragment (d)) | `raise-overdue-escalation` `lifetime-ceiling`, creation port | `order` | `lifetime-ceiling-reached` |
 
 Under `fail-fast` the definition does not call `create-manual-task` for a forward line or an
 `invalid-dependency-graph` plan; those subjects reach the incident port inside
@@ -809,8 +816,8 @@ sequenceDiagram
         IR ->> R: one incident per subject per order version
     end
     MTC ->> R: per subject: open task? absorb : resolved after retry? reopen : insert
-    MTC -->> D: taskRefs[], exhaustedTaskRefs[], slaRemaining, slaRound
-    D ->> D: awaitResolution fork: resolution listen × SLA wait × hold × amendment × cancel
+    MTC -->> D: taskRefs[], exhaustedTaskRefs[], slaRound
+    D ->> D: awaitResolution fork: resolution listen × PT5M SLA tick × hold × amendment × cancel
 ```
 
 **Algorithm: `create-manual-task`** (the creation port runs steps 2–6 inside its caller's transaction)
@@ -820,7 +827,7 @@ sequenceDiagram
 3. [ ] - `p1` - Read the pinned `policy` from the plan (or `remediate` where no plan exists); **IF** the reason is a forward line or `invalid-dependency-graph` reason **AND** the policy is `fail-fast`: **RETURN** `permanent-failure` with `version-mismatch` — the definition must not call it there (§4.8), and the incident port is the fail-fast door - `inst-cmt-policy`
 4. [ ] - `p1` - **FOR EACH** subject, under `UNIQUE (order_id, order_version, task_scope, scope_ref, failure_reason)`: **IF** an open task exists: absorb (refresh `last_failed_at`, `failure_cause`); **ELSE IF** a `resolved` task exists with `resolution_action = retry`: transition `resolved → reopened`, increment `reopen_count` and `failed_attempt_count`, recompute `sla_deadline` from now; **ELSE IF** a `resolved` task exists otherwise: insert nothing and **RETURN** its `taskRef` (the subject was closed by override, cancel or exhaustion and a repeat entrance is a duplicate report); **ELSE** insert a task with `severity` (`urgent` for `activated-cancel-failed`, else `normal`), `sla_deadline` per §4.1 and `resolution_actions` per §4.4 - `inst-cmt-upsert`
 5. [ ] - `p1` - **IF** a reopened task's `failed_attempt_count` reaches 3 **AND** its scope is `line` or `plan` with a forward reason: resolve it `exhausted` / `remediation-exhausted` and add it to `exhaustedTaskRefs` (§4.2) - `inst-cmt-exhaust`
-6. [ ] - `p1` - Write the `step-completion` audit entry per task; settle the key; **RETURN** `taskRefs[]`, `exhaustedTaskRefs[]`, `slaRemaining` (earliest open `sla_deadline` − database now) and the next `slaRound` - `inst-cmt-settle`
+6. [ ] - `p1` - Write the `step-completion` audit entry per task; settle the key; **RETURN** `taskRefs[]`, `exhaustedTaskRefs[]` and the next `slaRound` - `inst-cmt-settle`
 
 **Description**: Regardless of which route drives a subject to failure, the same effect runs
 before any terminal outcome. The `reopened` branch keeps the 100 %-visibility guarantee true on the
@@ -850,7 +857,7 @@ sequenceDiagram
     SD ->> D: plugin-control signal
     D ->> RMT: resolve (ref, trigger request, taskRef, requestRef)
     RMT ->> R: re-check preconditions in-transaction; apply action; mark request applied | refused
-    RMT -->> D: resolution, resumeAt, attemptKey, openTaskCount, slaRemaining
+    RMT -->> D: resolution, resumeAt, attemptKey, openTaskCount, slaRound
     alt resolution override
         D ->> D: verify-override (next sequence)
     else retry
@@ -860,27 +867,28 @@ sequenceDiagram
     else closed | escalated | refused | none
         D ->> D: awaitResolution again
     end
-    Note over D,RMT: SLA branch: wait slaRemaining, then resolve (trigger sla-check, slaRound)
+    Note over D,RMT: SLA branch: every PT5M resolve (trigger sla-check, slaRound); a no-op until the stored sla_deadline
 ```
 
 **Algorithm: `resolve-manual-task`**
 
 1. [ ] - `p1` - Resolve the instance; refuse `version-mismatch` if terminal - `inst-rmt-resolve`
-2. [ ] - `p1` - **IF** `trigger = sla-check`: **FOR EACH** open task of the instance with `sla_deadline ≤ now` (database time) and `sla_breached_at` NULL: stamp `sla_breached_at`, raise `severity` to `escalated`, set `escalated_to = seller-operator`, write an `escalation` entry; **IF** its scope is `line` or `plan` with a forward reason: resolve it `exhausted` / `remediation-exhausted` and **RETURN** `exhausted`; otherwise (compensation or order scope) leave it open and continue; **RETURN** `escalated` if any breach was recorded, else `none`, with the fresh `slaRemaining` and next `slaRound` - `inst-rmt-sla`
+2. [ ] - `p1` - **IF** `trigger = sla-check`: **IF** no open task of the instance has `sla_deadline ≤ now` (database time) with `sla_breached_at` NULL: record nothing, leave the registry record `open` and **RETURN** `none` with the same `slaRound` — the call is a no-op until the stored deadline; otherwise **FOR EACH** open task of the instance with `sla_deadline ≤ now` (database time) and `sla_breached_at` NULL: stamp `sla_breached_at`, raise `severity` to `escalated`, set `escalated_to = seller-operator`, write an `escalation` entry; **IF** its scope is `line` or `plan` with a forward reason: resolve it `exhausted` / `remediation-exhausted` and **RETURN** `exhausted`; otherwise (compensation or order scope) leave it open and continue; **RETURN** `escalated` with the next `slaRound` - `inst-rmt-sla`
 3. [ ] - `p1` - **IF** `trigger = request`: read the request row by `requestRef`; **IF** it is not `requested` **RETURN** its recorded result (absorbed replay); **IF** the task is `resolved` or `action` is not in its current `resolution_actions`: mark the request `refused` with `action-not-offered`, **RETURN** `refused` - `inst-rmt-read`
 4. [ ] - `p1` - **IF** `action ∈ {retry, override}` on a forward-reason task: re-check the fence and terminal conditions of §2.2 against `owf_cancellation_fence` and the instance in this transaction; on a hit mark the request `refused` with `order-fenced`, **RETURN** `refused` - `inst-rmt-fence`
 5. [ ] - `p1` - **IF** `action = retry`: invoke `retry-step`'s effect in-process (01: quarantine, next `attempt` for the step's key family); on `poison-step` mark the request `refused`, **RETURN** `refused`; for a `line` forward task move the line `failed → pending` (wave 1) or `failed → draft_created` (wave 2) through slice 04's transition function with the request's principal as `last_transition_actor`; resolve the task `retry` / `retry-dispatched`; **RETURN** `retry` with `attemptKey` and `resumeAt` — `barrier` (line), `plan` (plan scope: a new `attempt` of `construct-and-freeze-plan`), `compensation` (compensation reason: `compensate-order` again), `stage` (order scope: re-enter the stage whose operation failed) - `inst-rmt-retry`
 6. [ ] - `p1` - **IF** `action = override`: leave the request `requested` and the task `in_progress`; **RETURN** `override` — `verify-override` applies it - `inst-rmt-override`
 7. [ ] - `p1` - **IF** `action = cancel`: resolve the task `cancel` / `cancelled-by-seller-operator` with the request's principal and justification; **IF** it was the last open task of a `line` or `plan` subject that is still failed under a live order: **RETURN** `exhausted` (the Seller Operator's judgement that remediation is moot is the exhaustion of that subject; decision D-99: cancelling the last open forward task of a still-failed subject declares remediation exhausted); **ELSE RETURN** `closed` - `inst-rmt-cancel`
-8. [ ] - `p1` - Mark the request `applied`, write the `step-completion` entry with the request's principal and justification, settle the key, **RETURN** with `openTaskCount`, `slaRemaining`, `slaRound` - `inst-rmt-settle`
+8. [ ] - `p1` - Mark the request `applied`, write the `step-completion` entry with the request's principal and justification, settle the key, **RETURN** with `openTaskCount`, `slaRound` - `inst-rmt-settle`
 
 **Description**: The control endpoint records and signals; the definition applies. That split is
 what keeps the process path and the task record from diverging: an operator's retry that the
 definition never observed would leave a task `resolved` with nothing re-dispatched, and a
 re-dispatch the task never recorded would be an unattributed provisioning. The SLA branch is the
-breach detector the previous design lacked: the definition's `wait` fires at `slaRemaining`, and
-`resolve-manual-task` re-checks against database time, so an early or late fire (after a hold arm
-cancelled and re-entered the wait) is corrected by the answer rather than trusted.
+breach detector the previous design lacked: the definition's fixed `PT5M` `waitSla` tick calls
+`resolve-manual-task` with `trigger: sla-check`, which compares database time with the stored
+`sla_deadline` and is a no-op until it has passed, so no remainder is carried and a tick cancelled
+and re-entered by another arm is corrected by the next answer rather than trusted.
 
 #### Override Rejected Without Verified Subscription
 
@@ -937,10 +945,10 @@ written in the one transaction that accepts the override.
 
 ```mermaid
 sequenceDiagram
-    participant D as Definition (10 §3.6 a, b)
+    participant D as Definition (10 §3.6 a, b, d)
     participant ROE as raise-overdue-escalation
     participant R as Record
-    D ->> D: waitOverdue (expectedFulfillmentAt + 24 h) | waitCeiling (90 d) | waitTtlMargin (escalateAfter) | outage threshold
+    D ->> D: overdueMonitor PT1H tick (due past expected_fulfillment_at + 24 h) | ceiling stage after waitCeiling (P90D) | park loop once arm-park-escalation is due | outage arm once the threshold is due
     D ->> ROE: raise (ref, escalationKind, subjectRef, stepRef)
     ROE ->> R: read step context from the record (last settled step, wave, open lines, blocking object)
     alt park
@@ -950,7 +958,7 @@ sequenceDiagram
     end
     ROE ->> R: insert owf_overdue_escalation (unique per version, kind, subject)
     ROE -->> D: escalationRef, raised, taskRef
-    Note over D: overdue: nothing else; lifetime: park (01) next; park: loop without re-arming
+    Note over D: overdue: due false → next PT1H tick, else nothing else; lifetime: park (01) next; park: loop without re-arming
 ```
 
 **Algorithm: `raise-overdue-escalation`**
@@ -1285,9 +1293,10 @@ counter is per task.
   compensation. The 3-attempt clause does not apply to these tasks; `retry-step`'s quarantine
   (`poison-step`, `01 §4.13`) bounds a retry train on them.
 
-The breach is **observed**, not assumed: the definition's SLA `wait` fires at the returned
-`slaRemaining`, and `resolve-manual-task` (`sla-check`) re-checks `sla_deadline` against database
-time (`01 §4.15`), so a fire before the deadline answers `none` with a fresh remainder.
+The breach is **observed**, not assumed: the definition's SLA branch is a fixed `PT5M` tick, and
+`resolve-manual-task` (`sla-check`) re-checks `sla_deadline` against database time (`01 §4.15`), so
+a tick before the deadline is a no-op that answers `none` and leaves the key `open`; no remainder
+is returned or carried.
 
 ### 4.3 The `ManualTask` state machine (normative)
 
@@ -1389,11 +1398,11 @@ when the fragments were reconciled with the slice operations (D-80, D-81):
 
 1. [ ] - `p1` - **Creation before terminal.** On every failure path under `remediate`, and on the plan-level `topology-unavailable` path under either policy, `create-manual-task` **MUST** precede any `run-cancellation-fence`, `report-outcome` or `terminate-instance`; under `fail-fast` the definition **MUST NOT** call it for a forward line or `invalid-dependency-graph` subject - `inst-c7-create-first`
 2. [ ] - `p1` - **No swallowing.** `create-manual-task` **MUST NOT** be inside a `catch` that continues the forward path (`10 §4.6`); its retry exhaustion fails the invocation, whose platform status the backstop sweep observes (`01 §3.8`) - `inst-c7-no-swallow`
-3. [ ] - `p1` - **Every task has a waiter.** Every arm that follows `create-manual-task` — fragment (c)'s `awaitResolution` and `awaitCompensationResolution`, and the arms after a refused reflection (03), an unverified trigger (02) and a withdrawn authority (08) — **MUST** be a competing `fork` containing the `task-resolution-requested` `listen` followed by `resolve-manual-task`, and an SLA branch that calls `resolve-manual-task` with `trigger: sla-check` on entry and waits the returned `slaRemaining` (**alignment**: fragment (c) has no SLA branch) - `inst-c7-waiter`
+3. [ ] - `p1` - **Every task has a waiter.** Every arm that follows `create-manual-task` — fragment (c)'s `awaitResolution` and `awaitCompensationResolution`, and the arms after a refused reflection (03), an unverified trigger (02) and a withdrawn authority (08) — **MUST** be a competing `fork` containing the `task-resolution-requested` `listen` followed by `resolve-manual-task`, and an SLA branch that waits the fixed `PT5M` `waitSla` tick and then calls `resolve-manual-task` with `trigger: sla-check` and the last `slaRound`, carrying no remainder; the call **MUST** be a no-op until the stored SLA deadline has passed - `inst-c7-waiter`
 4. [ ] - `p1` - **Routing on the answer.** `exhaustedTaskRefs` non-empty after `create-manual-task`, `exhausted` from `resolve-manual-task`, and `exhausted: true` from `verify-override` **MUST** route to `compensateOrder`; `retry` **MUST** route by `resumeAt` (`barrier`, `plan`, `compensation`, `stage`) and carry `attemptKey`; `closed`, `escalated`, `refused` and `none` **MUST** return to the waiting fork (**alignment**: fragment (c) routes every `retry` to `barrier` and does not read `exhaustedTaskRefs`) - `inst-c7-routing`
 5. [ ] - `p1` - **Override order.** `verify-override` **MUST** follow a `resolve-manual-task` that answered `override` for the same `requestRef`, and **MUST NOT** be called otherwise - `inst-c7-override-order`
-6. [ ] - `p1` - **The overdue arm.** The overdue `wait` **MUST** arm `expectedFulfillmentAt` from `construct-and-freeze-plan` plus the overdue window; it **MUST** be in a `fork` that contains no hold arm (a hold does not pause it, `01 §4.4`); on completion it **MUST** call only `raise-overdue-escalation` with `escalationKind: overdue-fulfillment`; it **MUST NOT** win the outer race and **MUST** complete only on the order's own `OrderFulfillmentCompleted` / `OrderFulfillmentAborted` - `inst-c7-overdue`
-7. [ ] - `p1` - **The other escalation arms.** The lifetime arm **MUST** call `raise-overdue-escalation` (`lifetime-ceiling`) before `park`; the park arm **MUST** call it with `escalationKind: park` and the `parkRef`, and **MUST NOT** re-arm after it answered (`03 §4.5`); the outage arm with `approval-outage` and the gate position - `inst-c7-escalation-arms`
+6. [ ] - `p1` - **The overdue arm.** The overdue window **MUST** be the top-level `overdueMonitor` branch of the `lifetime` fork (`10 §3.6` (a)), outside every stage and with no hold arm (a hold does not pause it, `01 §4.4`), and **MUST NOT** be a `listen` in fragment (b): a fixed `PT1H` `waitOverdue` tick followed by `raise-overdue-escalation` with `escalationKind: overdue-fulfillment` and nothing else, looping while `due` and `raised` are both `false`; the deadline (`expected_fulfillment_at` + the overdue window) is the operation's stored value, never the definition's; the branch **MUST NOT** complete, so it never wins the outer race, and it stops with the invocation - `inst-c7-overdue`
+7. [ ] - `p1` - **The other escalation arms.** The ceiling stage of `10 §3.6` (d), entered when the top-level `P90D` ceiling fires outside an unwind, **MUST** call `raise-overdue-escalation` (`lifetime-ceiling`) before `park`, and its operator wait **MUST** carry the task-resolution arm through which a `retry` of the `lifetime-ceiling-reached` task reaches `unpark`; the park arm **MUST** call it with `escalationKind: park` and the `parkRef`, and **MUST NOT** re-arm after it answered (`03 §4.5`); the outage arm with `approval-outage` and the gate position - `inst-c7-escalation-arms`
 8. [ ] - `p1` - **Bounds.** The SLA classes of §4.1 **MUST** be less than or equal to the overdue window, and the overdue window less than the lifetime ceiling (`10 §2.2` rule 4) - `inst-c7-bounds`
 9. [ ] - `p1` - **Signals handled.** This slice's arms consume `task-resolution-requested` (correlated on `orderId` and `orderVersion`); they are left by `cancel-requested`, `OrderAmended` and the terminal order events, whose paths end in `terminate-instance`, which closes this slice's records through the closure port - `inst-c7-signals`
 
@@ -1416,7 +1425,7 @@ definition input, not an Orders release) — the business default of 24 hours is
   `cpt-cf-bss-orders-workflow-adr-references-not-payloads`
 - **Definition**: [10-process-definition.md](./10-process-definition.md) §3.6 (c)
   `cpt-cf-bss-orders-workflow-seq-def-partial-failure` (the fragment that sequences these
-  operations), §3.6 (b) (the overdue arm), §3.6 (a) (the lifetime and park arms), §3.3 and §4.4
+  operations), §3.6 (a) (the `overdueMonitor` and `lifetimeCeiling` branches and the park loop), §3.6 (b) (the overdue monitor's list), §3.6 (d) (the ceiling stage), §3.3 and §4.4
   (signals), §4.1 (the fence)
 - **Decisions**: `DECISIONS.md` D-29 (two compensation reasons), D-32 (one task by any route),
   D-33 (override rejected without verification), D-34 (overdue non-terminal), D-53 (lifetime

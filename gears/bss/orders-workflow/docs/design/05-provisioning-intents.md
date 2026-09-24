@@ -197,8 +197,9 @@ evidence that the confirmation is stale or already applied. The unmatched-confir
 
 A line the dispatch operations cannot admit now — per-order parallelism reached, the seller's
 allowance or the aggregate cap exhausted, a downstream throttle, an open hold — is returned in
-`deferred[]` of a **settled success**, with a `retryAfterMs` hint, and the definition waits and
-calls again under the next dispatch round (§4.5). It is never a `retryable-failure`, because the
+`deferred[]` of a **settled success**, with a `retryAfterMs` hint, and the definition waits the fixed
+`PT1M` deferral tick and calls again under the next dispatch round (§4.5); `retryAfterMs` sets the
+deferral instant the operation records and is never a `wait` value. It is never a `retryable-failure`, because the
 PRD forbids a throttle from consuming the retry budget
 (`cpt-cf-bss-orders-workflow-fr-owf-backpressure`) and the retry budget is now the definition's
 per-task retry (`catch.retry` under `use.retries`, `10 §2`), which counts every failed attempt. (decision D-96: an
@@ -590,7 +591,7 @@ definition never computes one (`01 §4.14`). Every step key is recomposed server
 |-------|-------|
 | `protection` | `protected` — Waves stage: after `begin-fulfillment`, before `re-check-pre-activation` (`10 §4.1`) |
 | `input` | `ref`, `planRef`, `lineRefs[]` (the whole plan on first entry; the rebuilt lines after `rebuild-wave1`; the deferred lines of the previous round), `dispatchRound`, `attemptKey` (nullable; the key `retry-step` minted for a manual `retry` of one line) |
-| `output` | `accepted[]` (lineRef), `failed[]` (lineRef + reason code), `deferred[]` (lineRef), `deferReason` (`admission` · `throttle` · `held`, nullable), `retryAfterMs` (nullable), `due: true\|false` on a non-empty `deferred[]` — database time against the deferral instant this operation records with the round (`now + retryAfterMs`), the answer the definition's deferral re-check loop switches on (`10 §3.6` (b)); a call before that instant re-defers with `due: false`, `nextDispatchRound` |
+| `output` | `accepted[]` (lineRef), `failed[]` (lineRef + reason code), `deferred[]` (lineRef), `deferReason` (`admission` · `throttle` · `held`, nullable), `retryAfterMs` (nullable; advisory — it sets the recorded deferral instant and is not read by the definition, never a `wait` value), `due: true\|false` on a non-empty `deferred[]` — database time against the deferral instant this operation records with the round (`now + retryAfterMs`), the answer the definition's `PT1M` deferral re-check loop switches on (`10 §3.6` (b)); a call before that instant re-defers with `due: false`, `nextDispatchRound` |
 | `idempotency_key` | step key, instance-scoped: `{tenant}:{correlationId}:dispatch-wave1-create:{planRef}:{dispatchRound}`; per line, the intent key `{tenant}:{orderId}:{orderVersion}:{orderLineId}:wave1_create:draft_create[:{wave_attempt}]` resolved from the record, never supplied |
 | `declared_event` | `OrderFulfillmentStepCompleted`, once per line a synchronous Subscriptions refusal moves `pending → failed` (04's terminal-state rule); none for an accepted line |
 | `compensation` | `compensate-order` (06) — the draft-void leg for every `draft_created` line |
@@ -605,7 +606,7 @@ definition never computes one (`01 §4.14`). Every step key is recomposed server
 |-------|-------|
 | `protection` | `protected` — Waves stage: after `report-spawn-signal` (`10 §4.1`); the only route to `report-outcome` with `outcome: completed` |
 | `input` | `ref`, `planRef`, `lineRefs[]` (the eligible set `evaluate-activation-eligibility` returned; empty is permitted and is the completion check), `dispatchRound`, `attemptKey` (nullable) |
-| `output` | `accepted[]`, `activated[]`, `failed[]` (lineRef + reason code), `pending[]`, `lapsed[]`, `deferred[]` (all lineRef), `deferReason`, `retryAfterMs`, `due: true\|false` on a non-empty `deferred[]` — database time against the deferral instant this operation records with the round (`now + retryAfterMs`), the answer the definition's deferral re-check loop switches on (`10 §3.6` (b)); a call before that instant re-defers with `due: false`, `nextDispatchRound`. `pending[]` names **every** plan line not yet recorded `activated` or `failed` — in flight, not yet eligible, lapsed or deferred — so an empty `pending[]` and an empty `failed[]` together mean the order is complete; `lapsed[]` and `deferred[]` are subsets of `pending[]` that name why |
+| `output` | `accepted[]`, `activated[]`, `failed[]` (lineRef + reason code), `pending[]`, `lapsed[]`, `deferred[]` (all lineRef), `deferReason`, `retryAfterMs` (advisory, as for wave 1; never a `wait` value), `due: true\|false` on a non-empty `deferred[]` — database time against the deferral instant this operation records with the round (`now + retryAfterMs`), the answer the definition's `PT1M` deferral re-check loop switches on (`10 §3.6` (b)); a call before that instant re-defers with `due: false`, `nextDispatchRound`. `pending[]` names **every** plan line not yet recorded `activated` or `failed` — in flight, not yet eligible, lapsed or deferred — so an empty `pending[]` and an empty `failed[]` together mean the order is complete; `lapsed[]` and `deferred[]` are subsets of `pending[]` that name why |
 | `idempotency_key` | step key, instance-scoped: `{tenant}:{correlationId}:dispatch-wave2-activate:{planRef}:{dispatchRound}`; per line, the intent key `{tenant}:{orderId}:{orderVersion}:{orderLineId}:wave2_activate:activation` |
 | `declared_event` | `OrderFulfillmentStepCompleted`, once per line a synchronous refusal moves `draft_created → failed` |
 | `compensation` | `compensate-order` (06) — the activated-cancel leg for every line whose activation was accepted |
@@ -759,8 +760,8 @@ sequenceDiagram
     SUB -->> OP: accepted (transition_request_id) | refused
     OP ->> DB: settle: acceptance fields; refused line pending → failed
     OP -->> PL: accepted[], failed[], deferred[], nextDispatchRound
-    Note over PL: deferred → re-check loop until due, call again; failed → fragment (c)
-    Note over PL: barrier: waitExpected, then evaluate (04) ⇄ confirmation listen / poll
+    Note over PL: deferred → wait PT1M, call again under the next round until due; failed → fragment (c)
+    Note over PL: barrier: waitExpected (PT1H re-check), then evaluate (04) ⇄ confirmation listen / poll
     PL ->> OP: confirmation arm or poll arm: reconcile-intent
     OP ->> SUB: status read (SUB-O13)
     OP ->> DB: intent draft_created; task pending → draft_created (04 rule)
@@ -1074,8 +1075,8 @@ Related, already-registered asks:
 
 **Platform asks this slice depends on** (recorded in `UPSTREAM_REQS.md` §2.9,
 serverless-runtime section): a `wait` whose duration is a runtime expression as a plugin
-extension (`retryAfterMs`, `expectedFulfillmentAt`; Q-11 (i)), until which the re-check loop of
-§4.5 item 4 applies; a `listen` whose stored event can be restricted to the
+extension (Q-11 (i)), until which the re-check loop of §4.5 item 4 applies — and even then
+`retryAfterMs` stays advisory, because the deferral instant is the operation's recorded value; a `listen` whose stored event can be restricted to the
 exported members, because the Subscriptions outcome event as published carries a
 `subscriptionId`, which ADR-0013 keeps out of engine history (decision D-97: until the platform can filter a consumed event, the confirmation arm targets a
 reference-only Subscriptions notification — a further Subscriptions ask — or is dropped in favour
@@ -1209,8 +1210,9 @@ slice operations (D-80, D-81).
 4. **Deferral routes to a wait, never to failure.** A non-empty `deferred[]` **MUST** route to
    the deferral re-check loop and then the same operation with `nextDispatchRound`; it **MUST
    NOT** route to fragment (c) and **MUST NOT** be raised as an error †. A 1.0.0 `wait` takes no
-   runtime expression, so until Q-11 (i) is answered the loop is a fixed-granularity `wait` (the
-   granularity `10 §3.6` declares for deferral) followed by the same call, which re-defers with
+   runtime expression, so the loop is the fixed `PT1M` `wait` `10 §3.6` *Fixed waits and re-check
+   loops* declares for deferral (`waitDeferral1`, `waitDeferral2`) followed by the same call;
+   `retryAfterMs` **MUST NOT** be used as a `wait` value. The call re-defers with
    `due: false` while the recorded deferral instant has not been reached; the loop repeats while
    `due` is `false`.
 5. **Lapsed routes to rebuild, rebuild routes to wave 1.** A non-empty `lapsed[]` **MUST** route to

@@ -98,8 +98,10 @@ and audit grade. Concretely:
   `gts.cf.core.sless.workflow.v1~` callable and executed by the serverless-runtime Temporal plugin.
   The definition uses the grammar subset `call` (HTTP to a step operation; a registered Function
   only for a `composable` operation), `listen` (the nine Lifecycle triggers, the approval decision,
-  the Subscriptions confirmation and failure events and Orders' own two terminal process events on
-  the overdue arm — event-broker GTS events — and the four operator signals `cancel-requested`,
+  the Subscriptions confirmation and failure events and Orders' own two terminal process events —
+  event-broker GTS events; the last two are allowed in the closed set but unused by the canonical
+  definition, whose overdue monitor stops with the invocation (`design/10-process-definition.md`
+  §2.2 *The closed trigger set*) — and the four operator signals `cancel-requested`,
   `reauthorize-requested`, `task-resolution-requested`, `unpark-requested`; the closed set is
   ADR-0012 rule 3), `wait`, `switch`, `fork`,
   `try`/`catch`/`raise` and `set`. It does not use `run` (containers and scripts) and does not use

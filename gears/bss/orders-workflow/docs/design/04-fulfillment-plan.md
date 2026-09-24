@@ -490,8 +490,9 @@ compensation, not order state.
   are the definition's `listen` arms and eligibility poll `wait` (§2.1, §4.8).
 - The barrier's timer half (the expected-fulfillment wake-up) — retired by ADR-0011; the instant is
   returned by `construct-and-freeze-plan` as `expectedFulfillmentAt`, stored on the plan, and
-  awaited by the definition's `waitExpected` re-check loop, which switches on the `due` of
-  `evaluate-activation-eligibility`; the all-creates half is `evaluate-activation-eligibility`,
+  awaited by the definition's `waitExpected` re-check loop — a fixed `PT1H` `wait`, then
+  `evaluate-activation-eligibility`, looping while its `due` is `false` (`10 §3.6` *Fixed waits and
+  re-check loops*); the definition never waits on the instant itself; the all-creates half is `evaluate-activation-eligibility`,
   re-evaluated by the definition on every contributing signal.
 - The Progress Tracker's execution of the abort path (draft void, `ActivationAbortRecord` void
   outcome, `fulfillment_failed` acknowledgement) and of the completion acknowledgement — moved to
@@ -584,7 +585,7 @@ the barrier loop, whose hold, amendment and cancel arms consume what the operati
 | Catalog | dependency-topology read (revision-stamped, per-line resolved/unresolved markers, §3.2) | Inter-line edges for plan construction; read only. **Posture**: required at construction; transient failure is `retryable-failure`; incomplete or unstamped is `topology-unavailable`. |
 | Account Management | payer commercial-profile read | The `(currency, region)` binding the order market is compared against at construction (advisory) and in `re-check-pre-activation` (authoritative). Same read the Lifecycle submit gate uses ([`03-gate-and-pin.md`](../../../orders-lifecycle/docs/design/03-gate-and-pin.md) §3.4). |
 | Subscriptions | overlap-presence read `SUB-O5` (`cpt-cf-bss-orders-workflow-upreq-overlap-presence-read`); the provisioning-intent contract is slice 05's | Construction-time observation and pre-activation re-check; this slice records the transition-request identifier and `subscription_id` supplied by slice 05's handlers. |
-| Platform (serverless-runtime) | None called — this slice is **called by** the definition through the step routes | The definition fragment `10 §3.6` (b) invokes the operations; the `wait` on `expectedFulfillmentAt` and the `listen` arms are the plugin's. |
+| Platform (serverless-runtime) | None called — this slice is **called by** the definition through the step routes | The definition fragment `10 §3.6` (b) invokes the operations; the fixed `PT1H` `waitExpected` tick that re-checks `expected_fulfillment_at` through `evaluate-activation-eligibility`, and the `listen` arms, are the plugin's. |
 
 **Dependency Rules** (per project conventions):
 - No circular dependencies
@@ -786,8 +787,8 @@ Output: due, released, eligibleLineRefs[], pendingLineRefs[], nextEvaluationSeq
 4. [ ] - `p1` - Otherwise the conjunction holds; `eligibleLineRefs` = every `draft_created` task whose dependencies in the frozen graph are all `activated`; `pendingLineRefs` = every `draft_created` task with an unactivated dependency; **RETURN** `released: true` - `inst-ae-released`
 5. [ ] - `p1` - Record the evaluation, including the first `released: true` instant per plan as the SLA window opening (§1.2) - `inst-ae-record`
 
-**Description**: The definition's barrier loop calls this operation once after `waitExpected`
-and again on **every** contributing signal — a Subscriptions draft-create outcome event or the
+**Description**: The definition's barrier loop calls this operation after every `PT1H`
+`waitExpected` tick until `due` is `true`, and again on **every** contributing signal — a Subscriptions draft-create outcome event or the
 poll interval — so a confirmation recorded between an evaluation and the `listen` cannot hang the
 barrier ([`../ADR/0004`](../ADR/0004-cpt-cf-bss-orders-workflow-adr-two-wave-activation-barrier.md)
 as amended). The confirmation count lives in `owf_fulfillment_task.state`, written by slice 05's
@@ -1210,10 +1211,11 @@ the fragment now carries each rule, and the note is kept as the reason the rule 
 6. **Evaluation sequences** — the definition **MUST** export `nextEvaluationSeq` from each of the
    three evaluation operations and pass it (and, to `begin-fulfillment`, the `eligible` round's
    value as `eligibilitySeq`) into the next call (§4.1) (**alignment**).
-7. **The barrier** — `waitExpected` **MUST** wait until `expectedFulfillmentAt` as returned by
-   `construct-and-freeze-plan`. A 1.0.0 `wait` takes no runtime expression, so until Q-11 (i) is
-   answered it is the bounded re-check loop of `10 §3.6` (b) — a fixed-granularity `wait`, then
-   `evaluate-activation-eligibility`, looping while its `due` is `false`; the overdue deadline is
+7. **The barrier** — the timer half **MUST** be the `waitExpected` re-check loop of `10 §3.6` (b):
+   a fixed `PT1H` `wait`, then `evaluate-activation-eligibility`, looping while its `due` is
+   `false`; `due` is database time against the plan's stored `expected_fulfillment_at`, so the
+   definition **MUST NOT** wait on `expectedFulfillmentAt` itself (a 1.0.0 `wait` takes no runtime
+   expression, `10 §3.6` *Fixed waits and re-check loops*); the overdue deadline is
    the same instant plus 24 h, owned by slice 07; `evaluate-activation-eligibility` **MUST** be re-invoked on every
    Subscriptions draft-create outcome event **and** on the poll interval; the definition **MUST
    NOT** decide release from its own memory of confirmations.

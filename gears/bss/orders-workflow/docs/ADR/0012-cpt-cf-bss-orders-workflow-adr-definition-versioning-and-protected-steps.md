@@ -88,7 +88,8 @@ rather than one task, fails closed before a definition can be executed, and stil
      registered Function targets only a `composable` operation;
   3. every `listen` target is within the closed set: the nine Lifecycle triggers, the approval
      decision, the Subscriptions confirmation and failure events, Orders' own two terminal process
-     events (the overdue arm only) and the operator signals of `design/10-process-definition.md`
+     events (allowed, but unused by the canonical definition, whose overdue monitor stops with the
+     invocation, `design/10-process-definition.md` §2.2) and the operator signals of `design/10-process-definition.md`
      §3.3 (`cancel-requested`, `reauthorize-requested`, `task-resolution-requested`,
      `unpark-requested`);
   4. bounds nest: per-operation deadline < task retry budget < task timeout < the overdue window

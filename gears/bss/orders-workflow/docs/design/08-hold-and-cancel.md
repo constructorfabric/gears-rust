@@ -42,14 +42,15 @@
 
 This slice provides three **step operations** and sequences none of them. `apply-hold` records
 that the process is suspended for an order after `OrderHeld`, pauses the approval-escalation
-windows of the gates the definition names through slice 03's gate-window port, and returns the
-remaining window; `apply-resume` closes that suspension after `OrderResumed`, re-arms the same
-windows through the same port, applies the failure outcomes the hold deferred, and returns the
-remainder the definition re-arms; `authorize-cancel` re-checks, at apply time, the authorization
+windows of the gates the definition names through slice 03's gate-window port, which keeps the
+remaining window in Orders' record; `apply-resume` closes that suspension after `OrderResumed`,
+re-arms the same windows through the same port, applies the failure outcomes the hold deferred,
+and answers `due` against the re-based escalation deadline, the first answer of the definition's
+escalation re-check; `authorize-cancel` re-checks, at apply time, the authorization
 snapshot the control gateway recorded when a Seller Operator's cancel was accepted, and answers
 whether the cancel path may proceed into slice 06's fence. The order in which they run, the
-`listen` arms that deliver `OrderHeld`, `OrderResumed` and `cancel-requested`, the escalation
-`wait` a hold cancels and a resume re-arms, and the branch each returned value selects are the
+`listen` arms that deliver `OrderHeld`, `OrderResumed` and `cancel-requested`, the `PT5M`
+escalation tick a hold cancels and the re-check that follows a resume, and the branch each returned value selects are the
 definition fragments
 [`10 §3.6` (e) *Hold and resume*](./10-process-definition.md#e-hold-and-resume) and
 [`10 §3.6` (d) *Cancel*](./10-process-definition.md#d-cancel); the protected order they must keep
@@ -83,7 +84,7 @@ this slice calls no Lifecycle endpoint.
 
 | Requirement | Design Response |
 |-------------|------------------|
-| `cpt-cf-bss-orders-workflow-fr-owf-hold-resume` | The definition's hold arm (`10 §3.6` (e)) consumes `OrderHeld` and calls `apply-hold`, which records the suspension, sets the hold predicate the dispatch operations read, and pauses the named gates' escalation windows through slice 03's gate-window port; the resume arm consumes `OrderResumed` and calls `apply-resume`, which closes the suspension, re-arms the same windows through the port, and applies the outcomes the sweep deferred. The definition re-arms the escalation `wait` with the remainder the operation returns. |
+| `cpt-cf-bss-orders-workflow-fr-owf-hold-resume` | The definition's hold arm (`10 §3.6` (e)) consumes `OrderHeld` and calls `apply-hold`, which records the suspension, sets the hold predicate the dispatch operations read, and pauses the named gates' escalation windows through slice 03's gate-window port; the resume arm consumes `OrderResumed` and calls `apply-resume`, which closes the suspension, re-arms the same windows through the port, and applies the outcomes the sweep deferred. The definition carries no remainder: `apply-resume`'s `due` is the first answer of the escalation re-check, then the `PT5M` `waitEscalation` tick resumes (`10 §3.6` (e)). |
 | `cpt-cf-bss-orders-workflow-fr-owf-dependency-resilience` | **Moved out of this slice by ADR-0011.** Transient failures are the definition's task retry policy (`10 §2`) plus the per-dependency circuit breaker inside each operation (`01 §4.5`); exhaustion marks the step failed through the definition's failure arm, whose partial-failure policy decides whether a manual task follows (`10 §3.6` (c)). This slice keeps `cpt-cf-bss-orders-workflow-principle-resilience-distinct-from-park`. |
 | `cpt-cf-bss-orders-workflow-fr-owf-compensation-execution` | The definition's cancel arm (`10 §3.6` (d)) calls `authorize-cancel` before `run-cancellation-fence`; a withdrawn authority raises one `authority-withdrawn` manual task and leaves the phase unchanged. Fencing, compensation and the Lifecycle submission are slice 06's. |
 
@@ -91,7 +92,7 @@ this slice calls no Lifecycle endpoint.
 
 | NFR ID | NFR Summary | Allocated To | Design Response | Verification Approach |
 |--------|-------------|--------------|-----------------|----------------------|
-| `cpt-cf-bss-orders-workflow-nfr-owf-escalation-timer` | Approval escalation timers are configurable per gate, default **72 h**, accuracy within **± 5 min** — and a hold/resume cycle must neither silently extend that window nor misrepresent a foreign clock as paused | `apply-hold`, `apply-resume` (through slice 03's gate-window port) | The remainder is captured by the port against database time into `owf_approval_gate.window_remaining_ms`, the single authority for it (`03 §4.2`); the definition re-arms exactly the value `apply-resume` returns, so the 72 h window is consumed once across any number of cycles; the fire instant is the plugin's durable timer; the draft auto-void TTL is never read, stored or paused by this gear | Cycle test asserting *n* hold/resume cycles on one gate still fire escalation within 72 h + 5 min of the gate opening; redelivery test asserting a second `apply-resume` under the same key returns the stored remainder and re-arms nothing; code-boundary test asserting no local reference to a Subscriptions TTL value |
+| `cpt-cf-bss-orders-workflow-nfr-owf-escalation-timer` | Approval escalation timers are configurable per gate, default **72 h**, accuracy within **± 5 min** — and a hold/resume cycle must neither silently extend that window nor misrepresent a foreign clock as paused | `apply-hold`, `apply-resume` (through slice 03's gate-window port) | The remainder is captured by the port against database time into `owf_approval_gate.window_remaining_ms`, the single authority for it (`03 §4.2`); the port re-bases the gate's escalation deadline from exactly that value and the definition carries none, so the 72 h window is consumed once across any number of cycles; the fire instant is the first `PT5M` re-check (or `apply-resume`'s `due`) past the re-based deadline, at most one tick plus one call late; the draft auto-void TTL is never read, stored or paused by this gear | Cycle test asserting *n* hold/resume cycles on one gate still fire escalation within 72 h + 5 min of the gate opening; redelivery test asserting a second `apply-resume` under the same key returns the stored answer and re-arms nothing; code-boundary test asserting no local reference to a Subscriptions TTL value |
 | `cpt-cf-bss-orders-workflow-nfr-owf-availability` | **99.9 %** control-plane availability, with in-flight processes unaffected by control-plane restarts | the step envelope (`01 §3.2`) and the definition's retry policy; this slice's three operations | Each operation is one unit of work that settles its idempotency record, its audit entry and its rows together, so a crash before commit replays under the same key and a crash after it is absorbed; the suspension survives restart because it is a row, not an engine flag | Restart test asserting a suspended instance, killed between `apply-hold` and the resume arm, resumes on `OrderResumed` with the recorded remainder; replay test asserting every operation is an absorbed duplicate under its key |
 
 #### Key ADRs
@@ -180,8 +181,8 @@ The mechanism is slice 03's gate-window port
 `pause_windows(correlationId, gateRefs, hold)` and `apply-resume` calls
 `rearm_windows(correlationId, gateRefs, hold)` inside their own settlement transaction. The
 remainder is captured by the port into `owf_approval_gate.window_remaining_ms`, which is the
-**single** authority for it (`03 §4.2`); this slice stores no copy of it, and the value either
-operation returns is read from that column in the same transaction. Because the port counts pause
+**single** authority for it (`03 §4.2`); this slice stores no copy of it and returns none; `apply-resume`'s
+`due` is computed from the deadline the port re-bases from that column in the same transaction. Because the port counts pause
 causes, a hold that overlaps a Generic Approval outage pause captures nothing a second time and a
 resume that leaves the outage cause open re-arms nothing (`03 §4.2`).
 
@@ -196,11 +197,17 @@ the overdue window (slice 07), which only runs once the order is in fulfillment,
 is cycling in `pending_approval`.
 
 The backstop is the unconditional **`max_process_lifetime` of 90 days** (`DECISIONS.md` D-4,
-**Accepted**), which is now the top-level competing `wait` of
+**Accepted**), which is now the literal `P90D` `wait` of the top-level
+`lifetimeCeiling` branch of
 [`10 §3.6` (a)](./10-process-definition.md#a-start-and-approval), outside every stage fork, so no
-hold arm can cancel it and no resume can re-arm it; on completion the definition calls
+hold arm can cancel it and no resume can re-arm it; on completion the definition enters the
+ceiling stage of [`10 §3.6` (d)](./10-process-definition.md#d-cancel), which calls
 `raise-overdue-escalation` with `escalationKind: lifetime-ceiling` and `park` with
 `parkReason: lifetime-ceiling` ([`01 §4.2`](./01-foundation.md#42-five-distinct-bounds-two-owners)).
+After an operator unpark the process resumes the stage and checkpoint the ceiling interrupted
+under a fresh `P90D` ceiling of the re-entered `lifetime` fork. A ceiling that fires during an
+unwind does not park (there is no `compensating → parked` edge, `01 §3.7`); the unwind continues
+under the fresh ceiling.
 There is deliberately **no cap on the number of hold/resume cycles** and no cap on total held
 time; those would refuse a legitimate commercial hold, whereas a lifetime ceiling only refuses an
 order that has been non-terminal for a quarter of a year. On expiry the order still reaches a
@@ -350,8 +357,8 @@ Owns `apply-hold` (§3.3). In one unit of work: inserts the `ProcessSuspension` 
 unique index (a losing insert is an absorbed duplicate, never a second suspension) or consumes a
 `resume_ahead` row; sets `owf_process_instance.suspended` and moves the phase projection
 `started → suspended` through the envelope; calls the gate-window port's `pause_windows` for the
-`gateRefs` the definition passes and records them on the suspension; and returns the smallest
-remainder the port reports. It pauses nothing else.
+`gateRefs` the definition passes and records them on the suspension; and returns `holdOutcome` and
+`suspensionRef`; the remainder the port captures stays on the gate. It pauses nothing else.
 
 **Intents are partitioned by three states, not two.** A hold reaches an outbound provisioning
 intent in one of three conditions; the behaviour is enforced by slice 05's dispatch operations
@@ -395,8 +402,8 @@ Owns `apply-resume` (§3.3). In one unit of work: closes the open `ProcessSuspen
 `owf_process_instance.suspended` and moves the phase projection `suspended → started`; calls the
 gate-window port's `rearm_windows` for the suspension's `paused_gate_refs`; applies the
 failure outcomes slice 05 recorded as deferred during the hold, in observation order, advancing
-the affected `owf_fulfillment_task` rows to `failed`; and returns the remainder the port reports
-and the references of the tasks it failed.
+the affected `owf_fulfillment_task` rows to `failed`; and returns `due` against the re-based
+escalation deadline and the references of the tasks it failed.
 
 **Resume re-evaluates; it does not wait for a spent signal.** There is no one-shot barrier timer
 any more: the barrier is the definition's poll `wait` plus `evaluate-activation-eligibility`
@@ -502,15 +509,16 @@ operation resolves `correlationId` to the instance, narrows every read and write
 
 | `name` | `protection` | `input` | `output` | `idempotency_key` | `declared_event` | `compensation` | `reasons` | `audit_kind` | `retry_class` | `deadline` |
 |--------|--------------|---------|----------|-------------------|------------------|----------------|-----------|--------------|---------------|------------|
-| `apply-hold` | `protected` | ref + `holdEventId`, `gateRefs[]` (the references `open-gates` last returned; empty outside the approval stage) | `holdOutcome` ∈ `suspended` · `reconciled-out-of-order` · `absorbed-duplicate` · `not-applicable`; `suspensionRef` (nullable); `escalationRemaining` (duration, nullable — null when no named window was armed) | instance-scoped `{tenant}:{correlationId}:apply-hold:{holdEventId}` | none (`OrderHeld` is Lifecycle's) | `apply-resume` (the paired close, like `park`/`unpark`; not a saga leg) | `version-mismatch`, `not-found` (a `gateRef` not of this instance), `idempotency-key-conflict` | `phase-transition` | `retryable-on: transient` | 5 s |
-| `apply-resume` | `protected` | ref + `resumeEventId`, `suspensionRef` (nullable — null on the stage-level resume arm) | `resumeOutcome` ∈ `resumed` · `resume-ahead-recorded` · `absorbed-duplicate`; `escalationRemaining` (duration, nullable); `due: true\|false` — database time against the escalation deadline re-armed from the stored `window_remaining_ms` (true when no remainder is left), the answer the resumed escalation re-check loop switches on first (`10 §3.6` (e)); `failedTaskRefs[]` (tasks advanced to `failed` from deferred outcomes; opaque `owf_fulfillment_task` references) | instance-scoped `{tenant}:{correlationId}:apply-resume:{resumeEventId}` | none (`OrderResumed` is Lifecycle's) | none | `version-mismatch`, `not-found` (a `suspensionRef` not of this instance), `idempotency-key-conflict` | `phase-transition` | `retryable-on: transient` | 5 s |
+| `apply-hold` | `protected` | ref + `holdEventId`, `gateRefs[]` (the references `open-gates` last returned; empty outside the approval stage) | `holdOutcome` ∈ `suspended` · `reconciled-out-of-order` · `absorbed-duplicate` · `not-applicable`; `suspensionRef` (nullable). No remaining duration is returned: the remainder stays in `owf_approval_gate.window_remaining_ms` and the definition consumes none | instance-scoped `{tenant}:{correlationId}:apply-hold:{holdEventId}` | none (`OrderHeld` is Lifecycle's) | `apply-resume` (the paired close, like `park`/`unpark`; not a saga leg) | `version-mismatch`, `not-found` (a `gateRef` not of this instance), `idempotency-key-conflict` | `phase-transition` | `retryable-on: transient` | 5 s |
+| `apply-resume` | `protected` | ref + `resumeEventId`, `suspensionRef` (nullable — null on the stage-level resume arm) | `resumeOutcome` ∈ `resumed` · `resume-ahead-recorded` · `absorbed-duplicate`; `due: true\|false` — database time against the escalation deadline re-based from the stored `window_remaining_ms` (true when no remainder is left), the answer the resumed escalation re-check loop switches on first (`10 §3.6` (e)), after which the `PT5M` `waitEscalation` tick resumes; `failedTaskRefs[]` (tasks advanced to `failed` from deferred outcomes; opaque `owf_fulfillment_task` references) | instance-scoped `{tenant}:{correlationId}:apply-resume:{resumeEventId}` | none (`OrderResumed` is Lifecycle's) | none | `version-mismatch`, `not-found` (a `suspensionRef` not of this instance), `idempotency-key-conflict` | `phase-transition` | `retryable-on: transient` | 5 s |
 | `authorize-cancel` | `protected` | ref + `cancelRequestRef` | `authorized` (bool); `taskRef` (the `authority-withdrawn` manual task, on `authorized = false`) | instance-scoped `{tenant}:{correlationId}:authorize-cancel:{cancelRequestRef}` | none (`OrderFulfillmentAborted` is `report-outcome`'s, slice 06) | none | `authority-withdrawn` (recorded refusal, rides the task), `not-found` (a request not of this instance), `version-mismatch`, `per-attempt-timeout`, `idempotency-key-conflict` | `step-completion` | `retryable-on: transient` | 10 s (one PDP decision) |
 
 **What each answer means to the definition.** `suspended` enters the resume wait of `10 §3.6` (e);
 `reconciled-out-of-order`, `absorbed-duplicate` and `not-applicable` are settled successes that
 return to the stage the hold arm interrupted. `resumed` and `resume-ahead-recorded` return to the
-stage with `escalationRemaining` as the escalation window left and `due` as the first answer of
-its re-check loop (a 1.0.0 `wait` takes no runtime expression, `10 §3.6`); a non-empty
+stage and loop the hold interrupted with `due` as the first answer of the escalation re-check
+loop, then the `PT5M` tick (a 1.0.0 `wait` takes no runtime expression, `10 §3.6` *Fixed waits and
+re-check loops*); a non-empty
 `failedTaskRefs[]` routes to the partial-failure arm of `10 §3.6` (c) first. `authorized = true`
 routes into `run-cancellation-fence`; `authorized = false` is a settled success that returns to
 where the cancel arm was taken (§4.7 item 5). A PDP outage is `retryable-failure` without a
@@ -613,17 +621,17 @@ sequenceDiagram
         H -->> D: reconciled-out-of-order → back to the stage
     else no unsettled row
         H ->> PS: insert open (partial unique index arbitrates), paused_gate_refs
-        H ->> G: pause_windows(gateRefs, hold) → captured remainder
-        H -->> D: suspended, suspensionRef, escalationRemaining
+        H ->> G: pause_windows(gateRefs, hold) → remainder captured on the gate
+        H -->> D: suspended, suspensionRef
     end
     Note over D: resume wait: resume × amendment × cancel;<br/>lifetime wait (top level), barrier poll, overdue wait keep running;<br/>draft auto-void TTL untouched
     LC -->> D: OrderResumed (listen)
     D ->> R: ref + resumeEventId, suspensionRef
     R ->> PS: close (resumed)
-    R ->> G: rearm_windows(paused_gate_refs, hold) → remainder
+    R ->> G: rearm_windows(paused_gate_refs, hold) → deadline re-based from the remainder
     R ->> R: apply deferred failure outcomes in observation order
-    R -->> D: resumed, escalationRemaining, failedTaskRefs
-    D ->> D: failedTaskRefs non-empty → partial-failure arm (10 §3.6 c); else re-enter gateLoop with wait = escalationRemaining
+    R -->> D: resumed, due, failedTaskRefs
+    D ->> D: failedTaskRefs non-empty → partial-failure arm (10 §3.6 c); else re-enter gateLoop: due → escalate-gate, else the PT5M tick
 ```
 
 **Description**: Both events are keyed by their event id, and both have a durable dedup row below
@@ -637,18 +645,18 @@ conditions are re-evaluated by level after resume by `evaluate-activation-eligib
 2. [ ] - `p1` - **IF** a `resume_ahead` row exists for the order, set it `closed` with `closed_reason = reconciled-out-of-order`, `triggering_event_id = holdEventId`, `closed_at = now()`, and **RETURN** `reconciled-out-of-order` - `inst-ah-consume-ahead`
 3. [ ] - `p1` - Insert the `open` row with `triggering_event_id`, `suspended_at = now()` (database time) and `paused_gate_refs = gateRefs`; **IF** the partial unique index refuses it, **RETURN** `absorbed-duplicate` with the existing row's `suspensionRef` and change nothing - `inst-ah-insert`
 4. [ ] - `p1` - Set `owf_process_instance.suspended = true` and the phase projection `started → suspended` through the envelope - `inst-ah-predicate`
-5. [ ] - `p1` - Call the gate-window port `pause_windows(correlationId, gateRefs, hold)`; the port captures each armed window's remainder into `owf_approval_gate.window_remaining_ms` and reports it - `inst-ah-pause`
-6. [ ] - `p1` - **RETURN** `suspended`, `suspensionRef` and the smallest reported remainder as `escalationRemaining` (null when none was armed); the envelope settles the key, writes `phase-transition` and commits once - `inst-ah-return`
+5. [ ] - `p1` - Call the gate-window port `pause_windows(correlationId, gateRefs, hold)`; the port captures each armed window's remainder into `owf_approval_gate.window_remaining_ms` - `inst-ah-pause`
+6. [ ] - `p1` - **RETURN** `suspended` and `suspensionRef`; the envelope settles the key, writes `phase-transition` and commits once - `inst-ah-return`
 
 **`apply-resume` — inside the operation**:
 
 1. [ ] - `p1` - Lock the `owf_process_instance` row; resolve the open suspension (by `suspensionRef` if given, else the order's `open` row) - `inst-ar-resolve`
-2. [ ] - `p1` - **IF** none is open, insert a `resume_ahead` row with `resume_event_id`; **IF** `UNIQUE (order_id, resume_event_id)` or the partial index refuses it, **RETURN** `absorbed-duplicate`; else **RETURN** `resume-ahead-recorded` with null `escalationRemaining` and empty `failedTaskRefs` - `inst-ar-ahead`
+2. [ ] - `p1` - **IF** none is open, insert a `resume_ahead` row with `resume_event_id`; **IF** `UNIQUE (order_id, resume_event_id)` or the partial index refuses it, **RETURN** `absorbed-duplicate`; else **RETURN** `resume-ahead-recorded` with `due: false` and empty `failedTaskRefs` - `inst-ar-ahead`
 3. [ ] - `p1` - Close the row: `state = closed`, `closed_reason = resumed`, `resume_event_id`, `resumed_at = closed_at = now()` - `inst-ar-close`
 4. [ ] - `p1` - Clear `owf_process_instance.suspended` and move the phase projection `suspended → started` - `inst-ar-predicate`
-5. [ ] - `p1` - Call the gate-window port `rearm_windows(correlationId, paused_gate_refs, hold)`; the port re-arms only windows whose `pause_causes` becomes empty and reports each remainder - `inst-ar-rearm`
+5. [ ] - `p1` - Call the gate-window port `rearm_windows(correlationId, paused_gate_refs, hold)`; the port re-arms only windows whose `pause_causes` becomes empty, re-basing each one's escalation deadline from its stored remainder - `inst-ar-rearm`
 6. [ ] - `p1` - Apply every deferred failure outcome slice 05 recorded for the instance during the suspension, ordered by observation instant: advance the task to `failed` with the recorded reason and clear the deferral - `inst-ar-deferred`
-7. [ ] - `p1` - **RETURN** `resumed`, the smallest reported remainder as `escalationRemaining` and the failed tasks as `failedTaskRefs`; one commit - `inst-ar-return`
+7. [ ] - `p1` - **RETURN** `resumed`, `due` (database time against the earliest re-based deadline; `false` when no window was re-armed) and the failed tasks as `failedTaskRefs`; one commit - `inst-ar-return`
 
 #### Transient Outage: Retry-Then-Manual-Task
 
@@ -679,7 +687,7 @@ sequenceDiagram
     D ->> OV: ref
     OV -->> D: unobtainable (key left open)
     Note over D: park arm only (03 §4.5 item 2): park → arm-park-escalation → parkLoop;<br/>order remains submitted; Lifecycle submitted TTL NOT paused;<br/>no hold arm in the park loop
-    D ->> D: wait escalateAfter → raise-overdue-escalation (park)
+    D ->> D: every PT5M: arm-park-escalation until due → raise-overdue-escalation (park)
 ```
 
 **Description**: Shown for boundary clarity only; the sequence is slice 03's and fragment
@@ -865,8 +873,11 @@ performs nor shadows either.
 The bounded-lifetime hazard (§2.2) is backstopped by the 90-day top-level `wait` of `10 §3.6` (a),
 never by the overdue window, which cannot see an order cycled through hold and resume while still
 `pending_approval`. The value is a product decision carried openly (D-4); the mechanism does not
-depend on it: whatever ceiling is chosen, it is armed once at start, is outside every hold arm,
-and parks the process for operator disposition rather than terminating it silently.
+depend on it: whatever ceiling is chosen, it is a literal of the definition version, is outside
+every hold arm, and parks the process for operator disposition rather than terminating it
+silently. After an unpark the process resumes its saved stage and checkpoint under a fresh `P90D`
+ceiling; a ceiling that fires during an unwind does not park (no `compensating → parked` edge,
+`01 §3.7`) and the unwind continues (`10 §3.6` (a), (d)).
 
 ### 4.6 Retired responsibilities
 
@@ -889,8 +900,8 @@ the fence of [`10 §4.1`](./10-process-definition.md#41-the-fence)
 (`cpt-cf-bss-orders-workflow-adr-definition-versioning-and-protected-steps`); a definition version
 that violates any of them **MUST** be refused.
 
-1. [ ] - `p1` - **Order in the hold arm.** In the arm that owns an escalation `wait`, `apply-hold` **<** `apply-resume`; the escalation `wait` after a resume **MUST** arm the `escalationRemaining` `apply-resume` returned (or, on `reconciled-out-of-order` / `absorbed-duplicate`, the value in force before the hold), never a literal and never the definition's own arithmetic - `inst-c8-hold-order`
-2. [ ] - `p1` - **Placement.** Every stage fork **MUST** carry a hold arm; the hold arm **MUST** be inside the competing fork whose escalation `wait` it pauses; the lifetime `wait` **MUST** be a top-level arm outside every stage fork; the barrier poll, the expected-fulfillment `wait` and the overdue `wait` **MUST** be in branches a hold arm does not cancel (`10 §4.5`) - `inst-c8-placement`
+1. [ ] - `p1` - **Order in the hold arm.** In the arm that owns an escalation `wait`, `apply-hold` **<** `apply-resume`; after a resume the escalation re-check **MUST** take `apply-resume`'s `due` as its first answer and then return to the fixed `PT5M` `waitEscalation` tick followed by `escalate-gate` `mode: fire`; the definition **MUST NOT** carry a remaining duration or compute the deadline, and `apply-hold`'s answer carries none to consume - `inst-c8-hold-order`
+2. [ ] - `p1` - **Placement.** Every stage fork **MUST** carry a hold arm; the hold arm **MUST** be inside the competing fork whose escalation `wait` it pauses; the lifetime `wait` **MUST** be the top-level `lifetimeCeiling` branch outside every stage fork, and the overdue `wait` the top-level `overdueMonitor` branch; the barrier poll and the expected-fulfillment tick **MUST** be in branches a hold arm does not cancel (`10 §4.5`) - `inst-c8-placement`
 3. [ ] - `p1` - **Early resume.** Every stage fork that carries a hold arm **MUST** also carry a resume arm that calls `apply-resume` with a null `suspensionRef` and returns to the stage, so a resume delivered before its hold is recorded as `resume-ahead-recorded` and not lost; the definition **MUST** enter the resume wait only on `holdOutcome = suspended` - `inst-c8-early-resume`
 4. [ ] - `p1` - **References.** `apply-hold` **MUST** receive `holdEventId` and the `gateRefs` `open-gates` last returned (empty outside the approval stage); `apply-resume` **MUST** receive `resumeEventId` exported from the resume `listen` and the `suspensionRef` `apply-hold` returned; `authorize-cancel` **MUST** receive the `cancelRequestRef` of the `cancel-requested` signal. No other member is admitted (ADR-0013) - `inst-c8-refs`
 5. [ ] - `p1` - **Denied cancel.** On `authorized = false` the definition **MUST** return to the arm the cancel was taken from — the stage loop, or the resume wait when the cancel was taken from hold (the instance is still `suspended`) — and **MUST NOT** call `run-cancellation-fence`; `authorize-cancel` **MUST** precede `run-cancellation-fence` on every cancel path, including the one taken from the resume wait - `inst-c8-denied-cancel`
@@ -902,10 +913,10 @@ that violates any of them **MUST** be refused.
 `10 §3.6` (e) carries every item of this contract, including the stage-level resume arm (item 3),
 `resumeEventId` exported from the resume `listen` (item 4) and the return to the resume wait on a
 denied cancel taken from hold (item 5); `apply-resume` re-reads no drafts (the re-read is inside
-the wave-2 dispatch, §3.2) and the remainder is slice 03's gate-window port value. Item 1's
-escalation `wait` stands for the remainder `apply-resume` returned; a 1.0.0 `wait` takes no runtime
-expression, so until Q-11 (i) is answered it is the bounded re-check loop of `10 §3.6`, which
-switches on `due`.
+the wave-2 dispatch, §3.2) and the remainder is slice 03's gate-window port value, never
+returned to the definition. A 1.0.0 `wait` takes no runtime expression, so item 1's escalation
+re-check is the bounded loop of `10 §3.6` *Fixed waits and re-check loops*: `apply-resume`'s `due`
+first, then the `PT5M` tick.
 
 ### 4.8 Cross-slice asks raised by this slice
 
