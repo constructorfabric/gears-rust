@@ -204,6 +204,36 @@ impl StoredCompleteResult {
             "manual" => BindState::Manual,
             _ => return None,
         };
+        // Cross-field consistency: each field above already parses on its
+        // own, but a snapshot that mixes them inconsistently is just as
+        // untrustworthy as an unrecognized spelling -- treated the same way
+        // (`None`, caller falls back to rebuilding from the version row).
+        //
+        // `hash_mode` vs. `part_count`/manifest, matching
+        // `MultipartService::complete_multipart_upload`'s `single_part`
+        // branch: a one-part plan always degenerates to `whole-sha256` with
+        // no manifest row (the ADR-0006 single-part amendment), so
+        // `part_count` is always exactly `1` and a manifest is never
+        // expected. A one-part `multipart-composite-sha256` row is a valid
+        // *legacy* state instead (written before that amendment existed) --
+        // only an impossible `part_count < 1` is rejected there.
+        match hash_mode {
+            HashMode::WholeSha256 if self.part_count != 1 || manifest.is_some() => return None,
+            HashMode::MultipartCompositeSha256 if self.part_count < 1 => return None,
+            _ => {}
+        }
+        // `bind_state` vs. `etag`/`current_etag`, matching what
+        // `resolve_bind_state` actually writes for each state: `Bound` always
+        // carries the new content `etag`, `Conflict` always carries the
+        // current-content `current_etag`. `Manual` writes neither, but
+        // nothing else ever populates them for a manual snapshot either, so
+        // there is nothing to check there.
+        if bind_state == BindState::Bound && self.etag.is_none() {
+            return None;
+        }
+        if bind_state == BindState::Conflict && self.current_etag.is_none() {
+            return None;
+        }
         Some(CompletedMultipartUpload {
             version_id: self.version_id,
             size: self.size,
@@ -670,5 +700,151 @@ mod tests {
             compute_plan(declared_size, None, None).expect("boundary value must be accepted");
         assert_eq!(part_size, MAX_PART_SIZE);
         assert_eq!(parts.len() as u64, MAX_PART_COUNT);
+    }
+
+    // ── `StoredCompleteResult::into_completed` cross-field consistency ──────
+    //
+    // `hash_mode` and `bind_state` each already parse independently; a
+    // snapshot that combines otherwise-valid values in a combination
+    // `complete_multipart_upload`/`resolve_bind_state` never actually
+    // produces must still be rejected (`None`), exactly like an unrecognized
+    // enum spelling -- `replay_completed` (`multipart_service.rs`) falls back
+    // to rebuilding from the version row either way.
+
+    /// A minimal, internally-consistent `whole-sha256`/`bound` snapshot --
+    /// the baseline every negative test below mutates one field away from.
+    fn stored_bound() -> StoredCompleteResult {
+        StoredCompleteResult {
+            version_id: Uuid::now_v7(),
+            size: 11,
+            content_hash: hex::encode([0u8; 32]),
+            hash_mode: HashMode::WholeSha256.as_str().to_owned(),
+            part_count: 1,
+            bind_state: BindState::Bound.as_str().to_owned(),
+            etag: Some("\"etag-value\"".to_owned()),
+            current_etag: None,
+        }
+    }
+
+    #[test]
+    fn into_completed_accepts_whole_sha256_bound_snapshot() {
+        let completed = stored_bound()
+            .into_completed(None)
+            .expect("a valid whole-sha256/bound snapshot must be accepted unchanged");
+        assert_eq!(completed.hash_mode, HashMode::WholeSha256);
+        assert_eq!(completed.part_count, 1);
+        assert_eq!(completed.bind_state, BindState::Bound);
+        assert_eq!(completed.etag.as_deref(), Some("\"etag-value\""));
+    }
+
+    #[test]
+    fn into_completed_accepts_composite_conflict_snapshot() {
+        let stored = StoredCompleteResult {
+            hash_mode: HashMode::MultipartCompositeSha256.as_str().to_owned(),
+            part_count: 3,
+            bind_state: BindState::Conflict.as_str().to_owned(),
+            etag: None,
+            current_etag: Some("\"current-etag\"".to_owned()),
+            ..stored_bound()
+        };
+        let completed = stored
+            .into_completed(Some("v1,0:aa".to_owned()))
+            .expect("a valid composite/conflict snapshot must be accepted unchanged");
+        assert_eq!(completed.bind_state, BindState::Conflict);
+        assert_eq!(completed.current_etag.as_deref(), Some("\"current-etag\""));
+    }
+
+    #[test]
+    fn into_completed_accepts_manual_snapshot_with_no_etags() {
+        let stored = StoredCompleteResult {
+            bind_state: BindState::Manual.as_str().to_owned(),
+            etag: None,
+            current_etag: None,
+            ..stored_bound()
+        };
+        assert!(
+            stored.into_completed(None).is_some(),
+            "manual requires neither etag nor current_etag"
+        );
+    }
+
+    #[test]
+    fn into_completed_accepts_legacy_one_part_composite_snapshot() {
+        // ADR-0006: a one-part `multipart-composite-sha256` row predating the
+        // single-part amendment is a valid historical state, not corruption.
+        let stored = StoredCompleteResult {
+            hash_mode: HashMode::MultipartCompositeSha256.as_str().to_owned(),
+            part_count: 1,
+            bind_state: BindState::Manual.as_str().to_owned(),
+            etag: None,
+            current_etag: None,
+            ..stored_bound()
+        };
+        assert!(
+            stored.into_completed(Some("v1,0:aa".to_owned())).is_some(),
+            "a legacy one-part composite snapshot must not be rejected"
+        );
+    }
+
+    #[test]
+    fn into_completed_rejects_whole_sha256_with_part_count_other_than_one() {
+        let stored = StoredCompleteResult {
+            part_count: 2,
+            ..stored_bound()
+        };
+        assert!(
+            stored.into_completed(None).is_none(),
+            "whole-sha256 with part_count != 1 must fall back, not be accepted as-is"
+        );
+    }
+
+    #[test]
+    fn into_completed_rejects_whole_sha256_with_unexpected_manifest() {
+        let stored = stored_bound();
+        assert!(
+            stored.into_completed(Some("v1,0:aa".to_owned())).is_none(),
+            "whole-sha256 must never carry a manifest"
+        );
+    }
+
+    #[test]
+    fn into_completed_rejects_composite_with_zero_part_count() {
+        let stored = StoredCompleteResult {
+            hash_mode: HashMode::MultipartCompositeSha256.as_str().to_owned(),
+            part_count: 0,
+            ..stored_bound()
+        };
+        assert!(
+            stored.into_completed(Some("v1,0:aa".to_owned())).is_none(),
+            "an impossible zero-part composite snapshot must fall back"
+        );
+    }
+
+    #[test]
+    fn into_completed_rejects_bound_without_etag() {
+        let stored = StoredCompleteResult {
+            etag: None,
+            ..stored_bound()
+        };
+        assert!(
+            stored.into_completed(None).is_none(),
+            "bind_state=bound without an etag must fall back"
+        );
+    }
+
+    #[test]
+    fn into_completed_rejects_conflict_without_current_etag() {
+        let stored = StoredCompleteResult {
+            hash_mode: HashMode::MultipartCompositeSha256.as_str().to_owned(),
+            part_count: 2,
+            bind_state: BindState::Conflict.as_str().to_owned(),
+            etag: None,
+            current_etag: None,
+            ..stored_bound()
+        };
+        assert!(
+            stored.into_completed(Some("v1,0:aa".to_owned())).is_none(),
+            "bind_state=conflict without a current_etag must fall back"
+        );
     }
 }

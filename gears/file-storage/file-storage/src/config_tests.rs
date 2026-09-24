@@ -1051,3 +1051,52 @@ fn validate_rejects_wrong_length_previous_signing_public_key() {
         "error should name the length mismatch: {err}"
     );
 }
+
+/// Distinct, well-formed (base64url, 32-byte) synthetic keys -- `Verifier`
+/// only checks decoded length at `validate()` time (the curve-point check
+/// happens lazily inside `ring` at actual signature-verification time), so a
+/// fixed byte pattern per index is enough here.
+fn synthetic_previous_keys(n: usize) -> Vec<String> {
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+    (0..n)
+        .map(|i| {
+            let b = u8::try_from(i).expect("test count stays well within u8 range");
+            URL_SAFE_NO_PAD.encode([b; 32])
+        })
+        .collect()
+}
+
+#[test]
+fn validate_accepts_previous_signing_public_keys_at_max() {
+    let cfg = FileStorageConfig {
+        require_signing_key_seed: false,
+        previous_signing_public_keys: synthetic_previous_keys(
+            crate::infra::signed_url::MAX_PREVIOUS_SIGNING_PUBLIC_KEYS,
+        ),
+        ..FileStorageConfig::default()
+    };
+    assert!(
+        cfg.validate().is_ok(),
+        "exactly MAX_PREVIOUS_SIGNING_PUBLIC_KEYS entries must be accepted"
+    );
+}
+
+#[test]
+fn validate_rejects_previous_signing_public_keys_above_max() {
+    let cfg = FileStorageConfig {
+        require_signing_key_seed: false,
+        previous_signing_public_keys: synthetic_previous_keys(
+            crate::infra::signed_url::MAX_PREVIOUS_SIGNING_PUBLIC_KEYS + 1,
+        ),
+        ..FileStorageConfig::default()
+    };
+    let err = cfg
+        .validate()
+        .expect_err("one entry over MAX_PREVIOUS_SIGNING_PUBLIC_KEYS must fail gear init");
+    assert!(
+        err.to_string().contains("MAX_PREVIOUS_SIGNING_PUBLIC_KEYS"),
+        "error should name the exceeded ceiling: {err}"
+    );
+}

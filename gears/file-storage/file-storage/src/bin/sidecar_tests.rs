@@ -13,6 +13,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header};
+use axum::response::Response;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bytes::Bytes;
@@ -32,10 +33,12 @@ use file_storage::infra::metrics::NoopMetrics;
 use file_storage::infra::signed_url::{Claims, Issuer, MultipartClaims, Op, UploadConstraints};
 
 use super::{
-    DEFAULT_MAX_BODY_BYTES, DEFAULT_MAX_CONCURRENT_PART_UPLOADS, SidecarState, TokenQuery,
-    build_config, build_router, check_part_buffer_budget, dedupe_public_keys, extract_token,
-    finalize_with_control_plane, idle_timeout_stream, interpret_finalize_response, parse_optional,
-    parse_public_key_list, write_multipart_part_native, write_multipart_part_offset_object,
+    DEFAULT_MAX_BODY_BYTES, DEFAULT_MAX_CONCURRENT_PART_UPLOADS, MAX_PREVIOUS_SIGNING_PUBLIC_KEYS,
+    SidecarState, TokenQuery, build_config, build_router, check_part_buffer_budget,
+    dedupe_public_keys, extract_token, finalize_with_control_plane, idle_timeout_stream,
+    interpret_finalize_response, parse_optional, parse_public_key_list,
+    report_part_with_control_plane, write_multipart_part_native,
+    write_multipart_part_offset_object,
 };
 
 /// A part-upload concurrency semaphore sized at the production default
@@ -1356,6 +1359,178 @@ async fn finalize_callback_total_time_bounded_by_retry_budget() {
     );
 }
 
+// ── `report_part_with_control_plane` retry/HTTP-classification (mirrors the
+// `finalize_with_control_plane` retry tests above: both callbacks share
+// `post_with_retry`, but nothing previously exercised report-part through it
+// directly) ─────────────────────────────────────────────────────────────────
+
+/// Call `report_part_with_control_plane` with arbitrary-but-fixed
+/// identifiers -- these tests only care about the callback's retry/status
+/// behavior, never about which upload/part it names.
+async fn call_report_part(state: &SidecarState) -> Result<(), Response> {
+    report_part_with_control_plane(
+        state,
+        "dummy-token",
+        "test-request-id",
+        Uuid::nil(),
+        Uuid::nil(),
+        Uuid::nil(),
+        1,
+        "\"backend-etag\"",
+        "deadbeef",
+        0,
+    )
+    .await
+}
+
+/// A transport failure (here, a control plane that accepts every connection
+/// but never responds, i.e. every attempt eventually times out) must be
+/// retried up to `CALLBACK_MAX_ATTEMPTS` times -- not fewer (the retry
+/// contract), not unbounded (the P2 1.5 regression this mirrors from
+/// `finalize_callback_total_time_bounded_by_retry_budget`) -- and the final
+/// response must be the same `502 Bad Gateway` `finalize_with_control_plane`
+/// returns once its own retry budget is exhausted.
+#[tokio::test]
+async fn report_part_callback_retries_bounded_on_transport_failure_then_bad_gateway() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock control plane");
+    let addr = listener.local_addr().expect("local addr");
+
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let accepted_clone = Arc::clone(&accepted);
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            accepted_clone.fetch_add(1, Ordering::SeqCst);
+            // Never write a response and never let `stream` drop -- a drop
+            // would close the connection, surfacing as a read/reset error
+            // instead of the genuine per-attempt timeout this test needs.
+            std::mem::forget(stream);
+        }
+    });
+
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_millis(50))
+        .connect_timeout(Duration::from_millis(50))
+        .build()
+        .expect("client build");
+    let mut state = test_state();
+    state.http = http;
+    state.control_base_url = format!("http://{addr}");
+    // Comfortably above the expected ~3*50ms attempts + 2*100ms delays, so
+    // the retry loop itself -- not the outer budget -- is what exhausts
+    // `CALLBACK_MAX_ATTEMPTS` here.
+    state.callback_retry_budget = Duration::from_secs(5);
+
+    let outcome = tokio::time::timeout(Duration::from_secs(3), call_report_part(&state))
+        .await
+        .expect("report-part must return within the test's own timeout budget");
+
+    let Err(response) = outcome else {
+        panic!("report-part must fail once every attempt times out against a hung control plane");
+    };
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        3,
+        "exactly CALLBACK_MAX_ATTEMPTS connections should reach the mock control plane -- \
+         bounded, not unbounded, retries on a transport failure"
+    );
+}
+
+/// A control plane that answers every connection with a `4xx` must **not**
+/// be retried at all -- `post_with_retry` only retries a transport connect/
+/// timeout failure (`reqwest::Error::is_connect()`/`is_timeout()`); a real
+/// HTTP status, success or error, comes back from `send()` as `Ok(response)`
+/// and is handed straight to the caller's response interpretation. Exactly
+/// one connection must reach the mock control plane.
+#[tokio::test]
+async fn report_part_callback_4xx_is_not_retried() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock control plane");
+    let addr = listener.local_addr().expect("local addr");
+
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let accepted_clone = Arc::clone(&accepted);
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            accepted_clone.fetch_add(1, Ordering::SeqCst);
+            let mut buf = [0u8; 1024];
+            if stream.read(&mut buf).await.is_ok() {
+                stream
+                    .write_all(b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\n\r\n")
+                    .await
+                    .ok();
+            }
+        }
+    });
+
+    let mut state = test_state();
+    state.control_base_url = format!("http://{addr}");
+
+    let outcome = tokio::time::timeout(Duration::from_secs(3), call_report_part(&state))
+        .await
+        .expect("report-part must return within the test's own timeout budget");
+
+    let Err(response) = outcome else {
+        panic!("report-part must fail when the control plane returns a 4xx status");
+    };
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        1,
+        "a real 4xx status must not be retried -- exactly one attempt"
+    );
+}
+
+/// The `5xx` counterpart of the test above, fixing the actual (undocumented
+/// until now) behavior of `post_with_retry`: a `5xx` is, like a `4xx`, a real
+/// HTTP status rather than a transport failure, so it is likewise **not**
+/// retried -- exactly one connection reaches the mock control plane, same as
+/// `interpret_finalize_response_error_status_maps_to_bad_gateway` documents
+/// for `interpret_finalize_response` in isolation ("this function does not
+/// distinguish 4xx from 5xx").
+#[tokio::test]
+async fn report_part_callback_5xx_is_not_retried() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock control plane");
+    let addr = listener.local_addr().expect("local addr");
+
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let accepted_clone = Arc::clone(&accepted);
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            accepted_clone.fetch_add(1, Ordering::SeqCst);
+            let mut buf = [0u8; 1024];
+            if stream.read(&mut buf).await.is_ok() {
+                stream
+                    .write_all(b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\n\r\n")
+                    .await
+                    .ok();
+            }
+        }
+    });
+
+    let mut state = test_state();
+    state.control_base_url = format!("http://{addr}");
+
+    let outcome = tokio::time::timeout(Duration::from_secs(3), call_report_part(&state))
+        .await
+        .expect("report-part must return within the test's own timeout budget");
+
+    let Err(response) = outcome else {
+        panic!("report-part must fail when the control plane returns a 5xx status");
+    };
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        1,
+        "a real 5xx status must not be retried either -- exactly one attempt, same as a 4xx"
+    );
+}
+
 // ── `interpret_finalize_response` (E2E-02: X-FS-Bound/ETag echo contract) ──
 //
 // `docs/api.md` §"Single-part bind outcome headers": the sidecar's `200`
@@ -2507,6 +2682,59 @@ fn build_config_rotation_accepts_old_key_while_listed_then_rejects_once_removed(
         .verifier
         .verify(&token, OffsetDateTime::now_utc())
         .expect_err("a token signed by the old key must be rejected once it is no longer listed");
+}
+
+/// Distinct, well-formed (base64url, 32-byte) synthetic keys -- `Verifier`
+/// only checks decoded length at `build_config` time (the curve-point check
+/// happens lazily inside `ring` at actual signature-verification time), so a
+/// fixed byte pattern per index is enough here.
+fn synthetic_previous_keys_csv(n: usize) -> String {
+    (0..n)
+        .map(|i| {
+            let b = u8::try_from(i).expect("test count stays well within u8 range");
+            URL_SAFE_NO_PAD.encode([b; 32])
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Exactly `MAX_PREVIOUS_SIGNING_PUBLIC_KEYS` entries in
+/// `FS_SIDECAR_PREVIOUS_PUBLIC_KEYS` must be accepted.
+#[test]
+fn build_config_previous_keys_at_max_is_accepted() {
+    let (mut env, _issuer) = base_config_env();
+    env.insert(
+        "FS_SIDECAR_PREVIOUS_PUBLIC_KEYS",
+        synthetic_previous_keys_csv(MAX_PREVIOUS_SIGNING_PUBLIC_KEYS),
+    );
+
+    let config = build_config(lookup_fn(env))
+        .expect("exactly MAX_PREVIOUS_SIGNING_PUBLIC_KEYS entries must be accepted");
+    assert_eq!(
+        config.accepted_key_count,
+        MAX_PREVIOUS_SIGNING_PUBLIC_KEYS + 1,
+        "primary + every previous key, none of these are duplicates"
+    );
+}
+
+/// One entry over `MAX_PREVIOUS_SIGNING_PUBLIC_KEYS` in
+/// `FS_SIDECAR_PREVIOUS_PUBLIC_KEYS` must fail startup -- an unbounded list
+/// is an unbounded per-request linear scan in `Verifier::verify`, not just
+/// config hygiene.
+#[test]
+fn build_config_previous_keys_above_max_is_rejected() {
+    let (mut env, _issuer) = base_config_env();
+    env.insert(
+        "FS_SIDECAR_PREVIOUS_PUBLIC_KEYS",
+        synthetic_previous_keys_csv(MAX_PREVIOUS_SIGNING_PUBLIC_KEYS + 1),
+    );
+
+    let err = build_config(lookup_fn(env))
+        .expect_err("one entry over MAX_PREVIOUS_SIGNING_PUBLIC_KEYS must fail startup");
+    assert!(
+        err.to_string().contains("MAX_PREVIOUS_SIGNING_PUBLIC_KEYS"),
+        "error should name the exceeded ceiling: {err}"
+    );
 }
 
 // ── `check_part_buffer_budget` (T-worst-case-memory-vs-cgroup-limit) ────────

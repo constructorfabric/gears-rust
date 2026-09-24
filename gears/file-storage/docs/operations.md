@@ -27,16 +27,17 @@ gear started with no `file-storage` config section at all gets every default bel
 actually boot**: `require_signing_key_seed` defaults to `true` with `signing_key_seed` unset, and
 `FileStorageConfig::validate()` fails gear init on exactly that combination (see `require_signing_key_seed` below).
 A genuinely zero-config deployment is dev/test-only (set `require_signing_key_seed: false` there).
-`FileStorageConfig::validate()` (called at gear init, before anything is wired up) rejects **eighteen**
+`FileStorageConfig::validate()` (called at gear init, before anything is wired up) rejects **nineteen**
 invalid configurations — six missing-secret/zero-value guards (`sweep_interval_secs == 0` with the sweep enabled;
 `default_url_ttl_secs`, `multipart_session_ttl_secs` or `multipart_complete_lease_secs` equal to `0`, instead of
 silently using one second; `signing_key_seed` absent while required; `finalize_internal_secret` absent while
-required); seven absolute
+required); eight absolute
 ceilings (`finalize_token_grace_secs` above `MAX_FINALIZE_TOKEN_GRACE_SECS`, 7 days; `max_page_size` above
 `MAX_PAGE_SIZE_CEILING`, 1000; `max_url_ttl_secs` above `MAX_URL_TTL_CEILING`, 30 days; `multipart_session_ttl_secs`
 above `MAX_MULTIPART_SESSION_TTL_SECS`, 30 days; `multipart_complete_lease_secs` above
 `MAX_MULTIPART_COMPLETE_LEASE_SECS`, 1 day; `orphan_grace_secs` above `MAX_ORPHAN_GRACE_SECS`, 30 days;
-`idempotency_ttl_secs` above `MAX_IDEMPOTENCY_TTL_SECS`, 30 days — see those fields below); four cross-field ordering invariants (`default_url_ttl_secs`
+`idempotency_ttl_secs` above `MAX_IDEMPOTENCY_TTL_SECS`, 30 days; `previous_signing_public_keys` having more than
+`infra::signed_url::MAX_PREVIOUS_SIGNING_PUBLIC_KEYS`, 8, entries — see those fields below); four cross-field ordering invariants (`default_url_ttl_secs`
 vs. `max_url_ttl_secs`; `default_page_size` vs. `max_page_size`; `default_url_ttl_secs` vs. `orphan_grace_secs`;
 `multipart_session_ttl_secs` vs. `default_url_ttl_secs`); and one per-entry format check (each
 `previous_signing_public_keys` entry must be a validly-formed, 32-byte Ed25519 public key — see that field below) —
@@ -240,9 +241,11 @@ of the **Rotation** procedure, and clear it again once step 4 completes. **Misco
 during a rotation reproduces the bug this field exists to close — every upload started before the control-plane
 restart fails its finalize/report-part callback the instant the restart happens, even though the sidecar fleet
 still honours the client's in-flight signed URL. `validate()` fails gear init on a malformed entry (bad base64, or
-the wrong decoded length); harmless duplicates (of the current key, or within this list) are silently deduped with
-a startup warning once the current key is actually known — see `FileService::with_previous_signing_public_keys`
-and `infra::signed_url::dedupe_public_keys`.
+the wrong decoded length), or on more than `infra::signed_url::MAX_PREVIOUS_SIGNING_PUBLIC_KEYS` (8) entries — the
+same ceiling, and for the same reason (an unbounded per-callback linear scan through `Verifier::verify`), as the
+sidecar's own `FS_SIDECAR_PREVIOUS_PUBLIC_KEYS` below; harmless duplicates (of the current key, or within this
+list) are silently deduped with a startup warning once the current key is actually known — see
+`FileService::with_previous_signing_public_keys` and `infra::signed_url::dedupe_public_keys`.
 
 ### `require_signing_key_seed`
 When `true` (the default), `FileStorageConfig::validate()` makes gear init **fail fast** if `signing_key_seed` is
@@ -416,7 +419,7 @@ share `FileStorageConfig`. All of these are read once in `main()`.
 |---|---|---|
 | `FS_SIDECAR_ADDR` | `0.0.0.0:8087` | Bind address. |
 | `FS_SIDECAR_PUBLIC_KEY` | **required, no default** | Base64url Ed25519 **primary** public key; must match the control plane's `signing_key_seed`-derived keypair (see above). Startup fails (`anyhow::anyhow!`) if unset or malformed. |
-| `FS_SIDECAR_PREVIOUS_PUBLIC_KEYS` | unset (no previous keys) | Optional comma-separated list of additional base64url Ed25519 public keys, checked **after** the primary (same "try each, first match wins" verifier — no `kid`). Exists purely to give a `signing_key_seed` rotation a window where tokens signed by either the old or the new key still verify — see `signing_key_seed`'s **Rotation** paragraph below for the procedure. **Cost**: one extra Ed25519 verification per token that fails against the primary, times the list length — keep it short (one entry covering the immediately-prior seed is the normal case) and drop a key once `max_url_ttl_secs` has passed since the seed that produced it stopped being primary, so no still-valid token could possibly have been signed with it. An entry that duplicates `FS_SIDECAR_PUBLIC_KEY` or repeats elsewhere within the list is dropped at startup with a `warn`-level log (`dropped_duplicates`) rather than rejected — a harmless no-op, not a startup error, since the list need not be scrubbed the instant a rotation finishes, but the warning is a signal that step 4 of the rotation procedure has not been completed yet. A malformed entry fails sidecar startup exactly like a malformed `FS_SIDECAR_PUBLIC_KEY`. |
+| `FS_SIDECAR_PREVIOUS_PUBLIC_KEYS` | unset (no previous keys) | Optional comma-separated list of additional base64url Ed25519 public keys, checked **after** the primary (same "try each, first match wins" verifier — no `kid`). Exists purely to give a `signing_key_seed` rotation a window where tokens signed by either the old or the new key still verify — see `signing_key_seed`'s **Rotation** paragraph below for the procedure. **Cost**: one extra Ed25519 verification per token that fails against the primary, times the list length — keep it short (one entry covering the immediately-prior seed is the normal case) and drop a key once `max_url_ttl_secs` has passed since the seed that produced it stopped being primary, so no still-valid token could possibly have been signed with it. Capped at `infra::signed_url::MAX_PREVIOUS_SIGNING_PUBLIC_KEYS` (8) entries; `build_config` fails sidecar startup above it, for the same unbounded-linear-scan reason as the control plane's own `previous_signing_public_keys` ceiling above. An entry that duplicates `FS_SIDECAR_PUBLIC_KEY` or repeats elsewhere within the list is dropped at startup with a `warn`-level log (`dropped_duplicates`) rather than rejected — a harmless no-op, not a startup error, since the list need not be scrubbed the instant a rotation finishes, but the warning is a signal that step 4 of the rotation procedure has not been completed yet. A malformed entry fails sidecar startup exactly like a malformed `FS_SIDECAR_PUBLIC_KEY`. |
 | `FS_SIDECAR_BACKEND_ROOT` | `./.file-storage-data` | Local-fs backend root — same durability caveat as the control plane's `storage_root`; the two should point at the **same** underlying storage for a single-backend deployment, or the sidecar will read/write blobs the control plane's metadata doesn't expect to find there. |
 | `FS_SIDECAR_CONTROL_URL` | `http://localhost:8080` | Base URL of the control plane, used for the finalize/report-part callbacks. Setting it to the **empty string** explicitly disables the callback (dev/test only) — uploaded versions then stay `pending` forever, since nothing ever calls finalize; production must always set this to a reachable control-plane URL. The scheme is **not** validated, and the callbacks carry `x-fs-token` plus, when configured, the `x-fs-internal-token` shared secret — so keep this hop inside a trusted network boundary or point it at an HTTPS/mTLS endpoint; a plain-HTTP URL puts that secret on the wire in the clear. |
 | `FS_SIDECAR_MAX_BODY_BYTES` | `5368709120` (5 GiB) | Raises axum's blanket request-body floor (default 2 MiB). The limit is a `DefaultBodyLimit` layer on the **whole** sidecar router (`build_router`), so it applies to the request bodies of the single-part `PUT` and of multipart part uploads alike — not only to the single-part route. It does **not** bound download responses: the limit governs request-body extraction, and a download is a `GET`/`HEAD` whose response is streamed past it. This is a transport-layer ceiling only — the real per-request limit is the signed token's `max_size`/`exact_size` claim. **Misconfiguration risk**: setting it below the largest policy-permitted single-part upload causes legitimate uploads to be rejected at the transport layer before the token-level check even runs; because the planner may widen `part_size` up to `MAX_PART_SIZE` (5 GiB) for very large objects, lowering this variable can also reject every *part* of a multipart upload with `413`, which is easy to miss when tuning it with only single-part uploads in mind. |
