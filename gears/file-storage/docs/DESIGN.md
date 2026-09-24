@@ -154,6 +154,7 @@ See [PRD.md](./PRD.md) §1 "Overview" and §1.3 "Goals":
 | `cpt-cf-file-storage-adr-content-hash-selection`      | Content hash is a single hard-coded algorithm, SHA-256, with no configurable `hash_policy`/`allowed_algorithms`/allow-list surface; the two hash **modes** (whole-object, multipart-composite) are defined by `cpt-cf-file-storage-adr-content-hash-modes` (ADR-0006)                                                    |
 | `cpt-cf-file-storage-adr-s3-client-selection`         | `S3Backend` (`durable: true`, `multipart_native: true`) is built on `rusty-s3` (+ `quick-xml`), executed over the crate's existing `reqwest` stack — no second HTTP/TLS stack; presigning is unused, since the sidecar is the sole holder of S3 credentials. Shipped and opt-in (`s3_backends` config), pending ADR-0005's security-review gate before use in a production release path |
 | `cpt-cf-file-storage-adr-content-hash-modes`          | Two SHA-256 content-hash modes — whole-object (single-part) and a multipart offset-manifest composite (`root = sha256` of per-part `{offset}:sha256(part)` manifest), computed on-the-fly at upload, never by re-reading; client-verifiable. |
+| `cpt-cf-file-storage-adr-storage-layout-rules`        | Storage key/backend placement stays the fixed `default_backend_id` + `/{file_id}/{version_id}` convention today; a single placement seam removes the duplicated/recomputed path formula, with an opt-in `StoragePlacementResolver` Rust plugin (resolved via the platform's GTS/`ClientHub` plugin pattern, falling back to today's convention when unset) as the extension point for hierarchical keys and dynamic per-tenant private-backend routing |
 
 ### 1.3 Architecture Layers
 
@@ -951,11 +952,14 @@ schema, status codes — is documented in **[api.md](./api.md)**. The summary:
 
 **Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-gears`
 
-Every write is **presign (control) → `PUT` (data) → finalize (data→control callback) → `bind` (control)** — three
-control-plane touches and one data-plane touch. `finalize` and `bind` are two distinct steps: `finalize` flips a version `pending → available`
+The staged (`bind: "manual"`) write path is **presign (control) → `PUT` (data) → finalize (data→control callback) →
+`bind` (control)** — three control-plane touches and one data-plane touch. `finalize` and `bind` are two distinct
+steps: `finalize` flips a version `pending → available`
 and is called by the **sidecar**, authorized solely by the same signed upload token (`fs-token`) — no FS SDK call, no
-app-token, no on-behalf-of delegation. `bind` swaps the file's `content_id` pointer under `If-Match` and is called
-**only** by the client, as a separate request after a successful upload; the sidecar never binds.
+app-token, no on-behalf-of delegation. For `bind: "manual"`, `bind` swaps the file's `content_id` pointer under
+`If-Match` and is called by the client, as a separate request after a successful upload. The sidecar itself never
+binds in either mode — see the auto-bind amendment directly below for the default (`bind: "auto"`) path, where the
+control plane's finalize handler performs the pointer swap inline instead of waiting for a separate client call.
 
 **Auto-bind on finalize for a NEW file's first content.** `POST /files` defaults to
 `bind: "auto"`, which bakes a `bind_on_finalize` claim into the upload token: the finalize callback then also swaps
@@ -1266,6 +1270,10 @@ The file row holds **no bytes and no per-content fields** (mime, size, hash, bac
 - `PRIMARY KEY (file_id)`
 - `(tenant_id, owner_kind, owner_id, created_at DESC)` — covers `GET /files` listing
 - `(tenant_id, gts_file_type)` — supports per-type queries
+- partial index on `(created_at, file_id) WHERE content_id IS NULL` — supports the cleanup engine's
+  versionless-orphan-file sweep (a `POST /files` multipart create that crashed between the bare file insert and the
+  pending-version insert; `files_versionless_sweep_idx` in `docs/migration.sql`, see `docs/operations.md`'s
+  cleanup-sweep section)
 
 #### Table: `file_versions`
 
@@ -1283,7 +1291,7 @@ and is immutable.
 | `hash_algorithm`  | `text`                                | Always `'SHA-256'` — a single hard-coded algorithm, no algorithm widening     |
 | `hash_value`      | `bytea`                               | Content digest (32 bytes): `sha256(object bytes)` for `whole-sha256`, or `sha256(manifest)` (the ADR-0006 composite root) for `multipart-composite-sha256` |
 | `hash_mode`       | `text` (`'whole-sha256'` \| `'multipart-composite-sha256'`) | ADR-0006 discriminator: which of the two hash modes produced `hash_value` (§4.2) |
-| `part_count`      | `integer`, nullable                   | Number of parts; set only for `multipart-composite-sha256`, `NULL` for `whole-sha256` |
+| `part_count`      | `integer`, nullable                   | Number of parts; set only for `multipart-composite-sha256`, `NULL` for `whole-sha256`. When set, always `>= 2` — a one-part plan degenerates to `whole-sha256` instead (ADR-0006 single-part amendment); enforced by a `CHECK` constraint on Postgres and by `BEFORE INSERT`/`BEFORE UPDATE OF part_count` triggers on SQLite (`m20260923_000001_part_count_floor`, see `docs/migration.sql`) |
 | `status`          | `text` (`'pending'` \| `'available'`) | `'pending'` from pre-register until **finalize** (sidecar's post-`PUT` callback), then `'available'`. `bind` is a separate step (swaps `content_id`) and does not gate this column |
 | `is_current`      | `boolean`                             | Whether this version is the file's current content (matches `files.content_id`) |
 | `backend_id`      | `text`                                | `BackendConfig` that holds the bytes (platform YAML config in P1)            |
@@ -1339,7 +1347,7 @@ in P2 (`cpt-cf-file-storage-fr-metadata-limits`); in P1 only sanity limits apply
 
 | Table                              | Phase | Purpose                                                                                  | Forward reference                                                |
 |------------------------------------|-------|------------------------------------------------------------------------------------------|------------------------------------------------------------------|
-| `multipart_uploads`                | P2    | In-flight multipart sessions: `upload_id`, `file_id`, parts list with per-part hashes    | `cpt-cf-file-storage-fr-multipart-upload`                        |
+| `multipart_uploads`                | P2    | In-flight multipart sessions: `upload_id`, `file_id`, lease state, `auto_bind` flag, and the session's own `backend_id`/`backend_path` (recorded once at initiate from the pending version, so the cleanup sweep can resolve the target backend/object even once the `file_versions` row is already gone) | `cpt-cf-file-storage-fr-multipart-upload`                        |
 | `multipart_upload_parts`           | P2    | One row per uploaded part: `backend_etag`/offset, `size`, `part_hash` (SHA-256 of the part's bytes, computed on-the-fly; folded into the offset-manifest composite at `complete`, no re-read — ADR-0006, shipped) | `cpt-cf-file-storage-fr-multipart-upload`                        |
 | `idempotency_keys`                 | P2    | Owner-scoped idempotency for uploads                                                      | `cpt-cf-file-storage-fr-upload-idempotency`                      |
 | `audit_outbox`                     | P2    | Transactional-outbox rows drained by `audit-publisher` to the audit sink                 | `cpt-cf-file-storage-fr-audit-trail`                             |
@@ -1442,6 +1450,14 @@ Each driver has a different translation strategy:
 
 Drivers without native range MUST stream their fallback without buffering the whole object in memory; the driver's
 range adapter wraps the backend stream in `Skip + Take` style adapters operating on `Stream<Bytes>`.
+
+**Truncation/growth guard.** Every backend read (full or ranged) is handed the exact length the sidecar already
+committed to from its own earlier `stat`/`HeadObject` call, never a fresh, trusting read. If the backend's read
+response disagrees with that length — the object changed size in the window between the two calls — the backend
+driver refuses **before the first byte is streamed**, rather than handing back a body that would contradict the
+`Content-Length`/`Content-Range` headers already sent; the sidecar surfaces this as `503` with `Retry-After: 1` (a
+transient race, not a fault — see [api.md](./api.md#status-code-summary)). Any other backend read failure remains
+`500`.
 
 **`Accept-Ranges: bytes` advertising.** Every `GET` response from the sidecar (`200`/`206`) includes
 `Accept-Ranges: bytes`. This is independent of whether the request had a `Range` header — it advertises that the
@@ -1631,7 +1647,8 @@ enforced anywhere in code** — a documented extension point, not a shipped capa
   clamps** `exp` down to at signing (never a refusal). The sidecar rejects when `now >= exp` (expiry is
   exclusive: a token stops working exactly at `exp`, not one second later). The control plane applies the same rule
   everywhere except on the sidecar's own **finalize/report-part callbacks**, where the already-verified upload token
-  is accepted up to `finalize_token_grace_secs` (1 h default, `0` = strict) past `exp`: the sidecar checks the token
+  is accepted up to `finalize_token_grace_secs` (1 h default, `0` = strict, hard-capped at 7 days —
+  `MAX_FINALIZE_TOKEN_GRACE_SECS`, gear init fails above it) past `exp`: the sidecar checks the token
   once at the start of the `PUT` and never mid-stream, so a slow-but-live upload can legitimately reach the callback
   after its TTL with the bytes already written (`operations.md`, concurrency model §2.3). "Available to everyone for 5 minutes" =
   only `exp`, no token-claim predicate (predicates are not implemented, see above). A third, independent knob,
@@ -1888,4 +1905,5 @@ The control plane and the data-plane sidecar are implemented under `gears/file-s
   - [ADR-0002: Content Integrity Hash — SHA-256 in P1, Configurable in P2](./ADR/0002-cpt-cf-file-storage-adr-content-hash-selection.md)
   - [ADR-0005: S3 Client Selection](./ADR/0005-cpt-cf-file-storage-adr-s3-client-selection.md) — `rusty-s3` + `quick-xml`, pending security-review sign-off
   - [ADR-0006: Content-Hash Modes](./ADR/0006-cpt-cf-file-storage-adr-content-hash-modes.md) — `whole-sha256` / `multipart-composite-sha256`
+  - [ADR-0007: Storage Key Layout & Backend/Bucket Placement Rules](./ADR/0007-cpt-cf-file-storage-adr-storage-layout-rules.md) — fixed `default_backend_id` + `/{file_id}/{version_id}` today, with fallback preserved; opt-in `StoragePlacementResolver` Rust plugin (GTS/`ClientHub` pattern) as the extension point for hierarchical keys/dynamic tenant-private backends
 - **Features**: [features/](./features/) — `multipart-coordinator.md`, `policy-engine.md`, `retention-cleanup.md`, `audit-trail.md`, `backend-migration.md`, `ownership-transfer.md`, `content-hash-modes.md`
