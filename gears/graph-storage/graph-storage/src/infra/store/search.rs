@@ -20,6 +20,7 @@ use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, Condition, EntityTrait, Order, QueryOrder, QuerySelect};
 use toolkit_db::secure::{DBRunner, SecureEntityExt};
 
+use crate::infra::projections::{TypeId, type_id_columns};
 use crate::infra::storage::entity::{gts_type, node};
 use crate::infra::storage::migrations::FTS_CONFIG;
 use crate::infra::store::{PgGraphStore, map_db_error, map_scope_err};
@@ -45,7 +46,7 @@ pub async fn search(
             .secure()
             .scope_with(ctx.scope)
             .filter(Condition::all().add(gts_type::Column::GtsTypeId.is_in(names)))
-            .all(&conn)
+            .project_all(&conn, |query| type_id_columns(query).into_model::<TypeId>())
             .await
             .map_err(map_scope_err)?;
         Some(rows.into_iter().map(|r| r.id).collect::<Vec<_>>())

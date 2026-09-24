@@ -31,6 +31,9 @@ use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter};
 use std::collections::BTreeSet;
 use toolkit_db::secure::{DBRunner, SecureDeleteExt, SecureEntityExt};
 
+use crate::infra::projections::{
+    EndpointPair, NodeIdent, endpoint_pair_columns, node_ident_columns,
+};
 use crate::infra::storage::entity::{edge, gts_type, node};
 use crate::infra::store::map_scope_err;
 use crate::infra::store::types::traits_from_json;
@@ -116,7 +119,7 @@ pub(crate) async fn remove_stale(
     // The field name is a checked literal; the value is bound.
     let member =
         Expr::cust(format!("(payload #>> '{{{attribute}}}')")).eq(Expr::val(value.to_owned()));
-    let candidates: Vec<node::Model> = node::Entity::find()
+    let candidates: Vec<NodeIdent> = node::Entity::find()
         .secure()
         .scope_with(scope)
         .filter(
@@ -125,11 +128,13 @@ pub(crate) async fn remove_stale(
                 .add(node::Column::DeletedAt.is_null())
                 .add(member),
         )
-        .all(tx)
+        .project_all(tx, |query| {
+            node_ident_columns(query).into_model::<NodeIdent>()
+        })
         .await
         .map_err(map_scope_err)?;
 
-    let stale: Vec<&node::Model> = candidates
+    let stale: Vec<&NodeIdent> = candidates
         .iter()
         .filter(|row| !written.contains(&row.node_key))
         .collect();
@@ -228,7 +233,9 @@ pub(crate) async fn remove_stale(
                 .add(edge::Column::SrcNodeId.is_in(stale_ids.clone()))
                 .add(edge::Column::DstNodeId.is_in(stale_ids.clone())),
         )
-        .all(tx)
+        .project_all(tx, |query| {
+            endpoint_pair_columns(query).into_model::<EndpointPair>()
+        })
         .await
         .map_err(map_scope_err)?
         .into_iter()

@@ -14,5 +14,6 @@ pub mod engine;
 /// -- which is a test concern, not a shipped one.
 #[cfg(any(test, feature = "test-support"))]
 pub mod fake_store;
+pub(crate) mod projections;
 pub mod storage;
 pub mod store;

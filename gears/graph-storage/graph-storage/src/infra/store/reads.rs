@@ -19,6 +19,7 @@ use toolkit_db::secure::{DBRunner, SecureEntityExt};
 use toolkit_odata::{Page as OdataPage, SortDir};
 use uuid::Uuid;
 
+use crate::infra::projections::{NodeIdent, TypeName, node_ident_columns, type_name_columns};
 use crate::infra::storage::entity::{edge, graph_meta, gts_type, node};
 use crate::infra::storage::odata_mapper::NodeODataMapper;
 use crate::infra::store::{PgGraphStore, map_db_error, map_scope_err};
@@ -142,7 +143,9 @@ pub async fn resolve_node_ids(
         .scope_with(ctx.scope)
         .filter(Condition::all().add(node::Column::NodeKey.is_in(keys.to_vec())))
         .filter(Condition::all().add(node::Column::DeletedAt.is_null()))
-        .all(&conn)
+        .project_all(&conn, |query| {
+            node_ident_columns(query).into_model::<NodeIdent>()
+        })
         .await
         .map_err(map_scope_err)?;
     Ok(rows.into_iter().map(|r| (r.node_key, r.id)).collect())
@@ -238,7 +241,9 @@ async fn type_names(
         .secure()
         .scope_with(ctx.scope)
         .filter(Condition::all().add(gts_type::Column::Id.is_in(ids.to_vec())))
-        .all(runner)
+        .project_all(runner, |query| {
+            type_name_columns(query).into_model::<TypeName>()
+        })
         .await
         .map_err(map_scope_err)?;
     Ok(rows.into_iter().map(|r| (r.id, r.gts_type_id)).collect())

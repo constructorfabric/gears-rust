@@ -22,12 +22,15 @@ use graph_storage_sdk::plugin_api::{
     PathResponse, PatternRequest, PatternResponse, ShortestPathRequest, StoreCtx,
 };
 use sea_orm::sea_query::{Alias, Expr, ExprTrait as _};
-use sea_orm::{ColumnTrait, Condition, EntityTrait, FromQueryResult, QuerySelect};
+use sea_orm::{ColumnTrait, Condition, EntityTrait, FromQueryResult};
 use toolkit_db::secure::{DBRunner, ScopeError, SecureEntityExt};
 use toolkit_security::AccessScope;
 use tracing::warn;
 
 use crate::config::HopStrategy;
+use crate::infra::projections::{
+    NodeIdent, TypeId, TypeName, node_ident_columns, type_id_columns, type_name_columns,
+};
 use crate::infra::storage::entity::{edge, gts_type, node};
 use crate::infra::storage::graph::KnowledgeGraph;
 use crate::infra::store::PgGraphStore;
@@ -261,7 +264,9 @@ async fn edge_type_ids(
         .secure()
         .scope_with(ctx.scope)
         .filter(Condition::all().add(gts_type::Column::GtsTypeId.is_in(names)))
-        .all(runner)
+        .project_all(runner, |query| {
+            type_id_columns(query).into_model::<TypeId>()
+        })
         .await
         .map_err(scope_error)?;
     Ok(Some(rows.into_iter().map(|r| r.id).collect()))
@@ -406,29 +411,6 @@ struct Incidence {
     over_edge_budget: bool,
 }
 
-/// The two fields an endpoint-visibility map is built from.
-///
-/// Named so the projection can be narrow. A `node::Model` here compiles, runs
-/// and answers correctly; it just carries a payload and a vector back per
-/// endpoint to be thrown away on the next line.
-#[derive(Debug, sea_orm::FromQueryResult)]
-struct EndpointKey {
-    id: i64,
-    node_key: String,
-}
-
-/// The narrowing itself, named so a test can render it.
-///
-/// Inline in the closure it compiled and ran whatever it selected: adding a
-/// column, or dropping one `EndpointKey` expects, fails only at run time or
-/// not at all, and the cost of the regression is invisible in a test suite.
-fn endpoint_columns(query: sea_orm::Select<node::Entity>) -> sea_orm::Select<node::Entity> {
-    query
-        .select_only()
-        .column(node::Column::Id)
-        .column(node::Column::NodeKey)
-}
-
 async fn live_edges(
     ctx: &StoreCtx<'_>,
     runner: &impl DBRunner,
@@ -502,13 +484,13 @@ async fn live_edges(
     // payload and a 384-lane embedding per endpoint to build a map of two
     // small fields -- on the latency path, where the cost scales with how wide
     // the tenant's payloads happen to be rather than with the work.
-    let visible: Vec<EndpointKey> = node::Entity::find()
+    let visible: Vec<NodeIdent> = node::Entity::find()
         .secure()
         .scope_with(ctx.scope)
         .filter(Condition::all().add(node::Column::Id.is_in(endpoint_ids)))
         .filter(Condition::all().add(node::Column::DeletedAt.is_null()))
         .project_all(runner, |query| {
-            endpoint_columns(query).into_model::<EndpointKey>()
+            node_ident_columns(query).into_model::<NodeIdent>()
         })
         .await
         .map_err(scope_error)?;
@@ -522,7 +504,9 @@ async fn live_edges(
         .secure()
         .scope_with(ctx.scope)
         .filter(Condition::all().add(gts_type::Column::Id.is_in(type_names)))
-        .all(runner)
+        .project_all(runner, |query| {
+            type_name_columns(query).into_model::<TypeName>()
+        })
         .await
         .map_err(scope_error)?
         .into_iter()
@@ -674,42 +658,4 @@ fn hop_truncation(req: &ExpandRequest, incidence: &Incidence) -> Option<Truncati
     }
     (incidence.reached.len() as u64 > u64::from(req.budget.max_frontier))
         .then_some(TruncationReason::FrontierCap)
-}
-
-#[cfg(test)]
-mod tests {
-    use sea_orm::EntityTrait;
-
-    use super::{endpoint_columns, node};
-
-    /// The projection is a performance decision, and performance decisions
-    /// that live in a query builder regress silently.
-    ///
-    /// This runs once per hop for every distinct endpoint the hop touched.
-    /// Reading whole rows here answers correctly -- it just carries a payload
-    /// and a 384-lane embedding back per endpoint to build a map of two small
-    /// fields, at a cost that scales with how wide the tenant's payloads
-    /// happen to be rather than with the work. Nothing about that shows up as
-    /// a failure, so it is asserted rather than reviewed, the same way the
-    /// ranking projection is.
-    #[test]
-    fn the_endpoint_map_reads_two_columns_and_no_more() {
-        use sea_orm::QueryTrait;
-
-        let sql = endpoint_columns(node::Entity::find())
-            .build(sea_orm::DatabaseBackend::Postgres)
-            .to_string();
-        for wide in ["payload", "search_text", "embedding"] {
-            assert!(
-                !sql.contains(wide),
-                "the endpoint map must not read `{wide}`: {sql}"
-            );
-        }
-        for needed in ["id", "node_key"] {
-            assert!(
-                sql.contains(needed),
-                "the endpoint map needs `{needed}`: {sql}"
-            );
-        }
-    }
 }
