@@ -1211,4 +1211,37 @@ mod tests {
             revalidation.diagnostic.message
         );
     }
+
+    /// The one place a closed enum is decoded back out of storage, and the
+    /// arm that refuses an unknown spelling.
+    ///
+    /// `gts_type.kind` is `TEXT` under a `CHECK`, so a value outside the set
+    /// arrives only from schema drift or a corrupted row -- and the one
+    /// answer that is never right is to pick a variant anyway. A default arm
+    /// here would read an unknown kind as a node and quietly file a row under
+    /// the wrong half of the ontology; the Closed Enum Contract's third rule
+    /// exists to forbid exactly that, and until now nothing held it.
+    #[test]
+    fn an_unknown_persisted_kind_is_corruption_rather_than_a_guess() {
+        for (value, expected) in [
+            ("node", TypeKind::Node),
+            ("edge", TypeKind::Edge),
+            ("attribute", TypeKind::Attribute),
+        ] {
+            assert_eq!(
+                kind_from_str(value).expect("a spelling in the set decodes"),
+                expected
+            );
+        }
+
+        for unknown in ["", "Node", "node ", "relation", "attributes"] {
+            match kind_from_str(unknown) {
+                Err(GraphStoreError::Corrupt { reason }) => assert!(
+                    reason.contains(unknown),
+                    "the refusal names the offending value: {reason}"
+                ),
+                other => panic!("`{unknown}` must not decode to a known kind: {other:?}"),
+            }
+        }
+    }
 }
