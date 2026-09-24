@@ -220,3 +220,44 @@ fn a_store_whose_generation_an_invalidation_has_passed_is_dropped() {
     assert!(cache.populate(entry("one", t), current));
     assert!(cache.get("one", t).is_some());
 }
+
+#[test]
+fn a_local_or_tenant_set_invalidation_also_drops_a_store_it_has_passed() {
+    // The two paths the key-wide and subtree test does not drive: a local
+    // write evicts one scope, a restriction change evicts a set of tenants.
+    // Both move the whole key's generation — deliberately conservative: an
+    // in-flight read of any scope of the key loses its store and re-resolves
+    // on the next read, which costs a query and never serves a stale value.
+    // Another key is not touched.
+    let cache = EffectiveCache::new(Duration::from_secs(30));
+    let (t, other) = (Uuid::new_v4(), Uuid::new_v4());
+
+    let seen = cache.generation("local", t);
+    let seen_sibling = cache.generation("local", other);
+    let seen_unrelated = cache.generation("unrelated", t);
+    cache.invalidate("local", scope_class::LOCAL, Some(t));
+    assert!(
+        !cache.populate(entry("local", t), seen),
+        "the read of the written scope may predate the write"
+    );
+    assert!(
+        !cache.populate(entry("local", other), seen_sibling),
+        "a sibling scope of the same key re-resolves too"
+    );
+    assert!(
+        cache.populate(entry("unrelated", t), seen_unrelated),
+        "another key's read stands"
+    );
+
+    let seen = cache.generation("restricted", t);
+    let seen_unrelated = cache.generation("unrelated-too", t);
+    cache.invalidate_tenants("restricted", &[t]);
+    assert!(
+        !cache.populate(entry("restricted", t), seen),
+        "a restriction change passes the named tenant's read"
+    );
+    assert!(
+        cache.populate(entry("unrelated-too", t), seen_unrelated),
+        "and leaves another key's read standing"
+    );
+}
