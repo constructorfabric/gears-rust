@@ -257,12 +257,15 @@ jobs:
             "$DATA_DIR" > testing/e2e/logs/s3s-fs.log 2>&1 &
           echo "S3S_FS_PID=$!" >> "$GITHUB_ENV"
           disown
+          # Ready means s3s-fs itself is answering: an unsigned request gets its
+          # S3 `AccessDenied` error, not merely any HTTP response on the port.
           for i in $(seq 1 30); do
-            if curl -s -o /dev/null http://127.0.0.1:19099/; then
+            if curl -s http://127.0.0.1:19099/ 2>/dev/null | grep -q '<Code>AccessDenied</Code>'; then
               break
             fi
             if [ "$i" -eq 30 ]; then
-              echo "s3s-fs did not become reachable on 127.0.0.1:19099 within 30s" >&2
+              echo "s3s-fs did not become ready on 127.0.0.1:19099 within 30s" >&2
+              tail -n 50 testing/e2e/logs/s3s-fs.log >&2 || true
               exit 1
             fi
             sleep 1
