@@ -762,6 +762,10 @@ pg_case!(
     conformance::one_replacement_does_not_take_another_scopes_edges
 );
 pg_case!(
+    a_store_without_labels_refuses_every_label_call,
+    conformance::a_store_without_labels_refuses_every_label_call
+);
+pg_case!(
     an_edge_only_scope_drops_the_edges_it_stops_declaring,
     conformance::an_edge_only_scope_drops_the_edges_it_stops_declaring
 );

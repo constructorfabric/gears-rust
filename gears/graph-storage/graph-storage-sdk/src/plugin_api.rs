@@ -240,22 +240,37 @@ pub trait GraphStoreV1: Send + Sync + 'static {
     ) -> Result<DeleteOutcome, GraphStoreError>;
 
     // --- labels -----------------------------------------------------------
+    // Labels are deferred: no store in this release provides them and the
+    // gear routes nothing to these methods. The slots are in the contract so
+    // that labels can arrive as `StoreCapabilities::labels` turning true
+    // rather than as a new trait version, and they default to `Unsupported`
+    // so that a store which does not provide them — every store today —
+    // writes nothing for them. A store that sets the capability overrides
+    // all four.
     async fn upsert_label(
         &self,
-        ctx: &StoreCtx<'_>,
-        label: LabelSpec,
-    ) -> Result<LabelRecord, GraphStoreError>;
+        _ctx: &StoreCtx<'_>,
+        _label: LabelSpec,
+    ) -> Result<LabelRecord, GraphStoreError> {
+        Err(GraphStoreError::Unsupported { what: "labels" })
+    }
     async fn delete_label(
         &self,
-        ctx: &StoreCtx<'_>,
-        id: LabelId,
-    ) -> Result<RevisionOutcome, GraphStoreError>;
-    async fn list_labels(&self, ctx: &StoreCtx<'_>) -> Result<Vec<LabelRecord>, GraphStoreError>;
+        _ctx: &StoreCtx<'_>,
+        _id: LabelId,
+    ) -> Result<RevisionOutcome, GraphStoreError> {
+        Err(GraphStoreError::Unsupported { what: "labels" })
+    }
+    async fn list_labels(&self, _ctx: &StoreCtx<'_>) -> Result<Vec<LabelRecord>, GraphStoreError> {
+        Err(GraphStoreError::Unsupported { what: "labels" })
+    }
     async fn assign_labels(
         &self,
-        ctx: &StoreCtx<'_>,
-        req: LabelAssignment,
-    ) -> Result<RevisionOutcome, GraphStoreError>;
+        _ctx: &StoreCtx<'_>,
+        _req: LabelAssignment,
+    ) -> Result<RevisionOutcome, GraphStoreError> {
+        Err(GraphStoreError::Unsupported { what: "labels" })
+    }
 
     // --- read -------------------------------------------------------------
     /// Open a snapshot for a compound read. Every subsequent call carrying it

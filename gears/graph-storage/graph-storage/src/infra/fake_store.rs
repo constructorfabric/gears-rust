@@ -13,12 +13,11 @@ use async_trait::async_trait;
 use graph_storage_sdk::models::{
     AdjacencyEntry, AdjacencySide, AdmissionBasis, ComponentReadiness, DeleteOutcome,
     DeleteRequest, EdgeKey, EdgeView, ElementEnvelope, GraphRevision, GtsTypeId, IngestOutcome,
-    IngestRequest, ItemError, ItemFamily, ItemOutcome, LabelAssignment, LabelId, LabelRecord,
-    LabelSpec, NodeId, NodeKey, NodeRow, NodeView, OnExisting, Page, ProjectionRequest,
-    ReadSnapshot, ReadinessState, RegisteredType, RevisionOutcome, SchemaDiagnostic, SearchMode,
-    SearchRequest, SearchResponse, SourceNamespaceOwner, StoreCapabilities, Subject, TopologyPage,
-    TopologyRequest, TypeChange, TypeChangeState, TypeIdSet, TypeOutcome, TypeQuery, TypeRecord,
-    TypeRegistration, TypeRegistrationOptions,
+    IngestRequest, ItemError, ItemFamily, ItemOutcome, NodeId, NodeKey, NodeRow, NodeView,
+    OnExisting, Page, ProjectionRequest, ReadSnapshot, ReadinessState, RegisteredType,
+    SchemaDiagnostic, SearchMode, SearchRequest, SearchResponse, SourceNamespaceOwner,
+    StoreCapabilities, Subject, TopologyPage, TopologyRequest, TypeChange, TypeChangeState,
+    TypeIdSet, TypeOutcome, TypeQuery, TypeRecord, TypeRegistration, TypeRegistrationOptions,
 };
 use graph_storage_sdk::plugin_api::{
     EmbeddingPlan, EmbeddingState, GraphStoreError, GraphStoreV1, StoreCtx, VectorArm,
@@ -890,34 +889,6 @@ impl GraphStoreV1 for FakeGraphStore {
             tombstoned_nodes: nodes,
             tombstoned_edges: edges,
         })
-    }
-
-    async fn upsert_label(
-        &self,
-        _ctx: &StoreCtx<'_>,
-        _label: LabelSpec,
-    ) -> Result<LabelRecord, GraphStoreError> {
-        Err(GraphStoreError::Unsupported { what: "labels" })
-    }
-
-    async fn delete_label(
-        &self,
-        _ctx: &StoreCtx<'_>,
-        _id: LabelId,
-    ) -> Result<RevisionOutcome, GraphStoreError> {
-        Err(GraphStoreError::Unsupported { what: "labels" })
-    }
-
-    async fn list_labels(&self, _ctx: &StoreCtx<'_>) -> Result<Vec<LabelRecord>, GraphStoreError> {
-        Err(GraphStoreError::Unsupported { what: "labels" })
-    }
-
-    async fn assign_labels(
-        &self,
-        _ctx: &StoreCtx<'_>,
-        _req: LabelAssignment,
-    ) -> Result<RevisionOutcome, GraphStoreError> {
-        Err(GraphStoreError::Unsupported { what: "labels" })
     }
 
     async fn begin_read(&self, ctx: &StoreCtx<'_>) -> Result<ReadSnapshot, GraphStoreError> {

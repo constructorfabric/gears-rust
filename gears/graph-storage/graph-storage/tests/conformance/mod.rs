@@ -6277,3 +6277,50 @@ pub async fn a_batch_that_names_one_type_twice_is_refused(store: &dyn GraphStore
         .await
         .expect("the ontology registers once it names each type once");
 }
+
+/// A store that declares labels absent refuses every label call as
+/// `Unsupported` — the contract's rule for an absent capability — and does so
+/// without writing a body of its own for any of the four: they are the
+/// trait's defaults, so an implementor that does not provide labels owes
+/// nothing for them.
+pub async fn a_store_without_labels_refuses_every_label_call(
+    store: &dyn GraphStoreV1,
+    tenant: Uuid,
+) {
+    use graph_storage_sdk::models::{LabelAppliesTo, LabelAssignment, LabelSpec, LabelTarget};
+
+    assert!(
+        !store.capabilities().labels,
+        "this case is about a store that declares labels absent"
+    );
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    let unsupported = |what: &str, result: Result<(), GraphStoreError>| {
+        assert!(
+            matches!(result, Err(GraphStoreError::Unsupported { what: "labels" })),
+            "{what} must be refused as unsupported labels, got {result:?}"
+        );
+    };
+
+    let spec = LabelSpec {
+        name: "triage".to_owned(),
+        description: None,
+        style: None,
+        applies_to: LabelAppliesTo::Both,
+    };
+    unsupported(
+        "upsert_label",
+        store.upsert_label(&ctx, spec).await.map(drop),
+    );
+    unsupported("delete_label", store.delete_label(&ctx, 1).await.map(drop));
+    unsupported("list_labels", store.list_labels(&ctx).await.map(drop));
+    let assignment = LabelAssignment {
+        target: LabelTarget::Node("p-a".to_owned()),
+        attach: vec![1],
+        detach: Vec::new(),
+    };
+    unsupported(
+        "assign_labels",
+        store.assign_labels(&ctx, assignment).await.map(drop),
+    );
+}
