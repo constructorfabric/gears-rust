@@ -8,7 +8,8 @@
 //! primary key. Seeding the row here, at the platform minimum, leaves the pass
 //! one statement — an update of the row that is always there — so there is
 //! nothing to race for. The gear overwrites the value with its configured
-//! retention before every pass.
+//! retention before every pass. Rolling this migration back leaves the row:
+//! it is configuration, and the writer that stays live needs it there.
 
 use sea_orm_migration::prelude::*;
 use sea_orm_migration::sea_orm::{ConnectionTrait, DatabaseBackend};
@@ -40,11 +41,11 @@ impl MigrationTrait for Migration {
         Ok(())
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager
-            .get_connection()
-            .execute_unprepared("DELETE FROM settings_audit_policy WHERE id = 1;")
-            .await?;
+    /// Nothing: the row is configuration the gear has written, not schema.
+    /// Deleting it would stop a live instance's retention pass — the writer
+    /// only updates the row — and discard the operator's configured horizon.
+    /// The table itself goes with the migration that made it.
+    async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
         Ok(())
     }
 }

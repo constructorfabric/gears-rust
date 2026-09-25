@@ -36,3 +36,48 @@ async fn the_policy_row_is_there_once_after_the_migrations() {
         i32::try_from(crate::audit::MIN_RETENTION_DAYS).expect("fits")
     );
 }
+
+#[tokio::test]
+async fn rolling_the_seed_back_leaves_a_configured_row_where_it_is() {
+    // The row is configuration the gear has written, not schema: a rollback
+    // of this migration must not delete it, since the writer that stays live
+    // only ever updates it and would fail every pass with the row gone. The
+    // table itself goes with the migration that made it.
+    let db = Database::connect("sqlite::memory:")
+        .await
+        .expect("in-memory sqlite connects");
+    Migrator::up(&db, None).await.expect("migrations apply");
+    db.execute_unprepared("UPDATE settings_audit_policy SET retention_days = 730 WHERE id = 1;")
+        .await
+        .expect("the gear configured a longer retention");
+
+    Migrator::down(&db, Some(1)).await.expect("one step back");
+
+    let rows = db
+        .query_all_raw(Statement::from_string(
+            db.get_database_backend(),
+            "SELECT retention_days FROM settings_audit_policy WHERE id = 1;",
+        ))
+        .await
+        .expect("readable");
+    assert_eq!(rows.len(), 1, "the row survived the rollback");
+    assert_eq!(
+        rows[0].try_get::<i32>("", "retention_days").expect("days"),
+        730
+    );
+
+    // And applying the seed again over it is a no-op.
+    Migrator::up(&db, None).await.expect("re-applied");
+    let rows = db
+        .query_all_raw(Statement::from_string(
+            db.get_database_backend(),
+            "SELECT retention_days FROM settings_audit_policy;",
+        ))
+        .await
+        .expect("readable");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].try_get::<i32>("", "retention_days").expect("days"),
+        730
+    );
+}
