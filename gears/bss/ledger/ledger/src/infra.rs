@@ -30,3 +30,4 @@ pub mod reconciliation;
 pub mod retention;
 pub mod seller_guard;
 pub mod storage;
+pub mod tenant_lifecycle;

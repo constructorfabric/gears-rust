@@ -25,7 +25,7 @@
 //! OFF until the launch-blocking cross-team feed is live).
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use sea_orm::{ColumnTrait, Condition, EntityTrait, FromQueryResult, QuerySelect};
 use serde_json::json;
@@ -52,6 +52,7 @@ use crate::infra::storage::entity::journal_entry;
 use crate::infra::storage::repo::{
     ExceptionQueueRepo, JournalRepo, RecognitionRepo, ReconciliationRunRepo,
 };
+use crate::infra::tenant_lifecycle::LiveTenantFilter;
 use time::OffsetDateTime;
 
 /// `reconciliation_run.check_type` for the AR-ledger ↔ derived-projection tie-out (AC #7).
@@ -63,6 +64,13 @@ pub const CHECK_INVOICE_COMPLETENESS: &str = "INVOICE_COMPLETENESS";
 
 /// `reconciliation_run.status` literal for a finalized (completed) run.
 const RUN_STATUS_DONE: &str = "DONE";
+
+/// Reconciliation runs deleted per statement by the retired-tenant purge.
+/// Postgres has no `DELETE … LIMIT`, so the purge picks a batch of `run_id`s
+/// then deletes them by key; this bounds one statement's WAL while keeping the
+/// round-trip count low. Small enough that the `run_id IN (…)` bind list stays
+/// far below the 65,535-parameter ceiling.
+const PURGE_BATCH_ROWS: u64 = 5_000;
 
 /// Map a repo error into `DbError` for the in-txn run writes.
 #[allow(
@@ -99,13 +107,31 @@ pub struct ReconciliationFramework {
     /// `current_open_period` resolution for the ticker (reuses the recognition repo's
     /// fiscal-period read, like the `ExceptionRouter`).
     periods: RecognitionRepo,
+    /// The reconciliation-run repo — the ticker's retired-tenant purge writes
+    /// through it (`start` / `finalize` are in-transaction associated fns).
+    run_repo: ReconciliationRunRepo,
+    /// The platform tenant registry, as a lifecycle predicate over the
+    /// ledger-derived tenant enumeration. Ledger data never shrinks, so
+    /// without it the tick reconciles every tenant that ever posted a journal
+    /// entry, forever — see [`crate::infra::tenant_lifecycle`].
+    live_tenants: Arc<dyn LiveTenantFilter>,
+    /// Rotation cursor for the retired-tenant purge: the last retired tenant
+    /// the previous tick drained. The next tick resumes strictly after it, so
+    /// a retired set larger than one tick's budget is covered in rotation
+    /// instead of the sweep re-grinding the same head every tick.
+    purge_cursor: Mutex<Option<Uuid>>,
     config: ReconConfig,
 }
 
 impl ReconciliationFramework {
     /// Build the framework over one database provider, the event publisher, the
-    /// metrics sink, the exception router, the two control-feed read ports, and the
-    /// recon config (tolerance + enforcement flags).
+    /// metrics sink, the exception router, the two control-feed read ports, the
+    /// tenant-registry lifecycle filter, and the recon config (tolerance +
+    /// enforcement flags + purge budget).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the framework is init()-wired from the gear's already-resolved collaborators; each is a distinct seam"
+    )]
     #[must_use]
     pub fn new(
         db: DBProvider<DbError>,
@@ -114,10 +140,12 @@ impl ReconciliationFramework {
         exceptions: Arc<ExceptionRouter>,
         manifest_feed: Arc<dyn IssuedInvoiceManifestV1>,
         psp_feed: Arc<dyn PspSettlementFeedV1>,
+        live_tenants: Arc<dyn LiveTenantFilter>,
         config: ReconConfig,
     ) -> Self {
         let periods = RecognitionRepo::new(db.clone());
         let exception_repo = ExceptionQueueRepo::new(db.clone());
+        let run_repo = ReconciliationRunRepo::new(db.clone());
         Self {
             db,
             publisher,
@@ -127,6 +155,9 @@ impl ReconciliationFramework {
             manifest_feed,
             psp_feed,
             periods,
+            run_repo,
+            live_tenants,
+            purge_cursor: Mutex::new(None),
             config,
         }
     }
@@ -173,19 +204,34 @@ impl ReconciliationFramework {
     }
 
     /// The near-real-time ticker pass (cadence from `ReconConfig.recon_tick_secs`):
-    /// for every tenant with posted rows, reconcile its current OPEN period across all
-    /// three checks. AR↔derived always runs; Payments↔PSP + invoice-completeness are
-    /// inert until their control feeds land. A per-tenant failure is logged and skipped
-    /// (one flaky tenant must not starve the rest); the recon defects themselves are
-    /// reported via the runs / exceptions / alarms, not as `Err`.
+    /// for every **live** tenant with posted rows, reconcile its current OPEN period
+    /// across all three checks. AR↔derived always runs; Payments↔PSP +
+    /// invoice-completeness are inert until their control feeds land. A per-tenant
+    /// failure is logged and skipped (one flaky tenant must not starve the rest); the
+    /// recon defects themselves are reported via the runs / exceptions / alarms, not as
+    /// `Err`.
+    ///
+    /// **Lifecycle gate.** The candidate set comes from ledger data, which is
+    /// append-only and never cleaned, so it keeps every tenant that ever posted an
+    /// entry — including ones long since deleted. It is therefore intersected with the
+    /// platform tenant registry before anything is reconciled, and the retired
+    /// remainder feeds the purge below. Unfiltered, the pass wrote one row per dead
+    /// tenant per tick into a table with no delete path: 29 GB / 61M rows on stage1,
+    /// 99.9% of it for tenants that no longer exist.
+    ///
+    /// A registry read that FAILS is fail-safe in the direction of coverage: the tick
+    /// falls back to the full candidate set (reconciling a dead tenant wastes work;
+    /// silently *not* reconciling a live one blinds the close gate) and purges
+    /// nothing, since it cannot prove any tenant retired.
     ///
     /// # Errors
     /// Returns `Err` only if the up-front tenant enumeration fails (DB unreachable).
     pub async fn run(&self) -> anyhow::Result<()> {
         let ctx = SecurityContext::anonymous();
-        let tenant_ids = self.enumerate_tenants().await?;
+        let posted = self.enumerate_tenants().await?;
+        let (reconcilable, retired) = self.split_by_lifecycle(posted).await;
         let mut failed = 0_usize;
-        for tenant in tenant_ids {
+        for tenant in reconcilable {
             let scope = AccessScope::for_tenant(tenant);
             let period = match self.periods.current_open_period(&scope, tenant).await {
                 Ok(Some(p)) => p,
@@ -223,11 +269,147 @@ impl ReconciliationFramework {
                 "bss-ledger: reconciliation tick completed with per-tenant/check failures"
             );
         }
+        self.purge_retired_runs(&retired).await;
         Ok(())
     }
 
+    /// Split the ledger-derived candidate set into the tenants still live in the
+    /// platform registry (to reconcile) and those that have left it (to purge).
+    ///
+    /// Fail-safe on a registry fault: everything is treated as live, so a bad
+    /// registry tick degrades to the pre-fix behaviour (wasted work) rather than
+    /// to silent under-reconciliation or a purge of rows whose tenant might
+    /// still exist.
+    async fn split_by_lifecycle(&self, posted: HashSet<Uuid>) -> (Vec<Uuid>, Vec<Uuid>) {
+        let candidates: Vec<Uuid> = posted.into_iter().collect();
+        match self.live_tenants.live_tenants(&candidates).await {
+            Ok(live) => {
+                let (reconcilable, retired): (Vec<Uuid>, Vec<Uuid>) =
+                    candidates.into_iter().partition(|t| live.contains(t));
+                self.metrics.reconciliation_retired_tenants(
+                    i64::try_from(retired.len()).unwrap_or(i64::MAX),
+                );
+                if !retired.is_empty() {
+                    tracing::debug!(
+                        target: "bss-ledger",
+                        reconcilable = reconcilable.len(),
+                        retired = retired.len(),
+                        "recon tick: skipping tenants that left the platform registry"
+                    );
+                }
+                (reconcilable, retired)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "bss-ledger",
+                    error = %e,
+                    candidates = candidates.len(),
+                    "recon tick: tenant-registry lifecycle read failed; reconciling every \
+                     candidate and purging nothing this tick (fail-safe)"
+                );
+                (candidates, Vec::new())
+            }
+        }
+    }
+
+    /// Reclaim the uneventful reconciliation runs of tenants that have left the
+    /// platform registry — the tick's only delete path.
+    ///
+    /// Bounded three ways so a 29 GB backlog drains without any single tick
+    /// becoming a WAL event: `PURGE_BATCH_ROWS` rows per statement,
+    /// `purge_max_rows_per_tick` rows per tick (`0` disables the purge
+    /// outright), `purge_max_tenants_per_tick` tenants per tick. Progress is
+    /// kept in [`Self::purge_cursor`], so
+    /// consecutive ticks rotate through the retired set instead of re-grinding
+    /// its head. Fire-and-forget: a purge failure is logged and the tenant
+    /// skipped — reclaiming storage must never fail a reconciliation tick.
+    async fn purge_retired_runs(&self, retired: &[Uuid]) {
+        let mut budget = self.config.purge_max_rows_per_tick;
+        if budget == 0 || retired.is_empty() {
+            return;
+        }
+        // Sorted so the cursor ("resume strictly after this id") is meaningful
+        // across ticks even as the retired set grows.
+        let mut sorted: Vec<Uuid> = retired.to_vec();
+        sorted.sort_unstable();
+        let start_idx = self
+            .cursor()
+            .map_or(0, |c| sorted.partition_point(|t| *t <= c));
+
+        let visit = self.config.purge_max_tenants_per_tick.min(sorted.len());
+        let mut deleted_total = 0_u64;
+        let mut drained: Option<Uuid> = None;
+
+        for tenant in sorted.iter().copied().cycle().skip(start_idx).take(visit) {
+            if budget == 0 {
+                break;
+            }
+            loop {
+                let batch = budget.min(PURGE_BATCH_ROWS);
+                match self.run_repo.purge_uneventful_runs(tenant, batch).await {
+                    Ok(deleted) => {
+                        deleted_total = deleted_total.saturating_add(deleted);
+                        budget = budget.saturating_sub(deleted);
+                        // A short batch means the tenant has nothing left to
+                        // give; only then may the cursor pass it.
+                        if deleted < batch {
+                            drained = Some(tenant);
+                            break;
+                        }
+                        if budget == 0 {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "bss-ledger",
+                            %tenant,
+                            error = %e,
+                            "recon tick: purge of retired-tenant reconciliation runs failed; skipping tenant"
+                        );
+                        // Let the cursor pass a tenant whose purge keeps failing
+                        // too: the rotation must not stall on it. Its rows are
+                        // picked up on the next rotation.
+                        drained = Some(tenant);
+                        break;
+                    }
+                }
+            }
+        }
+
+        if let Some(last) = drained {
+            self.set_cursor(last);
+        }
+        if deleted_total > 0 {
+            self.metrics.reconciliation_runs_purged(deleted_total);
+            tracing::info!(
+                target: "bss-ledger",
+                deleted = deleted_total,
+                retired = retired.len(),
+                "recon tick: reclaimed reconciliation runs of retired tenants"
+            );
+        }
+    }
+
+    /// Read the purge rotation cursor. A poisoned lock is treated as "no
+    /// cursor" (restart the rotation) — the purge is idempotent, so losing the
+    /// position costs a repeated pass over already-drained tenants, never
+    /// correctness.
+    fn cursor(&self) -> Option<Uuid> {
+        self.purge_cursor.lock().ok().and_then(|c| *c)
+    }
+
+    /// Advance the purge rotation cursor. See [`Self::cursor`] on poisoning.
+    fn set_cursor(&self, tenant: Uuid) {
+        if let Ok(mut cursor) = self.purge_cursor.lock() {
+            *cursor = Some(tenant);
+        }
+    }
+
     /// Enumerate every tenant with posted rows (the same all-tenants `allow_all`
-    /// enumeration the tie-out job uses).
+    /// enumeration the tie-out job uses). This is a CANDIDATE set, not the set to
+    /// reconcile: ledger data is append-only, so it also contains every tenant that
+    /// has since been deleted. [`Self::split_by_lifecycle`] applies the registry gate.
     async fn enumerate_tenants(&self) -> anyhow::Result<HashSet<Uuid>> {
         #[derive(Debug, FromQueryResult)]
         struct TenantRow {

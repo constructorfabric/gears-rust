@@ -1944,6 +1944,8 @@ dependencies = [
  "cf-gears-bss-coord",
  "cf-gears-bss-ledger",
  "cf-gears-bss-ledger-sdk",
+ "cf-gears-tenant-resolver",
+ "cf-gears-tenant-resolver-sdk",
  "cf-gears-test-containers",
  "cf-gears-toolkit",
  "cf-gears-toolkit-canonical-errors",
