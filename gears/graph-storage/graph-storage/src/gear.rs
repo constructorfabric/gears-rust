@@ -294,3 +294,185 @@ impl RestApiCapability for GraphStorage {
         Ok(routes::register_routes(router, openapi, services))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! The boot-time path an operator depends on to get the provider they
+    //! configured: the plugins' own suites construct their providers
+    //! directly, so without these nothing ever ran `select_embedding_provider`
+    //! or either feature arm behind it.
+
+    use super::{EmbeddingProviderKind, GraphStorageConfig, select_embedding_provider};
+
+    fn with(kind: Option<EmbeddingProviderKind>) -> GraphStorageConfig {
+        GraphStorageConfig {
+            embedding_provider: kind,
+            ..GraphStorageConfig::default()
+        }
+    }
+
+    /// Unset is refused rather than quietly served by the fake, whose
+    /// vectors rank nothing -- and the refusal names what to set.
+    #[tokio::test]
+    async fn an_unset_provider_is_refused_and_says_what_to_set() {
+        let refused = select_embedding_provider(&with(None))
+            .await
+            .err()
+            .expect("no provider is not a default");
+        let message = refused.to_string();
+        for named in ["embedding_provider", "fake", "onnx", "remote"] {
+            assert!(message.contains(named), "{named} is named: {message}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_fake_is_wired_at_the_configured_dimension() {
+        let config = GraphStorageConfig {
+            embedding_dimension: 16,
+            ..with(Some(EmbeddingProviderKind::Fake))
+        };
+        let provider = select_embedding_provider(&config)
+            .await
+            .expect("the fake needs nothing");
+        assert_eq!(provider.embedding_space().dimension, 16);
+    }
+
+    /// Built with `remote`: the configuration becomes a remote provider,
+    /// and each key it cannot do without is refused by name.
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn remote_is_wired_from_the_configuration() {
+        let configured = GraphStorageConfig {
+            // Loopback, so no credential rule applies and nothing is sent:
+            // constructing the provider validates, it does not call out.
+            embedding_dimension: 32,
+            embedding_remote_base_url: Some("http://127.0.0.1:9/v1".to_owned()),
+            embedding_remote_model: Some("wired-model".to_owned()),
+            ..with(Some(EmbeddingProviderKind::Remote))
+        };
+        let provider = select_embedding_provider(&configured)
+            .await
+            .expect("a complete remote configuration boots");
+        // The remote identity is the model *at* its endpoint -- the same model
+        // name behind two endpoints is two spaces -- so this one comparison
+        // proves both configured values reached the provider.
+        assert_eq!(
+            provider.embedding_space().model_artifact,
+            "wired-model@http://127.0.0.1:9/v1/embeddings"
+        );
+        assert_eq!(provider.embedding_space().dimension, 32);
+
+        for (missing, key) in [
+            (
+                GraphStorageConfig {
+                    embedding_remote_base_url: None,
+                    ..configured.clone()
+                },
+                "embedding_remote_base_url",
+            ),
+            (
+                GraphStorageConfig {
+                    embedding_remote_model: None,
+                    ..configured.clone()
+                },
+                "embedding_remote_model",
+            ),
+        ] {
+            let refused = select_embedding_provider(&missing)
+                .await
+                .err()
+                .expect("a required key is required");
+            assert!(refused.to_string().contains(key), "{key}: {refused}");
+        }
+
+        // A credential variable that names nothing in this environment is a
+        // boot failure, not a provider that fails every request later.
+        let unset = GraphStorageConfig {
+            embedding_remote_api_key_env: Some(
+                "GRAPH_STORAGE_TEST_CREDENTIAL_THAT_IS_NEVER_SET".to_owned(),
+            ),
+            ..configured
+        };
+        let refused = select_embedding_provider(&unset)
+            .await
+            .err()
+            .expect("an unset credential variable stops the boot");
+        assert!(
+            refused.to_string().contains("not set"),
+            "the refusal says why: {refused}"
+        );
+    }
+
+    /// Built without `remote`, asking for it is a clear refusal rather than
+    /// a silent substitution.
+    #[cfg(not(feature = "remote"))]
+    #[tokio::test]
+    async fn remote_without_the_feature_says_so() {
+        let refused = select_embedding_provider(&with(Some(EmbeddingProviderKind::Remote)))
+            .await
+            .err()
+            .expect("a provider the binary lacks is refused");
+        assert!(
+            refused.to_string().contains("`remote` feature"),
+            "{refused}"
+        );
+    }
+
+    /// Built with `onnx`: a missing artifact is refused by name before
+    /// anything is loaded. Loading real artifacts is the ONNX lane's case
+    /// below, since only that lane has them.
+    #[cfg(feature = "onnx")]
+    #[tokio::test]
+    async fn onnx_names_the_artifact_it_is_missing() {
+        let refused = select_embedding_provider(&with(Some(EmbeddingProviderKind::Onnx)))
+            .await
+            .err()
+            .expect("no artifacts, no provider");
+        assert!(
+            refused.to_string().contains("embedding_model_path"),
+            "{refused}"
+        );
+    }
+
+    /// With the artifacts the ONNX lane downloads, the configured provider
+    /// is the one that loads. Skipped where they are absent, unless the
+    /// lane requires it -- a green run that quietly skipped would prove
+    /// nothing about the wiring.
+    #[cfg(feature = "onnx")]
+    #[tokio::test]
+    async fn onnx_is_wired_from_the_configuration() {
+        let (Ok(model), Ok(tokenizer)) = (
+            std::env::var("GRAPH_STORAGE_ONNX_MODEL"),
+            std::env::var("GRAPH_STORAGE_ONNX_TOKENIZER"),
+        ) else {
+            assert!(
+                std::env::var("GRAPH_STORAGE_ONNX_REQUIRED").is_err(),
+                "GRAPH_STORAGE_ONNX_REQUIRED is set but the model artifacts are not"
+            );
+            eprintln!("no ONNX artifacts in this environment - skipping");
+            return;
+        };
+        let configured = GraphStorageConfig {
+            embedding_model_path: Some(model),
+            embedding_tokenizer_path: Some(tokenizer),
+            ..with(Some(EmbeddingProviderKind::Onnx))
+        };
+        let provider = select_embedding_provider(&configured)
+            .await
+            .expect("the downloaded artifacts load");
+        assert_eq!(
+            provider.embedding_space().dimension,
+            configured.embedding_dimension
+        );
+    }
+
+    #[cfg(not(feature = "onnx"))]
+    #[tokio::test]
+    async fn onnx_without_the_feature_says_so() {
+        let refused = select_embedding_provider(&with(Some(EmbeddingProviderKind::Onnx)))
+            .await
+            .err()
+            .expect("a provider the binary lacks is refused");
+        assert!(refused.to_string().contains("`onnx` feature"), "{refused}");
+    }
+}

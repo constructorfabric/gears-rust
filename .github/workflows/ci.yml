@@ -642,6 +642,12 @@ jobs:
       # The ONNX plugin is not, and cannot be from here: its tests need a real
       # ONNX Runtime and a real model, which only its own lane downloads, so a
       # figure measured here would be the coverage of a suite that skipped.
+      #
+      # And the gear is built with `remote` here, so the boot path that turns
+      # its configuration into a remote provider is executed, not only
+      # compiled. The plugins' own suites construct their providers directly,
+      # which left `select_embedding_provider` and the gear's feature arms
+      # linted by the all-features clippy pass and run by nothing.
       - name: Test and enforce the coverage floor
         timeout-minutes: 30
         env:
@@ -652,6 +658,7 @@ jobs:
           cargo llvm-cov nextest \
             -p cf-gears-graph-storage -p cf-gears-graph-storage-sdk \
             -p cf-gears-graph-storage-remote-embedding-plugin \
+            --features cf-gears-graph-storage/remote \
             --test-threads=2 \
             --lcov --output-path lcov.info --fail-under-lines 85
 
@@ -756,6 +763,17 @@ jobs:
         env:
           GRAPH_STORAGE_ONNX_REQUIRED: "1"
         run: cargo test -p cf-gears-graph-storage-onnx-embedding-plugin
+
+      # The gear's own ONNX wiring, against the artifacts this lane downloaded:
+      # the plugin suite above loads the provider directly, so without this
+      # nothing ran the configuration-to-provider path an operator boots
+      # through. REQUIRED for the same reason as the step above.
+      - name: cargo test (graph-storage ONNX provider wiring)
+        shell: bash
+        timeout-minutes: 15
+        env:
+          GRAPH_STORAGE_ONNX_REQUIRED: "1"
+        run: "cargo test -p cf-gears-graph-storage --lib --features onnx gear::"
 
       - name: cargo check (graph-storage with the onnx feature)
         run: cargo check -p cf-gears-graph-storage --features onnx
