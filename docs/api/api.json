@@ -1,6 +1,46 @@
 {
   "components": {
     "schemas": {
+      "AccessReadDto": {
+        "description": "One tenant's access for one setting.",
+        "properties": {
+          "effective": {
+            "$ref": "#/components/schemas/EffectiveAccessDto",
+            "description": "The strictest access on the tenant's chain."
+          },
+          "etag": {
+            "description": "The tag a mutation of this pair must present: the stored row's, or the\nabsent-state tag. Also sent as the `ETag` header.",
+            "type": "string"
+          },
+          "key": {
+            "description": "The setting key.",
+            "type": "string"
+          },
+          "stored": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RestrictionDto",
+                "description": "The pair's own row, when one exists."
+              }
+            ]
+          },
+          "tenant_id": {
+            "description": "The tenant asked about.",
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "tenant_id",
+          "effective",
+          "etag"
+        ],
+        "type": "object"
+      },
       "AccountDto": {
         "description": "One chart-of-accounts row to seed.",
         "properties": {
@@ -1273,6 +1313,77 @@
         ],
         "type": "object"
       },
+      "AuditRecordDto": {
+        "description": "One audit record, as `GET /settings-service/v1/settings/{key}/history`\nreturns it.",
+        "properties": {
+          "actor": {
+            "description": "Who did it, masked when the identity is PII the caller may not see.",
+            "type": "string"
+          },
+          "actor_masked": {
+            "description": "Whether `actor` carries the mask token.",
+            "type": "boolean"
+          },
+          "change_set_id": {
+            "description": "The change set the mutation was produced under.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "description": "Record identity.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "occurred_at": {
+            "description": "When it happened.",
+            "type": "string"
+          },
+          "operation": {
+            "description": "`create`, `change`, `revert`, `remove`, `clone`, `secret_use` or `stage`.",
+            "type": "string"
+          },
+          "outcome": {
+            "description": "`success` or `failure`.",
+            "type": "string"
+          },
+          "post_value": {
+            "description": "The value after, as recorded."
+          },
+          "pre_value": {
+            "description": "The value before, as recorded; a secret was recorded masked."
+          },
+          "request_id": {
+            "description": "The request that produced the record.",
+            "type": "string"
+          },
+          "tenant_id": {
+            "description": "The scope the record is about, or `null` for a record about the\nsetting's definition — the declaration created, changed, retired —\nwhich belongs to no tenant and appears in every scope's history.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "values_masked": {
+            "description": "Whether the recorded values were masked for this caller.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "id",
+          "operation",
+          "actor",
+          "actor_masked",
+          "values_masked",
+          "outcome",
+          "request_id",
+          "occurred_at"
+        ],
+        "type": "object"
+      },
       "AuthConfig": {
         "properties": {
           "config": {
@@ -1372,6 +1483,125 @@
           "account_class",
           "currency",
           "balance_minor"
+        ],
+        "type": "object"
+      },
+      "BatchChangeRequest": {
+        "description": "One change of `POST /settings/batch`.",
+        "properties": {
+          "if_match": {
+            "description": "The value state tag the caller last read for this scope — for a revert,\nthe tag of the row being cleared — or the literal `absent` for a first\nwrite. Required in effect: a change that omits it is rejected on its\nown with `if_match_required` while the rest of the batch proceeds. It\nis optional in the schema only so that one missing tag refuses one\nchange instead of the whole request.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "key": {
+            "description": "The setting key.",
+            "type": "string"
+          },
+          "op": {
+            "description": "`set` or `revert`; absent is `set`, so a client written before the\nfield existed sends exactly what it sent before. An unrecognised word\nrefuses this change alone with `invalid`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tenant": {
+            "description": "The target tenant; absent, the caller's own.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "value": {
+            "description": "The new value, carried by a `set` and absent from a `revert`; a\nmismatch either way refuses this change alone with `invalid`. For a\n`secret`-trait setting this may instead be `{ \"pending_id\": \"…\" }`,\nnaming a secret staged earlier through `/secret-stage`: the staged\nentry is adopted and nothing is stored a second time. Any other shape\nis a value and validates as one — an explicit `null` included, which\nis a value and not the field's absence."
+          }
+        },
+        "required": [
+          "key"
+        ],
+        "type": "object"
+      },
+      "BatchItemDto": {
+        "description": "One entry of a batch answer.",
+        "properties": {
+          "change": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SetResultDto",
+                "description": "The change, when committed."
+              }
+            ]
+          },
+          "detail": {
+            "description": "The rejection in words.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "error": {
+            "description": "Why, when rejected — one of a fixed vocabulary: `invalid`,\n`if_match_required`, `stale`, `conflict`, `forbidden`, `retired`,\n`not_found`, `unavailable` or `error`.\n`retired` also covers a declaration retired after the client assembled\nthe change: the check runs again as each change commits.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "key": {
+            "description": "The setting key as requested.",
+            "type": "string"
+          },
+          "outcome": {
+            "description": "`committed` or `rejected`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "outcome"
+        ],
+        "type": "object"
+      },
+      "BatchRequest": {
+        "description": "`POST /settings/batch`.",
+        "properties": {
+          "changes": {
+            "description": "At most five hundred changes, evaluated in order.",
+            "items": {
+              "$ref": "#/components/schemas/BatchChangeRequest"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "changes"
+        ],
+        "type": "object"
+      },
+      "BatchResultDto": {
+        "description": "A batch answer: one entry per change.",
+        "properties": {
+          "change_set_id": {
+            "description": "The change set every committed change carries.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "results": {
+            "description": "In request order.",
+            "items": {
+              "$ref": "#/components/schemas/BatchItemDto"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "change_set_id",
+          "results"
         ],
         "type": "object"
       },
@@ -1955,6 +2185,57 @@
         ],
         "type": "object"
       },
+      "CategoryDto": {
+        "description": "A category as returned to a caller.\n\nField naming is `snake_case`, applied by `#[toolkit_macros::api_dto]` rather\nthan chosen here: every gear's DTOs serialize the same way, so a client does\nnot have to know which service produced a payload.",
+        "properties": {
+          "description": {
+            "description": "Optional long-form description.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "domain_affinity": {
+            "description": "Optional domain this category belongs to.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "icon": {
+            "description": "Optional icon reference.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "description": "Server-assigned identity, stable across a rename.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "key": {
+            "description": "The stable slug that becomes a setting key's category segment.",
+            "type": "string"
+          },
+          "name": {
+            "description": "Display name.",
+            "type": "string"
+          },
+          "sort_order": {
+            "description": "Ordering weight; lower sorts first.",
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "key",
+          "name",
+          "sort_order"
+        ],
+        "type": "object"
+      },
       "ChangeRecognitionScheduleRequest": {
         "description": "The `POST /recognition-schedules/{schedule_id}/changes` request body: change or\ncancel an ASC 606 recognition schedule (design §3.6 / §4.6). `{schedule_id}`\n(the ACTIVE schedule to change) comes from the PATH; the target seller ledger\nis the body's own `tenant_id` (tenant in body, not path — the vhp-core REST\nconvention); the `(entry, post)` PEP gate authorizes it (a change marks/mints\nschedule state). `change_id` is the idempotency key (a replay returns the prior\nresult, minting no second schedule). `action` is `\"cancel\"` | `\"replace\"`.\n`treatment` is the upstream modification-accounting decision: `\"prospective\"` /\n`\"separate_contract\"` apply; `\"catch_up\"` / unknown is rejected\n`MODIFICATION_TREATMENT_REVIEW` (the ledger never silently treats a\nmodification as prospective). `new_segments` is required for a `replace` (the\nNEW version's plan of the remaining deferred), ignored for a `cancel`.",
         "properties": {
@@ -2484,6 +2765,20 @@
           "composites_copied",
           "notices"
         ],
+        "type": "object"
+      },
+      "CloneRequest": {
+        "description": "`POST /settings/{key}/value/clone`: where to copy from.",
+        "properties": {
+          "from": {
+            "description": "The source tenant; absent, the caller's own tenant.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
         "type": "object"
       },
       "ClosePayerRequest": {
@@ -3269,6 +3564,51 @@
         ],
         "type": "object"
       },
+      "CreateCategoryRequest": {
+        "additionalProperties": false,
+        "description": "What a caller supplies to create a category.",
+        "properties": {
+          "description": {
+            "description": "Optional long-form description.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "domain_affinity": {
+            "description": "Optional domain affinity.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "icon": {
+            "description": "Optional icon reference.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "key": {
+            "description": "The stable slug. Validated before anything else touches it: 1 to 128\ncharacters, a GTS segment token — a lowercase letter or `_` first, then\nlowercase letters, digits and `_` — since every setting key declared\nunder the category is composed around it.",
+            "type": "string"
+          },
+          "name": {
+            "description": "Display name.",
+            "type": "string"
+          },
+          "sort_order": {
+            "description": "Ordering weight; defaults to 0 as DESIGN.md §4.7 specifies.",
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "key",
+          "name"
+        ],
+        "type": "object"
+      },
       "CreateChatReq": {
         "description": "Request DTO for creating a new chat.",
         "properties": {
@@ -3312,6 +3652,94 @@
           "tenant_id",
           "name",
           "country"
+        ],
+        "type": "object"
+      },
+      "CreateDeclarationRequest": {
+        "additionalProperties": false,
+        "description": "What an administrator supplies to declare a setting.\n\nThe key is not among the fields: the service composes it from the vendor,\nthe category's slug and the leaf name, so a caller cannot mint a key that\ndisagrees with where the setting is filed. `default_value` is mandatory --\nit is what makes resolution total -- and a setting with no meaningful\ndefault sends JSON `null` on a type that admits it; omitting the field is a\ndifferent thing and is refused.",
+        "properties": {
+          "anonymous_exposable": {
+            "description": "Whether the effective value may be served unauthenticated; `false` when\nabsent, and refused on a `pii` or `secret` setting.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "category_id": {
+            "description": "The category the setting is filed under; its slug rides in the key.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "data_classification": {
+            "description": "`public` or `pii`; `secret` is derived from the value type's trait and\nis refused here.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "default_value": {
+            "description": "The Schema Default. Mandatory, and an empty placeholder for a secret.\nKept as the request's own text until it is judged: a decimal a double\ncannot hold exactly is refused `value_not_canonical`, as a value write\nrefuses it, and only the text can tell — once parsed, the literal is\nalready the nearest double."
+          },
+          "description": {
+            "description": "Optional long-form description.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "domain_affinity": {
+            "description": "Optional administrative domain.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "licence_feature": {
+            "description": "Optional licence feature gating the setting in R2.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mode": {
+            "description": "`standard` or `advanced`; `standard` when absent.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "description": "The leaf name: the last segment of the key, unique in the category.",
+            "type": "string"
+          },
+          "requires_step_up": {
+            "description": "Whether a write needs a fresh re-authentication; the protective `true`\nwhen absent.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "scope_class": {
+            "description": "`global`, `cascading` or `local`.",
+            "type": "string"
+          },
+          "value_type_id": {
+            "description": "The value type the default and every override validate against: one of\nthe catalogue under `gts.cf.core.settings.type_*~`, or a registered\nmodule-owned one.",
+            "type": "string"
+          },
+          "vendor": {
+            "description": "The vendor segment of the composed key.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "value_type_id",
+          "vendor",
+          "name",
+          "category_id",
+          "default_value",
+          "scope_class"
         ],
         "type": "object"
       },
@@ -3931,6 +4359,32 @@
           "display_name"
         ],
         "type": "object"
+      },
+      "CreatedDeclarationDto": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/DeclarationDto",
+            "description": "The declaration now live at the key."
+          },
+          {
+            "properties": {
+              "evolved": {
+                "description": "`true` when the setting's active declaration changed its value type,\nSchema Default or scope class and this call evolved it: the declaration\nreturned is the next major, under a new `key`, holding every value of\nthe previous one re-validated, and the previous major is retired.",
+                "type": "boolean"
+              },
+              "reactivated": {
+                "description": "`true` when the key held a retired declaration that this call revived,\nwith its retained values re-entering resolution.",
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "reactivated",
+              "evolved"
+            ],
+            "type": "object"
+          }
+        ],
+        "description": "The response to a create: the declaration, and whether a retired one was\nrevived or the active one evolved rather than a new setting declared."
       },
       "CreditApplicationRequest": {
         "description": "The `POST /credit-applications` request body: ONE wire shape for both wallet\nkinds, discriminated by `kind` (`\"grant\"` | `\"apply\"`). The target seller\nledger is the body's own `tenant_id` (tenant in body, not path — the vhp-core\nREST convention); the `(credit_application, write)` PEP gate authorizes it.\n`scale` is advisory; the ledger resolves the authoritative per-line scale.\n\nThe kind-specific fields are all optional on the wire and validated in\n[`Self::into_sdk`]: a `grant` requires `amount_minor` + `credit_grant_event_type`\n(and ignores `targets`); an `apply` requires a non-empty `targets` (and ignores\nthe grant fields). A missing required field or an unknown `kind` is rejected\n`400 InvalidArgument` before the SDK type is built.",
@@ -4600,6 +5054,127 @@
         ],
         "type": "object"
       },
+      "DeclarationDto": {
+        "description": "A declaration as returned to a caller.\n\nCarries `key`, `value_type_id` and the resolved trait set, which is what the\nread surface is specified to render. The value type travels beside the key\nbecause the key no longer carries it: a setting key is a GTS *type* id\n(ADR-002), and which value type its default and overrides validate against\nis a separate fact of the declaration, not a half of its name.",
+        "properties": {
+          "anonymous_exposable": {
+            "description": "Whether the anonymous surface may show the value.",
+            "type": "boolean"
+          },
+          "category_id": {
+            "description": "Owning category.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "data_classification": {
+            "description": "`public`, `pii` or `secret`; `secret` is derived from the value type.",
+            "type": "string"
+          },
+          "default_value": {
+            "description": "The Schema Default every resolution chain ends in."
+          },
+          "description": {
+            "description": "Optional long-form description.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "domain_affinity": {
+            "description": "The administrative domain, when the declaration is bound to one.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "etag": {
+            "description": "The declaration's state tag, also sent as the `ETag` header.",
+            "type": "string"
+          },
+          "has_secret_trait": {
+            "description": "Whether the value type carries the `secret` trait.",
+            "type": "boolean"
+          },
+          "id": {
+            "description": "Server-assigned identity, stable across a re-key.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "key": {
+            "description": "The full setting key.",
+            "type": "string"
+          },
+          "last_change_at": {
+            "description": "When the definition last changed, RFC 3339.",
+            "type": "string"
+          },
+          "leaf_slug": {
+            "description": "The setting's own name slug, unique within its category.",
+            "type": "string"
+          },
+          "licence_feature": {
+            "description": "The licence feature that will gate this declaration once the License\nResolver exists. Reported, not enforced.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mode": {
+            "description": "`standard` or `advanced`.",
+            "type": "string"
+          },
+          "owner_module": {
+            "description": "The contributing module, for module-contributed declarations.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "requires_step_up": {
+            "description": "Whether a value write needs a fresh re-authentication.",
+            "type": "boolean"
+          },
+          "scope_class": {
+            "description": "`global`, `cascading`, or `local`.",
+            "type": "string"
+          },
+          "source": {
+            "description": "`admin_authored` or `module_contributed`.",
+            "type": "string"
+          },
+          "status": {
+            "description": "`active` or `retired`.",
+            "type": "string"
+          },
+          "traits": {
+            "description": "The value type's effective traits, merged across its inheritance chain.\n\nAn empty object when the registry could not answer. Always present so a\nclient renders the same shape either way rather than branching on\nabsence."
+          },
+          "value_type_id": {
+            "description": "GTS id of the value type the default and every override validate against.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "key",
+          "leaf_slug",
+          "value_type_id",
+          "category_id",
+          "scope_class",
+          "mode",
+          "status",
+          "default_value",
+          "data_classification",
+          "has_secret_trait",
+          "requires_step_up",
+          "anonymous_exposable",
+          "source",
+          "last_change_at",
+          "etag",
+          "traits"
+        ],
+        "type": "object"
+      },
       "DeclareTaxonomyValueRequest": {
         "additionalProperties": false,
         "description": "The one value a `POST …/values` declares — the authored fields and nothing\nelse.\n\nIts own type rather than [`TaxonomyValueView`], which is what this route read\nuntil D-355 added two **read-only** fields to that view. A declare body could\nthen carry `edit_governed` / `references`, `authored_entry` would ignore\nthem, and `docs/api/api.json` would advertise two settable properties the\nserver discards — the failure `authored_entry` refuses six lines into itself\nfor the tax markers, on the argument that *\"a field that vanishes silently\nreads to the operator exactly like one that failed to save\"*. A field absent\nfrom the request type cannot vanish silently: it is refused by the parse.",
@@ -5066,6 +5641,27 @@
         ],
         "type": "object"
       },
+      "EffectiveAccessDto": {
+        "description": "The effective access and where it comes from.",
+        "properties": {
+          "access": {
+            "description": "`overridable`, `read_only` or `hidden`.",
+            "type": "string"
+          },
+          "supplied_by": {
+            "description": "The tenant whose row supplies it; absent for `overridable`.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "access"
+        ],
+        "type": "object"
+      },
       "EffectiveIntervalView": {
         "description": "One scheduled interval of a history record.",
         "properties": {
@@ -5128,6 +5724,108 @@
         "required": [
           "per_mime_max_bytes",
           "metadata_limits"
+        ],
+        "type": "object"
+      },
+      "EffectiveValueDto": {
+        "description": "The effective value at a scope, as `GET /settings-service/v1/settings/{key}`\nreturns it.",
+        "properties": {
+          "data_classification": {
+            "description": "`public`, `pii` or `secret`.",
+            "type": "string"
+          },
+          "etag": {
+            "description": "The value state tag of the requested scope's own row, or of the absent\nstate — what a write at this scope presents in `If-Match`. Also sent as\nthe `ETag` header.",
+            "type": "string"
+          },
+          "fallback": {
+            "description": "What this scope resolves to without a row of its own — the nearest\nvalid ancestor override, else the Schema Default — masked by the same\nrule as `value`. Equal to `value` when the scope holds no override: the\nsettings table's *Default* column, and what a revert would leave."
+          },
+          "fallback_scope": {
+            "description": "The scope that supplies the fallback; absent for a Schema Default.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "fallback_source": {
+            "description": "`inherited` or `schema_default`; never `own_override`.",
+            "type": "string"
+          },
+          "inheritance_trail": {
+            "description": "The scopes inspected, root to self, with setter identity.",
+            "items": {
+              "$ref": "#/components/schemas/TrailEntryDto"
+            },
+            "type": "array"
+          },
+          "key": {
+            "description": "The setting key.",
+            "type": "string"
+          },
+          "last_change_at": {
+            "description": "Recency of the effective value the caller sees: the later of the\ndeclaration's own change and the resolved row's.",
+            "type": "string"
+          },
+          "masked": {
+            "description": "Whether `value` and `fallback` carry the mask token rather than the\nvalue: one decision, made on the declaration's classification, for\nboth.",
+            "type": "boolean"
+          },
+          "needs_review": {
+            "description": "Present when the requested scope's own override is flagged for review;\nthe value above is then the fallthrough the resolver served.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "needs_review_detail": {
+            "description": "Why the own override is flagged.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "scope": {
+            "description": "The requested scope.",
+            "type": "string"
+          },
+          "source": {
+            "description": "`own_override`, `inherited` or `schema_default`.",
+            "type": "string"
+          },
+          "source_scope": {
+            "description": "The scope that supplied the value; absent for a Schema Default.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tenant_id": {
+            "description": "The requested scope as a tenant id; the root tenant's id is platform\nscope.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "traits": {
+            "description": "The value type's resolved trait set."
+          },
+          "value": {
+            "description": "The resolved value, masked by classification."
+          }
+        },
+        "required": [
+          "key",
+          "scope",
+          "tenant_id",
+          "value",
+          "source",
+          "fallback",
+          "fallback_source",
+          "traits",
+          "inheritance_trail",
+          "last_change_at",
+          "data_classification",
+          "masked",
+          "etag"
         ],
         "type": "object"
       },
@@ -5775,6 +6473,24 @@
         ],
         "type": "object"
       },
+      "FallbackResultDto": {
+        "description": "A revert or remove: the row is gone and the scope falls back.",
+        "properties": {
+          "change": {
+            "$ref": "#/components/schemas/SetResultDto",
+            "description": "The change as recorded."
+          },
+          "effective": {
+            "$ref": "#/components/schemas/EffectiveValueDto",
+            "description": "What the scope resolves to now."
+          }
+        },
+        "required": [
+          "change",
+          "effective"
+        ],
+        "type": "object"
+      },
       "FileDto": {
         "description": "File metadata response (`GET /files/{id}`, and the body of mutations).",
         "properties": {
@@ -5899,6 +6615,61 @@
           "timezone",
           "granularity",
           "fy_start"
+        ],
+        "type": "object"
+      },
+      "FlaggedOverrideDto": {
+        "description": "An override flagged for review, as the needs-review listing reports it.",
+        "properties": {
+          "etag": {
+            "description": "The override's value state tag — what a write correcting this row\npresents in `If-Match`.",
+            "type": "string"
+          },
+          "key": {
+            "description": "The setting key.",
+            "type": "string"
+          },
+          "last_change_at": {
+            "description": "When the override last changed.",
+            "type": "string"
+          },
+          "masked": {
+            "description": "Whether `value` carries the mask token.",
+            "type": "boolean"
+          },
+          "needs_review_detail": {
+            "description": "Why the override no longer validates.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "scope": {
+            "description": "Its scope path.",
+            "type": "string"
+          },
+          "set_by": {
+            "description": "Who set it: an administrator's identity, masked for a caller not\nauthorized for unmasked PII.",
+            "type": "string"
+          },
+          "tenant_id": {
+            "description": "The tenant whose override is flagged.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "value": {
+            "description": "The stored value, masked by classification."
+          }
+        },
+        "required": [
+          "key",
+          "tenant_id",
+          "scope",
+          "value",
+          "masked",
+          "last_change_at",
+          "set_by",
+          "etag"
         ],
         "type": "object"
       },
@@ -6917,6 +7688,82 @@
           "width",
           "height",
           "data_base64"
+        ],
+        "type": "object"
+      },
+      "ImpactEntryDto": {
+        "description": "One descendant the change would affect.",
+        "properties": {
+          "current": {
+            "description": "Its effective value today, masked by classification."
+          },
+          "scope": {
+            "description": "Its scope path.",
+            "type": "string"
+          },
+          "tenant_id": {
+            "description": "The descendant.",
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenant_id",
+          "scope",
+          "current"
+        ],
+        "type": "object"
+      },
+      "ImpactReportDto": {
+        "description": "The bounded impact report.",
+        "properties": {
+          "changed": {
+            "description": "The first `limit` affected descendants in traversal order.",
+            "items": {
+              "$ref": "#/components/schemas/ImpactEntryDto"
+            },
+            "type": "array"
+          },
+          "scanned": {
+            "description": "How many descendants were examined.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_changed": {
+            "description": "How many would change, up to the node budget.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "truncated": {
+            "description": "Whether the budget or `limit` cut the report short: it then reads as\n\"at least this many\".",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "changed",
+          "total_changed",
+          "scanned",
+          "truncated"
+        ],
+        "type": "object"
+      },
+      "ImpactRequest": {
+        "description": "`POST /settings/{key}/impact`: the candidate whose reach is asked about.\nA body rather than a query string: a value may run to 64 KiB, which no\nURL carries.",
+        "properties": {
+          "limit": {
+            "description": "Page size, one to five hundred; outside that band it is clamped.",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "value": {
+            "description": "The candidate value."
+          }
+        },
+        "required": [
+          "value"
         ],
         "type": "object"
       },
@@ -9768,6 +10615,24 @@
         ],
         "type": "object"
       },
+      "Page_AuditRecordDto": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/AuditRecordDto"
+            },
+            "type": "array"
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ],
+        "type": "object"
+      },
       "Page_BalanceDto": {
         "properties": {
           "items": {
@@ -9791,6 +10656,24 @@
           "items": {
             "items": {
               "$ref": "#/components/schemas/BundleView"
+            },
+            "type": "array"
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ],
+        "type": "object"
+      },
+      "Page_CategoryDto": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/CategoryDto"
             },
             "type": "array"
           },
@@ -9899,6 +10782,24 @@
           "items": {
             "items": {
               "$ref": "#/components/schemas/DebitNoteView"
+            },
+            "type": "array"
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ],
+        "type": "object"
+      },
+      "Page_DeclarationDto": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/DeclarationDto"
             },
             "type": "array"
           },
@@ -10182,11 +11083,65 @@
         ],
         "type": "object"
       },
+      "Page_RestrictionDto": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/RestrictionDto"
+            },
+            "type": "array"
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ],
+        "type": "object"
+      },
       "Page_ReviewThreadDto": {
         "properties": {
           "items": {
             "items": {
               "$ref": "#/components/schemas/ReviewThreadDto"
+            },
+            "type": "array"
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ],
+        "type": "object"
+      },
+      "Page_SearchHitDto": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/SearchHitDto"
+            },
+            "type": "array"
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ],
+        "type": "object"
+      },
+      "Page_SettingItemDto": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/SettingItemDto"
             },
             "type": "array"
           },
@@ -10978,6 +11933,24 @@
           "restricted"
         ],
         "type": "string"
+      },
+      "PendingSecretDto": {
+        "description": "The answer to staging a secret: a token that stands in for the value, and\nwhen it stops standing in for it. Neither the plaintext nor the store\nreference.",
+        "properties": {
+          "expires_at": {
+            "description": "When the staged secret is swept, RFC 3339. After this the token is\nrefused and the credential-store entry is released.",
+            "type": "string"
+          },
+          "pending_id": {
+            "description": "The opaque, single-use token to send as the batch change's `value`,\nshaped `{ \"pending_id\": \"…\" }`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "pending_id",
+          "expires_at"
+        ],
+        "type": "object"
       },
       "PendingTaxonomyApprovalView": {
         "description": "A submitted taxonomy unit. The first three fields match a plan pending link.",
@@ -15589,6 +16562,40 @@
         },
         "type": "object"
       },
+      "RestrictionDto": {
+        "description": "A stored restriction row.",
+        "properties": {
+          "access": {
+            "description": "`read_only` or `hidden`.",
+            "type": "string"
+          },
+          "etag": {
+            "description": "The row's state tag, what a mutation of this pair must present.",
+            "type": "string"
+          },
+          "set_by": {
+            "description": "The administrator of a strict ancestor who recorded it: an\nadministrator's identity, masked for a caller not authorized for\nunmasked PII.",
+            "type": "string"
+          },
+          "tenant_id": {
+            "description": "The tenant restricted.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "updated_at": {
+            "description": "When it was last changed, RFC 3339.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenant_id",
+          "access",
+          "set_by",
+          "updated_at",
+          "etag"
+        ],
+        "type": "object"
+      },
       "ResubmitRequest": {
         "description": "A resubmit body carrying the preparer's edited intent (the stored `intent`\njsonb shape). The kind cannot change; the approval returns to `PENDING`.",
         "properties": {
@@ -16607,6 +17614,94 @@
         ],
         "type": "object"
       },
+      "SearchCategoryDto": {
+        "description": "The category a hit is filed under. Categories are flat, so this is the\nwhole breadcrumb.",
+        "properties": {
+          "id": {
+            "description": "Category identity.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "key": {
+            "description": "The category slug, as carried in the setting key.",
+            "type": "string"
+          },
+          "name": {
+            "description": "Display name.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "key",
+          "name"
+        ],
+        "type": "object"
+      },
+      "SearchHitDto": {
+        "description": "One search result. A declaration-level hit carries no scope; an override\nhit names the scope where the matched value is set.",
+        "properties": {
+          "category": {
+            "$ref": "#/components/schemas/SearchCategoryDto",
+            "description": "The category the setting is filed under."
+          },
+          "declaration_id": {
+            "description": "Identity of the declaration, for a follow-up read.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "description": {
+            "description": "The declaration's description, when it has one.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "key": {
+            "description": "The setting key.",
+            "type": "string"
+          },
+          "leaf_slug": {
+            "description": "The setting's leaf name.",
+            "type": "string"
+          },
+          "matched_field": {
+            "description": "Which field matched: `key`, `description`, `category_name`,\n`default_value` or `value`.",
+            "type": "string"
+          },
+          "mode": {
+            "description": "`standard` or `advanced`, from the declaration. A tag for grouping,\nnever a filter — no hit is withheld by it.",
+            "type": "string"
+          },
+          "scope": {
+            "description": "The scope path where the matched override is set. Absent on a\ndeclaration-level hit.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tenant_id": {
+            "description": "The tenant owning that scope. Absent on a declaration-level hit.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "value": {
+            "description": "The matched stored value — the override for a `value` hit, the Schema\nDefault for a `default_value` hit — masked by classification exactly\nas a read would mask it. Absent for a hit on the key, description or\ncategory name."
+          }
+        },
+        "required": [
+          "key",
+          "declaration_id",
+          "leaf_slug",
+          "category",
+          "matched_field",
+          "mode"
+        ],
+        "type": "object"
+      },
       "SecretMetadataDto": {
         "description": "Access metadata returned alongside the secret value.",
         "properties": {
@@ -16880,6 +17975,136 @@
         ],
         "type": "object"
       },
+      "SetRestrictionRequest": {
+        "description": "`PUT /settings/{key}/permissions`: the access to store.",
+        "properties": {
+          "access": {
+            "description": "`read_only` or `hidden`; `overridable` is expressed by DELETE.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "access"
+        ],
+        "type": "object"
+      },
+      "SetResultDto": {
+        "description": "A committed change.",
+        "properties": {
+          "change_set_id": {
+            "description": "The change set the write belongs to.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "etag": {
+            "description": "The scope's new value state tag; the next write presents it.",
+            "type": "string"
+          },
+          "key": {
+            "description": "The setting key.",
+            "type": "string"
+          },
+          "masked": {
+            "description": "Whether the values carry the mask token.",
+            "type": "boolean"
+          },
+          "new_value": {
+            "description": "The value after, masked by classification; absent after a removal."
+          },
+          "old_value": {
+            "description": "The value before, masked by classification; absent when no row existed."
+          },
+          "operation": {
+            "description": "`create`, `change`, `revert` or `remove`.",
+            "type": "string"
+          },
+          "scope": {
+            "description": "The target scope path.",
+            "type": "string"
+          },
+          "tenant_id": {
+            "description": "The target as a tenant id.",
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "scope",
+          "tenant_id",
+          "masked",
+          "etag",
+          "change_set_id",
+          "operation"
+        ],
+        "type": "object"
+      },
+      "SetValueRequest": {
+        "description": "`PUT /settings/{key}/value`: the value to store.",
+        "properties": {
+          "value": {
+            "description": "The new value, validated against the declaration's value type. Kept as\ntext until the guards have seen it: a number is refused, not rounded."
+          }
+        },
+        "required": [
+          "value"
+        ],
+        "type": "object"
+      },
+      "SettingItemDto": {
+        "description": "One entry of the browse page: a key with its own outcome.",
+        "properties": {
+          "detail": {
+            "description": "What went wrong, for the failure outcomes.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "effective": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/EffectiveValueDto",
+                "description": "The effective value, when `outcome` is `resolved`."
+              }
+            ]
+          },
+          "flagged": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/FlaggedOverrideDto",
+                "description": "The flagged override, when `outcome` is `needs_review`."
+              }
+            ]
+          },
+          "key": {
+            "description": "The setting key.",
+            "type": "string"
+          },
+          "mode": {
+            "description": "`standard` or `advanced`, from the declaration. Absent only for a\nrequested key that has no declaration. Mode is a tag, never a filter:\nevery page carries every setting and a client groups them itself.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "outcome": {
+            "description": "`resolved`, `needs_review`, `not_found`, `retired`, `unavailable` or\n`error`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "outcome"
+        ],
+        "type": "object"
+      },
       "SettlePaymentRequest": {
         "description": "The `POST /payments` request body: a settled payment to record (the\n**money-in** side). The target seller ledger is the body's own `tenant_id`\n(tenant in body, not path — the vhp-core REST convention); the `(payment,\nwrite)` PEP gate authorizes it. `scale` is the payment's currency scale as\nknown to the caller — advisory; the ledger resolves the authoritative\nper-line scale from the provisioned currency config. `effective_at` `None`\n⇒ the receipt is stamped at post time.",
         "properties": {
@@ -17073,6 +18298,18 @@
             "type": "array"
           }
         },
+        "type": "object"
+      },
+      "StageSecretRequest": {
+        "description": "`POST /settings/{key}/secret-stage`: the plaintext to stage ahead of the\nstep-up redirect.",
+        "properties": {
+          "value": {
+            "description": "The secret value, validated against the declaration's type exactly as\na set validates it."
+          }
+        },
+        "required": [
+          "value"
+        ],
         "type": "object"
       },
       "StorageDto": {
@@ -18490,6 +19727,54 @@
         ],
         "type": "string"
       },
+      "TrailEntryDto": {
+        "description": "One scope on the inheritance trail, with the setter identity and\ntimestamp the administrative read is allowed to show.",
+        "properties": {
+          "has_override": {
+            "description": "Whether an override row exists here.",
+            "type": "boolean"
+          },
+          "last_change_at": {
+            "description": "When the row here last changed.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "needs_review": {
+            "description": "Whether the row here is flagged for review and was skipped.",
+            "type": "boolean"
+          },
+          "provided_value": {
+            "description": "Whether this scope supplied the effective value.",
+            "type": "boolean"
+          },
+          "scope": {
+            "description": "`/` or `/tenants/{id}`.",
+            "type": "string"
+          },
+          "set_by": {
+            "description": "Who set the row here: an administrator's identity, masked for a\ncaller not authorized for unmasked PII.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tenant_id": {
+            "description": "The tenant inspected.",
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "scope",
+          "tenant_id",
+          "has_override",
+          "provided_value",
+          "needs_review"
+        ],
+        "type": "object"
+      },
       "TransferOwnershipReq": {
         "description": "Request to transfer ownership of a file (`POST /files/{id}/transfer`).\n\n@cpt-cf-file-storage-fr-ownership-transfer",
         "properties": {
@@ -18663,6 +19948,56 @@
         ],
         "type": "object"
       },
+      "UpdateCategoryRequest": {
+        "additionalProperties": false,
+        "description": "What a caller supplies to update a category's mutable fields.\n\nA partial update: any of the updatable fields, the rest left as they are.\nFor an optional field, omitting it leaves it and an explicit `null` clears\nit — two different things on the wire, told apart here.\n\n`key` is accepted by the parser and then refused, rather than removed from\nthe shape. `deny_unknown_fields` would reject a supplied `key` as an\n*unknown* field, which is untrue -- the field exists, it is returned in\nevery response, and it simply may not be changed. A caller deserves to be\ntold that, not that we have never heard of it.",
+        "properties": {
+          "description": {
+            "description": "Optional long-form description; omitted, unchanged; `null` clears it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "domain_affinity": {
+            "description": "Optional domain affinity; omitted, unchanged; `null` clears it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "icon": {
+            "description": "Optional icon reference; omitted, unchanged; `null` clears it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "key": {
+            "description": "The stable slug. Accepted only to be refused: see the type docs.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "description": "Display name; omitted, unchanged.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sort_order": {
+            "description": "Ordering weight; omitted, unchanged.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "UpdateChatReq": {
         "description": "Request DTO for updating a chat title.",
         "properties": {
@@ -18687,6 +20022,61 @@
           "name": {
             "type": [
               "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "UpdateDeclarationRequest": {
+        "description": "What an administrator may supply to edit a declaration's metadata.\n\nThis shape exists for the schema the operation publishes; the handler reads\nthe raw object, because what matters is which fields are *present*: an\nomitted field is untouched, an explicit `null` clears a nullable one, and a\nfield this shape does not carry is refused by name rather than ignored.\nA typed struct cannot express the first distinction, so it documents the\nsurface while the handler enforces it.",
+        "properties": {
+          "anonymous_exposable": {
+            "description": "Setting it `false` is immediate; enabling it requires step-up and is\nrefused on a `pii` or `secret` setting.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "data_classification": {
+            "description": "`public` or `pii`. Tightening is immediate, loosening requires step-up,\nand `secret` is derived from the value type and refused here.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "description": {
+            "description": "Long-form description; `null` clears it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "domain_affinity": {
+            "description": "Administrative domain; `null` clears it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "licence_feature": {
+            "description": "Licence feature; `null` clears it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mode": {
+            "description": "`standard` or `advanced`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "requires_step_up": {
+            "description": "Setting it `true` is immediate; clearing it requires step-up.",
+            "type": [
+              "boolean",
               "null"
             ]
           }
@@ -19403,6 +20793,63 @@
         ],
         "type": "object"
       },
+      "ValidateRequest": {
+        "description": "`POST /settings/{key}/validate`: the candidate to check.",
+        "properties": {
+          "limit": {
+            "description": "Page size of the impact report, for a cascading setting.",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "value": {
+            "description": "The candidate value."
+          }
+        },
+        "required": [
+          "value"
+        ],
+        "type": "object"
+      },
+      "ValidationReportDto": {
+        "description": "The read-only report of `validate`.",
+        "properties": {
+          "effective": {
+            "$ref": "#/components/schemas/EffectiveValueDto",
+            "description": "The current effective value at the target."
+          },
+          "impact": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ImpactReportDto",
+                "description": "The descendants the change would affect, for a cascading setting."
+              }
+            ]
+          },
+          "valid": {
+            "description": "Whether the candidate would be accepted.",
+            "type": "boolean"
+          },
+          "violations": {
+            "description": "Field-level detail; empty when valid.",
+            "items": {
+              "$ref": "#/components/schemas/ViolationDto"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "valid",
+          "violations",
+          "effective"
+        ],
+        "type": "object"
+      },
       "ValueReferencesView": {
         "description": "D-355: how many published things resolve through a value — the read-side twin\nof the retire guard's counts, so a UI can show that an edit is governed before\nthe operator makes one.\n\nPresent on both list and by-value GETs, alongside `edit_governed` derived\nfrom these same counts. Write responses and approval pins carry neither.",
         "properties": {
@@ -19487,6 +20934,29 @@
           "$ref": "#/components/schemas/VersionDto"
         },
         "type": "array"
+      },
+      "ViolationDto": {
+        "description": "One field-level violation.",
+        "properties": {
+          "code": {
+            "description": "A stable code.",
+            "type": "string"
+          },
+          "field": {
+            "description": "The offending field, as a JSON pointer under `value`.",
+            "type": "string"
+          },
+          "message": {
+            "description": "In words.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "field",
+          "code",
+          "message"
+        ],
+        "type": "object"
       },
       "WebSearchConfig": {
         "description": "Web search toggle.",
@@ -52075,6 +53545,3562 @@
         "summary": "Add membership",
         "tags": [
           "Resource Group Memberships"
+        ]
+      }
+    },
+    "/settings-service/v1/categories": {
+      "get": {
+        "description": "List categories visible to the caller, ordered by sort order then name. Supports OData `$filter` over `key`, `name` and `domain_affinity`, and `$orderby` over `key` and `name`, with cursor pagination. `$orderby` over `domain_affinity` is refused: it may be empty, and a page cursor cannot carry an empty value. `$select` is not supported and is rejected rather than ignored.",
+        "operationId": "settings_service.list_categories",
+        "parameters": [
+          {
+            "description": "Page size",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Cursor for pagination",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "OData v4 filter expression\n- key: eq|ne|contains|startswith|endswith|in\n- name: eq|ne|contains|startswith|endswith|in\n- domain_affinity: eq|ne|contains|startswith|endswith|in",
+            "in": "query",
+            "name": "$filter",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "OData v4 orderby expression\n- key asc\n- key desc\n- name asc\n- name desc",
+            "in": "query",
+            "name": "$orderby",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_CategoryDto"
+                }
+              }
+            },
+            "description": "A page of categories with its pagination cursors"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "List settings categories",
+        "tags": [
+          "settings-categories"
+        ],
+        "x-odata-filter": {
+          "allowedFields": {
+            "domain_affinity": [
+              "eq",
+              "ne",
+              "contains",
+              "startswith",
+              "endswith",
+              "in"
+            ],
+            "key": [
+              "eq",
+              "ne",
+              "contains",
+              "startswith",
+              "endswith",
+              "in"
+            ],
+            "name": [
+              "eq",
+              "ne",
+              "contains",
+              "startswith",
+              "endswith",
+              "in"
+            ]
+          }
+        },
+        "x-odata-orderby": {
+          "allowedFields": [
+            "key asc",
+            "key desc",
+            "name asc",
+            "name desc"
+          ]
+        }
+      },
+      "post": {
+        "description": "Create a category. The key becomes the category segment of every setting key declared under it, so it is stored verbatim and may not contain `/`.",
+        "operationId": "settings_service.create_category",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateCategoryRequest"
+              }
+            }
+          },
+          "description": "The category to create",
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CategoryDto"
+                }
+              }
+            },
+            "description": "The created category, with its ETag and Location",
+            "headers": {
+              "ETag": {
+                "description": "Tag of the returned representation; send it back as `If-Match` on PATCH and DELETE",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Location": {
+                "description": "URL of the created category",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Create a settings category",
+        "tags": [
+          "settings-categories"
+        ]
+      }
+    },
+    "/settings-service/v1/categories/{id}": {
+      "delete": {
+        "description": "Delete a category. Requires `If-Match`. Refused with 409 while any declaration still references it, including retired ones -- a retired declaration keeps its category and would otherwise be orphaned.",
+        "operationId": "settings_service.delete_category",
+        "parameters": [
+          {
+            "description": "Category UUID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The `ETag` from the caller's last read of this category. Absent -> 428; stale -> 412. The write happens only against the representation the caller saw.",
+            "in": "header",
+            "name": "If-Match",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The category was deleted"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "412": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The supplied If-Match is stale: re-read and retry"
+          },
+          "428": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "If-Match is required on a conditional write"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Delete a settings category",
+        "tags": [
+          "settings-categories"
+        ]
+      },
+      "get": {
+        "description": "Fetch one category by id. A category outside the caller's administrative domain answers 404 rather than 403, so a hidden category's existence is not disclosed. The response carries the category's ETag, which a later PATCH or DELETE must echo in `If-Match`.",
+        "operationId": "settings_service.get_category",
+        "parameters": [
+          {
+            "description": "Category UUID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CategoryDto"
+                }
+              }
+            },
+            "description": "The category, with its ETag",
+            "headers": {
+              "ETag": {
+                "description": "Tag of the returned representation; send it back as `If-Match` on PATCH and DELETE",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Get a settings category",
+        "tags": [
+          "settings-categories"
+        ]
+      },
+      "patch": {
+        "description": "Replace a category's mutable fields. Requires `If-Match`: the header is mandatory, so a write that never read the current state is refused rather than silently overwriting a concurrent edit.",
+        "operationId": "settings_service.update_category",
+        "parameters": [
+          {
+            "description": "Category UUID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The `ETag` from the caller's last read of this category. Absent -> 428; stale -> 412. The write happens only against the representation the caller saw.",
+            "in": "header",
+            "name": "If-Match",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateCategoryRequest"
+              }
+            }
+          },
+          "description": "The replacement representation",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CategoryDto"
+                }
+              }
+            },
+            "description": "The updated category, with its refreshed ETag",
+            "headers": {
+              "ETag": {
+                "description": "Tag of the returned representation; send it back as `If-Match` on PATCH and DELETE",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "412": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The supplied If-Match is stale: re-read and retry"
+          },
+          "428": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "If-Match is required on a conditional write"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Update a settings category",
+        "tags": [
+          "settings-categories"
+        ]
+      }
+    },
+    "/settings-service/v1/declarations": {
+      "get": {
+        "description": "List declarations visible to the caller. Supports OData `$filter` over `key`, `category_id`, `domain_affinity`, `mode`, `status` and `owner_module`, and `$orderby` over `key`, `category_id`, `mode` and `status`, with cursor pagination. `$orderby` over the two that may be empty is refused, since a page cursor cannot carry an empty value. `$select` is not supported and is rejected rather than ignored. Each declaration carries its `value_type_id` and the value type's resolved traits.",
+        "operationId": "settings_service.list_declarations",
+        "parameters": [
+          {
+            "description": "Page size",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Cursor for pagination",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "OData v4 filter expression\n- key: eq|ne|contains|startswith|endswith|in\n- category_id: eq|ne|in\n- domain_affinity: eq|ne|contains|startswith|endswith|in\n- mode: eq|ne|contains|startswith|endswith|in\n- status: eq|ne|contains|startswith|endswith|in\n- owner_module: eq|ne|contains|startswith|endswith|in",
+            "in": "query",
+            "name": "$filter",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "OData v4 orderby expression\n- key asc\n- key desc\n- category_id asc\n- category_id desc\n- mode asc\n- mode desc\n- status asc\n- status desc",
+            "in": "query",
+            "name": "$orderby",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_DeclarationDto"
+                }
+              }
+            },
+            "description": "A page of declarations with its pagination cursors"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "List setting declarations",
+        "tags": [
+          "settings-declarations"
+        ],
+        "x-odata-filter": {
+          "allowedFields": {
+            "category_id": [
+              "eq",
+              "ne",
+              "in"
+            ],
+            "domain_affinity": [
+              "eq",
+              "ne",
+              "contains",
+              "startswith",
+              "endswith",
+              "in"
+            ],
+            "key": [
+              "eq",
+              "ne",
+              "contains",
+              "startswith",
+              "endswith",
+              "in"
+            ],
+            "mode": [
+              "eq",
+              "ne",
+              "contains",
+              "startswith",
+              "endswith",
+              "in"
+            ],
+            "owner_module": [
+              "eq",
+              "ne",
+              "contains",
+              "startswith",
+              "endswith",
+              "in"
+            ],
+            "status": [
+              "eq",
+              "ne",
+              "contains",
+              "startswith",
+              "endswith",
+              "in"
+            ]
+          }
+        },
+        "x-odata-orderby": {
+          "allowedFields": [
+            "key asc",
+            "key desc",
+            "category_id asc",
+            "category_id desc",
+            "mode asc",
+            "mode desc",
+            "status asc",
+            "status desc"
+          ]
+        }
+      },
+      "post": {
+        "description": "Declare a setting under an existing category. The key is composed by the service from the vendor, the category's slug and the leaf name, so it can never disagree with where the setting is filed, and the composed type is registered in the types registry before the row is inserted. `default_value` is mandatory: it is what makes resolution total, and a secret-trait value type takes an empty placeholder rather than a credential. The classification is derived from the value type's traits; an author-supplied `secret` is refused. A key that holds a retired declaration is revived instead, which requires step-up and answers `200` with `reactivated`, its retained values re-entering resolution.",
+        "operationId": "settings_service.create_declaration",
+        "parameters": [
+          {
+            "description": "A fresh token from the identity provider proving the caller re-authenticated just now; absent, the bearer token itself is checked. Required by a retire, a revive, and any edit that loosens a gate or a classification.",
+            "in": "header",
+            "name": "X-Step-Up-Token",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateDeclarationRequest"
+              }
+            }
+          },
+          "description": "The declaration to create",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreatedDeclarationDto"
+                }
+              }
+            },
+            "description": "The revived declaration, `reactivated` true",
+            "headers": {
+              "ETag": {
+                "description": "The declaration's state tag; a PATCH or DELETE presents it in `If-Match`",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Location": {
+                "description": "URL of the declaration",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreatedDeclarationDto"
+                }
+              }
+            },
+            "description": "The created declaration, with its ETag and Location",
+            "headers": {
+              "ETag": {
+                "description": "The declaration's state tag; a PATCH or DELETE presents it in `If-Match`",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Location": {
+                "description": "URL of the declaration",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Declare a setting",
+        "tags": [
+          "settings-declarations"
+        ]
+      }
+    },
+    "/settings-service/v1/declarations/{id}": {
+      "delete": {
+        "description": "Retire a declaration: a soft delete that sets `status` to `retired` and answers `200` with the retired body, not `204`. Every stored value is retained and merely excluded from resolution, recoverable by re-declaring the key. Retire drops a live setting out of resolution at once, so it requires step-up; a gear's contributed declaration is refused with a conflict. Requires `If-Match`.",
+        "operationId": "settings_service.retire_declaration",
+        "parameters": [
+          {
+            "description": "Declaration UUID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The `ETag` from the caller's last read of this declaration. Absent -> 428; stale -> 412. The edit happens only against the representation the caller saw.",
+            "in": "header",
+            "name": "If-Match",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A fresh token from the identity provider proving the caller re-authenticated just now; absent, the bearer token itself is checked. Required by a retire, a revive, and any edit that loosens a gate or a classification.",
+            "in": "header",
+            "name": "X-Step-Up-Token",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeclarationDto"
+                }
+              }
+            },
+            "description": "The retired declaration, `status` retired",
+            "headers": {
+              "ETag": {
+                "description": "The declaration's state tag; a PATCH or DELETE presents it in `If-Match`",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "412": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The supplied If-Match is stale: re-read and retry"
+          },
+          "428": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "If-Match is required on a conditional write"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Retire a setting declaration",
+        "tags": [
+          "settings-declarations"
+        ]
+      },
+      "get": {
+        "description": "Fetch one declaration by its identifier, including its `value_type_id` and the value type's resolved traits. A declaration outside the caller's administrative domain is reported as absent rather than forbidden, so a gated declaration's existence is not disclosed.",
+        "operationId": "settings_service.get_declaration",
+        "parameters": [
+          {
+            "description": "Declaration UUID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeclarationDto"
+                }
+              }
+            },
+            "description": "The declaration and its resolved traits",
+            "headers": {
+              "ETag": {
+                "description": "The declaration's state tag; a PATCH or DELETE presents it in `If-Match`",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Get a setting declaration",
+        "tags": [
+          "settings-declarations"
+        ]
+      },
+      "patch": {
+        "description": "Edit descriptive metadata in place. Behaviour-affecting fields -- `default_value`, the value type, `scope_class` -- are refused as immutable, and so is any field this surface does not recognize, since an unknown field must never take the immediate path. Tightening a gate or a classification applies at once; loosening one -- clearing `requires_step_up`, enabling `anonymous_exposable`, moving `pii` back to `public` -- requires step-up. A gear's contributed declaration is refused with a conflict. Requires `If-Match`.",
+        "operationId": "settings_service.update_declaration",
+        "parameters": [
+          {
+            "description": "Declaration UUID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The `ETag` from the caller's last read of this declaration. Absent -> 428; stale -> 412. The edit happens only against the representation the caller saw.",
+            "in": "header",
+            "name": "If-Match",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A fresh token from the identity provider proving the caller re-authenticated just now; absent, the bearer token itself is checked. Required by a retire, a revive, and any edit that loosens a gate or a classification.",
+            "in": "header",
+            "name": "X-Step-Up-Token",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateDeclarationRequest"
+              }
+            }
+          },
+          "description": "The metadata fields to change",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeclarationDto"
+                }
+              }
+            },
+            "description": "The updated declaration, with its refreshed ETag",
+            "headers": {
+              "ETag": {
+                "description": "The declaration's state tag; a PATCH or DELETE presents it in `If-Match`",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "412": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The supplied If-Match is stale: re-read and retry"
+          },
+          "428": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "If-Match is required on a conditional write"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Edit a declaration's metadata",
+        "tags": [
+          "settings-declarations"
+        ]
+      }
+    },
+    "/settings-service/v1/search": {
+      "get": {
+        "description": "Cross-field search over every category the caller may see. Matches a setting's key, description, category name, Schema Default and the overrides explicitly set inside the target's subtree, under the same authorization, target, visibility and `hidden` rules as browsing; results come back flat and ordered by key, each hit with its category, the field that matched -- one of `key`, `description`, `category_name`, `default_value` or `value` -- and its declaration's `mode` as a tag that withholds nothing. A hit on the key, description, category name or default belongs to the declaration and carries no scope; a hit on an override names the scope and tenant where it is set. Search runs over stored rows, not resolved values: an inherited value is a hit where it was set, and a default is a hit on its declaration. `tenant` bounds the override corpus to that subtree and is resolution context as everywhere else. `q` is a case-insensitive substring of at least two characters and at most two hundred; shorter or longer is refused 400. A `secret` value is never matched, so an empty result says nothing about it; a `pii` value is matched only for a caller entitled to read it unmasked. A page holds up to `limit` settings; a setting with several matching overrides contributes one hit per override. `$filter`, `$orderby` and `$select` are refused.",
+        "operationId": "settings_service.search_settings",
+        "parameters": [
+          {
+            "description": "Free text, at least two and at most two hundred characters",
+            "in": "query",
+            "name": "q",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Target tenant id; omitted, the caller's own tenant",
+            "in": "query",
+            "name": "tenant",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page size, in settings",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Cursor for pagination",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_SearchHitDto"
+                }
+              }
+            },
+            "description": "A page of hits, ordered by key, with its pagination cursors"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Search settings across categories",
+        "tags": [
+          "settings-search"
+        ]
+      }
+    },
+    "/settings-service/v1/settings": {
+      "get": {
+        "description": "Resolve a page of settings at one scope. `tenant` is resolution context, never a filter: omitted, it is the caller's own tenant, which for a platform administrator is the root and therefore platform scope; a tenant outside the caller's subtree, or a standalone descendant, answers 403. OData `$filter` supports `category_id eq`, `key eq`, `key in (...)` and `needs_review eq true`, joined by `and`; an unmapped field or unsupported operator answers 400 rather than an unfiltered page. `$orderby` takes `key` and `category_id`; any other field answers 400. Each item carries its own outcome, so a named key that does not exist is reported in its entry, never as a failure of the request. `needs_review eq true` lists the flagged override rows in the caller's subtree instead of resolved values. Values are masked by classification.",
+        "operationId": "settings_service.browse_settings",
+        "parameters": [
+          {
+            "description": "Target tenant id; omitted, the caller's own tenant",
+            "in": "query",
+            "name": "tenant",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page size",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Cursor for pagination",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "OData v4 filter expression\n- key: eq|ne|contains|startswith|endswith|in\n- category_id: eq|ne|in\n- needs_review: eq|ne",
+            "in": "query",
+            "name": "$filter",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "OData v4 orderby expression\n- key asc\n- key desc\n- category_id asc\n- category_id desc",
+            "in": "query",
+            "name": "$orderby",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_SettingItemDto"
+                }
+              }
+            },
+            "description": "A page of per-key outcomes with its pagination cursors"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Browse effective values",
+        "tags": [
+          "settings-values"
+        ],
+        "x-odata-filter": {
+          "allowedFields": {
+            "category_id": [
+              "eq",
+              "ne",
+              "in"
+            ],
+            "key": [
+              "eq",
+              "ne",
+              "contains",
+              "startswith",
+              "endswith",
+              "in"
+            ],
+            "needs_review": [
+              "eq",
+              "ne"
+            ]
+          }
+        },
+        "x-odata-orderby": {
+          "allowedFields": [
+            "key asc",
+            "key desc",
+            "category_id asc",
+            "category_id desc"
+          ]
+        }
+      }
+    },
+    "/settings-service/v1/settings/batch": {
+      "post": {
+        "description": "At most five hundred changes, each with its own key, target tenant, operation, value and `if_match`. `op` is `set` (the default, so a client that never sends it is unaffected) or `revert`, which clears the scope's own override and carries no value; a key that is not a setting key, a `set` without a value, a `revert` with one, or an unknown word rejects that change alone with `invalid`, and a `revert` of a scope holding no override is rejected `not_found` alone. Step-up is verified once for the request when any target declaration requires it; each change then commits on its own, with no atomicity across changes, and the answer carries one entry per change - committed with its new tag and its `operation`, or rejected with one of a fixed vocabulary of codes: `invalid`, `if_match_required`, `stale`, `conflict`, `forbidden`, `retired`, `not_found`, `unavailable`, `error`. `if_match` is required in effect - a change without one is rejected `if_match_required` on its own while the rest proceed; a first write sends the literal `absent`. `retired` covers a declaration retired after the change was assembled, since the check runs again as each change commits. For a secret-trait setting the value may be `{ \"pending_id\": \"...\" }`, naming a secret staged through `/secret-stage` before the step-up redirect: the staged entry is adopted, and a token that is unknown, expired, or was staged by another subject or for another setting or tenant rejects that change `invalid`.",
+        "operationId": "settings_service.batch_set",
+        "parameters": [
+          {
+            "description": "A fresh token from the identity provider proving the caller re-authenticated just now; absent, the bearer token itself is checked. Required by declarations that require step-up",
+            "in": "header",
+            "name": "X-Step-Up-Token",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BatchRequest"
+              }
+            }
+          },
+          "description": "The changes, in order",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BatchResultDto"
+                }
+              }
+            },
+            "description": "One entry per change"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Set several settings in one call",
+        "tags": [
+          "settings-values"
+        ]
+      }
+    },
+    "/settings-service/v1/settings/{key}": {
+      "get": {
+        "description": "Resolve one setting at a scope: the value masked by classification, its source and source scope, the value type's traits, the inheritance trail with per-entry setter identity, a leak-safe `last_change_at`, the scope's own review flag when its override is flagged, and in `ETag` the value state tag a write at that scope must present. A key with no declaration answers 404; a retired declaration answers 410 with the `SETTING_RETIRED` precondition; a target outside the caller's subtree or a standalone descendant answers 403.",
+        "operationId": "settings_service.get_setting",
+        "parameters": [
+          {
+            "description": "The setting key, a URL-encoded GTS type id",
+            "in": "path",
+            "name": "key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Target tenant id; omitted, the caller's own tenant",
+            "in": "query",
+            "name": "tenant",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EffectiveValueDto"
+                }
+              }
+            },
+            "description": "The effective value with its trace, and the value state tag in ETag",
+            "headers": {
+              "ETag": {
+                "description": "The value state tag of the requested scope's own row, or of the absent state; a write at that scope presents it in `If-Match`",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "410": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Gone: the declaration is retired"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Read an effective value",
+        "tags": [
+          "settings-values"
+        ]
+      }
+    },
+    "/settings-service/v1/settings/{key}/history": {
+      "get": {
+        "description": "The mutation history of one setting at one scope, newest first and cursor-paginated, served from the gear's own audit store. `tenant` follows the read surface: omitted, the caller's own tenant; a tenant outside the caller's subtree or a standalone descendant answers 403. A `pii` actor, and `pii` values, are masked for a caller without the PII entitlement; a secret was never recorded in plaintext. A retired declaration keeps its history. An empty history is an empty page. `$filter`, `$orderby` and `$select` are refused.",
+        "operationId": "settings_service.get_setting_history",
+        "parameters": [
+          {
+            "description": "The setting key, a URL-encoded GTS type id",
+            "in": "path",
+            "name": "key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Target tenant id; omitted, the caller's own tenant",
+            "in": "query",
+            "name": "tenant",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page size",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Cursor for pagination",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_AuditRecordDto"
+                }
+              }
+            },
+            "description": "A page of audit records, newest first, with its pagination cursors"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Read a setting's history at a scope",
+        "tags": [
+          "settings-values"
+        ]
+      }
+    },
+    "/settings-service/v1/settings/{key}/impact": {
+      "post": {
+        "description": "Which descendants of the target would see a different effective value under the candidate: the first `limit` in breadth-first order (default 100, at most 500), the total, how many were scanned under the node budget of 5000, and whether the report was truncated. Standalone descendants are omitted from the list and the count; each listed descendant's current value is masked by the setting's classification. A POST because the candidate travels in the body, as it does for `validate` - a value may run to 64 KiB. Read-only, informational, and never blocking a write.",
+        "operationId": "settings_service.impact",
+        "parameters": [
+          {
+            "description": "The setting key, a URL-encoded GTS type id",
+            "in": "path",
+            "name": "key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Target tenant id; omitted, the caller's own tenant",
+            "in": "query",
+            "name": "tenant",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ImpactRequest"
+              }
+            }
+          },
+          "description": "The candidate value and the page size",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImpactReportDto"
+                }
+              }
+            },
+            "description": "The bounded report"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "410": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Gone: the declaration is retired"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Report the cascading impact of a candidate value",
+        "tags": [
+          "settings-values"
+        ]
+      }
+    },
+    "/settings-service/v1/settings/{key}/permissions": {
+      "delete": {
+        "description": "Delete the pair's row, making this level `overridable` while an ancestor row may still narrow the effective result. Clearing an absent row is a no-op that still requires the absent-state tag. Requires `delegate` and `If-Match`.",
+        "operationId": "settings_service.clear_tenant_access",
+        "parameters": [
+          {
+            "description": "The setting key, a URL-encoded GTS type id",
+            "in": "path",
+            "name": "key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The tenant the restriction is about, never the caller",
+            "in": "query",
+            "name": "tenant",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The restriction state tag the caller last read for this pair: the stored row's, or `absent`",
+            "in": "header",
+            "name": "If-Match",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessReadDto"
+                }
+              }
+            },
+            "description": "The resulting effective access and the absent-state tag",
+            "headers": {
+              "ETag": {
+                "description": "The pair's restriction state tag; a PUT or DELETE presents it in `If-Match`",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "412": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Precondition Failed"
+          },
+          "428": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Precondition Required"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Clear a descendant tenant's restriction on a setting",
+        "tags": [
+          "settings-tenant-access"
+        ]
+      },
+      "get": {
+        "description": "The pair's stored restriction if any, the effective access - the strictest row on the tenant's root-to-self chain, `overridable` when none - the tenant that supplies it, and in `ETag` the tag a PUT or DELETE must present; the absent-state tag when no row exists. The target must be the caller's own tenant or a non-standalone descendant; a setting hidden from the caller is absent.",
+        "operationId": "settings_service.read_tenant_access",
+        "parameters": [
+          {
+            "description": "The setting key, a URL-encoded GTS type id",
+            "in": "path",
+            "name": "key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The tenant the restriction is about, never the caller",
+            "in": "query",
+            "name": "tenant",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessReadDto"
+                }
+              }
+            },
+            "description": "The tenant's access, with its state tag",
+            "headers": {
+              "ETag": {
+                "description": "The pair's restriction state tag; a PUT or DELETE presents it in `If-Match`",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Read one tenant's access to a setting",
+        "tags": [
+          "settings-tenant-access"
+        ]
+      },
+      "put": {
+        "description": "Store `read_only` or `hidden` for a strict descendant that is not standalone; a caller cannot restrict itself, an ancestor or a sibling. `overridable` is the absence of a row and is expressed by DELETE. Requires `delegate` on the setting and `If-Match` against the tag the read returned. The row is stored even when a stricter ancestor already dominates it and takes effect when that is lifted. The target and its descendants are evicted from the cache.",
+        "operationId": "settings_service.set_tenant_access",
+        "parameters": [
+          {
+            "description": "The setting key, a URL-encoded GTS type id",
+            "in": "path",
+            "name": "key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The tenant the restriction is about, never the caller",
+            "in": "query",
+            "name": "tenant",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The restriction state tag the caller last read for this pair: the stored row's, or `absent`",
+            "in": "header",
+            "name": "If-Match",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetRestrictionRequest"
+              }
+            }
+          },
+          "description": "The access to store",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessReadDto"
+                }
+              }
+            },
+            "description": "The stored restriction, the resulting effective access and the refreshed tag",
+            "headers": {
+              "ETag": {
+                "description": "The pair's restriction state tag; a PUT or DELETE presents it in `If-Match`",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "412": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Precondition Failed: the row changed since it was read"
+          },
+          "428": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Precondition Required: If-Match is missing"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Restrict a descendant tenant's access to a setting",
+        "tags": [
+          "settings-tenant-access"
+        ]
+      }
+    },
+    "/settings-service/v1/settings/{key}/permissions/all": {
+      "get": {
+        "description": "Every stored restriction for the setting on the caller's own tenant and its reachable descendants, each with its state tag; standalone subtrees are left out. The list is small by nature and returned whole.",
+        "operationId": "settings_service.list_tenant_access",
+        "parameters": [
+          {
+            "description": "The setting key, a URL-encoded GTS type id",
+            "in": "path",
+            "name": "key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_RestrictionDto"
+                }
+              }
+            },
+            "description": "The stored restrictions"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "List the stored restrictions on a setting in the caller's subtree",
+        "tags": [
+          "settings-tenant-access"
+        ]
+      }
+    },
+    "/settings-service/v1/settings/{key}/secret-stage": {
+      "post": {
+        "description": "Store a secret-trait value in the credential store before the caller leaves for step-up, and answer with an opaque single-use token to send in place of the value in the following batch. It exists because a browser cannot carry a secret's plaintext across the identity provider's redirect: the token can cross it safely, since only this service can resolve it and it expires within minutes. The entry is created under this service's own principal, exactly as an ordinary secret write creates it, so the no-reveal-path guarantee is unchanged and the credential-store reference is never returned. Requires the same authorization a set requires and no step-up, since nothing live changes until the batch commits. A non-secret declaration is refused 400 with `not_a_secret`.",
+        "operationId": "settings_service.stage_secret",
+        "parameters": [
+          {
+            "description": "The setting key, a URL-encoded GTS type id",
+            "in": "path",
+            "name": "key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Target tenant id; omitted, the caller's own tenant",
+            "in": "query",
+            "name": "tenant",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StageSecretRequest"
+              }
+            }
+          },
+          "description": "The secret value to stage",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PendingSecretDto"
+                }
+              }
+            },
+            "description": "The token and its expiry"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "410": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Gone: the declaration is retired"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Stage a secret ahead of the batch",
+        "tags": [
+          "settings-values"
+        ]
+      }
+    },
+    "/settings-service/v1/settings/{key}/validate": {
+      "post": {
+        "description": "Report whether the candidate would be accepted, with field-level detail, the current effective value and its source at the target, and - for a cascading setting - the descendants the change would affect, in pages. Read-only: needs no step-up, stores nothing, emits no audit record, and is never required before a write.",
+        "operationId": "settings_service.validate_value",
+        "parameters": [
+          {
+            "description": "The setting key, a URL-encoded GTS type id",
+            "in": "path",
+            "name": "key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Target tenant id; omitted, the caller's own tenant",
+            "in": "query",
+            "name": "tenant",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ValidateRequest"
+              }
+            }
+          },
+          "description": "The candidate value",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValidationReportDto"
+                }
+              }
+            },
+            "description": "The report"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "410": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Gone: the declaration is retired"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Check a value without storing it",
+        "tags": [
+          "settings-values"
+        ]
+      }
+    },
+    "/settings-service/v1/settings/{key}/value": {
+      "delete": {
+        "description": "Remove the scope's own row; resolution falls back exactly as after a revert. Declaration removal is a separate, immediate soft-delete and is not reachable here.",
+        "operationId": "settings_service.remove_value",
+        "parameters": [
+          {
+            "description": "The setting key, a URL-encoded GTS type id",
+            "in": "path",
+            "name": "key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Target tenant id; omitted, the caller's own tenant",
+            "in": "query",
+            "name": "tenant",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The value state tag the caller last read for this scope, or `absent` when no row existed; a moved value is refused 412",
+            "in": "header",
+            "name": "If-Match",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A fresh token from the identity provider proving the caller re-authenticated just now; absent, the bearer token itself is checked. Required by declarations that require step-up",
+            "in": "header",
+            "name": "X-Step-Up-Token",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FallbackResultDto"
+                }
+              }
+            },
+            "description": "The change and what the scope resolves to now"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "410": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Gone: the declaration is retired"
+          },
+          "412": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Precondition Failed"
+          },
+          "428": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Precondition Required"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Remove a setting's value at a scope",
+        "tags": [
+          "settings-values"
+        ]
+      },
+      "put": {
+        "description": "Store a value at the target scope, effective on the next read. Authorization is decided first; a declaration that requires step-up then needs a fresh re-authentication token, refused 401 with the RFC 9470 challenge when absent or stale, and refuses a service principal outright. The value is validated against the declaration's type, the write is guarded on `If-Match`, and the value and its audit record commit in one transaction.",
+        "operationId": "settings_service.set_value",
+        "parameters": [
+          {
+            "description": "The setting key, a URL-encoded GTS type id",
+            "in": "path",
+            "name": "key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Target tenant id; omitted, the caller's own tenant",
+            "in": "query",
+            "name": "tenant",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The value state tag the caller last read for this scope, or `absent` when no row existed; a moved value is refused 412",
+            "in": "header",
+            "name": "If-Match",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A fresh token from the identity provider proving the caller re-authenticated just now; absent, the bearer token itself is checked. Required by declarations that require step-up",
+            "in": "header",
+            "name": "X-Step-Up-Token",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetValueRequest"
+              }
+            }
+          },
+          "description": "The value to store",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SetResultDto"
+                }
+              }
+            },
+            "description": "The committed change and its new tag",
+            "headers": {
+              "ETag": {
+                "description": "The scope's new value state tag; the next write presents it in `If-Match`",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "410": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Gone: the declaration is retired"
+          },
+          "412": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Precondition Failed: the value moved since it was read"
+          },
+          "428": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Precondition Required: If-Match is missing"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Set a setting's value at a scope",
+        "tags": [
+          "settings-values"
+        ]
+      }
+    },
+    "/settings-service/v1/settings/{key}/value/clone": {
+      "post": {
+        "description": "Copy the effective value resolved at `from` - the caller's own tenant when omitted - as an explicit override at the target, with no continuing link. Both ends are authorized and must lie within the caller's subtree; a secret-classified setting is refused 400 with `secret_not_cloneable`.",
+        "operationId": "settings_service.clone_value",
+        "parameters": [
+          {
+            "description": "The setting key, a URL-encoded GTS type id",
+            "in": "path",
+            "name": "key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Target tenant id; omitted, the caller's own tenant",
+            "in": "query",
+            "name": "tenant",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The value state tag the caller last read for this scope, or `absent` when no row existed; a moved value is refused 412",
+            "in": "header",
+            "name": "If-Match",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A fresh token from the identity provider proving the caller re-authenticated just now; absent, the bearer token itself is checked. Required by declarations that require step-up",
+            "in": "header",
+            "name": "X-Step-Up-Token",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CloneRequest"
+              }
+            }
+          },
+          "description": "The source scope",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SetResultDto"
+                }
+              }
+            },
+            "description": "The committed change at the target",
+            "headers": {
+              "ETag": {
+                "description": "The scope's new value state tag; the next write presents it in `If-Match`",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "410": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Gone: the declaration is retired"
+          },
+          "412": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Precondition Failed"
+          },
+          "428": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Precondition Required"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Clone a setting's effective value from another scope",
+        "tags": [
+          "settings-values"
+        ]
+      }
+    },
+    "/settings-service/v1/settings/{key}/value/revert": {
+      "post": {
+        "description": "Clear the override at the target scope so it falls back - to the nearest ancestor override for a cascading setting at a tenant, otherwise to the Schema Default, which the revert never touches. Same gates and `If-Match` as a set; the response carries the resulting effective value.",
+        "operationId": "settings_service.revert_value",
+        "parameters": [
+          {
+            "description": "The setting key, a URL-encoded GTS type id",
+            "in": "path",
+            "name": "key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Target tenant id; omitted, the caller's own tenant",
+            "in": "query",
+            "name": "tenant",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The value state tag the caller last read for this scope, or `absent` when no row existed; a moved value is refused 412",
+            "in": "header",
+            "name": "If-Match",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A fresh token from the identity provider proving the caller re-authenticated just now; absent, the bearer token itself is checked. Required by declarations that require step-up",
+            "in": "header",
+            "name": "X-Step-Up-Token",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FallbackResultDto"
+                }
+              }
+            },
+            "description": "The change and what the scope resolves to now"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "410": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Gone: the declaration is retired"
+          },
+          "412": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Precondition Failed"
+          },
+          "428": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Precondition Required"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Revert a setting's value at a scope",
+        "tags": [
+          "settings-values"
         ]
       }
     },

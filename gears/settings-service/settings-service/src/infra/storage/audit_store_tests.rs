@@ -1,0 +1,452 @@
+// Created: 2026-09-07 by Virtuozzo International GmbH
+//! The store over an in-memory database: append, history, retention.
+
+use std::sync::Arc;
+
+use serde_json::json;
+use time::{Duration, OffsetDateTime};
+use toolkit_db::{DBProvider, DbError};
+use toolkit_odata::ODataQuery;
+use toolkit_security::AccessScope;
+use uuid::Uuid;
+
+use super::AuditStore;
+use crate::audit::{AuditOperation, AuditRecord, AuditSink, AuditValue};
+use crate::domain::error::DomainError;
+use crate::test_support::sqlite_provider;
+
+const KEY: &str = "gts.cf.core.settings.setting_type.v1~acme.settings.network.enable_proxy.v1~";
+
+async fn db() -> Arc<DBProvider<DbError>> {
+    sqlite_provider().await
+}
+
+fn record(tenant: Uuid, request: &str) -> AuditRecord {
+    AuditRecord::new(KEY, Some(tenant), "admin", AuditOperation::Change, request)
+        .with_pre_image(AuditValue::record(json!(false), false))
+        .with_post_image(AuditValue::record(json!(true), false))
+}
+
+async fn history(
+    db: &DBProvider<DbError>,
+    tenant: Uuid,
+    limit: Option<u64>,
+    cursor: Option<toolkit_odata::CursorV1>,
+) -> toolkit_odata::Page<crate::audit::StoredAuditRecord> {
+    let conn = db.conn().expect("connection");
+    AuditStore
+        .history(
+            &conn,
+            &AccessScope::allow_all(),
+            KEY,
+            tenant,
+            &ODataQuery {
+                limit,
+                cursor,
+                ..ODataQuery::default()
+            },
+        )
+        .await
+        .expect("history reads")
+}
+
+#[tokio::test]
+async fn appended_records_come_back_newest_first_for_their_pair_only() {
+    let db = db().await;
+    let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+    let conn = db.conn().expect("connection");
+    for request in ["r1", "r2", "r3"] {
+        AuditStore
+            .append(&conn, &AccessScope::allow_all(), record(a, request))
+            .await
+            .expect("append");
+    }
+    AuditStore
+        .append(&conn, &AccessScope::allow_all(), record(b, "other-tenant"))
+        .await
+        .expect("append");
+
+    let page = history(&db, a, None, None).await;
+    let requests: Vec<&str> = page.items.iter().map(|r| r.request_id.as_str()).collect();
+    assert_eq!(requests, vec!["r3", "r2", "r1"], "newest first");
+    assert!(page.items.iter().all(|r| r.tenant_id == Some(a)));
+    assert_eq!(
+        page.items[0].pre_image,
+        Some(AuditValue::Clear(json!(false)))
+    );
+    assert_eq!(page.items[0].operation, AuditOperation::Change);
+
+    let empty = history(&db, Uuid::new_v4(), None, None).await;
+    assert!(
+        empty.items.is_empty(),
+        "no history is an empty page, not an error"
+    );
+}
+
+#[tokio::test]
+async fn a_second_page_follows_the_cursor_without_duplicates() {
+    let db = db().await;
+    let tenant = Uuid::new_v4();
+    let conn = db.conn().expect("connection");
+    for i in 0..5 {
+        AuditStore
+            .append(
+                &conn,
+                &AccessScope::allow_all(),
+                record(tenant, &format!("r{i}")),
+            )
+            .await
+            .expect("append");
+    }
+    let first = history(&db, tenant, Some(2), None).await;
+    assert_eq!(first.items.len(), 2);
+    let cursor = first.page_info.next_cursor.expect("more pages");
+    let parsed = toolkit_odata::CursorV1::decode(&cursor).expect("cursor decodes");
+    let second = history(&db, tenant, Some(2), Some(parsed)).await;
+    assert_eq!(second.items.len(), 2);
+    let mut seen: Vec<Uuid> = first
+        .items
+        .iter()
+        .chain(second.items.iter())
+        .map(|r| r.id)
+        .collect();
+    let before = seen.len();
+    seen.sort();
+    seen.dedup();
+    assert_eq!(seen.len(), before, "no record appears on both pages");
+}
+
+#[tokio::test]
+async fn a_secret_image_is_stored_masked_and_read_back_masked() {
+    let db = db().await;
+    let tenant = Uuid::new_v4();
+    let conn = db.conn().expect("connection");
+    let rec = AuditRecord::new(KEY, Some(tenant), "admin", AuditOperation::Change, "r")
+        .with_post_image(AuditValue::record(json!("hunter2"), true));
+    AuditStore
+        .append(&conn, &AccessScope::allow_all(), rec)
+        .await
+        .expect("append");
+    let page = history(&db, tenant, None, None).await;
+    assert_eq!(page.items[0].post_image, Some(AuditValue::Masked));
+}
+
+#[tokio::test]
+async fn pruning_removes_only_records_past_their_horizon() {
+    let db = db().await;
+    let tenant = Uuid::new_v4();
+    let conn = db.conn().expect("connection");
+    let now = OffsetDateTime::now_utc();
+    // Explicit horizons: one behind us, one ahead.
+    AuditStore
+        .append(
+            &conn,
+            &AccessScope::allow_all(),
+            record(tenant, "expired").with_retain_until(now - Duration::days(1)),
+        )
+        .await
+        .expect("append");
+    AuditStore
+        .append(
+            &conn,
+            &AccessScope::allow_all(),
+            record(tenant, "kept").with_retain_until(now + Duration::days(1)),
+        )
+        .await
+        .expect("append");
+    // No horizon: the default applies from when it was written, which is now.
+    AuditStore
+        .append(&conn, &AccessScope::allow_all(), record(tenant, "default"))
+        .await
+        .expect("append");
+
+    let pruned = AuditStore
+        .prune_expired(
+            &conn,
+            &AccessScope::allow_all(),
+            now,
+            Duration::days(365),
+            1_000,
+        )
+        .await
+        .expect("prune");
+    assert_eq!(pruned, 1);
+    let left: Vec<String> = history(&db, tenant, None, None)
+        .await
+        .items
+        .into_iter()
+        .map(|r| r.request_id)
+        .collect();
+    assert_eq!(left.len(), 2);
+    assert!(left.contains(&"kept".to_owned()) && left.contains(&"default".to_owned()));
+
+    // Far enough in the future the default horizon has passed too.
+    let pruned = AuditStore
+        .prune_expired(
+            &conn,
+            &AccessScope::allow_all(),
+            now + Duration::days(400),
+            Duration::days(365),
+            1_000,
+        )
+        .await
+        .expect("prune");
+    assert_eq!(pruned, 2);
+}
+
+#[tokio::test]
+async fn a_failed_append_is_unavailability() {
+    // A scope that denies everything cannot write a row; the sink reports it
+    // as unavailability for the caller to roll back on.
+    let db = db().await;
+    let conn = db.conn().expect("connection");
+    let err = AuditStore
+        .append(&conn, &AccessScope::deny_all(), record(Uuid::new_v4(), "r"))
+        .await
+        .expect_err("refused");
+    assert!(matches!(err, DomainError::Unavailable { .. }), "{err:?}");
+}
+
+#[tokio::test]
+async fn records_of_one_change_set_are_retrievable_together() {
+    let db = db().await;
+    let conn = db.conn().expect("connection");
+    let change_set = Uuid::new_v4();
+    for tenant in [Uuid::new_v4(), Uuid::new_v4()] {
+        AuditStore
+            .append(
+                &conn,
+                &AccessScope::allow_all(),
+                record(tenant, "batch").with_change_set(change_set),
+            )
+            .await
+            .expect("append");
+    }
+    AuditStore
+        .append(
+            &conn,
+            &AccessScope::allow_all(),
+            record(Uuid::new_v4(), "alone"),
+        )
+        .await
+        .expect("append");
+    let together = AuditStore
+        .by_change_set(&conn, &AccessScope::allow_all(), change_set)
+        .await
+        .expect("by change set");
+    assert_eq!(together.len(), 2);
+    assert!(together.iter().all(|r| r.change_set_id == Some(change_set)));
+}
+
+/// A stored row as the mapper sees it, with the given images.
+fn stored_row(
+    pre_value: Option<serde_json::Value>,
+) -> crate::infra::storage::entity::audit_record::Model {
+    crate::infra::storage::entity::audit_record::Model {
+        id: Uuid::new_v4(),
+        resource: format!("{KEY}#tenant"),
+        declaration_key: KEY.to_owned(),
+        tenant_id: Some(Uuid::new_v4()),
+        operation: "change".to_owned(),
+        actor: "admin".to_owned(),
+        actor_classification: "public".to_owned(),
+        pre_value,
+        post_value: Some(json!({ "kind": "clear", "value": true })),
+        outcome: "success".to_owned(),
+        request_id: "req".to_owned(),
+        change_set_id: None,
+        occurred_at: OffsetDateTime::now_utc(),
+        retain_until: None,
+    }
+}
+
+#[test]
+fn an_image_that_does_not_decode_is_an_integrity_error_not_an_absent_image() {
+    // The record's enum fields already refuse a value they cannot read; an
+    // image is evidence of what changed and gets the same treatment. Reading
+    // it as "no image" would erase the trace of a change without a sign.
+    let corrupt = super::to_domain(stored_row(Some(json!("garbage"))));
+    assert!(
+        matches!(corrupt, Err(DomainError::Internal { .. })),
+        "{corrupt:?}"
+    );
+
+    let intact = super::to_domain(stored_row(Some(json!({ "kind": "clear", "value": false }))))
+        .expect("an intact row maps");
+    assert_eq!(
+        intact.pre_image,
+        Some(AuditValue::record(json!(false), false))
+    );
+    let absent = super::to_domain(stored_row(None)).expect("an absent image is absent");
+    assert_eq!(absent.pre_image, None);
+}
+
+#[tokio::test]
+async fn the_store_itself_refuses_to_rewrite_a_record() {
+    // Append-only is a property of the table, not of call-site discipline: a
+    // future code path — or a misused one — that issues an `UPDATE` is refused
+    // by the trigger the migration carries, and the record reads back as it
+    // was written.
+    use sea_orm::sea_query::Expr;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    use toolkit_db::secure::SecureUpdateExt;
+
+    use crate::infra::storage::entity::audit_record::{Column, Entity as AuditEntity};
+
+    let db = db().await;
+    let tenant = Uuid::new_v4();
+    let conn = db.conn().expect("connection");
+    AuditStore
+        .append(&conn, &AccessScope::allow_all(), record(tenant, "once"))
+        .await
+        .expect("append");
+    let written = history(&db, tenant, None, None).await.items.remove(0);
+
+    let tampered = AuditEntity::update_many()
+        .col_expr(Column::Actor, Expr::value("someone else"))
+        .filter(Column::Id.eq(written.id))
+        .secure()
+        .scope_with(&AccessScope::allow_all())
+        .exec(&conn)
+        .await;
+    assert!(
+        tampered.is_err(),
+        "the store refuses the rewrite: {tampered:?}"
+    );
+
+    let read_back = history(&db, tenant, None, None).await.items.remove(0);
+    assert_eq!(read_back.actor, "admin", "the record is as it was written");
+}
+
+#[tokio::test]
+async fn a_cursor_minted_for_one_history_is_refused_on_another() {
+    // A cursor carries a boundary in one result set. Applied to another
+    // setting's or another scope's history it would silently skip or repeat
+    // rows there, so it is refused as a cursor for a different query.
+    let db = db().await;
+    let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+    {
+        let conn = db.conn().expect("connection");
+        for (tenant, request) in [(a, "a1"), (a, "a2"), (b, "b1"), (b, "b2")] {
+            AuditStore
+                .append(&conn, &AccessScope::allow_all(), record(tenant, request))
+                .await
+                .expect("append");
+        }
+    }
+    let first = history(&db, a, Some(1), None).await;
+    let cursor = toolkit_odata::CursorV1::decode(
+        &first
+            .page_info
+            .next_cursor
+            .expect("a second page for tenant a"),
+    )
+    .expect("cursor decodes");
+
+    // Its own history continues with it.
+    let second = history(&db, a, Some(1), Some(cursor.clone())).await;
+    assert_eq!(second.items.len(), 1);
+
+    // Another scope's history refuses it.
+    let conn = db.conn().expect("connection");
+    let foreign = AuditStore
+        .history(
+            &conn,
+            &AccessScope::allow_all(),
+            KEY,
+            b,
+            &ODataQuery {
+                limit: Some(1),
+                cursor: Some(cursor),
+                ..ODataQuery::default()
+            },
+        )
+        .await;
+    assert!(
+        matches!(foreign, Err(DomainError::Validation { .. })),
+        "a cursor for tenant a's history is refused on tenant b's: {foreign:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_prune_deletes_at_most_its_batch_and_only_what_is_expired() {
+    // One bounded statement per call: a backlog is worked off over several,
+    // each its own commit, and a record still held is never among them.
+    let db = db().await;
+    let tenant = Uuid::new_v4();
+    let conn = db.conn().expect("connection");
+    let now = OffsetDateTime::now_utc();
+    for i in 0..5 {
+        AuditStore
+            .append(
+                &conn,
+                &AccessScope::allow_all(),
+                record(tenant, &format!("old-{i}")),
+            )
+            .await
+            .expect("append");
+    }
+    AuditStore
+        .append(
+            &conn,
+            &AccessScope::allow_all(),
+            record(tenant, "held").with_retain_until(now + Duration::days(500)),
+        )
+        .await
+        .expect("append");
+
+    let later = now + Duration::days(400);
+    let mut passes = Vec::new();
+    loop {
+        let pruned = AuditStore
+            .prune_expired(
+                &conn,
+                &AccessScope::allow_all(),
+                later,
+                Duration::days(365),
+                2,
+            )
+            .await
+            .expect("prune");
+        passes.push(pruned);
+        if pruned == 0 {
+            break;
+        }
+    }
+    assert_eq!(passes, vec![2, 2, 1, 0]);
+    let left: Vec<String> = history(&db, tenant, None, None)
+        .await
+        .items
+        .into_iter()
+        .map(|r| r.request_id)
+        .collect();
+    assert_eq!(left, vec!["held".to_owned()]);
+}
+
+#[tokio::test]
+async fn a_record_is_stamped_on_the_shared_microsecond_clock() {
+    // Postgres keeps microseconds and SQLite keeps what it is given; every
+    // other timestamp column is aligned so both backends hold the same instant,
+    // and the history cursor, minted from `occurred_at`, is one of them.
+    let db = db().await;
+    let tenant = Uuid::new_v4();
+    let conn = db.conn().expect("connection");
+    for i in 0..5 {
+        AuditStore
+            .append(
+                &conn,
+                &AccessScope::allow_all(),
+                record(tenant, &format!("r{i}")),
+            )
+            .await
+            .expect("append");
+    }
+    for item in history(&db, tenant, None, None).await.items {
+        assert_eq!(
+            item.occurred_at.nanosecond() % 1_000,
+            0,
+            "{}",
+            item.occurred_at
+        );
+    }
+}

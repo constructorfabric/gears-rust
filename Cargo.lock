@@ -2389,6 +2389,7 @@ dependencies = [
  "cf-gears-oagw",
  "cf-gears-resource-group",
  "cf-gears-rg-tr-plugin",
+ "cf-gears-settings-service",
  "cf-gears-simple-user-settings",
  "cf-gears-single-tenant-tr-plugin",
  "cf-gears-static-authn-plugin",
@@ -3135,6 +3136,69 @@ version = "0.1.2"
 dependencies = [
  "hyper-rustls",
  "rustls",
+]
+
+[[package]]
+name = "cf-gears-settings-service"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "cf-gears-authn-resolver-sdk",
+ "cf-gears-authz-resolver-sdk",
+ "cf-gears-credstore",
+ "cf-gears-credstore-sdk",
+ "cf-gears-settings-service-sdk",
+ "cf-gears-tenant-resolver-sdk",
+ "cf-gears-toolkit",
+ "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-db",
+ "cf-gears-toolkit-db-macros",
+ "cf-gears-toolkit-macros",
+ "cf-gears-toolkit-odata",
+ "cf-gears-toolkit-security",
+ "cf-gears-types-registry",
+ "cf-gears-types-registry-sdk",
+ "http",
+ "inventory",
+ "jsonschema",
+ "opentelemetry",
+ "regex",
+ "sea-orm",
+ "sea-orm-migration",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "time",
+ "tokio",
+ "tokio-util",
+ "tower",
+ "tracing",
+ "utoipa",
+ "uuid",
+]
+
+[[package]]
+name = "cf-gears-settings-service-sdk"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-gts",
+ "cf-gears-toolkit-odata",
+ "cf-gears-toolkit-odata-macros",
+ "cf-gears-toolkit-security",
+ "gts-id",
+ "jsonschema",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

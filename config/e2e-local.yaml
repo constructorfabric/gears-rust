@@ -203,6 +203,16 @@ gears:
     config:
       vendor: "constructorfabric"
 
+  settings-service:
+    database:
+      server: "sqlite_users"
+      file: "settings-service.db"
+    # The empty section is deliberate and required. The gear reads its
+    # configuration fail-closed, so an absent `config:` key aborts startup
+    # rather than defaulting: bootstrap values are deployment-owned and are
+    # never themselves managed settings, so there is nothing to fall back to.
+    config: {}
+
   credstore:
     database:
       server: "sqlite_users"
