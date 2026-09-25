@@ -318,3 +318,39 @@ fn a_denial_names_the_resource_it_is_about_and_the_three_resources_differ() {
     assert_ne!(value, declaration);
     assert_ne!(category, declaration);
 }
+
+#[test]
+fn a_missing_credential_is_a_value_not_found_and_says_so() {
+    // `SecretNotConfigured` on the SDK side is told apart from a missing
+    // declaration by exactly this: the value resource, and a detail that names
+    // the credential. A generic declaration 404 here would let a consumer hand
+    // a placeholder to a backend believing it is a credential.
+    let value = problem(DomainError::NotFound {
+        resource: settings_service_sdk::gts::VALUE_SCHEMA,
+    });
+    assert_eq!(value["status"], 404, "{value}");
+    assert_eq!(
+        value["context"]["resource_type"],
+        serde_json::json!(settings_service_sdk::gts::VALUE_SCHEMA),
+        "{value}"
+    );
+    assert!(
+        value
+            .to_string()
+            .contains("no credential is configured at any scope"),
+        "{value}"
+    );
+
+    let declaration = problem(DomainError::NotFound {
+        resource: "gts.cf.core.settings.declaration.v1~",
+    });
+    assert_eq!(declaration["status"], 404);
+    assert_ne!(
+        declaration["context"]["resource_type"], value["context"]["resource_type"],
+        "the two not-founds differ in what they are about"
+    );
+    assert!(
+        !declaration.to_string().contains("credential"),
+        "{declaration}"
+    );
+}
