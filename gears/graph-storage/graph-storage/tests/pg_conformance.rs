@@ -1887,3 +1887,51 @@ pg_case!(
     an_edge_type_evolves_over_its_own_rows,
     conformance::an_edge_type_evolves_over_its_own_rows
 );
+
+/// What the ORM reports when `ON CONFLICT DO NOTHING` elides an insert whose
+/// row was asked back, on the server this store runs on.
+///
+/// Phantom creation relies on it: two batches naming one new endpoint race,
+/// the loser's insert is elided, and the loser must read the winner's row
+/// rather than fail. On a backend with `RETURNING` the elision surfaces as
+/// `RecordNotFound` -- the returning select found no row -- and that is the
+/// only variant the phantom path accepts as one. Were an ORM upgrade to
+/// report it differently, this is where it shows, not as a batch that fails
+/// only when two producers happen to collide.
+#[tokio::test]
+async fn an_elided_insert_that_asks_for_its_row_reports_record_not_found() {
+    use graph_storage::infra::storage::entity::graph_meta;
+    use sea_orm::{ActiveValue, EntityTrait as _, sea_query::OnConflict};
+
+    let Some(stand) = stand(HopStrategy::Pgq).await else {
+        return;
+    };
+    let raw = sea_orm::Database::connect(&stand.dsn)
+        .await
+        .expect("a plain connection to the stand");
+    let tenant = Uuid::now_v7();
+    let row = || graph_meta::ActiveModel {
+        tenant_id: ActiveValue::Set(tenant),
+        key: ActiveValue::Set("elision-probe".to_owned()),
+        value: ActiveValue::Set(serde_json::json!(0)),
+    };
+    let do_nothing = || {
+        OnConflict::columns([graph_meta::Column::TenantId, graph_meta::Column::Key])
+            .do_nothing()
+            .to_owned()
+    };
+
+    graph_meta::Entity::insert(row())
+        .on_conflict(do_nothing())
+        .exec_with_returning(&raw)
+        .await
+        .expect("the first insert lands and returns its row");
+    let elided = graph_meta::Entity::insert(row())
+        .on_conflict(do_nothing())
+        .exec_with_returning(&raw)
+        .await;
+    assert!(
+        matches!(elided, Err(sea_orm::DbErr::RecordNotFound(_))),
+        "an elided insert with RETURNING must report RecordNotFound, got {elided:?}"
+    );
+}

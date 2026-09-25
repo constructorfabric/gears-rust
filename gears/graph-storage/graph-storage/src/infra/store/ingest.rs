@@ -1230,12 +1230,15 @@ async fn insert_phantom(
         Ok(model) => Ok(model.id),
         // Nothing was inserted, so somebody else got there first. Read their
         // row and use it -- the endpoint the edge names is that node.
-        // `DO NOTHING` returns no row, and SeaORM reports that from
-        // `exec_with_returning` as one of these two depending on the path it
-        // took -- neither of which is a failure here.
-        Err(toolkit_db::secure::ScopeError::Db(
-            sea_orm::DbErr::RecordNotInserted | sea_orm::DbErr::RecordNotFound(_),
-        )) => {
+        // `DO NOTHING` returns no row, and on a backend with `RETURNING` --
+        // PostgreSQL, the only one this store runs on -- SeaORM reports that
+        // from `exec_with_returning` as `RecordNotFound`: its returning
+        // select found nothing. That is the one variant taken as the race;
+        // `RecordNotInserted` is what a backend *without* `RETURNING` says,
+        // so here it would be something else, and it surfaces as an error.
+        // `an_elided_insert_that_asks_for_its_row_reports_record_not_found`
+        // pins the variant against the server.
+        Err(toolkit_db::secure::ScopeError::Db(sea_orm::DbErr::RecordNotFound(_))) => {
             let settled = node::Entity::find()
                 .secure()
                 .scope_with(scope)
