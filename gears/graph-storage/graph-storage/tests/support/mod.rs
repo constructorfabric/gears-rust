@@ -72,6 +72,31 @@ impl AuthZResolverApi for AllowInOwnTenant {
     }
 }
 
+/// A PDP that grants `read` in the caller's own tenant and refuses every
+/// other action -- a producer team's permissions, not an ontology
+/// administrator's.
+pub struct ReadOnly;
+
+#[async_trait]
+impl AuthZResolverApi for ReadOnly {
+    async fn evaluate(
+        &self,
+        ctx: PlatformSecurityContext,
+        request: EvaluationRequest,
+    ) -> Result<EvaluationResponse, CanonicalError> {
+        if request.action.name != "read" {
+            return Ok(EvaluationResponse {
+                decision: false,
+                context: EvaluationResponseContext {
+                    constraints: Vec::new(),
+                    deny_reason: None,
+                },
+            });
+        }
+        AllowInOwnTenant.evaluate(ctx, request).await
+    }
+}
+
 /// A PDP that denies. The gear must answer `permission_denied` from the
 /// service rather than reaching the store at all.
 struct DenyEverything;

@@ -169,16 +169,32 @@ impl GraphServices {
         batch: Vec<TypeRegistration>,
         options: TypeRegistrationOptions,
     ) -> Result<Vec<RegisteredType>, DomainError> {
+        // A dry run is a read, and asks for read. That is the reason it is its
+        // own operation rather than a flag on registration (DESIGN § "Asking
+        // what an edit costs is its own operation"): a producer team should be
+        // able to learn whether a schema change would be admitted before it
+        // asks an ontology administrator to make it, and a preview that
+        // demanded the administrator's own permission -- and write access to
+        // the rows besides -- answered only the people who least needed to ask.
+        // Nothing is exposed that the same permissions do not already read: the
+        // schemas through the type catalogue, the rows through node reads. It
+        // writes nothing, which the dry-run cases on both surfaces hold.
+        let (type_action, row_action) = if options.dry_run {
+            (authz::actions::READ, authz::actions::READ)
+        } else {
+            (authz::actions::ADMIN, authz::actions::WRITE)
+        };
         let auth = self
-            .authorize(ctx, &authz::type_resource(), authz::actions::ADMIN)
+            .authorize(ctx, &authz::type_resource(), type_action)
             .await?;
         // Reading the tenant's rows — and a migration *writes* them — is not
         // something ontology administration authorizes. The data decision is
         // asked for separately and the call is served under its scope: the
         // same scope ingest writes those rows with, which is what makes one
-        // scope reach both the catalogue and the rows.
+        // scope reach both the catalogue and the rows. A dry run only reads
+        // them, even when it previews a migration.
         let auth = if options.revalidate || !options.migrations.is_empty() {
-            self.authorize(ctx, &authz::node_resource(), authz::actions::WRITE)
+            self.authorize(ctx, &authz::node_resource(), row_action)
                 .await?
         } else {
             auth

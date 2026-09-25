@@ -2415,7 +2415,8 @@ Tenant scoping is the outer wall; the PDP-derived `AccessScope` is the inner, re
 
 | Operation group | ResourceType | Action | Composition |
 |---|---|---|---|
-| Types (admin) | graph type (`cf.core.graph.type.v1~`) | admin | none (tenant-level) |
+| Types (admin) | graph type (`cf.core.graph.type.v1~`) | admin | none (tenant-level); an update that re-validates stored rows or migrates them also needs graph node write, since rows are data and ontology administration does not authorize data |
+| Types: compatibility preview | graph type, and graph node when it re-validates or previews a migration | read | none (tenant-level); a preview writes nothing and reads only what the same permissions already read — schemas through the type catalogue, rows through node reads — which is why it is an operation of its own rather than a flag on registration |
 | Source namespaces: list / transfer | graph type | read / admin | none (tenant-level); a transfer is ontology administration, not a write |
 | Ingest | graph node | write | edges authorize via both endpoints; chunks via parent node; scope replacement via owned scope; reference nodes additionally authorize against the source-namespace owner |
 | Node read | graph node | read | chunks, labels and adjacency via the node's scope; unauthorized key follows the anti-enumeration contract |

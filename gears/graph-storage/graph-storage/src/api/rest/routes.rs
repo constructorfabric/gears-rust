@@ -86,7 +86,17 @@ fn ontology_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
              how many rows the type has, the object levels a later edit will \
              not be able to extend in place, and whether the change would be \
              admitted. Re-validation of stored rows is on unless \
-             `options.revalidate` turns it off",
+             `options.revalidate` turns it off, because a dry run that skipped \
+             the row check would answer a different question from the one the \
+             update will ask.\n\n\
+             **What it requires and what it costs.** A dry run is a read and \
+             asks for read: read on the type, and -- with re-validation on, \
+             the default, or with `migrations` supplied -- read on the type's \
+             rows as well, which it scans in full. It needs none of the \
+             ontology administration the update it previews requires, so a \
+             producer can learn whether a change would be admitted before \
+             asking for it. For the schema verdict alone, without reading any \
+             row, pass `options.revalidate: false`",
         )
         .tag(API_TAG)
         .authenticated()

@@ -539,6 +539,55 @@ async fn an_embedding_space_mismatch_is_unhealthy_and_leaves_the_gear_ready() {
     assert_eq!(row.state, ReadinessState::Healthy, "{row:?}");
 }
 
+/// Asking what a type change costs needs read; making the change still needs
+/// administration.
+///
+/// That split is why the preview is an operation of its own rather than a
+/// flag on registration (DESIGN § "Asking what an edit costs is its own
+/// operation"): a producer team learns whether a change would be admitted
+/// before it asks an ontology administrator to make it. The preview here
+/// re-validates stored rows, as it does by default, so it reads data as well
+/// as schemas -- and still needs nothing beyond read.
+#[tokio::test]
+async fn a_type_preview_needs_read_and_the_change_it_previews_still_needs_admin() {
+    use graph_storage::infra::fake_store::FakeGraphStore;
+
+    let store = Arc::new(FakeGraphStore::new());
+    let administrator = Harness::configured_over(
+        Arc::clone(&store),
+        Arc::new(support::AllowInOwnTenant),
+        GraphStorageConfig::default(),
+    );
+    let admin_ctx = administrator.ctx();
+    administrator.seed_ontology(&admin_ctx).await;
+
+    let mut producer = Harness::configured_over(
+        store,
+        Arc::new(support::ReadOnly),
+        GraphStorageConfig::default(),
+    );
+    producer.tenant = administrator.tenant;
+    let producer_ctx = producer.ctx();
+    let candidate = conformance::ontology_batch();
+
+    let verdicts = producer
+        .services
+        .type_compatibility(&producer_ctx, candidate.clone(), true, Vec::new())
+        .await
+        .expect("a preview is a read, and read is what this caller holds");
+    assert!(!verdicts.is_empty(), "the preview answers for each type");
+
+    let refused = producer
+        .services
+        .register_types(&producer_ctx, candidate)
+        .await
+        .expect_err("making the change is still administration");
+    assert!(
+        matches!(refused, DomainError::AccessDenied),
+        "the refusal is a permission refusal, got {refused}"
+    );
+}
+
 #[tokio::test]
 async fn the_namespace_surface_lists_and_transfers() {
     let harness = Harness::allowed();
