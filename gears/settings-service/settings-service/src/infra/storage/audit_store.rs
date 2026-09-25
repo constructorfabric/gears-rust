@@ -348,8 +348,13 @@ impl AuditStore {
     /// which keeps it current with the configuration and retries a failed
     /// write on the next pass.
     ///
+    /// One statement: the row is seeded by a migration, so this only ever
+    /// updates it and two replicas' passes have nothing to race for. A row
+    /// that is not there is a schema the migrations did not produce.
+    ///
     /// # Errors
-    /// [`DomainError`] when the write fails, or `days` does not fit the column.
+    /// [`DomainError`] when the write fails, `days` does not fit the column, or
+    /// the seeded row is missing.
     pub async fn record_retention<C: DBRunner>(
         &self,
         conn: &C,
@@ -377,14 +382,10 @@ impl AuditStore {
             .await
             .map_err(unavailable)?;
         if updated.rows_affected == 0 {
-            let row = audit_policy::ActiveModel {
-                id: Set(1),
-                retention_days: Set(days),
-                updated_at: Set(now),
-            };
-            toolkit_db::secure::secure_insert::<PolicyEntity>(row, scope, conn)
-                .await
-                .map_err(unavailable)?;
+            return Err(DomainError::Internal {
+                diagnostic: "the audit retention policy row the migrations seed is missing"
+                    .to_owned(),
+            });
         }
         Ok(())
     }

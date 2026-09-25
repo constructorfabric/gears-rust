@@ -916,7 +916,9 @@ async fn a_retention_pass_writes_the_configured_retention_where_the_trigger_read
             .await
             .expect("readable")
     };
-    assert_eq!(recorded().await, None, "nothing before the first pass");
+    // Seeded by the migration at the minimum, so a pass only ever updates the
+    // row: two replicas' first passes cannot race to insert it.
+    assert_eq!(recorded().await, Some(365), "seeded before the first pass");
 
     let two_years = std::time::Duration::from_hours(730 * 24);
     SettingsService::prune_once(&db, two_years, now, batches, &live, &quiet).await;
