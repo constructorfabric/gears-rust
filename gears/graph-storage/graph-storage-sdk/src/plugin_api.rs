@@ -290,6 +290,22 @@ pub trait GraphStoreV1: Send + Sync + 'static {
         ctx: &StoreCtx<'_>,
         ids: &[NodeId],
     ) -> Result<Vec<NodeView>, GraphStoreError>;
+    /// The type of each live node named, under the caller's scope, without
+    /// reading its row: tombstoned, unknown and unauthorized ids are absent
+    /// from the answer alike, as they are from `hydrate_nodes`.
+    ///
+    /// A read that filters its output by type asks this first, so it
+    /// hydrates only the rows it will return and charges every row it reads
+    /// against its byte budget. Optional: the default answers `Unsupported`,
+    /// and the gear then hydrates and filters afterwards, which returns the
+    /// same answer at the cost of reading rows it discards.
+    async fn node_types(
+        &self,
+        _ctx: &StoreCtx<'_>,
+        _ids: &[NodeId],
+    ) -> Result<Vec<(NodeId, GtsTypeId)>, GraphStoreError> {
+        Err(GraphStoreError::Unsupported { what: "node_types" })
+    }
     /// One edge as an element, with its payload and audit envelope
     /// (`fr-audit-envelope`, which asks for the envelope on every node *and
     /// edge* a read surface returns). Scoped like a node read: an edge either

@@ -432,6 +432,14 @@ impl GraphStoreV1 for PgGraphStore {
         reads::hydrate_nodes(self, ctx, ids).await
     }
 
+    async fn node_types(
+        &self,
+        ctx: &StoreCtx<'_>,
+        ids: &[NodeId],
+    ) -> Result<Vec<(NodeId, graph_storage_sdk::models::GtsTypeId)>, GraphStoreError> {
+        reads::node_types(self, ctx, ids).await
+    }
+
     async fn search(
         &self,
         ctx: &StoreCtx<'_>,

@@ -354,6 +354,12 @@ async fn an_edge_cannot_name_a_tombstoned_endpoint() {
 }
 
 #[tokio::test]
+async fn node_types_answers_the_live_nodes_it_is_asked_about() {
+    conformance::node_types_answers_the_live_nodes_it_is_asked_about(&store(), Uuid::now_v7())
+        .await;
+}
+
+#[tokio::test]
 async fn an_edge_only_scope_drops_the_edges_it_stops_declaring() {
     conformance::an_edge_only_scope_drops_the_edges_it_stops_declaring(&store(), Uuid::now_v7())
         .await;

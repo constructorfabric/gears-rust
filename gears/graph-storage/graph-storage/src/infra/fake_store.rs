@@ -207,6 +207,9 @@ pub struct FakeGraphStore {
     /// that bound how much a read fetches, which nothing about the answer
     /// itself can show.
     rows_hydrated: std::sync::atomic::AtomicU64,
+    /// Calls to `hydrate_nodes`: a read that hydrates in pieces is bounded
+    /// in round trips as well as in rows.
+    hydrate_calls: std::sync::atomic::AtomicU64,
 }
 
 impl Default for FakeGraphStore {
@@ -227,7 +230,15 @@ impl FakeGraphStore {
             drift_per_revision_read: 0,
             revision_reads: std::sync::atomic::AtomicI64::new(0),
             rows_hydrated: std::sync::atomic::AtomicU64::new(0),
+            hydrate_calls: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// How many times `hydrate_nodes` has been called so far.
+    #[must_use]
+    pub fn hydrate_calls(&self) -> u64 {
+        self.hydrate_calls
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// How many rows `hydrate_nodes` has returned so far.
@@ -1061,7 +1072,29 @@ impl GraphStoreV1 for FakeGraphStore {
             .collect();
         self.rows_hydrated
             .fetch_add(views.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        self.hydrate_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(views)
+    }
+
+    async fn node_types(
+        &self,
+        ctx: &StoreCtx<'_>,
+        ids: &[NodeId],
+    ) -> Result<Vec<(NodeId, GtsTypeId)>, GraphStoreError> {
+        if !scope_admits(ctx.scope, ctx.tenant) {
+            return Ok(Vec::new());
+        }
+        let tenants = self.tenants.lock().map_err(|_| poisoned())?;
+        let Some(tenant) = tenants.get(&ctx.tenant) else {
+            return Ok(Vec::new());
+        };
+        let (nodes, _, _) = visible(tenant, ctx);
+        Ok(ids
+            .iter()
+            .filter_map(|id| nodes.iter().find(|n| n.id == *id && !n.deleted))
+            .map(|n| (n.id, n.type_id.clone()))
+            .collect())
     }
 
     async fn search(

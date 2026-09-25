@@ -1203,6 +1203,42 @@ impl GraphServices {
         // Output filtering is applied per piece and before a row is charged:
         // everything past the seeds must pass the node-type filter and the
         // phantom toggle, and a row that does not is not part of the answer.
+        //
+        // A filtered read asks the store for the types first, when it can
+        // answer, and hydrates only the rows that pass. A row the filter
+        // drops after hydration is read and never charged, so near the
+        // budget -- where a piece is one row -- a walk made mostly of
+        // filtered nodes cost one round trip per node, up to
+        // `traversal_max_nodes` of them. The filter below stays, for a store
+        // that cannot say and for a row that changed type in between.
+        let filtered: Vec<graph_storage_sdk::models::NodeId>;
+        let rest = if node_types.is_some() || !include_phantoms {
+            match self.store.node_types(&ctx, rest).await {
+                Ok(typed) => {
+                    let phantom = self
+                        .phantom_type_ids(&ctx, typed.iter().map(|(_, t)| t.as_str()))
+                        .await;
+                    let keep: std::collections::BTreeSet<graph_storage_sdk::models::NodeId> = typed
+                        .into_iter()
+                        .filter(|(_, type_id)| {
+                            node_types.as_ref().is_none_or(|set| set.contains(type_id))
+                                && (include_phantoms || !phantom.contains(type_id))
+                        })
+                        .map(|(id, _)| id)
+                        .collect();
+                    filtered = rest
+                        .iter()
+                        .copied()
+                        .filter(|id| keep.contains(id))
+                        .collect();
+                    filtered.as_slice()
+                }
+                Err(graph_storage_sdk::plugin_api::GraphStoreError::Unsupported { .. }) => rest,
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            rest
+        };
         let mut over_bytes = false;
         let mut cursor = 0usize;
         while cursor < rest.len() && !over_bytes {
@@ -1293,7 +1329,18 @@ impl GraphServices {
         ctx: &StoreCtx<'_>,
         nodes: &[NodeView],
     ) -> Result<std::collections::BTreeSet<GtsTypeId>, DomainError> {
-        let mut distinct: Vec<&str> = nodes.iter().map(|n| n.type_id.as_str()).collect();
+        Ok(self
+            .phantom_type_ids(ctx, nodes.iter().map(|n| n.type_id.as_str()))
+            .await)
+    }
+
+    /// Which of the named types are phantom-family.
+    async fn phantom_type_ids<'t>(
+        &self,
+        ctx: &StoreCtx<'_>,
+        type_ids: impl Iterator<Item = &'t str>,
+    ) -> std::collections::BTreeSet<GtsTypeId> {
+        let mut distinct: Vec<&str> = type_ids.collect();
         distinct.sort_unstable();
         distinct.dedup();
         let mut phantom = std::collections::BTreeSet::new();
@@ -1304,7 +1351,7 @@ impl GraphServices {
                 phantom.insert(type_id.to_owned());
             }
         }
-        Ok(phantom)
+        phantom
     }
 }
 

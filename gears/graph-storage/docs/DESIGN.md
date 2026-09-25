@@ -1427,6 +1427,12 @@ pub trait GraphStoreV1: Send + Sync + 'static {
         -> Result<EdgeView, GraphStoreError>;
     async fn hydrate_nodes(&self, ctx: &StoreCtx<'_>, ids: &[NodeId])
         -> Result<Vec<NodeView>, GraphStoreError>;
+    /// Each live node's type without its row, so a type-filtered read
+    /// hydrates only what it returns and charges every row it reads. Optional:
+    /// the default is `Unsupported`, and the gear then filters after
+    /// hydration -- the same answer, at the cost of rows read and discarded.
+    async fn node_types(&self, ctx: &StoreCtx<'_>, ids: &[NodeId])
+        -> Result<Vec<(NodeId, GtsTypeId)>, GraphStoreError> { /* Unsupported */ }
     /// One call, not one per arm: the scope must apply inside each arm before
     /// UNION, ranking and LIMIT, and RRF needs each arm's ranks. Exposing the
     /// arms separately would let a caller assemble them in an order that

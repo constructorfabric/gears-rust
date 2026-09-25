@@ -770,6 +770,10 @@ pg_case!(
     conformance::an_edge_cannot_name_a_tombstoned_endpoint
 );
 pg_case!(
+    node_types_answers_the_live_nodes_it_is_asked_about,
+    conformance::node_types_answers_the_live_nodes_it_is_asked_about
+);
+pg_case!(
     an_edge_only_scope_drops_the_edges_it_stops_declaring,
     conformance::an_edge_only_scope_drops_the_edges_it_stops_declaring
 );

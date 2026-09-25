@@ -1767,6 +1767,88 @@ async fn a_seed_set_over_the_budget_is_refused_before_it_is_read_in_full() {
     );
 }
 
+/// Near the budget, a walk whose remaining nodes are mostly filtered out
+/// stays a handful of round trips, not one per node.
+///
+/// A piece is as many rows as the remaining budget holds, so once seeds have
+/// spent most of it a piece is one row. A row the type filter then drops is
+/// never charged, the budget never moves, and the next piece is one row
+/// again: fifty filtered neighbours were fifty separate reads. The filter now
+/// runs on the types before anything is hydrated.
+#[tokio::test]
+async fn a_filtered_walk_near_its_budget_does_not_hydrate_row_by_row() {
+    const SEEDS: usize = 6;
+    const PHANTOMS: usize = 50;
+
+    let store = Arc::new(graph_storage::infra::fake_store::FakeGraphStore::new());
+    let budgeted = GraphStorageConfig {
+        response_max_bytes: 12 * 1024,
+        item_max_bytes: 2 * 1024,
+        ..GraphStorageConfig::default()
+    };
+    let harness = Harness::configured_over(
+        Arc::clone(&store),
+        Arc::new(support::AllowInOwnTenant),
+        budgeted,
+    );
+    let ctx = harness.ctx();
+    harness.seed_ontology(&ctx).await;
+
+    // Six seeds of 1.5 KB leave less than one `item_max_bytes` of the 12 KB
+    // budget, so every piece after them is one row.
+    let filler = "q".repeat(1_500);
+    let seeds: Vec<String> = (0..SEEDS).map(|index| format!("near-{index}")).collect();
+    let nodes = seeds
+        .iter()
+        .map(|key| NodeSpec {
+            payload: Some(serde_json::json!({ "note": filler })),
+            ..conformance::node(key, key)
+        })
+        .collect();
+    // Fifty neighbours of the first seed, all phantoms: the walk reaches
+    // them, and a filter on the seeds' own type drops every one.
+    let edges = (0..PHANTOMS)
+        .map(|index| conformance::edge(&seeds[0], &format!("ghost-{index}")))
+        .collect();
+    harness
+        .services
+        .ingest(&ctx, conformance::batch(nodes, edges))
+        .await
+        .expect("the batch commits");
+
+    let before = store.hydrate_calls();
+    let walked = harness
+        .services
+        .traverse(
+            &ctx,
+            TraverseRequest {
+                seeds: seeds.clone(),
+                depth: 1,
+                edge_type_patterns: Vec::new(),
+                node_type_patterns: vec![conformance::OWNED.to_owned()],
+                max_nodes: Some(1_000),
+            },
+        )
+        .await
+        .expect("the traversal answers");
+    let calls = store.hydrate_calls() - before;
+
+    let mut returned: Vec<String> = walked.nodes.iter().map(|n| n.node_key.clone()).collect();
+    returned.sort();
+    let mut expected = seeds;
+    expected.sort();
+    assert_eq!(
+        returned, expected,
+        "the answer is the seeds; every phantom is filtered"
+    );
+    // One for the test engine's hop, which hydrates its frontier, and the
+    // seeds in the pieces the budget holds. Nothing for the fifty phantoms.
+    assert!(
+        calls <= 3,
+        "{calls} hydrate calls for a walk of {SEEDS} seeds and {PHANTOMS} filtered neighbours"
+    );
+}
+
 /// How many rows one piece asks for when the whole budget remains -- the
 /// widest a piece can be.
 fn budgeted_piece(budget: u64, item_ceiling: u64) -> u64 {

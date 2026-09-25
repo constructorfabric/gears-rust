@@ -559,6 +559,41 @@ pub async fn hydrate_nodes(
     Ok(views)
 }
 
+/// Each live node's type, from the narrow row: what a type-filtered read asks
+/// before it hydrates anything.
+pub async fn node_types(
+    store: &PgGraphStore,
+    ctx: &StoreCtx<'_>,
+    ids: &[NodeId],
+) -> Result<Vec<(NodeId, String)>, GraphStoreError> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let conn = store.db().conn().map_err(|error| map_db_error(&error))?;
+    let rows = node::Entity::find()
+        .secure()
+        .scope_with(ctx.scope)
+        .filter(Condition::all().add(node::Column::Id.is_in(ids.to_vec())))
+        .filter(Condition::all().add(node::Column::DeletedAt.is_null()))
+        .project_all(&conn, |query| {
+            node_typed_columns(query).into_model::<NodeTyped>()
+        })
+        .await
+        .map_err(map_scope_err)?;
+    let mut type_ids: Vec<i32> = rows.iter().map(|row| row.gts_node_type_id).collect();
+    type_ids.sort_unstable();
+    type_ids.dedup();
+    let names = type_names(ctx, &conn, &type_ids).await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            names
+                .get(&row.gts_node_type_id)
+                .map(|name| (row.id, name.clone()))
+        })
+        .collect())
+}
+
 pub async fn project_table(
     store: &PgGraphStore,
     ctx: &StoreCtx<'_>,

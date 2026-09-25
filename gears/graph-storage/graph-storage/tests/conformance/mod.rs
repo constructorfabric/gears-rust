@@ -6385,3 +6385,73 @@ pub async fn an_edge_cannot_name_a_tombstoned_endpoint(store: &dyn GraphStoreV1,
         "the tombstoned node was not brought back as a phantom"
     );
 }
+
+/// `node_types` answers each live node's type, and nothing for a tombstoned
+/// or unknown id -- the same visibility `hydrate_nodes` has, so a read that
+/// filters on it first returns what a filter after hydration would.
+pub async fn node_types_answers_the_live_nodes_it_is_asked_about(
+    store: &dyn GraphStoreV1,
+    tenant: Uuid,
+) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    store
+        .register_types(&ctx, ontology_batch())
+        .await
+        .expect("the ontology registers");
+    ingest_batch(
+        store,
+        &ctx,
+        batch(
+            vec![node("typed-a", "a"), node("typed-gone", "gone")],
+            vec![edge("typed-a", "typed-ghost")],
+        ),
+    )
+    .await
+    .expect("the batch commits");
+    let ids: std::collections::BTreeMap<String, i64> = store
+        .resolve_node_ids(
+            &ctx,
+            &[
+                "typed-a".to_owned(),
+                "typed-gone".to_owned(),
+                "typed-ghost".to_owned(),
+            ],
+        )
+        .await
+        .expect("the keys resolve")
+        .into_iter()
+        .collect();
+    store
+        .soft_delete(&ctx, DeleteRequest::Node("typed-gone".to_owned()))
+        .await
+        .expect("the node is tombstoned");
+
+    let asked: Vec<i64> = ["typed-a", "typed-gone", "typed-ghost"]
+        .iter()
+        .map(|key| ids[*key])
+        .chain(std::iter::once(i64::MAX))
+        .collect();
+    let answered: std::collections::BTreeMap<i64, String> = store
+        .node_types(&ctx, &asked)
+        .await
+        .expect("both stores answer node_types")
+        .into_iter()
+        .collect();
+
+    assert_eq!(
+        answered.get(&ids["typed-a"]).map(String::as_str),
+        Some(OWNED)
+    );
+    assert!(
+        answered
+            .get(&ids["typed-ghost"])
+            .is_some_and(|type_id| type_id != OWNED),
+        "the phantom answers its own type: {answered:?}"
+    );
+    assert_eq!(
+        answered.len(),
+        2,
+        "no tombstoned or unknown id answers: {answered:?}"
+    );
+}
