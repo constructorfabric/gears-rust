@@ -265,19 +265,39 @@ impl S3Backend {
             .and_then(|v| v.parse::<u64>().ok())
     }
 
+    /// A `reqwest::Error` from a request this backend itself built and
+    /// signed: `e.is_builder()` means the request/URL was malformed before
+    /// any byte left the process (a configuration bug, e.g. a bad endpoint),
+    /// which retrying verbatim will only reproduce; every other cause
+    /// (connect failure, timeout, mid-request I/O, a body that failed to
+    /// decode) happened out on the wire and is exactly the class of fault a
+    /// retry is expected to clear.
     fn transport_err(&self, e: &reqwest::Error) -> DomainError {
-        DomainError::backend(&self.id, e.to_string())
+        if e.is_builder() {
+            DomainError::backend(&self.id, e.to_string())
+        } else {
+            DomainError::backend_unavailable(&self.id, e.to_string())
+        }
     }
 
     /// Build a `DomainError` from a non-2xx response, parsing the S3 XML error
     /// body (`<Error><Code>...</Code><Message>...</Message></Error>`) via
     /// `quick-xml` when a body is present (HEAD responses never carry one).
+    /// Classified via [`is_transient_s3`] — see its doc comment for which
+    /// statuses/codes count as transient.
     fn s3_error(&self, status: StatusCode, body: &[u8]) -> DomainError {
-        match parse_error_body(body) {
-            Some((code, message)) => {
-                DomainError::backend(&self.id, format!("S3 error {status} ({code}): {message}"))
-            }
-            None => DomainError::backend(&self.id, format!("S3 error {status}")),
+        let (msg, transient) = if let Some((code, message)) = parse_error_body(body) {
+            (
+                format!("S3 error {status} ({code}): {message}"),
+                is_transient_s3(status, Some(&code)),
+            )
+        } else {
+            (format!("S3 error {status}"), is_transient_s3(status, None))
+        };
+        if transient {
+            DomainError::backend_unavailable(&self.id, msg)
+        } else {
+            DomainError::backend(&self.id, msg)
         }
     }
 
@@ -334,8 +354,15 @@ impl S3Backend {
             .await
     }
 
+    /// `HEAD` responses never carry an S3 XML error body, so there is no
+    /// error code to classify against, only the status.
     fn head_error(&self, path: &str, status: StatusCode) -> DomainError {
-        DomainError::backend(&self.id, format!("HEAD {path} failed: {status}"))
+        let msg = format!("HEAD {path} failed: {status}");
+        if is_transient_s3(status, None) {
+            DomainError::backend_unavailable(&self.id, msg)
+        } else {
+            DomainError::backend(&self.id, msg)
+        }
     }
 
     /// Plain (overwrite-allowed) `PutObject`, buffering `bytes` whole. Not
@@ -1357,6 +1384,35 @@ fn percent_decode(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Whether a non-2xx S3 response is a transient fault worth retrying
+/// verbatim (overload, throttling, a momentary server-side hiccup) rather
+/// than a permanent one (bad request, auth, missing object, a genuine
+/// protocol violation).
+///
+/// `RequestTimeTooSkewed` is deliberately **not** included: it means the
+/// caller's clock has drifted out of `SigV4`'s tolerance window, which a bare
+/// retry does nothing to fix (every retry re-signs with the same skewed
+/// clock).
+fn is_transient_s3(status: StatusCode, code: Option<&str>) -> bool {
+    matches!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS
+            | StatusCode::INTERNAL_SERVER_ERROR
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT
+    ) || matches!(
+        code,
+        Some(
+            "SlowDown"
+                | "RequestTimeout"
+                | "ServiceUnavailable"
+                | "InternalError"
+                | "ThrottlingException"
+        )
+    )
 }
 
 #[cfg(test)]

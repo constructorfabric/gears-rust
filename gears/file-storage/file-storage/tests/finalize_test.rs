@@ -453,6 +453,7 @@ async fn version_repo_finalize_twice_second_call_returns_false() {
         backend_id: "mem".to_owned(),
         backend_path: backend_path(file_id, version_id),
         created_at: time::OffsetDateTime::now_utc(),
+        bound_on_finalize: false,
     };
     repo.insert(&conn, &scope, &pending)
         .await
@@ -1654,6 +1655,111 @@ async fn finalize_with_bind_claim_binds_first_content() {
     assert_eq!(retry.etag, outcome.etag);
 }
 
+/// A retry of an auto-bind finalize must replay the ORIGINAL call's own
+/// `Bound` decision, not recompute it from the file's CURRENT content
+/// pointer: if a legitimate, unrelated rebind moves the file's content to a
+/// different version between the original finalize and a retry of its own
+/// (still-valid) token -- e.g. the original response was lost in transit,
+/// and by the time the client retries, a separate later upload has rebound
+/// the file -- the retry must still report `Bound` + the ORIGINAL version's
+/// ETag, exactly what the client already received and acted on, never
+/// `Conflict` against the file's now-different live pointer.
+#[tokio::test]
+async fn finalize_by_token_retry_replays_bound_decision_despite_later_rebind() {
+    let (svc, backend, store) = build_service().await;
+    let ctx = ctx(Uuid::now_v7());
+    let ticket = svc.create_file(&ctx, new_file(), None, true).await.unwrap();
+
+    let bytes_a = Bytes::from_static(b"version A content");
+    let path_a = backend_path(ticket.file_id, ticket.version_id);
+    write_all(&backend, &path_a, bytes_a.clone()).await;
+
+    let claims_a = Claims {
+        op: Op::Put,
+        file_id: ticket.file_id,
+        version_id: ticket.version_id,
+        backend_id: "mem".to_owned(),
+        backend_path: path_a,
+        exp: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
+        upload: UploadConstraints::default(),
+        multipart: MultipartClaims::default(),
+        request_id: "test-request-id".to_owned(),
+        content_type: String::new(),
+        etag: String::new(),
+        bind_on_finalize: true,
+    };
+    let original = svc
+        .finalize_upload_by_token(
+            &claims_a,
+            i64::try_from(bytes_a.len()).unwrap(),
+            hash::sha256(&bytes_a),
+        )
+        .await
+        .unwrap();
+    assert_eq!(original.bind_state, Some(BindState::Bound));
+    assert!(original.etag.is_some());
+
+    // A legitimate, unrelated rebind moves the file's content elsewhere
+    // BEFORE the client's retry arrives.
+    let ticket_b = svc.presign_version(&ctx, ticket.file_id).await.unwrap();
+    let bytes_b = Bytes::from_static(b"version B content");
+    let path_b = backend_path(ticket.file_id, ticket_b.version_id);
+    write_all(&backend, &path_b, bytes_b.clone()).await;
+    svc.finalize_upload(
+        &ctx,
+        ticket.file_id,
+        ticket_b.version_id,
+        i64::try_from(bytes_b.len()).unwrap(),
+        hash::sha256(&bytes_b),
+    )
+    .await
+    .unwrap();
+    // The file is already bound to version A (the original auto-bind CAS
+    // won it), so rebinding to B needs A's own ETag as `If-Match`.
+    svc.bind(
+        &ctx,
+        ticket.file_id,
+        ticket_b.version_id,
+        original.etag.as_deref(),
+    )
+    .await
+    .unwrap();
+
+    let file = store
+        .get_file(&toolkit_security::AccessScope::allow_all(), ticket.file_id)
+        .await
+        .unwrap()
+        .expect("file");
+    assert_eq!(
+        file.content_id,
+        Some(ticket_b.version_id),
+        "the file must now legitimately point at version B"
+    );
+
+    // The client retries the ORIGINAL (version A) token -- its first
+    // response was lost in transit. It must still see `Bound` + version A's
+    // own ETag, exactly what the original call already decided and
+    // returned, not `Conflict` against version B's live pointer.
+    let retry = svc
+        .finalize_upload_by_token(
+            &claims_a,
+            i64::try_from(bytes_a.len()).unwrap(),
+            hash::sha256(&bytes_a),
+        )
+        .await
+        .expect("retry of an already-decided Bound finalize must not fail");
+    assert_eq!(
+        retry.bind_state,
+        Some(BindState::Bound),
+        "must replay the ORIGINAL Bound decision, not the file's current pointer"
+    );
+    assert_eq!(
+        retry.etag, original.etag,
+        "must report version A's own ETag, not a Conflict against version B"
+    );
+    assert_eq!(retry.current_etag, None);
+}
+
 /// Two create-tokens racing for the same new file: the second finalize loses
 /// the `content_id IS NULL` CAS and reports `conflict` + the CURRENT ETag —
 /// the upload itself succeeds (version available, manually bindable).
@@ -1731,6 +1837,92 @@ async fn finalize_bind_claim_lost_cas_reports_conflict() {
     )
     .await
     .expect("manual rebind with the conflict-reported ETag");
+}
+
+/// Regression guard alongside
+/// [`finalize_by_token_retry_replays_bound_decision_despite_later_rebind`]:
+/// a version whose auto-bind CAS was LOST at the ORIGINAL finalize never
+/// gets `bound_on_finalize` set, so its retry legitimately keeps re-deriving
+/// `Conflict` from a live read (there is no won decision to replay) --
+/// reporting the SAME current ETag as the original response, since nothing
+/// rebound the file in between.
+#[tokio::test]
+async fn finalize_by_token_retry_after_lost_cas_still_reports_conflict() {
+    let (svc, backend, store) = build_service().await;
+    let ctx = ctx(Uuid::now_v7());
+    let ticket = svc.create_file(&ctx, new_file(), None, true).await.unwrap();
+
+    // Winner: ordinary finalize + bind (simulates a first token's flow).
+    let winner_bytes = Bytes::from_static(b"winner");
+    let path_a = backend_path(ticket.file_id, ticket.version_id);
+    write_all(&backend, &path_a, winner_bytes.clone()).await;
+    svc.finalize_upload(
+        &ctx,
+        ticket.file_id,
+        ticket.version_id,
+        i64::try_from(winner_bytes.len()).unwrap(),
+        hash::sha256(&winner_bytes),
+    )
+    .await
+    .unwrap();
+    svc.bind(&ctx, ticket.file_id, ticket.version_id, None)
+        .await
+        .unwrap();
+
+    // Loser: a second pending version, finalized under a bind claim whose
+    // CAS can no longer win.
+    let ticket2 = svc.presign_version(&ctx, ticket.file_id).await.unwrap();
+    let loser_bytes = Bytes::from_static(b"loser!");
+    let path_b = backend_path(ticket.file_id, ticket2.version_id);
+    write_all(&backend, &path_b, loser_bytes.clone()).await;
+    let claims = Claims {
+        op: Op::Put,
+        file_id: ticket.file_id,
+        version_id: ticket2.version_id,
+        backend_id: "mem".to_owned(),
+        backend_path: path_b,
+        exp: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
+        upload: UploadConstraints::default(),
+        multipart: MultipartClaims::default(),
+        request_id: "test-request-id".to_owned(),
+        content_type: String::new(),
+        etag: String::new(),
+        bind_on_finalize: true,
+    };
+    let original = svc
+        .finalize_upload_by_token(
+            &claims,
+            i64::try_from(loser_bytes.len()).unwrap(),
+            hash::sha256(&loser_bytes),
+        )
+        .await
+        .unwrap();
+    assert_eq!(original.bind_state, Some(BindState::Conflict));
+
+    let retry = svc
+        .finalize_upload_by_token(
+            &claims,
+            i64::try_from(loser_bytes.len()).unwrap(),
+            hash::sha256(&loser_bytes),
+        )
+        .await
+        .expect("honest retry of a lost-CAS finalize must still converge");
+    assert_eq!(retry.bind_state, Some(BindState::Conflict));
+    assert_eq!(
+        retry.current_etag, original.current_etag,
+        "must report the SAME live current ETag as the original lost-CAS response"
+    );
+    assert_eq!(retry.etag, None);
+
+    let version = store
+        .get_version(ticket.file_id, ticket2.version_id)
+        .await
+        .unwrap()
+        .expect("version");
+    assert!(
+        !version.bound_on_finalize,
+        "a lost CAS must never set the persisted bind flag"
+    );
 }
 
 // ── t22: manual-mode (`bind_on_finalize: false`) retry convergence ──────────

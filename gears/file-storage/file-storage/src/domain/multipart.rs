@@ -358,6 +358,44 @@ pub fn resolve_bind_state(
     }
 }
 
+/// Single-part idempotent-retry counterpart of [`resolve_bind_state`]:
+/// replays the ORIGINAL finalize's own bind decision for a version that won
+/// its `bind_on_finalize` CAS, instead of re-deriving `Bound` vs. `Conflict`
+/// from a live read of the file's CURRENT content pointer -- which can have
+/// moved on to a different version by the time of the retry (a legitimate
+/// rebind that raced the retry, not a bug in that later rebind). Without
+/// this, `finalize_upload_by_token`'s already-`Available` fast path would
+/// report `Conflict` for a retry whose original call already returned
+/// `Bound`, disagreeing with a response the client already acted on.
+///
+/// `bound_on_finalize` is the version's own persisted flag (set by
+/// [`crate::infra::storage::repo::VersionRepo::mark_bound_on_finalize`] in
+/// the SAME transaction as the CAS it records): `true` means THIS call's own
+/// finalize won it, so the answer is `Bound` unconditionally, no live check
+/// needed. `false` covers every other case -- including a version whose CAS
+/// was lost, and a manual-mode version later bound by a SEPARATE, explicit
+/// `bind` call (which never sets this flag; only a finalize-time CAS does) --
+/// and for those, [`resolve_bind_state`]'s live-pointer read remains the
+/// right answer: a manual token made no bind decision to replay at finalize
+/// time, so its retry legitimately reports whatever the current state is.
+#[must_use]
+pub fn replay_finalize_bind_state(
+    file_id: Uuid,
+    content_id: Option<Uuid>,
+    version_id: Uuid,
+    bound_on_finalize: bool,
+    auto_bind: bool,
+) -> (BindState, Option<String>, Option<String>) {
+    if bound_on_finalize {
+        return (
+            BindState::Bound,
+            Some(crate::domain::etag::content_etag(file_id, version_id)),
+            None,
+        );
+    }
+    resolve_bind_state(file_id, content_id, version_id, auto_bind)
+}
+
 /// Result of `GET /files/{id}/multipart/{upload_id}` (item 3.4): the
 /// session's current state plus the received/missing parts, with fresh
 /// resume URLs for any part not yet uploaded.

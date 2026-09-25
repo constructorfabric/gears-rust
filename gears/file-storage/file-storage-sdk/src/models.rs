@@ -118,6 +118,11 @@ pub struct FileVersion {
     pub backend_id: String,
     pub backend_path: String,
     pub created_at: OffsetDateTime,
+    /// `true` once this version's own finalize won its auto-bind CAS (set in
+    /// that transaction, never cleared), so a retried finalize replays
+    /// `Bound` even if the file has since been rebound. A later explicit
+    /// `bind` does not set it.
+    pub bound_on_finalize: bool,
 }
 
 /// One user-defined custom-metadata key/value pair attached to a file.

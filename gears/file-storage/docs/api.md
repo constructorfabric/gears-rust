@@ -145,7 +145,10 @@ Notes:
   replay-safe and finalize converges an already-`available` version with matching size/hash to the same headers —
   never a 409 — **regardless of the upload's bind mode**: the sidecar publishes every single-part upload through the
   same replay-safe path whether or not the token carries the auto-bind claim, so a `bind: "manual"` retry converges
-  exactly like an auto-bind one, simply with no `X-FS-Bound`/`ETag` headers to report (as on the first call). With
+  exactly like an auto-bind one, simply with no `X-FS-Bound`/`ETag` headers to report (as on the first call). An
+  auto-bind retry that WON the CAS on its original call replays that exact `X-FS-Bound: true` + `ETag` outcome, even
+  if the file's content has legitimately moved on to a different version since — never the current pointer's
+  `conflict`, which would contradict what the original call already returned. With
   `bind: "manual"` (or `POST /files/{id}/versions`, which never auto-binds), the client follows up
   with an explicit `POST /files/{id}/bind` (see "Upload, bind, and the conflict retry" below).
 - `GET /files/{id}/versions` returns a JSON array of version objects, ordered `created_at DESC` with `version_id
@@ -185,8 +188,9 @@ run the full `download` handler, including streaming the entire object off the b
 afterwards. It resolves existence and size in a single combined backend round trip (`stat(2)` on `local-fs`,
 `HeadObject` on `S3Backend`) and returns the same `Accept-Ranges`/`Content-Type`/`ETag` headers as `download`'s
 `200`, plus an explicit `Content-Length` (a real `200`/`206` gets this for free from its body; `HEAD` has no body to
-derive it from). Nothing stored at the path → `404` (same as `GET`'s missing-blob case); a genuine backend fault
-distinct from "not found" → `500`.
+derive it from). Nothing stored at the path → `404` (same as `GET`'s missing-blob case); a `stat` failure distinct from
+"not found" is `503` + `Retry-After: 5` when the backend reports it as transient, `500` otherwise (same
+`BackendUnavailable`/`Backend` split described under "Status code summary" below).
 
 **Planned / not implemented**: `If-None-Match` → `304` support on the sidecar `GET`/`HEAD`. Every download token is
 already single-use-scoped to one `(file_id, version_id)`, so the bandwidth win of a conditional download is small.
@@ -211,7 +215,10 @@ backend can learn the object's real length before handing back any bytes:
   overrun the promised length, capped at) than the `Content-Length` already sent, i.e. a truncated/incomplete
   response, the same way any other server-side stream failure partway through a response looks to an HTTP client.
 
-Any other backend read failure (not a length mismatch) is a genuine I/O fault and stays `500`.
+Any other backend read failure (not a length mismatch) is classified by the same `BackendUnavailable`/`Backend`
+split as everywhere else in this gear: a transient fault (network, timeout, backend overload) is `503 Service
+Unavailable` with `Retry-After: 5` (`"backend temporarily unavailable, retry"`), logged at `warn`; a permanent one
+(bad config, a protocol violation by the backend, an internal invariant) stays `500`, logged at `error`.
 
 The sidecar verifies the signed token and its claims before serving — a valid token is the delegated authorization
 decision, so there is no request-time PDP call and no platform-JWT check of any kind (the `tok.<claim>` predicate
@@ -257,7 +264,8 @@ each part write in the multipart case — see `D2`).
   is marked `available`.
 - **Response**: `204 No Content`. Errors: `400` (validation/read-back mismatch), `403` (bad/expired/mismatched
   token, **or** missing/mismatched `x-fs-internal-token` when `finalize_internal_secret` is configured — see
-  above), `404` (version not found), `409` (already finalized), `500`.
+  above), `404` (version not found), `409` (already finalized), `500` (a permanent backend fault reading the blob
+  back), `503` (a transient one — network, timeout, backend overload — carries `Retry-After`).
 - This endpoint does **not** bind the version as current — `POST /files/{id}/bind` remains a separate, explicit
   client call.
 
@@ -298,7 +306,9 @@ Notes:
 - `P2-3` (`complete`) does **not** bind the version as current — like the single-part flow, `POST /files/{id}/bind`
   is a separate, explicit client call. It takes an **optional** `If-Match` header: a concrete value is checked
   against the file's current content ETag (`400` on mismatch — `FailedPrecondition` collapses to `400` on this
-  platform); `*` or an absent header is unconditional. The route declares `401`/`403`/`404`/`409`/`400`/`500`.
+  platform); `*` or an absent header is unconditional. The route declares `401`/`403`/`404`/`409`/`400`/`500`/`503`
+  (the winning completer's assembly calls `StorageBackend::complete_multipart`; a transient backend fault surfaces
+  as `503` + `Retry-After`, distinct from the `202`/`Retry-After` lease-poll signal above).
 - `P2-3` (`complete`) returns **`200`** with a JSON body — see the response shape below.
 - `P2-5` (`GET .../multipart/{upload_id}`, introspect/resume) is authorized on `write` (like initiate/complete/abort,
   not `read`) since it hands out live resume upload URLs. A foreign or missing `upload_id` is masked as `404`,
@@ -508,10 +518,10 @@ DELETE /retention-rules/{rule_id}   delete a retention rule
   `tenant`-scope rules, `user`-scope rules that target themselves, and `file`-scope rules whose target file they
   own (compared as the `(owner_kind, owner_id)` pair, not `owner_id` alone) — the underlying store query has no
   owner/target filter, so without this filtering step any tenant member could otherwise enumerate every other
-  member's retention configuration. Two caveats on the `file`-scope case: a rule whose target file has since been
-  deleted stays invisible to every non-admin caller (there is no stored record of who created it, so once the
-  file is gone there is nothing left to compare against); and a rule created via delegated `WRITE` on a file the
-  creator does not own stays invisible to that creator too, since visibility is gated on file *ownership*, not on
+  member's retention configuration. A `file`-scope rule is deleted together with its target file (there is no
+  FK/cascade at the DB level, so the delete path removes it explicitly), so it can no longer outlive the file and go
+  invisible that way. One remaining caveat on the `file`-scope case: a rule created via delegated `WRITE` on a file
+  the creator does not own stays invisible to that creator, since visibility is gated on file *ownership*, not on
   having created the rule.
 - `POST /retention-rules` with `scope="tenant"` requires the caller's `ADMIN_POLICY` authorization scope, with no
   fallback to `WRITE` — a tenant-scope rule is a standing instruction for the background sweep to permanently
@@ -850,10 +860,17 @@ access or carry substantially more per-request state in the token than it does t
 - `413 Payload Too Large` — upload exceeds the `max_size` claim, aborted mid-stream (sidecar, `PUT`).
 - `416 Range Not Satisfiable` — a well-formed `Range` that cannot be satisfied against the size (sidecar). An
   unparseable `Range` is **not** a `416` — it is ignored and the full body is served with `200`.
-- `503 Service Unavailable` — the sidecar's own response when a backend read (`GET`/`HEAD`, full or range) finds the
-  object's size disagrees with the length already resolved by the caller's earlier `stat`/`HeadObject` — a transient
-  read race, not a fault (see "P1 — Sidecar" above). Carries `Retry-After: 1`; the recovery is a plain retry. Distinct
-  from `502` (control-plane callback failure) and `500` (a genuine backend I/O fault).
+- `503 Service Unavailable` — two causes, both a signal to retry, never a fault:
+  - the sidecar's own response when a backend read (`GET`/`HEAD`, full or range) finds the object's size disagrees
+    with the length already resolved by the caller's earlier `stat`/`HeadObject` — a transient read race, not a
+    fault (see "P1 — Sidecar" above). Carries `Retry-After: 1`; the recovery is a plain retry.
+  - any storage-backend call (control plane or sidecar) failing with a **transient** backend fault — network,
+    timeout, backend overload/5xx, or the losing side of a concurrent object change (`DomainError::BackendUnavailable`,
+    per `docs/arch/errors/categories/14-service-unavailable.md`). Carries `retry_after_seconds` in the response body
+    and a matching `Retry-After: 5` header; the recovery is a plain retry once that window has elapsed. Distinct
+    from `502` (control-plane callback failure) and `500` (a **permanent** backend fault — bad config, a protocol
+    violation by the backend, or an internal invariant — which keeps the previous, non-retryable `500` and is
+    logged at `error`, not `warn`).
 - `429 Too Many Requests` — not implemented as a sidecar per-URL `max_conns` cause (that claim does not exist, see
   "Signed URLs" above); the only live `429` source is the control-plane storage quota check on
   `create_file`/`presign_version`/multipart `initiate` (`QuotaExceeded`). That check is itself only reachable when a

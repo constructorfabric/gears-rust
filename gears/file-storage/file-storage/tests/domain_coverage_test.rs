@@ -1894,6 +1894,7 @@ fn version_dto_from_file_version_omits_manifest() {
         backend_id: "mem".to_owned(),
         backend_path: "/a/b".to_owned(),
         created_at: OffsetDateTime::now_utc(),
+        bound_on_finalize: false,
     };
     let dto: VersionDto = v.clone().into();
     assert_eq!(dto.version_id, v.version_id);

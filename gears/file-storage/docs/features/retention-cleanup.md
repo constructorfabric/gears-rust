@@ -114,15 +114,13 @@ documented as a process in §3 instead.
   as the `(owner_kind, owner_id)` pair, not `owner_id` alone — `user` and `app` are disjoint owner
   spaces that can share a UUID) — the store query has no owner/target filter, so without this the
   response would leak every other tenant member's retention configuration
-- **Known limitations on the `File`-scope branch.** A rule whose target file has since been deleted
-  stays invisible to every non-admin caller, including whoever created it: `StoredRetentionRule`
-  carries no creator/`subject_id` column, so once the target file is gone there is no stored fact
-  left to compare against (an admin can still see it via `ADMIN_POLICY`, or remove it via
-  `delete_retention_rule`'s own dangling-target fallback). Separately, a `File`-scope rule can be
-  created by anyone holding per-file `WRITE` on the target — not only the file's owner — so a
-  subject who created such a rule via delegated `WRITE` on someone else's file will not see it in
-  this listing: visibility is gated on being the target file's *owner*, not on having created the
-  rule.
+- A `File`-scope rule is deleted together with its target file (every file-delete path removes it
+  in the same transaction, since there is no FK/cascade tying `retention_rules.scope_target_id` to
+  `files.file_id` at the DB level), so it no longer outlives the file it targets.
+- **Remaining known limitation on the `File`-scope branch.** A `File`-scope rule can be created by
+  anyone holding per-file `WRITE` on the target — not only the file's owner — so a subject who
+  created such a rule via delegated `WRITE` on someone else's file will not see it in this listing:
+  visibility is gated on being the target file's *owner*, not on having created the rule.
 
 **Error Scenarios**:
 - Caller lacks `READ` — `403`

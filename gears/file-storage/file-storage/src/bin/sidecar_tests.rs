@@ -568,6 +568,10 @@ enum ReadFault {
     Conflict,
     /// Any other backend error -- must still map to `500`.
     Other,
+    /// A transient backend fault (`BackendUnavailable`) -- must map to `503`
+    /// with `Retry-After: 5` (`BACKEND_RETRY_AFTER_SECS`), distinctly from
+    /// both `Conflict`'s own short `Retry-After: 1` and `Other`'s `500`.
+    Unavailable,
 }
 
 /// A [`StorageBackend`] wrapper around a real [`InMemoryBackend`] that makes
@@ -591,6 +595,10 @@ impl FaultyReadBackend {
             ReadFault::Other => {
                 DomainError::backend(self.inner.id(), "simulated I/O fault (test fault)")
             }
+            ReadFault::Unavailable => DomainError::backend_unavailable(
+                self.inner.id(),
+                "simulated transient backend fault (test fault)",
+            ),
         }
     }
 }
@@ -789,6 +797,43 @@ async fn download_other_backend_error_still_returns_500() {
     assert!(
         response.headers().get(header::RETRY_AFTER).is_none(),
         "a genuine backend error must not carry a Retry-After hint"
+    );
+}
+
+/// A `BackendUnavailable` from the backend's `get_stream` (a transient fault
+/// -- network, timeout, overload) must map to `503` with
+/// `Retry-After: BACKEND_RETRY_AFTER_SECS`, distinctly from both `Conflict`'s
+/// own `Retry-After: 1` and `Other`'s blanket `500`.
+#[tokio::test]
+async fn download_whole_backend_unavailable_returns_503_with_retry_after_5() {
+    let file_id = Uuid::now_v7();
+    let version_id = Uuid::now_v7();
+    let path = format!("/{file_id}/{version_id}");
+    let (state, issuer) =
+        test_faulty_download_state(&path, b"hello world", ReadFault::Unavailable).await;
+    let token = download_token(&issuer, file_id, version_id, &path);
+
+    let router = build_router(state, DEFAULT_MAX_BODY_BYTES);
+    let response = router
+        .oneshot(
+            Request::get(format!(
+                "/api/file-storage-data/v1/download/{file_id}/{version_id}?fs-token={token}"
+            ))
+            .body(Body::empty())
+            .expect("valid request"),
+        )
+        .await
+        .expect("router call succeeds");
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::RETRY_AFTER)
+            .expect("Retry-After header present on 503")
+            .to_str()
+            .expect("valid header value"),
+        file_storage::domain::error::BACKEND_RETRY_AFTER_SECS.to_string()
     );
 }
 

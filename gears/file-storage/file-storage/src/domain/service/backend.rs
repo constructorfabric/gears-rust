@@ -34,13 +34,22 @@ impl FileService {
     ///    same deterministic path) can be interrupted after writing but
     ///    before its own hash check and cleanup. So the pre-existing object
     ///    is read back and re-verified against the same hash spec before it
-    ///    is trusted; a mismatch (or a read failure) is treated like a
-    ///    source-verification failure and the object is unconditionally
-    ///    best-effort deleted (it carries no live database pointer either
-    ///    way).
-    /// 4. Transactionally update `backend_id` + `backend_path` and emit a
+    ///    is trusted. Only a **confirmed** mismatch (the object was read in
+    ///    full and its hash/length disagree) proves it is garbage and gets
+    ///    best-effort deleted; a re-verification that could not be completed
+    ///    at all (the read-back never opened, broke off mid-read, or left no
+    ///    verdict) proves nothing about the object's content, is left
+    ///    untouched, and surfaces as a retryable backend error instead — see
+    ///    `Self::verify_preexisting_dest_and_clean_on_confirmed_mismatch`'s
+    ///    own doc comment.
+    /// 4. Immediately before the CAS below, re-`stat` the destination object
+    ///    to confirm it is still there at the expected size. This narrows
+    ///    (it cannot fully close) the window between step 3's verification
+    ///    and the CAS: see the call site's own comment for why that is
+    ///    enough given step 3's stricter deletion rule.
+    /// 5. Transactionally update `backend_id` + `backend_path` and emit a
     ///    `BackendMigrate` audit row.
-    /// 5. Best-effort delete the source blob (orphan cleanup if this fails).
+    /// 6. Best-effort delete the source blob (orphan cleanup if this fails).
     ///
     /// Returns `Ok(())` when the file already lives on the target backend
     /// (no-op), or after the migration completes successfully.
@@ -113,6 +122,48 @@ impl FileService {
             expected_len,
         )
         .await?;
+
+        // Immediately before committing the CAS below, re-confirm the object
+        // this call is about to make live is actually still there and still
+        // the size this version declares. This narrows -- it cannot fully
+        // close -- the window between "verified" and "CAS": nothing
+        // coordinates a delete that lands in between this `stat` and the CAS
+        // call right below it either. What it closes is the specific
+        // data-loss scenario this function exists to prevent: the only path
+        // inside this function that ever deletes a destination object now
+        // requires a *confirmed* hash/length mismatch
+        // (`Self::verify_preexisting_dest_and_clean_on_confirmed_mismatch`
+        // above) -- content a writer with the correct bytes could never have
+        // produced -- so a delayed writer's own correctly-verified object can
+        // no longer be destroyed by a concurrent migration's cleanup path. An
+        // object that still vanishes here can only be the result of
+        // something outside that coordination entirely (an external actor,
+        // an operator action, direct backend surgery), which is exactly the
+        // class of failure a retryable backend error is the right response
+        // to -- not silently proceeding to bind a pointer at nothing.
+        match dest.stat(&dest_path).await? {
+            Some(actual_len) if actual_len == expected_len => {}
+            Some(actual_len) => {
+                // A concurrent actor changed the object in the narrow window
+                // between this call's own verification and this re-stat — see
+                // the doc comment above. Retrying the migration re-verifies
+                // and re-CASes from scratch, so this is transient, not a
+                // permanent fault.
+                return Err(DomainError::backend_unavailable(
+                    dest.id(),
+                    format!(
+                        "destination object size changed before commit: expected \
+                         {expected_len} byte(s), found {actual_len}"
+                    ),
+                ));
+            }
+            None => {
+                return Err(DomainError::backend_unavailable(
+                    dest.id(),
+                    "destination object disappeared before commit",
+                ));
+            }
+        }
 
         // Transactionally update the version row and emit the audit row. The
         // CAS predicate is the pre-migration snapshot captured above (before
@@ -204,9 +255,11 @@ impl FileService {
     /// - if this call's own `publish_exclusive` reported `created: false`
     ///   (the destination already held bytes), that pre-existing object is
     ///   independently read back and re-verified — see
-    ///   `Self::reject_and_clean_unverified_preexisting_dest`'s own doc
-    ///   comment for why `created: false` alone is not proof of anything,
-    ///   and for that path's own (unconditional) cleanup-on-failure rule.
+    ///   `Self::verify_preexisting_dest_and_clean_on_confirmed_mismatch`'s own
+    ///   doc comment for why `created: false` alone is not proof of anything,
+    ///   and for that path's own cleanup rule, which only deletes on a
+    ///   *confirmed* mismatch and otherwise surfaces a retryable backend
+    ///   error without touching the object.
     async fn stream_verify_and_publish_to_dest(
         &self,
         source: &dyn StorageBackend,
@@ -271,7 +324,7 @@ impl FileService {
         }
 
         if !outcome.created {
-            self.reject_and_clean_unverified_preexisting_dest(
+            self.verify_preexisting_dest_and_clean_on_confirmed_mismatch(
                 dest,
                 dest_path,
                 expected_len,
@@ -301,15 +354,28 @@ impl FileService {
     /// stream already went through, rather than trusting `created: false`
     /// as proof someone else already did.
     ///
-    /// On a mismatch (or a read failure), the object is deleted
-    /// unconditionally, unlike the source-verification-failure branch right
-    /// above this call's call site: this object carries no live database
-    /// pointer either way, since a competing migration that reaches this
-    /// same check always re-verifies this exact destination content before
-    /// committing its own CAS, so a passing competitor's blob can never be
-    /// mistaken for this failure — only a genuinely bad blob (or a read
-    /// fault) ends up here.
-    async fn reject_and_clean_unverified_preexisting_dest(
+    /// [`verify_existing_dest_object`] reports one of two outcomes, and they
+    /// are handled very differently:
+    /// - a [`PreexistingDestVerdict::Mismatch`] means the object was read to
+    ///   completion and its hash/length disagree with what this version
+    ///   declares. `publish_exclusive` publishes atomically, so any writer
+    ///   holding the correct bytes always passes this exact check — a
+    ///   passing competitor's blob can never end up here. This is therefore
+    ///   *confirmed* garbage (it carries no live database pointer either
+    ///   way), safe — and necessary, so it is not leaked forever — to
+    ///   best-effort delete unconditionally.
+    /// - a [`PreexistingDestVerdict::Unconfirmed`] means the check itself
+    ///   could not be completed: the read-back stream never opened, broke
+    ///   off mid-read, or the verdict slot was left empty. This proves
+    ///   NOTHING about the object's actual content — it may be perfectly
+    ///   valid data written by a concurrent migration that is merely
+    ///   momentarily unreachable (a dropped connection, a transient backend
+    ///   fault) — so deleting it here would recreate exactly the data-loss
+    ///   bug this function exists to prevent. It is left untouched and this
+    ///   returns the underlying `DomainError::Backend` unchanged: a
+    ///   retryable backend error at the REST boundary (`api/rest/error.rs`
+    ///   maps it to a 5xx), not a rejection of the migration itself.
+    async fn verify_preexisting_dest_and_clean_on_confirmed_mismatch(
         &self,
         dest: &dyn StorageBackend,
         dest_path: &str,
@@ -318,7 +384,7 @@ impl FileService {
         hash_value: Vec<u8>,
         manifest: Option<Manifest>,
     ) -> Result<(), DomainError> {
-        if let Err(dest_err) = verify_existing_dest_object(
+        match verify_existing_dest_object(
             dest,
             dest_path,
             expected_len,
@@ -328,10 +394,13 @@ impl FileService {
         )
         .await
         {
-            self.best_effort_blob_delete(dest.id(), dest_path).await;
-            return Err(dest_err);
+            Ok(()) => Ok(()),
+            Err(PreexistingDestVerdict::Mismatch(mismatch_err)) => {
+                self.best_effort_blob_delete(dest.id(), dest_path).await;
+                Err(mismatch_err)
+            }
+            Err(PreexistingDestVerdict::Unconfirmed(backend_err)) => Err(backend_err),
         }
-        Ok(())
     }
 
     // ── backends discovery ────────────────────────────────────────────────────
@@ -349,6 +418,25 @@ impl FileService {
     }
 }
 
+/// Outcome of [`verify_existing_dest_object`]'s attempt to establish whether
+/// a pre-existing destination object is valid: either the check ran to
+/// completion and definitively found the object wrong, or the check itself
+/// could not be completed at all. See
+/// [`FileService::verify_preexisting_dest_and_clean_on_confirmed_mismatch`]'s
+/// doc comment for how each variant is handled.
+enum PreexistingDestVerdict {
+    /// The object was read in full and its hash/length disagree with what
+    /// this version declares. `publish_exclusive` publishes atomically, so
+    /// this can only be genuinely bad content, never a passing competitor's
+    /// blob caught mid-write.
+    Mismatch(DomainError),
+    /// The check could not be completed either way: the read-back stream
+    /// never opened, broke off mid-read, or the verdict slot was left empty.
+    /// This is not evidence the object is bad — it says nothing about its
+    /// content at all.
+    Unconfirmed(DomainError),
+}
+
 /// Read back the object already sitting at `dest_path` on `dest` — reached
 /// only when a `publish_exclusive` call reported `created: false`, i.e. this
 /// call did not write it — and verify it against the same mode-aware hash
@@ -358,6 +446,12 @@ impl FileService {
 /// whatever it wrote was ever hash-checked, since a prior writer can crash or
 /// be cancelled after its own `publish_exclusive` call returns but before it
 /// reads its own `verify_slot` and cleans up on mismatch.
+///
+/// Every failure short of a fully-drained, definitively-mismatched read is
+/// reported as [`PreexistingDestVerdict::Unconfirmed`] rather than assumed to
+/// mean the object is bad — opening the stream, a mode/manifest mismatch
+/// (`stream_verify::verify_stream`'s own upfront validation), a mid-read
+/// error, and an empty verdict slot all land here.
 async fn verify_existing_dest_object(
     dest: &dyn StorageBackend,
     dest_path: &str,
@@ -365,30 +459,44 @@ async fn verify_existing_dest_object(
     hash_mode: HashMode,
     hash_value: Vec<u8>,
     manifest: Option<Manifest>,
-) -> Result<(), DomainError> {
-    let stream = dest.get_stream(dest_path, expected_len).await?;
+) -> Result<(), PreexistingDestVerdict> {
+    let stream = dest
+        .get_stream(dest_path, expected_len)
+        .await
+        .map_err(PreexistingDestVerdict::Unconfirmed)?;
     let (mut verified, verify_slot) =
-        stream_verify::verify_stream(stream, expected_len, hash_mode, hash_value, manifest)?;
+        stream_verify::verify_stream(stream, expected_len, hash_mode, hash_value, manifest)
+            .map_err(PreexistingDestVerdict::Unconfirmed)?;
     // Drain to the wrapped stream's terminal `None` -- the verdict is only
     // populated once that happens (see `stream_verify`'s module doc comment).
     // The bytes themselves are irrelevant here, only the verdict is, so they
-    // are read and dropped.
+    // are read and dropped. A read error here means the object opened fine
+    // and then broke off mid-read -- the verdict slot is never populated in
+    // that case, so this reports `Unconfirmed` directly rather than falling
+    // through to the (also-empty) slot check below.
     while let Some(chunk) = verified.next().await {
         if let Err(e) = chunk {
-            return Err(DomainError::backend(
+            return Err(PreexistingDestVerdict::Unconfirmed(DomainError::backend(
                 dest.id(),
                 format!("failed reading back destination object for verification: {e}"),
-            ));
+            )));
         }
     }
-    verify_slot
+    let verdict = verify_slot
         .lock()
-        .map_err(|_| DomainError::backend(dest.id(), "poisoned content-verification lock"))?
-        .take()
-        .unwrap_or_else(|| {
-            Err(DomainError::backend(
+        .map_err(|_| {
+            PreexistingDestVerdict::Unconfirmed(DomainError::backend(
                 dest.id(),
-                "destination read-back ended without fully draining the verified stream",
+                "poisoned content-verification lock",
             ))
-        })
+        })?
+        .take();
+    match verdict {
+        Some(Ok(())) => Ok(()),
+        Some(Err(mismatch_err)) => Err(PreexistingDestVerdict::Mismatch(mismatch_err)),
+        None => Err(PreexistingDestVerdict::Unconfirmed(DomainError::backend(
+            dest.id(),
+            "destination read-back ended without fully draining the verified stream",
+        ))),
+    }
 }

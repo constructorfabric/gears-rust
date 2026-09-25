@@ -82,6 +82,19 @@ impl From<DomainError> for CanonicalError {
                 tracing::error!(backend_id, message, "storage backend error");
                 CanonicalError::internal("storage backend error").create()
             }
+            DomainError::BackendUnavailable {
+                backend_id,
+                message,
+            } => {
+                tracing::warn!(
+                    backend_id,
+                    message,
+                    "storage backend temporarily unavailable"
+                );
+                CanonicalError::service_unavailable()
+                    .with_retry_after_seconds(crate::domain::error::BACKEND_RETRY_AFTER_SECS)
+                    .create()
+            }
             DomainError::Database { .. } => {
                 tracing::error!(error = ?e, "database error");
                 CanonicalError::internal("internal database error").create()

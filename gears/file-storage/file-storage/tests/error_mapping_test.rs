@@ -13,15 +13,16 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::doc_markdown)]
 
+use axum::http::header;
 use file_storage::domain::error::DomainError;
-use toolkit::api::canonical_prelude::CanonicalError;
+use toolkit::api::canonical_prelude::{CanonicalError, IntoResponse, Problem};
 use uuid::Uuid;
 
 /// Number of `DomainError` variants as of this test's writing. Kept as a
 /// belt-and-suspenders check alongside the exhaustive match in
 /// `expected_status`: bumping this without adding both a match arm there and
 /// an instance in `all_variant_instances` fails the test below.
-const EXPECTED_VARIANT_COUNT: usize = 24;
+const EXPECTED_VARIANT_COUNT: usize = 25;
 
 /// The expected HTTP status for every `DomainError` variant, per the
 /// canonical-error taxonomy in `libs/toolkit-canonical-errors/src/error.rs`
@@ -58,6 +59,7 @@ fn expected_status(err: &DomainError) -> u16 {
         DomainError::Database { .. } | DomainError::Backend { .. } | DomainError::InternalError => {
             500
         }
+        DomainError::BackendUnavailable { .. } => 503,
     }
 }
 
@@ -101,6 +103,10 @@ fn all_variant_instances() -> Vec<DomainError> {
         DomainError::Backend {
             backend_id: "s3".into(),
             message: "put failed".into(),
+        },
+        DomainError::BackendUnavailable {
+            backend_id: "s3".into(),
+            message: "connection timed out".into(),
         },
         DomainError::UnknownBackend {
             backend_id: "nope".into(),
@@ -209,4 +215,44 @@ fn declared_routes_match_the_pinned_status_table() {
             "{operation_id}'s declared route status must be 400 per the 2.5 fix"
         );
     }
+}
+
+/// `BackendUnavailable` maps to `503 service_unavailable` with
+/// `retry_after_seconds`/`Retry-After: 5` (categories/14-service-unavailable.md),
+/// while the plain `Backend` variant it sits beside keeps the previous `500`
+/// — a permanent-vs-transient backend fault must not collapse onto the same
+/// status.
+#[test]
+fn backend_unavailable_maps_to_503_with_retry_after_5() {
+    let err = DomainError::backend_unavailable("s3-primary", "connect timed out");
+    let canonical: CanonicalError = err.into();
+    assert_eq!(canonical.status_code(), 503);
+
+    let problem = Problem::from(canonical);
+    assert_eq!(
+        problem
+            .context
+            .get("retry_after_seconds")
+            .and_then(serde_json::Value::as_u64),
+        Some(5)
+    );
+
+    let response = problem.into_response();
+    assert_eq!(response.status().as_u16(), 503);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::RETRY_AFTER)
+            .expect("Retry-After header present on 503")
+            .to_str()
+            .expect("valid header value"),
+        "5"
+    );
+}
+
+#[test]
+fn backend_still_maps_to_500() {
+    let err = DomainError::backend("s3-primary", "invalid bucket config");
+    let canonical: CanonicalError = err.into();
+    assert_eq!(canonical.status_code(), 500);
 }

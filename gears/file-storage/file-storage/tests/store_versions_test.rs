@@ -30,7 +30,8 @@ use uuid::Uuid;
 
 use file_storage::domain::audit::{AuditEntry, AuditOperation, FileEvent};
 use file_storage::domain::error::DomainError;
-use file_storage::domain::ports::AutoBindOnFinalize;
+use file_storage::domain::policy::{AgeRetention, RetentionRuleBody, RetentionScope};
+use file_storage::domain::ports::{AutoBindOnFinalize, DeleteVersionOutcome};
 use file_storage::infra::content::hash_mode::HashMode;
 use file_storage::infra::storage::Store;
 use file_storage::infra::storage::migrations::Migrator;
@@ -99,6 +100,18 @@ fn new_version(
         backend_id: "mem".to_owned(),
         backend_path: format!("/{file_id}/{version_id}"),
         created_at: now,
+        bound_on_finalize: false,
+    }
+}
+
+/// A semantically valid retention-rule body (`validate_retention_rule`
+/// rejects an all-criteria-`None` body), for tests whose focus is the
+/// cascade-delete relationship rather than rule-body validation.
+fn valid_rule_body() -> RetentionRuleBody {
+    RetentionRuleBody {
+        age: Some(AgeRetention { max_age_days: 30 }),
+        inactivity: None,
+        metadata: None,
     }
 }
 
@@ -588,6 +601,11 @@ async fn finalize_version_with_auto_bind_marks_available_and_binds_content() {
         .expect("version exists");
     assert_eq!(v_row.status, VersionStatus::Available);
     assert!(v_row.is_current, "auto_bind must mark the version current");
+    assert!(
+        v_row.bound_on_finalize,
+        "a won auto-bind CAS must persist the bound_on_finalize flag \
+         (read back by FileService::finalize_upload_by_token's retry fast path)"
+    );
 
     let file = files.get(&conn, &scope, file_id).await.unwrap().unwrap();
     assert_eq!(file.content_id, Some(v1), "auto_bind must set content_id");
@@ -692,5 +710,95 @@ async fn finalize_version_lost_cas_when_not_pending_leaves_row_untouched() {
     assert!(
         audit_rows.is_empty(),
         "a lost CAS (updated == false) must never write an audit row"
+    );
+}
+
+// -- delete_version_or_whole_file: retention-rule cascade --------------------
+
+/// `delete_version_or_whole_file`'s whole-file branch (the target version is
+/// the file's only one) must remove any `File`-scope retention rule
+/// targeting that file, in the SAME transaction as the whole-file delete --
+/// `retention_rules` has no FK from `scope_target_id` to `files.file_id`, so
+/// nothing else would ever remove it. A `Tenant`-scope rule on the same
+/// tenant must survive untouched.
+#[tokio::test]
+async fn delete_version_or_whole_file_cascades_file_scope_retention_rule() {
+    let (store, db) = build_store().await;
+    let conn = db.conn().expect("conn");
+    let scope = AccessScope::allow_all();
+    let files = FileRepo::new();
+    let versions = VersionRepo::new();
+    let now = OffsetDateTime::now_utc();
+
+    let tenant_id = Uuid::now_v7();
+    let file_id = Uuid::now_v7();
+    let version_id = Uuid::now_v7();
+
+    files
+        .create(&conn, &scope, &new_file(file_id, tenant_id, None))
+        .await
+        .expect("create file");
+    versions
+        .insert(
+            &conn,
+            &scope,
+            &new_version(file_id, version_id, VersionStatus::Available, false),
+        )
+        .await
+        .expect("insert the file's only version");
+
+    let file_rule_id = store
+        .insert_retention_rule(
+            &scope,
+            tenant_id,
+            &RetentionScope::File,
+            Some(file_id),
+            &valid_rule_body(),
+            now,
+        )
+        .await
+        .expect("insert file-scope rule");
+    let tenant_rule_id = store
+        .insert_retention_rule(
+            &scope,
+            tenant_id,
+            &RetentionScope::Tenant,
+            None,
+            &valid_rule_body(),
+            now,
+        )
+        .await
+        .expect("insert tenant-scope rule");
+
+    let outcome = store
+        .delete_version_or_whole_file(
+            file_id,
+            version_id,
+            audit_entry(tenant_id, file_id, AuditOperation::DeleteVersion),
+            audit_entry(tenant_id, file_id, AuditOperation::DeleteFile),
+            None,
+        )
+        .await
+        .expect("delete_version_or_whole_file must not error");
+    assert!(
+        matches!(outcome, DeleteVersionOutcome::FileRemoved(_)),
+        "the target version is the file's only one, so the whole file must go: {outcome:?}"
+    );
+
+    assert!(
+        store
+            .get_retention_rule(&scope, file_rule_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "the file-scope rule must be removed along with its target file"
+    );
+    assert!(
+        store
+            .get_retention_rule(&scope, tenant_rule_id)
+            .await
+            .unwrap()
+            .is_some(),
+        "an unrelated tenant-scope rule on the same tenant must survive"
     );
 }

@@ -80,8 +80,17 @@ impl LocalFsBackend {
         Ok(out)
     }
 
-    fn io_err(&self, e: impl std::fmt::Display) -> DomainError {
-        DomainError::backend(&self.id, e.to_string())
+    /// Classifies by `e.kind()`: a stalled read/write, a signal-interrupted
+    /// syscall, or a would-block on a non-blocking fd are transient (retrying
+    /// the same operation is expected to make progress); anything else (a
+    /// missing path, permission denied, disk full, ...) is a permanent fault.
+    fn io_err(&self, e: &std::io::Error) -> DomainError {
+        let msg = e.to_string();
+        if is_transient_io_error(e.kind()) {
+            DomainError::backend_unavailable(&self.id, msg)
+        } else {
+            DomainError::backend(&self.id, msg)
+        }
     }
 
     /// Best-effort directory fsync: opening a directory for read and calling
@@ -102,7 +111,7 @@ impl LocalFsBackend {
         if let Some(parent) = &parent {
             tokio::fs::create_dir_all(parent)
                 .await
-                .map_err(|e| self.io_err(e))?;
+                .map_err(|e| self.io_err(&e))?;
         }
         Ok((target, parent))
     }
@@ -127,7 +136,7 @@ impl LocalFsBackend {
         // old file or the fully-written new one, never a torn mix.
         tokio::fs::rename(tmp, target)
             .await
-            .map_err(|e| self.io_err(e))?;
+            .map_err(|e| self.io_err(&e))?;
 
         if self.fsync_parent_dir
             && let Some(parent) = parent
@@ -174,7 +183,7 @@ impl LocalFsBackend {
                 Ok(true)
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
-            Err(e) => Err(self.io_err(e)),
+            Err(e) => Err(self.io_err(&e)),
         }
     }
 
@@ -219,17 +228,17 @@ impl LocalFsBackend {
     ) -> Result<(u64, [u8; 32]), DomainError> {
         let mut file = tokio::fs::File::create(tmp)
             .await
-            .map_err(|e| self.io_err(e))?;
+            .map_err(|e| self.io_err(&e))?;
         let mut hasher = hash::Hasher::new();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| self.io_err(e))?;
-            file.write_all(&chunk).await.map_err(|e| self.io_err(e))?;
+            let chunk = chunk.map_err(|e| self.io_err(&e))?;
+            file.write_all(&chunk).await.map_err(|e| self.io_err(&e))?;
             hasher.update(&chunk);
             if max_size.is_some_and(|m| hasher.len() > m) {
                 return Err(DomainError::validation("size", "exceeds max_size"));
             }
         }
-        file.sync_all().await.map_err(|e| self.io_err(e))?;
+        file.sync_all().await.map_err(|e| self.io_err(&e))?;
         let bytes_written = hasher.len();
         let digest = hash::digest_to_array(hasher.finalize());
         Ok((bytes_written, digest))
@@ -434,7 +443,7 @@ impl StorageBackend for LocalFsBackend {
         let mut file = match tokio::fs::File::open(&target).await {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(self.io_err(e)),
+            Err(e) => return Err(self.io_err(&e)),
         };
         let want = usize::try_from(max_bytes).unwrap_or(usize::MAX);
         let mut buf = vec![0u8; want];
@@ -443,7 +452,7 @@ impl StorageBackend for LocalFsBackend {
             let n = file
                 .read(&mut buf[filled..])
                 .await
-                .map_err(|e| self.io_err(e))?;
+                .map_err(|e| self.io_err(&e))?;
             if n == 0 {
                 break;
             }
@@ -480,8 +489,8 @@ impl StorageBackend for LocalFsBackend {
         let target = self.resolve(path)?;
         let file = tokio::fs::File::open(&target)
             .await
-            .map_err(|e| self.io_err(e))?;
-        let len = file.metadata().await.map_err(|e| self.io_err(e))?.len();
+            .map_err(|e| self.io_err(&e))?;
+        let len = file.metadata().await.map_err(|e| self.io_err(&e))?.len();
         if len != expected_len {
             return Err(DomainError::conflict(format!(
                 "object at '{path}' changed size before it could be read: expected {expected_len} byte(s), found {len}"
@@ -518,8 +527,8 @@ impl StorageBackend for LocalFsBackend {
         let target = self.resolve(path)?;
         let mut file = tokio::fs::File::open(&target)
             .await
-            .map_err(|e| self.io_err(e))?;
-        let total = file.metadata().await.map_err(|e| self.io_err(e))?.len();
+            .map_err(|e| self.io_err(&e))?;
+        let total = file.metadata().await.map_err(|e| self.io_err(&e))?.len();
         let Some((start, end)) = range.resolve(total) else {
             return Err(DomainError::validation("range", "unsatisfiable byte range"));
         };
@@ -533,7 +542,7 @@ impl StorageBackend for LocalFsBackend {
         }
         file.seek(std::io::SeekFrom::Start(start))
             .await
-            .map_err(|e| self.io_err(e))?;
+            .map_err(|e| self.io_err(&e))?;
         Ok(Self::chunked_file_stream(file, Some(expected_len)))
     }
 
@@ -544,7 +553,7 @@ impl StorageBackend for LocalFsBackend {
         let target = self.resolve(path)?;
         let meta = tokio::fs::metadata(&target)
             .await
-            .map_err(|e| self.io_err(e))?;
+            .map_err(|e| self.io_err(&e))?;
         Ok(meta.len())
     }
 
@@ -554,7 +563,7 @@ impl StorageBackend for LocalFsBackend {
             Ok(()) => Ok(()),
             // Idempotent: a missing blob is a successful delete.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(self.io_err(e)),
+            Err(e) => Err(self.io_err(&e)),
         }
     }
 
@@ -565,7 +574,7 @@ impl StorageBackend for LocalFsBackend {
         match tokio::fs::metadata(&target).await {
             Ok(_) => Ok(true),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(self.io_err(e)),
+            Err(e) => Err(self.io_err(&e)),
         }
     }
 
@@ -578,7 +587,7 @@ impl StorageBackend for LocalFsBackend {
         match tokio::fs::metadata(&target).await {
             Ok(meta) => Ok(Some(meta.len())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(self.io_err(e)),
+            Err(e) => Err(self.io_err(&e)),
         }
     }
 
@@ -592,7 +601,7 @@ impl StorageBackend for LocalFsBackend {
         match tokio::fs::metadata(&self.root).await {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
-            Err(e) => return Err(self.io_err(e)),
+            Err(e) => return Err(self.io_err(&e)),
         }
 
         let mut paths = Vec::new();
@@ -601,10 +610,10 @@ impl StorageBackend for LocalFsBackend {
         while let Some(dir) = stack.pop() {
             let mut entries = tokio::fs::read_dir(&dir)
                 .await
-                .map_err(|e| self.io_err(e))?;
+                .map_err(|e| self.io_err(&e))?;
 
-            while let Some(entry) = entries.next_entry().await.map_err(|e| self.io_err(e))? {
-                let ft = entry.file_type().await.map_err(|e| self.io_err(e))?;
+            while let Some(entry) = entries.next_entry().await.map_err(|e| self.io_err(&e))? {
+                let ft = entry.file_type().await.map_err(|e| self.io_err(&e))?;
                 if ft.is_dir() {
                     stack.push(entry.path());
                 } else if ft.is_file() {
@@ -627,11 +636,47 @@ impl StorageBackend for LocalFsBackend {
     async fn is_ready(&self) -> Result<(), DomainError> {
         let meta = tokio::fs::metadata(&self.root)
             .await
-            .map_err(|e| self.io_err(e))?;
+            .map_err(|e| self.io_err(&e))?;
         if meta.is_dir() {
             Ok(())
         } else {
             Err(DomainError::backend(&self.id, "root is not a directory"))
         }
+    }
+}
+
+/// Whether `kind` denotes a transient, expected-to-clear-on-retry I/O
+/// failure (a stalled read/write, a signal-interrupted syscall, a
+/// would-block on a non-blocking descriptor) as opposed to a persistent
+/// fault (missing path, permission denied, disk full, ...).
+fn is_transient_io_error(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::WouldBlock
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_transient_io_error;
+    use std::io::ErrorKind;
+
+    #[test]
+    fn classifies_timed_out_as_transient() {
+        assert!(is_transient_io_error(ErrorKind::TimedOut));
+    }
+
+    #[test]
+    fn classifies_interrupted_and_would_block_as_transient() {
+        assert!(is_transient_io_error(ErrorKind::Interrupted));
+        assert!(is_transient_io_error(ErrorKind::WouldBlock));
+    }
+
+    #[test]
+    fn classifies_not_found_and_permission_denied_as_permanent() {
+        assert!(!is_transient_io_error(ErrorKind::NotFound));
+        assert!(!is_transient_io_error(ErrorKind::PermissionDenied));
     }
 }

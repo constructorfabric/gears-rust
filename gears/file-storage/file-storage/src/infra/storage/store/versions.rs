@@ -251,6 +251,14 @@ impl Store {
                                     "target version no longer exists -- it was deleted concurrently",
                                 ));
                             }
+                            // Persist the CAS's own outcome on the version row
+                            // itself -- see `VersionRepo::mark_bound_on_finalize`'s
+                            // doc comment for why `finalize_upload_by_token`'s
+                            // idempotent-retry fast path needs this instead of
+                            // a live re-read of `files.content_id`.
+                            versions
+                                .mark_bound_on_finalize(tx, &scope, file_id, version_id)
+                                .await?;
                             audit_repo.insert(tx, &ab.audit).await?;
                             if let Some(ev) = ab.event {
                                 events_repo.enqueue(tx, &ev).await?;
@@ -375,6 +383,15 @@ impl Store {
                                 "target version no longer exists -- it was deleted concurrently",
                             ));
                         }
+                        // Same persisted-decision flag `finalize_version`'s
+                        // own auto-bind branch sets -- harmless here too: a
+                        // multipart retry replays from `complete_result`
+                        // (see this method's doc comment), never from this
+                        // column, but keeping it consistent per-version costs
+                        // nothing and avoids a single-part-only invariant.
+                        versions
+                            .mark_bound_on_finalize(tx, &scope, file_id, finish.version_id)
+                            .await?;
                         audit_repo.insert(tx, &ab.audit).await?;
                         if let Some(ev) = ab.event {
                             events_repo.enqueue(tx, &ev).await?;
@@ -639,6 +656,7 @@ impl Store {
     ) -> Result<DeleteVersionOutcome, DomainError> {
         let files = self.repos.files.clone();
         let versions = self.repos.versions.clone();
+        let retention_rules = self.repos.retention_rules.clone();
         let audit_repo = self.repos.audit.clone();
         let events_repo = self.repos.events_outbox.clone();
         let db = self.db.db();
@@ -651,6 +669,7 @@ impl Store {
         transaction_with_bounded_retry(&db, move |tx| {
             let files = files.clone();
             let versions = versions.clone();
+            let retention_rules = retention_rules.clone();
             let audit_repo = audit_repo.clone();
             let events_repo = events_repo.clone();
             let version_audit = version_audit.clone();
@@ -684,6 +703,11 @@ impl Store {
                         // statement.
                         return Ok(DeleteVersionOutcome::NotFound);
                     }
+                    // See `Store::delete_file_collecting_versions`'s matching
+                    // call for why this has no FK to lean on instead.
+                    retention_rules
+                        .delete_file_scope_rules(tx, &scope, file_id)
+                        .await?;
                     audit_repo.insert(tx, &file_audit).await?;
                     if let Some(ev) = file_event {
                         events_repo.enqueue(tx, &ev).await?;

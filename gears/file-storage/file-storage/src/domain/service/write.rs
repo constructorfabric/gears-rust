@@ -668,8 +668,11 @@ impl FileService {
     /// `publish_exclusive`, so a finalize that arrives for an
     /// already-`Available` version (its own first response lost in transit)
     /// never re-runs the finalize CAS — auto-bind or manual, matching
-    /// size/hash reports the state the original call already decided,
-    /// instead of a 409.
+    /// size/hash replays the state the original call already decided and
+    /// returned (a won auto-bind CAS via the version's persisted
+    /// `bound_on_finalize` flag) rather than a fresh, possibly
+    /// since-diverged read of the file's CURRENT content pointer, instead of
+    /// a 409.
     pub async fn finalize_upload_by_token(
         &self,
         claims: &Claims,
@@ -718,16 +721,30 @@ impl FileService {
                     hex::encode(&version.hash_value),
                 ));
             }
-            // Bind already decided (or never requested, for a manual token)
-            // by the original finalize — report the current state, run no
-            // new CAS. Same shared three-way model `MultipartService`'s
-            // `complete` retry path uses.
-            let (bind_state, etag, current_etag) = crate::domain::multipart::resolve_bind_state(
-                file_id,
-                file.content_id,
-                version_id,
-                claims.bind_on_finalize,
-            );
+            // Bind already decided by the ORIGINAL finalize call — replay
+            // that persisted decision (`version.bound_on_finalize`) rather
+            // than re-deriving `Bound` vs. `Conflict` from `file.content_id`
+            // read fresh at the top of THIS call: a legitimate rebind
+            // between the original finalize and this retry would otherwise
+            // make the retry disagree with the `Bound`/etag(A) outcome the
+            // original call already returned to the client.
+            // `file.content_id` is still needed for the `Conflict`/manual
+            // branches (the live pointer a manual rebind's `If-Match`
+            // needs, or a manual token's own current state) — only the
+            // WON-bind decision itself must never be re-derived live. Same
+            // shared three-way model `MultipartService`'s `complete` retry
+            // path uses, but sourced from this version's own persisted flag
+            // instead of `complete_result` (multipart's session-level
+            // snapshot; single-part has no session row to hang one off,
+            // hence the per-version column instead).
+            let (bind_state, etag, current_etag) =
+                crate::domain::multipart::replay_finalize_bind_state(
+                    file_id,
+                    file.content_id,
+                    version_id,
+                    version.bound_on_finalize,
+                    claims.bind_on_finalize,
+                );
             return Ok(FinalizeByTokenOutcome {
                 bind_state: Some(bind_state),
                 etag,

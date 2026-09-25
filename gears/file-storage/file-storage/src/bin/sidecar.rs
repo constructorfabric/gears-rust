@@ -118,7 +118,7 @@ use time::OffsetDateTime;
 use toolkit_utils::SecretString;
 use uuid::Uuid;
 
-use file_storage::domain::error::DomainError;
+use file_storage::domain::error::{BACKEND_RETRY_AFTER_SECS, DomainError};
 use file_storage::domain::ports::FileStorageMetricsPort;
 use file_storage::infra::backend::{BackendRegistry, LocalFsBackend, S3Backend, StorageBackend};
 use file_storage::infra::content::{hash, range};
@@ -826,8 +826,7 @@ async fn upload(
             if let Some(resp) = idle_timeout_response(&timed_out, &claims.backend_path, None) {
                 return resp;
             }
-            tracing::error!(error = %e, "backend publish_exclusive failed");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "backend error").into_response();
+            return backend_error_response(&e, "publish_exclusive");
         }
     };
     let (bytes_written, digest, created) = (outcome.bytes_written, outcome.digest, outcome.created);
@@ -1540,8 +1539,10 @@ async fn write_multipart_part_native(
                 )
                     .into_response());
             }
-            tracing::error!(error = %e, part_number, "backend native upload_part_stream failed");
-            Err((StatusCode::INTERNAL_SERVER_ERROR, "backend error").into_response())
+            Err(backend_error_response(
+                &e,
+                &format!("upload_part_stream (part {part_number})"),
+            ))
         }
     }
 }
@@ -1582,8 +1583,10 @@ async fn write_multipart_part_offset_object(
             if let Some(resp) = idle_timeout_response(&timed_out, &part_path, None) {
                 return Err(resp);
             }
-            tracing::error!(error = %e, part_number, "backend part write failed");
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, "backend error").into_response());
+            return Err(backend_error_response(
+                &e,
+                &format!("put_stream (part {part_number})"),
+            ));
         }
     };
 
@@ -1844,10 +1847,7 @@ async fn download(
     let total = match backend.stat(path).await {
         Ok(Some(n)) => n,
         Ok(None) => return (StatusCode::NOT_FOUND, "not found").into_response(),
-        Err(e) => {
-            tracing::error!(error = %e, "backend stat failed");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "backend error").into_response();
-        }
+        Err(e) => return backend_error_response(&e, "stat"),
     };
 
     // Range support (random read access) — a single signed URL serves many ranges.
@@ -1912,10 +1912,7 @@ async fn download_head(
     let total = match backend.stat(path).await {
         Ok(Some(n)) => n,
         Ok(None) => return (StatusCode::NOT_FOUND, "not found").into_response(),
-        Err(e) => {
-            tracing::error!(error = %e, "backend stat failed");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "backend error").into_response();
-        }
+        Err(e) => return backend_error_response(&e, "stat"),
     };
 
     let mut resp = (StatusCode::OK, ()).into_response();
@@ -1954,7 +1951,33 @@ fn backend_read_error_response(e: &DomainError, context: &str) -> Response {
             .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
         return resp;
     }
-    tracing::error!(error = %e, context, "backend read failed");
+    backend_error_response(e, context)
+}
+
+/// Map any other backend-call failure (`stat`/`get_stream`/`publish_exclusive`/
+/// `upload_part_stream`/...) to a response: `BackendUnavailable` — a
+/// transient fault (network, timeout, overload, a losing side of a
+/// concurrent object change) the platform-wide `service_unavailable`
+/// guideline (`docs/arch/errors/categories/14-service-unavailable.md`) says
+/// retrying is expected to clear — gets `503` + `Retry-After`, logged at
+/// `warn!` since it is an expected, recoverable condition, not an operator
+/// page. Every other `DomainError` is a genuine, non-retryable backend fault
+/// and keeps the previous `500` + `error!`.
+fn backend_error_response(e: &DomainError, context: &str) -> Response {
+    if let DomainError::BackendUnavailable { .. } = e {
+        tracing::warn!(error = %e, context, "backend temporarily unavailable");
+        let mut resp = (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "backend temporarily unavailable, retry",
+        )
+            .into_response();
+        resp.headers_mut().insert(
+            header::RETRY_AFTER,
+            HeaderValue::from(BACKEND_RETRY_AFTER_SECS),
+        );
+        return resp;
+    }
+    tracing::error!(error = %e, context, "backend error");
     (StatusCode::INTERNAL_SERVER_ERROR, "backend error").into_response()
 }
 

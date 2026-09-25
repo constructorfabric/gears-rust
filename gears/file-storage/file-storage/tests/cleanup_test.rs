@@ -5060,3 +5060,635 @@ async fn migrate_backend_rejects_corrupted_preexisting_destination_object_compos
         "corrupted pre-existing composite destination object must be cleaned up"
     );
 }
+
+// ── MAJOR remediation: a pre-existing destination object's re-verification
+// distinguishes a *confirmed* mismatch (delete) from a check that could not
+// be *completed at all* (read failure, broken stream) -- the latter must
+// NOT delete anything and must surface a retryable error instead; and a
+// pre-CAS `stat` re-check catches an object that vanished entirely between
+// this call's own verification and its CAS ─────────────────────────────────
+//
+// Regression for the MAJOR review finding: two concurrent migrations of the
+// same file to the same destination, where the losing racer's read-back
+// re-verification of the winner's already-correct object hits a *transient*
+// backend error (not a real content mismatch), used to be treated exactly
+// like a confirmed mismatch -- deleting the winner's live, correctly-written
+// object out from under it, after which the winner's own CAS would still
+// succeed (it only compares DB columns), leaving the version pointing at
+// nothing. These tests seed a pre-existing, CORRECT destination object (as
+// if written by a delayed concurrent migration attempt) and either inject a
+// transient read failure into its re-verification, or delete the object
+// entirely in the window between write and CAS.
+
+/// A `StorageBackend` wrapper whose `get_stream` yields only the first
+/// `abort_after` bytes of the real object, then a transport error --
+/// modeling a transient read failure (a dropped connection, a backend
+/// hiccup) while re-verifying a pre-existing destination object. Fetches the
+/// real object once via `inner.get_stream` (test-harness-only; the objects
+/// under test here are small) and rebuilds a stream from it with the fault
+/// applied. Everything else passes straight through to `inner`.
+struct DestReadFaultBackend {
+    inner: Arc<dyn StorageBackend>,
+    abort_after: usize,
+}
+
+#[async_trait]
+impl StorageBackend for DestReadFaultBackend {
+    fn id(&self) -> &str {
+        self.inner.id()
+    }
+    fn capabilities(&self) -> file_storage::infra::backend::BackendCapabilities {
+        self.inner.capabilities()
+    }
+    async fn put_stream(
+        &self,
+        path: &str,
+        stream: futures::stream::BoxStream<'_, std::io::Result<Bytes>>,
+        max_size: Option<u64>,
+    ) -> Result<(u64, [u8; 32]), DomainError> {
+        self.inner.put_stream(path, stream, max_size).await
+    }
+    async fn publish_exclusive(
+        &self,
+        path: &str,
+        stream: futures::stream::BoxStream<'_, std::io::Result<Bytes>>,
+        max_size: Option<u64>,
+    ) -> Result<file_storage::infra::backend::PublishOutcome, DomainError> {
+        self.inner.publish_exclusive(path, stream, max_size).await
+    }
+    async fn get_stream(
+        &self,
+        path: &str,
+        expected_len: u64,
+    ) -> Result<futures::stream::BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
+        use futures::StreamExt;
+
+        let mut real = self.inner.get_stream(path, expected_len).await?;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = real.next().await {
+            bytes.extend_from_slice(
+                &chunk.map_err(|e| DomainError::backend(self.id(), e.to_string()))?,
+            );
+        }
+        let take = self.abort_after.min(bytes.len());
+        let chunks: Vec<std::io::Result<Bytes>> = vec![
+            Ok(Bytes::copy_from_slice(&bytes[..take])),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "simulated destination transport failure",
+            )),
+        ];
+        Ok(Box::pin(futures::stream::iter(chunks)))
+    }
+    async fn read_prefix(&self, path: &str, max_bytes: u64) -> Result<Option<Bytes>, DomainError> {
+        self.inner.read_prefix(path, max_bytes).await
+    }
+    async fn get_range_stream(
+        &self,
+        path: &str,
+        range: file_storage_sdk::ByteRange,
+        expected_len: u64,
+    ) -> Result<futures::stream::BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
+        self.inner.get_range_stream(path, range, expected_len).await
+    }
+    async fn size(&self, path: &str) -> Result<u64, DomainError> {
+        self.inner.size(path).await
+    }
+    async fn delete(&self, path: &str) -> Result<(), DomainError> {
+        self.inner.delete(path).await
+    }
+    async fn exists(&self, path: &str) -> Result<bool, DomainError> {
+        self.inner.exists(path).await
+    }
+    async fn stat(&self, path: &str) -> Result<Option<u64>, DomainError> {
+        self.inner.stat(path).await
+    }
+}
+
+/// (a)+(b) A pre-existing, CORRECT destination object's re-verification hits
+/// a transient read failure (not a real mismatch): the migration must fail
+/// with a retryable backend error (not `HashMismatch`), and -- critically --
+/// must NOT delete the object, since it may be another migration's valid,
+/// already-verified content. A subsequent retry, once the read succeeds,
+/// must complete normally using that same, untouched object.
+#[tokio::test]
+async fn migrate_backend_dest_reverify_read_error_is_retryable_and_preserves_object() {
+    let db = build_db().await;
+    let store = Store::new(Arc::clone(&db));
+
+    let mem_backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let alt_inner: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("alt"));
+
+    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let authorizer: Arc<dyn file_storage::domain::authz::Authorizer> =
+        Arc::new(TenantOnlyAuthorizer);
+
+    // A plain registry, used both for initial setup and for the later,
+    // fault-free retry.
+    let plain_backends = BackendRegistry::new(
+        vec![Arc::clone(&mem_backend), Arc::clone(&alt_inner)],
+        "mem",
+    )
+    .expect("registry");
+    let plain_cfg = ServiceConfig {
+        default_url_ttl_secs: 3600,
+        sidecar_base_url: "http://sidecar.test".to_owned(),
+        default_page_size: 50,
+        max_page_size: 1000,
+        idempotency_ttl_secs: 86400,
+    };
+    let plain_svc = Arc::new(FileService::new(
+        store.clone(),
+        plain_backends.clone(),
+        Arc::clone(&issuer),
+        Arc::clone(&authorizer),
+        plain_cfg,
+        None,
+        None,
+    ));
+    let dp = TestDataPlane::new(Arc::clone(&plain_svc), store.clone(), plain_backends);
+
+    let tenant = Uuid::now_v7();
+    let ctx = ctx(tenant);
+    let content =
+        Bytes::from_static(b"content already correctly written by a delayed concurrent migration");
+
+    let ticket = plain_svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+    dp.put_content(
+        &ctx,
+        ticket.file_id,
+        ticket.version_id,
+        "text/plain",
+        content.clone(),
+    )
+    .await
+    .unwrap();
+    plain_svc
+        .bind(&ctx, ticket.file_id, ticket.version_id, None)
+        .await
+        .unwrap();
+
+    // Pre-seed "alt" at the canonical destination path with the CORRECT
+    // bytes -- standing in for a delayed writer (A in the review scenario)
+    // that already wrote and would have verified fine.
+    let dest_path = format!("/{}/{}", ticket.file_id, ticket.version_id);
+    write_all(&alt_inner, &dest_path, content.clone()).await;
+
+    // A second registry/service over the SAME db, substituting a
+    // read-fault-injecting wrapper for "alt" -- models this call (B in the
+    // review scenario) hitting a transient error while re-verifying A's
+    // object.
+    let faulty_alt: Arc<dyn StorageBackend> = Arc::new(DestReadFaultBackend {
+        inner: Arc::clone(&alt_inner),
+        abort_after: 10,
+    });
+    let faulty_backends = BackendRegistry::new(
+        vec![Arc::clone(&mem_backend), Arc::clone(&faulty_alt)],
+        "mem",
+    )
+    .expect("registry");
+    let faulty_cfg = ServiceConfig {
+        default_url_ttl_secs: 3600,
+        sidecar_base_url: "http://sidecar.test".to_owned(),
+        default_page_size: 50,
+        max_page_size: 1000,
+        idempotency_ttl_secs: 86400,
+    };
+    let faulty_svc = Arc::new(FileService::new(
+        store.clone(),
+        faulty_backends,
+        Arc::clone(&issuer),
+        Arc::clone(&authorizer),
+        faulty_cfg,
+        None,
+        None,
+    ));
+
+    let err = faulty_svc
+        .migrate_backend(&ctx, ticket.file_id, "alt")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, DomainError::Backend { .. }),
+        "a transient read failure while re-verifying a pre-existing destination \
+         object must surface as a retryable backend error, got {err:?}"
+    );
+
+    // The object must survive: a transient read failure is not proof of
+    // corruption.
+    assert!(
+        alt_inner.exists(&dest_path).await.unwrap(),
+        "a pre-existing destination object must NOT be deleted when its \
+         re-verification merely fails to complete"
+    );
+    let preserved = read_all(&alt_inner, &dest_path, content.len() as u64).await;
+    assert_eq!(
+        preserved, content,
+        "the preserved object's bytes must be untouched"
+    );
+
+    let after_failure = store
+        .get_version(ticket.file_id, ticket.version_id)
+        .await
+        .unwrap()
+        .expect("version must still exist");
+    assert_eq!(
+        after_failure.backend_id, "mem",
+        "version must stay on the source backend after a retryable failure"
+    );
+
+    // Retrying (without the fault) must now succeed, reusing the same,
+    // still-intact object.
+    plain_svc
+        .migrate_backend(&ctx, ticket.file_id, "alt")
+        .await
+        .expect("retrying once the read succeeds must complete the migration");
+
+    let after_retry = store
+        .get_version(ticket.file_id, ticket.version_id)
+        .await
+        .unwrap()
+        .expect("version must still exist");
+    assert_eq!(
+        after_retry.backend_id, "alt",
+        "retry must switch the version to alt"
+    );
+    assert_eq!(after_retry.backend_path, dest_path);
+}
+
+/// A `StorageBackend` wrapper whose `get_stream` fails to even open --
+/// modeling a transient backend fault (a dropped connection, a timeout)
+/// discovered before a single byte of the read-back is seen, as opposed to
+/// [`DestReadFaultBackend`]'s mid-read failure. Unlike a mid-read failure
+/// (whose chunk error type is a plain `std::io::Error`, always folded into
+/// `DomainError::Backend`), a failure to open the stream is already a
+/// `DomainError` returned by the backend itself, so
+/// `verify_existing_dest_object` propagates it completely unchanged -- this
+/// backend returns `BackendUnavailable` to prove that class survives the
+/// wrapping instead of being collapsed into `Backend`.
+struct DestOpenFaultBackend {
+    inner: Arc<dyn StorageBackend>,
+}
+
+#[async_trait]
+impl StorageBackend for DestOpenFaultBackend {
+    fn id(&self) -> &str {
+        self.inner.id()
+    }
+    fn capabilities(&self) -> file_storage::infra::backend::BackendCapabilities {
+        self.inner.capabilities()
+    }
+    async fn put_stream(
+        &self,
+        path: &str,
+        stream: futures::stream::BoxStream<'_, std::io::Result<Bytes>>,
+        max_size: Option<u64>,
+    ) -> Result<(u64, [u8; 32]), DomainError> {
+        self.inner.put_stream(path, stream, max_size).await
+    }
+    async fn publish_exclusive(
+        &self,
+        path: &str,
+        stream: futures::stream::BoxStream<'_, std::io::Result<Bytes>>,
+        max_size: Option<u64>,
+    ) -> Result<file_storage::infra::backend::PublishOutcome, DomainError> {
+        self.inner.publish_exclusive(path, stream, max_size).await
+    }
+    async fn get_stream(
+        &self,
+        _path: &str,
+        _expected_len: u64,
+    ) -> Result<futures::stream::BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
+        Err(DomainError::backend_unavailable(
+            self.id(),
+            "simulated transient connect failure (test fault)",
+        ))
+    }
+    async fn read_prefix(&self, path: &str, max_bytes: u64) -> Result<Option<Bytes>, DomainError> {
+        self.inner.read_prefix(path, max_bytes).await
+    }
+    async fn get_range_stream(
+        &self,
+        path: &str,
+        range: file_storage_sdk::ByteRange,
+        expected_len: u64,
+    ) -> Result<futures::stream::BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
+        self.inner.get_range_stream(path, range, expected_len).await
+    }
+    async fn size(&self, path: &str) -> Result<u64, DomainError> {
+        self.inner.size(path).await
+    }
+    async fn delete(&self, path: &str) -> Result<(), DomainError> {
+        self.inner.delete(path).await
+    }
+    async fn exists(&self, path: &str) -> Result<bool, DomainError> {
+        self.inner.exists(path).await
+    }
+    async fn stat(&self, path: &str) -> Result<Option<u64>, DomainError> {
+        self.inner.stat(path).await
+    }
+}
+
+/// A pre-existing destination object whose re-verification fails to even
+/// open the read-back stream with a `BackendUnavailable` must surface that
+/// exact error, unchanged -- not the `Backend` a mid-read failure would
+/// produce -- since `verify_existing_dest_object` propagates a `get_stream`
+/// failure directly rather than re-wrapping it. The object must survive and
+/// a fault-free retry must still complete the migration.
+#[tokio::test]
+async fn migrate_backend_dest_reverify_open_error_preserves_backend_unavailable_class() {
+    let db = build_db().await;
+    let store = Store::new(Arc::clone(&db));
+
+    let mem_backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let alt_inner: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("alt"));
+
+    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let authorizer: Arc<dyn file_storage::domain::authz::Authorizer> =
+        Arc::new(TenantOnlyAuthorizer);
+
+    let plain_backends = BackendRegistry::new(
+        vec![Arc::clone(&mem_backend), Arc::clone(&alt_inner)],
+        "mem",
+    )
+    .expect("registry");
+    let plain_cfg = ServiceConfig {
+        default_url_ttl_secs: 3600,
+        sidecar_base_url: "http://sidecar.test".to_owned(),
+        default_page_size: 50,
+        max_page_size: 1000,
+        idempotency_ttl_secs: 86400,
+    };
+    let plain_svc = Arc::new(FileService::new(
+        store.clone(),
+        plain_backends.clone(),
+        Arc::clone(&issuer),
+        Arc::clone(&authorizer),
+        plain_cfg,
+        None,
+        None,
+    ));
+    let dp = TestDataPlane::new(Arc::clone(&plain_svc), store.clone(), plain_backends);
+
+    let tenant = Uuid::now_v7();
+    let ctx = ctx(tenant);
+    let content = Bytes::from_static(b"content already correctly written, but unreachable");
+
+    let ticket = plain_svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+    dp.put_content(
+        &ctx,
+        ticket.file_id,
+        ticket.version_id,
+        "text/plain",
+        content.clone(),
+    )
+    .await
+    .unwrap();
+    plain_svc
+        .bind(&ctx, ticket.file_id, ticket.version_id, None)
+        .await
+        .unwrap();
+
+    let dest_path = format!("/{}/{}", ticket.file_id, ticket.version_id);
+    write_all(&alt_inner, &dest_path, content.clone()).await;
+
+    let faulty_alt: Arc<dyn StorageBackend> = Arc::new(DestOpenFaultBackend {
+        inner: Arc::clone(&alt_inner),
+    });
+    let faulty_backends = BackendRegistry::new(
+        vec![Arc::clone(&mem_backend), Arc::clone(&faulty_alt)],
+        "mem",
+    )
+    .expect("registry");
+    let faulty_cfg = ServiceConfig {
+        default_url_ttl_secs: 3600,
+        sidecar_base_url: "http://sidecar.test".to_owned(),
+        default_page_size: 50,
+        max_page_size: 1000,
+        idempotency_ttl_secs: 86400,
+    };
+    let faulty_svc = Arc::new(FileService::new(
+        store.clone(),
+        faulty_backends,
+        Arc::clone(&issuer),
+        Arc::clone(&authorizer),
+        faulty_cfg,
+        None,
+        None,
+    ));
+
+    let err = faulty_svc
+        .migrate_backend(&ctx, ticket.file_id, "alt")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, DomainError::BackendUnavailable { .. }),
+        "a get_stream failure that is already BackendUnavailable must propagate \
+         unchanged, not collapse into Backend, got {err:?}"
+    );
+
+    assert!(
+        alt_inner.exists(&dest_path).await.unwrap(),
+        "a pre-existing destination object must NOT be deleted when its \
+         re-verification merely fails to open"
+    );
+
+    plain_svc
+        .migrate_backend(&ctx, ticket.file_id, "alt")
+        .await
+        .expect("retrying once the open failure clears must complete the migration");
+
+    let after_retry = store
+        .get_version(ticket.file_id, ticket.version_id)
+        .await
+        .unwrap()
+        .expect("version must still exist");
+    assert_eq!(
+        after_retry.backend_id, "alt",
+        "retry must switch the version to alt"
+    );
+    assert_eq!(after_retry.backend_path, dest_path);
+}
+
+/// A `StorageBackend` wrapper whose `publish_exclusive` deletes the object it
+/// just wrote (straight from the underlying backend) immediately after a
+/// successful write, before returning control to the caller -- modeling an
+/// external actor (a distinct process, an operator, direct backend surgery)
+/// removing the object in the narrow window between this call's own
+/// write+verification and its CAS. This is exactly the window the pre-CAS
+/// `stat` re-check exists to catch.
+struct DeleteAfterPublishBackend {
+    inner: Arc<dyn StorageBackend>,
+}
+
+#[async_trait]
+impl StorageBackend for DeleteAfterPublishBackend {
+    fn id(&self) -> &str {
+        self.inner.id()
+    }
+    fn capabilities(&self) -> file_storage::infra::backend::BackendCapabilities {
+        self.inner.capabilities()
+    }
+    async fn put_stream(
+        &self,
+        path: &str,
+        stream: futures::stream::BoxStream<'_, std::io::Result<Bytes>>,
+        max_size: Option<u64>,
+    ) -> Result<(u64, [u8; 32]), DomainError> {
+        self.inner.put_stream(path, stream, max_size).await
+    }
+    async fn publish_exclusive(
+        &self,
+        path: &str,
+        stream: futures::stream::BoxStream<'_, std::io::Result<Bytes>>,
+        max_size: Option<u64>,
+    ) -> Result<file_storage::infra::backend::PublishOutcome, DomainError> {
+        let outcome = self.inner.publish_exclusive(path, stream, max_size).await?;
+        if outcome.created {
+            self.inner
+                .delete(path)
+                .await
+                .expect("test setup: delete-after-publish must succeed");
+        }
+        Ok(outcome)
+    }
+    async fn get_stream(
+        &self,
+        path: &str,
+        expected_len: u64,
+    ) -> Result<futures::stream::BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
+        self.inner.get_stream(path, expected_len).await
+    }
+    async fn read_prefix(&self, path: &str, max_bytes: u64) -> Result<Option<Bytes>, DomainError> {
+        self.inner.read_prefix(path, max_bytes).await
+    }
+    async fn get_range_stream(
+        &self,
+        path: &str,
+        range: file_storage_sdk::ByteRange,
+        expected_len: u64,
+    ) -> Result<futures::stream::BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
+        self.inner.get_range_stream(path, range, expected_len).await
+    }
+    async fn size(&self, path: &str) -> Result<u64, DomainError> {
+        self.inner.size(path).await
+    }
+    async fn delete(&self, path: &str) -> Result<(), DomainError> {
+        self.inner.delete(path).await
+    }
+    async fn exists(&self, path: &str) -> Result<bool, DomainError> {
+        self.inner.exists(path).await
+    }
+    async fn stat(&self, path: &str) -> Result<Option<u64>, DomainError> {
+        self.inner.stat(path).await
+    }
+}
+
+/// (d) The destination object is removed by something outside
+/// `migrate_backend`'s own coordination (modeled here via
+/// `DeleteAfterPublishBackend`) in the narrow window between this call's own
+/// successful write+verification and its CAS. The pre-CAS `stat` re-check
+/// must catch this: the CAS must never fire, the migration must fail with a
+/// retryable backend error, and the version must stay on the source backend
+/// untouched.
+#[tokio::test]
+async fn migrate_backend_dest_object_vanishes_before_cas_fails_without_committing() {
+    let db = build_db().await;
+    let store = Store::new(Arc::clone(&db));
+
+    let mem_backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let alt_inner: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("alt"));
+    let alt_vanishing: Arc<dyn StorageBackend> = Arc::new(DeleteAfterPublishBackend {
+        inner: Arc::clone(&alt_inner),
+    });
+
+    let backends = BackendRegistry::new(
+        vec![Arc::clone(&mem_backend), Arc::clone(&alt_vanishing)],
+        "mem",
+    )
+    .expect("registry");
+
+    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let authorizer: Arc<dyn file_storage::domain::authz::Authorizer> =
+        Arc::new(TenantOnlyAuthorizer);
+    let cfg = ServiceConfig {
+        default_url_ttl_secs: 3600,
+        sidecar_base_url: "http://sidecar.test".to_owned(),
+        default_page_size: 50,
+        max_page_size: 1000,
+        idempotency_ttl_secs: 86400,
+    };
+    let svc = Arc::new(FileService::new(
+        store.clone(),
+        backends.clone(),
+        issuer,
+        authorizer,
+        cfg,
+        None,
+        None,
+    ));
+    let dp = TestDataPlane::new(Arc::clone(&svc), store.clone(), backends);
+
+    let tenant = Uuid::now_v7();
+    let ctx = ctx(tenant);
+    let content = Bytes::from_static(b"vanishing destination object content");
+
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+    dp.put_content(
+        &ctx,
+        ticket.file_id,
+        ticket.version_id,
+        "text/plain",
+        content.clone(),
+    )
+    .await
+    .unwrap();
+    svc.bind(&ctx, ticket.file_id, ticket.version_id, None)
+        .await
+        .unwrap();
+
+    let before = store
+        .get_version(ticket.file_id, ticket.version_id)
+        .await
+        .unwrap()
+        .expect("version must exist before migration");
+
+    let dest_path = format!("/{}/{}", ticket.file_id, ticket.version_id);
+
+    let err = svc
+        .migrate_backend(&ctx, ticket.file_id, "alt")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, DomainError::BackendUnavailable { .. }),
+        "a destination object vanishing before the CAS is a concurrent-change \
+         race, not a permanent fault -- it must surface as a retryable \
+         BackendUnavailable (503), got {err:?}"
+    );
+
+    assert!(
+        !alt_inner.exists(&dest_path).await.unwrap(),
+        "test setup sanity check: the object must indeed be gone"
+    );
+
+    let after = store
+        .get_version(ticket.file_id, ticket.version_id)
+        .await
+        .unwrap()
+        .expect("version must still exist");
+    assert_eq!(
+        after.backend_id, before.backend_id,
+        "version must stay on the source backend when the destination \
+         object vanishes before the CAS"
+    );
+    assert_eq!(after.backend_path, before.backend_path);
+}
