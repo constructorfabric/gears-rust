@@ -248,9 +248,10 @@ class FileStorageSidecar:
     def _wait_up(self, timeout: int = 30) -> None:
         """Poll the sidecar upload endpoint until it answers (any HTTP status).
 
-        The sidecar has no /healthz, so we probe the data-plane upload path with
-        a dummy UUID pair.  Any HTTP response (even 401 / 403) proves the server
-        is accepting connections.
+        Probes the data-plane upload path with a dummy UUID pair rather than
+        `/healthz`, so readiness also confirms the upload route is served.  Any
+        HTTP response (even 401 / 403) proves the server is accepting
+        connections.
         """
         dummy = "00000000-0000-0000-0000-000000000000"
         url = (
