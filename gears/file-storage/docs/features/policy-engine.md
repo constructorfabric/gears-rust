@@ -2,7 +2,7 @@ Created:  2026-07-08 by Constructor Tech
 Updated:  2026-07-08 by Constructor Tech
 # Feature: Policy Engine (Allowed Types + Size Limits)
 
-- [ ] `p2` - **ID**: `cpt-cf-file-storage-featstatus-policy-engine-implemented`
+- [x] `p2` - **ID**: `cpt-cf-file-storage-featstatus-policy-engine-implemented`
 
 
 
@@ -34,7 +34,7 @@ Updated:  2026-07-08 by Constructor Tech
 
 ## 1. Feature Context
 
-- [ ] `p2` - `cpt-cf-file-storage-feature-policy-engine`
+- [x] `p2` - `cpt-cf-file-storage-feature-policy-engine`
 
 ### 1.1 Overview
 

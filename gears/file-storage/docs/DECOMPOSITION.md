@@ -35,6 +35,11 @@ following the structure set by `features/multipart-coordinator.md`. A further en
 content-hash-modes design — formalized in ADR-0006 and implemented alongside the rest of this feature set (see
 [features/content-hash-modes.md](features/content-hash-modes.md)'s "implemented" status).
 
+**Not started**: owner deletion / disposition workflow (`cpt-cf-file-storage-fr-owner-deletion`,
+`cpt-cf-file-storage-contract-serverless-runtime`) has no DECOMPOSITION entry and no implementation in this
+release — there is no EventBroker owner-deletion consumer and no Serverless Runtime invocation anywhere in this
+gear's code. It remains a planned P2 requirement (see PRD.md/DESIGN.md).
+
 **Decomposition Strategy**:
 
 - The multipart upload lifecycle (initiate, upload-part via sidecar, complete, abort, and introspect/resume) has a
@@ -106,7 +111,7 @@ content-hash-modes design — formalized in ADR-0006 and implemented alongside t
 
 ### 2.1 [Multipart Upload Coordinator](features/multipart-coordinator.md) - HIGH
 
-- [ ] `p2` - **ID**: `cpt-cf-file-storage-feature-multipart-coordinator`
+- [x] `p2` - **ID**: `cpt-cf-file-storage-feature-multipart-coordinator`
 
 - **Type**: Core
 - **Phases**: Single-phase implementation
@@ -132,21 +137,25 @@ content-hash-modes design — formalized in ADR-0006 and implemented alongside t
 
 - **Requirements Covered**:
 
-  - [ ] `p2` - `cpt-cf-file-storage-fr-multipart-upload`
-  - [ ] `p2` - `cpt-cf-file-storage-fr-size-limits-policy`
+  - [x] `p2` - `cpt-cf-file-storage-fr-multipart-upload`
+  - [x] `p2` - `cpt-cf-file-storage-fr-size-limits-policy`
   - [ ] `p2` - `cpt-cf-file-storage-fr-storage-quota` — the quota check runs at multipart initiate, but no quota
     client is configured, so quota is not enforced on multipart initiate — permissive/fail-open, blocked on a
     Quota Enforcement SDK crate (docs-only today)
+  - [x] `p2` - `cpt-cf-file-storage-fr-auto-bind`
+  - [x] `p2` - `cpt-cf-file-storage-fr-multipart-complete-lease`
+  - [x] `p2` - `cpt-cf-file-storage-fr-sidecar-callbacks`
+  - [x] `p2` - `cpt-cf-file-storage-fr-callback-internal-token`
 
 - **Design Principles Covered**:
 
-  - [ ] `p2` - `cpt-cf-file-storage-principle-control-no-content`
-  - [ ] `p2` - `cpt-cf-file-storage-principle-signed-urls`
+  - [x] `p2` - `cpt-cf-file-storage-principle-control-no-content`
+  - [x] `p2` - `cpt-cf-file-storage-principle-signed-urls`
 
 - **Design Constraints Covered**:
 
-  - [ ] `p2` - `cpt-cf-file-storage-constraint-sidecar`
-  - [ ] `p2` - `cpt-cf-file-storage-constraint-postgres`
+  - [x] `p2` - `cpt-cf-file-storage-constraint-sidecar`
+  - [x] `p2` - `cpt-cf-file-storage-constraint-postgres`
 
 - **Domain Model Entities**:
   - MultipartUpload (session)
@@ -170,7 +179,7 @@ content-hash-modes design — formalized in ADR-0006 and implemented alongside t
 
 ### 2.2 [Content-Hash Modes](features/content-hash-modes.md) - MEDIUM
 
-- [ ] `p2` - **ID**: `cpt-cf-file-storage-feature-content-hash-modes`
+- [x] `p2` - **ID**: `cpt-cf-file-storage-feature-content-hash-modes`
 
 - **Type**: Core
 - **Phases**: Staged implementation (see [features/content-hash-modes.md](features/content-hash-modes.md) §5/§7 -- groundwork, schema migration, multipart-composite-sha256 implementation, docs) -- all stages complete
@@ -195,18 +204,18 @@ content-hash-modes design — formalized in ADR-0006 and implemented alongside t
 
 - **Requirements Covered**:
 
-  - [ ] `p2` - `cpt-cf-file-storage-fr-multipart-upload`
-  - [ ] `p2` - `cpt-cf-file-storage-fr-metadata-storage`
-  - [ ] `p1` - `cpt-cf-file-storage-fr-get-metadata`
+  - [x] `p2` - `cpt-cf-file-storage-fr-multipart-upload`
+  - [x] `p2` - `cpt-cf-file-storage-fr-metadata-storage`
+  - [x] `p1` - `cpt-cf-file-storage-fr-get-metadata`
 
 - **Design Principles Covered**:
 
-  - [ ] `p2` - `cpt-cf-file-storage-principle-streaming`
-  - [ ] `p2` - `cpt-cf-file-storage-principle-control-no-content`
+  - [x] `p2` - `cpt-cf-file-storage-principle-streaming`
+  - [x] `p2` - `cpt-cf-file-storage-principle-control-no-content`
 
 - **Design Constraints Covered**:
 
-  - [ ] `p2` - `cpt-cf-file-storage-constraint-postgres`
+  - [x] `p2` - `cpt-cf-file-storage-constraint-postgres`
 
 - **Domain Model Entities**:
   - HashMode (enum)
@@ -226,7 +235,7 @@ content-hash-modes design — formalized in ADR-0006 and implemented alongside t
 
 ### 2.3 [Policy Engine](features/policy-engine.md) - HIGH
 
-- [ ] `p2` - **ID**: `cpt-cf-file-storage-feature-policy-engine`
+- [x] `p2` - **ID**: `cpt-cf-file-storage-feature-policy-engine`
 
 - **Type**: Core
 - **Phases**: Single-phase implementation
@@ -256,17 +265,17 @@ content-hash-modes design — formalized in ADR-0006 and implemented alongside t
 
 - **Requirements Covered**:
 
-  - [ ] `p2` - `cpt-cf-file-storage-fr-allowed-types-policy`
-  - [ ] `p2` - `cpt-cf-file-storage-fr-size-limits-policy`
-  - [ ] `p2` - `cpt-cf-file-storage-fr-metadata-limits`
+  - [x] `p2` - `cpt-cf-file-storage-fr-allowed-types-policy`
+  - [x] `p2` - `cpt-cf-file-storage-fr-size-limits-policy`
+  - [x] `p2` - `cpt-cf-file-storage-fr-metadata-limits`
 
 - **Design Principles Covered**:
 
-  - [ ] `p2` - `cpt-cf-file-storage-principle-control-no-content`
+  - [x] `p2` - `cpt-cf-file-storage-principle-control-no-content`
 
 - **Design Constraints Covered**:
 
-  - [ ] `p2` - `cpt-cf-file-storage-constraint-postgres`
+  - [x] `p2` - `cpt-cf-file-storage-constraint-postgres`
 
 - **Domain Model Entities**:
   - StoredPolicy
@@ -289,7 +298,7 @@ content-hash-modes design — formalized in ADR-0006 and implemented alongside t
 
 ### 2.4 [Retention Rules & Cleanup Sweep](features/retention-cleanup.md) - MEDIUM
 
-- [ ] `p2` - **ID**: `cpt-cf-file-storage-feature-retention-cleanup`
+- [x] `p2` - **ID**: `cpt-cf-file-storage-feature-retention-cleanup`
 
 - **Type**: Core
 - **Phases**: Single-phase implementation
@@ -319,16 +328,16 @@ content-hash-modes design — formalized in ADR-0006 and implemented alongside t
 
 - **Requirements Covered**:
 
-  - [ ] `p2` - `cpt-cf-file-storage-fr-retention-policies`
-  - [ ] `p2` - `cpt-cf-file-storage-fr-orphan-reconciliation`
+  - [x] `p2` - `cpt-cf-file-storage-fr-retention-policies`
+  - [x] `p2` - `cpt-cf-file-storage-fr-orphan-reconciliation`
 
 - **Design Principles Covered**:
 
-  - [ ] `p2` - `cpt-cf-file-storage-principle-control-no-content`
+  - [x] `p2` - `cpt-cf-file-storage-principle-control-no-content`
 
 - **Design Constraints Covered**:
 
-  - [ ] `p2` - `cpt-cf-file-storage-constraint-postgres`
+  - [x] `p2` - `cpt-cf-file-storage-constraint-postgres`
 
 - **Domain Model Entities**:
   - StoredRetentionRule
@@ -385,11 +394,11 @@ content-hash-modes design — formalized in ADR-0006 and implemented alongside t
 
 - **Design Principles Covered**:
 
-  - [ ] `p2` - `cpt-cf-file-storage-principle-control-no-content`
+  - [x] `p2` - `cpt-cf-file-storage-principle-control-no-content`
 
 - **Design Constraints Covered**:
 
-  - [ ] `p2` - `cpt-cf-file-storage-constraint-postgres`
+  - [x] `p2` - `cpt-cf-file-storage-constraint-postgres`
 
 - **Domain Model Entities**:
   - AuditEntry
@@ -446,7 +455,7 @@ content-hash-modes design — formalized in ADR-0006 and implemented alongside t
 
 - **Design Constraints Covered**:
 
-  - [ ] `p2` - `cpt-cf-file-storage-constraint-postgres`
+  - [x] `p2` - `cpt-cf-file-storage-constraint-postgres`
 
 - **Domain Model Entities**:
   - None new -- mutates the existing `File` entity's `owner_kind`/`owner_id` fields
@@ -465,7 +474,7 @@ content-hash-modes design — formalized in ADR-0006 and implemented alongside t
 
 ### 2.7 [Backend Migration](features/backend-migration.md) - MEDIUM
 
-- [ ] `p2` - **ID**: `cpt-cf-file-storage-feature-backend-migration`
+- [x] `p2` - **ID**: `cpt-cf-file-storage-feature-backend-migration`
 
 - **Type**: Core
 - **Phases**: Single-phase implementation
@@ -489,7 +498,7 @@ content-hash-modes design — formalized in ADR-0006 and implemented alongside t
 
 - **Requirements Covered**:
 
-  - [ ] `p2` - `cpt-cf-file-storage-fr-backend-migration`
+  - [x] `p2` - `cpt-cf-file-storage-fr-backend-migration`
 
 - **Design Principles Covered**:
 
@@ -499,7 +508,7 @@ content-hash-modes design — formalized in ADR-0006 and implemented alongside t
 
 - **Design Constraints Covered**:
 
-  - [ ] `p2` - `cpt-cf-file-storage-constraint-postgres`
+  - [x] `p2` - `cpt-cf-file-storage-constraint-postgres`
 
 - **Domain Model Entities**:
   - None new -- mutates the existing `FileVersion` entity's `backend_id`/`backend_path` fields

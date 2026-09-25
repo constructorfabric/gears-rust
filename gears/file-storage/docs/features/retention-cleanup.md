@@ -2,7 +2,7 @@ Created:  2026-07-08 by Constructor Tech
 Updated:  2026-07-08 by Constructor Tech
 # Feature: Retention Policies & Cleanup (Orphan Reconciliation)
 
-- [ ] `p2` - **ID**: `cpt-cf-file-storage-featstatus-retention-cleanup-implemented`
+- [x] `p2` - **ID**: `cpt-cf-file-storage-featstatus-retention-cleanup-implemented`
 
 
 
@@ -37,7 +37,7 @@ Updated:  2026-07-08 by Constructor Tech
 
 ## 1. Feature Context
 
-- [ ] `p2` - `cpt-cf-file-storage-feature-retention-cleanup`
+- [x] `p2` - `cpt-cf-file-storage-feature-retention-cleanup`
 
 ### 1.1 Overview
 

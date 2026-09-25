@@ -2,7 +2,7 @@ Created:  2026-07-02 by Constructor Tech
 Updated:  2026-07-02 by Constructor Tech
 # Feature: Multipart Upload Coordinator
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-featstatus-multipart-coordinator-implemented`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-featstatus-multipart-coordinator-implemented`
 
 
 
@@ -38,7 +38,7 @@ Updated:  2026-07-02 by Constructor Tech
 
 ## 1. Feature Context
 
-- [ ] `p2` - `cpt-cf-file-storage-feature-multipart-coordinator`
+- [x] `p2` - `cpt-cf-file-storage-feature-multipart-coordinator`
 
 ### 1.1 Overview
 
@@ -92,7 +92,7 @@ User-facing interactions that start with an actor (human or external system) and
 
 ### Initiate Multipart Upload
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-flow-multipart-initiate`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-flow-multipart-initiate`
 
 **Actor**: `cpt-cf-file-storage-actor-platform-user`
 
@@ -115,15 +115,15 @@ User-facing interactions that start with an actor (human or external system) and
 > [Sidecar Per-Part Enforcement](#sidecar-per-part-enforcement) below).
 
 **Steps**:
-1. [ ] - `p1` - Client: POST /api/file-storage/v1/files/{id}/multipart with body {declared_mime, declared_size, preferred_part_size?, concurrency?} - `inst-init-request`
-2. [ ] - `p1` - API: validate declared_mime against the effective allowed-types policy; RETURN 400 if rejected - `inst-init-mime-check`
-3. [ ] - `p1` - API: validate declared_size <= effective per-file size limit; RETURN 400 if exceeded - `inst-init-size-check`
-4. [ ] - `p1` - API: validate declared_size against storage quota; RETURN 429 if exceeded - `inst-init-quota-check`
-5. [ ] - `p1` - Algorithm: compute parts plan using `cpt-cf-file-storage-algo-compute-parts-plan` - `inst-init-plan`
-6. [ ] - `p1` - DB: INSERT into multipart_uploads (upload_id, file_id, version_id, declared_size, part_size, state=in_progress, expires_at) - `inst-init-db-session`
-7. [ ] - `p1` - DB: INSERT pending version row into file_versions (version_id, file_id, status=pending) - `inst-init-db-version`
-8. [ ] - `p1` - FOR EACH part in the plan: mint a signed URL (Ed25519, codec-equivalent to PASETO v4.public -- ADR-0004's Implementation note) with claims {upload_id, file_id, version_id, part_number, offset, size, op="multipart_part", exp} - `inst-init-sign-urls`
-9. [ ] - `p1` - RETURN 200 {upload_id, version_id, part_hash_algorithm, part_size, parts: [{part_number, offset, size, upload_url}], expires_at} - `inst-init-return`
+1. [x] - `p1` - Client: POST /api/file-storage/v1/files/{id}/multipart with body {declared_mime, declared_size, preferred_part_size?, concurrency?} - `inst-init-request`
+2. [x] - `p1` - API: validate declared_mime against the effective allowed-types policy; RETURN 400 if rejected - `inst-init-mime-check`
+3. [x] - `p1` - API: validate declared_size <= effective per-file size limit; RETURN 400 if exceeded - `inst-init-size-check`
+4. [x] - `p1` - API: validate declared_size against storage quota; RETURN 429 if exceeded - `inst-init-quota-check`
+5. [x] - `p1` - Algorithm: compute parts plan using `cpt-cf-file-storage-algo-compute-parts-plan` - `inst-init-plan`
+6. [x] - `p1` - DB: INSERT into multipart_uploads (upload_id, file_id, version_id, declared_size, part_size, state=in_progress, expires_at) - `inst-init-db-session`
+7. [x] - `p1` - DB: INSERT pending version row into file_versions (version_id, file_id, status=pending) - `inst-init-db-version`
+8. [x] - `p1` - FOR EACH part in the plan: mint a signed URL (Ed25519, codec-equivalent to PASETO v4.public -- ADR-0004's Implementation note) with claims {upload_id, file_id, version_id, part_number, offset, size, op="multipart_part", exp} - `inst-init-sign-urls`
+9. [x] - `p1` - RETURN 200 {upload_id, version_id, part_hash_algorithm, part_size, parts: [{part_number, offset, size, upload_url}], expires_at} - `inst-init-return`
 
 ### Upload a Part
 
@@ -165,7 +165,7 @@ User-facing interactions that start with an actor (human or external system) and
 
 ### Complete Multipart Upload
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-flow-multipart-complete`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-flow-multipart-complete`
 
 **Actor**: `cpt-cf-file-storage-actor-platform-user`
 
@@ -253,7 +253,7 @@ locally from the reported part rows, otherwise full re-assembly runs again. The 
 
 ### Abort Multipart Upload
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-flow-multipart-abort`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-flow-multipart-abort`
 
 **Actor**: `cpt-cf-file-storage-actor-platform-user`
 
@@ -270,12 +270,12 @@ locally from the reported part rows, otherwise full re-assembly runs again. The 
 - Session not found or client lacks write permission -- 404 / 403
 
 **Steps**:
-1. [ ] - `p1` - Client: DELETE /api/file-storage/v1/files/{id}/multipart/{upload_id} - `inst-abort-request`
-2. [ ] - `p1` - Authorize per-file `WRITE` on the path `file_id`; load the session by `upload_id` and verify it belongs to `file_id` (a foreign or missing `upload_id` is masked as `404`); RETURN 409 if the session's snapshot state is not `in_progress` - `inst-abort-check-status`
+1. [x] - `p1` - Client: DELETE /api/file-storage/v1/files/{id}/multipart/{upload_id} - `inst-abort-request`
+2. [x] - `p1` - Authorize per-file `WRITE` on the path `file_id`; load the session by `upload_id` and verify it belongs to `file_id` (a foreign or missing `upload_id` is masked as `404`); RETURN 409 if the session's snapshot state is not `in_progress` - `inst-abort-check-status`
 3. [x] - `p1` - DB, one transaction (CAS-first, runs BEFORE any backend call): flip `multipart_uploads.state` `in_progress -> aborted`; on success, DELETE FROM `multipart_upload_parts` WHERE `upload_id = ?` and insert the audit row; if the CAS does not win (state already changed under us), RETURN 409 and stop here, before touching the backend or the pending version. A `completing` session is **not** aborted by the client path (step 2 rejects it with `409`) -- an expired `completing` lease is reclaimed by the cleanup sweep's `abort_expired_completing`, never by a client `DELETE` - `inst-abort-delete-parts`
-4. [ ] - `p1` - Best-effort, now that the CAS has won: call backend `AbortMultipart(upload_handle)` to discard backend-side parts. A failure here is logged (`tracing::warn!`) and recorded via `record_backend_error`, then swallowed — never propagated to the client — leaving the backend-side upload for its own garbage collection - `inst-abort-backend`
-5. [ ] - `p1` - DB: DELETE the pending version row from `file_versions` WHERE `version_id = ?` AND `status = pending` (a missing row is fine — that is the desired end state) - `inst-abort-delete-version`
-6. [ ] - `p1` - RETURN 204 No Content - `inst-abort-return`
+4. [x] - `p1` - Best-effort, now that the CAS has won: call backend `AbortMultipart(upload_handle)` to discard backend-side parts. A failure here is logged (`tracing::warn!`) and recorded via `record_backend_error`, then swallowed — never propagated to the client — leaving the backend-side upload for its own garbage collection - `inst-abort-backend`
+5. [x] - `p1` - DB: DELETE the pending version row from `file_versions` WHERE `version_id = ?` AND `status = pending` (a missing row is fine — that is the desired end state) - `inst-abort-delete-version`
+6. [x] - `p1` - RETURN 204 No Content - `inst-abort-return`
 
 ### Introspect and Resume Multipart Upload
 
@@ -311,7 +311,7 @@ Internal system functions that do not interact with actors directly; called by a
 
 ### Compute Parts Plan
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-algo-compute-parts-plan`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-algo-compute-parts-plan`
 
 **Input**: declared_size (uint64), preferred_part_size (uint64 or null), backend.min_part_size (uint64)
 **Output**: {part_size, parts: [{part_number, offset, size}], part_hash_algorithm}
@@ -323,16 +323,16 @@ count implied by `declared_size` and the computed `part_size` would exceed the c
 `MAX_PART_SIZE` cannot fit it within `MAX_PART_COUNT` parts, the plan is rejected rather than minted.
 
 **Steps**:
-1. [ ] - `p1` - Compute candidate_part_size = max(preferred_part_size ?? backend.min_part_size, backend.min_part_size) - `inst-plan-candidate`
-2. [ ] - `p1` - Round candidate_part_size up to backend.min_part_size's granularity - `inst-plan-round`
-3. [ ] - `p1` - Compute part_count = ceil(declared_size / part_size) - `inst-plan-count`
-4. [ ] - `p1` - FOR EACH i in [1..part_count]: compute offset = (i-1) * part_size; size = min(part_size, declared_size - offset) - `inst-plan-parts`
-5. [ ] - `p1` - Set part_hash_algorithm = SHA-256 - `inst-plan-algo-fallback`
-6. [ ] - `p1` - RETURN {part_size, parts, part_hash_algorithm} -- the plan is deterministic from (declared_size, part_size) and can be recomputed for resume from the persisted columns - `inst-plan-return`
+1. [x] - `p1` - Compute candidate_part_size = max(preferred_part_size ?? backend.min_part_size, backend.min_part_size) - `inst-plan-candidate`
+2. [x] - `p1` - Round candidate_part_size up to backend.min_part_size's granularity - `inst-plan-round`
+3. [x] - `p1` - Compute part_count = ceil(declared_size / part_size) - `inst-plan-count`
+4. [x] - `p1` - FOR EACH i in [1..part_count]: compute offset = (i-1) * part_size; size = min(part_size, declared_size - offset) - `inst-plan-parts`
+5. [x] - `p1` - Set part_hash_algorithm = SHA-256 - `inst-plan-algo-fallback`
+6. [x] - `p1` - RETURN {part_size, parts, part_hash_algorithm} -- the plan is deterministic from (declared_size, part_size) and can be recomputed for resume from the persisted columns - `inst-plan-return`
 
 ### Enforce Per-Part Size Claim at Sidecar
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-algo-enforce-part-size`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-algo-enforce-part-size`
 
 **Input**: request body (stream), size_claim (uint64 from signed token)
 **Output**: accepted body bytes, or a 413/400 rejection
@@ -352,11 +352,11 @@ count implied by `declared_size` and the computed `part_size` would exceed the c
 > sidecar process.
 
 **Steps**:
-1. [ ] - `p1` - Stream the body; count bytes as they arrive on both paths - `inst-enforce-stream`
-2. [ ] - `p1` - **IF** byte count exceeds size_claim before body ends: RETURN HTTP 413 -- abort the write mid-stream; rollback any partially written bytes (on the offset path the write may already have reached the backend, requiring cleanup) - `inst-enforce-oversize`
-3. [ ] - `p1` - **IF** body ends before size_claim bytes received: RETURN HTTP 400 Bad Request (short body) - `inst-enforce-undersize`
-4. [ ] - `p1` - On `multipart_native`, the backend's own exact-length contract (`size_claim` sent as `Content-Length`) rejects an undersized stream as part of the backend write itself - `inst-enforce-cl-reject` (no-op on the offset path, where the counter above already enforced it)
-5. [ ] - `p1` - RETURN accepted bytes (exactly size_claim bytes) -- proceed to write - `inst-enforce-accept`
+1. [x] - `p1` - Stream the body; count bytes as they arrive on both paths - `inst-enforce-stream`
+2. [x] - `p1` - **IF** byte count exceeds size_claim before body ends: RETURN HTTP 413 -- abort the write mid-stream; rollback any partially written bytes (on the offset path the write may already have reached the backend, requiring cleanup) - `inst-enforce-oversize`
+3. [x] - `p1` - **IF** body ends before size_claim bytes received: RETURN HTTP 400 Bad Request (short body) - `inst-enforce-undersize`
+4. [x] - `p1` - On `multipart_native`, the backend's own exact-length contract (`size_claim` sent as `Content-Length`) rejects an undersized stream as part of the backend write itself - `inst-enforce-cl-reject` (no-op on the offset path, where the counter above already enforced it)
+5. [x] - `p1` - RETURN accepted bytes (exactly size_claim bytes) -- proceed to write - `inst-enforce-accept`
 
 ### Combine Part Hashes at Complete
 
@@ -382,7 +382,7 @@ offset-manifest from the already-persisted per-part digests+offsets and computes
 
 ### Multipart Session State Machine
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-state-multipart-session`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-state-multipart-session`
 
 **States**: in_progress, completing, completed, aborted
 
@@ -400,15 +400,15 @@ regardless of lease state.
 2. [x] - `p1` - **FROM** completing **TO** completing **WHEN** a `complete` call takes over a `completing` session whose `lease_until` has already passed (dead lease owner) - `inst-st-completing-takeover`
 3. [x] - `p1` - **FROM** completing **TO** in_progress **WHEN** the lease holder's assembly/finalize attempt fails (missing parts, size mismatch, policy violation, MIME mismatch, backend error) -- releases the lease so the next `complete` retries immediately - `inst-st-completing-release`
 4. [x] - `p1` - **FROM** completing **TO** completed **WHEN** the lease holder's finalize transaction commits (version `available` [+ bind], `complete_result` persisted, plus the audit row on the fast (first-attempt) path -- a takeover or converge path writes the audit row via a separate step instead) - `inst-st-to-completed`
-5. [ ] - `p1` - **FROM** in_progress **TO** aborted **WHEN** abort flow is called explicitly by the client - `inst-st-to-aborted`
-6. [ ] - `p1` - **FROM** in_progress **TO** aborted **WHEN** TTL/orphan-reconciliation sweep expires an unfinished session (`cpt-cf-file-storage-fr-orphan-reconciliation`) - `inst-st-ttl-abort`
-7. [ ] - `p1` - **FROM** completing **TO** aborted **WHEN** the orphan-reconciliation sweep finds the session's `expires_at` **and** its `lease_until` both already past (a live lease is never reaped mid-assembly) - `inst-st-completing-ttl-abort`
+5. [x] - `p1` - **FROM** in_progress **TO** aborted **WHEN** abort flow is called explicitly by the client - `inst-st-to-aborted`
+6. [x] - `p1` - **FROM** in_progress **TO** aborted **WHEN** TTL/orphan-reconciliation sweep expires an unfinished session (`cpt-cf-file-storage-fr-orphan-reconciliation`) - `inst-st-ttl-abort`
+7. [x] - `p1` - **FROM** completing **TO** aborted **WHEN** the orphan-reconciliation sweep finds the session's `expires_at` **and** its `lease_until` both already past (a live lease is never reaped mid-assembly) - `inst-st-completing-ttl-abort`
 
 ## 5. Definitions of Done
 
 ### Initiate Endpoint with Server-Authoritative Plan
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-dod-multipart-initiate`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-dod-multipart-initiate`
 
 The system **MUST** implement `POST /api/file-storage/v1/files/{id}/multipart` on the control plane. The endpoint validates declared_mime, declared_size, and storage quota; calls `cpt-cf-file-storage-algo-compute-parts-plan`; pre-registers a pending version; persists the multipart session with declared_size and part_size; mints one signed URL per part (Ed25519, codec-equivalent to PASETO v4.public -- ADR-0004) (claims: upload_id, file_id, version_id, part_number, offset, size, op, exp); and returns the full parts plan. The parts plan enforces a hard ceiling of 10,000 parts (`MAX_PART_COUNT`), widening the part size (up to `MAX_PART_SIZE`, 5 GiB) before rejecting a `declared_size` that cannot fit even at the maximum part size.
 
@@ -489,7 +489,7 @@ bind call needed in the `"bound"` case).
 
 ### Abort Endpoint
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-dod-multipart-abort`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-dod-multipart-abort`
 
 The system **MUST** implement `DELETE /api/file-storage/v1/files/{id}/multipart/{upload_id}`: verify session is
 in_progress; win the DB CAS marking the session aborted and deleting part rows (in one transaction) BEFORE touching
@@ -535,7 +535,7 @@ missing `upload_id` is masked as `404`, identical to `complete`'s guard.
 
 ### Schema: multipart_uploads Plan Columns
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-dod-multipart-schema-plan-columns`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-dod-multipart-schema-plan-columns`
 
 The system **MUST** add `version_id uuid NOT NULL`, `declared_size bigint NOT NULL CHECK (declared_size >= 0)`, and `part_size bigint NOT NULL` to the `multipart_uploads` table via migration `m20260701_000002_multipart_plan_columns`. These three columns make the plan deterministic from the session row (no per-part plan table needed), enable complete-time size verification without re-summing parts, and allow the introspect endpoint to reconstruct the plan for resume.
 
