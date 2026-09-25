@@ -37,6 +37,7 @@ fn the_harness_declares_its_migrations_in_order() {
             "m20260917_000001_value_type_namespace".to_owned(),
             "m20260924_000001_audit_records_append_only".to_owned(),
             "m20260924_000002_audit_records_retention_floor".to_owned(),
+            "m20260925_000001_audit_records_default_horizon_index".to_owned(),
         ]
     );
 }

@@ -161,7 +161,13 @@ async fn pruning_removes_only_records_past_their_horizon() {
         .expect("append");
 
     let pruned = AuditStore
-        .prune_expired(&conn, &AccessScope::allow_all(), now, Duration::days(365))
+        .prune_expired(
+            &conn,
+            &AccessScope::allow_all(),
+            now,
+            Duration::days(365),
+            1_000,
+        )
         .await
         .expect("prune");
     assert_eq!(pruned, 1);
@@ -181,6 +187,7 @@ async fn pruning_removes_only_records_past_their_horizon() {
             &AccessScope::allow_all(),
             now + Duration::days(400),
             Duration::days(365),
+            1_000,
         )
         .await
         .expect("prune");
@@ -359,4 +366,59 @@ async fn a_cursor_minted_for_one_history_is_refused_on_another() {
         matches!(foreign, Err(DomainError::Validation { .. })),
         "a cursor for tenant a's history is refused on tenant b's: {foreign:?}"
     );
+}
+
+#[tokio::test]
+async fn a_prune_deletes_at_most_its_batch_and_only_what_is_expired() {
+    // One bounded statement per call: a backlog is worked off over several,
+    // each its own commit, and a record still held is never among them.
+    let db = db().await;
+    let tenant = Uuid::new_v4();
+    let conn = db.conn().expect("connection");
+    let now = OffsetDateTime::now_utc();
+    for i in 0..5 {
+        AuditStore
+            .append(
+                &conn,
+                &AccessScope::allow_all(),
+                record(tenant, &format!("old-{i}")),
+            )
+            .await
+            .expect("append");
+    }
+    AuditStore
+        .append(
+            &conn,
+            &AccessScope::allow_all(),
+            record(tenant, "held").with_retain_until(now + Duration::days(500)),
+        )
+        .await
+        .expect("append");
+
+    let later = now + Duration::days(400);
+    let mut passes = Vec::new();
+    loop {
+        let pruned = AuditStore
+            .prune_expired(
+                &conn,
+                &AccessScope::allow_all(),
+                later,
+                Duration::days(365),
+                2,
+            )
+            .await
+            .expect("prune");
+        passes.push(pruned);
+        if pruned == 0 {
+            break;
+        }
+    }
+    assert_eq!(passes, vec![2, 2, 1, 0]);
+    let left: Vec<String> = history(&db, tenant, None, None)
+        .await
+        .items
+        .into_iter()
+        .map(|r| r.request_id)
+        .collect();
+    assert_eq!(left, vec!["held".to_owned()]);
 }

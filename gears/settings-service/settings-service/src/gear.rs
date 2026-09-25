@@ -123,6 +123,22 @@ fn ticking(period: Duration) -> tokio::time::Interval {
 /// nothing and keeps the pass cheap.
 const RETENTION_TICK: Duration = Duration::from_hours(24);
 
+/// How the retention pass takes a backlog: batches of `size`, at most
+/// `per_tick` of them a tick, each its own short statement and commit.
+#[derive(Debug, Clone, Copy)]
+struct PruneBatches {
+    size: u64,
+    per_tick: u32,
+}
+
+/// Ten thousand a batch and a hundred batches a tick: a million records, about
+/// seven days' worth at the declared bound of fifty million a year, so a
+/// backlog after a long outage clears in days while no statement runs long.
+const PRUNE_BATCHES: PruneBatches = PruneBatches {
+    size: 10_000,
+    per_tick: 100,
+};
+
 /// How often the managed lifecycle refreshes the needs-review gauge: two
 /// indexed counts, cheap enough for a minute's resolution on a dashboard.
 const REVIEW_TICK: Duration = Duration::from_mins(1);
@@ -171,7 +187,7 @@ impl SettingsService {
                 biased;
                 () = cancel.cancelled() => break,
                 _ = interval.tick() => Self::sweep_once(writes).await,
-                _ = retention_interval.tick() => Self::retention_tick(db, retention).await,
+                _ = retention_interval.tick() => Self::retention_tick(db, retention, cancel).await,
                 _ = review_interval.tick() => Self::review_once(db, review).await,
             }
         }
@@ -222,33 +238,46 @@ impl SettingsService {
     }
 
     /// The daily tick: one retention pass against the clock now.
-    async fn retention_tick(db: &DBProvider<DbError>, retention: Duration) {
-        Self::prune_once(db, retention, time::OffsetDateTime::now_utc()).await;
+    async fn retention_tick(
+        db: &DBProvider<DbError>,
+        retention: Duration,
+        cancel: &CancellationToken,
+    ) {
+        Self::prune_once(
+            db,
+            retention,
+            time::OffsetDateTime::now_utc(),
+            PRUNE_BATCHES,
+            cancel,
+        )
+        .await;
     }
 
     /// One audit retention pass, logged and never fatal: records past their
     /// horizon leave — an explicit `retain_until`, or `occurred_at` plus the
-    /// configured default. What a failed pass could not prune waits for the
-    /// next tick. Returns how many records went.
+    /// configured default — batch by batch, until a batch comes back short,
+    /// the tick's cap is reached or the lifecycle is stopped. What the pass
+    /// did not reach, or a failed batch left, waits for the next tick; what
+    /// earlier batches deleted stays deleted. Returns how many records went.
     async fn prune_once(
         db: &DBProvider<DbError>,
         default_retention: Duration,
         now: time::OffsetDateTime,
+        batches: PruneBatches,
+        cancel: &CancellationToken,
     ) -> u64 {
-        match Self::prune(db, default_retention, now).await {
-            Ok(0) => 0,
-            Ok(pruned) => {
-                info!(pruned, "audit records past their retention horizon pruned");
-                pruned
-            }
-            Err(err) => {
-                tracing::warn!(
-                    err = %LogSafe(&err),
-                    "audit retention pass failed; retried next tick"
-                );
-                0
-            }
+        let (pruned, failure) = Self::prune(db, default_retention, now, batches, cancel).await;
+        if pruned > 0 {
+            info!(pruned, "audit records past their retention horizon pruned");
         }
+        if let Some(err) = failure {
+            tracing::warn!(
+                pruned,
+                err = %LogSafe(&err),
+                "audit retention pass failed; the rest is retried next tick"
+            );
+        }
+        pruned
     }
 
     /// One pass of the sweep, logged and never fatal: what it could not
@@ -269,32 +298,56 @@ impl SettingsService {
         // @cpt-end:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-9
     }
 
-    /// The retention pass itself, its failures returned for the caller to log.
+    /// The retention pass itself: how many records it pruned, and the failure
+    /// that stopped it early, for the caller to log.
     async fn prune(
         db: &DBProvider<DbError>,
         default_retention: Duration,
         now: time::OffsetDateTime,
-    ) -> Result<u64, crate::domain::error::DomainError> {
-        let retention = time::Duration::try_from(default_retention).map_err(|_| {
-            crate::domain::error::DomainError::Internal {
-                diagnostic: "the audit retention does not fit a timestamp span".to_owned(),
+        batches: PruneBatches,
+        cancel: &CancellationToken,
+    ) -> (u64, Option<crate::domain::error::DomainError>) {
+        let Ok(retention) = time::Duration::try_from(default_retention) else {
+            return (
+                0,
+                Some(crate::domain::error::DomainError::Internal {
+                    diagnostic: "the audit retention does not fit a timestamp span".to_owned(),
+                }),
+            );
+        };
+        let conn = match db.conn() {
+            Ok(conn) => conn,
+            Err(err) => {
+                return (
+                    0,
+                    Some(crate::domain::error::DomainError::dependency_unavailable(
+                        "database",
+                        "open a connection",
+                        err,
+                    )),
+                );
             }
-        })?;
-        let conn = db.conn().map_err(|err| {
-            crate::domain::error::DomainError::dependency_unavailable(
-                "database",
-                "open a connection",
-                err,
-            )
-        })?;
-        crate::infra::storage::audit_store::AuditStore
-            .prune_expired(
-                &conn,
-                &toolkit_security::AccessScope::allow_all(),
-                now,
-                retention,
-            )
-            .await
+        };
+        let scope = toolkit_security::AccessScope::allow_all();
+        let mut pruned = 0;
+        for _ in 0..batches.per_tick {
+            if cancel.is_cancelled() {
+                break;
+            }
+            match crate::infra::storage::audit_store::AuditStore
+                .prune_expired(&conn, &scope, now, retention, batches.size)
+                .await
+            {
+                Ok(batch) => {
+                    pruned += batch;
+                    if batch < batches.size {
+                        break;
+                    }
+                }
+                Err(err) => return (pruned, Some(err)),
+            }
+        }
+        (pruned, None)
     }
 
     /// The bootstrap configuration, once initialization has run.

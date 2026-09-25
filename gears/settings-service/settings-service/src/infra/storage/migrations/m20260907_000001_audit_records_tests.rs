@@ -82,4 +82,10 @@ async fn the_scoped_and_retention_indexes_exist() {
         names.contains(&"idx_audit_retention".to_owned()),
         "{names:?}"
     );
+    // The default horizon — no `retain_until`, `occurred_at` past the
+    // configured retention — is what nearly every record is pruned on.
+    assert!(
+        names.contains(&"idx_audit_default_horizon".to_owned()),
+        "{names:?}"
+    );
 }

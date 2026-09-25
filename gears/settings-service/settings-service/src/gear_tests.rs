@@ -661,15 +661,80 @@ async fn a_retention_pass_prunes_what_is_past_its_horizon_and_nothing_younger() 
     let year = std::time::Duration::from_hours(365 * 24);
     let now = time::OffsetDateTime::now_utc();
 
+    let live = tokio_util::sync::CancellationToken::new();
+    let batches = super::PruneBatches {
+        size: 1_000,
+        per_tick: 10,
+    };
     assert_eq!(
-        SettingsService::prune_once(&db, year, now).await,
+        SettingsService::prune_once(&db, year, now, batches, &live).await,
         0,
         "a fresh record stays"
     );
     assert_eq!(
-        SettingsService::prune_once(&db, year, now + time::Duration::days(400)).await,
+        SettingsService::prune_once(&db, year, now + time::Duration::days(400), batches, &live)
+            .await,
         1,
         "past its horizon, it leaves"
+    );
+}
+
+#[tokio::test]
+async fn a_retention_pass_works_in_batches_up_to_its_cap_and_stops_when_cancelled() {
+    use crate::audit::{AuditOperation, AuditRecord, AuditSink as _};
+    let db = crate::test_support::sqlite_provider().await;
+    {
+        let conn = db.conn().expect("connection");
+        for i in 0..5 {
+            crate::infra::storage::audit_store::AuditStore
+                .append(
+                    &conn,
+                    &toolkit_security::AccessScope::allow_all(),
+                    AuditRecord::new("k", None, "admin", AuditOperation::Change, format!("r{i}")),
+                )
+                .await
+                .expect("append");
+        }
+    }
+    let year = std::time::Duration::from_hours(365 * 24);
+    let later = time::OffsetDateTime::now_utc() + time::Duration::days(400);
+    let live = tokio_util::sync::CancellationToken::new();
+
+    // Batches of two, two batches a tick: four go now, the last one next tick.
+    let capped = super::PruneBatches {
+        size: 2,
+        per_tick: 2,
+    };
+    assert_eq!(
+        SettingsService::prune_once(&db, year, later, capped, &live).await,
+        4
+    );
+    assert_eq!(
+        SettingsService::prune_once(&db, year, later, capped, &live).await,
+        1
+    );
+    assert_eq!(
+        SettingsService::prune_once(&db, year, later, capped, &live).await,
+        0
+    );
+
+    // A lifecycle being stopped prunes nothing more.
+    {
+        let conn = db.conn().expect("connection");
+        crate::infra::storage::audit_store::AuditStore
+            .append(
+                &conn,
+                &toolkit_security::AccessScope::allow_all(),
+                AuditRecord::new("k", None, "admin", AuditOperation::Change, "late"),
+            )
+            .await
+            .expect("append");
+    }
+    let stopped = tokio_util::sync::CancellationToken::new();
+    stopped.cancel();
+    assert_eq!(
+        SettingsService::prune_once(&db, year, later, capped, &stopped).await,
+        0
     );
 }
 

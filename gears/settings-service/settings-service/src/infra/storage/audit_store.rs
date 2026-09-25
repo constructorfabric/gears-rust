@@ -268,11 +268,15 @@ impl AuditStore {
         })
     }
 
-    /// Delete the records past their retention horizon, returning how many.
+    /// Delete at most `limit` of the records past their retention horizon,
+    /// returning how many.
     ///
     /// The only delete the table ever sees: rows with an explicit `retain_until`
     /// behind `now`, found through `idx_audit_retention`, and rows without one
-    /// whose `occurred_at` plus the configured default is behind `now`.
+    /// whose `occurred_at` plus the configured default is behind `now`, found
+    /// through `idx_audit_default_horizon`. Bounded, so one call is one short
+    /// statement and a backlog is worked off over several, each its own commit;
+    /// fewer than `limit` deleted means nothing expired is left.
     ///
     /// # Errors
     /// [`DomainError`] when the delete fails.
@@ -282,6 +286,7 @@ impl AuditStore {
         scope: &AccessScope,
         now: OffsetDateTime,
         default_retention: Duration,
+        limit: u64,
     ) -> Result<u64, DomainError> {
         // @cpt-begin:cpt-cf-settings-service-algo-audit-store-retention:p1:inst-as-ret-3
         let default_cutoff = now - default_retention;
@@ -296,8 +301,17 @@ impl AuditStore {
                     .add(audit_record::Column::RetainUntil.is_null())
                     .add(audit_record::Column::OccurredAt.lt(default_cutoff)),
             );
+        // The batch by id: `DELETE … LIMIT` is not portable, a bounded id
+        // subquery is. Unordered on purpose — any expired record may go in any
+        // batch, and a sort would make each one gather every expired row first.
+        let batch = sea_orm::sea_query::Query::select()
+            .column(audit_record::Column::Id)
+            .from(AuditEntity)
+            .cond_where(expired)
+            .limit(limit)
+            .to_owned();
         let outcome = AuditEntity::delete_many()
-            .filter(expired)
+            .filter(audit_record::Column::Id.in_subquery(batch))
             .secure()
             .scope_with(scope)
             .exec(conn)
