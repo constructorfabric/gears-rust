@@ -1258,7 +1258,13 @@ async fn the_sweep_keeps_a_row_whose_entry_it_could_not_release_and_retries_it()
     // The store is down: the release fails, and the row stays as the durable
     // handle on the entry for the next pass.
     h.secrets.go_down();
-    assert_eq!(h.coordinator.sweep_expired(100).await.expect("sweep"), 0);
+    assert_eq!(
+        h.coordinator
+            .sweep_expired(100, &running())
+            .await
+            .expect("sweep"),
+        0
+    );
     assert!(h.pending(stale.id).await.is_some(), "kept for the retry");
     assert_eq!(h.secrets.held(), vec!["stale-ref".to_owned()]);
 
@@ -1266,7 +1272,13 @@ async fn the_sweep_keeps_a_row_whose_entry_it_could_not_release_and_retries_it()
     h.secrets
         .unavailable
         .store(false, std::sync::atomic::Ordering::SeqCst);
-    assert_eq!(h.coordinator.sweep_expired(100).await.expect("sweep"), 1);
+    assert_eq!(
+        h.coordinator
+            .sweep_expired(100, &running())
+            .await
+            .expect("sweep"),
+        1
+    );
     assert!(h.pending(stale.id).await.is_none());
     assert_eq!(h.deleted(), vec!["stale-ref".to_owned()]);
     assert!(h.secrets.held().is_empty());
@@ -1438,10 +1450,20 @@ async fn the_sweep_clamps_its_limit_to_the_bound_whoever_calls_it() {
 
     // A caller asking for ten thousand gets the bound, and the rest waits
     // for the next pass.
-    let released = h.coordinator.sweep_expired(10_000).await.expect("sweep");
+    let released = h
+        .coordinator
+        .sweep_expired(10_000, &running())
+        .await
+        .expect("sweep");
     assert_eq!(released, usize::try_from(SWEEP_LIMIT).expect("fits"));
     assert_eq!(h.all_pending().await.len(), 1);
-    assert_eq!(h.coordinator.sweep_expired(10_000).await.expect("sweep"), 1);
+    assert_eq!(
+        h.coordinator
+            .sweep_expired(10_000, &running())
+            .await
+            .expect("sweep"),
+        1
+    );
 }
 
 #[tokio::test]
@@ -1458,7 +1480,11 @@ async fn the_sweep_releases_expired_stages_with_their_entries_and_keeps_live_one
         .insert_pending(d, root, &subject, "live-ref", now + Duration::minutes(9))
         .await;
 
-    let released = h.coordinator.sweep_expired(100).await.expect("sweep");
+    let released = h
+        .coordinator
+        .sweep_expired(100, &running())
+        .await
+        .expect("sweep");
     assert_eq!(released, 1);
     assert!(h.pending(stale.id).await.is_none());
     assert!(h.pending(live.id).await.is_some());
@@ -1466,7 +1492,13 @@ async fn the_sweep_releases_expired_stages_with_their_entries_and_keeps_live_one
     assert_eq!(h.secrets.held(), vec!["live-ref".to_owned()]);
 
     // Nothing left to sweep, and a second pass says so.
-    assert_eq!(h.coordinator.sweep_expired(100).await.expect("sweep"), 0);
+    assert_eq!(
+        h.coordinator
+            .sweep_expired(100, &running())
+            .await
+            .expect("sweep"),
+        0
+    );
 }
 
 /// Two step-up-gated `set`s at tenant `a`, whose effective access consults the
@@ -1649,4 +1681,46 @@ async fn a_rejected_secret_never_carries_its_plaintext_into_the_answer_or_the_ev
         .expect("a rejection event");
     assert!(!reason.contains("TOPSECRET"), "{reason}");
     assert!(h.secrets.held().is_empty(), "nothing reached the store");
+}
+
+/// A lifecycle token nobody has cancelled.
+fn running() -> tokio_util::sync::CancellationToken {
+    tokio_util::sync::CancellationToken::new()
+}
+
+#[tokio::test]
+async fn a_stopped_lifecycle_releases_nothing_more_and_keeps_every_row() {
+    // The sweep looks at the lifecycle before each row: a shutdown waits for
+    // at most the release already in flight, never for the rest of the batch.
+    // What it did not reach keeps its row, the durable handle on its entry.
+    let h = Harness::new().await;
+    let d = h.declare_secret("api_token").await;
+    let root = h.base.tree.root;
+    let subject = actor(root).subject();
+    let expired = OffsetDateTime::now_utc() - Duration::minutes(1);
+    for i in 0..3 {
+        h.insert_pending(d, root, &subject, &format!("ref-{i}"), expired)
+            .await;
+    }
+    let stopped = tokio_util::sync::CancellationToken::new();
+    stopped.cancel();
+
+    assert_eq!(
+        h.coordinator
+            .sweep_expired(100, &stopped)
+            .await
+            .expect("sweep"),
+        0
+    );
+    assert_eq!(h.all_pending().await.len(), 3, "every row kept");
+    assert!(h.deleted().is_empty(), "no entry released");
+
+    // A running lifecycle picks them up on its next pass.
+    assert_eq!(
+        h.coordinator
+            .sweep_expired(100, &running())
+            .await
+            .expect("sweep"),
+        3
+    );
 }

@@ -186,7 +186,7 @@ impl SettingsService {
             tokio::select! {
                 biased;
                 () = cancel.cancelled() => break,
-                _ = interval.tick() => Self::sweep_once(writes).await,
+                _ = interval.tick() => Self::sweep_once(writes, cancel).await,
                 _ = retention_interval.tick() => Self::retention_tick(db, retention, cancel).await,
                 _ = review_interval.tick() => Self::review_once(db, review).await,
             }
@@ -282,10 +282,13 @@ impl SettingsService {
 
     /// One pass of the sweep, logged and never fatal: what it could not
     /// release waits for the next tick.
-    async fn sweep_once(writes: &crate::infra::value_writes::WriteCoordinator) {
+    async fn sweep_once(
+        writes: &crate::infra::value_writes::WriteCoordinator,
+        cancel: &CancellationToken,
+    ) {
         // @cpt-begin:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-9
         match writes
-            .sweep_expired(crate::infra::value_writes::SWEEP_LIMIT)
+            .sweep_expired(crate::infra::value_writes::SWEEP_LIMIT, cancel)
             .await
         {
             Ok(0) => {}

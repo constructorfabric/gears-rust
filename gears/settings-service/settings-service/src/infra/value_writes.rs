@@ -12,6 +12,7 @@ use std::sync::Arc;
 use serde_json::Value;
 use settings_service_sdk::SettingKey;
 use time::OffsetDateTime;
+use tokio_util::sync::CancellationToken;
 use toolkit_db::secure::DBRunner;
 use toolkit_db::{DBProvider, DbError};
 use toolkit_security::AccessScope;
@@ -559,7 +560,11 @@ impl WriteCoordinator {
         let conn = self.db.conn().map_err(|e| conn_error(&e))?;
         // A stage is also the moment to let go of what nobody claimed; a sweep
         // that fails is logged and tried again by the next one.
-        if let Err(err) = self.sweep_expired_in(&conn, SWEEP_LIMIT).await {
+        // A request is not the lifecycle: nothing here stops it but its end.
+        if let Err(err) = self
+            .sweep_expired_in(&conn, SWEEP_LIMIT, &CancellationToken::new())
+            .await
+        {
             tracing::warn!(
                 err = %LogSafe(&err),
                 "pending-secret sweep failed; expired stages wait for the next pass"
@@ -657,19 +662,27 @@ impl WriteCoordinator {
     /// Release the stages nobody claimed: each expired row's entry is
     /// released and the row deleted, together. Returns how many rows went.
     /// `limit` is clamped to [`SWEEP_LIMIT`]: the bound holds whoever calls.
+    /// `stop` is looked at before each row, so a lifecycle being shut down
+    /// waits for at most the release in flight, not the rest of the batch.
     ///
     /// # Errors
     /// [`DomainError`] when the database cannot list or delete; a store that
     /// cannot release is logged per entry, the row kept for the next pass.
-    pub async fn sweep_expired(&self, limit: u64) -> Result<usize, DomainError> {
+    pub async fn sweep_expired(
+        &self,
+        limit: u64,
+        stop: &CancellationToken,
+    ) -> Result<usize, DomainError> {
         let conn = self.db.conn().map_err(|e| conn_error(&e))?;
-        self.sweep_expired_in(&conn, limit.min(SWEEP_LIMIT)).await
+        self.sweep_expired_in(&conn, limit.min(SWEEP_LIMIT), stop)
+            .await
     }
 
     async fn sweep_expired_in<C: DBRunner>(
         &self,
         conn: &C,
         limit: u64,
+        stop: &CancellationToken,
     ) -> Result<usize, DomainError> {
         // @cpt-begin:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-9
         let scope = AccessScope::allow_all();
@@ -679,6 +692,12 @@ impl WriteCoordinator {
             .await?;
         let mut released = 0;
         for row in expired {
+            // A release already asked for is let finish: dropped halfway, the
+            // store may or may not hold the entry, while an untouched row is
+            // simply the next pass's.
+            if stop.is_cancelled() {
+                break;
+            }
             let key = self
                 .declarations
                 .find(

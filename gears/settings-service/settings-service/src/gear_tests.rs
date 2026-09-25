@@ -252,7 +252,7 @@ async fn a_sweep_pass_that_finds_nothing_is_not_an_event() {
         std::sync::Arc::new(crate::test_support::RecordingPublisher::default()),
         std::sync::Arc::new(crate::test_support::FixedStepUp::verified()),
     );
-    SettingsService::sweep_once(&writes).await;
+    SettingsService::sweep_once(&writes, &tokio_util::sync::CancellationToken::new()).await;
     assert!(secrets.held().is_empty());
 }
 
@@ -284,7 +284,7 @@ async fn a_store_that_cannot_release_keeps_the_row_for_the_next_tick_which_relea
     );
     secrets.go_down();
 
-    SettingsService::sweep_once(&writes).await;
+    SettingsService::sweep_once(&writes, &tokio_util::sync::CancellationToken::new()).await;
 
     let conn = inner.db.conn().expect("connection");
     let scope = toolkit_security::AccessScope::allow_all();
@@ -302,7 +302,7 @@ async fn a_store_that_cannot_release_keeps_the_row_for_the_next_tick_which_relea
     secrets
         .unavailable
         .store(false, std::sync::atomic::Ordering::SeqCst);
-    SettingsService::sweep_once(&writes).await;
+    SettingsService::sweep_once(&writes, &tokio_util::sync::CancellationToken::new()).await;
     assert!(
         crate::infra::storage::pending_secret_repo::PendingSecretRepo
             .find(&conn, &scope, pending_id)

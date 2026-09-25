@@ -186,7 +186,7 @@ A `secret` declaration's default is a placeholder, an empty value of the type, e
 6. [x] - `p1` - **RETURN** `200` with `pending_id` and `expires_at`, never the reference and never the plaintext - `inst-sv-stage-6`
 7. [x] - `p1` - On a later batch change whose value is `{ "pending_id": ... }` for a `secret`-trait declaration: DB: SELECT the row by `pending_id`; **IF** none, **OR** its `(declaration_id, tenant_id)` differs from the change's, **OR** its `subject_id` is not the batch's actor, **OR** `expires_at` has passed → reject that change `invalid`, the row untouched - `inst-sv-stage-7`
 8. [x] - `p1` - Otherwise adopt its `secret_ref` as the staged reference, skip the store leg, and commit as steps 6-9 of the set flow commit, DELETEing the row inside that transaction with `expires_at` re-asserted in the same statement; a commit that fails leaves the row and the entry in place — the entry was the stage's to create, not the batch's to release — so the token stays claimable until it expires and is the sweep's after - `inst-sv-stage-8`
-9. [x] - `p1` - A sweep on `expires_at`: release each expired row's entry from the Credential Store, then DELETE the row; **IF** the release fails → keep the row and retry it on the next pass - `inst-sv-stage-9`
+9. [x] - `p1` - A sweep on `expires_at`: release each expired row's entry from the Credential Store, then DELETE the row; **IF** the release fails → keep the row and retry it on the next pass; the lifecycle's sweep checks for shutdown before each row and stops there, letting only the release in flight finish, so rows it did not reach wait for the next pass - `inst-sv-stage-9`
 
 ## 3. Processes / Business Logic (CDSL)
 
