@@ -485,6 +485,16 @@ async fn two_batches_naming_one_new_endpoint_both_land() {
 /// second delete reads the tombstone rather than racing the write -- what it
 /// proves here is that both routes answer with the same single tombstone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_node_delete_racing_its_edge_delete_counts_every_edge_once() {
+    conformance::a_node_delete_racing_its_edge_delete_counts_every_edge_once(
+        std::sync::Arc::new(store())
+            as std::sync::Arc<dyn graph_storage_sdk::plugin_api::GraphStoreV1>,
+        Uuid::now_v7(),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_deletes_of_one_node_tombstone_it_once() {
     conformance::two_deletes_of_one_node_tombstone_it_once(
         std::sync::Arc::new(store())

@@ -651,6 +651,20 @@ async fn two_batches_naming_one_new_endpoint_both_land() {
 
 /// Against the store the window opens in: both deletes read the row live
 /// before either commits.
+/// Against the store the window opens in: the node's delete and the edge's
+/// both read the edge live before either commits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_node_delete_racing_its_edge_delete_counts_every_edge_once() {
+    let Some(stand) = stand(HopStrategy::Pgq).await else {
+        return;
+    };
+    conformance::a_node_delete_racing_its_edge_delete_counts_every_edge_once(
+        std::sync::Arc::clone(&stand.store) as std::sync::Arc<dyn GraphStoreV1>,
+        Uuid::now_v7(),
+    )
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_deletes_of_one_node_tombstone_it_once() {
     let Some(stand) = stand(HopStrategy::Pgq).await else {

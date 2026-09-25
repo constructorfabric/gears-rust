@@ -6455,3 +6455,103 @@ pub async fn node_types_answers_the_live_nodes_it_is_asked_about(
         "no tombstoned or unknown id answers: {answered:?}"
     );
 }
+
+/// A node's delete racing a delete of one of its own edges tombstones every
+/// edge once and reports each once, between the two answers.
+///
+/// A node's delete tombstones its incident edges in its own transaction; a
+/// concurrent edge delete may reach one of them first. Whichever order the
+/// store serializes them in, the edge is one row, so one tombstone and one
+/// report -- neither counted by both, nor by neither.
+pub async fn a_node_delete_racing_its_edge_delete_counts_every_edge_once(
+    store: std::sync::Arc<dyn GraphStoreV1>,
+    tenant: Uuid,
+) {
+    const INCIDENT: usize = 3;
+
+    let scope = AccessScope::for_tenant(tenant);
+    let reader = ctx(tenant, &scope, None);
+    store
+        .register_types(&reader, ontology_batch())
+        .await
+        .expect("the ontology registers");
+
+    for round in 0..16 {
+        let key = format!("hub-{round}");
+        let neighbours: Vec<String> = (0..INCIDENT)
+            .map(|index| format!("spoke-{round}-{index}"))
+            .collect();
+        let mut nodes = vec![node(&key, "hub")];
+        nodes.extend(neighbours.iter().map(|n| node(n, n)));
+        ingest_batch(
+            store.as_ref(),
+            &reader,
+            batch(nodes, neighbours.iter().map(|n| edge(&key, n)).collect()),
+        )
+        .await
+        .expect("the hub and its edges are created");
+        let raced_edge = store
+            .get_node(&reader, &neighbours[0], 10)
+            .await
+            .expect("the spoke reads")
+            .adjacency
+            .first()
+            .expect("the spoke has its edge")
+            .edge_key
+            .clone();
+
+        let gate = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let spawn = |request: DeleteRequest| {
+            let store = std::sync::Arc::clone(&store);
+            let gate = std::sync::Arc::clone(&gate);
+            tokio::spawn(async move {
+                let scope = AccessScope::for_tenant(tenant);
+                let ctx = ctx(tenant, &scope, None);
+                gate.wait().await;
+                store.soft_delete(&ctx, request).await
+            })
+        };
+        let node_delete = spawn(DeleteRequest::Node(key.clone()));
+        let edge_delete = spawn(DeleteRequest::Edge(raced_edge));
+        let node_delete = node_delete
+            .await
+            .expect("the task does not panic")
+            .expect("a node delete racing an edge delete is not a failure");
+        let edge_delete = edge_delete
+            .await
+            .expect("the task does not panic")
+            .expect("an edge delete racing its node's delete is not a failure");
+
+        assert_eq!(
+            node_delete.tombstoned_nodes, 1,
+            "round {round}: the hub is tombstoned"
+        );
+        assert_eq!(
+            edge_delete.tombstoned_nodes, 0,
+            "round {round}: an edge delete takes no node"
+        );
+        assert!(
+            edge_delete.tombstoned_edges <= 1,
+            "round {round}: an edge delete tombstones its one edge at most"
+        );
+        assert_eq!(
+            node_delete.tombstoned_edges + edge_delete.tombstoned_edges,
+            INCIDENT as u64,
+            "round {round}: each incident edge is tombstoned once and reported once \
+             (node delete {}, edge delete {})",
+            node_delete.tombstoned_edges,
+            edge_delete.tombstoned_edges
+        );
+        for neighbour in &neighbours {
+            let adjacency = store
+                .get_node(&reader, neighbour, 10)
+                .await
+                .unwrap_or_else(|error| panic!("round {round}: {neighbour} reads: {error}"))
+                .adjacency;
+            assert!(
+                adjacency.is_empty(),
+                "round {round}: no edge to {neighbour} survives"
+            );
+        }
+    }
+}
