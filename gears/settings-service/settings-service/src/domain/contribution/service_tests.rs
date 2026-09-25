@@ -1162,3 +1162,190 @@ async fn a_secret_placeholder_must_be_an_instance_of_the_type_on_contribution_to
         .await;
     assert_eq!(codes(&result), vec![reason::DEFAULT_INVALID]);
 }
+
+// ── Registration precedes the row ────────────────────────────────────────────
+
+/// One log both the registrar and the declaration repository write to, so the
+/// order of the two calls is observed rather than inferred.
+type Journal = Arc<std::sync::Mutex<Vec<String>>>;
+
+struct JournalingRegistrar(Journal);
+
+#[async_trait::async_trait]
+impl crate::domain::contribution::SettingTypeRegistrar for JournalingRegistrar {
+    async fn register_setting_type(
+        &self,
+        key: &SettingKey,
+        _value_type_id: &str,
+    ) -> Result<(), crate::domain::error::DomainError> {
+        self.0.lock().expect("lock").push(format!("register {key}"));
+        Ok(())
+    }
+}
+
+/// The real repository, logging each insert.
+struct JournalingDeclarations(Journal);
+
+#[async_trait::async_trait]
+impl DeclarationRepository for JournalingDeclarations {
+    async fn find_by_key<C: toolkit_db::secure::DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        key: &str,
+    ) -> Result<Option<Declaration>, crate::domain::error::DomainError> {
+        DeclarationRepo.find_by_key(conn, scope, key).await
+    }
+    async fn find_by_key_prefix<C: toolkit_db::secure::DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        key_prefix: &str,
+    ) -> Result<Vec<Declaration>, crate::domain::error::DomainError> {
+        DeclarationRepo
+            .find_by_key_prefix(conn, scope, key_prefix)
+            .await
+    }
+    async fn insert<C: toolkit_db::secure::DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        draft: crate::domain::declaration::DeclarationDraft,
+    ) -> Result<Declaration, crate::domain::error::DomainError> {
+        self.0
+            .lock()
+            .expect("lock")
+            .push(format!("insert {}", draft.key));
+        DeclarationRepo.insert(conn, scope, draft).await
+    }
+    async fn update_metadata<C: toolkit_db::secure::DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        id: Uuid,
+        metadata: crate::domain::declaration::DeclarationMetadata,
+        expected: Option<time::OffsetDateTime>,
+        redefines: bool,
+    ) -> Result<(), crate::domain::error::DomainError> {
+        DeclarationRepo
+            .update_metadata(conn, scope, id, metadata, expected, redefines)
+            .await
+    }
+    async fn set_status<C: toolkit_db::secure::DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        id: Uuid,
+        status: &str,
+        expected: Option<time::OffsetDateTime>,
+    ) -> Result<(), crate::domain::error::DomainError> {
+        DeclarationRepo
+            .set_status(conn, scope, id, status, expected)
+            .await
+    }
+    async fn find_locked<C: toolkit_db::secure::DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        id: Uuid,
+    ) -> Result<Option<Declaration>, crate::domain::error::DomainError> {
+        DeclarationRepo.find_locked(conn, scope, id).await
+    }
+    async fn lock_for_update<C: toolkit_db::secure::DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        id: Uuid,
+    ) -> Result<(), crate::domain::error::DomainError> {
+        DeclarationRepo.lock_for_update(conn, scope, id).await
+    }
+    async fn set_default<C: toolkit_db::secure::DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        id: Uuid,
+        default_value: &Value,
+    ) -> Result<(), crate::domain::error::DomainError> {
+        DeclarationRepo
+            .set_default(conn, scope, id, default_value)
+            .await
+    }
+    async fn find<C: toolkit_db::secure::DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        visibility: &crate::domain::category::visibility::DomainVisibility,
+        id: Uuid,
+    ) -> Result<Option<Declaration>, crate::domain::error::DomainError> {
+        DeclarationRepo.find(conn, scope, visibility, id).await
+    }
+    async fn find_by_category<C: toolkit_db::secure::DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        category_id: Uuid,
+    ) -> Result<Vec<Declaration>, crate::domain::error::DomainError> {
+        DeclarationRepo
+            .find_by_category(conn, scope, category_id)
+            .await
+    }
+    async fn list<C: toolkit_db::secure::DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        visibility: &crate::domain::category::visibility::DomainVisibility,
+        hidden_for: &[Uuid],
+        query: &toolkit_odata::ODataQuery,
+    ) -> Result<toolkit_odata::Page<Declaration>, crate::domain::error::DomainError> {
+        DeclarationRepo
+            .list(conn, scope, visibility, hidden_for, query)
+            .await
+    }
+}
+
+#[tokio::test]
+async fn each_setting_type_is_registered_before_its_row_is_written() {
+    // The order is the guarantee: a type registered whose insert then fails is
+    // harmless and reused by the retry, while a row written before its type
+    // would name a type the registry does not have.
+    let journal: Journal = Arc::default();
+    let db = sqlite_provider().await;
+    let service = Arc::new(ContributionService::new(
+        JournalingDeclarations(Arc::clone(&journal)),
+        CategoryRepo,
+        ValueRepo,
+        Arc::new(GtsTypeValidator::new(catalogue())),
+        Arc::new(JournalingRegistrar(Arc::clone(&journal)))
+            as Arc<dyn crate::domain::contribution::SettingTypeRegistrar>,
+        Arc::new(RecordingAudit::default()),
+    ));
+    let client = ContributionClient::new(
+        Arc::clone(&db),
+        service,
+        Arc::new(crate::domain::resolution::EffectiveCache::new(
+            std::time::Duration::from_secs(30),
+        )),
+        Arc::new(RecordingPublisher::default()) as Arc<dyn crate::domain::ports::ChangePublisher>,
+    );
+    let result = client
+        .register_declarations(
+            &SecurityContext::anonymous(),
+            MODULE.to_owned(),
+            vec![flag("network", "proxy_enabled"), flag("limits", "strict")],
+        )
+        .await
+        .expect("register succeeds");
+    assert_eq!(result.registered, 2, "{result:?}");
+
+    let first = key("network", "proxy_enabled", 1).to_string();
+    let second = key("limits", "strict", 1).to_string();
+    assert_eq!(
+        *journal.lock().expect("lock"),
+        vec![
+            format!("register {first}"),
+            format!("insert {first}"),
+            format!("register {second}"),
+            format!("insert {second}"),
+        ]
+    );
+}
