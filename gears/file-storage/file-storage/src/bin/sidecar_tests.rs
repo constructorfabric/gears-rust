@@ -697,6 +697,258 @@ async fn test_faulty_download_state(
     (state, issuer)
 }
 
+/// A [`StorageBackend`] wrapper around a real [`InMemoryBackend`] whose
+/// `get_stream`/`get_range_stream` return `Ok` of a stream that itself yields
+/// two `Ok(Bytes)` chunks -- together shorter than the object's real,
+/// `stat`-able size -- and then an `Err`. Everything else (crucially `stat`,
+/// which resolves the `Content-Length`/`Content-Range` the handler commits to
+/// before ever touching the stream) delegates to the inner backend
+/// unchanged. Unlike [`FaultyReadBackend`], whose fault fires before
+/// `get_stream`/`get_range_stream` even return -- while the handler can still
+/// pick any status code -- this one fires *inside* the stream they return,
+/// after the response is already committed. Models a transient mid-read
+/// backend fault (dropped S3 connection, disk I/O hiccup) hitting on the far
+/// side of that point.
+struct MidStreamFaultBackend {
+    inner: InMemoryBackend,
+}
+
+impl MidStreamFaultBackend {
+    /// Two `Ok` chunks, then a simulated I/O fault -- with a short *real*
+    /// (not virtual-time) gap between each yield. Without the gap, hyper's
+    /// h1 server can coalesce the response head with the first body frames
+    /// into a single buffered write and abort the connection before ever
+    /// flushing that buffer to the socket on a fast loopback link, so the
+    /// client's `send()` itself fails with `IncompleteMessage` instead of
+    /// this test's intended shape (a genuine `200`/`206` with a committed
+    /// `Content-Length`, followed by a body-read error) -- still a client
+    /// error either way, but not the specific one this test asserts on. The
+    /// gap forces hyper to flush what it already has buffered before this
+    /// stream is polled again, so the response head is deterministically on
+    /// the wire before the fault lands.
+    fn fault_stream() -> futures::stream::BoxStream<'static, std::io::Result<Bytes>> {
+        Box::pin(futures::stream::unfold(0u8, |step| async move {
+            match step {
+                0 => Some((Ok(Bytes::from_static(b"first-chunk-")), 1)),
+                1 => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    Some((Ok(Bytes::from_static(b"second-chunk-")), 2))
+                }
+                2 => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    Some((Err(std::io::Error::other("simulated mid-stream fault")), 3))
+                }
+                _ => None,
+            }
+        }))
+    }
+}
+
+#[async_trait]
+impl StorageBackend for MidStreamFaultBackend {
+    fn id(&self) -> &str {
+        self.inner.id()
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        self.inner.capabilities()
+    }
+
+    async fn put_stream(
+        &self,
+        path: &str,
+        stream: futures::stream::BoxStream<'_, std::io::Result<Bytes>>,
+        max_size: Option<u64>,
+    ) -> Result<(u64, [u8; 32]), DomainError> {
+        self.inner.put_stream(path, stream, max_size).await
+    }
+
+    async fn publish_exclusive(
+        &self,
+        path: &str,
+        stream: futures::stream::BoxStream<'_, std::io::Result<Bytes>>,
+        max_size: Option<u64>,
+    ) -> Result<file_storage::infra::backend::PublishOutcome, DomainError> {
+        self.inner.publish_exclusive(path, stream, max_size).await
+    }
+
+    async fn read_prefix(&self, path: &str, max_bytes: u64) -> Result<Option<Bytes>, DomainError> {
+        self.inner.read_prefix(path, max_bytes).await
+    }
+
+    async fn size(&self, path: &str) -> Result<u64, DomainError> {
+        self.inner.size(path).await
+    }
+
+    async fn delete(&self, path: &str) -> Result<(), DomainError> {
+        self.inner.delete(path).await
+    }
+
+    async fn exists(&self, path: &str) -> Result<bool, DomainError> {
+        self.inner.exists(path).await
+    }
+
+    async fn stat(&self, path: &str) -> Result<Option<u64>, DomainError> {
+        self.inner.stat(path).await
+    }
+
+    async fn get_stream(
+        &self,
+        _path: &str,
+        _expected_len: u64,
+    ) -> Result<futures::stream::BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
+        Ok(Self::fault_stream())
+    }
+
+    async fn get_range_stream(
+        &self,
+        _path: &str,
+        _range: file_storage_sdk::ByteRange,
+        _expected_len: u64,
+    ) -> Result<futures::stream::BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
+        Ok(Self::fault_stream())
+    }
+}
+
+/// Build a download-ready `SidecarState` whose single "test" backend is
+/// [`MidStreamFaultBackend`] wrapping a real [`InMemoryBackend`] seeded with
+/// `path` -> `body` -- `stat` (and thus the `Content-Length`/`Content-Range`
+/// the handler commits to) sees `body`'s real, full length, while the actual
+/// read stream yields only two short chunks before erroring.
+async fn test_mid_stream_fault_download_state(
+    path: &str,
+    body: &'static [u8],
+) -> (SidecarState, Issuer) {
+    let issuer = Issuer::generate(60).expect("issuer generation");
+    let inner = InMemoryBackend::new("test");
+    write_all(&inner, path, Bytes::from_static(body)).await;
+    let backend: Arc<dyn StorageBackend> = Arc::new(MidStreamFaultBackend { inner });
+    let backends =
+        BackendRegistry::new(vec![backend], "test").expect("build test backend registry");
+    let state = SidecarState {
+        verifier: Arc::new(issuer.verifier()),
+        backends,
+        control_base_url: String::new(),
+        internal_token: None,
+        http: reqwest::Client::new(),
+        metrics: Arc::new(NoopMetrics),
+        body_idle_timeout: None,
+        callback_retry_budget: Duration::from_secs(10),
+    };
+    (state, issuer)
+}
+
+/// A backend read failure that surfaces only *after* `download_whole` has
+/// already committed to `200` + the object's full `Content-Length` must not
+/// let the client walk away believing it received the complete, correct
+/// object. `Router::oneshot` + `to_bytes` cannot observe this failure mode:
+/// it hands back whatever bytes the body stream produced before erroring as
+/// an `Ok` `Bytes`, silently discarding the error -- exactly the "truncated
+/// but apparently successful" outcome this test exists to rule out. A real
+/// TCP round-trip through `reqwest` is required so the assertion is about
+/// what a real HTTP/1 client observes on the wire.
+#[tokio::test]
+async fn download_whole_mid_stream_backend_error_aborts_response() {
+    let file_id = Uuid::now_v7();
+    let version_id = Uuid::now_v7();
+    let path = format!("/{file_id}/{version_id}");
+    let full_content =
+        b"this object is much longer than the two short chunks the fault stream ever yields";
+    let (state, issuer) = test_mid_stream_fault_download_state(&path, full_content).await;
+    let token = download_token(&issuer, file_id, version_id, &path);
+
+    let router = build_router(state, DEFAULT_MAX_BODY_BYTES);
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test server");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.ok();
+    });
+
+    let response = reqwest::Client::new()
+        .get(format!(
+            "http://{addr}/api/file-storage-data/v1/download/{file_id}/{version_id}?fs-token={token}"
+        ))
+        .send()
+        .await
+        .expect("real HTTP request reaches the sidecar and gets a response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_LENGTH)
+            .expect("Content-Length header present on 200")
+            .to_str()
+            .expect("valid header value"),
+        full_content.len().to_string(),
+        "the header was already committed to the full object size before the fault stream ran"
+    );
+
+    let body_result = response.bytes().await;
+    assert!(
+        body_result.is_err(),
+        "a mid-stream backend fault after a 200 with a committed Content-Length must surface to \
+         the client as a body-read error, not as a successful short read; got: {body_result:?}"
+    );
+}
+
+/// Range-request counterpart to
+/// `download_whole_mid_stream_backend_error_aborts_response`: the same
+/// mid-stream fault under a `Range: bytes=0-` request (a `206` whose
+/// `Content-Range`/`Content-Length` already promise the whole object -- see
+/// `download_range`'s own doc comment on why the open-ended range is not a
+/// rare edge case) must abort the same way, not fall back to some other
+/// client-visible success.
+#[tokio::test]
+async fn download_range_mid_stream_backend_error_aborts_response() {
+    let file_id = Uuid::now_v7();
+    let version_id = Uuid::now_v7();
+    let path = format!("/{file_id}/{version_id}");
+    let full_content =
+        b"this object is much longer than the two short chunks the fault stream ever yields";
+    let (state, issuer) = test_mid_stream_fault_download_state(&path, full_content).await;
+    let token = download_token(&issuer, file_id, version_id, &path);
+
+    let router = build_router(state, DEFAULT_MAX_BODY_BYTES);
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test server");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.ok();
+    });
+
+    let response = reqwest::Client::new()
+        .get(format!(
+            "http://{addr}/api/file-storage-data/v1/download/{file_id}/{version_id}?fs-token={token}"
+        ))
+        .header(header::RANGE, "bytes=0-")
+        .send()
+        .await
+        .expect("real HTTP request reaches the sidecar and gets a response");
+
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_LENGTH)
+            .expect("Content-Length header present on 206")
+            .to_str()
+            .expect("valid header value"),
+        full_content.len().to_string(),
+        "the header was already committed to the full range span before the fault stream ran"
+    );
+
+    let body_result = response.bytes().await;
+    assert!(
+        body_result.is_err(),
+        "a mid-stream backend fault after a 206 with a committed Content-Length must surface to \
+         the client as a body-read error, not as a successful short read; got: {body_result:?}"
+    );
+}
+
 /// A `Conflict` from the backend's `get_stream` (whole-object `GET`, no
 /// `Range` header) -- the object changed between the download handler's
 /// `stat` and `download_whole`'s own read -- must map to `503 Service
