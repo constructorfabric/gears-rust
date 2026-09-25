@@ -287,6 +287,28 @@ mod tests {
         assert!(problem.contains("drifted"), "{problem}");
     }
 
+    /// A zero vector points nowhere, so the cosine is undefined; the check
+    /// reads two zero vectors as the same embedding and a zero against
+    /// anything else as a different one, rather than dividing by zero.
+    #[test]
+    fn a_zero_vector_is_the_same_only_as_another_zero_vector() {
+        let zero = vec![vec![0.0_f32, 0.0, 0.0]];
+        assert_eq!(
+            determinism_violation(&zero, &zero),
+            None,
+            "a provider that answers a zero vector twice is deterministic"
+        );
+        let other = vec![unit(&[1.0, 0.0, 0.0])];
+        assert!(
+            determinism_violation(&zero, &other).is_some(),
+            "a zero vector and then a real one is not the same embedding"
+        );
+        assert!(
+            determinism_violation(&other, &zero).is_some(),
+            "nor the other way round"
+        );
+    }
+
     #[test]
     fn a_changed_shape_is_refused() {
         let one = vec![unit(&[1.0, 2.0])];
