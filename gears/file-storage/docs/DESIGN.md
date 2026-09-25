@@ -33,7 +33,7 @@
 
 <!-- /toc -->
 
-- [x] `p1` - **ID**: `cpt-cf-file-storage-design-overview`
+- [ ] `p1` - **ID**: `cpt-cf-file-storage-design-overview`
 ## 1. Architecture Overview
 
 ### 1.1 Architectural Vision
