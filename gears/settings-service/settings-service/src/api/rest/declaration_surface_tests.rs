@@ -595,3 +595,47 @@ async fn re_declaring_an_active_setting_with_a_new_shape_answers_200_evolved_und
         .await;
     assert_eq!(repeat.status, 409, "{}", repeat.body);
 }
+
+#[tokio::test]
+async fn a_page_ordered_by_any_orderable_field_continues_without_a_gap_or_a_repeat() {
+    // `mode`, `status` and `category_id` are the same for every row here: the
+    // page boundary falls inside a tie, and only the `key` tiebreaker the
+    // pagination appends keeps the next page from skipping or repeating one.
+    let h = RestHarness::new().await;
+    for name in ["alpha", "beta", "gamma"] {
+        create(&h, name).await;
+    }
+    for order in ["category_id%20asc", "mode%20asc", "status%20desc"] {
+        let (status, first) = h
+            .get(
+                &format!("{DECLARATIONS}?limit=2&$orderby={order}"),
+                h.inner.tree.root,
+            )
+            .await;
+        assert_eq!(status, 200, "{order}: {first}");
+        let mut seen = slugs(&first);
+        assert_eq!(seen.len(), 2, "{order}: a full first page");
+        let cursor = first["page_info"]["next_cursor"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{order}: a third row waits"))
+            .to_owned();
+        let (status, second) = h
+            .get(
+                &format!("{DECLARATIONS}?limit=2&cursor={cursor}"),
+                h.inner.tree.root,
+            )
+            .await;
+        assert_eq!(status, 200, "{order}: {second}");
+        seen.extend(slugs(&second));
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec!["alpha", "beta", "gamma"],
+            "{order}: each row once"
+        );
+        assert!(
+            second["page_info"]["next_cursor"].is_null(),
+            "{order}: {second}"
+        );
+    }
+}
