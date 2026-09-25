@@ -1281,3 +1281,79 @@ async fn history_shows_the_settings_definition_records_beside_the_scopes_and_tel
     assert!(items.iter().all(|i| i["tenant_id"].is_null()), "{items:?}");
     assert_eq!(items.len(), 1);
 }
+
+#[tokio::test]
+async fn setter_identity_is_masked_for_a_reader_without_the_pii_entitlement() {
+    // Who set an ancestor's override is an administrator's identity: the trail
+    // and the flagged listing show it to a reader who may read unmasked and
+    // mask it for one who may not, as the audit history masks its actor.
+    let entitled = RestHarness::new().await;
+    let d = entitled
+        .inner
+        .declare("proxy", "cascading", json!(true))
+        .await;
+    entitled
+        .inner
+        .set(d, entitled.inner.tree.root, json!(false))
+        .await;
+    entitled
+        .inner
+        .set_flagged(d, entitled.inner.tree.a, json!("aggressive"))
+        .await;
+    let key = entitled.inner.key("proxy").to_string().replace('~', "%7E");
+    let one = format!(
+        "/settings-service/v1/settings/{key}?tenant={}",
+        entitled.inner.tree.a
+    );
+    let flagged = "/settings-service/v1/settings?$filter=needs_review%20eq%20true";
+
+    let (status, body) = entitled.get(&one, entitled.inner.tree.root).await;
+    assert_eq!(status, 200, "{body}");
+    let trail = body["inheritance_trail"].as_array().expect("trail");
+    assert!(
+        trail.iter().any(|e| e["set_by"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty() && s != MASK_TOKEN)),
+        "an entitled reader sees who set it: {body}"
+    );
+
+    let masked = RestHarness::without_pii_entitlement().await;
+    let d = masked
+        .inner
+        .declare("proxy", "cascading", json!(true))
+        .await;
+    masked
+        .inner
+        .set(d, masked.inner.tree.root, json!(false))
+        .await;
+    masked
+        .inner
+        .set_flagged(d, masked.inner.tree.a, json!("aggressive"))
+        .await;
+    let one = format!(
+        "/settings-service/v1/settings/{key}?tenant={}",
+        masked.inner.tree.a
+    );
+    let (status, body) = masked.get(&one, masked.inner.tree.root).await;
+    assert_eq!(status, 200, "{body}");
+    for entry in body["inheritance_trail"].as_array().expect("trail") {
+        if entry["has_override"] == json!(true) {
+            assert_eq!(
+                entry["set_by"],
+                json!(MASK_TOKEN),
+                "masked on the trail: {entry}"
+            );
+        }
+    }
+    let (status, body) = masked.get(flagged, masked.inner.tree.root).await;
+    assert_eq!(status, 200, "{body}");
+    let items = body["items"].as_array().expect("items");
+    assert!(!items.is_empty(), "{body}");
+    for item in items {
+        assert_eq!(
+            item["flagged"]["set_by"],
+            json!(MASK_TOKEN),
+            "masked on the listing: {item}"
+        );
+    }
+}

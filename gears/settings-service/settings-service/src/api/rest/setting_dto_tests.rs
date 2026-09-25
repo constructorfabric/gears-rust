@@ -150,10 +150,16 @@ fn the_review_pair_appears_only_when_the_own_row_is_flagged_and_the_tag_follows_
 
 #[test]
 fn the_administrative_trail_keeps_setter_identity_and_time() {
-    let dto = render(&effective("public"), false);
+    let dto = render(&effective("public"), true);
     assert_eq!(
         dto.inheritance_trail[0].set_by.as_deref(),
         Some("root-admin")
+    );
+    // Without the entitlement the entry stays, but not who set it.
+    let masked = render(&effective("public"), false);
+    assert_eq!(
+        masked.inheritance_trail[0].set_by.as_deref(),
+        Some(MASK_TOKEN)
     );
     assert_eq!(
         dto.inheritance_trail[0].last_change_at.as_deref(),
@@ -333,9 +339,14 @@ mod browse_entry {
         let tenant = Uuid::from_u128(4);
         let root = Uuid::from_u128(1);
 
-        let shown = render_flagged("k", &stored("public", tenant), root, false);
+        let shown = render_flagged("k", &stored("public", tenant), root, true);
         assert_eq!(shown.value, json!("kept"));
         assert!(!shown.masked);
+        assert_eq!(
+            render_flagged("k", &stored("public", tenant), root, false).set_by,
+            MASK_TOKEN,
+            "the setter is masked without the entitlement"
+        );
         assert_eq!(
             shown.needs_review_detail.as_deref(),
             Some("no longer a port")

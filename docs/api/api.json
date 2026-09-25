@@ -6649,7 +6649,7 @@
             "type": "string"
           },
           "set_by": {
-            "description": "Who set it.",
+            "description": "Who set it: an administrator's identity, masked for a caller not\nauthorized for unmasked PII.",
             "type": "string"
           },
           "tenant_id": {
@@ -19726,7 +19726,7 @@
             "type": "string"
           },
           "set_by": {
-            "description": "Who set the row here.",
+            "description": "Who set the row here: an administrator's identity, masked for a\ncaller not authorized for unmasked PII.",
             "type": [
               "string",
               "null"

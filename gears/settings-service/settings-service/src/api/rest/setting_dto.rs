@@ -58,7 +58,8 @@ pub struct TrailEntryDto {
     pub provided_value: bool,
     /// Whether the row here is flagged for review and was skipped.
     pub needs_review: bool,
-    /// Who set the row here.
+    /// Who set the row here: an administrator's identity, masked for a
+    /// caller not authorized for unmasked PII.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub set_by: Option<String>,
     /// When the row here last changed.
@@ -165,7 +166,16 @@ pub fn render(effective: &EffectiveValue, may_read_pii: bool) -> EffectiveValueD
             has_override: e.has_override,
             provided_value: e.provided_value,
             needs_review: e.needs_review,
-            set_by: e.set_by.clone(),
+            // An administrator's identity, shown to a reader who may read
+            // unmasked and masked for one who may not — as the audit history
+            // masks its actor. The entry itself stays: what is hidden is who.
+            set_by: e.set_by.as_ref().map(|who| {
+                if may_read_pii {
+                    who.clone()
+                } else {
+                    MASK_TOKEN.to_owned()
+                }
+            }),
             last_change_at: e.last_change_at.map(rfc3339),
         })
         .collect();
@@ -228,7 +238,8 @@ pub struct FlaggedOverrideDto {
     pub needs_review_detail: Option<String>,
     /// When the override last changed.
     pub last_change_at: String,
-    /// Who set it.
+    /// Who set it: an administrator's identity, masked for a caller not
+    /// authorized for unmasked PII.
     pub set_by: String,
     /// The override's value state tag — what a write correcting this row
     /// presents in `If-Match`.
@@ -256,7 +267,12 @@ pub fn render_flagged(
         masked,
         needs_review_detail: row.needs_review_detail.clone(),
         last_change_at: rfc3339(row.last_change_at),
-        set_by: row.set_by.clone(),
+        // Masked for the same reader the trail masks it for.
+        set_by: if may_read_pii {
+            row.set_by.clone()
+        } else {
+            MASK_TOKEN.to_owned()
+        },
         // The value state tag a correcting write presents — the same definition
         // the write path compares, never `updated_at`, which a flag moves alone.
         etag: value_state_tag(Some(row)).as_str().to_owned(),

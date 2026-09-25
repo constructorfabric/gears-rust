@@ -598,7 +598,7 @@ An **applied** override at a specific scope, distinct from the Schema Default.
 | `needs_review_detail` | string | No | Short reason for the flag, shown to the admin (§4.3); `NULL` when `needs_review = false`. |
 | `last_change_at` | `timestamptz` | Yes | When this scoped value last changed. The *value arm* of the effective-value recency `max` (§4.3); on read only the **resolved** row's value contributes — never a max across sibling/descendant scopes. |
 | `created_at` / `updated_at` | `timestamptz` | Yes | UTC timestamps. |
-| `set_by` | string | Yes | Subject who set the value. |
+| `set_by` | string | Yes | Subject who set the value — an administrator identity, so PII on read: masked on the trail and in the needs-review listing for a caller not authorized for unmasked PII (§4.3). |
 
 **Invariants:** at most one applied value per scope shape — with a subject and without — enforced by the two partial unique indexes (§4.7), with a subject named by both of its columns or by neither; exactly one of `value`/`secret_ref` is set — and **which** one follows the declaration's `secret` trait, both enforced by `CHECK` (§4.7); the serialized `value` MUST NOT exceed the **64 KiB** size cap (enforced on write by the Type Validator, §4.2 *Type Validator*); `global` declarations may only have a value at platform scope (`tenant_id` = the root tenant); `local` and `cascading` may have per-tenant values. For a tenant caller, the caller's own effective access must be `overridable`; an authorized ancestor may manage a restricted descendant (§4.1 *TenantAccessRestriction*).
 
@@ -642,7 +642,7 @@ Returned by the resolver and the Settings Reader.
 | `fallback_source` | `EffectiveSource` | `inherited` or `schema_default`; never `own_override`. |
 | `fallback_scope` | string \| `null` | Scope that supplies the fallback (`null` for Schema Default). |
 | `traits` | object | Resolved trait set (for rendering / pre-validation), from the setting's `value_type_id` (§1.3). |
-| `inheritance_trail` | `TrailEntry[]` | Ordered scopes inspected during resolution — **limited to the caller's own ancestor chain** (root→self), never a sibling/descendant scope (same cross-tenant leak-safety invariant as `last_change_at`). The per-entry **who/when** (`set_by` + timestamp) is surfaced **only on the admin read** (§4.3), **not** on the consumer SDK `EffectiveValue` (§4.5) — an ancestor's setter identity is not exposed to a subordinate tenant. |
+| `inheritance_trail` | `TrailEntry[]` | Ordered scopes inspected during resolution — **limited to the caller's own ancestor chain** (root→self), never a sibling/descendant scope (same cross-tenant leak-safety invariant as `last_change_at`). The per-entry **who/when** (`set_by` + timestamp) is surfaced **only on the admin read** (§4.3), **not** on the consumer SDK `EffectiveValue` (§4.5) — an ancestor's setter identity is not exposed to a subordinate tenant. The identity is an administrator's, i.e. PII: masked for a caller not authorized for unmasked PII, as the audit actor is (§4.2 *Audit Emitter*), whatever the value's own classification. |
 
 #### Enum: `EffectiveSource`
 

@@ -113,7 +113,9 @@ pub(crate) async fn gate_target(
 }
 
 /// Whether the caller may see `pii` values unmasked: a separate decision on
-/// the value resource, asked only when a `pii` value is on the page.
+/// the value resource, asked only when the page carries something it
+/// governs — a `pii` value, or a setter identity, which is an
+/// administrator's and so PII as the audit actor is.
 pub(crate) async fn may_read_pii(
     enforcer: &authz_resolver_sdk::PolicyEnforcer,
     ctx: &SecurityContext,
@@ -188,7 +190,9 @@ pub async fn get_setting(
     }
     // @cpt-end:cpt-cf-settings-service-algo-value-resolution-dispatch:p1:inst-vr-disp-3
     // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-read:p1:inst-vr-aread-5
-    let pii = effective.data_classification == "pii" && may_read_pii(&enforcer, &ctx).await;
+    let governed = effective.data_classification == "pii"
+        || effective.trail.iter().any(|entry| entry.set_by.is_some());
+    let pii = governed && may_read_pii(&enforcer, &ctx).await;
     let dto: EffectiveValueDto = render(&effective, pii);
     let etag = dto.etag.clone();
     // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-source-trail:p1:inst-vr-trail-9
@@ -356,7 +360,6 @@ pub async fn browse_settings(
         .await?;
     // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-6
     let has_pii = page.items.iter().any(|d| d.data_classification == "pii");
-    let pii = has_pii && may_read_pii(&enforcer, &ctx).await;
 
     let mut items: Vec<SettingItemDto> = if filter.needs_review {
         // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-7
@@ -391,6 +394,8 @@ pub async fn browse_settings(
             }
             .into());
         }
+        // Every flagged row names who set it.
+        let pii = (has_pii || !rows.is_empty()) && may_read_pii(&enforcer, &ctx).await;
         // The page's declarations by id, built once: each row finds its own in
         // constant time rather than by a scan of the page.
         let by_id: std::collections::HashMap<Uuid, &crate::domain::declaration::Declaration> =
@@ -410,6 +415,12 @@ pub async fn browse_settings(
         let outcomes = resolver
             .resolve_declarations(&conn, &page.items, target)
             .await;
+        let names_a_setter = outcomes.iter().any(|outcome| {
+            outcome
+                .as_ref()
+                .is_ok_and(|effective| effective.trail.iter().any(|entry| entry.set_by.is_some()))
+        });
+        let pii = (has_pii || names_a_setter) && may_read_pii(&enforcer, &ctx).await;
         page.items
             .iter()
             .zip(outcomes)
