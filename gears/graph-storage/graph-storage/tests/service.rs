@@ -539,6 +539,69 @@ async fn an_embedding_space_mismatch_is_unhealthy_and_leaves_the_gear_ready() {
     assert_eq!(row.state, ReadinessState::Healthy, "{row:?}");
 }
 
+/// The readiness route answers anyone who can reach it, so a row says what is
+/// wrong in fixed words and leaves what the dependency said to the log. A
+/// provider's error names its endpoint; the row must not repeat it.
+#[tokio::test]
+async fn a_readiness_row_does_not_repeat_what_a_failing_dependency_said() {
+    use async_trait::async_trait;
+    use graph_storage::domain::embedding::{EmbeddingCoordinator, SpaceState};
+    use graph_storage::infra::embedding::fake::FakeEmbeddingProvider;
+    use graph_storage_sdk::models::{EMBEDDING_PROVIDER, EmbeddingSpaceId, ReadinessState};
+    use graph_storage_sdk::plugin_api::{
+        EmbedRequest, EmbedResponse, EmbeddingProviderError, EmbeddingProviderV1,
+    };
+
+    const INTERNAL: &str = "https://embeddings.internal.example:8443/v1/embeddings";
+
+    /// The fake, except that its health check fails the way a remote one
+    /// does: naming where it was calling.
+    struct Unreachable(FakeEmbeddingProvider);
+
+    #[async_trait]
+    impl EmbeddingProviderV1 for Unreachable {
+        fn embedding_space(&self) -> &EmbeddingSpaceId {
+            self.0.embedding_space()
+        }
+        fn dimension(&self) -> u32 {
+            self.0.dimension()
+        }
+        async fn embed(&self, req: EmbedRequest) -> Result<EmbedResponse, EmbeddingProviderError> {
+            self.0.embed(req).await
+        }
+        async fn health(&self) -> Result<(), EmbeddingProviderError> {
+            Err(EmbeddingProviderError::Unavailable {
+                reason: format!("{INTERNAL}: connection refused"),
+            })
+        }
+    }
+
+    let provider = Arc::new(Unreachable(FakeEmbeddingProvider::new(
+        conformance::DIMENSION,
+    )));
+    let coordinator = EmbeddingCoordinator::new(
+        provider,
+        SpaceState::Active {
+            epoch: conformance::EPOCH,
+        },
+        8 * 1024,
+    );
+    let harness = Harness::with_coordinator(Arc::new(support::AllowInOwnTenant), coordinator);
+    let readiness = harness.services.readiness().await;
+
+    let row = readiness
+        .components
+        .iter()
+        .find(|row| row.component == EMBEDDING_PROVIDER)
+        .expect("the provider has a row");
+    assert_eq!(row.state, ReadinessState::Degraded, "{row:?}");
+    let said = format!("{readiness:?}");
+    assert!(
+        !said.contains("embeddings.internal.example") && !said.contains("connection refused"),
+        "readiness repeats what the provider said: {row:?}"
+    );
+}
+
 /// Asking what a type change costs needs read; making the change still needs
 /// administration.
 ///

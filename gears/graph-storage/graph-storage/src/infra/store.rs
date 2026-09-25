@@ -265,11 +265,17 @@ impl GraphStoreV1 for PgGraphStore {
         // The database row first, because every other row is meaningless
         // without it. Two questions, not one: a reachable server whose
         // migrations have not run serves a schema the gear does not know.
+        //
+        // What the database said stays in the operator log: a driver error
+        // can name the server it failed to reach, and this route answers
+        // anyone who can reach it. The row says what is wrong in words that
+        // are the same for every deployment.
         if let Err(error) = self.db().conn() {
+            tracing::warn!(%error, "readiness: the database is unreachable");
             out.push(ComponentReadiness::new(
                 graph_storage_sdk::models::DATABASE,
                 ReadinessState::Unhealthy,
-                &format!("the database is unreachable: {error}"),
+                "the database is unreachable; the reason is in the gear's log",
                 "everything; no traffic is admitted",
                 "connectivity restored; the probe re-runs on the next request and flips \
                  without a restart",
@@ -289,24 +295,32 @@ impl GraphStoreV1 for PgGraphStore {
                         graph_storage_sdk::models::DATABASE,
                     ));
                 }
-                Ok(pending) => out.push(ComponentReadiness::new(
-                    graph_storage_sdk::models::DATABASE,
-                    ReadinessState::Unhealthy,
-                    &format!(
-                        "{} migration(s) have not been applied: {}",
-                        pending.len(),
-                        pending.join(", ")
-                    ),
-                    "everything; no traffic is admitted",
-                    "apply the migrations; the probe re-runs without a restart",
-                )),
-                Err(error) => out.push(ComponentReadiness::new(
-                    graph_storage_sdk::models::DATABASE,
-                    ReadinessState::Unhealthy,
-                    &format!("the migration history cannot be read: {error}"),
-                    "everything; no traffic is admitted",
-                    "restore access to the migration table",
-                )),
+                Ok(pending) => {
+                    tracing::warn!(
+                        pending = %pending.join(", "),
+                        "readiness: migrations have not been applied"
+                    );
+                    out.push(ComponentReadiness::new(
+                        graph_storage_sdk::models::DATABASE,
+                        ReadinessState::Unhealthy,
+                        &format!(
+                            "{} migration(s) have not been applied; the gear's log names them",
+                            pending.len(),
+                        ),
+                        "everything; no traffic is admitted",
+                        "apply the migrations; the probe re-runs without a restart",
+                    ));
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "readiness: the migration history cannot be read");
+                    out.push(ComponentReadiness::new(
+                        graph_storage_sdk::models::DATABASE,
+                        ReadinessState::Unhealthy,
+                        "the migration history cannot be read; the reason is in the gear's log",
+                        "everything; no traffic is admitted",
+                        "restore access to the migration table",
+                    ));
+                }
             }
         }
 

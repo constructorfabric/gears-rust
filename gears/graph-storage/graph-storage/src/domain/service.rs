@@ -323,16 +323,25 @@ impl GraphServices {
         // costs the deployment a billable inference request every time.
         // A provider that cannot say it is healthy degrades the paths that
         // need it and nothing else.
+        //
+        // The provider's own error stays in the operator log. It names an
+        // endpoint -- a remote provider's host, port and path -- and the
+        // transport's view of why it failed, and this route answers anyone
+        // who can reach it.
         match self.embedding.health().await {
             Ok(()) => rows.push(Row::healthy(EMBEDDING_PROVIDER)),
-            Err(error) => rows.push(Row::new(
-                EMBEDDING_PROVIDER,
-                State::Degraded,
-                &format!("the embedding provider is unavailable: {error}"),
-                "ingest with `embed=true`, and the vector arm of search",
-                "automatic on provider recovery; vectors missed meanwhile are stale by input \
-                 hash and re-embedded by the normal path",
-            )),
+            Err(error) => {
+                tracing::warn!(%error, "readiness: the embedding provider reports itself unavailable");
+                rows.push(Row::new(
+                    EMBEDDING_PROVIDER,
+                    State::Degraded,
+                    "the embedding provider reports itself unavailable; the reason is in the \
+                     gear's log",
+                    "ingest with `embed=true`, and the vector arm of search",
+                    "automatic on provider recovery; vectors missed meanwhile are stale by input \
+                     hash and re-embedded by the normal path",
+                ));
+            }
         }
 
         // The identity row is `unhealthy` and the gear stays ready — the one
