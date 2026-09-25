@@ -2726,6 +2726,17 @@ service. For every non-healthy state the matrix names three things — what stay
 available, the exact canonical rejection for what does not, and how the component
 returns to `Healthy`. A degraded component never silently widens behavior.
 
+The matrix is read in two places. The platform's `/readyz` and `/health`,
+served by the api-gateway — on a listener of its own when the deployment
+separates it — carry one composite check for the gear: `unhealthy` when the
+gear is not ready, `degraded` when it is ready with any row degraded or
+unhealthy, `healthy` otherwise, with a message that names components and
+nothing else. The gear's own `GET /health/ready` carries the rows. Both are
+unauthenticated, as orchestrator probes are, so a row's text is written for
+every deployment alike: it says what is wrong and what to do, and what a
+dependency said — a driver error, a provider's endpoint — goes to the gear's
+log instead.
+
 | Component | State | Blocked operations (canonical rejection) | Operations that remain available | Recovery transition |
 |---|---|---|---|---|
 | Database, migrations | `Unhealthy` — unreachable or migrations unapplied | Everything; gear not ready, no traffic admitted | None | Connectivity restored and migrations applied; probe re-runs on an interval and flips to `Healthy` without restart |

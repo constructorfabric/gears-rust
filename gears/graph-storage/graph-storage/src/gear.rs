@@ -6,7 +6,9 @@ use std::sync::{Arc, OnceLock};
 use async_trait::async_trait;
 use authz_resolver_sdk::pep::PolicyEnforcer;
 use toolkit::api::OpenApiRegistry;
-use toolkit::{DatabaseCapability, Gear, GearCtx, RestApiCapability};
+use toolkit::{
+    DatabaseCapability, Gear, GearCtx, Healthcheck, HealthcheckResult, RestApiCapability,
+};
 use tracing::{debug, error, info, warn};
 
 use graph_storage_sdk::GraphStorageClientV1;
@@ -302,6 +304,128 @@ impl RestApiCapability for GraphStorage {
             .ok_or_else(|| anyhow::anyhow!("graph-storage services are not initialized"))?
             .clone();
         Ok(routes::register_routes(router, openapi, services))
+    }
+
+    /// Readiness through the platform's own `/readyz` and `/health`, which
+    /// the gateway can serve on a listener of its own, apart from the API.
+    /// One composite check, as the platform asks: the gear's aggregate, not
+    /// its rows. The per-component detail stays on the gear's route.
+    fn healthcheck(&self, _ctx: &GearCtx) -> Option<Arc<dyn Healthcheck>> {
+        let services = self.services.get()?.clone();
+        Some(Arc::new(PlatformReadiness { services }))
+    }
+}
+
+struct PlatformReadiness {
+    services: Arc<GraphServices>,
+}
+
+#[async_trait]
+impl Healthcheck for PlatformReadiness {
+    fn name(&self) -> &'static str {
+        "graph-storage"
+    }
+
+    async fn check(&self) -> HealthcheckResult {
+        platform_result(&self.services.readiness().await)
+    }
+}
+
+/// The gear's readiness as the platform reads it.
+///
+/// Not ready is `unhealthy`: the pod leaves rotation. Ready with any row
+/// degraded or unhealthy -- a space mismatch, an unavailable provider, a
+/// preferred backend absent -- is `degraded`, which keeps it in rotation:
+/// the platform asks that a dependency the gear can serve around not evict
+/// every pod. A capability this build does not ship is not a fault. The
+/// message names components only, never a row's text, because `/health` is
+/// unauthenticated.
+fn platform_result(readiness: &graph_storage_sdk::models::Readiness) -> HealthcheckResult {
+    use graph_storage_sdk::models::ReadinessState;
+
+    let named = |fatal: bool| {
+        readiness
+            .components
+            .iter()
+            .filter(|row| {
+                if fatal {
+                    row.fatal()
+                } else {
+                    matches!(
+                        row.state,
+                        ReadinessState::Degraded | ReadinessState::Unhealthy
+                    )
+                }
+            })
+            .map(|row| row.component.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if !readiness.ready {
+        return HealthcheckResult::unhealthy(format!("not ready: {}", named(true)))
+            .with_code("graph_storage.not_ready");
+    }
+    let degraded = named(false);
+    if degraded.is_empty() {
+        HealthcheckResult::healthy()
+    } else {
+        HealthcheckResult::degraded(format!("degraded: {degraded}"))
+            .with_code("graph_storage.degraded")
+    }
+}
+
+#[cfg(test)]
+mod platform_readiness_tests {
+    use graph_storage_sdk::models::{
+        ComponentReadiness, DATABASE, DYNAMIC_INDEXES, EMBEDDING_SPACE, Readiness, ReadinessState,
+    };
+    use toolkit::HealthcheckStatus;
+
+    use super::platform_result;
+
+    fn row(component: &str, state: ReadinessState) -> ComponentReadiness {
+        ComponentReadiness::new(
+            component,
+            state,
+            "a problem text the platform must not see",
+            "what it blocks",
+            "recovery",
+        )
+    }
+
+    #[test]
+    fn all_healthy_is_healthy_and_a_missing_capability_is_not_a_fault() {
+        let result = platform_result(&Readiness::of(vec![
+            ComponentReadiness::healthy(DATABASE),
+            row(DYNAMIC_INDEXES, ReadinessState::NotImplemented),
+        ]));
+        assert_eq!(result.status, HealthcheckStatus::Healthy, "{result:?}");
+        assert_eq!(result.code, None);
+    }
+
+    /// The row the matrix keeps ready while unhealthy stays in rotation.
+    #[test]
+    fn a_space_mismatch_degrades_and_names_only_the_component() {
+        let result = platform_result(&Readiness::of(vec![
+            ComponentReadiness::healthy(DATABASE),
+            row(EMBEDDING_SPACE, ReadinessState::Unhealthy),
+        ]));
+        assert_eq!(result.status, HealthcheckStatus::Degraded, "{result:?}");
+        assert_eq!(result.code.as_deref(), Some("graph_storage.degraded"));
+        let message = result.message.unwrap_or_default();
+        assert!(message.contains(EMBEDDING_SPACE), "{message}");
+        assert!(!message.contains("problem text"), "{message}");
+    }
+
+    #[test]
+    fn not_ready_is_unhealthy_and_names_what_blocks_it() {
+        let result = platform_result(&Readiness::of(vec![
+            row(DATABASE, ReadinessState::Unhealthy),
+            row(EMBEDDING_SPACE, ReadinessState::Unhealthy),
+        ]));
+        assert_eq!(result.status, HealthcheckStatus::Unhealthy, "{result:?}");
+        assert_eq!(result.code.as_deref(), Some("graph_storage.not_ready"));
+        assert_eq!(result.message, Some(format!("not ready: {DATABASE}")));
     }
 }
 
