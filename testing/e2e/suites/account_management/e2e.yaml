@@ -8,4 +8,8 @@ features:
 launcher: e2e-launcher
 config_gears:
   - account-management
+  # AM declares resource-group a hard dependency (user groups, the
+  # soft-delete ownership probe); without its config block the server
+  # refuses to start: "Database is not configured for gear 'resource-group'".
+  - resource-group
   - static-idp-plugin

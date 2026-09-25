@@ -26,6 +26,15 @@ pub mod rg_tables {
     pub const MEMBERSHIP_RESOURCE_ID: &str = "resource_id";
     /// Column in membership table: the group the resource belongs to.
     pub const MEMBERSHIP_GROUP_ID: &str = "group_id";
+    /// Column in membership table: the RG-local GTS type surrogate.
+    pub const MEMBERSHIP_GTS_TYPE_ID: &str = "gts_type_id";
+
+    /// RG-local GTS type registry table.
+    pub const GTS_TYPE_TABLE: &str = "gts_type";
+    /// Primary key in the RG-local GTS type registry.
+    pub const GTS_TYPE_ID: &str = "id";
+    /// External GTS schema identifier in the RG-local type registry.
+    pub const GTS_TYPE_SCHEMA_ID: &str = "schema_id";
 
     /// Closure table for group hierarchy.
     pub const CLOSURE_TABLE: &str = "resource_group_closure";

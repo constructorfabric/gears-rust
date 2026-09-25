@@ -221,7 +221,7 @@ upstream PRD/DESIGN definition, with no broken references.
 - **Scope**:
   - Create child tenant: authenticated parent-tenant administrator creates a new child with an explicit `parent_id`, establishing the relationship immediately and finalising the tenant in `status = active` once the creation saga (insert-provisioning, IdP provision, finalise) completes successfully.
   - Read tenant detail by identifier within the caller's authorized scope.
-  - List direct children of a tenant, paginated and status-filterable.
+  - List children of a tenant, paginated and status-filterable: direct children by default, or every descendant visible to the caller with `recursive=true`, each with its ancestor chain relative to the requested tenant.
   - Update mutable tenant fields only (`name` and `active ↔ suspended` status transitions); immutable hierarchy-defining fields (`id`, `parent_id`, `tenant_type`, `self_managed`, `depth`) are rejected with `CanonicalError::InvalidArgument` (HTTP 400); `status=deleted` is rejected with `CanonicalError::FailedPrecondition` (HTTP 400) — soft-delete goes through the dedicated DELETE endpoint.
   - Tenant status change: administrator transitions between `active` and `suspended` without cascading to children; transition to `deleted` is not permitted via status change.
   - Soft-delete: non-root-only, requires zero non-deleted children and no remaining tenant-owned Resource Group associations; schedules hard-deletion after retention period; hard-delete runs leaf-first (`depth DESC`) and invokes IdP tenant-deprovisioning.
@@ -237,7 +237,7 @@ upstream PRD/DESIGN definition, with no broken references.
   - User-level IdP operations (provision/deprovision/query of users) — owned by `idp-user-operations-contract`. Tenant-side IdP operations (provision/deprovision of tenants) remain in this feature as hierarchy-op side-effects.
   - Tenant metadata CRUD, schemas, and inheritance resolution — owned by `tenant-metadata`; metadata is removed through the tenant-metadata feature's cascade-delete contract when a tenant row is removed, while the schema and resolution logic live in that feature.
   - User-group Resource Group type registration and lifecycle — owned by `user-groups`.
-  - Read-only plugin query facade (`get_tenant`, `get_ancestors`, `get_descendants`, barrier-mode reductions) — owned by `tenant-resolver-plugin`, which reads AM-owned `tenants` and `tenant_closure` directly via a dedicated SecureConn read-only pool.
+  - Read-only plugin query facade (`get_tenant`, `get_ancestors`, `get_descendants`, barrier-mode reductions) — owned by `tenant-resolver-plugin`, which reads AM-owned `tenants` and `tenant_closure` directly via a dedicated SecureConn read-only pool. The REST `recursive=true` children listing is not that facade — it is this feature's own paginated read over `tenants` + `tenant_closure`.
   - Cross-cutting error taxonomy, audit pipeline, reliability/SLA policy, data-classification policy — owned by `errors-observability`.
 
 - **Requirements Covered**:

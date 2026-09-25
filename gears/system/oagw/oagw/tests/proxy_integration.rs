@@ -1510,11 +1510,15 @@ async fn proxy_all_backends_unreachable() {
             "expected DownstreamError for unreachable backend, got: {err:?}"
         ),
         Ok(resp) => {
-            // Pingora may return a 503 response directly via fail_to_proxy.
+            // Pingora may write the gateway response directly via
+            // fail_to_proxy. An unreachable backend maps to 502 (DownstreamError
+            // — connection refused/closed), 503 (LinkUnavailable — no route),
+            // or 504 (connect timeout), depending on how the connection fails.
             assert!(
-                resp.status() == StatusCode::SERVICE_UNAVAILABLE
+                resp.status() == StatusCode::BAD_GATEWAY
+                    || resp.status() == StatusCode::SERVICE_UNAVAILABLE
                     || resp.status() == StatusCode::GATEWAY_TIMEOUT,
-                "expected 503 or 504, got: {}",
+                "expected 502, 503, or 504, got: {}",
                 resp.status()
             );
         }
@@ -1778,9 +1782,9 @@ async fn proxy_websocket_upgrade_returns_101() {
     );
 }
 
-// WebSocket upgrade rejected by upstream returns 503 ProtocolError with gateway error source.
+// WebSocket upgrade rejected by upstream returns 502 ProtocolError with gateway error source.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn proxy_websocket_upgrade_rejected_returns_503_protocol_error() {
+async fn proxy_websocket_upgrade_rejected_returns_502_protocol_error() {
     let h = AppHarness::builder().build().await;
     let ctx = h.security_context().clone();
 
@@ -2208,11 +2212,15 @@ async fn proxy_unreachable_backend_returns_rfc9457_problem_body() {
             );
         }
         Ok(resp) => {
-            // Pingora wrote the response directly via fail_to_proxy.
+            // Pingora wrote the response directly via fail_to_proxy. An
+            // unreachable backend maps to 502 (DownstreamError), 503
+            // (LinkUnavailable), or 504 (connect timeout).
             let status = resp.status();
             assert!(
-                status == StatusCode::SERVICE_UNAVAILABLE || status == StatusCode::GATEWAY_TIMEOUT,
-                "expected 503 or 504, got: {status}"
+                status == StatusCode::BAD_GATEWAY
+                    || status == StatusCode::SERVICE_UNAVAILABLE
+                    || status == StatusCode::GATEWAY_TIMEOUT,
+                "expected 502, 503, or 504, got: {status}"
             );
 
             let body_bytes = resp.into_body().into_bytes().await.unwrap();
@@ -2246,9 +2254,9 @@ async fn proxy_unreachable_backend_returns_rfc9457_problem_body() {
     }
 }
 
-// negative-8.1 (body-validation): Streaming body exceeding max_body_size returns 400 PayloadTooLarge.
+// negative-8.1 (body-validation): Streaming body exceeding max_body_size returns 413 PayloadTooLarge.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn proxy_streaming_body_exceeding_limit_returns_400() {
+async fn proxy_streaming_body_exceeding_limit_returns_413() {
     let mut guard = MockGuard::new();
     guard.mock(
         "POST",

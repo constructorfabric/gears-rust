@@ -62,7 +62,7 @@ The plugin talks to the Keycloak Admin REST and OAuth token endpoints directly o
 
 Three realm bindings are supported: `shared` (default; tenants share an operator-provisioned realm), `adopted` (an existing empty operator realm bound to one tenant), and `created` (the plugin creates and lifecycle-manages a dedicated realm — generated as `realm-{tenant_id}` for child tenants, while a root-target created realm requires an explicit operator-supplied name). Keycloak remains the user source of truth; the plugin persists nothing locally and returns a versioned opaque metadata envelope that Account Management stores and replays.
 
-`update_user` is intentionally not implemented in this revision: the plugin inherits the SDK default, which returns `IdpUserOperationFailure::UnsupportedOperation`.
+`update_user` applies Account Management's merge patch to a user inside the tenant's bound realm and returns the provider projection read back after the write (see [User Mutation Safety](#user-mutation-safety)).
 
 ### 1.2 Architecture Drivers
 
@@ -185,7 +185,7 @@ DTOs, cursors, and failure vocabularies all come from `account-management-sdk`, 
 
 - [ ] `p3` - **ID**: `cpt-cf-keycloak-idp-plugin-principle-no-silent-success`
 
-Unsupported operations (`update_user`, unsupported filters) return typed `UnsupportedOperation` failures. Truncated list drains are logged loudly. Already-absent resources are explicit success-equivalents, not silent no-ops.
+Unsupported operations (unsupported filters) return typed `UnsupportedOperation` failures; a user update whose tenant binding or touched attributes are refused is rejected before any provider write. The profile write itself is all-or-nothing (a rename collision or a lock the pre-write read missed rejects it whole), but the password is set by a second call: a password-policy rejection, or a failed read-back, can follow an already-applied profile change. The profile PUT is idempotent, so resubmitting the patch with the rejected value corrected converges. Truncated list drains are logged loudly. Already-absent resources are explicit success-equivalents, not silent no-ops.
 
 #### Least privilege by tier
 
@@ -357,7 +357,7 @@ Contract invariants implemented at the plugin's SDK boundary:
 - provider 5xx, transport/timeout, saga timeout, and staged `AmbiguousCreated` map to `IdpProvisionFailure::Ambiguous` for the provisioning reaper **once a mutation has been attempted and follow-up evidence cannot rule out retained state**; realm creation is the explicit reconciliation case: a post-failure 404 proves the realm was not retained and maps to `CleanFailure`, while an unsuccessful re-probe preserves `Ambiguous` — retained-state evidence, not the error class alone, separates this row from the one above;
 - missing bootstrap permissions (`BootstrapPermsMissing`) map to `UnsupportedOperation` with an operator-runbook detail;
 - tenant deprovisioning maps `DeprovisionNotFound` → `NotFound` (success-equivalent), `DeprovisionRetryable` → `Retryable`, and everything else — including metadata decode failures — → `Terminal`;
-- user failures use only `IdpUserOperationFailure` variants: KC 409 on create is `DuplicateUser` with the field refined from the provider message (`Username`/`Email`/`UsernameOrEmail`), password-policy rejections are `PasswordPolicy`, unsupported filters and the unimplemented `update_user` are `UnsupportedOperation`, provider/transport trouble is `Unavailable`;
+- user failures use only `IdpUserOperationFailure` variants: KC 409 on create is `DuplicateUser` with the field refined from the provider message (`Username`/`Email`/`UsernameOrEmail`), password-policy rejections are `PasswordPolicy`, unsupported filters are `UnsupportedOperation`, provider/transport trouble is `Unavailable`; on update, an absent user and a user bound to another tenant are both `NotFound` (indistinguishable by design), a rename collision is `DuplicateUser`, and a provider-managed attribute is `FieldNotWritable` naming every refused attribute;
 - service-account failures use the `IdpServiceAccountFailure` set: `InvalidInput` (bad name, disallowed scope, quota, taken client id), `NotFound` (absent or foreign account — indistinguishable by design), `Ambiguous` (stage-attributed transport uncertainty; stage tokens tabulated in §3.6), `CleanFailure` (pre-mutation failures). The taxonomy also carries `UnsupportedOperation`, which this plugin never returns for these methods because it implements them - it is the category an adapter that ships only the tenant and user halves surfaces through the contract's default implementations;
 - every mutating return carries redacted, truncated, grep-friendly detail: provider failures use `kc:{METHOD} {path_template} -> {status}: {body≤2KiB}`, internal component failures `internal:{component}: …`, and classified domain rejections a stable variant prefix (`ambig:{stage}: …`, `deprovision retryable: …`, `sa invalid input: …`, and so on).
 
@@ -439,7 +439,7 @@ Success returns the metadata envelope, records `provision_tenant_duration` and `
 
 **ID**: `cpt-cf-keycloak-idp-plugin-seq-user-mutation`
 
-**Use cases**: user provisioning/deprovisioning are exercised through the parent Account Management use cases; `cpt-cf-keycloak-idp-plugin-usecase-update-user` is p2 — **Actors**: `cpt-cf-keycloak-idp-plugin-actor-tenant-admin`, `cpt-cf-keycloak-idp-plugin-actor-account-management`, `cpt-cf-keycloak-idp-plugin-actor-keycloak`
+**Use cases**: user provisioning/deprovisioning are exercised through the parent Account Management use cases; user updates realise `cpt-cf-keycloak-idp-plugin-usecase-update-user` — **Actors**: `cpt-cf-keycloak-idp-plugin-actor-tenant-admin`, `cpt-cf-keycloak-idp-plugin-actor-account-management`, `cpt-cf-keycloak-idp-plugin-actor-keycloak`
 
 User operations resolve realm, admin client, and tenant group from replayed metadata and run each Keycloak step under an exactly-once reactive-401 wrapper.
 
@@ -447,7 +447,15 @@ User operations resolve realm, admin client, and tenant group from replayed meta
 
 *Deprovisioning* first reads the target user's stored `tenant_id` attribute; a mismatch against the request tenant performs no mutation and returns success-equivalently (non-disclosing, per ADR-0006 — this attribute check is the cross-tenant deletion guard). It then best-effort revokes sessions (configurable, default on) and deletes the identity; 404/410 are success-equivalent.
 
-*Updates* are not implemented: the SDK default returns `UnsupportedOperation`.
+*Updates* apply Account Management's merge patch (omitted fields unchanged, `null` clears a nullable field) in a fixed order, each step gated on the previous:
+
+1. `display_name` is refused up front as `FieldNotWritable`: Keycloak has no such property — the projection composes it from `firstName`/`lastName` — so accepting the write would silently drop it.
+2. One `GET /users/{id}?userProfileMetadata=true` answers both pre-write questions. The stored `tenant_id` attribute MUST equal the request tenant; a mismatch or an absent user returns `NotFound` with no mutation — the same attribute guard as deprovisioning, but an update never folds into success because no state exists in which the patch applied. The per-attribute `readOnly` flags then refuse every touched attribute Keycloak reports as non-writable (the `editUsernameAllowed` realm flag, declarative-profile edit permissions, read-only federation mappers) in one `FieldNotWritable`, so a multi-field patch cannot land half-applied.
+3. `PUT /users/{id}` carries only the touched profile fields (a clear is sent as an empty string, since Keycloak treats `null` as absent); a 409 is `DuplicateUser`, and a read-only refusal the pre-flight could not see is still classified as `FieldNotWritable`.
+4. A password in the patch is written through `PUT /users/{id}/reset-password`, because Keycloak accepts embedded credentials only on create. It runs after the profile write, so a password-policy rejection leaves the profile change applied. The order is deliberate: the profile PUT is idempotent, so resubmitting with a corrected password converges, whereas setting the password first could leave a retry blocked by a password-history policy.
+5. The user is read back and projected: Keycloak normalises what it stores (for example lower-casing `username`), so only the re-read is a truthful response.
+
+Success emits `user.updated` carrying the names of the changed properties, never their values.
 
 #### Tenant Deprovisioning
 
@@ -530,7 +538,7 @@ sequenceDiagram
   AM->>A: Durably correlate terminal outcome
 ```
 
-The plugin emits structured events on the `keycloak_idp_plugin.events` tracing target — `tenant.bound`, `realm.created`, `admin_user.bound`, `tenant.unbound`, `realm.removed`, `service_accounts.purged`, `user.provisioned` (includes `username`), `user.deprovisioned` — each carrying the acting subject (id, closed-set type, raw type, tenant). `user.deprovisioned` is emitted on every successful `deprovision_user` return, including the non-mutating cross-tenant-guard and already-absent paths, and its `already_absent` field is currently always `false`. This is an explicit development stand-in until the platform audit sink lands; durable one-outcome-per-call correlation is owned by Account Management and the platform audit owner. `list_users` and the service-account read/mutate paths emit no plugin audit events of their own; the only service-account audit signal is `service_accounts.purged` on tenant deprovisioning.
+The plugin emits structured events on the `keycloak_idp_plugin.events` tracing target — `tenant.bound`, `realm.created`, `admin_user.bound`, `tenant.unbound`, `realm.removed`, `service_accounts.purged`, `user.provisioned` (includes `username`), `user.updated` (names of the changed properties, never their values), `user.deprovisioned` — each carrying the acting subject (id, closed-set type, raw type, tenant). `user.deprovisioned` is emitted on every successful `deprovision_user` return, including the non-mutating cross-tenant-guard and already-absent paths, and its `already_absent` field is currently always `false`. This is an explicit development stand-in until the platform audit sink lands; durable one-outcome-per-call correlation is owned by Account Management and the platform audit owner. `list_users` and the service-account read/mutate paths emit no plugin audit events of their own; the only service-account audit signal is `service_accounts.purged` on tenant deprovisioning.
 
 Metrics: `keycloak_idp_plugin_provision_tenant_duration_seconds`, `user_op_duration_seconds`, `sa_op_duration_seconds`, `kc_admin_request_duration_seconds` (declared, not yet wired), `failure_total{op,failure_variant}`, `kc_admin_token_refresh_total` and `credential_refresh_total` (`{outcome,tier,realm}`), `credstore_write_total`, `metadata_decode_failure_total{version_observed}`, `deprovision_missing_metadata_total`, `orphan_user_compensation_total`, `realms_bound{realm_binding,realm_name}`. Every label is a closed enum except `version_observed` (an uncapped observed version string) and `realm`/`realm_name`, which share a cardinality budget (default 500 distinct realms) after which the label is dropped and a warning is logged on every observation of an over-cap realm.
 
@@ -596,7 +604,7 @@ The release-qualification query matrix for the PRD latency NFR covers unfiltered
 | Audit ownership | Parent Account Management and platform audit designs assign persistence, recovery, delivery, and retention; the plugin's tracing stand-in is not a production substitute |
 | Reconciliation | Operator runbook exists and consumes `ambig:{stage}` evidence without secret inspection |
 | Init dependency | Deployment ordering tolerates the pre-warm budget (Keycloak/Credential Store reachable within ≈37 s of plugin init) or explicitly disables the plugin |
-| User updates | `update_user` support requires implementing the SDK contract (JSON Merge Patch semantics, duplicate/password-policy classification) before any product surface promises profile editing through this provider |
+| User updates | The realm keeps the `tenant_id` user attribute readable through the admin API (Keycloak 24+ drops unmanaged attributes unless the realm allows them); without it every update is refused as `NotFound` by the cross-tenant guard |
 | Service-account contract | Implemented against the contract as shipped in `account-management-sdk` (PRD §5.4). The published trait is authoritative wherever it differs from the design below. Tenant and user lifecycle carry no dependency on it and gate independently, so a service-account regression cannot block them |
 | Host wiring | The crate is deliberately landed **unwired**: no host in this repository links it, so its `inventory`-based gear registration never fires, and the repository carries no worked configuration sample. Enabling it requires a host that links the crate, a `keycloak:` configuration tree satisfying `Gear::init` (`base_url`, `realm_admin.secret_ref_template`, `bootstrap_pre_warm.*`, `service_account.*`, `security_context.platform_tenant_id`, the metrics cap, `vendor`/`priority`), and `account-management.idp.vendor` aligned to this plugin's vendor. Until then the code is compiled and unit-tested but never initialized, which is why the gates below are stated as deployment obligations rather than satisfied conditions |
 
@@ -613,7 +621,7 @@ The wire-side suffix is baked into the name (`_total` for monotonic counters, a 
 | `keycloak_idp_plugin_provision_tenant_duration_seconds` | Histogram, seconds | `realm_binding` ∈ {`shared`, `adopted`, `created`} | `TenantLifecycleMetricsPort` | Live |
 | `keycloak_idp_plugin_realms_bound` | UpDownCounter (no suffix) | `realm_binding` × `realm_name` (capped) | `TenantLifecycleMetricsPort` | Live |
 | `keycloak_idp_plugin_deprovision_missing_metadata_total` | Counter | none — `realm_name` is unknowable by definition on this path, metadata was its only source | `TenantLifecycleMetricsPort` | Live |
-| `keycloak_idp_plugin_user_op_duration_seconds` | Histogram, seconds | `op` ∈ {`provision_user`, `deprovision_user`, `list_users`} | `UserOpMetricsPort` | Live |
+| `keycloak_idp_plugin_user_op_duration_seconds` | Histogram, seconds | `op` ∈ {`provision_user`, `update_user`, `deprovision_user`, `list_users`} | `UserOpMetricsPort` | Live |
 | `keycloak_idp_plugin_orphan_user_compensation_total` | Counter | `outcome` ∈ {`ok`, `failed`} | `UserOpMetricsPort` | Live |
 | `keycloak_idp_plugin_sa_op_duration_seconds` | Histogram, seconds | `op` ∈ {`sa_create`, `sa_rotate_secret`, `sa_revoke`, `sa_list`, `sa_purge`} | `SaOpMetricsPort` | Live |
 | `keycloak_idp_plugin_credstore_write_total` | Counter | `op` ∈ {`put`, `delete`} × `outcome` ∈ {`ok`, `error`} | `CredstoreMetricsPort` | Live |
@@ -646,9 +654,9 @@ Known ceiling on the op-level set: `user_op_duration_seconds` and `sa_op_duratio
 
 Both labels are closed sets, but the `failure_variant` vocabulary is **not** the `FailureVariant` constant list: every emit site converts through `From<&PluginError>`, so the wire values are whatever `failure_variant_label` in `src/domain/error.rs` produces. That is the authoritative list.
 
-`op` is a superset of every plugin-level operation: `provision_tenant`, `deprovision_tenant`, `provision_user`, `deprovision_user`, `list_users`, `sa_create`, `sa_rotate_secret`, `sa_revoke`, `sa_list`, `sa_purge`.
+`op` is a superset of every plugin-level operation: `provision_tenant`, `deprovision_tenant`, `provision_user`, `update_user`, `deprovision_user`, `list_users`, `sa_create`, `sa_rotate_secret`, `sa_revoke`, `sa_list`, `sa_purge`.
 
-`failure_variant` classifies the failure, not its text — 18 values: `config`, `credstore_read`, `metadata_decode`, `kc_rest`, `provision_input_rejected`, `ambiguous_created`, `created_realm_exists`, `bootstrap_perms_missing`, `deprovision_not_found`, `deprovision_retryable`, `deprovision_terminal`, `user_op_rejected`, `user_op_unavailable`, `user_op_unsupported`, `user_op_duplicate`, `user_op_password_policy`, `sa_invalid_input`, `sa_not_found`. A provider body never reaches a label — the counter is the metric-side counterpart of the redaction posture in §4.1.
+`failure_variant` classifies the failure, not its text — 21 values: `config`, `credstore_read`, `metadata_decode`, `kc_rest`, `provision_input_rejected`, `ambiguous_created`, `created_realm_exists`, `realm_create_not_retained`, `bootstrap_perms_missing`, `deprovision_not_found`, `deprovision_retryable`, `deprovision_terminal`, `user_op_rejected`, `user_op_unavailable`, `user_op_unsupported`, `user_op_duplicate`, `user_op_password_policy`, `user_op_not_found`, `user_op_field_not_writable`, `sa_invalid_input`, `sa_not_found`. A provider body never reaches a label — the counter is the metric-side counterpart of the redaction posture in §4.1.
 
 #### Instrument prefix
 
