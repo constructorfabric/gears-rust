@@ -375,6 +375,9 @@ jobs:
       - name: Test timescaledb usage-collector plugin (pg integration)
         run: make test-usage-collector-pg
 
+      - name: Test clickhouse usage-collector plugin (ch integration)
+        run: make test-usage-collector-ch
+
       - name: Test postgres-cluster-plugin (pg integration)
         run: make test-cluster-pg
 
