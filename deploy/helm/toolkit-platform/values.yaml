@@ -1,0 +1,42 @@
+# Default values for the toolkit-platform umbrella chart.
+#
+# Subchart values are nested under the subchart name. The platform-host is given
+# a stable fullnameOverride ("platform-host") so its Service DNS is predictable
+# and every OoP gear can reference it for TOOLKIT_DIRECTORY_ENDPOINT and the edge.
+
+platform-host:
+  enabled: true
+  fullnameOverride: platform-host
+  image:
+    repository: ghcr.io/constructorfabric/platform-host
+    tag: "dev"
+    pullPolicy: IfNotPresent
+
+postgres:
+  enabled: true
+  fullnameOverride: shared-postgres
+  databases:
+    - usersinfo
+
+hello:
+  enabled: true
+  fullnameOverride: hello
+  image:
+    repository: ghcr.io/constructorfabric/hello
+    tag: "dev"
+    pullPolicy: IfNotPresent
+  directoryEndpoint: "http://platform-host:50051"
+
+users-info:
+  enabled: true
+  fullnameOverride: users-info
+  image:
+    repository: ghcr.io/constructorfabric/users-info
+    tag: "dev"
+    pullPolicy: IfNotPresent
+  directoryEndpoint: "http://platform-host:50051"
+  postgres:
+    host: shared-postgres
+    database: usersinfo
+    user: platform
+    password: "platform-demo-pw"
