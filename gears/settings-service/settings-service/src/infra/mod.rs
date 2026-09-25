@@ -2,9 +2,9 @@
 //! Adapters to the outside world.
 
 pub mod contribution_client;
+pub mod lifecycle_metrics;
 pub mod platform_scope;
 pub mod reader_client;
-pub mod review_metrics;
 pub mod sdk_error_mapping;
 pub mod secret_manager;
 pub mod setting_type_registrar;

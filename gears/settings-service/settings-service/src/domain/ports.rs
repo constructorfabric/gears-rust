@@ -213,11 +213,16 @@ pub trait WriteMetrics: Send + Sync {
     fn step_up(&self, operation: &'static str, result: &'static str);
 }
 
-/// The gauge the lifecycle refreshes from the store.
-pub trait ReviewMetrics: Send + Sync {
+/// What the managed lifecycle's passes report.
+pub trait LifecycleMetrics: Send + Sync {
     /// `settings_needs_review_total` for one declaration source: the overrides
     /// flagged `needs_review` and awaiting an administrator's fix.
     fn needs_review(&self, source: &'static str, count: u64);
+    /// One audit retention pass: `settings_audit_retention_passes_total` by
+    /// `result` (`ok` or `failed`) and `settings_audit_records_pruned_total` by
+    /// `pruned`. A failed pass and one with nothing to prune both delete
+    /// nothing; this is what tells them apart.
+    fn retention_pass(&self, result: &'static str, pruned: u64);
 }
 
 /// Counts nothing; the test binding.

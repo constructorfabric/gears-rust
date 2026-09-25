@@ -227,7 +227,7 @@ The system **MUST** serve `GET /settings-service/v1/settings/{key}/history` from
 
 - [x] `p1` - **ID**: `cpt-cf-settings-service-dod-audit-store-retention`
 
-Every record **MUST** carry `retain_until` or fall under the store's configured default, which **MUST** be configurable and **MUST NOT** default below twelve months. Pruning **MUST** locate expired records through an index — `idx_audit_retention` for an explicit hold, `idx_audit_default_horizon` for the default — **MUST** delete them in bounded batches so no statement grows with a backlog, and **MUST** be the only path that deletes from the table.
+Every record **MUST** carry `retain_until` or fall under the store's configured default, which **MUST** be configurable and **MUST NOT** default below twelve months. Pruning **MUST** locate expired records through an index — `idx_audit_retention` for an explicit hold, `idx_audit_default_horizon` for the default — **MUST** delete them in bounded batches so no statement grows with a backlog, **MUST** report every pass — `settings_audit_retention_passes_total` by `result` (`ok`, `failed`) and `settings_audit_records_pruned_total` — so a pass that fails is told apart from one with nothing to prune, and **MUST** be the only path that deletes from the table. A failed pass is retried on the next daily tick rather than sooner: the retention is a minimum, so a record kept a day past its horizon breaks nothing.
 
 **Implements**:
 - `cpt-cf-settings-service-algo-audit-store-retention`

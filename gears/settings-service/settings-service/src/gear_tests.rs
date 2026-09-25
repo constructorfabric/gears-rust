@@ -662,18 +662,26 @@ async fn a_retention_pass_prunes_what_is_past_its_horizon_and_nothing_younger() 
     let now = time::OffsetDateTime::now_utc();
 
     let live = tokio_util::sync::CancellationToken::new();
+    let quiet = RecordingLifecycleMetrics::default();
     let batches = super::PruneBatches {
         size: 1_000,
         per_tick: 10,
     };
     assert_eq!(
-        SettingsService::prune_once(&db, year, now, batches, &live).await,
+        SettingsService::prune_once(&db, year, now, batches, &live, &quiet).await,
         0,
         "a fresh record stays"
     );
     assert_eq!(
-        SettingsService::prune_once(&db, year, now + time::Duration::days(400), batches, &live)
-            .await,
+        SettingsService::prune_once(
+            &db,
+            year,
+            now + time::Duration::days(400),
+            batches,
+            &live,
+            &quiet
+        )
+        .await,
         1,
         "past its horizon, it leaves"
     );
@@ -699,6 +707,7 @@ async fn a_retention_pass_works_in_batches_up_to_its_cap_and_stops_when_cancelle
     let year = std::time::Duration::from_hours(365 * 24);
     let later = time::OffsetDateTime::now_utc() + time::Duration::days(400);
     let live = tokio_util::sync::CancellationToken::new();
+    let quiet = RecordingLifecycleMetrics::default();
 
     // Batches of two, two batches a tick: four go now, the last one next tick.
     let capped = super::PruneBatches {
@@ -706,15 +715,15 @@ async fn a_retention_pass_works_in_batches_up_to_its_cap_and_stops_when_cancelle
         per_tick: 2,
     };
     assert_eq!(
-        SettingsService::prune_once(&db, year, later, capped, &live).await,
+        SettingsService::prune_once(&db, year, later, capped, &live, &quiet).await,
         4
     );
     assert_eq!(
-        SettingsService::prune_once(&db, year, later, capped, &live).await,
+        SettingsService::prune_once(&db, year, later, capped, &live, &quiet).await,
         1
     );
     assert_eq!(
-        SettingsService::prune_once(&db, year, later, capped, &live).await,
+        SettingsService::prune_once(&db, year, later, capped, &live, &quiet).await,
         0
     );
 
@@ -733,18 +742,25 @@ async fn a_retention_pass_works_in_batches_up_to_its_cap_and_stops_when_cancelle
     let stopped = tokio_util::sync::CancellationToken::new();
     stopped.cancel();
     assert_eq!(
-        SettingsService::prune_once(&db, year, later, capped, &stopped).await,
+        SettingsService::prune_once(&db, year, later, capped, &stopped, &quiet).await,
         0
     );
 }
 
-/// Records what the review pass publishes, in order.
+/// Records what the lifecycle passes publish, in order.
 #[derive(Default)]
-struct RecordingReviewMetrics(std::sync::Mutex<Vec<(&'static str, u64)>>);
+struct RecordingLifecycleMetrics {
+    review: std::sync::Mutex<Vec<(&'static str, u64)>>,
+    retention: std::sync::Mutex<Vec<(&'static str, u64)>>,
+}
 
-impl crate::domain::ports::ReviewMetrics for RecordingReviewMetrics {
+impl crate::domain::ports::LifecycleMetrics for RecordingLifecycleMetrics {
     fn needs_review(&self, source: &'static str, count: u64) {
-        self.0.lock().expect("lock").push((source, count));
+        self.review.lock().expect("lock").push((source, count));
+    }
+
+    fn retention_pass(&self, result: &'static str, pruned: u64) {
+        self.retention.lock().expect("lock").push((result, pruned));
     }
 }
 
@@ -763,10 +779,10 @@ async fn a_review_pass_counts_the_flagged_overrides_by_source_and_says_zero_wher
         .await;
     h.set(d, h.tree.root, serde_json::json!(false)).await;
 
-    let metrics = RecordingReviewMetrics::default();
+    let metrics = RecordingLifecycleMetrics::default();
     SettingsService::review_once(&h.db, &metrics).await;
     assert_eq!(
-        *metrics.0.lock().expect("lock"),
+        *metrics.review.lock().expect("lock"),
         vec![("admin_authored", 0), ("module_contributed", 2)],
         "the harness declares as a module; the unflagged row is not counted"
     );
@@ -807,10 +823,53 @@ async fn a_review_pass_counts_the_flagged_overrides_by_source_and_says_zero_wher
     };
     h.set_flagged(admin, h.tree.a, serde_json::json!("often"))
         .await;
-    let metrics = RecordingReviewMetrics::default();
+    let metrics = RecordingLifecycleMetrics::default();
     SettingsService::review_once(&h.db, &metrics).await;
     assert_eq!(
-        *metrics.0.lock().expect("lock"),
+        *metrics.review.lock().expect("lock"),
         vec![("admin_authored", 1), ("module_contributed", 2)]
+    );
+}
+
+#[tokio::test]
+async fn a_retention_pass_reports_its_outcome_so_a_failure_is_not_a_quiet_zero() {
+    // A pass that pruned nothing and a pass that could not run both return
+    // zero; only the metric tells them apart, which is what an alert needs.
+    let year = std::time::Duration::from_hours(365 * 24);
+    let live = tokio_util::sync::CancellationToken::new();
+    let batches = super::PruneBatches {
+        size: 10,
+        per_tick: 1,
+    };
+    let now = time::OffsetDateTime::now_utc();
+
+    let healthy = crate::test_support::sqlite_provider().await;
+    let metrics = RecordingLifecycleMetrics::default();
+    assert_eq!(
+        SettingsService::prune_once(&healthy, year, now, batches, &live, &metrics).await,
+        0
+    );
+
+    // A database without the audit table: the delete fails.
+    let broken = toolkit_db::DBProvider::new(
+        toolkit_db::connect_db(
+            "sqlite::memory:",
+            toolkit_db::ConnectOpts {
+                max_conns: Some(1),
+                min_conns: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("an empty database"),
+    );
+    assert_eq!(
+        SettingsService::prune_once(&broken, year, now, batches, &live, &metrics).await,
+        0
+    );
+
+    assert_eq!(
+        *metrics.retention.lock().expect("lock"),
+        vec![("ok", 0), ("failed", 0)]
     );
 }

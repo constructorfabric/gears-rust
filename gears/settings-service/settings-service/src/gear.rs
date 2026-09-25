@@ -165,8 +165,8 @@ impl SettingsService {
             tick_secs = SWEEP_TICK.as_secs(),
             "pending-secret sweep and audit retention started"
         );
-        let review = crate::infra::review_metrics::OtelReviewMetrics::new();
-        Self::tick_until_cancelled(&writes, &db, retention, &review, &cancel).await;
+        let metrics = crate::infra::lifecycle_metrics::OtelLifecycleMetrics::new();
+        Self::tick_until_cancelled(&writes, &db, retention, &metrics, &cancel).await;
         info!("pending-secret sweep and audit retention stopped");
         Ok(())
     }
@@ -176,7 +176,7 @@ impl SettingsService {
         writes: &crate::infra::value_writes::WriteCoordinator,
         db: &DBProvider<DbError>,
         retention: Duration,
-        review: &dyn crate::domain::ports::ReviewMetrics,
+        metrics: &dyn crate::domain::ports::LifecycleMetrics,
         cancel: &CancellationToken,
     ) {
         let mut interval = ticking(SWEEP_TICK);
@@ -187,8 +187,8 @@ impl SettingsService {
                 biased;
                 () = cancel.cancelled() => break,
                 _ = interval.tick() => Self::sweep_once(writes, cancel).await,
-                _ = retention_interval.tick() => Self::retention_tick(db, retention, cancel).await,
-                _ = review_interval.tick() => Self::review_once(db, review).await,
+                _ = retention_interval.tick() => Self::retention_tick(db, retention, cancel, metrics).await,
+                _ = review_interval.tick() => Self::review_once(db, metrics).await,
             }
         }
     }
@@ -199,12 +199,12 @@ impl SettingsService {
     /// until the next tick.
     async fn review_once(
         db: &DBProvider<DbError>,
-        review: &dyn crate::domain::ports::ReviewMetrics,
+        metrics: &dyn crate::domain::ports::LifecycleMetrics,
     ) {
         match Self::count_needs_review(db).await {
             Ok(counts) => {
                 for (source, count) in counts {
-                    review.needs_review(source, count);
+                    metrics.needs_review(source, count);
                 }
             }
             Err(err) => tracing::warn!(
@@ -242,6 +242,7 @@ impl SettingsService {
         db: &DBProvider<DbError>,
         retention: Duration,
         cancel: &CancellationToken,
+        metrics: &dyn crate::domain::ports::LifecycleMetrics,
     ) {
         Self::prune_once(
             db,
@@ -249,6 +250,7 @@ impl SettingsService {
             time::OffsetDateTime::now_utc(),
             PRUNE_BATCHES,
             cancel,
+            metrics,
         )
         .await;
     }
@@ -265,8 +267,12 @@ impl SettingsService {
         now: time::OffsetDateTime,
         batches: PruneBatches,
         cancel: &CancellationToken,
+        metrics: &dyn crate::domain::ports::LifecycleMetrics,
     ) -> u64 {
         let (pruned, failure) = Self::prune(db, default_retention, now, batches, cancel).await;
+        // Reported whatever happened: a failed pass and one with nothing to
+        // prune both return zero, and only this tells them apart.
+        metrics.retention_pass(if failure.is_some() { "failed" } else { "ok" }, pruned);
         if pruned > 0 {
             info!(pruned, "audit records past their retention horizon pruned");
         }
