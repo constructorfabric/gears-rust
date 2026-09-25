@@ -32,8 +32,19 @@ pub enum EmbeddingProviderKind {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HopStrategy {
-    /// One-statement SQL/PGQ `GRAPH_TABLE` hop (requires `PostgreSQL` 19+).
+    /// The SQL/PGQ hop where the server provides it, the two-query hop where
+    /// it does not. The default, because it is a preference and not a
+    /// demand: the gear's baseline is `PostgreSQL` 16 and SQL/PGQ a backend
+    /// capability (ADR-0001), so a server without it is served, not refused.
+    /// Readiness reports that fallback as `Degraded`; naming `two_query`
+    /// states the choice outright and reports healthy.
     #[default]
+    Auto,
+    /// One-statement SQL/PGQ `GRAPH_TABLE` hop (requires `PostgreSQL` 19+),
+    /// as a demand. On a server that cannot provide it the gear is not ready
+    /// and traversal is refused, rather than quietly served by another
+    /// backend: an operator who asked for this one by name would otherwise
+    /// never learn they are not getting it (ADR-0001, point 2).
     Pgq,
     /// Two scoped queries; the universal fallback every deployment can serve.
     TwoQuery,
@@ -580,6 +591,35 @@ mod tests {
         assert!(
             GraphStorageConfig::default().validate().is_ok(),
             "no variable named is not a malformed name"
+        );
+    }
+
+    /// The traversal backend defaults to a preference, and the three
+    /// spellings an operator writes are the three that parse.
+    ///
+    /// `auto` is the default because the gear's baseline is `PostgreSQL` 16
+    /// and SQL/PGQ a capability of 19: a default of `pgq` made every
+    /// deployment on the baseline a demand the server could not meet, which
+    /// is why readiness could never report that demand as the failure the
+    /// matrix says it is.
+    #[test]
+    fn the_traversal_backend_defaults_to_a_preference() {
+        assert_eq!(
+            GraphStorageConfig::default().traversal_hop,
+            HopStrategy::Auto
+        );
+        for (spelled, expected) in [
+            ("auto", HopStrategy::Auto),
+            ("pgq", HopStrategy::Pgq),
+            ("two_query", HopStrategy::TwoQuery),
+        ] {
+            let parsed: HopStrategy = serde_json::from_value(serde_json::json!(spelled))
+                .unwrap_or_else(|error| panic!("`{spelled}` parses: {error}"));
+            assert_eq!(parsed, expected, "`{spelled}`");
+        }
+        assert!(
+            serde_json::from_value::<HopStrategy>(serde_json::json!("pattern")).is_err(),
+            "an unknown backend is refused, not defaulted"
         );
     }
 

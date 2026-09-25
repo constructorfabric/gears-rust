@@ -1598,36 +1598,88 @@ async fn traversal_answers_on_a_server_without_the_property_graph() {
         "the fallback backend answers the same question the pattern would have"
     );
 
-    // And an engine constructed *after* the capability vanished never attempts
-    // the pattern at all — the probe is what init uses.
-    let unprobed = PgGraphEngine::new(Arc::new(PgGraphStore::new(
-        Arc::clone(&stand.db),
-        GraphStorageConfig {
-            traversal_hop: HopStrategy::Pgq,
-            ..GraphStorageConfig::default()
-        }
-        .validated()
-        .expect("the test configuration is valid"),
-        graph_storage::infra::engine::probe_pgq(stand.store.db()).await,
-    )));
-    let again = unprobed
-        .expand(
-            &ctx,
-            ExpandRequest {
-                frontier: vec![seed],
-                direction: Direction::Outgoing,
-                edge_types: None,
-                labels: None,
-                budget: HopBudget {
-                    max_frontier: 100,
-                    max_edges_scanned: 1_000,
-                },
-                with_degrees: false,
-            },
-        )
+    // And an engine constructed *after* the capability vanished resolves the
+    // backend from the configuration: `auto` is a preference and is served
+    // on the fallback, `pgq` is a demand and is refused rather than quietly
+    // substituted. The probe is what init uses, so these are the two engines
+    // a restart on this server would build.
+    let probed = graph_storage::infra::engine::probe_pgq(stand.store.db()).await;
+    let store_for = |hop: HopStrategy| {
+        Arc::new(PgGraphStore::new(
+            Arc::clone(&stand.db),
+            GraphStorageConfig {
+                traversal_hop: hop,
+                ..GraphStorageConfig::default()
+            }
+            .validated()
+            .expect("the test configuration is valid"),
+            probed,
+        ))
+    };
+    let hop = || ExpandRequest {
+        frontier: vec![seed],
+        direction: Direction::Outgoing,
+        edge_types: None,
+        labels: None,
+        budget: HopBudget {
+            max_frontier: 100,
+            max_edges_scanned: 1_000,
+        },
+        with_degrees: false,
+    };
+
+    let preferred = store_for(HopStrategy::Auto);
+    let again = PgGraphEngine::new(Arc::clone(&preferred))
+        .expand(&ctx, hop())
         .await
-        .expect("the fallback backend answers");
+        .expect("`auto` is a preference, and the fallback backend answers");
     assert_eq!(again.edges.len(), 1);
+    let row = sqlpgq_row(preferred.as_ref()).await;
+    assert_eq!(
+        row.state,
+        graph_storage_sdk::models::ReadinessState::Degraded,
+        "{row:?}"
+    );
+
+    let demanded = store_for(HopStrategy::Pgq);
+    let refused = PgGraphEngine::new(Arc::clone(&demanded))
+        .expand(&ctx, hop())
+        .await
+        .err()
+        .expect("`pgq` is a demand, and another backend is not substituted for it");
+    assert!(
+        matches!(refused, graph_storage_sdk::plugin_api::GraphEngineError::Unavailable { ref reason } if reason.contains("traversal_hop")),
+        "the refusal names the setting to change, got {refused:?}"
+    );
+    let row = sqlpgq_row(demanded.as_ref()).await;
+    assert_eq!(
+        row.state,
+        graph_storage_sdk::models::ReadinessState::Unhealthy,
+        "{row:?}"
+    );
+    assert!(
+        !graph_storage_sdk::models::Readiness::of(vec![row]).ready,
+        "an explicitly configured backend the server cannot provide leaves the gear not ready"
+    );
+
+    // Naming the fallback states the choice, and reports healthy.
+    let chosen = store_for(HopStrategy::TwoQuery);
+    let row = sqlpgq_row(chosen.as_ref()).await;
+    assert_eq!(
+        row.state,
+        graph_storage_sdk::models::ReadinessState::Healthy,
+        "{row:?}"
+    );
+}
+
+/// The SQL/PGQ row of a store's own readiness report.
+async fn sqlpgq_row(store: &PgGraphStore) -> graph_storage_sdk::models::ComponentReadiness {
+    store
+        .probe_readiness()
+        .await
+        .into_iter()
+        .find(|row| row.component == graph_storage_sdk::models::SQLPGQ)
+        .expect("the store reports its SQL/PGQ row")
 }
 
 /// What `StoreCapabilities::snapshots = false` actually means here.

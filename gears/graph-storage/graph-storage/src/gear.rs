@@ -68,7 +68,17 @@ impl Gear for GraphStorage {
         // engine then serves every hop on the fallback backend.
         let pgq_available = crate::infra::engine::probe_pgq(&db).await;
         if !pgq_available {
-            warn!("this server does not provide SQL/PGQ; traversal will use the two-query hop");
+            match cfg.traversal_hop {
+                crate::config::HopStrategy::Auto => warn!(
+                    "this server does not provide SQL/PGQ; traversal will use the two-query hop"
+                ),
+                crate::config::HopStrategy::Pgq => error!(
+                    "traversal_hop is `pgq` and this server does not provide SQL/PGQ; the gear \
+                     reports not ready and refuses traversal rather than substitute another \
+                     backend"
+                ),
+                crate::config::HopStrategy::TwoQuery => {}
+            }
         }
 
         let store = Arc::new(PgGraphStore::new(

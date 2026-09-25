@@ -2760,9 +2760,13 @@ rows have no component behind them in this build and are reported as
 (the platform PEP publishes no health surface), the types registry as a runtime
 dependency, dynamic indexes, tenant reconciliation and the metric-annotation
 source — so an operator sees what the gear cannot yet say instead of a green
-light that means nothing. SQL/PGQ is reported `Degraded`, never `Unhealthy`:
-`traversal_hop` has no "no preference" value, so the gear cannot tell an
-explicit demand from the default and does not pretend to. And the embedding
+light that means nothing. SQL/PGQ is reported by intent. `traversal_hop` defaults to `auto`, a
+preference: on a server without SQL/PGQ it is served by the two-query hop
+and the row is `Degraded`. A named `pgq` is a demand: on such a server the
+row is `Unhealthy`, the gear is not ready, and traversal is refused rather
+than quietly served by another backend. Naming `two_query` states the
+choice and reports healthy. (This used to be `Degraded` in every case,
+because the only value, `pgq`, could not say whether it was meant.) And the embedding
 provider's outage does not yet degrade hybrid search to its lexical arm as the
 row prescribes — a hybrid search whose query cannot be embedded fails
 (`unavailable`), which is honest but not the documented behaviour.

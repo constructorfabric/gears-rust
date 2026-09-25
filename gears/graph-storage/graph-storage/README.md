@@ -27,7 +27,8 @@ graph-storage:
     server: "pg_graph"          # the PostgreSQL 19 server alias
     dbname: "graph_storage"
   config:
-    traversal_hop: pgq          # pgq | two_query
+    traversal_hop: auto         # auto (default) | pgq | two_query -- `pgq` is a
+                                # demand: without SQL/PGQ the gear is not ready
     embedding_dimension: 384    # fixed at migration time
     embedding_provider: onnx    # fake | onnx | remote
     # onnx (feature `onnx`)

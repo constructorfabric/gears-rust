@@ -108,16 +108,27 @@ impl PgGraphEngine {
 
     /// The backend a request will actually use, given configuration and what
     /// the server can parse.
-    fn effective_strategy(&self) -> HopStrategy {
+    /// The backend this configuration resolves to on this server.
+    ///
+    /// `auto` falls back without a word per hop: on the `PostgreSQL` 16
+    /// baseline that is the normal path, and readiness already reports it.
+    /// `pgq` does not fall back at all. The gear does not substitute another
+    /// backend for one an operator asked for by name -- silently changing
+    /// traversal semantics would hide a deployment error -- so readiness
+    /// reports the deployment not ready, and a caller that reaches the engine
+    /// anyway (the in-process client does not pass through the readiness
+    /// gate) is refused with the reason.
+    fn effective_backend(&self) -> Result<HopBackend, GraphEngineError> {
+        let available = self.store.pgq_available();
         match self.store.config().traversal_hop {
-            HopStrategy::Pgq if !self.store.pgq_available() => {
-                warn!(
-                    reason = "server does not provide SQL/PGQ",
-                    "falling back to the two-query hop"
-                );
-                HopStrategy::TwoQuery
-            }
-            other => other,
+            HopStrategy::Auto | HopStrategy::Pgq if available => Ok(HopBackend::Pattern),
+            HopStrategy::Auto | HopStrategy::TwoQuery => Ok(HopBackend::TwoQuery),
+            HopStrategy::Pgq => Err(GraphEngineError::Unavailable {
+                reason: "traversal_hop is `pgq` and this server does not provide SQL/PGQ; \
+                         set it to `auto` or `two_query`, or run on PostgreSQL 19 with the \
+                         property-graph migration applied"
+                    .to_owned(),
+            }),
         }
     }
 }
@@ -181,10 +192,7 @@ impl GraphEngineV1 for PgGraphEngine {
         }
         // Nothing is walked on either of these paths, so the backend named is
         // the one that would have walked it.
-        let would_serve = match self.effective_strategy() {
-            HopStrategy::Pgq => HopBackend::Pattern,
-            HopStrategy::TwoQuery => HopBackend::TwoQuery,
-        };
+        let would_serve = self.effective_backend()?;
         if req.frontier.is_empty() {
             return Ok(ExpandResponse {
                 reached: Vec::new(),
@@ -204,8 +212,8 @@ impl GraphEngineV1 for PgGraphEngine {
             });
         }
 
-        match self.effective_strategy() {
-            HopStrategy::Pgq => match expand_pgq(&self.store, ctx, &req).await {
+        match self.effective_backend()? {
+            HopBackend::Pattern => match expand_pgq(&self.store, ctx, &req).await {
                 Ok(PatternOutcome::Answered(response)) => Ok(response),
                 // Two different reasons, one response: the pattern could not
                 // serve this request, and the two-query hop answers the same
@@ -221,7 +229,7 @@ impl GraphEngineV1 for PgGraphEngine {
                 }
                 Err(other) => Err(other),
             },
-            HopStrategy::TwoQuery => expand_two_query(&self.store, ctx, &req).await,
+            HopBackend::TwoQuery => expand_two_query(&self.store, ctx, &req).await,
         }
     }
 

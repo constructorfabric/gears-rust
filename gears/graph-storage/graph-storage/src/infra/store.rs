@@ -311,16 +311,20 @@ impl GraphStoreV1 for PgGraphStore {
             }
         }
 
-        // The traversal backend, as probed at init. Degraded and never
-        // unhealthy: the matrix reserves the second for a backend an operator
-        // explicitly demanded, and this configuration cannot express the
-        // difference between a demand and a preference (DESIGN § Readiness Matrix).
-        if self.pgq_available() {
-            out.push(ComponentReadiness::healthy(
-                graph_storage_sdk::models::SQLPGQ,
-            ));
-        } else {
-            out.push(ComponentReadiness::new(
+        // The traversal backend, as probed at init, read against what the
+        // configuration asked for. The matrix has two rows for a server
+        // without SQL/PGQ, and they differ only in intent: `Degraded` where
+        // the backend was preferred, `Unhealthy` where it was demanded. This
+        // used to report `Degraded` for both, because a single `pgq` value
+        // could not say which it was; `auto` is the preference now, so a
+        // named `pgq` is the demand, and an operator who named it is told
+        // the gear is not ready rather than being quietly served something
+        // else (DESIGN § Readiness Matrix, ADR-0001 point 2).
+        let row = match (self.config().traversal_hop, self.pgq_available()) {
+            (_, true) | (crate::config::HopStrategy::TwoQuery, false) => {
+                ComponentReadiness::healthy(graph_storage_sdk::models::SQLPGQ)
+            }
+            (crate::config::HopStrategy::Auto, false) => ComponentReadiness::new(
                 graph_storage_sdk::models::SQLPGQ,
                 ReadinessState::Degraded,
                 "the declared property graph did not answer a pattern at startup; the server \
@@ -328,9 +332,19 @@ impl GraphStoreV1 for PgGraphStore {
                  not why",
                 "nothing: every traversal is served by the two-query hop",
                 "restart after the property-graph migration runs on a server that supports \
-                 SQL/PGQ",
-            ));
-        }
+                 SQL/PGQ, or set traversal_hop to `two_query` to state the choice",
+            ),
+            (crate::config::HopStrategy::Pgq, false) => ComponentReadiness::new(
+                graph_storage_sdk::models::SQLPGQ,
+                ReadinessState::Unhealthy,
+                "traversal_hop is `pgq` and this server does not provide SQL/PGQ",
+                "everything: the gear is not ready, because an explicitly configured backend \
+                 is not substituted",
+                "run on PostgreSQL 19 with the property-graph migration applied, or set \
+                 traversal_hop to `auto` or `two_query`",
+            ),
+        };
+        out.push(row);
 
         out
     }
