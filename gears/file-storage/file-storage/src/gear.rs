@@ -288,17 +288,21 @@ impl Gear for FileStorageGear {
                 i64::try_from(cfg.multipart_complete_lease_secs).unwrap_or(120),
             ),
         );
-        self.multipart_service.set(multipart_svc).map_err(|_| {
-            anyhow::anyhow!(
-                "{} multipart service already initialized",
-                Self::MODULE_NAME
-            )
-        })?;
+        self.multipart_service
+            .set(Arc::clone(&multipart_svc))
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "{} multipart service already initialized",
+                    Self::MODULE_NAME
+                )
+            })?;
 
         let policy_svc = Arc::new(PolicyService::new(policy_store, authorizer));
-        self.policy_service.set(policy_svc).map_err(|_| {
-            anyhow::anyhow!("{} policy service already initialized", Self::MODULE_NAME)
-        })?;
+        self.policy_service
+            .set(Arc::clone(&policy_svc))
+            .map_err(|_| {
+                anyhow::anyhow!("{} policy service already initialized", Self::MODULE_NAME)
+            })?;
 
         let cleanup_deferred = if cfg.enable_background_sweep {
             Some(CleanupDeferred {
@@ -325,7 +329,11 @@ impl Gear for FileStorageGear {
 
         ctx.client_hub()
             .register::<dyn file_storage_sdk::FileStorageClientV1>(Arc::new(
-                FileStorageLocalClient::new(),
+                FileStorageLocalClient::new(
+                    Arc::clone(&service),
+                    Arc::clone(&multipart_svc),
+                    Arc::clone(&policy_svc),
+                ),
             ));
 
         info!("{} gear initialized", Self::MODULE_NAME);

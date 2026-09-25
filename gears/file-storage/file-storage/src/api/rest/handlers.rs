@@ -15,7 +15,7 @@ use uuid::Uuid;
 use toolkit::api::canonical_prelude::*;
 use toolkit_security::SecurityContext;
 
-use file_storage_sdk::{CustomMetadataPatch, FileVersion, NewFile, OwnerFilter, OwnerKind};
+use file_storage_sdk::{CustomMetadataPatch, NewFile, OwnerFilter, OwnerKind};
 
 use super::dto::{
     BindReq, CreateFileReq, CreateRetentionRuleReq, DownloadTicketDto, EffectivePolicyDto, FileDto,
@@ -32,7 +32,6 @@ use crate::domain::multipart_service::MultipartService;
 use crate::domain::policy::{PolicyScope, RetentionScope};
 use crate::domain::policy_service::PolicyService;
 use crate::domain::service::FileService;
-use crate::infra::content::hash_mode::HashMode;
 use crate::infra::signed_url::{Op, Verifier};
 
 type Svc = Extension<Arc<FileService>>;
@@ -194,59 +193,46 @@ pub async fn create_file(
             .collect(),
     };
 
-    if let Some(mp) = &req.multipart {
-        // The idempotency record stores a single-part replay ticket; a
-        // multipart plan does not fit that contract — reject rather than
-        // silently ignoring one of the two.
-        if req.idempotency_key.is_some() {
-            return Err(DomainError::validation(
-                "idempotency_key",
-                "not supported together with the multipart intent block",
+    let multipart_intent =
+        req.multipart
+            .as_ref()
+            .map(|mp| crate::domain::create_flow::MultipartIntent {
+                declared_size: mp.declared_size,
+                preferred_part_size: mp.preferred_part_size,
+                concurrency: mp.concurrency,
+            });
+
+    // Shared with the SDK local client — see `domain::create_flow`'s doc.
+    let outcome = crate::domain::create_flow::create_file(
+        &svc,
+        &msvc,
+        &ctx,
+        new,
+        req.idempotency_key,
+        auto_bind,
+        multipart_intent,
+    )
+    .await?;
+
+    match outcome {
+        crate::domain::create_flow::CreateFileOutcome::SinglePart(ticket) => {
+            let id = ticket.file_id.to_string();
+            Ok(created_json(
+                UploadTicketDto {
+                    file_id: ticket.file_id,
+                    version_id: ticket.version_id,
+                    upload_url: Some(ticket.upload_url),
+                    multipart: None,
+                },
+                &uri,
+                &id,
             )
-            .into());
+            .into_response())
         }
-        // Same plan computation the initiate path runs — decides up front
-        // whether this is a real (≥2 parts) multipart upload. One-part plans
-        // fall through to the ordinary single-part path below.
-        let (_, planned_parts) =
-            crate::domain::multipart::compute_plan(mp.declared_size, mp.preferred_part_size, None)?;
-        if planned_parts.len() >= 2 {
-            // Create the file row only (no single-part pending version — the
-            // multipart initiate registers its own; the old flow's abandoned
-            // presign orphan disappears).
-            let file_id = svc.create_file_bare(&ctx, new).await?;
-            let plan = match msvc
-                .initiate_multipart_upload(
-                    &ctx,
-                    file_id,
-                    &req.mime_type,
-                    mp.declared_size,
-                    mp.preferred_part_size,
-                    mp.concurrency,
-                    auto_bind,
-                )
-                .await
-            {
-                Ok(plan) => plan,
-                Err(e) => {
-                    // Known defect FS-01/F1 fix: a capability rejection or
-                    // backend-side initiation error here would otherwise
-                    // leave the bare file just created above as a
-                    // version-less orphan that nothing reclaims until the
-                    // background sweep's `sweep_versionless_files` phase
-                    // ages it past `orphan_grace_secs` — see
-                    // FileService::compensate_failed_multipart_initiate's
-                    // own doc. Compensate synchronously instead of waiting
-                    // on that sweep; the ORIGINAL initiate error is still
-                    // what the caller sees.
-                    svc.compensate_failed_multipart_initiate(&ctx, file_id)
-                        .await;
-                    return Err(e.into());
-                }
-            };
+        crate::domain::create_flow::CreateFileOutcome::Multipart { file_id, plan } => {
             let id = file_id.to_string();
             let version_id = plan.version_id;
-            return Ok(created_json(
+            Ok(created_json(
                 UploadTicketDto {
                     file_id,
                     version_id,
@@ -256,25 +242,9 @@ pub async fn create_file(
                 &uri,
                 &id,
             )
-            .into_response());
+            .into_response())
         }
     }
-
-    let ticket = svc
-        .create_file(&ctx, new, req.idempotency_key, auto_bind)
-        .await?;
-    let id = ticket.file_id.to_string();
-    Ok(created_json(
-        UploadTicketDto {
-            file_id: ticket.file_id,
-            version_id: ticket.version_id,
-            upload_url: Some(ticket.upload_url),
-            multipart: None,
-        },
-        &uri,
-        &id,
-    )
-    .into_response())
 }
 
 pub async fn presign_version(
@@ -322,15 +292,16 @@ pub async fn get_file(
         .and_then(|tag| HeaderValue::from_str(tag).ok());
 
     // Conditional GET: If-None-Match → 304 (still carrying the ETag header).
-    if let (Some(inm), Some(tag)) = (header_str(&headers, "if-none-match"), etag.as_deref()) {
-        let inm = inm.trim();
-        if inm == "*" || inm == tag {
-            let mut resp = StatusCode::NOT_MODIFIED.into_response();
-            if let Some(v) = etag_header {
-                resp.headers_mut().insert(header::ETAG, v);
-            }
-            return Ok(resp);
+    // Shared with the SDK local client's `get_file` — see `etag::if_none_match_satisfied`.
+    if etag::if_none_match_satisfied(
+        header_str(&headers, "if-none-match").as_deref(),
+        etag.as_deref(),
+    ) {
+        let mut resp = StatusCode::NOT_MODIFIED.into_response();
+        if let Some(v) = etag_header {
+            resp.headers_mut().insert(header::ETAG, v);
         }
+        return Ok(resp);
     }
 
     let dto = FileDto::from_parts(file, meta);
@@ -352,140 +323,17 @@ pub async fn list_files(
         owner_kind,
         owner_id: q.owner_id,
     };
-    let files = svc
-        .list_files(&ctx, owner, q.limit, q.offset.unwrap_or(0))
+    // Shared with the SDK local client — see `FileService::list_files_with_metadata`
+    // (batched: one `IN (...)` query for the whole page rather than one
+    // `list_metadata` call per file).
+    let files_with_metadata = svc
+        .list_files_with_metadata(&ctx, owner, q.limit, q.offset.unwrap_or(0))
         .await?;
-    // Batched (one `IN (...)` query for the whole page) rather than one
-    // `list_metadata` call per file — see `FileService::list_files_with_metadata`.
-    let file_ids: Vec<Uuid> = files.iter().map(|f| f.file_id).collect();
-    let mut metadata_by_file = svc.list_metadata_for_files(&file_ids).await?;
-    let items = files
+    let items = files_with_metadata
         .into_iter()
-        .map(|f| {
-            let meta = metadata_by_file.remove(&f.file_id).unwrap_or_default();
-            FileDto::from_parts(f, meta)
-        })
+        .map(|(f, meta)| FileDto::from_parts(f, meta))
         .collect();
     Ok(Json(FileDtoList(items)))
-}
-
-/// Aggregate manifest-byte budget for one `list_versions` response page.
-/// Enforced *while* manifests are being fetched (see
-/// [`fetch_manifests_within_budget`]), against the manifests that actually
-/// make the cut -- not as an up-front cap on `?limit` itself, which would
-/// shrink every page regardless of `hash_mode` (a real regression: see
-/// `docs/api.md`).
-const LIST_VERSIONS_MANIFEST_BUDGET_BYTES: u64 = 4 * 1024 * 1024;
-
-/// How many composite versions' manifests to fetch per DB round trip while
-/// walking a page in order (see [`fetch_manifests_within_budget`]). Small
-/// enough that a page whose budget is exhausted early (say, at the 3rd
-/// composite version) never pulls more than one extra batch's worth of
-/// manifests past the cutoff; large enough that a page that fits entirely
-/// within budget (the common case) still costs only a handful of queries,
-/// not one per version.
-const MANIFEST_FETCH_BATCH_SIZE: usize = 8;
-
-/// How many of `versions` (already offset/limit-paginated in the service's
-/// return order, newest first) to keep so the summed byte length of their
-/// `manifests` entries never exceeds `budget_bytes`.
-///
-/// The first version is always kept, even if its own manifest alone exceeds
-/// the budget: a single manifest is already bounded to roughly `MAX_PART_COUNT`
-/// (10 000) parts (~1 MiB, see [`crate::domain::multipart::CompletedMultipartUpload`]'s
-/// doc comment), so this never admits an unbounded response, and keeping it
-/// unconditionally guarantees forward progress -- a client resuming right
-/// after this version can never have its whole next page truncated to
-/// nothing by the same oversized manifest.
-///
-/// `VersionDtoList` serializes as a bare JSON array (see `docs/api.md`), so
-/// there is no `has_more`/`next_offset`/cursor field available to signal an
-/// early truncation without changing the wire format. Continuing correctly
-/// after a truncated page therefore relies on the client resuming at
-/// `offset + <number of versions actually received>` rather than
-/// `offset + limit` -- already the correct, general offset-pagination
-/// client contract (it is exactly how a short *final* page had to be
-/// handled even before this budget existed), so an early-truncated page
-/// composes with it with no special case. A client that instead always
-/// advances by `limit` risks skipping the remainder after a
-/// budget-truncated page.
-fn manifest_budget_cutoff(
-    versions: &[FileVersion],
-    manifests: &std::collections::HashMap<Uuid, String>,
-    budget_bytes: u64,
-) -> usize {
-    let mut used_bytes: u64 = 0;
-    for (i, v) in versions.iter().enumerate() {
-        let Some(manifest) = manifests.get(&v.version_id) else {
-            continue; // whole-sha256 (or no manifest found): no budget consumed
-        };
-        let size = manifest.len() as u64;
-        if i > 0 && used_bytes.saturating_add(size) > budget_bytes {
-            return i;
-        }
-        used_bytes = used_bytes.saturating_add(size);
-    }
-    versions.len()
-}
-
-/// Fetch every multipart-composite version's manifest for one
-/// `list_versions` page, in page order and in [`MANIFEST_FETCH_BATCH_SIZE`]-sized
-/// batches, stopping (and truncating `versions` in place via
-/// [`manifest_budget_cutoff`]) the moment the running manifest byte total
-/// would cross `budget_bytes` -- so a page whose budget is exhausted at the
-/// k-th version never fetches manifests beyond (at most one batch past)
-/// that cutoff. The previous implementation fetched every composite
-/// version's manifest on the page unconditionally in one query, then
-/// truncated the response after the fact -- correct output, but the DB
-/// round trip (and the allocated manifest strings) already paid for
-/// whatever `manifest_budget_cutoff` was about to throw away.
-///
-/// After each batch, [`manifest_budget_cutoff`] runs only over the *safe
-/// prefix* of `versions` whose composite manifests are now all known
-/// (`composite_positions[..fetched]`'s last entry, plus any trailing
-/// whole-sha256 versions that consume no budget either way) -- never over
-/// the whole page, which would otherwise treat a composite version whose
-/// manifest hasn't been fetched *yet* the same as one with no manifest row
-/// at all (free, no budget consumed) and silently admit it.
-async fn fetch_manifests_within_budget(
-    svc: &FileService,
-    versions: &mut Vec<FileVersion>,
-    budget_bytes: u64,
-) -> Result<std::collections::HashMap<Uuid, String>, DomainError> {
-    // Every composite version's id and its position within `versions`, in
-    // page order.
-    let mut composite_ids: Vec<Uuid> = Vec::new();
-    let mut composite_positions: Vec<usize> = Vec::new();
-    for (i, v) in versions.iter().enumerate() {
-        if v.hash_mode == HashMode::MULTIPART_COMPOSITE_SHA256 {
-            composite_ids.push(v.version_id);
-            composite_positions.push(i);
-        }
-    }
-
-    let mut manifests: std::collections::HashMap<Uuid, String> = std::collections::HashMap::new();
-    let mut fetched = 0usize;
-
-    for chunk in composite_ids.chunks(MANIFEST_FETCH_BATCH_SIZE) {
-        let batch = svc.manifests_for_versions(chunk).await?;
-        manifests.extend(batch);
-        fetched += chunk.len();
-
-        let safe_upto = composite_positions
-            .get(fetched)
-            .copied()
-            .unwrap_or(versions.len());
-        let cutoff = manifest_budget_cutoff(&versions[..safe_upto], &manifests, budget_bytes);
-        if cutoff < safe_upto {
-            versions.truncate(cutoff);
-            return Ok(manifests);
-        }
-        if safe_upto == versions.len() {
-            // Reached the end of the page without ever exceeding budget.
-            return Ok(manifests);
-        }
-    }
-    Ok(manifests)
 }
 
 pub async fn list_versions(
@@ -494,436 +342,17 @@ pub async fn list_versions(
     Path(file_id): Path<Uuid>,
     Query(q): Query<ListVersionsQuery>,
 ) -> ApiResult<JsonBody<VersionDtoList>> {
-    let mut versions = svc
-        .list_versions(&ctx, file_id, q.limit, q.offset.unwrap_or(0))
+    // The manifest-byte budget (and its batched-fetch/truncation) is shared
+    // with the SDK local client -- see `FileService::list_versions_with_manifests`.
+    let versions = svc
+        .list_versions_with_manifests(&ctx, file_id, q.limit, q.offset.unwrap_or(0))
         .await?;
-    // Attach the stored ADR-0006 offset-manifest to every
-    // multipart-composite version on the page -- fetched (and the page
-    // truncated to the manifest byte budget) by
-    // `fetch_manifests_within_budget`, in page order, in small batches, so
-    // a budget-truncated page never pays for manifests beyond its own
-    // cutoff.
-    let mut manifests =
-        fetch_manifests_within_budget(&svc, &mut versions, LIST_VERSIONS_MANIFEST_BUDGET_BYTES)
-            .await?;
     Ok(Json(VersionDtoList(
         versions
             .into_iter()
-            .map(|v| {
-                let manifest = manifests.remove(&v.version_id);
-                VersionDto::from_parts(v, manifest)
-            })
+            .map(|(v, manifest)| VersionDto::from_parts(v, manifest))
             .collect(),
     )))
-}
-
-#[cfg(test)]
-mod list_versions_manifest_budget_tests {
-    use std::collections::HashMap;
-
-    use file_storage_sdk::VersionStatus;
-    use time::OffsetDateTime;
-
-    use super::{FileVersion, Uuid, manifest_budget_cutoff};
-
-    fn whole_version() -> FileVersion {
-        FileVersion {
-            file_id: Uuid::now_v7(),
-            version_id: Uuid::now_v7(),
-            mime_type: "application/octet-stream".to_owned(),
-            size: 2,
-            hash_algorithm: "sha256".to_owned(),
-            hash_value: vec![0u8; 32],
-            hash_mode: "whole-sha256".to_owned(),
-            part_count: None,
-            status: VersionStatus::Available,
-            is_current: false,
-            backend_id: "mem".to_owned(),
-            backend_path: "path".to_owned(),
-            created_at: OffsetDateTime::now_utc(),
-        }
-    }
-
-    fn composite_version() -> FileVersion {
-        FileVersion {
-            hash_mode: "multipart-composite-sha256".to_owned(),
-            part_count: Some(2),
-            ..whole_version()
-        }
-    }
-
-    /// No composite versions on the page -- the manifest budget never
-    /// applies, no matter how many whole-sha256 versions there are (the
-    /// regression this whole change reverts: an unconditional page-size cap
-    /// that clamped every `list_versions` call, composite or not).
-    #[test]
-    fn keeps_the_whole_page_when_no_manifests_are_attached() {
-        let versions: Vec<FileVersion> = (0..8).map(|_| whole_version()).collect();
-        let manifests = HashMap::new();
-        assert_eq!(
-            manifest_budget_cutoff(&versions, &manifests, 4 * 1024 * 1024),
-            8
-        );
-    }
-
-    /// Composite versions whose manifests sum past the budget get cut
-    /// *before* the version that would push the total over -- the cutoff
-    /// index is exactly that version's position, so a client resuming at
-    /// `offset + cutoff` starts there next time (nothing skipped, nothing
-    /// duplicated).
-    #[test]
-    fn cuts_the_page_right_before_the_version_that_would_exceed_budget() {
-        let v0 = composite_version();
-        let v1 = composite_version();
-        let v2 = composite_version();
-        let mut manifests = HashMap::new();
-        manifests.insert(v0.version_id, "m".repeat(3));
-        manifests.insert(v1.version_id, "m".repeat(3));
-        manifests.insert(v2.version_id, "m".repeat(3));
-        let versions = vec![v0, v1, v2];
-
-        // Budget covers exactly 2 manifests (3 bytes each) but not a 3rd.
-        assert_eq!(manifest_budget_cutoff(&versions, &manifests, 6), 2);
-    }
-
-    /// The first version on the page is always kept, even alone against an
-    /// oversized manifest -- otherwise a client resuming right at it would
-    /// be handed an empty page forever (the listing would never progress).
-    #[test]
-    fn always_keeps_the_first_version_even_if_its_manifest_alone_exceeds_budget() {
-        let v0 = composite_version();
-        let mut manifests = HashMap::new();
-        manifests.insert(v0.version_id, "m".repeat(10));
-        let versions = vec![v0];
-
-        assert_eq!(manifest_budget_cutoff(&versions, &manifests, 1), 1);
-    }
-
-    /// A single oversized-manifest version followed by others: the first is
-    /// kept (previous test), but the budget is already exhausted, so
-    /// everything after it is cut -- the *next* page then starts exactly at
-    /// the still-untruncated second version.
-    #[test]
-    fn cuts_everything_after_an_oversized_first_manifest() {
-        let v0 = composite_version();
-        let v1 = composite_version();
-        let mut manifests = HashMap::new();
-        manifests.insert(v0.version_id, "m".repeat(10));
-        manifests.insert(v1.version_id, "m".to_owned());
-        let versions = vec![v0, v1];
-
-        assert_eq!(manifest_budget_cutoff(&versions, &manifests, 1), 1);
-    }
-
-    /// Pagination composes: simulate a client that (correctly) resumes at
-    /// `offset + <versions received>` across a truncated page and a
-    /// follow-up page, and check every version is seen exactly once.
-    #[test]
-    fn truncated_page_plus_follow_up_covers_every_version_exactly_once() {
-        let all: Vec<FileVersion> = (0..5).map(|_| composite_version()).collect();
-        let manifests: HashMap<Uuid, String> =
-            all.iter().map(|v| (v.version_id, "m".repeat(3))).collect();
-        let budget = 6; // exactly 2 manifests per page
-
-        let page1_len = manifest_budget_cutoff(&all, &manifests, budget);
-        assert_eq!(page1_len, 2, "first page must stop before the 3rd version");
-
-        let remaining = &all[page1_len..];
-        let page2_len = manifest_budget_cutoff(remaining, &manifests, budget);
-        assert_eq!(page2_len, 2);
-
-        let remaining2 = &remaining[page2_len..];
-        let page3_len = manifest_budget_cutoff(remaining2, &manifests, budget);
-        assert_eq!(page3_len, 1, "last page holds the one leftover version");
-
-        let mut seen: Vec<Uuid> = all[..page1_len]
-            .iter()
-            .chain(&remaining[..page2_len])
-            .chain(&remaining2[..page3_len])
-            .map(|v| v.version_id)
-            .collect();
-        seen.sort();
-        let mut expected: Vec<Uuid> = all.iter().map(|v| v.version_id).collect();
-        expected.sort();
-        assert_eq!(seen, expected, "every version must appear exactly once");
-    }
-}
-
-/// DB-backed tests for `fetch_manifests_within_budget` (the batched-fetch
-/// wrapper around `manifest_budget_cutoff`, above). Living in-crate (not
-/// under `tests/`) is what lets these reach the private `fetch_manifests_within_budget`
-/// directly, mirroring `domain/service/read_ops_tests.rs`'s own
-/// real-temp-file-SQLite harness pattern.
-#[cfg(test)]
-mod fetch_manifests_within_budget_tests {
-    use std::sync::Arc;
-
-    use sea_orm::Set;
-    use sea_orm_migration::MigratorTrait;
-    use time::OffsetDateTime;
-    use toolkit_db::migration_runner::run_migrations_for_testing;
-    use toolkit_db::secure::secure_insert_many;
-    use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
-    use toolkit_gts::gts_id;
-    use toolkit_security::AccessScope;
-    use uuid::Uuid;
-
-    use super::{FileVersion, MANIFEST_FETCH_BATCH_SIZE, fetch_manifests_within_budget};
-    use crate::domain::authz::TenantOnlyAuthorizer;
-    use crate::domain::service::{FileService, ServiceConfig};
-    use crate::infra::backend::{BackendRegistry, InMemoryBackend, StorageBackend};
-    use crate::infra::signed_url::Issuer;
-    use crate::infra::storage::Store;
-    use crate::infra::storage::entity::file::{
-        ActiveModel as FileActiveModel, Entity as FileEntity,
-    };
-    use crate::infra::storage::entity::file_version::{
-        ActiveModel as VersionActiveModel, Entity as VersionEntity,
-    };
-    use crate::infra::storage::entity::version_hash_manifest::{
-        ActiveModel as ManifestActiveModel, Entity as ManifestEntity,
-    };
-    use crate::infra::storage::migrations::Migrator;
-    use file_storage_sdk::VersionStatus;
-
-    const GTS: &str = gts_id!("cf.fstorage.file.type.v1~x.test.file.type.v1~");
-
-    async fn build_service() -> (Arc<FileService>, Arc<DBProvider<DbError>>) {
-        let mut path = std::env::temp_dir();
-        path.push(format!(
-            "cf-fs-lv-budget-test-{}.db",
-            Uuid::now_v7().simple()
-        ));
-        let dsn = format!("sqlite://{}?mode=rwc", path.display());
-        let opts = ConnectOpts {
-            max_conns: Some(1),
-            min_conns: Some(1),
-            ..Default::default()
-        };
-        let conn = connect_db(&dsn, opts).await.expect("connect sqlite");
-        run_migrations_for_testing(&conn, Migrator::migrations())
-            .await
-            .expect("migrations");
-        let db: Arc<DBProvider<DbError>> = Arc::new(DBProvider::new(conn));
-
-        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
-        let backends = BackendRegistry::new(vec![backend], "mem").expect("registry");
-        let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
-        let authorizer = Arc::new(TenantOnlyAuthorizer);
-        let cfg = ServiceConfig {
-            default_url_ttl_secs: 3600,
-            sidecar_base_url: "http://sidecar.test".to_owned(),
-            default_page_size: 50,
-            max_page_size: 1000,
-            idempotency_ttl_secs: 86400,
-        };
-        let store = Store::new(Arc::clone(&db));
-        let svc = Arc::new(FileService::new(
-            store, backends, issuer, authorizer, cfg, None, None,
-        ));
-        (svc, db)
-    }
-
-    /// Seed one parent `files` row plus `n` `multipart-composite-sha256`
-    /// `file_versions` rows (newest first: `created_at` strictly decreasing
-    /// with `i`, matching `list_versions`' own page order) and their
-    /// `version_hash_manifest` rows, each exactly `manifest_len` bytes --
-    /// direct entity inserts (mirrors `tests/version_repo_test.rs`'s own
-    /// `get_manifests_returns_all_results_across_multiple_chunks` seeding),
-    /// bypassing the real multipart-upload machinery so a many-version page
-    /// is cheap to build. Returns the version rows in page order, as plain
-    /// `FileVersion` SDK values (`fetch_manifests_within_budget` never reads
-    /// the DB for anything but the manifest text itself).
-    async fn seed_composite_page(
-        db: &Arc<DBProvider<DbError>>,
-        n: usize,
-        manifest_len: usize,
-    ) -> Vec<FileVersion> {
-        let conn = db.conn().expect("conn");
-        let scope = AccessScope::allow_all();
-        let now = OffsetDateTime::now_utc();
-        let tenant_id = Uuid::now_v7();
-        let file_id = Uuid::now_v7();
-
-        secure_insert_many::<FileEntity>(
-            vec![FileActiveModel {
-                file_id: Set(file_id),
-                tenant_id: Set(tenant_id),
-                owner_kind: Set("user".to_owned()),
-                owner_id: Set(Uuid::now_v7()),
-                name: Set("f.bin".to_owned()),
-                gts_file_type: Set(GTS.to_owned()),
-                content_id: Set(None),
-                meta_version: Set(0),
-                created_at: Set(now),
-                last_modified_at: Set(now),
-            }],
-            &scope,
-            &conn,
-        )
-        .await
-        .expect("seed parent file row");
-
-        let versions: Vec<FileVersion> = (0..n)
-            .map(|i| FileVersion {
-                file_id,
-                version_id: Uuid::now_v7(),
-                mime_type: "application/octet-stream".to_owned(),
-                size: 1024,
-                hash_algorithm: "SHA-256".to_owned(),
-                hash_value: vec![0u8; 32],
-                hash_mode: "multipart-composite-sha256".to_owned(),
-                part_count: Some(2),
-                status: VersionStatus::Available,
-                is_current: false,
-                backend_id: "mem".to_owned(),
-                backend_path: format!("/{file_id}/{i}"),
-                // Strictly decreasing so version 0 is newest -- matches the
-                // order this vec is already built in.
-                created_at: now - time::Duration::seconds(i64::try_from(i).unwrap_or(i64::MAX)),
-            })
-            .collect();
-
-        let version_models: Vec<VersionActiveModel> = versions
-            .iter()
-            .map(|v| VersionActiveModel {
-                file_id: Set(v.file_id),
-                version_id: Set(v.version_id),
-                mime_type: Set(v.mime_type.clone()),
-                size: Set(v.size),
-                hash_algorithm: Set(v.hash_algorithm.clone()),
-                hash_value: Set(v.hash_value.clone()),
-                hash_mode: Set(v.hash_mode.clone()),
-                part_count: Set(v.part_count),
-                status: Set("available".to_owned()),
-                is_current: Set(false),
-                backend_id: Set(v.backend_id.clone()),
-                backend_path: Set(v.backend_path.clone()),
-                created_at: Set(v.created_at),
-            })
-            .collect();
-        secure_insert_many::<VersionEntity>(version_models, &scope, &conn)
-            .await
-            .expect("seed file_versions rows");
-
-        let manifest_models: Vec<ManifestActiveModel> = versions
-            .iter()
-            .map(|v| ManifestActiveModel {
-                version_id: Set(v.version_id),
-                manifest: Set("m".repeat(manifest_len)),
-                created_at: Set(now),
-            })
-            .collect();
-        secure_insert_many::<ManifestEntity>(manifest_models, &scope, &conn)
-            .await
-            .expect("seed version_hash_manifest rows");
-
-        versions
-    }
-
-    /// A page whose manifest budget is exhausted partway through (well past
-    /// the first `MANIFEST_FETCH_BATCH_SIZE`-sized fetch batch, so this
-    /// exercises the "stop before the next batch" path, not just "the
-    /// cutoff happens to land in the first batch"): the truncated page must
-    /// match exactly what the old unconditional-fetch-then-truncate code
-    /// would have produced, while loading strictly fewer manifest rows than
-    /// the full page holds.
-    #[tokio::test]
-    async fn stops_fetching_once_budget_is_exceeded_and_matches_full_fetch_truncation() {
-        let (svc, db) = build_service().await;
-
-        // 20 composite versions, comfortably more than one fetch batch
-        // (MANIFEST_FETCH_BATCH_SIZE == 8); ~350 KiB manifests so the 4 MiB
-        // budget is exhausted a little past the 11th version (used bytes
-        // stay in the low single-digit MiB range for 11-12 versions), i.e.
-        // partway through the *second* fetch batch (versions 8..16).
-        let manifest_len = 350 * 1024;
-        let n = 20;
-        let versions = seed_composite_page(&db, n, manifest_len).await;
-
-        // Ground truth: fetch every manifest in one unrestricted call (the
-        // old code's own shape) and compute the cutoff via the unchanged
-        // pure `manifest_budget_cutoff`.
-        let all_ids: Vec<Uuid> = versions.iter().map(|v| v.version_id).collect();
-        let all_manifests = svc
-            .manifests_for_versions(&all_ids)
-            .await
-            .expect("fetch all manifests");
-        let expected_cutoff = super::manifest_budget_cutoff(
-            &versions,
-            &all_manifests,
-            super::LIST_VERSIONS_MANIFEST_BUDGET_BYTES,
-        );
-        assert!(
-            expected_cutoff > 1 && expected_cutoff < n,
-            "test setup must actually exercise a mid-page cutoff, got {expected_cutoff} of {n}"
-        );
-        assert!(
-            expected_cutoff > MANIFEST_FETCH_BATCH_SIZE,
-            "test setup must exercise more than one fetch batch, got cutoff {expected_cutoff}"
-        );
-
-        let mut budgeted_versions = versions.clone();
-        let budgeted_manifests = fetch_manifests_within_budget(
-            &svc,
-            &mut budgeted_versions,
-            super::LIST_VERSIONS_MANIFEST_BUDGET_BYTES,
-        )
-        .await
-        .expect("fetch_manifests_within_budget");
-
-        assert_eq!(
-            budgeted_versions.len(),
-            expected_cutoff,
-            "the batched fetch must truncate to exactly the same cutoff the \
-             old fetch-everything-then-truncate code would have produced"
-        );
-        for v in &budgeted_versions {
-            assert_eq!(
-                budgeted_manifests.get(&v.version_id),
-                all_manifests.get(&v.version_id),
-                "every surviving version's manifest text must be unchanged"
-            );
-        }
-
-        assert!(
-            budgeted_manifests.len() < all_manifests.len(),
-            "the batched fetch must load strictly fewer manifest rows ({}) \
-             than the full page holds ({}) once the budget is exhausted \
-             before the last version",
-            budgeted_manifests.len(),
-            all_manifests.len()
-        );
-        assert!(
-            budgeted_manifests.len() < expected_cutoff + MANIFEST_FETCH_BATCH_SIZE,
-            "over-fetch past the cutoff must be bounded by one batch, got {} \
-             manifests loaded for a cutoff at {}",
-            budgeted_manifests.len(),
-            expected_cutoff
-        );
-    }
-
-    /// A page that fits entirely within budget must load every manifest and
-    /// keep every version -- the batching must never truncate a page that
-    /// never actually exceeds the budget.
-    #[tokio::test]
-    async fn keeps_the_whole_page_when_it_fits_within_budget() {
-        let (svc, db) = build_service().await;
-        let n = 5;
-        let versions = seed_composite_page(&db, n, 1024).await;
-
-        let mut budgeted_versions = versions.clone();
-        let budgeted_manifests = fetch_manifests_within_budget(
-            &svc,
-            &mut budgeted_versions,
-            super::LIST_VERSIONS_MANIFEST_BUDGET_BYTES,
-        )
-        .await
-        .expect("fetch_manifests_within_budget");
-
-        assert_eq!(budgeted_versions.len(), n);
-        assert_eq!(budgeted_manifests.len(), n);
-    }
 }
 
 pub async fn download_url(

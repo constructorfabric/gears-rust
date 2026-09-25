@@ -23,6 +23,11 @@ default = []
 # Core dependencies for the public API trait + models
 uuid = { workspace = true }
 time = { workspace = true }
+async-trait = { workspace = true }
+
+# `SecurityContext` is the first argument of every `FileStorageClientV1`
+# method (same convention as `resource-group-sdk`).
+toolkit-security = { workspace = true }
 
 # Canonical error envelope (re-exported as `FileStorageError`)
 toolkit-canonical-errors = { workspace = true }

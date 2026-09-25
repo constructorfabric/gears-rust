@@ -1,8 +1,11 @@
 //! File Storage SDK
 //!
-//! Public API surface for the `file-storage` gear (control plane). The P1
-//! operations land incrementally; this crate currently pins the stable types
-//! other gears consume:
+//! Public API surface for the `file-storage` gear (control plane). Level 1:
+//! every control-plane operation runs in-process through
+//! [`FileStorageClientV1`] and returns models / signed URLs — the SDK never
+//! transfers file bytes itself (see `gears/file-storage/docs/DESIGN.md`'s
+//! `sdk-facade` component for what a future Level 2 would add). This crate
+//! pins the stable types other gears consume:
 //!
 //! - [`FileStorageClientV1`] — the inter-gear client trait (resolved from `ClientHub`)
 //! - model types ([`models`])
@@ -27,8 +30,14 @@ pub mod models;
 pub use api::FileStorageClientV1;
 pub use gts::FILE_TYPE_RESOURCE;
 pub use models::{
-    ByteRange, CustomMetadataEntry, CustomMetadataPatch, File, FileId, FileVersion, NewFile,
-    OwnerFilter, OwnerKind, VersionId, VersionStatus,
+    AgeRetention, BindState, ByteRange, CompletedMultipartUpload, CreateFileOutcome,
+    CustomMetadataEntry, CustomMetadataPatch, DownloadTicket, EffectivePolicy, File, FileFetch,
+    FileId, FileRecord, FileVersion, InactivityRetention, MetadataLimits, MetadataRetention,
+    MimeSizeOverride, MissingPart, MultipartCompleteOutcome, MultipartIntent, MultipartPartPlan,
+    MultipartPlan, MultipartStatus, MultipartUploadState, NewFile, OwnerFilter, OwnerKind, Page,
+    Policy, PolicyBody, PolicyScope, ReceivedPart, RetentionRule, RetentionRuleBody,
+    RetentionScope, SizeLimits, Storage, StorageCapabilities, UploadTicket, VersionId,
+    VersionRecord, VersionStatus,
 };
 
 pub use toolkit_canonical_errors::CanonicalError as FileStorageError;
