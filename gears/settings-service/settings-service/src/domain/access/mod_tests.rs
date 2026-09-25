@@ -163,3 +163,24 @@ async fn an_access_change_evicts_the_tenant_and_its_descendants_only() {
     assert!(cache.get("k", tree.child).is_none() && cache.get("k", tree.grandchild).is_none());
     assert!(cache.get("k", tree.root).is_some() && cache.get("k", tree.sibling).is_some());
 }
+
+#[test]
+fn the_access_spellings_are_the_shipped_ones_and_nothing_else_parses() {
+    // Stored and wire form at once, and permanent: a stored row or a client
+    // may hold any of them, so a rename is caught here, not in production.
+    for (access, spelling) in [
+        (TenantAccess::Overridable, "overridable"),
+        (TenantAccess::ReadOnly, "read_only"),
+        (TenantAccess::Hidden, "hidden"),
+    ] {
+        assert_eq!(access.as_str(), spelling);
+        assert_eq!(TenantAccess::parse(spelling), Some(access));
+    }
+    for unknown in ["Hidden", "readonly", "read-only", "", "overridable "] {
+        assert_eq!(
+            TenantAccess::parse(unknown),
+            None,
+            "`{unknown}` is not guessed"
+        );
+    }
+}

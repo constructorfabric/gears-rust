@@ -26,6 +26,27 @@ pub use repo::AccessRepository;
 pub use service::{AccessActor, AccessReadout, AccessService};
 
 /// What a tenant may do with a setting.
+///
+/// # Compatibility
+///
+/// The spelling [`Self::as_str`] gives is at once the stored form — the
+/// `tenant_permissions.access` column, under a check constraint that admits
+/// `read_only` and `hidden`, since `overridable` is no row — and the wire form,
+/// on the access readout and in a mutation's body. It is **permanent once
+/// shipped**: a row may hold it and a client may match on it. **Adding** a
+/// variant is compatible, with a migration widening the check constraint; a
+/// client should show a value it does not know as it is. **Renaming or
+/// removing** one is breaking.
+///
+/// The variants' order is part of the contract, not a detail of the
+/// declaration: it is strictness, `overridable < read_only < hidden`, and the
+/// effective access on a chain is the greatest row by it. A new variant goes
+/// where its strictness puts it.
+///
+/// This service never guesses: a stored value [`Self::parse`] does not know is
+/// an integrity error on the read, not a row read as some default access, and
+/// an unknown value in a mutation is refused `400`. The spellings are pinned
+/// by a test.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TenantAccess {
     /// Read and set its own override: the default, represented by no row.
