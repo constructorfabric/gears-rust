@@ -447,7 +447,8 @@ gear's code. It remains a planned P2 requirement (see PRD.md/DESIGN.md).
 
 - **Requirements Covered**:
 
-  - [ ] `p2` - `cpt-cf-file-storage-fr-ownership-transfer` -- PARTIAL, see the status note above
+  - [ ] `p2` - `cpt-cf-file-storage-fr-ownership-transfer`
+    (PARTIAL — see the status note above.)
 
 - **Design Principles Covered**:
 
