@@ -16,11 +16,10 @@ full file contents. Work from the diff.
 
 ## Input Files
 
-1. `/tmp/toolkit-pr-review-$REVIEW_ID/diff.patch` — the full diff under review. This is your primary input.
-2. `/tmp/toolkit-pr-review-$REVIEW_ID/context.json` — review metadata, file lists, changed line ranges
+Paths are in your spawn prompt, under the review's work directory:
 
-`$REVIEW_ID` is the PR number in PR mode, or `local-<branch-slug>` in local mode. The orchestrator
-supplies the concrete directory path.
+1. `<work>/diff.patch` — the full diff under review. This is your primary input.
+2. `<work>/context.json` — review metadata, file lists, changed line ranges
 
 Do not snapshot-read whole files from `files/`. If a specific file is genuinely necessary to confirm
 a structural claim, read that one file and no more. Reading a subject agent's way defeats the point of
@@ -101,7 +100,7 @@ Field rules:
 
 - `"file"`: repo-root-relative path, exactly as it appears in the diff (strip `a/` or `b/` prefix).
 - `"line"`: integer, must be in `files[file].ranges.right`. Omit the field entirely when no single line
-  represents the finding, or when the file is in `deleted_files`.
+  represents the finding, or when the file's `status` is `deleted`.
 - `"severity"`: one of `"CRITICAL"`, `"HIGH"`, `"MEDIUM"`, `"LOW"` (verbatim strings, uppercase).
 - `"id"`: always `"RUST-ARCH-001"`.
 - `"comment"`: **the inline comment body a human will read on GitHub.** 1 to 3 sentences.

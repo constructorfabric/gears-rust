@@ -195,7 +195,7 @@ stays masked.
 **Finding**: If the diff removes, weakens, or `#[ignore]`s a test that would otherwise fail, and there is **neither a linked follow-up issue nor a clear written justification**, flag it as TEST-QUALITY-9. Either one is acceptable on its own; a well-reasoned in-code justification with no ticket is not a finding. Two anchor cases:
 - The test was removed from a file that still exists — anchor on the removed line itself with `"side": "LEFT"` and a `line` from that file's `ranges.left`.
 - The **entire file** containing the test was deleted. Emit the finding with no `line` field at all
-  why: such a file is listed in `deleted_files` and its pre-deletion content is in
+  why: such a file has `status: "deleted"` and its pre-deletion content is in
        `files/<repo/path>`, fetched from the base commit. It has no line on either side.
 
 Do not omit either case for lack of a line — see Scope Rules and Output Contract.

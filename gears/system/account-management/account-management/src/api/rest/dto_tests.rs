@@ -21,7 +21,9 @@ use time::macros::datetime;
 use toolkit_gts::gts_id;
 use uuid::Uuid;
 
-use account_management_sdk::{IdpUser, MetadataEntry, Tenant, TenantId, TenantStatus};
+use account_management_sdk::{
+    IdpUser, MetadataEntry, Tenant, TenantAncestor, TenantId, TenantNode, TenantStatus,
+};
 use gts::GtsTypeId;
 
 use toolkit_security::SecurityContext;
@@ -1143,5 +1145,69 @@ fn me_dto_omits_subject_type_when_absent() {
             "subject_tenant_id": "44444444-4444-4444-4444-444444444444",
         }),
         "absent subject_type serialises with no `subject_type` key",
+    );
+}
+
+#[test]
+fn tenant_dto_from_sdk_tenant_omits_ancestors_key() {
+    // The non-recursive listing, `getTenant` and `createTenant` never
+    // carry `ancestors`; the key must be absent, not `null` / `[]`.
+    let json: Value =
+        serde_json::to_value(TenantDto::from_sdk_tenant(sample_active_tenant())).unwrap();
+    assert!(
+        json.as_object()
+            .is_some_and(|o| !o.contains_key("ancestors")),
+        "ancestors must be omitted: {json}"
+    );
+}
+
+#[test]
+fn tenant_dto_from_sdk_node_carries_ancestors_in_order() {
+    let node = TenantNode {
+        tenant: sample_active_tenant(),
+        ancestors: vec![
+            TenantAncestor {
+                id: TenantId(Uuid::from_u128(0xA1)),
+                name: "level-1".into(),
+                tenant_type: Some(sample_tenant_type().into()),
+            },
+            TenantAncestor {
+                id: sample_parent_id(),
+                name: "level-2".into(),
+                tenant_type: None,
+            },
+        ],
+    };
+    let json: Value = serde_json::to_value(TenantDto::from_sdk_node(node)).unwrap();
+    assert_eq!(
+        json["name"],
+        json!("acme corp"),
+        "tenant fields stay flat on the item"
+    );
+    assert_eq!(
+        json["ancestors"],
+        json!([
+            {
+                "id": Uuid::from_u128(0xA1).to_string(),
+                "name": "level-1",
+                "tenant_type": sample_tenant_type(),
+            },
+            { "id": "44444444-4444-4444-4444-444444444444", "name": "level-2" }
+        ]),
+        "top-down order, `tenant_type` omitted when unresolved: {json}"
+    );
+}
+
+#[test]
+fn tenant_dto_from_sdk_node_direct_child_has_empty_ancestors() {
+    let node = TenantNode {
+        tenant: sample_active_tenant(),
+        ancestors: vec![],
+    };
+    let json: Value = serde_json::to_value(TenantDto::from_sdk_node(node)).unwrap();
+    assert_eq!(
+        json["ancestors"],
+        json!([]),
+        "present and empty in recursive mode"
     );
 }

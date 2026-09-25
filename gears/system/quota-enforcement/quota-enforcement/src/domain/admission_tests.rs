@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use authz_resolver_sdk::PolicyEnforcer;
 use quota_enforcement_sdk::TenantId;
-use toolkit_security::{ScopeConstraint, ScopeFilter, pep_properties};
+use toolkit_security::pep_properties;
 use uuid::Uuid;
 
 use serde_json::{Map, Value};
@@ -56,14 +56,15 @@ async fn a_permit_that_names_the_target_tenant_is_admitted_with_the_scope_unmodi
 }
 
 #[tokio::test]
-async fn a_subtree_permit_for_a_descendant_tenant_is_admitted_with_the_scope_unmodified() {
-    // A hierarchy-aware PDP answers with `owner_tenant_id IN SUBTREE(root)`.
-    // The target is a descendant of the root: the filter's literal values do
-    // not name it, so an in-memory membership check would deny an authorized
-    // caller. Admission passes the filter through for `SecureConn` instead.
+async fn a_subtree_permit_is_refused_because_the_tenant_hierarchy_is_never_advertised() {
+    // QE resolves subjects without traversing any hierarchy and advertises no
+    // `tenant_hierarchy` capability, so a PDP has to expand a subtree into
+    // explicit tenants. One that answers `owner_tenant_id IN SUBTREE(root)`
+    // anyway breaks the capability contract, and the enforcer fails closed
+    // rather than hand storage a filter it has no closure table for.
     let root = Uuid::from_u128(0xa11ce);
     let (admission, metrics) = admission(Arc::new(PermitSubtreePdp::new(root)));
-    let admitted = admission
+    let err = admission
         .admit(
             &ctx(),
             &resources::QUOTA,
@@ -71,25 +72,16 @@ async fn a_subtree_permit_for_a_descendant_tenant_is_admitted_with_the_scope_unm
             AdmissionTarget::tenant(tenant()),
         )
         .await
-        .expect("a subtree permit admits the descendant tenant");
-    assert_eq!(admitted.tenant_id, tenant());
-    let filters: Vec<&ScopeFilter> = admitted
-        .access_scope
-        .constraints()
-        .iter()
-        .flat_map(ScopeConstraint::filters)
-        .collect();
+        .expect_err("an unadvertised subtree predicate never admits");
     assert!(
-        matches!(filters.as_slice(), [ScopeFilter::InTenantSubtree(_)]),
-        "the subtree filter reaches the handler as the PDP returned it: {filters:?}"
+        matches!(
+            &err,
+            DomainError::PdpDenied { reason: Some(reason) }
+                if reason == DomainError::CONSTRAINT_COMPILE_FAILED
+        ),
+        "{err:?}"
     );
-    assert!(
-        !admitted
-            .access_scope
-            .contains_uuid(pep_properties::OWNER_TENANT_ID, tenant().as_uuid()),
-        "the literal-value view of the scope does not cover the target; only SecureConn can"
-    );
-    assert!(metrics.denials().is_empty());
+    assert_eq!(metrics.denials(), vec![DenialReason::PermissionDenied]);
 }
 
 #[tokio::test]

@@ -2,7 +2,7 @@
 //!
 //! - [`PolicyEnforcer`] - PEP object (build → evaluate → compile)
 //! - [`ResourceType`] - Static descriptor for a resource type + its supported properties
-//! - [`compile_to_access_scope`] - Low-level: compile evaluation response into `AccessScope`
+//! - [`compile_to_access_scope`] - Low-level scalar/tenant constraint compilation
 //! - [`IntoPropertyValue`] - Convert typed values into `serde_json::Value` for PDP requests
 
 use serde_json::Value;

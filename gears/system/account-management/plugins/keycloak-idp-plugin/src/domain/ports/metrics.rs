@@ -44,6 +44,7 @@ use crate::domain::metadata_codec::{DecodeError, RealmBinding, version_observed_
 pub enum UserOp {
     ProvisionUser,
     DeprovisionUser,
+    UpdateUser,
     ListUsers,
 }
 
@@ -53,6 +54,7 @@ impl UserOp {
         match self {
             Self::ProvisionUser => "provision_user",
             Self::DeprovisionUser => "deprovision_user",
+            Self::UpdateUser => "update_user",
             Self::ListUsers => "list_users",
         }
     }
@@ -165,6 +167,7 @@ pub enum PluginOp {
     DeprovisionTenant,
     ProvisionUser,
     DeprovisionUser,
+    UpdateUser,
     ListUsers,
     SaCreate,
     SaRotateSecret,
@@ -181,6 +184,7 @@ impl PluginOp {
             Self::DeprovisionTenant => "deprovision_tenant",
             Self::ProvisionUser => "provision_user",
             Self::DeprovisionUser => "deprovision_user",
+            Self::UpdateUser => "update_user",
             Self::ListUsers => "list_users",
             Self::SaCreate => "sa_create",
             Self::SaRotateSecret => "sa_rotate_secret",

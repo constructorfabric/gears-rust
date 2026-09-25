@@ -214,6 +214,37 @@ impl UpdateTenantRequest {
     }
 }
 
+/// One node on the path between a recursive children listing's
+/// `tenant_id` and a listed descendant. Path context only: identity,
+/// label, and the tenant type a UI derives its badge from.
+///
+/// Not `#[non_exhaustive]` pre-1.0, same policy as [`Tenant`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TenantAncestor {
+    pub id: TenantId,
+    pub name: String,
+    /// Chained `gts.cf.core.am.tenant_type.v1~…` identifier. `None`
+    /// when the types registry was unreachable at lowering time — the
+    /// same best-effort policy as [`Tenant::tenant_type`].
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
+    pub tenant_type: Option<String>,
+}
+
+/// A descendant returned by the recursive children listing
+/// (`recursive=true`) together with its ancestor chain relative to the
+/// listing's `tenant_id`.
+///
+/// Rust-side shape. The REST DTO (`TenantDto`) flattens `tenant` into
+/// the item and carries `ancestors` beside the tenant fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TenantNode {
+    pub tenant: Tenant,
+    /// Ordered from the child of the listing's `tenant_id` down to
+    /// `tenant.parent_id`. Empty for a direct child of `tenant_id`.
+    /// Neither `tenant_id` nor `tenant` itself is included.
+    pub ancestors: Vec<TenantAncestor>,
+}
+
 /// Struct exists only to feed `#[derive(ODataFilterable)]`; `dead_code`
 /// allow is intentional.
 #[derive(ODataFilterable)]

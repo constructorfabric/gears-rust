@@ -39,7 +39,7 @@
 
 use axum::response::{IntoResponse, Response};
 use http::HeaderValue;
-use toolkit_canonical_errors::{CanonicalError, Problem, resource_error};
+use toolkit_canonical_errors::{CanonicalError, Http, Problem, resource_error};
 
 use crate::domain::error::DomainError;
 use crate::domain::gts_helpers as gts;
@@ -212,6 +212,7 @@ impl From<DomainError> for CanonicalError {
             DomainError::PayloadTooLarge { detail, .. } => {
                 OagwProxyError::out_of_range(detail.clone())
                     .with_field_violation("body", detail, field::PAYLOAD_TOO_LARGE)
+                    .with_override(Http::status_code(413))
                     .create()
             }
 
@@ -244,6 +245,7 @@ impl From<DomainError> for CanonicalError {
                 tracing::warn!(reason = %detail, "OAGW downstream error");
                 CanonicalError::service_unavailable()
                     .with_retry_after_seconds(RETRY_AFTER_TRANSIENT_SECS)
+                    .with_override(Http::status_code(502))
                     .create()
             }
 
@@ -251,6 +253,7 @@ impl From<DomainError> for CanonicalError {
                 tracing::warn!(reason = %detail, "OAGW upstream protocol error");
                 CanonicalError::service_unavailable()
                     .with_retry_after_seconds(RETRY_AFTER_TRANSIENT_SECS)
+                    .with_override(Http::status_code(502))
                     .create()
             }
 
@@ -302,6 +305,7 @@ impl From<DomainError> for CanonicalError {
                 tracing::warn!(reason = %detail, "OAGW upstream stream aborted");
                 CanonicalError::service_unavailable()
                     .with_retry_after_seconds(RETRY_AFTER_TRANSIENT_SECS)
+                    .with_override(Http::status_code(502))
                     .create()
             }
 
@@ -707,13 +711,17 @@ mod tests {
 
     #[test]
     fn service_unavailable_emissions_carry_retry_after_seconds() {
-        // Schema in categories/14-service-unavailable.md requires
-        // `retry_after_seconds` on every service_unavailable response;
-        // verify each oagw → service_unavailable path populates it with
-        // the per-failure-mode default.
-        fn assert_retry(err: DomainError, expected: u64, label: &str) {
+        // categories/14-service-unavailable.md requires `retry_after_seconds`
+        // on every service_unavailable emission. Wire status splits by
+        // attribution: upstream faults override to 502, gateway/admin
+        // unavailability stays at the 503 default.
+        fn assert_retry(err: DomainError, expected_status: u16, expected: u64, label: &str) {
             let p: Problem = err.into_test_problem();
-            assert_eq!(p.status, Some(503), "{label} should map to 503");
+            assert_eq!(
+                p.status,
+                Some(expected_status),
+                "{label} should map to {expected_status}",
+            );
             assert_eq!(
                 p.context["retry_after_seconds"].as_u64(),
                 Some(expected),
@@ -727,6 +735,7 @@ mod tests {
                 detail: "x".into(),
                 instance: i(),
             },
+            502,
             RETRY_AFTER_TRANSIENT_SECS,
             "DownstreamError",
         );
@@ -735,6 +744,7 @@ mod tests {
                 detail: "x".into(),
                 instance: i(),
             },
+            502,
             RETRY_AFTER_TRANSIENT_SECS,
             "ProtocolError",
         );
@@ -742,6 +752,7 @@ mod tests {
             DomainError::UpstreamDisabled {
                 alias: "alias".into(),
             },
+            503,
             RETRY_AFTER_ADMIN_SECS,
             "UpstreamDisabled",
         );
@@ -750,6 +761,7 @@ mod tests {
                 detail: "x".into(),
                 instance: i(),
             },
+            502,
             RETRY_AFTER_TRANSIENT_SECS,
             "StreamAborted",
         );
@@ -758,6 +770,7 @@ mod tests {
                 detail: "x".into(),
                 instance: i(),
             },
+            503,
             RETRY_AFTER_LINK_SECS,
             "LinkUnavailable",
         );
@@ -766,6 +779,7 @@ mod tests {
                 detail: "x".into(),
                 instance: i(),
             },
+            503,
             RETRY_AFTER_CIRCUIT_BREAKER_SECS,
             "CircuitBreakerOpen",
         );
@@ -777,51 +791,68 @@ mod tests {
                 instance: i(),
                 resource_id: None,
             },
+            503,
             RETRY_AFTER_GUARD_SECS,
             "GuardRejected 503",
         );
     }
 
     #[test]
-    fn payload_too_large_now_maps_to_400() {
+    fn payload_too_large_maps_to_413() {
         let err = DomainError::PayloadTooLarge {
             detail: "request body exceeds 100MB limit".into(),
             instance: "/oagw/v1/proxy/api.openai.com/v1/chat".into(),
         };
         let p: Problem = err.into_test_problem();
-        // ⚠ wire change accepted in the migration plan: 413 → 400.
-        assert_eq!(p.status, Some(400));
+        assert_eq!(p.status, Some(413));
+        // Canonical category is unchanged — only the wire status is overridden.
+        assert_eq!(
+            p.problem_type,
+            gts_uri!("cf.core.errors.err.v1~cf.core.err.out_of_range.v1~")
+        );
     }
 
     #[test]
-    fn downstream_error_now_maps_to_503() {
+    fn downstream_error_maps_to_502() {
         let err = DomainError::DownstreamError {
             detail: "upstream connection refused".into(),
             instance: "/oagw/v1/proxy/api.openai.com/v1/chat".into(),
         };
         let p: Problem = err.into_test_problem();
-        // ⚠ wire change accepted in the migration plan: 502 → 503.
-        assert_eq!(p.status, Some(503));
+        assert_eq!(p.status, Some(502));
+        // Canonical category is unchanged — only the wire status is overridden.
+        assert_eq!(
+            p.problem_type,
+            gts_uri!("cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~")
+        );
     }
 
     #[test]
-    fn protocol_error_now_maps_to_503() {
+    fn protocol_error_maps_to_502() {
         let err = DomainError::ProtocolError {
             detail: "upstream HTTP/2 error".into(),
             instance: "/oagw/v1/proxy/api.openai.com/v1/chat".into(),
         };
         let p: Problem = err.into_test_problem();
-        assert_eq!(p.status, Some(503));
+        assert_eq!(p.status, Some(502));
+        assert_eq!(
+            p.problem_type,
+            gts_uri!("cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~")
+        );
     }
 
     #[test]
-    fn stream_aborted_now_maps_to_503() {
+    fn stream_aborted_maps_to_502() {
         let err = DomainError::StreamAborted {
             detail: "upstream stream read error".into(),
             instance: "/oagw/v1/proxy/api.openai.com/v1/chat".into(),
         };
         let p: Problem = err.into_test_problem();
-        assert_eq!(p.status, Some(503));
+        assert_eq!(p.status, Some(502));
+        assert_eq!(
+            p.problem_type,
+            gts_uri!("cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~")
+        );
     }
 
     #[test]

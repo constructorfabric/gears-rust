@@ -39,7 +39,7 @@ BYTES_PER_TOKEN = 4.0
 
 ROOT = Path(__file__).resolve().parents[3]
 DOCS = ROOT / "docs/toolkit-pr-review"
-RULES_DIR = DOCS / "agent-rules"
+RULES_DIR = DOCS / "rules"
 AGENT_DIR = DOCS / "agents"
 
 # The six subject agents, in the order `prepare` reports them. Each name is both the
@@ -83,23 +83,17 @@ def architecture_tokens() -> int:
     return est_tokens(b) + PROMPT_TOKENS
 
 
-def agent_costs(corpus_tokens: int, diff_tokens: int,
-                per_agent_corpus: dict[str, int] | None = None) -> dict[str, int]:
+def agent_costs(corpus_tokens: int, diff_tokens: int) -> dict[str, int]:
     """Estimated input tokens per agent.
 
-    Every subject agent reads the whole diff. Five of them also read every changed file;
-    `toolkit` reads only the ToolKit-owned subset, so `per_agent_corpus` overrides the
-    corpus for any agent whose file list is narrower. The architecture agent reads the
-    diff alone, since RUST-ARCH-001 is about the shape of the change rather than the
-    contents of any one file.
+    Every subject agent reads the whole diff and every changed file. The architecture
+    agent reads the diff alone, since RUST-ARCH-001 is about the shape of the change
+    rather than the contents of any one file.
     """
-    over = per_agent_corpus or {}
-    out = {m: instruction_tokens(m) + over.get(m, corpus_tokens) + diff_tokens
-           for m in MODULES}
+    out = {m: instruction_tokens(m) + corpus_tokens + diff_tokens for m in MODULES}
     out["architecture"] = architecture_tokens() + diff_tokens
     return out
 
 
-def total_cost(corpus_tokens: int, diff_tokens: int,
-               per_agent_corpus: dict[str, int] | None = None) -> int:
-    return sum(agent_costs(corpus_tokens, diff_tokens, per_agent_corpus).values())
+def total_cost(corpus_tokens: int, diff_tokens: int) -> int:
+    return sum(agent_costs(corpus_tokens, diff_tokens).values())

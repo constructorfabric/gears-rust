@@ -24,8 +24,8 @@ use account_management_sdk::idp_service_account::{
     IdpServiceAccountCredentials, IdpServiceAccountFailure, IdpServiceAccountSummary,
 };
 use account_management_sdk::idp_user::{
-    IdpDeprovisionUserRequest, IdpListUsersRequest, IdpProvisionUserRequest, IdpUser,
-    IdpUserOperationFailure,
+    IdpDeprovisionUserRequest, IdpListUsersRequest, IdpProvisionUserRequest, IdpUpdateUserRequest,
+    IdpUser, IdpUserOperationFailure,
 };
 use async_trait::async_trait;
 use toolkit_odata::Page;
@@ -93,6 +93,17 @@ impl IdpPluginClient for KeycloakIdpPlugin {
     ) -> Result<(), IdpUserOperationFailure> {
         self.user_facade
             .deprovision_user_inner(ctx, req)
+            .await
+            .map_err(translate_user_op_failure)
+    }
+
+    async fn update_user(
+        &self,
+        ctx: &SecurityContext,
+        req: &IdpUpdateUserRequest,
+    ) -> Result<IdpUser, IdpUserOperationFailure> {
+        self.user_facade
+            .update_user_inner(ctx, req)
             .await
             .map_err(translate_user_op_failure)
     }
@@ -356,6 +367,18 @@ fn translate_user_op_failure(e: PluginError) -> IdpUserOperationFailure {
         }
         PluginError::UserOpUnsupported { detail } => {
             IdpUserOperationFailure::UnsupportedOperation { detail }
+        }
+        // Absent user (or a user bound to another tenant — deliberately
+        // indistinguishable). AM surfaces 404 for `update_user`; it never
+        // reaches the deprovision path, which folds absence into success
+        // before an error is constructed.
+        PluginError::UserOpNotFound { detail } => IdpUserOperationFailure::NotFound { detail },
+        // Provider-managed attributes: AM turns this into a 400 with one
+        // `field_violations[]` entry per refused property, each with
+        // `reason=IDP_MANAGED_FIELD`, so a client can disable every locked
+        // input from a single response.
+        PluginError::UserOpFieldNotWritable { fields, detail } => {
+            IdpUserOperationFailure::FieldNotWritable { fields, detail }
         }
         PluginError::KcRest { .. } => IdpUserOperationFailure::Unavailable {
             detail: e.to_string(),

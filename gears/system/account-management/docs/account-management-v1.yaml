@@ -1,5 +1,5 @@
 # Created:  2026-04-19 by Virtuozzo
-# Updated:  2026-06-09 by Virtuozzo
+# Updated:  2026-09-24 by Virtuozzo
 
 # NOTE: the aggregated, CI-verified schema for the whole platform is
 # docs/api/api.json (also served live by the api-gateway at {prefix}/docs).
@@ -250,23 +250,42 @@ paths:
       - $ref: '#/components/parameters/TenantId'
       - $ref: '#/components/parameters/Limit'
       - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Recursive'
       - $ref: '#/components/parameters/ODataFilter'
       - $ref: '#/components/parameters/ODataOrderBy'
     get:
       operationId: listChildren
       tags: [tenants]
-      summary: List direct children of a tenant
+      summary: List children of a tenant
       description: |
-        List direct children of the given tenant. Cursor-paginated with
-        `(created_at ASC, id ASC)` as the effective sort so siblings
-        sharing a `created_at` timestamp stay disambiguated across pages.
-        Soft-deleted rows are hidden by default — opt in with
+        List the children of the given tenant. Default: direct children
+        only. With `recursive=true`: every descendant visible to the caller
+        under the same visibility rules (a self-managed direct child of any
+        visible tenant is listed as an identity; nothing below a barrier
+        is), and every item carries `ancestors` — the chain from the child
+        of `tenant_id` down to the item's direct parent, empty for a direct
+        child; the key is absent without the flag.
+
+        Cursor-paginated with `(created_at ASC, id ASC)` as the effective
+        sort so rows sharing a `created_at` timestamp stay disambiguated
+        across pages. Soft-deleted rows are hidden by default — opt in with
         `?$filter=status eq 'deleted'`. AM-internal `provisioning` rows are
-        never surfaced. The parent must exist and be SDK-visible,
-        otherwise the call collapses to `not_found`.
+        never surfaced. The parent must exist and be SDK-visible, otherwise
+        the call collapses to `not_found`.
+
+        `$filter` operators by field: `name` — `eq`, `ne`, `in`,
+        `contains(name,'…')`, `startswith(name,'…')`, `endswith(name,'…')`
+        (on PostgreSQL: case-sensitive, and `%` / `_` in the literal match only
+        themselves; on SQLite: case-insensitive for ASCII letters, and `%`,
+        `_` and `\` in the literal are not matched literally); `status`,
+        `tenant_type` — `eq`, `ne`, `in`; `id`, `tenant_type_uuid` — `eq`,
+        `ne`, `in`; `self_managed` — `eq`, `ne`; `created_at`, `updated_at`
+        — `eq`, `ne`, `gt`, `ge`, `lt`, `le`, `in`; combinators `and`, `or`,
+        `not`, parentheses. `$orderby` accepts every field except
+        `tenant_type`.
       responses:
         '200':
-          description: Page of direct child tenants
+          description: Page of child tenants (direct, or the visible subtree with recursive=true)
           content:
             application/json:
               schema:
@@ -966,6 +985,22 @@ components:
         with an existing cursor returns `400 FILTER_MISMATCH`.
       schema:
         type: string
+    Recursive:
+      name: recursive
+      in: query
+      required: false
+      description: |
+        When `true`, list every descendant of the tenant visible to the
+        caller instead of its direct children only, and carry `ancestors`
+        on every item. Exactly the literals `true` / `false` are accepted;
+        anything else is `400 validation`. A cursor is bound to the mode it
+        was minted in: replaying it with a different `recursive` value is
+        `400 FILTER_MISMATCH`, like a changed `$filter`. A cursor issued
+        before mode binding existed carries no fingerprint and is accepted by
+        the direct listing only.
+      schema:
+        type: boolean
+        default: false
     ODataFilter:
       name: $filter
       in: query
@@ -1150,6 +1185,31 @@ components:
             Soft-delete tombstone. Present iff `status == deleted`;
             omitted for live tenants. The retention sweep becomes eligible
             to hard-delete this row at `deleted_at + retention_window`.
+        ancestors:
+          type: array
+          description: |
+            Ancestor chain relative to the listing's `tenant_id`, ordered from
+            the child of `tenant_id` down to this tenant's direct parent; empty
+            for a direct child. Present only on `listChildren` with
+            `recursive=true`; absent from every other response.
+          items:
+            $ref: '#/components/schemas/TenantAncestor'
+
+    TenantAncestor:
+      type: object
+      additionalProperties: false
+      required: [id, name]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        tenant_type:
+          type: string
+          description: |
+            Chained GTS tenant-type identifier. Omitted on a transient
+            types-registry blip (same policy as `Tenant.tenant_type`).
 
     TenantCreateRequest:
       type: object

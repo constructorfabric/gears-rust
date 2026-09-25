@@ -34,7 +34,9 @@ use toolkit_odata::{ODataQuery, Page};
 use crate::domain::error::DomainError;
 use crate::domain::tenant::closure::ClosureRow;
 use crate::domain::tenant::integrity::{IntegrityCategory, Violation};
-use crate::domain::tenant::model::{ChildCountFilter, NewTenant, TenantModel, TenantStatus};
+use crate::domain::tenant::model::{
+    ChildCountFilter, NewTenant, TenantAncestorRow, TenantModel, TenantStatus,
+};
 use crate::domain::tenant::retention::{
     HardDeleteEligibility, HardDeleteOutcome, TenantProvisioningRow, TenantRetentionRow,
 };
@@ -138,6 +140,68 @@ pub trait TenantRepo: Send + Sync {
         parent_id: Uuid,
         query: &ODataQuery,
     ) -> Result<Page<TenantModel>, DomainError>;
+
+    /// Recursive counterpart of [`Self::list_children`]: every tenant
+    /// whose parent is in `root_id`'s subtree and visible under
+    /// `visible`, i.e.
+    ///
+    /// ```text
+    /// tenants.parent_id IN (SELECT id FROM tenants
+    ///                       WHERE <visible scope>
+    ///                         AND id IN (SELECT descendant_id FROM tenant_closure
+    ///                                    WHERE ancestor_id = root_id))
+    /// ```
+    ///
+    /// with the rows themselves bounded by `enumeration`. `visible` is
+    /// the caller's PDP-emitted scope and is the authorization
+    /// boundary: it carries the scope's own barrier mode and any
+    /// `descendant_status` list. `enumeration` is its barrier-relaxed
+    /// clone (see `scope_util::relax_barriers`). This is the
+    /// `/children` direct-child carve-out generalised over the whole
+    /// subtree: under a barrier-respecting scope a self-managed direct
+    /// child of any visible tenant is returned as an identity and
+    /// nothing below a barrier ever is; `root_id` itself is never
+    /// returned. The parent set is a subquery of the page statement so
+    /// gate and page observe one snapshot. Same `Provisioning`
+    /// exclusion, hidden-status default, default order
+    /// `(created_at ASC, id ASC)` and cursor contract as
+    /// `list_children`.
+    ///
+    /// A `descendant_status` list is per-descendant, not per-path, so
+    /// this set can hold a row whose grandparent is status-hidden; the
+    /// service drops such rows by checking the ancestor chain (see
+    /// `TenantService::list_descendants`).
+    async fn list_descendants(
+        &self,
+        visible: &AccessScope,
+        enumeration: &AccessScope,
+        root_id: Uuid,
+        query: &ODataQuery,
+    ) -> Result<Page<TenantModel>, DomainError>;
+
+    /// Ancestor chains for a page of recursively listed tenants.
+    ///
+    /// For every id in `tenant_ids`: the tenants strictly between the
+    /// listing root (identified by its absolute `root_depth`) and that
+    /// tenant, ordered by depth ascending — the child of the root
+    /// first, the direct parent last. Ids with no such tenant (direct
+    /// children of the root) are absent from the map.
+    ///
+    /// Reads `tenant_closure` under `allow_all` (a `no_*` entity) and
+    /// the ancestors' `tenants` rows under `scope`. When a tenant was
+    /// listed by [`Self::list_descendants`], every tenant on the path
+    /// `(root, parent]` is Respect-visible by construction (`barrier`
+    /// is monotone along a path), so `scope` is defence-in-depth here,
+    /// not a filter. Both statements bind only `tenant_ids` (the
+    /// ancestor membership is a closure subquery), so a page-sized
+    /// input (≤ `listing.max_top`) stays under the bind-parameter
+    /// ceiling whatever the tree depth.
+    async fn ancestor_chains(
+        &self,
+        scope: &AccessScope,
+        root_depth: u32,
+        tenant_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<TenantAncestorRow>>, DomainError>;
 
     // ---- Write operations ----------------------------------------------
 

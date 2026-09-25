@@ -513,9 +513,9 @@ async fn e2e_invalid_content_length_returns_400() {
         .await;
 }
 
-// 8.11: Content-Length exceeding 100MB returns 400.
+// 8.11: Content-Length exceeding 100MB returns 413 PayloadTooLarge.
 #[tokio::test]
-async fn e2e_body_exceeding_limit_returns_400() {
+async fn e2e_body_exceeding_limit_returns_413() {
     let h = AppHarness::builder()
         .with_credentials(vec![("cred://openai-key".into(), "sk-e2e-test-key".into())])
         .build()
@@ -562,7 +562,10 @@ async fn e2e_body_exceeding_limit_returns_400() {
             http::header::CONTENT_LENGTH,
             http::HeaderValue::from_static("200000000"),
         )
-        .expect_status(400)
+        // Spec-mandated wire status for a body over the size cap: 413
+        // (PayloadTooLarge), carried by a transport override on the
+        // `out_of_range` canonical category. See oagw error mapping (T1).
+        .expect_status(413)
         .await;
 }
 
