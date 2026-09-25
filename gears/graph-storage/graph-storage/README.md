@@ -104,7 +104,12 @@ type-revision history.
 
 - *Ordinary ingests do not take the shared scope lock the ingest protocol
   describes* — a scope replacement fences on a monotonic generation instead,
-  which is the only serialization the secure ORM's surface allows. Producer
+  which is the only serialization the secure ORM's surface allows. What
+  protects an ordinary write from a concurrent replacement is that the
+  replacement re-checks scope membership in the statement that removes a
+  node, so a node an ingest has just moved out of the scope is not deleted.
+  One residual remains: a new edge written to a node a replacement is
+  removing at that moment can be lost (DESIGN § Concurrent Ingest Protocol). Producer
   identity *is* carried into the store: an idempotency receipt is keyed by
   `(tenant, producer, idempotency_key)`, and a scope records its owning
   producer and refuses a replacement submitted by anyone else. Source-namespace

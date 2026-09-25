@@ -125,15 +125,14 @@ pub(crate) async fn remove_stale(
     // happens to hold rather than one that must -- and the day a tenant can
     // hold edges without a managed node type, it would silently stop
     // removing them. The node half is skipped; the edge half never is.
+    // Membership is the payload attribute. The field name is a checked
+    // literal and the value is a bound parameter, the same shape the
+    // projection renders.
+    let member =
+        || Expr::cust(format!("(payload #>> '{{{attribute}}}')")).eq(Expr::val(value.to_owned()));
     let stale_ids: Vec<i64> = if types.managed_nodes.is_empty() {
         Vec::new()
     } else {
-        // Membership is the payload attribute. The field name is a checked
-        // literal and the value is a bound parameter, the same shape the
-        // projection renders.
-        // The field name is a checked literal; the value is bound.
-        let member =
-            Expr::cust(format!("(payload #>> '{{{attribute}}}')")).eq(Expr::val(value.to_owned()));
         let candidates: Vec<NodeIdent> = node::Entity::find()
             .secure()
             .scope_with(scope)
@@ -141,7 +140,7 @@ pub(crate) async fn remove_stale(
                 Condition::all()
                     .add(node::Column::GtsNodeTypeId.is_in(types.managed_nodes))
                     .add(node::Column::DeletedAt.is_null())
-                    .add(member),
+                    .add(member()),
             )
             .project_all(tx, |query| {
                 node_ident_columns(query).into_model::<NodeIdent>()
@@ -265,8 +264,30 @@ pub(crate) async fn remove_stale(
     let removed_nodes = if removable.is_empty() {
         0
     } else {
+        // Membership is checked again here, in the statement, and not only in
+        // the read that chose these rows. An ordinary ingest can move a node
+        // out of the scope between that read and this delete -- ordinary
+        // ingests do not take the scope's lock, and the secure ORM offers no
+        // row lock to take -- and deleting by id alone then removed a node the
+        // ingest had just reported writing, an outcome neither serial order
+        // produces: ingest-then-replace never sees it as a member, and
+        // replace-then-ingest deletes it and the ingest writes it back. With
+        // the predicate in the statement, PostgreSQL re-evaluates it on the
+        // row as the ingest left it, after waiting for its lock, and a node
+        // that has left the scope stays.
+        //
+        // Its static edges were removed above, before this, because the
+        // foreign key needs them gone first. A node that survives here without
+        // them is the replace-then-ingest outcome exactly -- the replacement
+        // takes the node and its edges, the ingest writes back the node alone
+        // -- so the pair still lands in a state a serial order reaches.
         node::Entity::delete_many()
-            .filter(Condition::all().add(node::Column::Id.is_in(removable)))
+            .filter(
+                Condition::all()
+                    .add(node::Column::Id.is_in(removable))
+                    .add(node::Column::DeletedAt.is_null())
+                    .add(member()),
+            )
             .secure()
             .scope_with(scope)
             .exec(tx)

@@ -621,6 +621,20 @@ async fn a_delete_racing_an_upsert_leaves_no_rewritten_tombstone() {
     .await;
 }
 
+/// Against the store the window opens in: the replacement's read and its
+/// removal are separate statements, and the ingest can commit between them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replacement_does_not_delete_what_an_ingest_moved_out_of_its_scope() {
+    let Some(stand) = stand(HopStrategy::Pgq).await else {
+        return;
+    };
+    conformance::a_replacement_does_not_delete_what_an_ingest_moved_out_of_its_scope(
+        std::sync::Arc::clone(&stand.store) as std::sync::Arc<dyn GraphStoreV1>,
+        Uuid::now_v7(),
+    )
+    .await;
+}
+
 /// Against the store where two inserts can genuinely collide on the unique
 /// key.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -440,6 +440,19 @@ async fn a_delete_racing_an_upsert_leaves_no_rewritten_tombstone() {
     .await;
 }
 
+/// Run here too. This store holds one lock across the whole of `ingest`, so
+/// the replacement's read and its removal cannot be split by another write;
+/// what it proves here is that both serial orders keep the moved node.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replacement_does_not_delete_what_an_ingest_moved_out_of_its_scope() {
+    conformance::a_replacement_does_not_delete_what_an_ingest_moved_out_of_its_scope(
+        std::sync::Arc::new(store())
+            as std::sync::Arc<dyn graph_storage_sdk::plugin_api::GraphStoreV1>,
+        Uuid::now_v7(),
+    )
+    .await;
+}
+
 /// Run here too: whether or not the window opens, a phantom two batches
 /// both name must be materialized once and shared.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

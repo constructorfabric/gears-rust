@@ -4354,6 +4354,109 @@ pub async fn an_edge_only_scope_drops_the_edges_it_stops_declaring(
     );
 }
 
+/// A replacement does not delete a node that an ordinary ingest moved out of
+/// the scope while the replacement was deciding.
+///
+/// The replacement reads the scope's members, decides which ones its batch no
+/// longer names, and removes them. An ordinary ingest that changes a member's
+/// scope attribute -- moving it out of the scope -- can commit between the
+/// read and the removal. Both serial orders leave that node in the graph:
+/// ingest-then-replace never sees it as a member, and replace-then-ingest
+/// deletes it and the ingest writes it back. So whichever order the two land
+/// in, a node the ingest reported writing must still be there; an interleaving
+/// that loses it is a successful write the caller was told about and does not
+/// have.
+///
+/// The ingest may instead be refused -- the replacement removed the row first
+/// and the ingest's write found nothing -- and that is honest: it did not
+/// claim a write it did not make.
+pub async fn a_replacement_does_not_delete_what_an_ingest_moved_out_of_its_scope(
+    store: std::sync::Arc<dyn GraphStoreV1>,
+    tenant: Uuid,
+) {
+    const ROUNDS: usize = 32;
+
+    let scope = AccessScope::for_tenant(tenant);
+    let reader = ctx(tenant, &scope, None);
+    store
+        .register_types(&reader, ontology_batch())
+        .await
+        .expect("the ontology registers");
+
+    let mut lost = Vec::new();
+    for round in 0..ROUNDS {
+        let generation = i64::try_from(round).expect("a handful of rounds") * 2 + 1;
+        let moving = format!("moving-{round}");
+        let staying = format!("staying-{round}");
+        ingest_batch(
+            store.as_ref(),
+            &reader,
+            batch_replacing(
+                vec![
+                    scoped_node(&moving, "acme/infra"),
+                    scoped_node(&staying, "acme/infra"),
+                ],
+                Vec::new(),
+                generation,
+            ),
+        )
+        .await
+        .expect("the scope's first declaration commits");
+
+        let gate = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let replacer = {
+            let store = std::sync::Arc::clone(&store);
+            let gate = std::sync::Arc::clone(&gate);
+            let staying = staying.clone();
+            tokio::spawn(async move {
+                let scope = AccessScope::for_tenant(tenant);
+                let ctx = ctx(tenant, &scope, None);
+                gate.wait().await;
+                // Names only `staying`, so `moving` is stale by this batch.
+                ingest_batch(
+                    store.as_ref(),
+                    &ctx,
+                    batch_replacing(
+                        vec![scoped_node(&staying, "acme/infra")],
+                        Vec::new(),
+                        generation + 1,
+                    ),
+                )
+                .await
+            })
+        };
+        let mover = {
+            let store = std::sync::Arc::clone(&store);
+            let gate = std::sync::Arc::clone(&gate);
+            let moving = moving.clone();
+            tokio::spawn(async move {
+                let scope = AccessScope::for_tenant(tenant);
+                let ctx = ctx(tenant, &scope, None);
+                gate.wait().await;
+                // An ordinary ingest that takes the node out of the scope.
+                ingest_batch(
+                    store.as_ref(),
+                    &ctx,
+                    batch(vec![scoped_node(&moving, "acme/elsewhere")], Vec::new()),
+                )
+                .await
+            })
+        };
+        let replacement = replacer.await.expect("the replacer does not panic");
+        let ingest = mover.await.expect("the mover does not panic");
+        replacement.expect("the replacement commits whichever order it lands in");
+
+        if ingest.is_ok() && store.get_node(&reader, &moving, 0).await.is_err() {
+            lost.push(round);
+        }
+    }
+    assert!(
+        lost.is_empty(),
+        "an ingest reported writing a node that the concurrent replacement then \
+         deleted, in rounds {lost:?} of {ROUNDS}: a successful write was lost"
+    );
+}
+
 /// Two mutations of one tenant never share a revision.
 ///
 /// The counter carries the Read Consistency Contract's central promise: a
