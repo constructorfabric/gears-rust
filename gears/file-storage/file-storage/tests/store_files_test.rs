@@ -27,6 +27,7 @@ use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 use file_storage::domain::audit::{AuditEntry, AuditOperation, FileEvent};
+use file_storage::domain::policy::{AgeRetention, RetentionRuleBody, RetentionScope};
 use file_storage::infra::content::hash_mode::HashMode;
 use file_storage::infra::storage::Store;
 use file_storage::infra::storage::migrations::Migrator;
@@ -94,6 +95,18 @@ fn new_version(
         backend_id: "mem".to_owned(),
         backend_path: format!("/{file_id}/{version_id}"),
         created_at: now,
+        bound_on_finalize: false,
+    }
+}
+
+/// A semantically valid retention-rule body (`validate_retention_rule`
+/// rejects an all-criteria-`None` body), for tests whose focus is the
+/// cascade-delete relationship rather than rule-body validation.
+fn valid_rule_body() -> RetentionRuleBody {
+    RetentionRuleBody {
+        age: Some(AgeRetention { max_age_days: 30 }),
+        inactivity: None,
+        metadata: None,
     }
 }
 
@@ -173,6 +186,77 @@ async fn files_delete_orphan_removes_file_with_no_content_and_no_versions() {
     );
     let events = store.list_file_events(file_id).await.unwrap();
     assert_eq!(events.len(), 1, "the deletion event must be enqueued");
+}
+
+/// `delete_orphan_file_with_event` must remove any `File`-scope retention
+/// rule targeting the reclaimed orphan file, in the SAME delete -- same
+/// no-FK reasoning as `delete_file_collecting_versions`'s matching test. A
+/// `Tenant`-scope rule on the same tenant must survive untouched.
+#[tokio::test]
+async fn files_delete_orphan_cascades_file_scope_retention_rule() {
+    let (store, db) = build_store().await;
+    let conn = db.conn().expect("conn");
+    let scope = AccessScope::allow_all();
+    let files = FileRepo::new();
+    let now = OffsetDateTime::now_utc();
+
+    let tenant_id = Uuid::now_v7();
+    let owner_id = Uuid::now_v7();
+    let file_id = Uuid::now_v7();
+    files
+        .create(&conn, &scope, &new_file(file_id, tenant_id, None))
+        .await
+        .expect("create orphan file");
+
+    let file_rule_id = store
+        .insert_retention_rule(
+            &scope,
+            tenant_id,
+            &RetentionScope::File,
+            Some(file_id),
+            &valid_rule_body(),
+            now,
+        )
+        .await
+        .expect("insert file-scope rule");
+    let tenant_rule_id = store
+        .insert_retention_rule(
+            &scope,
+            tenant_id,
+            &RetentionScope::Tenant,
+            None,
+            &valid_rule_body(),
+            now,
+        )
+        .await
+        .expect("insert tenant-scope rule");
+
+    let removed = store
+        .delete_orphan_file_with_event(
+            file_id,
+            audit_entry(tenant_id, file_id, AuditOperation::OrphanReconcile),
+            Some(file_event(tenant_id, owner_id, file_id, "file.deleted")),
+        )
+        .await
+        .expect("delete_orphan_file_with_event must not error");
+    assert!(removed);
+
+    assert!(
+        store
+            .get_retention_rule(&scope, file_rule_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "the file-scope rule must be removed along with its target file"
+    );
+    assert!(
+        store
+            .get_retention_rule(&scope, tenant_rule_id)
+            .await
+            .unwrap()
+            .is_some(),
+        "an unrelated tenant-scope rule on the same tenant must survive"
+    );
 }
 
 /// A file with bound content (`content_id` set) must never be treated as an
@@ -443,6 +527,89 @@ async fn files_delete_with_event_cascades_versions_and_metadata() {
     assert!(
         events.iter().any(|e| e.event_type == "file.deleted"),
         "expected a file.deleted event"
+    );
+}
+
+/// `delete_file_collecting_versions` must remove any `File`-scope retention
+/// rule targeting the deleted file, in the SAME delete -- `retention_rules`
+/// has no FK from `scope_target_id` to `files.file_id`, so nothing else
+/// would ever remove it. A `Tenant`-scope rule on the same tenant must
+/// survive untouched (only the `File`-scope rule targeting THIS file goes).
+#[tokio::test]
+async fn files_delete_with_event_cascades_file_scope_retention_rule() {
+    let (store, _db) = build_store().await;
+    let scope = AccessScope::allow_all();
+    let now = OffsetDateTime::now_utc();
+
+    let tenant_id = Uuid::now_v7();
+    let file_id = Uuid::now_v7();
+    let version_id = Uuid::now_v7();
+    let owner_id = Uuid::now_v7();
+
+    let new = new_file_req(owner_id, vec![]);
+    store
+        .create_file_with_pending_version(
+            &new,
+            file_id,
+            version_id,
+            tenant_id,
+            "mem",
+            "/mem/path",
+            now,
+            audit_entry(tenant_id, file_id, AuditOperation::Create),
+        )
+        .await
+        .expect("create must succeed");
+
+    let file_rule_id = store
+        .insert_retention_rule(
+            &scope,
+            tenant_id,
+            &RetentionScope::File,
+            Some(file_id),
+            &valid_rule_body(),
+            now,
+        )
+        .await
+        .expect("insert file-scope rule");
+    let tenant_rule_id = store
+        .insert_retention_rule(
+            &scope,
+            tenant_id,
+            &RetentionScope::Tenant,
+            None,
+            &valid_rule_body(),
+            now,
+        )
+        .await
+        .expect("insert tenant-scope rule");
+
+    let deleted = store
+        .delete_file_collecting_versions(
+            &scope,
+            file_id,
+            audit_entry(tenant_id, file_id, AuditOperation::DeleteFile),
+            Some(file_event(tenant_id, owner_id, file_id, "file.deleted")),
+        )
+        .await
+        .expect("delete_file_collecting_versions must not error");
+    assert!(deleted.removed);
+
+    assert!(
+        store
+            .get_retention_rule(&scope, file_rule_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "the file-scope rule must be removed along with its target file"
+    );
+    assert!(
+        store
+            .get_retention_rule(&scope, tenant_rule_id)
+            .await
+            .unwrap()
+            .is_some(),
+        "an unrelated tenant-scope rule on the same tenant must survive"
     );
 }
 

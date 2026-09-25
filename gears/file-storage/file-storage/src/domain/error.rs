@@ -4,6 +4,14 @@ use thiserror::Error;
 use toolkit_macros::domain_model;
 use uuid::Uuid;
 
+/// `Retry-After` (seconds) advertised for every `BackendUnavailable` emission.
+/// Short, like `oagw`'s own transient-upstream retry window
+/// (`RETRY_AFTER_TRANSIENT_SECS`) — these are network/timeout/overload
+/// blips or a losing side of a concurrent object change, not an outage a
+/// caller should back off from for long; a prompt retry is the expected
+/// recovery path.
+pub const BACKEND_RETRY_AFTER_SECS: u64 = 5;
+
 /// Domain-specific errors. Mapped to RFC-9457 Problem at the REST boundary
 /// (`api/rest/error.rs`).
 #[domain_model]
@@ -44,6 +52,11 @@ pub enum DomainError {
 
     #[error("Storage backend '{backend_id}' error: {message}")]
     Backend { backend_id: String, message: String },
+
+    /// Transient backend failure (network, timeout, overload, a concurrent change
+    /// of the object): retrying the same request later is expected to succeed.
+    #[error("Storage backend '{backend_id}' temporarily unavailable: {message}")]
+    BackendUnavailable { backend_id: String, message: String },
 
     #[error("Unknown storage backend: '{backend_id}'")]
     UnknownBackend { backend_id: String },
@@ -164,6 +177,13 @@ impl DomainError {
 
     pub fn backend(backend_id: impl Into<String>, message: impl Into<String>) -> Self {
         Self::Backend {
+            backend_id: backend_id.into(),
+            message: message.into(),
+        }
+    }
+
+    pub fn backend_unavailable(backend_id: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::BackendUnavailable {
             backend_id: backend_id.into(),
             message: message.into(),
         }

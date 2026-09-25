@@ -34,6 +34,8 @@ pub struct Model {
     pub backend_id: String,
     pub backend_path: String,
     pub created_at: OffsetDateTime,
+    /// See [`file_storage_sdk::FileVersion::bound_on_finalize`]'s doc comment.
+    pub bound_on_finalize: bool,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

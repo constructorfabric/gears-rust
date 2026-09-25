@@ -77,6 +77,7 @@ fn new_version(file_id: Uuid, version_id: Uuid, size: i64) -> FileVersion {
         backend_id: "mem".to_owned(),
         backend_path: format!("/{file_id}/{version_id}"),
         created_at: now,
+        bound_on_finalize: false,
     }
 }
 
@@ -98,6 +99,7 @@ fn new_pending_version(file_id: Uuid, version_id: Uuid, created_at: OffsetDateTi
         backend_id: "mem".to_owned(),
         backend_path: format!("/{file_id}/{version_id}"),
         created_at,
+        bound_on_finalize: false,
     }
 }
 
@@ -251,6 +253,7 @@ async fn get_manifests_returns_all_results_across_multiple_chunks() {
             backend_id: Set("mem".to_owned()),
             backend_path: Set(format!("/{file_id}/{version_id}")),
             created_at: Set(now),
+            bound_on_finalize: Set(false),
         })
         .collect();
     secure_insert_many::<FileVersionEntity>(version_models, &scope, &conn)

@@ -1388,6 +1388,7 @@ and is immutable.
 | `backend_id`      | `text`                                | `BackendConfig` that holds the bytes (platform YAML config in P1)            |
 | `backend_path`    | `text`                                | Opaque per-driver path (`/{file_id}/{version_id}` convention)                |
 | `created_at`      | `timestamptz`                         | Version creation time                                                        |
+| `bound_on_finalize` | `boolean`                            | `true` once this version's OWN finalize call has won a `bind_on_finalize` CAS (set in the same transaction as that CAS); replayed by a later idempotent finalize retry instead of re-deriving the bind outcome from a live read of `files.content_id`. Added in `m20260924_000001_upload_flow_redesign` |
 
 **PK**: `(file_id, version_id)` at the DB level. The SeaORM entity declares `version_id` alone as its primary key
 (globally unique), keeping updates/deletes keyed off a single PK column.

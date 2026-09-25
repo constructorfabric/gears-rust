@@ -63,6 +63,7 @@ impl VersionRepo {
             backend_id: Set(v.backend_id.clone()),
             backend_path: Set(v.backend_path.clone()),
             created_at: Set(v.created_at),
+            bound_on_finalize: Set(v.bound_on_finalize),
         };
         secure_insert::<Entity>(am, scope, conn)
             .await
@@ -349,6 +350,44 @@ impl VersionRepo {
     ) -> Result<u64, DomainError> {
         let res = Entity::update_many()
             .col_expr(Column::IsCurrent, Expr::value(true))
+            .filter(
+                Condition::all()
+                    .add(Column::FileId.eq(file_id))
+                    .add(Column::VersionId.eq(version_id)),
+            )
+            .secure()
+            .scope_with(scope)
+            .exec(conn)
+            .await
+            .map_err(db_err)?;
+        Ok(res.rows_affected)
+    }
+
+    /// Mark a version as having won its finalize-time bind CAS (upload-flow
+    /// redesign), persisted in the SAME transaction as the CAS itself --
+    /// see [`crate::infra::storage::store::Store::finalize_version`]/
+    /// `finalize_multipart_version`'s own `if swapped` branch, both of which
+    /// call this immediately after [`Self::set_current`] confirms the
+    /// promotion committed. Read back later by
+    /// `FileService::finalize_upload_by_token`'s idempotent-retry fast path,
+    /// which replays this flag instead of re-deriving the bind outcome from
+    /// a live (and possibly since-moved-on) read of `files.content_id`.
+    ///
+    /// Returns the raw `rows_affected` (0 or 1, same `(file_id, version_id)`-
+    /// keyed predicate as [`Self::set_current`]) -- a caller only reaches
+    /// this after `set_current` already returned non-zero for the SAME
+    /// version in the SAME transaction, so `0` here would mean the row
+    /// vanished between those two statements on the same connection, which
+    /// cannot happen.
+    pub async fn mark_bound_on_finalize<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        file_id: Uuid,
+        version_id: Uuid,
+    ) -> Result<u64, DomainError> {
+        let res = Entity::update_many()
+            .col_expr(Column::BoundOnFinalize, Expr::value(true))
             .filter(
                 Condition::all()
                     .add(Column::FileId.eq(file_id))

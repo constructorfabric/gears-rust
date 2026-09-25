@@ -91,6 +91,29 @@
 //!   the sort to an extra in-memory pass over every row sharing a
 //!   `created_at` instant.
 //!
+//! # 3. `file_versions.bound_on_finalize`
+//!
+//! `file_versions.bound_on_finalize boolean NOT NULL DEFAULT false`: set the
+//! moment a version's OWN finalize call wins a `bind_on_finalize` CAS
+//! (`Store::finalize_version`/`finalize_multipart_version`'s `if swapped`
+//! branch), in the SAME transaction as that CAS. `FileService::
+//! finalize_upload_by_token`'s idempotent-retry fast path reads this back
+//! instead of re-deriving the bind outcome from a live read of
+//! `files.content_id`, which can have moved on to a different version by the
+//! time of the retry.
+//!
+//! # 4. Dangling `File`-scope retention-rule cleanup
+//!
+//! `retention_rules` has no FK from `scope_target_id` to `files.file_id`
+//! (`scope = 'file'` rows are matched by id alone, see
+//! `m20260701_000001_p2_initial`), so every `files` row delete now also
+//! removes any `File`-scope rule still targeting it, in the same
+//! transaction (`Store::delete_file_collecting_versions`/
+//! `delete_orphan_file_with_event`/`delete_version_or_whole_file`). That
+//! only covers deletes from here on; this one-time `DELETE` sweeps out
+//! `File`-scope rules already left dangling by a `files` row deleted before
+//! this migration ran.
+//!
 //! # `down()`
 //!
 //! Rolls both parts back, in reverse order: first the five new indexes
@@ -102,7 +125,13 @@
 //! outcome an expired lease would eventually produce on its own —
 //! `backend_id`/`backend_path` are dropped without an inverse backfill (the
 //! round trip is schema-equivalence only for those two columns, not data
-//! preservation).
+//! preservation). `file_versions.bound_on_finalize` (part 3) is also dropped
+//! -- unlike part 2's indexes/part 1's columns, nothing else in this branch
+//! depends on it existing, so the rollback is a plain, symmetric drop. The
+//! part 4 retention-rule cleanup is data cleanup, not a schema change -- it
+//! has no inverse and is not undone on rollback (rows it deleted are gone;
+//! rolling back a schema migration was never expected to resurrect deleted
+//! rows).
 //!
 //! This migration merges two migrations from this branch into one, since
 //! neither had shipped in a release.
@@ -161,6 +190,22 @@ CREATE INDEX IF NOT EXISTS file_versions_file_created_idx
 CREATE INDEX IF NOT EXISTS files_owner_listing_v2_idx
     ON files (tenant_id, owner_kind, owner_id, created_at DESC, file_id DESC);
 DROP INDEX IF EXISTS files_owner_listing_idx;
+
+-- Part 3: persisted finalize-time bind decision (see the module doc).
+ALTER TABLE file_versions
+    ADD COLUMN IF NOT EXISTS bound_on_finalize boolean NOT NULL DEFAULT false;
+
+-- Part 4: one-time cleanup of `File`-scope retention rules already left
+-- dangling by a `files` row deleted before this migration ran (see the
+-- module doc) -- 'file' is `RetentionScope::File`'s wire/DB spelling, same
+-- value `m20260701_000001_p2_initial`'s CHECK and `RetentionRuleRepo::
+-- list_by_file_scope` use.
+DELETE FROM retention_rules
+WHERE scope = 'file'
+  AND scope_target_id IS NOT NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM files f WHERE f.file_id = retention_rules.scope_target_id
+  );
 ";
 
 // SQLite cannot alter or drop a CHECK constraint -- rebuild the table with the
@@ -253,6 +298,20 @@ CREATE INDEX IF NOT EXISTS file_versions_file_created_idx
 CREATE INDEX IF NOT EXISTS files_owner_listing_v2_idx
     ON files (tenant_id, owner_kind, owner_id, created_at DESC, file_id DESC);
 DROP INDEX IF EXISTS files_owner_listing_idx;
+
+-- Part 3: persisted finalize-time bind decision (see the module doc).
+-- SQLite's `ADD COLUMN` has no `IF NOT EXISTS` clause, unlike Postgres above.
+ALTER TABLE file_versions ADD COLUMN bound_on_finalize BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- Part 4: one-time cleanup of `File`-scope retention rules already left
+-- dangling by a `files` row deleted before this migration ran -- see
+-- POSTGRES_UP's matching statement for the full comment.
+DELETE FROM retention_rules
+WHERE scope = 'file'
+  AND scope_target_id IS NOT NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM files f WHERE f.file_id = retention_rules.scope_target_id
+  );
 ";
 
 // PostgreSQL down: reverse of POSTGRES_UP, in reverse order -- drop the five
@@ -272,6 +331,10 @@ DROP INDEX IF EXISTS file_versions_file_created_idx;
 DROP INDEX IF EXISTS files_versionless_sweep_idx;
 DROP INDEX IF EXISTS multipart_uploads_sweep_idx;
 DROP INDEX IF EXISTS idempotency_keys_file_idx;
+
+-- Part 3 (see the module doc): plain, symmetric drop -- nothing else in
+-- this migration depends on the column existing.
+ALTER TABLE file_versions DROP COLUMN IF EXISTS bound_on_finalize;
 
 UPDATE multipart_uploads SET state = 'aborted' WHERE state = 'completing';
 ALTER TABLE multipart_uploads DROP CONSTRAINT IF EXISTS multipart_uploads_state_check;
@@ -300,6 +363,10 @@ DROP INDEX IF EXISTS file_versions_file_created_idx;
 DROP INDEX IF EXISTS files_versionless_sweep_idx;
 DROP INDEX IF EXISTS multipart_uploads_sweep_idx;
 DROP INDEX IF EXISTS idempotency_keys_file_idx;
+
+-- Part 3 (see the module doc): plain, symmetric drop. SQLite's `DROP COLUMN`
+-- has no `IF EXISTS` clause, unlike Postgres's equivalent statement.
+ALTER TABLE file_versions DROP COLUMN bound_on_finalize;
 
 CREATE TABLE multipart_upload_parts_backup AS SELECT * FROM multipart_upload_parts;
 

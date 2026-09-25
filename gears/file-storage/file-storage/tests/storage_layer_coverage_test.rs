@@ -105,6 +105,7 @@ fn new_version(
         backend_id: "mem".to_owned(),
         backend_path: format!("/{file_id}/{version_id}"),
         created_at: now,
+        bound_on_finalize: false,
     }
 }
 

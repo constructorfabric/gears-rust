@@ -8,7 +8,9 @@ use file_storage_sdk::ByteRange;
 use futures::stream::{self, BoxStream};
 use tempfile::TempDir;
 
-use super::S3Backend;
+use reqwest::StatusCode;
+
+use super::{S3Backend, is_transient_s3};
 use crate::infra::backend::StorageBackend;
 use crate::infra::backend::backend_tests::{assert_backend_contract, read_all, write_all};
 use crate::infra::content::hash;
@@ -801,3 +803,65 @@ async fn s3_backend_publish_exclusive_multipart_rejects_overwrite() {
 // deployment-specific property validated as part of ADR-0005's release gate
 // (see `StorageBackend::publish_exclusive`'s doc comment), not something an
 // in-process unit test can establish.
+
+// ── `is_transient_s3` classification ───────────────────────────────────────
+
+#[test]
+fn is_transient_s3_true_for_5xx_and_throttling_status() {
+    assert!(is_transient_s3(StatusCode::SERVICE_UNAVAILABLE, None));
+    assert!(is_transient_s3(StatusCode::INTERNAL_SERVER_ERROR, None));
+    assert!(is_transient_s3(StatusCode::BAD_GATEWAY, None));
+    assert!(is_transient_s3(StatusCode::GATEWAY_TIMEOUT, None));
+    assert!(is_transient_s3(StatusCode::TOO_MANY_REQUESTS, None));
+}
+
+#[test]
+fn is_transient_s3_true_for_transient_s3_error_codes() {
+    // A transient S3 error code can arrive under a non-5xx status too (S3
+    // itself uses `503` for `SlowDown`/`ServiceUnavailable`, but the string
+    // code is the authoritative signal `s3_error` classifies on when a body
+    // is present).
+    assert!(is_transient_s3(
+        StatusCode::SERVICE_UNAVAILABLE,
+        Some("SlowDown")
+    ));
+    assert!(is_transient_s3(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Some("InternalError")
+    ));
+    assert!(is_transient_s3(
+        StatusCode::SERVICE_UNAVAILABLE,
+        Some("ServiceUnavailable")
+    ));
+    assert!(is_transient_s3(
+        StatusCode::BAD_REQUEST,
+        Some("RequestTimeout")
+    ));
+    assert!(is_transient_s3(
+        StatusCode::TOO_MANY_REQUESTS,
+        Some("ThrottlingException")
+    ));
+}
+
+#[test]
+fn is_transient_s3_false_for_permanent_faults() {
+    assert!(!is_transient_s3(
+        StatusCode::FORBIDDEN,
+        Some("AccessDenied")
+    ));
+    assert!(!is_transient_s3(StatusCode::NOT_FOUND, Some("NoSuchKey")));
+    assert!(!is_transient_s3(StatusCode::BAD_REQUEST, None));
+    assert!(!is_transient_s3(StatusCode::FORBIDDEN, None));
+    assert!(!is_transient_s3(StatusCode::NOT_FOUND, None));
+}
+
+#[test]
+fn is_transient_s3_false_for_clock_skew() {
+    // A retry re-signs with the same skewed clock, so this must NOT be
+    // treated as transient even though it is a real, retryable-sounding
+    // failure in spirit.
+    assert!(!is_transient_s3(
+        StatusCode::FORBIDDEN,
+        Some("RequestTimeTooSkewed")
+    ));
+}

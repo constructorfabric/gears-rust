@@ -65,6 +65,7 @@ pub(crate) fn file_version_from_model(e: file_version::Model) -> Result<FileVers
         backend_id: e.backend_id,
         backend_path: e.backend_path,
         created_at: e.created_at,
+        bound_on_finalize: e.bound_on_finalize,
     })
 }
 
@@ -135,6 +136,7 @@ mod tests {
             backend_id: "mem".to_owned(),
             backend_path: "/f/v".to_owned(),
             created_at: now,
+            bound_on_finalize: false,
         };
         let err = file_version_from_model(model)
             .expect_err("an unparseable status must surface as an error, not a default");

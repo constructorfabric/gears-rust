@@ -76,6 +76,10 @@ pub(crate) fn register_routes(
     // 409: the version was already finalized (double-finalize callback).
     .error_409(openapi)
     .error_500(openapi)
+    // 503: `finalize_upload_by_token`'s read-back (`stat`/`get_stream`/
+    // `exists` against the version's backend path) surfaces a transient
+    // `BackendUnavailable` as 503 + Retry-After (categories/14).
+    .error_503(openapi)
     .register(router, openapi);
 
     // ── Data-plane report-part (s2s, token-authenticated) ───────────────────
@@ -132,6 +136,12 @@ pub(crate) fn register_routes(
         // 409: an idempotency key was reused with a different request body.
         .error_409(openapi)
         .error_500(openapi)
+        // 503: with a `multipart` intent block whose plan has >=2 parts, this
+        // calls `MultipartService::initiate_multipart_upload`, which calls
+        // `StorageBackend::initiate_multipart` -- a transient backend fault
+        // surfaces as 503 + Retry-After (categories/14). The plain single-part
+        // path never touches the backend (only sync `capabilities()`/`id()`).
+        .error_503(openapi)
         .register(router, openapi);
 
     // POST /files/{id}/versions — presign a new version
@@ -485,6 +495,9 @@ pub(crate) fn register_routes(
         .error_403(openapi)
         .error_404(openapi)
         .error_500(openapi)
+        // 503: calls `StorageBackend::initiate_multipart` -- a transient
+        // backend fault surfaces as 503 + Retry-After (categories/14).
+        .error_503(openapi)
         .register(router, openapi);
 
     // NOTE: The control-plane PUT .../parts/{part_number} byte route is intentionally
@@ -534,6 +547,11 @@ pub(crate) fn register_routes(
     // to 400 by house convention (mirrors `bind`'s route above).
     .error_400(openapi)
     .error_500(openapi)
+    // 503: the winning completer's detached assembly task calls
+    // `StorageBackend::complete_multipart` (its result is awaited and
+    // returned to this same request) -- a transient backend fault surfaces
+    // as 503 + Retry-After (categories/14).
+    .error_503(openapi)
     .register(router, openapi);
 
     // GET /files/{id}/multipart/{upload_id} — introspect/resume (item 3.4)
@@ -604,6 +622,12 @@ pub(crate) fn register_routes(
         .error_404(openapi)
         .error_409(openapi)
         .error_500(openapi)
+        // 503: the streaming transfer/verify/re-verify/pre-commit-stat steps
+        // all call `StorageBackend` methods (`get_stream`/`publish_exclusive`/
+        // `stat`) -- a transient backend fault, or a losing side of a
+        // concurrent object change, surfaces as 503 + Retry-After
+        // (categories/14; `domain/service/backend.rs`).
+        .error_503(openapi)
         .register(router, openapi);
 
     // ── Ownership transfer (P2-M5) ─────────────────────────────────────────────

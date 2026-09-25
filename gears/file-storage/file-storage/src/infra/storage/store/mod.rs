@@ -159,5 +159,8 @@ pub(super) fn pending_version(
         backend_id: backend_id.to_owned(),
         backend_path: backend_path.to_owned(),
         created_at: now,
+        // A pending row has not been through finalize yet, let alone won a
+        // bind CAS there.
+        bound_on_finalize: false,
     }
 }

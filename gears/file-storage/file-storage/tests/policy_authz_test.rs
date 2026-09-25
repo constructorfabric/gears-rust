@@ -575,13 +575,17 @@ async fn delete_retention_rule_foreign_owner_is_denied() {
     assert_eq!(still_there.rule_id, rule.rule_id);
 }
 
-/// A `scope=file` rule whose target file has since been deleted (no FK/
-/// cascade ties `retention_rules.scope_target_id` to `files.file_id`) must
-/// remain deletable by the rule owner. Before the fix, `authorize_retention_scope`'s
-/// `File` arm always re-resolved the (now-gone) target via `require_file`,
-/// which 404s — permanently stuck rule, re-scanned by every sweep.
+/// A `scope=file` rule must be removed in the SAME transaction as its target
+/// file — no FK/cascade ties `retention_rules.scope_target_id` to
+/// `files.file_id` at the DB level, so `FileService::delete_file` itself
+/// removes any `File`-scope rule still targeting the file it deletes (see
+/// `RetentionRuleRepo::delete_file_scope_rules`'s callers). A rule that
+/// outlives its file used to be permanently stuck behind
+/// `authorize_retention_scope`'s `require_file` 404 unless a caller found
+/// its own way to `delete_retention_rule`'s dangling-target fallback; now
+/// there is nothing left to find — the row is simply gone.
 #[tokio::test]
-async fn delete_retention_rule_file_scope_target_deleted_still_deletable() {
+async fn delete_file_cascade_removes_file_scope_retention_rule() {
     let h = build_harness().await;
     let tenant = Uuid::now_v7();
     let owner = Uuid::now_v7();
@@ -604,40 +608,50 @@ async fn delete_retention_rule_file_scope_target_deleted_still_deletable() {
         .await
         .expect("create file-scope rule");
 
-    // Delete the target file out from under the rule (unconditional delete).
+    // Delete the target file (unconditional delete) -- the rule must go
+    // with it, in the same delete, with no separate cleanup step.
     h.file_svc
         .delete_file(&ctx_a, ticket.file_id, Some("*"))
         .await
         .expect("delete target file");
-
-    // The rule must still be deletable: authorization falls back to a plain
-    // tenant-wide WRITE gate instead of re-resolving the gone file.
-    let removed = h
-        .policy_svc
-        .delete_retention_rule(&ctx_a, rule.rule_id)
-        .await
-        .expect("delete_retention_rule must not fail once the file is gone");
-    assert!(removed, "the orphaned rule must actually be removed");
 
     let gone = h
         .policy_store
         .get_retention_rule(&AccessScope::allow_all(), rule.rule_id)
         .await
         .expect("get_retention_rule");
-    assert!(gone.is_none(), "rule row must be gone after delete");
+    assert!(
+        gone.is_none(),
+        "the file-scope rule must be removed along with its target file"
+    );
+
+    // The dangling-target fallback (`authorize_retention_scope` ->
+    // `File`-arm `WRITE` gate in `delete_retention_rule`) is now purely
+    // defensive against a race, not something this path ever needs to
+    // reach: the rule is already gone, so a later explicit delete simply
+    // reports the same `RetentionRuleNotFound` a nonexistent id would.
+    let result = h
+        .policy_svc
+        .delete_retention_rule(&ctx_a, rule.rule_id)
+        .await;
+    assert!(
+        matches!(
+            result,
+            Err(DomainError::RetentionRuleNotFound { rule_id }) if rule_id == rule.rule_id
+        ),
+        "expected RetentionRuleNotFound for an already-cascaded rule, got {result:?}"
+    );
 }
 
-/// The tenant-wide fallback used for an orphaned `scope=file` rule must not
-/// widen who can delete it: a caller in a *different* tenant than the rule
-/// must still fail — and, per the cross-tenant rule-ID oracle fix (P2
-/// remediation), as the exact same `RetentionRuleNotFound` a nonexistent
-/// `rule_id` produces (`delete_missing_retention_rule_returns_retention_not_found`
-/// below), never a `Forbidden` (which would leak "yes, a rule with this id
-/// exists") and never reaching the tenant-wide `WRITE` fallback at all: the
-/// rule is now fetched under the caller's *own* tenant scope, so a foreign
-/// tenant's rule_id simply does not resolve.
+/// The cascade delete above must not create a NEW cross-tenant oracle: once
+/// tenant A's file (and its file-scope rule) is deleted, a caller in a
+/// *different* tenant attempting to delete that same (now-gone) `rule_id`
+/// must see the exact same `RetentionRuleNotFound` a nonexistent id
+/// produces — same as tenant A's own caller would, per the test above —
+/// never a `Forbidden` (which would leak "yes, a rule with this id used to
+/// exist") and never a different error shape depending on which tenant asks.
 #[tokio::test]
-async fn delete_retention_rule_file_scope_deleted_target_foreign_tenant_cannot_delete() {
+async fn delete_retention_rule_after_file_cascade_is_not_found_for_any_tenant() {
     let h = build_harness().await;
     let tenant_a = Uuid::now_v7();
     let tenant_b = Uuid::now_v7();
@@ -668,6 +682,16 @@ async fn delete_retention_rule_file_scope_deleted_target_foreign_tenant_cannot_d
         .await
         .expect("tenant A deletes the target file");
 
+    let still_there = h
+        .policy_store
+        .get_retention_rule(&AccessScope::allow_all(), rule.rule_id)
+        .await
+        .expect("get_retention_rule");
+    assert!(
+        still_there.is_none(),
+        "the rule must have been cascaded away with tenant A's file"
+    );
+
     let result = h
         .policy_svc
         .delete_retention_rule(&ctx_b, rule.rule_id)
@@ -677,17 +701,9 @@ async fn delete_retention_rule_file_scope_deleted_target_foreign_tenant_cannot_d
             result,
             Err(DomainError::RetentionRuleNotFound { rule_id }) if rule_id == rule.rule_id
         ),
-        "tenant B must not be able to delete tenant A's orphaned rule, and must see \
-         RetentionRuleNotFound rather than Forbidden or a silent no-op; got {result:?}"
+        "tenant B must see RetentionRuleNotFound rather than Forbidden or a silent no-op; \
+         got {result:?}"
     );
-
-    let still_there = h
-        .policy_store
-        .get_retention_rule(&AccessScope::allow_all(), rule.rule_id)
-        .await
-        .expect("get_retention_rule")
-        .expect("rule must still exist, owned by tenant A");
-    assert_eq!(still_there.tenant_id, tenant_a);
 }
 
 /// The cross-tenant rule-ID oracle, closed directly: deleting an existing

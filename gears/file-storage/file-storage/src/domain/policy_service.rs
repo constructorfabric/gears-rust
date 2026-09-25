@@ -263,22 +263,21 @@ impl PolicyService {
                     ids.dedup();
                     ids
                 };
-                // A `file_id` absent from the result (in particular, one
-                // whose target file has since been deleted -- no FK ties
-                // `retention_rules.scope_target_id` to `files.file_id`, see
-                // `delete_retention_rule`'s comment on the same migration)
-                // simply has no entry here, exactly like a `FileNotFound`
-                // from `require_file` used to. `StoredRetentionRule` carries
-                // no creator/`subject_id` column, so once the file is gone
-                // there is no stored fact left to tell who may still see the
-                // rule -- unlike `delete_retention_rule` (which only needs to
-                // know *that* the target is gone to fall back to a coarser
-                // check), this listing would need to know *who created it*,
-                // which was never recorded. Not expressible without a schema
-                // change, so the rule is dropped for every non-admin caller
-                // here; an admin can still reach it via the `Ok` arm above,
-                // or remove it via `delete_retention_rule`'s own
-                // dangling-target fallback.
+                // A `file_id` absent from the result should no longer happen
+                // in practice: a `File`-scope rule is now removed in the SAME
+                // transaction as its target file (`Store::
+                // delete_file_collecting_versions`/`delete_orphan_file_with_event`/
+                // `delete_version_or_whole_file`, plus a one-time cleanup in
+                // `m20260924_000001_upload_flow_redesign` for rows already
+                // dangling before that fix), so a rule surviving its file is
+                // no longer an expected steady state -- only a defensive
+                // fallback for the race between this listing's rule read and
+                // its batched file read a few lines below (the target file
+                // could be deleted, by any of those same paths, in between).
+                // On that race, the rule simply has no entry here, exactly
+                // like a `FileNotFound` from `require_file` used to; an admin
+                // can still reach it via the `Ok` arm above, or remove it via
+                // `delete_retention_rule`'s own dangling-target fallback.
                 let owner_by_file: HashMap<Uuid, (String, Uuid)> = self
                     .store
                     .list_files_by_ids(&tenant_scope, &file_ids)
@@ -427,7 +426,14 @@ impl PolicyService {
             // `files.file_id`, see the m20260701_000001_p2_initial migration)
             // would otherwise be permanently undeletable: every future call
             // re-resolves the (now-gone) target via `require_file` and 404s
-            // before authorization is even attempted. Fall back to the same
+            // before authorization is even attempted. Every file-delete path
+            // now removes a file's `File`-scope rules in the same
+            // transaction (see `RetentionRuleRepo::delete_file_scope_rules`'s
+            // callers), so reaching this arm at all means the narrow race
+            // between the `get_retention_rule` fetch above and this
+            // authorization call -- the file existed at fetch time and was
+            // deleted (cascading its rule too) in between -- not a
+            // routinely-occurring dangling rule. Fall back to the same
             // plain tenant-wide `WRITE` gate — there is no file left to check
             // per-file `WRITE` against, so this is the closest equivalent, not
             // a weaker one: the actual

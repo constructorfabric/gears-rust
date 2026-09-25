@@ -237,6 +237,7 @@ impl Store {
     ) -> Result<DeletedFile, DomainError> {
         let files = self.repos.files.clone();
         let versions = self.repos.versions.clone();
+        let retention_rules = self.repos.retention_rules.clone();
         let audit_repo = self.repos.audit.clone();
         let events_repo = self.repos.events_outbox.clone();
         let del_scope = scope.clone();
@@ -247,6 +248,7 @@ impl Store {
         transaction_with_bounded_retry(&db, move |tx| {
             let files = files.clone();
             let versions = versions.clone();
+            let retention_rules = retention_rules.clone();
             let audit_repo = audit_repo.clone();
             let events_repo = events_repo.clone();
             let del_scope = del_scope.clone();
@@ -281,6 +283,15 @@ impl Store {
 
                 let removed = files.delete(tx, &del_scope, file_id).await?;
                 if removed {
+                    // `retention_rules` has no FK from `scope_target_id` to
+                    // `files.file_id` -- remove any `File`-scope rule still
+                    // targeting this file in the SAME transaction, so it can
+                    // never outlive its target (see
+                    // `RetentionRuleRepo::delete_file_scope_rules`'s doc
+                    // comment).
+                    retention_rules
+                        .delete_file_scope_rules(tx, &scope_all, file_id)
+                        .await?;
                     audit_repo.insert(tx, &audit).await?;
                     if let Some(ev) = event {
                         events_repo.enqueue(tx, &ev).await?;
@@ -347,6 +358,7 @@ impl Store {
         let files = self.repos.files.clone();
         let versions = self.repos.versions.clone();
         let multipart = self.repos.multipart.clone();
+        let retention_rules = self.repos.retention_rules.clone();
         let audit_repo = self.repos.audit.clone();
         let events_repo = self.repos.events_outbox.clone();
         let db = self.db.db();
@@ -358,6 +370,7 @@ impl Store {
             let files = files.clone();
             let versions = versions.clone();
             let multipart = multipart.clone();
+            let retention_rules = retention_rules.clone();
             let audit_repo = audit_repo.clone();
             let events_repo = events_repo.clone();
             let audit = audit.clone();
@@ -387,6 +400,11 @@ impl Store {
 
                 let removed = files.delete_if_orphan(tx, &scope, file_id).await? > 0;
                 if removed {
+                    // See `delete_file_collecting_versions`'s matching call
+                    // for why this has no FK to lean on instead.
+                    retention_rules
+                        .delete_file_scope_rules(tx, &scope, file_id)
+                        .await?;
                     audit_repo.insert(tx, &audit).await?;
                     if let Some(ev) = event {
                         events_repo.enqueue(tx, &ev).await?;

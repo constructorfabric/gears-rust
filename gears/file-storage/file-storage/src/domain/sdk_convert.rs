@@ -9,6 +9,12 @@
 //! is the one place their field-for-field mapping lives, so it happens
 //! exactly once instead of being reimplemented ad hoc at each
 //! [`super::local_client::FileStorageLocalClient`] method.
+//!
+//! Every one-way domain-to-SDK conversion below destructures its source
+//! struct field-by-field (no `..`) instead of reading fields off it
+//! (`p.field`), so that adding a field to the domain type is a compile error
+//! here rather than a silently-never-exported SDK field. A field
+//! deliberately not exported is bound `_` with a short comment saying why.
 
 use crate::domain::multipart;
 use crate::domain::policy;
@@ -19,22 +25,36 @@ use crate::infra::backend::BackendCapabilities;
 pub(super) fn multipart_part_plan(
     p: multipart::MultipartPartPlan,
 ) -> file_storage_sdk::MultipartPartPlan {
+    let multipart::MultipartPartPlan {
+        part_number,
+        offset,
+        size,
+        upload_url,
+    } = p;
     file_storage_sdk::MultipartPartPlan {
-        part_number: p.part_number,
-        offset: p.offset,
-        size: p.size,
-        upload_url: p.upload_url,
+        part_number,
+        offset,
+        size,
+        upload_url,
     }
 }
 
 pub(super) fn multipart_plan(p: multipart::MultipartPlan) -> file_storage_sdk::MultipartPlan {
+    let multipart::MultipartPlan {
+        upload_id,
+        version_id,
+        part_hash_algorithm,
+        part_size,
+        parts,
+        expires_at,
+    } = p;
     file_storage_sdk::MultipartPlan {
-        upload_id: p.upload_id,
-        version_id: p.version_id,
-        part_hash_algorithm: p.part_hash_algorithm,
-        part_size: p.part_size,
-        parts: p.parts.into_iter().map(multipart_part_plan).collect(),
-        expires_at: p.expires_at,
+        upload_id,
+        version_id,
+        part_hash_algorithm,
+        part_size,
+        parts: parts.into_iter().map(multipart_part_plan).collect(),
+        expires_at,
     }
 }
 
@@ -56,36 +76,62 @@ pub(super) fn multipart_upload_state(
 }
 
 pub(super) fn received_part(p: &multipart::ReceivedPart) -> file_storage_sdk::ReceivedPart {
+    // `p` is a shared reference, so this binds each field by reference
+    // (match ergonomics) -- dereferenced below, same zero-clone semantics as
+    // the plain `p.field` reads this replaces (every field here is `Copy`).
+    let multipart::ReceivedPart {
+        part_number,
+        size,
+        uploaded_at,
+    } = p;
     file_storage_sdk::ReceivedPart {
-        part_number: p.part_number,
-        size: p.size,
-        uploaded_at: p.uploaded_at,
+        part_number: *part_number,
+        size: *size,
+        uploaded_at: *uploaded_at,
     }
 }
 
 pub(super) fn missing_part(p: multipart::MissingPart) -> file_storage_sdk::MissingPart {
+    let multipart::MissingPart {
+        part_number,
+        offset,
+        size,
+        upload_url,
+    } = p;
     file_storage_sdk::MissingPart {
-        part_number: p.part_number,
-        offset: p.offset,
-        size: p.size,
-        upload_url: p.upload_url,
+        part_number,
+        offset,
+        size,
+        upload_url,
     }
 }
 
 pub(super) fn multipart_status(
     s: multipart::MultipartUploadStatus,
 ) -> file_storage_sdk::MultipartStatus {
+    let multipart::MultipartUploadStatus {
+        upload_id,
+        version_id,
+        state,
+        declared_mime,
+        declared_size,
+        part_size,
+        created_at,
+        expires_at,
+        received,
+        missing,
+    } = s;
     file_storage_sdk::MultipartStatus {
-        upload_id: s.upload_id,
-        version_id: s.version_id,
-        state: multipart_upload_state(&s.state),
-        declared_mime: s.declared_mime,
-        declared_size: s.declared_size,
-        part_size: s.part_size,
-        created_at: s.created_at,
-        expires_at: s.expires_at,
-        received: s.received.iter().map(received_part).collect(),
-        missing: s.missing.into_iter().map(missing_part).collect(),
+        upload_id,
+        version_id,
+        state: multipart_upload_state(&state),
+        declared_mime,
+        declared_size,
+        part_size,
+        created_at,
+        expires_at,
+        received: received.iter().map(received_part).collect(),
+        missing: missing.into_iter().map(missing_part).collect(),
     }
 }
 
@@ -100,17 +146,31 @@ pub(super) fn bind_state(b: multipart::BindState) -> file_storage_sdk::BindState
 pub(super) fn completed_multipart_upload(
     c: multipart::CompletedMultipartUpload,
 ) -> file_storage_sdk::CompletedMultipartUpload {
+    // `bind_state` is renamed on the way out -- it would otherwise shadow the
+    // `bind_state` conversion function called a few lines down.
+    let multipart::CompletedMultipartUpload {
+        version_id,
+        size,
+        hash_algorithm,
+        content_hash,
+        hash_mode,
+        part_count,
+        manifest,
+        bind_state: source_bind_state,
+        etag,
+        current_etag,
+    } = c;
     file_storage_sdk::CompletedMultipartUpload {
-        version_id: c.version_id,
-        size: c.size,
-        hash_algorithm: c.hash_algorithm.to_owned(),
-        content_hash: c.content_hash,
-        hash_mode: c.hash_mode.as_str().to_owned(),
-        part_count: c.part_count,
-        manifest: c.manifest,
-        bind_state: bind_state(c.bind_state),
-        etag: c.etag,
-        current_etag: c.current_etag,
+        version_id,
+        size,
+        hash_algorithm: hash_algorithm.to_owned(),
+        content_hash,
+        hash_mode: hash_mode.as_str().to_owned(),
+        part_count,
+        manifest,
+        bind_state: bind_state(source_bind_state),
+        etag,
+        current_etag,
     }
 }
 
@@ -130,12 +190,22 @@ pub(super) fn multipart_complete_outcome(
 // ── storage backends ─────────────────────────────────────────────────────────
 
 pub(super) fn storage(id: String, caps: BackendCapabilities) -> file_storage_sdk::Storage {
+    let BackendCapabilities {
+        multipart_native,
+        encryption_native,
+        range_native,
+        // Backend-internal / operational details, deliberately not part of
+        // the public SDK-facing capability surface.
+        presigned_url_internal: _,
+        max_size_bytes: _,
+        durable: _,
+    } = caps;
     file_storage_sdk::Storage {
         id,
         capabilities: file_storage_sdk::StorageCapabilities {
-            multipart_native: caps.multipart_native,
-            encryption_native: caps.encryption_native,
-            range_native: caps.range_native,
+            multipart_native,
+            encryption_native,
+            range_native,
         },
     }
 }
@@ -237,27 +307,41 @@ pub(super) fn policy_body_to_sdk(b: policy::PolicyBody) -> file_storage_sdk::Pol
 }
 
 pub(super) fn stored_policy(p: policy::StoredPolicy) -> file_storage_sdk::Policy {
+    let policy::StoredPolicy {
+        policy_id,
+        tenant_id,
+        scope,
+        scope_owner_id,
+        body,
+        created_at,
+        updated_at,
+    } = p;
     file_storage_sdk::Policy {
-        policy_id: p.policy_id,
-        tenant_id: p.tenant_id,
-        scope: policy_scope_to_sdk(&p.scope),
-        scope_owner_id: p.scope_owner_id,
-        body: policy_body_to_sdk(p.body),
-        created_at: p.created_at,
-        updated_at: p.updated_at,
+        policy_id,
+        tenant_id,
+        scope: policy_scope_to_sdk(&scope),
+        scope_owner_id,
+        body: policy_body_to_sdk(body),
+        created_at,
+        updated_at,
     }
 }
 
 pub(super) fn effective_policy(p: policy::EffectivePolicy) -> file_storage_sdk::EffectivePolicy {
+    let policy::EffectivePolicy {
+        allowed_mime_types,
+        max_bytes,
+        per_mime_max_bytes,
+        metadata_limits,
+    } = p;
     file_storage_sdk::EffectivePolicy {
-        allowed_mime_types: p.allowed_mime_types,
-        max_bytes: p.max_bytes,
-        per_mime_max_bytes: p
-            .per_mime_max_bytes
+        allowed_mime_types,
+        max_bytes,
+        per_mime_max_bytes: per_mime_max_bytes
             .into_iter()
             .map(mime_size_override_to_sdk)
             .collect(),
-        metadata_limits: metadata_limits_to_sdk(&p.metadata_limits),
+        metadata_limits: metadata_limits_to_sdk(&metadata_limits),
     }
 }
 
@@ -320,13 +404,21 @@ pub(super) fn retention_rule_body_to_sdk(
 pub(super) fn stored_retention_rule(
     r: policy::StoredRetentionRule,
 ) -> file_storage_sdk::RetentionRule {
+    let policy::StoredRetentionRule {
+        rule_id,
+        tenant_id,
+        scope,
+        scope_target_id,
+        body,
+        created_at,
+    } = r;
     file_storage_sdk::RetentionRule {
-        rule_id: r.rule_id,
-        tenant_id: r.tenant_id,
-        scope: retention_scope_to_sdk(&r.scope),
-        scope_target_id: r.scope_target_id,
-        body: retention_rule_body_to_sdk(r.body),
-        created_at: r.created_at,
+        rule_id,
+        tenant_id,
+        scope: retention_scope_to_sdk(&scope),
+        scope_target_id,
+        body: retention_rule_body_to_sdk(body),
+        created_at,
     }
 }
 
