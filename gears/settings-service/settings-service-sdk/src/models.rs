@@ -178,8 +178,9 @@ pub enum ContributedClassification {
 pub struct ContributedDeclaration {
     /// The setting key the module supplies.
     pub key: SettingKey,
-    /// The curated value type the setting's values validate against, from
-    /// `gts.cf.core.settings.type_*~`.
+    /// The value type the setting's values validate against: one of the
+    /// catalogue under `gts.cf.core.settings.type_*~`, or one the module
+    /// registered itself, in its own namespace, before declaring this.
     pub value_type_id: String,
     /// The Schema Default, validated against `value_type_id`. Mandatory: a
     /// setting with no meaningful default sends JSON `null` on a type that

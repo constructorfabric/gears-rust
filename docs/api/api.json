@@ -3725,7 +3725,7 @@
             "type": "string"
           },
           "value_type_id": {
-            "description": "The curated value type the default and every override validate against.",
+            "description": "The value type the default and every override validate against: one of\nthe catalogue under `gts.cf.core.settings.type_*~`, or a registered\nmodule-owned one.",
             "type": "string"
           },
           "vendor": {

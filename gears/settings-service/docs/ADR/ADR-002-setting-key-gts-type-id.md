@@ -21,6 +21,7 @@ decision-makers: Constructor Fabric Steering Committee
   - [The setting key is a GTS instance identifier](#the-setting-key-is-a-gts-instance-identifier)
   - [Admin settings are not GTS-registered; key is a category path](#admin-settings-are-not-gts-registered-key-is-a-category-path)
 - [More Information](#more-information)
+- [Amendment 2026-09-25: module-owned value types](#amendment-2026-09-25-module-owned-value-types)
 - [Traceability](#traceability)
 
 <!-- /toc -->
@@ -114,6 +115,16 @@ Supersedes ADR-001 *Setting Key Is a GTS Instance Identifier* (retired; the deci
 
 The design records the decision on its own terms in DESIGN.md §6 *Open Questions* ("Setting identity — RESOLVED") and specifies it in §3 *Setting key by author* and §4.7 *When the type is registered*.
 
+## Amendment 2026-09-25: module-owned value types
+
+The decision driver that the value's shape "must keep coming from a curated, reviewed catalog" is relaxed by a
+product decision taken in the review of the implementing PR. The catalogue under `gts.cf.core.settings.type_*~` stays
+what this gear ships; a module may also register its own value type, in its own namespace and with this gear's trait
+vocabulary, and name it as a setting's `value_type_id` (DESIGN §4.7 *Module-owned value types*). The part of the driver
+that mattered — the service must not become a second type system — holds unchanged: every value type is a GTS type in
+the Registry, and the Type Validator resolves them all the same way. The implementation already resolved any
+registered type; what changed is that this is now the design, not an unenforced gap.
+
 ## Traceability
 
 - **PRD**: [PRD.md](../PRD.md)
@@ -122,7 +133,7 @@ The design records the decision on its own terms in DESIGN.md §6 *Open Question
 This decision directly addresses the following requirements or design elements:
 
 * `cpt-cf-settings-service-constraint-key-is-gts-type-id` — this ADR is the rationale for that design constraint
-* `cpt-cf-settings-service-constraint-gts-value-validation` — identity and value shape are separate objects; the shape still comes from the curated catalog
+* `cpt-cf-settings-service-constraint-gts-value-validation` — identity and value shape are separate objects; the shape comes from a registered value type — the catalogue or a module's own (Amendment 2026-09-25)
 * `cpt-cf-settings-service-fr-per-setting-access` — a setting is a GTS type so that a policy can name it as its resource
 * `cpt-cf-settings-service-fr-settings-category-model` — the category slug is the third token of every key declared under it, and per-category leaf uniqueness is enforced in the Settings DB
 * `cpt-cf-settings-service-fr-typed-value-validation` — the value type validated against is `value_type_id`, no longer derived from the key

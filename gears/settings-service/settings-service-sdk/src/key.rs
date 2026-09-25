@@ -18,8 +18,9 @@
 //! the key a type rather than an instance — and a type is what a policy can name
 //! as its resource, which an instance identifier could not be (ADR-002).
 //!
-//! The value's **shape** is not in the key. It is a separate curated catalog type
-//! (`gts.cf.core.settings.type_*~`) named by the declaration's `value_type_id`,
+//! The value's **shape** is not in the key. It is a separate value type — from the
+//! catalogue (`gts.cf.core.settings.type_*~`) or a module's own — named by the
+//! declaration's `value_type_id`,
 //! so a value-shape change is an evolution of the same setting, not a new key.
 //!
 //! Grammar validation is delegated to `gts-id`, the platform's single source of

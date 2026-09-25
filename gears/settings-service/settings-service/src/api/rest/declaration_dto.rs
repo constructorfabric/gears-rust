@@ -129,7 +129,9 @@ impl From<RenderedDeclaration> for DeclarationDto {
 #[toolkit_macros::api_dto(request)]
 #[serde(deny_unknown_fields)]
 pub struct CreateDeclarationRequest {
-    /// The curated value type the default and every override validate against.
+    /// The value type the default and every override validate against: one of
+    /// the catalogue under `gts.cf.core.settings.type_*~`, or a registered
+    /// module-owned one.
     pub value_type_id: String,
     /// The vendor segment of the composed key.
     pub vendor: String,

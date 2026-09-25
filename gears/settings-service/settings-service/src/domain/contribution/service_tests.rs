@@ -1349,3 +1349,76 @@ async fn each_setting_type_is_registered_before_its_row_is_written() {
         ]
     );
 }
+
+// ── Value types a module registers itself ────────────────────────────────────
+
+#[tokio::test]
+async fn a_module_declares_settings_of_a_value_type_it_registered_itself() {
+    // The catalogue is what this gear ships, not the only shapes there are: a
+    // module may register its own value type, in its own namespace and with the
+    // gear's trait vocabulary, and its settings validate against it like any
+    // catalogue type's — including a secret trait deciding how values are kept.
+    const RETRY: &str = "gts.acme.demo.values.retry_policy.v1~";
+    const TOKEN: &str = "gts.acme.demo.values.api_token.v1~";
+    let source = catalogue()
+        .with_type(
+            RETRY,
+            json!({
+                "$id": format!("gts://{RETRY}"),
+                "type": "object",
+                "properties": { "attempts": { "type": "integer", "minimum": 1 } },
+                "required": ["attempts"],
+                "additionalProperties": false
+            }),
+        )
+        .with_type(
+            TOKEN,
+            json!({
+                "$id": format!("gts://{TOKEN}"),
+                "type": "string",
+                "x-gts-traits": { "secret": true }
+            }),
+        );
+    let h = Harness::build(
+        sqlite_provider().await,
+        RecordingRegistrar::default(),
+        source,
+    );
+    let declare = |name: &str, value_type: &str, default: Value| {
+        ContributedDeclaration::new(
+            key("network", name, 1),
+            value_type.to_owned(),
+            default,
+            ScopeClass::Cascading,
+        )
+    };
+    let result = h
+        .register(vec![
+            declare("retry", RETRY, json!({ "attempts": 3 })),
+            declare("backoff", RETRY, json!({ "attempts": 0 })),
+            declare("token", TOKEN, json!("")),
+        ])
+        .await;
+    assert_eq!(result.registered, 2, "{result:?}");
+    assert_eq!(
+        codes(&result),
+        vec![reason::DEFAULT_INVALID],
+        "its own schema refuses"
+    );
+
+    let conn = h.db.conn().expect("connection");
+    let token = DeclarationRepo
+        .find_by_key(
+            &conn,
+            &AccessScope::allow_all(),
+            key("network", "token", 1).as_str(),
+        )
+        .await
+        .expect("lookup")
+        .expect("registered");
+    assert!(
+        token.has_secret_trait,
+        "the module type's secret trait is honoured"
+    );
+    assert_eq!(token.data_classification, "secret");
+}

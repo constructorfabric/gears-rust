@@ -2,9 +2,11 @@
 //! The starter catalogue of value types a declaration's `value_type_id` names.
 //!
 //! A setting's *key* is a type of its own (ADR-002) and says nothing about the
-//! shape of its value; the shape comes from a curated **value type** under
-//! `gts.cf.core.settings.type_*~`, named by the declaration's
-//! `value_type_id` and validated against by the Type Validator. The catalogue
+//! shape of its value; the shape comes from a **value type** named by the
+//! declaration's `value_type_id` and validated against by the Type Validator.
+//! This catalogue, under `gts.cf.core.settings.type_*~`, is what the gear
+//! ships; a module whose setting fits none of it registers its own value type
+//! in its own namespace (DESIGN §4.7 *Module-owned value types*). The catalogue
 //! is the Settings gear's, under the gear's own namespace and beside the
 //! control-plane types it already owns: it ships from this SDK, and an
 //! identifier that said `toolkit` would name an owner that never held it.

@@ -4,8 +4,8 @@
 //! The Type Validator over the types registry.
 //!
 //! Generic over any GTS type id. For a setting the id passed in is the
-//! declaration's `value_type_id` — the curated catalogue type its values
-//! conform to — never the setting key, which is a type of its own that
+//! declaration's `value_type_id` — the catalogue type, or the module-owned one,
+//! its values conform to — never the setting key, which is a type of its own that
 //! describes nothing about the value's shape.
 //!
 //! # Two rules the registry does not know

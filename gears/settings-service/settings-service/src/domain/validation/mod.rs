@@ -81,10 +81,9 @@ impl ValidationResult {
 
 /// The resolved trait set of a value type, merged across its inheritance chain.
 ///
-/// The keys are read from the type's `x-gts-traits`. The curated value-type
-/// catalogue this vocabulary describes does not exist in the workspace yet;
-/// these are the names this gear reads, recorded in DECOMPOSITION §1 as the
-/// contract the catalogue must meet or this reader must follow.
+/// The keys are read from the type's `x-gts-traits`, whether the type is one of
+/// the catalogue or a module's own; these are the names this gear reads,
+/// recorded in DECOMPOSITION §1 as the contract every value type's traits meet.
 // Three flags mirror three boolean traits of the vocabulary; a state enum would
 // invent a relationship between `secret`, `multiline` and `regex` that the
 // traits do not have.

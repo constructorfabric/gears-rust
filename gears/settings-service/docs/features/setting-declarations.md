@@ -70,7 +70,7 @@ The hardest constraint here is not any single field but the rule connecting them
 | `cpt-cf-settings-service-actor-tenant-admin` | Reads declarations exposed by the visibility, domain, and licence gates |
 | `cpt-cf-settings-service-actor-contributing-module` | Owns `module_contributed` declarations, which this feature reads and protects from admin edit but does not itself write |
 | `cpt-cf-settings-service-actor-authz-resolver` | Supplies the authorization decision and the `AccessScope` constraints applied to reads |
-| `cpt-cf-settings-service-actor-types-registry` | Owns the curated value types a declaration names by `value_type_id`, and holds the setting's own type, registered under the Settings base when the declaration is created; this service consumes the catalogue and never authors a value shape |
+| `cpt-cf-settings-service-actor-types-registry` | Owns the value types a declaration names by `value_type_id` — this gear's catalogue and any a module registered in its own namespace — and holds the setting's own type, registered under the Settings base when the declaration is created; this service consumes the catalogue and never authors a value shape |
 
 ### 1.4 References
 

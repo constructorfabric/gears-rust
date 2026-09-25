@@ -1,8 +1,9 @@
 # cf-gears-settings-service-sdk
 
 Public SDK for the `settings-service` gear: the traits a consuming gear calls,
-the value objects its keys are made of, and the curated value-type catalogue a
-declaration picks from. The implementation lives in
+the value objects its keys are made of, and the value-type catalogue a
+declaration picks from — or goes beyond, with a value type a module registers in
+its own namespace. The implementation lives in
 [`cf-gears-settings-service`](../settings-service); nothing here depends on it.
 
 ## Setting keys
