@@ -2957,7 +2957,20 @@ the defaults above; four hard ranges differ from the table, deliberately —
 to 300 (the gateway's own 30 s ceiling is the binding one, ADR-0006) and
 `idempotency_retention_days` to 365. `embedding_input_max_bytes` (8 KiB,
 64 B – 256 KiB) bounds the composed embedding input and is not in the table
-above. `traversal_max_edges_scanned` is applied per hop rather than
+above. It is an upper bound on what is *sent* to a provider, not on what a
+vector *represents*: every provider has a window of its own, and the
+narrower of the two decides. The in-process ONNX provider embeds at most
+`max_tokens` tokens and, for the `MiniLM` artifacts it targets, the
+tokenizer fixes the sequence at 128 — roughly 500 to 700 characters of
+English — so with the default models the byte limit is never what cuts,
+and text past the window is not represented in the vector at all. That cut
+is not silent at the configuration level: the window and its truncation
+rule (`max_tokens`, `truncation: longest_first`) are part of the recorded
+embedding-space identity, so two deployments that embed differently
+cannot share a space. It is not reported per request — the provider
+contract returns no truncation signal — so a producer whose vectorized
+fields run long should put what should rank first, first. A remote
+provider's window is its model's, and is not visible to the gear. `traversal_max_edges_scanned` is applied per hop rather than
 cumulatively: each hop's scan is bounded, the walk's total is not. A hop that
 reaches the bound reports `EdgeScanCap` — it reads one row past the budget to
 know, then discards it — so a partial subgraph is no longer indistinguishable
