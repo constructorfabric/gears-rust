@@ -3590,7 +3590,7 @@
             ]
           },
           "key": {
-            "description": "The stable slug. Validated before anything else touches it.",
+            "description": "The stable slug. Validated before anything else touches it: 1 to 128\ncharacters, a GTS segment token — a lowercase letter or `_` first, then\nlowercase letters, digits and `_` — since every setting key declared\nunder the category is composed around it.",
             "type": "string"
           },
           "name": {

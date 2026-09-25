@@ -22,16 +22,25 @@ fn a_well_formed_key_is_accepted_verbatim() {
 }
 
 #[test]
-fn a_key_is_never_trimmed_or_case_folded() {
-    // Accepting " Network" as "network" would give one category two spellings,
-    // and the setting keys declared under each would not match.
+fn a_key_is_never_trimmed_or_case_folded_but_refused() {
+    // Accepting " Network" as "network" would give one category two spellings;
+    // storing it as supplied would give a category no setting could be
+    // declared under, since its key is the category token of every setting
+    // key and the GTS grammar has no uppercase and no space. So it is refused.
     for candidate in [" network", "network ", "Network", "NETWORK"] {
-        let key = CategoryKey::parse(candidate).expect("valid characters");
-        assert_eq!(
-            key.as_str(),
-            candidate,
-            "`{candidate}` must be stored exactly as supplied"
-        );
+        let err = CategoryKey::parse(candidate).expect_err("not a GTS token");
+        assert_eq!(code_of(&err), field::CATEGORY_KEY_GRAMMAR, "`{candidate}`");
+    }
+}
+
+#[test]
+fn a_key_is_a_gts_token_so_every_setting_under_it_composes() {
+    for candidate in ["network", "_internal", "net_2", "a"] {
+        assert!(CategoryKey::parse(candidate).is_ok(), "`{candidate}`");
+    }
+    for candidate in ["net-work", "net.work", "1network", "net work", "n\u{e9}t"] {
+        let err = CategoryKey::parse(candidate).expect_err("not a GTS token");
+        assert_eq!(code_of(&err), field::CATEGORY_KEY_GRAMMAR, "`{candidate}`");
     }
 }
 
@@ -63,9 +72,11 @@ fn the_bound_is_inclusive_at_both_ends() {
 fn the_bound_counts_characters_not_bytes() {
     // A limit on what an administrator writes. Counting bytes would refuse a
     // 128-character key for a length its author never sees.
+    // The grammar refuses it afterwards, but for its characters, not its length.
     let multibyte = "\u{e9}".repeat(128);
     assert!(multibyte.len() > 128, "the fixture is multi-byte");
-    assert!(CategoryKey::parse(&multibyte).is_ok());
+    let err = CategoryKey::parse(&multibyte).expect_err("not a GTS token");
+    assert_eq!(code_of(&err), field::CATEGORY_KEY_GRAMMAR);
 }
 
 #[test]

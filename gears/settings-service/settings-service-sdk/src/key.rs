@@ -295,6 +295,23 @@ impl SettingKey {
         // @cpt-end:cpt-cf-settings-service-algo-setting-declarations-key-construction:p1:inst-decl-key-4
     }
 
+    /// Check that `category` can be the category token of a setting key.
+    ///
+    /// A category key is stored once and every setting declared under it is
+    /// composed around it, so a key the grammar refuses would be a category
+    /// nothing can ever be declared in. The check is the key's own: a setting
+    /// key is composed around the candidate and parsed, so a category that
+    /// passes here composes, and one that composes passes here.
+    ///
+    /// # Errors
+    ///
+    /// The [`SettingKeyError`] the composed key's parse reports.
+    pub fn check_category(category: &str) -> Result<(), SettingKeyError> {
+        // A vendor and a leaf the grammar is known to accept, so any refusal
+        // is the category's.
+        Self::compose("probe", category, "probe").map(|_| ())
+    }
+
     /// Compose a module-contributed key.
     ///
     /// A contributed derived half is `<vendor>.<package>.<category>.<name>.v<major>~`:

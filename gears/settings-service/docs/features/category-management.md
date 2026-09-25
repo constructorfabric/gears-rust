@@ -226,7 +226,8 @@ The no-orphan rule protects the invariant that no declaration is ever left point
 1. [x] - `p1` - Take the key verbatim without trimming or case-folding, so a stored key and a supplied key compare identically - `inst-cat-keyval-1`
 2. [x] - `p1` - **IF** length falls outside 1..128 → **RETURN** validation problem for the length bound - `inst-cat-keyval-2`
 3. [x] - `p1` - **IF** the key contains `/` → **RETURN** validation problem stating the separator is reserved because the key becomes the single category segment of an admin setting key - `inst-cat-keyval-3`
-4. [x] - `p1` - **RETURN** the accepted key - `inst-cat-keyval-4`
+4. [x] - `p1` - **IF** the key is not a GTS segment token — a lowercase letter or `_` first, then only lowercase letters, digits and `_` — → **RETURN** validation problem `category_key_grammar`: the key is the category token of every setting key declared under it and cannot change later, so a key the grammar refuses would be a category nothing could be declared in; the grammar is the setting key's own, checked by composing one around the candidate - `inst-cat-keyval-5`
+5. [x] - `p1` - **RETURN** the accepted key - `inst-cat-keyval-4`
 
 ### No-Orphan Deletion Guard
 
@@ -316,7 +317,7 @@ The system **MUST** refuse to delete a category while any setting declaration re
 
 - [x] `p1` - **ID**: `cpt-cf-settings-service-dod-category-management-key-format`
 
-The system **MUST** reject a category `key` that is empty, exceeds 128 characters, or contains `/`, and **MUST** store it verbatim without trimming or case-folding so a stored key and a supplied key compare identically.
+The system **MUST** reject a category `key` that is empty, exceeds 128 characters, contains `/`, or is not a GTS segment token (a lowercase letter or `_` first, then lowercase letters, digits and `_`), since every setting key declared under the category is composed around it, and **MUST** take it verbatim without trimming or case-folding, refusing rather than normalizing, so a stored key and a supplied key compare identically.
 
 **Implements**:
 - `cpt-cf-settings-service-algo-category-management-key-validation`
@@ -385,7 +386,8 @@ The system **MUST** emit an audit record through the Audit Emitter for every suc
 - [ ] Creating a category whose `name` duplicates an existing category returns `409` naming `name` as the conflicting field
 - [ ] Creating a category whose `key` contains `/` returns `400` with a field-level error and inserts no row
 - [ ] Creating a category whose `key` is empty or exceeds 128 characters returns `400`
-- [ ] A `key` supplied with surrounding whitespace or mixed case is stored verbatim and matches only an identical string
+- [ ] A `key` supplied with surrounding whitespace or mixed case is refused `400 category_key_grammar` rather than trimmed or case-folded
+- [ ] Creating a category whose `key` is not a GTS segment token — `net-work`, `net.work`, `1network` — returns `400 category_key_grammar` and inserts no row
 - [ ] A `PATCH` carrying `key` returns `400` and the stored `key` is unchanged
 - [ ] A `PATCH` without `If-Match` returns `428` and modifies no row
 - [ ] A `PATCH` with a stale `If-Match` returns `412` and modifies no row

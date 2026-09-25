@@ -36,6 +36,10 @@ pub const CATEGORY_KEY_IMMUTABLE: &str = "category_key_immutable";
 /// A category key contains the reserved `/` separator.
 pub const CATEGORY_KEY_RESERVED_SEPARATOR: &str = "category_key_reserved_separator";
 
+/// A category key that is not a GTS segment token, so no setting key could be
+/// composed under it.
+pub const CATEGORY_KEY_GRAMMAR: &str = "category_key_grammar";
+
 /// An `OData` expression referenced an unmapped field, used an unsupported
 /// operator, or carried a cursor that no longer decodes.
 pub const ODATA_QUERY: &str = "odata_query";

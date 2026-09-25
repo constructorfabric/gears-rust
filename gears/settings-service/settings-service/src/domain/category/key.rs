@@ -11,6 +11,8 @@
 //! That is why `/` is rejected. A key carrying a separator would suggest nesting
 //! the grammar cannot express: a setting key has exactly one category segment,
 //! and categories are flat (ADR-001, and the PRD's own exclusion of nesting).
+//! And that is why the key must be a GTS segment token: one that is not would
+//! be stored, and then refuse every setting declared under it.
 
 use crate::field;
 
@@ -36,7 +38,8 @@ impl CategoryKey {
     /// # Errors
     ///
     /// [`DomainError::Validation`](crate::domain::error::DomainError::Validation)
-    /// naming the violated rule — the length bound, or the reserved separator.
+    /// naming the violated rule — the length bound, the reserved separator, or
+    /// the GTS token grammar.
     pub fn parse(candidate: &str) -> Result<Self, crate::domain::error::DomainError> {
         use crate::domain::error::DomainError;
 
@@ -74,6 +77,24 @@ impl CategoryKey {
             });
         }
         // @cpt-end:cpt-cf-settings-service-algo-category-management-key-validation:p1:inst-cat-keyval-3
+
+        // @cpt-begin:cpt-cf-settings-service-algo-category-management-key-validation:p1:inst-cat-keyval-5
+        // The key is the category token of every setting key declared under it,
+        // and it cannot be changed later: a candidate the GTS grammar refuses
+        // would be a category nothing could ever be declared in. The grammar is
+        // the setting key's own, checked by composing one around the candidate.
+        if settings_service_sdk::SettingKey::check_category(candidate).is_err() {
+            return Err(DomainError::Validation {
+                field: FIELD.to_owned(),
+                code: field::CATEGORY_KEY_GRAMMAR,
+                message: format!(
+                    "`{candidate}` cannot be the category token of a setting key: a category key \
+                     starts with a lowercase letter or `_` and holds only lowercase letters, \
+                     digits and `_`"
+                ),
+            });
+        }
+        // @cpt-end:cpt-cf-settings-service-algo-category-management-key-validation:p1:inst-cat-keyval-5
 
         // @cpt-begin:cpt-cf-settings-service-algo-category-management-key-validation:p1:inst-cat-keyval-4
         Ok(Self(candidate.to_owned()))

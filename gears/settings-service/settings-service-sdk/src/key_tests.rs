@@ -351,3 +351,20 @@ fn an_admin_key_at_a_later_major_shares_the_path_of_its_first() {
     assert_eq!(first.version_stripped_path(), later.version_stripped_path());
     assert_eq!(first.leaf_slug(), later.leaf_slug());
 }
+
+#[test]
+fn a_category_passes_exactly_when_a_setting_key_composes_around_it() {
+    for ok in ["network", "_internal", "net_2"] {
+        assert!(SettingKey::check_category(ok).is_ok(), "`{ok}`");
+        assert!(SettingKey::compose("acme", ok, "proxy").is_ok(), "`{ok}`");
+    }
+    for bad in [
+        "Network", " network", "net-work", "net.work", "1network", "",
+    ] {
+        assert!(SettingKey::check_category(bad).is_err(), "`{bad}`");
+        assert!(
+            SettingKey::compose("acme", bad, "proxy").is_err(),
+            "`{bad}`"
+        );
+    }
+}

@@ -514,7 +514,7 @@ Identity and shape are separate types, both the gear's. A setting `key` derives 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `id` | UUID | Yes | Unique category ID (UUIDv7). |
-| `key` | string (1..128) | Yes | Globally-unique category slug (e.g. `network`). Used as the single category segment in admin setting keys (§4.2 *Declaration Management*), so it MUST NOT contain `/` (reserved path separator; validated at create/update). |
+| `key` | string (1..128) | Yes | Globally-unique category slug (e.g. `network`). Used as the single category segment in admin setting keys (§4.2 *Declaration Management*), so it MUST NOT contain `/` (reserved path separator) and MUST be a GTS segment token — a lowercase letter or `_` first, then lowercase letters, digits and `_` — or no setting key could be composed under it (validated at create; the key is immutable). |
 | `name` | string (1..256) | Yes | Human-readable name; globally unique (categories are flat — no nesting). |
 | `description` | string (0..4096) | No | Category description. |
 | `domain_affinity` | `DomainAffinity` | No | Optional administrative-domain binding (e.g. `infrastructure`, `commercial`). |

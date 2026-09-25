@@ -145,6 +145,31 @@ async fn a_key_carrying_a_separator_is_refused_400() {
 // ── Read ─────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
+async fn a_key_no_setting_key_could_be_composed_under_is_refused_400() {
+    // An uppercase key would be stored and then refuse every declaration
+    // filed under it; it is refused here instead, where it can be corrected.
+    let h = RestHarness::new().await;
+    for key in ["Network", "net-work"] {
+        let answer = h
+            .send(
+                "POST",
+                CATEGORIES,
+                Some(create_body(key, "Network")),
+                None,
+                h.inner.tree.root,
+            )
+            .await;
+        assert_eq!(answer.status, 400, "`{key}`: {}", answer.body);
+        assert_eq!(
+            answer.body["context"]["field_violations"][0]["reason"],
+            json!(crate::field::CATEGORY_KEY_GRAMMAR),
+            "{}",
+            answer.body
+        );
+    }
+}
+
+#[tokio::test]
 async fn a_single_read_carries_the_tag_a_mutation_must_present() {
     let h = RestHarness::new().await;
     let (id, created_tag) = create(&h, "billing", "Invoices").await;

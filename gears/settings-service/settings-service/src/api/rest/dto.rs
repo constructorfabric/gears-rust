@@ -62,7 +62,10 @@ impl From<Category> for CategoryDto {
 #[toolkit_macros::api_dto(request)]
 #[serde(deny_unknown_fields)]
 pub struct CreateCategoryRequest {
-    /// The stable slug. Validated before anything else touches it.
+    /// The stable slug. Validated before anything else touches it: 1 to 128
+    /// characters, a GTS segment token — a lowercase letter or `_` first, then
+    /// lowercase letters, digits and `_` — since every setting key declared
+    /// under the category is composed around it.
     pub key: String,
     /// Display name.
     pub name: String,
