@@ -35,6 +35,11 @@ session. The shared routing lives in `modules/doc-stage-router.md` and
 `modules/code-stage-router.md`. Close checks the definition of done and offers
 the next artifact of the chain.
 
+Template and rules changes apply to newly authored documents only. Existing
+gear documents keep their structure until someone revises them; the backlog
+for bringing them in line (for example the frontmatter `description`) is
+tracked separately in the kit improvements backlog.
+
 ## Workflows
 
 - `cf-gears-doc-upstream-reqs`, `cf-gears-doc-prd`, `cf-gears-doc-adr`,

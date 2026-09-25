@@ -20,7 +20,7 @@ UNIT PrdPreset
 PURPOSE: Bind the gears PRD kit resources and route the requested stage through the gears document stage router.
 DO:
   SET GEARS_DOC_KIND = PRD, GEARS_DOC_SKILL = cf-gears-doc-prd, GEARS_DOC_NEXT_SKILL = cf-gears-doc-design
-  SET GEARS_DOC_UPSTREAM = gears/<gear>/docs/UPSTREAM_REQS.md, GEARS_DOC_UPSTREAM_REQUIRED = false
+  SET GEARS_DOC_UPSTREAM = gears/<gear>/docs/UPSTREAM_REQS.md (optional)
   SET GEARS_DOC_PATH_RULE = gears/<gear>/docs/PRD.md
   SET GEARS_DOC_TEMPLATE = {prd_template}, GEARS_DOC_RULES = {prd_rules}, GEARS_DOC_CHECKLIST = {prd_checklist}, GEARS_DOC_EXAMPLE = {prd_example}
   LOAD {gears_doc_stage_router}

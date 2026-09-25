@@ -9,7 +9,7 @@ definition of done live in `{gears_code_phase}`.
 
 Preset inputs (set by the preset before `CONTINUE GearsCodeStageEntry`):
 `GEARS_CODE_SKILL`, `GEARS_CODE_MODE` (feature-led | design-led),
-`GEARS_CODE_SOURCE_KIND` (FEATURE | DESIGN), `GEARS_CODE_RULES`,
+`GEARS_CODE_SOURCE_KIND` (FEATURE | DESIGN | ADR | PRD | UPSTREAM_REQS), `GEARS_CODE_RULES`,
 `GEARS_CODE_CHECKLIST`.
 
 ```pdsl
@@ -28,7 +28,6 @@ DO:
 RULES:
   ALWAYS treat the preset's rules, checklist, and source contract as read-only preset data
   NEVER write tests, code, or review verdicts in this module; route every stage to a Studio coding skill or the kit close unit
-  ALWAYS dispatch a main-context coder (cf-generate-coder-smart, or cf-generate-coder-casual for small slices) instead of the worktree-isolated cf-codegen while GEARS_SOURCE_PATH, its upstream docs, or files from earlier stages are uncommitted, because an isolated worktree only sees committed files
 ```
 
 ```pdsl
@@ -37,7 +36,9 @@ PURPOSE: Pick the stage from the pinned handoff, the request wording, or the def
 DO:
   SET GEARS_STAGE, GEARS_GEAR, GEARS_SOURCE_PATH, and GEARS_SLICE from NEXT_ACTION_PAYLOAD WHEN NEXT_ACTION_PAYLOAD contains GEARS_STAGE
   SET GEARS_FORWARD_PAYLOAD = NEXT_ACTION_PAYLOAD without the GEARS_* fields WHEN NEXT_ACTION_PAYLOAD is set
-  SET GEARS_STAGE = author, validate, review, fix, or close WHEN GEARS_STAGE == unset AND the request explicitly asks to implement without new tests, run the checks, review, fix findings, or close the slice
+  EMIT "Ignoring unknown stage '<GEARS_STAGE>' from the handoff; resolving the stage from the request instead." and SET GEARS_STAGE = unset WHEN GEARS_STAGE is set and is not one of tests, author, validate, review, fix, close
+  SET GEARS_STAGE = author WHEN GEARS_STAGE == unset AND the request states that failing tests for the slice already exist
+  SET GEARS_STAGE = validate, review, fix, or close WHEN GEARS_STAGE == unset AND the request explicitly asks to run the checks, review, fix findings, or close the slice
   SET GEARS_STAGE = tests WHEN GEARS_STAGE == unset
 ```
 
@@ -46,12 +47,13 @@ UNIT GearsCodeSourceResolve
 PURPOSE: Resolve the gear and the source contract the code must realize.
 DO:
   SET GEARS_GEAR = the gear named in the request or implied by GEARS_SOURCE_PATH WHEN GEARS_GEAR == unset
-  SET GEARS_SOURCE_PATH = the GEARS_CODE_SOURCE_KIND document named in the request, or the single one under gears/<GEARS_GEAR>/docs/, WHEN GEARS_SOURCE_PATH == unset
+  SET GEARS_SOURCE_PATH = the GEARS_CODE_SOURCE_KIND document named in the request, or the only such document under gears/<GEARS_GEAR>/docs/ when exactly one exists, WHEN GEARS_SOURCE_PATH == unset
   SET GEARS_SLICE = the source IDs the request scopes, or the first unimplemented slice of GEARS_SOURCE_PATH, WHEN GEARS_SLICE == unset
-  EMIT "Which <GEARS_CODE_SOURCE_KIND> should this implement? Reply with its path under gears/<gear>/docs/." WHEN GEARS_SOURCE_PATH == unset
+  EMIT "Which <GEARS_CODE_SOURCE_KIND> should this implement? Reply with its path under gears/<gear>/docs/ (candidates: <every matching document>)." WHEN GEARS_SOURCE_PATH == unset
   STOP_TURN WHEN GEARS_SOURCE_PATH == unset
 RULES:
   ALWAYS keep one run bound to one slice of one source contract
+  NEVER pick a source document when more than one of GEARS_CODE_SOURCE_KIND matches and the request names none; ask instead
 ```
 
 ```pdsl
@@ -76,10 +78,12 @@ UNIT GearsCodeDispatchContext
 PURPOSE: Build the kit context block every sub-agent dispatch of this stage must carry.
 DO:
   SET GEARS_DISPATCH_CONTEXT = "Gears kit context (read-only): implementation rules <GEARS_CODE_RULES>; source contract <GEARS_SOURCE_PATH>; slice <GEARS_SLICE>; gear gears/<GEARS_GEAR>/" WHEN GEARS_STAGE != review
-  SET GEARS_DISPATCH_CONTEXT = "Gears kit review methodology (apply in addition to the Studio methodologies, and cite its item IDs in findings): <GEARS_CODE_CHECKLIST>; implementation rules <GEARS_CODE_RULES>; source contract <GEARS_SOURCE_PATH>" WHEN GEARS_STAGE == review
+  SET GEARS_DISPATCH_CONTEXT = "Gears kit review methodology (apply in addition to the Studio methodologies, and cite its item IDs in findings): <GEARS_CODE_CHECKLIST>; implementation rules <GEARS_CODE_RULES>; source contract <GEARS_SOURCE_PATH>; slice <GEARS_SLICE>; gear gears/<GEARS_GEAR>/; mode <GEARS_CODE_MODE>" WHEN GEARS_STAGE == review
+  RUN `git status --porcelain -- <GEARS_SOURCE_PATH> gears/<GEARS_GEAR>/` and SET GEARS_WORKTREE_DIRTY = true when it lists any path, else false
 RULES:
   ALWAYS paste GEARS_DISPATCH_CONTEXT verbatim into the prompt of every sub-agent this stage dispatches (author, coder, test writer, reviewer, bug finder, fixer)
   NEVER dispatch a sub-agent in this stage without GEARS_DISPATCH_CONTEXT
+  ALWAYS dispatch a main-context coder (cf-generate-coder-smart, or cf-generate-coder-casual for small slices) instead of the worktree-isolated cf-codegen WHEN GEARS_WORKTREE_DIRTY == true, because an isolated worktree only sees committed files
 ```
 
 ```pdsl
@@ -99,8 +103,8 @@ PURPOSE: Pin the preset itself as the suggested next action with the next stage.
 DO:
   SET GEARS_NEXT_STAGE = author WHEN GEARS_STAGE == tests
   SET GEARS_NEXT_STAGE = validate WHEN GEARS_STAGE == author OR GEARS_STAGE == fix
-  SET GEARS_NEXT_STAGE = review WHEN GEARS_STAGE == validate AND GATE_STATUS != fail
-  SET GEARS_NEXT_STAGE = author WHEN GEARS_STAGE == validate AND GATE_STATUS == fail
+  SET GEARS_NEXT_STAGE = review WHEN GEARS_STAGE == validate AND GATE_STATUS == pass
+  SET GEARS_NEXT_STAGE = author when GATE_STATUS == fail, else validate again (an unset or unknown gate status never advances) WHEN GEARS_STAGE == validate AND GATE_STATUS != pass
   SET GEARS_NEXT_STAGE = close WHEN GEARS_STAGE == review AND REVIEW_FINDINGS_REMAINING == 0
   SET GEARS_NEXT_STAGE = fix WHEN GEARS_STAGE == review AND REVIEW_FINDINGS_REMAINING != 0
   SET NEXT_ACTION_PINNED_SKILL = GEARS_CODE_SKILL and NEXT_ACTION_PAYLOAD = GEARS_STAGE GEARS_NEXT_STAGE, GEARS_GEAR, GEARS_SOURCE_PATH, GEARS_SLICE, plus the loaded workflow's own handoff fields (FINDINGS, ReviewFindingsReport, APPROVED_REVIEW_FINDING_IDS, REVIEW_FIX_SCOPE, REVIEW_FIX_APPROVED, REVIEW_TARGET_PATHS, REVIEW_TARGET_SLICES, GATE_STATUS) when set
@@ -114,7 +118,7 @@ UNIT GearsCodeClose
 PURPOSE: Check the definition of done for the slice, report, and offer the next slice.
 DO:
   RUN `make gear-ci GEAR=<GEARS_GEAR>` and `make dylint` (plus `cfs validate` when GEARS_CODE_MODE == feature-led), then check every item of "{gears_code_phase}#definition-of-done" against those results and the review findings in GEARS_FORWARD_PAYLOAD
-  EMIT a SKILL_RESULT envelope with skill = GEARS_CODE_SKILL, status = completed when every definition-of-done item holds else failed, produced_artifacts = code-changes and unit-tests for GEARS_SLICE plus phase-status, report_outputs = the gate result, missing_artifacts = [], assumptions = any recorded overrides, and suggested_next_skills = [GEARS_CODE_SKILL, cf-git-commit]
+  EMIT a SKILL_RESULT envelope with skill = GEARS_CODE_SKILL, status = completed when every definition-of-done item holds else failed, produced_artifacts = code-changes and unit-tests for GEARS_SLICE plus phase-status, report_outputs = the gate result, missing_artifacts = every definition-of-done item that fails (failing gate commands, unresolved CRITICAL or MAJOR finding IDs, unmet traceability) or [] when all hold, assumptions = any recorded overrides, and suggested_next_skills = [GEARS_CODE_SKILL, cf-git-commit]
   SET NEXT_ACTION_PINNED_SKILL = GEARS_CODE_SKILL and NEXT_ACTION_PAYLOAD = GEARS_STAGE fix when review findings remain else author, GEARS_GEAR, GEARS_SOURCE_PATH, GEARS_SLICE, plus the unresolved findings WHEN a definition-of-done item fails
   SET NEXT_ACTION_PINNED_SKILL = GEARS_CODE_SKILL and NEXT_ACTION_PAYLOAD = GEARS_STAGE tests, GEARS_GEAR, GEARS_SOURCE_PATH WHEN every definition-of-done item holds AND GEARS_SOURCE_PATH still has unimplemented slices
   SET NEXT_ACTION_PINNED_SKILL = cf-git-commit WHEN every definition-of-done item holds AND every slice of GEARS_SOURCE_PATH is implemented

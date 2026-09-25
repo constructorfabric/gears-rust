@@ -7,10 +7,11 @@ skill, and pins the preset again with the next stage. The stage table and the
 definition of done live in `{gears_doc_phase}`.
 
 Preset inputs (all set by the preset before `CONTINUE GearsDocStageEntry`):
-`GEARS_DOC_KIND`, `GEARS_DOC_SKILL`, `GEARS_DOC_UPSTREAM`,
-`GEARS_DOC_UPSTREAM_REQUIRED`, `GEARS_DOC_NEXT_SKILL`, `GEARS_DOC_PATH_RULE`,
+`GEARS_DOC_KIND`, `GEARS_DOC_SKILL`, `GEARS_DOC_UPSTREAM` (entries tagged
+required or optional), `GEARS_DOC_NEXT_SKILL`, `GEARS_DOC_PATH_RULE`,
 `GEARS_DOC_TEMPLATE`, `GEARS_DOC_RULES`, `GEARS_DOC_CHECKLIST`,
-`GEARS_DOC_EXAMPLE`.
+`GEARS_DOC_EXAMPLE`, and optionally `GEARS_DOC_COMPANION` (a section of one
+other artifact the author stage must update in the same change).
 
 ```pdsl
 UNIT GearsDocStageEntry
@@ -37,6 +38,7 @@ DO:
   SET GEARS_STAGE = NEXT_ACTION_PAYLOAD.GEARS_STAGE WHEN NEXT_ACTION_PAYLOAD contains GEARS_STAGE
   SET GEARS_TARGET_PATH = NEXT_ACTION_PAYLOAD.GEARS_TARGET_PATH WHEN NEXT_ACTION_PAYLOAD contains GEARS_TARGET_PATH
   SET GEARS_FORWARD_PAYLOAD = NEXT_ACTION_PAYLOAD without GEARS_STAGE and GEARS_TARGET_PATH WHEN NEXT_ACTION_PAYLOAD is set
+  EMIT "Ignoring unknown stage '<GEARS_STAGE>' from the handoff; resolving the stage from the request instead." and SET GEARS_STAGE = unset WHEN GEARS_STAGE is set and is not one of author, validate, review, fix, close
   SET GEARS_STAGE = validate, review, fix, or close WHEN GEARS_STAGE == unset AND the request explicitly asks to validate or check, review, fix findings, or close the artifact
   SET GEARS_STAGE = author WHEN GEARS_STAGE == unset
 ```
@@ -62,10 +64,11 @@ DO:
   SET artifact_rules = GEARS_DOC_RULES
   SET artifact_checklist = GEARS_DOC_CHECKLIST
   SET artifact_example = GEARS_DOC_EXAMPLE WHEN GEARS_STAGE == review OR GEARS_STAGE == fix
-  SET AUTHOR_TARGET_PATHS = [GEARS_TARGET_PATH] and REVIEW_TARGET_PATHS = [GEARS_TARGET_PATH]
+  SET AUTHOR_TARGET_PATHS = [GEARS_TARGET_PATH] plus the file of GEARS_DOC_COMPANION when it is set and exists, and REVIEW_TARGET_PATHS = [GEARS_TARGET_PATH]
 RULES:
   ALWAYS keep GEARS_DOC_CHECKLIST review-only for authoring; GEARS_DOC_RULES carries no pre-write checklist directive, so the author does not load it
   ALWAYS keep GEARS_DOC_EXAMPLE out of the author stage so generation follows the template, not the example
+  ALWAYS limit edits to the GEARS_DOC_COMPANION file to the named section; every other part of that file stays untouched
 ```
 
 ```pdsl
@@ -74,9 +77,8 @@ PURPOSE: Require the upstream artifact of the gears chain before authoring.
 DO:
   LOAD {cf-studio-path}/.core/skills/studio/modules/runtime/skill-io-contract-load.md
   RUN SkillIoContractLoad
-  SET AVAILABLE_ARTIFACTS = one gears-upstream-doc descriptor per GEARS_DOC_UPSTREAM file that exists for the target gear
-  SET REQUIRED_ARTIFACT_SPECS = gears-upstream-doc with why_needed "The <GEARS_DOC_KIND> must trace to <GEARS_DOC_UPSTREAM>", accepted_shapes doc-ref, suggested_producers the kit preset that authors GEARS_DOC_UPSTREAM, override_allowed true, override_summary "Proceed without the upstream artifact; traceability to it stays open" WHEN GEARS_DOC_UPSTREAM_REQUIRED == true
-  SET REQUIRED_ARTIFACT_SPECS = [] WHEN GEARS_DOC_UPSTREAM_REQUIRED != true
+  SET AVAILABLE_ARTIFACTS = one gears-upstream-doc descriptor per GEARS_DOC_UPSTREAM entry that resolves to existing files, resolved under the gear the entry names (the target gear unless the entry names another gear)
+  SET REQUIRED_ARTIFACT_SPECS = one gears-upstream-doc spec per GEARS_DOC_UPSTREAM entry tagged required, with why_needed "The <GEARS_DOC_KIND> must trace to <entry>", accepted_shapes doc-ref, suggested_producers the kit preset that authors that entry's KIND, override_allowed true, override_summary "Proceed without the upstream artifact; traceability to it stays open"; [] when no entry is tagged required
   RUN PrerequisiteCheckContract
   CONTINUE GearsDocStageRoute WHEN PREREQUISITE_STATUS == ready OR OVERRIDE_REQUESTED == explicit-user-approval
 RULES:
@@ -124,8 +126,8 @@ UNIT GearsDocPinNextStage
 PURPOSE: Pin the preset itself as the suggested next action with the next stage.
 DO:
   SET GEARS_NEXT_STAGE = validate WHEN GEARS_STAGE == author
-  SET GEARS_NEXT_STAGE = review WHEN GEARS_STAGE == validate AND GATE_STATUS != fail
-  SET GEARS_NEXT_STAGE = author WHEN GEARS_STAGE == validate AND GATE_STATUS == fail
+  SET GEARS_NEXT_STAGE = review WHEN GEARS_STAGE == validate AND GATE_STATUS == pass
+  SET GEARS_NEXT_STAGE = author when GATE_STATUS == fail, else validate again (an unset or unknown gate status never advances) WHEN GEARS_STAGE == validate AND GATE_STATUS != pass
   SET GEARS_NEXT_STAGE = close WHEN GEARS_STAGE == review AND REVIEW_FINDINGS_REMAINING == 0
   SET GEARS_NEXT_STAGE = fix WHEN GEARS_STAGE == review AND REVIEW_FINDINGS_REMAINING != 0
   SET GEARS_NEXT_STAGE = review WHEN GEARS_STAGE == fix
@@ -141,7 +143,7 @@ PURPOSE: Check the definition of done, report, and offer the next artifact of th
 DO:
   RUN `cfs validate-toc <GEARS_TARGET_PATH>` and `cfs validate --artifact <GEARS_TARGET_PATH>`
   RUN check every item of "{gears_doc_phase}#definition-of-done" against those results and the review findings in GEARS_FORWARD_PAYLOAD
-  EMIT a SKILL_RESULT envelope with skill = GEARS_DOC_SKILL, status = completed when every definition-of-done item holds else failed, produced_artifacts = doc-changes for GEARS_TARGET_PATH plus phase-status, report_outputs = the validation result, missing_artifacts = [], assumptions = any recorded overrides, and suggested_next_skills = [GEARS_DOC_NEXT_SKILL]
+  EMIT a SKILL_RESULT envelope with skill = GEARS_DOC_SKILL, status = completed when every definition-of-done item holds else failed, produced_artifacts = doc-changes for GEARS_TARGET_PATH plus phase-status, report_outputs = the validation result, missing_artifacts = every definition-of-done item that fails (validation errors, unresolved CRITICAL or MAJOR finding IDs, uncovered upstream IDs) or [] when all hold, assumptions = any recorded overrides, and suggested_next_skills = [GEARS_DOC_NEXT_SKILL]
   SET NEXT_ACTION_PINNED_SKILL = GEARS_DOC_NEXT_SKILL WHEN every definition-of-done item holds
   SET NEXT_ACTION_PINNED_SKILL = GEARS_DOC_SKILL and NEXT_ACTION_PAYLOAD = GEARS_STAGE author, GEARS_TARGET_PATH WHEN a definition-of-done item fails
   LOAD {cf-studio-path}/.core/skills/studio/modules/ui/next-actions.md

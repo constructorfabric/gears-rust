@@ -20,7 +20,7 @@ UNIT DesignPreset
 PURPOSE: Bind the gears DESIGN kit resources and route the requested stage through the gears document stage router.
 DO:
   SET GEARS_DOC_KIND = DESIGN, GEARS_DOC_SKILL = cf-gears-doc-design, GEARS_DOC_NEXT_SKILL = cf-gears-decompose
-  SET GEARS_DOC_UPSTREAM = gears/<gear>/docs/PRD.md and accepted gears/<gear>/docs/ADR/*.md, GEARS_DOC_UPSTREAM_REQUIRED = true
+  SET GEARS_DOC_UPSTREAM = gears/<gear>/docs/PRD.md (required) and accepted gears/<gear>/docs/ADR/*.md (optional)
   SET GEARS_DOC_PATH_RULE = gears/<gear>/docs/DESIGN.md, or DESIGN-<aspect>.md when the request names a companion design aspect
   SET GEARS_DOC_TEMPLATE = {design_template}, GEARS_DOC_RULES = {design_rules}, GEARS_DOC_CHECKLIST = {design_checklist}, GEARS_DOC_EXAMPLE = {design_example}
   LOAD {gears_doc_stage_router}

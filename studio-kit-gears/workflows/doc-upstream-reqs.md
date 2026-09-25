@@ -20,7 +20,7 @@ UNIT UpstreamReqsPreset
 PURPOSE: Bind the gears UPSTREAM_REQS kit resources and route the requested stage through the gears document stage router.
 DO:
   SET GEARS_DOC_KIND = UPSTREAM_REQS, GEARS_DOC_SKILL = cf-gears-doc-upstream-reqs, GEARS_DOC_NEXT_SKILL = cf-gears-doc-prd
-  SET GEARS_DOC_UPSTREAM = the code or docs of at least one requesting gear named in the request, GEARS_DOC_UPSTREAM_REQUIRED = true
+  SET GEARS_DOC_UPSTREAM = the code or docs of each requesting gear named in the request, resolved under that requesting gear's own directory rather than the target gear (required, at least one)
   SET GEARS_DOC_PATH_RULE = gears/<gear>/docs/UPSTREAM_REQS.md
   SET GEARS_DOC_TEMPLATE = {upstream_reqs_template}, GEARS_DOC_RULES = {upstream_reqs_rules}, GEARS_DOC_CHECKLIST = {upstream_reqs_checklist}, GEARS_DOC_EXAMPLE = {upstream_reqs_example}
   LOAD {gears_doc_stage_router}

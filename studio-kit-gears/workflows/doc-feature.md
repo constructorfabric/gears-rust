@@ -20,7 +20,7 @@ UNIT FeaturePreset
 PURPOSE: Bind the gears FEATURE kit resources and route the requested stage through the gears document stage router.
 DO:
   SET GEARS_DOC_KIND = FEATURE, GEARS_DOC_SKILL = cf-gears-doc-feature, GEARS_DOC_NEXT_SKILL = cf-gears-implement
-  SET GEARS_DOC_UPSTREAM = the feature's entry in gears/<gear>/docs/DECOMPOSITION.md, GEARS_DOC_UPSTREAM_REQUIRED = true
+  SET GEARS_DOC_UPSTREAM = gears/<gear>/docs/DECOMPOSITION.md (required; the feature's entry in it is checked by the FEATURE rules)
   SET GEARS_DOC_PATH_RULE = gears/<gear>/docs/features/<file>.md, following the naming already used in that directory and defaulting to <NNNN>-<slug>.md
   SET GEARS_DOC_TEMPLATE = {feature_template}, GEARS_DOC_RULES = {feature_rules}, GEARS_DOC_CHECKLIST = {feature_checklist}, GEARS_DOC_EXAMPLE = {feature_example}
   LOAD {gears_doc_stage_router}

@@ -20,7 +20,8 @@ UNIT AdrPreset
 PURPOSE: Bind the gears ADR kit resources and route the requested stage through the gears document stage router.
 DO:
   SET GEARS_DOC_KIND = ADR, GEARS_DOC_SKILL = cf-gears-doc-adr, GEARS_DOC_NEXT_SKILL = cf-gears-doc-design
-  SET GEARS_DOC_UPSTREAM = gears/<gear>/docs/PRD.md, GEARS_DOC_UPSTREAM_REQUIRED = true
+  SET GEARS_DOC_UPSTREAM = gears/<gear>/docs/PRD.md (required)
+  SET GEARS_DOC_COMPANION = the Key ADRs section of gears/<gear>/docs/DESIGN.md, when that file exists
   SET GEARS_DOC_PATH_RULE = gears/<gear>/docs/ADR/<NNNN>-<slug>.md, with NNNN the next free four-digit number in that directory
   SET GEARS_DOC_TEMPLATE = {adr_template}, GEARS_DOC_RULES = {adr_rules}, GEARS_DOC_CHECKLIST = {adr_checklist}, GEARS_DOC_EXAMPLE = {adr_example}
   LOAD {gears_doc_stage_router}

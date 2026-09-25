@@ -46,9 +46,10 @@
 ### IDs and Structure
 - [ ] Generate the Table of Contents with `cfs toc <path>` once the final headings are in place
 - [ ] Link affected PRD, DESIGN, FEATURE, or UPSTREAM_REQS IDs when known
-- [ ] When the gear's `DESIGN.md` exists, reference the new ADR ID from its Key ADRs section in the same change; `cfs validate --artifact` rejects an ADR that an existing DESIGN does not reference (`ref-missing-from-kind`)
+- [ ] When the gear's `DESIGN.md` exists, reference the new ADR ID from its Key ADRs section in the same change; the preset binds that section as the author stage's companion target, and `cfs validate --artifact` rejects an ADR that an existing DESIGN does not reference (`ref-missing-from-kind`)
 - [ ] When the gear has no `DESIGN.md` yet, leave DESIGN untouched: validation then reports one expected `ref-target-not-in-scope` error for the DESIGN reference, which clears once `cf-gears-doc-design` authors DESIGN and references this ADR
 - [ ] Preserve accepted ADR history; supersede with a new ADR instead of silently rewriting a final decision
+- [ ] Re-check that the chosen `NNNN` is still free immediately before writing the file; if another ADR took it, use the next free number
 
 ---
 

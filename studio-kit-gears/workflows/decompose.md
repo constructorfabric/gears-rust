@@ -20,7 +20,7 @@ UNIT DecompositionPreset
 PURPOSE: Bind the gears DECOMPOSITION kit resources and route the requested stage through the gears document stage router.
 DO:
   SET GEARS_DOC_KIND = DECOMPOSITION, GEARS_DOC_SKILL = cf-gears-decompose, GEARS_DOC_NEXT_SKILL = cf-gears-doc-feature
-  SET GEARS_DOC_UPSTREAM = gears/<gear>/docs/DESIGN*.md, GEARS_DOC_UPSTREAM_REQUIRED = true
+  SET GEARS_DOC_UPSTREAM = gears/<gear>/docs/DESIGN*.md (required)
   SET GEARS_DOC_PATH_RULE = gears/<gear>/docs/DECOMPOSITION.md
   SET GEARS_DOC_TEMPLATE = {decomposition_template}, GEARS_DOC_RULES = {decomposition_rules}, GEARS_DOC_CHECKLIST = {decomposition_checklist}, GEARS_DOC_EXAMPLE = {decomposition_example}
   LOAD {gears_doc_stage_router}
