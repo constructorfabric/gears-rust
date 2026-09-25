@@ -755,6 +755,7 @@ Depth-3 neighborhood projection **MUST** answer within 1 second at p95 on a tena
 
 - **Threshold**: p95 <= 1 s, depth 3, node budget 1,000, same reference graph as search latency
 - **Rationale**: The UI neighborhood scenario is interactive and hits dense regions of the graph.
+- **Scope of the guarantee**: depth 3 is the measured point, not the admitted ceiling. Neighborhood and bounded traversal share one depth ceiling, `traversal_max_depth` (default 5, hard range 1 – 8), so a request may ask for more than depth 3 — and past depth 3 this NFR makes no latency promise. What bounds a deeper request is the node budget, the per-hop frontier and edge-scan caps, and the interactive deadline, each of which answers with a reported truncation or a refusal rather than an unbounded wait; latency past depth 3 is best-effort inside those bounds and has not been benchmarked. A deployment that needs a latency guarantee at a deeper depth measures it at that depth, or holds `traversal_max_depth` at 3.
 - **Architecture Allocation**: See DESIGN.md § NFR Allocation
 
 #### Analytics Topology Bound
