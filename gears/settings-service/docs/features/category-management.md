@@ -116,6 +116,7 @@ The no-orphan rule protects the invariant that no declaration is ever left point
 - Actor not authorized for `update`
 - Category does not exist
 - `If-Match` absent, or present but stale
+- The body names none of the updatable fields: `400 category_update_empty`, since applying nothing would still move the tag and record a change
 - Attempt to modify the immutable `key`
 - Updated `name` collides with an existing category
 

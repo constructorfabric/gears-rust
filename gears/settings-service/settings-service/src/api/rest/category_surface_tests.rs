@@ -591,3 +591,34 @@ async fn a_quoted_or_padded_tag_matches_here_as_on_every_other_surface() {
         answer.body
     );
 }
+
+#[tokio::test]
+async fn an_update_naming_no_field_is_refused_and_moves_nothing() {
+    // Nothing to apply: accepting `{}` would still move the tag and record a
+    // change that is none.
+    let h = RestHarness::new().await;
+    let (id, tag) = create(&h, "billing", "Invoices").await;
+    let uri = format!("{CATEGORIES}/{id}");
+    let answer = h
+        .send(
+            "PATCH",
+            &uri,
+            Some(json!({})),
+            Some(&tag),
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(answer.status, 400, "{}", answer.body);
+    assert_eq!(
+        answer.body["context"]["field_violations"][0]["reason"],
+        json!(crate::field::CATEGORY_UPDATE_EMPTY),
+        "{}",
+        answer.body
+    );
+    let read = h.send("GET", &uri, None, None, h.inner.tree.root).await;
+    assert_eq!(
+        read.etag.as_deref(),
+        Some(tag.as_str()),
+        "the tag did not move"
+    );
+}

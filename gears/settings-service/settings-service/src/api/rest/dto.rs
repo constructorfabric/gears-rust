@@ -173,6 +173,23 @@ impl UpdateCategoryRequest {
             });
         }
         // @cpt-end:cpt-cf-settings-service-flow-category-management-update:p1:inst-cat-update-4
+        // A body that names no field has nothing to apply. Accepting it would
+        // still move the tag and write an audit record of a change that is
+        // none, so it is refused before the row is even read.
+        if self.name.is_none()
+            && self.sort_order.is_none()
+            && self.description == Patch::Keep
+            && self.domain_affinity == Patch::Keep
+            && self.icon == Patch::Keep
+        {
+            return Err(DomainError::Validation {
+                field: "body".to_owned(),
+                code: crate::field::CATEGORY_UPDATE_EMPTY,
+                message: "an update names at least one of `name`, `description`, \
+                          `domain_affinity`, `sort_order`, `icon`"
+                    .to_owned(),
+            });
+        }
         // @cpt-begin:cpt-cf-settings-service-flow-category-management-update:p1:inst-cat-update-10
         // @cpt-begin:cpt-cf-settings-service-flow-category-management-update:p1:inst-cat-update-11
         // The same bounds as create, on the fields the update carries: a field

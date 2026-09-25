@@ -40,6 +40,10 @@ pub const CATEGORY_KEY_RESERVED_SEPARATOR: &str = "category_key_reserved_separat
 /// composed under it.
 pub const CATEGORY_KEY_GRAMMAR: &str = "category_key_grammar";
 
+/// A category update that names no field: nothing to apply, and applying
+/// nothing would still move the tag and write an audit record.
+pub const CATEGORY_UPDATE_EMPTY: &str = "category_update_empty";
+
 /// An `OData` expression referenced an unmapped field, used an unsupported
 /// operator, or carried a cursor that no longer decodes.
 pub const ODATA_QUERY: &str = "odata_query";
