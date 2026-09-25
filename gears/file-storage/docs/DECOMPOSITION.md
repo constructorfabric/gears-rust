@@ -161,6 +161,16 @@ gear's code. It remains a planned P2 requirement (see PRD.md/DESIGN.md).
   - MultipartUpload (session)
   - MultipartUploadPart
 
+- **Design Components**:
+
+  - [x] `p2` - `cpt-cf-file-storage-component-http-gateway`
+  - [x] `p2` - `cpt-cf-file-storage-component-signed-url-issuer`
+  - [x] `p2` - `cpt-cf-file-storage-component-bind-service`
+  - [x] `p2` - `cpt-cf-file-storage-component-sidecar-gateway`
+  - [x] `p2` - `cpt-cf-file-storage-component-stream-proxy`
+  - [x] `p2` - `cpt-cf-file-storage-component-content-pipeline`
+  - [x] `p2` - `cpt-cf-file-storage-component-backend-abstraction`
+
 - **API**:
   - `POST /api/file-storage/v1/files/{id}/multipart` -- initiate multipart upload
   - `PUT <sidecar signed part URL>` -- upload a single part (sidecar, not control plane)
@@ -221,6 +231,12 @@ gear's code. It remains a planned P2 requirement (see PRD.md/DESIGN.md).
   - HashMode (enum)
   - Manifest / ManifestEntry
 
+- **Design Components**:
+
+  - [x] `p2` - `cpt-cf-file-storage-component-bind-service`
+  - [x] `p2` - `cpt-cf-file-storage-component-content-pipeline`
+  - [x] `p2` - `cpt-cf-file-storage-component-metadata-service`
+
 - **API**:
   - `POST /api/file-storage/v1/files/{id}/multipart/{upload_id}/complete` -- response fields only (`hash_mode`, `part_count`, `manifest`); method/path unchanged
 
@@ -280,6 +296,10 @@ gear's code. It remains a planned P2 requirement (see PRD.md/DESIGN.md).
 - **Domain Model Entities**:
   - StoredPolicy
   - EffectivePolicy
+
+- **Design Components**:
+
+  - [x] `p2` - `cpt-cf-file-storage-component-http-gateway`
 
 - **API**:
   - `GET /api/file-storage/v1/policy` -- read a policy (tenant or user scope)
@@ -342,6 +362,10 @@ gear's code. It remains a planned P2 requirement (see PRD.md/DESIGN.md).
 - **Domain Model Entities**:
   - StoredRetentionRule
   - SweepResult (tally, not persisted)
+
+- **Design Components**:
+
+  - [x] `p2` - `cpt-cf-file-storage-component-http-gateway`
 
 - **API**:
   - `GET /api/file-storage/v1/retention-rules` -- list retention rules
@@ -461,6 +485,12 @@ gear's code. It remains a planned P2 requirement (see PRD.md/DESIGN.md).
 - **Domain Model Entities**:
   - None new -- mutates the existing `File` entity's `owner_kind`/`owner_id` fields
 
+- **Design Components**:
+
+  - [x] `p2` - `cpt-cf-file-storage-component-http-gateway`
+  - [x] `p2` - `cpt-cf-file-storage-component-metadata-service`
+  - [x] `p2` - `cpt-cf-file-storage-component-authz-adapter`
+
 - **API**:
   - `POST /api/file-storage/v1/files/{id}/transfer` -- transfer ownership
 
@@ -513,6 +543,12 @@ gear's code. It remains a planned P2 requirement (see PRD.md/DESIGN.md).
 
 - **Domain Model Entities**:
   - None new -- mutates the existing `FileVersion` entity's `backend_id`/`backend_path` fields
+
+- **Design Components**:
+
+  - [x] `p2` - `cpt-cf-file-storage-component-http-gateway`
+  - [x] `p2` - `cpt-cf-file-storage-component-backend-abstraction`
+  - [x] `p2` - `cpt-cf-file-storage-component-authz-adapter`
 
 - **API**:
   - `POST /api/file-storage/v1/files/{id}/migrate` -- migrate a file's content to a different backend
