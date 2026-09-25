@@ -2563,8 +2563,10 @@ dependencies = [
 name = "cf-gears-file-storage-sdk"
 version = "0.1.3"
 dependencies = [
+ "async-trait",
  "cf-gears-toolkit-canonical-errors",
  "cf-gears-toolkit-gts",
+ "cf-gears-toolkit-security",
  "time",
  "uuid",
 ]

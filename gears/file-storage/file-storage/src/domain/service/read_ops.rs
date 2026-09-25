@@ -111,6 +111,32 @@ impl FileService {
             .await
     }
 
+    /// `GET /files`, plus every file's custom metadata: the same listing
+    /// [`Self::list_files`] does, then a single batched
+    /// [`Self::list_metadata_for_files`] lookup for the whole page instead of
+    /// one `list_metadata` call per file. Extracted here (rather than left
+    /// inline in the REST handler) so both callers — the REST handler and the
+    /// SDK local client — attach metadata the exact same way, mirroring
+    /// [`Self::list_versions_with_manifests`] for the versions listing.
+    pub async fn list_files_with_metadata(
+        &self,
+        ctx: &SecurityContext,
+        owner: OwnerFilter,
+        limit: Option<u64>,
+        offset: u64,
+    ) -> Result<Vec<(File, Vec<CustomMetadataEntry>)>, DomainError> {
+        let files = self.list_files(ctx, owner, limit, offset).await?;
+        let file_ids: Vec<Uuid> = files.iter().map(|f| f.file_id).collect();
+        let mut metadata_by_file = self.list_metadata_for_files(&file_ids).await?;
+        Ok(files
+            .into_iter()
+            .map(|f| {
+                let meta = metadata_by_file.remove(&f.file_id).unwrap_or_default();
+                (f, meta)
+            })
+            .collect())
+    }
+
     /// Authorize `GET /storages` and `GET /storages/{id}` (backend
     /// discovery). Both handlers previously extracted no `SecurityContext`
     /// at all and called the synchronous, authz-free
@@ -224,6 +250,95 @@ impl FileService {
         version_ids: &[Uuid],
     ) -> Result<std::collections::HashMap<Uuid, String>, DomainError> {
         self.store.get_version_manifests(version_ids).await
+    }
+
+    /// `GET /files/{id}/versions`, plus the ADR-0006 offset-manifest for
+    /// every `multipart-composite-sha256` version on the page: the same
+    /// listing [`Self::list_versions`] does, batch-fetching (and, per
+    /// [`fetch_manifests_within_budget`], budget-truncating) the manifests
+    /// the REST handler and the SDK local client both need to attach.
+    /// Extracted here (rather than left inline in the REST handler) so both
+    /// callers apply the exact same manifest-byte budget and truncation —
+    /// see [`fetch_manifests_within_budget`]'s doc for the full contract.
+    pub async fn list_versions_with_manifests(
+        &self,
+        ctx: &SecurityContext,
+        file_id: Uuid,
+        limit: Option<u64>,
+        offset: u64,
+    ) -> Result<Vec<(FileVersion, Option<String>)>, DomainError> {
+        let mut versions = self.list_versions(ctx, file_id, limit, offset).await?;
+        let mut manifests = self
+            .fetch_manifests_within_budget(&mut versions, LIST_VERSIONS_MANIFEST_BUDGET_BYTES)
+            .await?;
+        Ok(versions
+            .into_iter()
+            .map(|v| {
+                let manifest = manifests.remove(&v.version_id);
+                (v, manifest)
+            })
+            .collect())
+    }
+
+    /// Fetch every multipart-composite version's manifest for one
+    /// `list_versions` page, in page order and in
+    /// [`MANIFEST_FETCH_BATCH_SIZE`]-sized batches, stopping (and truncating
+    /// `versions` in place via [`manifest_budget_cutoff`]) the moment the
+    /// running manifest byte total would cross `budget_bytes` -- so a page
+    /// whose budget is exhausted at the k-th version never fetches manifests
+    /// beyond (at most one batch past) that cutoff. Fetching every composite
+    /// version's manifest on the page unconditionally in one query, then
+    /// truncating the response after the fact, would pay for whatever
+    /// [`manifest_budget_cutoff`] was about to throw away.
+    ///
+    /// After each batch, [`manifest_budget_cutoff`] runs only over the *safe
+    /// prefix* of `versions` whose composite manifests are now all known
+    /// (`composite_positions[..fetched]`'s last entry, plus any trailing
+    /// whole-sha256 versions that consume no budget either way) -- never over
+    /// the whole page, which would otherwise treat a composite version whose
+    /// manifest hasn't been fetched *yet* the same as one with no manifest row
+    /// at all (free, no budget consumed) and silently admit it.
+    async fn fetch_manifests_within_budget(
+        &self,
+        versions: &mut Vec<FileVersion>,
+        budget_bytes: u64,
+    ) -> Result<std::collections::HashMap<Uuid, String>, DomainError> {
+        // Every composite version's id and its position within `versions`, in
+        // page order.
+        let mut composite_ids: Vec<Uuid> = Vec::new();
+        let mut composite_positions: Vec<usize> = Vec::new();
+        for (i, v) in versions.iter().enumerate() {
+            if v.hash_mode == crate::infra::content::hash_mode::HashMode::MULTIPART_COMPOSITE_SHA256
+            {
+                composite_ids.push(v.version_id);
+                composite_positions.push(i);
+            }
+        }
+
+        let mut manifests: std::collections::HashMap<Uuid, String> =
+            std::collections::HashMap::new();
+        let mut fetched = 0usize;
+
+        for chunk in composite_ids.chunks(MANIFEST_FETCH_BATCH_SIZE) {
+            let batch = self.manifests_for_versions(chunk).await?;
+            manifests.extend(batch);
+            fetched += chunk.len();
+
+            let safe_upto = composite_positions
+                .get(fetched)
+                .copied()
+                .unwrap_or(versions.len());
+            let cutoff = manifest_budget_cutoff(&versions[..safe_upto], &manifests, budget_bytes);
+            if cutoff < safe_upto {
+                versions.truncate(cutoff);
+                return Ok(manifests);
+            }
+            if safe_upto == versions.len() {
+                // Reached the end of the page without ever exceeding budget.
+                return Ok(manifests);
+            }
+        }
+        Ok(manifests)
     }
 
     /// Restore a prior version as current (a rebind: pointer swap, no re-upload).
@@ -459,6 +574,65 @@ impl FileService {
             }
         }
     }
+}
+
+/// Aggregate manifest-byte budget for one [`FileService::list_versions_with_manifests`]
+/// response page. Enforced *while* manifests are being fetched (see
+/// [`FileService::fetch_manifests_within_budget`]), against the manifests
+/// that actually make the cut -- not as an up-front cap on `?limit` itself,
+/// which would shrink every page regardless of `hash_mode` (a real
+/// regression: see `docs/api.md`).
+const LIST_VERSIONS_MANIFEST_BUDGET_BYTES: u64 = 4 * 1024 * 1024;
+
+/// How many composite versions' manifests to fetch per DB round trip while
+/// walking a page in order (see [`FileService::fetch_manifests_within_budget`]).
+/// Small enough that a page whose budget is exhausted early (say, at the 3rd
+/// composite version) never pulls more than one extra batch's worth of
+/// manifests past the cutoff; large enough that a page that fits entirely
+/// within budget (the common case) still costs only a handful of queries,
+/// not one per version.
+const MANIFEST_FETCH_BATCH_SIZE: usize = 8;
+
+/// How many of `versions` (already offset/limit-paginated in the service's
+/// return order, newest first) to keep so the summed byte length of their
+/// `manifests` entries never exceeds `budget_bytes`.
+///
+/// The first version is always kept, even if its own manifest alone exceeds
+/// the budget: a single manifest is already bounded to roughly `MAX_PART_COUNT`
+/// (10 000) parts (~1 MiB, see [`crate::domain::multipart::CompletedMultipartUpload`]'s
+/// doc comment), so this never admits an unbounded response, and keeping it
+/// unconditionally guarantees forward progress -- a client resuming right
+/// after this version can never have its whole next page truncated to
+/// nothing by the same oversized manifest.
+///
+/// `VersionDtoList` serializes as a bare JSON array (see `docs/api.md`), so
+/// there is no `has_more`/`next_offset`/cursor field available to signal an
+/// early truncation without changing the wire format. Continuing correctly
+/// after a truncated page therefore relies on the client resuming at
+/// `offset + <number of versions actually received>` rather than
+/// `offset + limit` -- already the correct, general offset-pagination
+/// client contract (it is exactly how a short *final* page had to be
+/// handled even before this budget existed), so an early-truncated page
+/// composes with it with no special case. A client that instead always
+/// advances by `limit` risks skipping the remainder after a
+/// budget-truncated page.
+fn manifest_budget_cutoff(
+    versions: &[FileVersion],
+    manifests: &std::collections::HashMap<Uuid, String>,
+    budget_bytes: u64,
+) -> usize {
+    let mut used_bytes: u64 = 0;
+    for (i, v) in versions.iter().enumerate() {
+        let Some(manifest) = manifests.get(&v.version_id) else {
+            continue; // whole-sha256 (or no manifest found): no budget consumed
+        };
+        let size = manifest.len() as u64;
+        if i > 0 && used_bytes.saturating_add(size) > budget_bytes {
+            return i;
+        }
+        used_bytes = used_bytes.saturating_add(size);
+    }
+    versions.len()
 }
 
 #[cfg(test)]

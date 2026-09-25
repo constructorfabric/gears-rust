@@ -14,9 +14,9 @@
 //! - `create.rs`   — create_file, presign_version, policy/quota helpers
 //! - `write.rs`    — authorize_write, finalize_upload, bind, update_metadata,
 //!   transfer_ownership, best_effort_blob_delete
-//! - `read_ops.rs` — get_file, get_file_with_metadata, list_files, get_version,
-//!   download_url, list_versions, restore_version,
-//!   delete_file, delete_file_inner, delete_version
+//! - `read_ops.rs` — get_file, get_file_with_metadata, list_files,
+//!   list_files_with_metadata, get_version, download_url, list_versions,
+//!   restore_version, delete_file, delete_file_inner, delete_version
 //! - `backend.rs`  — migrate_backend, list_backends, get_backend,
 //!   DataPlanePort trait impl
 
