@@ -655,6 +655,114 @@ async fn in_memory_publish_exclusive_rejects_second_write_to_same_path() {
     );
 }
 
+/// Drive two `publish_exclusive` calls to the SAME path with DIFFERENT
+/// full-size payloads, released at the same instant by a two-party
+/// `tokio::sync::Barrier` so both racers' writes genuinely overlap rather
+/// than merely being scheduled back-to-back. Asserts the invariant
+/// `publish_exclusive`'s doc comment promises: exactly one racer reports
+/// `created: true`, the other `created: false`, and the object a caller
+/// reads back afterwards is byte-for-byte one racer's payload in full —
+/// never a torn mix of both. Repeated several times to raise the odds of
+/// actually hitting the overlap window a single iteration might miss.
+async fn assert_publish_exclusive_concurrent_racers_never_mix(
+    make_backend: impl Fn() -> Arc<dyn StorageBackend>,
+) {
+    const SIZE: usize = 64 * 1024;
+    const ITERATIONS: u32 = 20;
+
+    for iteration in 0..ITERATIONS {
+        let backend = make_backend();
+        let path = format!("fid/vid-{iteration}");
+
+        let payload_a = Bytes::from(vec![0xAAu8; SIZE]);
+        let payload_b = Bytes::from(vec![0xBBu8; SIZE]);
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+        let task = |payload: Bytes,
+                    backend: Arc<dyn StorageBackend>,
+                    path: String,
+                    barrier: Arc<tokio::sync::Barrier>| async move {
+            let len = payload.len() as u64;
+            let stream: BoxStream<'_, std::io::Result<Bytes>> =
+                Box::pin(stream::once(async move { Ok(payload) }));
+            // Both racers build their stream first, then rendezvous here so
+            // the actual `publish_exclusive` calls start as close to
+            // simultaneously as two independently scheduled tasks can.
+            barrier.wait().await;
+            backend.publish_exclusive(&path, stream, Some(len)).await
+        };
+
+        let handle_a = tokio::spawn(task(
+            payload_a.clone(),
+            Arc::clone(&backend),
+            path.clone(),
+            Arc::clone(&barrier),
+        ));
+        let handle_b = tokio::spawn(task(
+            payload_b.clone(),
+            Arc::clone(&backend),
+            path.clone(),
+            Arc::clone(&barrier),
+        ));
+
+        let outcome_a = handle_a
+            .await
+            .expect("racer A task must not panic")
+            .expect("racer A's publish_exclusive must not error");
+        let outcome_b = handle_b
+            .await
+            .expect("racer B task must not panic")
+            .expect("racer B's publish_exclusive must not error");
+
+        assert_ne!(
+            outcome_a.created, outcome_b.created,
+            "iteration {iteration}: exactly one racer must report created:true and the \
+             other created:false, got ({}, {})",
+            outcome_a.created, outcome_b.created
+        );
+
+        let got = read_all(backend.as_ref(), &path, SIZE as u64).await;
+        assert!(
+            got == payload_a || got == payload_b,
+            "iteration {iteration}: the stored object must equal exactly one racer's full \
+             payload, never a mix of both"
+        );
+        // Cross-check that the `created` flags and the actually-stored bytes
+        // agree on the same winner.
+        if outcome_a.created {
+            assert_eq!(
+                got, payload_a,
+                "iteration {iteration}: racer A reported created:true but the stored \
+                 object does not match its payload"
+            );
+        } else {
+            assert_eq!(
+                got, payload_b,
+                "iteration {iteration}: racer B reported created:true but the stored \
+                 object does not match its payload"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn local_fs_publish_exclusive_concurrent_racers_never_mix() {
+    let root = unique_root();
+    assert_publish_exclusive_concurrent_racers_never_mix(|| {
+        Arc::new(LocalFsBackend::new("fs", &root)) as Arc<dyn StorageBackend>
+    })
+    .await;
+    drop(tokio::fs::remove_dir_all(&root).await);
+}
+
+#[tokio::test]
+async fn in_memory_publish_exclusive_concurrent_racers_never_mix() {
+    assert_publish_exclusive_concurrent_racers_never_mix(|| {
+        Arc::new(InMemoryBackend::new("mem")) as Arc<dyn StorageBackend>
+    })
+    .await;
+}
+
 /// `InMemoryBackend::publish_exclusive` must surface a chunk-level I/O error
 /// as `DomainError::Backend` (the `map_err` closure on the failing chunk)
 /// rather than panicking, and must not publish anything when the stream

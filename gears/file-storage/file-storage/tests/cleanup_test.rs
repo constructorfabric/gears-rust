@@ -4681,3 +4681,382 @@ async fn migrate_backend_same_target_race_preserves_winner_blob() {
         "surviving blob must match the winner's bytes"
     );
 }
+
+// ── P2 remediation: a pre-existing destination object is re-verified, never
+// trusted on the strength of `created: false` alone ────────────────────────
+//
+// `publish_exclusive`'s `created: false` only means *some* earlier attempt
+// already wrote to the deterministic destination path -- never that its
+// bytes were ever hash-checked. An interrupted earlier attempt (crashed or
+// cancelled after its own `publish_exclusive` call returned but before it
+// read its own verification slot and cleaned up on mismatch) can leave
+// unverified, possibly corrupt bytes sitting there with no live database
+// pointer. These tests seed exactly that: bytes already present at the
+// canonical destination path *before* `migrate_backend` ever runs, with no
+// racer involved at all (unlike `migrate_backend_loser_target_blob_cleaned_up`
+// / `migrate_backend_same_target_race_preserves_winner_blob` above, which
+// model a genuine in-flight concurrent racer).
+
+/// (a) Corrupted bytes already sit at the destination's canonical path
+/// (same declared length, different content) before `migrate_backend` runs
+/// at all. The call must read them back, notice the mismatch, refuse to
+/// migrate, and delete the garbage -- even though this call did not create
+/// it.
+#[tokio::test]
+async fn migrate_backend_rejects_corrupted_preexisting_destination_object() {
+    let db = build_db().await;
+    let mem_backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let alt_backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("alt"));
+    let backends = BackendRegistry::new(
+        vec![Arc::clone(&mem_backend), Arc::clone(&alt_backend)],
+        "mem",
+    )
+    .expect("registry");
+
+    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let authorizer: Arc<dyn file_storage::domain::authz::Authorizer> =
+        Arc::new(TenantOnlyAuthorizer);
+    let cfg = ServiceConfig {
+        default_url_ttl_secs: 3600,
+        sidecar_base_url: "http://sidecar.test".to_owned(),
+        default_page_size: 50,
+        max_page_size: 1000,
+        idempotency_ttl_secs: 86400,
+    };
+    let store = Store::new(Arc::clone(&db));
+    let svc = Arc::new(FileService::new(
+        store.clone(),
+        backends.clone(),
+        issuer,
+        authorizer,
+        cfg,
+        None,
+        None,
+    ));
+    let dp = TestDataPlane::new(Arc::clone(&svc), store.clone(), backends);
+
+    let tenant = Uuid::now_v7();
+    let ctx = ctx(tenant);
+    let content = Bytes::from_static(b"the real, correct content on the source backend");
+
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+    dp.put_content(
+        &ctx,
+        ticket.file_id,
+        ticket.version_id,
+        "text/plain",
+        content.clone(),
+    )
+    .await
+    .unwrap();
+    svc.bind(&ctx, ticket.file_id, ticket.version_id, None)
+        .await
+        .unwrap();
+
+    // Pre-seed "alt" at the canonical destination path with the SAME length
+    // but DIFFERENT bytes -- standing in for an earlier, interrupted
+    // migration attempt that wrote but never got to verify/clean up.
+    let dest_path = format!("/{}/{}", ticket.file_id, ticket.version_id);
+    let mut corrupted_bytes = content.to_vec();
+    for b in &mut corrupted_bytes {
+        *b ^= 0xFF;
+    }
+    let corrupted = Bytes::from(corrupted_bytes);
+    write_all(&alt_backend, &dest_path, corrupted).await;
+
+    let err = svc
+        .migrate_backend(&ctx, ticket.file_id, "alt")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, DomainError::HashMismatch { .. }),
+        "expected HashMismatch from the pre-existing destination object's read-back \
+         verification, got {err:?}"
+    );
+
+    // The version must stay on the source backend -- migration never
+    // committed.
+    let after = store
+        .get_version(ticket.file_id, ticket.version_id)
+        .await
+        .unwrap()
+        .expect("version must still exist");
+    assert_eq!(
+        after.backend_id, "mem",
+        "version must stay on the source backend when the pre-existing \
+         destination object fails re-verification"
+    );
+
+    // The garbage object must be deleted -- even though this call did not
+    // create it, it never proved itself to be anyone's verified content.
+    assert!(
+        !alt_backend.exists(&dest_path).await.unwrap(),
+        "corrupted pre-existing destination object must be cleaned up"
+    );
+}
+
+/// (b) The CORRECT bytes already sit at the destination's canonical path
+/// before `migrate_backend` runs (e.g. an earlier attempt that fully
+/// completed its own write and would have verified fine, but the CAS/audit
+/// step never ran for some unrelated reason). The read-back verification
+/// must pass and the migration must succeed exactly as if this call had
+/// written the bytes itself.
+#[tokio::test]
+async fn migrate_backend_accepts_correct_preexisting_destination_object() {
+    let db = build_db().await;
+    let mem_backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let alt_backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("alt"));
+    let backends = BackendRegistry::new(
+        vec![Arc::clone(&mem_backend), Arc::clone(&alt_backend)],
+        "mem",
+    )
+    .expect("registry");
+
+    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let authorizer: Arc<dyn file_storage::domain::authz::Authorizer> =
+        Arc::new(TenantOnlyAuthorizer);
+    let cfg = ServiceConfig {
+        default_url_ttl_secs: 3600,
+        sidecar_base_url: "http://sidecar.test".to_owned(),
+        default_page_size: 50,
+        max_page_size: 1000,
+        idempotency_ttl_secs: 86400,
+    };
+    let store = Store::new(Arc::clone(&db));
+    let svc = Arc::new(FileService::new(
+        store.clone(),
+        backends.clone(),
+        issuer,
+        authorizer,
+        cfg,
+        None,
+        None,
+    ));
+    let dp = TestDataPlane::new(Arc::clone(&svc), store.clone(), backends);
+
+    let tenant = Uuid::now_v7();
+    let ctx = ctx(tenant);
+    let content = Bytes::from_static(b"identical content on both backends");
+
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+    dp.put_content(
+        &ctx,
+        ticket.file_id,
+        ticket.version_id,
+        "text/plain",
+        content.clone(),
+    )
+    .await
+    .unwrap();
+    svc.bind(&ctx, ticket.file_id, ticket.version_id, None)
+        .await
+        .unwrap();
+
+    // Pre-seed "alt" at the canonical destination path with the CORRECT
+    // bytes -- this call must not need to write anything there itself.
+    let dest_path = format!("/{}/{}", ticket.file_id, ticket.version_id);
+    write_all(&alt_backend, &dest_path, content.clone()).await;
+
+    svc.migrate_backend(&ctx, ticket.file_id, "alt")
+        .await
+        .expect("a correct pre-existing destination object must be accepted");
+
+    let after = store
+        .get_version(ticket.file_id, ticket.version_id)
+        .await
+        .unwrap()
+        .expect("version must still exist");
+    assert_eq!(after.backend_id, "alt", "version must now point to alt");
+    assert_eq!(after.backend_path, dest_path);
+
+    // The (already-correct) destination object must be untouched.
+    let stored = read_all(&alt_backend, &dest_path, content.len() as u64).await;
+    assert_eq!(
+        stored, content,
+        "pre-existing correct destination object must be left as-is"
+    );
+
+    // A `backend_migrate` audit row must still be written -- this is a real
+    // committed migration, not a same-backend no-op.
+    let audit = store.list_audit(ticket.file_id).await.unwrap();
+    assert!(
+        audit.iter().any(|r| r.operation == "backend_migrate"),
+        "expected a backend_migrate audit row"
+    );
+}
+
+/// (c) Same as (a), but for a `multipart-composite-sha256` version: the
+/// pre-existing destination object's bytes are corrupted relative to the
+/// stored `version_hash_manifest`. The read-back verification must run the
+/// same composite-mode split-rehash-rebuild-compare algorithm the source
+/// stream uses, not a whole-object check, and must still reject and clean up
+/// on mismatch.
+#[tokio::test]
+async fn migrate_backend_rejects_corrupted_preexisting_destination_object_composite() {
+    use file_storage::domain::multipart::DEFAULT_MIN_PART_SIZE;
+
+    let db = build_db().await;
+    let mem_backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let alt_backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("alt"));
+    let backends = BackendRegistry::new(
+        vec![Arc::clone(&mem_backend), Arc::clone(&alt_backend)],
+        "mem",
+    )
+    .expect("registry");
+
+    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let authorizer: Arc<dyn file_storage::domain::authz::Authorizer> =
+        Arc::new(TenantOnlyAuthorizer);
+    let cfg = ServiceConfig {
+        default_url_ttl_secs: 3600,
+        sidecar_base_url: "http://sidecar.test".to_owned(),
+        default_page_size: 50,
+        max_page_size: 1000,
+        idempotency_ttl_secs: 86400,
+    };
+    let store = Store::new(Arc::clone(&db));
+    let multipart_store: Arc<dyn MultipartStore> = Arc::new(store.clone());
+    let svc = Arc::new(FileService::new(
+        store.clone(),
+        backends.clone(),
+        Arc::clone(&issuer),
+        Arc::clone(&authorizer),
+        cfg,
+        None,
+        None,
+    ));
+    let msvc = Arc::new(MultipartService::new(
+        multipart_store,
+        backends,
+        authorizer,
+        None,
+        issuer,
+        "http://sidecar.test".to_owned(),
+        3600,
+    ));
+
+    let tenant = Uuid::now_v7();
+    let ctx = ctx(tenant);
+
+    // `create_file_bare` creates the file with NO initial version at all
+    // (unlike `create_file`, whose returned ticket already carries one) --
+    // `migrate_backend` requires exactly 1 version, so the multipart upload
+    // below must be the file's only one.
+    let file_id = svc.create_file_bare(&ctx, new_file()).await.unwrap();
+
+    // Force a 2-part plan (part 1 = DEFAULT_MIN_PART_SIZE, part 2 = the
+    // 100-byte remainder) so the resulting version is
+    // `multipart-composite-sha256`, not the single-part fast path's
+    // `whole-sha256`.
+    let part1 = Bytes::from(vec![
+        0xABu8;
+        usize::try_from(DEFAULT_MIN_PART_SIZE)
+            .expect("fits in usize")
+    ]);
+    let part2 = Bytes::from(vec![0xCDu8; 100]);
+    let declared_size = part1.len() as u64 + part2.len() as u64;
+
+    let plan = msvc
+        .initiate_multipart_upload(
+            &ctx,
+            file_id,
+            "application/octet-stream",
+            declared_size,
+            Some(DEFAULT_MIN_PART_SIZE),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(plan.parts.len(), 2, "plan must have exactly 2 parts");
+
+    let session = store
+        .get_multipart_upload(plan.upload_id)
+        .await
+        .unwrap()
+        .expect("session must exist");
+    let backend_path = format!("/{}/{}", file_id, plan.version_id);
+
+    for (part, data) in plan.parts.iter().zip([part1.clone(), part2.clone()]) {
+        assert_eq!(
+            data.len() as u64,
+            part.size,
+            "part {} size",
+            part.part_number
+        );
+        let (stream, len) = one_shot_part_stream(data);
+        let (backend_etag, part_hash) = mem_backend
+            .upload_part_stream(
+                &backend_path,
+                &session.backend_upload_handle,
+                part.part_number,
+                part.offset,
+                stream,
+                len,
+            )
+            .await
+            .expect("backend upload_part_stream");
+        store
+            .upsert_multipart_part(
+                plan.upload_id,
+                i32::try_from(part.part_number).unwrap(),
+                &backend_etag,
+                part_hash,
+                i64::try_from(part.size).unwrap(),
+                time::OffsetDateTime::now_utc(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let _completed = msvc
+        .complete_multipart_upload(&ctx, file_id, plan.upload_id, None)
+        .await
+        .unwrap()
+        .unwrap_completed();
+    svc.bind(&ctx, file_id, plan.version_id, None)
+        .await
+        .unwrap();
+
+    let before = store
+        .get_version(file_id, plan.version_id)
+        .await
+        .unwrap()
+        .expect("version must exist after complete+bind");
+    assert_eq!(before.hash_mode, "multipart-composite-sha256");
+    assert_eq!(before.backend_id, "mem");
+
+    // Pre-seed "alt" at the canonical destination path with the correct
+    // TOTAL length but corrupted bytes in the second part's span.
+    let dest_path = format!("/{}/{}", file_id, plan.version_id);
+    let mut corrupted = Vec::with_capacity(usize::try_from(declared_size).expect("fits in usize"));
+    corrupted.extend_from_slice(&part1);
+    corrupted.extend_from_slice(&vec![0xEFu8; part2.len()]);
+    write_all(&alt_backend, &dest_path, Bytes::from(corrupted)).await;
+
+    let err = svc.migrate_backend(&ctx, file_id, "alt").await.unwrap_err();
+    assert!(
+        matches!(err, DomainError::HashMismatch { .. }),
+        "expected HashMismatch for the corrupted composite destination object, got {err:?}"
+    );
+
+    let after = store
+        .get_version(file_id, plan.version_id)
+        .await
+        .unwrap()
+        .expect("version must still exist");
+    assert_eq!(
+        after.backend_id, "mem",
+        "composite version must stay on the source backend on read-back mismatch"
+    );
+    assert!(
+        !alt_backend.exists(&dest_path).await.unwrap(),
+        "corrupted pre-existing composite destination object must be cleaned up"
+    );
+}
