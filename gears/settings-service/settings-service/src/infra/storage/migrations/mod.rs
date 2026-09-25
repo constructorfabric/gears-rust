@@ -24,6 +24,7 @@ mod m20260917_000001_value_type_namespace;
 mod m20260924_000001_audit_records_append_only;
 mod m20260924_000002_audit_records_retention_floor;
 mod m20260925_000001_audit_records_default_horizon_index;
+mod m20260925_000002_audit_retention_policy;
 
 /// The gear's migrations, oldest first.
 pub struct Migrator;
@@ -43,6 +44,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260924_000001_audit_records_append_only::Migration),
             Box::new(m20260924_000002_audit_records_retention_floor::Migration),
             Box::new(m20260925_000001_audit_records_default_horizon_index::Migration),
+            Box::new(m20260925_000002_audit_retention_policy::Migration),
         ]
     }
 }

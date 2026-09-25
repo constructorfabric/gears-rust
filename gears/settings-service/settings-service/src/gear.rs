@@ -338,6 +338,17 @@ impl SettingsService {
             }
         };
         let scope = toolkit_security::AccessScope::allow_all();
+        // The configured retention first, where the trigger reads it: the
+        // database then refuses deleting anything younger by any path, and a
+        // write that fails fails the pass, which the pass metric reports.
+        let days =
+            u32::try_from(default_retention.as_secs().div_euclid(86_400)).unwrap_or(u32::MAX);
+        if let Err(err) = crate::infra::storage::audit_store::AuditStore
+            .record_retention(&conn, &scope, days)
+            .await
+        {
+            return (0, Some(err));
+        }
         let mut pruned = 0;
         for _ in 0..batches.per_tick {
             if cancel.is_cancelled() {

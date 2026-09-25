@@ -895,3 +895,35 @@ async fn a_failed_review_pass_publishes_nothing_so_the_gauge_keeps_its_last_valu
     SettingsService::review_once(&broken, &metrics).await;
     assert!(metrics.review.lock().expect("lock").is_empty());
 }
+
+#[tokio::test]
+async fn a_retention_pass_writes_the_configured_retention_where_the_trigger_reads_it() {
+    // The database's trigger refuses deleting a record younger than the
+    // greater of the platform minimum and this row, so a deployment keeping
+    // records two years is guarded for two years, not one.
+    let db = crate::test_support::sqlite_provider().await;
+    let live = tokio_util::sync::CancellationToken::new();
+    let quiet = RecordingLifecycleMetrics::default();
+    let batches = super::PruneBatches {
+        size: 10,
+        per_tick: 1,
+    };
+    let now = time::OffsetDateTime::now_utc();
+    let recorded = || async {
+        let conn = db.conn().expect("connection");
+        crate::infra::storage::audit_store::AuditStore
+            .recorded_retention(&conn, &toolkit_security::AccessScope::allow_all())
+            .await
+            .expect("readable")
+    };
+    assert_eq!(recorded().await, None, "nothing before the first pass");
+
+    let two_years = std::time::Duration::from_hours(730 * 24);
+    SettingsService::prune_once(&db, two_years, now, batches, &live, &quiet).await;
+    assert_eq!(recorded().await, Some(730));
+
+    // A changed configuration is carried by the next pass.
+    let year = std::time::Duration::from_hours(400 * 24);
+    SettingsService::prune_once(&db, year, now, batches, &live, &quiet).await;
+    assert_eq!(recorded().await, Some(400));
+}

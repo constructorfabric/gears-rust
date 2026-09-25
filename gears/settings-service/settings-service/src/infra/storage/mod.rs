@@ -14,7 +14,10 @@ pub mod category_repo;
 pub mod clock;
 pub mod declaration_odata_mapper;
 pub mod declaration_repo;
-pub mod entity;
+// The tables' entities stay inside the crate: each store is the one way its
+// table is written, and the audit store the one way `audit_records` is — an
+// entity reachable from outside would be a second, unguarded path.
+pub(crate) mod entity;
 pub mod migrations;
 pub mod odata_mapper;
 pub mod pending_secret_repo;

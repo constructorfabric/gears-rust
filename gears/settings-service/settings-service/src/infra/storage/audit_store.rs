@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use sea_orm::{ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter};
 use time::{Duration, OffsetDateTime};
 use toolkit_db::odata::{FieldToColumn, LimitCfg, ODataFieldMapping, paginate_odata};
-use toolkit_db::secure::{DBRunner, SecureDeleteExt, SecureEntityExt};
+use toolkit_db::secure::{DBRunner, SecureDeleteExt, SecureEntityExt, SecureUpdateExt};
 use toolkit_odata::filter::{FieldKind, FilterField};
 use toolkit_odata::{ODataQuery, Page, SortDir};
 use toolkit_security::AccessScope;
@@ -322,6 +322,72 @@ impl AuditStore {
             .map_err(unavailable)?;
         Ok(outcome.rows_affected)
         // @cpt-end:cpt-cf-settings-service-algo-audit-store-retention:p1:inst-as-ret-3
+    }
+
+    /// Write the configured retention where the database's trigger reads it,
+    /// so the trigger refuses deleting a record younger than it, not only one
+    /// younger than the platform minimum. Written before every retention pass,
+    /// which keeps it current with the configuration and retries a failed
+    /// write on the next pass.
+    ///
+    /// # Errors
+    /// [`DomainError`] when the write fails, or `days` does not fit the column.
+    pub async fn record_retention<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        days: u32,
+    ) -> Result<(), DomainError> {
+        use crate::infra::storage::entity::audit_policy::{self, Entity as PolicyEntity};
+        let days = i32::try_from(days).map_err(|_| DomainError::Internal {
+            diagnostic: format!("an audit retention of {days} days does not fit the policy"),
+        })?;
+        let now = crate::infra::storage::clock::now();
+        let updated = PolicyEntity::update_many()
+            .col_expr(
+                audit_policy::Column::RetentionDays,
+                sea_orm::sea_query::Expr::value(days),
+            )
+            .col_expr(
+                audit_policy::Column::UpdatedAt,
+                sea_orm::sea_query::Expr::value(now),
+            )
+            .filter(audit_policy::Column::Id.eq(1_i16))
+            .secure()
+            .scope_with(scope)
+            .exec(conn)
+            .await
+            .map_err(unavailable)?;
+        if updated.rows_affected == 0 {
+            let row = audit_policy::ActiveModel {
+                id: Set(1),
+                retention_days: Set(days),
+                updated_at: Set(now),
+            };
+            toolkit_db::secure::secure_insert::<PolicyEntity>(row, scope, conn)
+                .await
+                .map_err(unavailable)?;
+        }
+        Ok(())
+    }
+
+    /// The retention the trigger currently reads, if the gear has written one.
+    ///
+    /// # Errors
+    /// [`DomainError`] when the read fails.
+    pub async fn recorded_retention<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+    ) -> Result<Option<u32>, DomainError> {
+        use crate::infra::storage::entity::audit_policy::Entity as PolicyEntity;
+        let row = PolicyEntity::find()
+            .secure()
+            .scope_with(scope)
+            .one(conn)
+            .await
+            .map_err(unavailable)?;
+        Ok(row.and_then(|r| u32::try_from(r.retention_days).ok()))
     }
 
     /// Every record of one change set, for callers that retrieve them together.
