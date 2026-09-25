@@ -18,19 +18,34 @@
 #     -t pg19-pgvector:latest gears/graph-storage/docker
 #   GEARS_TEST_PG_GRAPH_IMAGE=pg19-pgvector:latest make test-graph-storage-pg
 #
-# Both the extension and the base are pinned. The tag is a beta label Docker
-# Hub can move at any time, and a base that changes between the build stage
-# and the runtime stage — or between two CI runs — gives a `vector.so`
-# compiled against one set of server headers and loaded into another. A lane
-# whose server moves underneath it is a lane whose failures nobody can date.
+# The extension, the base **and the server headers** are pinned. The tag is a
+# beta label Docker Hub can move at any time, and a base that changes between
+# the build stage and the runtime stage — or between two CI runs — gives a
+# `vector.so` compiled against one set of server headers and loaded into
+# another. A lane whose server moves underneath it is a lane whose failures
+# nobody can date.
+#
+# The headers are the half that was missing, and it broke exactly as this
+# paragraph describes. `postgresql-server-dev-19` came from apt unversioned
+# while the base was pinned by digest, so the day pgdg published beta4 the
+# extension compiled against beta4 headers and was loaded into the beta3
+# server this image runs: `CREATE INDEX` then failed with "index access
+# method handler function ... did not return an IndexAmRoutine struct", and
+# the schema migration could not apply. Nothing in the repository had
+# changed. The dev package is now pinned to the version of the server
+# already installed in this very image, read out of it rather than written
+# down, so the two cannot drift apart and refreshing the base needs no second
+# edit here.
 # Refresh with: docker buildx imagetools inspect postgres:19beta3
 ARG PG_BASE=postgres:19beta3@sha256:a48b19841e04b35b72a25e9a94314ac80546d32b5e2e3cd9279390cbd8a99572
 FROM ${PG_BASE} AS build
 ARG PGVECTOR_REF=5219575
 RUN set -eux; \
     apt-get update; \
+    PG_SERVER_VERSION="$(dpkg-query -W -f='${Version}' postgresql-19)"; \
     apt-get install -y --no-install-recommends \
-        build-essential ca-certificates git postgresql-server-dev-19; \
+        build-essential ca-certificates git \
+        "postgresql-server-dev-19=${PG_SERVER_VERSION}"; \
     git clone https://github.com/pgvector/pgvector.git /tmp/pgvector; \
     cd /tmp/pgvector; \
     git checkout "${PGVECTOR_REF}"; \
