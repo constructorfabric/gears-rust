@@ -235,8 +235,8 @@ pub fn register_routes(
             "At most five hundred changes, each with its own key, target tenant, operation, \
              value and `if_match`. `op` is `set` (the default, so a client that never sends it \
              is unaffected) or `revert`, which clears the scope's own override and carries no \
-             value; a `set` without a value, a `revert` with one, or an unknown word rejects \
-             that change alone with `invalid`, and a `revert` of a scope holding no override \
+             value; a key that is not a setting key, a `set` without a value, a `revert` with \
+             one, or an unknown word rejects that change alone with `invalid`, and a `revert` of a scope holding no override \
              is rejected `not_found` alone. Step-up is verified once for the request when any \
              target declaration requires it; each change then commits on its own, with no \
              atomicity across changes, and the answer carries one entry per change - \

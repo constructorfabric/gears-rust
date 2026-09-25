@@ -84,6 +84,20 @@ pub struct BatchChange {
     pub if_match: Option<String>,
 }
 
+/// A batch entry the surface refused on its text, before it was a change: a
+/// key that is not a setting key, a number a double cannot hold. It carries
+/// the key as the caller wrote it and the scope it asked for, so the refusal
+/// is reported in its place and published like any other.
+#[derive(Debug)]
+pub struct RefusedEntry {
+    /// The key exactly as submitted, parsed or not.
+    pub key: String,
+    /// The target tenant; absent, the caller's own.
+    pub tenant: Option<Uuid>,
+    /// Why the entry was refused.
+    pub error: DomainError,
+}
+
 /// The change an entry asks for, before a secret's staged entry is resolved.
 ///
 /// `set` and `revert` are the whole vocabulary: `remove` is the administrative
@@ -283,22 +297,26 @@ impl WriteCoordinator {
         actor: &WriteActor,
         changes: Vec<BatchChange>,
     ) -> Result<BatchOutcome, DomainError> {
-        self.batch_entries(actor, changes.into_iter().map(Ok).collect())
-            .await
+        self.batch_entries(
+            actor,
+            changes.into_iter().map(Ok::<_, RefusedEntry>).collect(),
+        )
+        .await
     }
 
     /// [`Self::batch`] over entries the surface has already judged. An `Err`
-    /// entry is one refused on its text before it was a value — a number a
-    /// double cannot hold — and it is reported in its place, counts against
-    /// the limit, and is never gated or committed. The rest stand or fall
-    /// alone as before.
+    /// entry is one refused on its text before it was a change — a key that
+    /// does not parse, a number a double cannot hold — and it is reported in
+    /// its place, published under the change set like any refusal, counts
+    /// against the limit, and is never gated or committed. The rest stand or
+    /// fall alone as before.
     ///
     /// # Errors
     /// As [`Self::batch`].
     pub async fn batch_entries(
         &self,
         actor: &WriteActor,
-        entries: Vec<Result<BatchChange, DomainError>>,
+        entries: Vec<Result<BatchChange, RefusedEntry>>,
     ) -> Result<BatchOutcome, DomainError> {
         // @cpt-begin:cpt-cf-settings-service-flow-value-writes-batch:p1:inst-vw-batch-2
         if entries.len() > BATCH_LIMIT {
@@ -346,8 +364,23 @@ impl WriteCoordinator {
             // @cpt-begin:cpt-cf-settings-service-flow-value-writes-batch:p1:inst-vw-batch-6
             let change = match entry {
                 Ok(change) => change,
-                Err(err) => {
-                    results.push(Err(err));
+                // Refused on the surface: published like a refusal at the gate,
+                // at the scope asked for or the caller's own, so the events
+                // alone still tell the whole outcome of the batch.
+                Err(refused) => {
+                    let tenant_id = refused
+                        .tenant
+                        .unwrap_or_else(|| actor.ctx.subject_tenant_id());
+                    self.writer
+                        .after_rejection(
+                            &refused.key,
+                            tenant_id,
+                            actor,
+                            &refused.error,
+                            change_set_id,
+                        )
+                        .await;
+                    results.push(Err(refused.error));
                     continue;
                 }
             };

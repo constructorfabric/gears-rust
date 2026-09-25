@@ -30,7 +30,9 @@ use crate::domain::error::DomainError;
 use crate::domain::validation::guards;
 use crate::domain::writes::{Change, WriteActor};
 use crate::field;
-use crate::infra::value_writes::{BATCH_LIMIT, BatchChange, WriteCoordinator, batch_too_large};
+use crate::infra::value_writes::{
+    BATCH_LIMIT, BatchChange, RefusedEntry, WriteCoordinator, batch_too_large,
+};
 
 const READ: &str = "read";
 const WRITE: &str = "write";
@@ -332,11 +334,11 @@ pub async fn clone_value(
 /// `POST /settings-service/v1/settings/batch`
 ///
 /// # Errors
-/// 400 over five hundred changes or on a malformed key; 401 with the challenge
-/// when step-up is required and not proven; 403 when not authorized or a
-/// service principal targets a step-up declaration. Per-change refusals are
-/// entries, not errors — among them an entry whose `op` is unrecognised or
-/// whose `value` contradicts it.
+/// 400 over five hundred changes; 401 with the challenge when step-up is
+/// required and not proven; 403 when not authorized or a service principal
+/// targets a step-up declaration. Per-change refusals are entries, not errors
+/// — among them an entry whose key is not a setting key, whose `op` is
+/// unrecognised, or whose `value` contradicts it or fails the text guard.
 pub async fn batch_set(
     Extension(ctx): Extension<SecurityContext>,
     Extension(writes): Extension<Arc<WriteCoordinator>>,
@@ -363,21 +365,22 @@ pub async fn batch_set(
             value,
             if_match,
         } = change;
-        let key = parse_key(&key)?;
-        // A value the text guard refuses is this entry's fault alone, like any
-        // other fault of one change: reported in its place, the rest proceeds.
-        entries.push(
+        // A key that does not parse, or a value the text guard refuses, is
+        // this entry's fault alone, like any other fault of one change:
+        // reported in its place and published, and the rest proceeds.
+        let judged = parse_key(&key).and_then(|parsed| {
             value
                 .map(|raw| checked_value(&raw))
                 .transpose()
                 .map(|value| BatchChange {
-                    key,
+                    key: parsed,
                     tenant,
                     op,
                     value,
                     if_match,
-                }),
-        );
+                })
+        });
+        entries.push(judged.map_err(|error| RefusedEntry { key, tenant, error }));
     }
     // @cpt-end:cpt-cf-settings-service-flow-value-writes-batch:p1:inst-vw-batch-1
     let outcome = writes.batch_entries(&actor, entries).await;

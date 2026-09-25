@@ -1012,6 +1012,59 @@ async fn a_batch_entry_the_text_guard_refuses_is_rejected_alone() {
     assert_eq!(results[1]["outcome"], json!("committed"), "{}", results[1]);
 }
 
+#[tokio::test]
+async fn a_batch_entry_whose_key_does_not_parse_is_rejected_alone_and_published() {
+    // One entry with a key that is not a setting key, one whose number the
+    // text guard refuses, one that is fine: the batch answers each in its
+    // place, commits the good one, and publishes both refusals under its
+    // change set — refused on the surface or at the gate, a refusal is one.
+    let h = RestHarness::new().await;
+    h.inner.declare("first", "cascading", json!(true)).await;
+    h.inner.declare("second", "cascading", json!(true)).await;
+    let body = format!(
+        r#"{{"changes": [
+            {{"key": "not a key", "value": true, "if_match": "absent"}},
+            {{"key": "{first}", "value": 9007199254740993.0, "if_match": "absent"}},
+            {{"key": "{second}", "value": false, "if_match": "absent"}}
+        ]}}"#,
+        first = h.inner.key("first"),
+        second = h.inner.key("second"),
+    );
+
+    let answer = h
+        .send_text("POST", BATCH, &body, None, h.inner.tree.root)
+        .await;
+    assert_eq!(answer.status, 200, "{}", answer.body);
+    let results = answer.body["results"].as_array().expect("results");
+    assert_eq!(results.len(), 3, "{}", answer.body);
+    assert_eq!(results[0]["key"], json!("not a key"), "{}", results[0]);
+    assert_eq!(results[0]["outcome"], json!("rejected"), "{}", results[0]);
+    assert_eq!(results[0]["error"], json!("invalid"), "{}", results[0]);
+    assert_eq!(results[1]["outcome"], json!("rejected"), "{}", results[1]);
+    assert_eq!(results[2]["outcome"], json!("committed"), "{}", results[2]);
+
+    let change_set: uuid::Uuid = answer.body["change_set_id"]
+        .as_str()
+        .and_then(|s| s.parse().ok())
+        .expect("a change set id");
+    let events = h.published.events.lock().expect("lock");
+    let refused: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            crate::domain::ports::ValueEvent::ChangeFailed {
+                key, change_set_id, ..
+            } if *change_set_id == change_set => Some(key.as_str()),
+            _ => None,
+        })
+        .collect();
+    let first = h.inner.key("first").to_string();
+    assert_eq!(
+        refused,
+        vec!["not a key", first.as_str()],
+        "each refusal is published, in order: {events:?}"
+    );
+}
+
 // ── The tenant boundary ──────────────────────────────────────────────────────
 
 /// The boundary a write may not cross is enforced by the gate, not by a PDP
