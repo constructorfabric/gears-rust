@@ -33,6 +33,23 @@ pub fn node_ident_columns(query: Select<node::Entity>) -> Select<node::Entity> {
         .column(node::Column::NodeKey)
 }
 
+/// A node's identity and its type: what an adjacency entry says about the
+/// node at the far end of an edge.
+#[derive(Debug, sea_orm::FromQueryResult)]
+pub struct NodeTyped {
+    pub id: i64,
+    pub node_key: String,
+    pub gts_node_type_id: i32,
+}
+
+pub fn node_typed_columns(query: Select<node::Entity>) -> Select<node::Entity> {
+    query
+        .select_only()
+        .column(node::Column::Id)
+        .column(node::Column::NodeKey)
+        .column(node::Column::GtsNodeTypeId)
+}
+
 /// A registered type's interned id, when the name it was looked up by is
 /// already in hand.
 #[derive(Debug, sea_orm::FromQueryResult)]
@@ -77,6 +94,60 @@ pub fn type_traits_columns(query: Select<gts_type::Entity>) -> Select<gts_type::
         .column(gts_type::Column::EffectiveTraits)
 }
 
+/// An edge's own id and the two nodes it holds: what a delete needs to
+/// tombstone it and to check its endpoints are visible.
+#[derive(Debug, sea_orm::FromQueryResult)]
+pub struct EdgeEnds {
+    pub id: i64,
+    pub src_node_id: i64,
+    pub dst_node_id: i64,
+}
+
+pub fn edge_ends_columns(query: Select<edge::Entity>) -> Select<edge::Entity> {
+    query
+        .select_only()
+        .column(edge::Column::Id)
+        .column(edge::Column::SrcNodeId)
+        .column(edge::Column::DstNodeId)
+}
+
+/// Whether a node is tombstoned: what a conflict re-read asks, to say which
+/// of its causes the caller hit.
+#[derive(Debug, sea_orm::FromQueryResult)]
+pub struct NodeState {
+    pub deleted_at: Option<time::OffsetDateTime>,
+}
+
+pub fn node_state_columns(query: Select<node::Entity>) -> Select<node::Entity> {
+    query.select_only().column(node::Column::DeletedAt)
+}
+
+/// A registered type without its schema.
+///
+/// The schema is the one wide column on `gts_type`, and every read that is
+/// not about the schema itself -- matching type patterns, resolving a
+/// family, deciding which types a scope manages, validating an endpoint --
+/// wants the identifiers and the resolved traits and nothing else. Only the
+/// reads that answer with a schema, or walk one, read it.
+#[derive(Debug, sea_orm::FromQueryResult)]
+pub struct TypeMeta {
+    pub id: i32,
+    pub gts_type_uuid: uuid::Uuid,
+    pub gts_type_id: String,
+    pub kind: String,
+    pub effective_traits: serde_json::Value,
+}
+
+pub fn type_meta_columns(query: Select<gts_type::Entity>) -> Select<gts_type::Entity> {
+    query
+        .select_only()
+        .column(gts_type::Column::Id)
+        .column(gts_type::Column::GtsTypeUuid)
+        .column(gts_type::Column::GtsTypeId)
+        .column(gts_type::Column::Kind)
+        .column(gts_type::Column::EffectiveTraits)
+}
+
 /// Which two nodes an edge holds — all a reference check asks.
 #[derive(Debug, sea_orm::FromQueryResult)]
 pub struct EndpointPair {
@@ -116,8 +187,9 @@ mod tests {
     use sea_orm::{DatabaseBackend, EntityTrait, QueryTrait};
 
     use super::{
-        edge, edge_hop_columns, endpoint_pair_columns, gts_type, node, node_ident_columns,
-        type_id_columns, type_name_columns, type_traits_columns,
+        edge, edge_ends_columns, edge_hop_columns, endpoint_pair_columns, gts_type, node,
+        node_ident_columns, node_state_columns, node_typed_columns, type_id_columns,
+        type_meta_columns, type_name_columns, type_traits_columns,
     };
 
     /// The columns no projection here may read, by entity. Each of them is
@@ -189,5 +261,47 @@ mod tests {
     fn a_types_traits_are_read_without_its_schema() {
         let sql = rendered(&type_traits_columns(gts_type::Entity::find()));
         holds(&sql, &["schema"], &["id", "effective_traits"]);
+    }
+
+    #[test]
+    fn a_neighbour_reads_its_identity_and_type_and_no_more() {
+        holds(
+            &rendered(&node_typed_columns(node::Entity::find())),
+            &WIDE_NODE,
+            &["id", "node_key", "gts_node_type_id"],
+        );
+    }
+
+    #[test]
+    fn an_edges_ends_read_three_columns() {
+        holds(
+            &rendered(&edge_ends_columns(edge::Entity::find())),
+            &WIDE_EDGE,
+            &["id", "src_node_id", "dst_node_id"],
+        );
+    }
+
+    #[test]
+    fn a_nodes_state_reads_one_column() {
+        holds(
+            &rendered(&node_state_columns(node::Entity::find())),
+            &WIDE_NODE,
+            &["deleted_at"],
+        );
+    }
+
+    #[test]
+    fn a_types_meta_reads_everything_but_its_schema() {
+        holds(
+            &rendered(&type_meta_columns(gts_type::Entity::find())),
+            &["type_schema"],
+            &[
+                "id",
+                "gts_type_uuid",
+                "gts_type_id",
+                "kind",
+                "effective_traits",
+            ],
+        );
     }
 }

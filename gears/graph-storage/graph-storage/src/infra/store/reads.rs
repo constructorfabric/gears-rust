@@ -20,7 +20,8 @@ use toolkit_odata::{Page as OdataPage, SortDir};
 use uuid::Uuid;
 
 use crate::infra::projections::{
-    NodeIdent, TypeName, TypeTraits, node_ident_columns, type_name_columns, type_traits_columns,
+    EdgeHop, NodeIdent, NodeTyped, TypeName, TypeTraits, edge_hop_columns, node_ident_columns,
+    node_typed_columns, type_name_columns, type_traits_columns,
 };
 use crate::infra::storage::entity::{edge, graph_meta, gts_type, node};
 use crate::infra::storage::odata_mapper::NodeODataMapper;
@@ -334,24 +335,28 @@ pub async fn get_node(
     // Bidirectional adjacency, one extra row so truncation is observed rather
     // than inferred from a full page.
     let probe = u64::from(adjacency_limit) + 1;
-    let outgoing = edge::Entity::find()
+    let outgoing: Vec<EdgeHop> = edge::Entity::find()
         .secure()
         .scope_with(ctx.scope)
         .filter(Condition::all().add(edge::Column::SrcNodeId.eq(model.id)))
         .filter(Condition::all().add(edge::Column::DeletedAt.is_null()))
         .order_by(edge::Column::Id, sea_orm::Order::Asc)
         .limit(probe)
-        .all(&conn)
+        .project_all(&conn, |query| {
+            edge_hop_columns(query).into_model::<EdgeHop>()
+        })
         .await
         .map_err(map_scope_err)?;
-    let incoming = edge::Entity::find()
+    let incoming: Vec<EdgeHop> = edge::Entity::find()
         .secure()
         .scope_with(ctx.scope)
         .filter(Condition::all().add(edge::Column::DstNodeId.eq(model.id)))
         .filter(Condition::all().add(edge::Column::DeletedAt.is_null()))
         .order_by(edge::Column::Id, sea_orm::Order::Asc)
         .limit(probe)
-        .all(&conn)
+        .project_all(&conn, |query| {
+            edge_hop_columns(query).into_model::<EdgeHop>()
+        })
         .await
         .map_err(map_scope_err)?;
 
@@ -371,10 +376,12 @@ pub async fn get_node(
         .scope_with(ctx.scope)
         .filter(Condition::all().add(node::Column::Id.is_in(neighbour_ids)))
         .filter(Condition::all().add(node::Column::DeletedAt.is_null()))
-        .all(&conn)
+        .project_all(&conn, |query| {
+            node_typed_columns(query).into_model::<NodeTyped>()
+        })
         .await
         .map_err(map_scope_err)?;
-    let by_id: BTreeMap<i64, node::Model> = neighbours.into_iter().map(|n| (n.id, n)).collect();
+    let by_id: BTreeMap<i64, NodeTyped> = neighbours.into_iter().map(|n| (n.id, n)).collect();
 
     let mut type_ids: Vec<i32> = outgoing
         .iter()
@@ -484,10 +491,12 @@ pub async fn get_edge(
             Condition::all().add(node::Column::Id.is_in([model.src_node_id, model.dst_node_id])),
         )
         .filter(Condition::all().add(node::Column::DeletedAt.is_null()))
-        .all(&conn)
+        .project_all(&conn, |query| {
+            node_ident_columns(query).into_model::<NodeIdent>()
+        })
         .await
         .map_err(map_scope_err)?;
-    let by_id: BTreeMap<i64, node::Model> = endpoints.into_iter().map(|n| (n.id, n)).collect();
+    let by_id: BTreeMap<i64, NodeIdent> = endpoints.into_iter().map(|n| (n.id, n)).collect();
     let (Some(src), Some(dst)) = (by_id.get(&model.src_node_id), by_id.get(&model.dst_node_id))
     else {
         return Err(GraphStoreError::NotFound);

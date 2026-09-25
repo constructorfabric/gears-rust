@@ -26,6 +26,11 @@ use crate::domain::embedding::{PlannedVector, StoredVector, VectorOutcome, decid
 use crate::domain::identity;
 use crate::domain::ownership;
 use crate::domain::tally::IngestTally;
+use crate::infra::projections::{
+    EdgeEnds, EdgeHop, NodeIdent, NodeState, NodeTyped, TypeMeta, edge_ends_columns,
+    edge_hop_columns, node_ident_columns, node_state_columns, node_typed_columns,
+    type_meta_columns,
+};
 use crate::infra::storage::entity::{edge, graph_meta, ingest_idempotency, node, scope_registry};
 use crate::infra::store::types::interned_ids;
 use crate::infra::store::{PgGraphStore, TxStoreError, map_db_error, map_scope_err};
@@ -616,9 +621,14 @@ async fn lookup_endpoint(
         .secure()
         .scope_with(scope)
         .filter(Condition::all().add(node::Column::NodeKey.eq(key.to_owned())))
-        .one(tx)
+        .limit(1)
+        .project_all(tx, |query| {
+            node_typed_columns(query).into_model::<NodeTyped>()
+        })
         .await
         .map_err(map_scope_err)?
+        .into_iter()
+        .next()
         .map(|m| Endpoint {
             id: m.id,
             type_id: m.gts_node_type_id,
@@ -642,7 +652,9 @@ async fn endpoint_types(
             Condition::all()
                 .add(crate::infra::storage::entity::gts_type::Column::Id.is_in(ids.to_vec())),
         )
-        .all(tx)
+        .project_all(tx, |query| {
+            type_meta_columns(query).into_model::<TypeMeta>()
+        })
         .await
         .map_err(map_scope_err)?;
     Ok(rows
@@ -682,7 +694,7 @@ async fn revalidate_incident_edges(
                 .add(edge::Column::DstNodeId.eq(node_id)),
         )
         .filter(Condition::all().add(edge::Column::DeletedAt.is_null()))
-        .all(tx)
+        .project_all(tx, |query| edge_hop_columns(query).into_model::<EdgeHop>())
         .await
         .map_err(map_scope_err)?;
     if incident.is_empty() {
@@ -699,7 +711,9 @@ async fn revalidate_incident_edges(
             Condition::all()
                 .add(crate::infra::storage::entity::gts_type::Column::Id.is_in(edge_type_ids)),
         )
-        .all(tx)
+        .project_all(tx, |query| {
+            type_meta_columns(query).into_model::<TypeMeta>()
+        })
         .await
         .map_err(map_scope_err)?;
     let by_id: BTreeMap<i32, (String, EffectiveTraits)> = edge_types
@@ -1058,9 +1072,14 @@ async fn upsert_node(
             .filter(Condition::all().add(node::Column::Id.eq(id)))
             .secure()
             .scope_with(scope)
-            .one(tx)
+            .limit(1)
+            .project_all(tx, |query| {
+                node_state_columns(query).into_model::<NodeState>()
+            })
             .await
-            .map_err(map_scope_err)?;
+            .map_err(map_scope_err)?
+            .into_iter()
+            .next();
         return Err(GraphStoreError::Conflict {
             reason: match settled {
                 Some(row) if row.deleted_at.is_some() => format!(
@@ -1103,9 +1122,14 @@ async fn is_phantom_type(
         .filter(
             Condition::all().add(crate::infra::storage::entity::gts_type::Column::Id.eq(type_id)),
         )
-        .one(tx)
+        .limit(1)
+        .project_all(tx, |query| {
+            type_meta_columns(query).into_model::<TypeMeta>()
+        })
         .await
-        .map_err(map_scope_err)?;
+        .map_err(map_scope_err)?
+        .into_iter()
+        .next();
     Ok(model
         .and_then(|m| {
             m.effective_traits
@@ -1191,9 +1215,14 @@ async fn insert_phantom(
                 .scope_with(scope)
                 .filter(Condition::all().add(node::Column::NodeKey.eq(key.to_owned())))
                 .filter(Condition::all().add(node::Column::DeletedAt.is_null()))
-                .one(tx)
+                .limit(1)
+                .project_all(tx, |query| {
+                    node_ident_columns(query).into_model::<NodeIdent>()
+                })
                 .await
-                .map_err(map_scope_err)?;
+                .map_err(map_scope_err)?
+                .into_iter()
+                .next();
             // Unless what they wrote is already gone. A tombstoned key is not
             // reusable before purge, and materializing an endpoint onto one
             // would resurrect it by the back door.
@@ -1428,9 +1457,14 @@ pub async fn soft_delete(
                             .scope_with(&scope)
                             .filter(Condition::all().add(node::Column::NodeKey.eq(key.clone())))
                             .filter(Condition::all().add(node::Column::DeletedAt.is_null()))
-                            .one(tx)
+                            .limit(1)
+                            .project_all(tx, |query| {
+                                node_ident_columns(query).into_model::<NodeIdent>()
+                            })
                             .await
-                            .map_err(map_scope_err)?;
+                            .map_err(map_scope_err)?
+                            .into_iter()
+                            .next();
                         let Some(model) = live else {
                             return already_tombstoned_node(&scope, tx, &key, epoch).await;
                         };
@@ -1492,7 +1526,9 @@ pub async fn soft_delete(
                                     .add(edge::Column::DstNodeId.eq(model.id)),
                             )
                             .filter(Condition::all().add(edge::Column::DeletedAt.is_null()))
-                            .all(tx)
+                            .project_all(tx, |query| {
+                                edge_ends_columns(query).into_model::<EdgeEnds>()
+                            })
                             .await
                             .map_err(map_scope_err)?;
 
@@ -1534,9 +1570,14 @@ pub async fn soft_delete(
                             .scope_with(&scope)
                             .filter(Condition::all().add(edge::Column::EdgeKey.eq(key.clone())))
                             .filter(Condition::all().add(edge::Column::DeletedAt.is_null()))
-                            .one(tx)
+                            .limit(1)
+                            .project_all(tx, |query| {
+                                edge_ends_columns(query).into_model::<EdgeEnds>()
+                            })
                             .await
-                            .map_err(map_scope_err)?;
+                            .map_err(map_scope_err)?
+                            .into_iter()
+                            .next();
                         let Some(model) = live else {
                             return already_tombstoned_edge(&scope, tx, &key, epoch).await;
                         };
@@ -1551,7 +1592,9 @@ pub async fn soft_delete(
                             .scope_with(&scope)
                             .filter(Condition::all().add(node::Column::Id.is_in(endpoints.clone())))
                             .filter(Condition::all().add(node::Column::DeletedAt.is_null()))
-                            .all(tx)
+                            .project_all(tx, |query| {
+                                node_ident_columns(query).into_model::<NodeIdent>()
+                            })
                             .await
                             .map_err(map_scope_err)?;
                         if visible.len() != endpoints.len() {
@@ -1619,9 +1662,14 @@ async fn already_tombstoned_node(
         .secure()
         .scope_with(scope)
         .filter(Condition::all().add(node::Column::NodeKey.eq(key.to_owned())))
-        .one(tx)
+        .limit(1)
+        .project_all(tx, |query| {
+            node_ident_columns(query).into_model::<NodeIdent>()
+        })
         .await
-        .map_err(map_scope_err)?;
+        .map_err(map_scope_err)?
+        .into_iter()
+        .next();
     settle_no_op(scope, tx, tombstoned.is_some(), epoch).await
 }
 
@@ -1635,9 +1683,14 @@ async fn already_tombstoned_edge(
         .secure()
         .scope_with(scope)
         .filter(Condition::all().add(edge::Column::EdgeKey.eq(key.to_owned())))
-        .one(tx)
+        .limit(1)
+        .project_all(tx, |query| {
+            edge_ends_columns(query).into_model::<EdgeEnds>()
+        })
         .await
-        .map_err(map_scope_err)?;
+        .map_err(map_scope_err)?
+        .into_iter()
+        .next();
     settle_no_op(scope, tx, tombstoned.is_some(), epoch).await
 }
 

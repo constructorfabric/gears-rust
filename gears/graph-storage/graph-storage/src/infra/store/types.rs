@@ -22,6 +22,7 @@ use sea_orm::{ActiveValue, ColumnTrait, Condition, EntityTrait, ExprTrait, Query
 use toolkit_db::secure::{SecureEntityExt, SecureInsertExt, SecureUpdateExt};
 
 use crate::domain::{evolution, ontology};
+use crate::infra::projections::{TypeMeta, TypeName, type_meta_columns, type_name_columns};
 use crate::infra::storage::entity::gts_type;
 use crate::infra::store::{PgGraphStore, TxStoreError, map_db_error, map_scope_err};
 
@@ -1096,7 +1097,9 @@ pub async fn resolve_type_set(
     let models = gts_type::Entity::find()
         .secure()
         .scope_with(ctx.scope)
-        .all(&conn)
+        .project_all(&conn, |query| {
+            type_name_columns(query).into_model::<TypeName>()
+        })
         .await
         .map_err(map_scope_err)?;
 
@@ -1126,7 +1129,9 @@ pub async fn interned_ids(
         .secure()
         .scope_with(scope)
         .filter(Condition::all().add(gts_type::Column::GtsTypeId.is_in(type_ids.to_vec())))
-        .all(runner)
+        .project_all(runner, |query| {
+            type_meta_columns(query).into_model::<TypeMeta>()
+        })
         .await
         .map_err(map_scope_err)?;
     Ok(models

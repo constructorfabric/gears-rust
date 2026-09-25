@@ -32,7 +32,7 @@ use std::collections::BTreeSet;
 use toolkit_db::secure::{DBRunner, SecureDeleteExt, SecureEntityExt};
 
 use crate::infra::projections::{
-    EndpointPair, NodeIdent, endpoint_pair_columns, node_ident_columns,
+    EndpointPair, NodeIdent, TypeMeta, endpoint_pair_columns, node_ident_columns, type_meta_columns,
 };
 use crate::infra::storage::entity::{edge, gts_type, node};
 use crate::infra::store::map_scope_err;
@@ -65,7 +65,9 @@ async fn scoped_types(
     let rows = gts_type::Entity::find()
         .secure()
         .scope_with(scope)
-        .all(tx)
+        .project_all(tx, |query| {
+            type_meta_columns(query).into_model::<TypeMeta>()
+        })
         .await
         .map_err(map_scope_err)?;
 
