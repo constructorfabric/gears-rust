@@ -157,12 +157,14 @@ pub struct StepUpConfig {
     pub audience: Option<String>,
 
     /// Authentication context class references that satisfy the requirement,
-    /// compared exactly; a blank or whitespace-padded entry is refused at
-    /// init, since no claim could equal it.
+    /// compared exactly. Each entry is one token of 1 to 255 visible ASCII
+    /// characters — no space, no control character — listed once, at most 32
+    /// of them; anything else is refused at init, since no claim could equal
+    /// it or the challenge could not carry it.
     pub acr_values: Vec<String>,
 
-    /// Authentication methods that satisfy the requirement, compared exactly;
-    /// a blank or padded entry is refused at init.
+    /// Authentication methods that satisfy the requirement, compared exactly,
+    /// under the same rule as `acr_values`.
     pub amr_values: Vec<String>,
 }
 

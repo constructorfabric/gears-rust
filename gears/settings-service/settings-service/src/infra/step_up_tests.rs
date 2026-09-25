@@ -377,6 +377,54 @@ fn a_padded_issuer_or_audience_is_refused_at_construction() {
     }
 }
 
+#[test]
+fn an_assurance_entry_is_one_visible_token_listed_once_and_bounded() {
+    // An entry reaches the `acr_values` challenge parameter, a space-separated
+    // list: a space would split it in two, a control character makes the
+    // header unbuildable so it is dropped, a repeat says nothing new, and an
+    // entry or a list without bound is a typo nobody would write on purpose.
+    // All are refused at boot rather than degrading a challenge at request time.
+    let token = |v: &str| vec![v.to_owned()];
+    let refused = [
+        ("control character", token("urn:mfa\n")),
+        ("inner space", token("urn:mace silver")),
+        ("tab", token("mfa\tpwd")),
+        ("not ASCII", token("\u{43c}\u{444}\u{430}")),
+        ("too long", token(&"a".repeat(256))),
+        (
+            "duplicate",
+            vec!["mfa".to_owned(), "otp".to_owned(), "mfa".to_owned()],
+        ),
+        ("too many", (0..33).map(|i| format!("m{i}")).collect()),
+    ];
+    for (why, values) in refused {
+        for acr in [true, false] {
+            let config = if acr {
+                StepUpConfig {
+                    acr_values: values.clone(),
+                    ..StepUpConfig::default()
+                }
+            } else {
+                StepUpConfig {
+                    amr_values: values.clone(),
+                    ..StepUpConfig::default()
+                }
+            };
+            let err = AuthnStepUpVerifier::from_config(Arc::new(ClientHub::new()), &config)
+                .err()
+                .unwrap_or_else(|| panic!("{why} is refused"));
+            assert!(err.to_string().contains("step_up."), "{why}: `{err}`");
+        }
+    }
+    // At the bounds, accepted.
+    let config = StepUpConfig {
+        acr_values: vec!["a".repeat(255)],
+        amr_values: (0..32).map(|i| format!("m{i}")).collect(),
+        ..StepUpConfig::default()
+    };
+    AuthnStepUpVerifier::from_config(Arc::new(ClientHub::new()), &config).expect("bound");
+}
+
 /// A resolver that cannot answer, failing every call the way the test says.
 struct DownResolver(fn() -> AuthNResolverError);
 

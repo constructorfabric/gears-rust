@@ -91,15 +91,7 @@ impl AuthnStepUpVerifier {
             ("step_up.acr_values", &config.acr_values),
             ("step_up.amr_values", &config.amr_values),
         ] {
-            if let Some(entry) = values
-                .iter()
-                .find(|v| v.trim().is_empty() || v.trim() != *v)
-            {
-                anyhow::bail!(
-                    "{field} holds the entry `{entry}`, which no claim can equal: entries are \
-                     compared exactly, so each must be non-blank and carry no surrounding whitespace"
-                );
-            }
+            check_assurance_entries(field, values)?;
         }
         Ok(Self::new(
             hub,
@@ -261,6 +253,45 @@ impl StepUpVerifier for AuthnStepUpVerifier {
     fn requirement(&self) -> &StepUpRequirement {
         &self.requirement
     }
+}
+
+/// The most entries one assurance list may hold, and the longest entry.
+const MAX_ASSURANCE_ENTRIES: usize = 32;
+const MAX_ASSURANCE_ENTRY_LEN: usize = 255;
+
+/// Refuse at boot an assurance list the challenge could not carry faithfully.
+///
+/// Each entry is compared exactly against a claim and written into the
+/// space-separated `acr_values` parameter of the challenge, so it must be one
+/// visible ASCII token: a space would split it in two, a control character
+/// makes the header unbuildable so it is dropped, and anything outside ASCII
+/// is no claim value an issuer sends. A repeated entry says nothing new, and
+/// an entry or a list past its bound is a typo nobody writes on purpose.
+fn check_assurance_entries(field: &str, values: &[String]) -> anyhow::Result<()> {
+    if values.len() > MAX_ASSURANCE_ENTRIES {
+        anyhow::bail!(
+            "{field} holds {} entries; at most {MAX_ASSURANCE_ENTRIES} are accepted",
+            values.len()
+        );
+    }
+    let mut seen = std::collections::HashSet::new();
+    for entry in values {
+        if entry.is_empty()
+            || entry.len() > MAX_ASSURANCE_ENTRY_LEN
+            || !entry.bytes().all(|b| b.is_ascii_graphic())
+        {
+            anyhow::bail!(
+                "{field} holds the entry `{}`, which no claim can equal and the challenge cannot \
+                 carry: each entry is one token of 1 to {MAX_ASSURANCE_ENTRY_LEN} visible ASCII \
+                 characters, with no space or control character",
+                entry.escape_debug()
+            );
+        }
+        if !seen.insert(entry.as_str()) {
+            anyhow::bail!("{field} lists the entry `{entry}` twice");
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
