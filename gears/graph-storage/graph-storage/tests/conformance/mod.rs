@@ -4118,6 +4118,11 @@ pub async fn two_deletes_of_one_node_tombstone_it_once(
     store: std::sync::Arc<dyn GraphStoreV1>,
     tenant: Uuid,
 ) {
+    // Three incident edges, so the edge half of the answer is checked too: a
+    // node's delete takes its edges with it, and the loser of the race must
+    // neither tombstone them a second time nor report edges it did not write.
+    const INCIDENT: usize = 3;
+
     let scope = AccessScope::for_tenant(tenant);
     let reader = ctx(tenant, &scope, None);
     store
@@ -4127,13 +4132,18 @@ pub async fn two_deletes_of_one_node_tombstone_it_once(
 
     for round in 0..16 {
         let key = format!("deleted-twice-{round}");
+        let neighbours: Vec<String> = (0..INCIDENT)
+            .map(|index| format!("neighbour-{round}-{index}"))
+            .collect();
+        let mut nodes = vec![node(&key, "here")];
+        nodes.extend(neighbours.iter().map(|n| node(n, n)));
         ingest_batch(
             store.as_ref(),
             &reader,
-            batch(vec![node(&key, "here")], Vec::new()),
+            batch(nodes, neighbours.iter().map(|n| edge(&key, n)).collect()),
         )
         .await
-        .expect("the node is created");
+        .expect("the node and its edges are created");
 
         let gate = std::sync::Arc::new(tokio::sync::Barrier::new(2));
         let deleter = |()| {
@@ -4165,6 +4175,22 @@ pub async fn two_deletes_of_one_node_tombstone_it_once(
             1,
             "round {round}: one row, so one tombstone between the two deletes"
         );
+        assert_eq!(
+            first.tombstoned_edges + second.tombstoned_edges,
+            INCIDENT as u64,
+            "round {round}: each incident edge is tombstoned once and reported once"
+        );
+        for neighbour in &neighbours {
+            let adjacency = store
+                .get_node(&reader, neighbour, 10)
+                .await
+                .unwrap_or_else(|error| panic!("round {round}: {neighbour} reads: {error}"))
+                .adjacency;
+            assert!(
+                adjacency.is_empty(),
+                "round {round}: the edge to {neighbour} went with the node"
+            );
+        }
         assert!(
             matches!(
                 store.get_node(&reader, &key, 0).await,

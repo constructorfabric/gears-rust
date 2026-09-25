@@ -1435,6 +1435,51 @@ pub async fn soft_delete(
                             return already_tombstoned_node(&scope, tx, &key, epoch).await;
                         };
 
+                        let removed = node::Entity::update_many()
+                            .col_expr(node::Column::DeletedAt, Expr::value(Some(now)))
+                            .col_expr(
+                                node::Column::DeletedBySubjectId,
+                                Expr::value(Some(subject.subject_id)),
+                            )
+                            .col_expr(
+                                node::Column::DeletedBySubjectType,
+                                Expr::value(subject.subject_type.clone()),
+                            )
+                            .filter(
+                                Condition::all()
+                                    .add(node::Column::Id.eq(model.id))
+                                    .add(node::Column::DeletedAt.is_null()),
+                            )
+                            .secure()
+                            .scope_with(&scope)
+                            .exec(tx)
+                            .await
+                            .map_err(map_scope_err)?
+                            .rows_affected;
+                        // The node first, and its edges only if it was ours to
+                        // delete. The edges used to go first, so a delete that
+                        // then lost the node's compare-and-set had already
+                        // tombstoned them: the transaction committed those
+                        // writes on the no-op path below, and the answer said
+                        // `tombstoned_edges: 0` about edges it had just
+                        // deleted. Losing the node now means writing nothing
+                        // at all, which is what a no-op is.
+                        //
+                        // The row was live when it was read and is not now:
+                        // another delete landed in between, or a scope
+                        // replacement purged it. Either way the caller's
+                        // intent already holds, and rule 3 of the Soft Delete
+                        // Contract says so -- deleting an already-deleted row
+                        // is a no-op, not a failure, because a producer
+                        // retrying a delete whose response was lost cannot
+                        // tell the two apart from outside. The no-op settle
+                        // is the same answer the pre-read takes, and it
+                        // leaves the revision where it was rather than
+                        // bumping it for a write that did not happen.
+                        if removed == 0 {
+                            return already_tombstoned_node(&scope, tx, &key, epoch).await;
+                        }
+
                         // Incident edges are tombstoned in the same
                         // transaction: a node never outlives its edges'
                         // visibility, and never the reverse.
@@ -1481,41 +1526,6 @@ pub async fn soft_delete(
                                 .rows_affected;
                         }
 
-                        let removed = node::Entity::update_many()
-                            .col_expr(node::Column::DeletedAt, Expr::value(Some(now)))
-                            .col_expr(
-                                node::Column::DeletedBySubjectId,
-                                Expr::value(Some(subject.subject_id)),
-                            )
-                            .col_expr(
-                                node::Column::DeletedBySubjectType,
-                                Expr::value(subject.subject_type.clone()),
-                            )
-                            .filter(
-                                Condition::all()
-                                    .add(node::Column::Id.eq(model.id))
-                                    .add(node::Column::DeletedAt.is_null()),
-                            )
-                            .secure()
-                            .scope_with(&scope)
-                            .exec(tx)
-                            .await
-                            .map_err(map_scope_err)?
-                            .rows_affected;
-                        // The row was live when it was read and is not now:
-                        // another delete landed in between, or a scope
-                        // replacement purged it. Either way the caller's
-                        // intent already holds, and rule 3 of the Soft Delete
-                        // Contract says so -- deleting an already-deleted row
-                        // is a no-op, not a failure, because a producer
-                        // retrying a delete whose response was lost cannot
-                        // tell the two apart from outside. The no-op settle
-                        // is the same answer the pre-read takes, and it
-                        // leaves the revision where it was rather than
-                        // bumping it for a write that did not happen.
-                        if removed == 0 {
-                            return already_tombstoned_node(&scope, tx, &key, epoch).await;
-                        }
                         (removed, edges)
                     }
                     DeleteRequest::Edge(key) => {
