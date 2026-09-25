@@ -1377,3 +1377,34 @@ async fn evolution_needs_step_up_and_may_not_cross_the_secret_boundary() {
     assert_eq!(h.load(v1.id).await.status, "active", "nothing moved");
     assert!(h.by_key(&v1.key.replace(".v1~", ".v2~")).await.is_none());
 }
+
+#[tokio::test]
+async fn a_revive_that_cannot_happen_says_why_before_the_default_is_judged() {
+    // A retype of a retired setting is refused whatever its default: asking
+    // the administrator to fix a default for a revive that cannot happen would
+    // be the wrong refusal first.
+    let h = Harness::verified().await;
+    let created = h
+        .create(h.request("retry_policy"), &admin_actor())
+        .await
+        .expect("created");
+    let tag = etag_of(&created.declaration);
+    h.retire(created.declaration.id, Some(tag.as_str()), &admin_actor())
+        .await
+        .expect("retired");
+
+    let mut retyped = h.request("retry_policy");
+    retyped.value_type_id = TEXT.to_owned();
+    retyped.default_value = json!(42);
+    let err = h
+        .create(retyped, &admin_actor())
+        .await
+        .expect_err("refused");
+    match err {
+        DomainError::Conflict { detail } => assert!(
+            detail.starts_with(super::conflict::VALUE_TYPE_CHANGED),
+            "{detail}"
+        ),
+        other => panic!("the revive's own refusal first, got {other:?}"),
+    }
+}

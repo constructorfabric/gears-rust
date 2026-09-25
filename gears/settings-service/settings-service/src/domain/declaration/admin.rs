@@ -107,6 +107,57 @@ fn validation(field: &str, code: &'static str, message: impl Into<String>) -> Do
     }
 }
 
+/// What a revive may not change, refused before anything is written: the
+/// secret boundary and the scope class, which would move stored values rather
+/// than re-interpret them, and the value type, which the setting's own GTS
+/// type is registered with.
+fn revive_refusal(
+    retired: &Declaration,
+    request: &CreateDeclaration,
+    derived: &DerivedClassification,
+) -> Result<(), DomainError> {
+    // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-13
+    // What a revive may not change: the secret boundary (a secret's values
+    // live by reference, everything else inline) and the scope class, which
+    // would move values rather than re-interpret them; and the value type,
+    // which the setting's own GTS type is registered with — the registry
+    // does not replace a registered type, so a retyped row would disagree
+    // with it for good. The secret boundary is checked first: crossing it is
+    // always a retype too, and the more specific refusal says why.
+    if retired.has_secret_trait != derived.has_secret_trait {
+        return Err(conflict(
+            conflict::SECRETNESS_CHANGED,
+            format!(
+                "`{}` is declared with `{}`; `{}` is on the other side of the secret \
+                 boundary, and a revive does not move stored values across it",
+                retired.key, retired.value_type_id, request.value_type_id
+            ),
+        ));
+    }
+    if retired.scope_class != request.scope_class {
+        return Err(conflict(
+            conflict::SCOPE_CLASS_CHANGED,
+            format!(
+                "`{}` is a `{}` setting; the scope class decides where a value may exist \
+                 and is not revived into something else",
+                retired.key, retired.scope_class
+            ),
+        ));
+    }
+    if retired.value_type_id != request.value_type_id {
+        return Err(conflict(
+            conflict::VALUE_TYPE_CHANGED,
+            format!(
+                "`{}` is declared with `{}` and its setting type is registered with it; \
+                 a revive keeps that value type and cannot adopt `{}`",
+                retired.key, retired.value_type_id, request.value_type_id
+            ),
+        ));
+    }
+    // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-13
+    Ok(())
+}
+
 /// Whether a re-declaration changes what only a new major may carry: the value
 /// type, the Schema Default or the scope class. Anything else is metadata.
 fn changes_behaviour(active: &Declaration, request: &CreateDeclaration) -> bool {
@@ -427,6 +478,20 @@ where
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-10
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-9
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-8
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-evolve:p1:inst-decl-evolve-1
+        // The active declaration on the version-stripped path comes first,
+        // whatever its major: after `v1 → v2` the composed `v1` key is retired,
+        // and looking it up alone would revive it beside the live `v2`.
+        let on_path = self.declarations_on_path(conn, scope, &key).await?;
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-evolve:p1:inst-decl-evolve-1
+        // A revive's own refusals are about the retired row, not the default:
+        // judged first, so a retype is refused as one rather than as a default
+        // that does not fit the type it could never adopt.
+        if !on_path.iter().any(|d| d.status == "active")
+            && let Some(retired) = existing.as_ref().filter(|d| d.status == "retired")
+        {
+            revive_refusal(retired, &request, &derived)?;
+        }
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-11
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-12
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-13
@@ -485,12 +550,6 @@ where
         };
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-15
 
-        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-evolve:p1:inst-decl-evolve-1
-        // The active declaration on the version-stripped path comes first,
-        // whatever its major: after `v1 → v2` the composed `v1` key is retired,
-        // and looking it up alone would revive it beside the live `v2`.
-        let on_path = self.declarations_on_path(conn, scope, &key).await?;
-        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-evolve:p1:inst-decl-evolve-1
         if let Some(active) = on_path.iter().find(|d| d.status == "active") {
             // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-evolve:p1:inst-decl-evolve-2
             // A request matching the active declaration is not evolution: a
@@ -649,45 +708,8 @@ where
         self.verify_step_up(actor).await?;
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-8
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-7
-        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-13
-        // What a revive may not change: the secret boundary (a secret's values
-        // live by reference, everything else inline) and the scope class, which
-        // would move values rather than re-interpret them; and the value type,
-        // which the setting's own GTS type is registered with — the registry
-        // does not replace a registered type, so a retyped row would disagree
-        // with it for good. The secret boundary is checked first: crossing it is always a retype too, and the more
-        // specific refusal says why.
-        if retired.has_secret_trait != derived.has_secret_trait {
-            return Err(conflict(
-                conflict::SECRETNESS_CHANGED,
-                format!(
-                    "`{}` is declared with `{}`; `{}` is on the other side of the secret \
-                     boundary, and a revive does not move stored values across it",
-                    retired.key, retired.value_type_id, request.value_type_id
-                ),
-            ));
-        }
-        if retired.scope_class != request.scope_class {
-            return Err(conflict(
-                conflict::SCOPE_CLASS_CHANGED,
-                format!(
-                    "`{}` is a `{}` setting; the scope class decides where a value may exist \
-                     and is not revived into something else",
-                    retired.key, retired.scope_class
-                ),
-            ));
-        }
-        if retired.value_type_id != request.value_type_id {
-            return Err(conflict(
-                conflict::VALUE_TYPE_CHANGED,
-                format!(
-                    "`{}` is declared with `{}` and its setting type is registered with it; \
-                     a revive keeps that value type and cannot adopt `{}`",
-                    retired.key, retired.value_type_id, request.value_type_id
-                ),
-            ));
-        }
-        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-13
+        // Again here, whoever calls: `create` asks first, before the default.
+        revive_refusal(&retired, request, &derived)?;
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-14
         // The type the row goes live under is the registered one, confirmed
         // before anything is written — as a create registers before it inserts.
