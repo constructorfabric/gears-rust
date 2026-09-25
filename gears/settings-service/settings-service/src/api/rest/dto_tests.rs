@@ -5,6 +5,7 @@
 //! shapes are a contract consuming clients depend on.
 
 use super::{CategoryDto, CreateCategoryRequest, UpdateCategoryRequest};
+use crate::domain::category::Patch;
 use crate::domain::category::{Category, CategoryKey};
 use crate::domain::error::DomainError;
 use crate::domain::precondition::ETag;
@@ -98,11 +99,11 @@ fn a_request_validates_its_key_on_the_way_in() {
 fn update_req(key: Option<&str>) -> UpdateCategoryRequest {
     UpdateCategoryRequest {
         key: key.map(str::to_owned),
-        name: "Network".to_owned(),
-        description: None,
-        domain_affinity: None,
-        sort_order: 0,
-        icon: None,
+        name: Some("Network".to_owned()),
+        description: Patch::Keep,
+        domain_affinity: Patch::Keep,
+        sort_order: Some(0),
+        icon: Patch::Keep,
     }
 }
 
@@ -130,7 +131,7 @@ fn an_echoed_key_is_refused_just_the_same() {
 #[test]
 fn an_update_without_a_key_yields_a_patch() {
     let patch = update_req(None).into_patch().expect("no key supplied");
-    assert_eq!(patch.name, "Network");
+    assert_eq!(patch.name.as_deref(), Some("Network"));
 }
 
 #[test]
@@ -166,7 +167,7 @@ fn create_enforces_the_descriptive_bounds() {
 #[test]
 fn update_enforces_the_descriptive_bounds_too() {
     let mut req = update_req(None);
-    req.description = Some("d".repeat(4097));
+    req.description = Patch::Set("d".repeat(4097));
     match req.into_patch() {
         Err(DomainError::Validation { field, .. }) => assert_eq!(field, "description"),
         other => panic!("expected a description violation, got {other:?}"),
@@ -178,11 +179,32 @@ fn the_key_refusal_precedes_the_bounds_check() {
     // A body that breaks both must report the immutable key: it is a contract
     // violation, while an over-long name is merely a value the caller can fix.
     let mut req = update_req(Some("network"));
-    req.name = "n".repeat(257);
+    req.name = Some("n".repeat(257));
     match req.into_patch() {
         Err(DomainError::Validation { code, .. }) => {
             assert_eq!(code, crate::field::CATEGORY_KEY_IMMUTABLE);
         }
         other => panic!("expected the key refusal, got {other:?}"),
     }
+}
+
+#[test]
+fn an_omitted_optional_is_left_alone_and_an_explicit_null_clears_it() {
+    // Two different things on the wire, told apart at deserialization: the
+    // repository sets only the columns the patch carries.
+    let omitted: UpdateCategoryRequest =
+        serde_json::from_str(r#"{"sort_order": 3}"#).expect("a body without the optionals");
+    assert_eq!(omitted.name, None);
+    assert_eq!(omitted.description, Patch::Keep, "omitted: left alone");
+    assert_eq!(omitted.icon, Patch::Keep);
+    assert_eq!(omitted.sort_order, Some(3));
+
+    let cleared: UpdateCategoryRequest =
+        serde_json::from_str(r#"{"description": null, "icon": "x"}"#).expect("explicit null");
+    assert_eq!(cleared.description, Patch::Clear, "null: cleared");
+    assert_eq!(cleared.icon, Patch::Set("x".to_owned()));
+    assert_eq!(cleared.sort_order, None);
+    let patch = cleared.into_patch().expect("no key");
+    assert_eq!(patch.description, Patch::Clear);
+    assert_eq!(patch.name, None);
 }

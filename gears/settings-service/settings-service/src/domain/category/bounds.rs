@@ -36,6 +36,20 @@ pub const DESCRIPTION_FIELD: &str = "description";
 /// `name` is checked first, so a request that breaks both is reported against
 /// the field a caller is likelier to have gotten wrong.
 pub fn validate(name: &str, description: Option<&str>) -> Result<(), DomainError> {
+    validate_name(name)?;
+    if let Some(description) = description {
+        validate_description(description)?;
+    }
+    Ok(())
+}
+
+/// Validate a name against its bound, on its own: what an update carrying
+/// only the name checks.
+///
+/// # Errors
+///
+/// [`DomainError::Validation`] on `name` when it falls outside its bound.
+pub fn validate_name(name: &str) -> Result<(), DomainError> {
     // Characters, not bytes — the same rule the key bound follows. A name in a
     // non-Latin script would otherwise be refused for a length its author never
     // sees, and Postgres counts `varchar` in characters too, so counting bytes
@@ -50,23 +64,27 @@ pub fn validate(name: &str, description: Option<&str>) -> Result<(), DomainError
             ),
         });
     }
+    Ok(())
+}
 
-    // An absent description and an empty one are both fine: the column is
-    // nullable and the bound is an upper one only.
-    if let Some(description) = description {
-        let length = description.chars().count();
-        if length > DESCRIPTION_MAX {
-            return Err(DomainError::Validation {
-                field: DESCRIPTION_FIELD.to_owned(),
-                code: field::CATEGORY_DESCRIPTION_LENGTH,
-                message: format!(
-                    "a category description is at most {DESCRIPTION_MAX} characters; \
-                     this one is {length}"
-                ),
-            });
-        }
+/// Validate a description against its bound, on its own. An empty one is
+/// fine: the column is nullable and the bound is an upper one only.
+///
+/// # Errors
+///
+/// [`DomainError::Validation`] on `description` when it exceeds its bound.
+pub fn validate_description(description: &str) -> Result<(), DomainError> {
+    let length = description.chars().count();
+    if length > DESCRIPTION_MAX {
+        return Err(DomainError::Validation {
+            field: DESCRIPTION_FIELD.to_owned(),
+            code: field::CATEGORY_DESCRIPTION_LENGTH,
+            message: format!(
+                "a category description is at most {DESCRIPTION_MAX} characters; \
+                 this one is {length}"
+            ),
+        });
     }
-
     Ok(())
 }
 

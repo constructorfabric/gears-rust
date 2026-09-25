@@ -19922,24 +19922,24 @@
       },
       "UpdateCategoryRequest": {
         "additionalProperties": false,
-        "description": "What a caller supplies to replace a category's mutable fields.\n\nA full replacement, so an omitted optional field clears it rather than\nleaving it untouched. A partial update would need a distinct shape that can\ntell \"absent\" from \"set to null\", and the design does not ask for one.\n\n`key` is accepted by the parser and then refused, rather than removed from\nthe shape. `deny_unknown_fields` would reject a supplied `key` as an\n*unknown* field, which is untrue -- the field exists, it is returned in\nevery response, and it simply may not be changed. A caller deserves to be\ntold that, not that we have never heard of it.",
+        "description": "What a caller supplies to update a category's mutable fields.\n\nA partial update: any of the updatable fields, the rest left as they are.\nFor an optional field, omitting it leaves it and an explicit `null` clears\nit — two different things on the wire, told apart here.\n\n`key` is accepted by the parser and then refused, rather than removed from\nthe shape. `deny_unknown_fields` would reject a supplied `key` as an\n*unknown* field, which is untrue -- the field exists, it is returned in\nevery response, and it simply may not be changed. A caller deserves to be\ntold that, not that we have never heard of it.",
         "properties": {
           "description": {
-            "description": "Optional long-form description.",
+            "description": "Optional long-form description; omitted, unchanged; `null` clears it.",
             "type": [
               "string",
               "null"
             ]
           },
           "domain_affinity": {
-            "description": "Optional domain affinity.",
+            "description": "Optional domain affinity; omitted, unchanged; `null` clears it.",
             "type": [
               "string",
               "null"
             ]
           },
           "icon": {
-            "description": "Optional icon reference.",
+            "description": "Optional icon reference; omitted, unchanged; `null` clears it.",
             "type": [
               "string",
               "null"
@@ -19953,18 +19953,21 @@
             ]
           },
           "name": {
-            "description": "Display name.",
-            "type": "string"
+            "description": "Display name; omitted, unchanged.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "sort_order": {
-            "description": "Ordering weight.",
+            "description": "Ordering weight; omitted, unchanged.",
             "format": "int32",
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           }
         },
-        "required": [
-          "name"
-        ],
         "type": "object"
       },
       "UpdateChatReq": {

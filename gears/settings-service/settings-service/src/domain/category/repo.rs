@@ -56,16 +56,47 @@ pub struct Category {
 /// from the update path is what keeps that from being one typo away.
 #[derive(Debug, Clone)]
 pub struct CategoryPatch {
-    /// Display name.
-    pub name: String,
+    /// Display name; `None` leaves it.
+    pub name: Option<String>,
     /// Optional long-form description.
-    pub description: Option<String>,
+    pub description: Patch<String>,
     /// Optional domain affinity.
-    pub domain_affinity: Option<String>,
-    /// Ordering weight.
-    pub sort_order: i32,
+    pub domain_affinity: Patch<String>,
+    /// Ordering weight; `None` leaves it.
+    pub sort_order: Option<i32>,
     /// Optional icon reference.
-    pub icon: Option<String>,
+    pub icon: Patch<String>,
+}
+
+/// What a partial update does to one nullable field: three cases, since an
+/// omitted field and an explicit `null` mean different things on the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Patch<T> {
+    /// Not on the wire: the field keeps its value.
+    #[default]
+    Keep,
+    /// An explicit `null`: the field is cleared.
+    Clear,
+    /// A value: the field takes it.
+    Set(T),
+}
+
+impl<T> Patch<T> {
+    /// The value, when one is set.
+    pub const fn as_set(&self) -> Option<&T> {
+        match self {
+            Self::Set(value) => Some(value),
+            Self::Keep | Self::Clear => None,
+        }
+    }
+}
+
+impl<'de, T: serde::Deserialize<'de>> serde::Deserialize<'de> for Patch<T> {
+    /// Called only for a field on the wire — an absent one takes the
+    /// `Default`, `Keep`, through `#[serde(default)]` — so `null` is `Clear`.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Option::<T>::deserialize(deserializer).map(|value| value.map_or(Self::Clear, Self::Set))
+    }
 }
 
 /// What a create supplies.

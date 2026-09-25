@@ -54,7 +54,7 @@ mod transactional {
     use crate::audit::AuditOperation;
     use crate::domain::category::service::Actor;
     use crate::domain::category::{
-        CategoryDraft, CategoryKey, CategoryPatch, CategoryRepository, CategoryService,
+        CategoryDraft, CategoryKey, CategoryPatch, CategoryRepository, CategoryService, Patch,
     };
     use crate::domain::error::DomainError;
     use crate::infra::storage::audit_store::AuditStore;
@@ -83,11 +83,11 @@ mod transactional {
             .expect("inserts");
         let stale = created.updated_at - time::Duration::seconds(1);
         let patch = || CategoryPatch {
-            name: "Networking".to_owned(),
-            description: None,
-            domain_affinity: None,
-            sort_order: 0,
-            icon: None,
+            name: Some("Networking".to_owned()),
+            description: Patch::Keep,
+            domain_affinity: Patch::Keep,
+            sort_order: Some(0),
+            icon: Patch::Keep,
         };
 
         // The comparison ran against a read; a row that moved since finds no

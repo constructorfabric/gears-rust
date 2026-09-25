@@ -13,7 +13,7 @@ use toolkit_odata::{ODataQuery, Page, SortDir};
 
 use crate::domain::category::visibility::DomainVisibility;
 use crate::domain::category::{
-    Category, CategoryDraft, CategoryKey, CategoryPatch, CategoryRepository,
+    Category, CategoryDraft, CategoryKey, CategoryPatch, CategoryRepository, Patch,
 };
 use crate::domain::error::DomainError;
 use crate::domain::precondition;
@@ -203,27 +203,38 @@ impl CategoryRepository for CategoryRepo {
         // @cpt-begin:cpt-cf-settings-service-flow-category-management-update:p1:inst-cat-update-13
         // Uniqueness on `name` is the index's call, surfaced by `map_write_error`
         // as a conflict. `key` is not re-checked here: the patch cannot carry one.
-        let outcome = CategoryEntity::update_many()
-            .col_expr(
+        // Only the columns the patch carries are set: a field it leaves alone
+        // keeps its value, and an explicit clear writes NULL.
+        fn write_of(patch: &Patch<String>) -> Option<sea_orm::sea_query::SimpleExpr> {
+            match patch {
+                Patch::Keep => None,
+                Patch::Clear => Some(sea_orm::sea_query::Expr::value(None::<String>)),
+                Patch::Set(value) => Some(sea_orm::sea_query::Expr::value(value.clone())),
+            }
+        }
+        let mut update = CategoryEntity::update_many();
+        if let Some(name) = patch.name.clone() {
+            update = update.col_expr(
                 category::Column::Name,
-                sea_orm::sea_query::Expr::value(patch.name.clone()),
-            )
-            .col_expr(
-                category::Column::Description,
-                sea_orm::sea_query::Expr::value(patch.description.clone()),
-            )
-            .col_expr(
-                category::Column::DomainAffinity,
-                sea_orm::sea_query::Expr::value(patch.domain_affinity.clone()),
-            )
-            .col_expr(
+                sea_orm::sea_query::Expr::value(name),
+            );
+        }
+        if let Some(description) = write_of(&patch.description) {
+            update = update.col_expr(category::Column::Description, description);
+        }
+        if let Some(domain_affinity) = write_of(&patch.domain_affinity) {
+            update = update.col_expr(category::Column::DomainAffinity, domain_affinity);
+        }
+        if let Some(sort_order) = patch.sort_order {
+            update = update.col_expr(
                 category::Column::SortOrder,
-                sea_orm::sea_query::Expr::value(patch.sort_order),
-            )
-            .col_expr(
-                category::Column::Icon,
-                sea_orm::sea_query::Expr::value(patch.icon.clone()),
-            )
+                sea_orm::sea_query::Expr::value(sort_order),
+            );
+        }
+        if let Some(icon) = write_of(&patch.icon) {
+            update = update.col_expr(category::Column::Icon, icon);
+        }
+        let outcome = update
             .col_expr(
                 category::Column::UpdatedAt,
                 sea_orm::sea_query::Expr::value(stamp_after(Some(expected))),

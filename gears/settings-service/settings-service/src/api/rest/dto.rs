@@ -10,7 +10,7 @@
 
 use uuid::Uuid;
 
-use crate::domain::category::{Category, CategoryDraft, CategoryKey, CategoryPatch, bounds};
+use crate::domain::category::{Category, CategoryDraft, CategoryKey, CategoryPatch, Patch, bounds};
 use crate::domain::error::DomainError;
 
 /// A category as returned to a caller.
@@ -83,11 +83,11 @@ pub struct CreateCategoryRequest {
     pub icon: Option<String>,
 }
 
-/// What a caller supplies to replace a category's mutable fields.
+/// What a caller supplies to update a category's mutable fields.
 ///
-/// A full replacement, so an omitted optional field clears it rather than
-/// leaving it untouched. A partial update would need a distinct shape that can
-/// tell "absent" from "set to null", and the design does not ask for one.
+/// A partial update: any of the updatable fields, the rest left as they are.
+/// For an optional field, omitting it leaves it and an explicit `null` clears
+/// it — two different things on the wire, told apart here.
 ///
 /// `key` is accepted by the parser and then refused, rather than removed from
 /// the shape. `deny_unknown_fields` would reject a supplied `key` as an
@@ -101,20 +101,24 @@ pub struct UpdateCategoryRequest {
     /// The stable slug. Accepted only to be refused: see the type docs.
     #[serde(default)]
     pub key: Option<String>,
-    /// Display name.
-    pub name: String,
-    /// Optional long-form description.
+    /// Display name; omitted, unchanged.
     #[serde(default)]
-    pub description: Option<String>,
-    /// Optional domain affinity.
+    pub name: Option<String>,
+    /// Optional long-form description; omitted, unchanged; `null` clears it.
     #[serde(default)]
-    pub domain_affinity: Option<String>,
-    /// Ordering weight.
+    #[schema(value_type = Option<String>)]
+    pub description: Patch<String>,
+    /// Optional domain affinity; omitted, unchanged; `null` clears it.
     #[serde(default)]
-    pub sort_order: i32,
-    /// Optional icon reference.
+    #[schema(value_type = Option<String>)]
+    pub domain_affinity: Patch<String>,
+    /// Ordering weight; omitted, unchanged.
     #[serde(default)]
-    pub icon: Option<String>,
+    pub sort_order: Option<i32>,
+    /// Optional icon reference; omitted, unchanged; `null` clears it.
+    #[serde(default)]
+    #[schema(value_type = Option<String>)]
+    pub icon: Patch<String>,
 }
 
 impl CreateCategoryRequest {
@@ -171,9 +175,14 @@ impl UpdateCategoryRequest {
         // @cpt-end:cpt-cf-settings-service-flow-category-management-update:p1:inst-cat-update-4
         // @cpt-begin:cpt-cf-settings-service-flow-category-management-update:p1:inst-cat-update-10
         // @cpt-begin:cpt-cf-settings-service-flow-category-management-update:p1:inst-cat-update-11
-        // The same bounds as create: an update is a full replacement, so
-        // every field it carries faces the rule its column enforces.
-        bounds::validate(&self.name, self.description.as_deref())?;
+        // The same bounds as create, on the fields the update carries: a field
+        // it leaves alone keeps a value that already passed them.
+        if let Some(name) = &self.name {
+            bounds::validate_name(name)?;
+        }
+        if let Some(description) = self.description.as_set() {
+            bounds::validate_description(description)?;
+        }
         // @cpt-end:cpt-cf-settings-service-flow-category-management-update:p1:inst-cat-update-11
         // @cpt-end:cpt-cf-settings-service-flow-category-management-update:p1:inst-cat-update-10
         Ok(CategoryPatch {

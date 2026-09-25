@@ -331,6 +331,70 @@ async fn an_update_needs_the_tag_and_takes_effect_with_it() {
 }
 
 #[tokio::test]
+async fn a_patch_touches_only_the_fields_it_carries_and_an_explicit_null_clears_one() {
+    // The documented contract: any of the updatable fields, the rest left as
+    // they are. Omitting a field is not the same as sending `null` — the first
+    // leaves it, the second clears it — and `name` need not be resent.
+    let h = RestHarness::new().await;
+    let answer = h
+        .send(
+            "POST",
+            CATEGORIES,
+            Some(json!({
+                "key": "billing", "name": "Invoices", "sort_order": 1,
+                "description": "Money in", "domain_affinity": "finance", "icon": "coins"
+            })),
+            None,
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(answer.status, 201, "{}", answer.body);
+    let id = answer.body["id"].as_str().expect("an id").to_owned();
+    let tag = answer.etag.expect("a state tag");
+    let uri = format!("{CATEGORIES}/{id}");
+
+    let answer = h
+        .send(
+            "PATCH",
+            &uri,
+            Some(json!({ "sort_order": 7 })),
+            Some(&tag),
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(answer.status, 200, "{}", answer.body);
+    assert_eq!(answer.body["sort_order"], json!(7));
+    assert_eq!(
+        answer.body["name"],
+        json!("Invoices"),
+        "not resent, not touched"
+    );
+    assert_eq!(answer.body["description"], json!("Money in"));
+    assert_eq!(answer.body["domain_affinity"], json!("finance"));
+    assert_eq!(answer.body["icon"], json!("coins"));
+    let tag = answer.etag.expect("a refreshed tag");
+
+    let answer = h
+        .send(
+            "PATCH",
+            &uri,
+            Some(json!({ "description": null, "name": "Billing" })),
+            Some(&tag),
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(answer.status, 200, "{}", answer.body);
+    assert_eq!(answer.body["name"], json!("Billing"));
+    assert!(
+        answer.body["description"].is_null(),
+        "an explicit null clears: {}",
+        answer.body
+    );
+    assert_eq!(answer.body["icon"], json!("coins"), "still untouched");
+    assert_eq!(answer.body["sort_order"], json!(7));
+}
+
+#[tokio::test]
 async fn an_update_carrying_a_key_is_refused_even_when_the_key_is_unchanged() {
     // The rule is that an update does not carry one. Accepting an echo would
     // make the wire contract depend on a value the caller cannot change.
