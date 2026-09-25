@@ -55584,6 +55584,16 @@
             },
             "description": "Not Found"
           },
+          "410": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Gone: the declaration is retired"
+          },
           "500": {
             "content": {
               "application/problem+json": {
@@ -56338,6 +56348,16 @@
             },
             "description": "Not Found"
           },
+          "410": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Gone: the declaration is retired"
+          },
           "500": {
             "content": {
               "application/problem+json": {
@@ -56462,6 +56482,16 @@
               }
             },
             "description": "Not Found"
+          },
+          "410": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Gone: the declaration is retired"
           },
           "412": {
             "content": {
@@ -56819,6 +56849,16 @@
             },
             "description": "Conflict"
           },
+          "410": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Gone: the declaration is retired"
+          },
           "412": {
             "content": {
               "application/problem+json": {
@@ -56963,6 +57003,16 @@
               }
             },
             "description": "Not Found"
+          },
+          "410": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Gone: the declaration is retired"
           },
           "412": {
             "content": {

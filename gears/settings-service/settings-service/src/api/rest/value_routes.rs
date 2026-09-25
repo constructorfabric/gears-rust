@@ -135,6 +135,11 @@ pub fn register_routes(
         .error_404(openapi)
         .problem_response(
             openapi,
+            http::StatusCode::GONE,
+            "Gone: the declaration is retired",
+        )
+        .problem_response(
+            openapi,
             http::StatusCode::PRECONDITION_FAILED,
             "Precondition Failed",
         )
@@ -171,6 +176,11 @@ pub fn register_routes(
         .error_401(openapi)
         .error_403(openapi)
         .error_404(openapi)
+        .problem_response(
+            openapi,
+            http::StatusCode::GONE,
+            "Gone: the declaration is retired",
+        )
         .problem_response(
             openapi,
             http::StatusCode::PRECONDITION_FAILED,
@@ -214,6 +224,11 @@ pub fn register_routes(
         .error_403(openapi)
         .error_404(openapi)
         .error_409(openapi)
+        .problem_response(
+            openapi,
+            http::StatusCode::GONE,
+            "Gone: the declaration is retired",
+        )
         .problem_response(
             openapi,
             http::StatusCode::PRECONDITION_FAILED,
@@ -333,6 +348,11 @@ pub fn register_routes(
         .error_401(openapi)
         .error_403(openapi)
         .error_404(openapi)
+        .problem_response(
+            openapi,
+            http::StatusCode::GONE,
+            "Gone: the declaration is retired",
+        )
         .error_500(openapi)
         .error_503(openapi)
         .register(router, openapi);
@@ -362,6 +382,11 @@ pub fn register_routes(
         .error_401(openapi)
         .error_403(openapi)
         .error_404(openapi)
+        .problem_response(
+            openapi,
+            http::StatusCode::GONE,
+            "Gone: the declaration is retired",
+        )
         .error_500(openapi)
         .error_503(openapi)
         .register(router, openapi);
@@ -370,3 +395,7 @@ pub fn register_routes(
         .layer(axum::Extension(writes))
         .layer(axum::Extension(enforcer))
 }
+
+#[cfg(test)]
+#[path = "value_routes_tests.rs"]
+mod value_routes_tests;
