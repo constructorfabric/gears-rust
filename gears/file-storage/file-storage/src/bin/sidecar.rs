@@ -1981,6 +1981,44 @@ fn backend_error_response(e: &DomainError, context: &str) -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, "backend error").into_response()
 }
 
+/// Wrap a download body stream: record egress bytes per `Ok` chunk, and log
+/// the first `Err` at `warn!` before passing it through unchanged.
+///
+/// The status and `Content-Length` are already sent by then, so a `503` is no
+/// longer possible; the `Err` must still reach hyper so it aborts the
+/// connection (the client sees a read error, not a short success). The log is
+/// what tells this apart from a client that simply disconnected.
+fn download_stream_with_observability(
+    stream: futures::stream::BoxStream<'static, std::io::Result<bytes::Bytes>>,
+    metrics: Arc<dyn FileStorageMetricsPort>,
+    context: &'static str,
+    path: String,
+) -> impl futures::Stream<Item = std::io::Result<bytes::Bytes>> + Send + 'static {
+    let mut bytes_sent: u64 = 0;
+    let mut fault_logged = false;
+    stream.map(move |chunk| {
+        match &chunk {
+            Ok(bytes) => {
+                #[allow(clippy::cast_precision_loss)]
+                metrics.record_egress_bytes(bytes.len() as f64);
+                bytes_sent += bytes.len() as u64;
+            }
+            Err(e) if !fault_logged => {
+                fault_logged = true;
+                tracing::warn!(
+                    error = %e,
+                    context,
+                    path,
+                    bytes_sent,
+                    "backend read failed mid-stream; response already committed, aborting connection"
+                );
+            }
+            Err(_) => {}
+        }
+        chunk
+    })
+}
+
 /// Serve a `Range`-qualified `GET` once the blob's existence and size have
 /// already been resolved by the caller (`download`'s single `stat` call,
 /// -- `total` is that call's result, not a fresh backend round-trip).
@@ -2025,14 +2063,12 @@ async fn download_range(
             // egress must be attributed as each chunk actually leaves the
             // process — otherwise a connection that drops mid-transfer would
             // over-report bytes that were never actually sent.
-            let metrics = Arc::clone(&state.metrics);
-            let body_stream = stream.map(move |chunk| {
-                if let Ok(bytes) = &chunk {
-                    #[allow(clippy::cast_precision_loss)]
-                    metrics.record_egress_bytes(bytes.len() as f64);
-                }
-                chunk
-            });
+            let body_stream = download_stream_with_observability(
+                stream,
+                Arc::clone(&state.metrics),
+                "range",
+                path.to_owned(),
+            );
 
             let mut resp =
                 (StatusCode::PARTIAL_CONTENT, Body::from_stream(body_stream)).into_response();
@@ -2086,14 +2122,12 @@ async fn download_whole(
         Ok(stream) => {
             // Counted per chunk as it is handed to the client — see
             // `download_range`'s identical comment for why.
-            let metrics = Arc::clone(&state.metrics);
-            let body_stream = stream.map(move |chunk| {
-                if let Ok(bytes) = &chunk {
-                    #[allow(clippy::cast_precision_loss)]
-                    metrics.record_egress_bytes(bytes.len() as f64);
-                }
-                chunk
-            });
+            let body_stream = download_stream_with_observability(
+                stream,
+                Arc::clone(&state.metrics),
+                "whole",
+                path.to_owned(),
+            );
 
             let mut resp = (StatusCode::OK, Body::from_stream(body_stream)).into_response();
             let headers_mut = resp.headers_mut();

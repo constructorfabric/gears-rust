@@ -266,8 +266,10 @@ each part write in the multipart case — see `D2`).
   token, **or** missing/mismatched `x-fs-internal-token` when `finalize_internal_secret` is configured — see
   above), `404` (version not found), `409` (already finalized), `500` (a permanent backend fault reading the blob
   back), `503` (a transient one — network, timeout, backend overload — carries `Retry-After`).
-- This endpoint does **not** bind the version as current — `POST /files/{id}/bind` remains a separate, explicit
-  client call.
+- For a `bind: "manual"` upload (and `POST /files/{id}/versions`, which never auto-binds) this endpoint does **not**
+  bind the version as current — `POST /files/{id}/bind` remains a separate, explicit client call. For the default
+  `bind: "auto"` it binds inline under the same CAS and reports the outcome instead — see "Single-part bind outcome
+  headers" above.
 
 **`D2` report-part** — called by the sidecar after each successful multipart part write; this callback is what
 populates `multipart_upload_parts`, the table `complete` assembles from.
@@ -303,8 +305,10 @@ Notes:
   against the plain default configuration is rejected with `400` (`MULTIPART_NOT_SUPPORTED`). A configured S3 backend
   or the dev/test `memory` backend both advertise `multipart_native: true`, so multipart becomes available once one
   of them is made the default (`default_backend_id`) or the only backend.
-- `P2-3` (`complete`) does **not** bind the version as current — like the single-part flow, `POST /files/{id}/bind`
-  is a separate, explicit client call. It takes an **optional** `If-Match` header: a concrete value is checked
+- For a `bind: "manual"` session (and a standalone `POST /files/{id}/multipart` initiate), `P2-3` (`complete`) does
+  **not** bind the version as current — like the single-part manual flow, `POST /files/{id}/bind` is a separate,
+  explicit client call. For the default `bind: "auto"` it binds inline and reports `bind_state` — see "Bind inside
+  complete" below. It takes an **optional** `If-Match` header: a concrete value is checked
   against the file's current content ETag (`400` on mismatch — `FailedPrecondition` collapses to `400` on this
   platform); `*` or an absent header is unconditional. The route declares `401`/`403`/`404`/`409`/`400`/`500`/`503`
   (the winning completer's assembly calls `StorageBackend::complete_multipart`; a transient backend fault surfaces
@@ -759,6 +763,12 @@ Content-Range: bytes <s>-<e>/<n>     # only on 206 (and "bytes */<n>" on 416)
 Claims table above) rather than a control-plane round trip — the sidecar has no DB access, so the token is its only
 source for either. A token that leaves either claim empty falls back to `Content-Type: application/octet-stream` and
 omits `ETag` entirely, rather than sending an empty header.
+
+If the backend read fails *after* a `200`/`206` response's status and headers (including `Content-Length`) are
+already committed, the sidecar cannot retroactively switch to `503` — it aborts the connection instead, so the body
+ends up shorter than the `Content-Length` it already promised. A well-behaved HTTP client sees this as a read error,
+not as a short-but-successful response, and should retry with `Range: bytes=<bytes already received>-` against the
+same signed URL to resume from where it left off.
 
 **Planned / not implemented:**
 
