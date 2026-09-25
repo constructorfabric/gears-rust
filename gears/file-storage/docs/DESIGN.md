@@ -33,7 +33,7 @@
 
 <!-- /toc -->
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-design-overview`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-design-overview`
 ## 1. Architecture Overview
 
 ### 1.1 Architectural Vision
@@ -207,7 +207,7 @@ graph LR
 
 #### Backend opacity
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-principle-backend-opacity`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-principle-backend-opacity`
 
 Backends are an internal implementation detail. No public API surface — control REST, signed URL, SDK, or otherwise —
 exposes backend-addressable URLs, backend-native identifiers, or backend-specific error shapes. Even the signed URL
@@ -218,7 +218,7 @@ backend they are talking to.
 
 #### Control plane carries no content
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-principle-control-no-content`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-principle-control-no-content`
 
 The control-plane REST surface accepts and returns only metadata and signed URLs — never file bytes. All content is
 moved by the sidecar over signed URLs. The single exception is the in-process SDK proxy mode, which streams in the
@@ -229,7 +229,7 @@ independently of the control plane.
 
 #### Signed URLs, control-minted
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-principle-signed-urls`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-principle-signed-urls`
 
 Content access is authorized by a short-lived, opaque **Ed25519-signed compact token** (PASETO `v4.public`-equivalent
 codec, ADR-0004) that the **control plane alone mints** (holds the private key); the **sidecar only verifies** (holds
@@ -245,7 +245,7 @@ revocation (revocation is the auth module's token revocation). See §4.5.
 
 #### Immutable blob + pointer
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-principle-immutable-blob`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-principle-immutable-blob`
 
 A backend object `/{file_id}/{version_id}` is written once and never mutated. A file's live content is the `content_id`
 pointer; replacing content writes a **new** version and swaps the pointer under optimistic CAS (`If-Match`). This makes
@@ -256,7 +256,7 @@ the content-only ETag stable per version.
 
 #### Streaming over buffering
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-principle-streaming`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-principle-streaming`
 
 The sidecar's byte path moves bytes in chunks (axum `Body`/`Stream<Bytes>`) without holding whole files in memory.
 This applies to uploads, downloads, and range requests. SHA-256 hashing is a tap-like operation that updates on each
@@ -267,7 +267,7 @@ in-stream tap — it runs on the control plane, post-write (§4.2).
 
 #### Content-only content ETag
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-principle-content-only-etag`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-principle-content-only-etag`
 
 ETag is a function of `(file_id, content_id)` and hash is a function of the bytes only. Metadata updates change
 `meta_version` and `last_modified_at` but not ETag or hash — keeping ETag a pure content cache-validator (so CDNs do
@@ -286,7 +286,7 @@ contract locked in P1 without composing it into ETag (which would defeat CDN cac
 
 #### Capability discovery, not feature flags
 
-- [ ] `p2` - **ID**: `cpt-cf-file-storage-principle-capabilities`
+- [x] `p2` - **ID**: `cpt-cf-file-storage-principle-capabilities`
 
 Optional backend features (multipart, encryption) are declared per backend as capabilities, not bolted on as runtime
 flags. Clients query `/storages` and adapt. `multipart_native` is active where the backend supports it
@@ -300,7 +300,7 @@ capability.
 
 #### ToolKit in-process control gear
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-constraint-toolkit-gear`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-constraint-toolkit-gear`
 
 The **control plane** runs as an in-process ToolKit gear, registered via `#[toolkit::gear]`. Inter-gear callers use
 the generated SDK trait via ClientHub. There is no out-of-process gRPC variant of the control plane in P1; the OoP
@@ -309,7 +309,7 @@ plane).
 
 #### Sidecar is a separate deployable with no DB access
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-constraint-sidecar`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-constraint-sidecar`
 
 The **sidecar** is a separate deployable on its own domain, scaled independently of the control plane. It holds no
 authoritative state of its own and has **no direct DB connection at all** (§3.8) — it resolves everything it needs
@@ -319,14 +319,14 @@ is what makes it a full FileStorage data plane that can be relocated/co-located 
 
 #### Postgres as the metadata store
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-constraint-postgres`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-constraint-postgres`
 
 File metadata, custom metadata, and (P3) backend configurations are persisted in Postgres via SeaORM + SecureORM.
 Tenant scoping happens through SecureConn — there is no direct un-scoped DB access from request handlers.
 
 #### Configuration via the platform's gear YAML config
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-constraint-toml-config`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-constraint-toml-config`
 
 Backend definitions (`local-fs`, the opt-in `memory` backend, and any `s3_backends` entries) are loaded from the
 gear's own YAML config section (`FileStorageConfig`, via the platform's `gear_config`) at gear startup; the sidecar
@@ -424,7 +424,7 @@ graph TB
 
 #### `http-gateway`
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-component-http-gateway`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-component-http-gateway`
 
 ##### Why this component exists
 
@@ -460,7 +460,7 @@ Does not perform authorization decisions itself — delegates to `authz-adapter`
 
 #### `signed-url-issuer`
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-component-signed-url-issuer`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-component-signed-url-issuer`
 
 ##### Why this component exists
 
@@ -494,7 +494,7 @@ Does not verify signatures (that is the sidecar). Does not touch bytes. Does not
 
 #### `bind-service`
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-component-bind-service`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-component-bind-service`
 
 ##### Why this component exists
 
@@ -523,6 +523,8 @@ callback), and **bind** a finalized version as the file's current `content_id` u
 Does not stream bytes. Trusts a sidecar-reported `size`/`hash` claim only as a defense-in-depth cross-check — finalize
 independently re-reads and re-hashes the backend object rather than persisting the claim verbatim.
 
+**Traces to**: `cpt-cf-file-storage-fr-sidecar-callbacks`, `cpt-cf-file-storage-fr-callback-internal-token`
+
 ##### Related components
 
 - `cpt-cf-file-storage-component-metadata-service` — persists the version rows + pointer swap
@@ -531,7 +533,7 @@ independently re-reads and re-hashes the backend object rather than persisting t
 
 #### `sidecar-gateway`
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-component-sidecar-gateway`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-component-sidecar-gateway`
 
 ##### Why this component exists
 
@@ -590,7 +592,7 @@ token-authenticated HTTP callback (not the FS SDK, no delegated identity); it ne
 
 #### `stream-proxy`
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-component-stream-proxy`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-component-stream-proxy`
 
 ##### Why this component exists
 
@@ -625,7 +627,7 @@ come from the pre-registered version carried in the signed-URL context.
 
 #### `content-pipeline`
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-component-content-pipeline`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-component-content-pipeline`
 
 ##### Why this component exists
 
@@ -660,7 +662,7 @@ Does not validate MIME/content-type — that runs on the control plane (see abov
 
 #### `metadata-service`
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-component-metadata-service`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-component-metadata-service`
 
 ##### Why this component exists
 
@@ -699,7 +701,7 @@ Does not call backend drivers itself. Does not perform authorization checks. Doe
 
 #### `backend-abstraction`
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-component-backend-abstraction`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-component-backend-abstraction`
 
 ##### Why this component exists
 
@@ -742,7 +744,7 @@ discovery endpoint and are unreachable from the SDK-facing call site.
 
 #### `authz-adapter`
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-component-authz-adapter`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-component-authz-adapter`
 
 ##### Why this component exists
 
@@ -841,6 +843,11 @@ intended decomposition. Several already have a dedicated FEATURE artifact under 
 > integration (P2 1.12). See [../README.md](../README.md)'s Implementation status section and
 > [operations.md](./operations.md)'s "Storage quota (not enforced)" for detail.
 | `serverless-adapter`                                  | P2    | Subscribes to owner-deletion events; invokes the configured Serverless Runtime workflow per owner                        | PRD `cpt-cf-file-storage-fr-owner-deletion`                                                    |
+
+> **Not started.** `serverless-adapter` has no implementation in this release: there is no EventBroker owner-deletion
+> consumer and no Serverless Runtime client/invocation anywhere in this gear. `cpt-cf-file-storage-fr-owner-deletion`
+> and `cpt-cf-file-storage-contract-serverless-runtime` remain a planned P2 requirement with no code behind them yet.
+
 | `backend-migrator`                                    | P2    | Relocates a version's bytes between backends (cost-tier moves, deprecation, residency, rebalancing, DR) without rotating `file_id`/`version_id`; updates the version's `backend_id` after a verified copy | PRD `cpt-cf-file-storage-fr-backend-migration`                                                 |
 | `encryption-adapter`                                  | P3    | Manages server-side encryption parameters and key handles per backend                                                    | PRD `cpt-cf-file-storage-fr-file-encryption`                                                   |
 | `admin-config`                                        | P3    | DB-backed runtime backend management (CRUD on backend configs) with credential rotation                                  | PRD `cpt-cf-file-storage-fr-runtime-backends`                                                  |
@@ -886,7 +893,7 @@ Concrete request/response shapes (envelope fields, error codes, idempotency) are
 
 ### 3.3 API Contracts
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-interface-api-contracts`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-interface-api-contracts`
 
 The full HTTP surface — endpoint list, multipart envelope shape, conditional headers, Range semantics, response header
 schema, status codes — is documented in **[api.md](./api.md)**. The summary:
@@ -1001,6 +1008,8 @@ endpoint's own `If-Match`) or the explicit `bind`. `bind: "manual"` restores the
 `PUT`+finalize for an already-`available` version with the same size/hash converges to the same headers, never a 409.
 The full per-state failure/race analysis of both upload paths (who recovers, what garbage is left, who reaps it)
 lives in [concurrency-and-failure-model.md](./concurrency-and-failure-model.md).
+
+**Traces to**: `cpt-cf-file-storage-fr-auto-bind`
 
 ```mermaid
 sequenceDiagram
@@ -1257,7 +1266,7 @@ sequenceDiagram
 
 ### 3.7 Database Schemas & Tables
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-db-overview`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-db-overview`
 
 **Schema**: `file_storage` in the shared Postgres cluster (`migration.sql`'s canonical target). Entities are backed
 by SeaORM; migrations run through `db-runner` per
@@ -1396,7 +1405,7 @@ in P2 (`cpt-cf-file-storage-fr-metadata-limits`); in P1 only sanity limits apply
 
 ### 3.8 Deployment Topology
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-topology-overview`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-topology-overview`
 
 FileStorage deploys as **two units**: the control plane (an in-process ToolKit gear inside the Gears modular monolith)
 and the sidecar (a separate data-plane deployable on its own domain). The relevant deployment-time arrangements:
@@ -1442,7 +1451,7 @@ and the sidecar (a separate data-plane deployable on its own domain). The releva
 
 ### 4.1 Random Read Access
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-design-random-read-access`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-design-random-read-access`
 
 This section is the technical realization of PRD's `cpt-cf-file-storage-fr-range-requests`. The PRD requires that any
 download channel must support arbitrary byte-range access. Range is served entirely by the **sidecar**: parsing +
@@ -1528,7 +1537,7 @@ rather than relying on a sidecar-side conditional check.
 
 ### 4.2 Hash & ETag Pipeline
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-design-hash-etag-pipeline`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-design-hash-etag-pipeline`
 
 The hash and ETag share a derivation path but mean different things and live in different headers.
 
@@ -1600,7 +1609,7 @@ cache-validator surface from the hash-algorithm surface.
 
 ### 4.3 Concurrency & Streaming Backpressure
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-design-concurrency`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-design-concurrency`
 
 Every request flows through async tokio tasks; no thread-pool style blocking. The two design rules:
 
@@ -1636,7 +1645,7 @@ Concurrency caps:
 
 ### 4.5 Signed-URL signature
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-design-signed-urls`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-design-signed-urls`
 
 The technical realization of PRD `cpt-cf-file-storage-fr-signed-urls` and principle
 `cpt-cf-file-storage-principle-signed-urls`. The credential is a **single opaque token** minted by the control plane
@@ -1798,7 +1807,7 @@ microseconds — no DB hit, no network in the signing step. Two cases:
 
 ### 4.6 Worked example (LMS image upload and display)
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-design-worked-example`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-design-worked-example`
 
 A concrete end-to-end walkthrough tying together presign, the sidecar transfer, pre-register, bind, and a later
 download — a student uploading a screenshot into an LMS assessment, then that image rendering in a browser.
@@ -1862,7 +1871,7 @@ deferred "Sharing boundary (P3)" capability (§1.1), not something domain placem
 
 ### 4.7 Worked example (multipart upload and resume)
 
-- [ ] `p2` - **ID**: `cpt-cf-file-storage-design-worked-example-multipart`
+- [x] `p2` - **ID**: `cpt-cf-file-storage-design-worked-example-multipart`
 
 Multipart is **P2** (`cpt-cf-file-storage-fr-multipart-upload`). Same scenario style as §4.6, for a 320 MiB
 `lecture.mp4` upload, walking the interesting case: the user uploads a few parts, gets logged out, and later
@@ -1910,7 +1919,8 @@ resumes without re-uploading what already landed.
    `current_etag` (manual rebind, no re-upload). A `bind: "manual"` session (or one opened directly against an
    existing file, as in this example) keeps `bind_state: "manual"` and needs the separate `POST /files/{id}/bind`
    afterwards. `complete` is idempotent (a retry, including after a page reload, replays the persisted result) and
-   can return `202 {state: "completing", retry_after_secs}` while another caller holds the completion lease. The
+   can return `202 {state: "completing", retry_after_secs}` while another caller holds the completion lease
+   (`cpt-cf-file-storage-fr-multipart-complete-lease`). The
    full state/race/failure model is [concurrency-and-failure-model.md](./concurrency-and-failure-model.md).
 
 #### The other branch — session already reaped

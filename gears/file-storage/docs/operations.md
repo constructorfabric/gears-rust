@@ -343,7 +343,10 @@ Failed` when the key already exists. That is what stops a replayed `PUT` on a st
 bytes that are already published. FileStorage does not probe for this at runtime: an endpoint that silently ignores
 the header degrades to last-write-wins with no error anywhere in the request path, so it **must not** be used with
 this gear. AWS S3 documents support for it (since 2024-08-20); `s3s-fs` — the test double this crate's own tests and
-CI use — is verified against it by the crate's `s3_tests.rs`. Check any other endpoint before configuring it, with a
+CI use — is verified against it by the crate's `s3_tests.rs`, sequentially only: it checks the key with a plain
+existence test, so two truly concurrent writers can both succeed there. That is acceptable for a test double and is
+why the commands below check a real endpoint; it is not an endpoint to deploy. Check any other endpoint before
+configuring it, with a
 recent AWS CLI v2 (one that accepts `--if-none-match`) and credentials for the target bucket:
 
 ```bash

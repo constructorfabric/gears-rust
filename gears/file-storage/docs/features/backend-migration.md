@@ -40,10 +40,15 @@ the source backend into the destination backend — never fully buffered in
 memory — with its content hash verified incrementally as the bytes stream
 past; the pass/fail verdict is only known once the destination has finished
 receiving the whole stream. If it fails, nothing is committed and the
-destination object is best-effort cleaned up (see below). If it passes, the
-version row's `(backend_id, backend_path)` are swapped atomically under a
-compare-and-swap keyed on the pre-migration snapshot — all before the source
-blob is best-effort deleted.
+destination object is best-effort cleaned up (see below). If a destination
+object already existed at the canonical path before this call wrote anything
+there, it is never trusted on the strength of merely already being present —
+it is read back and re-verified against the same stored hash before the
+migration is allowed to proceed, since an earlier, interrupted migration
+attempt could otherwise have left unverified bytes sitting there. If it
+passes, the version row's `(backend_id, backend_path)` are swapped atomically
+under a compare-and-swap keyed on the pre-migration snapshot — all before the
+source blob is best-effort deleted.
 
 **Traces to**: `cpt-cf-file-storage-fr-backend-migration`, `cpt-cf-file-storage-fr-audit-trail`
 
@@ -121,6 +126,14 @@ apply to it)
   physically exist by the time the mismatch is discovered; this call cleans
   it up best-effort, but **only if this call itself created it** — see
   [Mode-Aware Content-Hash Verification Before Commit](#mode-aware-content-hash-verification-before-commit)
+- The destination object already existed before this call wrote anything (an
+  earlier migration attempt to the same canonical path got interrupted after
+  writing but before verifying/cleaning up after itself) and, read back and
+  re-verified, does not match the stored hash/length — `400` (`HashMismatch`),
+  same as a source mismatch. Unlike a source mismatch, this object is deleted
+  **unconditionally** (this call did not create it, but it also never proved
+  itself to be anyone's verified content, so it carries no live pointer either
+  way) — see [Mode-Aware Content-Hash Verification Before Commit](#mode-aware-content-hash-verification-before-commit)
 - The source stream breaks before finishing (a transport error mid-transfer)
   — the underlying transport error surfaces to the caller; same non-commit,
   same conditional cleanup as a hash mismatch
@@ -145,11 +158,12 @@ apply to it)
 5. [x] - `p1` - **IF** the target backend's capabilities report `durable == false`: additionally authorize `ADMIN_POLICY` on the file - `inst-migrate-nondurable-gate`
 6. [x] - `p1` - Open a stream from the source backend at the version's `backend_path` and write it, chunk by chunk, straight to the destination backend at the canonical path `/{file_id}/{version_id}` (create-exclusive — see [Concurrent-Migration CAS Resolution](#concurrent-migration-cas-resolution) for why), never buffering the whole object - `inst-migrate-stream-transfer`
 7. [x] - `p1` - Algorithm: verify the stream's hash incrementally, mode-aware per ADR-0006, using `cpt-cf-file-storage-algo-backend-migration-verify` below; its verdict is only available once the destination has finished receiving the stream - `inst-migrate-verify`
-8. [x] - `p1` - **IF** verification failed (hash mismatch, wrong length, or the source stream broke before finishing): do **not** proceed to the CAS step; best-effort delete the destination object, but only if this call is the one that created it (see below) - `inst-migrate-verify-failed-no-commit`
-9. [x] - `p1` - DB: `rebind_version_backend` — CAS the version row's `(backend_id, backend_path)` from the pre-migration snapshot to the destination, in the same transaction as a `BackendMigrate` audit row - `inst-migrate-cas-rebind`
-10. [x] - `p1` - **IF** the CAS lost: resolve using `cpt-cf-file-storage-algo-backend-migration-race-resolve` (below) — RETURN `404`/`409`/success-as-no-op depending on what actually happened - `inst-migrate-cas-race`
-11. [x] - `p1` - **IF** the CAS won: best-effort delete the source blob (failures logged, not surfaced to the caller — an orphan-cleanup concern, not a migration-correctness one) - `inst-migrate-cleanup-source`
-12. [x] - `p1` - RETURN `204 No Content` - `inst-migrate-return`
+8. [x] - `p1` - **IF** verification of the streamed source content failed (hash mismatch, wrong length, or the source stream broke before finishing): do **not** proceed to the CAS step; best-effort delete the destination object, but only if this call is the one that created it (see below) - `inst-migrate-verify-failed-no-commit`
+9. [x] - `p1` - **IF** source verification passed but the destination object already existed before this call (this call did not create it): read that object back and re-verify it against the exact same stored `(hash_mode, hash_value[, manifest], size)` used for the source stream, rather than assuming its mere presence means someone already verified it. **IF** that re-verification fails (mismatch, wrong length, or a read failure): do **not** proceed to the CAS step; best-effort delete the destination object unconditionally, then RETURN the same `HashMismatch` (or read-failure) error a source mismatch would have produced - `inst-migrate-verify-existing-dest`
+10. [x] - `p1` - DB: `rebind_version_backend` — CAS the version row's `(backend_id, backend_path)` from the pre-migration snapshot to the destination, in the same transaction as a `BackendMigrate` audit row - `inst-migrate-cas-rebind`
+11. [x] - `p1` - **IF** the CAS lost: resolve using `cpt-cf-file-storage-algo-backend-migration-race-resolve` (below) — RETURN `404`/`409`/success-as-no-op depending on what actually happened - `inst-migrate-cas-race`
+12. [x] - `p1` - **IF** the CAS won: best-effort delete the source blob (failures logged, not surfaced to the caller — an orphan-cleanup concern, not a migration-correctness one) - `inst-migrate-cleanup-source`
+13. [x] - `p1` - RETURN `204 No Content` - `inst-migrate-return`
 
 ## 3. Processes / Business Logic (CDSL)
 
@@ -157,11 +171,22 @@ apply to it)
 
 - [x] `p1` - **ID**: `cpt-cf-file-storage-algo-backend-migration-verify`
 
-**Input**: the object's bytes, streamed from the source backend as they are
-written to the destination (never buffered whole), the version's `hash_mode`
-(`whole-sha256` | `multipart-composite-sha256`), its stored `hash_value`, its
-declared size, and — only for `multipart-composite-sha256` — the version's
-`version_hash_manifest` row
+This algorithm runs twice per migration attempt in the worst case: once,
+always, against the object's bytes as they stream from the source backend to
+the destination; and a second time, only when the destination object already
+existed before this call wrote anything (i.e. this call did not create it),
+against the bytes already sitting at the destination, read back after the
+fact. Both runs use the exact same stored `(hash_mode, hash_value[, manifest],
+size)` — the second run exists because a destination object's mere presence
+is never, on its own, proof that anyone already verified it (see
+[Concurrent-Migration CAS Resolution](#concurrent-migration-cas-resolution)).
+
+**Input**: the object's bytes — either streamed from the source backend as
+they are written to the destination (never buffered whole), or, for the
+second run, read back from the destination object that already existed — the
+version's `hash_mode` (`whole-sha256` | `multipart-composite-sha256`), its
+stored `hash_value`, its declared size, and — only for
+`multipart-composite-sha256` — the version's `version_hash_manifest` row
 
 **Output**: `Ok(())` once the whole stream has been transferred and every
 byte verified, or a `HashMismatch`/database-consistency error — available
@@ -193,8 +218,14 @@ this: whichever racer's bytes land first stays there untouched: a second
 racer to the same path always finds the object already present and leaves
 it alone, regardless of what its own (possibly bad) bytes would have been.
 Combined with the fact that both racers are transferring the *same*,
-already-hash-committed version, this is what keeps a same-target race safe
-without requiring either racer to know about the other.
+already-hash-committed version, and that a racer finding the object already
+present re-verifies it against that same version before trusting it (see
+[Mode-Aware Content-Hash Verification Before Commit](#mode-aware-content-hash-verification-before-commit)),
+this is what keeps a same-target race safe without requiring either racer to
+know about the other — including the case where the object present at the
+path was left behind by an earlier attempt that never got around to
+verifying or cleaning up after itself, rather than by a genuine racer still
+in flight.
 
 **Input**: the destination blob already written by this call (either
 because this call created it, or because it already existed — see above),
@@ -211,11 +242,17 @@ destination write
 3. [x] - `p1` - **IF** the current row's `(backend_id, backend_path)` already equals **this call's own** destination: a concurrent migration to the identical target won the race first (deterministic canonical path, `/{file_id}/{version_id}`, means both racers wrote to the same location) — RETURN `Ok(())` as a no-op and do **NOT** delete the destination blob, since it is the winner's live content, not this call's to clean up - `inst-race-same-target-winner`
 4. [x] - `p1` - **ELSE** (a different concurrent migration won, to a different target): best-effort delete this call's own destination blob (guarded by a belt-and-suspenders re-check that it doesn't coincidentally equal the live pointer for some other reason) and RETURN `Conflict` ("concurrent backend migration in progress") - `inst-race-different-winner`
 
-The same "only delete what this call actually created" rule governs the
-verification-failure path (previous section): a failed verification deletes
-the destination object only when this call's own write is what created it —
-never an object that already existed there, since that content was put there
-by someone else's already-verified transfer and is not this call's to touch.
+The "only delete what this call actually created" rule from the previous
+section governs a failed **source-stream** verification specifically: it
+deletes the destination object only when this call's own write is what
+created it, never an object that already existed there, since a passing
+source-stream verification says nothing about bytes this call never wrote.
+A pre-existing object is instead independently re-verified (see
+[Mode-Aware Content-Hash Verification Before Commit](#mode-aware-content-hash-verification-before-commit))
+before ever being trusted; if that re-verification fails, the object is
+deleted **unconditionally**, regardless of who wrote it — passing that check
+is what actually proves a destination object is someone else's verified
+transfer and not this call's to touch, not merely its presence.
 
 ## 4. States (CDSL)
 
@@ -237,11 +274,18 @@ destination backend at the canonical path (create-exclusive, never fully
 buffered in memory), verify its hash mode-awarely against the stored
 `(hash_mode, hash_value[, manifest], size)` incrementally as it streams, and
 only once that verification passes proceed to atomically CAS the version
-row's backend pointer alongside a `BackendMigrate` audit row. It MUST NOT
-commit the CAS when verification fails, and MUST resolve lost-CAS races
-without ever destroying a concurrent winner's blob, best-effort cleaning up
-a destination object only when this call is the one that created it, and
-best-effort clean up the source blob only after the CAS has won.
+row's backend pointer alongside a `BackendMigrate` audit row. When the
+destination object already existed before this call wrote anything (this
+call did not create it), the system **MUST NOT** treat its mere presence as
+proof it was ever verified — it **MUST** read it back and re-verify it
+against that same stored hash spec before proceeding, and **MUST** delete it
+unconditionally if that re-verification fails. It MUST NOT commit the CAS
+when either verification fails, and MUST resolve lost-CAS races without ever
+destroying a concurrent winner's blob, best-effort cleaning up a destination
+object only when doing so cannot destroy a concurrent winner's already-live
+content (this call created it and its own verification failed, or it already
+existed and failed its independent re-verification), and best-effort clean up
+the source blob only after the CAS has won.
 
 **Implements**:
 - `cpt-cf-file-storage-flow-backend-migration`
@@ -286,3 +330,5 @@ implicitly.
 - [x] The source-to-destination transfer never materializes the whole object in memory: an object that arrives in many chunks streams through in many chunks, for both content-hash modes
 - [x] A source read that comes back with corrupted bytes (same length, different content) fails verification, leaves the version pointing at the source backend, and leaves nothing behind at the destination
 - [x] A source stream that breaks before finishing fails the migration the same way — version untouched, destination left empty
+- [x] A destination object that already exists at the canonical path before the migration call runs, and whose bytes do **not** match the stored hash, fails the migration (`HashMismatch`), leaves the version pointing at the source backend, and is deleted from the destination even though this call did not create it
+- [x] A destination object that already exists at the canonical path before the migration call runs, and whose bytes **do** match the stored hash, is trusted and the migration succeeds, repointing the version at the destination without re-writing the object

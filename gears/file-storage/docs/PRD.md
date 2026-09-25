@@ -215,7 +215,7 @@ roles) from the platform authentication middleware.
 
 #### Upload File
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-upload-file`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-fr-upload-file`
 
 The system **MUST** accept file content with metadata and persist it. Upload is a two-step exchange: the client first
 asks the control plane for a **signed upload URL** (`cpt-cf-file-storage-fr-signed-urls`), then transfers the bytes to
@@ -240,7 +240,7 @@ concurrent-write conflict cheap to recover from (re-bind, never re-upload).
 
 #### Download File
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-download-file`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-fr-download-file`
 
 The system **MUST** retrieve file content for consumption by requesting actors via a two-step exchange: the client
 asks the control plane for a **signed download URL** (`cpt-cf-file-storage-fr-signed-urls`), then fetches the bytes
@@ -257,7 +257,7 @@ opacity (the URL points at the sidecar, never the backend) and central metering/
 
 #### Delete File
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-delete-file`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-fr-delete-file`
 
 The system **MUST** allow any actor authorized for the **delete** action on the file's GTS type
 (`cpt-cf-file-storage-fr-authorization`) to delete a file. Deleting a file removes its metadata, ownership records, and
@@ -275,7 +275,7 @@ backend delete, so a deleted file never leaves a row pointing at missing bytes.
 
 #### Get File Metadata
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-get-metadata`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-fr-get-metadata`
 
 The system **MUST** return file metadata (name, size, mime_type, GTS file type, created date, modified date, owner,
 and custom metadata) without transferring file content.
@@ -286,7 +286,7 @@ initiating downloads, avoiding wasted bandwidth on incompatible files.
 
 #### List Files
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-list-files`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-fr-list-files`
 
 The system **MUST** support listing files with their metadata (no content transfer). The caller **MUST** specify the
 owner type as a mandatory filter:
@@ -304,7 +304,7 @@ filtering prevents unbounded queries across all files and aligns with the owners
 
 #### Multipart Upload
 
-- [ ] `p2` - **ID**: `cpt-cf-file-storage-fr-multipart-upload`
+- [x] `p2` - **ID**: `cpt-cf-file-storage-fr-multipart-upload`
 
 The system **MUST** support multipart (chunked) upload for large files. Multipart upload requires the multipart
 upload backend capability (`cpt-cf-file-storage-fr-backend-capabilities`). A multipart upload **MUST**:
@@ -324,9 +324,90 @@ Implementing multipart at the FileStorage layer without backend support would re
 the scalability benefits. Rejecting with a clear error lets clients adapt their upload strategy per backend.
 **Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-gears`
 
+#### Auto-Bind on Upload
+
+- [x] `p2` - **ID**: `cpt-cf-file-storage-fr-auto-bind`
+
+At file-creation time, the client **MAY** select a `bind` mode — `"auto"` (the default) or `"manual"`. Under
+`bind: "auto"`, finalizing the uploaded version **MUST**, in the same transaction, also bind it as the file's current
+content — a single-part upload finalizes and binds together, and a multipart upload's `complete` binds together with
+its finalize — so the common case needs no separate, later `bind` call. Under `bind: "manual"`, the system **MUST**
+leave `content_id` untouched at finalize and require the client to make the existing, separate `bind` request to
+activate the uploaded content. Either way the bind **MUST** remain the same optimistic-CAS operation
+(`cpt-cf-file-storage-fr-conditional-requests`): auto-bind either wins the CAS or reports a conflict without failing
+the upload, and the outcome **MUST** be reported back to the caller (`X-FS-Bound` header for single-part,
+`bind_state` field for multipart complete).
+
+**Rationale**: Auto-bind collapses the common "upload then immediately make it live" case from three round trips
+(presign, upload, bind) down to two (presign, upload) without weakening the CAS guarantee a manual bind already
+provides — a lost auto-bind CAS is reported, not silently dropped, and resolves through the same manual re-bind path.
+`bind: "manual"` is retained for callers that need to stage content before making it current (e.g. content requiring
+a later approval step).
+**Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-gears`
+
+#### Multipart Complete Under a Completion Lease
+
+- [x] `p2` - **ID**: `cpt-cf-file-storage-fr-multipart-complete-lease`
+
+The system **MUST** serialize concurrent `complete` calls against the same multipart session through a completion
+lease: exactly one caller **MUST** win the lease and perform the assembly/finalize work; every other caller arriving
+while the lease is held **MUST** receive `202 Accepted` (`state: "completing"`) instead of performing or waiting on
+the assembly itself, and **MUST** be able to poll for the result by re-issuing the identical `complete` call. A lease
+holder that fails or dies before finishing **MUST NOT** strand the session indefinitely — once the lease's own
+expiry passes, the next `complete` call **MUST** be able to take the lease over and retry. A retry of an
+already-completed session **MUST** be idempotent: it **MUST** return the original stored result rather than
+re-running assembly, re-verifying parts, or performing any further state transition.
+
+**Rationale**: Multipart `complete` performs non-trivial work (missing-part verification, backend assembly, hashing,
+finalize, and — for an auto-bind session — the bind) that must not run twice concurrently for the same session, and
+must not be lost if the instance that started it crashes mid-assembly. A time-bounded lease with a `202`/poll contract
+gives callers a well-defined way to wait without either blocking the request thread or racing a second assembly
+attempt, while a dead lease holder's session still converges instead of getting stuck.
+**Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-gears`
+
+#### Sidecar S2S Callbacks
+
+- [x] `p2` - **ID**: `cpt-cf-file-storage-fr-sidecar-callbacks`
+
+The sidecar **MUST** report back to the control plane over plain, token-authenticated HTTP callbacks for two events:
+finalizing a version after a successful single-part `PUT`, and reporting a successfully-written multipart part. Each
+callback's sole authorization **MUST** be the same signed upload token (`cpt-cf-file-storage-fr-signed-urls`) that
+authorized the original upload — no separate app-token or on-behalf-of delegation. The control plane **MUST** accept
+the callback within a short grace period after the token's `exp` has passed, since the callback necessarily arrives
+after the byte transfer the token authorized completes. On every callback the control plane **MUST** independently
+re-verify the reported size and content hash against what it observes (or, for a part, against the claims embedded in
+that part's own token) rather than trusting the sidecar's report at face value.
+
+**Rationale**: The sidecar holds no metadata-DB connection and no delegated user identity of its own
+(`cpt-cf-file-storage-fr-authorization`), so the signed token it already verified for the byte transfer is the only
+authorization available for reporting the outcome back. A short post-`exp` grace period accommodates the callback's
+inherent lag behind the transfer without extending the token's authority for any new operation. Independent
+re-verification on the control plane means a compromised or buggy sidecar cannot finalize a version whose actual
+bytes do not match what was claimed.
+**Actors**: `cpt-cf-file-storage-actor-cf-gears`
+
+#### Internal Callback Token (Second Factor)
+
+- [x] `p2` - **ID**: `cpt-cf-file-storage-fr-callback-internal-token`
+
+The system **MUST** support an optional shared-secret second factor, carried as the `x-fs-internal-token` header, on
+top of the signed upload token for the sidecar's finalize and report-part callbacks
+(`cpt-cf-file-storage-fr-sidecar-callbacks`). When no secret is configured, the control plane **MUST** accept a
+callback authorized by the signed token alone, unchanged from today. When a secret is configured, the control plane
+**MUST** additionally require a matching `x-fs-internal-token` on every such callback, rejecting a missing or
+mismatched header. Whether an absent secret is itself a startup error **MUST** be configurable, so a deployment can
+choose to fail fast rather than silently run without the second factor.
+
+**Rationale**: The signed upload token alone is sufficient authorization for a callback, but a deployment that wants
+an additional network-boundary control (e.g. because the sidecar-to-control-plane hop traverses a less trusted
+network segment) can add a shared secret without changing the token-based authorization model. Making both the
+secret's presence and its enforcement independently configurable lets a deployment roll the secret out gradually
+(set it on both sides before requiring it) instead of risking an outage from a mismatched rollout.
+**Actors**: `cpt-cf-file-storage-actor-cf-gears`
+
 #### Content-Type Validation
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-content-type-validation`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-fr-content-type-validation`
 
 The system **MUST** validate the declared mime_type against the actual file content (magic bytes / file signature) on
 every upload (all upload traffic transits the sidecar). If the declared type does not match the detected type, the
@@ -351,7 +432,7 @@ sequence, and it reuses the identical bounded-prefix sniff the single-part path 
 
 #### File Ownership
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-file-ownership`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-fr-file-ownership`
 
 The system **MUST** associate every file with `tenant_id` (mandatory, immutable) plus `owner_kind ∈ {user, app}` and
 `owner_id`. `user` is a platform user; `app` is a Gear (e.g., LLM Gateway owning its generated media).
@@ -368,7 +449,7 @@ human user.
 
 #### Authorization Checks
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-authorization`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-fr-authorization`
 
 The system **MUST** verify authorization for every file operation by requesting an access decision from the
 Authorization Service. Read, write, and delete operations **MUST** be checked against `gts.cf.fstorage.file.type.v1~` resources in
@@ -394,7 +475,7 @@ right.
 
 #### Tenant Boundary Enforcement
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-tenant-boundary`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-fr-tenant-boundary`
 
 The system **MUST** enforce tenant isolation on every file operation: a principal in one tenant **MUST NOT**
 access files owned by another tenant.
@@ -404,7 +485,7 @@ access files owned by another tenant.
 
 #### Data Classification
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-data-classification`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-fr-data-classification`
 
 FileStorage treats all stored files as opaque binary blobs and does **NOT** inspect, classify, or label file content by
 sensitivity level. Data classification (public, internal, confidential, restricted) is the responsibility of consuming
@@ -419,7 +500,7 @@ boundaries appropriate to the sensitivity level.
 
 #### File Type Classification
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-file-type-classification`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-fr-file-type-classification`
 
 The system **MUST** require a GTS file type identifier on every file at upload time. The file type classifies the file
 by domain and purpose following the GTS type format (e.g. `gts.cf.fstorage.file.type.v1~x.genai.llm.autogenerated.v1~`
@@ -452,6 +533,10 @@ operation and **MUST** require authorization of both the current owner and the r
 file's tenant preserves the tenant-isolation invariant.
 **Actors**: `cpt-cf-file-storage-actor-platform-user`
 
+**Partial:** the endpoint, atomic owner swap, audit row, file event, and usage-delta reporting are implemented;
+authorization of the receiving principal is not — `new_owner_id` is only checked against the nil UUID, since this
+gear has no account-management client to verify it names a real, existing, same-tenant principal.
+
 ### 5.3 Sharing
 
 FileStorage P1 exposes **only an authenticated REST surface**. Anonymous/public access, per-recipient grants,
@@ -472,7 +557,7 @@ eliminates JWT-bypass surfaces and owner-private-header redaction logic from Fil
 
 #### Allowed File Types Policy
 
-- [ ] `p2` - **ID**: `cpt-cf-file-storage-fr-allowed-types-policy`
+- [x] `p2` - **ID**: `cpt-cf-file-storage-fr-allowed-types-policy`
 
 The system **MUST** allow owners to define policies specifying which file types (by mime_type) are permitted for
 upload. Uploads of disallowed types **MUST** be rejected.
@@ -483,7 +568,7 @@ executable files).
 
 #### File Size Limits Policy
 
-- [ ] `p2` - **ID**: `cpt-cf-file-storage-fr-size-limits-policy`
+- [x] `p2` - **ID**: `cpt-cf-file-storage-fr-size-limits-policy`
 
 The system **MUST** enforce file size limits from two sources:
 
@@ -510,6 +595,11 @@ policy **MUST** define which event types are enabled.
 moderation, indexing, or backup triggers — without coupling FileStorage to specific consumers.
 **Actors**: `cpt-cf-file-storage-actor-platform-user`
 
+**Partial:** every write operation inserts a transactional-outbox row into `events_outbox`; there is no relay that
+drains it to the EventBroker gear, so no downstream consumer receives these events yet — see
+[features/audit-trail.md](./features/audit-trail.md), whose undrained-relay caveat covers this table's sibling
+`audit_outbox` under the identical pattern.
+
 #### Storage Usage Reporting
 
 - [ ] `p2` - **ID**: `cpt-cf-file-storage-fr-usage-reporting`
@@ -526,6 +616,12 @@ transfers shift per-owner storage consumption without changing total platform st
 billing and quota data become stale after transfers. Asynchronous reporting ensures file operations are not degraded by
 usage collection availability.
 **Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-gears`
+
+**Current status**: Usage reporting is **not sent in any deployment** — the call sites that would build and emit a
+usage report exist (`FileService`, `MultipartService`, and `CleanupEngine` all accept an optional usage-reporting
+sink), but every one of them is always constructed with the sink unset (`usage_reporter: None`), so no usage delta is
+ever reported. No Usage Collector client is wired in. Detail in [operations.md](./operations.md)'s "Storage quota
+(not enforced)" section, which covers this sibling gap.
 
 #### Storage Quota Enforcement
 
@@ -549,7 +645,7 @@ fail-closed call sites) is implemented and ready to enforce the check once that 
 
 #### Rich Metadata Storage
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-metadata-storage`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-fr-metadata-storage`
 
 The system **MUST** store and return the following system-managed metadata for every file:
 
@@ -573,7 +669,7 @@ Blob metadata.
 
 #### Update Custom Metadata
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-update-metadata`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-fr-update-metadata`
 
 Any actor authorized for the **write** action on the file's GTS type
 (`cpt-cf-file-storage-fr-authorization`) **MUST** be able to update the file's `custom_metadata` (user-defined
@@ -595,7 +691,7 @@ schema changes.
 
 #### Custom Metadata Limits
 
-- [ ] `p2` - **ID**: `cpt-cf-file-storage-fr-metadata-limits`
+- [x] `p2` - **ID**: `cpt-cf-file-storage-fr-metadata-limits`
 
 The system **MUST** enforce configurable limits on custom metadata: maximum number of key-value pairs per file, maximum
 key name length, maximum value length, and maximum total custom metadata size per file. Metadata operations exceeding
@@ -609,7 +705,7 @@ storage costs and degrading query performance.
 
 #### Indefinite Retention
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-retention-indefinite`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-fr-retention-indefinite`
 
 In phase 1, files **MUST** be retained indefinitely until explicitly deleted by an authorized actor
 (`cpt-cf-file-storage-fr-authorization`). The system **MUST NOT** automatically delete or expire file content based on
@@ -621,7 +717,7 @@ it prevents accidental data loss and gives consuming gears predictable storage s
 
 #### Retention Policies
 
-- [ ] `p2` - **ID**: `cpt-cf-file-storage-fr-retention-policies`
+- [x] `p2` - **ID**: `cpt-cf-file-storage-fr-retention-policies`
 
 The system **MUST** allow owners to define retention policies specifying automatic file expiration based on age,
 inactivity, or custom metadata criteria. The system **MUST** also support per-file retention overrides set by the file
@@ -654,11 +750,15 @@ mark them as orphaned for manual resolution.
 blind deletion risks data loss, while indefinite retention risks compliance violations. Delegating disposition to
 Serverless Runtime workflows enables deployment-specific logic (legal holds, data migration, cascading cleanup) without
 embedding policy decisions in FileStorage.
+
+**Not started**: no implementation in this release. There is no EventBroker owner-deletion consumer and no
+Serverless Runtime client anywhere in this gear's code; the requirement remains a planned P2 item (see DESIGN.md's
+`serverless-adapter` component).
 **Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-gears`
 
 #### Orphan Reconciliation
 
-- [ ] `p2` - **ID**: `cpt-cf-file-storage-fr-orphan-reconciliation`
+- [x] `p2` - **ID**: `cpt-cf-file-storage-fr-orphan-reconciliation`
 
 The system **MUST** automatically detect and reconcile orphan state between the metadata store and storage backends.
 Because content is uploaded to the sidecar and the version is only later **bound** in the metadata DB (the two writes
@@ -702,7 +802,7 @@ handling, because it implies backend data loss that auto-deletion would mask.
 
 #### File Versioning
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-file-versioning`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-fr-file-versioning`
 
 Versioning is a **FileStorage-level** feature and **MUST NOT** depend on a backend versioning capability: each version
 is a **distinct immutable backend object** at `/{file_id}/{version_id}` and the file's live content is the
@@ -736,7 +836,7 @@ keeps P1 simple (indefinite retention is the safe default); accumulation is acce
 
 #### Backend Migration
 
-- [ ] `p2` - **ID**: `cpt-cf-file-storage-fr-backend-migration`
+- [x] `p2` - **ID**: `cpt-cf-file-storage-fr-backend-migration`
 
 The system **MUST** be able to relocate a file's content from one storage backend to another **without changing the
 file's `/files/{id}` URL or its identity**. Migration **MUST**:
@@ -789,6 +889,10 @@ update). Audit records **MUST** include the operation type, actor identity, file
 **Rationale**: Audit trails are required for security forensics, compliance reporting, and operational troubleshooting.
 **Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-gears`
 
+**Partial:** every audited write inserts an `audit_outbox` row transactionally with the mutation (write side
+implemented and tested); there is no drain/relay to a downstream audit sink and no query API on this gear's own REST
+surface — see [features/audit-trail.md](./features/audit-trail.md).
+
 #### Read Audit Logging
 
 - [ ] `p3` - **ID**: `cpt-cf-file-storage-fr-read-audit`
@@ -807,7 +911,7 @@ across the platform, while enabling it where compliance demands it.
 
 #### Backend Abstraction
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-backend-abstraction`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-fr-backend-abstraction`
 
 The system **MUST** abstract the storage layer behind a common interface, enabling support for multiple backend types (
 S3, GCS, Azure Blob, NFS, FTP, SMB, WebDAV, local filesystem).
@@ -818,7 +922,7 @@ backend selection without changing the gear's core logic.
 
 #### Backend Capabilities
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-backend-capabilities`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-fr-backend-capabilities`
 
 The system **MUST** define a capability model for storage backends. Each backend **MUST** declare which optional
 capabilities it supports. The system **MUST** support at least the following client-facing capabilities:
@@ -854,7 +958,7 @@ opacity while keeping internal optimizations available to FileStorage itself.
 
 #### Backend Configuration Source
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-backend-config-source`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-fr-backend-config-source`
 
 In P1, storage backend configurations (`type`, `endpoint`, `credentials`, `capabilities`, `hash_policy`) **MUST** be
 loaded from a static TOML configuration file at gear startup. Adding, removing, or re-configuring a backend
@@ -881,7 +985,7 @@ or geographic requirements.
 
 #### Control-Plane REST API
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-rest-api`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-fr-rest-api`
 
 The system **MUST** expose a control-plane REST API under a single auth-required namespace (`/api/file-storage/v1`)
 for metadata management, listing, backend discovery, version bind, and the issuance of signed content URLs
@@ -894,7 +998,7 @@ what allows the data plane (sidecar) to scale independently (ADR-0003).
 
 #### Signed Content URLs
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-signed-urls`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-fr-signed-urls`
 
 The control plane **MUST** issue short-lived **signed URLs** that authorize a single content operation
 (`GET`/`PUT`/part) against the **sidecar** for a specific object. Signed URLs **MUST**:
@@ -942,7 +1046,7 @@ and without a per-request control round-trip on the data path. AND-combined cons
 
 #### Random Read Access
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-fr-range-requests`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-fr-range-requests`
 
 The **sidecar** download endpoint **MUST** support random (non-sequential) read access to arbitrary byte ranges of
 stored content so that consumers can seek through large files efficiently — most importantly, so that media players
@@ -994,9 +1098,15 @@ concurrently. Both follow standard HTTP semantics (RFC 7232) understood by all H
 file metadata for all backends, ETags are a FileStorage-level feature independent of backend capabilities.
 **Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-gears`
 
+**Partial:** the control plane implements `If-None-Match`/`If-Match` on metadata reads, requires `If-Match` on bind
+and `DELETE`, and supports the `If-Match-Metadata` revision precondition. The **sidecar** implements `Range`
+(`cpt-cf-file-storage-fr-range-requests`) but not `If-None-Match` → `304` on content download — a deliberate,
+documented-but-not-yet-implemented gap, since every download token is already single-use-scoped to one
+`(file_id, version_id)`, making the bandwidth win of a conditional download small.
+
 #### Upload Idempotency
 
-- [ ] `p2` - **ID**: `cpt-cf-file-storage-fr-upload-idempotency`
+- [x] `p2` - **ID**: `cpt-cf-file-storage-fr-upload-idempotency`
 
 The system **MUST** support idempotent uploads. A client **MUST** be able to provide a unique idempotency key with an
 upload request. If a subsequent upload request arrives with the same idempotency key, the system **MUST** return the
@@ -1141,6 +1251,9 @@ The following NFR categories from the platform checklist are **not applicable** 
 
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-interface-sdk-trait`
 
+**Partial:** the trait is registered for other Gears to resolve, but only a placeholder accessor exists; none of the
+operations below are implemented, so consuming Gears call the HTTP control API directly (see DESIGN's `sdk-facade`).
+
 **Type**: Rust trait (SDK crate)
 **Stability**: unstable
 **Description**: Async trait providing upload, download (seekable / with Range), delete, metadata read/update,
@@ -1151,7 +1264,7 @@ gear sees a normal seekable read/write (`cpt-cf-file-storage-component-sdk-facad
 
 #### Control-Plane REST API
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-interface-rest-api`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-interface-rest-api`
 
 **Type**: REST API (OpenAPI 3.0)
 **URL Prefix**: `/api/file-storage/v1`
@@ -1164,7 +1277,7 @@ signed-URL issuance. It does **not** carry file content — content moves over s
 
 #### Sidecar Data-Plane API
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-interface-sidecar-api`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-interface-sidecar-api`
 
 **Type**: HTTP (signed-URL authorized)
 **Stability**: unstable
@@ -1182,7 +1295,7 @@ the per-URL constraints the signature carries, plus the per-URL connection/rate 
 
 #### Gear Contract
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-contract-cf-gears`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-contract-cf-gears`
 
 **Direction**: provided by library (consumed by Gears)
 **Protocol/Format**: In-process Rust SDK trait via ClientHub
@@ -1190,7 +1303,7 @@ the per-URL constraints the signature carries, plus the per-URL connection/rate 
 
 #### Authorization Service Contract
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-contract-authz`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-contract-authz`
 
 **Direction**: required from external service (Authorization Service)
 **Protocol/Format**: Access decision requests for `gts.cf.fstorage.file.type.v1~` resources
@@ -1204,6 +1317,10 @@ the per-URL constraints the signature carries, plus the per-URL connection/rate 
 **Protocol/Format**: Asynchronous per-owner usage reports (storage consumption per owner, including ownership-transfer
 debits/credits per `cpt-cf-file-storage-fr-usage-reporting`)
 **Compatibility**: Contract follows platform usage reporting protocol; changes require coordinated release.
+
+**Current status**: Not exercised in any deployment — the usage-reporting sink this gear would call is always
+unset, so no usage delta is ever sent. See [operations.md](./operations.md)'s "Storage quota (not enforced)"
+section, which covers this sibling gap.
 
 #### Quota Enforcement Contract
 
@@ -1225,19 +1342,26 @@ deployment. `file-storage`'s side is implemented and ready. See [DESIGN.md](./DE
 **Protocol/Format**: Asynchronous event publishing and consumption via EventBroker gear
 **Compatibility**: Contract follows platform event protocol; event schema changes require coordinated release.
 
+**Partial:** the publish direction writes a transactional-outbox row (`events_outbox`) per write operation, but no
+relay drains it to EventBroker. The consume direction (owner-deletion events) is **not started** — see
+`cpt-cf-file-storage-fr-owner-deletion`.
+
 #### Serverless Runtime Contract
 
 - [ ] `p2` - **ID**: `cpt-cf-file-storage-contract-serverless-runtime`
 
 **Direction**: required from external service (Serverless Runtime)
 **Protocol/Format**: Workflow invocation for configurable lifecycle operations (e.g., owner deletion disposition)
+
+**Not started**: no implementation in this release — no Serverless Runtime client of any kind exists in this gear's
+code; see `cpt-cf-file-storage-fr-owner-deletion`.
 **Compatibility**: Contract follows platform Serverless Runtime invocation protocol; changes require coordinated release.
 
 ## 8. Use Cases
 
 ### Upload a File
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-usecase-upload`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-usecase-upload`
 
 **Actor**: `cpt-cf-file-storage-actor-platform-user`
 
@@ -1276,7 +1400,7 @@ deployment. `file-storage`'s side is implemented and ready. See [DESIGN.md](./DE
 
 ### Fetch File for Gear Processing
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-usecase-fetch-media`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-usecase-fetch-media`
 
 **Actor**: `cpt-cf-file-storage-actor-cf-gears`
 
@@ -1303,7 +1427,7 @@ deployment. `file-storage`'s side is implemented and ready. See [DESIGN.md](./DE
 
 ### Validate File Metadata Before Processing
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-usecase-get-metadata`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-usecase-get-metadata`
 
 **Actor**: `cpt-cf-file-storage-actor-cf-gears`
 
@@ -1328,7 +1452,7 @@ deployment. `file-storage`'s side is implemented and ready. See [DESIGN.md](./DE
 
 ### Delete a File
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-usecase-delete-file`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-usecase-delete-file`
 
 **Actor**: `cpt-cf-file-storage-actor-platform-user`
 
@@ -1375,7 +1499,7 @@ deployment. `file-storage`'s side is implemented and ready. See [DESIGN.md](./DE
 
 ### Multi-Backend Deployment
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-usecase-backend-config`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-usecase-backend-config`
 
 **Actor**: `cpt-cf-file-storage-actor-cf-gears`
 
@@ -1403,7 +1527,7 @@ deployment. `file-storage`'s side is implemented and ready. See [DESIGN.md](./DE
 
 ### Configure Policy
 
-- [ ] `p2` - **ID**: `cpt-cf-file-storage-usecase-configure-policy`
+- [x] `p2` - **ID**: `cpt-cf-file-storage-usecase-configure-policy`
 
 **Actor**: `cpt-cf-file-storage-actor-platform-user`
 
@@ -1430,82 +1554,92 @@ deployment. `file-storage`'s side is implemented and ready. See [DESIGN.md](./DE
 
 ## 9. Acceptance Criteria
 
-- [ ] File upload returns persistent URL and stores metadata (name, size, type, dates, owner)
-- [ ] File download returns content with correct metadata
-- [ ] File deletion of a non-versioned file permanently removes content; the metadata row is removed before the
+- [x] File upload returns persistent URL and stores metadata (name, size, type, dates, owner)
+- [x] File download returns content with correct metadata
+- [x] File deletion of a non-versioned file permanently removes content; the metadata row is removed before the
   best-effort backend delete, so a deleted file never leaves a row pointing at missing content, and re-deleting an
   already-deleted file is idempotent (`404`)
-- [ ] Deleting a file removes all of its versions (metadata-row-first, idempotent); a single version can be deleted by `version_id`
-- [ ] Authorization checked for every file operation via Authorization Service
-- [ ] Tenant boundary enforced — cross-tenant access rejected
-- [ ] Audit record emitted for every write operation
-- [ ] Policies enforce file type and size restrictions on upload (most restrictive wins across tenant and user levels)
-- [ ] All content traffic flows through the **sidecar** via signed URLs; no backend-addressable URL is returned to any client
-- [ ] Content upload and download are each a two-step exchange (control request → signed URL → byte transfer to/from the sidecar); the control REST surface never carries content
-- [ ] The credential is an opaque, asymmetric Ed25519-signed token (the bespoke codec-equivalent format per ADR-0004's Implementation note — not a literal PASETO library), carried in the query (`?fs-token=`) or a header, stateless, enforcing AND-combined claims (expiry, optional ip, optional token-claim predicates, upload size/hash); altering any claim invalidates the signature; only control+sidecar parse it
-- [ ] file_not_found error returned for non-existent files
-- [ ] access_denied error returned for unauthorized operations
-- [ ] Metadata-only queries complete without transferring file content
-- [ ] Content is mutable through dedicated content-replacement operations; ETag (content-derived) changes on every
+- [x] Deleting a file removes all of its versions (metadata-row-first, idempotent); a single version can be deleted by `version_id`
+- [x] Authorization checked for every file operation via Authorization Service
+- [x] Tenant boundary enforced — cross-tenant access rejected
+- [x] Audit record emitted for every write operation
+- [x] Policies enforce file type and size restrictions on upload (most restrictive wins across tenant and user levels)
+- [x] All content traffic flows through the **sidecar** via signed URLs; no backend-addressable URL is returned to any client
+- [x] Content upload and download are each a two-step exchange (control request → signed URL → byte transfer to/from the sidecar); the control REST surface never carries content
+- [x] The credential is an opaque, asymmetric Ed25519-signed token (the bespoke codec-equivalent format per ADR-0004's Implementation note — not a literal PASETO library), carried in the query (`?fs-token=`) or a header, stateless, enforcing AND-combined claims (expiry, optional ip, optional token-claim predicates, upload size/hash); altering any claim invalidates the signature; only control+sidecar parse it
+- [x] file_not_found error returned for non-existent files
+- [x] access_denied error returned for unauthorized operations
+- [x] Metadata-only queries complete without transferring file content
+- [x] Content is mutable through dedicated content-replacement operations; ETag (content-derived) changes on every
   content write; metadata-only updates do not change ETag or content hash
-- [ ] Content replacement uploads a new immutable version and **binds** it as current under `If-Match` CAS; a
+- [x] Content replacement uploads a new immutable version and **binds** it as current under `If-Match` CAS; a
   conflicting bind returns `400 failed_precondition` and is retried by re-binding the already-uploaded `version_id` without re-uploading
   the bytes; backend content is never mutated in place
-- [ ] `custom_metadata` is updatable by any actor authorized for the **write** action on the file's GTS type;
+- [x] `custom_metadata` is updatable by any actor authorized for the **write** action on the file's GTS type;
   system-managed metadata is not user-updatable
-- [ ] Custom metadata update changes the file's last modified date
-- [ ] File ownership (`owner_kind`, `owner_id`) is immutable after creation except through explicit ownership transfer
+- [x] Custom metadata update changes the file's last modified date
+- [x] File ownership (`owner_kind`, `owner_id`) is immutable after creation except through explicit ownership transfer
   or owner deletion workflows; `tenant_id` is never mutable
-- [ ] Every file has a mandatory GTS file type assigned at upload time; uploads without a file type are rejected
-- [ ] GTS file type is immutable after creation
-- [ ] Authorization requests include the file's GTS type, enabling per-type access decisions
-- [ ] A gear authorized only for type A cannot access files of type B
-- [ ] FileStorage SDK and REST API behave identically regardless of configured storage backend
-- [ ] File listing returns metadata only, is paginated, and requires a mandatory owner-kind filter (`user` or `app`)
-- [ ] Multipart upload assembles parts into a complete file with correct metadata
-- [ ] Upload rejected when declared mime_type does not match actual file content
-- [ ] Each backend declares its supported client-facing capabilities (multipart upload, server-side encryption);
+- [x] Every file has a mandatory GTS file type assigned at upload time; uploads without a file type are rejected
+- [x] GTS file type is immutable after creation
+- [x] Authorization requests include the file's GTS type, enabling per-type access decisions
+- [x] A gear authorized only for type A cannot access files of type B
+- [x] FileStorage SDK and REST API behave identically regardless of configured storage backend
+- [x] File listing returns metadata only, is paginated, and requires a mandatory owner-kind filter (`user` or `app`)
+- [x] Multipart upload assembles parts into a complete file with correct metadata
+- [x] Upload rejected when declared mime_type does not match actual file content
+- [x] Each backend declares its supported client-facing capabilities (multipart upload, server-side encryption);
   internal-only capabilities are not surfaced on public discovery
-- [ ] Consumers can discover backend capabilities at runtime
-- [ ] Operations requiring an unsupported capability return a clear error
-- [ ] Versioning is FileStorage-level and backend-agnostic: each content write creates a new immutable version at
+- [x] Consumers can discover backend capabilities at runtime
+- [x] Operations requiring an unsupported capability return a clear error
+- [x] Versioning is FileStorage-level and backend-agnostic: each content write creates a new immutable version at
   `/{file_id}/{version_id}`; metadata-only updates do not create a new version
-- [ ] All versions of a file are listable with `version_id`, size, hash, timestamp, and current-version flag
-- [ ] Restore rebinds `content_id` to a prior version (pointer swap, no re-upload), under the same authorization as a
+- [x] All versions of a file are listable with `version_id`, size, hash, timestamp, and current-version flag
+- [x] Restore rebinds `content_id` to a prior version (pointer swap, no re-upload), under the same authorization as a
   content write
-- [ ] In P1 versions are retained indefinitely (no automatic cleanup); P2 prunes via the retention policy +
+- [x] In P1 versions are retained indefinitely (no automatic cleanup); P2 prunes via the retention policy +
   reconciliation engine
-- [ ] Permanent delete of a specific version removes only that version
-- [ ] Declared capabilities are independently configurable (enable/disable) per backend
-- [ ] A capability disabled by configuration behaves identically to an unsupported capability
-- [ ] Download and metadata responses include `ETag` header derived from `(file_id, content_id)` and not equal
+- [x] Permanent delete of a specific version removes only that version
+- [x] Declared capabilities are independently configurable (enable/disable) per backend
+- [x] A capability disabled by configuration behaves identically to an unsupported capability
+- [x] Download and metadata responses include `ETag` header derived from `(file_id, content_id)` and not equal
   to the content hash
 - [ ] Conditional download with `If-None-Match` returns `304 Not Modified` when file is unchanged
-- [ ] `If-Match` is required on content **bind** and on `DELETE`; missing or mismatching `If-Match` returns `400 failed_precondition`
-- [ ] An optional metadata-revision precondition on metadata-only updates returns `400 failed_precondition` on mismatch, giving
+  (**Partial:** implemented on the control-plane metadata `GET`; not implemented on the sidecar's content download)
+- [x] `If-Match` is required on content **bind** and on `DELETE`; missing or mismatching `If-Match` returns `400 failed_precondition`
+- [x] An optional metadata-revision precondition on metadata-only updates returns `400 failed_precondition` on mismatch, giving
   lost-update protection for concurrent metadata writers; when omitted, metadata updates remain last-write-wins
-- [ ] An upload whose bind never completes leaves no current pointer to it; the orphan `pending` version and its blob
+- [x] An upload whose bind never completes leaves no current pointer to it; the orphan `pending` version and its blob
   are reconciled by the P2 cleanup engine (`cpt-cf-file-storage-fr-orphan-reconciliation`)
-- [ ] Retried upload with the same idempotency key returns the original result without creating a duplicate file
-- [ ] Retried upload with the same idempotency key by a different owner does not return or create the original owner's
+- [x] Retried upload with the same idempotency key returns the original result without creating a duplicate file
+- [x] Retried upload with the same idempotency key by a different owner does not return or create the original owner's
   file
 - [ ] Owner deletion event from EventBroker triggers a configurable Serverless Runtime workflow for file disposition
-- [ ] Files of a deleted owner are retained as orphaned when no workflow is configured
+  (**Not started:** no implementation in this release)
+- [ ] Files of a deleted owner are retained as orphaned when no workflow is configured (**Not started:** no
+  implementation in this release)
 - [ ] Server-side encryption is applied when the encryption capability is available and enabled for the backend
-- [ ] Upload rejected when storage quota would be exceeded (Quota Enforcement service check)
+- [ ] Upload rejected when storage quota would be exceeded (Quota Enforcement service check) (not enforced in any
+  deployment — see `cpt-cf-file-storage-fr-storage-quota`'s Current status)
 - [ ] Usage report emitted asynchronously on every storage-consuming write operation; file operations not blocked if
-  Usage Collector is unavailable
-- [ ] Ownership transfer emits usage reports for both previous and new owner
+  Usage Collector is unavailable (not sent in any deployment — see `cpt-cf-file-storage-fr-usage-reporting`'s
+  Current status)
+- [ ] Ownership transfer emits usage reports for both previous and new owner (the call site exists, but no usage
+  report is ever sent — see `cpt-cf-file-storage-fr-usage-reporting`'s Current status)
 - [ ] File events emitted to EventBroker on write operations (upload, update, delete) when enabled by owner policy
-- [ ] HTTP Range requests return partial content for downloads; seeking and resumable downloads supported;
+  (**Partial:** written to the `events_outbox`; no relay delivers them to EventBroker)
+- [x] HTTP Range requests return partial content for downloads; seeking and resumable downloads supported;
   `Accept-Ranges: bytes` set on every download response
-- [ ] Retention policies automatically expire and delete files based on configured age, inactivity, or custom metadata
+- [x] Retention policies automatically expire and delete files based on configured age, inactivity, or custom metadata
   criteria; per-file retention overrides are honored
 - [ ] Storage backends in P1 are loaded from a static TOML configuration file at gear startup; in P3, backends can
-  be connected and configured at runtime via admin API without service rebuild
+  be connected and configured at runtime via admin API without service rebuild (**Partial:** the P1 TOML loading half
+  is implemented; the P3 runtime admin API half is not)
 - [ ] File ownership transferable by current owner to another user or app within the same tenant; transfer requires
-  authorization of both parties and emits an audit record
-- [ ] Custom metadata operations rejected when exceeding configurable limits (max pairs, key length, value length, total
+  authorization of both parties and emits an audit record (**Partial:** the current owner's authorization is checked
+  and an audit record is emitted; the receiving principal's authorization/existence is not verified — see
+  `cpt-cf-file-storage-fr-ownership-transfer`)
+- [x] Custom metadata operations rejected when exceeding configurable limits (max pairs, key length, value length, total
   size)
 - [ ] Read audit records emitted for every download when enabled by policy
 
