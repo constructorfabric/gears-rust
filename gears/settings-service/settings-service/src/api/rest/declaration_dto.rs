@@ -224,7 +224,7 @@ pub struct UpdateDeclarationRequest {
 }
 
 /// The response to a create: the declaration, and whether a retired one was
-/// revived rather than a new row inserted.
+/// revived or the active one evolved rather than a new setting declared.
 #[derive(Debug, Clone, PartialEq)]
 #[toolkit_macros::api_dto(response)]
 pub struct CreatedDeclarationDto {
@@ -234,6 +234,11 @@ pub struct CreatedDeclarationDto {
     /// `true` when the key held a retired declaration that this call revived,
     /// with its retained values re-entering resolution.
     pub reactivated: bool,
+    /// `true` when the setting's active declaration changed its value type,
+    /// Schema Default or scope class and this call evolved it: the declaration
+    /// returned is the next major, under a new `key`, holding every value of
+    /// the previous one re-validated, and the previous major is retired.
+    pub evolved: bool,
 }
 
 #[cfg(test)]

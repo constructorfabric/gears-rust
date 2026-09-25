@@ -1184,3 +1184,196 @@ async fn a_secret_placeholder_must_be_an_instance_of_the_type_as_well_as_empty()
         .await
         .expect("the empty string is both empty and a string");
 }
+
+// ── Evolve by re-declaring ───────────────────────────────────────────────────
+
+impl Harness {
+    /// The declaration stored under `key`, whatever its status.
+    async fn by_key(&self, key: &str) -> Option<Declaration> {
+        let conn = self.base.db.conn().expect("connection");
+        DeclarationRepo
+            .find_by_key(&conn, &AccessScope::allow_all(), key)
+            .await
+            .expect("lookup")
+    }
+}
+
+#[tokio::test]
+async fn a_behaviour_change_on_an_active_path_evolves_it_to_the_next_major() {
+    let h = Harness::verified().await;
+    let created = h
+        .create(h.request("retry_policy"), &admin_actor())
+        .await
+        .expect("created");
+    let v1 = created.declaration;
+    assert!(v1.key.ends_with(".retry_policy.v1~"), "{}", v1.key);
+    let (a, b) = (h.base.tree.a, h.base.tree.b);
+    h.base.set(v1.id, a, json!(true)).await;
+    h.base.set_flagged(v1.id, b, json!("aggressive")).await;
+
+    // Re-declared as text: a new major carries the new shape.
+    let mut retyped = h.request("retry_policy");
+    retyped.value_type_id = TEXT.to_owned();
+    retyped.default_value = json!("gentle");
+    let evolved = h.create(retyped, &admin_actor()).await.expect("evolved");
+    assert!(evolved.evolved, "the answer says it evolved");
+    assert!(!evolved.reactivated);
+    let v2 = evolved.declaration;
+    assert!(v2.key.ends_with(".retry_policy.v2~"), "{}", v2.key);
+    assert_ne!(v2.id, v1.id, "a new declaration, not the old row retyped");
+    assert_eq!(v2.value_type_id, TEXT);
+    assert_eq!(v2.status, "active");
+    assert_eq!(
+        h.load(v1.id).await.status,
+        "retired",
+        "exactly one major is active"
+    );
+    assert_eq!(evolved.retired.as_deref(), Some(v1.key.as_str()));
+
+    // Every value moved to the new key and was re-validated there; the old
+    // key keeps its own.
+    let conn = h.base.db.conn().expect("connection");
+    let scope = AccessScope::allow_all();
+    let moved = ValueRepo
+        .find_one(&conn, &scope, v2.id, a)
+        .await
+        .expect("lookup")
+        .expect("copied");
+    assert_eq!(moved.value, Some(json!(true)), "copied, not coerced");
+    assert!(moved.needs_review, "`true` is not text");
+    let cleared = ValueRepo
+        .find_one(&conn, &scope, v2.id, b)
+        .await
+        .expect("lookup")
+        .expect("copied");
+    assert!(!cleared.needs_review, "text validates under the new type");
+    assert_eq!(
+        ValueRepo
+            .find_all(&conn, &scope, v1.id)
+            .await
+            .expect("lookup")
+            .len(),
+        2
+    );
+
+    // The new key is a new type, registered before it was written.
+    assert_eq!(
+        h.registrar.registered.lock().expect("lock").last(),
+        Some(&(v2.key.clone(), TEXT.to_owned()))
+    );
+}
+
+#[tokio::test]
+async fn evolution_follows_the_active_major_and_a_repeat_of_it_mints_nothing() {
+    let h = Harness::verified().await;
+    let v1 = h
+        .create(h.request("retry_policy"), &admin_actor())
+        .await
+        .expect("created")
+        .declaration;
+    let mut as_text = h.request("retry_policy");
+    as_text.value_type_id = TEXT.to_owned();
+    as_text.default_value = json!("gentle");
+    let v2 = h
+        .create(as_text.clone(), &admin_actor())
+        .await
+        .expect("to v2")
+        .declaration;
+
+    // The response was lost and the same request comes again: it matches the
+    // active v2, so it is a conflict, never an accidental v3.
+    let err = h
+        .create(as_text.clone(), &admin_actor())
+        .await
+        .expect_err("a repeat");
+    match err {
+        DomainError::Conflict { detail } => {
+            assert!(
+                detail.starts_with(super::conflict::KEY_CONFLICT),
+                "{detail}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // A later shape change evolves the active v2, not the retired v1.
+    let mut firmer = as_text;
+    firmer.default_value = json!("firm");
+    let v3 = h
+        .create(firmer, &admin_actor())
+        .await
+        .expect("to v3")
+        .declaration;
+    assert!(v3.key.ends_with(".retry_policy.v3~"), "{}", v3.key);
+    assert_eq!(h.load(v2.id).await.status, "retired");
+    assert_eq!(h.load(v1.id).await.status, "retired", "v1 stays retired");
+    assert!(h.by_key(&v3.key.replace(".v3~", ".v4~")).await.is_none());
+}
+
+#[tokio::test]
+async fn a_metadata_only_redeclaration_of_an_active_path_is_a_conflict() {
+    let h = Harness::verified().await;
+    h.create(h.request("retry_policy"), &admin_actor())
+        .await
+        .expect("created");
+    let mut described = h.request("retry_policy");
+    described.description = Some("another text".to_owned());
+    let err = h
+        .create(described, &admin_actor())
+        .await
+        .expect_err("PATCH it");
+    match err {
+        DomainError::Conflict { detail } => {
+            assert!(
+                detail.starts_with(super::conflict::KEY_CONFLICT),
+                "{detail}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn evolution_needs_step_up_and_may_not_cross_the_secret_boundary() {
+    // With no verifier configured, an evolve is refused and nothing moves.
+    let h = Harness::new().await;
+    let v1 = h
+        .create(h.request("retry_policy"), &admin_actor())
+        .await
+        .expect("a fresh create needs no step-up")
+        .declaration;
+    let mut as_text = h.request("retry_policy");
+    as_text.value_type_id = TEXT.to_owned();
+    as_text.default_value = json!("gentle");
+    let err = h
+        .create(as_text, &admin_actor())
+        .await
+        .expect_err("no step-up");
+    assert!(matches!(err, DomainError::StepUpRequired { .. }), "{err:?}");
+    assert_eq!(h.load(v1.id).await.status, "active");
+
+    // Values stored inline are not re-interpreted as secret references.
+    let h = Harness::verified().await;
+    let v1 = h
+        .create(h.request("retry_policy"), &admin_actor())
+        .await
+        .expect("created")
+        .declaration;
+    h.base.set(v1.id, h.base.tree.a, json!(true)).await;
+    let mut secreted = h.request("retry_policy");
+    secreted.value_type_id = SECRET.to_owned();
+    secreted.default_value = json!("");
+    let err = h
+        .create(secreted, &admin_actor())
+        .await
+        .expect_err("secretness");
+    match err {
+        DomainError::Conflict { detail } => assert!(
+            detail.starts_with(super::conflict::SECRETNESS_CHANGED),
+            "{detail}"
+        ),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(h.load(v1.id).await.status, "active", "nothing moved");
+    assert!(h.by_key(&v1.key.replace(".v1~", ".v2~")).await.is_none());
+}

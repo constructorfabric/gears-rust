@@ -172,9 +172,17 @@ pub async fn create_declaration(
         }
         Err(err) => return Err(err.into()),
     };
-    if created.reactivated {
+    // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-evolve:p1:inst-decl-evolve-7
+    // Retained values re-enter resolution on a revive; on an evolution the old
+    // key leaves it and the new one enters. Nothing cached may keep answering
+    // for either.
+    if created.reactivated || created.evolved {
         admin.evict(&created.declaration.key);
     }
+    if let Some(retired) = &created.retired {
+        admin.evict(retired);
+    }
+    // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-evolve:p1:inst-decl-evolve-7
     let location = format!(
         "/settings-service/v1/declarations/{}",
         created.declaration.id
@@ -183,11 +191,13 @@ pub async fn create_declaration(
     let dto = crate::api::rest::declaration_dto::CreatedDeclarationDto {
         declaration: DeclarationDto::from(rendered),
         reactivated: created.reactivated,
+        evolved: created.evolved,
     };
     let etag = dto.declaration.etag.clone();
-    // A revive answers `200`: the resource was already there, and the body says
-    // so with `reactivated`. Only a genuinely new row is a `201`.
-    let status = if created.reactivated {
+    // A revive or an evolution answers `200`: the setting was already there,
+    // and the body says which with `reactivated` or `evolved`. Only a
+    // genuinely new setting is a `201`.
+    let status = if created.reactivated || created.evolved {
         StatusCode::OK
     } else {
         StatusCode::CREATED

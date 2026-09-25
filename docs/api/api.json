@@ -4368,18 +4368,23 @@
           },
           {
             "properties": {
+              "evolved": {
+                "description": "`true` when the setting's active declaration changed its value type,\nSchema Default or scope class and this call evolved it: the declaration\nreturned is the next major, under a new `key`, holding every value of\nthe previous one re-validated, and the previous major is retired.",
+                "type": "boolean"
+              },
               "reactivated": {
                 "description": "`true` when the key held a retired declaration that this call revived,\nwith its retained values re-entering resolution.",
                 "type": "boolean"
               }
             },
             "required": [
-              "reactivated"
+              "reactivated",
+              "evolved"
             ],
             "type": "object"
           }
         ],
-        "description": "The response to a create: the declaration, and whether a retired one was\nrevived rather than a new row inserted."
+        "description": "The response to a create: the declaration, and whether a retired one was\nrevived or the active one evolved rather than a new setting declared."
       },
       "CreditApplicationRequest": {
         "description": "The `POST /credit-applications` request body: ONE wire shape for both wallet\nkinds, discriminated by `kind` (`\"grant\"` | `\"apply\"`). The target seller\nledger is the body's own `tenant_id` (tenant in body, not path — the vhp-core\nREST convention); the `(credit_application, write)` PEP gate authorizes it.\n`scale` is advisory; the ledger resolves the authoritative per-line scale.\n\nThe kind-specific fields are all optional on the wire and validated in\n[`Self::into_sdk`]: a `grant` requires `amount_minor` + `credit_grant_event_type`\n(and ignores `targets`); an `apply` requires a non-empty `targets` (and ignores\nthe grant fields). A missing required field or an unknown `kind` is rejected\n`400 InvalidArgument` before the SDK type is built.",

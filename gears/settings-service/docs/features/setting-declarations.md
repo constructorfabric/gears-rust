@@ -19,6 +19,7 @@
   - [Update Declaration Metadata](#update-declaration-metadata)
   - [Retire Declaration](#retire-declaration)
   - [Reactivate Declaration](#reactivate-declaration)
+  - [Evolve Declaration](#evolve-declaration)
   - [Declare Dependency Group](#declare-dependency-group)
   - [Read Declarations](#read-declarations)
 - [3. Processes / Business Logic (CDSL)](#3-processes--business-logic-cdsl)
@@ -205,7 +206,7 @@ The hardest constraint here is not any single field but the rule connecting them
 3. [x] - `p1` - **IF** the decision is deny or cannot be obtained → **RETURN** `403` - `inst-decl-react-3`
 4. [x] - `p1` - Construct the key and look up an existing declaration at that key - `inst-decl-react-4`
 5. [x] - `p1` - **IF** no row exists → continue as an ordinary create - `inst-decl-react-5`
-6. [x] - `p1` - **IF** a row exists with `status` = 'active' → **RETURN** `409` for the duplicate key - `inst-decl-react-6`
+6. [x] - `p1` - **IF** a row exists with `status` = 'active' → **RETURN** `409` for the duplicate key; an active declaration anywhere on the setting's version-stripped path is found first and the request is an evolution or a `409` (Evolve Declaration), so a revive considers only a path with no active major - `inst-decl-react-6`
 7. [x] - `p1` - Require a valid credential step-up assertion, because reactivation changes whether a live setting resolves - `inst-decl-react-7`
 8. [x] - `p1` - **IF** step-up is absent or invalid → **RETURN** `403` - `inst-decl-react-8`
 9. [x] - `p1` - **IF** the re-declaration flips the secret trait, changes the Scope Class or names a different `value_type_id` → **RETURN** `409` naming which, nothing written: the first two would move stored values rather than re-interpret them, and the setting's own GTS type is registered with its value type, which the Types Registry does not replace - `inst-decl-react-13`
@@ -214,6 +215,30 @@ The hardest constraint here is not any single field but the rule connecting them
 12. [x] - `p1` - Invalidate the local cache for the affected scopes, since retained values re-enter resolution - `inst-decl-react-10`
 13. [x] - `p1` - Emit a declaration-reactivated audit record - `inst-decl-react-11`
 14. [x] - `p1` - **RETURN** `200` with the revived declaration - `inst-decl-react-12`
+
+### Evolve Declaration
+
+- [x] `p1` - **ID**: `cpt-cf-settings-service-flow-setting-declarations-evolve`
+
+**Actor**: `cpt-cf-settings-service-actor-platform-admin`
+
+**Success Scenarios**:
+- An active admin-authored setting re-declared with a different value type, Schema Default or scope class evolves to the next free major on its version-stripped path: a new declaration under a new key, holding every value of the previous major re-validated, while the previous major is retired
+- A later shape change evolves whichever major is active, never a retired one
+
+**Error Scenarios**:
+- The re-declaration matches the active declaration, or changes only metadata: `409`, so a retry after a lost response never mints a major and metadata goes through PATCH
+- Credential step-up absent or invalid
+- The active declaration is contributed by a gear, or the new value type is on the other side of the secret boundary: `409`, nothing written
+
+**Steps**:
+1. [x] - `p1` - Look up every declaration on the request's version-stripped path — `(vendor, category, leaf name)`, whatever the major or status; **IF** one is active, the request is an evolution rather than a create or a revive - `inst-decl-evolve-1`
+2. [x] - `p1` - **IF** the request changes none of the value type, the Schema Default and the scope class of the active declaration → **RETURN** `409` for the duplicate key - `inst-decl-evolve-2`
+3. [x] - `p1` - Require a valid credential step-up assertion, because evolution retires a live setting's current major; **IF** absent or invalid → **RETURN** `401`/`403` - `inst-decl-evolve-3`
+4. [x] - `p1` - **IF** the active declaration is contributed by a gear → **RETURN** `409`; **IF** the new value type flips the secret trait → **RETURN** `409`, since stored values would be re-interpreted rather than moved - `inst-decl-evolve-4`
+5. [x] - `p1` - Mint the next free major: one above the highest major the path has ever used, retired ones included, composed as `<vendor>.settings.<category>.<name>.vN~` - `inst-decl-evolve-5`
+6. [x] - `p1` - In one transaction: retire the active predecessor and record it; insert the successor at the new key — its own GTS setting type registered first, its create recorded; copy every predecessor value to it at the same scope under an update lock, re-validating each against the new value type and flagging what fails `needs_review` with its detail, never coercing or dropping it - `inst-decl-evolve-6`
+7. [x] - `p1` - Invalidate the local cache for both keys, and **RETURN** `200` with the successor and `evolved: true` - `inst-decl-evolve-7`
 
 ### Declare Dependency Group
 
@@ -333,6 +358,7 @@ The hardest constraint here is not any single field but the rule connecting them
 2. [x] - `p1` - **FROM** `active` **TO** `retired` **WHEN** an authorized administrator retires it with a valid credential step-up assertion - `inst-decl-state-2`
 3. [x] - `p1` - **FROM** `retired` **TO** `active` **WHEN** the key is re-declared with a valid credential step-up assertion - `inst-decl-state-3`
 4. [x] - `p1` - **FROM** `retired` **TO** `retired` **WHEN** values remain stored against the declaration, since retire never deletes values and a retired declaration continues to occupy its category - `inst-decl-state-4`
+5. [x] - `p1` - **FROM** `active` **TO** `retired` **WHEN** the setting evolves to a new major with a valid credential step-up assertion; the successor enters `active` as a new declaration in the same transaction - `inst-decl-state-5`
 
 ## 5. Definitions of Done
 
@@ -426,11 +452,12 @@ The system **MUST** partition declaration changes into descriptive metadata appl
 
 - [x] `p1` - **ID**: `cpt-cf-settings-service-dod-setting-declarations-lifecycle`
 
-Retire **MUST** be an immediate soft delete setting `status` to `retired` in one transaction with cache invalidation and signal publication, **MUST** require credential step-up, and **MUST** retain every stored value while excluding the declaration from resolution. Reactivation **MUST** be expressed as re-declaring the key, also step-up gated; every retained value **MUST** be re-validated against the value type before it goes live, and the re-declaration **MUST** be refused when it flips the secret trait, changes the Scope Class or names a different value type — the setting's own GTS type is registered with its value type, and the Types Registry does not replace a registered type. Neither action goes through the value write path, and neither deletes values.
+Retire **MUST** be an immediate soft delete setting `status` to `retired` in one transaction with cache invalidation and signal publication, **MUST** require credential step-up, and **MUST** retain every stored value while excluding the declaration from resolution. Reactivation **MUST** be expressed as re-declaring the key, also step-up gated; every retained value **MUST** be re-validated against the value type before it goes live, and the re-declaration **MUST** be refused when it flips the secret trait, changes the Scope Class or names a different value type — the setting's own GTS type is registered with its value type, and the Types Registry does not replace a registered type. Evolution **MUST** be expressed as re-declaring an active setting with a different value type, Schema Default or scope class, step-up gated: it **MUST** insert the next free major under a new key and type, copy and re-validate every value of the active major, and retire that major, all in one transaction, and **MUST** refuse a request matching the active declaration, a contributed declaration, and a new value type across the secret boundary. None of these actions goes through the value write path, and none deletes values.
 
 **Implements**:
 - `cpt-cf-settings-service-flow-setting-declarations-retire`
 - `cpt-cf-settings-service-flow-setting-declarations-reactivate`
+- `cpt-cf-settings-service-flow-setting-declarations-evolve`
 - `cpt-cf-settings-service-state-setting-declarations-lifecycle`
 
 **Constraints**: `cpt-cf-settings-service-constraint-step-up-at-idp`
@@ -532,6 +559,9 @@ The system **MUST** emit an audit record through the Audit Emitter for every dec
 - [x] Re-declaring a retired key with step-up revives the row to `active` and its retained values participate in resolution again
 - [x] Re-declaring a retired key with a different value type is refused `409 value_type_changed` with nothing written; a revive under the same type re-validates every retained value, one that validates goes live and one that does not is flagged `needs_review` with its detail
 - [x] Re-declaring a retired key with a type that flips the secret trait, or with a different scope class, returns `409` and leaves the row retired and its values untouched
+- [x] Re-declaring an active setting with a different value type evolves it: `200` with `evolved: true`, the next major created and active, every value copied and re-validated with failures flagged `needs_review`, the previous major retired
+- [x] A later shape change evolves the active major, not a retired one, and a repeat of a request that matches the active declaration returns `409` without minting a major
+- [x] An evolution without step-up, of a contributed declaration, or across the secret boundary is refused and leaves the active declaration and its values untouched
 - [x] Re-declaring a key that is already `active` returns `409`
 - [ ] A Dependency Group naming a key that resolves to no active declaration returns `400`
 - [ ] An attempt to edit an existing Dependency Group or its constraint in place is rejected

@@ -29,7 +29,7 @@ use crate::domain::precondition::{self, ETag};
 use crate::domain::resolution::EffectiveCache;
 use crate::domain::stepup::{StepUpRefusal, StepUpVerifier};
 use crate::domain::validation::{TraitSet, TypeValidator};
-use crate::domain::value::{StoredValue, ValueRepository};
+use crate::domain::value::{StoredValue, ValueDraft, ValueRepository};
 use crate::domain::writes::WriteActor;
 use crate::field;
 
@@ -73,7 +73,12 @@ pub struct CreateDeclaration {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Created {
     pub declaration: Declaration,
+    /// A retired declaration was revived rather than a row inserted.
     pub reactivated: bool,
+    /// The active declaration on the path was evolved to this new major.
+    pub evolved: bool,
+    /// The key an evolution retired, for the caller to evict with the new one.
+    pub retired: Option<String>,
 }
 
 /// What the value type's traits and the author's wish resolve to.
@@ -100,6 +105,14 @@ fn validation(field: &str, code: &'static str, message: impl Into<String>) -> Do
         code,
         message: message.into(),
     }
+}
+
+/// Whether a re-declaration changes what only a new major may carry: the value
+/// type, the Schema Default or the scope class. Anything else is metadata.
+fn changes_behaviour(active: &Declaration, request: &CreateDeclaration) -> bool {
+    active.value_type_id != request.value_type_id
+        || active.default_value != request.default_value
+        || active.scope_class != request.scope_class
 }
 
 fn conflict(code: &str, message: impl std::fmt::Display) -> DomainError {
@@ -472,6 +485,44 @@ where
         };
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-15
 
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-evolve:p1:inst-decl-evolve-1
+        // The active declaration on the version-stripped path comes first,
+        // whatever its major: after `v1 → v2` the composed `v1` key is retired,
+        // and looking it up alone would revive it beside the live `v2`.
+        let on_path = self.declarations_on_path(conn, scope, &key).await?;
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-evolve:p1:inst-decl-evolve-1
+        if let Some(active) = on_path.iter().find(|d| d.status == "active") {
+            // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-evolve:p1:inst-decl-evolve-2
+            // A request matching the active declaration is not evolution: a
+            // retry after a lost response must not mint a major by accident,
+            // and a metadata change goes through PATCH.
+            if !changes_behaviour(active, &request) {
+                return Err(conflict(
+                    conflict::KEY_CONFLICT,
+                    format!(
+                        "`{}` is the active declaration of this setting and the request changes \
+                         none of its value type, Schema Default or scope class; metadata changes \
+                         use PATCH",
+                        active.key
+                    ),
+                ));
+            }
+            // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-evolve:p1:inst-decl-evolve-2
+            return self
+                .evolve(
+                    conn,
+                    scope,
+                    &key,
+                    active.clone(),
+                    &on_path,
+                    &request,
+                    derived,
+                    metadata,
+                    actor,
+                )
+                .await;
+        }
+
         match existing {
             // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-6
             Some(active) if active.status == "active" => Err(conflict(
@@ -573,6 +624,8 @@ where
         Ok(Created {
             declaration: inserted,
             reactivated: false,
+            evolved: false,
+            retired: None,
         })
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-21
     }
@@ -713,8 +766,166 @@ where
         Ok(Created {
             declaration: revived,
             reactivated: true,
+            evolved: false,
+            retired: None,
         })
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-12
+    }
+
+    /// Evolve the active declaration of a setting to the next free major: the
+    /// predecessor retired, the successor inserted under its own key and type,
+    /// every value copied to it and re-validated, all in the caller's
+    /// transaction. Nothing outside it sees the path without an active major,
+    /// and a failure anywhere leaves the predecessor active and untouched.
+    #[allow(clippy::too_many_arguments)]
+    async fn evolve<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        first: &SettingKey,
+        active: Declaration,
+        on_path: &[Declaration],
+        request: &CreateDeclaration,
+        derived: DerivedClassification,
+        metadata: DeclarationMetadata,
+        actor: &WriteActor,
+    ) -> Result<Created, DomainError> {
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-evolve:p1:inst-decl-evolve-3
+        // Evolution retires a live setting's current major: gated like a value
+        // change, before anything else is inspected.
+        self.verify_step_up(actor).await?;
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-evolve:p1:inst-decl-evolve-3
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-evolve:p1:inst-decl-evolve-4
+        if active.source == "module_contributed" {
+            return Err(conflict(
+                conflict::CONTRIBUTED_IMMUTABLE,
+                format!(
+                    "`{}` is contributed by a gear; it evolves when that gear registers a new \
+                     major",
+                    active.key
+                ),
+            ));
+        }
+        // A secret's values live by reference and everything else inline: a
+        // copy across that boundary would re-interpret stored values, not move
+        // them, exactly as a revive may not.
+        if active.has_secret_trait != derived.has_secret_trait {
+            return Err(conflict(
+                conflict::SECRETNESS_CHANGED,
+                format!(
+                    "`{}` is declared with `{}`; `{}` is on the other side of the secret \
+                     boundary, and an evolution does not move stored values across it",
+                    active.key, active.value_type_id, request.value_type_id
+                ),
+            ));
+        }
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-evolve:p1:inst-decl-evolve-4
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-evolve:p1:inst-decl-evolve-5
+        // One above the highest major the path has ever used, retired ones
+        // included: a retired major keeps its key, its type and its values.
+        let highest = on_path
+            .iter()
+            .filter_map(|d| SettingKey::parse(&d.key).ok())
+            .map(|k| k.major())
+            .max()
+            .unwrap_or(1);
+        let next = highest
+            .checked_add(1)
+            .and_then(std::num::NonZeroU32::new)
+            .ok_or_else(|| DomainError::Internal {
+                diagnostic: format!("`{}` has no major left above {highest}", active.key),
+            })?;
+        let successor_key =
+            SettingKey::compose_at(&request.vendor, first.category_slug(), &request.name, next)
+                .map_err(|err| DomainError::Internal {
+                    diagnostic: format!("the next major of `{first}` does not compose: {err}"),
+                })?;
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-evolve:p1:inst-decl-evolve-5
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-evolve:p1:inst-decl-evolve-6
+        // The predecessor retires first, and only because it must: both majors
+        // hold one leaf name in one category, and an active row per pair is
+        // all the unique index admits.
+        // @cpt-begin:cpt-cf-settings-service-state-setting-declarations-lifecycle:p1:inst-decl-state-5
+        self.declarations
+            .set_status(conn, scope, active.id, "retired", None)
+            .await?;
+        // @cpt-end:cpt-cf-settings-service-state-setting-declarations-lifecycle:p1:inst-decl-state-5
+        let retired = self.reload(conn, scope, &active.key).await?;
+        self.record(
+            conn,
+            &retired,
+            actor,
+            AuditOperation::Remove,
+            Some(snapshot(&active)),
+            Some(snapshot(&retired)),
+        )
+        .await?;
+        // The successor as any new declaration: its own type registered before
+        // its row is written, its create recorded.
+        let successor = self
+            .insert_new(
+                conn,
+                scope,
+                &successor_key,
+                request,
+                derived,
+                metadata,
+                actor,
+            )
+            .await?
+            .declaration;
+        // Every value moves to the successor at the same scope, read under an
+        // update lock so a write gated while the predecessor was active is
+        // either copied here or refused when it sees the row retired. A copy
+        // that no longer validates is stored flagged, never coerced or dropped.
+        for row in self.values.lock_all(conn, scope, active.id).await? {
+            let detail = self.revalidate(&request.value_type_id, &row).await?;
+            self.values
+                .insert(
+                    conn,
+                    scope,
+                    ValueDraft {
+                        declaration_id: successor.id,
+                        tenant_id: row.tenant_id,
+                        value: row.value.clone(),
+                        secret_ref: row.secret_ref.clone(),
+                        data_classification: derived.data_classification.to_owned(),
+                        needs_review: detail.is_some(),
+                        needs_review_detail: detail,
+                        set_by: row.set_by.clone(),
+                    },
+                )
+                .await?;
+        }
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-evolve:p1:inst-decl-evolve-6
+        Ok(Created {
+            declaration: successor,
+            reactivated: false,
+            evolved: true,
+            retired: Some(active.key),
+        })
+    }
+
+    /// Every declaration on the version-stripped path of `key`, whatever its
+    /// major or status.
+    async fn declarations_on_path<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        key: &SettingKey,
+    ) -> Result<Vec<Declaration>, DomainError> {
+        let path = key.version_stripped_path();
+        let prefix = format!("{}{path}.v", settings_service_sdk::gts::SETTING_TYPE_BASE);
+        Ok(self
+            .declarations
+            .find_by_key_prefix(conn, scope, &prefix)
+            .await?
+            .into_iter()
+            // A `LIKE` prefix is not a path — `_` in a slug is a wildcard there,
+            // so `retry_policy` also matches `retryXpolicy` — and each key is
+            // re-checked against the exact path.
+            .filter(|d| SettingKey::parse(&d.key).is_ok_and(|k| k.version_stripped_path() == path))
+            .collect())
     }
 
     /// The first violation of a retained value against `value_type_id`, as

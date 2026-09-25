@@ -251,13 +251,33 @@ impl SettingKey {
     /// Returns [`SettingKeyError`] when the composed key is not a valid setting
     /// key — an uppercase vendor, a `/` in a slug, a name that is not a GTS token.
     pub fn compose(vendor: &str, category: &str, name: &str) -> Result<Self, SettingKeyError> {
+        Self::compose_at(vendor, category, name, NonZeroU32::MIN)
+    }
+
+    /// Compose an admin-authored key at a given major.
+    ///
+    /// The first declaration of an admin setting sits at `.v1~`
+    /// ([`Self::compose`]); an evolution re-declares it at the next free major
+    /// on the same version-stripped path, `…retry_policy.v2~`, so the two are
+    /// separate declarations with separate types and the same path.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::compose`]. A major of zero cannot be asked for: the parameter
+    /// is non-zero by type.
+    pub fn compose_at(
+        vendor: &str,
+        category: &str,
+        name: &str,
+        major: NonZeroU32,
+    ) -> Result<Self, SettingKeyError> {
         // @cpt-begin:cpt-cf-settings-service-algo-setting-declarations-key-construction:p1:inst-decl-key-3
         // The `settings` package is fixed rather than supplied: an admin-authored
-        // derived half always sits at `<vendor>.settings.<category>.<name>.v1~`,
-        // the trailing terminator making it a type.
-        let derived = format!("{vendor}.settings.{category}.{name}.v1{TYPE_TERMINATOR}");
+        // derived half always sits at `<vendor>.settings.<category>.<name>.vN~`,
+        // `v1` until the setting evolves, the trailing terminator making it a
+        // type.
+        let derived = format!("{vendor}.settings.{category}.{name}.v{major}{TYPE_TERMINATOR}");
         // @cpt-end:cpt-cf-settings-service-algo-setting-declarations-key-construction:p1:inst-decl-key-3
-
         // @cpt-begin:cpt-cf-settings-service-algo-setting-declarations-key-construction:p1:inst-decl-key-4
         // @cpt-begin:cpt-cf-settings-service-algo-setting-declarations-key-construction:p1:inst-decl-key-1
         // @cpt-begin:cpt-cf-settings-service-algo-setting-declarations-key-construction:p1:inst-decl-key-2

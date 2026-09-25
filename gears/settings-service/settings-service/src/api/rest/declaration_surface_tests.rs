@@ -562,3 +562,36 @@ async fn ordering_by_a_column_that_may_be_empty_is_refused_before_any_page() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(slugs(&body), vec!["gamma", "beta"]);
 }
+
+#[tokio::test]
+async fn re_declaring_an_active_setting_with_a_new_shape_answers_200_evolved_under_the_next_major()
+{
+    let h = RestHarness::new().await;
+    let (id, _) = create(&h, "proxy_enabled").await;
+
+    let mut body = create_body(&h, "proxy_enabled");
+    body["value_type_id"] = json!(crate::test_support::TEXT);
+    body["default_value"] = json!("on");
+    let answer = h
+        .send(
+            "POST",
+            DECLARATIONS,
+            Some(body.clone()),
+            None,
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(answer.status, 200, "{}", answer.body);
+    assert_eq!(answer.body["evolved"], json!(true), "{}", answer.body);
+    assert_eq!(answer.body["reactivated"], json!(false));
+    let key = answer.body["key"].as_str().expect("a key");
+    assert!(key.ends_with(".proxy_enabled.v2~"), "{key}");
+    assert_ne!(answer.body["id"], json!(id), "a new declaration");
+    assert!(answer.etag.is_some());
+
+    // The same request again matches the live v2: a conflict, not a v3.
+    let repeat = h
+        .send("POST", DECLARATIONS, Some(body), None, h.inner.tree.root)
+        .await;
+    assert_eq!(repeat.status, 409, "{}", repeat.body);
+}

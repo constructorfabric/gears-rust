@@ -335,3 +335,19 @@ fn an_admin_composed_key_has_major_one_and_a_stripped_path_too() {
         "acme.settings.network.enable_proxy"
     );
 }
+
+#[test]
+fn an_admin_key_at_a_later_major_shares_the_path_of_its_first() {
+    let first = SettingKey::compose("acme", "network", "retry_policy").expect("v1");
+    let later = SettingKey::compose_at(
+        "acme",
+        "network",
+        "retry_policy",
+        std::num::NonZeroU32::new(2).expect("non-zero"),
+    )
+    .expect("v2");
+    assert!(later.as_str().ends_with(".retry_policy.v2~"), "{later}");
+    assert_eq!((first.major(), later.major()), (1, 2));
+    assert_eq!(first.version_stripped_path(), later.version_stripped_path());
+    assert_eq!(first.leaf_slug(), later.leaf_slug());
+}
