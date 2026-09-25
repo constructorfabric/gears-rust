@@ -27,6 +27,7 @@ description: "Tracked improvement candidates for the gears Constructor Studio ki
   - [KIT-013: `cfs validate-toc` exit code disagrees with its JSON](#kit-013-cfs-validate-toc-exit-code-disagrees-with-its-json)
   - [KIT-014: Duplicate `WriteDocsReviewFixGate` unit in the Studio core](#kit-014-duplicate-writedocsreviewfixgate-unit-in-the-studio-core)
   - [KIT-015: Merge the two coding presets](#kit-015-merge-the-two-coding-presets)
+  - [KIT-016: Validate the change-impact report path](#kit-016-validate-the-change-impact-report-path)
 - [Item template](#item-template)
 
 <!-- /toc -->
@@ -86,6 +87,7 @@ upgrades.
 | [KIT-013](#kit-013-cfs-validate-toc-exit-code-disagrees-with-its-json) | `cfs validate-toc` exit code disagrees with its JSON | upstream | medium | proposed |
 | [KIT-014](#kit-014-duplicate-writedocsreviewfixgate-unit-in-the-studio-core) | Duplicate `WriteDocsReviewFixGate` unit in the Studio core | upstream | low | proposed |
 | [KIT-015](#kit-015-merge-the-two-coding-presets) | Merge the two coding presets | kit | low | proposed |
+| [KIT-016](#kit-016-validate-the-change-impact-report-path) | Validate the change-impact report path | kit | low | proposed |
 
 ## Items
 
@@ -289,6 +291,20 @@ upgrades.
 - **Options:** keep both skill names as thin aliases for discoverability, or
   replace them with a single preset.
 - **Links:** raised in review of constructorfabric/gears-rust#4930
+
+### KIT-016: Validate the change-impact report path
+
+- **Status:** proposed
+- **Priority:** low
+- **Area:** kit
+- **Problem:** `cf-gears-change-impact-analysis` builds its report path as
+  `.change-impact/{UPSTREAM_ARTIFACT_ID}/report.md` from an unvalidated
+  string, so an ID containing `/` or `..` can place the report outside
+  `.change-impact/`.
+- **Benefit:** The report always stays inside its namespace.
+- **Options:** require `UPSTREAM_ARTIFACT_ID` to be a canonical `cpt-*` ID or a
+  single safe path segment before rendering the report.
+- **Links:** constructorfabric/gears-rust#4941
 
 ## Item template
 
