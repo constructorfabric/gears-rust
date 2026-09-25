@@ -26,6 +26,7 @@ description: "Tracked improvement candidates for the gears Constructor Studio ki
   - [KIT-012: Bundled SDLC kit and PDSL validator gaps](#kit-012-bundled-sdlc-kit-and-pdsl-validator-gaps)
   - [KIT-013: `cfs validate-toc` exit code disagrees with its JSON](#kit-013-cfs-validate-toc-exit-code-disagrees-with-its-json)
   - [KIT-014: Duplicate `WriteDocsReviewFixGate` unit in the Studio core](#kit-014-duplicate-writedocsreviewfixgate-unit-in-the-studio-core)
+  - [KIT-015: Merge the two coding presets](#kit-015-merge-the-two-coding-presets)
 - [Item template](#item-template)
 
 <!-- /toc -->
