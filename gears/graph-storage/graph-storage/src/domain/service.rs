@@ -453,6 +453,8 @@ impl GraphServices {
         let auth = self
             .authorize(ctx, &authz::type_resource(), authz::actions::ADMIN)
             .await?;
+        admission::admit_identifier(&self.config, "namespace", namespace)?;
+        admission::admit_identifier(&self.config, "owner_principal", owner_principal)?;
 
         // The namespace arrives as a path segment rather than out of a
         // payload, so `ownership::namespace_of`'s refusal never sees it -- and
@@ -504,6 +506,7 @@ impl GraphServices {
         let auth = self
             .authorize(ctx, &authz::type_resource(), authz::actions::READ)
             .await?;
+        admission::admit_identifier(&self.config, "type_id", type_id)?;
         Ok(self
             .store
             .get_type(&Self::store_ctx(&auth, None), type_id)
@@ -788,6 +791,7 @@ impl GraphServices {
         let auth = self
             .authorize(ctx, &authz::node_resource(), authz::actions::DELETE)
             .await?;
+        admission::admit_identifier(&self.config, "node_key", node_key)?;
         Ok(self
             .store
             .soft_delete(
@@ -805,6 +809,7 @@ impl GraphServices {
         let auth = self
             .authorize(ctx, &authz::node_resource(), authz::actions::DELETE)
             .await?;
+        admission::admit_identifier(&self.config, "edge_key", edge_key)?;
         Ok(self
             .store
             .soft_delete(
@@ -825,6 +830,7 @@ impl GraphServices {
         let auth = self
             .authorize(ctx, &authz::node_resource(), authz::actions::READ)
             .await?;
+        admission::admit_identifier(&self.config, "node_key", node_key)?;
         let limit = admission::admit_adjacency_limit(&self.config, adjacency_limit)?;
         Ok(self
             .store
@@ -846,6 +852,7 @@ impl GraphServices {
         let auth = self
             .authorize(ctx, &authz::node_resource(), authz::actions::READ)
             .await?;
+        admission::admit_identifier(&self.config, "edge_key", edge_key)?;
         Ok(self
             .store
             .get_edge(&Self::store_ctx(&auth, None), edge_key)

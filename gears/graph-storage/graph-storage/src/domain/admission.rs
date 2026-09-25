@@ -40,6 +40,30 @@ fn exceeded(what: impl Into<String>) -> DomainError {
     DomainError::LimitExceeded { what: what.into() }
 }
 
+/// One caller-supplied identifier on a read or a single-row write: a key,
+/// a type id or pattern, a namespace.
+///
+/// Ingest bounds every identifier it stores, so a longer one names nothing
+/// the gear can hold, and there is no reason to carry it into a statement,
+/// an index probe or a pattern match to find that out. Refused with the same
+/// bound and the same rejection an ingest gets. An edge key is a SHA-256 in
+/// hex, 64 bytes, and 64 is the smallest `identifier_max_bytes` the
+/// configuration admits, so one bound serves every kind.
+pub fn admit_identifier(
+    cfg: &GraphStorageConfig,
+    what: &str,
+    value: &str,
+) -> Result<(), DomainError> {
+    if value.len() > cfg.identifier_max_bytes as usize {
+        return Err(exceeded(format!(
+            "{what} is {} bytes; identifier_max_bytes is {}",
+            value.len(),
+            cfg.identifier_max_bytes
+        )));
+    }
+    Ok(())
+}
+
 /// Bounds every ingest batch must clear before any validation work is spent.
 pub fn admit_ingest(cfg: &GraphStorageConfig, request: &IngestRequest) -> Result<(), DomainError> {
     if request.nodes.len() > cfg.ingest_max_nodes as usize {
@@ -255,6 +279,9 @@ pub fn admit_search(cfg: &GraphStorageConfig, request: &SearchRequest) -> Result
             cfg.search_query_max_bytes
         )));
     }
+    for (index, pattern) in request.type_patterns.iter().enumerate() {
+        admit_identifier(cfg, &format!("type_patterns[{index}]"), pattern)?;
+    }
     Ok(())
 }
 
@@ -275,6 +302,9 @@ pub fn admit_type_query(
             "limit {top} is outside 1..={}",
             cfg.projection_max_page
         )));
+    }
+    if let Some(pattern) = &query.pattern {
+        admit_identifier(cfg, "pattern", pattern)?;
     }
     Ok(())
 }
@@ -317,6 +347,17 @@ pub fn admit_traverse(
             distinct.len()
         )));
     }
+    // The count bounds how many seeds, not how long each is; every one of
+    // them is bound into the resolution statement.
+    for (index, seed) in request.seeds.iter().enumerate() {
+        admit_identifier(cfg, &format!("seeds[{index}]"), seed)?;
+    }
+    for (index, pattern) in request.edge_type_patterns.iter().enumerate() {
+        admit_identifier(cfg, &format!("edge_type_patterns[{index}]"), pattern)?;
+    }
+    for (index, pattern) in request.node_type_patterns.iter().enumerate() {
+        admit_identifier(cfg, &format!("node_type_patterns[{index}]"), pattern)?;
+    }
     Ok(())
 }
 
@@ -349,7 +390,7 @@ pub fn admit_neighborhood(
             cfg.traversal_max_nodes
         )));
     }
-    Ok(())
+    admit_identifier(cfg, "root", &request.root)
 }
 
 pub fn admit_projection(

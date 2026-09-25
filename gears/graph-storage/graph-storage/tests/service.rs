@@ -1983,3 +1983,144 @@ async fn a_budgeted_neighborhood_keeps_the_best_connected_neighbours() {
     assert_eq!(whole.nodes.len(), 7, "the root and all six neighbours");
     assert!(whole.truncated.is_none());
 }
+
+/// Every identifier a caller hands a read, a delete or an administrative
+/// call is bounded like the ones an ingest stores.
+///
+/// Ingest refuses a key longer than `identifier_max_bytes`, so no such key
+/// names anything, and a read that carried one into a statement would spend
+/// an index probe learning that. The traversal seeds were the case found in
+/// review -- counted, never measured -- and the same was true of every other
+/// entry point listed here.
+#[tokio::test]
+async fn every_caller_supplied_identifier_is_bounded_before_it_reaches_the_store() {
+    let harness = Harness::allowed();
+    let ctx = harness.ctx();
+    let limit = GraphStorageConfig::default().identifier_max_bytes as usize;
+    let long = "k".repeat(limit + 1);
+    let fits = "k".repeat(limit);
+
+    let traverse = |seed: &str, edge: &str, node: &str| TraverseRequest {
+        seeds: vec![seed.to_owned()],
+        depth: 1,
+        edge_type_patterns: if edge.is_empty() {
+            Vec::new()
+        } else {
+            vec![edge.to_owned()]
+        },
+        node_type_patterns: if node.is_empty() {
+            Vec::new()
+        } else {
+            vec![node.to_owned()]
+        },
+        max_nodes: Some(10),
+    };
+    let neighborhood = |root: &str| NeighborhoodRequest {
+        root: root.to_owned(),
+        depth: 1,
+        node_budget: Some(10),
+        include_phantoms: false,
+    };
+    let search = |pattern: &str| SearchRequest {
+        mode: SearchMode::Lexical,
+        query: Some("anything".to_owned()),
+        arm_limit: 10,
+        limit: 10,
+        type_patterns: vec![pattern.to_owned()],
+    };
+    let type_query = |pattern: &str| TypeQuery {
+        kind: None,
+        pattern: Some(pattern.to_owned()),
+        top: Some(10),
+        cursor: None,
+    };
+    let s = &harness.services;
+
+    // Each entry point once with an identifier one byte over the bound, and
+    // once exactly at it: the first must be refused as a bound, the second
+    // must get past admission to whatever the store answers.
+    for (what, over, at) in [
+        (
+            "traverse seed",
+            s.traverse(&ctx, traverse(&long, "", "")).await.err(),
+            s.traverse(&ctx, traverse(&fits, "", "")).await.err(),
+        ),
+        (
+            "traverse edge pattern",
+            s.traverse(&ctx, traverse("k", &long, "")).await.err(),
+            s.traverse(&ctx, traverse("k", &fits, "")).await.err(),
+        ),
+        (
+            "traverse node pattern",
+            s.traverse(&ctx, traverse("k", "", &long)).await.err(),
+            s.traverse(&ctx, traverse("k", "", &fits)).await.err(),
+        ),
+        (
+            "neighborhood root",
+            s.neighborhood(&ctx, neighborhood(&long)).await.err(),
+            s.neighborhood(&ctx, neighborhood(&fits)).await.err(),
+        ),
+        (
+            "search type pattern",
+            s.search(&ctx, search(&long)).await.err(),
+            s.search(&ctx, search(&fits)).await.err(),
+        ),
+        (
+            "type catalogue pattern",
+            s.list_types(&ctx, type_query(&long)).await.err(),
+            s.list_types(&ctx, type_query(&fits)).await.err(),
+        ),
+        (
+            "get_type",
+            s.get_type(&ctx, &long).await.err(),
+            s.get_type(&ctx, &fits).await.err(),
+        ),
+        (
+            "get_node",
+            s.get_node(&ctx, &long, None).await.err(),
+            s.get_node(&ctx, &fits, None).await.err(),
+        ),
+        (
+            "get_edge",
+            s.get_edge(&ctx, &long).await.err(),
+            s.get_edge(&ctx, &fits).await.err(),
+        ),
+        (
+            "delete_node",
+            s.delete_node(&ctx, &long).await.err(),
+            s.delete_node(&ctx, &fits).await.err(),
+        ),
+        (
+            "delete_edge",
+            s.delete_edge(&ctx, &long).await.err(),
+            s.delete_edge(&ctx, &fits).await.err(),
+        ),
+        (
+            "namespace transfer",
+            s.transfer_source_namespace(&ctx, &long, "owner")
+                .await
+                .err(),
+            s.transfer_source_namespace(&ctx, &fits, "owner")
+                .await
+                .err(),
+        ),
+        (
+            "namespace owner",
+            s.transfer_source_namespace(&ctx, "github", &long)
+                .await
+                .err(),
+            s.transfer_source_namespace(&ctx, "github", &fits)
+                .await
+                .err(),
+        ),
+    ] {
+        assert!(
+            matches!(over, Some(DomainError::LimitExceeded { .. })),
+            "{what}: an identifier over the bound must be refused as one, got {over:?}"
+        );
+        assert!(
+            !matches!(at, Some(DomainError::LimitExceeded { .. })),
+            "{what}: an identifier at the bound must pass admission, got {at:?}"
+        );
+    }
+}

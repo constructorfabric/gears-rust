@@ -108,6 +108,10 @@ pub struct GraphStorageConfig {
     /// both are echoed back by every surface that returns the node — so an
     /// oversized one is paid for on every later read of that row, by every
     /// consumer, not only by the request that wrote it.
+    ///
+    /// The same ceiling bounds every identifier a caller hands any other
+    /// call -- a seed, a key to read or delete, a type id or pattern, a
+    /// namespace -- since a longer one names nothing ingest could have stored.
     pub identifier_max_bytes: u32,
     /// Ceiling on a search query's text. The lexical arm parses it and the
     /// vector arm embeds it; neither is work a caller should be able to ask

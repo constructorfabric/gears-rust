@@ -2916,7 +2916,7 @@ Every bound the gear enforces is a named configuration key with a safe default a
 | Ingest batch: edges | `ingest_max_edges` | 20,000 | 1 – 100,000 | Admission |
 | REST request body | `rest_max_body_bytes` | 32 MiB | 1 – 128 MiB | REST edge |
 | Node payload size | `payload_max_bytes` | 64 KiB | 1 KiB – 1 MiB | Admission (ADR-0003 ceiling) |
-| Producer key or node name | `identifier_max_bytes` | 2 KiB | 64 B – 64 KiB | Admission, per node key, name, edge endpoint and discriminator |
+| Producer key or node name | `identifier_max_bytes` | 2 KiB | 64 B – 64 KiB | Admission, per node key, name, edge endpoint and discriminator on ingest; and per identifier a caller hands any other call — traversal seeds and neighbourhood root, node and edge keys on reads and deletes, type ids and type patterns, source namespace and owner. A longer one names nothing ingest could have stored. The 64 B floor still fits an edge key, a SHA-256 in hex |
 | Search query text | `search_query_max_bytes` | 8 KiB | 64 B – 1 MiB | Admission |
 | Node content size | `content_max_bytes` | 2 MiB | 64 KiB – 16 MiB | Admission |
 | Total size of one node or edge (envelope + name + payload + content) | `item_max_bytes` | 256 KiB | 4 KiB – 4 MiB | Admission, per item |
