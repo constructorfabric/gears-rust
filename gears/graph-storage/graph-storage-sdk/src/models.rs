@@ -22,6 +22,13 @@ pub type NodeId = i64;
 pub type EdgeId = i64;
 
 /// Producer-supplied stable node key, unique within a tenant.
+///
+/// Stable is a commitment, not a hint: there is no re-key operation, so
+/// ingesting under a new key creates a different node. Edge keys are derived
+/// from their endpoints' keys, so re-keying a node re-keys every edge incident
+/// to it, and a tombstoned key cannot be reused before purge. The encoding a
+/// producer chooses for its keys is part of the same commitment. PRD
+/// `fr-stable-identity` states the consequences in full.
 pub type NodeKey = String;
 
 /// Deterministic edge key derived from (type, src, dst, discriminator).
