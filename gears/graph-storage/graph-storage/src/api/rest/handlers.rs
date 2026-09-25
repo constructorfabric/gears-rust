@@ -122,7 +122,8 @@ fn registration_options(
         Some("update") => m::OnExisting::Update,
         Some(other) => {
             return Err(DomainError::invalid(format!(
-                "`{other}` is not an accepted value for `options.on_existing`; it takes                  `reject` or `update`"
+                "`{other}` is not an accepted value for `options.on_existing`; it takes `reject` or \
+                 `update`"
             )));
         }
     };

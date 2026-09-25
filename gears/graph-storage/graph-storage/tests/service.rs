@@ -493,6 +493,52 @@ async fn readiness_answers_without_a_caller() {
     );
 }
 
+/// An embedding-space mismatch is reported on its own row and leaves the gear
+/// ready.
+///
+/// The Readiness Matrix, the PRD and ADR-0004 all say so, and the review asked
+/// whether readiness reports it at all; nothing held either half. Both halves
+/// matter: a row that stayed healthy would hide vector search being refused,
+/// and an aggregate that went unready would take lexical search, ingest,
+/// traversal and reads out over a capability they do not depend on.
+#[tokio::test]
+async fn an_embedding_space_mismatch_is_unhealthy_and_leaves_the_gear_ready() {
+    use graph_storage::domain::embedding::{EmbeddingCoordinator, SpaceState};
+    use graph_storage_sdk::models::{EMBEDDING_SPACE, ReadinessState};
+
+    let blocked = EmbeddingCoordinator::new(conformance::provider(), SpaceState::Blocked, 8 * 1024);
+    let harness = Harness::with_coordinator(Arc::new(support::AllowInOwnTenant), blocked);
+    let readiness = harness.services.readiness().await;
+
+    let space = readiness
+        .components
+        .iter()
+        .find(|row| row.component == EMBEDDING_SPACE)
+        .expect("the embedding space has a row");
+    assert_eq!(space.state, ReadinessState::Unhealthy, "{space:?}");
+    assert!(
+        space
+            .blocked
+            .as_deref()
+            .is_some_and(|what| what.contains("EMBEDDING_SPACE_MISMATCH")),
+        "the row names what it refuses: {space:?}"
+    );
+    assert!(
+        readiness.ready,
+        "a space mismatch blocks vector search, not the gear: {readiness:?}"
+    );
+
+    // The same service with an active space reports the row healthy -- the
+    // difference is the space and nothing else.
+    let healthy = Harness::allowed().services.readiness().await;
+    let row = healthy
+        .components
+        .iter()
+        .find(|row| row.component == EMBEDDING_SPACE)
+        .expect("the embedding space has a row");
+    assert_eq!(row.state, ReadinessState::Healthy, "{row:?}");
+}
+
 #[tokio::test]
 async fn the_namespace_surface_lists_and_transfers() {
     let harness = Harness::allowed();

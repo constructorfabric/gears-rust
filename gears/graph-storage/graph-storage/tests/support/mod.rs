@@ -326,6 +326,30 @@ impl Harness {
         }
     }
 
+    /// Over an embedding coordinator the case supplies -- one whose space is
+    /// blocked, for instance, which no store write can produce.
+    pub fn with_coordinator(
+        authz: Arc<dyn AuthZResolverApi>,
+        coordinator: graph_storage::domain::embedding::EmbeddingCoordinator,
+    ) -> Self {
+        let store = Arc::new(FakeGraphStore::new());
+        let engine = Arc::new(HopOverStore {
+            store: Arc::clone(&store),
+        });
+        Self {
+            services: Arc::new(GraphServices::new(
+                GraphStorageConfig::default()
+                    .validated()
+                    .expect("the default configuration is valid"),
+                store,
+                engine,
+                PolicyEnforcer::new(authz),
+                coordinator,
+            )),
+            tenant: Uuid::now_v7(),
+        }
+    }
+
     pub fn allowed() -> Self {
         Self::with(Arc::new(AllowInOwnTenant))
     }

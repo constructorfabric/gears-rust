@@ -328,7 +328,7 @@ impl GraphServices {
                 EMBEDDING_SPACE,
                 State::Unhealthy,
                 "stored vectors belong to a space the active provider is not",
-                "vector and hybrid search (`failed_precondition` /                  `EMBEDDING_SPACE_MISMATCH`)",
+                "vector and hybrid search (`failed_precondition` / `EMBEDDING_SPACE_MISMATCH`)",
                 "re-embed to the active space; the identity match restores the capability at \
                  cutover",
             ),
