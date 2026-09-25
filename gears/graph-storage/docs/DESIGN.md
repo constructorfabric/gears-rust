@@ -1824,7 +1824,7 @@ objects and a `phantoms_materialized` key list, which is not what shipped):
 ```jsonc
 {
   "revision": { "source_epoch": 1, "revision": 90412 }, // unchanged if the batch converged without writing
-  "replayed": false,               // true when a recorded idempotency receipt answered the call
+  "replayed": false,               // true when a recorded idempotency receipt answered the call; the revision and counts are then the first commit's, not the graph's now
   "counts": {
     "nodes_inserted": 0, "nodes_updated": 1, "nodes_unchanged": 0,
     "edges_inserted": 1, "edges_updated": 0, "edges_unchanged": 0,

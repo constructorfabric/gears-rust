@@ -805,6 +805,14 @@ pub struct IngestOutcome {
     pub revision: GraphRevision,
     /// True when an idempotency receipt answered the call without touching
     /// state.
+    ///
+    /// A replayed outcome is the record of the first attempt's commit, not a
+    /// view of the graph now: `revision` and `counts` are what that commit
+    /// reached and did, and a later write — a scope replacement included —
+    /// may since have changed or removed what it wrote. It carries no
+    /// per-item lists, because the receipt keeps counts only. A producer that
+    /// needs current state reads it, and compares `revision` with the
+    /// tenant's current one to know whether anything has committed since.
     pub replayed: bool,
     pub counts: IngestCounts,
     pub per_item_nodes: Option<Vec<ItemOutcome>>,
