@@ -1094,26 +1094,29 @@ impl GraphServices {
             });
         }
 
+        let seed_id_set: std::collections::BTreeSet<i64> = seed_ids.iter().copied().collect();
         let result = walk(self.engine.as_ref(), &ctx, seed_ids, &plan).await?;
-        let mut nodes = self.store.hydrate_nodes(&ctx, &result.nodes).await?;
 
-        // Output filtering. Seeds always survive; everything else must pass
-        // the node-type filter and the phantom toggle.
-        let phantom_types = self.phantom_types(&ctx, &nodes).await?;
-        nodes.retain(|view| {
-            if seed_keys.contains(view.node_key.as_str()) {
-                return true;
-            }
-            if let Some(set) = &node_types
-                && !set.contains(&view.type_id)
-            {
-                return false;
-            }
-            if !include_phantoms && phantom_types.contains(&view.type_id) {
-                return false;
-            }
-            true
-        });
+        // `walk` returns the seeds first and then every other reached node in
+        // the order retention prefers (`WalkResult`'s contract), and the byte
+        // budget keeps a prefix of that order. So the rest is hydrated in the
+        // same order, in pieces, and the first piece that crosses the budget
+        // is the last one read: the nodes kept are exactly the ones a single
+        // full hydration would have kept, without reading the ones it would
+        // have thrown away.
+        //
+        // It used to hydrate the whole walk first -- up to
+        // `traversal_max_nodes` full rows, payloads and all -- and measure
+        // afterwards, so what the database sent and the process held was
+        // bounded by the node count and not by `response_max_bytes`: a
+        // thousand nodes of a quarter of a megabyte each is 256 MB read to
+        // answer inside a 64 MiB budget.
+        let seed_count = result
+            .nodes
+            .iter()
+            .take_while(|id| seed_id_set.contains(id))
+            .count();
+        let (seed_part, rest) = result.nodes.split_at(seed_count);
 
         // Counts are not a memory bound. `traversal_max_nodes` elements of
         // `item_max_bytes` each is gigabytes at the hard limits, and every
@@ -1130,11 +1133,8 @@ impl GraphServices {
         // is refused rather than answered with something that breaks its own
         // promise.
         let budget = self.config.response_max_bytes;
-        let mut spent: u64 = nodes
-            .iter()
-            .filter(|view| seed_keys.contains(view.node_key.as_str()))
-            .map(hydrated_bytes)
-            .sum();
+        let mut nodes = self.store.hydrate_nodes(&ctx, seed_part).await?;
+        let mut spent: u64 = nodes.iter().map(hydrated_bytes).sum();
         if spent > budget {
             return Err(DomainError::LimitExceeded {
                 what: format!(
@@ -1143,26 +1143,43 @@ impl GraphServices {
                 ),
             });
         }
+        // The seeds are in `spent` already and exempt from the cut; what
+        // follows is only the rest. Each piece is as many rows as the
+        // remaining budget is guaranteed to hold at `item_max_bytes` apiece,
+        // so reading past the budget costs at most one row, not the walk.
+        // Output filtering is applied per piece and before a row is charged:
+        // everything past the seeds must pass the node-type filter and the
+        // phantom toggle, and a row that does not is not part of the answer.
+        let item_ceiling = u64::from(self.config.item_max_bytes).max(1);
         let mut over_bytes = false;
-        nodes.retain(|view| {
-            // A seed is already in `spent` from the precheck, and exempt from
-            // the cut by the rule stated above. Charging it again here spent
-            // the seeds' bytes twice over -- so a request whose seeds fit
-            // could still lose one, evicted from its own answer by an
-            // accounting error rather than by the budget.
-            if seed_keys.contains(view.node_key.as_str()) {
-                return true;
+        let mut cursor = 0usize;
+        while cursor < rest.len() && !over_bytes {
+            let remaining = budget.saturating_sub(spent);
+            // Whole rows only: a fraction of a row is a row that may not fit.
+            let fits = usize::try_from(remaining.div_euclid(item_ceiling)).unwrap_or(usize::MAX);
+            let take = fits.clamp(1, HYDRATION_PIECE_MAX).min(rest.len() - cursor);
+            let piece = &rest[cursor..cursor + take];
+            cursor += take;
+
+            let views = self.store.hydrate_nodes(&ctx, piece).await?;
+            let phantom_types = self.phantom_types(&ctx, &views).await?;
+            for view in views {
+                if let Some(set) = &node_types
+                    && !set.contains(&view.type_id)
+                {
+                    continue;
+                }
+                if !include_phantoms && phantom_types.contains(&view.type_id) {
+                    continue;
+                }
+                spent = spent.saturating_add(hydrated_bytes(&view));
+                if spent > budget {
+                    over_bytes = true;
+                    break;
+                }
+                nodes.push(view);
             }
-            if over_bytes {
-                return false;
-            }
-            spent = spent.saturating_add(hydrated_bytes(view));
-            if spent > budget {
-                over_bytes = true;
-                return false;
-            }
-            true
-        });
+        }
 
         // An edge whose endpoint the filter removed goes with it. The
         // filter's whole purpose is that those nodes are not part of the
@@ -1247,6 +1264,10 @@ impl GraphServices {
 /// node carries its neighbours' keys and types too, and a traversal returns
 /// many such nodes. Counting only the payload would make this a payload
 /// budget rather than a response budget.
+/// The most rows one traversal hydration piece asks for, whatever the budget
+/// would allow: it bounds the id list a single statement carries.
+const HYDRATION_PIECE_MAX: usize = 256;
+
 fn hydrated_bytes(view: &graph_storage_sdk::models::NodeView) -> u64 {
     let payload = view.payload.as_ref().map_or(0, |value| {
         serde_json::to_vec(value).map_or(u64::MAX, |bytes| bytes.len() as u64)

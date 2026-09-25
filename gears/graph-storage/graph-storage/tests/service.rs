@@ -1446,6 +1446,100 @@ async fn a_seed_is_not_evicted_by_its_own_bytes_counted_twice() {
     );
 }
 
+/// What a traversal reads is bounded by its byte budget, not by its node
+/// count.
+///
+/// The walk returns up to `traversal_max_nodes` ids and the answer keeps a
+/// prefix of them that fits `response_max_bytes`. Hydrating every id first
+/// and measuring afterwards made the database send, and the process hold,
+/// every row the walk reached -- a thousand quarter-megabyte nodes is 256 MB
+/// read to answer inside a 64 MiB budget -- whatever the answer kept.
+///
+/// A hub with a hundred fat leaves against a budget that holds a handful of
+/// them. The answer is the same as it always was; what is asserted is how
+/// much of the walk had to be read to produce it.
+#[tokio::test]
+async fn a_traversal_reads_what_its_budget_can_hold_and_not_the_whole_walk() {
+    const LEAVES: usize = 100;
+
+    let store = Arc::new(graph_storage::infra::fake_store::FakeGraphStore::new());
+    let budgeted = GraphStorageConfig {
+        response_max_bytes: 12 * 1024,
+        // A row ceiling in proportion to the rows here, so a piece is sized
+        // by the budget rather than falling back to one row at a time.
+        item_max_bytes: 2 * 1024,
+        ..GraphStorageConfig::default()
+    };
+    let harness = Harness::configured_over(
+        Arc::clone(&store),
+        Arc::new(support::AllowInOwnTenant),
+        budgeted,
+    );
+    let ctx = harness.ctx();
+    harness.seed_ontology(&ctx).await;
+
+    let filler = "q".repeat(1_500);
+    let mut nodes = vec![conformance::node("hub", "hub")];
+    let mut edges = Vec::new();
+    for index in 0..LEAVES {
+        let leaf = format!("fat-{index}");
+        edges.push(conformance::edge("hub", &leaf));
+        nodes.push(NodeSpec {
+            payload: Some(serde_json::json!({ "note": filler })),
+            ..conformance::node(&leaf, &leaf)
+        });
+    }
+    harness
+        .services
+        .ingest(&ctx, conformance::batch(nodes, edges))
+        .await
+        .expect("the batch commits");
+
+    let before = store.rows_hydrated();
+    let walked = harness
+        .services
+        .traverse(
+            &ctx,
+            TraverseRequest {
+                seeds: vec!["hub".to_owned()],
+                depth: 1,
+                edge_type_patterns: Vec::new(),
+                node_type_patterns: Vec::new(),
+                max_nodes: Some(1_000),
+            },
+        )
+        .await
+        .expect("the traversal answers");
+    let read = store.rows_hydrated() - before;
+
+    assert_eq!(
+        walked.truncated,
+        Some(TruncationReason::ResponseBytes),
+        "the budget is what cut the answer, or this proves nothing about it"
+    );
+    let returned = walked.nodes.len() as u64;
+    assert!(
+        returned > 1 && returned < (LEAVES as u64),
+        "the answer is a handful of leaves, not none and not all: {returned}"
+    );
+    // The seed, the rows kept, and at most one piece past them: the piece
+    // is sized so the remaining budget holds it, so crossing the budget
+    // costs what one piece read and never the rest of the walk.
+    let piece = budgeted_piece(12 * 1024, 2 * 1024);
+    assert!(
+        read <= returned + piece,
+        "read {read} rows to return {returned} out of a walk of {}; the reads \
+         should stop within one piece ({piece}) of the budget",
+        LEAVES + 1
+    );
+}
+
+/// How many rows one piece asks for when the whole budget remains -- the
+/// widest a piece can be.
+fn budgeted_piece(budget: u64, item_ceiling: u64) -> u64 {
+    budget.div_euclid(item_ceiling).max(1)
+}
+
 /// A batch is bounded by its total size, not only by its counts.
 ///
 /// Every per-item check can pass for a request no process survives: fifty

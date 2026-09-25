@@ -204,6 +204,10 @@ pub struct FakeGraphStore {
     drift_per_revision_read: i64,
     /// How many revision reads have happened, so the drift accumulates.
     revision_reads: std::sync::atomic::AtomicI64,
+    /// Rows handed back by `hydrate_nodes`, across every call. Read by tests
+    /// that bound how much a read fetches, which nothing about the answer
+    /// itself can show.
+    rows_hydrated: std::sync::atomic::AtomicU64,
 }
 
 impl Default for FakeGraphStore {
@@ -223,7 +227,15 @@ impl FakeGraphStore {
             declines_snapshots: false,
             drift_per_revision_read: 0,
             revision_reads: std::sync::atomic::AtomicI64::new(0),
+            rows_hydrated: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// How many rows `hydrate_nodes` has returned so far.
+    #[must_use]
+    pub fn rows_hydrated(&self) -> u64 {
+        self.rows_hydrated
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// A store shaped like the built-in one: it declares `snapshots = false`
@@ -1071,11 +1083,14 @@ impl GraphStoreV1 for FakeGraphStore {
             source_epoch: self.epoch,
             revision,
         };
-        Ok(ids
+        let views: Vec<NodeView> = ids
             .iter()
             .filter_map(|id| nodes.iter().find(|n| n.id == *id && !n.deleted))
             .map(|n| view_of(n, ctx.tenant, revision, Vec::new(), false))
-            .collect())
+            .collect();
+        self.rows_hydrated
+            .fetch_add(views.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        Ok(views)
     }
 
     async fn search(

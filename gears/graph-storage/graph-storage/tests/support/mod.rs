@@ -297,7 +297,17 @@ impl Harness {
     }
 
     pub fn configured(authz: Arc<dyn AuthZResolverApi>, config: GraphStorageConfig) -> Self {
-        let store = Arc::new(FakeGraphStore::new());
+        Self::configured_over(Arc::new(FakeGraphStore::new()), authz, config)
+    }
+
+    /// Both at once: limits the case sets, over a store the case keeps a
+    /// handle to -- for a case that has to look at what the store was asked
+    /// for, not only at what the service answered.
+    pub fn configured_over(
+        store: Arc<FakeGraphStore>,
+        authz: Arc<dyn AuthZResolverApi>,
+        config: GraphStorageConfig,
+    ) -> Self {
         let engine = Arc::new(HopOverStore {
             store: Arc::clone(&store),
         });
