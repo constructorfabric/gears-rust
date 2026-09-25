@@ -196,6 +196,7 @@ The hardest constraint here is not any single field but the rule connecting them
 - A retired declaration is revived by re-declaring its key with the value type it was declared with, and its retained values, re-validated against that type, resume participating in resolution
 
 **Error Scenarios**:
+- The retired declaration is `module_contributed`: refused with `409`, because a gear's declaration changes only through its owning module
 - Credential step-up absent or invalid
 - The re-declaration names a value type on the other side of the secret boundary, or a different scope class: refused with `409`, because either would move stored values rather than re-interpret them
 - The re-declared key does not match an existing retired row, in which case the request is an ordinary create
@@ -207,14 +208,15 @@ The hardest constraint here is not any single field but the rule connecting them
 4. [x] - `p1` - Construct the key and look up an existing declaration at that key - `inst-decl-react-4`
 5. [x] - `p1` - **IF** no row exists → continue as an ordinary create - `inst-decl-react-5`
 6. [x] - `p1` - **IF** a row exists with `status` = 'active' → **RETURN** `409` for the duplicate key; an active declaration anywhere on the setting's version-stripped path is found first and the request is an evolution or a `409` (Evolve Declaration), so a revive considers only a path with no active major - `inst-decl-react-6`
-7. [x] - `p1` - Require a valid credential step-up assertion, because reactivation changes whether a live setting resolves - `inst-decl-react-7`
-8. [x] - `p1` - **IF** step-up is absent or invalid → **RETURN** `403` - `inst-decl-react-8`
-9. [x] - `p1` - **IF** the re-declaration flips the secret trait, changes the Scope Class or names a different `value_type_id` → **RETURN** `409` naming which, nothing written — judged before the Schema Default is validated, so a revive that cannot happen is refused as such rather than for a default that does not fit a type it could never adopt: the first two would move stored values rather than re-interpret them, and the setting's own GTS type is registered with its value type, which the Types Registry does not replace - `inst-decl-react-13`
-10. [x] - `p1` - Confirm the setting's own type in the Types Registry under the stored value type before anything is written, as a create registers before it inserts - `inst-decl-react-14`
-11. [x] - `p1` - DB: UPDATE setting_declarations SET `status` = 'active', the re-declared Schema Default and metadata WHERE key = {key}; re-validate every retained value against the value type, which may have gained a compatible revision while the setting sat retired, flagging what no longer validates `needs_review` with its detail and clearing the flag on what validates again - `inst-decl-react-9`
-12. [x] - `p1` - Invalidate the local cache for the affected scopes, since retained values re-enter resolution - `inst-decl-react-10`
-13. [x] - `p1` - Emit a declaration-reactivated audit record - `inst-decl-react-11`
-14. [x] - `p1` - **RETURN** `200` with the revived declaration - `inst-decl-react-12`
+7. [x] - `p1` - **IF** the retired declaration is `module_contributed` → **RETURN** `409 ContributedDeclarationImmutable`, nothing written: a gear's declaration changes only through its owning module, a revive would replace its Schema Default and metadata, and the `settings` package an admin key is composed with is not reserved from modules — judged before the refusals below - `inst-decl-react-15`
+8. [x] - `p1` - Require a valid credential step-up assertion, because reactivation changes whether a live setting resolves - `inst-decl-react-7`
+9. [x] - `p1` - **IF** step-up is absent or invalid → **RETURN** `403` - `inst-decl-react-8`
+10. [x] - `p1` - **IF** the re-declaration flips the secret trait, changes the Scope Class or names a different `value_type_id` → **RETURN** `409` naming which, nothing written — judged before the Schema Default is validated, so a revive that cannot happen is refused as such rather than for a default that does not fit a type it could never adopt: the first two would move stored values rather than re-interpret them, and the setting's own GTS type is registered with its value type, which the Types Registry does not replace - `inst-decl-react-13`
+11. [x] - `p1` - Confirm the setting's own type in the Types Registry under the stored value type before anything is written, as a create registers before it inserts - `inst-decl-react-14`
+12. [x] - `p1` - DB: UPDATE setting_declarations SET `status` = 'active', the re-declared Schema Default and metadata WHERE key = {key}; re-validate every retained value against the value type, which may have gained a compatible revision while the setting sat retired, flagging what no longer validates `needs_review` with its detail and clearing the flag on what validates again - `inst-decl-react-9`
+13. [x] - `p1` - Invalidate the local cache for the affected scopes, since retained values re-enter resolution - `inst-decl-react-10`
+14. [x] - `p1` - Emit a declaration-reactivated audit record - `inst-decl-react-11`
+15. [x] - `p1` - **RETURN** `200` with the revived declaration - `inst-decl-react-12`
 
 ### Evolve Declaration
 
@@ -472,7 +474,7 @@ Retire **MUST** be an immediate soft delete setting `status` to `retired` in one
 
 - [x] `p1` - **ID**: `cpt-cf-settings-service-dod-setting-declarations-contributed-protection`
 
-A declaration whose `source` is `module_contributed` **MUST** be rejected for administrative update and administrative retire with a contributed-immutable conflict, and the database **MUST** enforce that `owner_module` is present exactly when `source` is `module_contributed`. This feature reads contributed declarations but never writes them.
+A declaration whose `source` is `module_contributed` **MUST** be rejected for administrative update, administrative retire and an administrative re-declaration that would revive it, with a contributed-immutable conflict, and the database **MUST** enforce that `owner_module` is present exactly when `source` is `module_contributed`. This feature reads contributed declarations but never writes them.
 
 **Implements**:
 - `cpt-cf-settings-service-flow-setting-declarations-update`
@@ -551,6 +553,7 @@ The system **MUST** emit an audit record through the Audit Emitter for every dec
 - [x] A `PATCH` loosening `data_classification` from `pii` to `public` without step-up returns `403`, and succeeds with a valid step-up assertion
 - [x] A `PATCH` clearing `requires_step_up` or enabling `anonymous_exposable` without step-up returns `403` and leaves the flag unchanged; the opposite edits apply immediately
 - [x] A `PATCH` on a `module_contributed` declaration returns a contributed-immutable conflict
+- [x] Re-declaring a retired `module_contributed` declaration at its key returns a contributed-immutable conflict — before a retype refusal — and leaves it retired with its Schema Default and owner
 - [x] A `PATCH` without `If-Match` returns `428`, and with a stale `If-Match` returns `412`
 - [x] Retiring a declaration without step-up returns `403`
 - [x] Retiring a declaration sets `status` to `retired`, leaves every row in `setting_values` intact, and does not go through the value write path

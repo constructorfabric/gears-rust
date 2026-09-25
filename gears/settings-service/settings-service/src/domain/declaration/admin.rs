@@ -490,6 +490,14 @@ where
         if !on_path.iter().any(|d| d.status == "active")
             && let Some(retired) = existing.as_ref().filter(|d| d.status == "retired")
         {
+            // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-15
+            // A gear's declaration changes only through its owning module, and
+            // a revive would replace its Schema Default and metadata. Nothing
+            // keeps a module out of the `settings` package an admin key is
+            // composed with, so its retired contribution can sit at this key.
+            // Who may change the row at all comes before what may change.
+            Self::refuse_contributed(retired)?;
+            // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-15
             revive_refusal(retired, &request, &derived)?;
         }
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-11

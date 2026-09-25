@@ -2,16 +2,18 @@
 //! Administrative authoring over the resolution harness: what is composed,
 //! what is derived, what is refused, and what needs a fresh authentication.
 
+use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use secrecy::SecretString;
 use serde_json::{Map, Value, json};
+use settings_service_sdk::SettingKey;
 use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
 use super::{CreateDeclaration, DeclarationAdmin, FieldClass, classify_field, etag_of};
 use crate::audit::AuditOperation;
-use crate::domain::declaration::{Declaration, DeclarationRepository};
+use crate::domain::declaration::{Declaration, DeclarationDraft, DeclarationRepository};
 use crate::domain::error::DomainError;
 use crate::domain::stepup::{StepUpRefusal, StepUpVerifier, USER_SUBJECT_TYPE};
 use crate::domain::value::ValueRepository;
@@ -618,6 +620,87 @@ async fn a_contributed_declaration_is_not_admin_editable_or_retirable() {
         other => panic!("{other:?}"),
     }
     assert_eq!(h.load(id).await.status, "active");
+}
+
+#[tokio::test]
+async fn a_retired_contributed_declaration_is_not_revived_by_an_administrative_create() {
+    // Nothing reserves the `settings` package an admin key is composed with,
+    // so a module's retired contribution can sit at exactly the key an
+    // administrative create composes.
+    let h = Harness::verified().await;
+    let key = SettingKey::contributed("acme", "settings", "network", "proxy", NonZeroU32::MIN)
+        .expect("key");
+    assert_eq!(
+        key.as_str(),
+        SettingKey::compose("acme", "network", "proxy")
+            .expect("admin key")
+            .as_str(),
+        "the module's key is the one an administrator composes"
+    );
+    let conn = h.base.db.conn().expect("connection");
+    let id = DeclarationRepo
+        .insert(
+            &conn,
+            &AccessScope::allow_all(),
+            DeclarationDraft {
+                key: key.to_string(),
+                leaf_slug: "proxy".to_owned(),
+                value_type_id: BOOL.to_owned(),
+                category_id: h.base.category_id(),
+                default_value: json!(true),
+                scope_class: "cascading".to_owned(),
+                mode: "standard".to_owned(),
+                requires_step_up: true,
+                anonymous_exposable: false,
+                domain_affinity: None,
+                has_secret_trait: false,
+                data_classification: "public".to_owned(),
+                source: "module_contributed".to_owned(),
+                owner_module: Some("module-x".to_owned()),
+                licence_feature: None,
+                description: None,
+                created_by: "module-x".to_owned(),
+            },
+        )
+        .await
+        .expect("contributed")
+        .id;
+    h.base.retire(id).await;
+
+    // Same value type, scope class and secret trait: only the owner stands
+    // between this request and a revive.
+    let err = h
+        .create(h.request("proxy"), &admin_actor())
+        .await
+        .expect_err("contributed");
+    match err {
+        DomainError::Conflict { detail } => assert!(
+            detail.starts_with(super::conflict::CONTRIBUTED_IMMUTABLE),
+            "{detail}"
+        ),
+        other => panic!("{other:?}"),
+    }
+    // A retype is refused for the same reason, not as a retype: who may change
+    // the row at all is judged first.
+    let mut retype = h.request("proxy");
+    retype.value_type_id = TEXT.to_owned();
+    retype.default_value = json!("");
+    let err = h
+        .create(retype, &admin_actor())
+        .await
+        .expect_err("contributed");
+    match err {
+        DomainError::Conflict { detail } => assert!(
+            detail.starts_with(super::conflict::CONTRIBUTED_IMMUTABLE),
+            "{detail}"
+        ),
+        other => panic!("{other:?}"),
+    }
+    let row = h.load(id).await;
+    assert_eq!(row.status, "retired");
+    assert_eq!(row.default_value, json!(true));
+    assert_eq!(row.owner_module.as_deref(), Some("module-x"));
+    assert!(h.audit.records().is_empty(), "nothing audited");
 }
 
 #[tokio::test]
