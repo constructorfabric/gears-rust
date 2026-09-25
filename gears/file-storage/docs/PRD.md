@@ -1251,15 +1251,21 @@ The following NFR categories from the platform checklist are **not applicable** 
 
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-interface-sdk-trait`
 
-**Partial:** the trait is registered for other Gears to resolve, but only a placeholder accessor exists; none of the
-operations below are implemented, so consuming Gears call the HTTP control API directly (see DESIGN's `sdk-facade`).
+**Partial:** every control-plane operation is implemented in-process (create/get/list/update/delete files and
+versions, bind, multipart upload, ownership transfer, backend migration/discovery, policy, retention rules) —
+`FileStorageLocalClient` calls the exact same services the REST handlers call, under the caller's own
+`SecurityContext`. Not implemented: the two-step (presign + sidecar transfer) proxied **inside the SDK** as a
+seekable read/write — a consuming gear still `PUT`s/`GET`s bytes against the sidecar itself, over the signed URLs
+this trait hands back (Level 2, see DESIGN's `sdk-facade`).
 
 **Type**: Rust trait (SDK crate)
 **Stability**: unstable
-**Description**: Async trait providing upload, download (seekable / with Range), delete, metadata read/update,
-listing, version listing/restore, and backend-capability discovery. The SDK performs the two-step (presign +
-sidecar transfer) **inside the consumer's process** — the control-plane service never streams bytes — so a consuming
-gear sees a normal seekable read/write (`cpt-cf-file-storage-component-sdk-facade`).
+**Description**: Async trait providing create/presign, conditional get, list, metadata update, delete, download-URL
+issuance, version listing/presign/bind/delete, multipart upload (initiate/introspect/complete/abort), ownership
+transfer, backend migration/discovery, and policy/retention-rule administration — every operation returns domain
+models and signed URLs, never file bytes. A future Level 2 addition would perform the two-step (presign + sidecar
+transfer) **inside the consumer's process** so a consuming gear sees a normal seekable read/write
+(`cpt-cf-file-storage-component-sdk-facade`).
 **Breaking Change Policy**: Major version bump required for trait signature changes.
 
 #### Control-Plane REST API

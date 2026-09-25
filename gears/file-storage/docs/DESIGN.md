@@ -108,7 +108,7 @@ See [PRD.md](./PRD.md) §1 "Overview" and §1.3 "Goals":
 - Persistent URLs that outlive provider-issued URLs (e.g., LLM Gateway media outputs)
 - Pluggable backends without service rebuild
 
-#### Functional Drivers (P1)
+#### Functional Drivers
 
 | PRD FR ID                                              | Design Response                                                                                                                                                          |
 |--------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
@@ -134,6 +134,18 @@ See [PRD.md](./PRD.md) §1 "Overview" and §1.3 "Goals":
 | `cpt-cf-file-storage-fr-conditional-requests`          | Content-only `ETag` derived from `(file_id, content_id)`; `If-None-Match` enforced on the control plane's metadata `GET` (→ `304`), `If-Match` on bind/delete; neither is processed on the sidecar's content `GET` |
 | `cpt-cf-file-storage-fr-signed-urls`                   | Control plane mints an Ed25519-signed compact token (PASETO `v4.public`-equivalent codec, sole issuer); sidecar verifies with the public key; AND-combined claims (`op`, `file_id`, `version_id`, `backend_id`, `backend_path`, `exp`, upload size/hash) carried in the query (`?fs-token=`) or a header — `ip`/token-claim predicates are a documented, not-yet-implemented extension point — see §4.5 |
 | `cpt-cf-file-storage-fr-file-versioning`               | `file_versions` table (P1); each version a distinct immutable object `/{file_id}/{version_id}`; current = `content_id` pointer; restore = re-bind a prior `version_id`; backend-agnostic |
+| `cpt-cf-file-storage-fr-multipart-upload`              | P2 resumable multipart upload, owned by the `multipart-coordinator` component: `POST .../multipart` computes a server-authoritative parts plan (one signed sidecar URL per part); the sidecar streams each part without buffering; `complete` assembles and hashes the parts (offset-manifest composite, ADR-0006) and finalizes the version; `abort`/`introspect` round out the session lifecycle |
+| `cpt-cf-file-storage-fr-auto-bind`                     | `bind: "auto"` (default) has the sidecar's finalize callback bind the first content itself under a `content_id IS NULL` CAS, in the same transaction as the `pending → available` flip — the dominant single-file upload is 2 requests (`POST /files` + `PUT`); `bind: "manual"` keeps the separate, client-issued `bind` request |
+| `cpt-cf-file-storage-fr-multipart-complete-lease`      | `complete_multipart_upload` is idempotent and returns `202 {state: "completing", retry_after_secs}` while another caller holds the completion lease, instead of a second concurrent assembly running; a retry (including after a page reload) replays the persisted result |
+| `cpt-cf-file-storage-fr-sidecar-callbacks`             | The sidecar's `finalize`/`report-part` callbacks are plain, token-authenticated HTTP `POST`s back to the control plane's `bind-service` — no FS SDK call, no app-token, no on-behalf-of delegation; the previously-verified signed token is the callback's sole authorization |
+| `cpt-cf-file-storage-fr-callback-internal-token`       | An optional interim gear-local shared-secret second factor (`x-fs-internal-token`, `FinalizeAuth`) layered on top of the signed upload token for the finalize/report-part callbacks; a stop-gap until the platform's `internal_auth` profiles are deployable in this gear |
+| `cpt-cf-file-storage-fr-allowed-types-policy`          | `policy-engine` (P2): tenant/user-scoped allowed-MIME-type policy, resolved most-restrictive-wins and enforced on every storage-increasing write |
+| `cpt-cf-file-storage-fr-size-limits-policy`            | `policy-engine` (P2): tenant/user-scoped size-limit policy (with per-MIME overrides), same most-restrictive-wins resolution and enforcement points as the allowed-types policy |
+| `cpt-cf-file-storage-fr-metadata-limits`               | `policy-engine` (P2): per-file custom-metadata value-length and count limits, enforced at the service layer (P1 only applies coarse sanity limits) |
+| `cpt-cf-file-storage-fr-retention-policies`            | `cleanup-engine` (P2): tenant/user/file-scoped retention rules (age / inactivity / metadata, OR semantics) drive a background sweep that prunes whole expired files |
+| `cpt-cf-file-storage-fr-orphan-reconciliation`         | `cleanup-engine` (P2): the same background sweep also reclaims abandoned `pending` versions and reaps expired multipart sessions (`AbortMultipartUpload`, part + pending-version rows removed) past their `expires_at` grace window |
+| `cpt-cf-file-storage-fr-backend-migration`             | `backend-migrator` (P2): relocates a non-versioned file's content between backends (cost-tier moves, deprecation, residency, rebalancing, DR) after a mode-aware verified copy, without rotating `file_id`/`version_id` |
+| `cpt-cf-file-storage-fr-upload-idempotency`            | Owner-scoped idempotency for uploads: an `idempotency_keys` table (P2) lets a retried `POST /files` with the same key replay the original ticket instead of creating a duplicate pending version |
 
 #### NFR Allocation
 
@@ -523,7 +535,8 @@ callback), and **bind** a finalized version as the file's current `content_id` u
 Does not stream bytes. Trusts a sidecar-reported `size`/`hash` claim only as a defense-in-depth cross-check — finalize
 independently re-reads and re-hashes the backend object rather than persisting the claim verbatim.
 
-**Traces to**: `cpt-cf-file-storage-fr-sidecar-callbacks`, `cpt-cf-file-storage-fr-callback-internal-token`
+**Traces to**: the sidecar-callbacks and callback-internal-token requirements — see
+[§1.2 Architecture Drivers](#12-architecture-drivers)
 
 ##### Related components
 
@@ -781,35 +794,69 @@ scope directly — so a cross-tenant file is invisible before authorization is e
 
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-component-sdk-facade`
 
-> **Status: registered, not implemented.** The in-process client trait exists only as a placeholder (a single
-> `module_name` accessor) and its only implementation is a trivial stub — the wiring for other Gears to resolve a
-> client is in place, but none of the operations below have landed. The SDK facade lags the control API: multipart
-> upload, ownership transfer, policy, retention-rule, and backend-migration operations have no in-process client
-> surface at all, on top of the placeholder P1 operations below. Consuming Gears wanting any of this today must call
-> the HTTP control API directly.
+> **Status: Level 1 implemented, Level 2 not implemented.** Every control-plane operation runs in-process:
+> `FileStorageLocalClient` (registered with `ClientHub` as `dyn FileStorageClientV1`) calls the exact same services
+> the REST handlers call — create/presign, conditional get, list, metadata update, delete, download-URL issuance,
+> version listing/presign/bind/delete, multipart upload (initiate/introspect/complete/abort), ownership transfer,
+> backend migration/discovery, and policy/retention-rule administration — under the caller's own `SecurityContext`,
+> so the same authorization decisions, audit rows, and idempotency behavior apply as for the REST surface. The SDK
+> never transfers file bytes itself: `create_file`/`presign_version`/`download_url` return signed URLs the caller
+> still `PUT`s/`GET`s against the sidecar over HTTP, exactly as a REST client would. **Level 2 — proxying the
+> two-step (presign + sidecar transfer) *inside* the SDK as a seekable reader/writer, so a caller never sees a signed
+> URL at all — is not implemented.** A consuming Gear wanting that today still drives the sidecar HTTP calls itself.
 
 ##### Why this component exists
 
 In-process SDK trait for other Gears (LLM Gateway, Reporting, etc.). Mirrors the control API one-to-one in domain
-types, and **proxies the two-step (presign + sidecar transfer) inside the consumer gear's process** so a caller sees a
-normal file read/write — including **random access** — without learning about signed URLs or the sidecar. The
-control-plane service never streams bytes for it.
+types. Level 1 (implemented) saves the HTTP hop to this gear's own REST surface for every control-plane decision.
+Level 2 (not implemented) would additionally **proxy the two-step (presign + sidecar transfer) inside the consumer
+gear's process** so a caller sees a normal file read/write — including **random access** — without learning about
+signed URLs or the sidecar at all. The control-plane service never streams bytes for either level.
 
 ##### Responsibility scope
 
-- Expose a Rust trait (`FileStorageClientV1`) in `file-storage-sdk` covering: `create_file`, `open_read` (a **seekable**
-  reader supporting reads at an arbitrary offset/length), `download_file` (whole-object `Stream<Bytes>`), `head_file`,
-  `update_metadata`, `delete_file`, `list_files`, `list_versions`, `restore_version`, `list_storages`, `get_storage`
-- For content: call control `metadata-service`/`signed-url-issuer` directly (in-process, no HTTP), obtain a signed URL,
-  then transfer to/from the sidecar over HTTP from the consumer's process. `open_read` presigns once (URL pins
-  `content_id`) and issues many `Range` GETs to the sidecar, re-presigning on `exp`
-- For write: presign → `PUT` to the sidecar → bind; surface a bind `400 failed_precondition` so the caller can retry without re-upload
-- Carry `SecurityContext` from the calling gear's request context; authorization runs through the same `authz-adapter`
+- Expose a Rust trait (`FileStorageClientV1`) in `file-storage-sdk` covering: `create_file`, `get_file` (conditional
+  on `If-None-Match`), `list_files`, `update_metadata`, `delete_file`, `download_url`, `list_versions`,
+  `presign_version`, `bind`, `delete_version`, `initiate_multipart`, `introspect_multipart`, `complete_multipart`,
+  `abort_multipart`, `transfer_ownership`, `migrate_backend`, `list_storages`, `get_storage`, `get_policy`,
+  `get_effective_policy`, `put_policy`, `list_retention_rules`, `create_retention_rule`, `delete_retention_rule`
+- Level 2 (not implemented): call control `metadata-service`/`signed-url-issuer` directly (in-process, no HTTP),
+  obtain a signed URL, then transfer to/from the sidecar over HTTP from the consumer's process — a seekable
+  `open_read` presigning once (URL pins `content_id`) and issuing many `Range` GETs to the sidecar, re-presigning on
+  `exp`; a write path that presigns → `PUT`s to the sidecar → binds, surfacing a bind `400 failed_precondition` so
+  the caller can retry without re-upload
+- Carry `SecurityContext` from the calling gear's request context; authorization runs through the same
+  `authz-adapter` (unchanged by which level a consumer uses)
 
 ##### Responsibility boundaries
 
-Does not stream bytes through the control-plane service. Does not expose backend types or the signed-URL format — only
-the same domain types as the control API.
+Does not stream bytes through the control-plane service, at either level. Does not expose backend types or the
+signed-URL format — only the same domain types as the control API. The s2s sidecar callbacks (`finalize`,
+`report-part`) are control-plane-internal and are not part of this trait at any level.
+
+##### Using the SDK from another gear
+
+A common Level-1 shape: a backend gear holds its own `app` identity (a `SecurityContext` with `subject_type: "app"`
+and a stable `subject_id`) and uses the SDK to manage files it generates on behalf of its end users — for example a
+media-generation gear storing model output. It resolves `dyn FileStorageClientV1` from `ClientHub` and calls
+`create_file` with `owner_kind: app, owner_id: <its own subject_id>`; a subject creating a file under its own app
+identity needs no elevated grant (the same self-service fast path a user gets for their own `owner_kind: user`
+files). The gear's own backend then uploads the bytes to the returned signed URL, and once the version reports
+`available` it calls `download_url` to mint a fresh signed URL for each end user it hands the file to — the calling
+gear decides who gets a URL and when; the SDK does not have a notion of "end user" of its own. Two things to keep
+in mind:
+
+- The signed URL points at the sidecar directly, which serves no CORS headers — a URL handed to a browser must be
+  fetched from a same-origin proxy or a context that does not enforce CORS, not from an arbitrary origin's
+  client-side code.
+- The tenant a file is created and read under is always the calling gear's own `SecurityContext.subject_tenant_id`
+  — there is no way to create or read a file in a tenant the caller isn't itself scoped to, so a multi-tenant
+  backend gear must carry the right tenant in its own context per call, exactly as it would for any other
+  tenant-scoped operation.
+
+Creating a file under a *different* owner (`owner_id` other than the caller's own `subject_id`, or `owner_kind`
+other than the caller's own kind) still requires the caller's context to carry `ADMIN_POLICY` — the self-service
+fast path only ever covers a subject acting on its own files.
 
 ##### Related components
 
@@ -827,9 +874,9 @@ intended decomposition. Several already have a dedicated FEATURE artifact under 
 
 | Component (`cpt-cf-file-storage-component-…`)         | Phase | One-line responsibility                                                                                                  | Forward reference                                                                              |
 |-------------------------------------------------------|-------|--------------------------------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------|
-| `multipart-coordinator`                               | P2    | Owns the multipart-upload lifecycle (initiate / part / complete / abort) and the per-part hash combiner — an offset-manifest composite (`root = sha256(manifest)`) built from the per-part digests at `complete`, no re-read (ADR-0006, see §4.2) | PRD `cpt-cf-file-storage-fr-multipart-upload`                                                  |
-| `policy-engine`                                       | P2    | Evaluates tenant/user policies (allowed types, size limits, custom-metadata limits)                                      | PRD `cpt-cf-file-storage-fr-allowed-types-policy`, `…fr-size-limits-policy`                    |
-| `cleanup-engine`                                      | P2    | Unified background process: whole-file retention pruning (age / inactivity / metadata) + orphan reconciliation; deletes files/version rows + backend objects via the sidecar; internal-only, audited. Per-version pruning of superseded (non-current) versions (≤ X versions / age T) is **P3** — deferred pending a versioning-policy schema | PRD `cpt-cf-file-storage-fr-retention-policies`, `…fr-orphan-reconciliation`                   |
+| `multipart-coordinator`                               | P2    | Owns the multipart-upload lifecycle (initiate / part / complete / abort) and the per-part hash combiner — an offset-manifest composite (`root = sha256(manifest)`) built from the per-part digests at `complete`, no re-read (ADR-0006, see §4.2) | PRD requirement: resumable multipart upload (see [§1.2 Architecture Drivers](#12-architecture-drivers)) |
+| `policy-engine`                                       | P2    | Evaluates tenant/user policies (allowed types, size limits, custom-metadata limits)                                      | PRD requirements: allowed-types and size-limits policy (see [§1.2 Architecture Drivers](#12-architecture-drivers)) |
+| `cleanup-engine`                                      | P2    | Unified background process: whole-file retention pruning (age / inactivity / metadata) + orphan reconciliation; deletes files/version rows + backend objects via the sidecar; internal-only, audited. Per-version pruning of superseded (non-current) versions (≤ X versions / age T) is **P3** — deferred pending a versioning-policy schema | PRD requirements: retention policies and orphan reconciliation (see [§1.2 Architecture Drivers](#12-architecture-drivers)) |
 | `audit-publisher`                                     | P2    | Transactional outbox writer + async worker that drains to the platform audit sink                                        | PRD `cpt-cf-file-storage-fr-audit-trail`                                                       |
 | `event-publisher`                                     | P2    | EventBroker emitter for upload/update/delete events, gated by owner policy                                               | PRD `cpt-cf-file-storage-fr-file-events`                                                       |
 | `quota-adapter`                                       | P2    | Synchronous quota check before storage-consuming operations; usage reports asynchronously                                | PRD `cpt-cf-file-storage-fr-storage-quota`, `…fr-usage-reporting`                              |
@@ -848,15 +895,16 @@ intended decomposition. Several already have a dedicated FEATURE artifact under 
 > consumer and no Serverless Runtime client/invocation anywhere in this gear. `cpt-cf-file-storage-fr-owner-deletion`
 > and `cpt-cf-file-storage-contract-serverless-runtime` remain a planned P2 requirement with no code behind them yet.
 
-| `backend-migrator`                                    | P2    | Relocates a version's bytes between backends (cost-tier moves, deprecation, residency, rebalancing, DR) without rotating `file_id`/`version_id`; updates the version's `backend_id` after a verified copy | PRD `cpt-cf-file-storage-fr-backend-migration`                                                 |
+| `backend-migrator`                                    | P2    | Relocates a version's bytes between backends (cost-tier moves, deprecation, residency, rebalancing, DR) without rotating `file_id`/`version_id`; updates the version's `backend_id` after a verified copy | PRD requirement: backend migration (see [§1.2 Architecture Drivers](#12-architecture-drivers)) |
 | `encryption-adapter`                                  | P3    | Manages server-side encryption parameters and key handles per backend                                                    | PRD `cpt-cf-file-storage-fr-file-encryption`                                                   |
 | `admin-config`                                        | P3    | DB-backed runtime backend management (CRUD on backend configs) with credential rotation                                  | PRD `cpt-cf-file-storage-fr-runtime-backends`                                                  |
 
 ##### Multipart upload — P2 (server-authoritative parts plan)
 
 The detailed multipart contract is **owned by the P2 FEATURE for `multipart-coordinator`**
-([features/multipart-coordinator.md](./features/multipart-coordinator.md),
-`cpt-cf-file-storage-fr-multipart-upload`); only its shape is fixed here. Multipart is **server-authoritative**: the
+([features/multipart-coordinator.md](./features/multipart-coordinator.md)), implementing the resumable
+multipart-upload requirement (see [§1.2 Architecture Drivers](#12-architecture-drivers)); only its shape is fixed
+here. Multipart is **server-authoritative**: the
 client sends its desired parameters (total size, preferred part size, concurrency) and the control plane returns the
 **exact** plan — part sizes/offsets plus a **signed URL per part** pointing at the sidecar; the server, not the
 client, owns the plan.
@@ -1009,7 +1057,8 @@ endpoint's own `If-Match`) or the explicit `bind`. `bind: "manual"` restores the
 The full per-state failure/race analysis of both upload paths (who recovers, what garbage is left, who reaps it)
 lives in [concurrency-and-failure-model.md](./concurrency-and-failure-model.md).
 
-**Traces to**: `cpt-cf-file-storage-fr-auto-bind`
+**Traces to**: the auto-bind requirement (`bind: "auto"`) — see
+[§1.2 Architecture Drivers](#12-architecture-drivers)
 
 ```mermaid
 sequenceDiagram
@@ -1228,9 +1277,8 @@ sequenceDiagram
 
 **Use cases**: `cpt-cf-file-storage-usecase-configure-policy`
 
-**Functional requirements**: `cpt-cf-file-storage-fr-allowed-types-policy`,
-`cpt-cf-file-storage-fr-size-limits-policy`, `cpt-cf-file-storage-fr-metadata-limits`,
-`cpt-cf-file-storage-fr-retention-policies`
+**Functional requirements**: allowed-types policy, size-limits policy, metadata limits, and retention policies
+(see [§1.2 Architecture Drivers](#12-architecture-drivers))
 
 The `configure-policy` use case lets operators set a tenant-scoped (or user-scoped) policy that governs
 allowed MIME types, size limits, custom-metadata limits, and retention rules.  The effective policy seen
@@ -1359,7 +1407,7 @@ and is immutable.
 
 **Additional info**: `ON DELETE CASCADE` from `files` removes all versions; the sidecar deletes the backend objects
 best-effort afterwards. No automatic pruning in P1 — versions accumulate. The P2 cleanup engine prunes whole **files**
-by retention rule (age / inactivity / metadata, `cpt-cf-file-storage-fr-retention-policies`), which removes all of a
+by retention rule (age / inactivity / metadata — the retention-policies requirement, §1.2), which removes all of a
 file's versions when the file itself expires. **Superseded (non-current) version reclamation is deferred to P3**:
 `RetentionRuleBody` carries no per-version criterion (no `keep_last_n` / `max_non_current_age_days`) to drive it, so a
 non-current version that is never superseded by a whole-file expiry accumulates indefinitely — a known P3 gap.
@@ -1386,7 +1434,7 @@ No row exists for `whole-sha256` versions.
 **PK**: `(file_id, key)`
 
 **Constraints**: `NOT NULL` on all columns; `value` length and per-file count limits are enforced at the service layer
-in P2 (`cpt-cf-file-storage-fr-metadata-limits`); in P1 only sanity limits apply
+in P2 (the metadata-limits policy, §1.2); in P1 only sanity limits apply
 
 **Additional info**: `ON DELETE CASCADE` so that deleting a `files` row removes its custom metadata automatically.
 
@@ -1394,13 +1442,13 @@ in P2 (`cpt-cf-file-storage-fr-metadata-limits`); in P1 only sanity limits apply
 
 | Table                              | Phase | Purpose                                                                                  | Forward reference                                                |
 |------------------------------------|-------|------------------------------------------------------------------------------------------|------------------------------------------------------------------|
-| `multipart_uploads`                | P2    | In-flight multipart sessions: `upload_id`, `file_id`, lease state, `auto_bind` flag, and the session's own `backend_id`/`backend_path` (recorded once at initiate from the pending version, so the cleanup sweep can resolve the target backend/object even once the `file_versions` row is already gone) | `cpt-cf-file-storage-fr-multipart-upload`                        |
-| `multipart_upload_parts`           | P2    | One row per uploaded part: `backend_etag`/offset, `size`, `part_hash` (SHA-256 of the part's bytes, computed on-the-fly; folded into the offset-manifest composite at `complete`, no re-read — ADR-0006, shipped) | `cpt-cf-file-storage-fr-multipart-upload`                        |
-| `idempotency_keys`                 | P2    | Owner-scoped idempotency for uploads                                                      | `cpt-cf-file-storage-fr-upload-idempotency`                      |
+| `multipart_uploads`                | P2    | In-flight multipart sessions: `upload_id`, `file_id`, lease state, `auto_bind` flag, and the session's own `backend_id`/`backend_path` (recorded once at initiate from the pending version, so the cleanup sweep can resolve the target backend/object even once the `file_versions` row is already gone) | resumable multipart upload (§1.2)                        |
+| `multipart_upload_parts`           | P2    | One row per uploaded part: `backend_etag`/offset, `size`, `part_hash` (SHA-256 of the part's bytes, computed on-the-fly; folded into the offset-manifest composite at `complete`, no re-read — ADR-0006, shipped) | resumable multipart upload (§1.2)                        |
+| `idempotency_keys`                 | P2    | Owner-scoped idempotency for uploads                                                      | upload idempotency (§1.2)                      |
 | `audit_outbox`                     | P2    | Transactional-outbox rows drained by `audit-publisher` to the audit sink                 | `cpt-cf-file-storage-fr-audit-trail`                             |
 | `events_outbox`                    | P2    | Outbox for EventBroker file-write events                                                 | `cpt-cf-file-storage-fr-file-events`                             |
-| `policies`                         | P2    | Tenant + user policy definitions                                                         | `cpt-cf-file-storage-fr-allowed-types-policy`, etc.              |
-| `retention_rules`                  | P2    | Auto-expiration definitions                                                              | `cpt-cf-file-storage-fr-retention-policies`                      |
+| `policies`                         | P2    | Tenant + user policy definitions                                                         | allowed-types / size-limits / metadata-limits policy (§1.2), etc.              |
+| `retention_rules`                  | P2    | Auto-expiration definitions                                                              | retention policies (§1.2)                      |
 | `storage_backends_runtime`         | P3    | DB-resident backend configuration that supersedes the P1 YAML-configured backend set      | `cpt-cf-file-storage-fr-runtime-backends`                        |
 
 ### 3.8 Deployment Topology
@@ -1873,7 +1921,7 @@ deferred "Sharing boundary (P3)" capability (§1.1), not something domain placem
 
 - [x] `p2` - **ID**: `cpt-cf-file-storage-design-worked-example-multipart`
 
-Multipart is **P2** (`cpt-cf-file-storage-fr-multipart-upload`). Same scenario style as §4.6, for a 320 MiB
+Multipart is **P2** (resumable multipart upload, §1.2). Same scenario style as §4.6, for a 320 MiB
 `lecture.mp4` upload, walking the interesting case: the user uploads a few parts, gets logged out, and later
 resumes without re-uploading what already landed.
 
@@ -1920,14 +1968,14 @@ resumes without re-uploading what already landed.
    existing file, as in this example) keeps `bind_state: "manual"` and needs the separate `POST /files/{id}/bind`
    afterwards. `complete` is idempotent (a retry, including after a page reload, replays the persisted result) and
    can return `202 {state: "completing", retry_after_secs}` while another caller holds the completion lease
-   (`cpt-cf-file-storage-fr-multipart-complete-lease`). The
+   (the multipart-complete-lease requirement, §1.2). The
    full state/race/failure model is [concurrency-and-failure-model.md](./concurrency-and-failure-model.md).
 
 #### The other branch — session already reaped
 
 7. Had the student stayed away longer than the session's `expires_at` (e.g. > 24h), the P2 cleanup engine would
-   already have reaped it (`AbortMultipartUpload`, the part and pending-version rows removed,
-   `cpt-cf-file-storage-fr-orphan-reconciliation`); the resume `GET` then returns `404` and the client must
+   already have reaped it (`AbortMultipartUpload`, the part and pending-version rows removed —
+   the orphan-reconciliation requirement, §1.2); the resume `GET` then returns `404` and the client must
    re-initiate from scratch. The session `expires_at` is the knob that bounds how long a half-finished upload
    stays resumable; the short per-part URL `exp` only controls how often the client re-presigns, never whether
    progress is lost.
