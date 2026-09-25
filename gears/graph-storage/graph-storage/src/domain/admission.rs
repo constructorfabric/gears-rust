@@ -129,13 +129,37 @@ pub fn admit_ingest(cfg: &GraphStorageConfig, request: &IngestRequest) -> Result
         }
     }
 
+    // The scope a replacement declares is caller-controlled too, and it is
+    // the one that outlives the request: `attribute` and `value` become the
+    // primary key of `scope_registry` and two indexed columns on every edge
+    // the scope owns. Bounding every key in the batch and not the key the
+    // batch is filed under left the one string that is written once and read
+    // by every later resync unbounded.
+    if let Some(replace) = &request.replace_scope {
+        for (what, value) in [
+            ("replace_scope.attribute", &replace.attribute),
+            ("replace_scope.value", &replace.value),
+        ] {
+            if value.len() > cfg.identifier_max_bytes as usize {
+                return Err(exceeded(format!(
+                    "{what} is {} bytes; identifier_max_bytes is {}",
+                    value.len(),
+                    cfg.identifier_max_bytes
+                )));
+            }
+        }
+    }
+
     // Counts and per-field ceilings are not a size bound on the batch, and
     // this is where that stopped being a theoretical point: every check above
     // passes for fifty thousand items that are each just under their own
     // ceiling, and the sum of them is a request the process does not survive.
     // Measured on the serialized form, because that is what is read, parsed,
     // held and written.
-    let mut total: u64 = 0;
+    // The scope's own bytes travel with the batch and are charged to it.
+    let mut total: u64 = request.replace_scope.as_ref().map_or(0, |replace| {
+        (replace.attribute.len() as u64).saturating_add(replace.value.len() as u64)
+    });
     for (family, index, bytes) in request
         .nodes
         .iter()
@@ -364,7 +388,7 @@ pub fn admit_adjacency_limit(
 mod tests {
     use graph_storage_sdk::models::NeighborhoodRequest;
 
-    use super::{GraphStorageConfig, admit_neighborhood, admit_traverse};
+    use super::{GraphStorageConfig, admit_ingest, admit_neighborhood, admit_traverse};
 
     fn neighborhood(depth: u8) -> NeighborhoodRequest {
         NeighborhoodRequest {
@@ -373,6 +397,83 @@ mod tests {
             node_budget: None,
             include_phantoms: true,
         }
+    }
+
+    /// The scope a replacement is filed under is bounded like every other
+    /// caller-supplied identifier.
+    ///
+    /// `attribute` and `value` are the pair that outlives the request: they
+    /// become the primary key of `scope_registry` and two indexed columns on
+    /// every edge the scope owns. Admission bounded every key *in* the batch
+    /// and not the key the batch is filed *under*, so a write-authorized
+    /// caller could hand the database a multi-megabyte primary key while
+    /// every other string in the same request was checked.
+    #[test]
+    fn the_scope_a_replacement_declares_is_bounded_like_any_other_identifier() {
+        use graph_storage_sdk::models::{IngestOptions, IngestRequest, ReplaceScope};
+
+        let cfg = GraphStorageConfig::default();
+        let batch = |attribute: String, value: String| IngestRequest {
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            options: IngestOptions::default(),
+            replace_scope: Some(ReplaceScope {
+                attribute,
+                value,
+                generation: 1,
+            }),
+            idempotency_key: None,
+        };
+        let fits = "a".repeat(cfg.identifier_max_bytes as usize);
+        let over = "a".repeat(cfg.identifier_max_bytes as usize + 1);
+
+        admit_ingest(&cfg, &batch(fits.clone(), fits.clone())).expect("at the ceiling is admitted");
+
+        for (attribute, value, named) in [
+            (over.clone(), fits.clone(), "replace_scope.attribute"),
+            (fits, over, "replace_scope.value"),
+        ] {
+            let refused = admit_ingest(&cfg, &batch(attribute, value))
+                .expect_err("a key the database will index is not unbounded");
+            assert!(
+                refused.to_string().contains(named),
+                "the refusal names the field: {refused}"
+            );
+        }
+    }
+
+    /// And its bytes are charged to the batch, not carried for free.
+    #[test]
+    fn the_scopes_own_bytes_count_against_the_batch_budget() {
+        use graph_storage_sdk::models::{IngestOptions, IngestRequest, NodeSpec, ReplaceScope};
+
+        let cfg = GraphStorageConfig {
+            // Room for the scope and almost nothing else.
+            ingest_max_bytes: u64::from(GraphStorageConfig::default().identifier_max_bytes) * 2 + 8,
+            ..GraphStorageConfig::default()
+        };
+        let filler = "a".repeat(cfg.identifier_max_bytes as usize);
+        let request = IngestRequest {
+            nodes: vec![NodeSpec {
+                node_key: "k".repeat(16),
+                type_id: "t".repeat(16),
+                ..NodeSpec::default()
+            }],
+            edges: Vec::new(),
+            options: IngestOptions::default(),
+            replace_scope: Some(ReplaceScope {
+                attribute: filler.clone(),
+                value: filler,
+                generation: 1,
+            }),
+            idempotency_key: None,
+        };
+        let refused = admit_ingest(&cfg, &request)
+            .expect_err("the scope fills the budget, so the node does not fit after it");
+        assert!(
+            refused.to_string().contains("ingest_max_bytes"),
+            "the refusal is the batch budget: {refused}"
+        );
     }
 
     /// The operator's depth ceiling governs both bounded walks.
