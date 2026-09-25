@@ -639,3 +639,28 @@ async fn a_page_ordered_by_any_orderable_field_continues_without_a_gap_or_a_repe
         );
     }
 }
+
+#[tokio::test]
+async fn a_default_that_does_not_survive_a_round_trip_is_refused_as_a_value_write_would() {
+    // The same literal a value write refuses with `value_not_canonical` — a
+    // decimal a double cannot hold exactly — must not slip in as a Schema
+    // Default. Only the raw text can tell: once parsed, the literal is already
+    // the nearest double, and no check on the parsed value can see the loss.
+    let h = RestHarness::new().await;
+    let body = format!(
+        r#"{{"value_type_id": "{BOOL}", "vendor": "acme", "name": "precise",
+            "category_id": "{}", "default_value": 0.1000000000000000055511151231257827,
+            "scope_class": "cascading"}}"#,
+        h.inner.category_id()
+    );
+    let answer = h
+        .send_text("POST", DECLARATIONS, &body, None, h.inner.tree.root)
+        .await;
+    assert_eq!(answer.status, 400, "{}", answer.body);
+    assert_eq!(
+        answer.body["context"]["field_violations"][0]["reason"],
+        json!(crate::field::VALUE_NOT_CANONICAL),
+        "{}",
+        answer.body
+    );
+}

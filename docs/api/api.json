@@ -3679,7 +3679,7 @@
             ]
           },
           "default_value": {
-            "description": "The Schema Default. Mandatory, and an empty placeholder for a secret."
+            "description": "The Schema Default. Mandatory, and an empty placeholder for a secret.\nKept as the request's own text until it is judged: a decimal a double\ncannot hold exactly is refused `value_not_canonical`, as a value write\nrefuses it, and only the text can tell — once parsed, the literal is\nalready the nearest double."
           },
           "description": {
             "description": "Optional long-form description.",

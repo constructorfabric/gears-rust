@@ -156,7 +156,7 @@ pub async fn create_declaration(
     // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-3
     // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-2
     let actor = crate::api::rest::value_handlers::actor(&ctx, &headers);
-    let request = crate::domain::declaration::CreateDeclaration::from(body);
+    let request = crate::domain::declaration::CreateDeclaration::try_from(body)?;
     // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-1
     let admin_for_tx = Arc::clone(&admin);
     let outcome = db

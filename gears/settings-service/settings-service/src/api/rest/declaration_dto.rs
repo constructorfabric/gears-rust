@@ -125,7 +125,8 @@ impl From<RenderedDeclaration> for DeclarationDto {
 /// it is what makes resolution total -- and a setting with no meaningful
 /// default sends JSON `null` on a type that admits it; omitting the field is a
 /// different thing and is refused.
-#[derive(Debug, Clone, PartialEq)]
+// No `PartialEq`: the raw default has none, and nothing compares requests.
+#[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request)]
 #[serde(deny_unknown_fields)]
 pub struct CreateDeclarationRequest {
@@ -140,7 +141,12 @@ pub struct CreateDeclarationRequest {
     /// The category the setting is filed under; its slug rides in the key.
     pub category_id: Uuid,
     /// The Schema Default. Mandatory, and an empty placeholder for a secret.
-    pub default_value: Value,
+    /// Kept as the request's own text until it is judged: a decimal a double
+    /// cannot hold exactly is refused `value_not_canonical`, as a value write
+    /// refuses it, and only the text can tell — once parsed, the literal is
+    /// already the nearest double.
+    #[schema(value_type = Value)]
+    pub default_value: Box<serde_json::value::RawValue>,
     /// `global`, `cascading` or `local`.
     pub scope_class: String,
     /// Optional long-form description.
@@ -169,14 +175,26 @@ pub struct CreateDeclarationRequest {
     pub data_classification: Option<String>,
 }
 
-impl From<CreateDeclarationRequest> for crate::domain::declaration::CreateDeclaration {
-    fn from(body: CreateDeclarationRequest) -> Self {
-        Self {
+impl TryFrom<CreateDeclarationRequest> for crate::domain::declaration::CreateDeclaration {
+    type Error = crate::domain::error::DomainError;
+
+    /// The same raw-text guard a value write runs: the size cap and numeric
+    /// canonicality, judged on the literal as written.
+    fn try_from(body: CreateDeclarationRequest) -> Result<Self, Self::Error> {
+        let default_value = crate::domain::validation::guards::parse_checked(
+            body.default_value.get(),
+        )
+        .map_err(|violation| crate::domain::error::DomainError::Validation {
+            field: format!("default_{}", violation.field),
+            code: violation.code,
+            message: violation.message,
+        })?;
+        Ok(Self {
             value_type_id: body.value_type_id,
             vendor: body.vendor,
             name: body.name,
             category_id: body.category_id,
-            default_value: body.default_value,
+            default_value,
             scope_class: body.scope_class,
             description: body.description,
             mode: body.mode,
@@ -185,7 +203,7 @@ impl From<CreateDeclarationRequest> for crate::domain::declaration::CreateDeclar
             domain_affinity: body.domain_affinity,
             licence_feature: body.licence_feature,
             data_classification: body.data_classification,
-        }
+        })
     }
 }
 
