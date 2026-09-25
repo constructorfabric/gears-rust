@@ -16574,7 +16574,7 @@
             "type": "string"
           },
           "set_by": {
-            "description": "The administrator of a strict ancestor who recorded it.",
+            "description": "The administrator of a strict ancestor who recorded it: an\nadministrator's identity, masked for a caller not authorized for\nunmasked PII.",
             "type": "string"
           },
           "tenant_id": {

@@ -5,6 +5,7 @@ use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
 use crate::domain::access::{AccessReadout, Restriction, restriction_tag};
+use crate::domain::resolution::MASK_TOKEN;
 
 /// `PUT /settings/{key}/permissions`: the access to store.
 #[derive(Debug, Clone)]
@@ -22,7 +23,9 @@ pub struct RestrictionDto {
     pub tenant_id: Uuid,
     /// `read_only` or `hidden`.
     pub access: String,
-    /// The administrator of a strict ancestor who recorded it.
+    /// The administrator of a strict ancestor who recorded it: an
+    /// administrator's identity, masked for a caller not authorized for
+    /// unmasked PII.
     pub set_by: String,
     /// When it was last changed, RFC 3339.
     pub updated_at: String,
@@ -31,12 +34,20 @@ pub struct RestrictionDto {
 }
 
 /// Render a stored row.
+///
+/// The setter is an ancestor's administrator, shown to the restricted tenant
+/// among others: masked unless `may_read_pii`, as the inheritance trail masks
+/// its setters and the audit history its actor.
 #[must_use]
-pub fn render_restriction(row: &Restriction) -> RestrictionDto {
+pub fn render_restriction(row: &Restriction, may_read_pii: bool) -> RestrictionDto {
     RestrictionDto {
         tenant_id: row.tenant_id,
         access: row.access.as_str().to_owned(),
-        set_by: row.set_by.clone(),
+        set_by: if may_read_pii {
+            row.set_by.clone()
+        } else {
+            MASK_TOKEN.to_owned()
+        },
         updated_at: row
             .updated_at
             .format(&Rfc3339)
@@ -74,13 +85,17 @@ pub struct AccessReadDto {
     pub etag: String,
 }
 
-/// Render a readout.
+/// Render a readout, the stored row's setter masked as
+/// [`render_restriction`] masks it.
 #[must_use]
-pub fn render_readout(readout: &AccessReadout) -> AccessReadDto {
+pub fn render_readout(readout: &AccessReadout, may_read_pii: bool) -> AccessReadDto {
     AccessReadDto {
         key: readout.declaration.key.clone(),
         tenant_id: readout.tenant_id,
-        stored: readout.stored.as_ref().map(render_restriction),
+        stored: readout
+            .stored
+            .as_ref()
+            .map(|row| render_restriction(row, may_read_pii)),
         effective: EffectiveAccessDto {
             access: readout.effective.access.as_str().to_owned(),
             supplied_by: readout.effective.supplied_by,

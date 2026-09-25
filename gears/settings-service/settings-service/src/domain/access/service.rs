@@ -70,11 +70,16 @@ fn absent() -> DomainError {
     }
 }
 
+/// A restriction as its audit images record it: the pair and its access.
+///
+/// Who changed it is the record's actor, which the history read classifies
+/// and masks for a caller not authorized for unmasked PII. The setter is not
+/// repeated here, where it would sit beside that mask in the clear; the one
+/// who set a replaced row is the actor of the record that set it.
 fn snapshot(row: &Restriction) -> serde_json::Value {
     json!({
         "tenant_id": row.tenant_id,
         "access": row.access.as_str(),
-        "set_by": row.set_by,
     })
 }
 

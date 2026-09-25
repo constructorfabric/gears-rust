@@ -159,6 +159,68 @@ async fn set_read_and_clear_round_trip_with_their_tags_and_records() {
 }
 
 #[tokio::test]
+async fn a_restrictions_audit_images_carry_the_pair_and_its_access_not_the_setter() {
+    // Who changed a restriction is the record's actor, which the history read
+    // classifies and masks. Repeating the setter inside the images would put
+    // the same identity beside that mask in the clear, so the images describe
+    // the row alone.
+    let h = Harness::new().await;
+    h.base
+        .declare("strict", scope_class::CASCADING, json!(false))
+        .await;
+    let t = &h.base.tree;
+    let conn = h.base.db.conn().expect("connection");
+    let root = actor(t.root);
+    let key = h.key("strict");
+
+    let set = h
+        .service
+        .set(
+            &conn,
+            &root,
+            &key,
+            t.a,
+            TenantAccess::Hidden,
+            Some(ABSENT_RESTRICTION_TAG),
+        )
+        .await
+        .expect("sets");
+    let changed = h
+        .service
+        .set(
+            &conn,
+            &root,
+            &key,
+            t.a,
+            TenantAccess::ReadOnly,
+            Some(set.etag.as_str()),
+        )
+        .await
+        .expect("changes");
+    h.service
+        .clear(&conn, &root, &key, t.a, Some(changed.etag.as_str()))
+        .await
+        .expect("clears");
+
+    let records = h.audit.records();
+    assert_eq!(records.len(), 3, "{records:?}");
+    for record in &records {
+        assert_eq!(record.actor, root.ctx.subject_id().to_string());
+        for image in [&record.pre_image, &record.post_image]
+            .into_iter()
+            .flatten()
+        {
+            let crate::audit::AuditValue::Clear(image) = image else {
+                panic!("a restriction is never secret: {record:?}");
+            };
+            assert_eq!(image["tenant_id"], json!(t.a), "{image}");
+            assert!(image["access"].is_string(), "{image}");
+            assert!(image.get("set_by").is_none(), "no setter in {image}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn only_a_reachable_strict_descendant_can_be_restricted_and_overridable_is_not_a_value() {
     let h = Harness::new().await;
     h.base

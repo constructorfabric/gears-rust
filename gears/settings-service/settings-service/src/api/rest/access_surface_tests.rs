@@ -11,6 +11,7 @@
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+use crate::domain::resolution::MASK_TOKEN;
 use crate::test_support::RestHarness;
 
 /// The permissions surface for one setting.
@@ -470,4 +471,79 @@ async fn a_restriction_survives_the_declaration_being_retired_and_revived() {
         json!("read_only"),
         "the row is retained across a retire: {body}"
     );
+}
+
+// ── Who recorded it, and who may learn that ─────────────────────────────────
+
+#[tokio::test]
+async fn a_restrictions_setter_is_masked_for_a_reader_without_the_pii_entitlement() {
+    // The setter is an ancestor's administrator — an identity, so PII — and
+    // it reaches the caller four ways: the write's answer, the read, the
+    // listing, and the history's image of the row. Each shows it to a caller
+    // who may read unmasked and masks it for one who may not, as the trail
+    // and the audit actor do.
+    for (h, entitled) in [
+        (RestHarness::new().await, true),
+        (RestHarness::without_pii_entitlement().await, false),
+    ] {
+        h.inner.declare("proxy", "cascading", json!(true)).await;
+        let (root, a) = (h.inner.tree.root, h.inner.tree.a);
+        let uri = format!("{}?tenant={a}", permissions(&h, "proxy"));
+        let set = h
+            .send(
+                "PUT",
+                &uri,
+                Some(json!({ "access": "read_only" })),
+                Some("absent"),
+                root,
+            )
+            .await;
+        assert_eq!(set.status, 200, "{}", set.body);
+        let (read, _) = read(&h, "proxy", a, root).await;
+        let listed = h
+            .items(&format!("{}/all", permissions(&h, "proxy")), root)
+            .await;
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        for (surface, set_by) in [
+            ("the write's answer", &set.body["stored"]["set_by"]),
+            ("the read", &read["stored"]["set_by"]),
+            ("the listing", &listed[0]["set_by"]),
+        ] {
+            let shown = set_by.as_str().expect("a setter");
+            if entitled {
+                assert!(
+                    !shown.is_empty() && shown != MASK_TOKEN,
+                    "{surface} shows who set it: {shown}"
+                );
+            } else {
+                assert_eq!(shown, MASK_TOKEN, "{surface} masks who set it");
+            }
+        }
+
+        // The history carries the change with its actor, masked as every
+        // actor is; the image of the row does not repeat the setter, where
+        // it would sit beside the mask in the clear.
+        let setting = permissions(&h, "proxy").replace("/permissions", "");
+        let history = h
+            .items(&format!("{setting}/history?tenant={a}"), root)
+            .await;
+        let record = history
+            .iter()
+            .find(|r| r["operation"] == json!("create"))
+            .expect("the restriction's record");
+        assert_eq!(
+            record["post_value"]["access"],
+            json!("read_only"),
+            "{record}"
+        );
+        assert!(
+            record["post_value"].get("set_by").is_none(),
+            "the image does not repeat the setter: {record}"
+        );
+        assert_eq!(
+            record["actor"] == json!(MASK_TOKEN),
+            !entitled,
+            "the actor is masked only without the entitlement: {record}"
+        );
+    }
 }

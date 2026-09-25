@@ -612,7 +612,7 @@ A row restricts one tenant's administrative access to one setting. No row means 
 | `declaration_id` | UUID | Yes | Declaration this decision is about (FK). |
 | `tenant_id` | UUID | Yes | The tenant it is about — the one **restricted**, not the one who decided. |
 | `access` | `TenantAccess` | Yes | `read_only` or `hidden`. `overridable` is represented by no row. |
-| `set_by` | string | Yes | Subject who recorded the decision — always an administrator of a **strict ancestor** of `tenant_id` (§4.2 *Tenant Access*). |
+| `set_by` | string | Yes | Subject who recorded the decision — always an administrator of a **strict ancestor** of `tenant_id` (§4.2 *Tenant Access*). An administrator identity, so PII on read: masked on the permissions surface for a caller not authorized for unmasked PII, and not repeated in the restriction's audit images, whose record carries it as the actor (§4.2 *Audit Emitter*). |
 | `created_at` / `updated_at` | `timestamptz` | Yes | UTC timestamps. |
 
 **Invariants:** one row per `(declaration_id, tenant_id)`; `access` is only `read_only` or `hidden`.

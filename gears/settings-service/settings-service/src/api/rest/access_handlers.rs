@@ -16,7 +16,7 @@ use crate::api::rest::access_dto::{
     AccessReadDto, RestrictionDto, SetRestrictionRequest, render_readout, render_restriction,
 };
 use crate::api::rest::if_match;
-use crate::api::rest::setting_handlers::TenantParam;
+use crate::api::rest::setting_handlers::{TenantParam, may_read_pii};
 use crate::domain::access::{AccessActor, AccessReadout, TenantAccess};
 use crate::domain::error::DomainError;
 use crate::field;
@@ -73,8 +73,16 @@ fn conn_error(err: &toolkit_db::DbError) -> DomainError {
     }
 }
 
-fn with_etag(readout: &AccessReadout) -> ([(header::HeaderName, String); 1], Json<AccessReadDto>) {
-    let dto = render_readout(readout);
+/// The readout with its tag in `ETag`. The stored row names who recorded it,
+/// an administrator's identity: the entitlement to see it unmasked is asked
+/// only when there is such a row.
+async fn with_etag(
+    readout: &AccessReadout,
+    enforcer: &authz_resolver_sdk::PolicyEnforcer,
+    ctx: &SecurityContext,
+) -> ([(header::HeaderName, String); 1], Json<AccessReadDto>) {
+    let pii = readout.stored.is_some() && may_read_pii(enforcer, ctx).await;
+    let dto = render_readout(readout, pii);
     ([(header::ETAG, super::etag_header(&dto.etag))], Json(dto))
 }
 
@@ -104,7 +112,7 @@ pub async fn read_access(
     let readout = service
         .read(&conn, &actor(&ctx, &headers), &key, target)
         .await?;
-    Ok(with_etag(&readout))
+    Ok(with_etag(&readout, &enforcer, &ctx).await)
 }
 
 // Axum extractors, one per dependency; bundling them would hide what the
@@ -159,7 +167,7 @@ pub async fn set_access(
     };
     service.evict(&key, target).await?;
     // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-set:p1:inst-ta-set-13
-    Ok(with_etag(&readout))
+    Ok(with_etag(&readout, &enforcer, &ctx).await)
     // @cpt-end:cpt-cf-settings-service-flow-tenant-access-set:p1:inst-ta-set-13
 }
 
@@ -201,7 +209,7 @@ pub async fn clear_access(
     };
     service.evict(&key, target).await?;
     // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-clear:p1:inst-ta-clear-9
-    Ok(with_etag(&readout))
+    Ok(with_etag(&readout, &enforcer, &ctx).await)
     // @cpt-end:cpt-cf-settings-service-flow-tenant-access-clear:p1:inst-ta-clear-9
 }
 
@@ -227,7 +235,12 @@ pub async fn list_access(
     let conn = db.conn().map_err(|e| conn_error(&e))?;
     let rows = service.list(&conn, &actor(&ctx, &headers), &key).await?;
     // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-list:p1:inst-ta-list-5
-    let items: Vec<RestrictionDto> = rows.iter().map(render_restriction).collect();
+    // Every row names who recorded it; asked once for the page.
+    let pii = !rows.is_empty() && may_read_pii(&enforcer, &ctx).await;
+    let items: Vec<RestrictionDto> = rows
+        .iter()
+        .map(|row| render_restriction(row, pii))
+        .collect();
     // The whole list in one page, by design: at most one row per descendant
     // tenant, the subtree walked under the shared budget and refused past it,
     // so there is nothing to continue from. The `Page` envelope is the
