@@ -119,6 +119,17 @@ pub enum Change {
 /// The Credential Store cannot join the row's transaction, so a secret is
 /// stored before it opens, under a reference unique to this write. What the
 /// transaction then persists is the reference; the plaintext is gone from here.
+/// Whether a stage judges the caller's `If-Match` before the store leg.
+#[derive(Debug, Clone, Copy)]
+pub enum StagePrecondition<'a> {
+    /// A write: the tag the caller presented, judged against the current row
+    /// before the plaintext goes anywhere, and again by the commit.
+    Judge(Option<&'a str>),
+    /// A secret staged ahead of its write: nothing to judge yet, since the
+    /// tag belongs to the batch that adopts the stage.
+    None,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Staged {
     /// A value to store: inline, or as the reference of an entry just created.
@@ -572,8 +583,28 @@ where
         gated: &Gated,
         actor: &WriteActor,
         change: Change,
+        precondition: StagePrecondition<'_>,
     ) -> Result<Staged, DomainError> {
         let declaration = &gated.declaration;
+        // The tag is judged before the plaintext goes anywhere: a stale or
+        // missing one is the cheapest refusal and the one a concurrent editor
+        // trips most, and refusing it here leaves no store entry to release,
+        // no intent row to sweep and no compensating delete to fail. It is a
+        // preview of the check the commit makes again under its lock, which
+        // is the one that decides; a row that moves in between is refused
+        // there, having cost one store entry — the race, not the rule.
+        if let StagePrecondition::Judge(if_match) = precondition {
+            let current = self
+                .values
+                .find_one(
+                    conn,
+                    &AccessScope::allow_all(),
+                    declaration.id,
+                    gated.tenant_id,
+                )
+                .await?;
+            precondition::evaluate(if_match, &value_state_tag(current.as_ref()))?;
+        }
         let value = match change {
             Change::Set(value) => value,
             Change::AdoptSecret {

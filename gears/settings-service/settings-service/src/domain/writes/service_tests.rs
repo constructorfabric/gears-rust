@@ -9,7 +9,11 @@ use settings_service_sdk::EffectiveSource;
 use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
-use super::{Change, Committed, Gated, StepUpPolicy, ValueWriter, WriteActor};
+use std::sync::atomic::Ordering;
+
+use super::{
+    Change, Committed, Gated, StagePrecondition, Staged, StepUpPolicy, ValueWriter, WriteActor,
+};
 use crate::audit::{AuditOperation, AuditValue};
 use crate::domain::access::{AccessRepository, RestrictionDraft, TenantAccess};
 use crate::domain::error::DomainError;
@@ -197,8 +201,28 @@ impl WriteHarness {
     ) -> Result<Committed, DomainError> {
         let staged = {
             let conn = self.base.db.conn().expect("connection");
-            self.writer.stage(&conn, &gated, actor, change).await?
+            self.writer
+                .stage(
+                    &conn,
+                    &gated,
+                    actor,
+                    change,
+                    StagePrecondition::Judge(if_match),
+                )
+                .await?
         };
+        self.commit_gated_staged(actor, gated, staged, if_match)
+            .await
+    }
+
+    /// The commit alone, for a stage the test made earlier.
+    async fn commit_gated_staged(
+        &self,
+        actor: &WriteActor,
+        gated: Gated,
+        staged: Staged,
+        if_match: Option<&str>,
+    ) -> Result<Committed, DomainError> {
         let writer = Arc::clone(&self.writer);
         let actor_owned = actor.clone();
         let if_match = if_match.map(str::to_owned);
@@ -1153,7 +1177,13 @@ async fn a_record_that_cannot_be_written_rolls_the_value_back() {
         .await
         .expect("gated");
     let staged = writer
-        .stage(&conn, &gated, &actor, Change::Set(json!(true)))
+        .stage(
+            &conn,
+            &gated,
+            &actor,
+            Change::Set(json!(true)),
+            StagePrecondition::Judge(Some("absent")),
+        )
         .await
         .expect("staged");
     let outcome = base
@@ -1360,7 +1390,7 @@ async fn a_secret_write_stores_only_the_reference_and_masks_both_images() {
 }
 
 #[tokio::test]
-async fn a_set_refused_on_its_tag_releases_the_entry_it_created_and_keeps_the_live_one() {
+async fn a_set_refused_on_its_tag_touches_no_entry_and_a_race_releases_the_one_it_made() {
     let (h, secrets) = WriteHarness::with_secrets().await;
     declare_secret(&h).await;
     let root = h.base.tree.root;
@@ -1380,9 +1410,10 @@ async fn a_set_refused_on_its_tag_releases_the_entry_it_created_and_keeps_the_li
         .and_then(Value::as_str)
         .expect("a reference")
         .to_owned();
+    let stores_after_live = secrets.stores.load(Ordering::SeqCst);
 
-    // Stale tag: the plaintext already went to the store, so the refusal
-    // releases that entry and the live one is untouched.
+    // A stale tag is judged before the plaintext goes anywhere: no entry is
+    // created, so none is released, and the live one is untouched.
     let refused = h
         .write(
             &actor(root),
@@ -1396,19 +1427,60 @@ async fn a_set_refused_on_its_tag_releases_the_entry_it_created_and_keeps_the_li
         matches!(refused, Err(DomainError::PreconditionFailed { .. })),
         "{refused:?}"
     );
+    assert_eq!(secrets.stores.load(Ordering::SeqCst), stores_after_live);
+    assert!(secrets.deleted.lock().expect("lock").is_empty());
     assert_eq!(secrets.held(), vec![live_ref.clone()]);
-    assert_eq!(
-        secrets
-            .entries
-            .lock()
-            .expect("lock")
-            .get(&live_ref)
-            .map(String::as_str),
-        Some("hunter2")
+
+    // The race the commit's own check exists for: the tag was current when the
+    // stage judged it and the row moved before the commit took its lock. The
+    // entry the stage created is released and the live one is untouched.
+    let gated = h
+        .gate(&actor(root), "api_token", None)
+        .await
+        .expect("gated");
+    let staged = {
+        let conn = h.base.db.conn().expect("connection");
+        h.writer
+            .stage(
+                &conn,
+                &gated,
+                &actor(root),
+                Change::Set(json!("racer")),
+                StagePrecondition::Judge(Some(&live.etag)),
+            )
+            .await
+            .expect("staged while the tag was current")
+    };
+    assert_eq!(secrets.stores.load(Ordering::SeqCst), stores_after_live + 1);
+    let moved = h
+        .write(
+            &actor(root),
+            "api_token",
+            None,
+            Change::Set(json!("hunter3")),
+            Some(&live.etag),
+        )
+        .await
+        .expect("another writer lands first");
+    let raced = h
+        .commit_gated_staged(&actor(root), gated, staged, Some(&live.etag))
+        .await;
+    assert!(
+        matches!(raced, Err(DomainError::PreconditionFailed { .. })),
+        "{raced:?}"
     );
+    let moved_ref = moved
+        .new_value
+        .as_ref()
+        .and_then(Value::as_str)
+        .expect("a reference")
+        .to_owned();
+    assert_eq!(secrets.held(), vec![moved_ref.clone()]);
     let deleted = secrets.deleted.lock().expect("lock");
-    assert_eq!(deleted.len(), 1);
-    assert_ne!(deleted[0], live_ref);
+    assert!(
+        deleted.iter().any(|r| r != &live_ref && r != &moved_ref),
+        "{deleted:?}"
+    );
 }
 
 #[tokio::test]

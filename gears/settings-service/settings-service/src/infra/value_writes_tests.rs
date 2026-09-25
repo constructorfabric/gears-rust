@@ -1724,3 +1724,64 @@ async fn a_stopped_lifecycle_releases_nothing_more_and_keeps_every_row() {
         3
     );
 }
+
+#[tokio::test]
+async fn a_secret_write_with_a_stale_or_missing_tag_never_reaches_the_store() {
+    // The tag is the cheapest check and the one a concurrent editor trips
+    // most: it is judged before the plaintext goes anywhere, so a refused
+    // write leaves no entry to release, no intent row to sweep, and no
+    // compensating delete to fail.
+    let h = Harness::with_step_up(Arc::new(FixedStepUp::verified())).await;
+    h.declare_secret("api_token").await;
+    let admin = actor(h.base.tree.root);
+    let first = h
+        .set(&admin, "api_token", None, json!("hunter2"), Some("absent"))
+        .await
+        .expect("first write");
+    let stores_after_first = h.stores();
+    let pending_after_first = h.all_pending().await.len();
+
+    for (tag, expected) in [
+        (Some("absent"), "stale"),
+        (Some("not-a-tag"), "stale"),
+        (None, "required"),
+    ] {
+        let err = h
+            .set(&admin, "api_token", None, json!("hunter3"), tag)
+            .await
+            .expect_err(expected);
+        match expected {
+            "stale" => assert!(
+                matches!(err, DomainError::PreconditionFailed { .. }),
+                "{err:?}"
+            ),
+            _ => assert!(
+                matches!(err, DomainError::PreconditionRequired { .. }),
+                "{err:?}"
+            ),
+        }
+    }
+    assert_eq!(
+        h.stores(),
+        stores_after_first,
+        "no plaintext went to the store"
+    );
+    assert_eq!(
+        h.all_pending().await.len(),
+        pending_after_first,
+        "no intent row written"
+    );
+    assert!(h.deleted().is_empty(), "nothing to compensate");
+
+    // The current tag still writes, as before.
+    h.set(
+        &admin,
+        "api_token",
+        None,
+        json!("hunter3"),
+        Some(&first.etag),
+    )
+    .await
+    .expect("current tag");
+    assert_eq!(h.stores(), stores_after_first + 1);
+}

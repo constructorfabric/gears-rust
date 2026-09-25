@@ -27,7 +27,9 @@ use crate::domain::secrets::pending::{
     self as pending, Claim, PendingSecret, PendingSecretRepository,
 };
 use crate::domain::writes::service::{ImpactReport, StepUpPolicy, ValidationReport};
-use crate::domain::writes::{Change, Committed, Gated, Staged, ValueWriter, WriteActor};
+use crate::domain::writes::{
+    Change, Committed, Gated, StagePrecondition, Staged, ValueWriter, WriteActor,
+};
 use crate::field;
 use crate::infra::storage::access_repo::AccessRepo;
 use crate::infra::storage::audit_store::AuditStore;
@@ -236,7 +238,17 @@ impl WriteCoordinator {
         // connection while one is open on this task. The connection here is
         // for the intent row a secret records before its entry exists.
         let conn = self.db.conn().map_err(|e| conn_error(&e))?;
-        let staged = match self.writer.stage(&conn, &gated, actor, change).await {
+        let staged = match self
+            .writer
+            .stage(
+                &conn,
+                &gated,
+                actor,
+                change,
+                StagePrecondition::Judge(if_match),
+            )
+            .await
+        {
             Ok(staged) => staged,
             Err(err) => {
                 self.writer
@@ -605,7 +617,13 @@ impl WriteCoordinator {
         // stage leaves nothing a set would not.
         let staged = self
             .writer
-            .stage(&conn, &gated, actor, Change::Set(value))
+            .stage(
+                &conn,
+                &gated,
+                actor,
+                Change::Set(value),
+                StagePrecondition::None,
+            )
             .await?;
         let Staged::Set {
             secret_ref: Some(_),
