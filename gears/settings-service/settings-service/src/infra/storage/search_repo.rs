@@ -80,7 +80,14 @@ impl Dialect {
     fn text_of(self, json_column: &str) -> String {
         match self {
             Self::Postgres => format!("({json_column} #>> '{{}}')"),
-            Self::Sqlite => format!("json_extract({json_column}, '$')"),
+            // `json_extract(…, '$')` unwraps a string but projects a boolean
+            // as the integer 1/0, which no word matches; `json()` keeps the
+            // JSON spelling — `true`, `12.5`, an object — which is what the
+            // other backend and the Rust-side attribution project.
+            Self::Sqlite => format!(
+                "(CASE json_type({json_column}) WHEN 'text' THEN json_extract({json_column}, '$') \
+                 ELSE json({json_column}) END)"
+            ),
         }
     }
 

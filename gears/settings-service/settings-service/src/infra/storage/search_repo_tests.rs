@@ -536,7 +536,11 @@ fn the_predicates_render_for_each_dialect_with_the_pattern_bound_in_place() {
         ))
         .build(SqliteQueryBuilder);
     assert!(
-        sql.contains("json_extract(setting_values.value, '$') LIKE ? ESCAPE '\\'"),
+        sql.contains(
+            "(CASE json_type(setting_values.value) WHEN 'text' THEN \
+             json_extract(setting_values.value, '$') ELSE json(setting_values.value) END) \
+             LIKE ? ESCAPE '\\'"
+        ),
         "{sql}"
     );
     assert_eq!(
@@ -552,5 +556,53 @@ fn the_predicates_render_for_each_dialect_with_the_pattern_bound_in_place() {
     assert_eq!(
         super::Dialect::Sqlite.not_json_null("setting_declarations.default_value"),
         "json_type(setting_declarations.default_value) <> 'null'"
+    );
+}
+
+#[tokio::test]
+async fn a_boolean_value_is_found_by_its_word_on_this_backend_too() {
+    // A JSON boolean must read as the text `true`/`false` for the search, as
+    // it does on PostgreSQL (`#>> '{}'`) and in the Rust-side attribution.
+    // SQLite's `json_extract(…, '$')` projects it as the integer 1/0, which no
+    // word can match; the projection has to spell it out.
+    let h = ResolutionHarness::new().await;
+    let on = declare_described(
+        &h,
+        "proxy_enabled",
+        None,
+        json!(true),
+        "public",
+        h.category_id(),
+    )
+    .await;
+    declare_described(
+        &h,
+        "compression",
+        None,
+        json!(false),
+        "public",
+        h.category_id(),
+    )
+    .await;
+    h.set(on, h.tree.a, json!(false)).await;
+
+    let all = &[h.tree.root, h.tree.a];
+    assert_eq!(
+        declaration_keys(&h, "true", Corpus::Public, all).await,
+        vec!["proxy_enabled"],
+        "the default `true` is found by its word"
+    );
+    let mut off = declaration_keys(&h, "false", Corpus::Public, all).await;
+    off.sort();
+    assert_eq!(
+        off,
+        vec!["compression", "proxy_enabled"],
+        "a `false` default and a `false` override are both found"
+    );
+    assert!(
+        declaration_keys(&h, "10", Corpus::Public, all)
+            .await
+            .is_empty(),
+        "and never by the integers SQLite would otherwise project"
     );
 }

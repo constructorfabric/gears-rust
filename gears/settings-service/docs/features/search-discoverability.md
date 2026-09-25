@@ -133,7 +133,7 @@ Search runs over stored rows, not resolved values. An inherited value is a hit a
 
 **Steps**:
 1. [x] - `p2` - Test the fields in the order a client is told about them — key, description, category name, Schema Default — and attribute the declaration-level hit to the first that contains the needle case-insensitively; a declaration on the page only because an override matched yields no declaration-level hit - `inst-sd-attr-1`
-2. [x] - `p2` - Match a JSON value by its text projection: a string as itself, anything else as its JSON text — the same projection the database indexes - `inst-sd-attr-2`
+2. [x] - `p2` - Match a JSON value by its text projection: a string as itself, anything else as its JSON text — the same projection the database indexes; on SQLite that projection is spelled with `json_type`, since `json_extract(…, '$')` alone would project a boolean as the integer `1`/`0`, which no word matches - `inst-sd-attr-2`
 3. [x] - `p2` - **IF** the database matched a declaration but no field and no override names the match in Rust — whitespace inside a JSON projection, or a case fold the two engines disagree on — attribute it to the Schema Default when that is in the corpus, else to the key, so a row the database returned is never silently dropped - `inst-sd-attr-3`
 
 ## 4. States (CDSL)
