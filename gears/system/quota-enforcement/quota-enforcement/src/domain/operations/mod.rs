@@ -8,12 +8,14 @@
 //! policy is selected and evaluated inside the storage transaction, and this
 //! layer only decides what to hash, what to look up, and what to record.
 
+pub mod batch;
 pub mod idempotency;
 pub mod lease_sweeper;
 pub mod leases;
 pub mod retention;
 pub mod service;
 
+pub use batch::BatchLimits;
 pub use idempotency::{IdempotencyCache, ReplayRecord};
 pub use lease_sweeper::{LeaseSweepReport, LeaseSweepTiming, LeaseSweeper};
 pub use leases::LeaseLimits;

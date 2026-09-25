@@ -28,6 +28,8 @@ pub struct OperationsRuntime {
     pub preparation_max_attempts: std::num::NonZeroU32,
     /// The TTL window lease acquisitions are checked against.
     pub leases: super::operations::LeaseLimits,
+    /// The batch debit's item limit and timeout.
+    pub batch: super::operations::BatchLimits,
 }
 
 /// Composition root of the domain. Handlers and the in-process client reach
@@ -44,6 +46,7 @@ pub struct Service {
     evaluation: quota_enforcement_sdk::engine::EvaluationLimits,
     preparation_max_attempts: std::num::NonZeroU32,
     leases: super::operations::LeaseLimits,
+    batch: super::operations::BatchLimits,
 }
 
 impl Service {
@@ -70,6 +73,7 @@ impl Service {
             evaluation: policy_limits.evaluation,
             preparation_max_attempts: operations.preparation_max_attempts,
             leases: operations.leases,
+            batch: operations.batch,
         }
     }
 
@@ -210,6 +214,7 @@ impl Service {
             evaluation: self.evaluation,
             preparation_max_attempts: self.preparation_max_attempts,
             leases: self.leases,
+            batch: self.batch,
         })
     }
 

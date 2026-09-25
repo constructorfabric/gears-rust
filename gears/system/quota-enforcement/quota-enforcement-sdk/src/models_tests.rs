@@ -1103,3 +1103,65 @@ fn a_rollback_names_the_namespace_of_the_operation_it_reverses() {
     .expect("the selector defaults");
     assert_eq!(legacy.original_operation, RollbackableOperation::Debit);
 }
+
+#[test]
+fn a_batch_is_denied_when_any_item_is_and_keeps_every_item_in_order() {
+    let allowed = crate::Decision::allowed_with_plan(std::collections::BTreeMap::new());
+    let denied = crate::Decision {
+        result: crate::DecisionResult::Denied {
+            violated_quota_ids: Vec::new(),
+            reason: "QUOTA_EXCEEDED".to_owned(),
+        },
+        debit_plan: std::collections::BTreeMap::new(),
+        diagnostics: std::collections::BTreeMap::new(),
+    };
+    let keys = || ["a".to_owned(), "b".to_owned(), "c".to_owned()];
+
+    let mixed = crate::BatchDecision::of(keys(), vec![allowed.clone(), denied, allowed.clone()]);
+    assert_eq!(mixed.result, crate::BatchResult::Denied);
+    let order: Vec<&str> = mixed
+        .items
+        .iter()
+        .map(|i| i.idempotency_key.as_str())
+        .collect();
+    assert_eq!(order, ["a", "b", "c"]);
+
+    let clean = crate::BatchDecision::of(keys(), vec![allowed.clone(), allowed.clone(), allowed]);
+    assert_eq!(clean.result, crate::BatchResult::Allowed);
+}
+
+#[test]
+fn a_batch_record_carries_its_schema_version() {
+    let record = crate::BatchRecord::new(Vec::new());
+    let value = serde_json::to_value(&record).expect("serialize");
+    assert_eq!(
+        value["__version"],
+        serde_json::json!(crate::BatchRecord::VERSION)
+    );
+    let back: crate::BatchRecord = serde_json::from_value(value).expect("deserialize");
+    assert_eq!(back, record);
+}
+
+#[test]
+fn a_batch_timer_is_armed_once_and_shared_by_every_attempt() {
+    let timer = crate::BatchTimer::new(std::time::Duration::from_mins(1));
+    assert!(!timer.expired(), "an unarmed timer has not run out");
+    assert_eq!(
+        timer.armed_remaining(),
+        None,
+        "an unarmed timer bounds nothing"
+    );
+    let first = timer.arm();
+    assert!(timer.armed_remaining().is_some_and(|left| left <= first));
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let second = timer.arm();
+    assert!(
+        second < first,
+        "the second attempt gets what is left, not a fresh budget"
+    );
+
+    let spent = crate::BatchTimer::new(std::time::Duration::ZERO);
+    assert!(spent.arm().is_zero());
+    assert!(spent.expired());
+    assert_eq!(spent.armed_remaining(), Some(std::time::Duration::ZERO));
+}

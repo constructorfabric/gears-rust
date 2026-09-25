@@ -9,9 +9,10 @@ use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::SecurityContext;
 
 use crate::models::{
-    AcquireLeaseOutcome, AcquireLeaseRequest, CommitLeaseRequest, CreditRequest, DeactivateOutcome,
-    DebitRequest, Decision, DecisionPreview, PageRequest, PageResult, PreviewRequest, QuotaFilter,
-    QuotaId, QuotaPatch, QuotaSpec, QuotaView, ReleaseLeaseRequest, RollbackRequest,
+    AcquireLeaseOutcome, AcquireLeaseRequest, BatchDebitRequest, BatchDecision, CommitLeaseRequest,
+    CreditRequest, DeactivateOutcome, DebitRequest, Decision, DecisionPreview, PageRequest,
+    PageResult, PreviewRequest, QuotaFilter, QuotaId, QuotaPatch, QuotaSpec, QuotaView,
+    ReleaseLeaseRequest, RollbackRequest,
 };
 
 /// Error of every client method: the platform canonical error.
@@ -198,6 +199,22 @@ pub trait QuotaEnforcementClientV1: Send + Sync + 'static {
         ctx: &SecurityContext,
         request: ReleaseLeaseRequest,
     ) -> Result<Decision, QuotaEnforcementError>;
+
+    /// Debit several metrics as one logical operation, all or nothing. A
+    /// denied batch is a verdict, not an error.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidArgument` for an empty batch, a non-positive amount (naming the
+    /// item), a missing key, mixed tenants, duplicate item keys, or a batch
+    /// over the configured size; `Unimplemented` for `independent` mode;
+    /// `DeadlineExceeded` when the batch timeout runs out; the canonical error
+    /// of any item's admission or evaluation, with nothing written.
+    async fn batch_debit(
+        &self,
+        ctx: &SecurityContext,
+        request: BatchDebitRequest,
+    ) -> Result<BatchDecision, QuotaEnforcementError>;
 }
 
 /// Platform operator policy surface. Every method requires explicit PDP admission.

@@ -585,6 +585,11 @@ pub struct OperationsSection {
     /// How long a cached record may answer a replay, in milliseconds. An entry
     /// never outlives the record's own retention whatever this says.
     pub idempotency_cache_ttl_ms: u64,
+    /// Most items one batch debit may carry.
+    pub max_batch_items: usize,
+    /// Batch-level evaluation timeout, in milliseconds. It supersedes each
+    /// item's per-policy timeout for the batch as a whole.
+    pub batch_timeout_ms: u64,
 }
 
 impl Default for OperationsSection {
@@ -593,6 +598,8 @@ impl Default for OperationsSection {
             idempotency_cache_entries: 4096,
             // The P1 reference default of the idempotency-replay algorithm.
             idempotency_cache_ttl_ms: 5_000,
+            max_batch_items: 100,
+            batch_timeout_ms: 250,
         }
     }
 }
@@ -614,7 +621,22 @@ impl OperationsSection {
                 "[quota-enforcement.operations].idempotency_cache_ttl_ms must be at least 1"
             );
         }
+        if self.max_batch_items == 0 {
+            anyhow::bail!("[quota-enforcement.operations].max_batch_items must be at least 1");
+        }
+        if self.batch_timeout_ms == 0 {
+            anyhow::bail!("[quota-enforcement.operations].batch_timeout_ms must be at least 1");
+        }
         Ok(())
+    }
+
+    /// The batch debit's bounds.
+    #[must_use]
+    pub const fn to_batch_limits(&self) -> crate::domain::operations::BatchLimits {
+        crate::domain::operations::BatchLimits {
+            max_items: self.max_batch_items,
+            timeout: Duration::from_millis(self.batch_timeout_ms),
+        }
     }
 
     /// How long a cached record may answer.

@@ -5,7 +5,7 @@ use quota_enforcement_sdk::StorageError;
 use sea_orm::DbErr;
 use toolkit_db::secure::ScopeError;
 
-use super::{ContentionBudget, is_lock_not_available, with_budget};
+use super::{ContentionBudget, is_lock_not_available, with_budget, with_budget_within};
 use crate::infra::storage::consumption_store::TxError;
 
 /// What a `NOWAIT` read on a held row comes back as once it is re-wrapped.
@@ -104,6 +104,54 @@ async fn the_budget_bounds_the_total_wait_across_every_retry() {
     assert!(
         waited < Duration::from_millis(600),
         "a deadline, not a per-retry bound: {waited:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_armed_batch_timer_ends_the_retries_before_a_longer_budget() {
+    let timer = quota_enforcement_sdk::BatchTimer::new(Duration::from_millis(30));
+    let attempts = AtomicU32::new(0);
+    let started = Instant::now();
+    let outcome: Result<(), TxError> = with_budget_within(
+        ContentionBudget::starting_now(Duration::from_secs(5)),
+        Some(&timer),
+        || {
+            // The first attempt arms the timer, as a batch that got its locks
+            // and later meets a held row on a retry does.
+            if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                let _armed = timer.arm();
+            }
+            async { Err(refused()) }
+        },
+    )
+    .await;
+    let waited = started.elapsed();
+    assert!(
+        matches!(outcome, Err(TxError::Storage(StorageError::BatchTimeout))),
+        "{outcome:?}"
+    );
+    assert!(
+        waited < Duration::from_millis(500),
+        "the timer, not the 5 s budget, bounds the retries: {waited:?}"
+    );
+    assert!(timer.expired(), "no attempt starts past the deadline");
+}
+
+#[tokio::test]
+async fn an_unarmed_batch_timer_leaves_the_budget_in_charge() {
+    let timer = quota_enforcement_sdk::BatchTimer::new(Duration::ZERO);
+    let outcome: Result<(), TxError> = with_budget_within(
+        ContentionBudget::starting_now(Duration::from_millis(20)),
+        Some(&timer),
+        || async { Err(refused()) },
+    )
+    .await;
+    assert!(
+        matches!(
+            outcome,
+            Err(TxError::Storage(StorageError::LeaseContentionTimeout))
+        ),
+        "lock waits before arming are the budget's (I8): {outcome:?}"
     );
 }
 

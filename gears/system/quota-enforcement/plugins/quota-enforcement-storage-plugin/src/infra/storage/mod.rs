@@ -1,5 +1,6 @@
 //! Storage layer of the plugin.
 
+pub mod batch_store;
 pub mod consumption_store;
 pub mod cursor;
 pub mod entity;

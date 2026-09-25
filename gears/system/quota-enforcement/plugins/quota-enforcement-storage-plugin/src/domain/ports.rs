@@ -219,6 +219,19 @@ pub trait ConsumptionStore: Send + Sync {
         events: &[NotificationEvent],
     ) -> Result<TransitionOutcome<EvaluatedDebit>, StorageError>;
 
+    /// Evaluate and apply an atomic batch under one envelope key.
+    ///
+    /// # Errors
+    ///
+    /// The contract's variants for `apply_batch_debit`.
+    async fn apply_batch_debit(
+        &self,
+        ctx: &SecurityContext,
+        scope: &AccessScope,
+        batch: &quota_enforcement_sdk::EvaluatedBatch<'_>,
+        events: &[NotificationEvent],
+    ) -> Result<TransitionOutcome<Vec<quota_enforcement_sdk::EvaluatedDebit>>, StorageError>;
+
     /// Return consumption to one Quota, deriving the idempotency scope under
     /// the row lock.
     ///

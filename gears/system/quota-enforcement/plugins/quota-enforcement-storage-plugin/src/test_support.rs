@@ -456,6 +456,19 @@ impl crate::domain::ConsumptionStore for FakeConsumptionStore {
         Err(unreached())
     }
 
+    async fn apply_batch_debit(
+        &self,
+        _ctx: &SecurityContext,
+        _scope: &AccessScope,
+        _batch: &quota_enforcement_sdk::EvaluatedBatch<'_>,
+        _events: &[NotificationEvent],
+    ) -> Result<
+        quota_enforcement_sdk::TransitionOutcome<Vec<quota_enforcement_sdk::EvaluatedDebit>>,
+        StorageError,
+    > {
+        Err(unreached())
+    }
+
     async fn apply_credit(
         &self,
         _ctx: &SecurityContext,

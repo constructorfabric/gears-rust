@@ -50,6 +50,7 @@ async fn harness(pdp: Arc<dyn AuthZResolverApi>) -> Harness {
             cache_ttl: std::time::Duration::from_secs(5),
             preparation_max_attempts: std::num::NonZeroU32::new(3).expect("attempts"),
             leases: crate::domain::operations::LeaseLimits::default(),
+            batch: crate::domain::operations::BatchLimits::default(),
         },
     ));
     let registry = Arc::new(FakeContractRegistry::llm_gateway());

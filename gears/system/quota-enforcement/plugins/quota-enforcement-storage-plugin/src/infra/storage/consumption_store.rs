@@ -213,9 +213,9 @@ pub(super) struct AppliedEntry {
 }
 
 /// What a debit committed, before it becomes the caller's result.
-struct Applied {
-    entries: Vec<AppliedEntry>,
-    crossings: Vec<ThresholdCrossing>,
+pub(super) struct Applied {
+    pub(super) entries: Vec<AppliedEntry>,
+    pub(super) crossings: Vec<ThresholdCrossing>,
 }
 
 // ---------------------------------------------------------------------------
@@ -888,7 +888,10 @@ impl SqlConsumptionStore {
         Ok(decode_version(&row)?)
     }
 
-    /// Evaluate the selected policy against the locked rows.
+    /// Evaluate the selected policy against the locked Quota rows, reading
+    /// their counters without locking them. Lease acquisition evaluates this
+    /// way: it takes its capacity row (rank 4) only after an allowed verdict,
+    /// so it may not hold counter rows (rank 5) before it.
     pub(super) async fn evaluate(
         tx: &impl DBRunner,
         scope: &AccessScope,
@@ -896,11 +899,45 @@ impl SqlConsumptionStore {
         mutation: &OwnedMutation,
         now: OffsetDateTime,
     ) -> Result<(PolicyVersion, Decision), TxError> {
-        let policy = Self::select_policy(tx, &mutation.applicable.metric).await?;
         let mut snapshots = Vec::with_capacity(quotas.len());
         for quota in quotas {
             snapshots.push(snapshot_of(tx, scope, quota, now).await?);
         }
+        Self::decide(tx, &snapshots, mutation, now, None).await
+    }
+
+    /// [`Self::evaluate`] over counter rows it locks first (rank 5), so the
+    /// counter and the expired-hold correction come from one state: every
+    /// writer that lowers a counter holds that row before stamping a hold.
+    pub(super) async fn evaluate_locked(
+        tx: &impl DBRunner,
+        scope: &AccessScope,
+        quotas: &[Quota],
+        mutation: &OwnedMutation,
+        now: OffsetDateTime,
+    ) -> Result<(PolicyVersion, Decision), TxError> {
+        let mut locked = Vec::with_capacity(quotas.len());
+        for quota in quotas {
+            locked.push(lock_counters_of(tx, scope, quota, now, RowWait::Nowait).await?);
+        }
+        let mut snapshots = Vec::with_capacity(quotas.len());
+        for (quota, counter) in quotas.iter().zip(&locked) {
+            snapshots.push(snapshot_of_locked(tx, scope, quota, counter, now).await?);
+        }
+        Self::decide(tx, &snapshots, mutation, now, None).await
+    }
+
+    /// Run the policy of `mutation`'s metric over `snapshots`. `budget`
+    /// replaces the policy's own timeout when given: a batch item runs on
+    /// what remains of the batch timer.
+    pub(super) async fn decide(
+        tx: &impl DBRunner,
+        snapshots: &[QuotaSnapshot],
+        mutation: &OwnedMutation,
+        now: OffsetDateTime,
+        budget: Option<quota_enforcement_sdk::engine::EvaluationBudget>,
+    ) -> Result<(PolicyVersion, Decision), TxError> {
+        let policy = Self::select_policy(tx, &mutation.applicable.metric).await?;
         let arbitration: Vec<Value> = snapshots
             .iter()
             .map(|s| Value::Object(s.metadata.clone()))
@@ -917,13 +954,17 @@ impl SqlConsumptionStore {
                 arbitration,
             })
             .collect();
-        // Resolve the budget from the version selected by this transaction.
-        let budget = mutation.limits.budget(policy.timeout_ms).map_err(|error| {
-            TxError::Storage(StorageError::EvaluationFailed {
-                engine_id: policy.engine_id.clone(),
-                failure: error.into(),
-            })
-        })?;
+        // Resolve the budget from the version selected by this transaction,
+        // unless the caller fixed it.
+        let budget = match budget {
+            Some(budget) => budget,
+            None => mutation.limits.budget(policy.timeout_ms).map_err(|error| {
+                TxError::Storage(StorageError::EvaluationFailed {
+                    engine_id: policy.engine_id.clone(),
+                    failure: error.into(),
+                })
+            })?,
+        };
         let context = EvaluationContext {
             policy: &policy,
             metric: &mutation.applicable.metric,
@@ -952,7 +993,7 @@ impl SqlConsumptionStore {
 
     /// Apply a validated plan: settle what the plan's Quotas outgrew, then move
     /// each counter in plan order.
-    async fn apply_plan(
+    pub(super) async fn apply_plan(
         tx: &impl DBRunner,
         scope: &AccessScope,
         quotas: &[Quota],
@@ -1003,30 +1044,87 @@ async fn snapshot_of(
     // A read may not write (I3), so it subtracts the expired holds nobody has
     // returned yet rather than returning them: an expired lease stops counting
     // against capacity at its TTL, whether or not a sweeper has been by (I4).
-    let (consumed, period) = if quota.quota_type == QuotaType::Consumption {
+    let counter = if quota.quota_type == QuotaType::Consumption {
         let latest = counter_repo::find_latest(tx, scope, quota.id.as_uuid()).await?;
-        let window = window_of(quota, now);
-        let current = latest.filter(|row| row.period_start <= now && now < row.period_end);
-        let stored = current
-            .as_ref()
-            .map_or(0, |row| u64::try_from(row.consumed).unwrap_or(0));
-        // @cpt-begin:cpt-cf-quota-enforcement-algo-lazy-expiry:p1:inst-lzy-capacity
-        let owed = unreturned_expired(
-            tx,
-            scope,
-            quota.id.as_uuid(),
-            current.as_ref().map(|row| row.period_id),
-            now,
-        )
-        .await?;
-        (stored.saturating_sub(owed), Some(window))
-        // @cpt-end:cpt-cf-quota-enforcement-algo-lazy-expiry:p1:inst-lzy-capacity
+        LockedCounter::consumption(quota, latest, now)
     } else {
         let row = counter_repo::find_allocation(tx, scope, quota.id.as_uuid()).await?;
-        let stored = row.map_or(0, |row| u64::try_from(row.in_flight).unwrap_or(0));
-        let owed = unreturned_expired(tx, scope, quota.id.as_uuid(), None, now).await?;
-        (stored.saturating_sub(owed), None)
+        LockedCounter::allocation(row.map(|row| row.in_flight))
     };
+    snapshot_of_locked(tx, scope, quota, &counter, now).await
+}
+
+/// What a Quota's counter holds: the stored value of its current period (or
+/// its allocation row), which period that is, and the window it falls in.
+pub(super) struct LockedCounter {
+    stored: u64,
+    period_id: Option<Uuid>,
+    window: Option<PeriodWindow>,
+}
+
+impl LockedCounter {
+    fn consumption(
+        quota: &Quota,
+        latest: Option<quota_consumption_counter::Model>,
+        now: OffsetDateTime,
+    ) -> Self {
+        let current = latest.filter(|row| row.period_start <= now && now < row.period_end);
+        Self {
+            stored: current
+                .as_ref()
+                .map_or(0, |row| u64::try_from(row.consumed).unwrap_or(0)),
+            period_id: current.as_ref().map(|row| row.period_id),
+            window: Some(window_of(quota, now)),
+        }
+    }
+
+    fn allocation(in_flight: Option<i64>) -> Self {
+        Self {
+            stored: in_flight.map_or(0, |value| u64::try_from(value).unwrap_or(0)),
+            period_id: None,
+            window: None,
+        }
+    }
+}
+
+/// Lock every counter row of `quota` that a write in this transaction can
+/// touch, in the order every writer takes them: its elapsed unsettled periods
+/// oldest first (what settlement locks), then its latest period whatever its
+/// state (what materializing a successor locks), or its allocation row.
+/// Nothing is written: a missing current period reads as zero.
+pub(super) async fn lock_counters_of(
+    tx: &impl DBRunner,
+    scope: &AccessScope,
+    quota: &Quota,
+    now: OffsetDateTime,
+    wait: RowWait,
+) -> Result<LockedCounter, TxError> {
+    if quota.quota_type == QuotaType::Consumption {
+        counter_repo::find_elapsed_unsettled_for_update(tx, scope, quota.id.as_uuid(), now, wait)
+            .await?;
+        let latest =
+            counter_repo::find_latest_for_update(tx, scope, quota.id.as_uuid(), wait).await?;
+        Ok(LockedCounter::consumption(quota, latest, now))
+    } else {
+        let row =
+            counter_repo::find_allocation_for_update(tx, scope, quota.id.as_uuid(), wait).await?;
+        Ok(LockedCounter::allocation(row.map(|row| row.in_flight)))
+    }
+}
+
+/// The snapshot of `quota` from its `counter`, less the expired holds nobody
+/// has returned yet.
+pub(super) async fn snapshot_of_locked(
+    tx: &impl DBRunner,
+    scope: &AccessScope,
+    quota: &Quota,
+    counter: &LockedCounter,
+    now: OffsetDateTime,
+) -> Result<QuotaSnapshot, TxError> {
+    // @cpt-begin:cpt-cf-quota-enforcement-algo-lazy-expiry:p1:inst-lzy-capacity
+    let owed = unreturned_expired(tx, scope, quota.id.as_uuid(), counter.period_id, now).await?;
+    let consumed = counter.stored.saturating_sub(owed);
+    // @cpt-end:cpt-cf-quota-enforcement-algo-lazy-expiry:p1:inst-lzy-capacity
     Ok(QuotaSnapshot {
         quota_id: quota.id,
         subject: quota.subject.clone(),
@@ -1036,7 +1134,7 @@ async fn snapshot_of(
         cap: quota.cap,
         consumed,
         remaining: quota.cap.map(|cap| cap.saturating_sub(consumed)),
-        period,
+        period: counter.window,
         metadata: quota.metadata.clone(),
         validity_window: quota.validity_window,
         currently_within_window: quota.validity_window.is_none_or(|w| w.contains(now)),
@@ -1086,7 +1184,7 @@ impl SqlConsumptionStore {
                 },
             }));
         }
-        let (policy, decision) = Self::evaluate(tx, scope, &quotas, mutation, now).await?;
+        let (policy, decision) = Self::evaluate_locked(tx, scope, &quotas, mutation, now).await?;
         if decision.denied_reason() == Some(NO_APPLICABLE_QUOTA) {
             // The one denial that records nothing at all:
             // provisioning a Quota must change the answer.
@@ -1502,6 +1600,16 @@ impl crate::domain::ports::ConsumptionStore for SqlConsumptionStore {
             OPERATION,
             TxError::Raced(Box::new(mutation.idempotency.clone())),
         ))
+    }
+
+    async fn apply_batch_debit(
+        &self,
+        ctx: &SecurityContext,
+        scope: &AccessScope,
+        batch: &quota_enforcement_sdk::EvaluatedBatch<'_>,
+        events: &[NotificationEvent],
+    ) -> Result<TransitionOutcome<Vec<EvaluatedDebit>>, StorageError> {
+        self.apply_batch_debit_impl(ctx, scope, batch, events).await
     }
 
     async fn apply_credit(

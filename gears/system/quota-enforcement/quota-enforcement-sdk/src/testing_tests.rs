@@ -11,21 +11,22 @@ use super::{
     InMemoryStorage, ScriptedEvaluator, bundle_with_global_policy, empty_engine_config,
     quota_draft, test_metric, test_subject, test_tenant,
 };
+use crate::engine::TransactionEvaluator;
 use crate::engine::{EvaluationContext, EvaluationLimits, PolicySchemaSnapshot};
 use crate::models::{
-    ApplicableQuotas, AttributionDigest, BatchDebitItem, BootstrapBundle, CapPatch, ConfigDefaults,
-    DecisionResult, EventId, IdempotencyScope, IdempotencySubjectKey, IdempotencyWrite, LeaseState,
-    LeaseToken, NotificationEvent, NotificationEventKind, OperationType, PageRequest, PayloadHash,
-    PolicyDraft, PolicyId, PolicyScope, PolicyUpdate, PolicyVersionState, QuotaFilter, QuotaId,
-    QuotaPatch, QuotaStatus,
+    ApplicableQuotas, AttributionDigest, BatchDebitItem, BatchRecord, BootstrapBundle, CapPatch,
+    ConfigDefaults, DecisionResult, EventId, IdempotencyScope, IdempotencySubjectKey,
+    IdempotencyWrite, LeaseState, LeaseToken, NotificationEvent, NotificationEventKind,
+    OperationType, PageRequest, PayloadHash, PolicyDraft, PolicyId, PolicyScope, PolicyUpdate,
+    PolicyVersionState, QuotaFilter, QuotaId, QuotaPatch, QuotaStatus,
 };
 use crate::models::{
     EvaluatedDebit, EvaluatedLease, PartialIdempotencyWrite, PeriodType, Retention, RollbackTarget,
     TransitionOutcome,
 };
 use crate::storage_plugin::{
-    CONTRACT_MAJOR, EvaluatedBatch, EvaluatedMutation, QuotaEnforcementStoragePluginV1,
-    StorageError,
+    BatchEntry, BatchTimer, CONTRACT_MAJOR, EvaluatedBatch, EvaluatedMutation,
+    QuotaEnforcementStoragePluginV1, StorageError,
 };
 
 /// The scripted evaluator as the owned callback the contract now takes.
@@ -1437,23 +1438,14 @@ async fn an_atomic_batch_evaluates_each_item_and_replays_as_one_envelope() {
             item_scope: None,
         },
     ];
-    let batch = EvaluatedBatch {
-        envelope: &envelope,
-        items: &items,
-        user_projection: None,
-        limits: limits(),
-        evaluate: Arc::clone(&call),
-    };
-    let applied = storage
-        .apply_batch_debit(&ctx(), &scope(), &batch, &[])
+    let applied = run_batch(&storage, &envelope, &items, &call)
         .await
         .expect("batch");
     assert_eq!(applied.get().len(), 2);
     assert_eq!(storage.consumed(id), 10, "both items applied");
     assert_eq!(evaluator.calls(), 2, "each item is evaluated on its own");
 
-    let replay = storage
-        .apply_batch_debit(&ctx(), &scope(), &batch, &[])
+    let replay = run_batch(&storage, &envelope, &items, &call)
         .await
         .expect("replay");
     assert!(matches!(replay, TransitionOutcome::NoOp(_)));
@@ -1516,6 +1508,56 @@ async fn selection_prefers_the_metric_policy_and_falls_through_to_global_once_it
     );
 }
 
+/// Run `items` as one atomic batch under `envelope`, every item under the
+/// test scope with no user tier, on a generous batch timer.
+async fn run_batch(
+    storage: &InMemoryStorage,
+    envelope: &IdempotencyWrite,
+    items: &[BatchDebitItem],
+    call: &Arc<TransactionEvaluator>,
+) -> Result<TransitionOutcome<Vec<EvaluatedDebit>>, StorageError> {
+    run_batch_within(
+        storage,
+        envelope,
+        items,
+        call,
+        Arc::new(BatchTimer::new(Duration::from_secs(5))),
+    )
+    .await
+}
+
+async fn run_batch_within(
+    storage: &InMemoryStorage,
+    envelope: &IdempotencyWrite,
+    items: &[BatchDebitItem],
+    call: &Arc<TransactionEvaluator>,
+    timer: Arc<BatchTimer>,
+) -> Result<TransitionOutcome<Vec<EvaluatedDebit>>, StorageError> {
+    let item_scope = scope();
+    let entries: Vec<BatchEntry<'_>> = items
+        .iter()
+        .map(|item| BatchEntry {
+            item,
+            scope: &item_scope,
+            user_projection: None,
+        })
+        .collect();
+    storage
+        .apply_batch_debit(
+            &ctx(),
+            &scope(),
+            &EvaluatedBatch {
+                envelope,
+                items: &entries,
+                limits: limits(),
+                evaluate: Arc::clone(call),
+                timer,
+            },
+            &[],
+        )
+        .await
+}
+
 fn batch_item(amount: u64) -> BatchDebitItem {
     BatchDebitItem {
         applicable: applicable(),
@@ -1537,19 +1579,7 @@ async fn an_atomic_batch_evaluates_against_running_state_and_denies_as_a_whole()
     let evaluator = Arc::new(ScriptedEvaluator::new());
     let call = scripted(&evaluator);
     let items = vec![batch_item(500), batch_item(500)];
-    let outcome = storage
-        .apply_batch_debit(
-            &ctx(),
-            &scope(),
-            &EvaluatedBatch {
-                envelope: &envelope,
-                items: &items,
-                user_projection: None,
-                limits: limits(),
-                evaluate: Arc::clone(&call),
-            },
-            &[],
-        )
+    let outcome = run_batch(&storage, &envelope, &items, &call)
         .await
         .expect("a denied batch is a decision, not a failure");
     let decided = outcome.get();
@@ -1578,21 +1608,14 @@ async fn an_atomic_batch_evaluates_against_running_state_and_denies_as_a_whole()
     // A batch every item can afford commits the union of the plans, each item
     // still evaluated against what its predecessors took.
     let fits = vec![batch_item(500), batch_item(200)];
-    let committed = storage
-        .apply_batch_debit(
-            &ctx(),
-            &scope(),
-            &EvaluatedBatch {
-                envelope: &idem(OperationType::Debit, "fits", 7),
-                items: &fits,
-                user_projection: None,
-                limits: limits(),
-                evaluate: Arc::clone(&call),
-            },
-            &[],
-        )
-        .await
-        .expect("batch");
+    let committed = run_batch(
+        &storage,
+        &idem(OperationType::Debit, "fits", 7),
+        &fits,
+        &call,
+    )
+    .await
+    .expect("batch");
     assert!(
         committed
             .get()
@@ -2355,19 +2378,7 @@ async fn a_failed_batch_item_discards_every_effect_of_the_items_before_it() {
     // exceeds the cap and denies the envelope.
     let items = vec![batch_item(60), batch_item(90)];
     let envelope = idem(OperationType::Debit, "batch", 5);
-    let outcome = storage
-        .apply_batch_debit(
-            &ctx(),
-            &scope(),
-            &EvaluatedBatch {
-                envelope: &envelope,
-                items: &items,
-                user_projection: None,
-                limits: limits(),
-                evaluate: Arc::clone(&call),
-            },
-            &[],
-        )
+    let outcome = run_batch(&storage, &envelope, &items, &call)
         .await
         .expect("a denied envelope is a successful call");
 
@@ -2674,4 +2685,114 @@ async fn a_settlement_refuses_a_token_outside_the_callers_tenant() {
         .await
         .expect_err("another tenant's token is simply absent");
     assert_eq!(refused, StorageError::LeaseNotFound { token });
+}
+
+#[tokio::test]
+async fn a_denied_item_does_not_stop_the_items_after_it_from_being_evaluated() {
+    // 800 of room: 500 fits, the next 500 does not, and 200 still fits
+    // against what the first left. Every item is reported; nothing moves.
+    let storage = storage_with_policy().await;
+    let id = seeded_quota(&storage, Some(800)).await;
+    let evaluator = Arc::new(ScriptedEvaluator::new());
+    let call = scripted(&evaluator);
+    let items = vec![batch_item(500), batch_item(500), batch_item(200)];
+    let envelope = idem(OperationType::BatchDebit, "all", 8);
+
+    let outcome = run_batch(&storage, &envelope, &items, &call)
+        .await
+        .expect("a denied batch is a decision");
+
+    let results: Vec<bool> = outcome
+        .get()
+        .iter()
+        .map(|item| matches!(item.decision.result, DecisionResult::Allowed))
+        .collect();
+    assert_eq!(
+        results,
+        [true, false, true],
+        "every item has its own verdict"
+    );
+    assert_eq!(
+        evaluator.calls(),
+        3,
+        "the item after the denial was evaluated"
+    );
+    assert_eq!(storage.consumed(id), 0, "a denied batch moves nothing");
+
+    let record = storage
+        .lookup_idempotency(&envelope.scope)
+        .await
+        .expect("lookup")
+        .expect("a denied batch records its outcome");
+    let stored: BatchRecord = serde_json::from_value(record.decision_blob).expect("batch record");
+    assert_eq!(stored.version, BatchRecord::VERSION);
+    assert_eq!(stored.decisions.len(), 3);
+}
+
+#[tokio::test]
+async fn a_spent_batch_timer_writes_nothing_and_leaves_the_key_free() {
+    let storage = storage_with_policy().await;
+    let id = seeded_quota(&storage, Some(100)).await;
+    let evaluator = Arc::new(ScriptedEvaluator::new());
+    let call = scripted(&evaluator);
+    let envelope = idem(OperationType::BatchDebit, "late", 9);
+
+    let outcome = run_batch_within(
+        &storage,
+        &envelope,
+        &[batch_item(1)],
+        &call,
+        Arc::new(BatchTimer::new(Duration::ZERO)),
+    )
+    .await;
+
+    assert!(
+        matches!(outcome, Err(StorageError::BatchTimeout)),
+        "{outcome:?}"
+    );
+    assert_eq!(storage.consumed(id), 0);
+    assert!(
+        storage
+            .lookup_idempotency(&envelope.scope)
+            .await
+            .expect("lookup")
+            .is_none(),
+        "a timed-out batch records nothing, so its retry runs again"
+    );
+}
+
+#[tokio::test]
+async fn an_engine_running_out_of_time_on_the_last_item_times_the_batch_out() {
+    let storage = storage_with_policy().await;
+    let id = seeded_quota(&storage, Some(100)).await;
+    let evaluator = Arc::new(ScriptedEvaluator::new());
+    let inner = scripted(&evaluator);
+    let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let counted = Arc::clone(&calls);
+    let call: Arc<TransactionEvaluator> = Arc::new(move |context: &EvaluationContext<'_>| {
+        if counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+            return Err(crate::engine::EvaluationFailure::Engine(
+                crate::engine::EngineError::Timeout,
+            ));
+        }
+        inner(context)
+    });
+
+    let outcome = run_batch(
+        &storage,
+        &idem(OperationType::BatchDebit, "slow", 10),
+        &[batch_item(1), batch_item(1)],
+        &call,
+    )
+    .await;
+
+    assert!(
+        matches!(outcome, Err(StorageError::BatchTimeout)),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        storage.consumed(id),
+        0,
+        "the first item's plan was discarded"
+    );
 }

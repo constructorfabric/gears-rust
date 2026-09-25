@@ -337,7 +337,27 @@ impl<'a> PreparedEvaluation<'a> {
     /// # Errors
     /// The mutation's own storage failure, or an internal error when the
     /// preparation budget is spent without the artifact becoming available.
-    pub async fn run<T, Fut>(&self, mut call: impl FnMut() -> Fut) -> Result<T, DomainError>
+    pub async fn run<T, Fut>(&self, call: impl FnMut() -> Fut) -> Result<T, DomainError>
+    where
+        Fut: std::future::Future<Output = Result<T, quota_enforcement_sdk::StorageError>>,
+    {
+        self.run_within(None, call).await
+    }
+
+    /// [`Self::run`] under a batch timer. Once an attempt has armed it, a
+    /// preparation waits no longer than what remains of it, and one the timer
+    /// outlasts answers `BatchTimeout`. Only the preparation is bounded: each
+    /// storage call runs its write and commit to the end. An abandoned
+    /// preparation still publishes its artifact ([`Self::prepare`]).
+    ///
+    /// # Errors
+    /// As [`Self::run`], and `BatchTimeout` when the armed timer runs out
+    /// during a preparation.
+    pub async fn run_within<T, Fut>(
+        &self,
+        timer: Option<&quota_enforcement_sdk::BatchTimer>,
+        mut call: impl FnMut() -> Fut,
+    ) -> Result<T, DomainError>
     where
         Fut: std::future::Future<Output = Result<T, quota_enforcement_sdk::StorageError>>,
     {
@@ -357,7 +377,13 @@ impl<'a> PreparedEvaluation<'a> {
                 )));
             }
             prepared += 1;
-            self.prepare(&failure.0, failure.1).await?;
+            let preparation = self.prepare(&failure.0, failure.1);
+            match timer.and_then(quota_enforcement_sdk::BatchTimer::armed_remaining) {
+                Some(left) => tokio::time::timeout(left, preparation)
+                    .await
+                    .map_err(|_| DomainError::BatchTimeout)??,
+                None => preparation.await?,
+            }
         }
     }
 

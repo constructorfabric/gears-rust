@@ -89,6 +89,8 @@ pub const OP_DEBIT: &str = "operation.debit";
 pub const OP_CREDIT: &str = "operation.credit";
 /// Operation name of a rollback.
 pub const OP_ROLLBACK: &str = "operation.rollback";
+/// Operation name of one entry of an applied batch debit.
+pub const OP_BATCH_DEBIT: &str = "operation.batch_debit";
 
 /// Delete up to `batch_size` entries older than `before`.
 ///

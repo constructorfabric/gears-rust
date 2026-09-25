@@ -28,18 +28,21 @@ use time::OffsetDateTime;
 use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
-use crate::engine::{EvaluationContext, EvaluationFailure, EvaluationQuota, QuotaScopeTier};
+use crate::engine::{
+    EngineError, EvaluationBudget, EvaluationContext, EvaluationFailure, EvaluationQuota,
+    QuotaScopeTier,
+};
 use crate::models::{
-    ActiveQuotaCounts, ApplicableQuotas, AppliedMutation, AttributionDigest, BootstrapBundle,
-    CapPatch, ConfigDefaults, ContractRef, DeactivateOutcome, DebitPlan, Decision, DecisionResult,
-    EnforcementMode, EvaluatedDebit, EvaluatedLease, EventId, ExpiredLease, IdempotencyRecord,
-    IdempotencyScope, IdempotencyWrite, LeaseHold, LeaseState, LeaseToken, MetricId,
-    MutationResult, NotificationEvent, NotificationEventKind, NotificationScope, OperationType,
-    PageRequest, PageResult, PartialIdempotencyWrite, PeriodId, PeriodType, PeriodWindow,
-    PolicyDraft, PolicyId, PolicyScope, PolicyUpdate, PolicyVersion, PolicyVersionMeta,
-    PolicyVersionState, ProjectionBinding, Quota, QuotaDraft, QuotaFilter, QuotaId, QuotaPatch,
-    QuotaSnapshot, QuotaSource, QuotaStatus, QuotaType, Retention, RollbackTarget, SubjectRef,
-    TenantId, TransitionOutcome, ValidityWindowPatch,
+    ActiveQuotaCounts, ApplicableQuotas, AppliedMutation, AttributionDigest, BatchRecord,
+    BootstrapBundle, CapPatch, ConfigDefaults, ContractRef, DeactivateOutcome, DebitPlan, Decision,
+    DecisionResult, EnforcementMode, EvaluatedDebit, EvaluatedLease, EventId, ExpiredLease,
+    IdempotencyRecord, IdempotencyScope, IdempotencyWrite, LeaseHold, LeaseState, LeaseToken,
+    MetricId, MutationResult, NotificationEvent, NotificationEventKind, NotificationScope,
+    OperationType, PageRequest, PageResult, PartialIdempotencyWrite, PeriodId, PeriodType,
+    PeriodWindow, PolicyDraft, PolicyId, PolicyScope, PolicyUpdate, PolicyVersion,
+    PolicyVersionMeta, PolicyVersionState, ProjectionBinding, Quota, QuotaDraft, QuotaFilter,
+    QuotaId, QuotaPatch, QuotaSnapshot, QuotaSource, QuotaStatus, QuotaType, Retention,
+    RollbackTarget, SubjectRef, TenantId, TransitionOutcome, ValidityWindowPatch,
 };
 use crate::storage_plugin::{
     CONTRACT_MAJOR, EvaluatedBatch, EvaluatedMutation, QuotaEnforcementStoragePluginV1,
@@ -853,6 +856,16 @@ impl InMemoryStorage {
         st: &StorageState,
         mutation: &EvaluatedMutation<'_>,
     ) -> Result<(PolicyVersion, Decision), StorageError> {
+        Self::evaluated_within(st, mutation, None)
+    }
+
+    /// [`Self::evaluated`] with the engine's budget given rather than resolved
+    /// from the policy: a batch item runs on what remains of the batch timer.
+    fn evaluated_within(
+        st: &StorageState,
+        mutation: &EvaluatedMutation<'_>,
+        budget: Option<EvaluationBudget>,
+    ) -> Result<(PolicyVersion, Decision), StorageError> {
         let policy = Self::select_policy(st, &mutation.applicable.metric)?;
         let snapshots: Vec<QuotaSnapshot> = st
             .quotas
@@ -876,13 +889,17 @@ impl InMemoryStorage {
                 arbitration,
             })
             .collect();
-        // Resolve the budget from the version selected by this transaction.
-        let budget = mutation.limits.budget(policy.timeout_ms).map_err(|error| {
-            StorageError::EvaluationFailed {
-                engine_id: policy.engine_id.clone(),
-                failure: error.into(),
-            }
-        })?;
+        // Resolve the budget from the version selected by this transaction,
+        // unless the caller already fixed it.
+        let budget = match budget {
+            Some(budget) => budget,
+            None => mutation.limits.budget(policy.timeout_ms).map_err(|error| {
+                StorageError::EvaluationFailed {
+                    engine_id: policy.engine_id.clone(),
+                    failure: error.into(),
+                }
+            })?,
+        };
         let decision = {
             let context = EvaluationContext {
                 policy: &policy,
@@ -907,10 +924,15 @@ impl InMemoryStorage {
         Ok((policy, decision.into_decision()))
     }
 
-    /// Evaluate and apply an envelope's items in submission order, each against
-    /// the counters its predecessors moved. Stops at the first denial and
-    /// reports that the batch did not commit; the caller restores the counters,
-    /// so nothing an earlier item applied survives a later refusal.
+    /// Evaluate every item of an envelope in submission order, each against the
+    /// counters every earlier allowed item moved, and report whether all were
+    /// allowed. A denial does not stop the loop: later items are still
+    /// evaluated for the caller's diagnostics. The caller restores the
+    /// counters when the batch is denied.
+    ///
+    /// The double holds every row at once, so it arms the batch timer here;
+    /// each engine runs on what remains of it, and the timer is checked once
+    /// more before anything is kept.
     fn run_batch(
         st: &mut StorageState,
         batch: &EvaluatedBatch<'_>,
@@ -918,8 +940,15 @@ impl InMemoryStorage {
         let mut decisions = Vec::with_capacity(batch.items.len());
         let mut entries = Vec::new();
         let mut policy = None;
+        let mut denied = false;
         let now = Self::now(st);
-        for item in batch.items {
+        if batch.timer.arm().is_zero() {
+            return Err(StorageError::BatchTimeout);
+        }
+        for entry in batch.items {
+            let item = entry.item;
+            let budget = EvaluationBudget::within(batch.timer.remaining(), batch.limits.cost_limit)
+                .ok_or(StorageError::BatchTimeout)?;
             let idempotency = IdempotencyWrite {
                 scope: item
                     .item_scope
@@ -927,41 +956,52 @@ impl InMemoryStorage {
                     .unwrap_or_else(|| batch.envelope.scope.clone()),
                 payload_hash: batch.envelope.payload_hash,
             };
-            let (selected, decision) = Self::evaluated(
+            let (selected, decision) = Self::evaluated_within(
                 st,
                 &EvaluatedMutation {
                     applicable: &item.applicable,
                     amount: item.amount,
                     request: &item.request,
                     resource: &item.resource,
-                    user_projection: batch.user_projection,
+                    user_projection: entry.user_projection,
                     limits: batch.limits,
                     idempotency: &idempotency,
                     authorized: item.authorized,
                     evaluate: Arc::clone(&batch.evaluate),
                 },
-            )?;
-            policy = Some(selected);
-            let denied = matches!(decision.result, DecisionResult::Denied { .. });
-            if !denied {
+                Some(budget),
+            )
+            .map_err(Self::batch_timeout)?;
+            // The record carries the first item's policy; each decision
+            // carries its own attribution.
+            policy.get_or_insert(selected);
+            if matches!(decision.result, DecisionResult::Denied { .. }) {
+                denied = true;
+            } else {
                 entries.extend(Self::debit(st, &decision.debit_plan, now)?);
             }
             decisions.push(decision);
-            if denied {
-                return Ok(BatchRun {
-                    policy,
-                    decisions,
-                    entries,
-                    committed: false,
-                });
-            }
+        }
+        if batch.timer.expired() {
+            return Err(StorageError::BatchTimeout);
         }
         Ok(BatchRun {
             policy,
             decisions,
             entries,
-            committed: true,
+            committed: !denied,
         })
+    }
+
+    /// An engine that ran out of the batch's time is the batch timing out.
+    fn batch_timeout(error: StorageError) -> StorageError {
+        match error {
+            StorageError::EvaluationFailed {
+                failure: EvaluationFailure::Engine(EngineError::Timeout),
+                ..
+            } => StorageError::BatchTimeout,
+            other => other,
+        }
     }
 
     /// Apply a validated plan, refusing a deactivated Quota before the first
@@ -1561,8 +1601,9 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
     ) -> Result<TransitionOutcome<Vec<EvaluatedDebit>>, StorageError> {
         self.transact(|st| {
             if let Some(blob) = Self::replayed(st, batch.envelope)? {
-                let decisions: Vec<Decision> = serde_json::from_value(blob)
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                let decisions = serde_json::from_value::<BatchRecord>(blob)
+                    .map_err(|e| StorageError::Internal(e.to_string()))?
+                    .decisions;
                 let retention = Self::retention_of(st, &batch.envelope.scope);
                 return Ok(TransitionOutcome::NoOp(
                     decisions
@@ -1583,7 +1624,7 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
                 *st = staged;
             }
             let retention_scope = batch.envelope.scope.clone();
-            let blob = Self::blob(&run.decisions)?;
+            let blob = Self::blob(&BatchRecord::new(run.decisions.clone()))?;
             // A denied envelope still occupies its idempotency key.
             let expires_at = Self::remember(st, batch.envelope, blob, run.policy.as_ref(), None);
             let _ = retention_scope;
@@ -1594,7 +1635,7 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
                         AppliedDebit {
                             authorized: batch.items.first().map_or_else(
                                 || AttributionDigest::from_bytes([0; 32]),
-                                |item| item.authorized,
+                                |entry| entry.item.authorized,
                             ),
                             entries: run.entries.clone(),
                             reversed_by_key: None,

@@ -72,6 +72,16 @@ impl ConsumptionStore for RecordingConsumptionStore {
         Err(StorageError::Internal("not part of this test".into()))
     }
 
+    async fn apply_batch_debit(
+        &self,
+        _ctx: &SecurityContext,
+        _scope: &AccessScope,
+        _batch: &quota_enforcement_sdk::EvaluatedBatch<'_>,
+        _events: &[NotificationEvent],
+    ) -> Result<TransitionOutcome<Vec<EvaluatedDebit>>, StorageError> {
+        Err(StorageError::Internal("not part of this test".into()))
+    }
+
     async fn apply_credit(
         &self,
         _ctx: &SecurityContext,

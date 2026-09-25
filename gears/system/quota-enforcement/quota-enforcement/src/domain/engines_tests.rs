@@ -755,6 +755,68 @@ async fn an_abandoned_caller_keeps_its_permit_until_the_compilation_publishes() 
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_armed_batch_timer_bounds_a_preparation_and_the_artifact_still_lands() {
+    use quota_enforcement_sdk::testing::InMemoryStorage;
+
+    let storage = InMemoryStorage::new();
+    let seeded = seed_policy(&storage, PolicyScope::Global, "cel").await;
+    let engines = EngineRegistry::new(vec![Arc::new(DwellingEngine {
+        in_flight: Arc::new(AtomicUsize::new(0)),
+        peak: Arc::new(AtomicUsize::new(0)),
+        entered: Arc::new(tokio::sync::Notify::new()),
+        dwell: Duration::from_millis(400),
+    }) as Arc<dyn QuotaResolutionEngineV1>])
+    .expect("registry");
+    let artifacts = Arc::new(PolicyArtifactCache::new(
+        NonZeroUsize::new(4).expect("capacity"),
+        NonZeroUsize::new(1).expect("permits"),
+    ));
+    let driver = super::PreparedEvaluation::new(
+        Arc::new(engines),
+        Arc::clone(&artifacts),
+        Arc::new(RecordingMetrics::default()),
+        &storage,
+        NonZeroU32::new(2).expect("attempts"),
+    );
+    let timer = quota_enforcement_sdk::BatchTimer::new(Duration::from_millis(30));
+    let attempts = std::cell::Cell::new(0_u32);
+
+    let started = std::time::Instant::now();
+    let err = driver
+        .run_within(Some(&timer), || {
+            attempts.set(attempts.get() + 1);
+            // The storage attempt arms the timer once it holds its locks,
+            // then finds the artifact missing.
+            let _armed = timer.arm();
+            async {
+                Err::<(), _>(quota_enforcement_sdk::StorageError::PreparationRequired {
+                    policy_id: PolicyId::global(),
+                    version: 1,
+                })
+            }
+        })
+        .await
+        .expect_err("the compilation outlasts the timer");
+    let waited = started.elapsed();
+
+    assert_eq!(err, DomainError::BatchTimeout);
+    assert!(
+        waited < Duration::from_millis(300),
+        "the timer, not the compilation, bounds the wait: {waited:?}"
+    );
+    assert_eq!(
+        attempts.get(),
+        1,
+        "no storage attempt starts past the deadline"
+    );
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(
+        artifacts.get(&seeded.policy_id, 1).is_some(),
+        "the abandoned compilation still publishes its artifact"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_waiter_cancelled_before_it_acquires_the_gate_still_releases_it() {
     use quota_enforcement_sdk::testing::InMemoryStorage;

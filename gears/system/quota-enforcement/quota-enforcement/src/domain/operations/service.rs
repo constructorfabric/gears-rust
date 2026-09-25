@@ -66,6 +66,8 @@ pub struct Operations<'a> {
     pub preparation_max_attempts: std::num::NonZeroU32,
     /// The TTL window lease acquisitions are checked against.
     pub leases: super::leases::LeaseLimits,
+    /// The batch debit's bounds.
+    pub batch: super::batch::BatchLimits,
 }
 
 /// What a dry run evaluates: the read snapshot and the documents the policy

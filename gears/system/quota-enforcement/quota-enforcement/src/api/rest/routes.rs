@@ -33,6 +33,7 @@ pub fn register_routes(
     let router = register_quota_routes(router, openapi);
     let router = super::policies::register(router, openapi);
     let router = super::operations::register(router, openapi);
+    let router = super::batch::register(router, openapi);
     super::leases::register(router, openapi).layer(Extension(service))
 }
 // @cpt-end:cpt-cf-quota-enforcement-flow-owner-projection-publication:p1:inst-pub-registry

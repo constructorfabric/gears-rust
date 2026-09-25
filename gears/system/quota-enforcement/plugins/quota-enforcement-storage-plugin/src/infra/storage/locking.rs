@@ -66,7 +66,7 @@
 use std::future::Future;
 use std::time::{Duration, Instant};
 
-use quota_enforcement_sdk::{IdempotencyScope, StorageError};
+use quota_enforcement_sdk::{BatchTimer, IdempotencyScope, StorageError};
 use sea_orm::{DbErr, RuntimeErr};
 use toolkit_db::secure::{DBRunner, ScopeError};
 
@@ -101,19 +101,30 @@ impl ContentionBudget {
         }
     }
 
+    /// The budget with the earlier deadline: a primitive spanning several
+    /// metrics waits no longer than the strictest of them allows.
+    pub(super) fn stricter(self, other: Self) -> Self {
+        if other.deadline < self.deadline {
+            other
+        } else {
+            self
+        }
+    }
+
     fn remaining(self) -> Duration {
         self.deadline.saturating_duration_since(Instant::now())
     }
 
-    /// Pause before another attempt: the shorter of `backoff` and what remains,
-    /// then double `backoff`. `false` when no budget is left to start one,
-    /// whether it was spent before the pause or by it.
-    async fn pause(self, backoff: &mut Duration) -> bool {
+    /// Pause before another attempt: the shortest of `backoff`, what remains,
+    /// and `cap`, then double `backoff`. `false` when no budget is left to
+    /// start one, whether it was spent before the pause or by it.
+    async fn pause(self, backoff: &mut Duration, cap: Option<Duration>) -> bool {
         let remaining = self.remaining();
         if remaining.is_zero() {
             return false;
         }
-        tokio::time::sleep((*backoff).min(remaining)).await;
+        let pause = (*backoff).min(remaining);
+        tokio::time::sleep(cap.map_or(pause, |cap| pause.min(cap))).await;
         *backoff = backoff.saturating_mul(2).min(MAX_BACKOFF);
         !self.remaining().is_zero()
     }
@@ -131,6 +142,28 @@ impl ContentionBudget {
 /// other error of `attempt` unchanged.
 pub(super) async fn with_budget<T, F, Fut>(
     budget: ContentionBudget,
+    attempt: F,
+) -> Result<T, TxError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, TxError>>,
+{
+    with_budget_within(budget, None, attempt).await
+}
+
+/// [`with_budget`] that also answers to a batch timer. Once an attempt has
+/// armed it, a pause never outlasts what remains of it, and a timer the pause
+/// spent ends the retries with `BatchTimeout` rather than starting an attempt
+/// past the deadline. A pause only ever follows a rolled-back attempt, so no
+/// write or commit is cut short.
+///
+/// # Errors
+///
+/// `BatchTimeout` once the armed timer is spent, `LeaseContentionTimeout` once
+/// the budget is, and any other error of `attempt` unchanged.
+pub(super) async fn with_budget_within<T, F, Fut>(
+    budget: ContentionBudget,
+    timer: Option<&BatchTimer>,
     mut attempt: F,
 ) -> Result<T, TxError>
 where
@@ -143,7 +176,12 @@ where
             // The transaction has already rolled back, so the pause holds no
             // row lock of ours.
             Err(error) if is_lock_not_available(&error) => {
-                if !budget.pause(&mut backoff).await {
+                let cap = timer.and_then(BatchTimer::armed_remaining);
+                let within = budget.pause(&mut backoff, cap).await;
+                if timer.is_some_and(BatchTimer::expired) {
+                    return Err(TxError::Storage(StorageError::BatchTimeout));
+                }
+                if !within {
                     return Err(TxError::Storage(StorageError::LeaseContentionTimeout));
                 }
             }

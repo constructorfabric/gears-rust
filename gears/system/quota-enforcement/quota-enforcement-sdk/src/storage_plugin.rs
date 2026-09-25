@@ -103,6 +103,10 @@ pub enum StorageError {
     /// The acquisition contention timeout elapsed (I8).
     #[error("acquisition contention timeout elapsed")]
     LeaseContentionTimeout,
+    /// A batch's evaluation outlasted the batch-level timeout. The batch was
+    /// rolled back and nothing was written.
+    #[error("batch evaluation exceeded the batch timeout")]
+    BatchTimeout,
     /// Commit amount exceeds the reserved amount.
     #[error("commit amount {actual} exceeds reserved amount {reserved}")]
     OverCommitNotAuthorized {
@@ -298,20 +302,91 @@ pub struct EvaluatedMutation<'a> {
     pub evaluate: Arc<TransactionEvaluator>,
 }
 
-/// An atomic batch under one envelope key. Every item is evaluated and applied
-/// in the same transaction, or none is.
+/// The batch-level evaluation timeout: one deadline for every attempt of one
+/// batch.
+///
+/// It is armed by the first attempt that holds its locks, not when the call
+/// starts: lock waits are the contention budget's (I8), and this bounds the
+/// evaluation. A later attempt (a contention retry, a preparation retry)
+/// finds it already armed and gets only what is left.
+#[derive(Debug)]
+pub struct BatchTimer {
+    timeout: Duration,
+    armed: std::sync::OnceLock<std::time::Instant>,
+}
+
+impl BatchTimer {
+    /// A timer of `timeout`, not yet armed.
+    #[must_use]
+    pub fn new(timeout: Duration) -> Self {
+        Self {
+            timeout,
+            armed: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Arm the timer if no attempt has, and return what remains: zero once
+    /// the deadline has passed.
+    #[must_use]
+    pub fn arm(&self) -> Duration {
+        let armed = *self.armed.get_or_init(std::time::Instant::now);
+        (armed + self.timeout).saturating_duration_since(std::time::Instant::now())
+    }
+
+    /// What remains of an armed timer; the whole timeout while unarmed.
+    #[must_use]
+    pub fn remaining(&self) -> Duration {
+        self.armed.get().map_or(self.timeout, |armed| {
+            (*armed + self.timeout).saturating_duration_since(std::time::Instant::now())
+        })
+    }
+
+    /// What remains once the timer is armed; `None` while it is not. A wait
+    /// outside the transaction (a lock retry's pause, a preparation) is
+    /// bounded by this, so no attempt outlives the deadline.
+    #[must_use]
+    pub fn armed_remaining(&self) -> Option<Duration> {
+        self.armed.get().map(|armed| {
+            (*armed + self.timeout).saturating_duration_since(std::time::Instant::now())
+        })
+    }
+
+    /// Whether the timer was armed and its deadline has passed.
+    #[must_use]
+    pub fn expired(&self) -> bool {
+        self.armed_remaining().is_some_and(|left| left.is_zero())
+    }
+}
+
+/// One item of an atomic batch together with what only the gear knows about
+/// it: the scope its own authorization produced, and its metric's user tier.
+pub struct BatchEntry<'a> {
+    /// The item.
+    pub item: &'a BatchDebitItem,
+    /// The item's admitted scope. Its Quotas are discovered, read and written
+    /// under this scope, never another item's.
+    pub scope: &'a AccessScope,
+    /// The owner projection this item's metric treats as its user tier.
+    pub user_projection: Option<&'a gts::GtsTypeId>,
+}
+
+/// An atomic batch under one envelope key. Every item is evaluated, in order,
+/// against the counters every earlier allowed item would leave; the union of
+/// the plans is applied only when every item is allowed, and a denied batch
+/// writes only its record. Every item names the envelope's tenant.
 pub struct EvaluatedBatch<'a> {
     /// Envelope idempotency key and payload digest.
     pub envelope: &'a IdempotencyWrite,
-    /// The items, each carrying its own subject set and requested amount.
-    pub items: &'a [BatchDebitItem],
-    /// The owner projection resolved as the user tier, shared by every item.
-    pub user_projection: Option<&'a gts::GtsTypeId>,
-    /// The operator clamp each item's budget is resolved from, against the
-    /// policy that item's evaluation selects.
+    /// The items, each with its own scope and user tier.
+    pub items: &'a [BatchEntry<'a>],
+    /// The cost limit each item's engine runs under. The time limit is the
+    /// batch timer's remainder, which supersedes the per-policy timeout.
     pub limits: EvaluationLimits,
     /// Synchronous, side-effect-free evaluation callback.
     pub evaluate: Arc<TransactionEvaluator>,
+    /// The batch-level timeout, shared by every attempt; the transaction
+    /// that arms it may run on another task, hence the `Arc`.
+    pub timer: Arc<BatchTimer>,
 }
 
 /// Persistence contract for Quotas, counters, leases, policies, idempotency,
@@ -468,12 +543,16 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
     ) -> Result<TransitionOutcome<EvaluatedDebit>, StorageError>;
 
     /// Evaluate and apply every item of an atomic batch under one envelope key.
-    /// A failure on any item leaves the whole batch unwritten.
+    /// A failure on any item leaves the whole batch unwritten; a denied batch
+    /// records its decisions and moves no counter. The record expires after
+    /// the longest idempotency retention configured for any item's metric.
     ///
     /// # Errors
     ///
     /// The variants of [`QuotaEnforcementStoragePluginV1::apply_debit_plan`],
-    /// raised for the first item that fails.
+    /// raised for the first item that fails, and
+    /// [`StorageError::BatchTimeout`] when the batch timer runs out before the
+    /// write phase.
     async fn apply_batch_debit(
         &self,
         ctx: &SecurityContext,

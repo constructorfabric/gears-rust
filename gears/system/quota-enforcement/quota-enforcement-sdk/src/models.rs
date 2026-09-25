@@ -1473,6 +1473,128 @@ pub struct ReleaseLeaseRequest {
     pub idempotency_key: String,
 }
 
+/// How a batch debit's items relate to each other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BatchMode {
+    /// All or nothing: every item is admitted, or none moves a counter.
+    Atomic,
+    /// Partial success for unrelated items. Not implemented in P1; refused
+    /// with `NOT_YET_IMPLEMENTED`.
+    Independent,
+}
+
+/// One item of a batch debit: a debit of its own metric.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchItemRequest {
+    /// Who and what this item charges.
+    pub attribution: EvaluationAttribution,
+    /// Requested amount. Signed so a non-positive value is refused as
+    /// `INVALID_AMOUNT` naming this item, rather than failing to decode.
+    pub amount: i64,
+    /// The item's own key, for identification only: it is part of the
+    /// envelope's payload and echoed in the outcome, and has no replay of its
+    /// own.
+    pub idempotency_key: String,
+}
+
+/// Several debits of one logical operation, admitted or refused as a whole.
+///
+/// The batch must not be empty (`BATCH_EMPTY`), and every item must name the
+/// same tenant (`BATCH_TENANT_MIXED`): the envelope has one idempotency scope,
+/// keyed by that tenant. Each item is still authorized on its own attribution.
+/// Item keys must be unique within the batch (`BATCH_ITEM_KEY_DUPLICATE`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchDebitRequest {
+    /// Required batch semantics.
+    pub mode: BatchMode,
+    /// The items, evaluated in this order.
+    pub items: Vec<BatchItemRequest>,
+    /// Envelope idempotency key: a replay returns the original outcome.
+    pub idempotency_key: String,
+}
+
+/// The batch-level verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BatchResult {
+    /// Every item was allowed and the union of their plans was applied.
+    Allowed,
+    /// At least one item was denied, and no counter moved.
+    Denied,
+}
+
+/// One item's decision, in submission order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchItemOutcome {
+    /// The item's own key.
+    pub idempotency_key: String,
+    /// The item's decision. On a denied batch the decisions are diagnostic:
+    /// nothing was applied, allowed items included.
+    pub decision: Decision,
+}
+
+/// The outcome of an atomic batch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[must_use]
+pub struct BatchDecision {
+    /// The batch-level verdict.
+    pub result: BatchResult,
+    /// One outcome per item, in submission order.
+    pub items: Vec<BatchItemOutcome>,
+}
+
+impl BatchDecision {
+    /// The batch outcome of per-item `decisions`, paired in order with the
+    /// items' `keys`: denied when any item is.
+    pub fn of(keys: impl IntoIterator<Item = String>, decisions: Vec<Decision>) -> Self {
+        let result = if decisions
+            .iter()
+            .all(|decision| matches!(decision.result, DecisionResult::Allowed))
+        {
+            BatchResult::Allowed
+        } else {
+            BatchResult::Denied
+        };
+        Self {
+            result,
+            items: keys
+                .into_iter()
+                .zip(decisions)
+                .map(|(idempotency_key, decision)| BatchItemOutcome {
+                    idempotency_key,
+                    decision,
+                })
+                .collect(),
+        }
+    }
+}
+
+/// What a batch envelope's idempotency record stores: one decision per item,
+/// in submission order, under a schema version.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchRecord {
+    /// Schema version of this record.
+    #[serde(rename = "__version")]
+    pub version: u32,
+    /// Every item's decision.
+    pub decisions: Vec<Decision>,
+}
+
+impl BatchRecord {
+    /// The current schema version.
+    pub const VERSION: u32 = 1;
+
+    /// A record of `decisions` under the current version.
+    #[must_use]
+    pub fn new(decisions: Vec<Decision>) -> Self {
+        Self {
+            version: Self::VERSION,
+            decisions,
+        }
+    }
+}
+
 /// A decision that was never applied. Structurally a [`Decision`] plus the flag
 /// that says so, so a caller can parse both responses the same way.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

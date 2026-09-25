@@ -41,6 +41,23 @@ impl StoragePlugin {
             .await
     }
 
+    /// Evaluate and apply an atomic batch under one envelope key.
+    ///
+    /// # Errors
+    ///
+    /// As the contract documents for `apply_batch_debit`.
+    pub async fn apply_batch_debit(
+        &self,
+        ctx: &SecurityContext,
+        scope: &AccessScope,
+        batch: &quota_enforcement_sdk::EvaluatedBatch<'_>,
+        events: &[NotificationEvent],
+    ) -> Result<TransitionOutcome<Vec<EvaluatedDebit>>, StorageError> {
+        self.consumption
+            .apply_batch_debit(ctx, scope, batch, events)
+            .await
+    }
+
     /// Return consumption to one Quota.
     ///
     /// # Errors

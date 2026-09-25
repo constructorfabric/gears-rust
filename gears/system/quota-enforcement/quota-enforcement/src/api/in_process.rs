@@ -234,4 +234,12 @@ impl quota_enforcement_sdk::QuotaEnforcementClientV1 for InProcessQuotaEnforceme
             .release_lease(ctx, request)
             .await?)
     }
+
+    async fn batch_debit(
+        &self,
+        ctx: &SecurityContext,
+        request: quota_enforcement_sdk::BatchDebitRequest,
+    ) -> Result<quota_enforcement_sdk::BatchDecision, QuotaEnforcementError> {
+        Ok(self.service.operations()?.batch_debit(ctx, request).await?)
+    }
 }

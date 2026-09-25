@@ -57,6 +57,17 @@ impl EvaluationBudget {
         })
     }
 
+    /// The budget of one batch item: whatever remains of the batch timer,
+    /// which supersedes the policy's own timeout. `None` once nothing
+    /// remains.
+    #[must_use]
+    pub fn within(remaining: Duration, cost_limit: NonZeroU64) -> Option<Self> {
+        (!remaining.is_zero()).then_some(Self {
+            timeout: remaining,
+            cost_limit,
+        })
+    }
+
     /// Maximum engine wall time for this invocation.
     #[must_use]
     pub const fn timeout(self) -> Duration {
