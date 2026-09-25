@@ -4274,6 +4274,86 @@ pub async fn two_batches_naming_one_new_endpoint_both_land(
     }
 }
 
+/// A scope whose replaced content is edges alone still converges.
+///
+/// Edge ownership is recorded on the edge row itself -- the scope attribute
+/// and value it was declared under -- and is not derived from any node type
+/// being scope-managed. So a producer whose scope names its nodes through a
+/// type that is not managed still owns the edges it declares under that
+/// scope, and a replacement that stops declaring one must remove it.
+///
+/// The endpoints here are of a type that opts out of scope management, so
+/// no node of the scope can ever be stale and the node half of the
+/// replacement has nothing to do; the edge half still does.
+pub async fn an_edge_only_scope_drops_the_edges_it_stops_declaring(
+    store: &dyn GraphStoreV1,
+    tenant: Uuid,
+) {
+    const UNMANAGED: &str =
+        "gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~acme.gs._.unmanaged.v1~";
+
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    let mut types = ontology_batch();
+    types.push(TypeRegistration {
+        type_id: UNMANAGED.to_owned(),
+        schema: serde_json::json!({
+            "$id": format!("gts://{UNMANAGED}"),
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "x-gts-traits": { "scope_managed": false },
+            "type": "object",
+            "allOf": [
+                { "$ref": format!("gts://{OWNED_FAMILY}") }
+            ]
+        }),
+    });
+    store
+        .register_types(&ctx, types)
+        .await
+        .expect("the ontology registers");
+
+    let endpoint = |key: &str| NodeSpec {
+        node_key: key.to_owned(),
+        type_id: UNMANAGED.to_owned(),
+        name: Some(key.to_owned()),
+        payload: Some(serde_json::json!({ "repository": "acme/infra" })),
+        ..NodeSpec::default()
+    };
+    let endpoints = || vec![endpoint("edge-only-a"), endpoint("edge-only-b")];
+
+    ingest_batch(
+        store,
+        &ctx,
+        batch_replacing(endpoints(), vec![edge("edge-only-a", "edge-only-b")], 1),
+    )
+    .await
+    .expect("the scope's first declaration commits");
+    assert_eq!(
+        store
+            .get_node(&ctx, &"edge-only-a".to_owned(), 10)
+            .await
+            .expect("the endpoint reads")
+            .adjacency
+            .len(),
+        1,
+        "the declared edge is there"
+    );
+
+    // The same scope re-declared without the edge.
+    ingest_batch(store, &ctx, batch_replacing(endpoints(), Vec::new(), 2))
+        .await
+        .expect("the replacement commits");
+    assert!(
+        store
+            .get_node(&ctx, &"edge-only-a".to_owned(), 10)
+            .await
+            .expect("the endpoint still reads -- it is not managed, so it is not removed")
+            .adjacency
+            .is_empty(),
+        "an edge the scope stopped declaring is gone, whatever its endpoints' type"
+    );
+}
+
 /// Two mutations of one tenant never share a revision.
 ///
 /// The counter carries the Read Consistency Contract's central promise: a

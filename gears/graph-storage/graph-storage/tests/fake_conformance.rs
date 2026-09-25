@@ -344,6 +344,12 @@ async fn scope_replacement_removes_what_the_batch_no_longer_names() {
 }
 
 #[tokio::test]
+async fn an_edge_only_scope_drops_the_edges_it_stops_declaring() {
+    conformance::an_edge_only_scope_drops_the_edges_it_stops_declaring(&store(), Uuid::now_v7())
+        .await;
+}
+
+#[tokio::test]
 async fn scope_replacement_removes_an_edge_whose_endpoints_remain() {
     conformance::scope_replacement_removes_an_edge_whose_endpoints_remain(&store(), Uuid::now_v7())
         .await;

@@ -748,6 +748,10 @@ pg_case!(
     conformance::one_replacement_does_not_take_another_scopes_edges
 );
 pg_case!(
+    an_edge_only_scope_drops_the_edges_it_stops_declaring,
+    conformance::an_edge_only_scope_drops_the_edges_it_stops_declaring
+);
+pg_case!(
     scope_replacement_removes_what_the_batch_no_longer_names,
     conformance::scope_replacement_removes_what_the_batch_no_longer_names
 );

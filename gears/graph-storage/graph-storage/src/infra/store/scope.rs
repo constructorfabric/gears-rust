@@ -109,36 +109,50 @@ pub(crate) async fn remove_stale(
         });
     }
     let types = scoped_types(scope, tx).await?;
-    if types.managed_nodes.is_empty() {
-        return Ok((0, 0));
-    }
 
-    // Membership is the payload attribute. The field name is a checked
-    // literal and the value is a bound parameter, the same shape the
-    // projection renders.
-    // The field name is a checked literal; the value is bound.
-    let member =
-        Expr::cust(format!("(payload #>> '{{{attribute}}}')")).eq(Expr::val(value.to_owned()));
-    let candidates: Vec<NodeIdent> = node::Entity::find()
-        .secure()
-        .scope_with(scope)
-        .filter(
-            Condition::all()
-                .add(node::Column::GtsNodeTypeId.is_in(types.managed_nodes))
-                .add(node::Column::DeletedAt.is_null())
-                .add(member),
-        )
-        .project_all(tx, |query| {
-            node_ident_columns(query).into_model::<NodeIdent>()
-        })
-        .await
-        .map_err(map_scope_err)?;
+    // No managed node type means no node of this scope can be stale -- but
+    // it does not mean nothing is. Edge ownership is recorded on the edge
+    // row itself, by scope attribute and value, not derived from any node
+    // type being managed, so the edge half below must run either way. This
+    // used to return `(0, 0)` here, before the edge block.
+    //
+    // As it stands that branch is not reachable: the abstract base node
+    // types are themselves scope-managed and are registered in any tenant
+    // an edge can exist in, since an edge needs endpoints and every endpoint
+    // type derives from them. So the return encoded an assumption that
+    // happens to hold rather than one that must -- and the day a tenant can
+    // hold edges without a managed node type, it would silently stop
+    // removing them. The node half is skipped; the edge half never is.
+    let stale_ids: Vec<i64> = if types.managed_nodes.is_empty() {
+        Vec::new()
+    } else {
+        // Membership is the payload attribute. The field name is a checked
+        // literal and the value is a bound parameter, the same shape the
+        // projection renders.
+        // The field name is a checked literal; the value is bound.
+        let member =
+            Expr::cust(format!("(payload #>> '{{{attribute}}}')")).eq(Expr::val(value.to_owned()));
+        let candidates: Vec<NodeIdent> = node::Entity::find()
+            .secure()
+            .scope_with(scope)
+            .filter(
+                Condition::all()
+                    .add(node::Column::GtsNodeTypeId.is_in(types.managed_nodes))
+                    .add(node::Column::DeletedAt.is_null())
+                    .add(member),
+            )
+            .project_all(tx, |query| {
+                node_ident_columns(query).into_model::<NodeIdent>()
+            })
+            .await
+            .map_err(map_scope_err)?;
 
-    let stale: Vec<&NodeIdent> = candidates
-        .iter()
-        .filter(|row| !written.contains(&row.node_key))
-        .collect();
-    let stale_ids: Vec<i64> = stale.iter().map(|row| row.id).collect();
+        let stale: Vec<&NodeIdent> = candidates
+            .iter()
+            .filter(|row| !written.contains(&row.node_key))
+            .collect();
+        stale.iter().map(|row| row.id).collect()
+    };
 
     // Edges first, and only the static ones: an analysis edge is a conclusion
     // about the content, not a copy of it.
