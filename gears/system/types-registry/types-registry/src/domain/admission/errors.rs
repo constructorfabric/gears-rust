@@ -1,6 +1,5 @@
 //! Admission failures shared by unit evaluation and worker orchestration.
 
-use serde_json::json;
 use toolkit_db::DbError;
 use toolkit_db::secure::ScopeError;
 use toolkit_macros::domain_model;
@@ -76,6 +75,9 @@ pub enum WorkerError {
     /// Commit-time revision-vector drift (D4, SPEC §8.1 step 4.3).
     #[error("the evaluation is stale and must be redone: {0}")]
     RevalidationRequired(VectorDrift),
+    /// A failure could not be encoded as its stored `error_payload`.
+    #[error("an item failure could not be encoded for storage: {0}")]
+    FailureUnencodable(#[source] serde_json::Error),
     #[error("storage failure during admission: {0}")]
     Storage(#[from] ScopeError),
     #[error("database failure during admission: {0}")]
@@ -106,7 +108,8 @@ impl WorkerError {
             | Self::DependencyTargetAbsent { .. }
             | Self::ResourceVersionExhausted { .. }
             | Self::RevisionNumberExhausted { .. }
-            | Self::RefusedAfterWrite(_) => false,
+            | Self::RefusedAfterWrite(_)
+            | Self::FailureUnencodable(_) => false,
         }
     }
 
@@ -131,6 +134,7 @@ impl WorkerError {
             Self::RevisionNumberExhausted { .. } => "revision_number_exhausted",
             Self::RefusedAfterWrite(_) => "unhandled_candidate_refusal",
             Self::RevalidationRequired(_) => "revalidation_required",
+            Self::FailureUnencodable(_) => "failure_unencodable",
             Self::Storage(_) => "storage_failure",
             Self::Db(_) => "database_failure",
         }
@@ -209,51 +213,110 @@ impl ItemFailure {
 
     /// The stored `error_payload`: structured, so the reason survives the round
     /// trip as a field rather than as a substring.
-    #[must_use]
-    pub fn to_payload(&self) -> String {
-        let mut payload = json!({ "reason": self.reason.as_str(), "message": self.message });
-        if let Some(dependency) = &self.dependency {
-            payload["dependency_id"] = json!(dependency.target);
-            payload["dependency_kind"] = json!(dependency.kind);
+    ///
+    /// # Errors
+    /// The `serde_json` error if the payload cannot be encoded.
+    pub fn to_payload(&self) -> Result<String, serde_json::Error> {
+        let dependency = self.dependency.as_ref();
+        StoredFailure {
+            reason: self.reason.as_str().to_owned(),
+            message: self.message.clone(),
+            dependency_id: dependency.map(|d| d.target.clone()),
+            dependency_kind: dependency.map(|d| d.kind.clone()),
+            error_code: None,
+            operation_id: None,
         }
-        payload.to_string()
+        .to_payload()
     }
 
     /// Parse stored failures while preserving invalid payloads as diagnostics.
     #[must_use]
     pub fn from_payload(payload: &str) -> Self {
-        match serde_json::from_str::<serde_json::Value>(payload) {
-            Ok(value) => {
-                let reason = value.get("reason").and_then(serde_json::Value::as_str);
-                let message = value.get("message").and_then(serde_json::Value::as_str);
-                match (reason, message) {
-                    (Some(reason), Some(message)) => Self {
-                        reason: AdmissionFailureReason::from_wire(reason),
-                        message: message.to_owned(),
-                        // Preserve unknown kinds written by newer versions.
-                        dependency: value
-                            .get("dependency_id")
-                            .and_then(serde_json::Value::as_str)
-                            .zip(
-                                value
-                                    .get("dependency_kind")
-                                    .and_then(serde_json::Value::as_str),
-                            )
-                            .map(|(target, kind)| FailureDependency {
-                                kind: kind.to_owned(),
-                                target: target.to_owned(),
-                            }),
-                    },
-                    _ => Self::new(
-                        AdmissionFailureReason::UnrecognizedPayload,
-                        payload.to_owned(),
-                    ),
-                }
+        match StoredFailure::parse(payload) {
+            Ok(stored) => Self {
+                reason: AdmissionFailureReason::from_wire(&stored.reason),
+                message: stored.message,
+                dependency: stored
+                    .dependency_id
+                    .zip(stored.dependency_kind)
+                    .map(|(target, kind)| FailureDependency { kind, target }),
+            },
+            Err(unreadable) => Self::new(unreadable.reason, payload.to_owned()),
+        }
+    }
+}
+
+/// A stored `error_payload`, in every field: each writer serializes this type and
+/// [`StoredFailure::parse`] reads it, so writer and reader cannot drift apart.
+#[domain_model]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct StoredFailure {
+    pub reason: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dependency_id: Option<String>,
+    /// Kept as written: newer writers may add kinds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dependency_kind: Option<String>,
+    /// Stable diagnostic code of a `system_failure`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<Uuid>,
+}
+
+/// A stored payload [`StoredFailure::parse`] refused, and why.
+#[domain_model]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnreadableFailure {
+    /// `unparsable_payload` or `unrecognized_payload`.
+    pub reason: AdmissionFailureReason,
+    pub cause: String,
+}
+
+impl StoredFailure {
+    /// A `system_failure`: stable codes only, never infrastructure error text.
+    #[must_use]
+    pub fn system_failure(operation_id: Uuid, error_code: &str) -> Self {
+        Self {
+            reason: AdmissionFailureReason::SystemFailure.as_str().to_owned(),
+            message: "admission could not complete because of a system failure".to_owned(),
+            dependency_id: None,
+            dependency_kind: None,
+            error_code: Some(error_code.to_owned()),
+            operation_id: Some(operation_id),
+        }
+    }
+
+    /// The stored `error_payload` text.
+    ///
+    /// # Errors
+    /// The `serde_json` error if the payload cannot be encoded.
+    pub fn to_payload(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+
+    /// # Errors
+    /// [`UnreadableFailure`] for text that is not JSON, or JSON of another shape,
+    /// including a dependency without both halves.
+    pub fn parse(payload: &str) -> Result<Self, UnreadableFailure> {
+        let unreadable = |reason, cause: String| UnreadableFailure { reason, cause };
+        match serde_json::from_str::<Self>(payload) {
+            Ok(stored) if stored.dependency_id.is_some() == stored.dependency_kind.is_some() => {
+                Ok(stored)
             }
-            Err(_) => Self::new(
+            Ok(_) => Err(unreadable(
+                AdmissionFailureReason::UnrecognizedPayload,
+                "dependency_id and dependency_kind must appear together".to_owned(),
+            )),
+            Err(e) if e.is_data() => Err(unreadable(
+                AdmissionFailureReason::UnrecognizedPayload,
+                e.to_string(),
+            )),
+            Err(e) => Err(unreadable(
                 AdmissionFailureReason::UnparsablePayload,
-                payload.to_owned(),
-            ),
+                e.to_string(),
+            )),
         }
     }
 }
@@ -303,6 +366,39 @@ mod tests {
             contention.transient(),
             "a closure read that failed on contention must be retried, not dead-lettered",
         );
+    }
+
+    /// Each writer serializes [`StoredFailure`], so the reader gets back every field.
+    #[test]
+    fn every_stored_failure_writer_round_trips_through_the_reader() -> Result<(), serde_json::Error>
+    {
+        let operation_id = Uuid::from_u128(7);
+        let system = StoredFailure::system_failure(operation_id, "storage_failure");
+        let payload = system.to_payload()?;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&payload)?,
+            serde_json::json!({
+                "reason": "system_failure",
+                "message": "admission could not complete because of a system failure",
+                "error_code": "storage_failure",
+                "operation_id": operation_id,
+            }),
+        );
+        assert_eq!(StoredFailure::parse(&payload), Ok(system));
+
+        let missing = ItemFailure::missing_dependency(DependencyEdge {
+            kind: DependencyKind::SchemaRef,
+            target: "cf.core.absent.type.v1~".to_owned(),
+        });
+        let stored = StoredFailure::parse(&missing.to_payload()?);
+        assert_eq!(
+            stored.map(|s| (s.dependency_id, s.dependency_kind)),
+            Ok((
+                Some("cf.core.absent.type.v1~".to_owned()),
+                Some("ref".to_owned())
+            )),
+        );
+        Ok(())
     }
 
     #[test]

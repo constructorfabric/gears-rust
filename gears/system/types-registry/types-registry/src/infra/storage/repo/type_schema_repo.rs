@@ -14,9 +14,10 @@ use toolkit_db::secure::{
 
 use super::IN_CHUNK;
 use crate::domain::ports::{
-    CurrentDocument, CurrentSchemaCas, CurrentSchemaProjection, CurrentTypeSchemaRow,
-    NewCurrentTypeSchema, NewRevision,
+    CurrentDocument, CurrentReadRow, CurrentSchemaCas, CurrentSchemaProjection,
+    CurrentTypeSchemaRow, NewCurrentTypeSchema, NewRevision, RevisionProvenance,
 };
+use crate::domain::selection::{EntityField, FieldSelection};
 use crate::infra::storage::entity::{type_schema, type_schema_revision};
 
 /// Chunk size for the exact-pair disjunction in
@@ -40,7 +41,42 @@ struct AuthoredDocument {
     entity_id: i64,
     revision_no: i32,
     raw_schema: String,
-    content_hash: Vec<u8>,
+}
+
+/// `SeaORM` reads a column absent from the result set into `Option` as `None`; the
+/// domain refuses a *selected* column that comes back `None`.
+#[derive(FromQueryResult)]
+struct SchemaReadPointer {
+    entity_id: i64,
+    revision_no: i32,
+    resolved_schema: Option<String>,
+    effective_traits: Option<String>,
+    effective_traits_schema: Option<String>,
+}
+
+/// See [`SchemaReadPointer`] for the `Option` contract.
+#[derive(FromQueryResult)]
+pub(super) struct RevisionReadColumns {
+    pub(super) entity_id: i64,
+    pub(super) content: Option<String>,
+    pub(super) gts_spec_version: Option<String>,
+    pub(super) gts_impl_version: Option<String>,
+    pub(super) compat_forced: Option<bool>,
+}
+
+impl RevisionReadColumns {
+    /// Provenance exists only when both engine versions were selected.
+    pub(super) fn take_provenance(&mut self) -> Option<RevisionProvenance> {
+        let (gts_spec_version, gts_impl_version) = self
+            .gts_spec_version
+            .take()
+            .zip(self.gts_impl_version.take())?;
+        Some(RevisionProvenance {
+            gts_spec_version,
+            gts_impl_version,
+            compat_forced: self.compat_forced,
+        })
+    }
 }
 
 /// One current-state row as the domain names it. See `entity_repo::row` for why
@@ -112,7 +148,6 @@ impl TypeSchemaRepo {
                         .column(type_schema_revision::Column::EntityId)
                         .column(type_schema_revision::Column::RevisionNo)
                         .column(type_schema_revision::Column::RawSchema)
-                        .column(type_schema_revision::Column::ContentHash)
                         .into_model::<AuthoredDocument>()
                 })
                 .await?;
@@ -126,7 +161,6 @@ impl TypeSchemaRepo {
                     entity_id: r.entity_id,
                     revision_no: r.revision_no,
                     raw_schema: r.raw_schema,
-                    content_hash: r.content_hash,
                     projection: CurrentSchemaCas {
                         revision_no: r.revision_no,
                         resolution_fingerprint: fingerprint,
@@ -155,6 +189,112 @@ impl TypeSchemaRepo {
             .one(runner)
             .await?
             .map(current_row))
+    }
+
+    /// Pointers by `entity_id IN`, then exact revision pairs, as in
+    /// [`Self::current_documents`]. Unselected columns stay out of the `SELECT`.
+    ///
+    /// # Errors
+    /// Propagates the scoped query's failure from any chunk.
+    pub async fn read_current(
+        runner: &impl DBRunner,
+        scope: &AccessScope,
+        entity_ids: &[i64],
+        selection: FieldSelection,
+    ) -> Result<Vec<CurrentReadRow>, ScopeError> {
+        let mut pointers: Vec<SchemaReadPointer> = Vec::with_capacity(entity_ids.len());
+        for chunk in entity_ids.chunks(IN_CHUNK) {
+            let rows = type_schema::Entity::find()
+                .filter(type_schema::Column::EntityId.is_in(chunk.iter().copied()))
+                .secure()
+                .scope_with(scope)
+                .project_all(runner, |query| {
+                    let mut query = query
+                        .select_only()
+                        .column(type_schema::Column::EntityId)
+                        .column(type_schema::Column::RevisionNo);
+                    for (field, column) in [
+                        (
+                            EntityField::ResolvedSchema,
+                            type_schema::Column::ResolvedSchema,
+                        ),
+                        (
+                            EntityField::EffectiveTraits,
+                            type_schema::Column::EffectiveTraits,
+                        ),
+                        (
+                            EntityField::EffectiveTraitsSchema,
+                            type_schema::Column::EffectiveTraitsSchema,
+                        ),
+                    ] {
+                        if selection.contains(field) {
+                            query = query.column(column);
+                        }
+                    }
+                    query.into_model::<SchemaReadPointer>()
+                })
+                .await?;
+            pointers.extend(rows);
+        }
+
+        let mut revisions: HashMap<i64, RevisionReadColumns> =
+            HashMap::with_capacity(pointers.len());
+        for chunk in pointers.chunks(PAIR_CHUNK) {
+            let mut pairs = Condition::any();
+            for row in chunk {
+                pairs = pairs.add(
+                    Condition::all()
+                        .add(type_schema_revision::Column::EntityId.eq(row.entity_id))
+                        .add(type_schema_revision::Column::RevisionNo.eq(row.revision_no)),
+                );
+            }
+            let rows = type_schema_revision::Entity::find()
+                .filter(pairs)
+                .secure()
+                .scope_with(scope)
+                .project_all(runner, |query| {
+                    let mut query = query
+                        .select_only()
+                        .column(type_schema_revision::Column::EntityId);
+                    if selection.contains(EntityField::Content) {
+                        query = query.column_as(type_schema_revision::Column::RawSchema, "content");
+                    }
+                    if selection.contains(EntityField::Provenance) {
+                        query = query
+                            .column(type_schema_revision::Column::GtsSpecVersion)
+                            .column(type_schema_revision::Column::GtsImplVersion)
+                            .column(type_schema_revision::Column::CompatForced);
+                    }
+                    query.into_model::<RevisionReadColumns>()
+                })
+                .await?;
+            revisions.extend(rows.into_iter().map(|row| (row.entity_id, row)));
+        }
+
+        let mut out: Vec<CurrentReadRow> = pointers
+            .into_iter()
+            .map(|pointer| {
+                let mut revision = revisions.remove(&pointer.entity_id).ok_or_else(|| {
+                    tracing::error!(
+                        entity_id = pointer.entity_id,
+                        revision_no = pointer.revision_no,
+                        "types_registry current Type Schema pointer names a missing revision"
+                    );
+                    ScopeError::Invalid("current Type Schema pointer names a missing revision")
+                })?;
+                let provenance = revision.take_provenance();
+                Ok(CurrentReadRow {
+                    entity_id: pointer.entity_id,
+                    content: revision.content,
+                    resolved_schema: pointer.resolved_schema,
+                    effective_traits: pointer.effective_traits,
+                    effective_traits_schema: pointer.effective_traits_schema,
+                    provenance,
+                })
+            })
+            .collect::<Result<_, ScopeError>>()?;
+        out.sort_by_key(|row| row.entity_id);
+        Ok(out)
     }
 
     /// Current revision numbers and fingerprints, `entity_id`-sorted, without artifacts.
@@ -205,7 +345,6 @@ impl TypeSchemaRepo {
             entity_id: Set(new.entity_id),
             revision_no: Set(new.revision_no),
             raw_schema: Set(new.raw_schema),
-            content_hash: Set(new.content_hash),
             gts_spec_version: Set(new.gts_spec_version),
             gts_impl_version: Set(new.gts_impl_version),
             compat_forced: Set(new.compat_forced),

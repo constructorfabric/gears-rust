@@ -5,6 +5,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::sync::Arc;
+use types_registry::domain::ports::ListFilter;
 
 use serde_json::{Value, json};
 use time::OffsetDateTime;
@@ -198,13 +199,18 @@ async fn items_of(db: &Provider, operation_id: Uuid) -> Vec<OperationItemRow> {
 async fn listed_ids(db: &Provider) -> Vec<String> {
     let provider = worker(db);
     let conn = provider.conn().expect("conn");
-    EntityRepo::list_page(&conn, &allow_all(), None, PageRequest::first(100))
-        .await
-        .expect("list")
-        .items
-        .into_iter()
-        .map(|row| row.gts_id)
-        .collect()
+    EntityRepo::list_page(
+        &conn,
+        &allow_all(),
+        &ListFilter::default(),
+        PageRequest::first(100),
+    )
+    .await
+    .expect("list")
+    .items
+    .into_iter()
+    .map(|row| row.gts_id)
+    .collect()
 }
 
 async fn entity_write_sequence(db: &Provider) -> i64 {

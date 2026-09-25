@@ -13,45 +13,15 @@
 //! `entity.resource_version` — reserved for optimistic writes. The canonical form
 //! is [`crate::domain::admission::fingerprint`]'s, for the reason stated there.
 //!
-//! # Digest algorithms
-//!
-//! `content_hash` uses FNV-1a because it is only a **prefilter** (ADR-0012): a
-//! collision proposes `unchanged`, and T11's exact byte comparison rejects it.
-//! `resolution_fingerprint`, however, is the persisted equality identity of the
-//! effective artifacts and has no exact-comparison fallback, so it uses SHA-256.
+//! `resolution_fingerprint` is the persisted equality identity of the effective
+//! artifacts and has no exact-comparison fallback, so it uses SHA-256. Authored
+//! content has no digest: `unchanged` compares the canonical bytes (ADR-0012).
 
 use aws_lc_rs::digest::{Context, SHA256};
 use gts::ResolvedType;
 use toolkit_macros::domain_model;
 
 use crate::domain::admission::fingerprint::canonical_text;
-
-/// FNV-1a 64-bit — deterministic, non-cryptographic fingerprint.
-///
-/// Fixed public constants (Fowler–Noll–Vo) give identical output across all Rust
-/// versions and platforms. That stability is a storage requirement here: these
-/// digests are persisted and compared against digests written by an earlier
-/// process.
-fn fnv1a_64(fields: &[&[u8]]) -> Vec<u8> {
-    const BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0000_0100_0000_01B3;
-    let mut hash = BASIS;
-    let mut absorb = |bytes: &[u8]| {
-        for &b in bytes {
-            hash ^= u64::from(b);
-            hash = hash.wrapping_mul(PRIME);
-        }
-    };
-    // Length-prefixed per field, so no two splits of adjacent fields collide. The
-    // prefix is a `u64`, not a `usize`, whose `to_be_bytes` is 4 bytes on a 32-bit
-    // target and 8 on a 64-bit one — that would make persisted digests a property
-    // of the platform. The saturation cannot happen: no field here is 16 exabytes.
-    for field in fields {
-        absorb(&u64::try_from(field.len()).unwrap_or(u64::MAX).to_be_bytes());
-        absorb(field);
-    }
-    hash.to_be_bytes().to_vec()
-}
 
 /// The three artifacts D3 materializes, plus their digest.
 #[domain_model]
@@ -102,17 +72,6 @@ pub fn resolution_fingerprint(
         hasher.update(field);
     }
     hasher.finish().as_ref().to_vec()
-}
-
-/// Digest one authored document's canonical bytes — `type_schema_revision.content_hash`.
-///
-/// A **prefilter only** (ADR-0012): equality of content hashes proposes that a
-/// revision is `unchanged`, and T11 confirms it by comparing the canonical bytes
-/// themselves. Effective artifacts are deliberately not inputs, because they move
-/// when a dependency moves while the authored content stands still.
-#[must_use]
-pub fn content_hash(canonical_body: &str) -> Vec<u8> {
-    fnv1a_64(&[b"tr-content-v1", canonical_body.as_bytes()])
 }
 
 #[cfg(test)]

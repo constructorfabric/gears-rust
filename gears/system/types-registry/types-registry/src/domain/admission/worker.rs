@@ -711,7 +711,9 @@ async fn record_failure(
 ) -> Result<ItemOutcome, WorkerError> {
     let tx_stores = Arc::clone(stores);
     let tx_scope = scope.clone();
-    let payload = failure.to_payload();
+    let payload = failure
+        .to_payload()
+        .map_err(WorkerError::FailureUnencodable)?;
     let item_id = item.id;
     let recorded = db
         .transaction(move |tx| {

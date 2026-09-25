@@ -329,6 +329,75 @@ async fn a_synchronous_refusal_writes_no_operation() {
     assert!(recorder.calls().is_empty(), "and must not dispatch");
 }
 
+/// One Type Schema whose `$id` names another entity refuses its whole batch: the
+/// valid neighbour is not accepted on its own, nothing is written or dispatched,
+/// and the key stays unbound.
+#[tokio::test]
+async fn a_batch_with_one_mismatched_schema_id_writes_and_dispatches_nothing() {
+    let db = test_db().await;
+    let provider = provider(&db);
+    let policy = RegistrationPolicy::default();
+    let config = TypesRegistryConfig::default();
+    let recorder = Arc::new(RecordingDispatch::default());
+    let dispatch: Arc<dyn OperationDispatch> = recorder.clone();
+    let metrics = common::metrics();
+    let ctx = context(&policy, &config, &metrics);
+
+    let other = gts_id!("cf.core.example.other.v1~");
+    let mut refused = request(KEY, schema(CF_TYPE));
+    refused.candidates.push(Candidate {
+        gts_id: other.to_owned(),
+        content: Some(schema(CF_TYPE)),
+        expected_resource_version: None,
+        force: false,
+    });
+
+    let err = accept(
+        &stores(),
+        &provider,
+        &allow_all(),
+        &ctx,
+        &dispatch,
+        &refused,
+        NOW,
+    )
+    .await
+    .expect_err("a mismatched $id must refuse the batch");
+    match err {
+        AcceptanceError::SchemaIdMismatch { gts_id } => assert_eq!(gts_id, other),
+        other => panic!("expected SchemaIdMismatch, got {other}"),
+    }
+
+    let conn = provider.conn().expect("conn");
+    let all = operation::Entity::find()
+        .secure()
+        .scope_with(&allow_all())
+        .all(&conn)
+        .await
+        .expect("read operations");
+    assert!(
+        all.is_empty(),
+        "a refused batch must not write an operation"
+    );
+    assert!(recorder.calls().is_empty(), "and must not dispatch");
+
+    // The corrected batch under the same key is a fresh acceptance, not a replay.
+    refused.candidates[1].content = Some(schema(other));
+    let accepted = accept(
+        &stores(),
+        &provider,
+        &allow_all(),
+        &ctx,
+        &dispatch,
+        &refused,
+        NOW,
+    )
+    .await
+    .expect("the corrected batch is accepted");
+    assert!(!accepted.replayed);
+    assert_eq!(recorder.calls(), vec![accepted.operation_id]);
+}
+
 // ---------------------------------------------------------------------------
 // Replay and conflict
 // ---------------------------------------------------------------------------

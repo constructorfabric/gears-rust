@@ -11,6 +11,9 @@ import httpx
 
 
 GTS_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "gts")
+# Everything a registration writes except `provenance`, whose implementation
+# versions are not a scenario claim. The default projection is document-free.
+ENTITY_SELECT = "origin,content,resolved_schema,effective_traits,effective_traits_schema"
 RFC3339 = re.compile(
     r"\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})"
 )
@@ -66,19 +69,18 @@ def assert_operation(operation, expected, *, ordered=False):
 
 
 async def read_created(client, api_path, expected, operation):
-    response = await client.get(f"{api_path}/entities/{expected['gts_id']}")
-    assert response.status_code == 200, response.text
-    assert response.headers["content-type"].startswith("application/json")
-    entity = response.json()
+    entity = await read_entity(client, api_path, expected["gts_id"])
     actual = deepcopy(entity)
     assert actual["gts_uuid"] == str(uuid.uuid5(GTS_NAMESPACE, expected["gts_id"]))
-    created = timestamp(actual["created_at"])
-    assert created == timestamp(actual["updated_at"]), actual
+    origin = actual["origin"]
+    created = timestamp(origin["created_at"])
+    assert created == timestamp(origin["updated_at"]), actual
     assert timestamp(operation["started_at"]) <= created <= timestamp(
         operation["completed_at"]
     ), actual
-    for field in ("gts_uuid", "created_at", "updated_at"):
-        actual[field] = f"<{field}>"
+    actual["gts_uuid"] = "<gts_uuid>"
+    for field in ("created_at", "updated_at"):
+        origin[field] = f"<{field}>"
     assert_json(actual, expected)
     return entity
 
@@ -171,9 +173,11 @@ async def delete_one_and_poll(client, api_path, key, expected_resource_version, 
     return await _poll(client, receipt, location, "deletion")
 
 
-async def read_entity(client, api_path, gts_id):
-    """Read one entity, tombstone or not, and return its complete body."""
-    response = await client.get(f"{api_path}/entities/{gts_id}")
+async def read_entity(client, api_path, key):
+    """Read one entity, tombstone or not, with its origin and documents."""
+    response = await client.get(
+        f"{api_path}/entities/{key}", params={"$select": ENTITY_SELECT}
+    )
     assert response.status_code == 200, response.text
     assert response.headers["content-type"].startswith("application/json")
     return response.json()
@@ -187,7 +191,7 @@ async def read_tombstone(client, api_path, before, operation):
     lifecycle, the version and the update timestamp.
     """
     actual = await read_entity(client, api_path, before["gts_id"])
-    updated = timestamp(actual["updated_at"])
+    updated = timestamp(actual["origin"]["updated_at"])
     assert timestamp(operation["started_at"]) <= updated <= timestamp(
         operation["completed_at"]
     ), actual
@@ -196,8 +200,11 @@ async def read_tombstone(client, api_path, before, operation):
         {
             **before,
             "lifecycle_status": "deleted",
-            "resource_version": before["resource_version"] + 1,
-            "updated_at": actual["updated_at"],
+            "origin": {
+                **before["origin"],
+                "resource_version": before["origin"]["resource_version"] + 1,
+                "updated_at": actual["origin"]["updated_at"],
+            },
         },
     )
     return actual

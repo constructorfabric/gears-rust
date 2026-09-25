@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 
 use serde_json::{Value, json};
-use toolkit_gts::gts_id;
+use toolkit_gts::{gts_id, gts_uri};
 
 use super::super::{Candidate, Precondition, SubmitRequest};
 use super::{AcceptanceContext, AcceptanceError, validate};
@@ -20,11 +20,13 @@ fn noop_metrics() -> std::sync::Arc<dyn crate::domain::ports::metrics::Admission
 }
 
 const CF_TYPE: &str = gts_id!("cf.core.example.type.v1~");
+const CF_URI: &str = gts_uri!("cf.core.example.type.v1~");
 const ACME_TYPE: &str = gts_id!("acme.crm.customer.type.v1~");
 
-fn schema() -> Value {
+/// A Draft-07 Type Schema whose `$id` names `gts_id`, as step 5 requires.
+fn schema(gts_id: &str) -> Value {
     json!({
-        "$id": format!("gts://{CF_TYPE}"),
+        "$id": format!("gts://{gts_id}"),
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
     })
@@ -33,7 +35,7 @@ fn schema() -> Value {
 fn candidate(gts_id: &str) -> Candidate {
     Candidate {
         gts_id: gts_id.to_owned(),
-        content: Some(schema()),
+        content: Some(schema(gts_id)),
         expected_resource_version: None,
         force: false,
     }
@@ -379,14 +381,136 @@ fn an_instance_identifier_must_name_a_stable_major_without_a_minor() {
 }
 
 // ---------------------------------------------------------------------------
-// Step 5: dialect
+// Step 5: declared identity and dialect
 // ---------------------------------------------------------------------------
+
+/// The schema URI of the item's own identifier is the one `$id` step 5 accepts.
+#[test]
+fn a_type_schema_whose_id_names_its_item_is_accepted() {
+    let pair = closed();
+    let validated = run(&pair, &request(vec![candidate(CF_TYPE)])).expect("accepted");
+    assert!(
+        validated.items[0]
+            .request_payload
+            .contains(&format!(r#""$id":"{CF_URI}""#)),
+        "the matching $id is stored as authored",
+    );
+}
+
+/// An absent `$id`, or one that is not a string, gives the document no identity
+/// to compare with the item's.
+#[test]
+fn a_type_schema_without_a_string_id_is_refused() {
+    let pair = closed();
+    for declared in [None, Some(Value::Null), Some(json!(7)), Some(json!({}))] {
+        let mut content = schema(CF_TYPE);
+        match declared {
+            Some(value) => content["$id"] = value,
+            None => {
+                content.as_object_mut().expect("object").remove("$id");
+            }
+        }
+        let mut req = request(vec![candidate(CF_TYPE)]);
+        req.candidates[0].content = Some(content);
+        match run(&pair, &req) {
+            Err(AcceptanceError::MissingSchemaId { gts_id }) => assert_eq!(gts_id, CF_TYPE),
+            other => panic!("expected MissingSchemaId, got {other:?}"),
+        }
+    }
+}
+
+/// Only the exact `gts://<gts_id>` spelling names the item. Another entity, a
+/// malformed URI, the bare canonical form GTS forbids in `$id`, and padded or
+/// differently cased spellings of the right identity are all refused rather than
+/// normalized, as step 2 refuses a non-canonical `gts_id`.
+#[test]
+fn a_type_schema_whose_id_differs_from_its_item_is_refused() {
+    let pair = closed();
+    for declared in [
+        gts_uri!("cf.core.example.other.v1~").to_owned(),
+        gts_uri!("cf.core.example.type.v2~").to_owned(),
+        "gts://not a gts id".to_owned(),
+        String::new(),
+        CF_TYPE.to_owned(),
+        format!("gts:{CF_TYPE}"),
+        format!("GTS://{CF_TYPE}"),
+        format!(" {CF_URI} "),
+        format!("{CF_URI}#"),
+    ] {
+        let mut req = request(vec![candidate(CF_TYPE)]);
+        req.candidates[0].content = Some(json!({
+            "$id": declared,
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+        }));
+        match run(&pair, &req) {
+            Err(AcceptanceError::SchemaIdMismatch { gts_id }) => assert_eq!(gts_id, CF_TYPE),
+            other => panic!("expected SchemaIdMismatch for {declared:?}, got {other:?}"),
+        }
+    }
+}
+
+/// The refusal names the expected URI but never echoes the declared value: an
+/// `$id` is unbounded caller input and is judged before the document size limit.
+#[test]
+fn a_mismatched_id_is_not_echoed_into_the_refusal() {
+    let pair = closed();
+    let declared = format!("gts://{}", "x".repeat(64 * 1024));
+    let mut req = request(vec![candidate(CF_TYPE)]);
+    req.candidates[0].content = Some(json!({
+        "$id": declared,
+        "$schema": "http://json-schema.org/draft-07/schema#",
+    }));
+    let error = run(&pair, &req).expect_err("a mismatched $id is refused");
+    let message = error.to_string();
+    assert!(
+        message.contains(CF_URI),
+        "names the expected URI: {message}"
+    );
+    assert!(!message.contains("xxxx"), "must not echo the declared $id");
+    assert!(
+        message.len() < 256,
+        "bounded by the identifier: {}",
+        message.len()
+    );
+}
+
+/// One mismatched Type Schema refuses the whole batch: acceptance is
+/// all-or-nothing, so no neighbour becomes an item.
+#[test]
+fn one_mismatched_id_refuses_the_whole_batch() {
+    let pair = closed();
+    let good = gts_id!("cf.core.a.type.v1~");
+    let bad = gts_id!("cf.core.b.type.v1~");
+    let mut mismatched = candidate(bad);
+    mismatched.content = Some(schema(good));
+    match run(&pair, &request(vec![candidate(good), mismatched])) {
+        Err(AcceptanceError::SchemaIdMismatch { gts_id, .. }) => assert_eq!(gts_id, bad),
+        other => panic!("expected SchemaIdMismatch, got {other:?}"),
+    }
+}
+
+/// An Instance's identity lives in the item alone: its value is not a schema, so
+/// neither an absent nor an unrelated `$id` is judged.
+#[test]
+fn an_instance_is_not_held_to_the_schema_id_rule() {
+    let pair = closed();
+    let instance = gts_id!("cf.core.example.type.v1~cf.core.example.item.v1");
+    for content in [
+        json!({ "name": "no id" }),
+        json!({ "$id": "urn:unrelated", "name": "unrelated id" }),
+    ] {
+        let mut req = request(vec![candidate(instance)]);
+        req.candidates[0].content = Some(content);
+        run(&pair, &req).unwrap_or_else(|e| panic!("an Instance must be accepted: {e}"));
+    }
+}
 
 #[test]
 fn a_type_schema_without_a_top_level_dialect_is_refused() {
     let pair = closed();
     let mut req = request(vec![candidate(CF_TYPE)]);
-    req.candidates[0].content = Some(json!({ "type": "object" }));
+    req.candidates[0].content = Some(json!({ "$id": CF_URI, "type": "object" }));
     assert!(matches!(
         run(&pair, &req),
         Err(AcceptanceError::MissingDialect { .. })
@@ -406,14 +530,17 @@ fn the_dialect_spelling_set_is_closed_and_normalizing() {
         "https://json-schema.org/draft-07/schema",
     ] {
         let mut req = request(vec![candidate(CF_TYPE)]);
-        req.candidates[0].content = Some(json!({ "$schema": accepted, "type": "object" }));
+        req.candidates[0].content =
+            Some(json!({ "$id": CF_URI, "$schema": accepted, "type": "object" }));
         run(&pair, &req).unwrap_or_else(|e| panic!("{accepted} must be accepted: {e}"));
     }
 
     let mut req = request(vec![candidate(CF_TYPE)]);
-    req.candidates[0].content = Some(
-        json!({ "$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object" }),
-    );
+    req.candidates[0].content = Some(json!({
+        "$id": CF_URI,
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+    }));
     match run(&pair, &req) {
         Err(AcceptanceError::UnsupportedDialect { found, .. }) => {
             assert!(found.contains("2020-12"));
@@ -430,6 +557,7 @@ fn a_nested_dialect_must_not_differ_but_may_be_spelled_differently() {
 
     let mut req = request(vec![candidate(CF_TYPE)]);
     req.candidates[0].content = Some(json!({
+        "$id": CF_URI,
         "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": { "inner": { "$schema": "https://json-schema.org/draft/2020-12/schema" } },
     }));
@@ -442,6 +570,7 @@ fn a_nested_dialect_must_not_differ_but_may_be_spelled_differently() {
 
     let mut req = request(vec![candidate(CF_TYPE)]);
     req.candidates[0].content = Some(json!({
+        "$id": CF_URI,
         "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": { "inner": { "$schema": "https://json-schema.org/draft-07/schema" } },
     }));
@@ -455,6 +584,7 @@ fn a_nested_dialect_must_be_a_supported_string() {
     for declared in [Value::Null, json!(7), json!({})] {
         let mut req = request(vec![candidate(CF_TYPE)]);
         req.candidates[0].content = Some(json!({
+            "$id": CF_URI,
             "$schema": "http://json-schema.org/draft-07/schema#",
             "properties": { "inner": { "$schema": declared } },
         }));
@@ -475,6 +605,7 @@ fn a_nested_dialect_is_found_through_arrays_and_at_depth() {
 
     let mut req = request(vec![candidate(CF_TYPE)]);
     req.candidates[0].content = Some(json!({
+        "$id": CF_URI,
         "$schema": "http://json-schema.org/draft-07/schema#",
         "anyOf": [
             { "type": "object" },
@@ -513,6 +644,7 @@ fn an_oversized_document_is_refused_against_the_configured_limit() {
     let pair = (policy, config);
     let mut req = request(vec![candidate(CF_TYPE)]);
     req.candidates[0].content = Some(json!({
+        "$id": CF_URI,
         "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "x".repeat(200),
     }));
@@ -534,10 +666,6 @@ fn force_is_refused_while_the_deployment_disallows_it() {
     let pair = closed();
     let mut req = request(vec![candidate(gts_id!("cf.core.example.type.v1.2~"))]);
     req.candidates[0].force = true;
-    req.candidates[0].content = Some(json!({
-        "$schema": "http://json-schema.org/draft-07/schema#",
-        "type": "object",
-    }));
     assert!(matches!(
         run(&pair, &req),
         Err(AcceptanceError::ForceNotPermitted { .. })
@@ -558,10 +686,6 @@ fn force_needs_a_cross_minor_check_to_waive() {
     ] {
         let mut req = request(vec![candidate(nothing_to_waive)]);
         req.candidates[0].force = true;
-        req.candidates[0].content = Some(json!({
-            "$schema": "http://json-schema.org/draft-07/schema#",
-            "type": "object",
-        }));
         match run(&pair, &req) {
             Err(AcceptanceError::ForceHasNothingToWaive { gts_id }) => {
                 assert_eq!(gts_id, nothing_to_waive);
@@ -582,10 +706,6 @@ fn force_on_a_later_minor_is_accepted_and_travels_on_the_item() {
 
     let mut req = request(vec![candidate(gts_id!("cf.core.example.type.v2.1~"))]);
     req.candidates[0].force = true;
-    req.candidates[0].content = Some(json!({
-        "$schema": "http://json-schema.org/draft-07/schema#",
-        "type": "object",
-    }));
     let validated = run(&pair, &req).expect("a later minor has a cross-minor check to waive");
     assert!(
         validated.items[0].compat_forced,
@@ -605,10 +725,6 @@ fn force_cannot_waive_the_intra_entity_edge_of_a_revision() {
     let mut req = request(vec![candidate(id)]);
     req.candidates[0].force = true;
     req.candidates[0].expected_resource_version = Some(3);
-    req.candidates[0].content = Some(json!({
-        "$schema": "http://json-schema.org/draft-07/schema#",
-        "type": "object",
-    }));
     match run(&pair, &req) {
         Err(AcceptanceError::ForceHasNothingToWaive { gts_id }) => assert_eq!(gts_id, id),
         other => panic!("expected ForceHasNothingToWaive, got {other:?}"),
@@ -624,10 +740,6 @@ fn a_forced_dry_run_reaches_the_force_gate_and_is_refused_there() {
     let mut req = request(vec![candidate(gts_id!("cf.core.example.type.v1.2~"))]);
     req.dry_run = true;
     req.candidates[0].force = true;
-    req.candidates[0].content = Some(json!({
-        "$schema": "http://json-schema.org/draft-07/schema#",
-        "type": "object",
-    }));
     match run(&pair, &req) {
         Err(AcceptanceError::ForceNotPermitted { .. }) => {}
         other => panic!("expected ForceNotPermitted, got {other:?}"),
@@ -736,7 +848,7 @@ fn a_deletion_without_a_precondition_is_refused() {
 #[test]
 fn a_deletion_carrying_content_is_refused() {
     let mut candidate = deletion(CF_TYPE, Some(1));
-    candidate.content = Some(schema());
+    candidate.content = Some(schema(CF_TYPE));
     match run(&closed(), &deletion_request(vec![candidate])) {
         Err(AcceptanceError::DeletionCarriesContent { gts_id }) => assert_eq!(gts_id, CF_TYPE),
         other => panic!("expected DeletionCarriesContent, got {other:?}"),

@@ -12,7 +12,7 @@ use toolkit::{Gear, GearCtx, RestApiCapability};
 use toolkit_db::outbox::OutboxHandle;
 use toolkit_db::{DBProvider, DbError};
 use toolkit_gts::{all_inventory_instances, all_inventory_type_schemas};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use types_registry_sdk::{RegisterResult, RegisterSummary, TypesRegistryClient};
 
 use crate::config::TypesRegistryConfig;
@@ -131,16 +131,6 @@ impl Gear for TypesRegistryGear {
             batch_candidates = cfg.limits.batch_candidates,
             "Validated types_registry registration policy and limits"
         );
-
-        // Warn once at boot so operators do not mistake accepted settings for enforced bounds.
-        let inert = cfg.inert_limit_keys();
-        if !inert.is_empty() {
-            warn!(
-                keys = ?inert,
-                "types_registry accepted configuration keys that P0 does not enforce; \
-                 see each key's documentation for its enforcement status"
-            );
-        }
 
         debug!(
             "Loaded types_registry config: entity_id_fields={:?}, schema_id_fields={:?}, \

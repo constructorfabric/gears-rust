@@ -101,7 +101,7 @@ The canonical representation of registry contracts is based on [Global Type Syst
 | External Registry Source | Registry or catalog outside Types Registry that remains authoritative for its entities. |
 | Registry Source Plugin | Governed read-only plugin through which Types Registry queries an External Registry Source. |
 | Source Claim | Rooted single-segment GTS wildcard declaring the non-overlapping identifier space served by one plugin. |
-| External Revision | Opaque source freshness token; equal revisions identify equal canonical content and content hash. |
+| External Revision | Opaque source freshness token for one entity and tenant; it changes whenever any source-owned response field that affects the platform-visible result changes — canonical content, effective artifacts, source lifecycle, ownership scope, or source-owned tenant enablement. Platform-owned availability and visibility inputs are separate validator inputs and do not move it. Conditional reads against it are delegated to the owning plugin. |
 | Managed Entity | Entity for which Types Registry is the source of truth. |
 | Externally Managed Entity | Entity obtained live from an External Registry Source while Types Registry applies platform visibility and usage semantics. |
 | Tenant Subtree | Tenant and all of its descendants in the platform hierarchy. |
@@ -359,7 +359,7 @@ Any visible and tenant-available entity **MUST** remain a valid target for exist
 
 - [ ] `p1` - **ID**: `cpt-cf-types-registry-fr-registry-federation`
 
-The system **MUST** support multiple Registry Sources, including Types Registry's own managed storage and External Registry Sources integrated through governed Registry Source Plugins. Types Registry **MUST NOT** persist external entity definitions, identifiers, revisions, content hashes, lifecycle state, Registry Reference mappings, query indexes, caches, or tombstones, and the owning plugin **MUST** serve that state live through the Types Registry federation contract. Under ADR-0011 this prohibition has no exception, and Registry Source Plugins **MUST NOT** have any write path into Types Registry state.
+The system **MUST** support multiple Registry Sources, including Types Registry's own managed storage and External Registry Sources integrated through governed Registry Source Plugins. Types Registry **MUST NOT** persist external entity definitions, identifiers, revisions, lifecycle state, Registry Reference mappings, query indexes, caches, or tombstones, and the owning plugin **MUST** serve that state live through the Types Registry federation contract. Under ADR-0011 this prohibition has no exception, and Registry Source Plugins **MUST NOT** have any write path into Types Registry state.
 
 - **Rationale**: Vendor products may already have authoritative type registries, but platform gears still need one Types Registry contract for resolving, discovery, and platform governance.
 - **Actors**: `cpt-cf-types-registry-actor-xaas-vendor-architect`, `cpt-cf-types-registry-actor-gears-developer`, `cpt-cf-types-registry-actor-registry-source-plugin`
@@ -375,7 +375,7 @@ The Types Registry federation contract is total: across its whole claimed identi
 - batch forward and reverse resolution, with reverse resolution retained after deletion;
 - complete bounded candidate queries with opaque pagination;
 - lifecycle, ownership/visibility, and tenant-state assertions;
-- revision/hash and conditional-read semantics; and
+- External Revision and conditional-read semantics; and
 - structured source failures.
 
 For a Type Schema result — an identifier with a trailing `~` — it **MUST** also return resolved effective schema and trait artifacts. A claim covers both entity kinds in its space, so a source holding none of one kind **MUST** report that kind's identifiers absent exactly as it reports any other absent identifier, with no separate outcome for an unheld kind. These obligations are mandatory and authoritative; dependency registration and reverse-impact lookup are absent from the contract under the closed boundary.
@@ -399,7 +399,7 @@ Their identifier spaces **MUST** be disjoint, with no reference or derivation ac
 
 Types Registry **MUST NOT** parse external content to detect a source-authored `$ref` or `x-gts-ref` to a Managed Entity. Such a reference receives no platform guarantee: no managed-target deletion safety, availability propagation, dependent revalidation, lifecycle notification, or protection from purge and identifier rebinding. This limitation does not weaken the managed target's own compatibility guarantee.
 
-The External Registry Source **MUST** remain sole authority for source-owned entity validity; Types Registry **MUST NOT** require, interpret, or reproduce its validation results. Before exposure, Types Registry validates only platform-owned response invariants: identifier and Registry Reference integrity, Source Claim, entity kind as determined by the identifier's trailing `~`, authorization, visibility, lifecycle mapping, availability, and freshness. Every result **MUST** carry External Revision and canonical content hash, neither persisted by Types Registry.
+The External Registry Source **MUST** remain sole authority for source-owned entity validity; Types Registry **MUST NOT** require, interpret, or reproduce its validation results. Before exposure, Types Registry validates only platform-owned response invariants: identifier and Registry Reference integrity, Source Claim, entity kind as determined by the identifier's trailing `~`, authorization, visibility, lifecycle mapping, availability, and freshness. Every result **MUST** carry its External Revision, which Types Registry does not persist.
 
 - **Rationale**: External source ownership must not bypass platform contract governance, while source-owned entity validation policies and results remain outside the Types Registry responsibility boundary.
 - **Actors**: `cpt-cf-types-registry-actor-platform-gear`, `cpt-cf-types-registry-actor-domain-gear`, `cpt-cf-types-registry-actor-registry-source-plugin`
@@ -558,7 +558,7 @@ The availability-blocking relationships are:
 
 A new relationship kind **MUST** be classified by the same semantic-contract rule before it affects availability. Blocking edges exist only between Managed Entities; an Externally Managed Entity's availability is obtained live from its source and has no registry-composed Availability Closure.
 
-P1 has no managed enablement override. A visible `ACTIVE` Managed Entity is eligible for `AVAILABLE` but **MUST** be reasoned `UNAVAILABLE` when a blocking target is unavailable. A `DELETED` entity **MUST** be unavailable yet still be returned by exact read as deleted; discovery, search, and query assistance exclude it. Admission Candidates **MUST NOT** participate.
+P1 has no managed enablement override. A visible `ACTIVE` Managed Entity is eligible for `AVAILABLE` but **MUST** be reasoned `UNAVAILABLE` when a blocking target is unavailable. A `DELETED` entity **MUST** be unavailable yet still be returned by exact read as deleted; discovery excludes it by default but includes it on explicit `lifecycle_status=deleted|all`, while search and query assistance exclude it. Admission Candidates **MUST NOT** participate.
 
 The Context Tenant defaults to the subject tenant on the tenant plane. A caller may name a descendant only when the platform PDP authorizes the subject-to-context ancestor relation. The platform plane has no default; without an explicit Context Tenant the verdict **MUST** be absent, with no synthetic not-evaluated state.
 
@@ -595,7 +595,7 @@ Every exact resolution, by either key or as a batch member, **MUST** return meta
 
 The validator **MUST** cover the complete projected result, including tenant availability, rather than only entity `resource_version`. It **MUST** be scoped to the entity, Context Tenant, visibility context, and field projection for which it was issued; a validator from another scope or projection **MUST** yield the full result, never a false unchanged response.
 
-For an Externally Managed Entity, the validator **MUST** derive from the source's opaque revision and content hash, remain unpersisted by Types Registry, and change whenever the platform-visible result for that entity and tenant changes, including source-owned tenant enablement. Validation **MUST** delegate to the owning source's conditional-read semantics under the federation contract.
+For an Externally Managed Entity, the validator **MUST** derive from the source's opaque External Revision together with the platform-owned availability and visibility inputs, remain unpersisted by Types Registry, and change whenever the platform-visible result for that entity and tenant changes, including source-owned tenant enablement. Validation **MUST** delegate to the owning source's conditional-read semantics under the federation contract.
 
 Single and batch reads **MUST** accept caller-supplied validators and return an unchanged outcome instead of the full result when current; batch evaluation is per item. Types Registry **MUST NOT** report unchanged unless currentness is established (`cpt-cf-types-registry-principle-fail-closed`). Callers may use this contract directly or through the P1 SDK cache of `cpt-cf-types-registry-fr-client-cache`.
 
@@ -807,7 +807,7 @@ The system **MUST** prevent SDK clients from treating invalidated registry looku
 
 **Main Flow**:
 1. Types Registry checks managed storage and selects the owning Registry Source Plugin using the ordered Source Claim model.
-2. The plugin resolves or queries the externally managed entity live and returns canonical content, opaque revision, content hash, source lifecycle and ownership/visibility assertions, and authoritative tenant state when required.
+2. The plugin resolves or queries the externally managed entity live and returns canonical content, opaque External Revision, source lifecycle and ownership/visibility assertions, and authoritative tenant state when required.
 3. Types Registry validates federation response conformance, the Registry Reference, and the Source Claim, then applies platform-owned authorization, visibility, lifecycle mapping, availability, and cache/freshness rules.
 4. The domain gear resolves or discovers the entity through the normal Types Registry SDK or REST contract.
 

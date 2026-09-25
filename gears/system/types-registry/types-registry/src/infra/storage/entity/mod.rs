@@ -29,6 +29,7 @@ pub mod coordination_state;
 pub mod dependency;
 #[allow(clippy::module_inception)]
 pub mod entity;
+pub mod entity_gts_segment;
 pub mod instance;
 pub mod instance_revision;
 pub mod operation;

@@ -4012,6 +4012,7 @@ dependencies = [
  "cf-gears-toolkit-db-macros",
  "cf-gears-toolkit-gts",
  "cf-gears-toolkit-macros",
+ "cf-gears-toolkit-odata",
  "cf-gears-toolkit-utils",
  "cf-gears-types-registry-sdk",
  "chrono",

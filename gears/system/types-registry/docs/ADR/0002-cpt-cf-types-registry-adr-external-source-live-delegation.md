@@ -85,7 +85,7 @@ ADR-0011 states the rule this enumeration expresses — Types Registry persists 
 
 * Type Schema or registered Instance content;
 * external entity identifiers;
-* external revisions or content hashes;
+* external revisions;
 * definition, dependency, lifecycle, or search projections;
 * UUID-to-GTS-Identifier mappings;
 * source-owned tenant enablement state;
@@ -107,7 +107,6 @@ Every live external entity result must include at least:
 * entity kind and canonical content — the authored document, in the same slot a Managed Entity's authored document occupies;
 * for a Type Schema, the resolved effective schema and the effective trait artifacts, computed by the plugin;
 * an opaque `external_revision`;
-* a canonical `content_hash`;
 * the ownership scope: platform-wide, or the identifier of the one tenant that owns the entity. This is mandatory, so there is no default to get wrong; an absent scope, or one naming a tenant the platform does not know, is an `INVALID_SOURCE_RESPONSE`. The plugin states this flat fact only — Types Registry expands it into the descendant-visibility relation itself, and the assertion confers no authority, since no write path reaches an external entity (ADR-0009);
 * tenant enablement state when the operation requires tenant-specific availability.
 
@@ -154,16 +153,16 @@ Discovery, search, and query assistance exclude deleted entities because they do
 
 For one exact external entity:
 
-* the same `external_revision` must always identify the same canonical content and `content_hash`;
-* changed canonical content must produce a different `external_revision`;
+* the same `external_revision`, scoped to the entity and the tenant it was issued for, must always identify the same values of every source-owned response field that affects the platform-visible result: canonical content, effective artifacts for a Type Schema, source lifecycle, ownership scope, and source-owned tenant enablement;
+* a change to any of those fields must produce a different `external_revision`;
+* the revision need not change for platform-owned tenant availability or visibility, which Types Registry computes itself and covers with separate validator inputs;
 * Types Registry does not assume that revisions are numeric, monotonic, or comparable across entities or sources.
 
-Revision and hash are protocol metadata. Types Registry:
+The revision is opaque protocol metadata; no content digest accompanies it. Types Registry:
 
-* validates the returned hash against canonical content when present;
-* validates revision/hash consistency against caller- or cache-supplied conditional metadata when available;
-* exposes both for conditional requests and delegates conditional reads to the owning plugin;
-* never persists them as registry state.
+* requires it on every result and rejects a result without one, or one exceeding the length bound, as an invalid source response;
+* carries it verbatim in the external validator and delegates every conditional read to the owning plugin, which alone decides whether the caller's revision is still current;
+* never compares, interprets, or persists it as registry state.
 
 Plugin contract tests and source monitoring verify the revision contract across requests without requiring prior values in Types Registry. `cpt-cf-types-registry-fr-cache-freshness-metadata` makes this conditional metadata a P1 obligation.
 
@@ -171,7 +170,7 @@ Plugin contract tests and source monitoring verify the revision contract across 
 
 The External Registry Source remains responsible for source-owned schema, instance, evolution, and derivation validation. Types Registry validates every live result's GTS envelope, Registry Reference mapping, source-pattern claim, authorization, tenant visibility, and lifecycle exposure before returning it as usable. It validates nothing about the content, and there is no further platform check a result must satisfy: ADR-0011 closes the boundary, so no Managed Entity can depend on an external one, and a consumer reading an external entity directly decides for itself what it needs of it.
 
-Any source assertion used for admission must be bound to the returned `external_revision` and `content_hash`. P1 does not persist external admission receipts. A stateful admission mechanism for external entities requires a future ADR.
+Any source assertion used for admission must be bound to the returned `external_revision`, which identifies the source-owned state — canonical content, effective artifacts, lifecycle, ownership scope, and tenant enablement — the assertion was made over; where exact content matters, the assertion is checked against that canonical content itself, never against a digest of it. P1 does not persist external admission receipts. A stateful admission mechanism for external entities requires a future ADR.
 
 External Registry Sources cannot provide Aliases, and Externally Managed Entities cannot be Alias targets.
 
@@ -216,12 +215,12 @@ All P1 Types Registry operations that require the source fail closed. In particu
 
 This decision is confirmed when:
 
-* Types Registry storage contains no external definition, identifier, revision, content-hash, dependency, lifecycle, tenant-state, or UUID-mapping value in any column;
+* Types Registry storage contains no external definition, identifier, revision, dependency, lifecycle, tenant-state, or UUID-mapping value in any column;
 * a source result that does not satisfy ADR-0007's contract as applicable to the returned identifier is rejected as an invalid source response rather than interpreted, and the affected request fails closed;
 * managed entities continue to resolve entirely from Types Registry storage in P1, and Managed Aliases do so when Alias support is introduced in P2;
 * external single and batch forward/reverse resolution are delegated through the normal Types Registry API;
-* every external response carries revision and hash metadata, returned content hashes are verifiable, and conditional requests reject inconsistent revision/hash pairs;
-* plugin contract tests prove that repeated results with the same external revision have the same canonical content and hash;
+* every external response carries an opaque `external_revision`, and conditional reads are answered by the owning plugin rather than by Types Registry;
+* plugin contract tests prove that repeated results with the same external revision have the same canonical content, effective artifacts, source lifecycle, ownership scope, and source-owned tenant enablement, and that changing any of them changes the revision;
 * integration tests distinguish `NOT_FOUND`, `SOURCE_UNAVAILABLE`, and invalid plugin responses;
 * P1 registry entity list and search tests prove that a selected source failure returns no partial result page;
 * plugin-owned tombstones preserve external reverse resolution after logical deletion;
@@ -313,5 +312,5 @@ This decision directly addresses:
 * `cpt-cf-types-registry-fr-type-query-assistance` - requires plugin-owned query capability behind Types Registry.
 * `cpt-cf-types-registry-fr-tenant-availability` - obtains authoritative external tenant state at decision time.
 * `cpt-cf-types-registry-fr-tenant-enablement` - keeps external tenant enablement source-owned while Types Registry owns managed tenant enablement when that post-P1 capability is introduced.
-* `cpt-cf-types-registry-fr-cache-freshness-metadata` - uses plugin-supplied revision and hash as the external validator without persisting external cache state.
+* `cpt-cf-types-registry-fr-cache-freshness-metadata` - uses the plugin-supplied revision as the external validator without persisting external cache state.
 * `cpt-cf-types-registry-contract-toolkit-plugins` - preserves plugin isolation behind Types Registry.

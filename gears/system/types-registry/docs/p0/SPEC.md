@@ -4,8 +4,9 @@ Derived from [DESIGN.md](../DESIGN.md), [PRD.md](../PRD.md), [database.sql](../d
 P0 is a scope cut of Product P1, not a separate design: every decision below either
 implements a DESIGN clause or records an explicit, named deviation from one.
 
-Status: **approved**. The live execution artifacts are [`plan.md`](./plan.md) and
-[`todo.md`](./todo.md); where this document and the plan disagree on *ordering*, the plan
+Status: **approved**, including the P19/P20 read-scope revisions. The live execution
+artifacts are [`plan.md`](./plan.md) and [`todo.md`](./todo.md); where this document and
+the plan disagree on *ordering*, the plan
 wins (it supersedes §15 — see `plan.md` P1). Where they disagree on a *decision*, that is a
 bug in this document: report it rather than picking one.
 
@@ -56,6 +57,8 @@ without re-registration.
 | Lifecycle `ACTIVE` / `DELETED`, tombstones retained | ADR-0008 |
 | Dry Run as a mode of registration and deletion | `fr-dry-run` |
 | New SDK trait + REST surface for the above | §3.3 |
+| `$select` field projection on exact read, `batchGet` and discovery; one document-free default | §3.3 *Field selection*, plan P19 |
+| Discovery filtering by maximum GTS chain `depth` and entity `kind`, composed with `pattern` before pagination | §3.3 *GET /entities*, plan P20 |
 | SDK reconciliation of explicitly supplied documents; registry-side collection of linked inventory at startup | §3.3, P0 deviation D11 |
 | Three backends: SQLite, PostgreSQL, MySQL | `constraint-multi-backend` |
 
@@ -70,8 +73,8 @@ without re-registration.
 | Federation: `source_claim`, the `routing` coordination state, Registry Source Plugins, Control-Plane Validator | Whole subsystem |
 | Availability Evaluator, `tenant-resolver` dependency | Needs tenancy |
 | Validator inputs that only a tenant or external read has: subject visibility-chain version, Context Tenant availability-chain version, routing generation, `external_revision` | Each is `tenant plane only`, availability-conditional or external, so **none participates in a platform-plane read** — the validator itself is in P0, see §8.5 |
-| Arbitrary `$select` projections | The **default** field set is in P0 — that is what makes discovery content-free (§10.2). Caller-chosen sets additionally need optional fields across the models and a normalized field-set digest inside the validator, and buy nothing while there is one representation to select from (ceiling C7) |
-| `expand_type_filter` and `limits.expansion_references` | Its DESIGN definition *is* `$select=gts_uuid&availability=available`, with the availability filter fixed by the method rather than supplied by the caller. Availability is out of P0 (needs tenancy), so a P0 method of that name would report retired contracts as usable — a same-named different meaning, which is worse than absence. Paging `list_entities` directly is available to any caller that wants the traversal |
+| Availability, reason and Context Tenant ownership-view fields in `$select` | Those values need the tenant availability and visibility work deferred to P1. P0 still supports caller-chosen selection over its managed field allowlist (§10.2, plan P19) |
+| `expand_type_filter` | Its DESIGN definition *is* `$select=gts_uuid&availability=available` (plus explicit `lifecycle_status=active`), with the availability filter fixed by the method rather than supplied by the caller. Availability is out of P0 (needs tenancy), so a P0 method of that name would report retired contracts as usable — a same-named different meaning, which is worse than absence. Paging `list_entities` directly is available to any caller that wants the traversal |
 | Operator purge job, operation-retention sweep | ADR-0013, §3.2 — no P0 consumer |
 | Aliases, Validation Hooks, casting, tenant enablement | P2 in DESIGN |
 
@@ -98,7 +101,9 @@ correctness core, not scope.
 | D9 | **Use `toolkit-db/preview-outbox`** | Closes DESIGN §4's outbox sign-off for this gear |
 | D10 | **`POST /entities` breaks**: `200` + results becomes `202` + operation | No compatibility path on that route. The gear's REST stability is `unstable`; the break is called out in the changelog |
 | D11 | **P0 retains registry-side inventory pull; per-gear push moves to P1** | Supersedes the original P0 push decision (plan P4/P18). types-registry seeds all linked inventory plus `cfg.entities` through the outbox, requiring every seed item to be `succeeded` or `unchanged` before publishing its client. T23 reconciles explicitly supplied documents for existing registration callers; no per-gear inventory filter or new inventory startup calls in P0. C3 remains open until P1 integrates inventory attribution and push with the platform-plane client |
-| D12 | **`GET /entities` becomes a bounded content-free page with a cursor** | The current shape returns every match with its full `content`; with D3 that is *entity count* × up to 1 MB in one response, and the count is now every gear's declarations. DESIGN specifies this route as content-free discovery returning one page and a cursor. A `limit` without a cursor would bound the response by making the endpoint incomplete, so both land together (§10.2) |
+| D12 | **`GET /entities` becomes a bounded page with a cursor, document-free by default** | The old shape returns every match with full `content` in one response. A `limit` without a cursor would make the endpoint incomplete, so both land together. P19 adds `$select` on this page and the two exact-key routes; selected documents are explicit and the discovery cursor binds the normalized selection (§10.2) |
+| D13 | **P0 field projection on all three reads** (plan P19) | An absent `$select` means the same document-free managed metadata set on exact read, `batchGet` and discovery. P0 selects only fields it can answer; documents are flat and individually selectable. One normalized set drives SQL retrieval, cursor identity, T29 validators and T30 cache keys (§10.2) |
+| D14 | **Discovery filters by `pattern`, `depth`, `kind` and `lifecycle_status`, all exact SQL before `LIMIT`** (plan P20) | `depth` is an inclusive maximum GTS chain length; `kind` is `type_schema` or `instance`; `lifecycle_status` defaults to `active`. Admission materializes `entity.chain_depth` and one `entity_gts_segment` row per parsed segment; the repository compiles the `gts-rust`-parsed pattern into one join per constrained segment and fetches `limit + 1`, so only the last page is short. The cursor binds the filters so continuation cannot splice different result sets (§8.2, §10.2) |
 
 ---
 
@@ -170,7 +175,7 @@ store-build cache. Everything else comes from the workspace.
 
 | Concern | Choice |
 |---|---|
-| GTS semantics | `gts` / `gts-id` / `gts-macros` **0.12.0** — **sole** source, no local approximation (`constraint-gts-implementation`). Upgrade from 0.11.0 is part of this task, §7 |
+| GTS semantics | `gts` / `gts-id` / `gts-macros` **0.12.0** — **sole** source, no local approximation (`constraint-gts-implementation`). Upgrade from 0.11.0 is part of this task, §7. Discovery's SQL pattern compiler mirrors the `gts-id` matcher under differential tests (D14) |
 | Persistence | SeaORM via `toolkit-db` `DBProvider`, `sea-orm-migration` |
 | Async dispatch | `toolkit-db` outbox, leased mode, table prefix `types_registry__outbox` |
 | REST | Axum via `OperationBuilder`, utoipa, RFC-9457 problem details |
@@ -334,8 +339,16 @@ out of scope):
 4. Managed identifier profile — refuse an explicit UUID tail (ADR-0001); refuse a minor
    or major 0 in the **last** segment of an Instance identifier (ADR-0004, ADR-0015).
    A minor on a Type Schema identifier is admissible under any prefix.
-5. Declared dialect, Type Schema candidates — top-level `$schema` present and in the
-   closed Draft-07 spelling set; any `$schema` below the root must not differ (ADR-0014).
+5. Declared identity and dialect, Type Schema candidates — the item's `gts_id` is the
+   entity's identity, and the document must agree with it: top-level `$id` is exactly
+   `gts://<gts_id>`, with no trimming, case folding or bare `gts.` spelling. An absent
+   or non-string `$id` is refused as `missing_schema_id`; any other string, malformed or
+   naming another entity, as `schema_id_mismatch`, without echoing the declared value.
+   Both are `400` field violations on `entity` with reason `VALIDATION_FAILED`, before
+   any operation exists, so one such candidate refuses its whole batch. Instances are
+   not checked: their identity is the item's `gts_id` alone. Then top-level `$schema`
+   present and in the closed Draft-07 spelling set; any `$schema` below the root must not
+   differ (ADR-0014).
 6. `force` per candidate — require `allow_compatibility_force` and a waivable
    cross-minor baseline from `compat::select_baseline`. Intra-entity revisions are
    never waivable. Store the request on `operation_item.compat_forced`; each worker
@@ -749,14 +762,17 @@ instance validation against a type. All of that happens **inside** admission, on
 candidate plus what it consumes.
 
 Reads need rows. The exact-read primitive is a keyed lookup, and the list primitive is
-identifier matching that `gts-id` already implements as a pure function on the identifier
-string — the current `InMemoryGtsRepository::list` iterates the store purely as a row
-container and filters with `GtsIdPattern`, never asking the store a semantic question. And
+identifier matching, a pure function of the parsed identifier — no store question. And
 by D3 the effective artifacts a reader wants (`resolved_schema`, `effective_traits`,
 `effective_traits_schema`) are already materialized on the current-state row. So a read is
-a `SELECT` plus, for a pattern query, `GtsId::matches_pattern` over the candidate rows in
-Rust. No GTS semantics are reimplemented, so `constraint-gts-implementation` is not
-touched.
+a selected-column lookup (with a kind-selected current-revision join that checks the
+pointer and reads `content` or `provenance` when selected). Discovery (D14) decides every
+filter in one statement: `kind` and `lifecycle_status` on stored columns, `depth` on the
+materialized `chain_depth`, and `pattern` as joins on `entity_gts_segment`, the segments
+`GtsId::segments()` produced at admission. `gts-rust` parses both sides; the repository
+only compiles the parsed pattern (`repo/segment_filter.rs`), and differential tests pin it
+to `GtsId::matches_pattern` on every backend. T22b keeps document columns out of
+metadata-only reads.
 
 **Why the process-local snapshot was rejected.** A snapshot rebuilt after each local
 admission unit cannot satisfy the multi-pod read criterion of §13 — *"two pods, commit on
@@ -835,18 +851,18 @@ What P0 builds is DESIGN's cache minus what needs inputs P0 does not have:
 |---|---|
 | Bounded store, LRU eviction | ✅ — bound is **bytes**, not entries: §3.2 caps one resolved document at 1 MB, so today's `capacity: 1024` bounds memory to nothing useful. DESIGN's argument, adopted |
 | Freshness window, `0` meaningful and supported | ✅ — DESIGN's 30 s default replaces today's 1 min |
-| `fresh` per-call bypass | ✅ — without validators it re-reads from the source rather than revalidating, which is the same guarantee for the caller |
+| `fresh` per-call bypass | ✅ — T29's validator makes the call revalidate unconditionally against the source, even within the freshness window |
 | Invalidation on an observed terminal mutation, across identifier and UUID keys | ✅ — a client observes a mutation when a poll or the reconciliation helper returns a terminal successful outcome, **not** when the `POST` is accepted |
 | Entries indexed by both identifier and UUID | ✅ — already true of the current cache |
 | `NotFound`, `Failed`, discovery pages and operation resources never cached | ✅ — all four are expressible in P0 |
-| Key includes visibility context, Context Tenant, normalized projection | ❌ — no tenancy and no projections in P0. The key carries the fields as fixed markers so P1 adds dimensions without reshaping it |
+| Key includes visibility context, Context Tenant, normalized projection | ✅ for the selected-field set from T22b; visibility context and Context Tenant remain fixed P0 markers. A narrow entry never answers a wider selection |
 | Batched conditional revalidation against validators, fail-closed | ✅ — §8.5 puts validators in P0, so expiry sends expired keys and their validators in one conditional `batchGet` and keeps an `unchanged` entry. A failed revalidation propagates and never extends the window |
 
 The cache is not carried over as-is: it is typed on `GtsTypeSchema` / `GtsInstance`, which
 D6 deletes, so it is ported onto `EntitySnapshot` when the new trait lands. Until then the
 existing cache keeps serving the old trait untouched.
 
-Ceiling C7 records what is still fixed rather than derived: the visibility and projection key dimensions.
+Ceiling C7 records what is still fixed rather than derived: visibility and Context Tenant key dimensions. Projection is real in P0.
 
 ---
 
@@ -941,7 +957,7 @@ for a gRPC adapter without adding domain methods — every REST handler is a map
 | The new SDK trait | Transport-agnostic — no Axum, no HTTP types, no serde in the SDK crate |
 | The async protocol | Submit → operation id → poll. No streaming, callbacks or shared memory |
 | Multi-pod correctness (D4) | Already assumes several processes against one database |
-| Materialized artifacts (D3) | A remote reader gets everything in one response; the server holds no per-caller state |
+| Materialized artifacts (D3) | A remote reader can select all needed artifacts in one response; the server holds no per-caller state |
 
 **The pull model is an in-process-only assumption, and it blocks OoP.**
 `all_inventory_type_schemas()` collects `inventory` records linked into *this* binary. A gear
@@ -982,13 +998,14 @@ need the inputs tenancy supplies; DESIGN §3.3's own input table
 | subject visibility-chain version | ✓ **tenant plane only** | **no** — DESIGN: *"a platform read has no subject visibility chain"*, and §8.4 establishes every P0 read is platform-plane |
 | Context Tenant availability-chain version | ✓, only when availability is selected | **no** — availability is out of scope, and the input is conditional even in P1 |
 | routing generation | — external only | **no** — federation is out of scope |
-| `external_revision`, `content_hash` | — external only | **no** — Externally Managed Entities are out of scope |
-| normalized projection | ✓ | **yes**, as a constant — no caller-chosen `$select` exists (§10.2). One marker suffices because the only two validated surfaces, the exact read and `batchGet`, share one default set; a discovery page carries no validator at all |
+| `external_revision` | — external only | **no** — Externally Managed Entities are out of scope; managed revisions already move `resource_version` |
+| normalized projection | ✓ | **yes** — T22b normalizes the actual selected-field set for exact read and `batchGet`. Absent `$select` equals an explicit default set; order and case do not alter the digest. Discovery pages carry no validator |
 
 The tenant inputs are not missing from P0. They **do not participate** in a platform-plane
 managed read, by DESIGN's own rule. So the P0 validator is complete rather than approximate:
 a versioned digest over `resource_version`, `resolution_fingerprint` where the kind has one,
-and the default-projection marker.
+and the normalized selected-field set. A validator for a narrow representation cannot
+match a wider one, even if the underlying entity version is unchanged.
 
 `resolution_fingerprint` is not redundant beside `resource_version`, and this is the case a
 simpler digest gets wrong: a dependent's effective schema is refreshed when a base is revised
@@ -1002,7 +1019,7 @@ cache holds one as authority.
 **Wire form is DESIGN's**: base64url of a versioned JSON object, byte-identical in the `ETag`
 header and in batch bodies, 128-bit digest for the managed case. Comparison decodes the fields
 rather than matching encoded strings. The version field is load-bearing — it is what lets P1
-add the chain versions and a real projection digest while refusing to honour a P0 token
+add the chain versions while retaining the projection digest and refusing to honour a P0 token
 (ceiling C7).
 
 **Where they apply.** Exact reads carry an `ETag`; a matching `If-None-Match` returns a bodyless
@@ -1064,7 +1081,7 @@ Successful admissions carry no compatibility diagnostics.
 
 ## 9. Database
 
-`database.sql` is the normative target. P0 creates **10 of its 11 tables**, omitting only
+`database.sql` is the normative target. P0 creates **11 of its 12 tables**, omitting only
 `source_claim` (federation). The exception is `coordination_state`, which arrives in its
 own second migration rather than the initial one, because the initial migration is
 already applied on every existing installation and would never deliver a new table to it.
@@ -1088,7 +1105,8 @@ every P0 entity.
 | Table | P0 |
 |---|---|
 | `version_family` | full, global scope only |
-| `entity` | full, global scope only |
+| `entity` | full, global scope only; `chain_depth` materialized (D14) |
+| `entity_gts_segment` | full — one row per parsed segment, written with the entity (D14) |
 | `type_schema_revision` | full |
 | `instance_revision` | full |
 | `type_schema` | full — artifacts materialized (D3) |
@@ -1107,6 +1125,10 @@ Migration notes:
 - `coordination_state` in its own second migration, `m2026NNNN_000002_coordination_state.rs`,
   seeding `entity_write_order` at sequence zero with a migration timestamp; re-running it
   against a database that already has the table and row preserves both.
+- `entity.chain_depth`, `entity_gts_segment` and the discovery indexes in
+  `m20260925_000005_entity_gts_segment.rs`. It has no backfill, so it refuses while
+  `entity` holds a row; SQLite's `chain_depth` is nullable with a CHECK rejecting NULL,
+  because SQLite cannot add a `NOT NULL` column without a default.
 - Outbox tables come from `outbox_migrations_with_prefix("types_registry__outbox")`,
   not from this migration.
 - `routing` is not seeded, because federation has not landed: its migration will seed
@@ -1126,13 +1148,14 @@ and remains open until P1. The rows are kept because other documents cite the nu
 |---|---|---|
 | C1 | **Struck by D2.** Was: the whole entity set held in process memory, so entity count becomes a memory bound | Resolved in P0 — the store is transient per admission unit and bounded by the unit's dependency closure (§8.2) |
 | C2 | `idempotency_scope_hash` digests three constants, so the key namespace is **global**: two unrelated callers reusing one key collide with `409` | Real scope arrives with planes and principals at P1 |
-| C3 | **Process-wide inventory pull and placeholder attribution.** P0 only collects declarations linked into the registry process (§8.4); `owning_gear = "types-registry"` is a compatibility placeholder for all admissions, not the actual declaring gear and never authority | P1 #4628: T22 metadata/filtering, per-gear startup push through the platform client, and correction of existing attribution even when authored content is unchanged. `cfg.entities` keeps explicit operator/bootstrap attribution; no owner is inferred from a GTS namespace |
+| C3 | **Process-wide inventory pull and placeholder attribution.** P0 only collects declarations linked into the registry process (§8.4); `owning_gear = "types-registry"` is a compatibility placeholder for all admissions, not the actual declaring gear and never authority | P1 #4628: T22 metadata/filtering, per-gear startup push through the platform client, correction of existing attribution even when authored content is unchanged, and exposing `owning_gear` on reads alongside the ownership view (§10.2). `cfg.entities` keeps explicit operator/bootstrap attribution; no owner is inferred from a GTS namespace |
 | C4 | **Struck by D2.** Was: startup reads the whole table on the platform boot path, so startup time is linear in entity count | Resolved in P0 — no warm-up read; startup cost is the seed set, not the table (§8.2) |
 | C5 | No operation-retention sweep: terminal operations accumulate | The §3.2 sweep, once volume justifies it |
-| C6 | **No PDP.** Access is authenticated but not authorized, contrary to `06`. `#[secure(unrestricted)]` entities reject tenant-scoped queries. Registration policy covers creations only (§8.1 step 3); callers reaching mutations can revise or tombstone eligible entities, including `cf.core.*`, even in closed regions. Lifecycle, version and dependant checks provide no authority check. P0 limits access through internal-only mutation routes (C8) | P1 epic #4628: identity-to-permission binding first, then owner/principal checks before `unit::commit_revision` and `deletion::commit_deletion`, plus `tenant_col` + `PolicyEnforcer` (§12) |
-| C7 | **The validator has no tenant or projection dimensions.** P0's validator digests `resource_version`, `resolution_fingerprint` and a fixed default-projection marker (§8.5); the SDK cache key likewise carries visibility context and projection as constants. Correct while every read is platform-plane and no `$select` exists, and wrong the moment either arrives | The wire form is a **versioned** JSON object, so P1 adds the chain versions and the real projection digest under a new version and refuses to honour a P0 token |
+| C6 | **No PDP.** Access is authenticated but not authorized, contrary to `06`. `#[secure(unrestricted)]` entities reject tenant-scoped queries. Registration policy covers creations only (§8.1 step 3); callers reaching mutations can revise or tombstone eligible entities, including `cf.core.*`, even in closed regions. Lifecycle, version and dependant checks provide no authority check. P0 limits access through internal-only mutation routes (C8). Exact, batch and discovery reads are authenticated only too, and like every v2 route are not exposed through api-gateway | P1 epic #4628: identity-to-permission binding first, then owner/principal checks before `unit::commit_revision` and `deletion::commit_deletion`, plus `tenant_col` + `PolicyEnforcer` (§12) |
+| C7 | **The validator and cache key have no tenant or visibility dimensions.** P0's validator digests `resource_version`, `resolution_fingerprint` and T22b's normalized selected-field set (§8.5); the SDK cache key carries the same projection and fixed visibility/Context Tenant markers. Correct for managed platform-plane reads, and incomplete once tenant visibility or availability arrives | The wire form is a **versioned** JSON object, so P1 adds the chain versions under a new version and refuses to honour a P0 token. The cache key gains real visibility/Context Tenant dimensions without changing its projection rule |
 | C8 | **Platform-plane mutations are internal-only.** Every P0 operation is platform-plane (`plane = 1`), but an in-process gear has no inbound platform-identity validator, api-gateway has no platform listener, and `OperationBuilder` cannot mark a route platform-only (§8.4). Registration and deletion therefore keep `exposed = false`; internal and non-mutating calls retain authentication, because `.anonymous()` without a platform identity would be a regression | A platform listener with `X-ToolKit-Internal-Token` / `PlatformIdentity`, a declarative platform-plane route marker, and a platform-principal/PDP decision before mutation dispatch. Only then may mutation routes be exposed. This is toolkit/api-gateway work outside this gear, and ADR-0006/0008 already ask for the listener |
 | C9 | **Implementation sequencing.** T14 adds reverse-impact refresh; T17 adds compatibility checks and effective waiver provenance, replacing the temporary `force` refusal. ADR-0004 still permanently forbids content revisions of minor-bearing Type Schemas; creation is admissible (§8.1 step 4). C8 keeps mutations internal | Remove this row when Checkpoints 3 and 4 are complete, before T24 exposes consumers. The ADR-0004 restriction remains |
+| C10 | **`batchGet` names at most 100 keys, not DESIGN §3.3's 500.** T22b's default and narrow projections reduce ordinary transfer cost, but `$select=content,resolved_schema,effective_traits,effective_traits_schema` can still request large documents for every key. The item limit is retained without claiming that it bounds aggregate response bytes; reconciliation inspecting more than 100 identifiers pages its reads | T23's reconciliation helper pages `batchGet`. A separately designed response-byte budget may justify lifting the key count later; discovery likewise limits items, and callers selecting documents should request smaller pages (§10.2) |
 
 
 Each ceiling gets a `ponytail:`-style source comment naming the bound and the upgrade
@@ -1148,7 +1171,8 @@ path at the point where it bites.
 once every consumer has moved (D6). During the migration both exist briefly, but the old one
 is not a supported surface — it is a step in the cutover, not a deprecation window.
 
-Shape follows DESIGN §3.3, minus tenancy, projections, validators and federation:
+Shape follows DESIGN §3.3, minus tenancy, availability and federation. T22b supplies
+projection, and T29 supplies validators before the P0 cutover:
 
 ```rust
 #[async_trait]
@@ -1201,8 +1225,22 @@ pub trait TypesRegistryEntities: Send + Sync {
 }
 ```
 
+`BatchGet` carries one `Projection` for all keys, `EntityQuery` carries it for discovery,
+and provided single-read helpers pass it to `batch_get_entities`. The SDK exposes typed
+field constants and `light()` / `with(&[…])` / `full()` selection builders rather than a
+type parameter, preserving object safety. `Default` and an explicit selection of the §10.2
+default fields have one normalized identity. An empty or unsupported selection fails before
+transport; the REST adapter applies the same rules to wire input.
+
+`EntityQuery::filter` carries P0 `pattern`, `max_chain_depth`, `kind` and `lifecycle` alongside its
+projection and page request. `max_chain_depth` maps to REST `depth`; `kind` uses the
+existing `EntityKind` vocabulary. Omitted fields mean no restriction, except `lifecycle`,
+which defaults to `Active`; the server
+applies the same filter before either projected items or cursors are produced (§10.2).
+
 **Reconciliation takes explicitly supplied desired documents in P0 (T23).** It batch-reads
-their identifiers, skips equal authored content, supplies the read `resource_version` for
+their identifiers with `content` selected, compares authored canonical bytes exactly (there is no
+content digest to shortcut it), supplies the read `resource_version` for
 updates, and returns `UpToDate` without submitting if nothing differs. Otherwise it submits
 bounded batches and polls to terminal outcomes, with bounded retries for missing dependencies
 and a deadline. It never discovers inventory or deletes records absent from the supplied set.
@@ -1219,7 +1257,12 @@ materialized documents as **plain fields** — `content`, `resolved_schema`,
 `effective_traits`, `effective_traits_schema` — plus a small `segments` accessor, so a
 consumer that previously called the old models' computed methods reads a field instead.
 No accessor is needed to reach inside a group, because outside `provenance` there is no
-group to reach inside of.
+group to reach inside of. `gts_id`, `gts_uuid`, `kind` and `lifecycle_status` are plain
+fields, present on every snapshot; the rest are optional because selection may omit them;
+`Some` containing JSON `null` still represents a selected document, while `None` means
+unselected or inapplicable. `origin` has only the managed variant in P0 and carries
+`resource_version` and timestamps; `provenance` follows §10.2. List
+helpers explicitly select the documents they read, on the page or through `batchGet`.
 
 **The old models' client-side `effective_*` methods are deleted, and duplication is the
 weakest of three reasons.**
@@ -1239,7 +1282,8 @@ weakest of three reasons.**
    the OoP blocker recorded in §8.4.
 
 D3 removes the need entirely: the server materializes `resolved_schema`, `effective_traits`
-and `effective_traits_schema` at admission, through `gts-rust`, and a read returns them.
+and `effective_traits_schema` at admission, through `gts-rust`, and a read returns each
+when explicitly selected.
 
 **Consequence for the migration, stated because it will look like a regression.** A
 materialized value is not always byte-equal to what the old method returned — it differs
@@ -1256,7 +1300,8 @@ than faked now.
 
 Models: `EntityKey`, `EntityLookup` (`Found` / `Unchanged` / `NotFound`; no `Failed`
 without federation), `EntitySnapshot`, `EntityKind`, `LifecycleStatus`,
-`Provenance`, `BatchGet`, `BatchGetItem`,
+`Origin::Managed`, `Provenance`, `Projection`, `FieldSelection`,
+`EntityQuery`, `EntityPage`, `BatchGet`, `BatchGetItem`,
 `RegisterEntities`, `RegisterItem`, `DeleteEntities`, `DeleteItem`,
 `RegistrationOperation`, `RegistrationItemResult`,
 `OperationStatus`, `CandidateStatus`. Field-for-field the DESIGN §3.3 shapes with the
@@ -1276,17 +1321,24 @@ Business listener, `.authenticated()`, path `/types-registry/v1/...` per DE0801.
 | `DELETE` | `/types-registry/v1/entities/{entity_key}` | `202` + operation; `200` on terminal replay |
 | `POST` | `/types-registry/v1/entities:batchGet` | `200`, one result per requested key |
 | `GET` | `/types-registry/v1/entities/{entity_key}` | `200`; `404` when absent |
-| `GET` | `/types-registry/v1/entities` | `200` + one content-free page and a cursor |
+| `GET` | `/types-registry/v1/entities` | `200` + one bounded page and a cursor; document-free by default |
 | `GET` | `/types-registry/v1/operations/{operation_id}` | `200` |
 
 `Idempotency-Key` is required on every mutation, both deletion spellings included. Every `202` carries operation
 `Location` and advisory `Retry-After`. Errors are RFC-9457 via
 `modkit::api::problem` with `.standard_errors(openapi)`.
 
+`POST /entities:batchGet` names **at most 100 keys** — the write ceiling, not DESIGN §3.3's
+500. Its default is small, but explicit document selection can make a response large;
+P0 has no aggregate response-byte budget (ceiling C10). Absence is a per-key `not_found`
+inside a `200`, never a `404`:
+one missing key must not lose the answers for the others.
+
 `POST /entities` **breaks** (D10): its success shape changes from `200` + per-item results
 to `202` + operation, on the same path, with no transitional alias. The route's declared
 stability is `unstable`, the change is called out in the changelog, and any REST caller
-must move to submit-then-poll. `GET /entities/{gts_id}` keeps its current response shape.
+must move to submit-then-poll. `GET /entities/{entity_key}` keeps its route and `200`/`404`
+semantics, but T22b changes its default representation as described below.
 
 **The break is withdrawn for the T9a–T24 window** (`plan.md` P12). T9 took it early by
 repointing the existing v1 routes at the database, which changed `POST /v1/entities`'s
@@ -1314,47 +1366,119 @@ break above is reinstated there. Route paths come from one constant per version
 rather than a sweep. The table above describes the **post-T24a** surface, which is the P0
 end state.
 
-**`GET /entities` breaks too, and this is the second wire break (D12).** Today it returns
-every match in one array, each item carrying its full `content`. DESIGN specifies this route
-as *"content-free discovery"* returning *"one page and a cursor"*, and P0 adopts that:
+**The read representation breaks too (D12–D14).** The old `GET /entities` returns every
+match in one array, each item carrying full `content`; old exact reads likewise include
+documents by default. P0 makes discovery a page and adopts DESIGN §3.3's field selection:
 
-- **A page, not a list.** `limit` defaults to 100 and may not exceed 1000; the response
-  carries a cursor when more remains. Ordering is by canonical identifier and deleted
-  entities are excluded, which is what makes the cursor a plain keyset — `gts_id` is unique
+- **A page, not a list.** `limit` defaults to 50 and may not exceed 100; the response
+  carries a cursor exactly when another match remains, and a page with a cursor is full
+  (the query fetches `limit + 1`). Ordering is by canonical identifier, which is what
+  makes the cursor a plain keyset — `gts_id` is unique
   and immutable, so a page boundary cannot drift or duplicate. Cursors come from
   `toolkit-odata`, which already encodes them as versioned base64url and refuses an unknown
-  version.
-- **Content-free by default.** The default field set is identity and metadata; `content`,
-  `resolved_schema` and `effective_traits` are not on a discovery page. Arbitrary `$select`
-  stays out of P0 (§2), so the default set is the *only* set — which is why it must be the
-  right one.
-
-**Callers do not choose fields in P0, and there is one default set per surface, not one per
-gear.** A discovery page is content-free; an exact read and `batchGet` return the full
-representation, authored content plus the materialized artifacts of D3. Discovery answers
-*what exists*, an exact read answers *what is in it*, and DESIGN's *"absent `$select` equals an
-explicit default set"* is read per surface.
-
-**A request carrying `$select` is refused, not ignored.** Silently returning a full
-representation to a caller that asked for one field is worse than a refusal on three counts:
-the caller gets up to 1 MB it did not ask for, it may build on behaviour that P1 will change
-under it, and the validator would be computed over a projection the caller does not believe it
-has. The refusal is an RFC-9457 problem naming `$select` as unsupported at this version. This
-is deliberately unlike the retired cache config keys, which are accepted-and-ignored: a
-deployment must not fail to start over a stale setting, while a request must not be answered
-with something other than what it asked for (`principle-fail-closed`).
+  version. `depth`, `kind` and a non-default `lifecycle_status` join the cursor's filter
+  hash as terms added only when present, on top of T22b's pattern/`$select` expression:
+  no release preceded T22c, so the wire version stays `CursorV1`'s `1`, and naming or
+  changing any of them is a `400`. A token resumes only while its canonical `$select`
+  is unchanged.
+- **Lifecycle filter (discovery only).** `lifecycle_status=active|deleted|all`, default
+  `active`: `active` lists live entities, `deleted` only tombstones, `all` both. It is an
+  SQL predicate on the stored status, intersected with the other filters before the page
+  limit. Unknown, empty or repeated values are a `400` naming `lifecycle_status`.
+  Exact reads and `batchGet` are unchanged: they always return tombstones by key.
+- **P0 discovery filters.** `pattern` is a GTS pattern parsed by `gts-rust` and matched
+  exactly in SQL over the stored segments (D14). `depth` is an optional **inclusive maximum number of
+  GTS identifier segments**: a one-segment root has depth 1, and a derived type or
+  Instance tail adds one for each segment. The same rule applies with or without
+  `pattern`; a filter of `depth=2` includes depth 1 and 2. REST accepts an integer
+  `1..=255` (the SDK uses `u8`) and refuses zero, negative, non-integer and overflow
+  values with an RFC-9457 `depth` field violation. Count parsed `GtsId::segments()`,
+  stored as `entity.chain_depth`; do not count `~` characters or traverse dependency
+  edges. `kind` is optional and
+  accepts only `type_schema` or `instance`, using the stored `entity.kind` and the
+  same enum as read results; unknown values are `400` naming `kind`. The old v1
+  `is_schema` spelling is not an alias. A caller may
+  combine `pattern`, `depth`, `kind` and `lifecycle_status`; all are intersected
+  **before** the page limit and projection. `limit` and `cursor` control
+  traversal, while `$select` controls returned fields; none changes the match predicate.
+- **One document-free default on all three reads.** Absent `$select` is identical to an
+  explicit selection of `gts_id,gts_uuid,kind,origin,lifecycle_status`.
+  `origin` has only the `managed` variant in P0 and carries `resource_version`, `created_at`
+  and `updated_at`; its `external` variant waits for federation. The P0 default omits
+  DESIGN's availability/reason and Context Tenant ownership view, which cannot be answered
+  without tenancy. `owning_gear` is internal attribution, not ownership: P0 persists it
+  on the entity (§9) but returns it on no read, neither in `provenance` nor as a
+  stand-in for the missing ownership view, and defines no ownership group. Exposing it
+  is P1 work, designed with that view. REST `origin` is
+  an internally tagged object: `{"type":"managed","resource_version":1,
+  "created_at":"...","updated_at":"..."}`; timestamps use RFC 3339. Federation's external
+  variant adds `{"type":"external","source":"..."}` without changing the managed shape.
+- **P0 selectable fields.** The complete allowlist is the five default fields plus
+  `content`, `resolved_schema`, `effective_traits`, `effective_traits_schema` and
+  `provenance`. `content` is the whole authored JSON document for either kind. The three
+  effective documents apply only to Type Schemas and are absent on Instances. Each document
+  is selected independently and appears at the top level; there is no `effective` or
+  `authored` wrapper. `provenance` is the one group and contains exactly `gts_spec_version`,
+  `gts_impl_version` and `compat_forced` (`null` for Instances). Selecting
+  a group returns it whole; selecting a document never projects paths inside its JSON.
+- **No content digest.** Authored content has no stored or selectable digest, so no
+  digest name is in the allowlist. Reconciliation selects `content` and
+  compares canonical authored bytes before deciding `UpToDate`, and admission compares
+  them before deciding `unchanged`. The `ETag` inputs above are unaffected.
+- **Selection rules.** Field names are case-insensitive with surrounding whitespace
+  trimmed, matching ToolKit OData parsing. Normalize them to a sorted, unique canonical
+  set; order does not affect identity, while duplicates are rejected by the parser.
+  An empty, unknown, unavailable, nested, malformed or excessive selection is `400`
+  RFC-9457 with a field violation naming `$select` and reason `INVALID_SELECT`, the
+  reason ToolKit's own parser reports. *Unavailable* means a DESIGN §3.3 field P0 cannot
+  answer — `availability` and `owned_by_context_tenant` — and *nested* any name
+  containing `.` or `/`. The canonical identity is the selected names sorted and
+  comma-joined, e.g. `content,gts_id,gts_uuid,kind,lifecycle_status`. In particular, reject empty comma
+  segments such as `$select=content,,kind`: ToolKit's parser currently drops those,
+  so the gear checks the raw spelling as well. Honor ToolKit's 2048-character and
+  100-field parser limits. `gts_id`, `gts_uuid`, `kind` and `lifecycle_status` are
+  mandatory on every entity of all three reads, whatever `$select` names, including a
+  deleted result, so a narrow projection still says which documents apply;
+  they are always in the normalized effective set, so naming them does not change cursor,
+  validator or cache identity. Unselected fields
+  are omitted, while a selected JSON `null` remains present. `key`, per-key status and
+  `etag` are batch result
+  envelope metadata outside selection. An exact `ETag` is likewise outside the body.
+  REST DTOs and OpenAPI mark the four mandatory fields required and non-nullable and
+  every other field optional, omitting an unselected one; selected nullable values
+  remain present as JSON `null`.
+- **Transport placement.** Exact `GET /entities/{entity_key}` and discovery `GET /entities`
+  take `$select` in the query. `POST /entities:batchGet` takes one top-level body
+  `"$select"` string applying to every `items[]` key, never a per-item selection or query
+  parameter. Its per-item `if_none_match` remains independent. The GET routes register
+  ToolKit's OData `$select` parameter and use its extractor; this gear accepts only its
+  declared options (`pattern`, `depth`, `kind`, `lifecycle_status`, `limit`/`$top`,
+  `cursor`/`$skiptoken` on discovery;
+  `$select` on exact read) and rejects unsupported OData options, v1-only filters and
+  unknown unprefixed parameters rather than silently ignoring them.
+- **Cursor and storage contract.** Discovery's cursor binds the normalized selection in
+  addition to `pattern`, `depth`, `kind`, `lifecycle_status` and the keyset position;
+  changing any bound filter or the selection on continuation is `400`. Absent
+  `depth`/`kind` are distinct from explicit values and must be bound as such; absent
+  `lifecycle_status` and explicit `active` are one binding.
+  Absent selection and an explicit default set are interchangeable. The hidden canonical
+  `gts_id` used for ordering remains available even if the caller does not select it.
+  A metadata-only read does not fetch or parse authored/effective JSON. Selected documents
+  are fetched in bounded batches within the same database snapshot as identity/current
+  state, through SecureORM, without one query per entity. Trimming a fully hydrated DTO
+  with `apply_select()` would not satisfy this storage contract.
 - **No validator on a page** (§8.5): a page is a changing set, not an exact-key answer.
 
-Why this is not deferrable to P1 despite being a break: the current shape is unbounded in
-both directions. With effective artifacts materialized (D3) a single response is
-*entity count* × up to 1 MB, and the entity count is now every gear's declarations rather
-than one gear's. A `limit` alone would not fix it either — without a cursor a caller cannot
-reach the rest of the set, so the bound would make the endpoint incomplete instead of large.
+Why pagination is in P0: the old discovery response is unbounded in entity count, and the
+entity count is now every gear's declarations. A `limit` alone would make the endpoint
+incomplete without a cursor. The default page is document-free; a caller selecting
+documents may ask for a smaller `limit`. P0's fixed item limits and per-document budgets
+do not amount to an aggregate response-byte budget (C10).
 
 **Consequence for the SDK, stated because it changes consumer code.** `list_instances` and
 `list_type_schemas` are provided helpers over `list_entities` (§10.1), and their ~87 existing
-call sites read payloads from the result. With a content-free page the helpers hydrate through
-`batchGet` — one extra round trip per page, absorbed by the client cache (§8.3) on repeat.
+call sites read payloads from the result. The helpers explicitly select those documents,
+on the page itself or through an optional `batchGet` for per-key validators and caching (§8.3).
 The result is complete with respect to the traversal rather than to an instant, which is the
 same trade DESIGN accepts for type-filter expansion.
 
@@ -1373,8 +1497,8 @@ gears:
         resolution_closure: 64
         batch_candidates: 100
         activation_write_set: 512      # DESIGN §3.2; the profile is §4
-        page_size_default: 100         # `GET /entities`, DESIGN §3.3
-        page_size_max: 1000
+        page_size_default: 50          # `GET /entities`, DESIGN §3.3
+        page_size_max: 100             # at most 100, the batch-read ceiling (C10)
       registration_policy: {}          # closed by default; global `cf` implicit
       worker:
         operation_timeout: 5m          # T21 lease-handler budget; must be > 0. Not
@@ -1750,25 +1874,38 @@ identifier profile refusals, topological order, baseline selection.
 | Failed revalidation | error propagates, window is not extended (`principle-fail-closed`) |
 | Validator of an unchanged entity | byte-identical across two reads; a revision changes it |
 | Validator of a dependent refreshed by a base revision | changes even though its own `resource_version` did not move |
-| `If-None-Match` with the current validator | bodyless `304`; with a stale one, `200` and the document |
+| `If-None-Match` with the current validator | bodyless `304`; with a stale one, `200` and the selected representation |
 | `batchGet` with a mix of current and stale validators | `200`, `unchanged` for current keys, snapshots for the rest |
 | Instance validator | omits `resolution_fingerprint` and still changes on revision |
 | Validator with an unknown version field | rejected, never treated as a match |
+| Same key under two selected-field sets | validators differ; a narrow token never answers `unchanged` for a wider selection. Reordered and explicit-default selections yield the same token |
 | Type Schema whose `$ref` targets a type **outside** its derivation chain | `resolved_schema` closes over that reference too — the case the deleted client-side `effective_schema` left unresolved (§10.1) |
 | `effective_traits` of a chain with a trait default at two levels | matches `gts-rust`, not the deleted client-side merge order |
-| Request carrying `$select` | refused with an RFC-9457 problem naming the parameter, never answered with the default representation |
+| `$select` on exact read, `batchGet` and discovery | each applies the same field allowlist and document-free default; exact and batch return the same projected entity for one key; each document can be selected alone |
+| Invalid `$select` | empty, empty comma segment, duplicate, unknown, unavailable, nested and over-limit fields return RFC-9457 `400` naming `$select`; unsupported OData options and unknown unprefixed query keys are refused |
+| Projected Instance and deleted entity | Type Schema-only fields are absent for an Instance; `$select=resolved_schema` on an Instance still returns exactly the mandatory `gts_id`, `gts_uuid`, `kind: instance`, `lifecycle_status`; a deleted exact read with `$select=content` still includes `kind` and `lifecycle_status: deleted` |
+| Metadata-only exact/batch/discovery reads | instrumented storage proves no authored/effective JSON column is fetched or parsed; selected documents are fetched in bounded, snapshot-consistent batches on SQLite, PostgreSQL and MySQL |
+| Content equality and reconciliation | no digest field is selectable; `unchanged` and `UpToDate` follow exact canonical authored-byte equality |
 | Registration policy, four DESIGN §3.2 entries | each admits and refuses exactly what §10.3's table says, including the exact-key-versus-`~*` split |
 | Per-parameter resolution | longest literal prefix wins; an exact key beats any pattern; an entry omitting `allowed_vendors` is skipped so a less-specific entry supplies it; no entry means closed |
 | `allowed_vendors` of a more specific entry | replaces, never extends, a less-specific set |
 | Region with no entry | first creation refused, naming region **and** parameter |
 | Revision or deletion in a closed region | admitted — closing a region must not freeze existing entities |
 | Config carrying `tenant_ownable` | parsed and validated, never enforced, and never silently treated as enabling tenant ownership |
-| Discovery page | bounded by `limit`, ordered by canonical identifier, deleted entities absent, `content` absent |
+| Discovery page | bounded by `limit`, ordered by canonical identifier, deleted entities absent by default; `content` absent by default and present only when selected |
+| Discovery `lifecycle_status` | `active` (default), `deleted` and `all` list live, tombstoned and both; composes with `pattern`/`depth`/`kind` across sparse pages; malformed or repeated values are `400`; the cursor binds the normalized value |
+| Discovery `depth` and `kind` | a one-segment Type Schema matches `depth=1`, a two-segment derived schema or Instance does not; `depth=2` includes both levels, while `kind=type_schema` and `kind=instance` partition the same active fixture set |
+| Combined discovery filters | `pattern`, `depth`, `kind` and `lifecycle_status` intersect in SQL before `LIMIT`; a sparse match set returns full pages, never an empty page with a cursor, and filtering is independent of `$select` |
+| Discovery pattern semantics | a generated corpus is discovered under every wildcard cut, bare `~*`, minors pinned in early segments, instance tails and UUID-tail patterns, returning exactly what `GtsId::matches_pattern` accepts on SQLite, PostgreSQL and MySQL; a UUID-tail identifier is refused at storage |
+| Invalid discovery filters | `depth=0`, negative, non-integer and overflow values, plus unknown `kind` and legacy `is_schema`, return RFC-9457 `400` with the offending field named |
 | `limit` above `page_size_max` | refused, not silently clamped |
-| Cursor traversal over a set larger than one page | every entity appears exactly once across pages |
-| Entity admitted mid-traversal | the traversal stays consistent: no duplicate and no skipped predecessor, because the cursor is a keyset over an immutable unique `gts_id` |
+| Cursor traversal over a matching set larger than one page, unchanged while it is walked | every matching entity (active by default) appears exactly once across pages |
+| Entity admitted mid-traversal | every entity that continues to match throughout the traversal appears exactly once; a newly admitted `gts_id` behind the cursor is skipped, while one ahead of it can appear. The cursor is a keyset over an immutable unique `gts_id`, not a snapshot, so it never repeats an entity but does not freeze membership |
 | Cursor with an unknown version | rejected rather than reinterpreted |
-| `list_instances` helper over a content-free page | hydrates through `batchGet` and returns payloads, so the call shape consumers use is preserved |
+| Cursor resumed with another selection or filter | changing `$select`, `pattern`, `depth` or `kind` is rejected with `400`; absent `$select` and the explicit default field set resume interchangeably |
+| Filtered cursor traversal | mixed depths and kinds across multiple pages produce each matching entity exactly once, under any `lifecycle_status`; every page with a cursor is full and the last page has none |
+| SDK cache under two selections | different normalized sets occupy different entries; reordered/default-equivalent selections reuse one entry |
+| `list_instances` helper over a document-free default | selects documents on the page or through `batchGet` and returns payloads, so the call shape consumers use is preserved |
 | Two pods, concurrent dependency change | commit-time revision-vector mismatch rolls back and retries |
 | Dry Run | full check sequence runs, nothing committed, `resource_version` unmoved |
 | Dry Run of a batch | matches real-run statuses/reasons on identical initial state; admits a referrer to an in-batch base and refuses an Instance invalidated by an in-batch revision |
@@ -1795,7 +1932,8 @@ references.
   code organisation, layering, DB access and test shape. **Ignore
   `guidelines/DNA/languages/RUST.md` — it is outdated.**
 - Take GTS semantics from `gts-rust`. A missing behaviour is an upstream change request,
-  never a local approximation (`constraint-gts-implementation`).
+  never a local approximation (`constraint-gts-implementation`). Discovery's SQL
+  compiler is the one mirror, and it stays under differential tests (D14).
 - Keep repositories on `runner: &impl DBRunner` and the Secure ORM; raw SQL only in
   migration definitions.
 - Validate at the admission boundary before touching storage.
@@ -1889,8 +2027,13 @@ is the executable task list. The number is kept because other documents cite it.
     a batch read reports `unchanged` per key while returning `200`; a dependent refreshed
     by a base revision gets a new validator even though its own `resource_version` did not
     move (§8.5).
-15. `GET /entities` returns a bounded, content-free page whose cursor traverses the whole
-    set exactly once, and no response is unbounded in item count or in bytes (§10.2, D12).
+15. Exact read, `batchGet` and discovery honor one normalized `$select` contract and
+    return document-free managed metadata by default. `GET /entities` is bounded in
+    item count; under one `pattern`/`depth`/`kind`/`lifecycle_status` filter and one
+    selection its cursor returns no entity twice and returns every entity that matches
+    (active by default) for the whole traversal exactly once;
+    selected documents are fetched only on request. P0 has no aggregate response-byte
+    budget (§10.2, D12–D14, C10).
 16. Every admission decision is diagnosable from the emitted signals alone (§8.6): each terminal
     outcome and each refusal is counted under a closed vocabulary, an `Unknown` compatibility
     verdict and a forced waiver are each distinguishable in the metrics, and no series blends a

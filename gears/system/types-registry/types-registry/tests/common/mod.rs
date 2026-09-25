@@ -173,6 +173,11 @@ where
 /// The database-backed persistence ports, as the gear wires them. Tests that
 /// drive `accept` / `run_operation` / `RegistryService` pass this: the domain names
 /// only its ports, so the adapter is chosen here exactly as `init()` chooses it.
+/// A read document as a tree, to compare with an authored `json!` value.
+pub fn doc(raw: Option<&serde_json::value::RawValue>) -> Option<serde_json::Value> {
+    raw.map(|raw| serde_json::from_str(raw.get()).expect("a read document is JSON"))
+}
+
 pub fn stores() -> Arc<dyn types_registry::domain::ports::Stores> {
     Arc::new(types_registry::infra::storage::Repos)
 }
@@ -588,7 +593,6 @@ pub async fn seed_type_schema_revision(
             entity_id: Set(entity_id),
             revision_no: Set(revision_no),
             raw_schema: Set(raw_schema.to_owned()),
-            content_hash: Set(vec![u8::try_from(revision_no).expect("small revision")]),
             gts_spec_version: Set(gts::GTS_SPECIFICATION_VERSION.to_owned()),
             gts_impl_version: Set(gts::GTS_IMPLEMENTATION_VERSION.to_owned()),
             compat_forced: Set(false),

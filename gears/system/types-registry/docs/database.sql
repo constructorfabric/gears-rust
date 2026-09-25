@@ -6,7 +6,7 @@
 -- JSON documents are stored as canonical UTF-8 text. Externally managed entities
 -- are not stored here.
 --
--- Every GTS Identifier, pattern, and family_key uses varchar(1024), binary
+-- Every GTS Identifier, pattern, segment name, and family_key uses varchar(1024), binary
 -- collation, and an ASCII character set where the backend default is multi-byte.
 -- This preserves exact prefix-range semantics and keeps MySQL indexes within
 -- InnoDB key limits.
@@ -211,8 +211,9 @@ CREATE TABLE types_registry__operation_item (
 -- One logical managed entity per canonical GTS Identifier. Deleted rows remain as
 -- tombstones so issued Registry References stay reverse-resolvable.
 --
--- `gts_uuid` and `entity_kind` are identifier-derived but materialized for portable
--- lookup and constraints. The write path verifies them and the ownership projection,
+-- `gts_uuid`, `entity_kind` and `chain_depth` (`GtsId::segments().len()`) are
+-- identifier-derived but materialized for portable lookup, constraints and
+-- discovery filters. The write path verifies them and the ownership projection,
 -- which is copied from version_family for scoped, join-free reads. `owning_gear` is
 -- caller-declared attribution, never authority; it is required for global entities
 -- and optional for tenant-owned entities.
@@ -226,6 +227,7 @@ CREATE TABLE types_registry__entity (
     gts_id                   varchar(1024) COLLATE "C" NOT NULL,
     -- 1 type_schema, 2 instance
     entity_kind              smallint      NOT NULL,
+    chain_depth              smallint      NOT NULL,
     family_id                bigint        NOT NULL,
     ownership_scope          smallint      NOT NULL, -- 1 global, 2 tenant
     owner_tenant_id          uuid          NULL,
@@ -244,6 +246,8 @@ CREATE TABLE types_registry__entity (
         REFERENCES types_registry__version_family (id) ON DELETE RESTRICT,
     CONSTRAINT ck_tr_entity_kind
         CHECK (entity_kind IN (1, 2)),
+    CONSTRAINT ck_tr_entity_chain_depth
+        CHECK (chain_depth >= 1),
     CONSTRAINT ck_tr_entity_owner CHECK (
         (ownership_scope = 1                          -- global
             AND owner_tenant_id IS NULL
@@ -275,16 +279,64 @@ CREATE INDEX idx_tr_entity_visibility
         gts_id
     );
 
+-- Serves discovery `depth=1` in `gts_id` order.
+CREATE INDEX idx_tr_entity_depth
+    ON types_registry__entity (chain_depth, gts_id);
 
--- Type Schema admission snapshot: authored document, content hash, and
--- validation-engine provenance. The write path treats snapshot fields as immutable;
+-- Serves discovery by `kind` under one `lifecycle_status` in `gts_id` order.
+-- `kind` leads so that a query without it cannot pick this index and sort: with
+-- `lifecycle_status` first, MySQL did so for every page.
+CREATE INDEX idx_tr_entity_kind_lifecycle
+    ON types_registry__entity (entity_kind, lifecycle_status, gts_id);
+
+-- Serves discovery under one `lifecycle_status` in `gts_id` order: tombstone-only
+-- listings, and active pages with or without a pattern range, with no sort.
+CREATE INDEX idx_tr_entity_lifecycle
+    ON types_registry__entity (lifecycle_status, gts_id);
+
+
+-- One row per parsed segment of entity.gts_id, written with the entity and never
+-- updated. Discovery compiles a gts-rust-parsed pattern into one join per
+-- constrained segment: exact name, major and type marker for a concrete segment,
+-- minor only when the pattern names one; a name prefix range and optional major
+-- for a trailing wildcard. Managed identifiers carry no UUID tail (ADR-0001).
+CREATE TABLE types_registry__entity_gts_segment (
+    entity_id     bigint        NOT NULL,
+    segment_no    smallint      NOT NULL, -- 0-based chain position
+    segment_name  varchar(1024) COLLATE "C" NOT NULL, -- vendor.package.namespace.type
+    major         bigint        NOT NULL,
+    minor         bigint        NULL,
+    is_type       boolean       NOT NULL, -- segment ends with `~`
+
+    CONSTRAINT pk_tr_entity_gts_segment PRIMARY KEY (entity_id, segment_no),
+    CONSTRAINT fk_tr_entity_gts_segment_entity
+        FOREIGN KEY (entity_id)
+        REFERENCES types_registry__entity (id) ON DELETE CASCADE,
+    CONSTRAINT ck_tr_entity_gts_segment_no CHECK (segment_no >= 0),
+    CONSTRAINT ck_tr_entity_gts_segment_version
+        CHECK (major >= 0 AND (minor IS NULL OR minor >= 0))
+);
+
+-- Lets a selective segment filter drive the discovery join.
+CREATE INDEX idx_tr_entity_gts_segment_lookup
+    ON types_registry__entity_gts_segment (
+        segment_no,
+        segment_name,
+        major,
+        is_type,
+        minor,
+        entity_id
+    );
+
+
+-- Type Schema admission snapshot: authored document and validation-engine
+-- provenance. The write path treats snapshot fields as immutable;
 -- the DDL does not enforce immutability. Resolved artifacts belong to current state.
 -- operation_item_id retains the admitting operation provenance until purge.
 CREATE TABLE types_registry__type_schema_revision (
     entity_id                  bigint       NOT NULL,
     revision_no                integer      NOT NULL,
     raw_schema                 text         NOT NULL,
-    content_hash               bytea        NOT NULL,
     gts_spec_version           varchar(32)  NOT NULL,
     gts_impl_version           varchar(32)  NOT NULL,
     -- True when admission explicitly waived cross-minor compatibility.
@@ -306,7 +358,8 @@ CREATE TABLE types_registry__type_schema_revision (
     CONSTRAINT ck_tr_type_schema_revision_no CHECK (revision_no >= 1)
 );
 
--- No content-hash index: equality checks compare only with the current revision.
+-- No content digest or index: `unchanged` compares canonical bytes with the
+-- current revision only.
 
 
 -- Instance admission snapshot, including the exact Type Schema revision that
@@ -317,7 +370,6 @@ CREATE TABLE types_registry__instance_revision (
     entity_id                     bigint       NOT NULL,
     revision_no                   integer      NOT NULL,
     canonical_value               text         NOT NULL,
-    content_hash                  bytea        NOT NULL,
     type_schema_entity_id         bigint       NOT NULL,
     type_schema_revision_no       integer      NOT NULL,
     gts_spec_version              varchar(32)  NOT NULL,
@@ -348,7 +400,7 @@ CREATE TABLE types_registry__instance_revision (
     CONSTRAINT ck_tr_instance_revision_no CHECK (revision_no >= 1)
 );
 
--- No content-hash index; reverse dependency traversal drives schema revalidation.
+-- No content digest or index; reverse dependency traversal drives schema revalidation.
 
 
 -- Current Type Schema revision and its dependency-resolved artifacts. Authored
@@ -458,9 +510,9 @@ CREATE TABLE types_registry__coordination_state (
 -- explicitly removes the claim before deleting its referenced revision.
 --
 -- priority (lower wins) and plugin_entity_gts_id are copied from the plugin for
--- join-free routing and overlap checks. Claims are kind-independent. No specialized
--- pattern-search index or stored upper bound is used because the authoritative GTS
--- matcher must verify every prefilter.
+-- join-free routing and overlap checks. Claims are kind-independent. Claims are
+-- patterns matched against external identifiers, so no pattern-search index or
+-- stored upper bound is used; the GTS matcher verifies every candidate claim.
 CREATE TABLE types_registry__source_claim (
     id                         bigint        GENERATED BY DEFAULT AS IDENTITY,
     gts_id_pattern             varchar(1024) COLLATE "C" NOT NULL,

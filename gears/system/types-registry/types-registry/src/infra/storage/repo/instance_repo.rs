@@ -6,15 +6,18 @@
 //! halves optional on both sides.
 
 use sea_orm::sea_query::Expr;
-use sea_orm::{ActiveValue::Set, ColumnTrait, Condition, EntityTrait, QueryFilter};
+use sea_orm::{ActiveValue::Set, ColumnTrait, Condition, EntityTrait, QueryFilter, QuerySelect};
 use toolkit_db::secure::{
     AccessScope, DBRunner, ScopeError, SecureEntityExt, SecureUpdateExt, secure_insert,
 };
 
 use super::IN_CHUNK;
+use super::type_schema_repo::RevisionReadColumns;
 use crate::domain::ports::{
-    CurrentInstanceRow, CurrentInstanceValue, NewCurrentInstance, NewInstanceRevision,
+    CurrentInstanceRow, CurrentInstanceValue, CurrentReadRow, NewCurrentInstance,
+    NewInstanceRevision,
 };
+use crate::domain::selection::{EntityField, FieldSelection};
 use crate::infra::storage::entity::{instance, instance_revision};
 
 /// Half of [`super::IN_CHUNK`]: each pair binds two parameters rather than one.
@@ -80,11 +83,77 @@ impl InstanceRepo {
                 entity_id: r.entity_id,
                 revision_no: r.revision_no,
                 canonical_value: r.canonical_value,
-                content_hash: r.content_hash,
                 type_schema_entity_id: r.type_schema_entity_id,
                 type_schema_revision_no: r.type_schema_revision_no,
             }));
         }
+        Ok(out)
+    }
+
+    /// See [`super::type_schema_repo::TypeSchemaRepo::read_current`].
+    ///
+    /// # Errors
+    /// Propagates the scoped query's failure from any chunk.
+    pub async fn read_current(
+        runner: &impl DBRunner,
+        scope: &AccessScope,
+        entity_ids: &[i64],
+        selection: FieldSelection,
+    ) -> Result<Vec<CurrentReadRow>, ScopeError> {
+        let mut pointers: Vec<(i64, i32)> = Vec::with_capacity(entity_ids.len());
+        for chunk in entity_ids.chunks(IN_CHUNK) {
+            let rows = instance::Entity::find()
+                .filter(instance::Column::EntityId.is_in(chunk.iter().copied()))
+                .secure()
+                .scope_with(scope)
+                .all(runner)
+                .await?;
+            pointers.extend(rows.into_iter().map(|r| (r.entity_id, r.revision_no)));
+        }
+
+        let mut out = Vec::with_capacity(pointers.len());
+        for chunk in pointers.chunks(PAIR_CHUNK) {
+            let mut pairs = Condition::any();
+            for (entity_id, revision_no) in chunk {
+                pairs = pairs.add(
+                    Condition::all()
+                        .add(instance_revision::Column::EntityId.eq(*entity_id))
+                        .add(instance_revision::Column::RevisionNo.eq(*revision_no)),
+                );
+            }
+            let rows = instance_revision::Entity::find()
+                .filter(pairs)
+                .secure()
+                .scope_with(scope)
+                .project_all(runner, |query| {
+                    let mut query = query
+                        .select_only()
+                        .column(instance_revision::Column::EntityId);
+                    if selection.contains(EntityField::Content) {
+                        query =
+                            query.column_as(instance_revision::Column::CanonicalValue, "content");
+                    }
+                    if selection.contains(EntityField::Provenance) {
+                        query = query
+                            .column(instance_revision::Column::GtsSpecVersion)
+                            .column(instance_revision::Column::GtsImplVersion);
+                    }
+                    query.into_model::<RevisionReadColumns>()
+                })
+                .await?;
+            out.extend(rows.into_iter().map(|mut revision| {
+                let provenance = revision.take_provenance();
+                CurrentReadRow {
+                    entity_id: revision.entity_id,
+                    content: revision.content,
+                    resolved_schema: None,
+                    effective_traits: None,
+                    effective_traits_schema: None,
+                    provenance,
+                }
+            }));
+        }
+        out.sort_by_key(|row| row.entity_id);
         Ok(out)
     }
 
@@ -127,7 +196,6 @@ impl InstanceRepo {
             entity_id: Set(new.entity_id),
             revision_no: Set(new.revision_no),
             canonical_value: Set(new.canonical_value),
-            content_hash: Set(new.content_hash),
             type_schema_entity_id: Set(new.type_schema_entity_id),
             type_schema_revision_no: Set(new.type_schema_revision_no),
             gts_spec_version: Set(new.gts_spec_version),

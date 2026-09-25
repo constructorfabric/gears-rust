@@ -1375,6 +1375,55 @@
         ],
         "type": "object"
       },
+      "BatchGetItemDto": {
+        "additionalProperties": false,
+        "description": "One key in a batch read.",
+        "properties": {
+          "if_none_match": {
+            "description": "This key's validator from an earlier read, which makes just this key\nconditional. The field the two header names lowercase to — `if_none_match`\ngoing out, `etag` coming back — because one `If-None-Match` header cannot\nrepresent a batch of them (DESIGN §3.3).\n\n**No read emits a validator yet:** T29 adds `etag` to a result and the\ncomparison behind it. Until then no value a caller could hold can match, so\nevery present key is read unconditionally and answers `found` — which is\nwhat a stale validator does after T29 too. The field is declared now so the\nwire shape does not change under the callers T23 migrates.",
+            "maxLength": 1024,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "key": {
+            "description": "A canonical GTS identifier or a Registry Reference UUID, classified exactly\nas `GET /entities/{entity_key}` classifies its path segment.",
+            "maxLength": 1024,
+            "type": "string"
+          }
+        },
+        "required": [
+          "key"
+        ],
+        "type": "object"
+      },
+      "BatchGetRequest": {
+        "additionalProperties": false,
+        "description": "A batch read. Unknown fields are refused, so a misspelled `$select` is not\nanswered with the default set.",
+        "properties": {
+          "$select": {
+            "description": "Fields to return for every key, spelled as the GET routes' `$select`.\nAbsent is the document-free default.",
+            "maxLength": 2048,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "items": {
+            "description": "No `max_items`: the ceiling is `MAX_BATCH_GET_KEYS`, applied while the body\nis parsed. Items past it are counted, not kept.",
+            "items": {
+              "$ref": "#/components/schemas/BatchGetItemDto"
+            },
+            "minItems": 1,
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "type": "object"
+      },
       "BatteryInfoDto": {
         "properties": {
           "on_battery": {
@@ -5297,55 +5346,49 @@
         "type": "object"
       },
       "EntityDto": {
-        "description": "One entity with its authored content and the artifacts materialized at\nadmission (D3). No consumer recomputes an effective form.",
+        "description": "One entity, projected by `$select` (SPEC §10.2).\n\n`gts_id`, `gts_uuid`, `kind` and `lifecycle_status` are always present, so a\nprojected item is identifiable, its kind needs no second read, and a tombstone is\nnever mistaken for an absence. An\nunselected field is omitted; a selected document that is JSON `null` stays\npresent as `null`. The three artifacts are absent on an Instance. Documents\nare written as stored, canonical text: keys sorted, no insignificant whitespace.",
         "properties": {
-          "content": {},
-          "created_at": {
-            "format": "date-time",
-            "type": "string"
+          "content": {
+            "description": "The whole authored document, either kind."
           },
-          "effective_traits": {},
-          "effective_traits_schema": {},
+          "effective_traits": {
+            "description": "Type Schemas only."
+          },
+          "effective_traits_schema": {
+            "description": "Type Schemas only."
+          },
           "gts_id": {
+            "description": "Always present.",
             "type": "string"
           },
           "gts_uuid": {
-            "description": "The Registry Reference: a deterministic `UUIDv5` of the identifier.",
+            "description": "Always present. The Registry Reference: a deterministic `UUIDv5` of the\nidentifier.",
             "format": "uuid",
             "type": "string"
           },
           "kind": {
-            "$ref": "#/components/schemas/EntityKindDto"
+            "$ref": "#/components/schemas/EntityKindDto",
+            "description": "Always present."
           },
           "lifecycle_status": {
             "$ref": "#/components/schemas/LifecycleStatusDto",
-            "description": "A tombstone stays exact-readable and only leaves discovery."
+            "description": "Always present. A tombstone stays exact-readable and is listed only on request."
           },
-          "owning_gear": {
-            "description": "Caller-declared attribution. It MUST NOT be used to authorize.",
-            "type": [
-              "string",
-              "null"
-            ]
+          "origin": {
+            "$ref": "#/components/schemas/OriginDto"
           },
-          "resolved_schema": {},
-          "resource_version": {
-            "format": "int64",
-            "type": "integer"
+          "provenance": {
+            "$ref": "#/components/schemas/ProvenanceDto"
           },
-          "updated_at": {
-            "format": "date-time",
-            "type": "string"
+          "resolved_schema": {
+            "description": "Type Schemas only."
           }
         },
         "required": [
           "gts_id",
           "gts_uuid",
           "kind",
-          "lifecycle_status",
-          "resource_version",
-          "created_at",
-          "updated_at"
+          "lifecycle_status"
         ],
         "type": "object"
       },
@@ -5356,6 +5399,76 @@
           "instance"
         ],
         "type": "string"
+      },
+      "EntityLookupDto": {
+        "description": "One key's answer, echoing the key it was asked by.\n\nThe echo is not redundant: a caller that mixed identifiers and Registry\nReferences matches answers to questions without re-deriving either, and an\nabsence has no entity to carry the key for it.",
+        "properties": {
+          "entity": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/EntityDto",
+                "description": "The selected fields, exactly as the exact read returns them for the same\n`$select`. Absent on `not_found`."
+              }
+            ]
+          },
+          "key": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/EntityLookupStatusDto"
+          }
+        },
+        "required": [
+          "key",
+          "status"
+        ],
+        "type": "object"
+      },
+      "EntityLookupStatusDto": {
+        "description": "`found` or `not_found`.\n\nDESIGN's `unchanged` arrives with T29's validators and its `failed` needs\nfederation, which is out of P0 (SPEC §2). Declaring either now would publish a\nvocabulary value this gear never emits, which a generated client would\ntype-check against.",
+        "enum": [
+          "found",
+          "not_found"
+        ],
+        "type": "string"
+      },
+      "EntityLookupsDto": {
+        "description": "The results of one batch read, in request order.",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/EntityLookupDto"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "type": "object"
+      },
+      "EntityPageDto": {
+        "description": "One bounded page of discovery results (SPEC §10.1's `EntityPage`).",
+        "properties": {
+          "items": {
+            "description": "Each item projected exactly as the exact read projects it.",
+            "items": {
+              "$ref": "#/components/schemas/EntityDto"
+            },
+            "type": "array"
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/PageInfoDto"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ],
+        "type": "object"
       },
       "EntryAnnotationRequestDto": {
         "description": "The `PATCH /journal-entries/{entryId}/annotation` request body (Group 2B,\nVariant C): set the typed controlled non-financial `description` note on the\nentry (or one of its lines). `description` is screened for raw customer PII\nbefore any write (`PII_IN_METADATA_VALUE`); `null` clears the note.",
@@ -9267,7 +9380,15 @@
         "description": "One candidate's durable outcome.",
         "properties": {
           "error": {
-            "description": "The refusal as `{reason, message}`, when this candidate failed.\n`reason` is a stable machine-readable code; `message` is an explanation for humans.\nStructured candidate or system-failure details.\nCompatibility messages include causes and schema locations where available.\nClients must not parse `message` or depend on its wording."
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/OperationItemErrorDto",
+                "description": "Present when this candidate failed."
+              }
+            ]
           },
           "gts_id": {
             "type": "string"
@@ -9286,6 +9407,39 @@
         "required": [
           "gts_id",
           "status"
+        ],
+        "type": "object"
+      },
+      "OperationItemErrorDto": {
+        "description": "Why a candidate failed. `reason` is a stable code and may be one the client\ndoes not know; `message` is for humans and must not be parsed.",
+        "properties": {
+          "dependency_id": {
+            "description": "The missing dependency, for `dependency_not_found`.",
+            "type": "string"
+          },
+          "dependency_kind": {
+            "description": "`base`, `conforming_type` or `ref`; newer writers may add kinds.",
+            "type": "string"
+          },
+          "error_code": {
+            "description": "Stable diagnostic code of a `system_failure`.",
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "operation_id": {
+            "description": "The operation a `system_failure` terminalized.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "reason",
+          "message"
         ],
         "type": "object"
       },
@@ -9316,6 +9470,40 @@
           "completed"
         ],
         "type": "string"
+      },
+      "OriginDto": {
+        "description": "Where an entity comes from. P0 has only the managed variant; federation adds\n`external` without changing this one.",
+        "oneOf": [
+          {
+            "properties": {
+              "created_at": {
+                "format": "date-time",
+                "type": "string"
+              },
+              "resource_version": {
+                "format": "int64",
+                "type": "integer"
+              },
+              "type": {
+                "enum": [
+                  "managed"
+                ],
+                "type": "string"
+              },
+              "updated_at": {
+                "format": "date-time",
+                "type": "string"
+              }
+            },
+            "required": [
+              "resource_version",
+              "created_at",
+              "updated_at",
+              "type"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "OsInfoDto": {
         "properties": {
@@ -9721,6 +9909,28 @@
             ]
           },
           "prev_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "limit"
+        ],
+        "type": "object"
+      },
+      "PageInfoDto": {
+        "description": "Where the next page starts.\n\n`next_cursor` and the page size only. No `prev_cursor`, because discovery pages\nforward only, and no total, because counting a set this page did not read would\nbe a second unbounded query.",
+        "properties": {
+          "limit": {
+            "description": "The page size actually applied, which is the default when the caller named none.",
+            "format": "int32",
+            "minimum": 1,
+            "type": "integer"
+          },
+          "next_cursor": {
+            "description": "Present exactly when another match exists, and then the page is full.\nAbsent means this page is the last one.",
             "type": [
               "string",
               "null"
@@ -13107,6 +13317,29 @@
         },
         "required": [
           "operation"
+        ],
+        "type": "object"
+      },
+      "ProvenanceDto": {
+        "description": "Who admitted the current revision and how. Selected as one group.",
+        "properties": {
+          "compat_forced": {
+            "description": "Whether ADR-0004 `force` waived a cross-minor check; `null` for Instances.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "gts_impl_version": {
+            "type": "string"
+          },
+          "gts_spec_version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "gts_spec_version",
+          "gts_impl_version"
         ],
         "type": "object"
       },
@@ -53070,6 +53303,178 @@
       }
     },
     "/types-registry/v2/entities": {
+      "get": {
+        "description": "Return one bounded page of entities, ordered by canonical identifier, with a cursor only when another match remains; a page with a cursor is full. `lifecycle_status` is `active` (default), `deleted` (tombstones only) or `all`. Each item is projected by `$select` exactly as GET /types-registry/v2/entities/{entity_key} projects it; absent, the document-free default; `gts_id`, `gts_uuid`, `kind` and `lifecycle_status` are always returned. A page never carries a validator. `depth` bounds the number of identifier segments and `kind` narrows to Type Schemas or Instances; `lifecycle_status`, `depth` and `kind` intersect with `pattern` before the page limit. `limit` (alias `$top`) defaults to 50 and may not exceed 100; a caller selecting documents should page smaller. `cursor` (alias `$skiptoken`) is opaque, versioned and bound to the pattern, `depth`, `kind`, `lifecycle_status` and the normalized `$select` it was issued for: resuming under any of them changed, or with a token of another version, is a 400, while an absent and an explicit default value of `$select` or `lifecycle_status` are interchangeable. Any other query parameter is refused.",
+        "operationId": "types_registry.list_entities",
+        "parameters": [
+          {
+            "description": "A GTS identifier pattern (GTS spec section 10), with or without a wildcard. With one trailing `*`, starting at a segment token or the version, it matches every identifier under that prefix, derived types and Instances included (e.g. gts.acme.core.*, gts.acme.core.events.user_created.v1~*). Without `*` it must be a valid GTS identifier: a Type Schema identifier matches itself, every type derived from it and every Instance of them (e.g. gts.acme.core.events.user_created.v1~); an Instance identifier matches that Instance. In either form a segment that gives only a major version (`v1`) matches every minor of that major (`v1`, `v1.0`, `v1.3`), while a given minor matches only itself. A pattern that does not parse is a 400",
+            "in": "query",
+            "name": "pattern",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Inclusive maximum number of GTS identifier segments, 1 to 255: a one-segment root has depth 1 and each derived type or Instance tail adds one. Applies with or without `pattern`",
+            "in": "query",
+            "name": "depth",
+            "required": false,
+            "schema": {
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Only entities of this kind: `type_schema` or `instance`. Absent means both; any other value is a 400",
+            "in": "query",
+            "name": "kind",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "`active` (default), `deleted` (tombstones only) or `all` (both). Any other value, empty or repeated, is a 400",
+            "in": "query",
+            "name": "lifecycle_status",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page size, 1 to 100. Defaults to 50. Alias: $top",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The previous page's page_info.next_cursor, under the same pattern, depth, kind, lifecycle_status and $select. Absent starts at the beginning. Alias: $skiptoken",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "OData v4 select expression",
+            "in": "query",
+            "name": "$select",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EntityPageDto"
+                }
+              }
+            },
+            "description": "One page and, while more remains, its cursor"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Discover GTS entities",
+        "tags": [
+          "Types Registry"
+        ]
+      },
       "post": {
         "description": "Submit one or more GTS entities for admission. Returns 202 with the operation's Location; poll GET /types-registry/v2/operations/{operation_id} for the per-candidate outcome. A replay of a terminal operation returns 200. An Idempotency-Key header is required: a replay with the same body returns the same operation, and a different body under the same key is a conflict.",
         "operationId": "types_registry.submit_entities",
@@ -53463,7 +53868,7 @@
         ]
       },
       "get": {
-        "description": "Return one entity with its authored document and the effective artifacts materialized at admission. The key is either a canonical GTS identifier or the Registry Reference UUID derived from it. A deleted entity is still readable and reports its lifecycle status.",
+        "description": "Return one entity, projected by `$select`. The key is either a canonical GTS identifier or the Registry Reference UUID derived from it; a key over 1024 bytes is a 400, and any other key naming no entity is a 404. Absent `$select` is the document-free default `gts_id,gts_uuid,kind,origin,lifecycle_status`; documents are selected individually from `content`, `resolved_schema`, `effective_traits` and `effective_traits_schema` (the last three Type Schemas only), plus the `provenance` group. Names are case-insensitive; an empty, duplicate, unknown or nested name is a 400. `gts_id`, `gts_uuid`, `kind` and `lifecycle_status` are always returned, whether or not `$select` names them, so a deleted entity is still readable and reports it. No other query parameter is accepted.",
         "operationId": "types_registry.get_entity",
         "parameters": [
           {
@@ -53471,6 +53876,15 @@
             "in": "path",
             "name": "entity_key",
             "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "OData v4 select expression",
+            "in": "query",
+            "name": "$select",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -53777,6 +54191,154 @@
           }
         ],
         "summary": "Submit GTS entities for deletion",
+        "tags": [
+          "Types Registry"
+        ]
+      }
+    },
+    "/types-registry/v2/entities:batchGet": {
+      "post": {
+        "description": "Read up to 100 entities in one round trip. Each item names one entity in `key` (a canonical GTS identifier or the Registry Reference UUID derived from it), resolved exactly as GET /types-registry/v2/entities/{entity_key} resolves it. A top-level `$select` string applies to every key and follows that route's `$select` rules; absent, the document-free default. Tombstones are `found`. Returns 200 with one result per requested key, in request order and echoing the key it was asked by: `found` with the selected fields, exactly as the exact read returns them and always including `gts_id`, `gts_uuid`, `kind` and `lifecycle_status`, or `not_found`. Query parameters are refused, `$select` included. A key named twice collapses onto its first mention; the two spellings of one entity are two keys and get two results. An absent key is not a 404: one missing key must not lose the answers for the others. The If-None-Match header is refused rather than ignored: validators are per key and belong in each item's `if_none_match`.",
+        "operationId": "types_registry.batch_get_entities",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BatchGetRequest"
+              }
+            }
+          },
+          "description": "Keys to read",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EntityLookupsDto"
+                }
+              }
+            },
+            "description": "One result per requested key"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "413": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Payload Too Large"
+          },
+          "415": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unsupported Media Type"
+          },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Read a set of GTS entities by key",
         "tags": [
           "Types Registry"
         ]

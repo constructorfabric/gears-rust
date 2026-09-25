@@ -9,10 +9,11 @@ use toolkit_db::secure::{AccessScope, ScopeError};
 use super::overlay::CarriedDocument;
 use super::{AdmissionView, CurrentKind, unsupported};
 use crate::domain::ports::{
-    CurrentDocument, CurrentInstanceRow, CurrentInstanceValue, CurrentSchemaCas,
+    CurrentDocument, CurrentInstanceRow, CurrentInstanceValue, CurrentReadRow, CurrentSchemaCas,
     CurrentSchemaProjection, CurrentTypeSchemaRow, InstanceStore, NewCurrentInstance,
     NewCurrentTypeSchema, NewInstanceRevision, NewRevision, TypeSchemaStore,
 };
+use crate::domain::selection::FieldSelection;
 
 #[async_trait]
 impl TypeSchemaStore for AdmissionView {
@@ -32,6 +33,23 @@ impl TypeSchemaStore for AdmissionView {
         );
         docs.sort_by_key(|doc| doc.entity_id);
         Ok(docs)
+    }
+
+    /// The read path's projected current-state read. Admission compares state through
+    /// [`Self::current_schema_projections`] and writes through the two current-state
+    /// calls; it never needs a batch of materialized artifacts, and an overlay has
+    /// none to give for a candidate whose artifacts this pass only predicted.
+    async fn read_current_schemas(
+        &self,
+        _tx: &DbTx<'_>,
+        _scope: &AccessScope,
+        _entity_ids: &[i64],
+        _selection: FieldSelection,
+    ) -> Result<Vec<CurrentReadRow>, ScopeError> {
+        Err(unsupported(
+            "an admission view does not serve batched current-state artifacts; \
+             the read path does",
+        ))
     }
 
     async fn find_current_schema(
@@ -125,12 +143,7 @@ impl TypeSchemaStore for AdmissionView {
             .await?
             .into_iter()
             .next()
-            .map(|doc| -> CarriedDocument {
-                (
-                    Arc::from(doc.raw_schema.as_str()),
-                    Arc::from(doc.content_hash.as_slice()),
-                )
-            });
+            .map(|doc| -> CarriedDocument { Arc::from(doc.raw_schema.as_str()) });
         // Not `is_ok()`: both compare-and-swap misses already returned above, so
         // failing here means the projection has a current row and the document
         // read found none behind it. That is an inconsistent overlay, not a lost
@@ -180,6 +193,20 @@ impl InstanceStore for AdmissionView {
             return Ok(None);
         }
         self.base.find_current_instance(tx, scope, entity_id).await
+    }
+
+    /// Refused for the reason [`TypeSchemaStore::read_current_schemas`] is.
+    async fn read_current_values(
+        &self,
+        _tx: &DbTx<'_>,
+        _scope: &AccessScope,
+        _entity_ids: &[i64],
+        _selection: FieldSelection,
+    ) -> Result<Vec<CurrentReadRow>, ScopeError> {
+        Err(unsupported(
+            "an admission view does not serve projected current-state reads; \
+             the read path does",
+        ))
     }
 
     async fn insert_instance_revision(

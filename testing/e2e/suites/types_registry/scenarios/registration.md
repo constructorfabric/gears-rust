@@ -71,3 +71,15 @@ This checks batch-level ordering, not every graph-ordering case.
 
 B also reports `dependency_kind=ref` and the missing ID. A is readable; B and C
 return RFC-9457 `404` responses.
+
+### TR-REG-005 — Refuse a Type Schema whose `$id` does not name its item
+
+**Given:** the [person schema](../fixtures/registration/person_schema.json) and its conforming [Instance](../fixtures/registration/person_instance.json), both absent, with the schema's `content.$id` replaced by one of: absent, a non-string, a malformed URI, or the `gts://` URI of another Type Schema.
+
+**When:** submit `[person_instance, person_schema]` in one request.
+
+**Then:**
+
+1. The request is refused synchronously with `400` RFC-9457 `invalid_argument` naming the schema's `gts_id` as `resource_name`, with one field violation on `entity`, reason `VALIDATION_FAILED`, whose description names the expected `gts://<gts_id>`.
+2. No `202`, operation or `Location` is returned, so nothing is admitted.
+3. Neither the schema nor its valid batch neighbour, the Instance, is readable; both return `404`.

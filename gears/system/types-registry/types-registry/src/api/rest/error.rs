@@ -6,7 +6,8 @@ use types_registry_sdk::{field, precondition};
 use crate::domain::admission::acceptance::{AcceptanceError, MAX_IDEMPOTENCY_KEY};
 use crate::domain::admission::worker::WorkerError;
 use crate::domain::error::DomainError;
-use crate::domain::registry_service::ServiceError;
+use crate::domain::registry_service::{MAX_BATCH_GET_KEYS, MAX_KEY_LEN, ServiceError};
+use crate::domain::selection::{EntityField, SelectionError};
 
 #[resource_error(gts_id!("cf.types_registry.registry.type.v1~"))]
 pub struct TypeRegistryError;
@@ -120,6 +121,13 @@ fn opaque_internal(cause: &dyn std::fmt::Display, at: &'static str) -> Canonical
     CanonicalError::internal(OPAQUE_INTERNAL).create()
 }
 
+/// A response body `serde_json` refused to encode: a defect of ours, and not a
+/// blocking-task failure, so it is logged under its own step.
+#[must_use]
+pub fn response_not_serialized(cause: &serde_json::Error) -> CanonicalError {
+    opaque_internal(cause, "response serialization")
+}
+
 impl From<ServiceError> for CanonicalError {
     fn from(e: ServiceError) -> Self {
         match e {
@@ -128,6 +136,7 @@ impl From<ServiceError> for CanonicalError {
             // Storage and database failures are not the caller's fault and carry
             // nothing the caller can act on, so they stay opaque.
             ServiceError::Storage(inner) => opaque_internal(&inner, "storage read"),
+            ServiceError::Blocking(inner) => opaque_internal(&inner, "blocking task"),
             ServiceError::Db(inner) => opaque_internal(&inner, "database read"),
             // A stored document that will not parse is corruption, not input, so
             // the offending value goes to the operator log and not to the caller.
@@ -140,6 +149,32 @@ impl From<ServiceError> for CanonicalError {
             )
             .with_resource(gts_uuid.to_string())
             .create(),
+            // The three read-surface envelope refusals (T22a). Each names the
+            // request field the caller has to change, and each states the bound
+            // rather than the configuration key holding it — as
+            // `AcceptanceError::BatchTooLarge` does, and for the same reason.
+            ServiceError::BatchReadOutOfRange { count } => invalid_field(
+                violation_field::ITEMS,
+                format!(
+                    "a batch read must name between 1 and {MAX_BATCH_GET_KEYS} keys; \
+                     this one named {count}"
+                ),
+                field::VALIDATION_FAILED,
+            ),
+            ServiceError::PageSizeOutOfRange { limit, max } => invalid_field(
+                violation_field::LIMIT,
+                format!("a page size must be between 1 and {max}; this request asked for {limit}"),
+                field::VALIDATION_FAILED,
+            ),
+            // `gts-rust`'s own message: it names the position and the token it
+            // refused, which is what a caller fixing a wildcard needs, and it
+            // describes the caller's input rather than anything of ours.
+            ServiceError::InvalidPattern { message } => invalid_field(
+                violation_field::PATTERN,
+                format!("the pattern is not a GTS identifier pattern: {message}"),
+                field::INVALID_QUERY,
+            ),
+            ServiceError::KeyTooLong { len } => key_too_long(len),
         }
     }
 }
@@ -241,20 +276,36 @@ impl From<WorkerError> for CanonicalError {
             WorkerError::RevalidationRequired(drift) => {
                 opaque_internal(&drift.to_string(), "admission")
             }
+            WorkerError::FailureUnencodable(inner) => {
+                opaque_internal(&inner, "failure payload encoding")
+            }
             WorkerError::Storage(inner) => opaque_internal(&inner, "storage write"),
             WorkerError::Db(inner) => opaque_internal(&inner, "database write"),
         }
     }
 }
 
-/// The three field names this mapping keys violations by, beyond the two
-/// `field::` constants the SDK already publishes.
+/// The field names this mapping keys violations by, beyond the two `field::`
+/// constants the SDK already publishes.
+///
+/// Header and query-parameter names are spelled exactly as the caller sent them,
+/// `$select` included, so a caller greps the violation for the thing it wrote.
 mod violation_field {
     pub const IDEMPOTENCY_KEY: &str = "Idempotency-Key";
     pub const IF_MATCH: &str = "If-Match";
+    pub const IF_NONE_MATCH: &str = "If-None-Match";
     pub const ITEMS: &str = "items";
+    pub const KEY: &str = "key";
+    pub const IF_NONE_MATCH_ITEM: &str = "if_none_match";
     pub const FORCE: &str = "force";
     pub const EXPECTED_RESOURCE_VERSION: &str = "expected_resource_version";
+    pub const PATTERN: &str = "pattern";
+    pub const KIND: &str = "kind";
+    pub const LIFECYCLE_STATUS: &str = "lifecycle_status";
+    pub const DEPTH: &str = "depth";
+    pub const LIMIT: &str = "limit";
+    pub const CURSOR: &str = "cursor";
+    pub const SELECT: &str = "$select";
 }
 
 /// One invalid-argument problem keyed by a field, with no resource attached.
@@ -289,6 +340,209 @@ pub fn if_match_not_supported() -> CanonicalError {
         "If-Match is not supported on this route; name the precondition in \
          expected_resource_version, whose failure is reported on the operation item"
             .to_owned(),
+        field::VALIDATION_FAILED,
+    )
+}
+
+/// Reject the `If-None-Match` **header** on a batch read.
+///
+/// Refused rather than ignored: validators and `unchanged` results are per key,
+/// one header cannot carry a batch of them, and a caller that sent one believes
+/// its request is conditional (DESIGN §3.3). The per-item slot is named in the
+/// message, so the fix is in the refusal.
+#[must_use]
+pub fn if_none_match_not_supported() -> CanonicalError {
+    invalid_field(
+        violation_field::IF_NONE_MATCH,
+        "If-None-Match is not supported on a batch read; carry each key's validator \
+         in that item's if_none_match, because one header cannot represent a batch"
+            .to_owned(),
+        field::VALIDATION_FAILED,
+    )
+}
+
+/// Caller input echoed into a problem document, cut to a bounded length.
+fn shown(raw: &str) -> String {
+    raw.chars().take(64).collect()
+}
+
+/// One refusal for every malformed `depth`, whichever layer spotted it.
+#[must_use]
+pub fn depth_not_recognized(raw: &str) -> CanonicalError {
+    let shown = shown(raw);
+    invalid_field(
+        violation_field::DEPTH,
+        format!("depth must be an integer from 1 to 255, not `{shown}`"),
+        field::VALIDATION_FAILED,
+    )
+}
+
+#[must_use]
+pub fn kind_not_recognized(raw: &str) -> CanonicalError {
+    let shown = shown(raw);
+    invalid_field(
+        violation_field::KIND,
+        format!("kind must be `type_schema` or `instance`, not `{shown}`"),
+        field::VALIDATION_FAILED,
+    )
+}
+
+#[must_use]
+pub fn lifecycle_status_not_recognized(raw: &str) -> CanonicalError {
+    let shown = shown(raw);
+    invalid_field(
+        violation_field::LIFECYCLE_STATUS,
+        format!("lifecycle_status must be `active`, `deleted` or `all`, not `{shown}`"),
+        field::VALIDATION_FAILED,
+    )
+}
+
+/// `0` is refused under the spelling the caller used, before `ToolKit` reports
+/// it as `$top`.
+#[must_use]
+pub fn page_size_zero(name: &str) -> CanonicalError {
+    invalid_field(
+        name,
+        format!("{name} must be a positive page size"),
+        field::VALIDATION_FAILED,
+    )
+}
+
+/// Reason code of every `$select` refusal, matching `ToolKit`'s own `$select` parser.
+const INVALID_SELECT: &str = "INVALID_SELECT";
+
+#[must_use]
+pub fn select_refused(error: &SelectionError) -> CanonicalError {
+    let detail = match error {
+        SelectionError::Empty => "$select must name at least one field".to_owned(),
+        SelectionError::EmptySegment => {
+            "$select must not contain an empty field name between commas".to_owned()
+        }
+        SelectionError::Duplicate(name) => format!("duplicate field in $select: {name}"),
+        SelectionError::Unknown(name) => format!(
+            "'{name}' is not a selectable field; select from {}",
+            selectable_fields()
+        ),
+        SelectionError::Unavailable(name) => format!(
+            "'{name}' is not available at this version; select from {}",
+            selectable_fields()
+        ),
+        SelectionError::Nested(name) => {
+            format!("'{name}' names a path inside a field; $select takes whole top-level fields")
+        }
+    };
+    invalid_field(violation_field::SELECT, detail, INVALID_SELECT)
+}
+
+/// One violation per key, with `ToolKit`'s reason code for the `$` namespace.
+#[must_use]
+pub fn unsupported_query_params(keys: &[&str], allowed: &[&str]) -> CanonicalError {
+    let accepted = if allowed.is_empty() {
+        "this route accepts no query parameters".to_owned()
+    } else {
+        format!("this route accepts only {}", allowed.join(", "))
+    };
+    let violation = |key: &str| {
+        let key = shown(key);
+        let detail = format!("unsupported query parameter `{key}`; {accepted}");
+        (key, detail, "UNSUPPORTED_QUERY_PARAM")
+    };
+    let Some((first, rest)) = keys.split_first() else {
+        return query_params_unreadable("no parameter to refuse");
+    };
+    let (key, detail, reason) = violation(first);
+    let mut error = TypeRegistryError::invalid_argument().with_field_violation(key, detail, reason);
+    for key in rest {
+        let (key, detail, reason) = violation(key);
+        error = error.with_field_violation(key, detail, reason);
+    }
+    error.create()
+}
+
+#[must_use]
+pub fn too_many_query_params(count: usize, max: usize) -> CanonicalError {
+    invalid_field(
+        "query",
+        format!("at most {max} query parameters are accepted; this request has {count}"),
+        field::VALIDATION_FAILED,
+    )
+}
+
+#[must_use]
+pub fn duplicate_query_param(key: &str) -> CanonicalError {
+    invalid_field(
+        key,
+        format!("query parameter `{key}` is given more than once"),
+        field::VALIDATION_FAILED,
+    )
+}
+
+#[must_use]
+pub fn query_params_unreadable(detail: &str) -> CanonicalError {
+    invalid_field(
+        "query",
+        format!("the query string could not be read: {detail}"),
+        field::VALIDATION_FAILED,
+    )
+}
+
+fn selectable_fields() -> String {
+    EntityField::ALL.map(EntityField::name).join(", ")
+}
+
+/// Reject a read key over [`MAX_KEY_LEN`] bytes, whichever layer spotted it.
+#[must_use]
+pub fn key_too_long(len: usize) -> CanonicalError {
+    invalid_field(
+        violation_field::KEY,
+        format!("a key must be at most {MAX_KEY_LEN} bytes; this one is {len}"),
+        field::VALIDATION_FAILED,
+    )
+}
+
+/// Reject a batch-get `if_none_match` longer than a key may be.
+#[must_use]
+pub fn validator_too_long(len: usize) -> CanonicalError {
+    invalid_field(
+        violation_field::IF_NONE_MATCH_ITEM,
+        format!("each if_none_match must be at most 1024 bytes; this one is {len}"),
+        field::VALIDATION_FAILED,
+    )
+}
+
+/// Reject a `pattern` query parameter that exceeds the GTS identifier ceiling
+/// (1 024 bytes).
+#[must_use]
+pub fn pattern_too_long(len: usize) -> CanonicalError {
+    invalid_field(
+        violation_field::PATTERN,
+        format!("pattern must be at most 1024 bytes; this one is {len}"),
+        field::VALIDATION_FAILED,
+    )
+}
+
+/// Reject a `cursor` query parameter that exceeds the cursor size ceiling
+/// (4 096 bytes).
+#[must_use]
+pub fn cursor_too_long(len: usize) -> CanonicalError {
+    invalid_field(
+        violation_field::CURSOR,
+        format!("cursor must be at most 4096 bytes; this one is {len}"),
+        field::VALIDATION_FAILED,
+    )
+}
+
+/// Reject a cursor this build cannot use: unreadable, of an unknown version, or
+/// issued for a different query.
+///
+/// Splicing two traversals would return a page that is neither complete for the
+/// old query nor for the new one, so a mismatch is refused rather than reinterpreted.
+/// `detail` comes from `toolkit-odata`, which distinguishes the cases.
+#[must_use]
+pub fn cursor_not_usable(detail: &str) -> CanonicalError {
+    invalid_field(
+        violation_field::CURSOR,
+        format!("the cursor cannot be used for this request: {detail}"),
         field::VALIDATION_FAILED,
     )
 }
@@ -359,6 +613,25 @@ impl From<AcceptanceError> for CanonicalError {
             ),
 
             // --- the candidate document ---------------------------------------
+            AcceptanceError::MissingSchemaId { gts_id } => invalid_candidate(
+                gts_id,
+                field::ENTITY_FIELD,
+                format!(
+                    "Type Schema '{gts_id}' declares no string top-level $id; \
+                     it must be 'gts://{gts_id}'"
+                ),
+                field::VALIDATION_FAILED,
+            ),
+            // The declared value is not echoed: it is unbounded caller input.
+            AcceptanceError::SchemaIdMismatch { gts_id } => invalid_candidate(
+                gts_id,
+                field::ENTITY_FIELD,
+                format!(
+                    "Type Schema '{gts_id}' declares a top-level $id other than \
+                     'gts://{gts_id}'"
+                ),
+                field::VALIDATION_FAILED,
+            ),
             AcceptanceError::MissingDialect { gts_id } => invalid_candidate(
                 gts_id,
                 field::ENTITY_FIELD,
@@ -597,6 +870,16 @@ mod tests {
                 },
                 field::GTS_ID_FIELD,
                 field::INVALID_GTS_ID,
+            ),
+            (
+                AcceptanceError::MissingSchemaId { gts_id: id.clone() },
+                field::ENTITY_FIELD,
+                field::VALIDATION_FAILED,
+            ),
+            (
+                AcceptanceError::SchemaIdMismatch { gts_id: id.clone() },
+                field::ENTITY_FIELD,
+                field::VALIDATION_FAILED,
             ),
             (
                 AcceptanceError::MissingDialect { gts_id: id.clone() },

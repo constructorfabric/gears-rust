@@ -15,7 +15,7 @@
 //! | 2 candidate identifiers | here |
 //! | 3 registration policy | here (via [`RegistrationPolicy`]), for creations only |
 //! | 4 managed identifier profile | here |
-//! | 5 declared dialect | here |
+//! | 5 declared identity and dialect | here |
 //! | 6 `force` | here |
 //! | 7 ADR-0015 major-0 quarantine | **the worker** — see below |
 //! | 8 canonicalize, fingerprint, idempotency | here |
@@ -27,7 +27,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use gts::{GtsId, GtsIdSegment};
+use gts::{GTS_ID_URI_PREFIX, GtsId, GtsIdSegment};
 use serde_json::Value;
 use time::OffsetDateTime;
 use toolkit_db::secure::{AccessScope, ScopeError};
@@ -75,6 +75,15 @@ pub enum AcceptanceError {
     ExplicitUuidTail { gts_id: String },
     #[error("registered Instance '{gts_id}' must name a stable version: {reason}")]
     InstanceVersionProfile { gts_id: String, reason: String },
+    #[error("Type Schema '{gts_id}' declares no string top-level $id")]
+    MissingSchemaId { gts_id: String },
+    /// The declared value is deliberately not carried: it is unbounded caller
+    /// input, checked before the document size limit, and would otherwise be
+    /// echoed into the Problem detail and the refusal log.
+    #[error(
+        "Type Schema '{gts_id}' declares a top-level $id other than '{GTS_ID_URI_PREFIX}{gts_id}'"
+    )]
+    SchemaIdMismatch { gts_id: String },
     #[error("'{gts_id}' declares no top-level $schema")]
     MissingDialect { gts_id: String },
     #[error("'{gts_id}' declares dialect '{found}', which is not the Draft-07 spelling set")]
@@ -137,6 +146,8 @@ impl AcceptanceError {
             Self::PolicyRefused(_) => "policy_refused",
             Self::ExplicitUuidTail { .. } => "explicit_uuid_tail",
             Self::InstanceVersionProfile { .. } => "instance_version_profile",
+            Self::MissingSchemaId { .. } => "missing_schema_id",
+            Self::SchemaIdMismatch { .. } => "schema_id_mismatch",
             Self::MissingDialect { .. } => "missing_dialect",
             Self::UnsupportedDialect { .. } => "unsupported_dialect",
             Self::ConflictingDialect { .. } => "conflicting_dialect",
@@ -330,7 +341,7 @@ pub fn validate(
             }
         }
 
-        // --- step 5: declared dialect ------------------------------------
+        // --- step 5: declared identity and dialect -----------------------
         // Deletion skips document checks (steps 5 and 8). Store JSON `null` because
         // `ck_tr_operation_item_state` requires a non-null pending payload.
         let content = match (&candidate.content, deletion) {
@@ -350,6 +361,7 @@ pub fn validate(
         if let Some(content) = content
             && id.is_type()
         {
+            check_schema_id(id.id(), content)?;
             check_dialect(id.id(), content)?;
         }
 
@@ -602,6 +614,28 @@ fn resolve_replay(
             operation_id: existing.id,
         })
     }
+}
+
+/// Step 5. The document names the entity the item names: a Type Schema's
+/// top-level `$id` is exactly `gts://<gts_id>`.
+///
+/// `gts_id` is already canonical (step 2), so exact string equality is the
+/// canonical comparison. Nothing is trimmed or normalized: like step 2, a second
+/// spelling of the same identity is refused as ambiguous rather than repaired,
+/// and a bare `gts.` spelling is not a schema URI (GTS forbids it in `$id`).
+/// Instances are not checked: their identity lives in the item alone.
+fn check_schema_id(gts_id: &str, content: &Value) -> Result<(), AcceptanceError> {
+    let declared = content.get("$id").and_then(Value::as_str).ok_or_else(|| {
+        AcceptanceError::MissingSchemaId {
+            gts_id: gts_id.to_owned(),
+        }
+    })?;
+    if declared.strip_prefix(GTS_ID_URI_PREFIX) != Some(gts_id) {
+        return Err(AcceptanceError::SchemaIdMismatch {
+            gts_id: gts_id.to_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// Step 5. A top-level `$schema` in the closed Draft-07 set, and no differing

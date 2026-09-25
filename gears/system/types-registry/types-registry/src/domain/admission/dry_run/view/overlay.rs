@@ -25,8 +25,8 @@ use crate::domain::ports::{
 pub(super) type EdgeSet = Arc<[(DependencyKind, i64)]>;
 
 /// An authored document carried onto a current row this pass did not author —
-/// the text and its digest, shared.
-pub(super) type CarriedDocument = (Arc<str>, Arc<[u8]>);
+/// the text, shared.
+pub(super) type CarriedDocument = Arc<str>;
 
 /// A current-row write has neither a virtual revision nor a carried-over document.
 #[domain_model]
@@ -45,7 +45,6 @@ pub(super) struct RevisionNotWritten {
 #[derive(Clone, Debug)]
 struct AuthoredSchema {
     raw_schema: Arc<str>,
-    content_hash: Arc<[u8]>,
 }
 
 /// The authored value of one virtual Instance revision, with the schema pair it
@@ -54,7 +53,6 @@ struct AuthoredSchema {
 #[derive(Clone, Debug)]
 struct AuthoredInstance {
     canonical_value: Arc<str>,
-    content_hash: Arc<[u8]>,
     type_schema_entity_id: i64,
     type_schema_revision_no: i32,
 }
@@ -66,7 +64,6 @@ struct AuthoredInstance {
 pub(super) struct SchemaState {
     pub revision_no: i32,
     pub raw_schema: Arc<str>,
-    pub content_hash: Arc<[u8]>,
     pub resolved_schema: Arc<str>,
     pub effective_traits: Arc<str>,
     pub effective_traits_schema: Arc<str>,
@@ -88,7 +85,6 @@ impl SchemaState {
             entity_id,
             revision_no: self.revision_no,
             raw_schema: self.raw_schema.to_string(),
-            content_hash: self.content_hash.to_vec(),
             projection: self.cas(),
         }
     }
@@ -120,7 +116,6 @@ impl SchemaState {
 pub(super) struct InstanceState {
     pub revision_no: i32,
     pub canonical_value: Arc<str>,
-    pub content_hash: Arc<[u8]>,
     pub type_schema_entity_id: i64,
     pub type_schema_revision_no: i32,
     pub created_at: OffsetDateTime,
@@ -133,7 +128,6 @@ impl InstanceState {
             entity_id,
             revision_no: self.revision_no,
             canonical_value: self.canonical_value.to_string(),
-            content_hash: self.content_hash.to_vec(),
             type_schema_entity_id: self.type_schema_entity_id,
             type_schema_revision_no: self.type_schema_revision_no,
         }
@@ -346,7 +340,6 @@ impl Overlay {
             (new.entity_id, new.revision_no),
             Arc::new(AuthoredSchema {
                 raw_schema: new.raw_schema.as_str().into(),
-                content_hash: new.content_hash.as_slice().into(),
             }),
         );
     }
@@ -356,7 +349,6 @@ impl Overlay {
             (new.entity_id, new.revision_no),
             Arc::new(AuthoredInstance {
                 canonical_value: new.canonical_value.as_str().into(),
-                content_hash: new.content_hash.as_slice().into(),
                 type_schema_entity_id: new.type_schema_entity_id,
                 type_schema_revision_no: new.type_schema_revision_no,
             }),
@@ -371,17 +363,13 @@ impl Overlay {
         new: &NewCurrentTypeSchema,
         carried: Option<CarriedDocument>,
     ) -> Result<(), RevisionNotWritten> {
-        let (raw_schema, content_hash) =
-            match self.authored_schemas.get(&(new.entity_id, new.revision_no)) {
-                Some(authored) => (
-                    Arc::clone(&authored.raw_schema),
-                    Arc::clone(&authored.content_hash),
-                ),
-                None => carried.ok_or(RevisionNotWritten {
-                    entity_id: new.entity_id,
-                    revision_no: new.revision_no,
-                })?,
-            };
+        let raw_schema = match self.authored_schemas.get(&(new.entity_id, new.revision_no)) {
+            Some(authored) => Arc::clone(&authored.raw_schema),
+            None => carried.ok_or(RevisionNotWritten {
+                entity_id: new.entity_id,
+                revision_no: new.revision_no,
+            })?,
+        };
         let created_at = self
             .schemas
             .get(&new.entity_id)
@@ -391,7 +379,6 @@ impl Overlay {
             Arc::new(SchemaState {
                 revision_no: new.revision_no,
                 raw_schema,
-                content_hash,
                 resolved_schema: new.resolved_schema.as_str().into(),
                 effective_traits: new.effective_traits.as_str().into(),
                 effective_traits_schema: new.effective_traits_schema.as_str().into(),
@@ -426,7 +413,6 @@ impl Overlay {
             Arc::new(InstanceState {
                 revision_no: new.revision_no,
                 canonical_value: Arc::clone(&authored.canonical_value),
-                content_hash: Arc::clone(&authored.content_hash),
                 type_schema_entity_id: authored.type_schema_entity_id,
                 type_schema_revision_no: authored.type_schema_revision_no,
                 created_at,

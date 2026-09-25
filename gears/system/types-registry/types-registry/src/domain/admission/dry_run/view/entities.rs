@@ -6,11 +6,12 @@ use toolkit_db::DbTx;
 use toolkit_db::secure::{AccessScope, ScopeError};
 use uuid::Uuid;
 
-use super::AdmissionView;
+use super::{AdmissionView, unsupported};
 use crate::domain::enums::{EntityKind, OwnershipScope};
 use crate::domain::family::FamilyKey;
 use crate::domain::ports::{
-    EntityRow, EntityStore, EntityWriteOrderStore, NewEntity, VersionFamilyRow, VersionFamilyStore,
+    EntityPage, EntityRow, EntityStore, EntityWriteOrderStore, ListFilter, NewEntity, PageRequest,
+    VersionFamilyRow, VersionFamilyStore,
 };
 
 #[async_trait]
@@ -129,6 +130,23 @@ impl EntityStore for AdmissionView {
         rows.sort_by(|a, b| a.gts_id.cmp(&b.gts_id));
         rows.dedup_by(|a, b| a.id == b.id);
         Ok(rows)
+    }
+
+    /// Not answerable over an overlay: a discovery page is a keyset traversal of
+    /// stored rows, and a predicted pass holds candidates whose identifiers have no
+    /// position in that order yet. Nothing on the admission path lists entities —
+    /// admission reaches them by identifier, by id or through the dependency
+    /// relation — so refusing is the honest answer rather than a gap.
+    async fn list_page(
+        &self,
+        _tx: &DbTx<'_>,
+        _scope: &AccessScope,
+        _filter: &ListFilter,
+        _request: PageRequest,
+    ) -> Result<EntityPage, ScopeError> {
+        Err(unsupported(
+            "an admission view is not discoverable; it answers by key, not by page",
+        ))
     }
 
     async fn find_by_gts_uuid(

@@ -69,7 +69,6 @@ This ADR does not apply to runtime domain objects stored by owning gears or to E
 | Admission candidate | Proposed canonical Instance content undergoing validation before initial admission or before it can replace the current revision. It is not yet an Instance revision. |
 | Candidate status | Per-candidate workflow and outcome state — `pending`, `running`, `succeeded`, `unchanged`, or `failed` under ADR-0012 — distinct from operation progress and logical-entity Lifecycle Status. |
 | Conforming Type Schema revision | The exact Type Schema revision used to validate an Instance revision at admission time. |
-| Content hash | A digest of canonical Instance content used for idempotency, validation binding, and diagnostics. |
 
 ## Decision Drivers
 
@@ -94,9 +93,9 @@ Chosen option: a managed registered GTS Instance is a mutable logical entity who
 
 * Initial successful admission atomically creates the logical registered Instance in lifecycle `ACTIVE`, creates Instance revision `1`, and makes it current.
 * Each successful content update allocates the next monotonically increasing revision number scoped to the logical Instance.
-* Each revision contains at least the logical Instance reference, revision number, canonical content, content hash, creation and admission metadata, conforming Type Schema GTS ID, and exact conforming Type Schema revision.
+* Each revision contains at least the logical Instance reference, revision number, canonical content, creation and admission metadata, conforming Type Schema GTS ID, and exact conforming Type Schema revision.
 * Revision numbers are allocated only when admission succeeds. Only a `succeeded` candidate allocates one; a `pending`, `running`, `failed`, or `unchanged` candidate is not an admitted revision and consumes no revision number — `unchanged` because its content already equals the current revision (ADR-0012).
-* Revision content, number, hash, and schema-validation provenance are immutable after creation.
+* Revision content, number, and schema-validation provenance are immutable after creation.
 * The logical Instance owns a current-revision pointer. Ordinary resolution returns the current revision.
 * Re-submitting content equal to the current canonical content is an idempotent no-op and does not allocate a revision.
 * Re-admitting content equal to an older non-current revision allocates a new monotonically increasing revision after normal validation.
@@ -110,7 +109,7 @@ An admission candidate becomes an admitted Instance revision and current only wh
 3. the candidate content validates against the current admitted Type Schema revision selected at validation time;
 4. every GTS and JSON Schema reference in the candidate is resolvable and valid;
 5. ownership, lifecycle, dependency, and alias rules pass;
-6. when P2 Validation Hooks are enabled and a required binding matches, every selected owning-gear semantic validator accepts the same candidate content hash and schema revision;
+6. when P2 Validation Hooks are enabled and a required binding matches, every selected owning-gear semantic validator accepts exactly the candidate canonical content and schema revision being admitted — admission re-checks that the content it commits is byte-for-byte the content the validator accepted;
 7. optimistic concurrency and schema freshness preconditions still hold at commit time.
 
 Types Registry records the exact conforming Type Schema revision on the admitted Instance revision. If that Type Schema revision changes while Instance validation is in progress, the candidate must be revalidated or fail with a structured stale-baseline conflict. The race does not arise where the conforming Type Schema is minor-bearing, since ADR-0004 makes such an entity immutable and it therefore has no later revision to move to.
@@ -135,7 +134,7 @@ Before initial admission there is no public logical registered Instance and no e
 
 ### Retention
 
-* Every admitted registered Instance revision is retained for the lifetime of the registry identity, including after logical deletion while Registry References or registered dependents may still exist. As with a Type Schema, resolving the reference is not the whole reason: a gear holding a reference to a deleted well-known Instance may still need its value to retire what depends on it, so the current value survives deletion rather than only its hash (ADR-0013).
+* Every admitted registered Instance revision is retained for the lifetime of the registry identity, including after logical deletion while Registry References or registered dependents may still exist. As with a Type Schema, resolving the reference is not the whole reason: a gear holding a reference to a deleted well-known Instance may still need its value to retire what depends on it, so the current value itself survives deletion (ADR-0013).
 * Admitted revisions are never physically removed by a retention period, time-to-live, or background policy. Physical removal happens only through the explicit platform-level purge operation decided by ADR-0013, which is operator-invoked and never automatic.
 * Authorization and tenant visibility apply to historical revisions at least as strictly as to the current Instance; historical access must not expose content to a caller who could not access the logical entity.
 * Failed candidates may be retained under an operation-artifact policy but are not admitted revisions.
@@ -167,7 +166,7 @@ Admitting an internal Instance revision does not change Lifecycle Status, and ne
 Ordinary registered Instance resolution returns:
 
 * stable GTS ID and Registry Reference;
-* current content hash and the freshness validator;
+* the freshness validator;
 * lifecycle and tenant availability metadata.
 
 As with a Type Schema, this list is the **default field projection** rather than a minimum, and the caller selects content explicitly. The canonical value is therefore not returned unless asked for — which reads oddly for an Instance, whose value is most of what it is, and is nonetheless right: reverse-resolving a batch of stored references to display their identifiers is a common operation that has no use for the values, and paying for them by default would make the cheap case expensive.
@@ -212,7 +211,7 @@ This decision is confirmed when:
 * a Type Schema update cannot activate while an affected current registered Instance would become invalid;
 * P2 hook tests cover initial admission and content revisions of managed registered Instances;
 * all admitted Instance revisions remain internally retrievable after later updates and logical deletion;
-* ordinary resolution returns the current value's content hash, the freshness validator, and lifecycle and availability metadata, while stable references remain logical — and returns neither the Instance revision number nor the conforming Type Schema revision, since §*Resolution and historical access* keeps both out of the contract.
+* ordinary resolution returns the freshness validator and lifecycle and availability metadata, while stable references remain logical — and returns neither the Instance revision number nor the conforming Type Schema revision, since §*Resolution and historical access* keeps both out of the contract.
 
 ## Pros and Cons of the Options
 
@@ -265,6 +264,6 @@ This decision directly addresses:
 * `cpt-cf-types-registry-fr-register-instances` - defines managed registered Instance content-update semantics.
 * `cpt-cf-types-registry-fr-gts-validation` - binds each Instance revision to the exact Type Schema revision used for validation.
 * `cpt-cf-types-registry-fr-ref-tracking` - protects registered Instance dependencies during schema and Instance updates.
-* `cpt-cf-types-registry-fr-cache-freshness-metadata` - provides Instance revision and content hash as result validators.
+* `cpt-cf-types-registry-fr-cache-freshness-metadata` - provides Instance revision state as the result validator.
 * `cpt-cf-types-registry-fr-validation-hooks` - delegates domain-specific transition safety to the owning gear.
 * `cpt-cf-types-registry-fr-two-phase-init` - defines the per-Instance candidate, initial revision, and publication semantics used by the dependency-aware partial batch admission of ADR-0012.

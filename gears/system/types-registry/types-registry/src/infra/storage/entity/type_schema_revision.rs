@@ -40,7 +40,6 @@ pub struct Model {
     pub revision_no: i32,
     /// The authored document as submitted, canonical UTF-8 text.
     pub raw_schema: String,
-    pub content_hash: Vec<u8>,
     pub gts_spec_version: String,
     pub gts_impl_version: String,
     /// True when ADR-0004 `force` waived ADR-0003 cross-minor compatibility.

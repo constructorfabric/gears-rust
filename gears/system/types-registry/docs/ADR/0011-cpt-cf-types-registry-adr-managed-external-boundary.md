@@ -39,7 +39,7 @@ decision-makers: Constructor Fabric Steering Committee
 
 ## Context and Problem Statement
 
-ADR-0002 puts Externally Managed Entities entirely under their source: Types Registry persists no external definitions, revisions, hashes, dependencies, lifecycle, mappings, caches, or tombstones. ADR-0007 routes to sources through non-overlapping Source Claims. Both describe a clean separation.
+ADR-0002 puts Externally Managed Entities entirely under their source: Types Registry persists no external definitions, revisions, dependencies, lifecycle, mappings, caches, or tombstones. ADR-0007 routes to sources through non-overlapping Source Claims. Both describe a clean separation.
 
 The separation stops being clean the moment an entity on one side of the boundary points at an entity on the other. Four consequences of that were left unresolved and now block DESIGN:
 
@@ -96,7 +96,7 @@ A Managed Entity may not reference or derive from an Externally Managed Entity, 
 
 > Types Registry persists no state whose authority belongs to a source.
 
-That is the whole rule, with no exception. ADR-0002's enumeration of prohibited persistence stands in full: an external entity's definition, identifier, revision, content hash, lifecycle, tenant state, availability, dependencies, caches, tombstones, and Registry Reference mapping are source-authoritative and are never stored.
+That is the whole rule, with no exception. ADR-0002's enumeration of prohibited persistence stands in full: an external entity's definition, identifier, revision, lifecycle, tenant state, availability, dependencies, caches, tombstones, and Registry Reference mapping are source-authoritative and are never stored.
 
 One plausible exception is an external identifier stored as a dependency-edge label. The rationale is sound: dependents of a Managed Entity look like a fact about that entity, not source state.
 
@@ -135,7 +135,7 @@ The prohibition on an Externally Managed Entity depending on a Managed Entity ha
 
 **A reference from inside an external schema document is representable and undetectable.** The claim grammar constrains identifiers, not content. An External Registry Source is outside the platform's control and its implementation may well permit a `$ref` or `x-gts-ref` to a managed identifier, and ADR-0002 forbids Types Registry from interpreting source-owned content, so the platform neither sees nor checks it. The `MUST NOT` for this case is therefore a statement about what the platform recognizes, not about what a source can publish.
 
-**Types Registry consequently offers no guarantee for such a reference.** Admission-time validation applies to Managed Entities only; for a live external result the platform validates the response envelope and its own invariants — identifier integrity, derived reference equality, claim conformance, entity kind, revision and hash consistency — and nothing about content. Specifically, for a cross-boundary content reference:
+**Types Registry consequently offers no guarantee for such a reference.** Admission-time validation applies to Managed Entities only; for a live external result the platform validates the response envelope and its own invariants — identifier integrity, derived reference equality, claim conformance, entity kind, presence of the opaque `external_revision` — and nothing about content. Specifically, for a cross-boundary content reference:
 
 * **Deletion safety does not extend to it.** The reference is not a registered dependent and cannot become one, since plugins have no write path. The managed target can be deleted with no block, no registry event, and no way for the source to have been consulted.
 * **Availability does not propagate to it.** ADR-0010's blocking closure holds between Managed Entities only, so an unavailable managed target does not make the external entity `UNAVAILABLE` through the registry.
@@ -205,7 +205,7 @@ This costs a table of patterns. It persists no external entity identifiers — T
 
 Reservation alone is not sufficient, and the gap is stated rather than hidden. It prevents an identifier from rebinding to a Managed Entity, but a **successor plugin** serving the same claim could serve different content under the same identifier, and deterministic Registry References would rebind persisted domain data to it.
 
-**There is therefore no claim takeover operation.** Activating a plugin claim that overlaps a retired reservation is rejected with no exception and no declared-intent escape. A governed takeover was considered and is not built, because the assertion it would carry cannot be checked by anything: this ADR's own persistence rule leaves Types Registry holding no identifier, revision, or content hash of what the predecessor served, so a successor's claim of continuity would be compared against nothing. An unverifiable assertion accepted through an API reads as a check and is a formality, which is the shape `cpt-cf-types-registry-principle-local-authority` exists to refuse.
+**There is therefore no claim takeover operation.** Activating a plugin claim that overlaps a retired reservation is rejected with no exception and no declared-intent escape. A governed takeover was considered and is not built, because the assertion it would carry cannot be checked by anything: this ADR's own persistence rule leaves Types Registry holding no identifier, revision, or content of what the predecessor served, so a successor's claim of continuity would be compared against nothing. An unverifiable assertion accepted through an API reads as a check and is a formality, which is the shape `cpt-cf-types-registry-principle-local-authority` exists to refuse.
 
 Two paths remain for reusing a reserved space, and neither is an ordinary operation:
 
@@ -253,7 +253,7 @@ This decision is confirmed when:
 
 * admission rejects a managed Type Schema containing a `$ref` or `x-gts-ref` to an externally managed target, and rejects a managed identifier deriving from an externally managed base, with diagnostics naming the offending reference;
 * Source Claim activation rejects a pattern covering an `x-gts-ref` authority identifier in current Managed Type Schema content;
-* no admitted managed revision contains an external revision token or content hash in its provenance record;
+* no admitted managed revision contains an external revision token or any other source-derived value in its provenance record;
 * Types Registry storage contains no external entity identifier in any column, including on dependency edges;
 * an externally managed entity cannot be admitted as derived from a managed base, and the impossibility follows from claim selection on the first segment rather than from a check that could be bypassed;
 * a managed entity referenced from inside an external schema document is deletable, purgeable, and revisable without obstruction, and no availability verdict or revalidation reflects that reference — the documented gap is exercised as a test rather than assumed;
@@ -265,7 +265,7 @@ This decision is confirmed when:
 * deleting a Managed Entity with no managed dependent succeeds while every plugin is unreachable, and deleting one with a managed dependent is rejected while every plugin is unreachable — both proving the decision used local state only;
 * registering a Managed Entity whose identifier matches a retired Source Claim is rejected, and deleting a plugin Instance retires its claims into exactly that state while an unreachable plugin retains its own;
 * activating a new plugin's claim over a retired claim is rejected with no exception, and no request field, declared intent, or continuity assertion makes it succeed;
-* the retargeting migration is documented as carrying the hazard it cannot dispel rather than as a safe path: the persistence rule leaves the platform holding no identifier, revision, or content hash of what the predecessor served, so nothing verifies that the named successor serves the same logical entities, and a successor that serves different content under a reserved identifier silently rebinds every domain row holding its Registry Reference. What stands behind continuity there is the review of that migration, never a registry check;
+* the retargeting migration is documented as carrying the hazard it cannot dispel rather than as a safe path: the persistence rule leaves the platform holding no identifier, revision, or content of what the predecessor served, so nothing verifies that the named successor serves the same logical entities, and a successor that serves different content under a reserved identifier silently rebinds every domain row holding its Registry Reference. What stands behind continuity there is the review of that migration, never a registry check;
 * no plugin operation asks a source about dependents, and no plugin output is permitted to degrade with a warning in place of failing closed — the contract has no optional or advisory tier to test.
 
 ## Pros and Cons of the Options
