@@ -46,6 +46,23 @@ pub enum DomainVisibility {
     Restricted(Vec<String>),
 }
 
+impl DomainVisibility {
+    /// What two restrictions both let through. A caller authorized twice for
+    /// one operation — `read` on a clone's source, `write` on its target —
+    /// sees a declaration only where both answers show it.
+    #[must_use]
+    pub fn narrowed(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Unrestricted, other) | (other, Self::Unrestricted) => other,
+            (Self::Restricted(mine), Self::Restricted(theirs)) => Self::Restricted(
+                mine.into_iter()
+                    .filter(|domain| theirs.contains(domain))
+                    .collect(),
+            ),
+        }
+    }
+}
+
 /// Read the administrative-domain restriction off a caller's scope.
 ///
 /// Returns [`DomainVisibility::Unrestricted`] when the scope carries no domain

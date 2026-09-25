@@ -98,7 +98,7 @@ The standalone seam lives here too, because it is the same boundary drawn from t
 3. [x] - `p1` - **IF** the decision is deny or cannot be obtained → **RETURN** `403` - `inst-ta-set-3`
 4. [x] - `p1` - Invoke the strict-descendant target check for the caller and `tenant`; **IF** it fails → **RETURN** `403`, since a caller that could restrict itself could lift the restriction again - `inst-ta-set-4`
 5. [x] - `p1` - **IF** `access` is not `read_only` or `hidden` → **RETURN** `400`, because `overridable` is the absence of a row and is expressed by DELETE - `inst-ta-set-5`
-6. [x] - `p1` - DB: SELECT the declaration by key; **IF** none, **OR** the caller's own effective access for it is `hidden` → **RETURN** `404`, so a caller cannot restrict what it cannot see and cannot learn that it exists; then DB: SELECT that declaration row for update for the rest of the transaction, so a value write in flight — which holds it for share until its commit — either lands before this restriction or derives the writer's access again after it and is refused - `inst-ta-set-6`
+6. [x] - `p1` - DB: SELECT the declaration by key; **IF** none, **OR** it lies outside the caller's administrative domain, **OR** the caller's own effective access for it is `hidden` → **RETURN** `404`, so a caller cannot restrict what it cannot see and cannot learn that it exists; then DB: SELECT that declaration row for update for the rest of the transaction, so a value write in flight — which holds it for share until its commit — either lands before this restriction or derives the writer's access again after it and is refused - `inst-ta-set-6`
 7. [x] - `p1` - DB: SELECT the row for `(declaration_id, tenant_id)`, and compute the restriction state tag for the stored row or for the absent state - `inst-ta-set-7`
 8. [x] - `p1` - Evaluate the `If-Match` precondition against that tag; **IF** absent → **RETURN** `428`; **IF** stale → **RETURN** `412` - `inst-ta-set-8`
 9. [x] - `p1` - DB: UPSERT tenant_permissions on `uq_tenant_permission` with `access`, `set_by` from the authenticated principal, and `updated_at` now — the UPDATE filtered on the version the tag was compared against, the INSERT guarded by the unique index — in one transaction with the audit record and with the comparison above; **IF** no row matched or the insert collides → **RETURN** `412`, so concurrent delegates cannot silently overwrite each other - `inst-ta-set-9`
@@ -124,7 +124,7 @@ The standalone seam lives here too, because it is the same boundary drawn from t
 1. [x] - `p1` - Actor sends DELETE /settings-service/v1/settings/{key}/permissions?tenant={tenant_id} with `If-Match` - `inst-ta-clear-1`
 2. [x] - `p1` - Authorize `delegate` on the setting's key; **IF** deny or cannot be obtained → **RETURN** `403` - `inst-ta-clear-2`
 3. [x] - `p1` - Invoke the strict-descendant target check; **IF** it fails → **RETURN** `403` - `inst-ta-clear-3`
-4. [x] - `p1` - DB: SELECT the declaration by key; **IF** none, **OR** hidden from the caller → **RETURN** `404`; then DB: SELECT that declaration row for update for the rest of the transaction, serializing against value writes in flight as a set does - `inst-ta-clear-4`
+4. [x] - `p1` - DB: SELECT the declaration by key; **IF** none, **OR** outside the caller's administrative domain, **OR** hidden from the caller → **RETURN** `404`; then DB: SELECT that declaration row for update for the rest of the transaction, serializing against value writes in flight as a set does - `inst-ta-clear-4`
 5. [x] - `p1` - DB: SELECT the row for the pair and compute the restriction state tag; evaluate `If-Match`; **IF** absent → **RETURN** `428`; **IF** stale → **RETURN** `412` - `inst-ta-clear-5`
 6. [x] - `p1` - DB: DELETE the row at the version the tag was compared against, in one transaction with the audit record; **IF** no row matched → **RETURN** `412`; clearing an already absent row is a no-op that still requires the absent-state tag - `inst-ta-clear-6`
 7. [x] - `p1` - Emit an audit record carrying the removed row as pre-image, the pair and its access, the remover as the record's actor - `inst-ta-clear-7`
@@ -148,7 +148,7 @@ The standalone seam lives here too, because it is the same boundary drawn from t
 1. [x] - `p1` - Actor sends GET /settings-service/v1/settings/{key}/permissions?tenant={tenant_id} - `inst-ta-read-1`
 2. [x] - `p1` - Authorize `read` on the setting's key; **IF** deny or cannot be obtained → **RETURN** `403` - `inst-ta-read-2`
 3. [x] - `p1` - Confirm the target is the caller's own tenant or a descendant that is not standalone; **IF** not → **RETURN** `403` - `inst-ta-read-3`
-4. [x] - `p1` - DB: SELECT the declaration by key; **IF** none, **OR** hidden from the caller → **RETURN** `404` - `inst-ta-read-4`
+4. [x] - `p1` - DB: SELECT the declaration by key; **IF** none, **OR** outside the caller's administrative domain, **OR** hidden from the caller → **RETURN** `404` - `inst-ta-read-4`
 5. [x] - `p1` - Invoke effective access resolution for the setting over the target's root-to-self chain - `inst-ta-read-5`
 6. [x] - `p1` - Compute the restriction state tag for the pair's stored row or for the absent state - `inst-ta-read-6`
 7. [x] - `p1` - **RETURN** `200` with the stored row or `overridable` for absence, the effective access, the supplying tenant, and the tag in `ETag`; the stored row's setter — an ancestor's administrator, so PII — is masked for a caller not authorized for unmasked PII, as the inheritance trail masks its setters - `inst-ta-read-7`
@@ -169,7 +169,7 @@ The standalone seam lives here too, because it is the same boundary drawn from t
 **Steps**:
 1. [x] - `p1` - Actor sends GET /settings-service/v1/settings/{key}/permissions/all; the listing takes no cursor — it is small by nature, at most one row per descendant tenant, and is returned whole - `inst-ta-list-1`
 2. [x] - `p1` - Authorize `read` on the setting's key; **IF** deny or cannot be obtained → **RETURN** `403` - `inst-ta-list-2`
-3. [x] - `p1` - DB: SELECT the declaration by key; **IF** none, **OR** hidden from the caller → **RETURN** `404` - `inst-ta-list-3`
+3. [x] - `p1` - DB: SELECT the declaration by key; **IF** none, **OR** outside the caller's administrative domain, **OR** hidden from the caller → **RETURN** `404` - `inst-ta-list-3`
 4. [x] - `p1` - DB: SELECT tenant_permissions for the declaration where the tenant lies inside the caller's subtree, as the `AccessScope` constrains it, excluding standalone descendants, through `idx_tenant_permission_tenant`; the subtree is obtained under the shared subtree budget, and **IF** the budget cuts it → **RETURN** `400` naming the bound rather than a partial listing - `inst-ta-list-4`
 5. [x] - `p1` - **RETURN** `200` with every row in one page, each carrying its tag and its setter, masked for a caller not authorized for unmasked PII, in the shared `Page` envelope with `next_cursor` never set: the list is bounded by the subtree budget of step 4, not paginated - `inst-ta-list-5`
 
@@ -256,7 +256,7 @@ The system **MUST** persist restrictions in a `tenant_permissions` table carryin
 
 - [x] `p1` - **ID**: `cpt-cf-settings-service-dod-tenant-access-operations`
 
-The system **MUST** expose set, clear, read and list over restrictions, authorized by `delegate` for mutations and `read` for reads on the setting's key, **MUST** accept a mutation only for a strict descendant of the caller that is not standalone, **MUST** refuse `overridable` as a stored value, and **MUST** report a setting the caller cannot see as absent. The read **MUST** return the effective access and the tenant that supplies it. A stored row's setter is an administrator's identity: every response carrying one **MUST** mask it for a caller not authorized for unmasked PII, and a restriction's audit images **MUST NOT** repeat it — who changed the row is the record's actor.
+The system **MUST** expose set, clear, read and list over restrictions, authorized by `delegate` for mutations and `read` for reads on the setting's key, **MUST** accept a mutation only for a strict descendant of the caller that is not standalone, **MUST** refuse `overridable` as a stored value, and **MUST** report a setting the caller cannot see — hidden from it, or outside its administrative domain — as absent. The read **MUST** return the effective access and the tenant that supplies it. A stored row's setter is an administrator's identity: every response carrying one **MUST** mask it for a caller not authorized for unmasked PII, and a restriction's audit images **MUST NOT** repeat it — who changed the row is the record's actor.
 
 **Implements**:
 - `cpt-cf-settings-service-flow-tenant-access-set`
@@ -354,6 +354,7 @@ An access change **MUST** evict the setting's cached entries for the target tena
 - [x] `DELETE` clears one row, and the effective access afterwards reflects any ancestor row that remains
 - [x] Setting or clearing a restriction evicts the cached entries of the target tenant and its descendants
 - [x] Restriction rows survive a retire and revive of their declaration unchanged
+- [x] A declaration outside the caller's administrative domain is absent to read, set, clear and list, and an undomained one is visible to every domain-restricted caller
 - [x] A restriction listing over a caller subtree past the subtree budget is refused `400` naming the bound; an access change on such a subtree evicts the setting key-wide
 - [x] Every restriction change leaves an audit record with the previous and the new row
 - [x] A restriction's setter is masked in the write's answer, the read and the listing without the PII entitlement and shown with it, and the change's audit images carry the pair and its access but not the setter

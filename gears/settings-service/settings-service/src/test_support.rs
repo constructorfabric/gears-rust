@@ -586,6 +586,31 @@ impl ResolutionHarness {
             .id
     }
 
+    /// Bind a declaration to an administrative domain, the rest of its
+    /// metadata as `declare` leaves it.
+    pub async fn bind_domain(&self, declaration_id: Uuid, domain: &str) {
+        let conn = self.db.conn().expect("connection");
+        DeclarationRepo
+            .update_metadata(
+                &conn,
+                &AccessScope::allow_all(),
+                declaration_id,
+                crate::domain::declaration::DeclarationMetadata {
+                    mode: "standard".to_owned(),
+                    description: None,
+                    domain_affinity: Some(domain.to_owned()),
+                    licence_feature: None,
+                    data_classification: "public".to_owned(),
+                    requires_step_up: true,
+                    anonymous_exposable: false,
+                },
+                None,
+                true,
+            )
+            .await
+            .expect("metadata");
+    }
+
     pub async fn retire(&self, declaration_id: Uuid) {
         let conn = self.db.conn().expect("connection");
         DeclarationRepo

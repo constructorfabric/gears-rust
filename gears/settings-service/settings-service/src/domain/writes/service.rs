@@ -22,6 +22,7 @@ use uuid::Uuid;
 use super::{image_of, value_state_tag};
 use crate::audit::{AuditOperation, AuditRecord, AuditSink, AuditValue};
 use crate::domain::access::{AccessRepository, TenantAccess};
+use crate::domain::category::{DomainVisibility, is_visible};
 use crate::domain::declaration::{Declaration, DeclarationRepository};
 use crate::domain::error::DomainError;
 use crate::domain::ports::{ChangePublisher, SecretManager, ValueEvent, WriteMetrics};
@@ -53,6 +54,11 @@ pub struct WriteActor {
     /// length of its freshness window, so it never sits in a plain `String`
     /// that a log line or a panic message could carry.
     pub step_up_token: Option<SecretString>,
+    /// The administrative domains the caller may see, read off the scope its
+    /// authorization returned: a declaration outside them is absent to its
+    /// writes, as it is to its reads. Unrestricted when the scope carries no
+    /// domain constraint.
+    pub visibility: DomainVisibility,
 }
 
 impl WriteActor {
@@ -335,8 +341,9 @@ where
         &self.secrets
     }
 
-    /// The declaration at a key as a write sees it: absent or hidden from the
-    /// caller is not-found, retired is the distinct retired outcome.
+    /// The declaration at a key as a write sees it: absent, outside the
+    /// caller's administrative domain or hidden from it is not-found, retired
+    /// is the distinct retired outcome.
     ///
     /// # Errors
     /// [`DomainError::NotFound`], [`DomainError::Retired`], or a read failure.
@@ -355,6 +362,14 @@ where
                 .ok_or(DomainError::NotFound {
                     resource: "declaration",
                 })?;
+        // Outside the caller's administrative domain is absent, as it is to
+        // the read: a write must neither disclose nor change what a read of
+        // the setting hides. Every write reaches the declaration through here.
+        if !is_visible(&actor.visibility, declaration.domain_affinity.as_deref()) {
+            return Err(DomainError::NotFound {
+                resource: "declaration",
+            });
+        }
         let caller = ScopeTarget::Tenant(actor.ctx.subject_tenant_id()).normalize(root);
         if self
             .resolver

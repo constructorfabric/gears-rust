@@ -151,6 +151,7 @@ fn admin_actor() -> WriteActor {
             .expect("context"),
         request_id: "req".to_owned(),
         step_up_token: Some(SecretString::from("token".to_owned())),
+        visibility: crate::domain::category::DomainVisibility::Unrestricted,
     }
 }
 
@@ -164,6 +165,7 @@ fn service_actor() -> WriteActor {
             .expect("context"),
         request_id: "req".to_owned(),
         step_up_token: None,
+        visibility: crate::domain::category::DomainVisibility::Unrestricted,
     }
 }
 
@@ -1013,6 +1015,7 @@ async fn a_person_labelled_user_reaches_the_step_up_gate_of_a_declaration_action
             ctx: ctx.build().expect("context"),
             request_id: "req".to_owned(),
             step_up_token: Some(SecretString::from("token".to_owned())),
+            visibility: crate::domain::category::DomainVisibility::Unrestricted,
         }
     };
     let err = refusing

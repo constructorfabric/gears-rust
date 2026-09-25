@@ -257,7 +257,7 @@ Throughout, `tenant` omitted means the caller's own tenant, which for a platform
 
 **Steps**:
 1. [x] - `p1` - Authorize `write` on the setting's key through the `PolicyEnforcer` PEP; **IF** deny or cannot be obtained → **RETURN** `403` without consulting step-up - `inst-vw-gate-1`
-2. [x] - `p1` - DB: SELECT the declaration by key; **IF** none, **OR** the caller's effective access is `hidden` → **RETURN** `404` - `inst-vw-gate-2`
+2. [x] - `p1` - DB: SELECT the declaration by key; **IF** none, **OR** it lies outside the caller's administrative domain, **OR** the caller's effective access is `hidden` → **RETURN** `404`, the answer a read of the setting gives; every write — set, clone, revert, remove, a batch entry, validate, impact, a secret stage — reaches the declaration through this step - `inst-vw-gate-2`
 3. [x] - `p1` - **IF** the declaration is retired → **RETURN** the distinct retired outcome; a retired setting takes no value - `inst-vw-gate-3`
 4. [x] - `p1` - Confirm through the tenant resolver that the target is the caller's own tenant or a descendant that is not standalone; **IF** not → **RETURN** `403` - `inst-vw-gate-6`
 5. [x] - `p1` - **IF** the scope class is `global` **AND** the target is not the root tenant → **RETURN** `409`; nobody, platform administrator included, writes a tenant-scoped value for a `global` setting - `inst-vw-gate-7`
@@ -504,6 +504,7 @@ Every committed change **MUST** publish `event_value_changed` and every rejected
 - [x] A `read_only` tenant's write is refused, an `overridable` ancestor's write at that tenant succeeds and the value is stored at the descendant
 - [x] A write to a tenant outside the caller's subtree, or to a standalone descendant, is refused `403`
 - [x] A valid set stores the value, and a subsequent read returns it with the `etag` the write returned
+- [x] A set, a clone, a batch entry and a validate against a declaration outside the caller's administrative domain answer `404` and store nothing, and a caller inside that domain writes it
 - [x] An invalid value is refused `400` with field-level detail and nothing is stored
 - [x] A set whose `If-Match` is stale is refused `412`, nothing is stored, and the stored value is the other writer's
 - [x] Of N concurrent sets presenting the same tag exactly one commits, the rest return `412`, and exactly one audit record exists for the stored change

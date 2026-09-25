@@ -1355,7 +1355,7 @@ Both are **immediate** — declaration operations do not go through the value wr
 
 | Condition | Error | Description |
 |-----------|-------|-------------|
-| Setting visible to caller | `404` | Hidden settings never leak |
+| Setting visible to caller | `404` | Hidden settings, and settings outside the caller's administrative domain, never leak |
 | Caller may write | `403`/`409` | No tenant overrides a `global` setting. A tenant caller's own effective access must be `overridable`; the target tenant's access does not restrict an authorized ancestor writing there (`cpt-cf-settings-service-fr-setting-scope-class`, `cpt-cf-settings-service-fr-tenant-scope-enforcement`) |
 | Value valid | `422` | Validated against type + traits (`cpt-cf-settings-service-fr-typed-value-validation`) |
 | Value within size cap | `413`/`422 ValueTooLarge` | Serialized value MUST NOT exceed 64 KiB (§4.2 *Type Validator*) |
@@ -1896,6 +1896,8 @@ Authorization is enforced server-side via `PolicyEnforcer` over the AuthZ Resolv
 | Read activation status (`GET /settings-service/v1/change-sets/{change_set_id}/activation`) | `read` on `gts.cf.core.settings.change_set.v1~` | The change set's tenant subtree | `404` when not visible (activation §4.8) |
 | Resolve a secret's plaintext (`resolve_secret`, machine path) | **Machine-only — no administrative action exists.** Authorized **per setting** — the resource is that setting's key, so a service is granted the secrets it needs one at a time or by wildcard — against the **calling service**, and audited as a secret-use event (§4.2 *Secret Manager*); but against a **declared** identity while a verified one is still a prerequisite (§6), so both the check and the attribution are bounded by the trusted-caller boundary below, not stronger than it. | Caller's scope | `403` |
 | Internal **SDK traits** (`SettingsReaderClient` read; `SettingsContributionClient` register/retire) | **Trusted caller** — no in-service service-identity check (§6). Caller owns `tenant_id` correctness/scope-read right (read) and `owner_module` correctness (contribution). Valid **within the deployment's trust boundary** only. | — | — |
+
+**Administrative domain.** A declaration outside the caller's administrative domain — the `domain_affinity` constraint the policy decision point returns on the caller's `AccessScope` (§4.2 *Category Management*) — answers `404` on every operation that loads it by key: the read, the history, browse and search, every value write (set, clone, revert, remove, a batch entry, validate, impact), and the tenant-access operations, exactly as a `hidden` setting does. An operation authorized twice, such as a clone's `read` and `write`, sees only the domains both answers allow. None of the three settings resources declares `domain_affinity` as a PEP property yet, and the constraint compiler fails a constraint on an undeclared property closed, so today a policy that narrows one of them by domain is a `403` on every route of that resource rather than a narrowing; the checks above are what hold once the property is declared.
 
 `PATCH`/`DELETE` on categories and declarations additionally require the `If-Match` precondition (§4.3).
 

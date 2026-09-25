@@ -131,3 +131,33 @@ fn the_empty_restriction_shows_undomained_categories_and_nothing_else() {
     assert!(!is_visible(&none, Some("infra")));
     assert!(!is_visible(&none, Some("")));
 }
+
+#[test]
+fn two_restrictions_narrow_to_the_domains_both_let_through() {
+    let restricted = |domains: &[&str]| {
+        DomainVisibility::Restricted(domains.iter().map(|d| (*d).to_owned()).collect())
+    };
+    assert_eq!(
+        DomainVisibility::Unrestricted.narrowed(DomainVisibility::Unrestricted),
+        DomainVisibility::Unrestricted
+    );
+    // An unrestricted answer narrows nothing, on either side.
+    assert_eq!(
+        DomainVisibility::Unrestricted.narrowed(restricted(&["commercial"])),
+        restricted(&["commercial"])
+    );
+    assert_eq!(
+        restricted(&["commercial"]).narrowed(DomainVisibility::Unrestricted),
+        restricted(&["commercial"])
+    );
+    assert_eq!(
+        restricted(&["commercial", "infrastructure"]).narrowed(restricted(&["infrastructure"])),
+        restricted(&["infrastructure"])
+    );
+    // Disjoint answers leave the undomained declarations, as an empty list
+    // always does.
+    let disjoint = restricted(&["commercial"]).narrowed(restricted(&["infrastructure"]));
+    assert_eq!(disjoint, restricted(&[]));
+    assert!(is_visible(&disjoint, None));
+    assert!(!is_visible(&disjoint, Some("commercial")));
+}

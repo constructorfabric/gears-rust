@@ -8,7 +8,7 @@ use axum::http::{HeaderMap, header};
 use axum::{Extension, Json};
 use settings_service_sdk::SettingKey;
 use toolkit::api::canonical_prelude::*;
-use toolkit_security::SecurityContext;
+use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
 use crate::api::authz::{self, resource};
@@ -18,6 +18,7 @@ use crate::api::rest::access_dto::{
 use crate::api::rest::if_match;
 use crate::api::rest::setting_handlers::{TenantParam, may_read_pii};
 use crate::domain::access::{AccessActor, AccessReadout, TenantAccess};
+use crate::domain::category::domain_visibility;
 use crate::domain::error::DomainError;
 use crate::field;
 use crate::infra::storage::access_repo::AccessRepo;
@@ -59,11 +60,13 @@ fn parse_target(raw: Option<&str>) -> Result<Uuid, DomainError> {
         })
 }
 
-fn actor(ctx: &SecurityContext, headers: &HeaderMap) -> AccessActor {
+/// The caller, with the administrative domains its authorization lets it see.
+fn actor(ctx: &SecurityContext, headers: &HeaderMap, scope: &AccessScope) -> AccessActor {
     AccessActor {
         ctx: ctx.clone(),
         request_id: toolkit::api::error_layer::extract_trace_id(headers)
             .unwrap_or_else(|| Uuid::new_v4().to_string()),
+        visibility: domain_visibility(scope),
     }
 }
 
@@ -106,11 +109,11 @@ pub async fn read_access(
     let target = parse_target(params.tenant.as_deref())?;
     // @cpt-end:cpt-cf-settings-service-flow-tenant-access-read:p1:inst-ta-read-1
     // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-read:p1:inst-ta-read-2
-    authz::access_scope(&enforcer, &ctx, &resource::VALUE, READ, None).await?;
+    let scope = authz::access_scope(&enforcer, &ctx, &resource::VALUE, READ, None).await?;
     // @cpt-end:cpt-cf-settings-service-flow-tenant-access-read:p1:inst-ta-read-2
     let conn = db.conn().map_err(|e| conn_error(&e))?;
     let readout = service
-        .read(&conn, &actor(&ctx, &headers), &key, target)
+        .read(&conn, &actor(&ctx, &headers, &scope), &key, target)
         .await?;
     Ok(with_etag(&readout, &enforcer, &ctx).await)
 }
@@ -146,10 +149,10 @@ pub async fn set_access(
     // @cpt-end:cpt-cf-settings-service-flow-tenant-access-set:p1:inst-ta-set-1
     // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-set:p1:inst-ta-set-2
     // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-set:p1:inst-ta-set-3
-    authz::access_scope(&enforcer, &ctx, &resource::VALUE, DELEGATE, None).await?;
+    let scope = authz::access_scope(&enforcer, &ctx, &resource::VALUE, DELEGATE, None).await?;
     // @cpt-end:cpt-cf-settings-service-flow-tenant-access-set:p1:inst-ta-set-3
     // @cpt-end:cpt-cf-settings-service-flow-tenant-access-set:p1:inst-ta-set-2
-    let actor = actor(&ctx, &headers);
+    let actor = actor(&ctx, &headers, &scope);
     let if_match = if_match(&headers).map(str::to_owned);
     let readout = {
         let service = Arc::clone(&service);
@@ -189,9 +192,9 @@ pub async fn clear_access(
     let target = parse_target(params.tenant.as_deref())?;
     // @cpt-end:cpt-cf-settings-service-flow-tenant-access-clear:p1:inst-ta-clear-1
     // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-clear:p1:inst-ta-clear-2
-    authz::access_scope(&enforcer, &ctx, &resource::VALUE, DELEGATE, None).await?;
+    let scope = authz::access_scope(&enforcer, &ctx, &resource::VALUE, DELEGATE, None).await?;
     // @cpt-end:cpt-cf-settings-service-flow-tenant-access-clear:p1:inst-ta-clear-2
-    let actor = actor(&ctx, &headers);
+    let actor = actor(&ctx, &headers, &scope);
     let if_match = if_match(&headers).map(str::to_owned);
     let readout = {
         let service = Arc::clone(&service);
@@ -230,10 +233,12 @@ pub async fn list_access(
     let key = parse_key(&key)?;
     // @cpt-end:cpt-cf-settings-service-flow-tenant-access-list:p1:inst-ta-list-1
     // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-list:p1:inst-ta-list-2
-    authz::access_scope(&enforcer, &ctx, &resource::VALUE, READ, None).await?;
+    let scope = authz::access_scope(&enforcer, &ctx, &resource::VALUE, READ, None).await?;
     // @cpt-end:cpt-cf-settings-service-flow-tenant-access-list:p1:inst-ta-list-2
     let conn = db.conn().map_err(|e| conn_error(&e))?;
-    let rows = service.list(&conn, &actor(&ctx, &headers), &key).await?;
+    let rows = service
+        .list(&conn, &actor(&ctx, &headers, &scope), &key)
+        .await?;
     // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-list:p1:inst-ta-list-5
     // Every row names who recorded it; asked once for the page.
     let pii = !rows.is_empty() && may_read_pii(&enforcer, &ctx).await;

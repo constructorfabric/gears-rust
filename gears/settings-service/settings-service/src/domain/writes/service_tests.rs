@@ -99,6 +99,7 @@ fn actor(tenant: Uuid) -> WriteActor {
             .expect("context"),
         request_id: "req".to_owned(),
         step_up_token: Some(SecretString::from("token".to_owned())),
+        visibility: crate::domain::category::DomainVisibility::Unrestricted,
     }
 }
 
@@ -112,6 +113,7 @@ fn service_actor(tenant: Uuid) -> WriteActor {
             .expect("context"),
         request_id: "req".to_owned(),
         step_up_token: None,
+        visibility: crate::domain::category::DomainVisibility::Unrestricted,
     }
 }
 
@@ -845,6 +847,7 @@ fn actor_labelled(tenant: Uuid, subject_type: Option<&str>) -> WriteActor {
         ctx: ctx.build().expect("context"),
         request_id: "req".to_owned(),
         step_up_token: Some(SecretString::from("token".to_owned())),
+        visibility: crate::domain::category::DomainVisibility::Unrestricted,
     }
 }
 
@@ -1163,6 +1166,7 @@ async fn a_record_that_cannot_be_written_rolls_the_value_back() {
             .expect("context"),
         request_id: "req".to_owned(),
         step_up_token: Some(SecretString::from("t".to_owned())),
+        visibility: crate::domain::category::DomainVisibility::Unrestricted,
     };
     let conn = base.db.conn().expect("connection");
     let gated = writer

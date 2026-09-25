@@ -22,6 +22,7 @@ use uuid::Uuid;
 use super::{BATCH_LIMIT, BatchChange, WriteCoordinator};
 use crate::api::rest::value_dto::rejection_code;
 use crate::audit::{AuditOperation, AuditValue, StoredAuditRecord};
+use crate::domain::category::DomainVisibility;
 use crate::domain::declaration::DeclarationRepository;
 use crate::domain::error::DomainError;
 use crate::domain::ports::NoMetrics;
@@ -198,6 +199,32 @@ impl Harness {
             .expect("metadata");
     }
 
+    /// Bind a declaration to an administrative domain, still writable without
+    /// step-up.
+    async fn bind_domain(&self, id: Uuid, domain: &str) {
+        use crate::domain::declaration::DeclarationMetadata;
+        let conn = self.base.db.conn().expect("connection");
+        DeclarationRepo
+            .update_metadata(
+                &conn,
+                &AccessScope::allow_all(),
+                id,
+                DeclarationMetadata {
+                    mode: "standard".to_owned(),
+                    description: None,
+                    domain_affinity: Some(domain.to_owned()),
+                    licence_feature: None,
+                    data_classification: "public".to_owned(),
+                    requires_step_up: false,
+                    anonymous_exposable: false,
+                },
+                None,
+                true,
+            )
+            .await
+            .expect("metadata");
+    }
+
     async fn set(
         &self,
         actor: &WriteActor,
@@ -286,6 +313,7 @@ fn actor(tenant: Uuid) -> WriteActor {
             .expect("context"),
         request_id: "req".to_owned(),
         step_up_token: Some(SecretString::from("token".to_owned())),
+        visibility: crate::domain::category::DomainVisibility::Unrestricted,
     }
 }
 
@@ -459,6 +487,7 @@ fn actor_labelled(tenant: Uuid, subject_type: Option<&str>) -> WriteActor {
         ctx: ctx.build().expect("context"),
         request_id: "req".to_owned(),
         step_up_token: Some(SecretString::from("token".to_owned())),
+        visibility: crate::domain::category::DomainVisibility::Unrestricted,
     }
 }
 
@@ -736,6 +765,76 @@ async fn an_entry_whose_value_contradicts_its_op_is_invalid_and_the_rest_commits
     assert_eq!(h.rows(d).await.len(), 1);
     assert_eq!(h.rows(d).await[0].value, Some(json!(true)));
     assert_eq!(h.rows(good).await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_declaration_outside_the_callers_domain_is_absent_to_its_writes() {
+    // The read answers 404 for a declaration outside the caller's
+    // administrative domain; a write must answer the same, whatever its
+    // entry point, and store nothing — or it would both disclose and change
+    // what the read hides.
+    let h = Harness::new().await;
+    let d = h.declare("flag", scope_class::CASCADING).await;
+    h.bind_domain(d, "infrastructure").await;
+    let root = h.base.tree.root;
+    let within = |domain: &str| WriteActor {
+        visibility: DomainVisibility::Restricted(vec![domain.to_owned()]),
+        ..actor(root)
+    };
+    let outside = within("commercial");
+    let is_absent = |err: &DomainError| {
+        matches!(
+            err,
+            DomainError::NotFound {
+                resource: "declaration"
+            }
+        )
+    };
+
+    let err = h
+        .set(&outside, "flag", None, json!(true), Some("absent"))
+        .await
+        .expect_err("a set");
+    assert!(is_absent(&err), "{err:?}");
+    let err = h
+        .coordinator
+        .validate(&outside, &h.base.key("flag"), None, &json!(true), None)
+        .await
+        .expect_err("a validate");
+    assert!(is_absent(&err), "{err:?}");
+    let err = h
+        .coordinator
+        .clone_value(
+            &outside,
+            &h.base.key("flag"),
+            Some(root),
+            Some(h.base.tree.a),
+            Some("absent"),
+        )
+        .await
+        .expect_err("a clone");
+    assert!(is_absent(&err), "{err:?}");
+    let batch = h
+        .coordinator
+        .batch(
+            &outside,
+            vec![entry(h.base.key("flag"), None, Some(json!(true)), "absent")],
+        )
+        .await
+        .expect("the batch runs");
+    let err = batch.results[0].as_ref().expect_err("the entry");
+    assert_eq!(rejection_code(err), "not_found", "{err:?}");
+    assert!(h.rows(d).await.is_empty(), "nothing stored");
+
+    h.set(
+        &within("infrastructure"),
+        "flag",
+        None,
+        json!(true),
+        Some("absent"),
+    )
+    .await
+    .expect("inside the domain");
 }
 
 #[tokio::test]

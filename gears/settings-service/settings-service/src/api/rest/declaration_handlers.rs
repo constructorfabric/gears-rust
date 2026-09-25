@@ -155,7 +155,11 @@ pub async fn create_declaration(
     // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-1
     // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-3
     // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-2
-    let actor = crate::api::rest::value_handlers::actor(&ctx, &headers);
+    let actor = crate::api::rest::value_handlers::actor(
+        &ctx,
+        &headers,
+        crate::domain::category::domain_visibility(&scope),
+    );
     let request = crate::domain::declaration::CreateDeclaration::try_from(body)?;
     // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-1
     let admin_for_tx = Arc::clone(&admin);
@@ -240,7 +244,11 @@ pub async fn update_declaration(
         authz::access_scope(&enforcer, &ctx, &resource::DECLARATION, UPDATE, Some(id)).await?;
     // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-update:p1:inst-decl-update-3
     // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-update:p1:inst-decl-update-2
-    let actor = crate::api::rest::value_handlers::actor(&ctx, &headers);
+    let actor = crate::api::rest::value_handlers::actor(
+        &ctx,
+        &headers,
+        crate::domain::category::domain_visibility(&scope),
+    );
     let if_match = crate::api::rest::if_match(&headers).map(str::to_owned);
     // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-update:p1:inst-decl-update-1
     let admin_for_tx = Arc::clone(&admin);
@@ -300,7 +308,11 @@ pub async fn retire_declaration(
         authz::access_scope(&enforcer, &ctx, &resource::DECLARATION, DELETE, Some(id)).await?;
     // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-retire:p1:inst-decl-retire-3
     // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-retire:p1:inst-decl-retire-2
-    let actor = crate::api::rest::value_handlers::actor(&ctx, &headers);
+    let actor = crate::api::rest::value_handlers::actor(
+        &ctx,
+        &headers,
+        crate::domain::category::domain_visibility(&scope),
+    );
     let if_match = crate::api::rest::if_match(&headers).map(str::to_owned);
     // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-retire:p1:inst-decl-retire-1
     let admin_for_tx = Arc::clone(&admin);

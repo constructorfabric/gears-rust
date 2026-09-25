@@ -7,12 +7,27 @@ use axum::response::IntoResponse;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
-use super::{STEP_UP_HEADER, actor, if_match, parse_key, parse_tenant, respond, step_up_challenge};
+use super::{STEP_UP_HEADER, if_match, parse_key, parse_tenant, respond, step_up_challenge};
+use crate::domain::category::DomainVisibility;
 use crate::domain::error::DomainError;
 use crate::domain::writes::WriteActor;
 use crate::field;
 
 const KEY: &str = "gts.cf.core.settings.setting_type.v1~acme.billing.network.proxy.v1~";
+
+/// The handlers' actor for a caller whose scope carries no domain constraint.
+fn actor(ctx: &SecurityContext, headers: &HeaderMap) -> WriteActor {
+    super::actor(ctx, headers, DomainVisibility::Unrestricted)
+}
+
+#[test]
+fn the_actor_carries_the_domains_its_authorization_let_it_see() {
+    let restricted = DomainVisibility::Restricted(vec!["commercial".to_owned()]);
+    assert_eq!(
+        super::actor(&context(), &HeaderMap::new(), restricted.clone()).visibility,
+        restricted
+    );
+}
 
 fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
     let mut map = HeaderMap::new();

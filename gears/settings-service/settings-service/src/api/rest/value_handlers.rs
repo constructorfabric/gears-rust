@@ -26,6 +26,7 @@ use crate::api::rest::value_dto::{
     ImpactRequest, SetValueRequest, StageSecretRequest, ValidateRequest, render_batch_item,
     render_committed, render_impact, render_pending, render_validation,
 };
+use crate::domain::category::{DomainVisibility, domain_visibility};
 use crate::domain::error::DomainError;
 use crate::domain::validation::guards;
 use crate::domain::writes::{Change, WriteActor};
@@ -52,7 +53,11 @@ fn request_id(headers: &HeaderMap) -> String {
         .unwrap_or_else(|| Uuid::new_v4().to_string())
 }
 
-pub(crate) fn actor(ctx: &SecurityContext, headers: &HeaderMap) -> WriteActor {
+pub(crate) fn actor(
+    ctx: &SecurityContext,
+    headers: &HeaderMap,
+    visibility: DomainVisibility,
+) -> WriteActor {
     // @cpt-begin:cpt-cf-settings-service-flow-value-writes-set:p1:inst-vw-set-1
     // Wrapped from the first moment: the header's bytes go straight into a
     // `SecretString`, and the session's bearer is cloned as the secret it
@@ -64,6 +69,7 @@ pub(crate) fn actor(ctx: &SecurityContext, headers: &HeaderMap) -> WriteActor {
         ctx: ctx.clone(),
         request_id: request_id(headers),
         step_up_token,
+        visibility,
     }
     // @cpt-end:cpt-cf-settings-service-flow-value-writes-set:p1:inst-vw-set-1
 }
@@ -171,9 +177,9 @@ pub async fn set_value(
     // @cpt-begin:cpt-cf-settings-service-algo-value-writes-gates:p1:inst-vw-gate-1
     // Authorization first, and alone: an unauthorized caller never has its
     // step-up token looked at.
-    authz::access_scope(&enforcer, &ctx, &resource::VALUE, WRITE, None).await?;
+    let scope = authz::access_scope(&enforcer, &ctx, &resource::VALUE, WRITE, None).await?;
     // @cpt-end:cpt-cf-settings-service-algo-value-writes-gates:p1:inst-vw-gate-1
-    let actor = actor(&ctx, &headers);
+    let actor = actor(&ctx, &headers, domain_visibility(&scope));
     let outcome = writes
         .change(
             &actor,
@@ -206,8 +212,8 @@ async fn fall_back(
 ) -> ApiResult<Response> {
     let key = parse_key(&key)?;
     let tenant = parse_tenant(params.tenant.as_deref())?;
-    authz::access_scope(enforcer, ctx, &resource::VALUE, WRITE, None).await?;
-    let actor = actor(ctx, &headers);
+    let scope = authz::access_scope(enforcer, ctx, &resource::VALUE, WRITE, None).await?;
+    let actor = actor(ctx, &headers, domain_visibility(&scope));
     let outcome = writes
         .change(&actor, &key, tenant, change, if_match(&headers), operation)
         .await;
@@ -315,10 +321,12 @@ pub async fn clone_value(
     let key = parse_key(&key)?;
     let to = parse_tenant(params.tenant.as_deref())?;
     // @cpt-end:cpt-cf-settings-service-flow-value-writes-clone:p1:inst-vw-clone-1
-    // Both ends authorized: `read` for the source, `write` for the target.
-    authz::access_scope(&enforcer, &ctx, &resource::VALUE, READ, None).await?;
-    authz::access_scope(&enforcer, &ctx, &resource::VALUE, WRITE, None).await?;
-    let actor = actor(&ctx, &headers);
+    // Both ends authorized: `read` for the source, `write` for the target,
+    // and the declaration visible under both answers.
+    let readable = authz::access_scope(&enforcer, &ctx, &resource::VALUE, READ, None).await?;
+    let writable = authz::access_scope(&enforcer, &ctx, &resource::VALUE, WRITE, None).await?;
+    let visibility = domain_visibility(&readable).narrowed(domain_visibility(&writable));
+    let actor = actor(&ctx, &headers, visibility);
     let outcome = writes
         .clone_value(&actor, &key, body.from, to, if_match(&headers))
         .await;
@@ -347,14 +355,14 @@ pub async fn batch_set(
     Json(body): Json<BatchRequest>,
 ) -> ApiResult<Response> {
     // @cpt-begin:cpt-cf-settings-service-flow-value-writes-batch:p1:inst-vw-batch-1
-    authz::access_scope(&enforcer, &ctx, &resource::VALUE, WRITE, None).await?;
+    let scope = authz::access_scope(&enforcer, &ctx, &resource::VALUE, WRITE, None).await?;
     // The size first, on the deserialized list, before a key is cloned or
     // parsed; the coordinator's own check stays as the backstop for callers
     // that do not come through REST.
     if body.changes.len() > BATCH_LIMIT {
         return Err(batch_too_large().into());
     }
-    let actor = actor(&ctx, &headers);
+    let actor = actor(&ctx, &headers, domain_visibility(&scope));
     let keys: Vec<String> = body.changes.iter().map(|c| c.key.clone()).collect();
     let mut entries = Vec::with_capacity(body.changes.len());
     for change in body.changes {
@@ -424,8 +432,8 @@ pub async fn stage_secret(
     let tenant = parse_tenant(params.tenant.as_deref())?;
     // @cpt-begin:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-1
     // The same `write` a set needs, decided first and alone.
-    authz::access_scope(&enforcer, &ctx, &resource::VALUE, WRITE, None).await?;
-    let actor = actor(&ctx, &headers);
+    let scope = authz::access_scope(&enforcer, &ctx, &resource::VALUE, WRITE, None).await?;
+    let actor = actor(&ctx, &headers, domain_visibility(&scope));
     let pending = writes
         .stage_secret(&actor, &key, tenant, checked_value(&body.value)?)
         .await?;
@@ -456,9 +464,9 @@ pub async fn validate_value(
     // @cpt-end:cpt-cf-settings-service-flow-value-writes-validate:p1:inst-vw-val-1
     // @cpt-begin:cpt-cf-settings-service-flow-value-writes-validate:p1:inst-vw-val-2
     // `read`, and no step-up: nothing is written.
-    authz::access_scope(&enforcer, &ctx, &resource::VALUE, READ, None).await?;
+    let scope = authz::access_scope(&enforcer, &ctx, &resource::VALUE, READ, None).await?;
     // @cpt-end:cpt-cf-settings-service-flow-value-writes-validate:p1:inst-vw-val-2
-    let actor = actor(&ctx, &headers);
+    let actor = actor(&ctx, &headers, domain_visibility(&scope));
     let report = writes
         .validate(
             &actor,
@@ -497,8 +505,8 @@ pub async fn impact(
     let key = parse_key(&key)?;
     let tenant = parse_tenant(params.tenant.as_deref())?;
     // @cpt-end:cpt-cf-settings-service-flow-value-writes-impact:p1:inst-vw-imp-1
-    authz::access_scope(&enforcer, &ctx, &resource::VALUE, READ, None).await?;
-    let actor = actor(&ctx, &headers);
+    let scope = authz::access_scope(&enforcer, &ctx, &resource::VALUE, READ, None).await?;
+    let actor = actor(&ctx, &headers, domain_visibility(&scope));
     let outcome = writes
         .impact(
             &actor,

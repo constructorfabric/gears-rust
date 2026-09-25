@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use super::{AccessActor, AccessService};
 use crate::domain::access::{ABSENT_RESTRICTION_TAG, TenantAccess};
+use crate::domain::category::DomainVisibility;
 use crate::domain::error::DomainError;
 use crate::domain::resolution::{ScopeTarget, scope_class};
 use crate::infra::storage::access_repo::AccessRepo;
@@ -56,6 +57,7 @@ fn actor(tenant: Uuid) -> AccessActor {
             .build()
             .expect("context"),
         request_id: "req".to_owned(),
+        visibility: crate::domain::category::DomainVisibility::Unrestricted,
     }
 }
 
@@ -218,6 +220,92 @@ async fn a_restrictions_audit_images_carry_the_pair_and_its_access_not_the_sette
             assert!(image.get("set_by").is_none(), "no setter in {image}");
         }
     }
+}
+
+#[tokio::test]
+async fn a_declaration_outside_the_callers_domain_is_absent_to_every_permission_operation() {
+    // The read of the setting answers 404 for a declaration outside the
+    // caller's administrative domain; its permissions must not answer
+    // anything else, or they would show what the read hides and let a
+    // restriction be placed on it.
+    let h = Harness::new().await;
+    let id = h
+        .base
+        .declare("strict", scope_class::CASCADING, json!(false))
+        .await;
+    h.base.bind_domain(id, "infrastructure").await;
+    h.base
+        .declare("open", scope_class::CASCADING, json!(false))
+        .await;
+    let t = &h.base.tree;
+    let conn = h.base.db.conn().expect("connection");
+    let key = h.key("strict");
+    let within = |domain: &str| AccessActor {
+        visibility: DomainVisibility::Restricted(vec![domain.to_owned()]),
+        ..actor(t.root)
+    };
+    let outside = within("commercial");
+
+    let absent = |result: Result<(), DomainError>, what: &str| {
+        assert!(
+            matches!(
+                result,
+                Err(DomainError::NotFound {
+                    resource: "declaration"
+                })
+            ),
+            "{what}: {result:?}"
+        );
+    };
+    absent(
+        h.service.read(&conn, &outside, &key, t.a).await.map(drop),
+        "read",
+    );
+    absent(
+        h.service
+            .set(
+                &conn,
+                &outside,
+                &key,
+                t.a,
+                TenantAccess::Hidden,
+                Some(ABSENT_RESTRICTION_TAG),
+            )
+            .await
+            .map(drop),
+        "set",
+    );
+    absent(
+        h.service
+            .clear(&conn, &outside, &key, t.a, Some(ABSENT_RESTRICTION_TAG))
+            .await
+            .map(drop),
+        "clear",
+    );
+    absent(
+        h.service.list(&conn, &outside, &key).await.map(drop),
+        "list",
+    );
+    assert!(h.audit.records().is_empty(), "nothing was written");
+
+    // Inside the domain it is there, and an undomained declaration is there
+    // for every restricted caller.
+    let inside = within("infrastructure");
+    h.service
+        .set(
+            &conn,
+            &inside,
+            &key,
+            t.a,
+            TenantAccess::Hidden,
+            Some(ABSENT_RESTRICTION_TAG),
+        )
+        .await
+        .expect("inside the domain");
+    h.service
+        .read(&conn, &outside, &h.key("open"), t.a)
+        .await
+        .expect("an undomained declaration");
 }
 
 #[tokio::test]

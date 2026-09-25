@@ -18,6 +18,7 @@ use super::{
     evict_access_change, may_restrict, restriction_tag, strictest,
 };
 use crate::audit::{AuditOperation, AuditRecord, AuditSink, AuditValue};
+use crate::domain::category::{DomainVisibility, is_visible};
 use crate::domain::declaration::{Declaration, DeclarationRepository};
 use crate::domain::error::DomainError;
 use crate::domain::platform_scope::PlatformScope;
@@ -31,6 +32,11 @@ pub struct AccessActor {
     pub ctx: SecurityContext,
     /// The request the change belongs to.
     pub request_id: String,
+    /// The administrative domains the caller may see, read off the scope its
+    /// authorization returned: a declaration outside them is absent here, as
+    /// it is to a read of the setting. Unrestricted when the scope carries no
+    /// domain constraint.
+    pub visibility: DomainVisibility,
 }
 
 /// What a read of one pair returns.
@@ -108,13 +114,14 @@ where
         }
     }
 
-    /// The declaration at `key`, or absent when there is none or the caller's
-    /// own effective access hides it: a caller cannot restrict, or learn of,
-    /// what it cannot see.
+    /// The declaration at `key`, or absent when there is none, it lies outside
+    /// the caller's administrative domain, or the caller's own effective
+    /// access hides it: a caller cannot restrict, or learn of, what it cannot
+    /// see — the same answers a read of the setting gives.
     async fn visible_declaration<C: DBRunner>(
         &self,
         conn: &C,
-        caller: Uuid,
+        actor: &AccessActor,
         key: &SettingKey,
     ) -> Result<Declaration, DomainError> {
         let declaration = self
@@ -122,8 +129,11 @@ where
             .find_by_key(conn, &AccessScope::allow_all(), key.as_str())
             .await?
             .ok_or_else(absent)?;
+        if !is_visible(&actor.visibility, declaration.domain_affinity.as_deref()) {
+            return Err(absent());
+        }
         if self
-            .effective_for(conn, declaration.id, caller)
+            .effective_for(conn, declaration.id, actor.ctx.subject_tenant_id())
             .await?
             .is_hidden()
         {
@@ -202,7 +212,7 @@ where
         self.readable_target(caller, target).await?;
         // @cpt-end:cpt-cf-settings-service-flow-tenant-access-read:p1:inst-ta-read-3
         // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-read:p1:inst-ta-read-4
-        let declaration = self.visible_declaration(conn, caller, key).await?;
+        let declaration = self.visible_declaration(conn, actor, key).await?;
         // @cpt-end:cpt-cf-settings-service-flow-tenant-access-read:p1:inst-ta-read-4
         // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-read:p1:inst-ta-read-5
         // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-read:p1:inst-ta-read-6
@@ -247,7 +257,7 @@ where
         }
         // @cpt-end:cpt-cf-settings-service-flow-tenant-access-set:p1:inst-ta-set-5
         // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-set:p1:inst-ta-set-6
-        let declaration = self.visible_declaration(conn, caller, key).await?;
+        let declaration = self.visible_declaration(conn, actor, key).await?;
         // The row is taken for update for the rest of this transaction. A
         // value write in flight holds it for share until its commit and
         // derives the writer's access again once the lock clears, so this
@@ -331,7 +341,7 @@ where
         }
         // @cpt-end:cpt-cf-settings-service-flow-tenant-access-clear:p1:inst-ta-clear-3
         // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-clear:p1:inst-ta-clear-4
-        let declaration = self.visible_declaration(conn, caller, key).await?;
+        let declaration = self.visible_declaration(conn, actor, key).await?;
         // Lifting a restriction serializes against writes in flight the same
         // way setting one does; see `set`.
         self.declarations
@@ -402,7 +412,7 @@ where
     ) -> Result<Vec<Restriction>, DomainError> {
         let caller = actor.ctx.subject_tenant_id();
         // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-list:p1:inst-ta-list-3
-        let declaration = self.visible_declaration(conn, caller, key).await?;
+        let declaration = self.visible_declaration(conn, actor, key).await?;
         // @cpt-end:cpt-cf-settings-service-flow-tenant-access-list:p1:inst-ta-list-3
         // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-list:p1:inst-ta-list-4
         // Under the subtree budget: a listing the budget would cut is refused
