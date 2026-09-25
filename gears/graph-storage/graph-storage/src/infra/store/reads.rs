@@ -19,7 +19,9 @@ use toolkit_db::secure::{DBRunner, SecureEntityExt};
 use toolkit_odata::{Page as OdataPage, SortDir};
 use uuid::Uuid;
 
-use crate::infra::projections::{NodeIdent, TypeName, node_ident_columns, type_name_columns};
+use crate::infra::projections::{
+    NodeIdent, TypeName, TypeTraits, node_ident_columns, type_name_columns, type_traits_columns,
+};
 use crate::infra::storage::entity::{edge, graph_meta, gts_type, node};
 use crate::infra::storage::odata_mapper::NodeODataMapper;
 use crate::infra::store::{PgGraphStore, map_db_error, map_scope_err};
@@ -570,7 +572,9 @@ pub async fn project_table(
             .secure()
             .scope_with(ctx.scope)
             .filter(Condition::all().add(gts_type::Column::GtsTypeId.is_in(names)))
-            .all(&conn)
+            .project_all(&conn, |query| {
+                type_traits_columns(query).into_model::<TypeTraits>()
+            })
             .await
             .map_err(map_scope_err)?;
         let ids: Vec<i32> = types.iter().map(|t| t.id).collect();

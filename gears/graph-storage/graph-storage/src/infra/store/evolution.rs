@@ -19,6 +19,7 @@ use std::collections::BTreeMap;
 use toolkit_db::secure::{DBRunner, SecureEntityExt, SecureUpdateExt};
 
 use crate::domain::ontology::ChainValidator;
+use crate::infra::projections::{NodeIdent, node_ident_columns};
 use crate::infra::storage::entity::{edge, node};
 use crate::infra::store::map_scope_err;
 
@@ -70,7 +71,9 @@ async fn endpoint_keys(
         .secure()
         .scope_with(scope)
         .filter(Condition::all().add(node::Column::Id.is_in(ids)))
-        .all(tx)
+        .project_all(tx, |query| {
+            node_ident_columns(query).into_model::<NodeIdent>()
+        })
         .await
         .map_err(map_scope_err)?
         .into_iter()

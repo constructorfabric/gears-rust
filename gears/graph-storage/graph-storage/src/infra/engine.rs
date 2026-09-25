@@ -29,7 +29,8 @@ use tracing::warn;
 
 use crate::config::HopStrategy;
 use crate::infra::projections::{
-    NodeIdent, TypeId, TypeName, node_ident_columns, type_id_columns, type_name_columns,
+    EdgeHop, EndpointPair, NodeIdent, TypeId, TypeName, edge_hop_columns, endpoint_pair_columns,
+    node_ident_columns, type_id_columns, type_name_columns,
 };
 use crate::infra::storage::entity::{edge, gts_type, node};
 use crate::infra::storage::graph::KnowledgeGraph;
@@ -461,9 +462,11 @@ async fn live_edges(
 
     // One row past the budget, so the difference between "exactly the budget"
     // and "more than the budget" is observable; the extra row is then dropped.
-    let mut rows = select
+    let mut rows: Vec<EdgeHop> = select
         .limit(req.budget.max_edges_scanned.saturating_add(1))
-        .all(runner)
+        .project_all(runner, |query| {
+            edge_hop_columns(query).into_model::<EdgeHop>()
+        })
         .await
         .map_err(scope_error)?;
     let over_edge_budget = rows.len() as u64 > req.budget.max_edges_scanned;
@@ -598,7 +601,9 @@ async fn degrees_of(
         .filter(incidence)
         .filter(Condition::all().add(edge::Column::DeletedAt.is_null()))
         .limit(budget.saturating_add(1))
-        .all(runner)
+        .project_all(runner, |query| {
+            endpoint_pair_columns(query).into_model::<EndpointPair>()
+        })
         .await
         .map_err(scope_error)?;
     let over_budget = rows.len() as u64 > budget;

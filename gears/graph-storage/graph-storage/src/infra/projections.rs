@@ -58,6 +58,25 @@ pub fn type_name_columns(query: Select<gts_type::Entity>) -> Select<gts_type::En
         .column(gts_type::Column::GtsTypeId)
 }
 
+/// A type's interned id and its resolved traits, without the schema.
+///
+/// The projection read needs the traits to decide which payload paths a
+/// `$filter` may name, and the id to narrow the statement; the schema the
+/// type was registered with is the widest column on the row and plays no
+/// part in either.
+#[derive(Debug, sea_orm::FromQueryResult)]
+pub struct TypeTraits {
+    pub id: i32,
+    pub effective_traits: serde_json::Value,
+}
+
+pub fn type_traits_columns(query: Select<gts_type::Entity>) -> Select<gts_type::Entity> {
+    query
+        .select_only()
+        .column(gts_type::Column::Id)
+        .column(gts_type::Column::EffectiveTraits)
+}
+
 /// Which two nodes an edge holds — all a reference check asks.
 #[derive(Debug, sea_orm::FromQueryResult)]
 pub struct EndpointPair {
@@ -72,13 +91,33 @@ pub fn endpoint_pair_columns(query: Select<edge::Entity>) -> Select<edge::Entity
         .column(edge::Column::DstNodeId)
 }
 
+/// What one hop needs of an edge: which edge, of which type, between which
+/// two nodes. Read per hop for every live incident edge, so its payload and
+/// audit columns were the widest thing on the traversal hot path.
+#[derive(Debug, sea_orm::FromQueryResult)]
+pub struct EdgeHop {
+    pub edge_key: String,
+    pub gts_edge_type_id: i32,
+    pub src_node_id: i64,
+    pub dst_node_id: i64,
+}
+
+pub fn edge_hop_columns(query: Select<edge::Entity>) -> Select<edge::Entity> {
+    query
+        .select_only()
+        .column(edge::Column::EdgeKey)
+        .column(edge::Column::GtsEdgeTypeId)
+        .column(edge::Column::SrcNodeId)
+        .column(edge::Column::DstNodeId)
+}
+
 #[cfg(test)]
 mod tests {
     use sea_orm::{DatabaseBackend, EntityTrait, QueryTrait};
 
     use super::{
-        edge, endpoint_pair_columns, gts_type, node, node_ident_columns, type_id_columns,
-        type_name_columns,
+        edge, edge_hop_columns, endpoint_pair_columns, gts_type, node, node_ident_columns,
+        type_id_columns, type_name_columns, type_traits_columns,
     };
 
     /// The columns no projection here may read, by entity. Each of them is
@@ -135,5 +174,20 @@ mod tests {
             &WIDE_EDGE,
             &["src_node_id", "dst_node_id"],
         );
+    }
+
+    #[test]
+    fn an_edge_hop_reads_four_columns() {
+        holds(
+            &rendered(&edge_hop_columns(edge::Entity::find())),
+            &WIDE_EDGE,
+            &["edge_key", "gts_edge_type_id", "src_node_id", "dst_node_id"],
+        );
+    }
+
+    #[test]
+    fn a_types_traits_are_read_without_its_schema() {
+        let sql = rendered(&type_traits_columns(gts_type::Entity::find()));
+        holds(&sql, &["schema"], &["id", "effective_traits"]);
     }
 }
