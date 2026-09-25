@@ -95,6 +95,35 @@ impl FilterField for CategoryOrderField {
     }
 }
 
+/// The fields `GET /settings` orders by. The browse pages declarations, so an
+/// order is a declaration column, and one that is never empty: `needs_review`
+/// belongs to value rows and orders nothing here, and the columns that may be
+/// empty would break the page's cursor for the reason [`DeclarationOrderField`]
+/// gives. What remains is what the browse also filters on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SettingOrderField {
+    Key,
+    CategoryId,
+}
+
+impl FilterField for SettingOrderField {
+    const FIELDS: &'static [Self] = &[Self::Key, Self::CategoryId];
+
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Key => "key",
+            Self::CategoryId => "category_id",
+        }
+    }
+
+    fn kind(&self) -> FieldKind {
+        match self {
+            Self::Key => FieldKind::String,
+            Self::CategoryId => FieldKind::Uuid,
+        }
+    }
+}
+
 /// Refuse an `$orderby` naming a field outside `O`, the fields `resource` is
 /// ordered by — before any page is read, so the refusal names the field rather
 /// than surfacing later as a cursor that will not encode.

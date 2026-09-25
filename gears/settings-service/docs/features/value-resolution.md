@@ -201,7 +201,7 @@ Three properties matter more than the walk itself.
 - The `needs_review` filter over a target whose subtree exceeds the subtree budget
 
 **Steps**:
-1. [x] - `p1` - Actor sends GET /settings-service/v1/settings with optional `tenant`, OData `$filter` over `category_id`, `key in (…)` or `needs_review eq true`, `$orderby`, and a pagination cursor; `tenant` and scope are resolution context, never filters - `inst-vr-browse-1`
+1. [x] - `p1` - Actor sends GET /settings-service/v1/settings with optional `tenant`, OData `$filter` over `category_id`, `key in (…)` or `needs_review eq true`, `$orderby` over `key` or `category_id` — any other field is refused `400 odata_unsortable_field`, since the page is a page of declarations and an order must be one of their columns that is never empty — and a pagination cursor; `tenant` and scope are resolution context, never filters - `inst-vr-browse-1`
 2. [x] - `p1` - Authorize `read` once on the settings base type; **IF** allowed → the caller's grant covers every setting and no further decision is needed for the page - `inst-vr-browse-2`
 3. [x] - `p1` - **ELSE** assemble the page under the narrowed grant: fetch a candidate batch wider than the page, evaluate the candidates in one batch decision, keep what is allowed, and refill until the page is full or the candidates run out; a setting the caller may not read is absent from the page and the count, never marked - `inst-vr-browse-3`
 4. [x] - `p1` - Confirm the target is within the caller's subtree and not standalone; **IF** not → **RETURN** `403` - `inst-vr-browse-4`

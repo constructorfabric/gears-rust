@@ -45,7 +45,8 @@ pub fn register_routes(
              caller's subtree, or a standalone descendant, answers 403. OData `$filter` \
              supports `category_id eq`, `key eq`, `key in (...)` and `needs_review eq true`, \
              joined by `and`; an unmapped field or unsupported operator answers 400 rather \
-             than an unfiltered page. Each item carries its own outcome, so a named key \
+             than an unfiltered page. `$orderby` takes `key` and `category_id`; any other \
+             field answers 400. Each item carries its own outcome, so a named key \
              that does not exist is reported in its entry, never as a failure of the \
              request. `needs_review eq true` lists the flagged override rows in the \
              caller's subtree instead of resolved values. Values are masked by \
@@ -68,7 +69,7 @@ pub fn register_routes(
             "A page of per-key outcomes with its pagination cursors",
         )
         .with_odata_filter::<SettingFilterField>()
-        .with_odata_orderby::<SettingFilterField>()
+        .with_odata_orderby::<crate::domain::odata::SettingOrderField>()
         .error_400(openapi)
         .error_401(openapi)
         .error_403(openapi)

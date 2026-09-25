@@ -285,6 +285,39 @@ async fn a_search_query_shorter_than_two_characters_is_refused() {
 }
 
 #[tokio::test]
+async fn browse_orders_by_the_fields_it_advertises_and_refuses_the_rest_up_front() {
+    // The browse pages declarations, so an order it accepts must be a
+    // declaration column that is never empty: `needs_review` is not one, and
+    // `mode`, `status` or `domain_affinity` are not what the page advertises —
+    // the last would also break the page's cursor on its first empty value.
+    let h = RestHarness::new().await;
+    h.inner.declare("alpha", "cascading", json!(true)).await;
+    for field in ["needs_review", "mode", "domain_affinity", "owner_module"] {
+        let (status, body) = h
+            .get(
+                &format!("/settings-service/v1/settings?$orderby={field}%20asc"),
+                h.inner.tree.root,
+            )
+            .await;
+        assert_eq!(status, 400, "{field}: {body}");
+        assert_eq!(
+            body["context"]["field_violations"][0]["reason"],
+            json!(crate::field::ODATA_UNSORTABLE_FIELD),
+            "{field}: {body}"
+        );
+    }
+    for field in ["key", "category_id"] {
+        let (status, body) = h
+            .get(
+                &format!("/settings-service/v1/settings?$orderby={field}%20desc"),
+                h.inner.tree.root,
+            )
+            .await;
+        assert_eq!(status, 200, "{field}: {body}");
+    }
+}
+
+#[tokio::test]
 async fn browse_refuses_a_filter_on_a_field_it_does_not_map() {
     let h = RestHarness::new().await;
     let uri = "/settings-service/v1/settings?$filter=tenant%20eq%20%27x%27";

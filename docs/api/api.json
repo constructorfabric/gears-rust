@@ -54996,7 +54996,7 @@
     },
     "/settings-service/v1/settings": {
       "get": {
-        "description": "Resolve a page of settings at one scope. `tenant` is resolution context, never a filter: omitted, it is the caller's own tenant, which for a platform administrator is the root and therefore platform scope; a tenant outside the caller's subtree, or a standalone descendant, answers 403. OData `$filter` supports `category_id eq`, `key eq`, `key in (...)` and `needs_review eq true`, joined by `and`; an unmapped field or unsupported operator answers 400 rather than an unfiltered page. Each item carries its own outcome, so a named key that does not exist is reported in its entry, never as a failure of the request. `needs_review eq true` lists the flagged override rows in the caller's subtree instead of resolved values. Values are masked by classification.",
+        "description": "Resolve a page of settings at one scope. `tenant` is resolution context, never a filter: omitted, it is the caller's own tenant, which for a platform administrator is the root and therefore platform scope; a tenant outside the caller's subtree, or a standalone descendant, answers 403. OData `$filter` supports `category_id eq`, `key eq`, `key in (...)` and `needs_review eq true`, joined by `and`; an unmapped field or unsupported operator answers 400 rather than an unfiltered page. `$orderby` takes `key` and `category_id`; any other field answers 400. Each item carries its own outcome, so a named key that does not exist is reported in its entry, never as a failure of the request. `needs_review eq true` lists the flagged override rows in the caller's subtree instead of resolved values. Values are masked by classification.",
         "operationId": "settings_service.browse_settings",
         "parameters": [
           {
@@ -55036,7 +55036,7 @@
             }
           },
           {
-            "description": "OData v4 orderby expression\n- key asc\n- key desc\n- category_id asc\n- category_id desc\n- needs_review asc\n- needs_review desc",
+            "description": "OData v4 orderby expression\n- key asc\n- key desc\n- category_id asc\n- category_id desc",
             "in": "query",
             "name": "$orderby",
             "required": false,
@@ -55142,9 +55142,7 @@
             "key asc",
             "key desc",
             "category_id asc",
-            "category_id desc",
-            "needs_review asc",
-            "needs_review desc"
+            "category_id desc"
           ]
         }
       }

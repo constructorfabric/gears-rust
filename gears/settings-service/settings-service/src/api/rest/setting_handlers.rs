@@ -317,6 +317,9 @@ pub async fn browse_settings(
     // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-1
     let requested = parse_tenant(params.tenant.as_deref())?;
     crate::domain::odata::reject_unsupported_options(&query, "settings")?;
+    crate::domain::odata::reject_unsortable::<crate::domain::odata::SettingOrderField>(
+        &query, "settings",
+    )?;
     let filter = interpret(query.filter.as_deref())?;
     // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-1
     // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-2
