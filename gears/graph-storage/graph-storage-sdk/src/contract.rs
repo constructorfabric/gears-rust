@@ -125,6 +125,49 @@ async fn assert_alignment_and_width<P: EmbeddingProviderV1 + ?Sized>(provider: &
     );
 }
 
+/// How far two embeddings of the same text may diverge, as `1 - cosine`.
+///
+/// Well above the drift of nondeterministic floating-point reduction on
+/// unit vectors, which sits around `1e-6`, and well below what separates two
+/// different texts: at `1e-4` a provider that answers a different direction
+/// the second time still fails.
+const DETERMINISM_TOLERANCE: f32 = 1e-4;
+
+/// What is wrong, if anything, with two embeddings of the same batch.
+fn determinism_violation(first: &[Vec<f32>], second: &[Vec<f32>]) -> Option<String> {
+    if first.len() != second.len() {
+        return Some(format!(
+            "the same batch answered {} vectors and then {}",
+            first.len(),
+            second.len()
+        ));
+    }
+    for (index, (a, b)) in first.iter().zip(second).enumerate() {
+        if a.len() != b.len() {
+            return Some(format!("vector {index} changed width between calls"));
+        }
+        let similarity = cosine(a, b);
+        if similarity < 1.0 - DETERMINISM_TOLERANCE {
+            return Some(format!(
+                "vector {index} drifted to cosine {similarity} of itself between two calls \
+                 with the same input; the same text must embed to the same direction"
+            ));
+        }
+    }
+    None
+}
+
+fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+    let norm = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let denominator = norm(a) * norm(b);
+    if denominator == 0.0 {
+        // Two zero vectors point nowhere; equal is the only honest reading.
+        return if a == b { 1.0 } else { 0.0 };
+    }
+    dot / denominator
+}
+
 async fn assert_determinism<P: EmbeddingProviderV1 + ?Sized>(provider: &P) {
     let inputs = sample_inputs();
     let first = provider
@@ -136,12 +179,20 @@ async fn assert_determinism<P: EmbeddingProviderV1 + ?Sized>(provider: &P) {
         .await
         .expect("a provider must embed a well-formed batch");
 
-    assert_eq!(
-        first.vectors, second.vectors,
-        "the same text must embed to the same vector: ingest and query embed \
-         at different times, and a drifting provider ranks a document below \
-         its own text"
-    );
+    // The same text must embed to the same *direction*: ingest and query
+    // embed at different times, and a provider whose second answer points
+    // elsewhere ranks a document below its own text. Bit-for-bit equality is
+    // more than that asks, and more than ADR-0004 asks -- it wants
+    // determinism of the fake, for CI's sake, not of every provider. GPU
+    // inference and multi-threaded BLAS reduce in a nondeterministic order
+    // and drift in the last few bits, which moves no document relative to
+    // its own text; an exact comparison would have refused every such
+    // provider on a property the gear never relies on. Nothing downstream
+    // compares vectors exactly either: re-embedding is decided by a hash of
+    // the input text, not of the vector.
+    if let Some(problem) = determinism_violation(&first.vectors, &second.vectors) {
+        panic!("{problem}");
+    }
     assert_ne!(
         first.vectors.first(),
         first.vectors.get(1),
@@ -201,4 +252,51 @@ async fn assert_budget_and_cancellation<P: EmbeddingProviderV1 + ?Sized>(provide
         ),
         "a cancelled call must be refused as `Cancelled`"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::determinism_violation;
+
+    fn unit(v: &[f32]) -> Vec<f32> {
+        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        v.iter().map(|x| x / norm).collect()
+    }
+
+    /// The drift nondeterministic reduction produces -- last-bits noise on a
+    /// unit vector -- is not a violation. An exact comparison refused it.
+    #[test]
+    fn last_bits_drift_is_the_same_embedding() {
+        let first = vec![unit(&[0.3, 0.5, 0.8, 0.1])];
+        let second: Vec<Vec<f32>> = first
+            .iter()
+            .map(|v| v.iter().map(|x| x + 1e-6).collect())
+            .collect();
+        assert_ne!(first, second, "the fixture must actually differ");
+        assert_eq!(determinism_violation(&first, &second), None);
+    }
+
+    /// A provider whose second answer points somewhere else still fails:
+    /// that is the property the clause exists for.
+    #[test]
+    fn a_different_direction_is_not_the_same_embedding() {
+        let first = vec![unit(&[1.0, 0.0, 0.0, 0.0])];
+        let second = vec![unit(&[0.9, 0.3, 0.0, 0.0])];
+        let problem =
+            determinism_violation(&first, &second).expect("a vector that moved is refused");
+        assert!(problem.contains("drifted"), "{problem}");
+    }
+
+    #[test]
+    fn a_changed_shape_is_refused() {
+        let one = vec![unit(&[1.0, 2.0])];
+        assert!(
+            determinism_violation(&one, &[]).is_some(),
+            "a vector went missing"
+        );
+        assert!(
+            determinism_violation(&one, &[unit(&[1.0, 2.0, 3.0])]).is_some(),
+            "a vector changed width"
+        );
+    }
 }
