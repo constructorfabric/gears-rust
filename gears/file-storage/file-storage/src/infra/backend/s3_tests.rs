@@ -779,3 +779,25 @@ async fn s3_backend_publish_exclusive_multipart_rejects_overwrite() {
         "the original multipart object must survive the rejected overwrite"
     );
 }
+
+// A genuinely-concurrent (barrier-synchronized) `publish_exclusive` racer
+// test, mirroring `local_fs_publish_exclusive_concurrent_racers_never_mix` /
+// `in_memory_publish_exclusive_concurrent_racers_never_mix` above, is
+// deliberately NOT included here: `s3s-fs`'s own `PutObject` handler checks
+// `If-None-Match: *` via a plain `object_path.exists()` call and only writes
+// the file afterwards, with no lock spanning the two -- the same
+// check-then-write race `StorageBackend::publish_exclusive`'s own doc comment
+// describes as its non-atomic fallback shape. Two truly concurrent
+// `publish_exclusive` calls against `s3s-fs` can both observe "does not
+// exist" and both report `created: true`, which is a limitation of this
+// in-process test double, not of `S3Backend` (which sends the same
+// conditional header real S3 relies on) -- so a hard "exactly one winner"
+// assertion here would test `s3s-fs`'s own race, not this crate's code, and
+// would be flaky by construction. `S3Backend`'s conditional-write header is
+// still covered sequentially by
+// `s3_backend_publish_exclusive_single_put_rejects_overwrite` /
+// `s3_backend_publish_exclusive_multipart_rejects_overwrite` above; genuine
+// concurrent-write atomicity against a real S3-compatible endpoint is a
+// deployment-specific property validated as part of ADR-0005's release gate
+// (see `StorageBackend::publish_exclusive`'s doc comment), not something an
+// in-process unit test can establish.

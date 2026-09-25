@@ -29,10 +29,13 @@ workspace = true
 [features]
 default = []
 
-# Gates the Postgres-backed real-DB concurrency suite
-# (tests/pg_concurrency_test.rs). Disabled by default because it spins up a
-# `testcontainers` Docker container; enable with `--features integration`
-# when Docker is available locally or in CI.
+# Gates RUNNING the Postgres-backed real-DB concurrency suite
+# (tests/pg_concurrency_test.rs), which spins up a `testcontainers` Docker
+# container; enable with `--features integration` when Docker is available
+# locally or in CI. Cargo has no way to make a dev-dependency itself optional,
+# so the `testcontainers`/`testcontainers-modules` dev-dependencies below are
+# always compiled in a dev build regardless of this feature — it only skips
+# actually running the container-backed tests.
 integration = []
 
 [dependencies]

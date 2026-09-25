@@ -3233,6 +3233,18 @@ async fn upload_multipart_part_native_oversized_returns_413() {
 /// `write_multipart_part_native`'s streaming rewrite still honours the idle
 /// guard exactly like the (removed) whole-part-buffering version did.
 ///
+/// Beyond the status code, this also asserts the part was never actually
+/// counted as delivered, two ways:
+/// - the backend's own multipart session never received part 1's bytes:
+///   `InMemoryBackend::upload_part_stream` only inserts into its per-handle
+///   part map on a fully-drained, exact-length stream, which the idle-timeout
+///   error path never reaches, so forcing `complete_multipart` on the same
+///   (still-open) handle afterwards assembles a 0-byte object;
+/// - the control plane's report-part callback (`report_part_with_control_plane`,
+///   which runs only after `write_multipart_part` returns `Ok`) is never even
+///   dialed -- a mock control-plane listener's accepted-connection count
+///   stays at 0.
+///
 /// `start_paused = true` for the same reason as the single-part counterpart:
 /// the 50ms idle timeout and the second chunk's 2s stall are both
 /// `tokio::time`, so virtual time resolves this without a real wait.
@@ -3247,6 +3259,28 @@ async fn upload_multipart_part_native_idle_timeout_returns_408() {
     state.verifier = Arc::new(issuer.verifier());
     state.backends = backends;
     state.body_idle_timeout = Some(Duration::from_millis(50));
+
+    // Mock control plane: only its accepted-connection count matters here --
+    // the report-part callback must never even try to dial it.
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock control plane");
+    let control_plane_addr = listener.local_addr().expect("local addr");
+    let report_part_calls = Arc::new(AtomicUsize::new(0));
+    let report_part_calls_srv = Arc::clone(&report_part_calls);
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            report_part_calls_srv.fetch_add(1, Ordering::SeqCst);
+            let mut buf = [0u8; 1024];
+            if stream.read(&mut buf).await.is_ok() {
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                    .await
+                    .ok();
+            }
+        }
+    });
+    state.control_base_url = format!("http://{control_plane_addr}");
 
     let file_id = Uuid::now_v7();
     let version_id = Uuid::now_v7();
@@ -3300,6 +3334,151 @@ async fn upload_multipart_part_native_idle_timeout_returns_408() {
         .expect("router call succeeds");
 
     assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+
+    assert_eq!(
+        report_part_calls.load(Ordering::SeqCst),
+        0,
+        "the report-part callback must never be dialed for a part the idle timeout aborted"
+    );
+
+    // Force-complete the still-open handle: `complete_multipart` assembles
+    // its result purely from whatever this backend's own per-handle part map
+    // actually holds (never from the caller-supplied completion-parts list,
+    // which only feeds the returned manifest) -- see its own doc comment. A
+    // 0-byte assembled object proves part 1's bytes never landed on the
+    // backend, independent of the mock control-plane check above.
+    let (_manifest, _root) = backend
+        .complete_multipart(
+            &backend_path,
+            &backend_handle,
+            &[(1, 0, [0u8; 32], "unused-etag".to_owned())],
+        )
+        .await
+        .expect("force-completing the still-open handle must succeed");
+    let assembled_len = backend
+        .stat(&backend_path)
+        .await
+        .expect("stat succeeds")
+        .expect("complete_multipart always publishes the assembled object");
+    assert_eq!(
+        assembled_len, 0,
+        "the idle-timed-out part must never have landed in the backend's part map"
+    );
+}
+
+/// Route-level counterpart to `upload_multipart_part_native_idle_timeout_returns_408`,
+/// for the offset-object write path (`write_multipart_part_offset_object`,
+/// `LocalFsBackend` -- `capabilities().multipart_native == false`): a part
+/// body that stalls past `FS_SIDECAR_BODY_IDLE_TIMEOUT_SECS` must answer
+/// `408`, must never leave a visible `.part.N` object behind (`put_stream`
+/// only renames its temp file into place on success -- see its own doc
+/// comment -- and the idle-timeout error path never reaches that point), and
+/// must never dial the control plane's report-part callback (which only runs
+/// after `write_multipart_part` returns `Ok`).
+///
+/// `start_paused = true` for the same reason as the native-multipart and
+/// single-part counterparts.
+#[tokio::test(start_paused = true)]
+async fn upload_multipart_part_offset_object_idle_timeout_returns_408() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let backend = Arc::new(LocalFsBackend::new("local-fs", dir.path()));
+    let backends = BackendRegistry::new(
+        vec![Arc::clone(&backend) as Arc<dyn StorageBackend>],
+        "local-fs",
+    )
+    .expect("build test backend registry");
+    let issuer = Issuer::generate(60).expect("issuer generation");
+    let mut state = test_state();
+    state.verifier = Arc::new(issuer.verifier());
+    state.backends = backends;
+    state.body_idle_timeout = Some(Duration::from_millis(50));
+
+    // Mock control plane: only its accepted-connection count matters here --
+    // the report-part callback must never even try to dial it.
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock control plane");
+    let control_plane_addr = listener.local_addr().expect("local addr");
+    let report_part_calls = Arc::new(AtomicUsize::new(0));
+    let report_part_calls_srv = Arc::clone(&report_part_calls);
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            report_part_calls_srv.fetch_add(1, Ordering::SeqCst);
+            let mut buf = [0u8; 1024];
+            if stream.read(&mut buf).await.is_ok() {
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                    .await
+                    .ok();
+            }
+        }
+    });
+    state.control_base_url = format!("http://{control_plane_addr}");
+
+    let file_id = Uuid::now_v7();
+    let version_id = Uuid::now_v7();
+    let upload_id = Uuid::now_v7();
+    let backend_path = format!("/{file_id}/{version_id}");
+    // Declared size is larger than what the stream ever delivers -- the idle
+    // timeout must fire well before an undersized-part rejection would.
+    // `LocalFsBackend` has no native multipart handle, so the last arg (the
+    // native `backend_handle` claim) is unused by this write path -- pass an
+    // empty string like the other offset-object tests in this file do.
+    let token = multipart_part_token(
+        &issuer,
+        file_id,
+        version_id,
+        "local-fs",
+        &backend_path,
+        upload_id,
+        1,
+        0,
+        1024,
+        "",
+    );
+
+    // Yields one chunk immediately, then goes silent well past the 50ms
+    // idle timeout configured above.
+    let body_stream = futures::stream::unfold(0u8, |i| async move {
+        match i {
+            0 => Some((
+                Ok::<_, std::io::Error>(Bytes::from_static(b"first-chunk")),
+                1,
+            )),
+            1 => {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                Some((Ok(Bytes::from_static(b"never-sent")), 2))
+            }
+            _ => None,
+        }
+    });
+
+    let router = build_router(state, DEFAULT_MAX_BODY_BYTES);
+    let response = router
+        .oneshot(
+            Request::put(format!(
+                "/api/file-storage-data/v1/multipart/{file_id}/{version_id}/parts/1?fs-token={token}"
+            ))
+            .body(Body::from_stream(body_stream))
+            .expect("valid request"),
+        )
+        .await
+        .expect("router call succeeds");
+
+    assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+
+    let part_path = format!("{backend_path}.part.1");
+    let stat = backend.stat(&part_path).await.expect("stat succeeds");
+    assert!(
+        stat.is_none(),
+        "an idle-timed-out part must never leave a visible .part.N object"
+    );
+
+    assert_eq!(
+        report_part_calls.load(Ordering::SeqCst),
+        0,
+        "the report-part callback must never be dialed for a part the idle timeout aborted"
+    );
 }
 
 // ── observable metrics + download Content-Length (T12) ─────────────────────

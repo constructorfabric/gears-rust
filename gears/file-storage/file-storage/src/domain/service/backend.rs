@@ -1,5 +1,6 @@
 //! Backend migration and backend discovery.
 
+use futures::StreamExt;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
@@ -8,7 +9,7 @@ use crate::domain::authz::actions;
 use crate::domain::error::DomainError;
 use crate::domain::service::FileService;
 use crate::domain::storage_layout;
-use crate::infra::backend::BackendCapabilities;
+use crate::infra::backend::{BackendCapabilities, StorageBackend};
 use crate::infra::content::hash_mode::{HashMode, Manifest};
 use crate::infra::content::stream_verify;
 
@@ -24,9 +25,19 @@ impl FileService {
     /// 2. Stream the blob from the source backend into the destination
     ///    backend at the canonical path, verifying its content hash (SHA-256,
     ///    mode-aware per ADR-0006) incrementally on the same pass.
-    /// 3. If verification fails (or the source stream breaks mid-read), fail
-    ///    without committing the CAS below, and best-effort delete the
-    ///    destination object if this call is the one that created it.
+    /// 3. If verification of the source stream fails (or it breaks
+    ///    mid-read), fail without committing the CAS below, and best-effort
+    ///    delete the destination object if this call is the one that created
+    ///    it. If the destination object already existed (`created: false`),
+    ///    that alone is not proof it was ever verified — an earlier attempt
+    ///    (this exact call retried, or a distinct migration racing on the
+    ///    same deterministic path) can be interrupted after writing but
+    ///    before its own hash check and cleanup. So the pre-existing object
+    ///    is read back and re-verified against the same hash spec before it
+    ///    is trusted; a mismatch (or a read failure) is treated like a
+    ///    source-verification failure and the object is unconditionally
+    ///    best-effort deleted (it carries no live database pointer either
+    ///    way).
     /// 4. Transactionally update `backend_id` + `backend_path` and emit a
     ///    `BackendMigrate` audit row.
     /// 5. Best-effort delete the source blob (orphan cleanup if this fails).
@@ -87,90 +98,21 @@ impl FileService {
         // Stream the blob from the source backend straight into the
         // destination, verifying its content hash incrementally on the same
         // pass (mode-aware, ADR-0006) instead of materializing the whole
-        // object in memory. For `whole-sha256` this hashes the object as it
-        // streams through. For `multipart-composite-sha256` it fetches the
-        // version's `version_hash_manifest` row up front and hashes each part
-        // against that manifest ALONE (split-rehash-rebuild-compare) as the
-        // corresponding bytes stream past, with no dependency on
-        // `multipart_upload_parts` still existing — the manifest is the
-        // durable, self-contained record. Either way, the verdict is only
-        // known once the destination write below has fully drained the
-        // stream — see `infra::content::stream_verify`'s doc comment.
+        // object in memory, and only return once that verification (source
+        // stream, plus a pre-existing destination object's own read-back
+        // where relevant) has passed — see
+        // `Self::stream_verify_and_publish_to_dest`'s own doc comment for the
+        // full contract, including its cleanup behavior on failure.
         let expected_len = u64::try_from(version.size).unwrap_or(0);
-        let hash_mode = HashMode::parse(&version.hash_mode).ok_or_else(|| {
-            DomainError::database(format!(
-                "version {} has an unrecognized hash_mode {:?}",
-                version.version_id, version.hash_mode
-            ))
-        })?;
-        let manifest = match hash_mode {
-            HashMode::WholeSha256 => None,
-            HashMode::MultipartCompositeSha256 => {
-                let raw = self
-                    .store
-                    .get_version_manifest(version.version_id)
-                    .await?
-                    .ok_or_else(|| {
-                        DomainError::database(format!(
-                            "multipart-composite version {} is missing its version_hash_manifest row",
-                            version.version_id
-                        ))
-                    })?;
-                Some(Manifest::from_wire_string(&raw)?)
-            }
-        };
-
-        let source_stream = source
-            .get_stream(&version.backend_path, expected_len)
-            .await?;
-        let (verified_stream, verify_slot) = stream_verify::verify_stream(
-            source_stream,
-            expected_len,
-            hash_mode,
-            version.hash_value.clone(),
-            manifest,
-        )?;
-
-        // Write to the destination at the canonical path. Create-exclusive
-        // (`publish_exclusive`, not `put_stream`): `dest_path` is
-        // deterministic (`/{file_id}/{version_id}`), so two concurrent
-        // migrations to the SAME target both attempt to write here — with a
-        // plain overwriting write the second writer to land always wins
-        // physically, which only stays harmless as long as both writers'
-        // content is identical. `publish_exclusive` keeps that true even when
-        // it might not otherwise be: once the first writer's (verified, or
-        // about to be verified) bytes are in place, a second writer whose own
-        // read from the source turned out corrupted can never clobber them —
-        // it observes `created: false` and its own bytes are simply
-        // discarded. `created` below is what decides whether a failed
-        // verification may delete the object this call just wrote (see
-        // `features/backend-migration.md`).
         let dest_path = storage_layout::backend_path(file_id, version.version_id);
-        let outcome = dest
-            .publish_exclusive(&dest_path, verified_stream, Some(expected_len))
-            .await?;
-
-        let verify_result = verify_slot
-            .lock()
-            .map_err(|_| DomainError::backend(dest.id(), "poisoned content-verification lock"))?
-            .take()
-            .unwrap_or_else(|| {
-                Err(DomainError::backend(
-                    dest.id(),
-                    "destination write completed without fully draining the verified source stream",
-                ))
-            });
-        if let Err(verify_err) = verify_result {
-            // Only clean up the destination if THIS call actually created the
-            // object there: `created: false` means something else (a
-            // concurrent migration, or an earlier attempt) already put
-            // verified content at this exact path, and it is not this call's
-            // to delete.
-            if outcome.created {
-                self.best_effort_blob_delete(dest.id(), &dest_path).await;
-            }
-            return Err(verify_err);
-        }
+        self.stream_verify_and_publish_to_dest(
+            source.as_ref(),
+            dest.as_ref(),
+            version,
+            &dest_path,
+            expected_len,
+        )
+        .await?;
 
         // Transactionally update the version row and emit the audit row. The
         // CAS predicate is the pre-migration snapshot captured above (before
@@ -246,6 +188,152 @@ impl FileService {
         Ok(())
     }
 
+    /// The streaming transfer + verification half of `migrate_backend`:
+    /// resolves `version`'s mode-aware hash spec (`hash_mode` and, for
+    /// `multipart-composite-sha256`, its stored manifest), streams its bytes
+    /// from `source` straight into `dest` at `dest_path` (create-exclusive —
+    /// see [Concurrent-Migration CAS
+    /// Resolution](../../../docs/features/backend-migration.md) for why),
+    /// verifying incrementally on the same pass, and returns `Ok(())` only
+    /// once that content is confirmed correct at `dest_path`:
+    /// - if this call's own write's source-stream verification fails (or the
+    ///   source stream breaks mid-read), the destination object is
+    ///   best-effort deleted only if this call actually created it
+    ///   (`created: false` means something else already had bytes there
+    ///   before this call, which this verification says nothing about);
+    /// - if this call's own `publish_exclusive` reported `created: false`
+    ///   (the destination already held bytes), that pre-existing object is
+    ///   independently read back and re-verified — see
+    ///   `Self::reject_and_clean_unverified_preexisting_dest`'s own doc
+    ///   comment for why `created: false` alone is not proof of anything,
+    ///   and for that path's own (unconditional) cleanup-on-failure rule.
+    async fn stream_verify_and_publish_to_dest(
+        &self,
+        source: &dyn StorageBackend,
+        dest: &dyn StorageBackend,
+        version: &file_storage_sdk::FileVersion,
+        dest_path: &str,
+        expected_len: u64,
+    ) -> Result<(), DomainError> {
+        let hash_mode = HashMode::parse(&version.hash_mode).ok_or_else(|| {
+            DomainError::database(format!(
+                "version {} has an unrecognized hash_mode {:?}",
+                version.version_id, version.hash_mode
+            ))
+        })?;
+        let manifest = match hash_mode {
+            HashMode::WholeSha256 => None,
+            HashMode::MultipartCompositeSha256 => {
+                let raw = self
+                    .store
+                    .get_version_manifest(version.version_id)
+                    .await?
+                    .ok_or_else(|| {
+                        DomainError::database(format!(
+                            "multipart-composite version {} is missing its version_hash_manifest row",
+                            version.version_id
+                        ))
+                    })?;
+                Some(Manifest::from_wire_string(&raw)?)
+            }
+        };
+
+        let source_stream = source
+            .get_stream(&version.backend_path, expected_len)
+            .await?;
+        let (verified_stream, verify_slot) = stream_verify::verify_stream(
+            source_stream,
+            expected_len,
+            hash_mode,
+            version.hash_value.clone(),
+            manifest.clone(),
+        )?;
+
+        let outcome = dest
+            .publish_exclusive(dest_path, verified_stream, Some(expected_len))
+            .await?;
+
+        let verify_result = verify_slot
+            .lock()
+            .map_err(|_| DomainError::backend(dest.id(), "poisoned content-verification lock"))?
+            .take()
+            .unwrap_or_else(|| {
+                Err(DomainError::backend(
+                    dest.id(),
+                    "destination write completed without fully draining the verified source stream",
+                ))
+            });
+        if let Err(verify_err) = verify_result {
+            if outcome.created {
+                self.best_effort_blob_delete(dest.id(), dest_path).await;
+            }
+            return Err(verify_err);
+        }
+
+        if !outcome.created {
+            self.reject_and_clean_unverified_preexisting_dest(
+                dest,
+                dest_path,
+                expected_len,
+                hash_mode,
+                version.hash_value.clone(),
+                manifest,
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Called from `migrate_backend` only when this call's own
+    /// `publish_exclusive` reported `created: false`, i.e. `dest_path`
+    /// already held bytes before this call ever tried to write there.
+    ///
+    /// `created: false` alone is not proof those bytes were ever
+    /// hash-checked: an earlier attempt (this exact call retried, or a
+    /// distinct migration racing on the same deterministic path) can write
+    /// here via its own `publish_exclusive` and then be interrupted —
+    /// process crash, cancellation — before it reads its own `verify_slot`
+    /// and cleans up on mismatch, leaving unverified bytes sitting at this
+    /// path with no live database pointer. That is exactly the object
+    /// `migrate_backend`'s CAS is about to make live, so this reads it back
+    /// and runs it through the same mode-aware verification the source
+    /// stream already went through, rather than trusting `created: false`
+    /// as proof someone else already did.
+    ///
+    /// On a mismatch (or a read failure), the object is deleted
+    /// unconditionally, unlike the source-verification-failure branch right
+    /// above this call's call site: this object carries no live database
+    /// pointer either way, since a competing migration that reaches this
+    /// same check always re-verifies this exact destination content before
+    /// committing its own CAS, so a passing competitor's blob can never be
+    /// mistaken for this failure — only a genuinely bad blob (or a read
+    /// fault) ends up here.
+    async fn reject_and_clean_unverified_preexisting_dest(
+        &self,
+        dest: &dyn StorageBackend,
+        dest_path: &str,
+        expected_len: u64,
+        hash_mode: HashMode,
+        hash_value: Vec<u8>,
+        manifest: Option<Manifest>,
+    ) -> Result<(), DomainError> {
+        if let Err(dest_err) = verify_existing_dest_object(
+            dest,
+            dest_path,
+            expected_len,
+            hash_mode,
+            hash_value,
+            manifest,
+        )
+        .await
+        {
+            self.best_effort_blob_delete(dest.id(), dest_path).await;
+            return Err(dest_err);
+        }
+        Ok(())
+    }
+
     // ── backends discovery ────────────────────────────────────────────────────
 
     /// `GET /storages`: configured backends and their capabilities.
@@ -259,4 +347,48 @@ impl FileService {
         let b = self.backends.get(id)?;
         Ok((b.id().to_owned(), b.capabilities()))
     }
+}
+
+/// Read back the object already sitting at `dest_path` on `dest` — reached
+/// only when a `publish_exclusive` call reported `created: false`, i.e. this
+/// call did not write it — and verify it against the same mode-aware hash
+/// spec (`hash_mode`/`hash_value`/`manifest`) the source stream was already
+/// checked against in [`FileService::migrate_backend`]. `created: false`
+/// means only that *something* wrote here first; it is not evidence that
+/// whatever it wrote was ever hash-checked, since a prior writer can crash or
+/// be cancelled after its own `publish_exclusive` call returns but before it
+/// reads its own `verify_slot` and cleans up on mismatch.
+async fn verify_existing_dest_object(
+    dest: &dyn StorageBackend,
+    dest_path: &str,
+    expected_len: u64,
+    hash_mode: HashMode,
+    hash_value: Vec<u8>,
+    manifest: Option<Manifest>,
+) -> Result<(), DomainError> {
+    let stream = dest.get_stream(dest_path, expected_len).await?;
+    let (mut verified, verify_slot) =
+        stream_verify::verify_stream(stream, expected_len, hash_mode, hash_value, manifest)?;
+    // Drain to the wrapped stream's terminal `None` -- the verdict is only
+    // populated once that happens (see `stream_verify`'s module doc comment).
+    // The bytes themselves are irrelevant here, only the verdict is, so they
+    // are read and dropped.
+    while let Some(chunk) = verified.next().await {
+        if let Err(e) = chunk {
+            return Err(DomainError::backend(
+                dest.id(),
+                format!("failed reading back destination object for verification: {e}"),
+            ));
+        }
+    }
+    verify_slot
+        .lock()
+        .map_err(|_| DomainError::backend(dest.id(), "poisoned content-verification lock"))?
+        .take()
+        .unwrap_or_else(|| {
+            Err(DomainError::backend(
+                dest.id(),
+                "destination read-back ended without fully draining the verified stream",
+            ))
+        })
 }
