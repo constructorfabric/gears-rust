@@ -1532,7 +1532,7 @@ The unwind stage, the `do` list of `process.unwind` — the order of `06 §4.7`:
 - fence:                                # protected (06): claims or absorbs, promotes failure → cancel (06 §4.3); a permanent failure faults the invocation
     timeout: step
     try:
-      - call: { step: run-cancellation-fence }   # body: ref + trigger: $context.unwind, failureReason, cancelRequestRef, triggerEventId
+      - call: { step: run-cancellation-fence }   # body: ref + trigger: $context.unwind, failureReason, cancelRequestRef, triggerEventId; key ends in the request ref (06 §4.3), so a second cancel is absorbed, not a key conflict
     catch: *transient
     export: { as: '${ $context + { pass: ($context.pass // 1) } }' }
 - enterCompensate: { set: { stageLoop: compensate } }

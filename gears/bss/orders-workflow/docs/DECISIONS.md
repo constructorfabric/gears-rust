@@ -1860,6 +1860,17 @@ as a duplicate of the previous round.
 `design/02-triggers-and-start.md` §2.1; `design/04-fulfillment-plan.md` §3.3, §4.1;
 `design/06-saga-and-compensation.md` §3.3.
 
+**Amended (2026-09-25)**: `run-cancellation-fence`'s step key ends in the triggering request's
+reference, `…:run-cancellation-fence:{trigger}[:{triggerRef}]`: `cancelRequestRef` on `cancel`,
+`triggerEventId` on `supersede` and `terminal-event`, and nothing on `failure`. The body carries
+that reference and the registry fingerprints the body, so a key naming only the trigger kind made
+a second authorized cancel an uncaught `idempotency-key-conflict`. That was the only exit from a
+withdrawn-authority stall (`design/06-saga-and-compensation.md` §4.3), and the conflict faulted the
+invocation partway through compensation. A supersede or terminal event arrives at most once per
+version, so its reference only keeps the rule uniform. With the reference in the key, a replay of one request is still absorbed, and a
+different request reaches the fence's absorption table. Propagated: `design/06-saga-and-compensation.md`
+§3.3, §4.3; `design/10-process-definition.md` §3.6 fragment (c); ADR-0006 as amended.
+
 ### D-75 (M) Supersession is unwind-then-start, and admission waits for the prior instance
 
 **Accepted.** *(replaces the atomic terminate-then-start step; D-06 and D-07 stand; amends D-49's use of the one-active-instance index)*

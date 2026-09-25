@@ -567,7 +567,7 @@ Every operation answers `permanent-failure` with `version-mismatch` on a termina
 
 | `name` | `protection` | `input` | `output` | `idempotency_key` | `declared_event` | `compensation` | `reasons` | `audit_kind` | `retry_class` | `deadline` |
 |--------|--------------|---------|----------|-------------------|------------------|----------------|-----------|--------------|---------------|------------|
-| `run-cancellation-fence` | `protected` | ref + `trigger` ∈ `failure` · `cancel` · `supersede` · `terminal-event`; `failureReason` (Lifecycle's closed `failure_reason` enum, on `failure` only); `cancelRequestRef` (slice 08's request reference, on `cancel` only); `triggerEventId` (on `supersede` and `terminal-event`) | `fenceRef`, `claim` ∈ `claimed` · `absorbed`, `effectiveTrigger` (the row's trigger after any promotion), `inFlightCount` | instance-scoped `{tenant}:{correlationId}:run-cancellation-fence:{trigger}` | none | none — the fence is a path step, not an undoable effect | `version-mismatch`, `idempotency-key-conflict`, `per-attempt-timeout` | `phase-transition` (`started`/`suspended`/`parked` → `compensating`) on a claim; `step-completion` on an absorption | `retryable-on: transient` | 5 s |
+| `run-cancellation-fence` | `protected` | ref + `trigger` ∈ `failure` · `cancel` · `supersede` · `terminal-event`; `failureReason` (Lifecycle's closed `failure_reason` enum, on `failure` only); `cancelRequestRef` (slice 08's request reference, on `cancel` only); `triggerEventId` (on `supersede` and `terminal-event`) | `fenceRef`, `claim` ∈ `claimed` · `absorbed`, `effectiveTrigger` (the row's trigger after any promotion), `inFlightCount` | instance-scoped `{tenant}:{correlationId}:run-cancellation-fence:{trigger}[:{triggerRef}]`, where `triggerRef` is `cancelRequestRef` on `cancel` and `triggerEventId` on `supersede` and `terminal-event`, and is absent on `failure` (§4.3 *One key per trigger request*) | none | none — the fence is a path step, not an undoable effect | `version-mismatch`, `idempotency-key-conflict`, `per-attempt-timeout` | `phase-transition` (`started`/`suspended`/`parked` → `compensating`) on a claim; `step-completion` on an absorption | `retryable-on: transient` | 5 s |
 | `compensate-order` | `protected` | ref + `pass` (1 on first entry, else the previous answer's `nextPass`, or previous `pass` + 1 after an exhausted retry) | `compensationState` ∈ `complete` · `in-progress` · `pending-escalation`; `nextPass`; `taskRefs[]` (manual tasks raised for `failed-pending-escalation` legs, this pass or earlier) | step: instance-scoped `{tenant}:{correlationId}:compensate-order:{pass}`; per leg: intent family `{tenant}:{orderId}+{orderVersion}+{orderLineId}+{wave}+{intentKind}[+{wave_attempt}]` with `intentKind` ∈ `draft_void` · `activated_cancel` (§2.1) | none — `OrderFulfillmentAborted` belongs to `report-outcome` | none — compensation is not itself compensable (§2.1 *No Intra-Saga Pivot*) | `fence-not-claimed`, `draft-void-failed`, `activated-cancel-failed`, `blocked-upstream` (the last three recorded per leg and carried on the manual task, never a synchronous refusal), `authority-withdrawn` (recorded on the task slice 08's cancel-authority port raises at `pre-compensation`), `circuit-breaker-open`, `per-attempt-timeout`, `idempotency-key-conflict`, `version-mismatch` | `compensation`, one entry per leg settled in the pass; `step-completion` for the pass | `retryable-on: transient` | 10 s |
 | `report-outcome` | `protected` | ref + `outcome` ∈ `completed` · `failed` · `cancelled` · `superseded` · `terminal-event` | `reportedOutcome` (the mode actually reported — differs from `outcome` only by the §4.3 promotion `failed` → `cancelled`), `lifecycleCall` ∈ `acknowledged` · `none` | step: instance-scoped `{tenant}:{correlationId}:report-outcome`; seam: lifecycle-transition `{tenant}:{orderId}:{orderVersion}:{trigger}` with `trigger` ∈ `acknowledge-completed` · `acknowledge-failed` · `cancel-workflow-mediated` | `OrderFulfillmentCompleted` on `completed`; `OrderFulfillmentAborted` on `failed`, `cancelled`, and on `terminal-event` where fulfillment had begun (§3.2) | none — `report-outcome` is itself the declared compensation of `begin-fulfillment` (§2.1) | `fence-not-claimed`, `outcome-not-reportable`, `authority-withdrawn` (the `pre-submission` re-check on a cancel run), `version-mismatch`, `circuit-breaker-open`, `per-attempt-timeout`, `idempotency-key-conflict` | `step-completion` | `retryable-on: transient` | 10 s |
 
@@ -1028,6 +1028,29 @@ subscription; a stuck activated-cancel points at an active subscription still bi
 consuming resources, a materially more urgent state.
 
 ### 4.3 Concurrent and late triggers (normative)
+
+**One key per trigger request.** The fence's step key ends in the reference of the request that
+triggered it: the cancel request, or the supersede or terminal event. The request body carries the
+same reference, and the registry fingerprints the body (`01 §3.7`, `request_fingerprint`), so a key
+that named only the trigger kind would turn every second request of that kind into an
+`idempotency-key-conflict`. That refusal is a permanent failure the definition does not catch
+(`10 §3.6` fragment (c), the `fence` task), so it would fault the invocation partway through
+compensation. With the reference in the key:
+
+- a **replay** of the same request (a platform retry, or a re-run after a crash) derives the same
+  key and fingerprint and is an absorbed duplicate of the registry;
+- a **different** request of the same kind (a second authorized cancel) is a first call under its
+  own key, which runs the operation and reaches the losing insert below. A supersede or a
+  terminal event arrives at most once per order version, so its `triggerEventId` changes nothing
+  today; it keeps the rule uniform, so a trigger kind added later cannot reintroduce the collision;
+- a `failure` run carries no request reference. The definition's three failure exits
+  (`planFailFastUnwind`, `preActivationAbort` and `failFastUnwind`, `10 §3.6` fragment (b)) all
+  leave the fulfillment stage, and after the fence the phase is `compensating`, so a version gets
+  at most one `failure` fence call. A failed compensation leg is `compensate-order`'s, not a new
+  fence call. A replay therefore carries the same `failureReason` and is absorbed.
+
+The key never includes a platform-supplied value (ADR-0006 as amended). Decision D-74 records the
+component.
 
 The `owf_cancellation_fence` primary key is the arbiter; `run-cancellation-fence` applies this
 table on a losing insert:
