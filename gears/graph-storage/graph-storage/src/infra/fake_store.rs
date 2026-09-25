@@ -2245,6 +2245,16 @@ fn apply_endpoint(
     if let Some(existing) = nodes.iter().find(|n| n.key == key && !n.deleted) {
         return Ok(existing.id);
     }
+    // A tombstoned key keeps its row until purge; an edge may neither link to
+    // it nor push a second node under the same key beside it.
+    if nodes.iter().any(|n| n.key == key && n.deleted) {
+        return Err(GraphStoreError::Conflict {
+            reason: format!(
+                "edge[{index}] names endpoint `{key}`, which is tombstoned; the key cannot be \
+                 linked to or re-ingested before purge"
+            ),
+        });
+    }
     if !create_phantoms {
         return Err(validation(
             index,

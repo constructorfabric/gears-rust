@@ -349,6 +349,11 @@ async fn a_store_without_labels_refuses_every_label_call() {
 }
 
 #[tokio::test]
+async fn an_edge_cannot_name_a_tombstoned_endpoint() {
+    conformance::an_edge_cannot_name_a_tombstoned_endpoint(&store(), Uuid::now_v7()).await;
+}
+
+#[tokio::test]
 async fn an_edge_only_scope_drops_the_edges_it_stops_declaring() {
     conformance::an_edge_only_scope_drops_the_edges_it_stops_declaring(&store(), Uuid::now_v7())
         .await;

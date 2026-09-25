@@ -6324,3 +6324,64 @@ pub async fn a_store_without_labels_refuses_every_label_call(
         store.assign_labels(&ctx, assignment).await.map(drop),
     );
 }
+
+/// An edge may not name a tombstoned node as an endpoint, with phantom
+/// creation on or off.
+///
+/// The key still occupies its row until purge. Linking to it makes an edge
+/// about a node every read calls absent; materializing a phantom over it
+/// brings the key back by the back door. Both stores refuse it the way a
+/// node re-ingest under a tombstoned key is refused, and write nothing.
+pub async fn an_edge_cannot_name_a_tombstoned_endpoint(store: &dyn GraphStoreV1, tenant: Uuid) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    store
+        .register_types(&ctx, ontology_batch())
+        .await
+        .expect("the ontology registers");
+    ingest_batch(
+        store,
+        &ctx,
+        batch(vec![node("dead", "dead"), node("alive", "alive")], vec![]),
+    )
+    .await
+    .expect("the nodes commit");
+    store
+        .soft_delete(&ctx, DeleteRequest::Node("dead".to_owned()))
+        .await
+        .expect("the node is tombstoned");
+    let before = store.revision(&ctx).await.expect("the revision reads");
+
+    for create_phantoms in [true, false] {
+        let mut request = batch(vec![], vec![edge("alive", "dead")]);
+        request.options.create_phantoms = Some(create_phantoms);
+        let refused = ingest_batch(store, &ctx, request).await;
+        assert!(
+            matches!(&refused, Err(GraphStoreError::Conflict { reason }) if reason.contains("tombstoned")),
+            "create_phantoms={create_phantoms}: an edge to a tombstoned endpoint must be a \
+             conflict naming it, got {refused:?}"
+        );
+    }
+
+    assert_eq!(
+        store.revision(&ctx).await.expect("the revision reads"),
+        before,
+        "the refused batches wrote nothing"
+    );
+    let alive = store
+        .get_node(&ctx, &"alive".to_owned(), 10)
+        .await
+        .expect("the live endpoint still reads");
+    assert!(
+        alive.adjacency.is_empty(),
+        "no edge was written to the tombstoned endpoint: {:?}",
+        alive.adjacency
+    );
+    assert!(
+        matches!(
+            store.get_node(&ctx, &"dead".to_owned(), 10).await,
+            Err(GraphStoreError::NotFound)
+        ),
+        "the tombstoned node was not brought back as a phantom"
+    );
+}

@@ -766,6 +766,10 @@ pg_case!(
     conformance::a_store_without_labels_refuses_every_label_call
 );
 pg_case!(
+    an_edge_cannot_name_a_tombstoned_endpoint,
+    conformance::an_edge_cannot_name_a_tombstoned_endpoint
+);
+pg_case!(
     an_edge_only_scope_drops_the_edges_it_stops_declaring,
     conformance::an_edge_only_scope_drops_the_edges_it_stops_declaring
 );

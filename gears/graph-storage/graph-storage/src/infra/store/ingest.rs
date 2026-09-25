@@ -612,6 +612,10 @@ async fn fence_scope(
     Ok(())
 }
 
+/// The live node an edge endpoint names, if there is one.
+///
+/// Live only: a tombstoned node reads as absent everywhere else, and an edge
+/// linked to one would be a statement about a node no read returns.
 async fn lookup_endpoint(
     scope: &AccessScope,
     tx: &impl DBRunner,
@@ -621,6 +625,7 @@ async fn lookup_endpoint(
         .secure()
         .scope_with(scope)
         .filter(Condition::all().add(node::Column::NodeKey.eq(key.to_owned())))
+        .filter(Condition::all().add(node::Column::DeletedAt.is_null()))
         .limit(1)
         .project_all(tx, |query| {
             node_typed_columns(query).into_model::<NodeTyped>()
@@ -633,6 +638,27 @@ async fn lookup_endpoint(
             id: m.id,
             type_id: m.gts_node_type_id,
         }))
+}
+
+async fn endpoint_is_tombstoned(
+    scope: &AccessScope,
+    tx: &impl DBRunner,
+    key: &str,
+) -> Result<bool, GraphStoreError> {
+    Ok(node::Entity::find()
+        .secure()
+        .scope_with(scope)
+        .filter(Condition::all().add(node::Column::NodeKey.eq(key.to_owned())))
+        .filter(Condition::all().add(node::Column::DeletedAt.is_not_null()))
+        .limit(1)
+        .project_all(tx, |query| {
+            node_state_columns(query).into_model::<NodeState>()
+        })
+        .await
+        .map_err(map_scope_err)?
+        .into_iter()
+        .next()
+        .is_some())
 }
 
 /// The GTS identifier and family of each interned type named, for the
@@ -1871,6 +1897,20 @@ async fn resolve_endpoint(
     if let Some(endpoint) = lookup_endpoint(w.scope, tx, key).await? {
         node_ids.insert(key.to_owned(), endpoint);
         return Ok(false);
+    }
+    // No live node, but perhaps a tombstoned one. The key still occupies its
+    // row until purge, so the edge can neither link to it -- that is an edge
+    // to a node every read calls absent -- nor materialize a phantom over it,
+    // which would bring the key back by the back door. The same refusal a
+    // node re-ingest under a tombstoned key gets, and whether phantom
+    // creation is on changes nothing about it.
+    if endpoint_is_tombstoned(w.scope, tx, key).await? {
+        return Err(GraphStoreError::Conflict {
+            reason: format!(
+                "edge[{index}] names endpoint `{key}`, which is tombstoned; the key cannot be \
+                 linked to or re-ingested before purge"
+            ),
+        });
     }
     if !create_phantoms {
         return Err(item_error(
