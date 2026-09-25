@@ -174,7 +174,10 @@ impl AuditSink for AuditStore {
             outcome: Set(record.outcome.as_str().to_owned()),
             request_id: Set(record.request_id),
             change_set_id: Set(record.change_set_id),
-            occurred_at: Set(OffsetDateTime::now_utc()),
+            // The shared clock, aligned to what Postgres keeps: both backends
+            // then hold the same instant, as for every other timestamp column,
+            // and the history cursor minted from it means the same on either.
+            occurred_at: Set(crate::infra::storage::clock::now()),
             retain_until: Set(record.retain_until),
         };
         // @cpt-end:cpt-cf-settings-service-algo-audit-store-append:p1:inst-as-append-4

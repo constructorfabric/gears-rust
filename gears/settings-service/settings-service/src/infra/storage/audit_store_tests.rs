@@ -422,3 +422,31 @@ async fn a_prune_deletes_at_most_its_batch_and_only_what_is_expired() {
         .collect();
     assert_eq!(left, vec!["held".to_owned()]);
 }
+
+#[tokio::test]
+async fn a_record_is_stamped_on_the_shared_microsecond_clock() {
+    // Postgres keeps microseconds and SQLite keeps what it is given; every
+    // other timestamp column is aligned so both backends hold the same instant,
+    // and the history cursor, minted from `occurred_at`, is one of them.
+    let db = db().await;
+    let tenant = Uuid::new_v4();
+    let conn = db.conn().expect("connection");
+    for i in 0..5 {
+        AuditStore
+            .append(
+                &conn,
+                &AccessScope::allow_all(),
+                record(tenant, &format!("r{i}")),
+            )
+            .await
+            .expect("append");
+    }
+    for item in history(&db, tenant, None, None).await.items {
+        assert_eq!(
+            item.occurred_at.nanosecond() % 1_000,
+            0,
+            "{}",
+            item.occurred_at
+        );
+    }
+}
