@@ -1618,3 +1618,35 @@ async fn every_rejected_batch_entry_is_published_under_the_batchs_change_set() {
          {events:?}"
     );
 }
+
+#[tokio::test]
+async fn a_rejected_secret_never_carries_its_plaintext_into_the_answer_or_the_event() {
+    // A secret that fails its type is still a secret: neither the answer nor
+    // the rejection event — which the log prints and a broker would carry —
+    // may quote what was submitted.
+    let h = Harness::with_step_up(Arc::new(FixedStepUp::verified())).await;
+    h.declare_secret("api_token").await;
+    let admin = actor(h.base.tree.root);
+    let err = h
+        .set(
+            &admin,
+            "api_token",
+            None,
+            json!({ "token": "sk-live-TOPSECRET" }),
+            Some("absent"),
+        )
+        .await
+        .expect_err("not a string");
+    assert!(matches!(err, DomainError::Validation { .. }), "{err:?}");
+    assert!(!err.to_string().contains("TOPSECRET"), "{err}");
+    let events = h.published.events.lock().expect("lock");
+    let reason = events
+        .iter()
+        .find_map(|e| match e {
+            crate::domain::ports::ValueEvent::ChangeFailed { reason, .. } => Some(reason.clone()),
+            _ => None,
+        })
+        .expect("a rejection event");
+    assert!(!reason.contains("TOPSECRET"), "{reason}");
+    assert!(h.secrets.held().is_empty(), "nothing reached the store");
+}

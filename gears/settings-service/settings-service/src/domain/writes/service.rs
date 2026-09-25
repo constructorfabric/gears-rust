@@ -1024,7 +1024,7 @@ where
                 key: key.to_owned(),
                 tenant_id,
                 actor: actor.subject(),
-                reason: reason.wire_message(),
+                reason: reason.event_reason(),
                 change_set_id,
             })
             .await;

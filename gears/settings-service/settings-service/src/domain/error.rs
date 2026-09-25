@@ -152,6 +152,24 @@ impl DomainError {
         }
     }
 
+    /// The error as a rejection event carries it: [`Self::wire_message`],
+    /// except that a validation failure is reduced to its field and code.
+    ///
+    /// A validation message answers the caller who submitted the value, and
+    /// some name part of it — an enum member, a reference, a number. The event
+    /// goes further than that answer: into the log, and in R2 onto a broker,
+    /// where the value's classification is not the reader's to see. Where and
+    /// why the change failed is what the event needs; the caller has the rest.
+    #[must_use]
+    pub fn event_reason(&self) -> String {
+        match self {
+            Self::Validation { field, code, .. } => {
+                format!("validation failed on `{field}`: {code}")
+            }
+            other => other.wire_message(),
+        }
+    }
+
     /// The in-process diagnostic of an internal fault, for the log line the
     /// handling site writes; `None` for every other variant.
     #[must_use]

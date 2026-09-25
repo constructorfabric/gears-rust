@@ -1570,3 +1570,34 @@ async fn a_rejection_event_carries_the_wire_message_and_the_diagnostic_stays_in_
         other => panic!("one rejection event expected, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn a_rejection_event_names_the_field_and_code_of_a_validation_failure_and_no_more() {
+    // A validation message may name part of what was submitted — an enum
+    // member, a reference, a number — and the event goes further than the
+    // answer did: to the log, and in R2 to a broker. It carries where and why.
+    let h = WriteHarness::new().await;
+    let refused = DomainError::Validation {
+        field: "value/member".to_owned(),
+        code: crate::field::VALUE_NOT_IN_ENUM,
+        message: "`jane.doe@example.com` is not a registered member of `staff`".to_owned(),
+    };
+    h.writer
+        .after_rejection(
+            "k",
+            h.base.tree.root,
+            &actor(h.base.tree.root),
+            &refused,
+            Uuid::new_v4(),
+        )
+        .await;
+    let events = h.published.events.lock().expect("lock");
+    match events.as_slice() {
+        [ValueEvent::ChangeFailed { reason, .. }] => {
+            assert!(!reason.contains("jane.doe"), "{reason}");
+            assert!(reason.contains("value/member"), "{reason}");
+            assert!(reason.contains(crate::field::VALUE_NOT_IN_ENUM), "{reason}");
+        }
+        other => panic!("one rejection event expected, got {other:?}"),
+    }
+}

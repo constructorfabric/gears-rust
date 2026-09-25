@@ -236,10 +236,14 @@ impl<S: SchemaSource> TypeValidator for GtsTypeValidator<S> {
                 jsonschema::error::ValidationErrorKind::Format { .. } => field::VALUE_FORMAT,
                 _ => field::VALUE_SCHEMA,
             };
+            // Masked: the rule is named and `field` gives the position, but
+            // the instance is not repeated. The message reaches a 400, a batch
+            // item and a log line, and the value may be a credential or
+            // personal data — a secret that fails its type is still a secret.
             violations.push(FieldViolation {
                 field: format!("value{}", error.instance_path()),
                 code,
-                message: error.to_string(),
+                message: error.masked().to_string(),
             });
         }
         // @cpt-end:cpt-cf-settings-service-algo-typed-value-validation-validate:p1:inst-tvv-val-6

@@ -152,6 +152,26 @@ async fn a_schema_violation_names_the_position() {
 }
 
 #[tokio::test]
+async fn a_schema_violation_names_the_rule_and_never_quotes_the_value() {
+    // The message travels: into a 400, a batch item, a log line. The value may
+    // be a credential or personal data, so the rule is named and the position
+    // is given by `field`; what was submitted is not repeated back.
+    let v = GtsTypeValidator::new(catalogue());
+    let result = v
+        .validate_value(PORT_TYPE, &json!({ "port": "sk-live-TOPSECRET" }))
+        .await
+        .expect("validates");
+    assert_eq!(codes(&result), vec![field::VALUE_SCHEMA]);
+    assert_eq!(result.violations[0].field, "value/port");
+    let message = &result.violations[0].message;
+    assert!(!message.contains("TOPSECRET"), "{message}");
+    assert!(
+        message.contains("integer"),
+        "the rule is still named: {message}"
+    );
+}
+
+#[tokio::test]
 async fn a_format_keyword_is_asserted_not_annotated() {
     // `format` is advisory to a plain JSON Schema validator; here a value that
     // does not match rejects, exactly as `type` would.

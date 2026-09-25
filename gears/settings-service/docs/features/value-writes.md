@@ -299,7 +299,7 @@ Throughout, `tenant` omitted means the caller's own tenant, which for a platform
 6. [x] - `p1` - Invoke the audit sink's append in the same transaction with the pre-image and post-image masked by classification, the operation — `create`, `change`, `revert` or `remove` — the actor, the request id and the change set id; **IF** the append fails → roll back and **RETURN** rejected `503` - `inst-vw-commit-6`
 7. [x] - `p1` - Commit; **IF** the commit fails → **RETURN** rejected `503` with nothing stored - `inst-vw-commit-7`
 8. [x] - `p1` - Evict the local cache for the key at the target, key-wide when the scope class is `cascading`, so descendants re-resolve lazily - `inst-vw-commit-8`
-9. [x] - `p1` - Publish `event_value_changed` through the Change Publisher port, and on a rejection `event_value_change_failed` with the reason and the change set id — minted before the gate, so a refusal at the gate carries it too — so a failed change is a durable notification an operator can join to its request; count the outcome on `settings_value_writes_total` - `inst-vw-commit-9`
+9. [x] - `p1` - Publish `event_value_changed` through the Change Publisher port, and on a rejection `event_value_change_failed` with the reason and the change set id — minted before the gate, so a refusal at the gate carries it too — so a failed change is a durable notification an operator can join to its request; a validation failure's reason is its field and code only, never the message, which may name part of the submitted value; count the outcome on `settings_value_writes_total` - `inst-vw-commit-9`
 10. [x] - `p1` - **RETURN** the old value, the new value, the scope and the new tag - `inst-vw-commit-10`
 
 ### Value State Tag
@@ -480,7 +480,7 @@ A write to a `secret`-trait declaration **MUST** hand the plaintext to the Secre
 
 - [x] `p1` - **ID**: `cpt-cf-settings-service-dod-value-writes-observability`
 
-Every committed change **MUST** publish `event_value_changed` and every rejected one — at the gate, at validation or at commit — `event_value_change_failed` with its reason and its change set id, and the service **MUST** expose `settings_value_writes_total` by result, `settings_value_write_failure_ratio` for the platform dashboards, and `settings_step_up_total` by operation and result.
+Every committed change **MUST** publish `event_value_changed` and every rejected one — at the gate, at validation or at commit — `event_value_change_failed` with its reason and its change set id — for a validation failure the field and code only, since the event travels further than the answer and the value may be a credential or personal data — and the service **MUST** expose `settings_value_writes_total` by result, `settings_value_write_failure_ratio` for the platform dashboards, and `settings_step_up_total` by operation and result.
 
 **Implements**:
 - `cpt-cf-settings-service-algo-value-writes-commit`

@@ -90,7 +90,7 @@ Not applicable. Validation is an internal service invoked by other features rath
 2. [x] - `p1` - **IF** a guard rejects the value → **RETURN** its error without resolving the type or attempting schema validation - `inst-tvv-val-4`
 3. [x] - `p1` - Resolve the type's JSON Schema and its trait annotations through the types registry client - `inst-tvv-val-1`
 4. [x] - `p1` - **IF** the type cannot be resolved → **RETURN** a validation failure rather than accepting the value, so an unresolvable type fails closed - `inst-tvv-val-2`
-5. [x] - `p1` - Validate the value structurally against the JSON Schema dialect the registry publishes - `inst-tvv-val-5`
+5. [x] - `p1` - Validate the value structurally against the JSON Schema dialect the registry publishes; a violation names the rule, with the position in its field, and never repeats the submitted value, which may be a credential or personal data - `inst-tvv-val-5`
 6. [x] - `p1` - Assert every `format` keyword the schema declares, such as URI and IP address forms, as a hard check rather than an annotation - `inst-tvv-val-6`
 7. [x] - `p1` - **FOR EACH** trait-driven rule on the resolved trait set, over the value's string leaves collected once; **IF** a leaf-bound trait is declared and the value holds more than the leaf cap of strings → **RETURN** a too-many-leaves error before any rule runs, since each leaf costs a parse, a compile or a lookup - `inst-tvv-val-7`
    1. [x] - `p1` - Assert a cron-dialect value parses under its declared dialect - `inst-tvv-val-8`
