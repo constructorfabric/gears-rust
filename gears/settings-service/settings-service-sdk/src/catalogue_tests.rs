@@ -118,3 +118,21 @@ fn the_scalar_shapes_validate_what_they_claim() {
     assert!(check(super::JSON, json!({ "any": [1, 2] })));
     assert!(!check(super::JSON, json!("a string is not an object")));
 }
+
+#[test]
+fn the_readme_names_every_catalogue_type() {
+    // The README is the catalogue's public list; a type added here and not
+    // there is a type no consumer reading it knows to exist.
+    let readme = include_str!("../README.md");
+    for value_type in CATALOGUE {
+        let name = value_type
+            .id
+            .strip_prefix(VALUE_TYPE_PREFIX)
+            .and_then(|rest| rest.strip_suffix(".v1~"))
+            .expect("a catalogue id");
+        assert!(
+            readme.contains(&format!("`{name}`")),
+            "README.md does not list `{name}`"
+        );
+    }
+}
