@@ -1164,16 +1164,37 @@ impl GraphServices {
         // do not fit there is no honest truncation left to make, and the read
         // is refused rather than answered with something that breaks its own
         // promise.
+        //
+        // The seeds are read the way the rest is, in pieces the remaining
+        // budget is guaranteed to hold, and the refusal comes at the first
+        // row that crosses it. They used to be read in one call and measured
+        // afterwards, so a seed set of `traversal_max_nodes` large rows was
+        // read in full -- the very overshoot the pieces below exist to stop
+        // -- only to be refused.
         let budget = self.config.response_max_bytes;
-        let mut nodes = self.store.hydrate_nodes(&ctx, seed_part).await?;
-        let mut spent: u64 = nodes.iter().map(hydrated_bytes).sum();
-        if spent > budget {
-            return Err(DomainError::LimitExceeded {
-                what: format!(
-                    "the seeds alone hydrate to {spent} bytes; response_max_bytes is \
-                     {budget}. Ask for fewer seeds, or for a narrower node type set"
-                ),
-            });
+        let item_ceiling = u64::from(self.config.item_max_bytes).max(1);
+        let mut nodes = Vec::with_capacity(seed_part.len());
+        let mut spent: u64 = 0;
+        let mut cursor = 0usize;
+        while cursor < seed_part.len() {
+            let take = budgeted_piece(budget.saturating_sub(spent), item_ceiling)
+                .min(seed_part.len() - cursor);
+            let piece = &seed_part[cursor..cursor + take];
+            cursor += take;
+            for view in self.store.hydrate_nodes(&ctx, piece).await? {
+                spent = spent.saturating_add(hydrated_bytes(&view));
+                if spent > budget {
+                    return Err(DomainError::LimitExceeded {
+                        what: format!(
+                            "the seeds alone exceed response_max_bytes ({budget} bytes): \
+                             seed {} of {} crosses it. Ask for fewer seeds",
+                            nodes.len() + 1,
+                            seed_part.len()
+                        ),
+                    });
+                }
+                nodes.push(view);
+            }
         }
         // The seeds are in `spent` already and exempt from the cut; what
         // follows is only the rest. Each piece is as many rows as the
@@ -1182,14 +1203,11 @@ impl GraphServices {
         // Output filtering is applied per piece and before a row is charged:
         // everything past the seeds must pass the node-type filter and the
         // phantom toggle, and a row that does not is not part of the answer.
-        let item_ceiling = u64::from(self.config.item_max_bytes).max(1);
         let mut over_bytes = false;
         let mut cursor = 0usize;
         while cursor < rest.len() && !over_bytes {
-            let remaining = budget.saturating_sub(spent);
-            // Whole rows only: a fraction of a row is a row that may not fit.
-            let fits = usize::try_from(remaining.div_euclid(item_ceiling)).unwrap_or(usize::MAX);
-            let take = fits.clamp(1, HYDRATION_PIECE_MAX).min(rest.len() - cursor);
+            let take =
+                budgeted_piece(budget.saturating_sub(spent), item_ceiling).min(rest.len() - cursor);
             let piece = &rest[cursor..cursor + take];
             cursor += take;
 
@@ -1299,6 +1317,15 @@ impl GraphServices {
 /// The most rows one traversal hydration piece asks for, whatever the budget
 /// would allow: it bounds the id list a single statement carries.
 const HYDRATION_PIECE_MAX: usize = 256;
+
+/// How many rows the remaining budget is guaranteed to hold at
+/// `item_ceiling` bytes apiece, as one piece: whole rows only, since a
+/// fraction of a row is a row that may not fit, and at least one, so a
+/// nearly spent budget still finds out whether the next row fits.
+fn budgeted_piece(remaining: u64, item_ceiling: u64) -> usize {
+    let fits = usize::try_from(remaining.div_euclid(item_ceiling)).unwrap_or(usize::MAX);
+    fits.clamp(1, HYDRATION_PIECE_MAX)
+}
 
 fn hydrated_bytes(view: &graph_storage_sdk::models::NodeView) -> u64 {
     let payload = view.payload.as_ref().map_or(0, |value| {

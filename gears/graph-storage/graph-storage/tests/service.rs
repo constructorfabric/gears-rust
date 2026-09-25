@@ -1692,6 +1692,81 @@ async fn a_traversal_reads_what_its_budget_can_hold_and_not_the_whole_walk() {
     );
 }
 
+/// A seed set that does not fit the budget is refused having read about what
+/// the budget holds, not every seed.
+///
+/// Seeds survive truncation, so a seed set over the budget has no honest
+/// answer and is refused. It used to be read in one call first -- up to
+/// `traversal_max_nodes` full rows -- and measured afterwards.
+#[tokio::test]
+async fn a_seed_set_over_the_budget_is_refused_before_it_is_read_in_full() {
+    const SEEDS: usize = 40;
+
+    let store = Arc::new(graph_storage::infra::fake_store::FakeGraphStore::new());
+    let budgeted = GraphStorageConfig {
+        response_max_bytes: 12 * 1024,
+        item_max_bytes: 2 * 1024,
+        ..GraphStorageConfig::default()
+    };
+    let harness = Harness::configured_over(
+        Arc::clone(&store),
+        Arc::new(support::AllowInOwnTenant),
+        budgeted,
+    );
+    let ctx = harness.ctx();
+    harness.seed_ontology(&ctx).await;
+
+    let filler = "q".repeat(1_500);
+    let keys: Vec<String> = (0..SEEDS)
+        .map(|index| format!("fat-seed-{index}"))
+        .collect();
+    let nodes = keys
+        .iter()
+        .map(|key| NodeSpec {
+            payload: Some(serde_json::json!({ "note": filler })),
+            ..conformance::node(key, key)
+        })
+        .collect();
+    harness
+        .services
+        .ingest(&ctx, conformance::batch(nodes, Vec::new()))
+        .await
+        .expect("the batch commits");
+
+    let before = store.rows_hydrated();
+    let refused = harness
+        .services
+        .traverse(
+            &ctx,
+            TraverseRequest {
+                seeds: keys,
+                depth: 1,
+                edge_type_patterns: Vec::new(),
+                node_type_patterns: Vec::new(),
+                max_nodes: Some(1_000),
+            },
+        )
+        .await
+        .expect_err("forty seeds of 1.5 KB do not fit a 12 KB budget");
+    // The test engine resolves a hop by hydrating its frontier, so it reads
+    // each seed once to expand it -- a cost of the double, not of the
+    // service, which the PostgreSQL engine does not pay. What is left is what
+    // the service read to answer.
+    let read = store.rows_hydrated() - before - SEEDS as u64;
+
+    assert!(
+        matches!(refused, DomainError::LimitExceeded { .. }),
+        "the refusal is a bound: {refused}"
+    );
+    // Every seed row is over 1.5 KB, so the budget holds at most eight; the
+    // reads stop at the one that crosses it.
+    let holds: u64 = (12_u64 * 1024).div_euclid(1_500);
+    assert!(
+        read <= holds + 1,
+        "read {read} of {SEEDS} seed rows to refuse a budget that holds {holds}"
+    );
+}
+
 /// How many rows one piece asks for when the whole budget remains -- the
 /// widest a piece can be.
 fn budgeted_piece(budget: u64, item_ceiling: u64) -> u64 {
