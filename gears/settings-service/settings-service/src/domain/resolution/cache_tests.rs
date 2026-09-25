@@ -89,6 +89,24 @@ fn a_local_change_evicts_only_the_named_scope() {
 }
 
 #[test]
+fn a_global_change_evicts_every_tenants_copy_of_the_key_and_nothing_else() {
+    // A global setting is read from the root's row for every tenant but cached
+    // under the tenant that asked, and a write can only land at the root: the
+    // root's slot alone would leave every other tenant serving the old value.
+    let cache = EffectiveCache::new(Duration::from_secs(30));
+    let (root, a, b) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    for tenant in [root, a, b] {
+        cache.seed(entry("flag", tenant));
+    }
+    cache.seed(entry("other", a));
+    cache.invalidate("flag", scope_class::GLOBAL, Some(root));
+    assert!(cache.get("flag", a).is_none());
+    assert!(cache.get("flag", b).is_none());
+    assert!(cache.get("flag", root).is_none());
+    assert!(cache.get("other", a).is_some(), "another key is untouched");
+}
+
+#[test]
 fn a_declaration_change_evicts_the_whole_key() {
     let cache = EffectiveCache::new(Duration::from_secs(30));
     let (a, b) = (Uuid::new_v4(), Uuid::new_v4());

@@ -250,7 +250,9 @@ impl EffectiveCache {
     ///
     /// A `cascading` declaration is evicted key-wide: an ancestor's change
     /// alters its descendants' effective values, and they re-resolve lazily on
-    /// their next read. Eviction is local to this instance; converging peer
+    /// their next read. So is a `global` one: every tenant reads the root's
+    /// row, cached under the tenant that asked, so the root's slot alone would
+    /// leave the rest serving the old value. Eviction is local to this instance; converging peer
     /// replicas is the R2 broadcast and out of scope here.
     pub fn invalidate(&self, key: &str, declaration_scope_class: &str, tenant: Option<Uuid>) {
         let mut store = self.lock();
@@ -258,7 +260,14 @@ impl EffectiveCache {
         // of this key must find its generation moved when it comes to store.
         store.bump_key(key);
         // @cpt-begin:cpt-cf-settings-service-algo-value-resolution-cache-invalidate:p1:inst-vr-inv-2
-        if declaration_scope_class == scope_class::CASCADING || tenant.is_none() {
+        // A cascading change alters what descendants inherit; a global one is
+        // the value every tenant reads, cached under each tenant that asked
+        // though written only at the root. Either way every scope of the key
+        // goes. Only a local value is its own scope's alone.
+        if declaration_scope_class == scope_class::CASCADING
+            || declaration_scope_class == scope_class::GLOBAL
+            || tenant.is_none()
+        {
             store.entries.retain(|(k, _), _| k != key);
             return;
         }

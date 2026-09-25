@@ -280,7 +280,7 @@ Three properties matter more than the walk itself.
 
 **Steps**:
 1. [x] - `p1` - **IF** a specific scope is named → evict the entry for that key and scope on this instance - `inst-vr-inv-1`
-2. [x] - `p1` - **IF** the affected declaration is `cascading` → evict every cached scope for that key, because an ancestor change alters descendants' effective values and they must re-resolve lazily on next read - `inst-vr-inv-2`
+2. [x] - `p1` - **IF** the affected declaration is `cascading` or `global` → evict every cached scope for that key: an ancestor change alters descendants' effective values, and a global value is the one every tenant reads, cached under each tenant that asked though written only at the root; they re-resolve lazily on next read - `inst-vr-inv-2`
 3. [x] - `p1` - **WHEN** a tenant hierarchy change is signalled, such as a re-parent or a mid-chain insertion → evict the cached entries of the affected subtree for every cascading declaration, since an effective value is a function of the ancestor chain and no value write need be involved - `inst-vr-inv-3`
 4. [x] - `p1` - Record that the tenant resolver publishes no such hierarchy signal today, so until it does the time-to-live is the only backstop and the post-re-parent staleness window equals it - `inst-vr-inv-4`
 5. [x] - `p1` - **RETURN** having evicted locally only; converging peer replicas is the R2 `cache_invalidate` broadcast and out of scope here - `inst-vr-inv-5`
