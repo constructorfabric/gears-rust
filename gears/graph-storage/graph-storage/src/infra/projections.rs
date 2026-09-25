@@ -122,6 +122,18 @@ pub fn node_state_columns(query: Select<node::Entity>) -> Select<node::Entity> {
     query.select_only().column(node::Column::DeletedAt)
 }
 
+/// Whether an edge is tombstoned: what a delete that lost its
+/// compare-and-set asks, to tell a row already deleted from a key now held by
+/// another.
+#[derive(Debug, sea_orm::FromQueryResult)]
+pub struct EdgeState {
+    pub deleted_at: Option<time::OffsetDateTime>,
+}
+
+pub fn edge_state_columns(query: Select<edge::Entity>) -> Select<edge::Entity> {
+    query.select_only().column(edge::Column::DeletedAt)
+}
+
 /// A registered type without its schema.
 ///
 /// The schema is the one wide column on `gts_type`, and every read that is
@@ -187,9 +199,9 @@ mod tests {
     use sea_orm::{DatabaseBackend, EntityTrait, QueryTrait};
 
     use super::{
-        edge, edge_ends_columns, edge_hop_columns, endpoint_pair_columns, gts_type, node,
-        node_ident_columns, node_state_columns, node_typed_columns, type_id_columns,
-        type_meta_columns, type_name_columns, type_traits_columns,
+        edge, edge_ends_columns, edge_hop_columns, edge_state_columns, endpoint_pair_columns,
+        gts_type, node, node_ident_columns, node_state_columns, node_typed_columns,
+        type_id_columns, type_meta_columns, type_name_columns, type_traits_columns,
     };
 
     /// The columns no projection here may read, by entity. Each of them is
@@ -278,6 +290,15 @@ mod tests {
             &rendered(&edge_ends_columns(edge::Entity::find())),
             &WIDE_EDGE,
             &["id", "src_node_id", "dst_node_id"],
+        );
+    }
+
+    #[test]
+    fn an_edges_state_reads_one_column() {
+        holds(
+            &rendered(&edge_state_columns(edge::Entity::find())),
+            &WIDE_EDGE,
+            &["deleted_at"],
         );
     }
 

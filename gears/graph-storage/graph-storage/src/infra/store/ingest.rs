@@ -27,9 +27,9 @@ use crate::domain::identity;
 use crate::domain::ownership;
 use crate::domain::tally::IngestTally;
 use crate::infra::projections::{
-    EdgeEnds, EdgeHop, NodeIdent, NodeState, NodeTyped, TypeMeta, edge_ends_columns,
-    edge_hop_columns, node_ident_columns, node_state_columns, node_typed_columns,
-    type_meta_columns,
+    EdgeEnds, EdgeHop, EdgeState, NodeIdent, NodeState, NodeTyped, TypeMeta, edge_ends_columns,
+    edge_hop_columns, edge_state_columns, node_ident_columns, node_state_columns,
+    node_typed_columns, type_meta_columns,
 };
 use crate::infra::storage::entity::{edge, graph_meta, ingest_idempotency, node, scope_registry};
 use crate::infra::store::types::interned_ids;
@@ -1644,7 +1644,7 @@ pub async fn soft_delete(
         .map_err(|error| error.0)
 }
 
-/// Settle a delete of a row that is already tombstoned.
+/// Settle a delete that found no live row to tombstone.
 ///
 /// Rule 3 of the Soft Delete Contract: "deleting an already-deleted row is a
 /// no-op that leaves it untouched, exactly as a converging ingest replay
@@ -1652,25 +1652,34 @@ pub async fn soft_delete(
 /// response was lost look like a delete of something that never existed, and
 /// a producer cannot tell those apart from outside. A key that genuinely does
 /// not exist still reads as absent, so nothing about enumeration changes.
+///
+/// Only a *tombstoned* row under the key is that proof. The row the delete
+/// read can also have been purged by a scope replacement and the key taken
+/// by a new, live row before this re-read runs -- the purge frees the key,
+/// and read committed lets the re-read see the newcomer. Settling on that
+/// row would report a delete that touched nothing, while a live node the
+/// caller named stays. It is a `Conflict` instead: the delete read one row
+/// and the key now holds another, and a retry deletes the one that is there.
 async fn already_tombstoned_node(
     scope: &AccessScope,
     tx: &impl DBRunner,
     key: &str,
     epoch: i64,
 ) -> Result<DeleteOutcome, TxStoreError> {
-    let tombstoned = node::Entity::find()
+    let found = node::Entity::find()
         .secure()
         .scope_with(scope)
         .filter(Condition::all().add(node::Column::NodeKey.eq(key.to_owned())))
         .limit(1)
         .project_all(tx, |query| {
-            node_ident_columns(query).into_model::<NodeIdent>()
+            node_state_columns(query).into_model::<NodeState>()
         })
         .await
         .map_err(map_scope_err)?
         .into_iter()
-        .next();
-    settle_no_op(scope, tx, tombstoned.is_some(), epoch).await
+        .next()
+        .map(|row| row.deleted_at.is_some());
+    settle_no_op(scope, tx, found, "node", key, epoch).await
 }
 
 async fn already_tombstoned_edge(
@@ -1679,19 +1688,20 @@ async fn already_tombstoned_edge(
     key: &str,
     epoch: i64,
 ) -> Result<DeleteOutcome, TxStoreError> {
-    let tombstoned = edge::Entity::find()
+    let found = edge::Entity::find()
         .secure()
         .scope_with(scope)
         .filter(Condition::all().add(edge::Column::EdgeKey.eq(key.to_owned())))
         .limit(1)
         .project_all(tx, |query| {
-            edge_ends_columns(query).into_model::<EdgeEnds>()
+            edge_state_columns(query).into_model::<EdgeState>()
         })
         .await
         .map_err(map_scope_err)?
         .into_iter()
-        .next();
-    settle_no_op(scope, tx, tombstoned.is_some(), epoch).await
+        .next()
+        .map(|row| row.deleted_at.is_some());
+    settle_no_op(scope, tx, found, "edge", key, epoch).await
 }
 
 /// The revision as it stands, with nothing tombstoned — or absence, when the
@@ -1699,12 +1709,12 @@ async fn already_tombstoned_edge(
 async fn settle_no_op(
     scope: &AccessScope,
     tx: &impl DBRunner,
-    existed: bool,
+    tombstoned: Option<bool>,
+    what: &str,
+    key: &str,
     epoch: i64,
 ) -> Result<DeleteOutcome, TxStoreError> {
-    if !existed {
-        return Err(GraphStoreError::NotFound.into());
-    }
+    no_op_verdict(tombstoned, what, key)?;
     let revision = current_revision(scope, tx).await?;
     Ok(DeleteOutcome {
         revision: GraphRevision {
@@ -1714,6 +1724,22 @@ async fn settle_no_op(
         tombstoned_nodes: 0,
         tombstoned_edges: 0,
     })
+}
+
+/// What a delete that found no live row may answer, from what it found
+/// under the key instead: nothing (`None`), a live row (`Some(false)`), or a
+/// tombstoned one (`Some(true)`). Only the last is a no-op.
+fn no_op_verdict(tombstoned: Option<bool>, what: &str, key: &str) -> Result<(), GraphStoreError> {
+    match tombstoned {
+        None => Err(GraphStoreError::NotFound),
+        Some(false) => Err(GraphStoreError::Conflict {
+            reason: format!(
+                "the {what} `{key}` this delete read was removed and the key is now held by \
+                 another, live {what}; retry the delete to remove that one"
+            ),
+        }),
+        Some(true) => Ok(()),
+    }
 }
 
 /// Ensure the tenant's meta rows exist, and the deployment epoch.
@@ -2001,4 +2027,40 @@ async fn replay_receipt(
     let mut outcome = outcome_from_json(&receipt.response)?;
     outcome.replayed = true;
     Ok(Some(outcome))
+}
+
+#[cfg(test)]
+mod no_op_verdict_tests {
+    use graph_storage_sdk::plugin_api::GraphStoreError;
+
+    use super::no_op_verdict;
+
+    /// A tombstoned row under the key is a delete that already happened.
+    #[test]
+    fn a_tombstoned_row_settles_as_a_no_op() {
+        assert!(no_op_verdict(Some(true), "node", "k").is_ok());
+    }
+
+    /// No row at all is a key that does not exist.
+    #[test]
+    fn no_row_is_not_found() {
+        assert!(matches!(
+            no_op_verdict(None, "node", "k"),
+            Err(GraphStoreError::NotFound)
+        ));
+    }
+
+    /// A live row under the key is not the row the delete read: that one was
+    /// purged and the key taken again. Settling on it would report a delete
+    /// that touched nothing while the node the caller named is still there.
+    #[test]
+    fn a_live_row_under_the_key_is_a_conflict_not_a_settled_delete() {
+        for what in ["node", "edge"] {
+            let verdict = no_op_verdict(Some(false), what, "k");
+            assert!(
+                matches!(&verdict, Err(GraphStoreError::Conflict { reason }) if reason.contains(what)),
+                "a live {what} under the key must be a conflict, got {verdict:?}"
+            );
+        }
+    }
 }
