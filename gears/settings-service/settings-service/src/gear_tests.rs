@@ -873,3 +873,25 @@ async fn a_retention_pass_reports_its_outcome_so_a_failure_is_not_a_quiet_zero()
         vec![("ok", 0), ("failed", 0)]
     );
 }
+
+#[tokio::test]
+async fn a_failed_review_pass_publishes_nothing_so_the_gauge_keeps_its_last_values() {
+    // All or nothing: a pass that cannot count every source records no source
+    // at all, rather than zero for the ones it did not reach — a zero would
+    // read as "the backlog was fixed".
+    let broken = toolkit_db::DBProvider::new(
+        toolkit_db::connect_db(
+            "sqlite::memory:",
+            toolkit_db::ConnectOpts {
+                max_conns: Some(1),
+                min_conns: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("an empty database"),
+    );
+    let metrics = RecordingLifecycleMetrics::default();
+    SettingsService::review_once(&broken, &metrics).await;
+    assert!(metrics.review.lock().expect("lock").is_empty());
+}
