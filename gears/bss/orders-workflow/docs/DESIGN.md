@@ -977,7 +977,7 @@ additionally carry `seller_tenant_id`, and per-tenant fairness and back-pressure
 | `owf_process_instance` | `01 §3.7` | foundation — step envelope | **mutable** — recorded phase projection, `invocation_id`, `last_settled_step`, suspension state, `row_version`, audit counter |
 | `owf_definition_binding` | `01 §3.7` | foundation — `start-instance` | append-only — one row per instance, written in the instance-creating transaction; no UPDATE or DELETE grant |
 | `owf_step_log` | `01 §3.7` | foundation — step envelope | append-only — one row per receipt with the platform `attempt_id`; recovery and join evidence, explicitly **not** the audit source of record |
-| `owf_idempotency_registry` | `01 §3.7` | foundation — idempotency registry | **mutable** — lease heartbeat, `open`, settlement; rows age out at the key lifetime |
+| `owf_idempotency_registry` | `01 §3.7` | foundation — idempotency registry | **mutable** — lease holder and heartbeat, `open`, settlement under the holder fence; keys age out at the key lifetime and rows stay as tombstones until the instance has been terminal for 30 days |
 | `owf_step_operation` | `01 §3.7` | foundation — operation registry | load-only — replaced from the compiled registry at startup and audited on load; no runtime write path; no tenant column |
 | `owf_audit_entry` | `01 §3.7` | foundation — audit writer | append-only, hash-chained, trigger-protected — no UPDATE/DELETE grant to any role and triggers rejecting both (D-59) |
 | `owf_audit_checkpoint` | `01 §3.7` | foundation — audit writer, checkpoint phase | append-only, trigger-protected — per-namespace roll-up headers chained under `01 §4.17` (D-59) |
@@ -1017,16 +1017,18 @@ eighteen slice tables, one of them pending.
 | `owf_audit_checkpoint`, `owf_audit_checkpoint_member` | retained with the evidence they cover; never purged |
 | `owf_process_instance`, `owf_definition_binding` | retained for the life of the order record; no DELETE grant to the retention worker |
 | `owf_step_log` | 90 days |
-| `owf_idempotency_registry` | 30 days — at or above the maximum retry horizon, which includes manual-task resolution and hold/resume |
+| `owf_idempotency_registry` | a 30-day key lifetime — at or above the maximum retry horizon, which includes manual-task resolution and hold/resume — with each row kept as a tombstone until its instance has been terminal for 30 days, so an expired key is never read as a first call (`01 §3.7`, D-104) |
 | `owf_dispatch_admission` | a seller row with no non-terminal intent for 30 days |
 | `owf_step_operation` | replaced on every load |
 
-Every growth table — step log, audit, manual tasks, resolution requests, provisioning intents and
-compensation records — is a monthly range partition on its creation instant, and a declared
-retention window with no worker behind it is an unbounded store, so the retention purge in §3.8 is
-a condition of these numbers rather than a convenience. The audit store and its checkpoints are
-the exception in kind, not in shape: nothing is ever purged from them, the purge worker holds no
-grant on them, and their partitioning, where applied, serves query cost only (`01 §3.7`). The
+No Workflow-owned table is partitioned (D-104, following Lifecycle D-91): PostgreSQL would
+enforce the deduplication uniques of the growth tables — step log, registry, manual tasks,
+resolution requests, provisioning intents and compensation records — only within one partition.
+Every growth table is purged row-wise in bounded batches through its retention index, and a
+declared retention window with no worker behind it is an unbounded store, so the retention purge
+in §3.8 is a condition of these numbers rather than a convenience. The audit store and its
+checkpoints are the exception in kind: nothing is ever purged from them and the purge worker holds
+no grant on them (`01 §3.7`). The
 platform `toolkit_db::outbox` tables behind the producer queue are outside this register: the
 library owns their retention and vacuum. The engine's history is outside it too: its retention is
 the platform's, and it holds references only (ADR-0013).
@@ -1078,7 +1080,9 @@ namespace `bss-orders-workflow`:
 
 There is no timer wake-up worker — every timer is a definition `wait` — and no dead-lease scan — a
 dead lease on a dispatching step key is found by `reconcile-intent`'s read on the sweep's schedule
-and settled by `settle-from-lookup`. There is no dead-letter delivery sweep: inbound dead letters
+and settled by `settle-from-lookup`, a dead lease on any other key is re-run under a new holder by
+its next same-key call, and a record-only operation holds its lease inside its settlement
+transaction and leaves none (`01 §3.7`, §4.3, D-103). There is no dead-letter delivery sweep: inbound dead letters
 are the platform trigger path's. `cluster-sdk` is not selected and `gears/bss/libs/coord` is a
 candidate to be decided jointly with Lifecycle and Pricing (`DECISIONS.md` Q-09).
 
@@ -1140,8 +1144,8 @@ a workshop that disagrees has something specific to change.
 
 **Cost** is dominated by the shared `toolkit-db` backend and scales with retained process history
 rather than with process rate: the ≥ 400-day audit floor, not throughput, is the growth driver,
-which is why §3.7 partitions every growth table and names a purge worker for every declared
-window. The background workers are advisory-lock-coordinated and idle-cheap. The platform engine's
+which is why §3.7 names a bounded row-wise purge for every growth table and a worker for every
+declared window. The background workers are advisory-lock-coordinated and idle-cheap. The platform engine's
 run cost — Temporal Server, its persistence and the plugin workers executing ~1,800 suspended
 invocations and ~75 task dispatches a second — is serverless-runtime's, an inherited platform cost
 this gear consumes but does not budget; the capacity rows above are the load this gear presents to
@@ -1249,7 +1253,7 @@ The gear stores no cardholder data and holds no payment instrument — it consum
 | Commercial data in engine history | Resolved totals, approver identities, tenant axes or payloads appear in Temporal history through task inputs and outputs, and are exposed through the platform timeline | Third-party / retention boundary | `cpt-cf-bss-orders-workflow-adr-references-not-payloads`: task inputs and outputs are identifiers and closed enums only, checked against each operation's reference schema before publish and on every request; engine history is non-citable (ADR-0003) and the record is complete without it | **Bounded, not closed.** `correlationId`, `orderId` and `orderVersion` with their timestamps still sit in a Temporal persistence backend whose location and retention the platform sets; residency pinning and stated retention are the upstream ask `…-upreq-serverless-runtime-history-residency-retention`, and Q-12 (the pending half of Q-01) closes on it. **Trigger inputs and consumed events are a further residual**: the start trigger's input and every consumed Lifecycle, Generic Approval and Subscriptions event may sit in history as published — Lifecycle's tenant axes, per-line net components, deciding authority, actor and reason fields, the Subscriptions `subscriptionId` — until the platform persists only the selected members (`…-upreq-serverless-runtime-consumed-event-member-storage`) or Lifecycle publishes thin events or confirms the full events may be stored (`…-upreq-lifecycle-thin-events`); ADR-0013 and D-66 as amended |
 | Diagnostic leakage to operators | Raw downstream error text reaches the task queue, event payloads or a task output in engine history | Wire boundary | The RFC 9457 envelope carries no internal diagnostics; a task output carries a reason code, never a message (ADR-0013); stored downstream error text is sanitised to the reason catalogue before it reaches an operator surface, and the raw form is retained only where the audit role can read it | An unsanitised field added later; caught by the reason-catalogue structural test, not by the type system |
 | Event-payload over-exposure | Process events carry commercial context including resolved totals onto a shared bus | Data boundary | The event set is closed and its payload fields are declared per event type in `01 §4`; the bus's authorized consumer set is an upstream ask, not an assumption | Consumer-set definition is not owned by this gear and is registered upstream |
-| Manual-task flooding | A systemic downstream fault converts every line into an operator object | Availability boundary | Per-store retention with a purge worker, partitioning, and the manual-task arrival alert of §4.1 | A sustained downstream outage still produces a queue an operator cannot drain; that is a staffing question the alert surfaces rather than hides |
+| Manual-task flooding | A systemic downstream fault converts every line into an operator object | Availability boundary | Per-store retention with a bounded row-wise purge worker and the manual-task arrival alert of §4.1 | A sustained downstream outage still produces a queue an operator cannot drain; that is a staffing question the alert surfaces rather than hides |
 
 **Supply chain.** The gear introduces no third-party runtime dependency beyond the platform's own
 ToolKit and PostgreSQL — worker coordination is toolkit-db's session advisory locks, not a further
@@ -1558,6 +1562,6 @@ alone.
 - **PRD**: [`PRD.md`](./PRD.md)
 - **ADRs**: [`ADR/`](./ADR/) — thirteen decisions: `cpt-cf-bss-orders-workflow-adr-durable-execution-substrate`, `cpt-cf-bss-orders-workflow-adr-slice-decomposition`, `cpt-cf-bss-orders-workflow-adr-process-state-non-authoritative`, `cpt-cf-bss-orders-workflow-adr-two-wave-activation-barrier`, `cpt-cf-bss-orders-workflow-adr-saga-compensable-no-pivot`, `cpt-cf-bss-orders-workflow-adr-idempotency-key-composition`, `cpt-cf-bss-orders-workflow-adr-fail-closed-verdict-park`, `cpt-cf-bss-orders-workflow-adr-outbox-process-events`, `cpt-cf-bss-orders-workflow-adr-manual-task-dead-letter-separation`, `cpt-cf-bss-orders-workflow-adr-platform-pdp-authorization`, `cpt-cf-bss-orders-workflow-adr-flow-as-platform-definition`, `cpt-cf-bss-orders-workflow-adr-definition-versioning-and-protected-steps`, `cpt-cf-bss-orders-workflow-adr-references-not-payloads`
 - **Design set**: [`design/`](./design/) — the foundation, the process definition ([`design/10-process-definition.md`](./design/10-process-definition.md), first in build order after the foundation) and the capability slices; the phased build order is authored in [`design/README.md`](./design/README.md)
-- **Decisions register**: [`DECISIONS.md`](./DECISIONS.md) — D-65…D-101 carry the platform-definition decision and the slice decisions it produced; Q-01 answered in two parts, Q-10…Q-13 open
+- **Decisions register**: [`DECISIONS.md`](./DECISIONS.md) — D-65…D-101 carry the platform-definition decision and the slice decisions it produced, D-102…D-104 the second-review decisions; Q-01 answered in two parts, Q-10…Q-13 open
 - **Upstream requirements**: [`UPSTREAM_REQS.md`](./UPSTREAM_REQS.md) — the asks this gear raises on gears it does not own, serverless-runtime in §2.9
 - **Platform**: serverless-runtime [DESIGN.md](../../../serverless-runtime/docs/DESIGN.md) §1.1, §1.4, §3.1, §3.3; [ADR-0003](../../../serverless-runtime/docs/ADR/0003-cpt-cf-serverless-runtime-adr-workflow-dsl.md), [ADR-0004](../../../serverless-runtime/docs/ADR/0004-cpt-cf-serverless-runtime-adr-temporal-workflow-engine.md), [ADR-0005](../../../serverless-runtime/docs/ADR/0005-cpt-cf-serverless-runtime-adr-thin-host.md)

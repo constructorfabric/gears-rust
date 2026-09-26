@@ -517,7 +517,7 @@ null, and applies the answer: a terminal confirmation or failure to the intent r
 04's transition rule — to the task; a compensating outcome (`voided`, `cancelled`) to the row that
 06 reads; the not-found branch of §4.4; and the ladder of §4.2 to the sweep columns. When the step
 key of the call that dispatched the intent is `in_flight` with a dead lease, it settles that key
-only through `settle-from-lookup` (`01 §3.3`), in-process.
+only through `settle-from-lookup` (`01 §3.3`), in-process, naming the record's `lease_holder`.
 
 ##### Responsibility boundaries
 
@@ -577,12 +577,16 @@ in `unresolved` and a manual task created by the definition's failure arm.
 
 In every input below, `ref` is the reference tuple of `10 §3.6` — `correlationId`, `orderId`,
 `orderVersion`, `resourceTenantId`, `invocationId`, `attemptId` — and `lineRefs[]` are `taskRef`s of
-slice 04's `FulfillmentTask` rows. `dispatchRound` and `sweepRound` are small non-negative integers
-the definition takes from the previous output of the same family (`nextDispatchRound`,
-`nextSweepRound`) and passes back unchanged, 0 on first entry; the envelope validates a round
-against the count of settled `owf_step_log` rows of that operation for the instance — equal is a new
-round, lower is a replay the registry absorbs, higher is `idempotency-key-mismatch` — so the
-definition never computes one (`01 §4.14`). Every step key is recomposed server-side from the body
+slice 04's `FulfillmentTask` rows. `dispatchRound`, `rereadRound`, `rebuildRound`, `sweepRound`
+and `report-spawn-signal`'s `round` are small non-negative integers the definition takes from the
+previous output **of the same operation** (`nextDispatchRound` per wave, `nextRereadRound`,
+`nextRebuildRound`, `nextSweepRound`, `nextRound`) and passes back unchanged, 0 on first entry; the
+envelope validates a round against that operation's counter in `owf_process_instance.key_rounds` —
+equal is a new round, lower is a replay the registry absorbs, higher is
+`idempotency-key-mismatch` — so the definition never computes one (`01 §4.14`, [`01 §3.3` *Rounds and attempts*](./01-foundation.md#rounds-and-attempts-the-one-rule-for-re-invokable-operations)). No
+round is validated against a count of `owf_step_log` rows, which the 90-day step-log retention
+removes while a long-lived or held instance still runs, and no operation is passed another
+operation's round. Every step key is recomposed server-side from the body
 (`01 §3.3` step 3).
 
 ##### `dispatch-wave1-create`
@@ -620,12 +624,12 @@ definition never computes one (`01 §4.14`). Every step key is recomposed server
 | Field | Value |
 |-------|-------|
 | `protection` | `protected` — Waves stage: after `re-check-pre-activation`, before `dispatch-wave2-activate` (`10 §4.1`) |
-| `input` | `ref` |
-| `output` | `spawnSignal` (`recorded` · `already-recorded`) |
-| `idempotency_key` | Lifecycle-transition family: `{tenant}:{orderId}:{orderVersion}:report-spawn-signal`, the same key passed to Lifecycle, so a replay returns Lifecycle's stored outcome |
+| `input` | `ref`, `round` (0 on first entry, else the previous answer's `nextRound`) |
+| `output` | `spawnSignal` (`recorded` · `already-recorded` · `held` — Lifecycle refused `not-admissible` and the order read shows `on_hold`, a settled success after which the definition waits in the barrier loop for the resume and calls again under the next round); `nextRound` |
+| `idempotency_key` | Lifecycle-transition family: `{tenant}:{orderId}:{orderVersion}:report-spawn-signal:{round}`, the same key passed to Lifecycle, so a replay of one round returns Lifecycle's stored outcome and a refusal of one round is never replayed into the next ([`01 §3.3` *Rounds and attempts*](./01-foundation.md#rounds-and-attempts-the-one-rule-for-re-invokable-operations) rule 4) |
 | `declared_event` | none |
 | `compensation` | none — the spawn signal is written once and never cleared (Lifecycle `06 §4.3`) |
-| `reasons` | `version-mismatch` (Lifecycle `version-conflict` or `not-admissible`, e.g. a held order), `activation-precondition-unmet` (no `proceed` verdict of `re-check-pre-activation` recorded for this order version), `circuit-breaker-open`, `per-attempt-timeout`, `idempotency-key-conflict`, `not-found` |
+| `reasons` | `version-mismatch` (Lifecycle `version-conflict`, or `not-admissible` of an order the Lifecycle read does not show `on_hold`), `activation-precondition-unmet` (no `proceed` verdict of `re-check-pre-activation` recorded for this order version), `circuit-breaker-open`, `per-attempt-timeout`, `idempotency-key-conflict`, `not-found` |
 | `audit_kind` | `step-completion` |
 | `retry_class` | `retryable-on: transient` |
 | `deadline` | 10 s |
@@ -635,9 +639,9 @@ definition never computes one (`01 §4.14`). Every step key is recomposed server
 | Field | Value |
 |-------|-------|
 | `protection` | `composable` — advisory; the gate is inside `dispatch-wave2-activate` |
-| `input` | `ref`, `planRef`, `lineRefs[]`, `dispatchRound` |
-| `output` | `live[]`, `lapsed[]`, `unevaluable[]` (all lineRef) |
-| `idempotency_key` | instance-scoped: `{tenant}:{correlationId}:reread-draft-liveness:{planRef}:{dispatchRound}` |
+| `input` | `ref`, `planRef`, `lineRefs[]`, `rereadRound` (this operation's own round) |
+| `output` | `live[]`, `lapsed[]`, `unevaluable[]` (all lineRef), `nextRereadRound` |
+| `idempotency_key` | instance-scoped: `{tenant}:{correlationId}:reread-draft-liveness:{planRef}:{rereadRound}` |
 | `declared_event` | none |
 | `compensation` | none |
 | `reasons` | `circuit-breaker-open`, `per-attempt-timeout`, `version-mismatch`, `not-found` |
@@ -650,9 +654,9 @@ definition never computes one (`01 §4.14`). Every step key is recomposed server
 | Field | Value |
 |-------|-------|
 | `protection` | `composable` |
-| `input` | `ref`, `planRef`, `lineRefs[]` (from a `lapsed[]` output), `dispatchRound` |
-| `output` | `rebuilt[]`, `refused[]` (all lineRef; a line is refused when its current draft is not recorded `lapsed`), `nextDispatchRound` |
-| `idempotency_key` | instance-scoped: `{tenant}:{correlationId}:rebuild-wave1:{planRef}:{dispatchRound}` |
+| `input` | `ref`, `planRef`, `lineRefs[]` (from a `lapsed[]` output), `rebuildRound` (this operation's own round, never `dispatch-wave1-create`'s) |
+| `output` | `rebuilt[]`, `refused[]` (all lineRef; a line is refused when its current draft is not recorded `lapsed`), `nextRebuildRound`; the next `dispatch-wave1-create` keeps wave 1's own `dispatchRound` |
+| `idempotency_key` | instance-scoped: `{tenant}:{correlationId}:rebuild-wave1:{planRef}:{rebuildRound}` |
 | `declared_event` | none |
 | `compensation` | none — it submits nothing; the new draft is `dispatch-wave1-create`'s and is compensated there |
 | `reasons` | `version-mismatch`, `not-found`, `idempotency-key-mismatch` |
@@ -815,8 +819,8 @@ sequenceDiagram
     OP -->> PL: lapsed[] (⊂ pending[])
     PL ->> OP: rebuild-wave1 (lapsed lineRefs)
     OP ->> DB: wave_attempt + 1; task draft_created → pending (reason draft-voided)
-    OP -->> PL: rebuilt[], nextDispatchRound
-    PL ->> OP: dispatch-wave1-create (rebuilt lineRefs, next round)
+    OP -->> PL: rebuilt[], nextRebuildRound
+    PL ->> OP: dispatch-wave1-create (rebuilt lineRefs, wave 1's own next round)
     OP ->> SUB: draft-create under the new intent key (attempt 2)
     Note over PL: back through the barrier; the join must complete again before wave 2
 ```
@@ -834,7 +838,7 @@ pending`, reason `draft-voided`, driven only by `rebuild-wave1`).
 1. [ ] - `p1` - For each `lineRef`, read the line's current `draft_create` intent; **IF** its status is not `lapsed`, add the line to `refused[]` - `inst-rb-verify`
 2. [ ] - `p1` - Set the line's next `wave_attempt` to the recorded attempt plus one, read inside the unit of work (never re-minted on replay, `01 §4.14`) - `inst-rb-mint`
 3. [ ] - `p1` - Apply 04's transition `draft_created → pending` with reason `draft-voided` and write the `step-completion` entry - `inst-rb-reset`
-4. [ ] - `p1` - **RETURN** `rebuilt[]`, `refused[]`, `nextDispatchRound` - `inst-rb-return`
+4. [ ] - `p1` - **RETURN** `rebuilt[]`, `refused[]`, `nextRebuildRound` - `inst-rb-return`
 
 #### Reconciliation Sweep Cycle
 
@@ -887,7 +891,7 @@ requirement.
 4. [ ] - `p1` - **IF** compensating outcome (`voided`, `cancelled`, or its failure): write it on the compensating row; 06's `compensate-order` reads it on its next pass - `inst-ri-compensating`
 5. [ ] - `p1` - **IF** not found: apply the never-dispatched branch of §4.4 - `inst-ri-not-found`
 6. [ ] - `p1` - **IF** still non-terminal: advance `sweep_tier`, `sweep_reads`, `next_sweep_at` on the ladder of §4.2; at the floor set `status = unresolved`, `next_sweep_at` null, and report the line in `unresolved[]` - `inst-ri-ladder`
-7. [ ] - `p1` - **IF** the step key recorded for the dispatching call is `in_flight` with a dead lease, call `settle-from-lookup` in-process with the looked-up outcome (`success` once every intent row that attempt wrote has a known downstream state, `absent` when none was sent, `non-terminal` otherwise) - `inst-ri-settle-key`
+7. [ ] - `p1` - **IF** the step key recorded for the dispatching call is `in_flight` with a dead lease, call `settle-from-lookup` in-process with the record's `lease_holder` and the looked-up outcome (`success` once every intent row that attempt wrote has a known downstream state, `absent` when none was sent, `non-terminal` otherwise) - `inst-ri-settle-key`
 8. [ ] - `p1` - Write the `sweep` audit entry for the read - `inst-ri-audit`
 
 **Caller-Side Duplicate Protocol** (applied per line inside the dispatch operations, conforming to
@@ -948,11 +952,12 @@ by row locks, not an in-memory controller). It writes no `owf_durable_timer` row
 | `not_found_at` | timestamptz nullable | Set by `reconcile-intent` when the status read answers "no such transition request" inside the key lifetime; tells the next dispatch round to send this never-sent row under its unchanged key (§4.4); cleared by that send. |
 | `deferred_failure_reason` | text nullable | A catalogue reason (`wave1-create-failed` or `wave2-activation-failed`) for a terminal failure `reconcile-intent` read while the instance was suspended; the task is not advanced. Applied and cleared by `apply-resume` (slice 08) in its settlement transaction. |
 | `deferred_observed_at` | timestamptz nullable | Database time the deferred failure was read; `apply-resume` applies deferred failures in this order. NOT NULL exactly when `deferred_failure_reason` is. |
-| `created_at` | timestamptz | Row creation; the partition key. |
+| `created_at` | timestamptz | Row creation; the retention index's column. |
 
 **PK**: `intent_id`
 
-**Constraints**: `NOT NULL` on every column not marked nullable; `UNIQUE(idempotency_key)`;
+**Constraints**: `NOT NULL` on every column not marked nullable; `UNIQUE(idempotency_key)` over
+the whole table, which is why the table is not partitioned (`01 §3.7`, D-104);
 `UNIQUE(order_id, execution_seq)` where `execution_seq` is not null.
 
 **Additional info**: Indexes —
@@ -979,8 +984,9 @@ the sweep columns are updated in place; the audit chain (`01 §3.7`) is the hist
 deleted before retention, except the never-sent activation row removed in the settlement unit of
 work of step 7 of the dispatch algorithm. **Tenant axes**: `resource_tenant_id` is the isolation
 column (SecureORM `tenant_col`); `seller_tenant_id` is carried for admission and the operator
-surface. **Retention**: ≥ 400 days, matching `owf_compensation_record`. **Partitioning**: monthly
-range partition on `created_at`.
+surface. **Retention**: ≥ 400 days, matching `owf_compensation_record`, purged row-wise through a
+`created_at` index. **Partitioning**: none (`01 §3.7` *Partitioning, retention and immutability*,
+D-104).
 
 **Example**:
 
@@ -1225,8 +1231,12 @@ slice operations (D-80, D-81).
 7. **Confirmation arm.** The `listen` on the Subscriptions outcome events **MUST** export only the
    line reference and wave and **MUST** call `reconcile-intent` with them before re-entering
    `evaluate` †; `$context` **MUST NOT** hold any other member of the event.
-8. **Rounds are passed back, not computed.** Every call of this slice **MUST** pass the
-   `nextDispatchRound` / `nextSweepRound` of the previous call of its family, or 0 on first entry.
+8. **Rounds are passed back, not computed.** Every call of this slice **MUST** pass the round its
+   own operation's previous call returned — `nextDispatchRound` per wave, `nextRereadRound`,
+   `nextRebuildRound`, `nextSweepRound`, `report-spawn-signal`'s `nextRound` — or 0 on first
+   entry, and **MUST NOT** pass one operation's round to another (`rebuild-wave1` never receives
+   or writes back wave 1's `dispatchRound`). A `held` answer of `report-spawn-signal` **MUST**
+   route to the barrier loop, whose hold and resume arms consume the hold, never to a failure arm.
 9. **Completion.** `report-outcome` with `outcome: completed` **MUST** follow a
    `dispatch-wave2-activate` whose `pending[]` and `failed[]` were both empty (`10 §4.1`).
    `dispatch-wave2-activate` with an empty `lineRefs[]` **MUST** be reached only from the barrier

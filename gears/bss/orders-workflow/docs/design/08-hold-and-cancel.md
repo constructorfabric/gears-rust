@@ -524,9 +524,13 @@ routes into `run-cancellation-fence`; `authorized = false` is a settled success 
 where the cancel arm was taken (§4.7 item 5). A PDP outage is `retryable-failure` without a
 Workflow reason (canonical `ServiceUnavailable`, `01 §4.9`); its exhaustion is §4.7 item 6.
 
-`not-applicable` answers a hold consumed in a phase other than `started` — `parked` or
-`compensating` — and records the event in `owf_step_log` without a suspension row: a hold does not
-interrupt an unwind already running, and a parked instance dispatches nothing to suppress.
+`not-applicable` answers a hold consumed while `compensating` and records the event in
+`owf_step_log` without a suspension row: a hold does not interrupt an unwind already running. A
+hold consumed while `parked` — the park loop's record-only hold arm, `03 §4.5` item 6 — records the
+suspension and sets the `suspended` flag but leaves the phase `parked`: a parked instance
+dispatches nothing to suppress, and the flag is what makes `unpark` restore `suspended` and the
+reflection after it answer `held` rather than replay a Lifecycle refusal
+([`01 §3.3` *Rounds and attempts*](./01-foundation.md#rounds-and-attempts-the-one-rule-for-re-invokable-operations)).
 
 #### Hold and resume consumption
 
@@ -641,10 +645,10 @@ conditions are re-evaluated by level after resume by `evaluate-activation-eligib
 
 **`apply-hold` — inside the operation**:
 
-1. [ ] - `p1` - Lock the `owf_process_instance` row; **IF** `phase` is `parked` or `compensating` **RETURN** `holdOutcome = not-applicable` and record the event in `owf_step_log` - `inst-ah-phase`
+1. [ ] - `p1` - Lock the `owf_process_instance` row; **IF** `phase` is `compensating` **RETURN** `holdOutcome = not-applicable` and record the event in `owf_step_log` - `inst-ah-phase`
 2. [ ] - `p1` - **IF** a `resume_ahead` row exists for the order, set it `closed` with `closed_reason = reconciled-out-of-order`, `triggering_event_id = holdEventId`, `closed_at = now()`, and **RETURN** `reconciled-out-of-order` - `inst-ah-consume-ahead`
 3. [ ] - `p1` - Insert the `open` row with `triggering_event_id`, `suspended_at = now()` (database time) and `paused_gate_refs = gateRefs`; **IF** the partial unique index refuses it, **RETURN** `absorbed-duplicate` with the existing row's `suspensionRef` and change nothing - `inst-ah-insert`
-4. [ ] - `p1` - Set `owf_process_instance.suspended = true` and the phase projection `started → suspended` through the envelope - `inst-ah-predicate`
+4. [ ] - `p1` - Set `owf_process_instance.suspended = true` and, **IF** `phase` is `started`, the phase projection `started → suspended` through the envelope; a `parked` phase stays `parked`, and its `unpark` restores `suspended` (`01 §3.7`) - `inst-ah-predicate`
 5. [ ] - `p1` - Call the gate-window port `pause_windows(correlationId, gateRefs, hold)`; the port captures each armed window's remainder into `owf_approval_gate.window_remaining_ms` - `inst-ah-pause`
 6. [ ] - `p1` - **RETURN** `suspended` and `suspensionRef`; the envelope settles the key, writes `phase-transition` and commits once - `inst-ah-return`
 
@@ -653,7 +657,7 @@ conditions are re-evaluated by level after resume by `evaluate-activation-eligib
 1. [ ] - `p1` - Lock the `owf_process_instance` row; resolve the open suspension (by `suspensionRef` if given, else the order's `open` row) - `inst-ar-resolve`
 2. [ ] - `p1` - **IF** none is open, insert a `resume_ahead` row with `resume_event_id`; **IF** `UNIQUE (order_id, resume_event_id)` or the partial index refuses it, **RETURN** `absorbed-duplicate`; else **RETURN** `resume-ahead-recorded` with `due: false` and empty `failedTaskRefs` - `inst-ar-ahead`
 3. [ ] - `p1` - Close the row: `state = closed`, `closed_reason = resumed`, `resume_event_id`, `resumed_at = closed_at = now()` - `inst-ar-close`
-4. [ ] - `p1` - Clear `owf_process_instance.suspended` and move the phase projection `suspended → started` - `inst-ar-predicate`
+4. [ ] - `p1` - Clear `owf_process_instance.suspended` and, **IF** `phase` is `suspended`, move the phase projection `suspended → started`; a `parked` phase stays `parked`, and its `unpark` then restores `started` - `inst-ar-predicate`
 5. [ ] - `p1` - Call the gate-window port `rearm_windows(correlationId, paused_gate_refs, hold)`; the port re-arms only windows whose `pause_causes` becomes empty, re-basing each one's escalation deadline from its stored remainder - `inst-ar-rearm`
 6. [ ] - `p1` - Apply every deferred failure outcome slice 05 recorded for the instance during the suspension, ordered by observation instant: advance the task to `failed` with the recorded reason and clear the deferral - `inst-ar-deferred`
 7. [ ] - `p1` - **RETURN** `resumed`, `due` (database time against the earliest re-based deadline; `false` when no window was re-armed) and the failed tasks as `failedTaskRefs`; one commit - `inst-ar-return`
@@ -685,8 +689,8 @@ sequenceDiagram
     participant D as Definition
     participant OV as obtain-verdict (03)
     D ->> OV: ref
-    OV -->> D: unobtainable (key left open)
-    Note over D: park arm only (03 §4.5 item 2): park → arm-park-escalation → parkLoop;<br/>order remains submitted; Lifecycle submitted TTL NOT paused;<br/>no hold arm in the park loop
+    OV -->> D: unobtainable, nextRound (a settled round)
+    Note over D: park arm only (03 §4.5 item 2): park → arm-park-escalation → parkLoop;<br/>order remains submitted; Lifecycle submitted TTL NOT paused;<br/>the park loop's hold arm only records
     D ->> D: every PT5M: arm-park-escalation until due → raise-overdue-escalation (park)
 ```
 
@@ -769,7 +773,7 @@ cancelled uses the `escalate` task resolution, which routes the decision to a Se
 | resumed_at | timestamptz, nullable | Set only with `closed_reason = resumed` |
 | closed_at | timestamptz, nullable | Set on every transition to `closed` |
 | attempt_id | text | Platform attempt identifier of the step call that last wrote the row (`01 §3.3` *Attempt identity*) |
-| created_at | timestamptz | Row creation instant; the partition key |
+| created_at | timestamptz | Row creation instant; the retention index's column |
 
 **PK**: `suspension_id`
 
@@ -789,8 +793,9 @@ CHECK `(closed_reason = 'resumed') = (resumed_at IS NOT NULL)`.
 `run-cancellation-fence` (slice 06) calls in fencing step 1 on an unwind entered while a row is
 `open` or `resume_ahead`. **Mutability**: deliberately mutable (state and close columns).
 **Tenant axes**: `resource_tenant_id` (always) and `seller_tenant_id`. **Retention** ≥ 400 days —
-a suspension is audit evidence of who froze an order and for how long. Monthly range partition on
-`created_at`. The event-id uniqueness constraints deduplicate redelivery below the idempotency
+a suspension is audit evidence of who froze an order and for how long. Not partitioned
+(`01 §3.7`, D-104), so the one-open-suspension partial index and the event-id uniqueness hold across the
+whole table; purged row-wise through a `created_at` index. The event-id uniqueness constraints deduplicate redelivery below the idempotency
 key; they are deliberately **not** the at-most-one rule, which the partial index alone carries.
 The hold predicate the dispatch operations read is `owf_process_instance.suspended`
 ([`01 §3.7`](./01-foundation.md#table-owf_process_instance)), written by the same two operations

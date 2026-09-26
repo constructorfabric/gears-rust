@@ -828,9 +828,10 @@ which binds `owf_process_instance.invocation_id` from it (`design/01-foundation.
 §3.6), and no platform document states it.
 
 - **What the design cannot do until it lands**: `owf_step_log.attempt_id` records the stand-in
-  `"{invocationId}:{taskName}"` plus the envelope's receipt ordinal (`01 §3.3` *Attempt identity*)
-  rather than the platform's attempt, so an auditor's join to the platform timeline is by task
-  name rather than attempt; and the envelope bounds each attempt by the operation's own
+  `"{invocationId}:{taskReference}"` (the DSL's `$task.reference`, the step's position in the
+  document) plus the key's receipt ordinal (`01 §3.3` *Attempt identity*) rather than the
+  platform's attempt, so an auditor's join to the platform timeline is by task position rather
+  than attempt; and the envelope bounds each attempt by the operation's own
   `deadline_ms` only, so an attempt started late in the task timeout can outlive it and be
   answered to a caller that has already given up (absorbed on the re-issue, but wasted). If
   `$workflow.id` is not the `invocation_id`, the binding holds an identifier no Invocation API call
@@ -1084,7 +1085,7 @@ shorten.
   `ADR/0008` and `DECISIONS.md` D-58 (platform producer outbox, §2.7 co-signature);
   `DECISIONS.md` D-16 (Catalog topology), D-46 and Q-02 (relational escalation threshold), D-50 and
   D-38 (audit retention and the privacy ask); `ADR/0010` and `DECISIONS.md` D-63 (platform PDP
-  authorization, §2.8); `ADR/0011`, `ADR/0012`, `ADR/0013` and `DECISIONS.md` D-65…D-101, Q-10…Q-13
+  authorization, §2.8); `ADR/0011`, `ADR/0012`, `ADR/0013` and `DECISIONS.md` D-65…D-104, Q-10…Q-13
   (serverless-runtime, §2.9)
 - **Platform register**: serverless-runtime has no upstream-requirements register; §2.9 cites its
   [DESIGN.md](../../../serverless-runtime/docs/DESIGN.md), [PRD.md](../../../serverless-runtime/docs/PRD.md),

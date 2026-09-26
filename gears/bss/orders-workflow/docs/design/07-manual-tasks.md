@@ -684,9 +684,9 @@ calls a downstream, 5 s for a record-only one.
 | `name` | `protection` | `input` | `output` | `idempotency_key` | `declared_event` | `compensation` | `reasons` | `audit_kind` | `retry_class` | `deadline` |
 |--------|--------------|---------|----------|-------------------|------------------|----------------|-----------|--------------|---------------|------------|
 | `create-manual-task` | `protected` | ref + `scope` ∈ `line` · `plan` · `order`; `subjects[]` (`subjectRef` — `lineRef`, `planRef` or `correlationId` — plus `reason`, the §3.7 enum); `failureCause` (§3.7 enum); `sourceStep` (operation name); `sourceAttempt` (that step's key `attempt` component) | `taskRefs[]`; `exhaustedTaskRefs[]` (tasks whose re-entrance was the third failed attempt, §4.2); `slaRound` (the SLA deadline stays in the record; the definition carries no remainder) | instance-scoped `{tenant}:{correlationId}:create-manual-task:{sourceStep}:{sourceAttempt}`; a re-failure after a retry carries the new `attempt` and therefore a new key, which is what reaches the reopen branch | none | none | `idempotency-key-conflict`, `not-found` (a subject the record does not show failed), `version-mismatch` | `step-completion` | `retryable-on: transient` | 5 s |
-| `resolve-manual-task` | `composable` | ref + `trigger` ∈ `request` · `sla-check`; `taskRef` and `requestRef` (on `request`, from the signal's `data`); `slaRound` (on `sla-check`, as last returned) | `resolution` ∈ `retry` · `override` · `closed` · `escalated` · `exhausted` · `refused` · `none`; `resumeAt` ∈ `plan` · `barrier` · `compensation` · `stage` (on `retry`); `attemptKey` (on `retry`, from `retry-step`); `openTaskCount`; `slaRound` — on `sla-check` before any open task's stored `sla_deadline` has passed, the call records nothing, answers `none` with the same `slaRound` and leaves the registry record `open`, so the next `PT5M` tick calls the same key again | instance-scoped `{tenant}:{correlationId}:resolve-manual-task:{taskRef}:{requestRef}` on `request`; `{tenant}:{correlationId}:resolve-manual-task:sla:{slaRound}` on `sla-check` | none (`retry` of a line re-enters `failed` → prior state through slice 04's function, which emits nothing on a non-terminal entry) | none | `order-fenced`, `action-not-offered`, `poison-step` (from `retry-step`), `not-found`, `version-mismatch` | `step-completion`; `escalation` when an SLA breach escalates; `retry` (written by `retry-step`) | `retryable-on: transient` | 5 s |
+| `resolve-manual-task` | `composable` | ref + `trigger` ∈ `request` · `sla-check`; `taskRef` and `requestRef` (on `request`, from the signal's `data`); `slaRound` (on `sla-check`, as last returned) | `resolution` ∈ `retry` · `override` · `closed` · `escalated` · `exhausted` · `refused` · `none`; `resumeAt` ∈ `plan` · `barrier` · `compensation` · `stage` (on `retry`); `attemptKey` (on `retry`, from `retry-step`); `openTaskCount`; `slaRound` — on `sla-check` before any open task's stored `sla_deadline` has passed, the call records nothing and answers `none` with the next `slaRound` as a settled success of its round, so the next `PT5M` tick calls the next key and no tick's key approaches the key lifetime ([`01 §3.3` *Rounds and attempts*](./01-foundation.md#rounds-and-attempts-the-one-rule-for-re-invokable-operations)) | instance-scoped `{tenant}:{correlationId}:resolve-manual-task:{taskRef}:{requestRef}` on `request`; `{tenant}:{correlationId}:resolve-manual-task:sla:{slaRound}` on `sla-check` | none (`retry` of a line re-enters `failed` → prior state through slice 04's function, which emits nothing on a non-terminal entry) | none | `order-fenced`, `action-not-offered`, `poison-step` (from `retry-step`), `not-found`, `version-mismatch` | `step-completion`; `escalation` when an SLA breach escalates; `retry` (written by `retry-step`) | `retryable-on: transient` | 5 s |
 | `verify-override` | `composable` | ref + `taskRef`, `requestRef` | `verified` (bool); `rejection` ∈ `not-active` · `binding-mismatch` · `no-binding-reference` · `corroboration-divergent` · `not-found` · `order-fenced` · `null`; `exhausted` (bool) | instance-scoped `{tenant}:{correlationId}:verify-override:{taskRef}:{requestRef}`; the Subscriptions status read is a read and carries no key | `OrderFulfillmentStepCompleted` with `provenance = operator-override`, enqueued by slice 04's transition function in this settlement transaction, on `verified` only | none — an override-attached subscription is undone as a subject of `compensate-order`, not by a paired undo | `override-unverified`, `order-fenced`, `circuit-breaker-open`, `per-attempt-timeout`, `not-found`, `version-mismatch` | `step-completion` (justification in `owf_audit_entry.justification`) | `retryable-on: transient` | 10 s |
-| `raise-overdue-escalation` | `composable` | ref + `escalationKind` ∈ `overdue-fulfillment` · `lifetime-ceiling` · `park` · `approval-outage`; `subjectRef` (`parkRef` on `park`; the gate `position` on `approval-outage`; null otherwise); `stepRef` (the definition's position, nullable) | `due: true\|false` on `overdue-fulfillment` — database time against the stored `expected_fulfillment_at` + 24 h, the answer the overdue re-check loop switches on (`10 §3.6` (b)); `due: false` raises nothing and leaves the registry record `open`; `escalationRef`; `raised` (bool; false when absorbed, not due, or when the subject has already resolved); `taskRef` (on `lifetime-ceiling`) | instance-scoped `{tenant}:{correlationId}:raise-overdue-escalation:{escalationKind}:{orderVersion}:{subjectRef or "-"}` | none | none | `not-found` (unknown `parkRef` or position), `version-mismatch` | `escalation` | `retryable-on: transient` | 5 s |
+| `raise-overdue-escalation` | `composable` | ref + `escalationKind` ∈ `overdue-fulfillment` · `lifetime-ceiling` · `park` · `approval-outage`; `subjectRef` (`parkRef` on `park`; the gate `position` on `approval-outage`; null otherwise); `stepRef` (the definition's position, nullable); `round` (on `overdue-fulfillment` only: 0 on the first tick, else the previous answer's `nextRound`) | `due: true\|false` on `overdue-fulfillment` — database time against the stored `expected_fulfillment_at` + 24 h, the answer the overdue re-check loop switches on (`10 §3.6` (b)); `due: false` raises nothing and is a settled success of its round; `nextRound` (on `overdue-fulfillment`), so each hourly tick runs under a new key and the monitor keeps working for an order whose expected fulfillment lies beyond the 30-day key lifetime ([`01 §3.3` *Rounds and attempts*](./01-foundation.md#rounds-and-attempts-the-one-rule-for-re-invokable-operations)); `escalationRef`; `raised` (bool; false when absorbed, not due, or when the subject has already resolved); `taskRef` (on `lifetime-ceiling`) | instance-scoped `{tenant}:{correlationId}:raise-overdue-escalation:{escalationKind}:{orderVersion}:{subjectRef or "-"}[:{round}]`, the round present on `overdue-fulfillment` only; the one escalation per subject is `owf_overdue_escalation`'s uniqueness, not the key's | none | none | `not-found` (unknown `parkRef` or position), `version-mismatch` | `escalation` | `retryable-on: transient` | 5 s |
 
 `resolve-manual-task`, `verify-override` and `raise-overdue-escalation` are `composable`: a
 definition version may reposition them, but the constraints of §4.8 bind any version that contains
@@ -873,7 +873,7 @@ sequenceDiagram
 **Algorithm: `resolve-manual-task`**
 
 1. [ ] - `p1` - Resolve the instance; refuse `version-mismatch` if terminal - `inst-rmt-resolve`
-2. [ ] - `p1` - **IF** `trigger = sla-check`: **IF** no open task of the instance has `sla_deadline ≤ now` (database time) with `sla_breached_at` NULL: record nothing, leave the registry record `open` and **RETURN** `none` with the same `slaRound` — the call is a no-op until the stored deadline; otherwise **FOR EACH** open task of the instance with `sla_deadline ≤ now` (database time) and `sla_breached_at` NULL: stamp `sla_breached_at`, raise `severity` to `escalated`, set `escalated_to = seller-operator`, write an `escalation` entry; **IF** its scope is `line` or `plan` with a forward reason: resolve it `exhausted` / `remediation-exhausted` and **RETURN** `exhausted`; otherwise (compensation or order scope) leave it open and continue; **RETURN** `escalated` with the next `slaRound` - `inst-rmt-sla`
+2. [ ] - `p1` - **IF** `trigger = sla-check`: **IF** no open task of the instance has `sla_deadline ≤ now` (database time) with `sla_breached_at` NULL: record nothing and **RETURN** `none` with the next `slaRound` — a settled success of this round; the call is a no-op until the stored deadline, and each tick is a new key; otherwise **FOR EACH** open task of the instance with `sla_deadline ≤ now` (database time) and `sla_breached_at` NULL: stamp `sla_breached_at`, raise `severity` to `escalated`, set `escalated_to = seller-operator`, write an `escalation` entry; **IF** its scope is `line` or `plan` with a forward reason: resolve it `exhausted` / `remediation-exhausted` and **RETURN** `exhausted`; otherwise (compensation or order scope) leave it open and continue; **RETURN** `escalated` with the next `slaRound` - `inst-rmt-sla`
 3. [ ] - `p1` - **IF** `trigger = request`: read the request row by `requestRef`; **IF** it is not `requested` **RETURN** its recorded result (absorbed replay); **IF** the task is `resolved` or `action` is not in its current `resolution_actions`: mark the request `refused` with `action-not-offered`, **RETURN** `refused` - `inst-rmt-read`
 4. [ ] - `p1` - **IF** `action ∈ {retry, override}` on a forward-reason task: re-check the fence and terminal conditions of §2.2 against `owf_cancellation_fence` and the instance in this transaction; on a hit mark the request `refused` with `order-fenced`, **RETURN** `refused` - `inst-rmt-fence`
 5. [ ] - `p1` - **IF** `action = retry`: invoke `retry-step`'s effect in-process (01: quarantine, next `attempt` for the step's key family); on `poison-step` mark the request `refused`, **RETURN** `refused`; for a `line` forward task move the line `failed → pending` (wave 1) or `failed → draft_created` (wave 2) through slice 04's transition function with the request's principal as `last_transition_actor`; resolve the task `retry` / `retry-dispatched`; **RETURN** `retry` with `attemptKey` and `resumeAt` — `barrier` (line), `plan` (plan scope: a new `attempt` of `construct-and-freeze-plan`), `compensation` (compensation reason: `compensate-order` again), `stage` (order scope: re-enter the stage whose operation failed) - `inst-rmt-retry`
@@ -966,9 +966,9 @@ sequenceDiagram
 1. [ ] - `p1` - Resolve the instance; refuse `version-mismatch` if terminal - `inst-roe-resolve`
 2. [ ] - `p1` - **IF** `escalationKind = park`: read the park by `subjectRef`; **IF** it is resolved or `escalated_at` is set **RETURN** `raised: false`; **ELSE** stamp `escalated_at` through slice 03's park port and record `park_reason` and the time remaining before the `submitted` TTL (D-57) - `inst-roe-park`
 3. [ ] - `p1` - **IF** `escalationKind = approval-outage`: record the paused gates at `subjectRef` as the blocking object - `inst-roe-outage`
-4. [ ] - `p1` - **IF** `escalationKind = overdue-fulfillment`: **IF** the instance already has a settled `report-outcome` **RETURN** `raised: false`; read `expected_fulfillment_at` from the plan (04); **IF** database now is before it plus 24 h **RETURN** `due: false`, `raised: false` and leave the key `open`; **ELSE** set `due: true` and read the last settled step operation and the non-terminal lines and intents - `inst-roe-overdue`
+4. [ ] - `p1` - **IF** `escalationKind = overdue-fulfillment`: **IF** the instance already has a settled `report-outcome` **RETURN** `raised: false`; read `expected_fulfillment_at` from the plan (04); **IF** database now is before it plus 24 h **RETURN** `due: false`, `raised: false` and `nextRound` — a settled success of this round; **ELSE** set `due: true` and read the last settled step operation and the non-terminal lines and intents - `inst-roe-overdue`
 5. [ ] - `p1` - **IF** `escalationKind = lifetime-ceiling`: create the order-scope `lifetime-ceiling-reached` task through the creation port - `inst-roe-lifetime`
-6. [ ] - `p1` - Insert `owf_overdue_escalation` under its uniqueness; write the `escalation` entry; settle the key; **RETURN** `escalationRef`, `raised: true`, `taskRef` - `inst-roe-settle`
+6. [ ] - `p1` - Insert `owf_overdue_escalation` under its uniqueness; write the `escalation` entry; settle the key; **RETURN** `escalationRef`, `raised: true`, `taskRef` and, on `overdue-fulfillment`, `nextRound` - `inst-roe-settle`
 
 **Description**: The four clocks are the definition's; the escalation and its step context are
 Orders'. The operation marks nothing failed and transitions nothing, so the non-terminalling
@@ -1050,7 +1050,7 @@ and `escalate`, and `override_subscription_ref` and the override resolution, wri
 **Additional info**: Tenant axes are `resource_tenant_id` and `seller_tenant_id`. Index on
 (`seller_tenant_id`, `assignment_state`, `sla_deadline`) for queue scoping and the keyset order;
 index on (`correlation_id`) WHERE `assignment_state <> 'resolved'` for the closure port and the SLA
-check. **Retention ≥ 400 days.** Growth table — **monthly range partition on `created_at`**.
+check. **Retention ≥ 400 days.** Growth table, **not partitioned** (`01 §3.7`, D-104); purged row-wise through a `created_at` index.
 
 **Example**:
 
@@ -1096,8 +1096,7 @@ check. **Retention ≥ 400 days.** Growth table — **monthly range partition on
 
 **Additional info**: Tenant axes as above. This is the request row `10 §4.4` requires be recorded
 before a signal is delivered: a signal the platform loses leaves a `requested` row that the queue
-shows as unanswered. **Retention ≥ 400 days.** Growth table — **monthly range partition on
-`requested_at`**.
+shows as unanswered. **Retention ≥ 400 days.** Growth table, **not partitioned** (`01 §3.7`, D-104); purged row-wise through a `requested_at` index.
 
 #### Table: owf_incident
 
@@ -1130,8 +1129,8 @@ the key, a v2 failure on a subject that already failed in v1 is its own row.
 port). **Mutability**: append-only.
 
 **Additional info**: Tenant axes as above. Non-actionable; read-only in the queue. Index on
-(`seller_tenant_id`, `created_at`). **Retention ≥ 400 days.** Growth table — **monthly range
-partition on `created_at`**.
+(`seller_tenant_id`, `created_at`). **Retention ≥ 400 days.** Growth table, **not partitioned** (`01 §3.7`, D-104);
+purged row-wise through a `created_at` index.
 
 **Example**:
 
@@ -1178,8 +1177,7 @@ termination and by the Operator Task Queue when an operator records an abort req
 **Mutability**: mutable in `outcome` only.
 
 **Additional info**: Tenant axes as above. It does **not** mark any line `failed` and does not
-transition the order. **Retention ≥ 400 days.** Growth table — **monthly range partition on
-`raised_at`**.
+transition the order. **Retention ≥ 400 days.** Growth table, **not partitioned** (`01 §3.7`, D-104); purged row-wise through a `raised_at` index.
 
 **Example**:
 
@@ -1229,8 +1227,8 @@ above.
 **Ownership**: written only by `cpt-cf-bss-orders-workflow-component-operator-task-queue`. It is
 the operator-facing state of the platform's object, never a second inspectable object.
 
-**Additional info**: Tenant axes as above. **Retention ≥ 400 days.** Growth table — **monthly range
-partition on `created_at`**.
+**Additional info**: Tenant axes as above. **Retention ≥ 400 days.** Growth table, **not partitioned** (`01 §3.7`, D-104);
+purged row-wise through a `created_at` index.
 
 ### 3.8 Deployment Topology
 
@@ -1295,8 +1293,8 @@ counter is per task.
 
 The breach is **observed**, not assumed: the definition's SLA branch is a fixed `PT5M` tick, and
 `resolve-manual-task` (`sla-check`) re-checks `sla_deadline` against database time (`01 §4.15`), so
-a tick before the deadline is a no-op that answers `none` and leaves the key `open`; no remainder
-is returned or carried.
+a tick before the deadline is a no-op that answers `none` and the next `slaRound`, a settled
+success of its round ([`01 §3.3` *Rounds and attempts*](./01-foundation.md#rounds-and-attempts-the-one-rule-for-re-invokable-operations)); no remainder is returned or carried.
 
 ### 4.3 The `ManualTask` state machine (normative)
 

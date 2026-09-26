@@ -126,6 +126,21 @@ derived from, the process `correlationId`.
 > gains a test that a second authorized cancel during a cancel unwind is absorbed and clears the
 > re-authorization mark.
 
+> **Amended 2026-09-26 by D-102**: a Lifecycle transition call is keyed
+> `orderId + orderVersion + transitionName + round` (plus the operator-retry `attempt` where one
+> was minted), and every re-invokable operation's step key ends in its round. Lifecycle settles a
+> `not-admissible` refusal under the key and replays it whatever version a retry carries, so a
+> refusal caused by a state that passes (a hold) must never be presented again under the same key:
+> the operation answers `held`, and the definition calls again under the next round after the
+> resume. The round is not a platform-supplied value: the definition passes back the value the
+> previous settled answer returned, and the envelope validates it against the instance's per-family
+> counter (`design/01-foundation.md` §3.3 *Rounds and attempts*), so the Confirmation's static check
+> still holds. The Confirmation gains a test that a spawn signal, a reflection and a completion
+> acknowledgement refused `not-admissible` while the order is held succeed under the next round
+> after the resume, and that a replay of the refused round still returns the stored refusal. The
+> step-key `attempt` is minted by `retry-step` per step family, on an operator's retry; the
+> intent key's `wave_attempt` is still minted only by `rebuild-wave1`.
+
 ### Confirmation
 
 Confirmed by a test that submits a wave-1 draft-create, retries it under a client-side timeout with the same idempotency key, and asserts Subscriptions returns the original outcome rather than creating a second subscription; by a test that amends the order to a new `orderVersion` before wave-1 completes and asserts the new version's draft-create intent carries a different idempotency key than the superseded version's, so it is not rejected as an in-flight duplicate; by a test asserting draft-create and activation for the same line and same order version carry different idempotency keys; by a test asserting a `draft_void` for a line carries a different idempotency key than the `draft_create` it reverses, and an `activated_cancel` a different key than the `activation` it reverses, so neither compensating submit is absorbed as a duplicate of its forward submit; by a test asserting a wave-1 rebuild increments `wave_attempt` and produces a key distinct from every prior attempt's; by a test asserting a `gateId` re-derived after a simulated crash equals the one derived before it; and by a static/schema check asserting no code path assigns the same value to both the idempotency-key field and the correlationId field on an outbound intent, and that no key is minted without a tenant prefix; and by a test that runs a second authorized cancel while a cancel unwind carries `reauthorization_required_at`, and asserts the fence absorbs it, replaces `cancel_request_ref`, clears the mark and lets the walk resume, while a replay of the first cancel is an absorbed duplicate.

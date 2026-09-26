@@ -120,6 +120,9 @@
   - [D-99 (M) The remediation hold is a flag; cancelling the last open forward task exhausts remediation](#d-99-m-the-remediation-hold-is-a-flag-cancelling-the-last-open-forward-task-exhausts-remediation)
   - [D-100 (M) Task actions record a request and signal; every mutating route requires a key](#d-100-m-task-actions-record-a-request-and-signal-every-mutating-route-requires-a-key)
   - [D-101 (L) The task queue sorts on the immutable `(created_at, task_id)` key](#d-101-l-the-task-queue-sorts-on-the-immutable-created_at-task_id-key)
+  - [D-102 (H) One rule for re-invokable operations: a round in, the next round out, a counter on the instance row, an attempt only from an operator retry](#d-102-h-one-rule-for-re-invokable-operations-a-round-in-the-next-round-out-a-counter-on-the-instance-row-an-attempt-only-from-an-operator-retry)
+  - [D-103 (M) The registry lease is fenced by a holder token, sized below the retry horizon, and resolved per key family](#d-103-m-the-registry-lease-is-fenced-by-a-holder-token-sized-below-the-retry-horizon-and-resolved-per-key-family)
+  - [D-104 (M) No Workflow-owned table is partitioned; registry rows are kept as tombstones until no replay can arrive](#d-104-m-no-workflow-owned-table-is-partitioned-registry-rows-are-kept-as-tombstones-until-no-replay-can-arrive)
 - [Open Questions](#open-questions)
   - [Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?](#q-01-which-durable-execution-substrate-backs-the-process--the-oss-workflow-engine-or-a-bss-local-mechanism)
   - [Q-02: The Generic Approval escalation threshold — the one PRD-deferred numeric value this design deliberately leaves unset](#q-02-the-generic-approval-escalation-threshold--the-one-prd-deferred-numeric-value-this-design-deliberately-leaves-unset)
@@ -220,6 +223,11 @@ that produces double-provisioning.
 
 **Propagates to**: `gears/bss/orders-workflow/docs/design/01-foundation.md` § `4.3 The
 idempotency registry's non-success outcomes are exhaustive`
+
+**Amended (2026-09-26)**: the outcome set is unchanged; how a dead lease resolves now depends on
+the key family — a lookup on an intent-submitting key, a re-run under a new holder on every other
+key — and every settlement is fenced by the lease holder token (D-103). An aged-out key is
+evaluated from its retained row, never from a missing one (D-104).
 
 ### D-04: The dead-letter record and the manual-task record are two separate objects; a failed step never grows a second inspectable object
 
@@ -1453,7 +1461,7 @@ roster for the five Workflow-owned workers in gear namespace `bss-orders-workflo
 `audit/<audit-tenant UUID>` — each with the transactional recheck that keeps it correct when its
 lock session is lost, because a session advisory lock is not a TTL lease and not a fence.
 Lifecycle `01 §3.8`'s deployment constraint and *session loss is not fencing* rule apply by
-reference. There is no idempotency-window sweep (registry retention is a partition drop) and no
+reference. There is no idempotency-window sweep (registry retention is the retention purge's tombstone rule, D-104) and no
 dead-letter delivery-count sweep (the delivery path parks inline). `cluster-sdk` is not selected
 for the reason Lifecycle gives. `gears/bss/libs/coord` — Pricing's DB-backed TTL lease with an
 in-transaction fence — is a candidate for the same roster and is registered as Q-09 for the
@@ -1568,7 +1576,8 @@ The decisions in this section were taken when the order process flow moved from 
 gear to a versioned platform workflow definition (`ADR/0011`, `ADR/0012`, `ADR/0013`), and when
 each slice was restructured into step operations and a definition fragment. D-65…D-72 carry the
 three ADRs and their cross-cutting consequences; D-73…D-101 are the decisions the slice
-restructurings recorded. Each names the entries it amends; the amended entries carry a dated
+restructurings recorded, and D-102 onwards the decisions taken on the second review of
+2026-09-26. Each names the entries it amends; the amended entries carry a dated
 **Amended by** note. All were taken on 2026-09-24.
 
 ### D-65 (H) The order process flow is a versioned platform workflow definition executed by serverless-runtime
@@ -1794,6 +1803,12 @@ whether or not the platform is healthy.
 **Propagated**: `design/01-foundation.md` §3.8; `design/05-provisioning-intents.md` §3.8;
 `DESIGN.md` §3.8; Q-09.
 
+**Amended (2026-09-26)**: the settlement by `settle-from-lookup` applies to a dead lease on an
+intent-submitting key (`dispatch-wave1-create`, `dispatch-wave2-activate`, `compensate-order`);
+a dead lease on any other key is re-run under a new holder by its next same-key call, and a
+record-only operation leaves none (D-103). The roster is unchanged: still no dead-lease scan.
+The retention purge deletes row-wise; no table is partitioned (D-104).
+
 ### D-72 (M) Inbound dead letters are the platform trigger path's; `owf_dead_letter_record` is retired
 
 **Accepted.** *(amends D-04, D-05, D-44)*
@@ -1870,6 +1885,12 @@ invocation partway through compensation. A supersede or terminal event arrives a
 version, so its reference only keeps the rule uniform. With the reference in the key, a replay of one request is still absorbed, and a
 different request reaches the fence's absorption table. Propagated: `design/06-saga-and-compensation.md`
 §3.3, §4.3; `design/10-process-definition.md` §3.6 fragment (c); ADR-0006 as amended.
+
+**Amended (2026-09-26)**: generalised by D-102. "Two round components" understated the surface:
+every re-invokable operation carries a round, every Lifecycle-transition key ends in
+`{round}[:{attempt}]`, and the two keys named above are two rows of the register in
+`design/01-foundation.md` §3.3 *Rounds and attempts*, where each round is validated against the
+instance's `key_rounds` counter.
 
 ### D-75 (M) Supersession is unwind-then-start, and admission waits for the prior instance
 
@@ -1952,6 +1973,11 @@ mechanisms protect stay Orders' guards so a publish cannot weaken them.
 
 **Propagated**: `design/03-approval-execution.md` §3.3, §4.2; `design/04-fulfillment-plan.md`
 §3.3; `design/05-provisioning-intents.md` §3.3; `design/10-process-definition.md` §3.6 (a), (b).
+
+**Amended (2026-09-26)**: the park loop carries a hold and a resume arm that only record
+(`holdPauses` false); a hold during a park records the suspension and leaves the phase `parked`,
+so the reflection after the `unpark` answers `held` and waits for the resume instead of replaying a
+Lifecycle refusal (D-102). The park clock is still never paused and the TTL rule is unchanged.
 
 ### D-79 (M) Each wave is one `call` carrying the line set as references
 
@@ -2348,6 +2374,113 @@ between pages.
 
 **Propagated**: `design/07-manual-tasks.md` §3.3; `design/09-read-and-authz.md` §2.2.
 
+### D-102 (H) One rule for re-invokable operations: a round in, the next round out, a counter on the instance row, an attempt only from an operator retry
+
+**Accepted (2026-09-26).** *(generalises D-74; amends D-78; ADR-0006 as amended)*
+
+**Decision**: every **re-invokable** operation — every re-check of a fixed-wait loop, the
+dispatch, re-read, rebuild and sweep operations, the evaluations, and every operation that calls a
+Lifecycle transition — keys on a round the definition passes back from the previous settled answer
+of the same operation (`0` on first entry) and returns the next one. Every settled success returns
+the next round, including `due: false`, `unobtainable`, `none`, `withheld` and `held`, and none
+leaves its record `open`. The envelope validates the round against a per-instance, per-family
+counter, `owf_process_instance.key_rounds`, advanced in the settlement transaction, never against a
+count of `owf_step_log` rows. An operator retry mints the next `attempt` of the failed step's family
+through `retry-step`; the re-entered operation appends it after the round, and `reflect-verdict`
+gains it. The Lifecycle-transition family is
+`{tenant}:{orderId}:{orderVersion}:{transitionName}:{round}[:{attempt}]`. On a Lifecycle
+`not-admissible` the operation reads the order, and if it is `on_hold` answers `held`, a settled
+success; the definition waits for the resume (`awaitHeldReflect`, `heldWait` or the eligibility
+wait, each with a `PT5M` tick) and calls again under the next round. The park loop gains a hold and
+a resume arm that only record, and `apply-hold` on a parked instance records the suspension and
+leaves the phase `parked`. `rebuild-wave1` and `reread-draft-liveness` get rounds of their own.
+`begin-fulfillment` short-circuits to `in-fulfillment` once committed and answers `held` and
+`version-conflict` as settled successes, so its call sits under a plain retry-only `catch`. The
+definition's `attemptId` reads `$task.reference`, not `$task.name`.
+
+**Rationale**: Lifecycle settles a `not-admissible` refusal under its key and replays it
+"regardless of the version the retry carries" (Lifecycle `01-foundation.md:2097`, `:2163`), so a
+fixed per-trigger key let one hold-time refusal block the spawn signal, the reflection or the
+completion acknowledgement for good (second review OW2-41). Lifecycle's own answer to a held order,
+`not-dispatchable` — re-read the order, wait for the resume, re-run (`06-workflow-seam.md:743`) —
+is the precedent the `held` answer follows. The same rule closes six more findings: a same-key
+`due: false` loop kept one key open past its 30-day lifetime (OW2-34); counting settled step-log
+rows broke once the 90-day step-log purge ran (OW2-38); `rebuild-wave1` was given wave 1's round
+(OW2-22); an operator retry of a refused reflection replayed the stored refusal (OW2-25);
+`begin-fulfillment`'s 409 catch read still-processing as a version conflict (OW2-24); and the
+register named two round components where many exist (OW2-26). `$task` in the call envelope is the
+inner `call` task every step shares, so `$task.name` was `call` everywhere (OW2-5). Rejected:
+exempting re-check keys from the key lifetime, which leaves `01 §3.7`'s "`open` only after a
+retryable failure" contradicted; and mapping `not-admissible` to a retryable answer, because a
+retry reuses the key and Lifecycle answers it with the stored refusal.
+
+**Propagated**: `design/01-foundation.md` §3.3 (*The step-operation contract*, *Rounds and
+attempts*, *Attempt identity*, `retry-step`), §3.7 (`owf_process_instance`, the phase table),
+§4.3, §4.14; `design/03-approval-execution.md` §3.3, §3.6, §4.1, §4.4, §4.5;
+`design/04-fulfillment-plan.md` §3.3, §3.6, §4.1, §4.8; `design/05-provisioning-intents.md` §3.3,
+§3.6, §4.5; `design/06-saga-and-compensation.md` §3.3, §3.6; `design/07-manual-tasks.md` §3.3,
+§3.6, §4.2; `design/08-hold-and-cancel.md` §3.3, §3.6; `design/10-process-definition.md` §3.1,
+§3.6 (a), (b), (e); `UPSTREAM_REQS.md` §2.9; ADR-0006 as amended; D-74, D-78.
+
+### D-103 (M) The registry lease is fenced by a holder token, sized below the retry horizon, and resolved per key family
+
+**Accepted (2026-09-26).** *(amends D-03 and D-71)*
+
+**Decision**: `owf_idempotency_registry` gains `lease_holder`, a token minted at every lease
+acquisition, and `receipt_count`. Every heartbeat and settlement is a conditional update on
+`status = in_flight`, the caller's `lease_holder` and a live `lease_expires_at`, run last in its
+transaction; zero rows rolls the settlement back whole and answers `retryable-failure`. A
+record-only operation resolves, runs and settles in **one** transaction, so a crash leaves no
+`in_flight` row. A dead lease is settled by lookup (`settle-from-lookup`) only on the
+intent-submitting operations — `dispatch-wave1-create`, `dispatch-wave2-activate`,
+`compensate-order`; every other operation re-runs it under a new holder, because its outbound call
+is a read or a submission the downstream de-duplicates under the key the step derives. The lease is
+**15 s** with a **5 s** heartbeat (was 60 s and 20 s). `settle-from-lookup` keys on the stuck
+record's `lease_holder`. `owf_step_log` rows carry a per-key `receipt_ordinal`, with
+`UNIQUE (operation, idempotency_key, receipt_ordinal)`; `attempt_number` is a derived, non-unique
+count.
+
+**Rationale**: the precedent is the BSS `coord` lease, whose ack transaction ends in a conditional
+self-update on `locked_by` and the live deadline and rolls back on zero rows
+(`gears/bss/libs/coord/src/lease/guard.rs:160-264`); the single-transaction record-only shape is
+Lifecycle's (`01 §4.2`, "crash recovery normally relies on transaction rollback or settled-outcome
+replay"). Without a holder a late holder could commit over a re-run or a lookup settlement
+(OW2-36); a crash during any non-dispatch step left a key no one could settle, and a 60 s lease
+outlived the ~15-30 s retry budget so every retry met a live lease (OW2-30); a second crash behind
+an `absent` reopen was absorbed as a replay of the first lookup (OW2-31); and a UNIQUE over the
+settled-attempt count collided with the rule that every receipt writes a row (OW2-37).
+
+**Propagated**: `design/01-foundation.md` §3.3 (`settle-from-lookup`, the outcome table), §3.6,
+§3.7 (`owf_step_log`, `owf_idempotency_registry`), §3.8, §4.3; `design/05-provisioning-intents.md`
+§3.2, §3.6, §4.4; `design/06-saga-and-compensation.md` §3.6; `DESIGN.md` §3.7, §3.8; D-03, D-71.
+
+### D-104 (M) No Workflow-owned table is partitioned; registry rows are kept as tombstones until no replay can arrive
+
+**Accepted (2026-09-26).** *(mirrors Lifecycle D-91)*
+
+**Decision**: no Workflow-owned table is range-partitioned, in any slice; every purge is a bounded
+row-wise `DELETE … WHERE` through the table's retention index, run by `retention-purge`. A future
+partitioning **MUST** put the partition column in every PK and UNIQUE and **MUST NOT** be applied
+to a table whose uniqueness is a deduplication guard. `owf_idempotency_registry` rows are deleted
+only once `expires_at` has passed and the owning instance has been terminal for 30 days (a
+`trigger`-family row that started no instance: 30 days past `expires_at`); until then an expired row
+stays as a tombstone, and aged-out is evaluated from it.
+
+**Rationale**: PostgreSQL requires every unique constraint of a partitioned table to include the
+partition columns, so the registry PK, `UNIQUE (idempotency_key)` on intents and compensation
+records and the one-open-row partial indexes could not be built as written, or held only within a
+month (OW2-33). Lifecycle withdrew partitioning for this class of reason (Lifecycle D-91);
+Ledger's composite keys add the partition column (`01-repository-foundation.md:453`), which keeps a
+constraint buildable but gives up the global uniqueness deduplication needs. Once a registry
+partition was dropped, an expired key had no row and resolved as a first call, so a late replay
+could repeat its effect (OW2-39); Lifecycle's rule that "expiry is logical, not dependent on sweep
+timing" (`01 §4.2`) is the one kept here.
+
+**Propagated**: `design/01-foundation.md` §3.7 (every table, *Partitioning, retention and
+immutability*), §3.8; `design/03-approval-execution.md` §3.7; `design/04-fulfillment-plan.md`
+§3.7; `design/05-provisioning-intents.md` §3.7; `design/06-saga-and-compensation.md` §3.7;
+`design/07-manual-tasks.md` §3.7; `design/08-hold-and-cancel.md` §3.7; `DESIGN.md` §3.7, §4.1.
+
 ## Open Questions
 
 ### Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?
@@ -2674,6 +2807,9 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-99 | M Remediation hold and exhaustion | `design/07-manual-tasks.md` §3.3, §4.3 |
 | D-100 | M Task actions and keys | `design/07-manual-tasks.md` §3.3, `design/09-read-and-authz.md` §3.3, §4.1, `DESIGN.md` §3.3 |
 | D-101 | M Task-queue sort key | `design/07-manual-tasks.md` §3.3, `design/09-read-and-authz.md` §2.2 |
+| D-102 | M Rounds and attempts for re-invokable operations | `design/01-foundation.md` §3.3, §3.7, §4.3, §4.14, `design/03-approval-execution.md` §3.3, §4.4, §4.5, `design/04-fulfillment-plan.md` §3.3, §3.6, §4.1, §4.8, `design/05-provisioning-intents.md` §3.3, §4.5, `design/06-saga-and-compensation.md` §3.3, `design/07-manual-tasks.md` §3.3, `design/08-hold-and-cancel.md` §3.3, `design/10-process-definition.md` §3.6, `ADR/0006`; D-74, D-78 |
+| D-103 | M Registry lease fence and dead-lease resolution | `design/01-foundation.md` §3.3, §3.7, §3.8, §4.3, `design/05-provisioning-intents.md` §3.6, `design/06-saga-and-compensation.md` §3.6, `DESIGN.md` §3.7, §3.8; D-03, D-71 |
+| D-104 | M No partitioned tables; registry tombstones | `design/01-foundation.md` §3.7, §3.8, every slice §3.7, `DESIGN.md` §3.7, §4.1; Lifecycle D-91 |
 
-Highest decision number used: **D-101**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
+Highest decision number used: **D-104**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
 register; there are no parts.

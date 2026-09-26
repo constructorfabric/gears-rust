@@ -782,9 +782,13 @@ attempt identifier to the callee is **not stated** in the serverless-runtime des
 is whether the spec's `$workflow.id` runtime argument equals the platform `invocation_id`; both
 are registered as the upstream ask `…-upreq-serverless-runtime-attempt-and-deadline-propagation`
 in `UPSTREAM_REQS.md` §2.9. Until it is answered, the
-definition supplies `attemptId` as `"{invocationId}:{taskName}"` from the spec's `$workflow.id`
-and `$task.name` runtime arguments, and the envelope appends its own receipt ordinal to make the
-recorded value unique per receipt. Recording it is what lets an auditor join Orders' record to
+definition supplies `attemptId` as `"{invocationId}:{taskReference}"` from the spec's `$workflow.id`
+and `$task.reference` runtime arguments, and the envelope appends the key's receipt ordinal
+(`owf_step_log.receipt_ordinal`, §3.7) to make the recorded value unique per receipt. The
+reference, not the name: the task that evaluates the expression is the inner `call` task every
+step's `try` wraps, so `$task.name` is `call` for every step, while `$task.reference` is the
+task's position in the document (`/do/…/admitStart/try/0/call`; Serverless Workflow DSL 1.0.0,
+dsl.md *Task Descriptor*, `reference`) and names the step that made the call. Recording it is what lets an auditor join Orders' record to
 the platform's timeline without depending on the timeline surviving.
 
 **What the envelope guarantees around a call**: the idempotency key is resolved before the
@@ -833,7 +837,7 @@ declaration is mirrored into `owf_step_operation` (§3.7):
 | `protection` | Whether a definition may omit or replace it | `protected` (must appear on its path, never replaced) · `composable` (may be omitted) |
 | `input` | GTS reference schema of the request body; references and small enums only | a `gts.cf.bss.orders_workflow.step.<name>.input.v1~` type |
 | `output` | GTS reference schema of the success body | a `gts.cf.bss.orders_workflow.step.<name>.output.v1~` type |
-| `idempotency_key` | Derivation family per [`../ADR/0006`](../ADR/0006-cpt-cf-bss-orders-workflow-adr-idempotency-key-composition.md), recomposed server-side | intent · approval-request · lifecycle-transition · instance-scoped (`{tenant}:{correlationId}:{name}[:{subject}][:{attempt}]`) · trigger (`{tenant}:{eventId}:admit-trigger[:listen]`, event-scoped, [`02 §2.1`](./02-triggers-and-start.md#21-design-principles)). Two instance-bound keys carry a round component: `begin-fulfillment`'s lifecycle-transition key ends in the eligibility round (`…:begin-fulfillment:{eligibilitySeq}`, [`04 §3.3`](./04-fulfillment-plan.md#33-api-contracts)) and `compensate-order`'s step key ends in the pass (`…:compensate-order:{pass}`, [`06 §3.3`](./06-saga-and-compensation.md#33-api-contracts)) |
+| `idempotency_key` | Derivation family per [`../ADR/0006`](../ADR/0006-cpt-cf-bss-orders-workflow-adr-idempotency-key-composition.md), recomposed server-side | intent · approval-request · lifecycle-transition · instance-scoped (`{tenant}:{correlationId}:{name}[:{subject}][:{round}][:{attempt}]`) · trigger (`{tenant}:{eventId}:admit-trigger[:listen]`, event-scoped, [`02 §2.1`](./02-triggers-and-start.md#21-design-principles)). Every **re-invokable** operation's key ends in its round, and a key a manual-task retry re-enters ends in the minted `attempt` after it — the one rule of *Rounds and attempts* below, whose register lists every re-invokable operation and its round member |
 | `declared_event` | The process event enqueued in the settlement transaction on success | one of the six of §4.7, or none |
 | `compensation` | The operation that undoes this one's effect | a registered operation name, or none |
 | `reasons` | The catalogue subset it may raise | names from §4.9 |
@@ -855,7 +859,7 @@ definition's `catch` sees (`$error.status`, `10 §2`):
 |---------|---------|--------|
 | `retryable-failure` | The attempt failed transiently — downstream not accepting, per-operation deadline cut it before an accept, or an open breaker; the registry record is left `open` and the definition's retry policy may re-issue the same key | 503 or 504 with the catalogue reason |
 | `permanent-failure` | The attempt failed in a way the operation declared non-retryable, or the caller presented a key conflict; the definition's failure arm applies | 400, 403, 404 or 409 (`AlreadyExists`) with the catalogue reason |
-| `still-processing` | The registry found an `in_flight` record under this key with a live lease, or a dead lease inside the key lifetime; the caller must not infer success and must not resubmit under a new key; re-issue the same key after backoff or wait for `settle-from-lookup` | 409 `Aborted`, `still-processing` or `idempotency-lease-expired` |
+| `still-processing` | The registry found an `in_flight` record under this key with a live lease, or a dead lease inside the key lifetime on a key whose dead lease is settled by lookup (§4.3 *Lease-expired*); the caller must not infer success and must not resubmit under a new key; re-issue the same key after backoff or wait for `settle-from-lookup` | 409 `Aborted`, `still-processing` or `idempotency-lease-expired` |
 | `aged-out` | The key's retention window (§3.7) elapsed with no settled record; the next attempt is a **new operation under a new key** — it appends the key's `attempt` component — never a resume of the old one | 400, `idempotency-key-aged-out` |
 
 `dead-lettered` is **not** an outcome of this surface: a delivery that exhausts its cap is the
@@ -863,6 +867,85 @@ platform trigger path's (§4.8), and a step-level failure has the manual task. A
 receiving `still-processing` **MUST NOT** treat it as success and **MUST NOT** call a different
 operation to "move on"; only a settled success or a settled permanent failure may advance the path
 (`cpt-cf-bss-orders-workflow-fr-owf-retry`).
+
+#### Rounds and attempts: the one rule for re-invokable operations
+
+An operation is **re-invokable** when the definition may call it again for the same instance and
+subject after a settled answer and expects a fresh evaluation rather than the stored answer: every
+re-check of `10 §3.6` *Fixed waits and re-check loops*, every dispatch, re-read, rebuild and sweep
+of slice 05, the evaluations of slice 04, and every operation that calls a Lifecycle transition,
+because a Lifecycle refusal caused by a state that passes (a hold) must not be replayed once the
+state has passed. Every re-invokable operation follows one rule (decision D-102: a round in, the
+next round out, a per-instance counter, an attempt only from an operator retry):
+
+1. [ ] - `p1` - **Round in, next round out.** The key ends in the operation's round member, and
+   the body carries it. The definition passes the value the previous settled answer of the same
+   family returned, `0` on first entry, and never computes one (§4.14). Every settled success of a
+   re-invokable operation returns the next round, including an answer that records nothing
+   (`due: false`, `unobtainable`, `none`, `withheld`, `held`, a deferral). Such an answer is a
+   settled success of its round, never an `open` record, so each tick of a re-check loop runs under
+   a new key and no loop keeps one key open towards its lifetime (§3.7 *Key lifetime*); `open` is
+   entered only by a settled `retryable-failure` - `inst-owf-round-in-out`
+2. [ ] - `p1` - **The counter is on the instance row.** The envelope keeps one counter per family
+   in `owf_process_instance.key_rounds` (§3.7). A family is the operation name plus the subject
+   its key names (the stage, gate position and mode, park, plan or wave). The counter advances by
+   one in the transaction that settles a round's key with success, under the instance row lock the
+   audit append already takes (§4.17). At `inst-owf-step-shape` the envelope compares the
+   presented round with the counter: equal is the next round; lower is a replay, which the
+   registry resolves under its retained record (§3.7 *Retention*); higher is
+   `idempotency-key-mismatch` (400). The round is never counted from `owf_step_log` rows, which the
+   90-day step-log retention removes while an instance still lives. Where a round is another
+   operation's answer — `begin-fulfillment`'s `eligibilitySeq`, `open-gates`' `position` —
+   the operation's own guard validates it instead, as its register row states - `inst-owf-round-counter`
+3. [ ] - `p1` - **An operator retry mints a new attempt.** `retry-step` mints the next `attempt` of
+   the failed step's family (a second counter in the same `key_rounds` entry) and returns it as
+   `attemptKey`. The definition passes it to the operation the retry re-enters, whose key ends in
+   `:{attempt}` after the round, and clears it once that operation settles; attempt `0` is
+   omitted from the key. A round is the definition's loop; an attempt is an operator's decision
+   that a failed step runs again, and it is the only way past a settled refusal of the same round.
+   An attempt above the family's minted counter is `idempotency-key-mismatch` - `inst-owf-attempt`
+4. [ ] - `p1` - **A Lifecycle-transition key carries the round.** The key Orders passes to
+   Lifecycle is `{tenant}:{orderId}:{orderVersion}:{transitionName}:{round}[:{attempt}]`, with the
+   round and attempt of the Orders step key of the operation that calls it. Lifecycle settles a
+   `not-admissible` refusal under the key ([Lifecycle `01 §4.1`](../../../orders-lifecycle/docs/design/01-foundation.md#41-the-transition-contract-normative),
+   `01-foundation.md:2097`) and replays it "regardless of the version the retry carries"
+   ([Lifecycle `01 §4.2`](../../../orders-lifecycle/docs/design/01-foundation.md#42-idempotency-semantics-normative), `01-foundation.md:2163`),
+   so the same key can never pass once the refusing state has passed. On a Lifecycle
+   `not-admissible`, the operation reads the order through the Lifecycle PDP-authorized order read
+   (Lifecycle `08 §4`); if the order is `on_hold`, it settles **success** with the answer `held`
+   and the next round, and the definition waits for the resume and calls again under that round.
+   That is the handling Lifecycle prescribes for its own `not-dispatchable` answer: re-read the
+   order, wait for the resume, re-run
+   ([Lifecycle `06 §4.3`](../../../orders-lifecycle/docs/design/06-workflow-seam.md#43-begin-fulfillment-and-the-spawn-signal-normative),
+   `06-workflow-seam.md:743`). Any other `not-admissible` stays `permanent-failure` with
+   `version-mismatch` - `inst-owf-round-lifecycle`
+
+**The register of re-invokable operations.** Each operation's §3.3 declaration is authoritative;
+this table is the index the validation hook of `10 §2.2` and the envelope's counter read from.
+
+| Operation (slice) | Round member, in → out | Key tail |
+|-------------------|------------------------|----------|
+| `obtain-verdict` (03) | `round` → `nextRound` | `…:obtain-verdict:{orderVersion}:{round}` |
+| `reflect-verdict` (03), per `stage` | `round` → `nextRound`; `attemptKey` | step `…:reflect-verdict:{orderVersion}:{stage}:{round}[:{attempt}]`; Lifecycle `…:{trigger}:{round}[:{attempt}]` |
+| `open-gates` (03) | `position` → `record-decision`'s `nextPosition`, validated by the position guard (`03 §4.4`) | `…:open-gates:{orderVersion}:{position}` |
+| `arm-park-escalation` (03), per park | `round` → `nextRound` | `…:arm-park-escalation:{parkRef}:{round}` |
+| `escalate-gate` (03), per position and mode | `round` → `escalationRound` · `probeRound` | `…:escalate-gate:{orderVersion}:{position}:{mode}:{round}` |
+| `evaluate-payment-auth-eligibility`, `evaluate-activation-eligibility`, `re-check-pre-activation` (04) | `evaluationSeq` → `nextEvaluationSeq` | `…:{evaluationSeq}` |
+| `begin-fulfillment` (04) | `eligibilitySeq` — the round of the `eligible` answer it follows, validated against that settled answer (`04 §3.6` `inst-bf-guard-frozen`) rather than a counter of its own; it returns no round | `…:begin-fulfillment:{eligibilitySeq}`, step and Lifecycle alike |
+| `dispatch-wave1-create`, `dispatch-wave2-activate` (05), per wave | `dispatchRound` → `nextDispatchRound`; `attemptKey` | `…:{planRef}:{dispatchRound}` |
+| `reread-draft-liveness` (05) | `rereadRound` → `nextRereadRound` | `…:reread-draft-liveness:{planRef}:{rereadRound}` |
+| `rebuild-wave1` (05) | `rebuildRound` → `nextRebuildRound` | `…:rebuild-wave1:{planRef}:{rebuildRound}` |
+| `reconcile-intent` (05) | `sweepRound` → `nextSweepRound` | `…:reconcile-intent:{sweepRound}` |
+| `report-spawn-signal` (05) | `round` → `nextRound` | `{tenant}:{orderId}:{orderVersion}:report-spawn-signal:{round}`, step and Lifecycle alike |
+| `compensate-order` (06) | `pass` → `nextPass` | `…:compensate-order:{pass}` |
+| `report-outcome` (06) | `round` → `nextRound` | step `…:report-outcome:{round}`; Lifecycle `…:{trigger}:{round}` |
+| `resolve-manual-task` `sla-check` (07) | `slaRound` → `slaRound` | `…:resolve-manual-task:sla:{slaRound}` |
+| `raise-overdue-escalation` `overdue-fulfillment` (07) | `round` → `nextRound` | `…:raise-overdue-escalation:overdue-fulfillment:{orderVersion}:-:{round}` |
+
+`construct-and-freeze-plan` (04) carries only an `attempt`, because it is re-entered only by a
+plan-level task's retry. The other operations are called once per subject, or are keyed by the
+event or request that triggered them (`admit-trigger`, `apply-hold`, `apply-resume`,
+`record-decision`, `authorize-cancel`, `run-cancellation-fence`), and carry no round.
 
 #### The foundation's own operations
 
@@ -900,9 +983,9 @@ from `invocationId` in the output and the definition ends its own invocation (`1
 | Field | Value |
 |-------|-------|
 | `protection` | `protected`, **sweep-only**: it is never a definition `call` target (the validation hook rejects one, `10 §2`); it is invoked in-process by `reconcile-intent` (slice 05) and by the `reconciliation-sweep` worker (§3.8) |
-| `input` | `correlationId`, `operation`, `idempotencyKey` (the stuck key), `lookupOutcome` (`success` · `failure` · `absent` · `non-terminal`), `lookupRef` (the downstream `transition_request_id` or null), `reason` (catalogue, on `failure`), `attemptId` |
+| `input` | `correlationId`, `operation`, `idempotencyKey` (the stuck key), `lookupOutcome` (`success` · `failure` · `absent` · `non-terminal`), `lookupRef` (the downstream `transition_request_id` or null), `reason` (catalogue, on `failure`), `leaseHolder` (the stuck record's `lease_holder`, §3.7), `attemptId` |
 | `output` | `registryStatus`, `outcome` |
-| `idempotency_key` | instance-scoped: `{tenant}:{idempotencyKey}:settle-from-lookup:{lookupOutcome}` |
+| `idempotency_key` | instance-scoped: `{tenant}:{idempotencyKey}:settle-from-lookup:{leaseHolder}:{lookupOutcome}` — one settlement per dead lease, so a re-run that also dies behind an `absent` reopen gets its own settlement rather than an absorbed replay of the first (D-103) |
 | `declared_event` | none — advancing the task the key belongs to is the owning slice's operation, which the definition calls next |
 | `compensation` | none |
 | `reasons` | `idempotency-key-aged-out`, `idempotency-key-conflict` |
@@ -910,15 +993,15 @@ from `invocationId` in the output and the definition ends its own invocation (`1
 | `retry_class` | `never` |
 | `deadline` | 5 s |
 
-Effect: under the registry row's lock, re-read `status` and `lease_expires_at`; if the row is
-still `in_flight` with a dead lease, or `open`, write the step record for the stuck attempt with
+Effect: under the registry row's lock, re-read `status`, `lease_expires_at` and `lease_holder`;
+if the row is still `in_flight` with a dead lease held by `leaseHolder`, or `open`, write the step record for the stuck attempt with
 the looked-up result, settle the key (`settled/success` or `settled/failure` on a terminal lookup),
 or leave it `open` — on `non-terminal` inside the key lifetime, and on `absent` (nothing the
 attempt would have sent was sent, so the dispatching operation's same-key re-run is safe by
 construction, [`05 §4.4`](./05-provisioning-intents.md#44-operation-rules-normative)) — and write
 `sweep-settlement`. A row that
-settled in the meantime — the original holder answered after all — makes this call an absorbed
-no-op. Past the key lifetime the operation is **read-only**: it records `aged-out` and settles
+settled in the meantime — the original holder answered after all — or that a later attempt has
+re-leased under another `lease_holder` makes this call an absorbed no-op. Past the key lifetime the operation is **read-only**: it records `aged-out` and settles
 nothing. This is the only path that may settle a key whose closure it did not run (§4.3
 *Lease-expired*), which is what closes the former finding that a dead lease had no settler.
 
@@ -928,7 +1011,7 @@ nothing. This is the only path that may settle a key whose closure it did not ru
 |-------|-------|
 | `protection` | `composable` (operator) |
 | `input` | `correlationId`, `stepRef` (operation name plus subject reference), `taskRef` (the manual task whose `retry` resolution invokes it), `attemptId` |
-| `output` | `attemptKey` (the new key the definition passes to the re-dispatched operation), `quarantined` |
+| `output` | `attemptKey` (the minted `attempt` the definition passes to the re-entered operation, which appends it to its key after the round, §3.3 *Rounds and attempts*), `quarantined` |
 | `idempotency_key` | instance-scoped: `{tenant}:{correlationId}:retry-step:{taskRef}:{resolutionSeq}` |
 | `declared_event` | none |
 | `compensation` | none |
@@ -939,8 +1022,8 @@ nothing. This is the only path that may settle a key whose closure it did not ru
 
 Effect: verify the instance `row_version` the caller presents, apply the Orders-side quarantine
 of §4.13 (three consecutive retries of one `stepRef` whose attempts terminated without a settled
-outcome trip `poison-step`), mint the next `attempt` component for the step's key family, and
-record the operator's retry as a `retry` audit entry with the actor from the `SecurityContext`.
+outcome trip `poison-step`), mint the next `attempt` of the step's family in
+`owf_process_instance.key_rounds` (§3.3 *Rounds and attempts*, rule 3), and record the operator's retry as a `retry` audit entry with the actor from the `SecurityContext`.
 The re-dispatch itself is the definition's resume arm (`10 §3.6` (c)).
 
 ##### `park` and `unpark`
@@ -1153,9 +1236,9 @@ sequenceDiagram
     RI -->> PL: 200 line activated
 ```
 
-**Description**: A dead lease is never a free key: the envelope answers `still-processing` and
-the only thing that may settle the key without re-running the effect is a lookup of the real
-downstream outcome. The recheck under the row lock is what keeps two overlapping settlers — the
+**Description**: A dead lease on a dispatching key is never a free key: the envelope answers
+`still-processing` and the only thing that may settle the key without re-running the effect is a
+lookup of the real downstream outcome (the other families are §4.3 *Lease-expired*). The recheck under the row lock is what keeps two overlapping settlers — the
 definition's reconcile arm and the `reconciliation-sweep` worker — from settling one key twice.
 This closes the former findings that the dead-lease state had no settler and that the sweep's
 settlement was undefined.
@@ -1232,6 +1315,7 @@ has no enforcing predicate.
 | last_settled_step | text, nullable | The last settled **protected** operation and its subject; a read-side marker, not a resume pointer — the platform resumes from its own history |
 | row_version | bigint, NOT NULL, DEFAULT 0 | Optimistic-concurrency version, incremented on **every** write to this row; surfaced to operator callers as an ETag and required as `If-Match` on the mutating operations of `09 §3.3` |
 | audit_sequence | bigint, NOT NULL, DEFAULT 0 | The instance's committed audit-chain head: incremented under this row's lock in the same transaction as every `owf_audit_entry` append for this `correlation_id` (§4.17). The `start-instance` transaction that inserts this row also writes the `instance-start` entry |
+| key_rounds | jsonb, NOT NULL, DEFAULT `{}` | The per-family round and attempt counters of §3.3 *Rounds and attempts*: one entry `{round, attempt}` per family (operation name plus the subject its key names). Written only by the envelope, under this row's lock, in the transaction that settles a round with success (`round`) or that `retry-step` commits (`attempt`); never decremented, never purged while the row exists |
 | terminal_outcome | enum, nullable | `completed`, `aborted`, or NULL while non-terminal |
 | created_at, updated_at | timestamptz | Bookkeeping |
 
@@ -1253,7 +1337,7 @@ is by reference only.
 | `started` | `parked` | `park` |
 | `suspended` | `parked` | `park` with `parkReason = lifetime-ceiling` only — the lifetime ceiling fired while the order is held; the open suspension of slice 08 is left open, because the hold is still Lifecycle's fact ([`08 §2.1`](./08-hold-and-cancel.md#21-design-principles)) |
 | `parked` | `started` | `unpark`, when the hold flag `suspended` is false |
-| `parked` | `suspended` | `unpark`, when the hold flag `suspended` is true — restores the pre-park phase of a lifetime-ceiling park taken while held; the open suspension resumes only through `apply-resume` |
+| `parked` | `suspended` | `unpark`, when the hold flag `suspended` is true — restores `suspended` for a lifetime-ceiling park taken while held, and for a park during which the park loop's hold arm recorded a hold (`apply-hold` sets the flag and leaves `parked`, `08 §3.3`); the open suspension resumes only through `apply-resume` |
 | `parked` | `compensating` | `run-cancellation-fence` (slice 06) — a parked instance, including one parked at the lifetime ceiling, reaches an unwind only by passing the cancellation fence |
 | `started` | `compensating` | `run-cancellation-fence` (slice 06) |
 | `suspended` | `compensating` | `run-cancellation-fence` (slice 06) |
@@ -1324,7 +1408,8 @@ versions named here against the registry.
 | subject_ref | text, nullable | The per-line, per-gate or per-task reference the call named; NULL for instance-scoped operations |
 | idempotency_key | text, NOT NULL | The key the call carried |
 | attempt_id | text, NOT NULL | **The platform's attempt identifier** the call carried (§3.3 *Attempt identity*); the join to the platform timeline |
-| attempt_number | integer, NOT NULL | Orders' count of settled attempts under this key, starting at 1 |
+| receipt_ordinal | integer, NOT NULL | This row's ordinal among every receipt under the key, starting at 1, taken from the registry's `receipt_count` in the transaction that writes the row; the value the envelope appends to `attempt_id` |
+| attempt_number | integer, NOT NULL | Orders' count of settled attempts under this key at the time of this row, starting at 1; a derived count, **not unique** — a `still-processing` or `aged-out` row carries the count it found |
 | outcome | enum | `success`, `retryable-failure`, `permanent-failure`, `still-processing`, `aged-out` |
 | result | jsonb, nullable | **The settled outcome's machine-readable result.** For an operation that accepted a downstream intent it carries the `transition_request_id` the downstream assigned plus the downstream's own status token; for a refusal it carries the catalogue reason and the redacted diagnostic (§4.11); NULL on `still-processing` and `aged-out` |
 | deadline_at | timestamptz, NOT NULL | The effective per-operation deadline that bounded the attempt (§3.3 step 4) |
@@ -1332,7 +1417,9 @@ versions named here against the registry.
 
 **PK**: step_log_id
 
-**Constraints**: `(correlation_id, idempotency_key, attempt_number)` UNIQUE; indexed on
+**Constraints**: `(operation, idempotency_key, receipt_ordinal)` UNIQUE — one row per receipt,
+so two `still-processing` answers under one key and the holder's own settlement never collide
+(D-103); indexed on `received_at` for the retention purge; indexed on
 `(correlation_id, operation, subject_ref, settled_at DESC)` for the settled-result lookup the
 registry's `outcome_ref` resolves through and the progress read projects from; indexed on
 `attempt_id`.
@@ -1349,8 +1436,9 @@ it created, so the sweep can look it up and compensation can undo it.
 
 **Additional info**: **Ownership**: written only by the step envelope. **Tenant axis**:
 `resource_tenant_id` only. This table is execution history for recovery and reads — it is
-explicitly **not** the audit source of record (§4.1). **Retention**: 90 days; **monthly range
-partition on `received_at`** so the purge is a partition drop.
+explicitly **not** the audit source of record (§4.1). **Retention**: 90 days, purged row-wise
+(*Partitioning, retention and immutability* below); **not partitioned**. Nothing reads a count of
+these rows to validate a round (§3.3 *Rounds and attempts*, rule 2).
 
 #### Table: owf_idempotency_registry
 
@@ -1366,15 +1454,19 @@ partition on `received_at`** so the purge is a partition drop.
 | resource_tenant_id | uuid, NOT NULL | Resource-recipient axis; recomposed from the key and compared against it on every resolve |
 | request_fingerprint | bytea, NOT NULL | **SHA-256 over the canonical request body**, excluding `invocationId`, `attemptId` and transport headers. A record whose fingerprint does not match the current request is an `idempotency-key-conflict` refusal, not an absorbed duplicate |
 | status | enum | `in_flight` (lease held, effect running), **`open`** (last attempt settled `retryable-failure`; the effect may run once more under this key), `settled` (absorbed thereafter) |
-| lease_expires_at | timestamptz, nullable | Set while `in_flight`; **60 s** from the last heartbeat |
-| lease_heartbeat_at | timestamptz, nullable | Last heartbeat from the holder; refreshed every **20 s** while the effect runs |
+| lease_holder | uuid, nullable | **The holder token**: minted fresh by the envelope at every lease acquisition — first call, `open` re-run, dead-lease re-run — and cleared at settlement. Every heartbeat and settlement is conditional on it (the fence below) |
+| lease_expires_at | timestamptz, nullable | Set while `in_flight`; **15 s** from the last heartbeat |
+| lease_heartbeat_at | timestamptz, nullable | Last heartbeat from the holder; refreshed every **5 s** while the effect runs |
+| receipt_count | integer, NOT NULL, DEFAULT 0 | Receipts under this key; incremented under the row lock in every transaction that writes an `owf_step_log` row for the key, which takes it as its `receipt_ordinal` |
 | outcome | enum, nullable | `success` or `failure` once `settled`; `failure` also on an `open` record, describing its last attempt |
 | outcome_ref | uuid, nullable | Reference to the `owf_step_log` entry the last settlement produced; that entry's `result` is how a replay recovers the downstream `transition_request_id` |
-| created_at, expires_at | timestamptz | The key's retention window; `expires_at = created_at + 30 days` |
+| created_at, expires_at | timestamptz | The key's lifetime; `expires_at = created_at + 30 days`, written at creation from database time and never extended by a re-run, a heartbeat or a settlement |
 
-**PK**: (operation, idempotency_key)
+**PK**: (operation, idempotency_key) — the table is **not partitioned** (D-104), so the key is
+unique across the whole table and not only within a month
 
-**Constraints**: indexed on `expires_at` for the retention purge and the aging check; indexed on
+**Constraints**: indexed on `(correlation_id, expires_at)` for the retention purge and on
+`expires_at` for the aging check; indexed on
 `(lease_expires_at) WHERE status = 'in_flight'` and on `(correlation_id) WHERE status <> 'settled'`
 for `reconcile-intent`'s check of a dispatching step key (§3.8).
 
@@ -1383,15 +1475,40 @@ for `reconcile-intent`'s check of a dispatching step key (§3.8).
 | Value | Working baseline | Derivation |
 |-------|------------------|------------|
 | Key lifetime (`expires_at`) | **30 days** from creation | At or above the maximum retry horizon, which includes manual-task resolution and one or more hold/resume cycles and is therefore measured in days, not hours |
-| In-flight lease (`lease_expires_at`) | **60 s** | Long enough that an ordinary slow downstream call does not lose its lease mid-flight, short enough that a crashed holder's key is settleable on the next reconcile arm |
-| Lease heartbeat | **20 s** | One third of the lease, so two consecutive missed heartbeats are needed before a lease is considered dead |
+| In-flight lease (`lease_expires_at`) | **15 s** | Above the longest per-operation deadline (10 s, §4.2), so a live holder never loses its lease before its own deadline cuts it; below the retry horizon (~15-30 s of cumulative backoff, §4.5), so the later same-key retries of a crashed holder land on a dead lease, which §4.3 resolves, instead of all landing on a live one and exhausting into the failure arm |
+| Lease heartbeat | **5 s** | One third of the lease, so two consecutive missed heartbeats are needed before a lease is considered dead |
 
 **The heartbeat rule is normative.** While an effect runs under an `in_flight` record, the holder
-**MUST** refresh `lease_heartbeat_at` and extend `lease_expires_at` every 20 s. A lease whose
+**MUST** refresh `lease_heartbeat_at` and extend `lease_expires_at` every 5 s. A lease whose
 `lease_expires_at` has passed is **dead**, and a dead lease is *not* a free key: it resolves to
-the `lease-expired` outcome of §4.3, is answered as still-processing, and is settled only by
-`settle-from-lookup` (§3.3). A replica whose clock is outside the §4.15 skew tolerance **MUST**
-drop its lease rather than continue heartbeating it.
+the `lease-expired` outcome of §4.3, which says per key family whether it is re-run under a new
+holder or settled only by `settle-from-lookup` (§3.3). A replica whose clock is outside the §4.15
+skew tolerance **MUST** drop its lease rather than continue heartbeating it.
+
+**The lease is fenced by its holder token** (decision D-103; the precedent is the BSS `coord`
+lease, whose ack transaction ends in a conditional self-update on `locked_by` and the live
+deadline and rolls back on zero rows, [`coord` `LeaseGuard::with_ack_in_tx`](../../../libs/coord/src/lease/guard.rs),
+`guard.rs:160-264`). Every heartbeat and every settlement **MUST** be a conditional update
+`WHERE status = 'in_flight' AND lease_holder = <mine> AND lease_expires_at > <database now>`,
+executed as the last statement of its transaction. Zero rows means the lease is no longer the
+caller's — it died, and was re-leased or settled by lookup — and the transaction **MUST** roll back
+whole: the step record, the audit entry, the producer enqueue and the settlement are not written,
+and the envelope answers `retryable-failure` (503). A holder whose lease died therefore never
+commits over a later re-run or a lookup settlement; its downstream effect, if any, is found by the
+next re-run under the same downstream key or by the lookup (§4.3 *Lease-expired*).
+
+**A record-only operation holds its lease inside its settlement transaction.** An operation whose
+effect calls nothing outside Orders' database — the 5 s class of §4.2, except `admit-trigger`,
+whose 5 s include a Lifecycle read (`02 §3.3`) — resolves the key, runs the
+effect and settles in **one** transaction: the `in_flight` row it inserts or flips is never
+committed on its own, so a crash rolls back to the prior state (no record, or `open`) and the
+platform's same-key re-issue runs it as a first call or re-run. A concurrent same-key call waits
+on the row lock and then resolves the committed outcome. This is Lifecycle's shape, whose in-flight
+marker, effect and settlement share one transaction so that "crash recovery normally relies on
+transaction rollback or settled-outcome replay"
+([Lifecycle `01 §4.2`](../../../orders-lifecycle/docs/design/01-foundation.md#42-idempotency-semantics-normative),
+`01-foundation.md:2239-2240`); only an operation that
+calls a downstream commits `in_flight` before its effect (§3.6).
 
 **`open` is the retry contract with the platform.** The definition's task retry policy re-issues
 a failed call with the same key; without a state that says "this key may run again" the envelope
@@ -1406,8 +1523,18 @@ supplied key, or if the `orderId` inside it is outside the caller's authorized s
 **Additional info**: **Ownership**: written only by the idempotency registry
 (`cpt-cf-bss-orders-workflow-component-idempotency-registry`) inside the envelope and by
 `settle-from-lookup`. There is no `delivery_count`: inbound delivery counting is the platform
-trigger path's (§4.8). **Tenant axis**: `resource_tenant_id` only. **Retention**: 30 days,
-aligned with the key lifetime; **monthly range partition on `created_at`**.
+trigger path's (§4.8). **Tenant axis**: `resource_tenant_id` only. **Retention**: a row is
+kept as long as a replay of its key can arrive, not for the key lifetime: the retention purge
+deletes it only once `expires_at` has passed **and** the owning instance has been terminal for
+30 days (`owf_process_instance.terminal_outcome` set; for a `trigger`-family row whose admission
+started no instance, 30 days past `expires_at`). Until then an expired row stays as a
+**tombstone**, so an aged-out key resolves `aged-out` from the row it finds — expiry is logical,
+evaluated against `expires_at` and database time, never inferred from a missing row, which is
+Lifecycle's rule ("expiry is logical, not dependent on sweep timing",
+[Lifecycle `01 §4.2`](../../../orders-lifecycle/docs/design/01-foundation.md#42-idempotency-semantics-normative),
+`01-foundation.md:2259`). A replay that arrives
+after the purge finds an instance that answers every operation `version-mismatch` (§3.3
+`terminate-instance`). **Not partitioned** (D-104).
 
 #### Table: owf_step_operation
 
@@ -1520,9 +1647,7 @@ rewrites either.
 its own. 100% of process state transitions are recorded here with zero silent drops; this table,
 not `owf_step_log` and not the platform's invocation history, is the audit source of record
 (§4.1). **Retention**: **≥ 400 days**, enforced by this gear independently of platform history;
-**not partitioned for retention**; monthly range partitioning on `created_at` **may** be applied
-for query-planner and vacuum cost, and the chain is unaffected because no partition is ever
-dropped. **Verification and roll-ups**: the `audit/<audit-tenant>` worker of §3.8 under §4.17.
+**not partitioned** (§3.7 *Partitioning, retention and immutability*, D-104). **Verification and roll-ups**: the `audit/<audit-tenant>` worker of §3.8 under §4.17.
 
 #### Table: owf_audit_checkpoint
 
@@ -1626,16 +1751,28 @@ scaffolding, and an idempotency key is a short-lived deduplication token.
 
 | Store | Retention | Partitioning |
 |-------|-----------|--------------|
-| `owf_audit_entry` | ≥ 400 days; no UPDATE or DELETE grant to any role, triggers reject both; the retention worker never touches it | Not partitioned for retention; monthly range partition on `created_at` optional for query cost |
-| `owf_audit_checkpoint`, `owf_audit_checkpoint_member` | Retained with the evidence they cover; never purged | Not partitioned for retention |
+| `owf_audit_entry` | ≥ 400 days; no UPDATE or DELETE grant to any role, triggers reject both; the retention worker never touches it | Not partitioned |
+| `owf_audit_checkpoint`, `owf_audit_checkpoint_member` | Retained with the evidence they cover; never purged | Not partitioned |
 | `owf_process_instance` | Retained for the life of the order record | None — sized by order count |
 | `owf_definition_binding` | Retained with its instance; no DELETE grant to the retention worker | None — sized by instance count |
-| `owf_step_log` | 90 days | Monthly range partition on `received_at` |
-| `owf_idempotency_registry` | 30 days, aligned with the key lifetime | Monthly range partition on `created_at` |
+| `owf_step_log` | 90 days | None — purged row-wise through the `received_at` index |
+| `owf_idempotency_registry` | Until `expires_at` has passed and the owning instance has been terminal for 30 days (the tombstone rule of `owf_idempotency_registry` above) | None — purged row-wise through the `(correlation_id, expires_at)` index |
 | `owf_step_operation` | Replaced on every load | None |
 
-Partitioning is monthly **range** partitioning so a purge is a partition drop rather than a bulk
-DELETE. The platform `toolkit_db::outbox` tables are outside this register.
+**No Workflow-owned table is partitioned** (decision D-104), in any slice. The rule is Lifecycle's
+D-91, adopted with its grounds ([Lifecycle `01 §3.7`](../../../orders-lifecycle/docs/design/01-foundation.md#37-database-schemas-and-tables)):
+PostgreSQL requires every PRIMARY KEY and UNIQUE constraint of a partitioned table to include the
+partition columns, so a `created_at`-partitioned table can enforce `UNIQUE (idempotency_key)`, the
+registry's `(operation, idempotency_key)` or a one-open-row partial index only *within* a month —
+a duplicate intent, key or open task created in another month would be accepted, and the
+key-collision safety of `../ADR/0006` rests on exactly those constraints. Adding the partition
+column to the key, as Ledger's composite keys do for its deferred partitioning
+([Ledger `01-repository-foundation.md:453`](../../../ledger/docs/design/01-repository-foundation.md)), keeps the constraint buildable but
+removes the global uniqueness the deduplication exists for. Every purge is therefore a bounded
+row-wise `DELETE … WHERE` through the index the table names, run by the `retention-purge` worker
+(§3.8). A future partitioning of any table **MUST** put the partition column in every PK and
+UNIQUE and **MUST NOT** be applied to a table whose uniqueness is a deduplication guard. The
+platform `toolkit_db::outbox` tables are outside this register.
 
 **Immutability is per table.** Append-only with **no UPDATE or DELETE grant**: `owf_audit_entry`,
 `owf_audit_checkpoint` and `owf_audit_checkpoint_member` (all three additionally
@@ -1664,7 +1801,7 @@ workers** (D-62 as amended by ADR-0011), in the shape of
 | Worker | Advisory key within gear namespace `bss-orders-workflow` | Correctness check independent of scheduler ownership |
 |--------|-----------------------------------------------------------|-----------------------------------------------------|
 | Intent reconciliation sweep | `reconciliation-sweep` | Selects every due intent — `owf_provisioning_intent` rows with `next_sweep_at <= now()` over non-terminal intents, ordered by `next_sweep_at`, one bounded page per pass ([`05 §3.8`](./05-provisioning-intents.md#38-deployment-topology)) — **whether or not** the owning instance has a live invocation, and runs `reconcile-intent`'s effect for each in-process; the definition's poll and confirmation arms are early reads of the same rows, never a reason to skip one. It reads the owning invocation's status (`GET /api/serverless-runtime/v1/invocations/{invocation_id}`, [`DESIGN.md:867`](../../../../serverless-runtime/docs/DESIGN.md#invocation-api)) only to report, as a metric, intents whose instance has no live invocation. Correctness check: the intent row lock of `reconcile-intent` and, for a stuck step key, settlement only through `settle-from-lookup`, which rechecks the registry row's `status` and lease under its row lock and writes `sweep-settlement` in that transaction |
-| Retention purge | `retention-purge` | Bounded conditional deletes — partition drops and `DELETE … WHERE` predicates re-evaluated inside the deleting transaction — over the rows whose window has elapsed: `owf_step_log` and `owf_idempotency_registry` (§3.7); `owf_compensation_record` and `owf_cancellation_fence` at ≥ 400 days by partition ([`06 §3.7`](./06-saga-and-compensation.md#37-database-schemas--tables)); `owf_task_resolution_request` at ≥ 400 days by partition ([`07 §3.7`](./07-manual-tasks.md#37-database-schemas--tables)); and `owf_dispatch_admission` seller rows with no non-terminal intent for 30 days ([`05 §3.7`](./05-provisioning-intents.md#37-database-schemas--tables)). Never `owf_audit_entry`, `owf_audit_checkpoint`, `owf_audit_checkpoint_member` or `owf_definition_binding`, on which it holds no grant |
+| Retention purge | `retention-purge` | Bounded conditional row-wise deletes — `DELETE … WHERE` predicates re-evaluated inside the deleting transaction, one bounded batch per pass, through each table's retention index (no table is partitioned, §3.7, D-104) — over the rows whose window has elapsed: `owf_step_log` at 90 days and `owf_idempotency_registry` under its tombstone rule (§3.7); `owf_compensation_record` and `owf_cancellation_fence` at ≥ 400 days ([`06 §3.7`](./06-saga-and-compensation.md#37-database-schemas--tables)); `owf_task_resolution_request` at ≥ 400 days ([`07 §3.7`](./07-manual-tasks.md#37-database-schemas--tables)); and every other slice table at the retention its §3.7 states; and `owf_dispatch_admission` seller rows with no non-terminal intent for 30 days ([`05 §3.7`](./05-provisioning-intents.md#37-database-schemas--tables)). Never `owf_audit_entry`, `owf_audit_checkpoint`, `owf_audit_checkpoint_member` or `owf_definition_binding`, on which it holds no grant |
 | Audit verification and checkpointing | `audit/<canonical audit-tenant UUID>` | SELECT-only verification of each chain (§4.17 *Verifier*); the checkpoint-append phase runs under its own INSERT grant, and the `(audit_tenant_id, checkpoint_sequence)` primary key rejects a competing checkpoint from a second replica |
 
 There is **no timer wake-up worker**: every timer is a definition `wait` executed by the plugin.
@@ -1672,9 +1809,10 @@ There is **no dead-lease scan**: a dead lease on a dispatching step key is detec
 `reconcile-intent`'s read of the intents that key wrote — driven by this roster's
 `next_sweep_at` schedule for every instance, and earlier by the definition's poll arm
 (`10 §3.6`) for a live one — and is settled by `settle-from-lookup` (decision D-71: the sweep worker's candidate set is `next_sweep_at <= now` over every non-terminal intent,
-aligning this roster with `05 §3.8`). There is no idempotency-window
-sweep: registry retention is the monthly partition drop, and an aged-out key needs no worker
-because §4.3 makes the *next* attempt a new key.
+aligning this roster with `05 §3.8`); a dead lease on any other key is re-run by the next same-key
+call (§4.3 *Lease-expired*), and a record-only operation leaves none (§3.7). There is no
+idempotency-window sweep: registry retention is the tombstone purge above, and an aged-out key
+needs no worker because §4.3 makes the *next* attempt a new key.
 
 **Selected primitive: `toolkit_db::Db::lock(gear, key)`**, or bounded non-blocking acquisition
 through `Db::try_lock` with `LockConfig`, holding the `DbLockGuard` for one bounded pass and
@@ -1789,17 +1927,18 @@ exactly one of them:
 
 | Registry outcome | Record state | Rule |
 |------------------|--------------|------|
-| **First call / re-run** | No record, **or** `open` with a matching `request_fingerprint` | Insert or flip to `in_flight`, take the lease, run the effect, settle. An `open` record is re-runnable exactly once per settled retryable failure. |
+| **First call / re-run** | No record, **or** `open` with a matching `request_fingerprint` | Insert or flip to `in_flight`, take the lease under a new `lease_holder`, run the effect, settle under the fence of §3.7; a record-only operation does all of it in one transaction (§3.7). An `open` record is re-runnable exactly once per settled retryable failure. A round above its family's counter never reaches resolution (§3.3 *Rounds and attempts*). |
 | **Absorbed duplicate** | `settled`, `request_fingerprint` matches | Return the stored outcome unchanged; the effect is **never** re-run. |
 | **Key conflict** | Any state, `request_fingerprint` does **not** match | Refuse the call (`idempotency-key-conflict`, `permanent-failure`). The same key was presented for a materially different request, which is a caller defect — a wrongly authored definition input — not a duplicate. |
 | **Still-processing** | `in_flight`, lease **live** | **MUST NOT** be inferred as success and **MUST NOT** be resubmitted under a new key; the definition re-issues the same key after backoff (`still-processing`, 409 `Aborted`). |
-| **Lease-expired** | `in_flight`, `lease_expires_at` passed, `expires_at` **not** passed | Treat as **still-processing** (`idempotency-lease-expired`, 409 `Aborted`): the real outcome is confirmed by lookup and settled only by `settle-from-lookup` (§3.3); the effect is **never** re-run blind, because the holder may have crashed *after* the downstream accepted the call. |
-| **Aged-out key** | `expires_at` passed with no settled record | `settle-from-lookup` is read-only past this point. The next attempt is a **new operation under a new key** — it appends the key's `attempt` component (minted by `retry-step` or by the rebuild path of slice 05) — never a resume of the old one and never a replay of the identical key string. |
+| **Lease-expired** | `in_flight`, `lease_expires_at` passed, `expires_at` **not** passed | Resolved by the key's family (D-103). **The intent-submitting operations** — `dispatch-wave1-create`, `dispatch-wave2-activate` and `compensate-order` — treat it as **still-processing** (`idempotency-lease-expired`, 409 `Aborted`): the real outcome is confirmed by lookup and settled only by `settle-from-lookup` (§3.3); the effect is **never** re-run blind, because the holder may have crashed *after* Subscriptions accepted an intent. **Every other operation** re-runs it as a re-run under a new `lease_holder`: its outbound call is either a read or a submission the downstream de-duplicates under the key the step derives — Lifecycle answers a committed transition with its stored outcome ([Lifecycle `01 §4.2`](../../../orders-lifecycle/docs/design/01-foundation.md#42-idempotency-semantics-normative), first row), and the approval-request key does the same at Generic Approval (`../ADR/0006`) — so a crash after the downstream accepted is absorbed downstream, and the old holder's late settlement fails the fence. A record-only operation never leaves this state behind (§3.7). |
+| **Aged-out key** | `expires_at` passed with no settled record | Evaluated on the retained row — the tombstone rule of §3.7 keeps it until no replay can arrive, so expiry is logical and never inferred from a missing row. `settle-from-lookup` is read-only past this point. The next attempt is a **new operation under a new key** — it appends the key's `attempt` component (minted by `retry-step` or by the rebuild path of slice 05) — never a resume of the old one and never a replay of the identical key string. |
 
 No seventh outcome exists. **These six are registry outcomes, not additional step outcomes.**
 They are what resolving a key yields *inside* the envelope; the definition still sees only the
 closed set of §3.3. The mapping is fixed: first call, re-run and absorbed duplicate resolve to the
-settled outcome; lease-expired and still-processing both surface as `still-processing`; aged-out
+settled outcome; still-processing surfaces as `still-processing`, and so does lease-expired on
+an intent-submitting key, while on every other key lease-expired resolves as a re-run; aged-out
 surfaces as `aged-out`; a key conflict surfaces as `permanent-failure` carrying
 `idempotency-key-conflict`.
 
@@ -2325,7 +2464,7 @@ call** is deterministic in everything the record already fixed:
 | Value | Computed | Why |
 |-------|----------|-----|
 | The process `correlationId` | **Once, by `admit-trigger`, deterministically** (UUIDv5 per [`02 §2.1`](./02-triggers-and-start.md#21-design-principles)) and persisted by `start-instance` before any other operation | Every audit entry, step record and event is keyed on it and it is one of the two genesis inputs of the audit chain (§4.17); a re-derived value on replay is the same value by construction |
-| The idempotency key of a call | **In the definition, from the task's inputs** (`10 §2`), never from a per-attempt value; recomposed and verified by the envelope | A key that varied per attempt would make every platform retry a first call and void §4.3 |
+| The idempotency key of a call | **In the definition, from the task's inputs** (`10 §2`), never from a per-attempt value — a round is the value the previous answer returned and an attempt the value `retry-step` minted, both inputs, both validated against the instance's `key_rounds` (§3.3 *Rounds and attempts*); recomposed and verified by the envelope | A key that varied per attempt would make every platform retry a first call and void §4.3 |
 | The backoff delay draw | **By the plugin**, inside its own replay-safe timer | Orders never draws it and never records it; the platform `attempt_id` is what Orders records |
 | Timestamps used in a decision | Read from **database time** (§4.15) inside the operation and persisted with the step record | Wall-clock reads diverge across replicas |
 | Identifiers a step mints (`gateId`, the event envelope `id`, the rebuild `attempt` component) | Inside the unit of work that persists them, never re-minted on replay; where a step must mint an identifier *before* it can persist it, it **MUST** be derived deterministically (UUIDv5 over the step's fixed inputs) | A re-minted identifier on replay creates a second row for one logical object |

@@ -545,7 +545,7 @@ gear's authority — the caller supplies references, never authority (ADR-0013, 
 |-------|-------------------------------------|-----------------------------|---------------------|-----------------------------------|---------------------------|
 | `protection` | `protected` | `protected` | `protected` — the R1 seam call | `composable` | `protected` |
 | `input` (beyond the common members) | `trigger` ∈ `initial` · `acceptance-recorded` · `reauthorize-requested` · `poll`; `requestRef` (the signal's request, nullable); `evaluationSeq` | `attempt` (default 0; minted by `retry-step` on a plan-level task's retry) | `planRef`, `eligibilitySeq` (the `evaluationSeq` of the `eligible` answer) | `planRef`, `evaluationSeq` | `planRef`, `evaluationSeq` |
-| `output` | `eligibility` ∈ `eligible` · `pending` · `withheld`; `withheldCause` ∈ `acceptance-not-recorded` · `acceptance-unevaluable` · `null`; `nextEvaluationSeq` | `planRef`, `lineRefs[]`, `expectedFulfillmentAt` (instant), `policy` ∈ `remediate` · `fail-fast`, `planState` ∈ `frozen` · `invalid-graph` · `topology-unavailable`, `reason` (catalogue code, nullable) | `result` ∈ `in-fulfillment` · `withheld`; `withheldCause` ∈ `authorization-pending` · `authorization-failed` · `acceptance-required-not-recorded` · `acceptance-requirement-unevaluable` · `null` | `due: true\|false` — database time against the plan's stored `expected_fulfillment_at`, the answer the barrier's re-check loop switches on (`10 §3.6` (b)); `released` (bool), `eligibleLineRefs[]`, `pendingLineRefs[]`, `nextEvaluationSeq` | `verdict` ∈ `proceed` · `abort` · `not-dispatchable`; `abortReason` (catalogue code, nullable); `observed` ∈ `on-hold` · `superseded` · `terminal` · `null`; `nextEvaluationSeq` |
+| `output` | `eligibility` ∈ `eligible` · `pending` · `withheld`; `withheldCause` ∈ `acceptance-not-recorded` · `acceptance-unevaluable` · `null`; `nextEvaluationSeq` | `planRef`, `lineRefs[]`, `expectedFulfillmentAt` (instant), `policy` ∈ `remediate` · `fail-fast`, `planState` ∈ `frozen` · `invalid-graph` · `topology-unavailable`, `reason` (catalogue code, nullable) | `result` ∈ `in-fulfillment` · `withheld` · `held` (Lifecycle `not-admissible` and the order read shows `on_hold`) · `version-conflict` (Lifecycle `version-conflict`: the order moved; the amendment arm resolves it) — every one a settled success, so no answer of this operation is a 409 the definition must interpret; `withheldCause` ∈ `authorization-pending` · `authorization-failed` · `acceptance-required-not-recorded` · `acceptance-requirement-unevaluable` · `null` | `due: true\|false` — database time against the plan's stored `expected_fulfillment_at`, the answer the barrier's re-check loop switches on (`10 §3.6` (b)); `released` (bool), `eligibleLineRefs[]`, `pendingLineRefs[]`, `nextEvaluationSeq` | `verdict` ∈ `proceed` · `abort` · `not-dispatchable`; `abortReason` (catalogue code, nullable); `observed` ∈ `on-hold` · `superseded` · `terminal` · `null`; `nextEvaluationSeq` |
 | `idempotency_key` | instance-scoped `{tenant}:{correlationId}:evaluate-payment-auth-eligibility:{evaluationSeq}` | instance-scoped `{tenant}:{correlationId}:construct-and-freeze-plan:{attempt}` | lifecycle-transition `{tenant}:{orderId}:{orderVersion}:begin-fulfillment:{eligibilitySeq}` (§4.1) | instance-scoped `{tenant}:{correlationId}:evaluate-activation-eligibility:{planRef}:{evaluationSeq}` | instance-scoped `{tenant}:{correlationId}:re-check-pre-activation:{planRef}:{evaluationSeq}` |
 | `declared_event` | none | none | `OrderFulfillmentStarted` on `result = in-fulfillment` | none | none |
 | `compensation` | none | none — a frozen plan is superseded by a new order version, never undone | none — the unwind of an order in fulfillment is `run-cancellation-fence` → `compensate-order` → `report-outcome` (06), a path, not a paired undo | none (read-only) | none |
@@ -755,16 +755,22 @@ authoritative decision is `re-check-pre-activation` (§4.2). A `topology-unavail
 Input: correlationId, orderId, orderVersion, planRef, eligibilitySeq, attemptId
 Output: result, withheldCause
 
-1. [ ] - `p1` - **IF** the plan named by `planRef` is not frozen, or the settled `evaluate-payment-auth-eligibility` step record for `eligibilitySeq` did not answer `eligible`: settle `permanent-failure` with `version-mismatch` - `inst-bf-guard-frozen`
-2. [ ] - `p1` - Call Lifecycle `begin-fulfillment` with the recorded `payment_auth_outcome`, the expected order version, the process `correlationId` and the operation's key as the Lifecycle idempotency key - `inst-bf-call`
-3. [ ] - `p1` - **IF** Lifecycle answers a transient failure or `still-processing`: settle `retryable-failure` (503 or 409 `Aborted`); never infer success - `inst-bf-if-transient`
-4. [ ] - `p1` - **IF** Lifecycle refuses with a precondition guard (`authorization-pending`, `authorization-failed`, `acceptance-required-not-recorded`, `acceptance-requirement-unevaluable`): record the refusal code; **RETURN** `withheld` with that `withheldCause` - `inst-bf-if-withheld`
-5. [ ] - `p1` - **IF** Lifecycle refuses with `version-conflict`: settle `permanent-failure` with `version-mismatch` — the order moved; the amendment or terminal-event arm resolves it - `inst-bf-if-version`
-6. [ ] - `p1` - On a committed `in_fulfillment`: set `begin_fulfillment_committed_at`, enqueue `OrderFulfillmentStarted` through the platform producer in the settlement transaction; **RETURN** `in-fulfillment` - `inst-bf-committed`
+1. [ ] - `p1` - **IF** the plan row's `begin_fulfillment_committed_at` is set: **RETURN** `in-fulfillment` without calling Lifecycle — a later eligible round, or a re-entry after an earlier attempt committed in the background, observes the committed transition instead of presenting a new key to Lifecycle for an order already `in_fulfillment` (the check `inst-pa-if-already-begun` makes for the eligibility evaluation) - `inst-bf-if-already-begun`
+2. [ ] - `p1` - **IF** the plan named by `planRef` is not frozen, or the settled `evaluate-payment-auth-eligibility` step record for `eligibilitySeq` did not answer `eligible`: settle `permanent-failure` with `version-mismatch` - `inst-bf-guard-frozen`
+3. [ ] - `p1` - Call Lifecycle `begin-fulfillment` with the recorded `payment_auth_outcome`, the expected order version, the process `correlationId` and the operation's key as the Lifecycle idempotency key - `inst-bf-call`
+4. [ ] - `p1` - **IF** Lifecycle answers a transient failure or `still-processing`: settle `retryable-failure` (503 or 409 `Aborted`); never infer success. A 409 from this operation is therefore only ever a retryable answer, which the definition's retry policy re-issues under the same key - `inst-bf-if-transient`
+5. [ ] - `p1` - **IF** Lifecycle refuses with a precondition guard (`authorization-pending`, `authorization-failed`, `acceptance-required-not-recorded`, `acceptance-requirement-unevaluable`): record the refusal code; **RETURN** `withheld` with that `withheldCause` - `inst-bf-if-withheld`
+6. [ ] - `p1` - **IF** Lifecycle refuses `not-admissible`: read the order through the Lifecycle PDP-authorized order read; **IF** it is `on_hold` **RETURN** `held` ([`01 §3.3` *Rounds and attempts*](./01-foundation.md#rounds-and-attempts-the-one-rule-for-re-invokable-operations) rule 4); otherwise settle `permanent-failure` with `version-mismatch` - `inst-bf-if-held`
+7. [ ] - `p1` - **IF** Lifecycle refuses with `version-conflict`: record the refusal; **RETURN** `version-conflict` — a settled success: the order moved, and the amendment or terminal-event arm of the eligibility wait resolves it - `inst-bf-if-version`
+8. [ ] - `p1` - On a committed `in_fulfillment`: set `begin_fulfillment_committed_at`, enqueue `OrderFulfillmentStarted` through the platform producer in the settlement transaction; **RETURN** `in-fulfillment` - `inst-bf-committed`
 
-**Description**: `withheld` is a settled success, so the definition's retry policy never burns
-its budget on a guard refusal; the definition returns to `awaitEligibilityChange` (§4.8, item 2)
-and the next `eligible` answer carries a new `eligibilitySeq`, hence a new key. A re-issued call
+**Description**: `withheld`, `held` and `version-conflict` are settled successes, so the
+definition's retry policy never burns its budget on a guard refusal and no `catch` has to tell a
+version conflict from a still-processing answer by status; the definition returns to
+`awaitEligibilityChange` (§4.8, item 2), whose hold, resume and amendment arms consume what the
+answer named, and the next `eligible` answer carries a new `eligibilitySeq`, hence a new key.
+Once the transition has committed, every later call short-circuits to `in-fulfillment`
+(`inst-bf-if-already-begun`). A re-issued call
 under the same key is absorbed by this gear's registry and, on the Lifecycle side, by Lifecycle's
 own key handling, so the transition is applied once.
 
@@ -952,7 +958,7 @@ table is lost; no table in this slice holds a timer.
 | frozen_at | timestamptz nullable | When the plan was frozen; an unfrozen row is never dispatched against. |
 | frozen_by_attempt_id | text nullable | The platform `attempt_id` of the call that froze the plan (`01 §3.3` *Attempt identity*). |
 | abort_record | jsonb nullable | `ActivationAbortRecord`: `reason` (`overlap-collision` \| `market-divergence` \| `payment-authorization-stale` \| `overlap-read-unevaluable` \| `invalid-dependency-graph` \| `catalog-topology-unavailable`), per-line reasons, evidence reference, `recorded_at`, `attempt_id`. |
-| created_at | timestamptz | Row creation time; the partition key. |
+| created_at | timestamptz | Row creation time; the retention index's column. |
 
 **PK**: (order_id, order_version)
 
@@ -975,7 +981,7 @@ freeze and in the listed post-freeze columns (`begin_fulfillment_committed_at`, 
 the operator read; `payer_tenant_id` is carried because the market re-check needs the payer. None
 of these columns crosses the engine boundary (ADR-0013). **Retention**: ≥ 400 days, matching
 `owf_compensation_record` and `owf_audit_entry`, which join to the plan. **Partitioning**:
-monthly range partition on `created_at`.
+none (`01 §3.7`, D-104); purged row-wise through a `created_at` index.
 
 **Example**:
 
@@ -1006,7 +1012,7 @@ monthly range partition on `created_at`.
 | terminal_event_emitted_seq | integer | Highest `terminal_entry_seq` for which `OrderFulfillmentStepCompleted` has been enqueued; the guard is `terminal_event_emitted_seq < terminal_entry_seq`. |
 | terminal_event_emitted_at | timestamptz | When that emission was enqueued. |
 | last_transition_actor | text nullable | Opaque subject id of the operator for an operator-driven transition; NOT NULL on any transition out of `failed`. |
-| created_at | timestamptz | Row creation time; the partition key. |
+| created_at | timestamptz | Row creation time; the retention index's column. |
 
 **PK**: (order_id, order_version, order_line_id)
 
@@ -1037,8 +1043,8 @@ unit of work of the slice 05 or slice 07 operation or handler that invoked it. *
 deliberately mutable in `state`, the evidence columns and the emission counters. Indexed on
 (order_id, order_version) for the progress read and the completion predicate, and on
 (resource_tenant_id, order_id, order_version) so the tenant predicate is index-supported.
-**Retention**: ≥ 400 days, with its plan row. **Partitioning**: monthly range partition on
-`created_at`.
+**Retention**: ≥ 400 days, with its plan row. **Partitioning**: none
+(`01 §3.7`, D-104); purged row-wise with its plan row.
 
 **Example**:
 
@@ -1069,7 +1075,10 @@ duplicate of the same evaluation. `begin-fulfillment` extends the lifecycle-tran
 (`orderId + orderVersion + transitionName`) with the `eligibilitySeq` of the `eligible` answer it
 follows, because a `withheld` answer is a settled outcome and a later eligible round needs a new
 key; a replay of the committed round is absorbed by both gears. (decision D-74: the begin-fulfillment key carries the eligibility round, amending ADR-0006's
-lifecycle-transition family for this one transition.)
+lifecycle-transition family for this one transition; generalised by D-102 to every
+Lifecycle-transition key, [`01 §3.3` *Rounds and attempts*](./01-foundation.md#rounds-and-attempts-the-one-rule-for-re-invokable-operations).) The evaluation sequences are rounds under that rule: the
+envelope validates each against the instance's `key_rounds` counter, never against a count of
+step-log rows.
 
 ### 4.2 The re-check: advisory at construction, authoritative before wave 2
 
@@ -1189,8 +1198,10 @@ the fragment now carries each rule, and the note is kept as the reason the rule 
    `begin-fulfillment` **<** `dispatch-wave1-create` **<** `re-check-pre-activation` **<**
    `report-spawn-signal` **<** `dispatch-wave2-activate`, as `10 §4.1` states. `begin-fulfillment`
    **MUST** follow a settled `eligible` of the same round and a settled `frozen`.
-2. **`begin-fulfillment` `withheld`** **MUST** route back to the eligibility wait, never forward to
-   the waves and never to a failure arm (**alignment**: the fragment had no `switch` after
+2. **`begin-fulfillment` `withheld`, `held` and `version-conflict`** **MUST** route back to the
+   eligibility wait, never forward to the waves and never to a failure arm; the call **MUST** sit
+   under a retry-only `catch` that re-issues every 409 under the same key, because none of its
+   409s is a routing answer (`inst-bf-if-transient`) (**alignment**: the fragment had no `switch` after
    `beginFulfillment`).
 3. **`planState`** — `frozen` → `begin-fulfillment`; `invalid-graph` → fragment (c) per policy,
    with `begin-fulfillment` passed before the unwind (§4.3); `topology-unavailable` →

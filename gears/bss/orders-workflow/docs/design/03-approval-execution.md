@@ -596,12 +596,12 @@ calls a downstream, 5 s for a record-only one.
 
 | `name` | `protection` | `input` | `output` | `idempotency_key` | `declared_event` | `compensation` | `reasons` | `audit_kind` | `retry_class` | `deadline` |
 |--------|--------------|---------|----------|-------------------|------------------|----------------|-----------|--------------|---------------|------------|
-| `obtain-verdict` | `protected` | ref | `verdict` ∈ `required` · `not-required` · `unobtainable`; `parkRef` and `parkReason` (the §3.7 enum) only on `unobtainable` | instance-scoped `{tenant}:{correlationId}:obtain-verdict:{orderVersion}`; an `unobtainable` answer leaves the registry record `open` (§4.4) | none | none | `per-attempt-timeout`, `idempotency-key-conflict`, `version-mismatch` | `step-completion` | `retryable-on: transient` | 10 s |
-| `reflect-verdict` | `protected` | ref + `stage` ∈ `requirement` · `gate-outcome` | `reflected` ∈ `pending_approval` · `approved` · `rejected` | step: instance-scoped `{tenant}:{correlationId}:reflect-verdict:{orderVersion}:{stage}`; seam: lifecycle-transition `{tenant}:{orderId}:{orderVersion}:{trigger}` with `trigger` one of the four `reflect-approval-*` (§4.4) | none (Lifecycle emits `OrderApproved` / `OrderRejected`) | none | `approval-reflection-refused` (the `permanent-failure` of a refused seam transition, §4.5; the manual-task reason of `07 §3.3`), `version-mismatch`, `gate-not-open`, `circuit-breaker-open`, `per-attempt-timeout`, `idempotency-key-conflict` | `step-completion` | `retryable-on: transient` | 10 s |
+| `obtain-verdict` | `protected` | ref + `round` (0 on first entry, else the previous answer's `nextRound`) | `verdict` ∈ `required` · `not-required` · `unobtainable`; `parkRef` and `parkReason` (the §3.7 enum) only on `unobtainable`; `nextRound` | instance-scoped `{tenant}:{correlationId}:obtain-verdict:{orderVersion}:{round}`; every answer, `unobtainable` included, is a settled success of its round ([`01 §3.3` *Rounds and attempts*](./01-foundation.md#rounds-and-attempts-the-one-rule-for-re-invokable-operations), §4.4) | none | none | `per-attempt-timeout`, `idempotency-key-conflict`, `version-mismatch` | `step-completion` | `retryable-on: transient` | 10 s |
+| `reflect-verdict` | `protected` | ref + `stage` ∈ `requirement` · `gate-outcome`, `round` (0 on each stage's first entry, else that stage's previous `nextRound`), `attemptKey` (nullable; the `attempt` `retry-step` minted for an `approval-reflection-refused` task's retry) | `reflected` ∈ `pending_approval` · `approved` · `rejected` · `held` (Lifecycle refused `not-admissible` and the order read shows `on_hold`, a settled success); `nextRound` | step: instance-scoped `{tenant}:{correlationId}:reflect-verdict:{orderVersion}:{stage}:{round}[:{attempt}]`; seam: lifecycle-transition `{tenant}:{orderId}:{orderVersion}:{trigger}:{round}[:{attempt}]` with `trigger` one of the four `reflect-approval-*` (§4.4, [`01 §3.3` *Rounds and attempts*](./01-foundation.md#rounds-and-attempts-the-one-rule-for-re-invokable-operations)) | none (Lifecycle emits `OrderApproved` / `OrderRejected`) | none | `approval-reflection-refused` (the `permanent-failure` of a refused seam transition, §4.5; the manual-task reason of `07 §3.3`), `version-mismatch`, `gate-not-open`, `circuit-breaker-open`, `per-attempt-timeout`, `idempotency-key-conflict` | `step-completion` | `retryable-on: transient` | 10 s |
 | `open-gates` | `composable` | ref + `position` (0 on first entry, else `record-decision`'s `nextPosition`) | `gateRefs[]`, `position`, `escalationRound = 0` | step: instance-scoped `{tenant}:{correlationId}:open-gates:{orderVersion}:{position}`; downstream: approval-request `{tenant}:{orderId}:{orderVersion}:{gateId}` per gate | `OrderApprovalRequested`, one per gate opened in the settlement transaction | none — gates are closed by the closure port, not by an undo | `circuit-breaker-open`, `per-attempt-timeout`, `idempotency-key-conflict`, `version-mismatch` | `step-completion` | `retryable-on: transient` | 10 s |
 | `record-decision` | `protected` | ref + `gateRef`, `decisionEventId`, `outcome` ∈ `approved` · `rejected` | `applied` (boolean), `gateState` ∈ `approved` · `rejected` · `next-position` · `pending`, `nextPosition` (on `next-position`) | instance-scoped `{tenant}:{correlationId}:record-decision:{gateRef}:{decisionEventId}` | none | none | `gate-not-open`, `submitter-barred` (both recorded refusals, §4.4), `not-found`, `circuit-breaker-open`, `idempotency-key-conflict`, `version-mismatch` | `step-completion` | `retryable-on: transient` | 10 s |
-| `arm-park-escalation` | `composable` | ref + `parkRef` | `due: true\|false` — database time against the park row's stored `escalation_due_at`, the answer the definition's re-check loop switches on (`10 §3.6` (a)), and `false` once the park has escalated; a `false` answer leaves the registry record `open`, so the next re-check re-runs | instance-scoped `{tenant}:{correlationId}:arm-park-escalation:{parkRef}` | none | none | `not-found`, `version-mismatch` | `step-completion` | `retryable-on: transient` | 5 s |
-| `escalate-gate` | `composable` | ref + `position`, `mode` ∈ `fire` · `probe`, `round` (the `escalationRound` or `probeRound` last returned) | `due: true\|false` — database time against the stored deadline (`fire`: the gate's escalation deadline, never due while a `pause_causes` member is set; `probe` on `outage`: the outage-threshold deadline), the answer the definition's re-check loop switches on (`10 §3.6` (a)); `fire` with `due: false` escalates nothing and leaves the registry record `open`; `fire`: `escalationRound`; `probe`: `serviceState` ∈ `available` · `outage`, `probeRound`. The definition reads only `due` and `serviceState` (and the round it passes back); no remaining duration is returned | instance-scoped `{tenant}:{correlationId}:escalate-gate:{orderVersion}:{position}:{mode}:{round}` | `OrderApprovalEscalated` per gate escalated (`fire` only) | none | `gate-not-open`, `circuit-breaker-open` (`fire` in outage), `per-attempt-timeout`, `version-mismatch` | `escalation` (`fire`); `step-completion` (`probe`) | `retryable-on: transient` | 10 s |
+| `arm-park-escalation` | `composable` | ref + `parkRef`, `round` (0 on the park's first check, else the previous `nextRound`) | `due: true\|false` — database time against the park row's stored `escalation_due_at`, the answer the definition's re-check loop switches on (`10 §3.6` (a)), and `false` once the park has escalated; `nextRound`. Every answer is a settled success of its round, so the next re-check runs under the next key ([`01 §3.3` *Rounds and attempts*](./01-foundation.md#rounds-and-attempts-the-one-rule-for-re-invokable-operations)) | instance-scoped `{tenant}:{correlationId}:arm-park-escalation:{parkRef}:{round}` | none | none | `not-found`, `version-mismatch` | `step-completion` | `retryable-on: transient` | 5 s |
+| `escalate-gate` | `composable` | ref + `position`, `mode` ∈ `fire` · `probe`, `round` (the `escalationRound` or `probeRound` last returned) | `due: true\|false` — database time against the stored deadline (`fire`: the gate's escalation deadline, never due while a `pause_causes` member is set; `probe` on `outage`: the outage-threshold deadline), the answer the definition's re-check loop switches on (`10 §3.6` (a)); `fire` with `due: false` escalates nothing and is a settled success of its round; every answer returns the next round ([`01 §3.3` *Rounds and attempts*](./01-foundation.md#rounds-and-attempts-the-one-rule-for-re-invokable-operations)) — `fire`: `escalationRound`; `probe`: `serviceState` ∈ `available` · `outage`, `probeRound`. The definition reads only `due` and `serviceState` (and the round it passes back); no remaining duration is returned | instance-scoped `{tenant}:{correlationId}:escalate-gate:{orderVersion}:{position}:{mode}:{round}` | `OrderApprovalEscalated` per gate escalated (`fire` only) | none | `gate-not-open`, `circuit-breaker-open` (`fire` in outage), `per-attempt-timeout`, `version-mismatch` | `escalation` (`fire`); `step-completion` (`probe`) | `retryable-on: transient` | 10 s |
 
 `arm-park-escalation` and `escalate-gate` are `composable`: a definition version may reposition
 them inside the verdict stage, but the constraints of §4.5 still bind any version that contains
@@ -731,7 +731,7 @@ sequenceDiagram
 2. [ ] - `p1` - **IF** a `owf_approval_verdict_cache` row exists for the version **RETURN** its `verdict` without querying — the stored row is authoritative once present - `inst-ov-cached`
 3. [ ] - `p1` - Read order context from Lifecycle (R4) and query the verdict through the approval client behind the breaker of §4.0, inside the effective deadline - `inst-ov-query`
 4. [ ] - `p1` - **IF** the answer names a deciding authority: insert the cache row with `reflected_at` NULL, close any open park for the version with `resolution = verdict-obtained`, **RETURN** the verdict - `inst-ov-store`
-5. [ ] - `p1` - **ELSE** (breaker open, query refused, bounded query attempts exhausted inside the deadline, or authority unnamed): insert the park row — or reuse the open one under the partial unique index — with `park_reason`, `parked_at` and `escalation_due_at` per §4.2, leave the registry record `open`, **RETURN** `unobtainable` with `parkRef` and `parkReason` - `inst-ov-park`
+5. [ ] - `p1` - **ELSE** (breaker open, query refused, bounded query attempts exhausted inside the deadline, or authority unnamed): insert the park row — or reuse the open one under the partial unique index — with `park_reason`, `parked_at` and `escalation_due_at` per §4.2, **RETURN** `unobtainable` with `parkRef`, `parkReason` and `nextRound` — a settled success of this round; the park loop's next retry calls the next round - `inst-ov-park`
 
 **Algorithm: `reflect-verdict`**
 
@@ -739,7 +739,7 @@ sequenceDiagram
 2. [ ] - `p1` - **IF** `stage = requirement`: **IF** `reflected_at` is set **RETURN** the stored result; else map `required` → `reflect-approval-required`, `not_required` → `reflect-approval-not-required` - `inst-rv3-requirement`
 3. [ ] - `p1` - **IF** `stage = gate-outcome`: **IF** `gate_outcome_reflected_at` is set **RETURN** the stored result; else compute the aggregate from `owf_approval_gate` — all `approved` → `reflect-approval-granted` with the deciding authorities; any `rejected` → `reflect-approval-denied` with the rejecting gate's `decision_reason` as the denial reason; otherwise refuse `gate-not-open` - `inst-rv3-gate-outcome`
 4. [ ] - `p1` - Call `approval-reflection` with the trigger, `deciding_authority`, `expected_version = orderVersion`, the lifecycle-transition key and `correlation_id`, propagating the effective deadline - `inst-rv3-call`
-5. [ ] - `p1` - On success stamp `reflected_at` (or `gate_outcome` and `gate_outcome_reflected_at`) in the settlement transaction and **RETURN** `reflected`; on Lifecycle `version-conflict` or a refused transition answer `permanent-failure` with `version-mismatch` carrying the Lifecycle reason in `owf_step_log.result`; on a transport or 5xx failure answer `retryable-failure` - `inst-rv3-settle`
+5. [ ] - `p1` - On success stamp `reflected_at` (or `gate_outcome` and `gate_outcome_reflected_at`) in the settlement transaction and **RETURN** `reflected` and `nextRound`; **IF** Lifecycle refuses `not-admissible`: read the order through the Lifecycle PDP-authorized order read and, **IF** it is `on_hold`, **RETURN** `held` and `nextRound` — a settled success, so the definition waits for the resume and reflects again under the next round rather than replaying the stored refusal ([`01 §3.3`](./01-foundation.md#rounds-and-attempts-the-one-rule-for-re-invokable-operations) rule 4); on Lifecycle `version-conflict` or any other refused transition answer `permanent-failure` with `version-mismatch` carrying the Lifecycle reason in `owf_step_log.result`; on a transport or 5xx failure answer `retryable-failure` - `inst-rv3-settle`
 
 **Description**: A repeat call for a version that already has a cache row never queries the
 authority again, so a disagreeing later answer is never even obtained; a row with `reflected_at`
@@ -973,7 +973,7 @@ the evidence of who exempted a commercial decision from approval.
 | deciding_authority | text, nullable | Named authority once decided; null while open |
 | idempotency_key | text | The approval-request key `resource_tenant_id` + `orderId` + `orderVersion` + `gateId` |
 | opened_at, decided_at | timestamptz nullable, timestamptz nullable | Bookkeeping; `opened_at` is when the window starts, which for a sequenced gate is later than the verdict |
-| created_at | timestamptz | Partition key |
+| created_at | timestamptz | Row creation; the retention index's column |
 
 **PK**: `gate_id`
 
@@ -994,8 +994,8 @@ slice 06's `run-cancellation-fence`. **Mutability**: deliberately mutable (state
 record). **Tenant axis**: `resource_tenant_id` (isolation), `seller_tenant_id` (operator- and
 approver-surface scoping). `decision_reason` is a catalogue value and is what the
 `reflect-approval-denied` seam call carries; human free text goes to
-`owf_audit_entry.justification` instead. **Retention**: ≥ 400 days; monthly range partition on
-`created_at`.
+`owf_audit_entry.justification` instead. **Retention**: ≥ 400 days, purged row-wise through a `created_at` index; not partitioned
+(`01 §3.7`, D-104).
 
 **Example**:
 
@@ -1034,7 +1034,7 @@ per gate; the idempotency key that guarantees single submission lives on `owf_ap
 echoed into `request_payload` for the receiving service, not stored twice as a column here.
 `resolved_total` is non-authoritative: it is a snapshot for the approver's benefit, and Orders
 Lifecycle remains the system of record for price; it never crosses to the definition (ADR-0013).
-**Retention**: ≥ 400 days; monthly range partition on `submitted_at`.
+**Retention**: ≥ 400 days, purged row-wise through a `submitted_at` index; not partitioned (`01 §3.7`, D-104).
 
 **Example**:
 
@@ -1150,9 +1150,13 @@ process is parked, not why, not since when, and not whether the escalation has f
 expression, so the definition's `waitTtlMargin` is the bounded re-check loop of `10 §3.6` (a) — a
 fixed-granularity `wait`, then `arm-park-escalation`, looping while `due` is `false` — and the
 deadline stays this slice's stored value. The park clock is **not**
-pausable: the `parkLoop` fork contains no hold arm that could cancel it, because a hold does not
-stop the Lifecycle TTL, and pausing the thing that races it would be an escalation that arrives
-after the order has already expired (§4.5). There is no park timer row any more — the retired
+pausable, because a hold does not stop the Lifecycle TTL, and pausing the thing that races it
+would be an escalation that arrives after the order has already expired (§4.5). The `parkLoop`
+fork carries a hold and a resume arm that only **record** (`holdPauses` is false there): a hold
+winning the race cancels one tick, `apply-hold` records the suspension on the parked instance, and
+the loop is re-entered at once against the same stored `escalation_due_at`, so the clock loses at
+most one tick and is never paused. The arms exist so that the reflection after an `unpark` knows
+the order is held and waits for its resume rather than replaying a refusal (§4.4). There is no park timer row any more — the retired
 `owf_durable_timer` `approval-escalation` row with `subject_ref = park_id` was exactly the
 discriminator a hold-by-kind could not see.
 
@@ -1175,8 +1179,9 @@ unhandled one: the order fails closed and visibly, and the escalation that fired
 in §4.2 exists solely to make that window real rather than nominal.
 
 **How a park ends otherwise.** The definition's `retryVerdict` branch calls `obtain-verdict` again
-every 5 minutes for as long as the instance lives; because `unobtainable` leaves the registry
-record `open` (§4.4), each call re-runs under the same step key. A call that returns a verdict with
+every 5 minutes for as long as the instance lives; each `unobtainable` answer is a settled
+success of its round and returns the next one (§4.4), so each retry is a new step key and none
+approaches the key lifetime. A call that returns a verdict with
 a named authority writes the cache row and closes the park with `resolution = verdict-obtained` in
 the same transaction; the definition calls `unpark` and then `reflect-verdict`. A workflow-mediated
 cancel takes the `cancel` branch to the cancel path (slice 08). There is no fourth exit; see §2.1
@@ -1335,20 +1340,30 @@ all `approved`.
 
 **Keys.** Every step key is instance-scoped and tenant-prefixed and **MUST** be recomposable from
 the body (`01 §3.3` step 3). The Lifecycle seam key is the lifecycle-transition family
-`{tenant}:{orderId}:{orderVersion}:{trigger}` with the trigger resolved by `reflect-verdict` from
-the record, never supplied by the definition; the approval-request key is
-`{tenant}:{orderId}:{orderVersion}:{gateId}`; neither contains `correlationId` (§2.2).
-`obtain-verdict` **MUST** leave its registry record `open` on an `unobtainable` answer and settle it
-only when a verdict is cached, so the park loop's repeated calls re-run under one key and a verdict
-obtained on any of them is the one absorbed thereafter. `escalate-gate` keys include the `round`
-the previous call returned, so each fire and each probe is one settled record and a platform
-replay of either is absorbed.
+`{tenant}:{orderId}:{orderVersion}:{trigger}:{round}[:{attempt}]` with the trigger resolved by
+`reflect-verdict` from the record, never supplied by the definition, and the round and attempt of
+the step key; the approval-request key is `{tenant}:{orderId}:{orderVersion}:{gateId}`; neither
+contains `correlationId` (§2.2). `obtain-verdict`, `reflect-verdict`, `arm-park-escalation` and
+`escalate-gate` are re-invokable and follow
+[`01 §3.3` *Rounds and attempts*](./01-foundation.md#rounds-and-attempts-the-one-rule-for-re-invokable-operations):
+each settled answer — `unobtainable`, `due: false` and `held` included — is a success of its round
+and returns the next, so every retry, tick, fire and probe is one settled record under its own key
+and a platform replay of any of them is absorbed. A verdict obtained on any round is cached, and
+every later round returns the cached row without querying (`inst-ov-cached`). `reflect-verdict`
+carries a round per stage because a Lifecycle refusal is settled and replayed under its key
+([Lifecycle `01 §4.2`](../../../orders-lifecycle/docs/design/01-foundation.md#42-idempotency-semantics-normative)):
+a reflection refused `not-admissible` while the order is `on_hold` answers `held`, and the
+definition reflects again under the next round after the resume. An operator retry of an
+`approval-reflection-refused` task carries the `attempt` `retry-step` minted, which is the only
+way past a settled refusal of the same round.
 
 **Expected version and refusals from Lifecycle.** Every `approval-reflection` call **MUST** carry
 `expected_version = orderVersion` and the process `correlationId`. A Lifecycle `version-conflict`
 or a refused transition — the order moved on while the reflection was in flight — **MUST** settle
 `permanent-failure` with `version-mismatch` and the Lifecycle reason in `owf_step_log.result`, and
-**MUST NOT** be retried under a new key or inferred as success; a transport failure or a 5xx
+**MUST NOT** be retried under a new round or inferred as success; the one exception is a
+`not-admissible` refusal of an order the Lifecycle read shows `on_hold`, which **MUST** answer
+`held` with the next round (§3.3); a transport failure or a 5xx
 **MUST** settle `retryable-failure`.
 
 **Refusal codes** this slice may raise are the registered `submitter-barred` and `gate-not-open`
@@ -1369,8 +1384,8 @@ that violates any of them **MUST** be refused.
 3. [ ] - `p1` - **No swallowing.** `obtain-verdict`, `reflect-verdict` and `record-decision` **MUST NOT** be inside a `catch` that continues the forward path (`10 §4.6`); a `permanent-failure` of `reflect-verdict` **MUST** reach `create-manual-task` (slice 07) and then an arm that waits on the amendment, terminal-event and cancel `listen`s, because the order state that refused the reflection is a commercial fact only a human or a Lifecycle event resolves - `inst-c3-no-swallow`
 4. [ ] - `p1` - **The escalation fork.** The escalation `wait` **MUST** be a branch of a competing `fork` that also contains the decision `listen`, the probe branch, the hold arm, the amendment arm and the cancel arm; it **MUST** be the fixed `PT5M` `waitEscalation` tick followed by `escalate-gate` `mode: fire`, looping while `due` is `false`; after a resume the first answer **MUST** be `apply-resume`'s `due`; the definition **MUST NOT** carry a remaining duration or compute the deadline - `inst-c3-escalation-fork`
 5. [ ] - `p1` - **The probe branch.** The `gateLoop` fork **MUST** carry a probe branch calling `escalate-gate` with `mode: probe` at an interval no longer than 30 s; on `serviceState = outage` the definition **MUST** enter an outage arm that competes a probe loop (until `available`), whose probe also re-checks the outage threshold (`due` on `outage`) and on `due` leads to one `raise-overdue-escalation` with `escalationKind: approval-outage`, the hold arm and the cancel arm, and on `available` **MUST** re-enter `gateLoop` - `inst-c3-probe`
-6. [ ] - `p1` - **The park clock.** The park-escalation `wait` **MUST** be the fixed `PT5M` `waitTtlMargin` tick followed by `arm-park-escalation`, looping while its `due` is `false`, **MUST NOT** be inside a fork that contains a hold arm, and **MUST NOT** be re-armed after `raise-overdue-escalation` has recorded the park escalation — a re-entry to the park loop after `escalated` runs only the verdict retry, cancel and terminal-event arms - `inst-c3-park-clock`
-7. [ ] - `p1` - **Positions and rounds.** `open-gates` **MUST** be called with `position = 0` first and thereafter only with `record-decision`'s `nextPosition`; `escalate-gate` **MUST** carry the `escalationRound` or `probeRound` the previous call returned. These are re-keyed references, not computed values (`01 §4.14`) - `inst-c3-positions`
+6. [ ] - `p1` - **The park clock.** The park-escalation `wait` **MUST** be the fixed `PT5M` `waitTtlMargin` tick followed by `arm-park-escalation`, looping while its `due` is `false` under the `nextRound` each answer returns; its fork **MUST** carry a hold and a resume arm that only record and return to the loop (`holdPauses` false), so a hold never pauses the park clock; and it **MUST NOT** be re-armed after `raise-overdue-escalation` has recorded the park escalation — a re-entry to the park loop after `escalated` runs only the verdict retry, cancel and terminal-event arms - `inst-c3-park-clock`
+7. [ ] - `p1` - **Positions and rounds.** `open-gates` **MUST** be called with `position = 0` first and thereafter only with `record-decision`'s `nextPosition`; `escalate-gate` **MUST** carry the `escalationRound` or `probeRound` the previous call returned, and `obtain-verdict`, `reflect-verdict` (per stage) and `arm-park-escalation` the `nextRound` of their previous answer, with `reflect-verdict` also carrying a retry's `attemptKey`; a `held` reflection **MUST** wait for the resume before the next round. These are re-keyed references, not computed values (`01 §4.14`) - `inst-c3-positions`
 8. [ ] - `p1` - **Signals handled.** This slice's stage consumes the approval decision event (`listen`, correlated on `orderId` and `orderVersion`); it is paused by `OrderHeld` / `OrderResumed` through `apply-hold` / `apply-resume` (slice 08), which call the gate-window port with the `gateRefs` `open-gates` returned; it is left by `cancel-requested`, `OrderAmended` and the terminal order events, whose paths close its records through the closure port inside `run-cancellation-fence` (slice 06) - `inst-c3-signals`
 
 `10 §3.6` (a) carries every part of this contract: the escalation branch, the probe branch and

@@ -1436,7 +1436,7 @@ NFR workshop, not as settled numbers.
   | `owf_audit_checkpoint`, `owf_audit_checkpoint_member` | retained with the evidence they cover; never purged |
   | `owf_process_instance`, `owf_definition_binding` | the life of the order record (`01 §3.7`) |
   | `owf_step_log` | 90 days |
-  | `owf_idempotency_registry` | 30 days |
+  | `owf_idempotency_registry` | a 30-day key lifetime; each row kept as a tombstone until its instance has been terminal for 30 days (`01 §3.7`, D-104) |
   | `owf_process_progress_view` | lives as long as the process record it projects; never purged ahead of it |
 
   `owf_dead_letter_record` and `owf_retry_state` are retired (`01 §3.7` *Retired tables*); their
