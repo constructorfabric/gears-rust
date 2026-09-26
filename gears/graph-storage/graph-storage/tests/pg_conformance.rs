@@ -1997,3 +1997,8 @@ async fn two_scopes_racing_to_claim_an_unowned_edge_leave_it_with_one() {
     )
     .await;
 }
+
+pg_case!(
+    an_edge_does_not_follow_a_node_ingested_under_a_new_key,
+    conformance::an_edge_does_not_follow_a_node_ingested_under_a_new_key
+);

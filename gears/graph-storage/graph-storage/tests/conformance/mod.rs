@@ -6679,3 +6679,77 @@ pub async fn two_scopes_racing_to_claim_an_unowned_edge_leave_it_with_one(
         );
     }
 }
+
+/// A node ingested under a new key is a different node, and the edges of the
+/// old one stay with the old one.
+///
+/// `fr-stable-identity`: there is no re-key operation. An edge's key is
+/// derived from its endpoints' keys, so an edge declared against the old key
+/// names the old node, and nothing moves it when the producer starts keying
+/// the same object differently. The old node is not tombstoned by that
+/// either; retiring it is a delete the producer issues.
+pub async fn an_edge_does_not_follow_a_node_ingested_under_a_new_key(
+    store: &dyn GraphStoreV1,
+    tenant: Uuid,
+) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    store
+        .register_types(&ctx, ontology_batch())
+        .await
+        .expect("the ontology registers");
+
+    ingest_batch(
+        store,
+        &ctx,
+        batch(
+            vec![node("old-key", "the object"), node("other", "other")],
+            vec![edge("old-key", "other")],
+        ),
+    )
+    .await
+    .expect("the object and its edge are created");
+    // The same object, as the producer now keys it: a new node, not a new
+    // version of the old one.
+    ingest_batch(
+        store,
+        &ctx,
+        batch(vec![node("new-key", "the object")], Vec::new()),
+    )
+    .await
+    .expect("the re-keyed object is created");
+
+    let old = store
+        .get_node(&ctx, &"old-key".to_owned(), 10)
+        .await
+        .expect("the old key still names its node");
+    let new = store
+        .get_node(&ctx, &"new-key".to_owned(), 10)
+        .await
+        .expect("the new key names a node of its own");
+    assert_eq!(
+        old.adjacency.len(),
+        1,
+        "the edge stays with the node it was declared against: {:?}",
+        old.adjacency
+    );
+    assert!(
+        new.adjacency.is_empty(),
+        "nothing followed the object to its new key: {:?}",
+        new.adjacency
+    );
+    let other = store
+        .get_node(&ctx, &"other".to_owned(), 10)
+        .await
+        .expect("the neighbour reads");
+    let neighbours: Vec<&str> = other
+        .adjacency
+        .iter()
+        .map(|entry| entry.neighbor_key.as_str())
+        .collect();
+    assert_eq!(
+        neighbours,
+        ["old-key"],
+        "the neighbour still sees the old node, and only it"
+    );
+}

@@ -299,6 +299,11 @@ pub trait GraphStoreV1: Send + Sync + 'static {
     /// against its byte budget. Optional: the default answers `Unsupported`,
     /// and the gear then hydrates and filters afterwards, which returns the
     /// same answer at the cost of reading rows it discards.
+    ///
+    /// The order of the pairs is not part of the contract. The gear keys the
+    /// answer by id and never reads it in sequence; the built-in store
+    /// answers in whatever order the statement returns, and a store that
+    /// preserves the order asked promises nothing more by doing so.
     async fn node_types(
         &self,
         _ctx: &StoreCtx<'_>,

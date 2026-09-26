@@ -210,6 +210,18 @@ pub struct FakeGraphStore {
     /// Calls to `hydrate_nodes`: a read that hydrates in pieces is bounded
     /// in round trips as well as in rows.
     hydrate_calls: std::sync::atomic::AtomicU64,
+    /// What `node_types` answers: the types, `Unsupported` as a store that
+    /// never implemented the optional method would, or a failure.
+    node_types_answer: NodeTypesAnswer,
+}
+
+/// The three things `node_types` can answer, so a test can see the service
+/// take each of them apart.
+#[derive(Clone, Copy, Debug)]
+enum NodeTypesAnswer {
+    Typed,
+    Unsupported,
+    Failing,
 }
 
 impl Default for FakeGraphStore {
@@ -231,6 +243,27 @@ impl FakeGraphStore {
             revision_reads: std::sync::atomic::AtomicI64::new(0),
             rows_hydrated: std::sync::atomic::AtomicU64::new(0),
             hydrate_calls: std::sync::atomic::AtomicU64::new(0),
+            node_types_answer: NodeTypesAnswer::Typed,
+        }
+    }
+
+    /// A store that never implemented `node_types`: the trait's default,
+    /// `Unsupported`, which a filtered read has to work without.
+    #[must_use]
+    pub fn without_node_types() -> Self {
+        Self {
+            node_types_answer: NodeTypesAnswer::Unsupported,
+            ..Self::new()
+        }
+    }
+
+    /// A store whose `node_types` fails outright, which is not the same
+    /// thing as one that cannot say.
+    #[must_use]
+    pub fn failing_node_types() -> Self {
+        Self {
+            node_types_answer: NodeTypesAnswer::Failing,
+            ..Self::new()
         }
     }
 
@@ -1082,6 +1115,17 @@ impl GraphStoreV1 for FakeGraphStore {
         ctx: &StoreCtx<'_>,
         ids: &[NodeId],
     ) -> Result<Vec<(NodeId, GtsTypeId)>, GraphStoreError> {
+        match self.node_types_answer {
+            NodeTypesAnswer::Typed => {}
+            NodeTypesAnswer::Unsupported => {
+                return Err(GraphStoreError::Unsupported { what: "node_types" });
+            }
+            NodeTypesAnswer::Failing => {
+                return Err(GraphStoreError::Unavailable {
+                    reason: "node_types is failing, as this test asked".to_owned(),
+                });
+            }
+        }
         if !scope_admits(ctx.scope, ctx.tenant) {
             return Ok(Vec::new());
         }

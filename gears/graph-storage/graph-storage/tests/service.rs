@@ -1917,6 +1917,80 @@ async fn a_type_filter_drops_the_edges_of_the_nodes_it_filters() {
     );
 }
 
+/// A store that cannot answer `node_types` is served by hydrating and
+/// filtering afterwards; one that fails to answer is not.
+///
+/// The trait makes the method optional and its default answers
+/// `Unsupported`, which the walk takes as "hydrate everything and filter
+/// after". Any other failure is a failure of the read and is carried to the
+/// caller: reading it as "cannot say" would turn a store outage into a
+/// slower answer, and the two arms are next to each other in the service.
+#[tokio::test]
+async fn a_filtered_walk_survives_a_store_without_node_types_and_not_one_that_fails_them() {
+    async fn walk(
+        store: graph_storage::infra::fake_store::FakeGraphStore,
+    ) -> Result<Vec<String>, DomainError> {
+        let store = Arc::new(store);
+        let harness = Harness::configured_over(
+            Arc::clone(&store),
+            Arc::new(support::AllowInOwnTenant),
+            GraphStorageConfig::default(),
+        );
+        let ctx = harness.ctx();
+        harness.seed_ontology(&ctx).await;
+        harness
+            .services
+            .ingest(
+                &ctx,
+                conformance::batch(
+                    vec![
+                        conformance::node("seed", "seed"),
+                        conformance::node("kept", "kept"),
+                    ],
+                    vec![
+                        conformance::edge("seed", "kept"),
+                        conformance::edge("seed", "ghost"),
+                    ],
+                ),
+            )
+            .await
+            .expect("the batch commits");
+        let walked = harness
+            .services
+            .traverse(
+                &ctx,
+                TraverseRequest {
+                    seeds: vec!["seed".to_owned()],
+                    depth: 1,
+                    edge_type_patterns: Vec::new(),
+                    node_type_patterns: vec![conformance::OWNED.to_owned()],
+                    max_nodes: Some(1_000),
+                },
+            )
+            .await?;
+        let mut keys: Vec<String> = walked.nodes.into_iter().map(|n| n.node_key).collect();
+        keys.sort_unstable();
+        Ok(keys)
+    }
+
+    let answered = walk(graph_storage::infra::fake_store::FakeGraphStore::without_node_types())
+        .await
+        .expect("a store that cannot say the types is hydrated and filtered instead");
+    assert_eq!(
+        answered,
+        ["kept", "seed"],
+        "the filter still applies, after hydration"
+    );
+
+    let failed = walk(graph_storage::infra::fake_store::FakeGraphStore::failing_node_types())
+        .await
+        .expect_err("a store that fails to answer fails the walk");
+    assert!(
+        failed.to_string().contains("node_types is failing"),
+        "the caller is told the store's failure, not served a slower answer: {failed}"
+    );
+}
+
 /// How many rows one piece asks for when the whole budget remains -- the
 /// widest a piece can be.
 fn budgeted_piece(budget: u64, item_ceiling: u64) -> u64 {
