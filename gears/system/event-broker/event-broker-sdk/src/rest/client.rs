@@ -370,7 +370,6 @@ fn subscription_from_wire(w: wire::SubscriptionWire) -> Result<Subscription, Eve
         interests,
         assigned,
         topology_version: w.topology_version,
-        expires_at: w.expires_at,
         created_at: w.created_at,
     })
 }
@@ -665,7 +664,6 @@ impl EventBrokerApi for RestBroker {
         Ok(SubscriptionAssignment {
             subscription_id: SubscriptionId(resp.id),
             topology_version: resp.topology_version,
-            expires_at: resp.expires_at,
             assigned: resp
                 .assigned
                 .into_iter()

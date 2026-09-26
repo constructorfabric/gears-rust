@@ -1,4 +1,4 @@
-//! `Storage` facade (`ConsumerGroupRepo`/`CursorRepo`/`SubscriptionRepo`/
+//! `Storage` facade (`ConsumerGroupRepo`/`CursorRepo`/`RoutingMarkers`/
 //! `ActiveStreamMarker`/`DeliveryNotifier`).
 //!
 //! The event log itself is not here. It belongs to whichever

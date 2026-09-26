@@ -1,4 +1,6 @@
-//! Repository contracts (`DESIGN.md:595`'s `SubscriptionRepo`, `CursorRepo`).
+//! Repository contracts (`DESIGN.md:595`'s `CursorRepo`, plus the routing
+//! markers). Subscriptions have none: they are held in memory by the
+//! `ConsumerGroupCoordinator` of the instance that owns their group.
 //! Signatures only - no implementation (backed by `infra::storage::Storage`
 //! for persisted entities, `domain::cluster` for ephemeral cache-backed ones
 //! per the Domain Model's persisted-vs-ephemeral split). Topics and events
@@ -9,7 +11,7 @@
 //! either.
 //!
 //! Method names are deliberately distinct across these traits
-//! (`find_subscription`, `find_cursor`, `find_consumer_group`, not a shared
+//! (`find_cursor`, `find_consumer_group`, not a shared
 //! `get`) - `Storage` (`infra/storage/storage.rs`) implements all of them on
 //! one struct, and identically-named methods across traits in scope on the
 //! same receiver are ambiguous at the call site (would force
@@ -19,14 +21,26 @@ use async_trait::async_trait;
 use toolkit_gts::GtsInstanceId;
 
 use crate::domain::error::DomainError;
-use crate::domain::model::{ConsumerGroup, Cursor, Subscription};
+use crate::domain::model::{ConsumerGroup, Cursor};
 
+/// The cluster-visible trace of a subscription: markers a dispatcher reads to
+/// route a request to the instance that holds it. Never the subscription
+/// itself - that lives in the owning instance's `ConsumerGroupCoordinator`.
+///
+/// Two hops, because a request names either one: a subscription id resolves
+/// to its group, and a group resolves to the instance that owns it
+/// (`DESIGN.md`'s `evbk.group.endpoint:{consumer_group}`).
 #[async_trait]
-pub trait SubscriptionRepo: Send + Sync {
-    async fn find_subscription(&self, id: uuid::Uuid) -> Result<Option<Subscription>, DomainError>;
-    async fn list_subscriptions(&self) -> Result<Vec<Subscription>, DomainError>;
-    async fn put_subscription(&self, subscription: &Subscription) -> Result<(), DomainError>;
-    async fn delete_subscription(&self, id: uuid::Uuid) -> Result<(), DomainError>;
+pub trait RoutingMarkers: Send + Sync {
+    async fn mark_subscription(
+        &self,
+        subscription_id: uuid::Uuid,
+        group: &GtsInstanceId,
+    ) -> Result<(), DomainError>;
+    async fn unmark_subscription(&self, subscription_id: uuid::Uuid) -> Result<(), DomainError>;
+    /// Records this instance as the group's owner.
+    async fn mark_group(&self, group: &GtsInstanceId) -> Result<(), DomainError>;
+    async fn unmark_group(&self, group: &GtsInstanceId) -> Result<(), DomainError>;
 }
 
 #[async_trait]
@@ -60,9 +74,4 @@ pub trait ConsumerGroupRepo: Send + Sync {
     )]
     async fn list_consumer_groups(&self) -> Result<Vec<ConsumerGroup>, DomainError>;
     async fn delete_consumer_group(&self, id: &GtsInstanceId) -> Result<(), DomainError>;
-
-    /// Whether any subscription currently has an active membership in this
-    /// group - guards `DELETE /v1/consumer-groups/{id}`
-    /// (`ConsumerGroupHasActiveMembers`).
-    async fn has_active_members(&self, id: &GtsInstanceId) -> Result<bool, DomainError>;
 }

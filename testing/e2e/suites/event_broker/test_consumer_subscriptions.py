@@ -72,7 +72,6 @@ async def test_cold_join_fresh_group_returns_201(api):
         ],
         "assigned": [{"topic": TOPIC_STREAM, "partition": 0}],
         "topology_version": 1,
-        "expires_at": body["expires_at"],
         "created_at": body["created_at"],
     }
 
@@ -408,7 +407,6 @@ async def test_read_subscription_returns_200(api):
         ],
         "assigned": [{"topic": TOPIC_STREAM, "partition": 0}],
         "topology_version": 1,
-        "expires_at": body["expires_at"],
         "created_at": body["created_at"],
     }
 

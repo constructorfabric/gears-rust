@@ -275,6 +275,7 @@ pub struct EventBrokerHarness {
     ingest: Arc<dyn IngestService>,
     delivery: Arc<dyn DeliveryService>,
     storage: Arc<Storage>,
+    groups: Arc<crate::domain::consumer_group_coordinator::ConsumerGroupCoordinator>,
     ctx: SecurityContext,
     router: axum::Router,
     /// Kept alive for the harness's lifetime, never `.stop()`'d - see
@@ -352,11 +353,18 @@ impl EventBrokerHarness {
     /// Low-level access to the backing `Storage` - topic/event-type
     /// fixtures go through `EventBrokerHarnessBuilder::with_type_registry`
     /// instead; this stays for whatever else a test needs the real repo
-    /// for (`ConsumerGroupRepo`/`CursorRepo`/`SubscriptionRepo`/
-    /// `ActiveStreamMarker` - `Storage` implements all of them).
+    /// for (`ConsumerGroupRepo`/`CursorRepo`/`RoutingMarkers` - `Storage`
+    /// implements all of them).
     #[must_use]
     pub fn repo(&self) -> &Storage {
         &self.storage
+    }
+
+    /// The in-memory home of every subscription - what a test reads to see a
+    /// subscription's stored state, or seeds one the REST surface cannot make.
+    #[must_use]
+    pub fn groups(&self) -> &crate::domain::consumer_group_coordinator::ConsumerGroupCoordinator {
+        &self.groups
     }
 
     #[must_use]
@@ -454,7 +462,11 @@ impl EventBrokerHarnessBuilder {
         let spec_manager = seeded_spec_manager(Arc::clone(&db), self.type_registry).await;
 
         let (_hub, cluster) = crate::test_support::standalone_event_broker_cluster().await;
-        let storage = Arc::new(Storage::new(Arc::clone(&db), Arc::clone(&spec_manager)));
+        let storage = Arc::new(Storage::new(
+            Arc::clone(&db),
+            Arc::clone(&spec_manager),
+            Uuid::new_v4(),
+        ));
         storage.set_cache(cluster.cache.clone());
 
         let (backend, backend_resolver, outbox_handle) = start_outbox(
@@ -484,6 +496,21 @@ impl EventBrokerHarnessBuilder {
             loader_shutdown.clone(),
         ));
 
+        // The production sweeper and join timeout, on the loader's token, so a
+        // disconnected member is reaped exactly as a running instance reaps it.
+        let groups = Arc::new(
+            crate::domain::consumer_group_coordinator::ConsumerGroupCoordinator::new(
+                std::time::Duration::from_secs(u64::from(
+                    crate::config::SubscriptionConfig::default().join_timeout_secs,
+                )),
+            ),
+        );
+        tokio::spawn(crate::domain::consumer_group_coordinator::sweeper::run(
+            Arc::clone(&groups),
+            Arc::clone(&storage) as Arc<dyn crate::domain::repo::RoutingMarkers>,
+            loader_shutdown.clone(),
+        ));
+
         let attacher: Arc<dyn crate::domain::streaming::source::ReaderAttacher> = topics.clone();
         let HandlerState { ingest, delivery } = crate::infra::wiring::build_handler_state(
             Arc::clone(&storage),
@@ -491,6 +518,7 @@ impl EventBrokerHarnessBuilder {
             spec_manager,
             backend_resolver,
             attacher,
+            Arc::clone(&groups),
             Arc::clone(&leases),
             crate::config::BatchConfig::default(),
             // Short cadences so idle behaviour is testable without real waits.
@@ -538,6 +566,7 @@ impl EventBrokerHarnessBuilder {
             ingest,
             delivery,
             storage,
+            groups,
 
             ctx,
             router,

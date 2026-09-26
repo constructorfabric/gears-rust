@@ -54,7 +54,7 @@ impl From<toolkit_db::secure::ScopeError> for DomainError {
 }
 
 /// `cluster_sdk::ClusterError` covers resolution/backend failures for
-/// `Storage`'s `subscription` namespace (`ClusterCacheV1`) - always
+/// `Storage`'s routing markers (`ClusterCacheV1`) - always
 /// infrastructure, matching the `DbError` mapping above.
 impl From<cluster_sdk::ClusterError> for DomainError {
     fn from(err: cluster_sdk::ClusterError) -> Self {

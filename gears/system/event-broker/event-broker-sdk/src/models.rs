@@ -72,7 +72,6 @@ pub struct Subscription {
     pub interests: Vec<SubscriptionInterest>,
     pub assigned: Vec<PartitionAssignment>,
     pub topology_version: i64,
-    pub expires_at: DateTime<Utc>,
     /// When the subscription was created (at JOIN); the stable sort key for
     /// listing subscriptions.
     pub created_at: DateTime<Utc>,

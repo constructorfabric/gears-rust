@@ -771,7 +771,7 @@ paths:
         - name: $filter
           in: query
           schema: { type: string }
-          description: "OData v4 filter expression. Filterable fields: `id` (eq/ne/in), `consumer_group` (eq/ne), `expires_at` (gt/ge/lt/le)."
+          description: "OData v4 filter expression. Filterable fields: `id` (eq/ne/in), `consumer_group` (eq/ne)."
         - name: $orderby
           in: query
           schema: { type: string }

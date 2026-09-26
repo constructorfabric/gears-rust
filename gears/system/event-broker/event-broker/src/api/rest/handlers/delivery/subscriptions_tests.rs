@@ -7,7 +7,7 @@
 //! group, joining a subscription) and asserts the exact response body
 //! received - no shared setup helpers, so nothing about what a test sends,
 //! or what it checks, is hidden outside the test itself. Dynamic
-//! server-minted values (subscription id, consumer-group id, `expires_at`)
+//! server-minted values (subscription id, consumer-group id, `created_at`)
 //! are extracted from the response and reused to build the exact expected
 //! body, rather than skipped.
 //!
@@ -33,7 +33,7 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 use crate::domain::model::{ConsumerGroup, ConsumerGroupKind};
-use crate::domain::repo::{ConsumerGroupRepo, CursorRepo, SubscriptionRepo};
+use crate::domain::repo::{ConsumerGroupRepo, CursorRepo};
 use crate::domain::streaming::lease::StreamLeases;
 use crate::test_support::{DenyingAuthZ, EventBrokerHarness, Json, StaticTypesRegistry};
 
@@ -71,10 +71,6 @@ async fn join_happy_path_returns_201_with_full_assignment() {
     resp.assert_status(201);
     let body = resp.json();
     let id = body["id"].as_str().expect("id must be a string").to_owned();
-    let expires_at = body["expires_at"]
-        .as_str()
-        .expect("expires_at must be a string")
-        .to_owned();
     let created_at = body["created_at"]
         .as_str()
         .expect("created_at must be a string")
@@ -99,7 +95,6 @@ async fn join_happy_path_returns_201_with_full_assignment() {
                 { "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partition": 2 },
             ],
             "topology_version": 1,
-            "expires_at": expires_at,
             "created_at": created_at,
         })
     );
@@ -181,10 +176,6 @@ async fn join_carries_tenant_traversal_scope_through_to_the_echoed_interest() {
     resp.assert_status(201);
     let body = resp.json();
     let id = body["id"].as_str().expect("id must be a string").to_owned();
-    let expires_at = body["expires_at"]
-        .as_str()
-        .expect("expires_at must be a string")
-        .to_owned();
     let created_at = body["created_at"]
         .as_str()
         .expect("created_at must be a string")
@@ -207,7 +198,6 @@ async fn join_carries_tenant_traversal_scope_through_to_the_echoed_interest() {
                 { "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partition": 0 },
             ],
             "topology_version": 1,
-            "expires_at": expires_at,
             "created_at": created_at,
         })
     );
@@ -489,15 +479,19 @@ async fn join_bad_type_pattern_returns_400() {
 
 // -- session_timeout parsing (toolkit_utils::iso8601_duration) --
 
-/// Seconds between `expires_at` (RFC 3339) and now - used to check the
-/// parsed `session_timeout` actually took effect, since `SubscriptionDto`
-/// doesn't echo `session_timeout` itself.
-fn expires_at_secs_from_now(body: &serde_json::Value) -> i64 {
-    let expires_at = body["expires_at"]
-        .as_str()
-        .expect("expires_at must be a string");
-    let expires_at = chrono::DateTime::parse_from_rfc3339(expires_at).expect("valid RFC 3339");
-    (expires_at.with_timezone(&Utc) - Utc::now()).num_seconds()
+/// The `session_timeout` the stored subscription actually carries - the
+/// response does not expose it, so the parse is checked where it takes effect.
+fn stored_session_timeout(
+    harness: &EventBrokerHarness,
+    body: &serde_json::Value,
+) -> std::time::Duration {
+    let id = Uuid::parse_str(body["id"].as_str().expect("id must be a string"))
+        .expect("id must be a uuid");
+    harness
+        .groups()
+        .get(id)
+        .expect("the joined subscription must be stored")
+        .session_timeout
 }
 
 #[tokio::test]
@@ -529,9 +523,10 @@ async fn join_without_session_timeout_defaults_to_30_seconds() {
         .await;
 
     resp.assert_status(201);
-    assert!(
-        (25..=30).contains(&expires_at_secs_from_now(&resp.json())),
-        "expected ~30s default session timeout"
+    assert_eq!(
+        stored_session_timeout(&harness, &resp.json()),
+        std::time::Duration::from_secs(30),
+        "expected the 30s default session timeout"
     );
 }
 
@@ -567,8 +562,9 @@ async fn join_session_timeout_with_hour_designator_is_parsed_correctly() {
         .await;
 
     resp.assert_status(201);
-    assert!(
-        (3590..=3600).contains(&expires_at_secs_from_now(&resp.json())),
+    assert_eq!(
+        stored_session_timeout(&harness, &resp.json()),
+        std::time::Duration::from_hours(1),
         "expected the full 1-hour session timeout, not the 30s default"
     );
 }
@@ -1141,10 +1137,6 @@ async fn join_succeeds_when_every_interest_passes_all_three_checks() {
     resp.assert_status(201);
     let body = resp.json();
     let id = body["id"].as_str().expect("id must be a string").to_owned();
-    let expires_at = body["expires_at"]
-        .as_str()
-        .expect("expires_at must be a string")
-        .to_owned();
     let created_at = body["created_at"]
         .as_str()
         .expect("created_at must be a string")
@@ -1167,7 +1159,6 @@ async fn join_succeeds_when_every_interest_passes_all_three_checks() {
                 { "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partition": 0 },
             ],
             "topology_version": 1,
-            "expires_at": expires_at,
             "created_at": created_at,
         })
     );
@@ -1348,10 +1339,8 @@ async fn leave_rejects_a_caller_from_a_different_tenant() {
     resp.assert_status(403);
     assert!(
         harness
-            .repo()
-            .find_subscription(Uuid::parse_str(&id).unwrap())
-            .await
-            .expect("repo lookup must not fail")
+            .groups()
+            .get(Uuid::parse_str(&id).unwrap())
             .is_some(),
         "a denied leave must not delete the subscription"
     );
@@ -1434,8 +1423,8 @@ async fn list_subscriptions_excludes_a_different_tenant() {
     own.assert_status(201);
     let own_id = own.json()["id"].as_str().unwrap().to_owned();
 
-    // A subscription belonging to a different tenant, inserted directly
-    // into the repo (there's no REST path to create one under a tenant the
+    // A subscription belonging to a different tenant, joined directly into
+    // the coordinator (there's no REST path to create one under a tenant the
     // harness's own `ctx` doesn't hold - that's exactly the property this
     // test is checking).
     let foreign = crate::domain::model::Subscription {
@@ -1448,15 +1437,9 @@ async fn list_subscriptions_excludes_a_different_tenant() {
         assigned: vec![],
         topology_version: 1,
         session_timeout: std::time::Duration::from_secs(30),
-        last_seen_at: Utc::now(),
-        expires_at: Utc::now() + chrono::Duration::seconds(30),
         created_at: Utc::now(),
     };
-    harness
-        .repo()
-        .put_subscription(&foreign)
-        .await
-        .expect("seeding a foreign-tenant subscription must not fail");
+    harness.groups().join(foreign, &[]);
 
     let resp = harness.api_v1().get_subscriptions().send().await;
 

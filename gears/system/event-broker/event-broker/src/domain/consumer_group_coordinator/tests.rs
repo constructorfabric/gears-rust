@@ -6,7 +6,9 @@ use uuid::Uuid;
 use crate::domain::streaming::assignment::AssignmentDelta;
 use toolkit_gts::GtsInstanceId;
 
-use super::{ConsumerGroupCoordinator, MemberStatus, TopicInterest, range_split};
+use tokio::time::Instant;
+
+use super::{ConsumerGroupCoordinator, MemberState, Removal, TopicInterest, range_split};
 
 fn topic(suffix: &str, partitions: i32) -> TopicInterest {
     TopicInterest {
@@ -80,13 +82,19 @@ fn range_split_zero_partitions() {
 
 // --- ConsumerGroupCoordinator::join ---
 
+const JOIN_TIMEOUT: Duration = Duration::from_mins(1);
+
+fn coordinator() -> Arc<ConsumerGroupCoordinator> {
+    Arc::new(ConsumerGroupCoordinator::new(JOIN_TIMEOUT))
+}
+
 #[test]
 fn first_join_version_one_all_partitions() {
-    let coordinator = ConsumerGroupCoordinator::new();
+    let coordinator = coordinator();
     let group = group_id("g1");
     let sub_id = Uuid::new_v4();
 
-    let (assigned, version, _) = coordinator.join(
+    let (assigned, version, _) = coordinator.join_member(
         &group,
         sub_id,
         &[topic("topic", 4)],
@@ -97,14 +105,15 @@ fn first_join_version_one_all_partitions() {
     let mut parts: Vec<i32> = assigned.iter().map(|a| a.partition).collect();
     parts.sort_unstable();
     assert_eq!(parts, vec![0, 1, 2, 3]);
+    assert_eq!(coordinator.state_of(sub_id), Some(MemberState::Joined));
 }
 
 #[test]
 fn second_join_splits_and_increments_version() {
-    let coordinator = ConsumerGroupCoordinator::new();
+    let coordinator = coordinator();
     let group = group_id("g2");
 
-    let (_, v1, _) = coordinator.join(
+    let (_, v1, _) = coordinator.join_member(
         &group,
         Uuid::new_v4(),
         &[topic("topic", 4)],
@@ -112,7 +121,7 @@ fn second_join_splits_and_increments_version() {
     );
     assert_eq!(v1, 1);
 
-    let (assigned_b, v2, _) = coordinator.join(
+    let (assigned_b, v2, _) = coordinator.join_member(
         &group,
         Uuid::new_v4(),
         &[topic("topic", 4)],
@@ -124,22 +133,18 @@ fn second_join_splits_and_increments_version() {
 
 #[test]
 fn third_join_four_partitions_all_members_covered() {
-    let coordinator = ConsumerGroupCoordinator::new();
+    let coordinator = coordinator();
     let group = group_id("g3");
 
-    coordinator.join(
-        &group,
-        Uuid::new_v4(),
-        &[topic("topic", 4)],
-        Duration::from_secs(30),
-    );
-    coordinator.join(
-        &group,
-        Uuid::new_v4(),
-        &[topic("topic", 4)],
-        Duration::from_secs(30),
-    );
-    let (assigned_c, v3, _) = coordinator.join(
+    for _ in 0..2 {
+        coordinator.join_member(
+            &group,
+            Uuid::new_v4(),
+            &[topic("topic", 4)],
+            Duration::from_secs(30),
+        );
+    }
+    let (assigned_c, v3, _) = coordinator.join_member(
         &group,
         Uuid::new_v4(),
         &[topic("topic", 4)],
@@ -151,25 +156,76 @@ fn third_join_four_partitions_all_members_covered() {
     assert!(assigned_c.len() <= 2);
 }
 
+/// A rebalance rewrites every member's stored subscription, so a read of a
+/// sibling is its current assignment and topology version rather than what it
+/// was given at its own JOIN.
+#[test]
+fn a_join_rewrites_every_siblings_stored_subscription() {
+    let coordinator = coordinator();
+    let group = group_id("gsib");
+    let sub_a = Uuid::new_v4();
+    coordinator.join_member(&group, sub_a, &[topic("topic", 4)], Duration::from_secs(30));
+    coordinator.join_member(
+        &group,
+        Uuid::new_v4(),
+        &[topic("topic", 4)],
+        Duration::from_secs(30),
+    );
+
+    let a = coordinator.get(sub_a).expect("sub_a is a member");
+    assert_eq!(a.topology_version, 2);
+    assert_eq!(a.assigned.len(), 2);
+}
+
+// --- lookups ---
+
+#[test]
+fn get_list_and_has_members_reflect_membership() {
+    let coordinator = coordinator();
+    let group = group_id("glookup");
+    let sub_a = Uuid::new_v4();
+    let sub_b = Uuid::new_v4();
+    assert!(!coordinator.has_members(&group));
+    assert!(coordinator.get(sub_a).is_none());
+
+    coordinator.join_member(&group, sub_a, &[topic("topic", 2)], Duration::from_secs(30));
+    coordinator.join_member(&group, sub_b, &[topic("topic", 2)], Duration::from_secs(30));
+
+    assert!(coordinator.has_members(&group));
+    assert_eq!(coordinator.get(sub_a).map(|s| s.id), Some(sub_a));
+    let mut listed: Vec<Uuid> = coordinator.list().into_iter().map(|s| s.id).collect();
+    listed.sort_unstable();
+    let mut expected = vec![sub_a, sub_b];
+    expected.sort_unstable();
+    assert_eq!(listed, expected);
+}
+
 // --- ConsumerGroupCoordinator::leave ---
 
 #[tokio::test]
 async fn leave_sends_terminal_to_survivor() {
-    let coordinator = Arc::new(ConsumerGroupCoordinator::new());
+    let coordinator = coordinator();
     let group = group_id("g4");
 
     let sub_a = Uuid::new_v4();
     let sub_b = Uuid::new_v4();
-    coordinator.join(&group, sub_a, &[topic("topic", 4)], Duration::from_secs(30));
-    coordinator.join(&group, sub_b, &[topic("topic", 4)], Duration::from_secs(30));
+    coordinator.join_member(&group, sub_a, &[topic("topic", 4)], Duration::from_secs(30));
+    coordinator.join_member(&group, sub_b, &[topic("topic", 4)], Duration::from_secs(30));
 
-    let coordinator = Arc::new(coordinator);
     let (mut generations, _membership) =
         ConsumerGroupCoordinator::subscribe(&coordinator, &group, sub_a)
             .expect("sub_a is a member");
     let before = generations.borrow_and_update().clone();
 
-    coordinator.leave(&group, sub_b);
+    let removal = coordinator.leave(&group, sub_b);
+    assert_eq!(
+        removal,
+        Some(Removal {
+            subscription_id: sub_b,
+            group,
+            group_emptied: false,
+        })
+    );
 
     assert!(
         generations
@@ -190,116 +246,265 @@ async fn leave_sends_terminal_to_survivor() {
     );
 }
 
-#[test]
-fn leave_last_member_removes_group() {
-    let coordinator = ConsumerGroupCoordinator::new();
-    let group = group_id("g5");
+/// A LEAVE of a member whose stream is open must end that stream. The member's
+/// watch is left holding an empty assignment - lose-all, which the session
+/// turns into a terminal close - rather than a sender that simply vanished.
+#[tokio::test]
+async fn leave_of_a_streaming_member_publishes_lose_all_to_its_own_stream() {
+    let coordinator = coordinator();
+    let group = group_id("gleave");
     let sub_a = Uuid::new_v4();
-    let _ = coordinator.join(&group, sub_a, &[topic("topic", 2)], Duration::from_secs(30));
+    coordinator.join_member(&group, sub_a, &[topic("topic", 4)], Duration::from_secs(30));
+    let (mut generations, _membership) =
+        ConsumerGroupCoordinator::subscribe(&coordinator, &group, sub_a)
+            .expect("sub_a is a member");
+    let before = generations.borrow_and_update().clone();
+
     coordinator.leave(&group, sub_a);
 
-    assert!(!coordinator.state.lock().unwrap().contains_key(&group));
+    let after = generations.borrow_and_update().clone();
+    assert!(after.assigned.is_empty(), "got {after:?}");
+    assert_eq!(
+        AssignmentDelta::classify(&before, &after),
+        AssignmentDelta::LoseAll
+    );
 }
 
-// --- Dead-sender eviction on JOIN ---
-
 #[test]
-fn unassigned_member_evicted_on_next_join() {
-    let coordinator = ConsumerGroupCoordinator::new();
-    let group = group_id("g6");
-
+fn leave_last_member_removes_group() {
+    let coordinator = coordinator();
+    let group = group_id("g5");
     let sub_a = Uuid::new_v4();
-    coordinator.join(&group, sub_a, &[topic("topic", 4)], Duration::from_secs(30));
+    coordinator.join_member(&group, sub_a, &[topic("topic", 2)], Duration::from_secs(30));
 
-    coordinator
-        .state
-        .lock()
-        .unwrap()
-        .get_mut(&group)
-        .unwrap()
-        .members
-        .get_mut(&sub_a)
-        .unwrap()
-        .status = MemberStatus::Unassigned;
-
-    let sub_b = Uuid::new_v4();
-    let (assigned_b, _, _) =
-        coordinator.join(&group, sub_b, &[topic("topic", 4)], Duration::from_secs(30));
-    assert_eq!(assigned_b.len(), 4);
-
+    assert_eq!(
+        coordinator.leave(&group, sub_a),
+        Some(Removal {
+            subscription_id: sub_a,
+            group: group.clone(),
+            group_emptied: true,
+        })
+    );
     assert!(
         !coordinator
             .state
             .lock()
             .unwrap()
-            .get(&group)
-            .unwrap()
-            .members
-            .contains_key(&sub_a)
+            .groups
+            .contains_key(&group)
+    );
+    assert!(coordinator.get(sub_a).is_none());
+}
+
+#[test]
+fn leave_of_an_unknown_member_is_none() {
+    let coordinator = coordinator();
+    let group = group_id("gunknown");
+    coordinator.join_member(
+        &group,
+        Uuid::new_v4(),
+        &[topic("topic", 2)],
+        Duration::from_secs(30),
+    );
+    assert_eq!(coordinator.leave(&group, Uuid::new_v4()), None);
+}
+
+// --- Disconnected eviction on JOIN ---
+
+#[test]
+fn disconnected_member_evicted_on_next_join() {
+    let coordinator = coordinator();
+    let group = group_id("g6");
+
+    let sub_a = Uuid::new_v4();
+    coordinator.join_member(&group, sub_a, &[topic("topic", 4)], Duration::from_secs(30));
+    let (_generations, membership) =
+        ConsumerGroupCoordinator::subscribe(&coordinator, &group, sub_a)
+            .expect("sub_a is a member");
+    drop(membership);
+    assert_eq!(coordinator.state_of(sub_a), Some(MemberState::Disconnected));
+
+    let sub_b = Uuid::new_v4();
+    let (assigned_b, _, evicted) =
+        coordinator.join_member(&group, sub_b, &[topic("topic", 4)], Duration::from_secs(30));
+    assert_eq!(assigned_b.len(), 4);
+    assert_eq!(
+        evicted,
+        vec![Removal {
+            subscription_id: sub_a,
+            group,
+            group_emptied: false,
+        }]
+    );
+    assert!(coordinator.get(sub_a).is_none());
+}
+
+/// Only `Disconnected` members are evicted by a JOIN: a member that joined and
+/// has not opened its stream yet is mid-handshake, not gone.
+#[test]
+fn a_joined_member_is_not_evicted_by_a_later_join() {
+    let coordinator = coordinator();
+    let group = group_id("gjoined");
+    let sub_a = Uuid::new_v4();
+    coordinator.join_member(&group, sub_a, &[topic("topic", 4)], Duration::from_secs(30));
+
+    let (_, _, evicted) = coordinator.join_member(
+        &group,
+        Uuid::new_v4(),
+        &[topic("topic", 4)],
+        Duration::from_secs(30),
+    );
+    assert!(evicted.is_empty());
+    assert_eq!(coordinator.state_of(sub_a), Some(MemberState::Joined));
+}
+
+// --- state transitions ---
+
+#[test]
+fn opening_a_stream_moves_to_streaming_and_closing_it_to_disconnected() {
+    let coordinator = coordinator();
+    let group = group_id("gtrans");
+    let sub_a = Uuid::new_v4();
+    coordinator.join_member(&group, sub_a, &[topic("topic", 2)], Duration::from_secs(30));
+    assert_eq!(coordinator.state_of(sub_a), Some(MemberState::Joined));
+
+    let (_generations, membership) =
+        ConsumerGroupCoordinator::subscribe(&coordinator, &group, sub_a)
+            .expect("sub_a is a member");
+    assert_eq!(coordinator.state_of(sub_a), Some(MemberState::Streaming));
+
+    drop(membership);
+    assert_eq!(coordinator.state_of(sub_a), Some(MemberState::Disconnected));
+
+    // Reconnect.
+    let (_generations, _membership) =
+        ConsumerGroupCoordinator::subscribe(&coordinator, &group, sub_a)
+            .expect("a disconnected member can reopen its stream");
+    assert_eq!(coordinator.state_of(sub_a), Some(MemberState::Streaming));
+}
+
+#[test]
+fn subscribing_an_unknown_member_is_none() {
+    let coordinator = coordinator();
+    let group = group_id("gnone");
+    assert!(ConsumerGroupCoordinator::subscribe(&coordinator, &group, Uuid::new_v4()).is_none());
+}
+
+// --- sweep ---
+
+/// The Windows CI failure: a member with a one-second `session_timeout` whose
+/// JOIN -> SEEK -> open took longer than a second lost its subscription before
+/// the stream opened. `session_timeout` governs only a *disconnected* member;
+/// a joined one has the join timeout, however short its own timeout is.
+#[test]
+fn a_joined_member_with_a_short_session_timeout_survives_until_the_join_timeout() {
+    let coordinator = coordinator();
+    let group = group_id("gshort");
+    let sub_a = Uuid::new_v4();
+    let joined_at = Instant::now();
+    coordinator.join_member(&group, sub_a, &[topic("topic", 2)], Duration::from_secs(1));
+
+    assert!(
+        coordinator
+            .sweep(joined_at + Duration::from_secs(59))
+            .is_empty(),
+        "a joined member must outlive its own session_timeout"
+    );
+    assert!(
+        ConsumerGroupCoordinator::subscribe(&coordinator, &group, sub_a).is_some(),
+        "its stream must still open 59s after JOIN"
     );
 }
 
-// --- Watcher fires on stream drop, timer evicts and rebalances survivor ---
+#[test]
+fn a_joined_member_that_never_streams_is_reaped_at_the_join_timeout() {
+    let coordinator = coordinator();
+    let group = group_id("gjt");
+    let sub_a = Uuid::new_v4();
+    let joined_at = Instant::now();
+    coordinator.join_member(&group, sub_a, &[topic("topic", 2)], Duration::from_secs(30));
 
-/// Drop the stream receiver (simulating TCP disconnect) — the per-member watcher
-/// task detects the closure via `tx.closed().await`, marks the member `Unassigned`,
-/// and arms a one-shot timer for `session_timeout`.  When the timer fires, the
-/// dead member is evicted and the surviving member receives a `Terminal` frame
-/// (gain rule: any gained partition triggers terminal + re-JOIN).
-#[tokio::test]
-async fn watcher_fires_on_disconnect_timer_evicts_and_notifies_survivor() {
-    tokio::time::pause();
+    assert_eq!(
+        coordinator.sweep(joined_at + JOIN_TIMEOUT + Duration::from_millis(1)),
+        vec![Removal {
+            subscription_id: sub_a,
+            group: group.clone(),
+            group_emptied: true,
+        }]
+    );
+    assert!(coordinator.get(sub_a).is_none());
+    assert!(!coordinator.has_members(&group));
+}
 
-    let coordinator = Arc::new(ConsumerGroupCoordinator::new());
+#[test]
+fn a_streaming_member_is_never_swept() {
+    let coordinator = coordinator();
+    let group = group_id("gstream");
+    let sub_a = Uuid::new_v4();
+    let joined_at = Instant::now();
+    coordinator.join_member(&group, sub_a, &[topic("topic", 2)], Duration::from_secs(1));
+    let (_generations, _membership) =
+        ConsumerGroupCoordinator::subscribe(&coordinator, &group, sub_a)
+            .expect("sub_a is a member");
+
+    assert!(
+        coordinator
+            .sweep(joined_at + Duration::from_hours(24))
+            .is_empty()
+    );
+    assert_eq!(coordinator.state_of(sub_a), Some(MemberState::Streaming));
+}
+
+/// A disconnected member keeps its partitions until its `session_timeout`
+/// runs out; then it is reaped and the survivor gains them.
+#[test]
+fn a_disconnected_member_is_reaped_after_its_session_timeout_and_the_survivor_gains() {
+    let coordinator = coordinator();
     let group = group_id("g8");
     let session_timeout = Duration::from_millis(100);
 
     let sub_a = Uuid::new_v4();
     let sub_b = Uuid::new_v4();
-    coordinator.join(&group, sub_a, &[topic("topic", 4)], session_timeout);
-    coordinator.join(&group, sub_b, &[topic("topic", 4)], session_timeout);
+    coordinator.join_member(&group, sub_a, &[topic("topic", 4)], session_timeout);
+    coordinator.join_member(&group, sub_b, &[topic("topic", 4)], session_timeout);
 
     let (mut generations_b, _membership_b) =
         ConsumerGroupCoordinator::subscribe(&coordinator, &group, sub_b)
             .expect("sub_b is a member");
     generations_b.borrow_and_update();
 
-    // Dropping the handle *is* the disconnect. No watcher task and no channel:
-    // a session holds this for its lifetime, so the stream ending and the
-    // member being marked unassigned are the same moment.
     let (_generations_a, membership_a) =
         ConsumerGroupCoordinator::subscribe(&coordinator, &group, sub_a)
             .expect("sub_a is a member");
     drop(membership_a);
+    let disconnected_at = Instant::now();
 
-    // One yield, for the grace timer to register with the time driver. The
-    // status change itself already happened synchronously inside `Drop`, which
-    // is the behaviour difference from awaiting a channel close.
-    tokio::task::yield_now().await;
+    assert!(
+        coordinator
+            .sweep(disconnected_at + session_timeout / 2)
+            .is_empty(),
+        "partitions stay held within session_timeout"
+    );
+    assert!(
+        !generations_b
+            .has_changed()
+            .expect("sender outlives the receiver"),
+        "no rebalance while the disconnected member is within its timeout"
+    );
 
-    // sub_a must be Unassigned, timer must be running.
-    {
-        let state = coordinator.state.lock().unwrap();
-        let grp = state.get(&group).unwrap();
-        assert_eq!(
-            grp.members.get(&sub_a).unwrap().status,
-            MemberStatus::Unassigned
-        );
-        assert!(grp.timer_running, "timer must be armed after disconnect");
-    }
-
-    // Advance mock time past session_timeout — wakes the timer task.
-    tokio::time::advance(session_timeout + Duration::from_millis(1)).await;
-    // One more yield to let the timer task call `timer_fired`.
-    tokio::task::yield_now().await;
-
-    // sub_b gains sub_a's partitions. The coordinator publishes that; the
-    // session is what turns a gain into a terminal close.
+    assert_eq!(
+        coordinator.sweep(disconnected_at + session_timeout + Duration::from_millis(1)),
+        vec![Removal {
+            subscription_id: sub_a,
+            group,
+            group_emptied: false,
+        }]
+    );
     assert!(
         generations_b
             .has_changed()
             .expect("sender outlives the receiver"),
-        "the surviving member's new assignment must be published once the timer evicts"
+        "the surviving member's new assignment must be published once the sweep reaps"
     );
     let after_b = generations_b.borrow_and_update().clone();
     assert_eq!(
@@ -307,60 +512,60 @@ async fn watcher_fires_on_disconnect_timer_evicts_and_notifies_survivor() {
         4,
         "the survivor must hold every partition after eviction, got {after_b:?}"
     );
-
-    // sub_a must be evicted; sub_b must still be active.
-    let state = coordinator.state.lock().unwrap();
-    let grp = state
-        .get(&group)
-        .expect("group must still exist with sub_b");
-    assert!(
-        !grp.members.contains_key(&sub_a),
-        "dead member must be evicted"
-    );
-    assert!(grp.members.contains_key(&sub_b), "survivor must remain");
+    assert!(coordinator.get(sub_a).is_none());
+    assert_eq!(coordinator.state_of(sub_b), Some(MemberState::Streaming));
 }
 
-// --- Timer no-op when consumer reconnects before grace period ---
-
+/// A reconnect inside `session_timeout` makes the member `Streaming` again,
+/// so a later sweep - even one past the original timeout - leaves it alone.
 #[test]
-fn timer_noop_when_no_unassigned_remain() {
-    let coordinator = ConsumerGroupCoordinator::new();
+fn a_reconnect_within_session_timeout_keeps_the_member() {
+    let coordinator = coordinator();
     let group = group_id("g7");
-
+    let session_timeout = Duration::from_millis(50);
     let sub_a = Uuid::new_v4();
-    let _ = coordinator.join(
-        &group,
-        sub_a,
-        &[topic("topic", 2)],
-        Duration::from_millis(50),
+    coordinator.join_member(&group, sub_a, &[topic("topic", 2)], session_timeout);
+
+    let (_generations, membership) =
+        ConsumerGroupCoordinator::subscribe(&coordinator, &group, sub_a)
+            .expect("sub_a is a member");
+    drop(membership);
+    let disconnected_at = Instant::now();
+    let (_generations, _membership) =
+        ConsumerGroupCoordinator::subscribe(&coordinator, &group, sub_a).expect("sub_a reconnects");
+
+    assert!(
+        coordinator
+            .sweep(disconnected_at + session_timeout * 10)
+            .is_empty()
     );
+    assert_eq!(coordinator.state_of(sub_a), Some(MemberState::Streaming));
+}
 
-    coordinator
-        .state
-        .lock()
-        .unwrap()
-        .get_mut(&group)
-        .unwrap()
-        .members
-        .get_mut(&sub_a)
-        .unwrap()
-        .status = MemberStatus::Unassigned;
+/// A member's lifetime runs from when it entered its current state, not from
+/// its JOIN: a disconnect long after joining still gets its full timeout.
+#[test]
+fn a_disconnected_members_timeout_runs_from_the_disconnect_not_the_join() {
+    let coordinator = coordinator();
+    let group = group_id("gsince");
+    let session_timeout = Duration::from_secs(5);
+    let sub_a = Uuid::new_v4();
+    coordinator.join_member(&group, sub_a, &[topic("topic", 2)], session_timeout);
+    let (_generations, membership) =
+        ConsumerGroupCoordinator::subscribe(&coordinator, &group, sub_a)
+            .expect("sub_a is a member");
+    drop(membership);
+    let disconnected_at = Instant::now();
 
-    // New consumer re-JOINs (clears the Unassigned entry)
-    let sub_b = Uuid::new_v4();
-    let _ = coordinator.join(
-        &group,
-        sub_b,
-        &[topic("topic", 2)],
-        Duration::from_millis(50),
+    assert!(
+        coordinator
+            .sweep(disconnected_at + session_timeout - Duration::from_millis(1))
+            .is_empty()
     );
-
-    // Trigger timer_fired — should find no Unassigned, do nothing
-    coordinator.timer_fired(&group);
-
-    let state = coordinator.state.lock().unwrap();
-    let grp = state.get(&group).expect("group should still exist");
-    assert!(grp.members.contains_key(&sub_b), "sub_b should survive");
+    assert_eq!(
+        coordinator.sweep(disconnected_at + session_timeout).len(),
+        1
+    );
 }
 
 /// A membership change is never lost, whether or not a stream is open.
@@ -372,10 +577,10 @@ fn timer_noop_when_no_unassigned_remain() {
 /// since only the latest assignment is actionable.
 #[test]
 fn an_assignment_published_with_no_stream_open_is_not_lost() {
-    let coordinator = Arc::new(ConsumerGroupCoordinator::new());
+    let coordinator = coordinator();
     let group = group_id("gnostream");
     let sub_a = Uuid::new_v4();
-    coordinator.join(&group, sub_a, &[topic("topic", 4)], Duration::from_secs(30));
+    coordinator.join_member(&group, sub_a, &[topic("topic", 4)], Duration::from_secs(30));
 
     // Subscribing *after* the join, as a real stream does - the assignment was
     // published when nobody was listening. `watch::Sender::send` fails and
@@ -397,10 +602,10 @@ fn an_assignment_published_with_no_stream_open_is_not_lost() {
 /// Several changes in a row collapse to the newest rather than dropping any.
 #[test]
 fn rapid_membership_changes_coalesce_to_the_latest() {
-    let coordinator = Arc::new(ConsumerGroupCoordinator::new());
+    let coordinator = coordinator();
     let group = group_id("gcoalesce");
     let sub_a = Uuid::new_v4();
-    coordinator.join(&group, sub_a, &[topic("topic", 8)], Duration::from_secs(30));
+    coordinator.join_member(&group, sub_a, &[topic("topic", 8)], Duration::from_secs(30));
 
     let (mut generations, _membership) =
         ConsumerGroupCoordinator::subscribe(&coordinator, &group, sub_a)
@@ -408,11 +613,13 @@ fn rapid_membership_changes_coalesce_to_the_latest() {
     generations.borrow_and_update();
 
     // Three siblings join back to back, with nothing reading in between.
-    let mut siblings = Vec::new();
     for _ in 0..3 {
-        let sub = Uuid::new_v4();
-        coordinator.join(&group, sub, &[topic("topic", 8)], Duration::from_secs(30));
-        siblings.push(sub);
+        coordinator.join_member(
+            &group,
+            Uuid::new_v4(),
+            &[topic("topic", 8)],
+            Duration::from_secs(30),
+        );
     }
 
     assert!(

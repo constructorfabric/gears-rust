@@ -8,7 +8,8 @@
 //!
 //! Namespace-to-engine split (design.md D2, corrected mid-design against
 //! DESIGN.md's own "why subscription/group state is ephemeral" invariant):
-//! `subscription` -> `ClusterCacheV1` (session-lifetime, TTL); `cursor`/
+//! routing markers -> `ClusterCacheV1` (subscriptions themselves are not
+//! stored here - they live in `ConsumerGroupCoordinator`); `cursor`/
 //! `consumer_group`/`producer_state` -> `SQLite` (durable). `cursor` and
 //! `producer_sequence` denormalize `tenant_id` from their owning
 //! `consumer_group`/`producer` row at write time, since neither has an
@@ -36,17 +37,29 @@ use crate::domain::ingest::{
     ProducerCursors, ProducerMode, ProducerPartitionCursor, ProducerRecord, ProducerRegistration,
     ProducerRegistry, ProducerResetScope, ProducerTopicCursors,
 };
-use crate::domain::model::{ConsumerGroup, ConsumerGroupKind, Cursor, Subscription};
+use crate::domain::model::{ConsumerGroup, ConsumerGroupKind, Cursor};
 use crate::domain::notify::{DeliveryNotifier, NOTIFICATION_PREFIX};
-use crate::domain::repo::{ConsumerGroupRepo, CursorRepo, SubscriptionRepo};
+use crate::domain::repo::{ConsumerGroupRepo, CursorRepo, RoutingMarkers};
 use crate::domain::specification::SpecificationManager;
 use crate::infra::storage::entity::{consumer_group, cursor, producer, producer_sequence};
 use crate::infra::storage::error::db_err_from_scope;
 
-const SUBSCRIPTION_KEY_PREFIX: &str = "subscription/";
+/// Subscription id -> its consumer group.
+fn subscription_marker_key(id: Uuid) -> String {
+    format!("subscription-group/{id}")
+}
 
-fn subscription_key(id: Uuid) -> String {
-    format!("{SUBSCRIPTION_KEY_PREFIX}{id}")
+/// Consumer group -> the delivery instance that owns it (`DESIGN.md`'s
+/// `evbk.group.endpoint:{consumer_group}` routing cache).
+///
+/// Keyed by the group's deterministic UUID, not its id: a GTS id's `.` and `~`
+/// are outside the cache's key alphabet. The same encoding
+/// `domain::notify::notification_key` uses for a topic.
+fn group_marker_key(group: &GtsInstanceId) -> Result<String, DomainError> {
+    let uuid = gts::GtsId::try_new(group.as_ref())
+        .map_err(|e| DomainError::Internal(format!("consumer group id is not a GTS id: {e}")))?
+        .to_uuid();
+    Ok(format!("group-owner/{uuid}"))
 }
 
 fn kind_to_str(kind: ConsumerGroupKind) -> &'static str {
@@ -127,6 +140,9 @@ pub struct Storage {
     /// traffic reaches it before `serve()` has started (`host_runtime.rs`'s
     /// REST-phase-before-start-phase ordering).
     outbox: OnceLock<Arc<Outbox>>,
+    /// This process's instance id - what a group marker names as the group's
+    /// owner.
+    instance_id: Uuid,
 }
 
 impl Storage {
@@ -134,16 +150,18 @@ impl Storage {
     pub fn new(
         db: Arc<DBProvider<toolkit_db::DbError>>,
         spec_manager: Arc<dyn SpecificationManager>,
+        instance_id: Uuid,
     ) -> Self {
         Self {
             db,
             spec_manager,
             cache: OnceLock::new(),
             outbox: OnceLock::new(),
+            instance_id,
         }
     }
 
-    /// Wires the `subscription` namespace's `ClusterCacheV1` in once
+    /// Wires the routing markers' `ClusterCacheV1` in once
     /// `EventBrokerModule::serve()` has resolved it.
     ///
     /// # Panics
@@ -159,7 +177,7 @@ impl Storage {
     fn cache(&self) -> &ClusterCacheV1 {
         self.cache
             .get()
-            .expect("Storage subscription-namespace access before EventBrokerModule::serve() resolved the cluster cache")
+            .expect("Storage cluster-cache access before EventBrokerModule::serve() resolved it")
     }
 
     /// Wires the ingest outbox pipeline in once `EventBrokerModule::serve()`
@@ -242,26 +260,6 @@ impl ConsumerGroupRepo for Storage {
             .exec(&conn)
             .await?;
         Ok(())
-    }
-
-    async fn has_active_members(&self, id: &GtsInstanceId) -> Result<bool, DomainError> {
-        let keys = self.cache().scan_prefix(SUBSCRIPTION_KEY_PREFIX).await?;
-        for key in keys {
-            let Some(entry) = self.cache().get(&key).await? else {
-                continue;
-            };
-            let subscription: Subscription = match serde_json::from_slice(&entry.value) {
-                Ok(s) => s,
-                Err(err) => {
-                    tracing::warn!(%err, key, "failed to deserialize cached subscription");
-                    continue;
-                }
-            };
-            if &subscription.consumer_group == id {
-                return Ok(true);
-            }
-        }
-        Ok(false)
     }
 }
 
@@ -685,58 +683,44 @@ impl Storage {
 }
 
 #[async_trait]
-impl SubscriptionRepo for Storage {
-    async fn find_subscription(&self, id: Uuid) -> Result<Option<Subscription>, DomainError> {
-        let Some(entry) = self.cache().get(&subscription_key(id)).await? else {
-            return Ok(None);
-        };
-        let subscription: Subscription = serde_json::from_slice(&entry.value).map_err(|e| {
-            DomainError::Internal(format!("failed to deserialize cached subscription: {e}"))
-        })?;
-        Ok(Some(subscription))
-    }
-
-    /// Full scan (`scan_prefix` + per-key `get`), matching
-    /// `InMemoryDomainRepo`'s own full-`Vec`-scan complexity today - not a
-    /// regression, since `Subscription` was already an unindexed in-memory
-    /// collection before this change (eb-single-process-implementation
-    /// task 4.2).
-    async fn list_subscriptions(&self) -> Result<Vec<Subscription>, DomainError> {
-        let keys = self.cache().scan_prefix(SUBSCRIPTION_KEY_PREFIX).await?;
-        let mut subscriptions = Vec::with_capacity(keys.len());
-        for key in keys {
-            let Some(entry) = self.cache().get(&key).await? else {
-                continue;
-            };
-            match serde_json::from_slice::<Subscription>(&entry.value) {
-                Ok(subscription) => subscriptions.push(subscription),
-                Err(err) => {
-                    tracing::warn!(%err, key, "failed to deserialize cached subscription");
-                }
-            }
-        }
-        Ok(subscriptions)
-    }
-
-    async fn put_subscription(&self, subscription: &Subscription) -> Result<(), DomainError> {
-        let value = serde_json::to_vec(subscription)
-            .map_err(|e| DomainError::Internal(format!("failed to serialize subscription: {e}")))?;
-        // TTL matches the subscription's own session_timeout (design.md D2) -
-        // an expired-but-not-yet-reaped subscription simply falls out of the
-        // cache on its own; the reaper worker's job is idempotency-key
-        // cleanup and any earlier explicit-delete path, not this TTL.
+impl RoutingMarkers for Storage {
+    async fn mark_subscription(
+        &self,
+        subscription_id: Uuid,
+        group: &GtsInstanceId,
+    ) -> Result<(), DomainError> {
+        // Indefinite: a marker is removed with the member it points at, never
+        // aged out from under a member that is still here.
         self.cache()
             .put(PutRequest {
-                key: &subscription_key(subscription.id),
-                value: &value,
-                ttl: Ttl::Of(subscription.session_timeout),
+                key: &subscription_marker_key(subscription_id),
+                value: group.as_ref().as_bytes(),
+                ttl: Ttl::Indefinite,
             })
             .await?;
         Ok(())
     }
 
-    async fn delete_subscription(&self, id: Uuid) -> Result<(), DomainError> {
-        self.cache().delete(&subscription_key(id)).await?;
+    async fn unmark_subscription(&self, subscription_id: Uuid) -> Result<(), DomainError> {
+        self.cache()
+            .delete(&subscription_marker_key(subscription_id))
+            .await?;
+        Ok(())
+    }
+
+    async fn mark_group(&self, group: &GtsInstanceId) -> Result<(), DomainError> {
+        self.cache()
+            .put(PutRequest {
+                key: &group_marker_key(group)?,
+                value: self.instance_id.to_string().as_bytes(),
+                ttl: Ttl::Indefinite,
+            })
+            .await?;
+        Ok(())
+    }
+
+    async fn unmark_group(&self, group: &GtsInstanceId) -> Result<(), DomainError> {
+        self.cache().delete(&group_marker_key(group)?).await?;
         Ok(())
     }
 }
@@ -748,8 +732,10 @@ mod tests {
     use types_registry_sdk::testing::{MockTypesRegistryClient, make_test_instance};
 
     use super::*;
+
+    const TEST_INSTANCE_ID: Uuid = Uuid::from_u128(0x5eed);
     use crate::domain::idempotency::ProducerChainCheck;
-    use crate::domain::model::{BarrierMode, ConsumerGroupKind, Interest, TenantTraversalDepth};
+    use crate::domain::model::ConsumerGroupKind;
     use crate::infra::specification::TypesRegistrySpecificationManager;
     use crate::infra::storage::migrations::Migrator;
 
@@ -835,7 +821,7 @@ mod tests {
             .expect("cluster resolves")
             .cache;
 
-        let storage = Storage::new(Arc::clone(&db), Arc::new(spec_manager));
+        let storage = Storage::new(Arc::clone(&db), Arc::new(spec_manager), TEST_INSTANCE_ID);
         storage.set_cache(cache);
 
         // `check_and_enqueue` needs a started outbox pipeline to insert
@@ -979,7 +965,7 @@ mod tests {
         let spec_manager = TypesRegistrySpecificationManager::new(Arc::clone(&db));
         // No `set_outbox`: exactly the state `Storage` is in between `init()`
         // and `serve()`.
-        let storage = Storage::new(db, Arc::new(spec_manager));
+        let storage = Storage::new(db, Arc::new(spec_manager), TEST_INSTANCE_ID);
 
         let err = storage
             .check_and_enqueue(
@@ -1048,60 +1034,36 @@ mod tests {
         );
     }
 
+    /// A subscription marker names the subscription's group, is removed on
+    /// unmark, and carries no TTL - it lives exactly as long as the member.
     #[tokio::test]
-    async fn has_active_members_reflects_a_live_subscription() {
+    async fn subscription_marker_round_trip() {
         let storage = test_storage().await;
-        let tenant_id = Uuid::new_v4();
-        let group = test_consumer_group(
+        let id = Uuid::new_v4();
+        let group = GtsInstanceId::try_new(
             "gts.cf.core.events.consumer_group.v1~example.eb.storage.cg2.v1",
-            tenant_id,
-        );
+        )
+        .unwrap();
+        let key = subscription_marker_key(id);
+        assert!(storage.cache().get(&key).await.expect("get").is_none());
+
         storage
-            .create_consumer_group(group.clone())
+            .mark_subscription(id, &group)
             .await
-            .expect("create must succeed");
+            .expect("mark must succeed");
+        let entry = storage
+            .cache()
+            .get(&key)
+            .await
+            .expect("get")
+            .expect("the marker must exist");
+        assert_eq!(entry.value, group.as_ref().as_bytes());
 
-        assert!(
-            !storage
-                .has_active_members(&group.id)
-                .await
-                .expect("has_active_members must succeed"),
-            "no subscription exists yet"
-        );
-
-        let subscription = Subscription {
-            id: Uuid::new_v4(),
-            tenant_id,
-            consumer_group: group.id.clone(),
-            client_agent: "test-agent".to_owned(),
-            interests: vec![Interest {
-                topic: GtsInstanceId::try_new(TOPIC_ID).unwrap(),
-                tenant_id,
-                depth: TenantTraversalDepth::CurrentTenant,
-                barrier_mode: BarrierMode::Respect,
-                types: vec![],
-                filter: None,
-            }],
-            topics: vec![GtsInstanceId::try_new(TOPIC_ID).unwrap()],
-            assigned: vec![],
-            topology_version: 1,
-            session_timeout: std::time::Duration::from_secs(30),
-            last_seen_at: Utc::now(),
-            expires_at: Utc::now() + chrono::Duration::seconds(30),
-            created_at: Utc::now(),
-        };
         storage
-            .put_subscription(&subscription)
+            .unmark_subscription(id)
             .await
-            .expect("put_subscription must succeed");
-
-        assert!(
-            storage
-                .has_active_members(&group.id)
-                .await
-                .expect("has_active_members must succeed"),
-            "a live subscription now belongs to this group"
-        );
+            .expect("unmark must succeed");
+        assert!(storage.cache().get(&key).await.expect("get").is_none());
     }
 
     #[tokio::test]
@@ -1165,58 +1127,30 @@ mod tests {
         );
     }
 
+    /// A group marker names this instance as the group's owner.
     #[tokio::test]
-    async fn subscription_find_put_delete_round_trip() {
+    async fn group_marker_names_this_instance() {
         let storage = test_storage().await;
-        let id = Uuid::new_v4();
-        assert!(
-            storage
-                .find_subscription(id)
-                .await
-                .expect("find must succeed")
-                .is_none()
-        );
+        let group = GtsInstanceId::try_new(
+            "gts.cf.core.events.consumer_group.v1~example.eb.storage.cg4.v1",
+        )
+        .unwrap();
+        let key = group_marker_key(&group).expect("a consumer group id is a GTS id");
 
-        let subscription = Subscription {
-            id,
-            tenant_id: Uuid::new_v4(),
-            consumer_group: GtsInstanceId::try_new(
-                "gts.cf.core.events.consumer_group.v1~example.eb.storage.cg4.v1",
-            )
-            .unwrap(),
-            client_agent: "test-agent".to_owned(),
-            interests: vec![],
-            topics: vec![],
-            assigned: vec![],
-            topology_version: 1,
-            session_timeout: std::time::Duration::from_secs(30),
-            last_seen_at: Utc::now(),
-            expires_at: Utc::now() + chrono::Duration::seconds(30),
-            created_at: Utc::now(),
-        };
-        storage
-            .put_subscription(&subscription)
+        storage.mark_group(&group).await.expect("mark must succeed");
+        let entry = storage
+            .cache()
+            .get(&key)
             .await
-            .expect("put must succeed");
-
-        let found = storage
-            .find_subscription(id)
-            .await
-            .expect("find must succeed")
-            .expect("subscription must exist");
-        assert_eq!(found.client_agent, "test-agent");
+            .expect("get")
+            .expect("the marker must exist");
+        assert_eq!(entry.value, TEST_INSTANCE_ID.to_string().as_bytes());
 
         storage
-            .delete_subscription(id)
+            .unmark_group(&group)
             .await
-            .expect("delete must succeed");
-        assert!(
-            storage
-                .find_subscription(id)
-                .await
-                .expect("find after delete must succeed")
-                .is_none()
-        );
+            .expect("unmark must succeed");
+        assert!(storage.cache().get(&key).await.expect("get").is_none());
     }
 
     #[tokio::test]

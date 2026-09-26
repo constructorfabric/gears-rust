@@ -121,7 +121,6 @@ pub struct AssignedPartition {
 pub struct SubscriptionAssignment {
     pub subscription_id: SubscriptionId,
     pub topology_version: i64,
-    pub expires_at: chrono::DateTime<chrono::Utc>,
     pub assigned: Vec<AssignedPartition>,
 }
 

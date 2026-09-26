@@ -120,6 +120,11 @@ pub struct EventBrokerModule {
     /// delivery service so a session can attach readers, and `serve()` hands it
     /// to the loader so those readers get filled.
     topics: OnceLock<Arc<crate::infra::loader::topics::TopicManager>>,
+    /// This instance's consumer groups and the subscriptions in them. Built in
+    /// `init` for the same reason as `topics`: `register_rest` hands it to the
+    /// delivery service and `serve` hands it to the sweeper, and two would be
+    /// two disjoint sets of members.
+    groups: OnceLock<Arc<crate::domain::consumer_group_coordinator::ConsumerGroupCoordinator>>,
     /// The whole operator config, kept because the retention worker needs two
     /// parts of it that no other collaborator does: the per-topic settings map
     /// and the deployment's default backend name, which together decide what
@@ -130,7 +135,7 @@ pub struct EventBrokerModule {
     /// `init()` alongside `spec_manager` from the backend plugin's provider,
     /// read by `register_rest()`.
     backend_resolver: OnceLock<Arc<dyn crate::domain::backend::BackendResolver>>,
-    /// The real `Storage` (`ConsumerGroupRepo`/`CursorRepo`/`SubscriptionRepo`/
+    /// The real `Storage` (`ConsumerGroupRepo`/`CursorRepo`/`RoutingMarkers`/
     /// `IdempotencyGuard`/`ProducerRegistry`/`ActiveStreamMarker`) -
     /// `InMemoryDomainRepo`'s permanent replacement (eb-single-process-
     /// implementation D2 risk mitigation). Built in `init()`, read by
@@ -192,6 +197,13 @@ impl Gear for EventBrokerModule {
             .map_err(|_| anyhow::anyhow!("{} module already initialized", Self::MODULE_NAME))?;
         self.loader
             .set(cfg.loader)
+            .map_err(|_| anyhow::anyhow!("{} module already initialized", Self::MODULE_NAME))?;
+        self.groups
+            .set(Arc::new(
+                crate::domain::consumer_group_coordinator::ConsumerGroupCoordinator::new(
+                    std::time::Duration::from_secs(u64::from(cfg.subscription.join_timeout_secs)),
+                ),
+            ))
             .map_err(|_| anyhow::anyhow!("{} module already initialized", Self::MODULE_NAME))?;
 
         // `DatabaseCapability::migrations()` has already run by this point
@@ -259,7 +271,7 @@ impl Gear for EventBrokerModule {
 
         // eb-single-process-implementation D2 risk mitigation: the real
         // `Storage`, wired against the same `db` and `spec_manager`. Its
-        // `ClusterCacheV1` (backing the ephemeral `subscription` namespace)
+        // `ClusterCacheV1` (backing the routing markers)
         // is deliberately NOT resolved here - `ClusterGear` only registers
         // its backends into the `ClientHub` during the platform's *start*
         // phase, which runs after every gear's `init()`
@@ -269,7 +281,11 @@ impl Gear for EventBrokerModule {
         // standalone binary, since every test wires the cluster cache
         // directly, bypassing this ordering constraint entirely).
         self.storage
-            .set(Arc::new(Storage::new(db, Arc::clone(&spec_manager))))
+            .set(Arc::new(Storage::new(
+                db,
+                Arc::clone(&spec_manager),
+                ctx.instance_id(),
+            )))
             .map_err(|_| anyhow::anyhow!("{} module already initialized", Self::MODULE_NAME))?;
 
         tracing::info!(
@@ -368,6 +384,11 @@ impl RestApiCapability for EventBrokerModule {
                 .get()
                 .ok_or_else(|| anyhow::anyhow!("init must run before register_rest()"))?
                 .clone();
+            let groups = self
+                .groups
+                .get()
+                .ok_or_else(|| anyhow::anyhow!("init must run before register_rest()"))?
+                .clone();
             // The production heartbeat is the configured whole-second knob; the
             // `Duration` arg exists only so a test harness can run it faster.
             let heartbeat =
@@ -378,6 +399,7 @@ impl RestApiCapability for EventBrokerModule {
                 spec_manager,
                 backend_resolver,
                 topics,
+                groups,
                 // Process-local: a group is owned by one delivery instance, so
                 // stream exclusion needs no storage and no coordination.
                 Arc::new(crate::domain::streaming::lease::InProcessStreamLeases::new()),
@@ -498,6 +520,7 @@ impl EventBrokerModule {
         // so a loader there would fetch for readers that cannot exist.
         if mode.delivery_active() {
             self.start_loader(sup)?;
+            self.start_subscription_sweeper(sup)?;
         }
 
         // Wherever events are stored: an instance that holds rows is the one
@@ -647,6 +670,27 @@ impl EventBrokerModule {
         let token = sup.cancel().clone();
         sup.spawn("retention", async move {
             worker.run(token).await;
+            Ok(())
+        });
+        Ok(())
+    }
+
+    /// Registers the sweeper that reaps subscriptions past their state's
+    /// lifetime, running until the child token fires.
+    fn start_subscription_sweeper(&self, sup: &mut Supervisor) -> anyhow::Result<()> {
+        let groups = self
+            .groups
+            .get()
+            .ok_or_else(|| anyhow::anyhow!("init must run before serve()"))?
+            .clone();
+        let markers: Arc<dyn crate::domain::repo::RoutingMarkers> = self
+            .storage
+            .get()
+            .ok_or_else(|| anyhow::anyhow!("init must run before serve()"))?
+            .clone();
+        let token = sup.cancel().clone();
+        sup.spawn("subscription-sweeper", async move {
+            crate::domain::consumer_group_coordinator::sweeper::run(groups, markers, token).await;
             Ok(())
         });
         Ok(())

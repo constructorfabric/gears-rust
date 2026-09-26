@@ -62,7 +62,7 @@ use uuid::Uuid;
 
 use event_broker::domain::consumer_group_coordinator::{ConsumerGroupCoordinator, TopicInterest};
 use event_broker::domain::model::{
-    Assignment, BarrierMode, Cursor, Event, Interest, Sequence, TenantTraversalDepth,
+    Assignment, BarrierMode, Cursor, Event, Interest, Sequence, Subscription, TenantTraversalDepth,
 };
 use event_broker::domain::streaming::filter::{EventFilter, InterestFilter};
 use event_broker::domain::streaming::frames::Frame;
@@ -430,17 +430,27 @@ fn open_session(
         Uuid::new_v4()
     ))
     .expect("a uuid instance part is a valid consumer group id");
+    let interests: Vec<TopicInterest> = keys
+        .iter()
+        .map(|key| TopicInterest {
+            id: key.topic.clone(),
+            partitions: i32::try_from(profile.partitions_per_topic).unwrap_or(i32::MAX),
+        })
+        .collect();
     groups.join(
-        &group,
-        subscription_id,
-        &keys
-            .iter()
-            .map(|key| TopicInterest {
-                id: key.topic.clone(),
-                partitions: i32::try_from(profile.partitions_per_topic).unwrap_or(i32::MAX),
-            })
-            .collect::<Vec<_>>(),
-        Duration::from_mins(5),
+        Subscription {
+            id: subscription_id,
+            tenant_id: Uuid::nil(),
+            consumer_group: group.clone(),
+            client_agent: "bench".to_owned(),
+            interests: Vec::new(),
+            topics: interests.iter().map(|t| t.id.clone()).collect(),
+            assigned: Vec::new(),
+            topology_version: 0,
+            session_timeout: Duration::from_mins(5),
+            created_at: Utc::now(),
+        },
+        &interests,
     );
     let (generations, membership) =
         ConsumerGroupCoordinator::subscribe(groups, &group, subscription_id)
@@ -827,7 +837,7 @@ async fn run_once(profile: FanOutProfile) -> Outcome {
 
     let starts = group_starts(profile);
     let leases = Arc::new(InProcessStreamLeases::new());
-    let groups = Arc::new(ConsumerGroupCoordinator::new());
+    let groups = Arc::new(ConsumerGroupCoordinator::new(Duration::from_mins(5)));
     let mut expected: u64 = 0;
     let mut sessions = Vec::with_capacity(profile.groups);
     for (group, start) in starts.iter().copied().enumerate() {

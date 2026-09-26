@@ -357,7 +357,6 @@ impl TryFrom<DomainSubscription> for Subscription {
                 })
                 .collect(),
             topology_version: sub.topology_version,
-            expires_at: sub.expires_at,
             created_at: sub.created_at,
         })
     }
@@ -371,7 +370,6 @@ impl From<DomainSubscription> for SubscriptionAssignment {
         SubscriptionAssignment {
             subscription_id: SubscriptionId(sub.id),
             topology_version: sub.topology_version,
-            expires_at: sub.expires_at,
             assigned: sub
                 .assigned
                 .into_iter()

@@ -1047,19 +1047,18 @@ async fn verify_gap_free_and_final_state(
             .expect("get subscription");
         assert_eq!(resp.status(), 200);
         let body = resp.json::<Value>().await.expect("subscription json");
-        let expires_at = body["expires_at"].clone();
         let created_at = body["created_at"].clone();
         // `notify_members` sends NO frame at all when a rebalance leaves a
         // member's own assigned set unchanged (`if new_set == old_set {
         // continue; }` in consumer_group_coordinator/mod.rs) - but
-        // `join()`'s sibling-persistence loop still bumps that member's DB
-        // `topology_version` to the new value regardless. So a member whose
+        // every rebalance still bumps that member's stored `topology_version`
+        // to the new value regardless. So a member whose
         // OWN assignment never changes across a LATER, unrelated rebalance
-        // ends up with a DB `topology_version` ahead of anything its own
+        // ends up with a stored `topology_version` ahead of anything its own
         // stream was ever told about via a frame - the spec's own
         // "topology_version bumped, assigned set unchanged" case (which it
         // says must still emit a non-terminal topology frame) isn't
-        // actually implemented. Tracking this in the DB only, silently, is
+        // actually implemented. Tracking this in stored state only, silently, is
         // why `topology_version` here is read from the response rather
         // than asserted against what frames told this test - it's real
         // server state this test cannot predict without also modeling
@@ -1067,7 +1066,7 @@ async fn verify_gap_free_and_final_state(
         let actual_topology_version = body["topology_version"].as_i64().expect("topology_version");
         assert!(
             actual_topology_version >= m.topology_version,
-            "{}'s DB topology_version ({actual_topology_version}) must never be BEHIND what its own \
+            "{}'s stored topology_version ({actual_topology_version}) must never be BEHIND what its own \
              frames reported ({})",
             m.client_agent,
             m.topology_version
@@ -1094,7 +1093,6 @@ async fn verify_gap_free_and_final_state(
                     .collect::<Vec<_>>(),
                 "topology_version": actual_topology_version,
                 "created_at": created_at,
-                "expires_at": expires_at,
             }),
             "final subscription state mismatch for {}",
             m.client_agent

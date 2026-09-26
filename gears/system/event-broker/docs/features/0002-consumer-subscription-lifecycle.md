@@ -285,7 +285,7 @@ async def reaper_loop():
     while True:
         await sleep(5)
         for sub in state.subscriptions.values():
-            if sub.expires_at < now():
+            if sub.session_timeout_lapsed():
                 remove_member(sub.group, sub.id, reason="session_timeout")
 ```
 
@@ -313,12 +313,12 @@ def deliver_to_member(member, raw_events):
 ### 2.7 Session timeout (heartbeat-via-poll)
 
 ```python
-# Each poll arrival refreshes the subscription's expires_at
+# Each poll arrival restarts the subscription's session_timeout window
 def on_poll_arrival(sub_id):
     sub = state.subscriptions[sub_id]
-    sub.expires_at = now() + sub.session_timeout       # heartbeat-via-poll
+    sub.restart_session_window()                       # heartbeat-via-poll
 
-# Reaper (see §2.5) deletes subs past expires_at and triggers rebalance.
+# Reaper (see §2.5) deletes subs whose session_timeout lapsed and triggers rebalance.
 # Consumer's next poll after the reap returns 404 SubscriptionNotFound;
 # consumer re-JOINs per §2.3.
 
@@ -380,7 +380,7 @@ A subscription carries a `created_at` timestamp set at JOIN. `GET /v1/subscripti
 - `GroupState` carries per-member filters / topic lists; rebalance respects them.
 - `cursor.offset` is updated atomically via cache CAS (compare-and-swap with `>=` semantics — forward-only during streaming; the SEEK endpoint accepts any valid range pre-stream).
 - `topology_version` is exposed on every poll response.
-- Reaper removes subscriptions past `expires_at` and triggers rebalance.
+- Reaper removes subscriptions whose `session_timeout` lapsed and triggers rebalance.
 - The eight flows above are implemented end-to-end and visible through `evbk_*` metrics.
 
 ## 6. Acceptance Criteria

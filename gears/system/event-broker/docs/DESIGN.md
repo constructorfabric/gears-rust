@@ -288,8 +288,6 @@ classDiagram
         +List~String~ topics (GTS Identifiers)
         +List~Assignment~ assigned
         +Duration session_timeout
-        +Timestamp last_seen_at
-        +Timestamp expires_at
     }
     class Assignment {
         +String topic (GTS Identifier)
@@ -340,7 +338,7 @@ classDiagram
   - **Named groups**: caller MUST hold an explicit `consume` permission on the concrete GTS instance via the `authz-resolver` PEP (e.g., `gts.cf.core.events.consumer_group.v1~vendor.audit-processor.v1:consume`). No tenant-equality short-circuit — named groups are first-class platform resources gated by explicit grants. This is the path for legitimate cross-tenant or cross-module shared consumption: the platform / operator grants `consume` to specific principals, and they can JOIN.
   
   This structurally eliminates the cross-tenant accidental-collision bug R52 flagged: anonymous groups are tenant-bound at creation; named groups require explicit permission. The "first JOIN claims it" race condition is gone.
-- **GroupState**: The runtime state of a consumer group. **Ephemeral**, lives in the cache, keyed by the consumer_group GTS identifier (the string alone — no topic, no tenant). Holds active subscriptions and their per-member topic lists and filters, partition assignments per `(topic, partition)`, topology version, and the owning delivery instance endpoint. **Each member can have its own topic subset and filter set** — there is no canonical topic list or canonical filter at the group level (see "Per-Member Subscriptions" below). The group's TTL is the max `last_seen_at + session_timeout` across active members; an empty group is reaped.
+- **GroupState**: The runtime state of a consumer group. **Ephemeral**, lives in the cache, keyed by the consumer_group GTS identifier (the string alone — no topic, no tenant). Holds active subscriptions and their per-member topic lists and filters, partition assignments per `(topic, partition)`, topology version, and the owning delivery instance endpoint. **Each member can have its own topic subset and filter set** — there is no canonical topic list or canonical filter at the group level (see "Per-Member Subscriptions" below). The group lives as long as its longest-lived active member; an empty group is reaped.
 - **Cursor**: Group-scoped offset tracking, held in cache. Keyed by `(consumer_group, topic, partition)`. Stores `offset` (session cursor set by SEEK; broker emits from offset+1) and `last_examined` (offset adviser, see R57). Survives subscription churn, delivery instance failover, and group emptiness. **`topic` is in the key for partition disambiguation only** (a partition number is meaningless without saying "of which topic") — `topic` is NOT part of group identity.
 
 **Sequence scope** is `(topic, partition)` — sequence numbers are globally unique within `(topic, partition)`, regardless of tenant. Topic GTS identifiers are globally unique by construction (vendor-namespaced).
@@ -355,7 +353,7 @@ classDiagram
 - During a rolling deploy where v1 (filters F1) and v2 (filters F2) coexist, partitions migrate organically; the **single-consumer-per-partition invariant** ensures no partition is ever processed by two filters simultaneously, but at the moment of partition handover the cursor reflects the previous owner's processing position. This is documented as accepted rollout behavior (see R60).
 - Operators wanting strict atomic semantics (no overlap of filter generations) use a hard-stop deploy (drain v1, deploy v2 — orchestrated via k8s or similar)
 
-**Why subscription/group state is ephemeral**: subscription columns (`last_seen_at`, `expires_at`, `id`, `session_timeout`, plus per-member `topics` and `filters`) are session-lifetime data; nothing about a subscription needs to outlive the consumer process. Keeping this state in the DB would create write churn on every JOIN/POLL/expire for no persistence value. Cache-based state makes JOIN/POLL/ACK primarily in-memory operations and keeps the cursor (the only persistent piece) correctly group-scoped.
+**Why subscription/group state is ephemeral**: subscription columns (`id`, `session_timeout`, plus per-member `topics` and `filters`) are session-lifetime data; nothing about a subscription needs to outlive the consumer process. Keeping this state in the DB would create write churn on every JOIN/POLL/expire for no persistence value. Cache-based state makes JOIN/POLL/ACK primarily in-memory operations and keeps the cursor (the only persistent piece) correctly group-scoped.
 
 #### Topic Schema
 
@@ -490,9 +488,7 @@ The schema is the wire shape returned by `POST /v1/subscriptions` and the cache 
   - `filter` (Object optional) — consolidated per-interest filter with required `engine` (GTS identifier of filter engine) and `expression` (engine-specific source string, ≤4096 bytes). Absent means no filter. Replaces the former flat paired-optional `expression_type` + `expression` fields.
   Per ADR-0005. Different members of the same group MAY declare different `interests[]` sets (rolling-deploy preserved by construction).
 - `assigned` (Array of `{topic, partition}` pairs): Subset of the group's `(topic, partition)` pairs assigned to this subscription by the rebalance algorithm. Computed at JOIN and updated on every topology change. Topic-centric; matches the existing seek mechanics. The topic set is the union of `interest.topic` values across all interests (broker doesn't derive topics — they're explicit on the wire).
-- `session_timeout` (String, ISO 8601 Duration): TTL refreshed on every poll/seek (default: `PT30S`).
-- `last_seen_at` (String, ISO 8601): Last poll/seek activity timestamp.
-- `expires_at` (String, ISO 8601): Current expiry timestamp (= `last_seen_at + session_timeout`).
+- `session_timeout` (String, ISO 8601 Duration): how long the subscription survives a dropped stream before it is reaped (default: `PT30S`). The resulting expiry is internal and not exposed.
 - `created_at` (String, ISO 8601): When the subscription was created (at JOIN). The stable sort key for `GET /v1/subscriptions`, which returns subscriptions newest-first (`created_at` descending, `id` as tiebreaker).
 - (cache-internal, not on the wire) `compiled_interests` — for each interest, the resolved concrete-type-set and the optional compiled `FilterEngine` handle. Lifetime = subscription. Evicted with the subscription on `session_timeout`.
 
@@ -512,7 +508,7 @@ Fields:
 
 **No canonical topic list, no canonical filter at the group level.** Each member's `topics` and `filters` apply to that member alone. The group's effective topic set is the union across active members; partition assignment respects per-member topic subscriptions. See "Per-Member Subscriptions" in §3.1 entity descriptions.
 
-TTL: `max(member.expires_at)` across active members. An empty group is reaped immediately. Cursor state lives in the runtime cache for active subscription sessions (see "Cursor Schema" below).
+TTL: the longest remaining `session_timeout` window across active members. An empty group is reaped immediately. Cursor state lives in the runtime cache for active subscription sessions (see "Cursor Schema" below).
 
 #### Cursor Schema (Ephemeral, In-Cache, Group-Scoped)
 
@@ -719,8 +715,8 @@ The dispatcher routes requests with `subscription_id` only — no `consumer_grou
 ```
 Cache 1 — Subscription Resolution:
   Key:    evbk.subscription:{subscription_id}
-  Value:  { consumer_group, ...meta (topology_version, etc.) }
-  TTL:    session_timeout (refreshed on every poll/seek)
+  Value:  consumer_group
+  TTL:    none - removed when the subscription is reaped or leaves
 
 Cache 2 — Group Endpoint:
   Key:    evbk.group.endpoint:{consumer_group}
@@ -755,11 +751,11 @@ Holds active members (each with their own topic list and filters), partition ass
 ```
 Cache key:    evbk.group.{consumer_group}
 Value:        GroupState (see §3.1 schema)
-TTL:          max(member.expires_at) across active_members; auto-reaped when empty
+TTL:          longest remaining session_timeout window across active_members; auto-reaped when empty
 Lock:         evbk.group.{consumer_group}.rebalance
 ```
 
-Dead-member eviction (standalone mode): stream disconnects are detected immediately via `Sender::closed().await` (fires the instant the HTTP connection drops, with no polling). Partitions are marked `Unassigned` and a one-shot timer is armed for `session_timeout`. When the timer fires, remaining `Unassigned` partitions are redistributed to surviving members (same rebalance path as LEAVE). If the consumer reconnects and re-JOINs before the timer fires, the new JOIN evicts the `Unassigned` entry and the timer exits without action. No periodic background scan is needed.
+Member lifecycle: subscriptions live in the owning delivery instance's memory, never in the cluster cache, which holds only routing markers (subscription -> group, group -> owning instance). Each member is `Joined` (joined, no stream yet), `Streaming`, or `Disconnected` (its stream dropped - detected the instant the connection closes). `Joined` lives at most `subscription.join_timeout_secs` (default 60); `Disconnected` lives at most the member's own `session_timeout`, holding its partitions meanwhile so a reconnect resumes without a rebalance; `Streaming` has no limit. A per-instance sweep (every second) reaps members past their state's lifetime and redistributes their partitions (same rebalance path as LEAVE). A new JOIN evicts the group's `Disconnected` members.
 
 The cache is replicated/shared via ClusterCapabilities (concrete provider varies — Redis, K8s ConfigMap+watch, Postgres LISTEN+UNLISTEN, NATS KV, in-memory for standalone). Required primitives:
 
@@ -1179,9 +1175,9 @@ For the full normative surface — wire shapes, registration ergonomics, mode-sh
 Subscriptions are session-lifetime resources with session-timeout-based expiry:
 
 1. `POST /v1/subscriptions` creates a subscription with `interests[]` (topic-anchored typed-filter selections per [ADR-0005](ADR/0005-subscription-filter-typing.md)) and `session_timeout`. JOIN validation is all-or-nothing — see ADR-0005 § JOIN Validation Order.
-2. `expires_at = now() + session_timeout` set on creation.
-3. Each poll with `subscription_id` refreshes: `last_seen_at = now()`, `expires_at = now() + session_timeout`.
-4. Subscriptions not polled within `session_timeout` become eligible for cleanup by the Reaper worker (which also evicts the compiled-filter handles).
+2. The subscription must open its stream within `subscription.join_timeout_secs` (default 60) or it is reaped.
+3. Once streaming it is never reaped; when its stream drops it has `session_timeout` to reconnect.
+4. The per-instance sweep reaps a subscription past either limit (which also evicts the compiled-filter handles).
 
 Consumer progress is tracked by the consumer via SEEK (`POST /v1/subscriptions/{id}:seek`), not by a broker-side ACK. See [ADR-0006](ADR/0006-offset-authority.md).
 
@@ -1813,7 +1809,6 @@ POST   /v1/subscriptions                          # JOIN
        Returns 201:
          id:               <uuid>
          topology_version: <i64>
-         expires_at:       <datetime>
          assigned:         [{topic, partition}, ...]  # topic+partition only; no offsets in assignment
 
 POST   /v1/subscriptions/{id}:seek               # SEEK (pre-stream, required before first stream open)
@@ -1853,7 +1848,7 @@ GET    /v1/subscriptions                         # LIST — OData-filterable pag
                                                  # Ordered newest-first (created_at desc, id tiebreaker).
        Returns 200:
          items:      [{ id, consumer_group, assigned: [{topic,partition}],
-                        topology_version, created_at, expires_at }]
+                        topology_version, created_at }]
          page_info:  { next_cursor, prev_cursor, limit }
 
 GET    /v1/subscriptions/{id}                    # READ — single subscription by id
@@ -1863,7 +1858,6 @@ GET    /v1/subscriptions/{id}                    # READ — single subscription 
          assigned:         [{topic, partition}, ...]
          topology_version: <i64>
          created_at:       <datetime>
-         expires_at:       <datetime>
 ```
 
 **Consumer group identifier**: `consumer_group` is **required** and must be a GTS identifier conforming to `gts.cf.core.events.consumer_group.v1~`. Two patterns:

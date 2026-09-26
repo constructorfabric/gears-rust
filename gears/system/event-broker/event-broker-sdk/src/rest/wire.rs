@@ -387,7 +387,6 @@ pub(crate) struct SubscriptionWire {
     pub interests: Vec<InterestResponseWire>,
     pub assigned: Vec<AssignedPartitionWire>,
     pub topology_version: i64,
-    pub expires_at: chrono::DateTime<chrono::Utc>,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 

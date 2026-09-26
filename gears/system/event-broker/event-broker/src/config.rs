@@ -146,6 +146,10 @@ pub struct SubscriptionConfig {
     /// config-loading implementation, not this skeleton.
     pub default_session_timeout: String,
     pub min_session_timeout: String,
+    /// How long a subscription may sit joined without ever opening a stream
+    /// before it is reaped. Default 60.
+    #[serde(deserialize_with = "deserialize_nonzero_secs")]
+    pub join_timeout_secs: u32,
 }
 
 impl Default for SubscriptionConfig {
@@ -153,6 +157,7 @@ impl Default for SubscriptionConfig {
         Self {
             default_session_timeout: "PT30S".to_owned(),
             min_session_timeout: "PT1S".to_owned(),
+            join_timeout_secs: 60,
         }
     }
 }

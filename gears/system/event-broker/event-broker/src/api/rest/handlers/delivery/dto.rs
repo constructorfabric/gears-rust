@@ -432,7 +432,6 @@ pub struct SubscriptionDto {
     pub assigned: Vec<AssignedPartitionDto>,
     pub topology_version: i64,
     pub created_at: DateTime<Utc>,
-    pub expires_at: DateTime<Utc>,
 }
 
 impl From<Subscription> for SubscriptionDto {
@@ -453,7 +452,6 @@ impl From<Subscription> for SubscriptionDto {
                 .collect(),
             topology_version: s.topology_version,
             created_at: s.created_at,
-            expires_at: s.expires_at,
         }
     }
 }

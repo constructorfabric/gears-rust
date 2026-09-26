@@ -253,10 +253,10 @@ pub struct Interest {
     pub filter: Option<FilterSpec>,
 }
 
-/// `gts.cf.core.events.subscription.v1~` - ephemeral, in-cache consumer
-/// instance.
+/// `gts.cf.core.events.subscription.v1~` - ephemeral consumer instance, held in
+/// memory by the `ConsumerGroupCoordinator` of the instance that owns its group.
 #[domain_model]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct Subscription {
     pub id: Uuid,
     pub tenant_id: Uuid,
@@ -266,19 +266,11 @@ pub struct Subscription {
     pub topics: Vec<GtsInstanceId>,
     pub assigned: Vec<Assignment>,
     /// Monotonically increasing per group; set by `ConsumerGroupCoordinator`
-    /// on each JOIN or LEAVE that changes the partition assignment.
-    #[serde(default)]
+    /// on every rebalance of the group.
     pub topology_version: i64,
-    /// `std::time::Duration` has no built-in `serde` impl - `Storage`'s
-    /// `subscription` namespace (eb-single-process-implementation D2)
-    /// stores this as JSON in `ClusterCacheV1`, so it round-trips through
-    /// whole seconds via `serde_duration_secs` (a pure serialization helper,
-    /// not an infra dependency - stays in `domain/` alongside the type that
-    /// needs it).
-    #[serde(with = "serde_duration_secs")]
+    /// How long the subscription survives a dropped stream before it is
+    /// reaped.
     pub session_timeout: Duration,
-    pub last_seen_at: DateTime<Utc>,
-    pub expires_at: DateTime<Utc>,
     /// When this subscription was created (at JOIN). The stable primary sort
     /// key for `GET /v1/subscriptions`, so a new subscription has a
     /// deterministic page position rather than one that depends on its random
@@ -373,22 +365,4 @@ pub struct TopicSegmentManifest {
     pub start_time: Option<DateTime<Utc>>,
     pub end_time: Option<DateTime<Utc>>,
     pub segments: Vec<JsonValue>,
-}
-
-/// `#[serde(with = "...")]` helper for `Subscription::session_timeout` -
-/// `std::time::Duration` has no built-in `serde` support. Whole-second
-/// precision only (matches every other duration-as-config-field in this
-/// crate, e.g. `config::StreamingConfig::heartbeat_interval_secs`).
-mod serde_duration_secs {
-    use std::time::Duration;
-
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S: Serializer>(value: &Duration, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_u64(value.as_secs())
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Duration, D::Error> {
-        Ok(Duration::from_secs(u64::deserialize(deserializer)?))
-    }
 }

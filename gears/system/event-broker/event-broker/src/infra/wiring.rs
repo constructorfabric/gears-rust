@@ -51,6 +51,7 @@ pub fn build_handler_state(
     spec_manager: Arc<dyn SpecificationManager>,
     backend_resolver: Arc<dyn BackendResolver>,
     attacher: Arc<dyn crate::domain::streaming::source::ReaderAttacher>,
+    groups: Arc<ConsumerGroupCoordinator>,
     leases: Arc<InProcessStreamLeases>,
     batch: BatchConfig,
     streaming: StreamingConfig,
@@ -63,7 +64,6 @@ pub fn build_handler_state(
         Arc::clone(&backend_resolver),
         batch,
     ));
-    let groups = Arc::new(ConsumerGroupCoordinator::new());
     let delivery_impl = DeliveryServiceImpl::new(
         storage,
         policy_enforcer,

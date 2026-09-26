@@ -150,10 +150,12 @@ fn membership(
 ) {
     use crate::domain::consumer_group_coordinator::{ConsumerGroupCoordinator, TopicInterest};
 
-    let groups = Arc::new(ConsumerGroupCoordinator::new());
+    let groups = Arc::new(ConsumerGroupCoordinator::new(
+        std::time::Duration::from_mins(1),
+    ));
     let group = gts("gts.cf.core.events.consumer_group.v1~02943530-10da-4624-a3ae-b998c425847f");
     let sub_id = Uuid::new_v4();
-    groups.join(
+    groups.join_member(
         &group,
         sub_id,
         &[TopicInterest {

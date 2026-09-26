@@ -255,10 +255,7 @@ impl<R> DeliveryServiceImpl<R> {
     }
 }
 
-impl<R> DeliveryServiceImpl<R>
-where
-    R: crate::domain::repo::SubscriptionRepo + Send + Sync + 'static,
-{
+impl<R> DeliveryServiceImpl<R> {
     /// Fetches `subscription_id`, returning `SubscriptionNotFound` if
     /// absent, then verifies the calling principal is authorized to act as
     /// the subscription's `tenant_id` (`domain::authz::tenant_authorized`,
@@ -271,15 +268,14 @@ where
         ctx: &SecurityContext,
         subscription_id: Uuid,
     ) -> Result<Subscription, DomainError> {
-        let subscription = self
-            .repo
-            .find_subscription(subscription_id)
-            .await?
-            .ok_or_else(|| DomainError::NotFound {
-                code: ErrorCode::SubscriptionNotFound,
-                message: format!("subscription '{subscription_id}' does not exist"),
-                resource: subscription_id.to_string(),
-            })?;
+        let subscription =
+            self.groups
+                .get(subscription_id)
+                .ok_or_else(|| DomainError::NotFound {
+                    code: ErrorCode::SubscriptionNotFound,
+                    message: format!("subscription '{subscription_id}' does not exist"),
+                    resource: subscription_id.to_string(),
+                })?;
         tenant_authorized(
             ctx,
             &self.policy_enforcer,
@@ -397,7 +393,7 @@ where
 #[async_trait]
 impl<R> DeliveryService for DeliveryServiceImpl<R>
 where
-    R: crate::domain::repo::SubscriptionRepo
+    R: crate::domain::repo::RoutingMarkers
         + crate::domain::repo::CursorRepo
         + crate::domain::repo::ConsumerGroupRepo
         + DeliveryNotifier
@@ -508,49 +504,52 @@ where
             });
         }
 
-        let (assigned, topology_version, sibling_updates) = self.groups.join(
-            &request.consumer_group,
-            sub_id,
+        // Markers first: if the cluster cache cannot take them, the JOIN fails
+        // before a member exists that no dispatcher could route to.
+        self.repo
+            .mark_subscription(sub_id, &request.consumer_group)
+            .await?;
+        self.repo.mark_group(&request.consumer_group).await?;
+
+        // `assigned` and `topology_version` are the coordinator's to fill.
+        let outcome = self.groups.join(
+            Subscription {
+                id: sub_id,
+                tenant_id: ctx.subject_tenant_id(),
+                consumer_group: request.consumer_group,
+                client_agent: request.client_agent,
+                interests: request.interests,
+                topics,
+                assigned: Vec::new(),
+                topology_version: 0,
+                session_timeout: request.session_timeout,
+                created_at: Utc::now(),
+            },
             &topic_interests,
-            request.session_timeout,
         );
-
-        for (sibling_id, sibling_assigned) in sibling_updates {
-            if let Ok(Some(mut sub)) = self.repo.find_subscription(sibling_id).await {
-                sub.assigned = sibling_assigned;
-                sub.topology_version = topology_version;
-                drop(self.repo.put_subscription(&sub).await);
-            }
+        for removal in &outcome.evicted {
+            crate::domain::consumer_group_coordinator::sweeper::clear_markers(&*self.repo, removal)
+                .await;
         }
-
-        let now = Utc::now();
-        let subscription = Subscription {
-            id: sub_id,
-            tenant_id: ctx.subject_tenant_id(),
-            consumer_group: request.consumer_group,
-            client_agent: request.client_agent,
-            interests: request.interests,
-            topics,
-            assigned,
-            topology_version,
-            session_timeout: request.session_timeout,
-            last_seen_at: now,
-            expires_at: now
-                + chrono::Duration::from_std(request.session_timeout)
-                    .unwrap_or(chrono::Duration::seconds(30)),
-            created_at: now,
-        };
-        self.repo.put_subscription(&subscription).await?;
-        Ok(subscription)
+        Ok(outcome.subscription)
     }
 
     async fn leave(&self, ctx: &SecurityContext, subscription_id: Uuid) -> Result<(), DomainError> {
         let subscription = self
             .find_authorized_subscription(ctx, subscription_id)
             .await?;
-        self.repo.delete_subscription(subscription_id).await?;
-        self.groups
-            .leave(&subscription.consumer_group, subscription_id);
+        // `None` is the sweep having reaped it since the lookup - already gone,
+        // markers already cleared.
+        if let Some(removal) = self
+            .groups
+            .leave(&subscription.consumer_group, subscription_id)
+        {
+            crate::domain::consumer_group_coordinator::sweeper::clear_markers(
+                &*self.repo,
+                &removal,
+            )
+            .await;
+        }
         Ok(())
     }
 
@@ -558,7 +557,7 @@ where
         &self,
         ctx: &SecurityContext,
     ) -> Result<Vec<Subscription>, DomainError> {
-        let subscriptions = self.repo.list_subscriptions().await?;
+        let subscriptions = self.groups.list();
         filter_by_authorized_tenant(subscriptions, ctx, &self.policy_enforcer, "consume", |s| {
             s.tenant_id
         })
@@ -906,7 +905,7 @@ where
     ) -> Result<(), DomainError> {
         self.find_authorized_consumer_group(ctx, "manage", id)
             .await?;
-        if self.repo.has_active_members(id).await? {
+        if self.groups.has_members(id) {
             return Err(DomainError::Conflict {
                 code: ErrorCode::ConsumerGroupHasActiveMembers,
                 message: format!("consumer group '{id}' still has active members"),

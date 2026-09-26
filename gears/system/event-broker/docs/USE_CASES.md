@@ -234,7 +234,7 @@ rebalance(group G):  # G is the GTS-typed consumer_group identifier
   try:
     group_state = cache.get("evbk.group.{G}")
     active_subs = group_state.active_members.values()
-                    .filter(s => s.expires_at > now())
+                    .filter(s => not s.session_timeout_lapsed())
                     .sorted_by(s => (s.created_at, s.id))
 
     # Compute group's effective topic set: union of all members' topics
@@ -278,7 +278,7 @@ rebalance(group G):  # G is the GTS-typed consumer_group identifier
     # naturally reset when partitions migrate to a new subscription
     
     group_state.topology_version += 1
-    cache.put("evbk.group.{G}", group_state, ttl=max(member.expires_at))
+    cache.put("evbk.group.{G}", group_state, ttl=longest_remaining_session_window(active_subs))
     
     cluster.publish("evbk.group.{G}.topology",
                     { version: group_state.topology_version, changed_at })
@@ -286,7 +286,7 @@ rebalance(group G):  # G is the GTS-typed consumer_group identifier
     release lock
 ```
 
-**Triggers**: `POST /v1/subscriptions` (JOIN), `DELETE /v1/subscriptions/{id}` (LEAVE), Reaper detecting `expires_at < now()` (CRASH).
+**Triggers**: `POST /v1/subscriptions` (JOIN), `DELETE /v1/subscriptions/{id}` (LEAVE), Reaper detecting a lapsed `session_timeout` (CRASH).
 
 **Concurrency**: Multiple JOINs in flight serialize on the lock; each runs a fresh rebalance with the latest membership.
 
