@@ -1248,8 +1248,10 @@ the fragment now carries each rule, and the note is kept as the reason the rule 
    NOT** decide release from its own memory of confirmations.
 8. **No swallowing `catch`** — `evaluate-payment-auth-eligibility`, `construct-and-freeze-plan`,
    `begin-fulfillment` and `re-check-pre-activation` **MUST NOT** be inside a `catch` that returns
-   normally after a permanent failure (`10 §4.6`); their retry-only `catch` **MUST** propagate
-   exhaustion to the stage's failure arm.
+   normally after a permanent failure (`10 §4.6`); their retry-only `catch` lets exhaustion
+   fault the invocation, which the instance liveness pass raises as the `invocation-dead` task
+   (decision D-114). A plan that does not freeze is an answer, not a failure of the call, and
+   takes the plan-task route of item 3.
 9. **References only** — `lineRefs`, `eligibleLineRefs` and `pendingLineRefs` are opaque task
    references; the definition **MUST NOT** carry any other plan member. Their cardinality is
    visible in engine history; that residual is ADR-0013's to state.

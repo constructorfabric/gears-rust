@@ -126,9 +126,10 @@ already taken, so the two Orders gears share one authorization contract. Concret
   returns a sanitized 503, performs no mutation, settles no idempotency key and never falls back
   to a local decision; the workers continue because their authority is configured, not obtained
   from the PDP. The apply-time re-check of a long-running command (`09 §4.4`) re-runs the same PDP
-  decision on the same target; a refusal there routes the command to a manual task with reason
-  `authority-withdrawn` and the process left in its current phase — never to `parked`, which is
-  the verdict park of ADR-0007.
+  decision on the same target; a refusal there refuses the command before the fence, or routes it
+  to a manual task with reason `authority-withdrawn` once the fence waits on it (decision D-115),
+  and leaves the process in its current phase — never `parked`, which is the verdict park of
+  ADR-0007.
 
 ### Consequences
 
@@ -171,7 +172,8 @@ no mutation and no key settlement, and that the workers continue; a PostgreSQL i
 racing a mutating operation against a `seller_tenant_id` change and asserting zero rows affected;
 a test that an approver whose `subject_id` is not the gate's `assigned_principal` receives 404 on
 the decision endpoint and an empty inbox page; and a test that the apply-time re-check refusal
-raises one `authority-withdrawn` manual task and leaves `owf_process_instance.phase` unchanged.
+refuses the request with no task at `pre-fence`, raises one `authority-withdrawn` manual task at
+`pre-compensation`, and leaves `owf_process_instance.phase` unchanged in both.
 
 ## Pros and Cons of the Options
 

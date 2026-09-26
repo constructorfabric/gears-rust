@@ -71,7 +71,8 @@ Dependency resilience for Orders Lifecycle, Subscriptions and Payments is **no l
 slice's**. The retry loop, backoff and budget are the definition's task retry policy executed by
 the platform plugin, the circuit breaker is the rule every operation applies to its own outbound
 calls ([`01 §4.5`](./01-foundation.md#45-the-envelopes-bound-and-the-caller-side-duplicate-protocol)),
-and exhaustion is the definition's failure arm (`10 §3.6` (c)). What stays here is the principle
+and exhaustion faults the invocation except on the failure routes the definition names
+(`10 §4.6`, D-114). What stays here is the principle
 that this path and slice 03's fail-closed verdict park are different mechanisms. The
 workflow-mediated cancel is the third concern: this slice owns only the authorization re-check at
 the head of the cancel path; the fence, the reverse walk and the Lifecycle `workflow-cancel`
@@ -85,8 +86,8 @@ this slice calls no Lifecycle endpoint.
 | Requirement | Design Response |
 |-------------|------------------|
 | `cpt-cf-bss-orders-workflow-fr-owf-hold-resume` | The definition's hold arm (`10 §3.6` (e)) consumes `OrderHeld` and calls `apply-hold`, which records the suspension, sets the hold predicate the dispatch operations read, and pauses the named gates' escalation windows through slice 03's gate-window port; the resume arm consumes `OrderResumed` and calls `apply-resume`, which closes the suspension, re-arms the same windows through the port, and applies the outcomes the sweep deferred. The definition carries no remainder: `apply-resume`'s `due` is the first answer of the escalation re-check, then the `PT5M` `waitEscalation` tick resumes (`10 §3.6` (e)). |
-| `cpt-cf-bss-orders-workflow-fr-owf-dependency-resilience` | **Moved out of this slice by ADR-0011.** Transient failures are the definition's task retry policy (`10 §2`) plus the per-dependency circuit breaker inside each operation (`01 §4.5`); exhaustion marks the step failed through the definition's failure arm, whose partial-failure policy decides whether a manual task follows (`10 §3.6` (c)). This slice keeps `cpt-cf-bss-orders-workflow-principle-resilience-distinct-from-park`. |
-| `cpt-cf-bss-orders-workflow-fr-owf-compensation-execution` | The definition's cancel arm (`10 §3.6` (d)) calls `authorize-cancel` before `run-cancellation-fence`; a withdrawn authority raises one `authority-withdrawn` manual task and leaves the phase unchanged. Fencing, compensation and the Lifecycle submission are slice 06's. |
+| `cpt-cf-bss-orders-workflow-fr-owf-dependency-resilience` | **Moved out of this slice by ADR-0011.** Transient failures are the definition's task retry policy (`10 §2`) plus the per-dependency circuit breaker inside each operation (`01 §4.5`); exhaustion of a wave call marks the lines failed through the definition's failure route, whose partial-failure policy decides whether a manual task follows (`10 §3.6` (c)); exhaustion of any other step call faults the invocation, which the instance liveness pass raises as the `invocation-dead` task (`10 §4.6`, D-114). This slice keeps `cpt-cf-bss-orders-workflow-principle-resilience-distinct-from-park`. |
+| `cpt-cf-bss-orders-workflow-fr-owf-compensation-execution` | The definition's cancel arm (`10 §3.6` (d)) calls `authorize-cancel` before `run-cancellation-fence`; a withdrawn authority refuses the request, audited, raises no task and leaves the phase unchanged (D-115); the `pre-compensation` re-check inside `compensate-order` raises the one `authority-withdrawn` task, which the unwind waits on. Fencing, compensation and the Lifecycle submission are slice 06's. |
 
 #### NFR Allocation
 
@@ -154,8 +155,10 @@ whether or not a hold occurred.
 
 Transient unavailability of Orders Lifecycle, Subscriptions or Payments is a retry-then-failure
 concern: the operation answers `retryable-failure`, the definition's task retry policy re-issues
-the same key, and on exhaustion the definition's failure arm marks the step failed and hands it to
-the configured partial-failure policy. Unavailability of the Generic Approval service is not this
+the same key, and on exhaustion either the definition's named failure route marks the subject
+failed and hands it to the configured partial-failure policy — the wave calls — or the
+invocation faults and the instance liveness pass raises the `invocation-dead` task (`10 §4.6`,
+D-114). Unavailability of the Generic Approval service is not this
 path: slice 03's `obtain-verdict` answers `unobtainable`, the definition routes only to the park
 arm, the order stays `submitted`, the Lifecycle `submitted` TTL is not paused, and the park
 escalates before it elapses. The two are triggered by different answers, resolved by different
@@ -336,9 +339,9 @@ graph LR
     RC -->|gate-window port: rearm| AGM
     RC -->|apply deferred outcomes| PI[(owf_provisioning_intent / owf_fulfillment_task, slice 05/04)]
     CM -->|re-check| PDP[PolicyEnforcer adapter, slice 09]
-    CM -->|authority-withdrawn| MTC[cpt-cf-bss-orders-workflow-component-manual-task-creator slice 07]
+    CM -->|authority-withdrawn, pre-compensation only| MTC[cpt-cf-bss-orders-workflow-component-manual-task-creator slice 07]
     CF[cpt-cf-bss-orders-workflow-component-cancellation-fencer slice 06] -->|suspension closure port| PS
-    OR[report-outcome, slice 06] -->|cancel-authority port| CM
+    CO[compensate-order, slice 06] -->|cancel-authority port, pre-compensation| CM
 ```
 
 #### Suspension Controller
@@ -441,7 +444,9 @@ the definition's task retry policy executed by the platform plugin (`10 §2`, wo
 [`01 §4.2`](./01-foundation.md#42-five-distinct-bounds-two-owners)); the per-dependency circuit
 breaker is applied by every operation to its own outbound calls
 ([`01 §4.5`](./01-foundation.md#45-the-envelopes-bound-and-the-caller-side-duplicate-protocol));
-exhaustion is the definition's failure arm and the partial-failure policy (`10 §3.6` (c)). The
+exhaustion is the definition's named failure route and the partial-failure policy where
+`10 §4.6` names one, and otherwise a fault of the invocation that the liveness pass raises
+(D-114). The
 per-dependency budget table formerly here is superseded by the definition's per-task retry policy,
 which **MAY** be tighter per task and **MUST** nest inside the task timeout (`10 §2.2` rule 4)
 (decision D-70: the per-dependency retry budgets of the former governor
@@ -474,8 +479,10 @@ cancel (`09 §4.4`; the request record `cancelRequestRef` names), rebuilds a `Se
 its four subject fields without a bearer token, and re-runs the snapshot's `(resource, action)`
 decision on the same target through the shared `PolicyEnforcer` adapter. On allow it answers
 `authorized`. On deny, or a fresh scope that matches zero rows, it raises **one** manual task with
-reason `authority-withdrawn` through slice 07's creator in the same unit of work, leaves the phase
-unchanged, and answers `withdrawn`. On a PDP outage it answers `retryable-failure` (canonical 503)
+reason `authority-withdrawn` through slice 07's creator in the same unit of work — at
+`pre-compensation` only, where the claimed fence waits on it; at `pre-fence` it marks the request
+`refused` with `authority-withdrawn` and raises no task, because the process continues where the
+cancel was taken (D-115) — leaves the phase unchanged, and answers `withdrawn`. On a PDP outage it answers `retryable-failure` (canonical 503)
 and changes nothing.
 
 ##### Responsibility boundaries
@@ -483,7 +490,7 @@ and changes nothing.
 Does not implement or sequence the five fencing steps, the two compensation legs or the Lifecycle
 submission — all slice 06. Never calls Lifecycle. Never enters `parked`: a withdrawn authority is
 not an unobtainable verdict (`09 §4.4`). Never re-authorizes: a new authorization is a new accepted
-command with its own snapshot, submitted by a human who resolves the `authority-withdrawn` task.
+command with its own snapshot, submitted by a human as a new cancel request.
 
 ##### Related components (by ID)
 
@@ -512,8 +519,8 @@ operation resolves `correlationId` to the instance, narrows every read and write
 | `name` | `protection` | `input` | `output` | `idempotency_key` | `declared_event` | `compensation` | `reasons` | `audit_kind` | `retry_class` | `deadline` |
 |--------|--------------|---------|----------|-------------------|------------------|----------------|-----------|--------------|---------------|------------|
 | `apply-hold` | `protected` | ref + `holdEventId`, `gateRefs[]` (the references `open-gates` last returned; empty outside the approval stage) | `holdOutcome` ∈ `suspended` · `reconciled-out-of-order` · `absorbed-duplicate` · `not-applicable`; `suspensionRef` (nullable). No remaining duration is returned: the remainder stays in `owf_approval_gate.window_remaining_ms` and the definition consumes none | instance-scoped `{tenant}:{correlationId}:apply-hold:{holdEventId}` | none (`OrderHeld` is Lifecycle's) | `apply-resume` (the paired close, like `park`/`unpark`; not a saga leg) | `version-mismatch`, `not-found` (a `gateRef` not of this instance), `idempotency-key-conflict` | `phase-transition` | `retryable-on: transient` | 5 s |
-| `apply-resume` | `protected` | ref + `resumeEventId`, `suspensionRef` (nullable — null on the stage-level resume arm) | `resumeOutcome` ∈ `resumed` · `resume-ahead-recorded` · `absorbed-duplicate`; `due: true\|false` — database time against the escalation deadline re-based from the stored `window_remaining_ms` (true when no remainder is left), the answer the resumed escalation re-check loop switches on first (`10 §3.6` (e)), after which the `PT5M` `waitEscalation` tick resumes; `failedTaskRefs[]` (tasks advanced to `failed` from deferred outcomes; opaque `owf_fulfillment_task` references) | instance-scoped `{tenant}:{correlationId}:apply-resume:{resumeEventId}` | none (`OrderResumed` is Lifecycle's) | none | `version-mismatch`, `not-found` (a `suspensionRef` not of this instance), `idempotency-key-conflict` | `phase-transition` | `retryable-on: transient` | 5 s |
-| `authorize-cancel` | `protected` | ref + `cancelRequestRef` | `authorized` (bool); `preFulfillment` (bool — `true` with `authorized = false` when the order's fulfillment has not begun and Lifecycle does not hold it terminal, §3.6 `inst-ac-fulfillment`); `taskRef` (the `authority-withdrawn` manual task, on a withdrawn `authorized = false`) | instance-scoped `{tenant}:{correlationId}:authorize-cancel:{cancelRequestRef}` | none (`OrderFulfillmentAborted` is `report-outcome`'s, slice 06) | none | `authority-withdrawn` (recorded refusal, rides the task), `not-found` (a request not of this instance), `version-mismatch`, `per-attempt-timeout`, `idempotency-key-conflict` | `step-completion` | `retryable-on: transient` | 10 s (one PDP decision) |
+| `apply-resume` | `protected` | ref + `resumeEventId`, `suspensionRef` (nullable — null on the stage-level resume arm) | `resumeOutcome` ∈ `resumed` · `resume-ahead-recorded` · `absorbed-duplicate`; `due: true\|false` — database time against the escalation deadline re-based from the stored `window_remaining_ms` (true when no remainder is left), the answer the resumed escalation re-check loop switches on first (`10 §3.6` (e)), after which the `PT5M` `waitEscalation` tick resumes; `failedTaskRefs[]` (tasks advanced to `failed` from deferred outcomes: the opaque `owf_fulfillment_task` reference as `lineRef` plus the `reason` slice 05 recorded with the deferral, the shape of a wave's `failed[]`, so the definition can name each subject's reason to `create-manual-task`) | instance-scoped `{tenant}:{correlationId}:apply-resume:{resumeEventId}` | none (`OrderResumed` is Lifecycle's) | none | `version-mismatch`, `not-found` (a `suspensionRef` not of this instance), `idempotency-key-conflict` | `phase-transition` | `retryable-on: transient` | 5 s |
+| `authorize-cancel` | `protected` | ref + `cancelRequestRef` | `authorized` (bool); `preFulfillment` (bool — `true` with `authorized = false` when the order's fulfillment has not begun and Lifecycle does not hold it terminal, §3.6 `inst-ac-fulfillment`); no `taskRef`: a withdrawn authority at `pre-fence` raises no task (D-115) | instance-scoped `{tenant}:{correlationId}:authorize-cancel:{cancelRequestRef}` | none (`OrderFulfillmentAborted` is `report-outcome`'s, slice 06) | none | `authority-withdrawn` (recorded on the request as its refusal; the answer is the settled `authorized = false`), `not-found` (a request not of this instance), `version-mismatch`, `per-attempt-timeout`, `idempotency-key-conflict` | `step-completion` | `retryable-on: transient` | 10 s (one PDP decision) |
 
 **What each answer means to the definition.** `suspended` enters the resume wait of `10 §3.6` (e);
 `reconciled-out-of-order`, `absorbed-duplicate` and `not-applicable` are settled successes that
@@ -524,7 +531,8 @@ re-check loops*); a non-empty
 `failedTaskRefs[]` routes to the partial-failure arm of `10 §3.6` (c) first. `authorized = true`
 routes into `run-cancellation-fence`; `authorized = false` is a settled success that returns to
 where the cancel arm was taken (§4.7 item 5). A PDP outage is `retryable-failure` without a
-Workflow reason (canonical `ServiceUnavailable`, `01 §4.9`); its exhaustion is §4.7 item 6.
+Workflow reason (canonical `ServiceUnavailable`, `01 §4.9`); its exhaustion faults the
+invocation (§4.7 item 6).
 
 `not-applicable` answers a hold consumed while `compensating` and records the event in
 `owf_step_log` without a suspension row: a hold does not interrupt an unwind already running. A
@@ -662,7 +670,7 @@ conditions are re-evaluated by level after resume by `evaluate-activation-eligib
 4. [ ] - `p1` - Clear `owf_process_instance.suspended` and, **IF** `phase` is `suspended`, move the phase projection `suspended → started`; a `parked` phase stays `parked`, and its `unpark` then restores `started` - `inst-ar-predicate`
 5. [ ] - `p1` - Call the gate-window port `rearm_windows(correlationId, paused_gate_refs, hold)`; the port re-arms only windows whose `pause_causes` becomes empty, re-basing each one's escalation deadline from its stored remainder - `inst-ar-rearm`
 6. [ ] - `p1` - Apply every deferred failure outcome slice 05 recorded for the instance during the suspension, ordered by observation instant: advance the task to `failed` with the recorded reason and clear the deferral - `inst-ar-deferred`
-7. [ ] - `p1` - **RETURN** `resumed`, `due` (database time against the earliest re-based deadline; `false` when no window was re-armed) and the failed tasks as `failedTaskRefs`; one commit - `inst-ar-return`
+7. [ ] - `p1` - **RETURN** `resumed`, `due` (database time against the earliest re-based deadline; `false` when no window was re-armed) and the failed tasks as `failedTaskRefs` (`lineRef` + `reason`); one commit - `inst-ar-return`
 
 #### Transient Outage: Retry-Then-Manual-Task
 
@@ -672,9 +680,12 @@ conditions are re-evaluated by level after resume by `evaluate-activation-eligib
 
 **Retired as a slice-08 sequence by ADR-0011; the path now**: definition task → operation
 (`retryable-failure`, key left `open`, breaker refusal not counted as an attempt, `01 §4.5`) →
-plugin retry under the task's retry policy with the same key → on exhaustion the stage's failure
-arm → `create-manual-task` under `remediate`, or the unwind path under `fail-fast`
-([`10 §3.6` (c)](./10-process-definition.md#c-partial-failure-manual-task-resume-or-compensate)).
+plugin retry under the task's retry policy with the same key → on exhaustion of a wave call the
+stage's failure route → `create-manual-task` under `remediate`, or the unwind path under
+`fail-fast` ([`10 §3.6` (c)](./10-process-definition.md#c-partial-failure-manual-task-resume-or-compensate));
+on exhaustion of any other step call a fault of the invocation → the instance liveness pass's
+`invocation-dead` task, whose platform re-drive resumes at the faulted call
+([`10 §4.6`](./10-process-definition.md#46-protected-operations-are-never-inside-a-swallowing-catch), D-114).
 The step is marked failed exactly once, by the operation that owns it, and the partial-failure
 policy — never a retry component — decides whether a manual task follows.
 
@@ -725,7 +736,7 @@ sequenceDiagram
     D ->> AC: ref + cancelRequestRef
     AC ->> AC: re-check snapshot at pre-fence
     alt withdrawn
-        AC ->> AC: one authority-withdrawn manual task (07); phase unchanged
+        AC ->> AC: request refused authority-withdrawn, audited; no task (D-115); phase unchanged
         AC -->> D: authorized = false → return to the arm's origin
     else allowed
         AC -->> D: authorized = true
@@ -746,7 +757,7 @@ cancelled uses the `escalate` task resolution, which routes the decision to a Se
 2. [ ] - `p1` - **Fulfillment begun** (decision D-109). **IF** the plan row's `begin_fulfillment_committed_at` is null for the version: read the order through the Lifecycle PDP-authorized order read; **IF** it is not terminal: mark the request `refused`, create no task, **RETURN** `authorized = false` with `preFulfillment = true` — this gear has no seam to cancel an order before `in_fulfillment` ([Lifecycle `08 §4.3`](../../../orders-lifecycle/docs/design/08-read-and-authz.md#43-the-permission-model-normative): "via workflow-cancel only"), so the cancel is Lifecycle's ordinary cancel, whose `OrderCancelled` the definition's lifecycle arm consumes; **IF** the read is unavailable **RETURN** `retryable-failure`. A terminal order continues to step 3, and the run then reports no Lifecycle transition (`06 §3.6` `inst-ro-reauthorize`). Fulfillment never returns to `approved`, so a committed begin needs no read - `inst-ac-fulfillment`
 3. [ ] - `p1` - Run the cancel-authority port at `pre-fence`: rebuild the `SecurityContext` from the snapshot's subject fields (no bearer token) and request the snapshot's `(resource, action)` on the order with its current prefetched properties, constraints required - `inst-ac-decide`
 4. [ ] - `p1` - **IF** the PDP is unavailable **RETURN** `retryable-failure` (canonical 503) and write nothing but the envelope's step record - `inst-ac-outage`
-5. [ ] - `p1` - **IF** the PDP denies or the compiled scope matches zero rows, create one manual task with reason `authority-withdrawn` naming the request and the subject through slice 07's creator, leave `phase` unchanged, and **RETURN** `authorized = false` with its `taskRef` - `inst-ac-withdrawn`
+5. [ ] - `p1` - **IF** the PDP denies or the compiled scope matches zero rows: mark the request `refused` with `authority-withdrawn`, write the `step-completion` entry naming the refusal, create **no** manual task, leave `phase` unchanged, and **RETURN** `authorized = false` — nothing waits on a task here, because the definition returns to where the cancel was taken, and a Seller Operator who still means it submits a new cancel under a fresh authorization (decision D-115; the precedent is Lifecycle's late authorization conflict, a refusal with an audit entry and no automatic re-authorization, [Lifecycle `08 §4`](../../../orders-lifecycle/docs/design/08-read-and-authz.md) `08-read-and-authz.md:1286-1293`) - `inst-ac-withdrawn`
 6. [ ] - `p1` - **ELSE RETURN** `authorized = true`; the envelope settles the key and writes `step-completion` with the snapshot's subject as the recorded actor - `inst-ac-authorized`
 
 ### 3.7 Database schemas & tables
@@ -862,10 +873,11 @@ requires the definition to consume that early resume.
 before the fence and before the first compensating leg. The Lifecycle submission is not
 re-checked (D-84 as amended): after the walk it records a fact rather than performing a
 destructive act, and a refusal there would fault the invocation with every subscription already
-removed. A withdrawn
-authority raises exactly one `authority-withdrawn` manual task per request and point — the task is
-created under the operation's key, so a replay does not create a second — leaves
-`owf_process_instance.phase` unchanged, and **MUST NOT** enter `parked`. At `pre-compensation`
+removed. A withdrawn authority at `pre-fence` refuses the request, audited, and raises no task:
+the process continues where the cancel was taken (decision D-115). At `pre-compensation` it
+raises exactly one `authority-withdrawn` manual task per request — created under the operation's
+key, so a replay does not create a second — because the claimed fence waits on it. Either way it
+leaves `owf_process_instance.phase` unchanged and **MUST NOT** enter `parked`. At `pre-compensation`
 the caller (slice 06) additionally marks the fence as awaiting
 re-authorization so no further leg dispatches; that column is slice 06's. A PDP outage is a
 retryable failure of the calling operation, never a default allow. The step-4 wording of
@@ -916,12 +928,12 @@ that violates any of them **MUST** be refused.
 3. [ ] - `p1` - **Early resume.** Every stage fork that carries a hold arm **MUST** also carry a resume arm that calls `apply-resume` with a null `suspensionRef` and returns to the stage, so a resume delivered before its hold is recorded as `resume-ahead-recorded` and not lost; the definition **MUST** enter the resume wait only on `holdOutcome = suspended` - `inst-c8-early-resume`
 4. [ ] - `p1` - **References.** `apply-hold` **MUST** receive `holdEventId` and the `gateRefs` `open-gates` last returned (empty outside the approval stage); `apply-resume` **MUST** receive `resumeEventId` exported from the resume `listen` and the `suspensionRef` `apply-hold` returned; `authorize-cancel` **MUST** receive the `cancelRequestRef` of the `cancel-requested` signal. No other member is admitted (ADR-0013) - `inst-c8-refs`
 5. [ ] - `p1` - **Denied cancel.** On `authorized = false` — a withdrawn authority, or `preFulfillment` — the definition **MUST** return to the arm the cancel was taken from — the stage loop, or the resume wait when the cancel was taken from hold (the instance is still `suspended`) — and **MUST NOT** call `run-cancellation-fence`; `authorize-cancel` **MUST** precede `run-cancellation-fence` on every cancel path, including the one taken from the resume wait - `inst-c8-denied-cancel`
-6. [ ] - `p1` - **No swallowing.** `apply-hold`, `apply-resume` and `authorize-cancel` **MUST NOT** be inside a `catch` that continues the forward path (`10 §4.6`). A retry exhaustion of `authorize-cancel` **MUST** reach `create-manual-task` with reason `authority-withdrawn` and then the arm of item 5; an exhaustion of `apply-hold` or `apply-resume` **MUST** reach `create-manual-task` and **MUST NOT** proceed as though the hold or resume had been recorded - `inst-c8-no-swallow`
+6. [ ] - `p1` - **No swallowing.** `apply-hold`, `apply-resume` and `authorize-cancel` **MUST NOT** be inside a `catch` that continues the forward path (`10 §4.6`), and **MUST** carry a retry-only `catch`: a spent retry budget or timeout of any of them faults the invocation, which the instance liveness pass raises as the `invocation-dead` task, and **MUST NOT** proceed as though the hold, the resume or the authority had been recorded (decision D-114). The platform re-drive resumes at the faulted call under its still-open key; the task's fallback for a spent `authorize-cancel` is the cancel itself (`01 §4.16`) - `inst-c8-no-swallow`
 7. [ ] - `p1` - **Two resilience paths.** No arm **MAY** route an `unobtainable` verdict into a retry-then-failure arm, and no arm **MAY** route `retry-budget-exhausted` or a task timeout into the park arm (`cpt-cf-bss-orders-workflow-principle-resilience-distinct-from-park`) - `inst-c8-two-paths`
 8. [ ] - `p1` - **Deferred failures.** After `apply-resume`, a non-empty `failedTaskRefs[]` **MUST** route to the partial-failure arm of `10 §3.6` (c) before any dispatch operation is called - `inst-c8-deferred`
 9. [ ] - `p1` - **Signals handled.** This slice's operations are called from the `OrderHeld` and `OrderResumed` `listen`s and the `cancel-requested` signal only; hold and resume **MUST NOT** be delivered as platform `suspend`/`resume` and cancel **MUST NOT** use the platform's generic `cancel` (`10 §4.4`) - `inst-c8-signals`
 
-`10 §3.6` (e) carries every item of this contract, including the stage-level resume arm (item 3),
+`10 §3.6` (d) and (e) carry every item of this contract, including the stage-level resume arm (item 3),
 `resumeEventId` exported from the resume `listen` (item 4) and the return to the resume wait on a
 denied cancel taken from hold (item 5); `apply-resume` re-reads no drafts (the re-read is inside
 the wave-2 dispatch, §3.2) and the remainder is slice 03's gate-window port value, never

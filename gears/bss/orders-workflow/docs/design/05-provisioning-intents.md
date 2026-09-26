@@ -625,7 +625,7 @@ operation's round. Every step key is recomposed server-side from the body
 |-------|-------|
 | `protection` | `protected` — Waves stage: after `re-check-pre-activation`, before `dispatch-wave2-activate` (`10 §4.1`) |
 | `input` | `ref`, `round` (0 on first entry, else the previous answer's `nextRound`) |
-| `output` | `spawnSignal` (`recorded` · `already-recorded` · `held` — Lifecycle refused `not-admissible` and the order read shows `on_hold`, a settled success after which the definition waits in the barrier loop for the resume and calls again under the next round · `not-dispatchable` — Lifecycle refused `not-admissible` and the order read shows a terminal state: a cancel committed before the signal, the race Lifecycle declares normal ([`06 §4.3`](../../../orders-lifecycle/docs/design/06-workflow-seam.md#43-begin-fulfillment-and-the-spawn-signal-normative)), a settled success after which the definition dispatches nothing and returns to the barrier loop, whose lifecycle arm consumes `OrderCancelled`); `nextRound` |
+| `output` | `spawnSignal` (`recorded` · `already-recorded` · `held` — Lifecycle refused `not-admissible` and the order read shows `on_hold`, a settled success after which the definition waits in `heldWait` — the fork of the resume arm and a `PT5M` tick, `10 §3.6` (b) — re-runs `re-check-pre-activation` after the resume, as Lifecycle prescribes, and calls again under the next round · `not-dispatchable` — Lifecycle refused `not-admissible` and the order read shows a terminal state: a cancel committed before the signal, the race Lifecycle declares normal ([`06 §4.3`](../../../orders-lifecycle/docs/design/06-workflow-seam.md#43-begin-fulfillment-and-the-spawn-signal-normative)), a settled success after which the definition dispatches nothing and returns to the barrier loop, whose lifecycle arm consumes `OrderCancelled`); `nextRound` |
 | `idempotency_key` | Lifecycle-transition family: `{tenant}:{orderId}:{orderVersion}:report-spawn-signal:{round}`, the same key passed to Lifecycle, so a replay of one round returns Lifecycle's stored outcome and a refusal of one round is never replayed into the next ([`01 §3.3` *Rounds and attempts*](./01-foundation.md#rounds-and-attempts-the-one-rule-for-re-invokable-operations) rule 4) |
 | `declared_event` | none |
 | `compensation` | none — the spawn signal is written once and never cleared (Lifecycle `06 §4.3`) |
@@ -1227,8 +1227,11 @@ slice operations (D-80, D-81).
    never directly to `dispatch-wave2-activate` †.
 6. **Failures and unresolved intents route to the failure arm.** A non-empty `failed[]` from any
    operation of this slice, and a non-empty `unresolved[]` from `reconcile-intent`, **MUST** route
-   to fragment (c); a non-empty `redispatch[]` **MUST** route to the named wave's dispatch
-   operation with the next round. The poll arm **MUST NOT** discard `reconcile-intent`'s output †.
+   to fragment (c), each line with its reason; a non-empty `redispatch[]` **MUST** route to the
+   named wave's dispatch operation with the next round. A line is listed in `failed[]` or
+   `unresolved[]` only by the round whose settlement records that failure — an already-terminal
+   intent read again (`inst-ri-lock`) is not listed again — so routing failures first never
+   starves `redispatch[]`. The poll arm **MUST NOT** discard `reconcile-intent`'s output †.
 7. **Confirmation arm.** The `listen` on the Subscriptions outcome events **MUST** export only the
    line reference and wave and **MUST** call `reconcile-intent` with them before re-entering
    `evaluate` †; `$context` **MUST NOT** hold any other member of the event.
@@ -1237,7 +1240,8 @@ slice operations (D-80, D-81).
    `nextRebuildRound`, `nextSweepRound`, `report-spawn-signal`'s `nextRound` — or 0 on first
    entry, and **MUST NOT** pass one operation's round to another (`rebuild-wave1` never receives
    or writes back wave 1's `dispatchRound`). A `held` answer of `report-spawn-signal` **MUST**
-   route to the barrier loop, whose hold and resume arms consume the hold, never to a failure arm;
+   route to the held wait (`heldWait`, `10 §3.6` (b)), whose resume arm and `PT5M` tick lead back
+   through `re-check-pre-activation` to the next round, never to a failure arm;
    a `not-dispatchable` answer **MUST** route to the barrier loop too, whose lifecycle arm consumes
    the terminal event, and **MUST NOT** reach `dispatch-wave2-activate` (decision D-109).
 9. **Completion.** `report-outcome` with `outcome: completed` **MUST** follow a

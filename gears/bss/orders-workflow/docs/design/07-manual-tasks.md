@@ -67,7 +67,8 @@ The slice keeps the facts that make failure visible: the task record, its unique
 machine and its SLA; the incident record for fail-fast; the escalation record; and the operator
 queue over all three. "By any route" stays the load-bearing property: every failed-entrance route
 — a wave's `failed[]` or `unresolved[]` list, retry exhaustion in the definition's `catch`, a
-plan that does not freeze, a refused seam call, a withdrawn authority, the lifetime ceiling, and a
+plan that does not freeze, a refused seam call, a withdrawn authority, the lifetime ceiling, a dead
+invocation, and a
 compensation leg that reaches `failed-pending-escalation` — reaches the same creation path, either
 as a definition `call` to `create-manual-task` or as an in-process call to its creation port from
 inside another operation's unit of work. The two compensation-failure reasons of slice 06
@@ -320,7 +321,7 @@ only against the order's own terminal process event (`10 §3.6` (b)).
 
 | Entity | Description | Schema |
 |--------|-------------|--------|
-| `ManualTask` | Actionable operator task for one failed **subject** — a line, the plan, or the order (`task_scope`) — created under the remediation policy, or for a compensation leg in `failed-pending-escalation` under either policy, or for an order-scope failure (refused reflection, unverified trigger applicability, withdrawn authority, lifetime ceiling); carries the subject reference, the failure reason and cause, severity, SLA deadline, resolution actions, assignment state and resolution record | [owf_manual_task](#table-owf_manual_task) |
+| `ManualTask` | Actionable operator task for one failed **subject** — a line, the plan, or the order (`task_scope`) — created under the remediation policy, or for a compensation leg in `failed-pending-escalation` under either policy, or for an order-scope failure (refused reflection, authority withdrawn at `pre-compensation`, lifetime ceiling, dead invocation); carries the subject reference, the failure reason and cause, severity, SLA deadline, resolution actions, assignment state and resolution record | [owf_manual_task](#table-owf_manual_task) |
 | `ManualTaskState` | The `assignment_state` set with declared transitions: `unassigned \| assigned \| in_progress \| resolved \| reopened` (§4.3). The remediation hold of slice 04 is a derived property of an open line- or plan-scope task, not a sixth member (§4.3) | enum column on `owf_manual_task` |
 | `TaskResolutionRequest` | One operator request (retry, override, cancel) recorded by the control endpoint with the `SecurityContext` principal, the justification and — for an override — the claimed `subscriptionId`, **before** the definition is signalled; the `requestRef` is the only thing the signal carries. It is the "request row of the originating control operation" `10 §4.4` requires | [owf_task_resolution_request](#table-owf_task_resolution_request) |
 | `Incident` | Tracked, non-actionable audit entry for a permanently failed line or plan under the fail-fast policy. Forward-execution failures only (§2.2) | [owf_incident](#table-owf_incident) |
@@ -372,10 +373,11 @@ actionable task, by any route" is enforced structurally rather than by conventio
 Owns `create-manual-task` and `resolve-manual-task` (§3.3), and two in-process ports other
 slices' operations call inside **their** unit of work:
 
-- **The creation port** `create_tasks(correlationId, scope, subjects[], failureCause, source)` —
-  the same effect as `create-manual-task`, for a caller that discovers the failure inside its own
-  transaction (`compensate-order`, `authorize-cancel`, `raise-overdue-escalation` with
-  `lifetime-ceiling`). It creates or reopens exactly one task per `(order_id, order_version,
+- **The creation port** `create_tasks(correlationId, scope, subjects[], source)` —
+  the same effect as `create-manual-task`, each subject carrying its reason and cause, for a caller
+  that discovers the failure inside its own transaction (`compensate-order`, including slice 08's
+  cancel-authority port at `pre-compensation`; `raise-overdue-escalation` with `lifetime-ceiling`;
+  the `reconciliation-sweep` worker's liveness pass). It creates or reopens exactly one task per `(order_id, order_version,
   task_scope, scope_ref, failure_reason)` with the reason, the cause, the severity, the SLA deadline
   of §4.1 and the resolution actions the row offers.
 - **The closure port** `close_open_tasks(correlationId, outcome)` — called by `terminate-instance`
@@ -683,9 +685,9 @@ calls a downstream, 5 s for a record-only one.
 
 | `name` | `protection` | `input` | `output` | `idempotency_key` | `declared_event` | `compensation` | `reasons` | `audit_kind` | `retry_class` | `deadline` |
 |--------|--------------|---------|----------|-------------------|------------------|----------------|-----------|--------------|---------------|------------|
-| `create-manual-task` | `protected` | ref + `scope` ∈ `line` · `plan` · `order`; `subjects[]` (`subjectRef` — `lineRef`, `planRef` or `correlationId` — plus `reason`, the §3.7 enum); `failureCause` (§3.7 enum); `sourceStep` (operation name); `sourceAttempt` (that step's key `attempt` component) | `taskRefs[]`; `exhaustedTaskRefs[]` (tasks whose re-entrance was the third failed attempt, §4.2); `slaRound` (the SLA deadline stays in the record; the definition carries no remainder) | instance-scoped `{tenant}:{correlationId}:create-manual-task:{sourceStep}:{sourceAttempt}`; a re-failure after a retry carries the new `attempt` and therefore a new key, which is what reaches the reopen branch | none | none | `idempotency-key-conflict`, `not-found` (a subject the record does not show failed), `version-mismatch` | `step-completion` | `retryable-on: transient` | 5 s |
-| `resolve-manual-task` | `composable` | ref + `trigger` ∈ `request` · `sla-check`; `taskRef` and `requestRef` (on `request`, from the signal's `data`); `slaRound` (on `sla-check`, as last returned) | `resolution` ∈ `retry` · `override` · `closed` · `escalated` · `exhausted` · `refused` · `none`; `resumeAt` ∈ `plan` · `barrier` · `compensation` · `stage` (on `retry`); `attemptKey` (on `retry`, from `retry-step`); `openTaskCount`; `slaRound` — on `sla-check` before any open task's stored `sla_deadline` has passed, the call records nothing and answers `none` with the next `slaRound` as a settled success of its round, so the next `PT5M` tick calls the next key and no tick's key approaches the key lifetime ([`01 §3.3` *Rounds and attempts*](./01-foundation.md#rounds-and-attempts-the-one-rule-for-re-invokable-operations)) | instance-scoped `{tenant}:{correlationId}:resolve-manual-task:{taskRef}:{requestRef}` on `request`; `{tenant}:{correlationId}:resolve-manual-task:sla:{slaRound}` on `sla-check` | none (`retry` of a line re-enters `failed` → prior state through slice 04's function, which emits nothing on a non-terminal entry) | none | `order-fenced`, `action-not-offered`, `poison-step` (from `retry-step`), `not-found`, `version-mismatch` | `step-completion`; `escalation` when an SLA breach escalates; `retry` (written by `retry-step`) | `retryable-on: transient` | 5 s |
-| `verify-override` | `composable` | ref + `taskRef`, `requestRef` | `verified` (bool); `rejection` ∈ `not-active` · `binding-mismatch` · `no-binding-reference` · `corroboration-divergent` · `not-found` · `order-fenced` · `null`; `exhausted` (bool) | instance-scoped `{tenant}:{correlationId}:verify-override:{taskRef}:{requestRef}`; the Subscriptions status read is a read and carries no key | `OrderFulfillmentStepCompleted` with `provenance = operator-override`, enqueued by slice 04's transition function in this settlement transaction, on `verified` only | none — an override-attached subscription is undone as a subject of `compensate-order`, not by a paired undo | `override-unverified`, `order-fenced`, `circuit-breaker-open`, `per-attempt-timeout`, `not-found`, `version-mismatch` | `step-completion` (justification in `owf_audit_entry.justification`) | `retryable-on: transient` | 10 s |
+| `create-manual-task` | `protected` | ref + `scope` ∈ `line` · `plan` · `order`; `subjects[]`, one per subject: `subjectRef` (`lineRef`, `planRef` or `correlationId`), `reason` (the §3.7 `failure_reason` enum) and `cause` (the §3.7 `failure_cause` enum), set by the definition branch that enters the failure stage (`10 §3.6` (c), decision D-116); `sourceStep` (operation name); `sourceAttempt` (the failing call's key tail `{round}[:{attempt}]`, [`01 §3.3` *Rounds and attempts*](./01-foundation.md#rounds-and-attempts-the-one-rule-for-re-invokable-operations); the event reference for an operation keyed by its event — `resumeEventId` for `apply-resume` — and the `attempt` alone for `construct-and-freeze-plan`) | `taskRefs[]`; `exhaustedTaskRefs[]` (tasks whose re-entrance was the third failed attempt, §4.2); `slaRound` (the SLA deadline stays in the record; the definition carries no remainder) | instance-scoped `{tenant}:{correlationId}:create-manual-task:{sourceStep}:{sourceAttempt}`; every failing call has its own tail, so a second failure from the same step is a new key, and a re-failure after a retry carries the new `attempt`, which is what reaches the reopen branch | none | none | `idempotency-key-conflict`, `not-found` (a subject the record does not show failed), `version-mismatch` | `step-completion` | `retryable-on: transient` | 5 s |
+| `resolve-manual-task` | `composable` | ref + `trigger` ∈ `request` · `sla-check`; `taskRef` and `requestRef` (on `request`, from the signal's `data`); `slaRound` (on `sla-check`, as last returned) | `resolution` ∈ `retry` · `override` · `closed` · `escalated` · `exhausted` · `refused` · `none`; `resumeAt` ∈ `plan` · `barrier` · `compensation` · `stage` (on `retry`); `attemptKey` (on `retry`, from `retry-step`); `openTaskCount` (the instance's open tasks after this call, which the definition's remediation hold reads, §4.8 item 4); `slaRound` — on `sla-check` before any open task's stored `sla_deadline` has passed, the call records nothing and answers `none` with the next `slaRound` as a settled success of its round, so the next `PT5M` tick calls the next key and no tick's key approaches the key lifetime ([`01 §3.3` *Rounds and attempts*](./01-foundation.md#rounds-and-attempts-the-one-rule-for-re-invokable-operations)) | instance-scoped `{tenant}:{correlationId}:resolve-manual-task:{taskRef}:{requestRef}` on `request`; `{tenant}:{correlationId}:resolve-manual-task:sla:{slaRound}` on `sla-check` | none (`retry` of a line re-enters `failed` → prior state through slice 04's function, which emits nothing on a non-terminal entry) | none | `order-fenced`, `action-not-offered`, `poison-step` (from `retry-step`), `not-found`, `version-mismatch` | `step-completion`; `escalation` when an SLA breach escalates; `retry` (written by `retry-step`) | `retryable-on: transient` | 5 s |
+| `verify-override` | `composable` | ref + `taskRef`, `requestRef` | `verified` (bool); `rejection` ∈ `not-active` · `binding-mismatch` · `no-binding-reference` · `corroboration-divergent` · `not-found` · `order-fenced` · `null`; `exhausted` (bool); `openTaskCount` (as for `resolve-manual-task`) | instance-scoped `{tenant}:{correlationId}:verify-override:{taskRef}:{requestRef}`; the Subscriptions status read is a read and carries no key | `OrderFulfillmentStepCompleted` with `provenance = operator-override`, enqueued by slice 04's transition function in this settlement transaction, on `verified` only | none — an override-attached subscription is undone as a subject of `compensate-order`, not by a paired undo | `override-unverified`, `order-fenced`, `circuit-breaker-open`, `per-attempt-timeout`, `not-found`, `version-mismatch` | `step-completion` (justification in `owf_audit_entry.justification`) | `retryable-on: transient` | 10 s |
 | `raise-overdue-escalation` | `composable` | ref + `escalationKind` ∈ `overdue-fulfillment` · `lifetime-ceiling` · `park` · `approval-outage`; `subjectRef` (`parkRef` on `park`; the gate `position` on `approval-outage`; null otherwise); `stepRef` (the definition's position, nullable); `round` (on `overdue-fulfillment` only: 0 on the first tick, else the previous answer's `nextRound`) | `due: true\|false` on `overdue-fulfillment` — database time against the stored `expected_fulfillment_at` + 24 h, the answer the overdue re-check loop switches on (`10 §3.6` (b)); `due: false` raises nothing and is a settled success of its round; `nextRound` (on `overdue-fulfillment`), so each hourly tick runs under a new key and the monitor keeps working for an order whose expected fulfillment lies beyond the 30-day key lifetime ([`01 §3.3` *Rounds and attempts*](./01-foundation.md#rounds-and-attempts-the-one-rule-for-re-invokable-operations)); `escalationRef`; `raised` (bool; false when absorbed, not due, or when the subject has already resolved); `taskRef` (on `lifetime-ceiling`) | instance-scoped `{tenant}:{correlationId}:raise-overdue-escalation:{escalationKind}:{orderVersion}:{subjectRef or "-"}[:{round}]`, the round present on `overdue-fulfillment` only; the one escalation per subject is `owf_overdue_escalation`'s uniqueness, not the key's | none | none | `not-found` (unknown `parkRef` or position), `version-mismatch` | `escalation` | `retryable-on: transient` | 5 s |
 
 `resolve-manual-task`, `verify-override` and `raise-overdue-escalation` are `composable`: a
@@ -702,11 +704,18 @@ failed-entrance route is a change to this table.
 | `reconcile-intent` `failed[]` / `unresolved[]` (05) | definition | `line` | `wave1-create-failed`, `wave2-activation-failed`, `never-dispatched`, `intent-unresolved` |
 | Plan not frozen (04 §4.3) | definition | `plan` | `invalid-dependency-graph` (under `remediate`), `catalog-topology-unavailable` (either policy) |
 | `reflect-verdict` `permanent-failure` (03 §4.5) | definition | `order` | `approval-reflection-refused` |
-| `admit-trigger` retry exhaustion on a `listen` arm (02 §4.6) | definition | `order` | `trigger-applicability-unverified` |
 | Compensation leg `failed-pending-escalation` (06) | `compensate-order`, creation port, **either policy** | `line` | `draft-void-failed`, `activated-cancel-failed` |
-| Apply-time authority re-check fails (08, `09 §4`) | `authorize-cancel`, creation port | `order` | `authority-withdrawn` |
+| Deferred failures applied by `apply-resume` (`08 §4.7` item 8) | definition | `line` | the reason slice 05 recorded with the deferred outcome: `wave1-create-failed`, `wave2-activation-failed`, `never-dispatched`, `intent-unresolved` |
+| Apply-time authority re-check fails at `pre-compensation` (`06 §3.6` `inst-co-reauthorize`, `09 §4.4`) | `compensate-order`, through slice 08's cancel-authority port and the creation port | `order` | `authority-withdrawn` |
 | Lifetime ceiling (ceiling stage, fragment (d)) | `raise-overdue-escalation` `lifetime-ceiling`, creation port | `order` | `lifetime-ceiling-reached` |
 | Invocation no longer live (`01 §3.8` *Instance liveness pass*) | `reconciliation-sweep` worker, creation port, **either policy** — no definition runs to call `create-manual-task` | `order` | `invocation-dead` |
+
+No other route creates a task (decision D-114). A spent retry budget, a spent timeout or an
+uncaught permanent refusal of any other step call — a listen-arm `admit-trigger`, `apply-hold`,
+`apply-resume`, `authorize-cancel`, the fence, `report-outcome`, `create-manual-task` itself —
+faults the invocation, and reaches the operator through the `invocation-dead` row
+(`10 §4.6`). An authority the re-check finds withdrawn at `pre-fence` refuses the cancel request
+and raises no task, because nothing waits on it (decision D-115).
 
 Under `fail-fast` the definition does not call `create-manual-task` for a forward line or an
 `invalid-dependency-graph` plan; those subjects reach the incident port inside
@@ -808,9 +817,9 @@ sequenceDiagram
     participant MTC as create-manual-task / creation port
     participant IR as incident port
     participant R as Record (owf_manual_task, owf_incident)
-    alt remediate: wave failed[] / unresolved[], retry exhaustion, plan not frozen, refused reflection, unverified trigger
-        D ->> MTC: createTasks (ref, scope, subjects[], failureCause, sourceStep, sourceAttempt)
-    else compensation leg failed-pending-escalation (either policy), withdrawn authority, lifetime ceiling
+    alt remediate: wave failed[] / unresolved[], wave retry exhaustion, plan not frozen, refused reflection, deferred failures after a resume
+        D ->> MTC: createTasks (ref, scope, subjects[] of subjectRef + reason + cause, sourceStep, sourceAttempt)
+    else compensation leg failed-pending-escalation (either policy), authority withdrawn at pre-compensation, lifetime ceiling, dead invocation
         CO ->> MTC: creation port, inside the caller's unit of work
     else fail-fast forward failure
         CO ->> IR: incident port inside run-cancellation-fence (trigger failure, forward lines only)
@@ -862,7 +871,7 @@ sequenceDiagram
     alt resolution override
         D ->> D: verify-override (next sequence)
     else retry
-        D ->> D: resumeAt: barrier | plan | compensation | stage, under attemptKey
+        D ->> D: resumeAt: barrier | plan | compensation | stage, under attemptKey; barrier waits while openTaskCount > 0
     else exhausted
         D ->> D: compensateOrder (06)
     else closed | escalated | refused | none
@@ -1003,10 +1012,10 @@ it.
 | task_scope | enum | `line` \| `plan` \| `order` — the subject the task is about (slice 04 §4.7 ask) |
 | scope_ref | text | `lineRef`, `planRef` or `correlationId`, per `task_scope`; replaces the former `*plan*` sentinel |
 | line_ref | text, nullable | Line item reference; equals `scope_ref` when `task_scope = line`, NULL otherwise |
-| failure_reason | enum | **Enum, not text**; a catalogue reason (`01 §4.9`). Line: `wave1-create-failed`, `wave2-activation-failed`, `never-dispatched`, `intent-unresolved`; compensation (line): `draft-void-failed`, `activated-cancel-failed`, `blocked-upstream`; plan: `invalid-dependency-graph`, `catalog-topology-unavailable`; order: `trigger-applicability-unverified`, `approval-reflection-refused`, `authority-withdrawn`, `lifetime-ceiling-reached`, `invocation-dead`. The wave pair is the **wave discriminator** the PRD requires. `overlap-collision` and `market-divergence` are **not** members: a pre-activation abort creates no task (04 §2.1) |
+| failure_reason | enum | **Enum, not text**; a catalogue reason (`01 §4.9`). Line: `wave1-create-failed`, `wave2-activation-failed`, `never-dispatched`, `intent-unresolved`; compensation (line): `draft-void-failed`, `activated-cancel-failed`, `blocked-upstream`; plan: `invalid-dependency-graph`, `catalog-topology-unavailable`; order: `approval-reflection-refused`, `authority-withdrawn`, `lifetime-ceiling-reached`, `invocation-dead`. The wave pair is the **wave discriminator** the PRD requires. `overlap-collision` and `market-divergence` are **not** members: a pre-activation abort creates no task (04 §2.1) |
 | failure_cause | enum | Why, orthogonal to which step: `retry-budget-exhausted`, `step-deadline-exceeded`, `explicit-failure-confirmation`, `sweep-discovered-terminal-failure`, `sweep-floor-reached`, `permanent-refusal`, `plan-not-frozen`, `lifetime-elapsed`, `invocation-ended` (the platform reports the bound invocation not live, `01 §3.8`) |
 | source_step | text | The operation whose failure produced the entrance (`sourceStep`) |
-| source_attempt | integer | That step's key `attempt` component at the entrance |
+| source_attempt | text | The failing call's key tail at the entrance, `{round}[:{attempt}]` (or the event reference of an event-keyed operation, §3.3) |
 | severity | enum | `normal` \| `urgent` \| `escalated`. `activated-cancel-failed` is created `urgent` |
 | sla_deadline | timestamptz | Computed by §4.1 at creation and recomputed on `reopened` |
 | sla_breached_at | timestamptz, nullable | Stamped by `resolve-manual-task` (`sla-check`) when the deadline was found elapsed |
@@ -1263,7 +1272,7 @@ where `class_window` is chosen by whether the stuck subject is **resource-affect
 | `wave1-create-failed`, `never-dispatched`, `intent-unresolved` | no — a draft carries no billable facts | **24 h** |
 | `draft-void-failed` | no — same reason, in reverse | **24 h** |
 | `invalid-dependency-graph`, `catalog-topology-unavailable` | no — nothing is provisioned before the plan freezes | **24 h** |
-| `trigger-applicability-unverified`, `approval-reflection-refused`, `authority-withdrawn`, `lifetime-ceiling-reached` | no — an order-scope decision, not a live resource | **24 h** |
+| `approval-reflection-refused`, `authority-withdrawn`, `lifetime-ceiling-reached` | no — an order-scope decision, not a live resource | **24 h** |
 | `invocation-dead` | yes — nothing drives the order any more, and activated subscriptions may be live with no report pending (D-105) | **4 h** |
 | dead-letter triage (pending) | no — the delivery was not processed at all | **24 h** |
 
@@ -1323,7 +1332,9 @@ state. It is answered as a derived property: a task with `assignment_state <> re
 ∈ {line, plan}`, a forward reason, under the pinned `remediate` policy, **is** the order's
 remediation hold, and the queue projects it as `remediationHold: true`. Dispatch is stopped
 structurally by the definition's position in `awaitResolution` (04 §4.4), not by a column this
-slice writes; a sixth `assignment_state` member would conflate the operator's progress with the
+slice writes, and it lasts until the order's last open task resolves: a `retry` or a verified
+override of one line while others are open returns the definition to `awaitResolution`
+(decision D-117); a sixth `assignment_state` member would conflate the operator's progress with the
 order's dispatch state (decision D-99: the remediation hold is an open
 forward task under `remediate`, projected as a flag, not an assignment state).
 
@@ -1336,7 +1347,7 @@ forward task under `remediate`, projected as a flag, not an assignment state).
 | `line`, forward reason | yes, unless fenced or terminal; per wave (04 §3.7: wave 1 → `pending`, wave 2 → `draft_created`) | yes, unless fenced or terminal | yes | Seller Operator |
 | `line`, compensation reason | yes while the fence is open; not on a terminal order | no — there is no fulfillment to confirm | yes | no while the subject is live |
 | `plan` | yes — a new `attempt` of `construct-and-freeze-plan` | no | yes | Seller Operator |
-| `order` | yes — re-enter the stage whose operation failed (`admit-trigger`, `reflect-verdict`, `authorize-cancel`); for `lifetime-ceiling-reached`, `unpark` through the task-resolution arm of the lifetime-ceiling park in `10 §3.6` (d), beside its unpark-requested arm | no | yes | Seller Operator |
+| `order` | yes — for `approval-reflection-refused`, re-enter `reflect-verdict` under the minted `attempt`; for `authority-withdrawn` (raised only at `pre-compensation`), a new `compensate-order` pass, which submits no leg while the fence awaits re-authorization — the resolution is a newly authorized cancel, absorbed against the run through the unwind's cancel arm (`06 §4.3`); for `lifetime-ceiling-reached`, `unpark` through the task-resolution arm of the lifetime-ceiling park in `10 §3.6` (d), beside its unpark-requested arm | no | yes | Seller Operator |
 | `order`, `invocation-dead` | the platform re-drive — the control gateway issues `…:control` `retry` of the bound invocation instead of a signal ([`01 §4.16`](./01-foundation.md#416-recovery-is-the-platforms-invocation-and-orders-record) item 1); offered only from a platform state the platform confirms `retry` from, keeping `invocation_id` and resuming at the faulted task, and never once the fence is claimed (`order-fenced`) | no | yes | Seller Operator — the order cancel of `09 §3.3`, which, with no invocation to signal, the liveness pass carries out as the dead-instance unwind (`01 §4.16` item 2); `action-not-offered` while the order's fulfillment has not begun and Lifecycle holds it live, because only Lifecycle's own cancel can end such an order (D-109) |
 
 The Fulfillment Operator (`cpt-cf-bss-orders-workflow-actor-owf-fulfillment-operator`) views the
@@ -1399,8 +1410,8 @@ when the fragments were reconciled with the slice operations (D-80, D-81):
 
 1. [ ] - `p1` - **Creation before terminal.** On every failure path under `remediate`, and on the plan-level `topology-unavailable` path under either policy, `create-manual-task` **MUST** precede any `run-cancellation-fence`, `report-outcome` or `terminate-instance`; under `fail-fast` the definition **MUST NOT** call it for a forward line or `invalid-dependency-graph` subject - `inst-c7-create-first`
 2. [ ] - `p1` - **No swallowing.** `create-manual-task` **MUST NOT** be inside a `catch` that continues the forward path (`10 §4.6`); its retry exhaustion fails the invocation, which the sweep's instance liveness pass raises as an `invocation-dead` task within one pass interval (`01 §3.8`, D-105) - `inst-c7-no-swallow`
-3. [ ] - `p1` - **Every task has a waiter.** Every arm that follows `create-manual-task` — fragment (c)'s `awaitResolution` and `awaitCompensationResolution`, and the arms after a refused reflection (03), an unverified trigger (02) and a withdrawn authority (08) — **MUST** be a competing `fork` containing the `task-resolution-requested` `listen` followed by `resolve-manual-task`, and an SLA branch that waits the fixed `PT5M` `waitSla` tick and then calls `resolve-manual-task` with `trigger: sla-check` and the last `slaRound`, carrying no remainder; the call **MUST** be a no-op until the stored SLA deadline has passed - `inst-c7-waiter`
-4. [ ] - `p1` - **Routing on the answer.** `exhaustedTaskRefs` non-empty after `create-manual-task`, `exhausted` from `resolve-manual-task`, and `exhausted: true` from `verify-override` **MUST** route to `compensateOrder`; `retry` **MUST** route by `resumeAt` (`barrier`, `plan`, `compensation`, `stage`) and carry `attemptKey`; `closed`, `escalated`, `refused` and `none` **MUST** return to the waiting fork (**alignment**: fragment (c) routes every `retry` to `barrier` and does not read `exhaustedTaskRefs`) - `inst-c7-routing`
+3. [ ] - `p1` - **Every task has a waiter.** Every arm that follows `create-manual-task` — fragment (c)'s `awaitResolution` and `awaitCompensationResolution`, and the arm after a refused reflection (03), which is fragment (c)'s `awaitResolution` — **MUST** be a competing `fork` containing the `task-resolution-requested` `listen` followed by `resolve-manual-task`, and an SLA branch that waits the fixed `PT5M` `waitSla` tick and then calls `resolve-manual-task` with `trigger: sla-check` and the last `slaRound`, carrying no remainder; the call **MUST** be a no-op until the stored SLA deadline has passed - `inst-c7-waiter`
+4. [ ] - `p1` - **Routing on the answer.** `exhaustedTaskRefs` non-empty after `create-manual-task`, `exhausted` from `resolve-manual-task`, and `exhausted: true` from `verify-override` **MUST** route to `compensateOrder`; `retry` **MUST** route by `resumeAt` (`barrier`, `plan`, `compensation`, `stage`) and carry `attemptKey`, except that a `barrier` retry or a verified override **MUST** return to the waiting fork while `openTaskCount` is above 0 — the remediation hold of §4.3 holds until the order's last open task resolves, so every open task keeps its waiter (decision D-117); `closed`, `escalated`, `refused` and `none` **MUST** return to the waiting fork (**alignment**: fragment (c) routes every `retry` to `barrier` and does not read `exhaustedTaskRefs`) - `inst-c7-routing`
 5. [ ] - `p1` - **Override order.** `verify-override` **MUST** follow a `resolve-manual-task` that answered `override` for the same `requestRef`, and **MUST NOT** be called otherwise - `inst-c7-override-order`
 6. [ ] - `p1` - **The overdue arm.** The overdue window **MUST** be the top-level `overdueMonitor` branch of the `lifetime` fork (`10 §3.6` (a)), outside every stage and with no hold arm (a hold does not pause it, `01 §4.4`), and **MUST NOT** be a `listen` in fragment (b): a fixed `PT1H` `waitOverdue` tick followed by `raise-overdue-escalation` with `escalationKind: overdue-fulfillment` and nothing else, looping while `due` and `raised` are both `false`; the deadline (`expected_fulfillment_at` + the overdue window) is the operation's stored value, never the definition's; the branch **MUST NOT** complete, so it never wins the outer race, and it stops with the invocation - `inst-c7-overdue`
 7. [ ] - `p1` - **The other escalation arms.** The ceiling stage of `10 §3.6` (d), entered when the top-level `P90D` ceiling fires outside an unwind, **MUST** call `raise-overdue-escalation` (`lifetime-ceiling`) before `park`, and its operator wait **MUST** carry the task-resolution arm through which a `retry` of the `lifetime-ceiling-reached` task reaches `unpark`; the park arm **MUST** call it with `escalationKind: park` and the `parkRef`, and **MUST NOT** re-arm after it answered (`03 §4.5`); the outage arm with `approval-outage` and the gate position - `inst-c7-escalation-arms`
@@ -1431,15 +1442,16 @@ definition input, not an Orders release) — the business default of 24 hours is
 - **Decisions**: `DECISIONS.md` D-29 (two compensation reasons), D-32 (one task by any route),
   D-33 (override rejected without verification), D-34 (overdue non-terminal), D-53 (lifetime
   ceiling), D-55 (remediation exhausted); D-98 (reason enum and SLA classes), D-99 (remediation hold, last-task
-  cancel) and D-100 (resolution requests and keys)
+  cancel), D-100 (resolution requests and keys), D-114 (one failure rule), D-115 (no task for a
+  pre-fence denial), D-116 (the task body) and D-117 (the remediation hold holds)
 - **Prior slices**: [01-foundation.md](./01-foundation.md) (envelope, `retry-step`,
   `terminate-instance`, reason catalogue, dead letters), [02-triggers-and-start.md](./02-triggers-and-start.md)
-  (`trigger-applicability-unverified`), [03-approval-execution.md](./03-approval-execution.md)
+  (`admit-trigger`, whose listen-arm exhaustion faults the invocation, D-114), [03-approval-execution.md](./03-approval-execution.md)
   (park port, `approval-reflection-refused`), [04-fulfillment-plan.md](./04-fulfillment-plan.md)
   (transition function, plan-level failures, remediation hold), [05-provisioning-intents.md](./05-provisioning-intents.md)
   (`binding_reference`, `failed[]`/`unresolved[]`), [06-saga-and-compensation.md](./06-saga-and-compensation.md)
   (`compensate-order` as creation-port caller, `run-cancellation-fence` as incident-port caller), [08-hold-and-cancel.md](./08-hold-and-cancel.md)
-  (`authority-withdrawn`, lifetime ceiling), [09-read-and-authz.md](./09-read-and-authz.md)
+  (`authority-withdrawn` at `pre-compensation`, deferred failures, lifetime ceiling), [09-read-and-authz.md](./09-read-and-authz.md)
   (catalogue, scope predicates)
 - **Retired here**: the overdue durable timer (`owf_durable_timer` `overdue-fulfillment`), the
   Orders dead-letter redrive path, the override's `owf_compensation_record` write, and the

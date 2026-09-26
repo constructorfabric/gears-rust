@@ -643,7 +643,8 @@ no REST, SDK or event-handler caller.
 5. **Subject-only evaluation for the apply-time re-check** (`09 §4.4`): a decision on a context
    carrying `subject_id`, `subject_type`, `subject_tenant_id` and `token_scopes` but no bearer
    token, days after acceptance. If the provider cannot evaluate it, say so; the re-check then
-   fails closed into an `authority-withdrawn` manual task.
+   fails closed: the cancel is refused before the fence, and an `authority-withdrawn` manual task
+   holds it after (D-115).
 6. **Delegation proof as request context.** Lifecycle D-111 items 1–3 (carrier, policy
    evaluation, distinguishable deny reasons) apply by reference; Workflow never validates proof.
 

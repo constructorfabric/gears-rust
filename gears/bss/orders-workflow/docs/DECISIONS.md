@@ -132,6 +132,11 @@
   - [D-111 (M) The report follows the fence row, carries the requester's reason, and names an answer for every Lifecycle refusal](#d-111-m-the-report-follows-the-fence-row-carries-the-requesters-reason-and-names-an-answer-for-every-lifecycle-refusal)
   - [D-112 (M) `reflect-verdict` sends Lifecycle's wire form, and a moved order is waited out, not failed](#d-112-m-reflect-verdict-sends-lifecycles-wire-form-and-a-moved-order-is-waited-out-not-failed)
   - [D-113 (M) Workflow does not pre-check buyer acceptance](#d-113-m-workflow-does-not-pre-check-buyer-acceptance)
+  - [D-114 (H) One rule for a step call that fails: it faults the invocation unless the failure is a subject an operator acts on](#d-114-h-one-rule-for-a-step-call-that-fails-it-faults-the-invocation-unless-the-failure-is-a-subject-an-operator-acts-on)
+  - [D-115 (M) An authority withdrawn before the fence refuses the cancel and raises no task](#d-115-m-an-authority-withdrawn-before-the-fence-refuses-the-cancel-and-raises-no-task)
+  - [D-116 (M) Each task subject carries its reason and cause, and the task key ends in the failing call's tail](#d-116-m-each-task-subject-carries-its-reason-and-cause-and-the-task-key-ends-in-the-failing-calls-tail)
+  - [D-117 (M) The remediation hold lasts until the order's last open task resolves](#d-117-m-the-remediation-hold-lasts-until-the-orders-last-open-task-resolves)
+  - [D-118 (M) `escalate-gate` and `arm-park-escalation` have algorithms; every answer returns the next round, and a fire during an outage pauses](#d-118-m-escalate-gate-and-arm-park-escalation-have-algorithms-every-answer-returns-the-next-round-and-a-fire-during-an-outage-pauses)
 - [Open Questions](#open-questions)
   - [Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?](#q-01-which-durable-execution-substrate-backs-the-process--the-oss-workflow-engine-or-a-bss-local-mechanism)
   - [Q-02: The Generic Approval escalation threshold — the one PRD-deferred numeric value this design deliberately leaves unset](#q-02-the-generic-approval-escalation-threshold--the-one-prd-deferred-numeric-value-this-design-deliberately-leaves-unset)
@@ -2151,6 +2156,11 @@ refusal there would fault the invocation with every subscription already removed
 Lifecycle asserting subscriptions that no longer exist. That is the rationale 06 §3.2 already gave.
 `authorize-cancel` also answers `preFulfillment` (D-109).
 
+**Amended (2026-09-26)**: a withdrawn authority at `pre-fence` refuses the request and raises no
+task; the task is raised only at `pre-compensation` (D-115). A spent retry budget of
+`authorize-cancel` no longer creates a task: it faults the invocation, and the `invocation-dead`
+task's re-drive resumes at `authorize-cancel` (D-114).
+
 ### D-85 (M) The cancel request is a slice-09 table; task requests are slice 07's
 
 **Accepted.**
@@ -2217,6 +2227,10 @@ off (Q-02); a probe arm keeps the pause decision in the definition and the evide
 
 **Propagated**: `design/03-approval-execution.md` §4.1, §4.2; `design/08-hold-and-cancel.md` §3.7;
 `design/10-process-definition.md` §3.6 (a).
+
+**Amended (2026-09-26)**: "first-observed unavailability" is now a column,
+`owf_approval_gate.outage_since`, set with the `approval-outage` cause and cleared with it. A
+fire that finds the breaker open pauses the due gates instead of refusing (D-118).
 
 ### D-88 (L) The approval routing plan is saved at the first `open-gates`
 
@@ -2381,6 +2395,11 @@ inside the 24 h overdue window so an SLA breach is visible before the order-leve
 
 **Propagated**: `design/07-manual-tasks.md` §3.7, §4.1, §4.7.
 
+**Amended (2026-09-26)**: `trigger-applicability-unverified` is no longer a task reason. A spent
+listen-arm admission faults the invocation and reaches the operator as `invocation-dead` (D-114).
+It stays a catalogue reason, the retryable refusal of `admit-trigger`, so the catalogue count is
+unchanged.
+
 ### D-99 (M) The remediation hold is a flag; cancelling the last open forward task exhausts remediation
 
 **Accepted.**
@@ -2394,6 +2413,10 @@ remediation exhausted for that subject.
 state; cancelling the last task is the Seller Operator's judgement that remediation is moot.
 
 **Propagated**: `design/07-manual-tasks.md` §3.3, §4.3.
+
+**Amended (2026-09-26)**: the hold lasts until the order's last open task resolves. A line retry or
+a verified override while other tasks are open returns the definition to `awaitResolution`, and
+the last resolution takes every retried line back to the barrier (D-117).
 
 ### D-100 (M) Task actions record a request and signal; every mutating route requires a key
 
@@ -2589,6 +2612,11 @@ order's state. Lifecycle admits that trigger only from fulfillment. For an order
 never began, the task's `cancel` is `action-not-offered` while Lifecycle holds the order live. The
 Seller Operator cancels it through Lifecycle first, and the unwind then makes no Lifecycle call
 (D-109).
+
+**Amended (2026-09-26)**: the liveness pass is the failure arm of every step call the definition
+does not catch. Retry exhaustion of a listen-arm admission, `apply-hold`, `apply-resume`,
+`authorize-cancel`, the fence or `report-outcome` reaches the operator only as `invocation-dead`
+(D-114).
 
 ### D-106 (H) Every step call is bound to the instance's invocation, and the fence needs a recorded cause
 
@@ -2824,6 +2852,151 @@ never snapshotted, and `08 §4.2`, which says the read "MUST NOT expose guard st
 `begin-fulfillment`'s existing `withheld` mapping (`04 §3.6`).
 
 **Propagated**: `design/04-fulfillment-plan.md` §1.2, §3.2, §3.3, §3.6.
+
+### D-114 (H) One rule for a step call that fails: it faults the invocation unless the failure is a subject an operator acts on
+
+**Accepted (2026-09-26).** *(amends D-84 and D-105)*
+
+**Decision**: a spent retry budget, a spent timeout and a permanent refusal of a step call fault
+the invocation. The instance liveness pass raises the `invocation-dead` task within one pass
+interval. The task's platform re-drive resumes at the faulted call under its still-open key,
+because `retryable-failure` leaves the key `open`. The definition catches a failure only where it
+is the failure of a subject an operator can act on:
+
+- a wave call's exhaustion and a wave's `failed[]` (line tasks);
+- `compensate-order`'s exhaustion (`awaitCompensationResolution`, then the next pass);
+- `reflect-verdict`'s refusal (`approval-reflection-refused`, an order-scope task);
+- the start path's `prior-instance-active` (the `supersession` retry).
+
+Every other call faults: listen-arm admissions, `apply-hold`, `apply-resume`, `authorize-cancel`,
+slice 04's evaluations and `begin-fulfillment`, `report-spawn-signal`, the fence,
+`report-outcome`, `create-manual-task` and `terminate-instance`. `trigger-applicability-unverified`
+stays a retryable refusal of `admit-trigger` but is no longer a manual-task reason, and
+`authorize-cancel`'s exhaustion catch and the definition's `authorityTask` are removed.
+
+**Rationale**: four slices promised that an exhausted admission, hold, resume, fence or report
+would reach `create-manual-task`, while the canonical definition carried a bare retry, and
+`10 §4.6` endorsed letting exhaustion propagate (OW2-13, 06 §4.7 item 5). Routing each of them
+into the failure stage would need a return point into another stage's checkpoint. The one such
+route that existed, a spent `authorize-cancel` taken from the hold's resume wait, stranded the
+order once the failure stage consumed the resume (OW2-19). A fault of these calls is a failure
+of Orders or of a dependency the order cannot proceed without, not of a subject, so no stage
+remedy fits it. The permanent refusals of the fence and the report are defects no retry of the
+same step resolves. **Precedent**: the platform's own status machine, where a failed invocation
+with no `on_failure` handler moves to `dead_lettered`
+([serverless-runtime `DESIGN.md:458`](../../../serverless-runtime/docs/DESIGN.md#invocation-status-state-machine)).
+The liveness pass that observes it is D-105. `DESIGN.md` §1.2 already stated this split for
+`report-outcome` and `create-manual-task`.
+
+**Propagated**: `design/10-process-definition.md` §2.2, §3.6 (c), (d), §4.6;
+`design/01-foundation.md` §3.3, §4.5, §4.8, §4.13; `design/02-triggers-and-start.md` §4.2, §4.7;
+`design/04-fulfillment-plan.md` §4.8; `design/06-saga-and-compensation.md` §4.7;
+`design/07-manual-tasks.md` §3.3, §3.7, §4.1, §4.4, §4.8; `design/08-hold-and-cancel.md` §1.1,
+§1.2, §2.1, §3.2, §3.3, §3.6, §4.7; `design/09-read-and-authz.md` §4.4, §4.6; `DESIGN.md` §1.2, §4.4.
+
+### D-115 (M) An authority withdrawn before the fence refuses the cancel and raises no task
+
+**Accepted (2026-09-26).** *(amends D-84)*
+
+**Decision**: at `pre-fence`, `authorize-cancel` marks a withdrawn authority's request `refused`
+with `authority-withdrawn`, audits it, creates no manual task and answers `authorized = false`. The
+definition returns to where the cancel was taken. A Seller Operator who still means the cancel
+submits a new one under a fresh authorization. The `authority-withdrawn` task is raised only at
+`pre-compensation`, inside `compensate-order`, where the claimed fence waits on it in
+`awaitCompensationResolution`. `authorize-cancel` returns no `taskRef`.
+
+**Rationale**: the deny created a task and the definition went `back` to a stage fork with no
+resolution arm and no SLA branch. That broke "every task has a waiter" (`07 §4.8` item 3): the
+operator's action had no consumer and the SLA never breached (OW2-12). Nothing waits on the task
+at `pre-fence`, because the order continues, and its only meaningful resolution was always a new
+cancel. **Precedent**: Lifecycle's late authorization conflict is a refusal with an audit entry,
+"with no automatic reauthorization"; "a subsequent attempt must … obtain fresh authorization"
+([Lifecycle `08-read-and-authz.md:1286-1293`](../../orders-lifecycle/docs/design/08-read-and-authz.md)).
+
+**Propagated**: `design/08-hold-and-cancel.md` §1.2, §3.2, §3.3, §3.6, §4.3;
+`design/09-read-and-authz.md` §4.4; `design/07-manual-tasks.md` §3.2, §3.3, §4.4;
+`design/10-process-definition.md` §3.6 (d); `ADR/0010`; `UPSTREAM_REQS.md` §2.8.
+
+### D-116 (M) Each task subject carries its reason and cause, and the task key ends in the failing call's tail
+
+**Accepted (2026-09-26).**
+
+**Decision**: every branch that enters the failure stage sets the whole `create-manual-task` body:
+
+- `failureScope`;
+- `failureSubjects`, one `{ subjectRef, reason, cause }` per subject, from the `failure_reason`
+  and `failure_cause` enums of `07 §3.7`;
+- `sourceStep`;
+- `sourceAttempt`, the failing call's key tail `{round}[:{attempt}]`, exported with that call's
+  answer: the event reference for `apply-resume` and the `attempt` alone for
+  `construct-and-freeze-plan`.
+
+The call-level `failureCause` is removed. `owf_manual_task.source_attempt` becomes text.
+`apply-resume`'s `failedTaskRefs[]` carries `lineRef` and `reason`, the shape of a wave's
+`failed[]`.
+
+**Rationale**: no branch set `failureCause` or `sourceAttempt`, and the subjects came in three
+shapes. Two failures from one step therefore presented one key with different bodies, which is
+`idempotency-key-conflict`, and the reopen branch was unreachable (OW2-14). A sweep answer mixes
+terminal failures and unresolved intents in one call, so the cause belongs to the subject, as it
+does on the `owf_manual_task` row. **No precedent exists** in the sibling gears for a
+definition-built task body. The rule reuses this gear's round tail (D-102) and the table's own
+per-row reason and cause.
+
+**Propagated**: `design/07-manual-tasks.md` §3.2, §3.3, §3.6, §3.7;
+`design/08-hold-and-cancel.md` §3.3, §3.6; `design/10-process-definition.md` §3.6 (a), (b), (c),
+(e); `design/06-saga-and-compensation.md` §4.8.
+
+### D-117 (M) The remediation hold lasts until the order's last open task resolves
+
+**Accepted (2026-09-26).** *(amends D-99)*
+
+**Decision**: `resolve-manual-task` and `verify-override` return `openTaskCount`. A line `retry`,
+or a verified override, while `openTaskCount > 0` returns the definition to `awaitResolution`. The
+resolution that leaves no open task takes every retried line back to the barrier together.
+`reconcile-intent` lists a line in `failed[]` or `unresolved[]` only in the round that records the
+failure.
+
+**Rationale**: the first retry left the failure stage, and the barrier fork had no resolution arm.
+The sibling tasks lost their waiter, and their SLA ticks stopped (OW2-15). Staying in the stage is
+the remediation hold that `07 §4.3` and `04 §4.4` already define: dispatch is stopped by the
+definition's position in `awaitResolution`. Listing a failure once removes the ordering hazard in
+`onSweep`. **Precedent**: D-99 and `04 §4.4` in this gear. No sibling gear runs a multi-task
+remediation.
+
+**Propagated**: `design/07-manual-tasks.md` §3.3, §3.6, §4.3, §4.8;
+`design/05-provisioning-intents.md` §4.5; `design/10-process-definition.md` §3.6 (b), (c).
+
+### D-118 (M) `escalate-gate` and `arm-park-escalation` have algorithms; every answer returns the next round, and a fire during an outage pauses
+
+**Accepted (2026-09-26).** *(amends D-87)*
+
+**Decision**: slice 03 gives CDSL algorithms for `escalate-gate` `fire`, `escalate-gate` `probe`
+and `arm-park-escalation`:
+
+- **Rounds**: every answer, `due: false`, `available` and `outage` included, settles its key and
+  returns the next round. The `escalate-gate` family is the position and mode, so each position
+  starts both rounds at 0.
+- **`fire`**: escalates the open, unpaused gates whose window has elapsed. It stamps
+  `escalated_at`, re-arms the window, enqueues `OrderApprovalEscalated` and delivers the
+  escalation command under the step key.
+- **`fire` on an open breaker**: sends no command. It pauses the due gates for `approval-outage`
+  with no remainder and answers `due: false`, and is no longer refused `circuit-breaker-open`.
+- **`probe`**: records the outage pause or its end.
+- **Outage threshold**: measured from a new `owf_approval_gate.outage_since` column.
+- **`arm-park-escalation`**: answers `due` against `escalation_due_at`, and `false` once the park
+  has escalated. It records nothing.
+
+**Rationale**: the sequence had a diagram but no steps. It never said when a round advances or
+what a fire sends. A probe that replayed its first `available` would never detect an outage
+(OW2-20). The diagram still said "key open" for `due: false`, contradicting D-102. A fire refused
+`circuit-breaker-open` would, under D-114, fault the invocation exactly when the approval service
+is down. **Precedent**: Lifecycle's expiry scheduler answers `expiry-not-due` against the stored
+effective TTL and records the outcome
+([Lifecycle `07-hold-and-expiry.md:358`](../../orders-lifecycle/docs/design/07-hold-and-expiry.md)).
+The round rule is D-102.
+
+**Propagated**: `design/03-approval-execution.md` §3.2, §3.3, §3.6, §3.7.
 
 ## Open Questions
 
@@ -3163,6 +3336,11 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-111 | M Report follows the fence row; cancel reason; every Lifecycle answer | `design/06-saga-and-compensation.md` §3.2, §3.3, §3.6, §3.7, §4.3, §4.7, §4.9, `design/09-read-and-authz.md` §3.3, §3.7, `design/10-process-definition.md` §3.6, `DESIGN.md` §3.3, §3.6 |
 | D-112 | M `reflect-verdict` wire form and refusals | `design/03-approval-execution.md` §3.3, §3.6, §4.4, `design/10-process-definition.md` §3.6 |
 | D-113 | M No Workflow acceptance pre-check | `design/04-fulfillment-plan.md` §1.2, §3.2, §3.3, §3.6 |
+| D-114 | H One failure rule: fault unless a subject | `design/10-process-definition.md` §2.2, §3.6, §4.6, `design/01-foundation.md` §3.3, §4.5, §4.8, §4.13, `design/02-triggers-and-start.md` §4.2, §4.7, `design/04-fulfillment-plan.md` §4.8, `design/06-saga-and-compensation.md` §4.7, `design/07-manual-tasks.md` §3.3, §3.7, §4.1, §4.4, §4.8, `design/08-hold-and-cancel.md` §1.1, §1.2, §2.1, §3.2, §3.3, §3.6, §4.7, `design/09-read-and-authz.md` §4.4, §4.6, `DESIGN.md` §1.2, §4.4; D-84, D-105 |
+| D-115 | M No task for a pre-fence authority denial | `design/08-hold-and-cancel.md` §1.2, §3.2, §3.3, §3.6, §4.3, `design/09-read-and-authz.md` §4.4, `design/07-manual-tasks.md` §3.2, §3.3, §4.4, `design/10-process-definition.md` §3.6, `ADR/0010`, `UPSTREAM_REQS.md` §2.8; D-84 |
+| D-116 | M Task body: subject reason and cause, failing call's tail | `design/07-manual-tasks.md` §3.2, §3.3, §3.6, §3.7, `design/08-hold-and-cancel.md` §3.3, §3.6, `design/10-process-definition.md` §3.6, `design/06-saga-and-compensation.md` §4.8 |
+| D-117 | M Remediation hold until the last open task | `design/07-manual-tasks.md` §3.3, §3.6, §4.3, §4.8, `design/05-provisioning-intents.md` §4.5, `design/10-process-definition.md` §3.6; D-99 |
+| D-118 | M Escalation and park-clock algorithms | `design/03-approval-execution.md` §3.2, §3.3, §3.6, §3.7; D-87, D-102 |
 
-Highest decision number used: **D-113**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
+Highest decision number used: **D-118**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
 register; there are no parts.

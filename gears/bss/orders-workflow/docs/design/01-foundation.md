@@ -858,7 +858,7 @@ definition's `catch` sees (`$error.status`, `10 §2`):
 | Outcome | Meaning | Answer |
 |---------|---------|--------|
 | `retryable-failure` | The attempt failed transiently — downstream not accepting, per-operation deadline cut it before an accept, or an open breaker; the registry record is left `open` and the definition's retry policy may re-issue the same key | 503 or 504 with the catalogue reason |
-| `permanent-failure` | The attempt failed in a way the operation declared non-retryable, or the caller presented a key conflict; the definition's failure arm applies | 400, 403, 404 or 409 (`AlreadyExists`) with the catalogue reason |
+| `permanent-failure` | The attempt failed in a way the operation declared non-retryable, or the caller presented a key conflict; the definition's named failure route applies where `10 §4.6` names one, and otherwise the invocation faults | 400, 403, 404 or 409 (`AlreadyExists`) with the catalogue reason |
 | `still-processing` | The registry found an `in_flight` record under this key with a live lease, or a dead lease inside the key lifetime on a key whose dead lease is settled by lookup (§4.3 *Lease-expired*); the caller must not infer success and must not resubmit under a new key; re-issue the same key after backoff or wait for `settle-from-lookup` | 409 `Aborted`, `still-processing` or `idempotency-lease-expired` |
 | `aged-out` | The key's retention window (§3.7) elapsed with no settled record; the next attempt is a **new operation under a new key** — it appends the key's `attempt` component — never a resume of the old one | 400, `idempotency-key-aged-out` |
 
@@ -1995,11 +1995,13 @@ records from the gate's `opened_at` and window (slice 08), and no table in this 
 ### 4.5 The envelope's bound and the caller-side duplicate protocol
 
 The envelope enforces the per-operation deadline and nothing else of the five (§4.2). **What
-follows from an exhausted definition bound is the definition's failure arm**, never a decision the
-envelope takes: when the platform's retry policy is exhausted or a task times out, the definition's
-`catch` calls `create-manual-task` (remediate) or the compensation arm (fail-fast) with the
-catalogue reason `retry-budget-exhausted` or `step-deadline-exceeded` (`10 §3.6` (c)); the
-envelope creates no manual task, opens no incident and acknowledges nothing to Lifecycle.
+follows from an exhausted definition bound is the definition's**, never a decision the
+envelope takes: when the platform's retry policy is exhausted or a task times out on a wave call,
+the definition's `catch` calls `create-manual-task` (remediate) or the compensation arm
+(fail-fast) with the cause `retry-budget-exhausted` or `step-deadline-exceeded`
+(`10 §3.6` (c)); on any other step call the invocation faults and the instance liveness pass
+(§3.8) raises the `invocation-dead` task (`10 §4.6`, decision D-114). The envelope creates no
+manual task, opens no incident and acknowledges nothing to Lifecycle.
 
 **Caller-side duplicate protocol** (binding on the definition's retry arms and on every operation
 that calls a downstream):
@@ -2234,8 +2236,9 @@ outcome, and **MUST** be visible to the fulfillment operator — that visibility
 surface and is requested in `UPSTREAM_REQS.md` §2.9, not built here.
 
 **The step-level path is the manual task, by construction.** A step operation settles
-`retryable-failure` or `permanent-failure`; what follows is the definition's failure arm, whose
-consequence is `create-manual-task` (slice 07) or the compensation arm — which is why
+`retryable-failure` or `permanent-failure`; what follows is the definition's named failure route,
+whose consequence is `create-manual-task` (slice 07) or the compensation arm, or a fault of the
+invocation that the liveness pass raises as the `invocation-dead` task (`10 §4.6`) — which is why
 `owf_step_log.outcome` carries no `dead-lettered` member and why no operation raises one. An
 **outbound** process event the platform permanently rejects is a `toolkit_db::outbox` dead letter
 (§3.6) and writes no Orders record either. One fact, one store, in all three directions.
@@ -2467,7 +2470,8 @@ even resolve a key for — is answered as a validation refusal (400) and recorde
 deterministic answer to the same input. Per-task retry is the definition's own — a `try` whose
 `catch` names a `use.retries` policy through `catch.retry` (Serverless Workflow DSL 1.0.0,
 dsl-reference.md *Try*, *Retry*; `10 §2`) — and a 400 is not retried because no `catch` of the
-canonical definition matches it, so the definition's failure arm runs. The platform
+canonical definition matches it, so the definition's named failure route runs where `10 §4.6`
+names one, and otherwise the invocation faults. The platform
 `RetryPolicy` ([`DESIGN.md:354`–`370`](../../../../serverless-runtime/docs/DESIGN.md#retrypolicy))
 is invocation-level, by SDK error category, and is not a per-task policy. A crash loop of the **platform worker** itself is the
 plugin's poison handling and ends in the invocation's `failed` or `dead_lettered` status

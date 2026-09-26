@@ -244,8 +244,8 @@ refusal are settled successes (`version-conflict`, `held`), so its every 409 is 
 retry (`04 §3.6`). Every task that calls an
 operation declares a `timeout` (`use.timeouts`: `step` 3 min, `wave1` 10 min, `wave2` 3 min,
 `admission` 25 h) on the `try` that carries its retry, so rule 4's nesting is checkable per task. A 409 `idempotency-key-conflict`
-is a caller defect the same-key retry cannot fix; it exhausts the budget bounded and lands in the
-failure arm with its reason. Whether the plugin surfaces the Problem body's `error_code` on
+is a caller defect the same-key retry cannot fix; it exhausts the budget bounded and faults the
+invocation, or lands on a named failure route where §4.6 names one. Whether the plugin surfaces the Problem body's `error_code` on
 `$error` so the two 409s can be told apart before the budget is spent is part of Q-11.
 
 #### The closed trigger set
@@ -286,7 +286,7 @@ consumer-supplied hook before publish — a pending ask
 3. [ ] - `p1` - Every `listen` filter type is in the closed set above and carries the two correlations - `inst-def-listen-targets`
 4. [ ] - `p1` - Bounds nest: for every `call`, the operation's `deadline_ms` **<** the cumulative backoff of its retry policy **<** the task's `timeout` **<** the overdue `wait` **<** the lifetime `wait` - `inst-def-bounds-nest`
 5. [ ] - `p1` - Every task `input`, `output`, `export` and every `body` member validates against the operation's registered reference schemas; no member outside them - `inst-def-references-only`
-6. [ ] - `p1` - No `protected` operation is inside a `try` whose `catch` has no `raise` or `then` that leaves the stage — its failure **MUST** propagate to the path's failure arm - `inst-def-no-swallowing-catch`
+6. [ ] - `p1` - No `protected` operation is inside a `try` whose `catch` continues the forward path: a `catch` either only retries, so exhaustion faults the invocation, or routes to one of the named failure routes of §4.6 - `inst-def-no-swallowing-catch`
 7. [ ] - `p1` - No `run`, no `emit`, no `for`, no `schedule`: the start mechanism is exactly the two platform event triggers of §3.3, `OrderSubmitted` and `OrderAmended` — Lifecycle publishes no `OrderSubmitted` after an amendment ([Lifecycle `04 §4.3`](../../../orders-lifecycle/docs/design/04-versioning.md#43-re-approval-is-a-two-step-seam-interaction-normative), `02 §4.7` item 9); every `wait` is a literal duration (§3.6 *Fixed waits and re-check loops*) - `inst-def-grammar-subset`
 8. [ ] - `p1` - Every branch of a competing `fork` that can complete ends by `set`-ting `arm` so the sibling `switch` can route; every `fork` is followed by a `switch` on `arm`; every `then` names a task of its own `do` list, `exit` or `end` (the stage dispatcher of §3.6) - `inst-def-fork-routing`
 
@@ -887,7 +887,7 @@ The approval stage, the `do` list of `process.approval`:
     catch:                              # a permanent refusal: approval-reflection-refused needs a human (03 §4.5 item 3)
       errors: { with: { type: https://serverlessworkflow.io/spec/1.0.0/errors/communication, status: 400 } }
       do: [ { refused: { set: { reflected: refused } } } ]
-    export: { as: '${ $context + { reflected: .reflected, reflectRound: (.nextRound // $context.reflectRound), attemptKey: null } }' }   # reflected ∈ pending_approval | approved | rejected | held | moved | refused; a retry's attempt is spent once the call settles
+    export: { as: '${ $context + { reflected: .reflected, reflectRound: (.nextRound // $context.reflectRound), reflectAttempt: (($context.reflectRound | tostring) + (if $context.attemptKey then ":" + ($context.attemptKey | tostring) else "" end)), attemptKey: null } }' }   # reflectAttempt: the call's key tail {round}[:{attempt}], the task's sourceAttempt; reflected ∈ pending_approval | approved | rejected | held | moved | refused; a retry's attempt is spent once the call settles
 - afterReflect:
     switch:
       - approved: { when: '${ $context.reflected == "approved" }', then: toFulfillment }
@@ -912,7 +912,7 @@ The approval stage, the `do` list of `process.approval`:
       - other: { then: leave }          # hold | resume | lifecycle | cancel
 - toFulfillment: { set: { nextStage: fulfillment, stageLoop: null }, then: exit }   # Lifecycle emits OrderApproved; fragment (b) follows in the same invocation
 - reflectionTask:                       # fragment (c): an order-scope task whose retry re-enters reflectVerdict
-    set: { failureScope: order, failureSubjects: [ '${ $context.correlationId }' ], failureReason: approval-reflection-refused, sourceStep: reflect-verdict, forceTask: true, taskReturnStage: approval, taskReturnLoop: reflectVerdict, nextStage: failure, stageLoop: null }
+    set: { failureScope: order, failureSubjects: '${ [ { subjectRef: $context.correlationId, reason: "approval-reflection-refused", cause: "permanent-refusal" } ] }', sourceStep: reflect-verdict, sourceAttempt: '${ $context.reflectAttempt }', forceTask: true, taskReturnStage: approval, taskReturnLoop: reflectVerdict, nextStage: failure, stageLoop: null }
     then: exit
 - terminateRejected:                    # protected (01); terminationKind: rejected
     timeout: step
@@ -1176,7 +1176,7 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
       - invalidRemediate: { when: '${ $context.policy == "remediate" }', then: planTask }
       - invalidFailFast:  { then: planFailFast }
 - planTask:                             # fragment (c)
-    set: { failureScope: plan, failureSubjects: [ '${ $context.planRef }' ], failureReason: '${ $context.planReason }', sourceStep: construct-and-freeze-plan, forceTask: true, nextStage: failure, stageLoop: null }
+    set: { failureScope: plan, failureSubjects: '${ [ { subjectRef: $context.planRef, reason: $context.planReason, cause: "plan-not-frozen" } ] }', sourceStep: construct-and-freeze-plan, sourceAttempt: '${ $context.planAttempt | tostring }', forceTask: true, nextStage: failure, stageLoop: null }
     then: exit
 - planFailFast:                         # no Workflow transition leaves approved: begin-fulfillment is passed before the unwind (04 §4.3); also the failure stage's route for an exhausted plan task (D-109)
     timeout: step
@@ -1211,8 +1211,8 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
     catch:                              # 409: still-processing | idempotency-lease-expired (Q-11 (ii)), read before re-issuing (05 §4.5 item 3); otherwise the budget or the timeout is spent
       as: waveError
       when: '${ $waveError.status as $s | any((409, 408, 429, 503, 504); . == $s) }'
-      do: [ { classify: { set: { waveOutcome: '${ if $waveError.status == 409 then "reread" else "exhausted" end }' } } } ]
-    export: { as: '${ $context + { waveOutcome: (.waveOutcome // "answered"), wave1Failed: ($context.wave1Failed + (.failed // [])), wave1Deferred: (.deferred // []), wave1Round: (.nextDispatchRound // $context.wave1Round) } }' }
+      do: [ { classify: { set: { waveOutcome: '${ if $waveError.status == 409 then "reread" else "exhausted" end }', waveCause: '${ if $waveError.status == 408 then "step-deadline-exceeded" else "retry-budget-exhausted" end }' } } } ]
+    export: { as: '${ $context + { waveOutcome: (.waveOutcome // "answered"), waveCause: (.waveCause // null), wave1Failed: ($context.wave1Failed + (.failed // [])), wave1Deferred: (.deferred // []), wave1Round: (.nextDispatchRound // $context.wave1Round), wave1Attempt: (($context.wave1Round | tostring) + (if $context.attemptKey then ":" + ($context.attemptKey | tostring) else "" end)) } }' }   # wave1Attempt: the call's key tail, the task's sourceAttempt
 - onWave1:
     switch:
       - reread:    { when: '${ $context.waveOutcome == "reread" }',    then: wave1Reread }
@@ -1227,12 +1227,12 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
     catch: *transient
     then: wave1
 - wave1Exhausted:
-    set: { failureScope: line, failureSubjects: '${ $context.wave1LineRefs }', failureReason: wave1-create-failed, sourceStep: dispatch-wave1-create, nextStage: failure, stageLoop: null }
+    set: { failureScope: line, failureSubjects: '${ [ $context.wave1LineRefs[] | { subjectRef: ., reason: "wave1-create-failed", cause: $context.waveCause } ] }', sourceStep: dispatch-wave1-create, sourceAttempt: '${ $context.wave1Attempt }', nextStage: failure, stageLoop: null }
     then: exit
 - waitDeferral1: { wait: PT1M }         # the re-dispatch is the re-check: before the recorded instant it re-defers with due: false
 - wave1Again: { set: { wave1LineRefs: '${ $context.wave1Deferred }' }, then: wave1 }
 - lineFailure1:                         # fragment (c)
-    set: { failureScope: line, failureSubjects: '${ $context.wave1Failed }', sourceStep: dispatch-wave1-create, nextStage: failure, stageLoop: null }
+    set: { failureScope: line, failureSubjects: '${ [ $context.wave1Failed[] | { subjectRef: .lineRef, reason: .reason, cause: "explicit-failure-confirmation" } ] }', sourceStep: dispatch-wave1-create, sourceAttempt: '${ $context.wave1Attempt }', nextStage: failure, stageLoop: null }
     then: exit
 - enterAwaitExpected: { set: { stageLoop: awaitExpected, holdPauses: false } }
 - evaluate:                             # composable (04): both halves from Orders' record — due (database time against expected_fulfillment_at) and every create confirmed
@@ -1293,22 +1293,22 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
     try:
       - call: { step: reconcile-intent }   # body: ref + lineRef: $context.confirmedLineRef, wave: $context.confirmedWave, sweepRound
     catch: *transient
-    export: { as: '${ $context + { sweepFailed: .failed, sweepUnresolved: .unresolved, redispatch: .redispatch, sweepRound: .nextSweepRound } }' }
+    export: { as: '${ $context + { sweepFailed: .failed, sweepUnresolved: .unresolved, redispatch: .redispatch, sweepAttempt: ($context.sweepRound | tostring), sweepRound: .nextSweepRound } }' }
     then: onSweep
 - reconcilePoll:                        # composable (05): an early read of the due intents; settles a dead lease through settle-from-lookup in-process
     timeout: step
     try:
       - call: { step: reconcile-intent }   # body: ref + sweepRound
     catch: *transient
-    export: { as: '${ $context + { sweepFailed: .failed, sweepUnresolved: .unresolved, redispatch: .redispatch, sweepRound: .nextSweepRound } }' }
-- onSweep:                              # 05 §4.5 item 6: the poll and confirmation arms never discard reconcile-intent's output
+    export: { as: '${ $context + { sweepFailed: .failed, sweepUnresolved: .unresolved, redispatch: .redispatch, sweepAttempt: ($context.sweepRound | tostring), sweepRound: .nextSweepRound } }' }
+- onSweep:                              # 05 §4.5 item 6: the poll and confirmation arms never discard reconcile-intent's output; a line is listed failed or unresolved only in the round that records it, so failed first never starves redispatch
     switch:
       - failed:      { when: '${ (($context.sweepFailed + $context.sweepUnresolved) | length) > 0 }', then: sweepFailure }
       - redispatch1: { when: '${ [ $context.redispatch[] | select(.wave == "wave1_create") ] | length > 0 }', then: redispatchWave1 }
       - redispatch2: { when: '${ [ $context.redispatch[] | select(.wave == "wave2_activate") ] | length > 0 }', then: wave2 }
       - reevaluate:  { then: evaluate }
 - sweepFailure:                         # fragment (c): never-dispatched | intent-unresolved | wave failures
-    set: { failureScope: line, failureSubjects: '${ $context.sweepFailed + $context.sweepUnresolved }', sourceStep: reconcile-intent, nextStage: failure, stageLoop: null }
+    set: { failureScope: line, failureSubjects: '${ [ $context.sweepFailed[] | { subjectRef: .lineRef, reason: .reason, cause: "sweep-discovered-terminal-failure" } ] + [ $context.sweepUnresolved[] | { subjectRef: ., reason: "intent-unresolved", cause: "sweep-floor-reached" } ] }', sourceStep: reconcile-intent, sourceAttempt: '${ $context.sweepAttempt }', nextStage: failure, stageLoop: null }
     then: exit
 - redispatchWave1: { set: { wave1LineRefs: '${ [ $context.redispatch[] | select(.wave == "wave1_create") | .lineRef ] }' }, then: enterWave1 }
 - preActivation:                        # protected (04): SUB-O5 overlap presence + market + authorization freshness, immediately before the first activation
@@ -1347,8 +1347,8 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
     catch:                              # 409: activation-precondition-unmet, still-processing or idempotency-lease-expired — read, then back to the barrier
       as: waveError
       when: '${ $waveError.status as $s | any((409, 408, 429, 503, 504); . == $s) }'
-      do: [ { classify: { set: { waveOutcome: '${ if $waveError.status == 409 then "reread" else "exhausted" end }' } } } ]
-    export: { as: '${ $context + { waveOutcome: (.waveOutcome // "answered"), wave2Failed: ($context.wave2Failed + (.failed // [])), wave2Pending: (.pending // []), lapsed: (.lapsed // []), wave2Deferred: (.deferred // []), wave2Round: (.nextDispatchRound // $context.wave2Round) } }' }
+      do: [ { classify: { set: { waveOutcome: '${ if $waveError.status == 409 then "reread" else "exhausted" end }', waveCause: '${ if $waveError.status == 408 then "step-deadline-exceeded" else "retry-budget-exhausted" end }' } } } ]
+    export: { as: '${ $context + { waveOutcome: (.waveOutcome // "answered"), waveCause: (.waveCause // null), wave2Attempt: (($context.wave2Round | tostring) + (if $context.attemptKey then ":" + ($context.attemptKey | tostring) else "" end)), wave2Failed: ($context.wave2Failed + (.failed // [])), wave2Pending: (.pending // []), lapsed: (.lapsed // []), wave2Deferred: (.deferred // []), wave2Round: (.nextDispatchRound // $context.wave2Round) } }' }
 - onWave2:                              # 05 §4.5 items 4–6 and 9
     switch:
       - reread:     { when: '${ $context.waveOutcome == "reread" }',    then: wave2Reread }
@@ -1365,7 +1365,7 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
     catch: *transient
     then: enterBarrierLoop
 - wave2Exhausted:
-    set: { failureScope: line, failureSubjects: '${ $context.eligibleLineRefs }', failureReason: wave2-activation-failed, sourceStep: dispatch-wave2-activate, nextStage: failure, stageLoop: null }
+    set: { failureScope: line, failureSubjects: '${ [ $context.eligibleLineRefs[] | { subjectRef: ., reason: "wave2-activation-failed", cause: $context.waveCause } ] }', sourceStep: dispatch-wave2-activate, sourceAttempt: '${ $context.wave2Attempt }', nextStage: failure, stageLoop: null }
     then: exit
 - rebuildLapsed:                        # composable (05): a lapsed draft is rebuilt and goes back through wave 1 and the barrier, never straight to wave 2
     timeout: step
@@ -1377,7 +1377,7 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
 - waitDeferral2: { wait: PT1M }
 - wave2Again: { set: { eligibleLineRefs: '${ $context.wave2Deferred }' }, then: wave2 }
 - lineFailure2:
-    set: { failureScope: line, failureSubjects: '${ $context.wave2Failed }', sourceStep: dispatch-wave2-activate, nextStage: failure, stageLoop: null }
+    set: { failureScope: line, failureSubjects: '${ [ $context.wave2Failed[] | { subjectRef: .lineRef, reason: .reason, cause: "explicit-failure-confirmation" } ] }', sourceStep: dispatch-wave2-activate, sourceAttempt: '${ $context.wave2Attempt }', nextStage: failure, stageLoop: null }
     then: exit
 - reportCompleted:                      # protected (06): in_fulfillment → completed with per-line subscription ids; enqueues OrderFulfillmentCompleted
     timeout: step
@@ -1513,9 +1513,13 @@ with the invocation, so it needs no `listen` for Orders' own terminal events.
 
 **Actors**: `cpt-cf-bss-orders-workflow-actor-owf-fulfillment-operator`, `cpt-cf-bss-orders-workflow-actor-owf-subscriptions`, `cpt-cf-bss-orders-workflow-actor-owf-orders-lifecycle`
 
-The failure stage, the `do` list of `process.failure` — entered with `failureScope`,
-`failureSubjects` (lineRef + reason, or a plan/order reference) and `sourceStep` in `$context`, and,
-for an order-scope task, `taskReturnStage` and `taskReturnLoop`:
+The failure stage, the `do` list of `process.failure` — entered with the four members of the
+`create-manual-task` body in `$context`, which every entering branch sets (decision D-116):
+`failureScope`; `failureSubjects`, one `{ subjectRef, reason, cause }` per subject, with `reason`
+and `cause` the `failure_reason` and `failure_cause` enums of `07 §3.7`; `sourceStep`; and
+`sourceAttempt`, the failing call's key tail `{round}[:{attempt}]` (`01 §3.3` *Rounds and
+attempts*; `resumeEventId` for `apply-resume`, which is keyed by its event) — and, for an
+order-scope task, `taskReturnStage` and `taskReturnLoop`:
 
 ```yaml
 - enter:
@@ -1535,7 +1539,7 @@ for an order-scope task, `taskReturnStage` and `taskReturnLoop`:
 - createTasks:                          # protected (07): exactly one actionable task per failed subject, reopen semantics inside
     timeout: step
     try:
-      - call: { step: create-manual-task }   # body: ref + scope: $context.failureScope, subjects: $context.failureSubjects, failureCause, sourceStep, sourceAttempt
+      - call: { step: create-manual-task }   # body: ref + scope: $context.failureScope, subjects: $context.failureSubjects, sourceStep: $context.sourceStep, sourceAttempt: $context.sourceAttempt
     catch: *transient
     export: { as: '${ $context + { taskRefs: .taskRefs, exhaustedTaskRefs: .exhaustedTaskRefs, slaRound: .slaRound, wave1Failed: [], wave2Failed: [], forceTask: false } }' }
 - onCreate:
@@ -1575,7 +1579,7 @@ for an order-scope task, `taskReturnStage` and `taskReturnLoop`:
     try:
       - call: { step: resolve-manual-task }   # body: ref + trigger: request, taskRef, requestRef
     catch: *transient
-    export: { as: '${ $context + { resolution: .resolution, resumeAt: .resumeAt, attemptKey: .attemptKey, slaRound: .slaRound } }' }
+    export: { as: '${ $context + { resolution: .resolution, resumeAt: .resumeAt, attemptKey: .attemptKey, openTaskCount: .openTaskCount, slaRound: .slaRound } }' }
     then: onResolution
 - slaCheck:                             # composable (07): the SLA re-check; escalates inside the operation only once the stored SLA deadline has passed
     timeout: step
@@ -1591,23 +1595,25 @@ for an order-scope task, `taskReturnStage` and `taskReturnLoop`:
       - wait:      { then: awaitResolution }   # closed | escalated | refused | none: back to the waiting fork
 - routeRetry:                           # by resumeAt, carrying attemptKey
     switch:
-      - barrier:      { when: '${ $context.resumeAt == "barrier" }',      then: toBarrier }
+      - barrier:      { when: '${ $context.resumeAt == "barrier" and $context.openTaskCount == 0 }', then: toBarrier }
+      - siblingsOpen: { when: '${ $context.resumeAt == "barrier" }',      then: awaitResolution }   # 07 §4.3 remediation hold: dispatch waits until the order's last open task resolves (D-117)
       - plan:         { when: '${ $context.resumeAt == "plan" }',         then: toPlan }
       - compensation: { when: '${ $context.resumeAt == "compensation" }', then: toCompensation }
       - stage:        { then: retryStage }   # an order-scope task: the stage whose operation failed
-- toBarrier: { set: { nextStage: fulfillment, stageLoop: barrierLoop }, then: exit }   # the line re-enters the conjunction; the wave re-dispatches it under attemptKey
+- toBarrier: { set: { nextStage: fulfillment, stageLoop: barrierLoop }, then: exit }   # every retried line re-enters the conjunction; the wave re-dispatches it under attemptKey
 - toPlan: { set: { nextStage: fulfillment, stageLoop: freezePlan, planAttempt: '${ $context.attemptKey }' }, then: exit }   # a new attempt of construct-and-freeze-plan
 - toCompensation: { set: { nextStage: unwind, stageLoop: compensate }, then: exit }   # a new pass of compensate-order
-- retryStage: { set: { nextStage: '${ $context.taskReturnStage }', stageLoop: '${ $context.taskReturnLoop }' }, then: exit }   # reflect-verdict → approval at reflectVerdict; authorize-cancel → the stage the cancel was taken from
+- retryStage: { set: { nextStage: '${ $context.taskReturnStage }', stageLoop: '${ $context.taskReturnLoop }' }, then: exit }   # reflect-verdict → approval at reflectVerdict, the one order-scope task the definition creates (D-114)
 - verifyOverride:                       # composable (07): follows only a resolve-manual-task that answered override for the same requestRef
     timeout: step
     try:
-      - call: { step: verify-override } # body: ref + taskRef, requestRef; output: verified, rejection, exhausted
+      - call: { step: verify-override } # body: ref + taskRef, requestRef; output: verified, rejection, exhausted, openTaskCount
     catch: *transient
-    export: { as: '${ $context + { overrideVerified: .verified, overrideExhausted: .exhausted } }' }
+    export: { as: '${ $context + { overrideVerified: .verified, overrideExhausted: .exhausted, openTaskCount: .openTaskCount } }' }
 - afterOverride:
     switch:
-      - verified:  { when: '${ $context.overrideVerified }', then: toBarrier }      # the line is activated; the conjunction decides whether the order completes
+      - verified:  { when: '${ $context.overrideVerified and $context.openTaskCount == 0 }', then: toBarrier }   # the line is activated; the conjunction decides whether the order completes
+      - held:      { when: '${ $context.overrideVerified }', then: awaitResolution }                             # siblings still open: the remediation hold holds (D-117)
       - exhausted: { when: '${ $context.overrideExhausted }', then: failFastUnwind }
       - rejected:  { then: awaitResolution }                                      # the task remains open
 - leave: { set: { nextStage: '${ .arm }', returnStage: failure }, then: exit }
@@ -1684,11 +1690,12 @@ report):
     switch:
       - again: { when: '${ $context.resolution == "retry" or $context.resolution == "exhausted" }', then: compensate }   # resumeAt: compensation
       - wait:  { then: awaitCompensationResolution }                                                                    # closed | escalated | refused | none
-- reportOutcome:                        # protected (06): the sole Lifecycle outcome caller; outcome-not-reportable or fence-not-claimed fault the invocation
+- reportOutcome:                        # protected (06): the sole Lifecycle outcome caller; outcome-not-reportable or fence-not-claimed fault the invocation (§4.6)
     timeout: step
     try:
-      - call: { step: report-outcome }  # body: ref + outcome: $context.reportAs ∈ failed | cancelled | superseded | terminal-event, from the fence's effectiveTrigger; reportedOutcome is terminal-event where Lifecycle already holds the order terminal (06 §4.9)
+      - call: { step: report-outcome }  # body: ref + outcome: $context.reportAs ∈ failed | cancelled | superseded | terminal-event, from the fence's effectiveTrigger, round: ($context.reportRound // 0); reportedOutcome is terminal-event where Lifecycle already holds the order terminal (06 §4.9)
     catch: *transient
+    export: { as: '${ $context + { reportRound: .nextRound } }' }   # the family's round carries over from a held completion report; held cannot arise here (06 §4.9: rows 26 and 27 admit failed and cancelled from a held order), so no switch follows
 - terminateAborted:                     # protected (01); terminationKind: $context.terminationKind, supersededByOrderVersion on supersede
     timeout: step
     try:
@@ -1726,7 +1733,18 @@ re-polled on the `PT30S` interval; `pending-escalation` and an exhausted budget 
 authorized, then absorbed and promoted by the fence, then the walk continues) and no hold arm. A
 permanent refusal of `run-cancellation-fence` or `report-outcome` is not caught: it faults the
 invocation, which the platform records as `failed` and, with no function-level handler,
-`dead_lettered` (§3.3 *Generic control*). `report-outcome` is called only when `compensate-order`
+`dead_lettered` (§3.3 *Generic control*), and which the instance liveness pass raises as the
+`invocation-dead` task (§4.6, decision D-114). The unwind's `report-outcome` carries the
+family's round, which a held completion report may already have advanced; it needs no `held`
+case. **One failure rule.** A retry budget spent, a timeout, or a permanent refusal faults the
+invocation, except where this fragment catches it because the failure is a subject an
+operator can act on: a wave call's exhaustion and a wave's `failed[]` (line tasks),
+`compensate-order`'s exhaustion (the next pass, after `awaitCompensationResolution`) and
+`reflect-verdict`'s refusal (an order-scope task). **The remediation hold holds**: a `retry`
+or a verified override of one line while the order still has open tasks
+(`openTaskCount > 0`) returns to `awaitResolution`, where every open task keeps its waiter, and
+the last resolution takes every retried line back to the barrier together (`07 §4.3`,
+decision D-117). `report-outcome` is called only when `compensate-order`
 reports `complete`, which is the PRD's "order remains non-terminal until operational compensation
 reaches a known outcome".
 
@@ -1758,26 +1776,16 @@ of the stage the cancel was taken from:
 
 ```yaml
 - authorize:                            # protected (08): the apply-time re-check of authority (09 §4.4); precedes the fence on every cancel path
+    timeout: step
     try:
-      - authorizeCall:
-          timeout: step
-          try:
-            - call: { step: authorize-cancel }   # body: ref + cancelRequestRef; output: authorized (bool), taskRef
-          catch: *transient
-    catch:                              # the budget or the timeout spent: the authority-withdrawn task (08 §4.7 item 6)
-      errors: { with: { type: https://serverlessworkflow.io/spec/1.0.0/errors/communication } }
-      when: '${ $error.status as $s | any((408, 429, 503, 504, 409); . == $s) }'
-      do: [ { withdrawn: { set: { authorized: null } } } ]
+      - call: { step: authorize-cancel }   # body: ref + cancelRequestRef; output: authorized (bool), preFulfillment (bool)
+    catch: *transient                   # the budget or the timeout spent faults the invocation (§4.6, D-114): the re-drive resumes here under the open key, and the fallback is this cancel
     export: { as: '${ $context + { cancelAuthorized: .authorized } }' }
 - onAuthorize:
     switch:
       - authorized: { when: '${ $context.cancelAuthorized == true }', then: toCancelUnwind }
-      - withdrawn:  { when: '${ $context.cancelAuthorized == null }', then: authorityTask }
-      - denied:     { then: back }      # the stage and loop the cancel was taken from — the resume wait when taken from a hold (08 §4.7 item 5); also preFulfillment (08 §3.6, D-109): the order is cancelled through Lifecycle and the lifecycle arm ends the process
+      - denied:     { then: back }      # the stage and loop the cancel was taken from — the resume wait when taken from a hold (08 §4.7 item 5): a withdrawn authority, refused and audited with no task (D-115), or preFulfillment (08 §3.6, D-109): the order is cancelled through Lifecycle and the lifecycle arm ends the process
 - toCancelUnwind: { set: { unwind: cancel, nextStage: unwind, stageLoop: null }, then: exit }   # fragment (c): the fence claims, or absorbs against a running unwind and promotes only a failure run (06 §4.3); reportAs follows its effectiveTrigger
-- authorityTask:                        # fragment (c): an order-scope task whose retry returns to the stage the cancel was taken from
-    set: { failureScope: order, failureSubjects: [ '${ $context.correlationId }' ], failureReason: authority-withdrawn, sourceStep: authorize-cancel, forceTask: true, taskReturnStage: '${ $context.returnStage }', taskReturnLoop: '${ $context.stageLoop }', nextStage: failure, stageLoop: null }
-    then: exit
 - back: { set: { nextStage: '${ $context.returnStage }' }, then: exit }
 ```
 
@@ -1858,8 +1866,13 @@ through `back` to the stage and loop the cancel was taken from, which is the res
 cancel route refuses it and `authorize-cancel` answers `preFulfillment` if one reaches it, so it
 also returns through `back`, and the order is cancelled through Lifecycle's own cancel, whose
 `OrderCancelled` the lifecycle arm consumes (decision D-109). The approval and eligibility forks
-keep their cancel arm for a request accepted against an order Lifecycle already holds terminal. A spent budget of `authorize-cancel` opens the `authority-withdrawn` task, whose
-retry returns to that same stage and loop. A parked instance — including one parked at the
+keep their cancel arm for a request accepted against an order Lifecycle already holds terminal. A
+withdrawn authority is refused and audited on the request and raises no task, because nothing
+waits on it: the process continues where the cancel was taken, and a Seller Operator who still
+means it submits a new cancel under a fresh authorization (decision D-115). A spent budget of
+`authorize-cancel` faults the invocation (§4.6): the platform re-drive resumes at
+`authorize-cancel` under its still-open key, and the `invocation-dead` fallback is the cancel
+itself (`01 §4.16`, decision D-114). A parked instance — including one parked at the
 lifetime ceiling — reaches an unwind only through this path and the fence
 (`parked → compensating`, `01 §3.7`). **After the ceiling** the instance waits in
 `awaitOperatorAfterPark` for either the `unpark-requested` signal or an operator `retry` of the
@@ -1976,7 +1989,7 @@ null):
 - applyResume:                          # protected (08): phase → started; re-arms the gate windows through the gate-window port
     timeout: step
     try:
-      - call: { step: apply-resume }    # body: ref + resumeEventId, suspensionRef (null on the stage-level arm); output: resumeOutcome, due, failedTaskRefs[]
+      - call: { step: apply-resume }    # body: ref + resumeEventId, suspensionRef (null on the stage-level arm); output: resumeOutcome, due, failedTaskRefs[] (lineRef + reason)
     catch: *transient
     export: { as: '${ $context + { resumeDue: (.due // false), resumeFailed: .failedTaskRefs, returnStage: $context.heldStage, stageLoop: $context.heldLoop } }' }
 - onResume:                             # 08 §4.7 item 8: deferred failures first, before any dispatch
@@ -1984,7 +1997,7 @@ null):
       - deferredFailures: { when: '${ ($context.resumeFailed | length) > 0 }', then: resumeFailure }
       - back:             { then: back }   # the stage and loop the hold interrupted; apply-resume's due is the escalation re-check's first answer
 - resumeFailure:                        # fragment (c)
-    set: { failureScope: line, failureSubjects: '${ $context.resumeFailed }', sourceStep: apply-resume, nextStage: failure, stageLoop: null }
+    set: { failureScope: line, failureSubjects: '${ [ $context.resumeFailed[] | { subjectRef: .lineRef, reason: .reason, cause: (if .reason == "intent-unresolved" then "sweep-floor-reached" else "sweep-discovered-terminal-failure" end) } ] }', sourceStep: apply-resume, sourceAttempt: '${ $context.resumeEventId }', nextStage: failure, stageLoop: null }
     then: exit
 - back: { set: { nextStage: '${ $context.returnStage }' }, then: exit }
 ```
@@ -2283,10 +2296,35 @@ could be armed directly, which is (i) (open question Q-11: Q-11 carries the five
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-constraint-definition-no-swallowing-catch`
 
 A `try` whose task list contains a `protected` operation **MUST** have a `catch` that either
-carries only `retry` (so exhaustion propagates the error) or ends in a `raise` or a `then` into
-the stage's failure arm. A `catch` that returns normally after a protected operation's permanent
-failure — continuing the path as if the step had settled — is refused before publish (§2.2 rule
-6). **Rationale**: a swallowed failure of `reflect-verdict`, `begin-fulfillment`,
+carries only `retry` or routes to one of the named failure routes below. A `catch` that returns
+normally after a protected operation's permanent failure — continuing the path as if the step
+had settled — is refused before publish (§2.2 rule 6).
+
+**One failure rule** (decision D-114). A step call's spent retry budget, its spent timeout, and
+a permanent refusal the definition does not route **MUST** fault the invocation. The platform
+records it `failed`, then `dead_lettered`, and the instance liveness pass raises the
+`invocation-dead` task within one pass interval (`01 §3.8`, `01 §4.16`). The task's platform
+re-drive resumes at the faulted task under its still-open key: `retryable-failure` leaves the
+key `open` (`01 §3.3`). The definition **MUST** catch a failure only where it is the failure of a
+subject an operator can act on, and only on these routes:
+
+| Route | Caught | Leads to |
+|-------|--------|----------|
+| `dispatch-wave1-create`, `dispatch-wave2-activate` | budget or timeout spent (408, 429, 503, 504); 409 is the re-read | a line task per wave line (fragment (c), `07 §3.3`) |
+| `compensate-order` | budget or timeout spent, 409 | `awaitCompensationResolution`, then the next pass (`06 §4.7` item 5) |
+| `reflect-verdict` | `approval-reflection-refused` (400) | an order-scope task whose retry re-enters `reflectVerdict` (`03 §4.5` item 3) |
+| `admit-trigger` on the start path | `prior-instance-active` (409) | the `supersession` retry, then a fault (`02 §4.7` item 7) |
+
+Everything else faults: every listen-arm admission, `apply-hold`, `apply-resume`,
+`authorize-cancel`, the evaluations and `begin-fulfillment` of slice 04,
+`report-spawn-signal`, `run-cancellation-fence`, `report-outcome`, `create-manual-task` and
+`terminate-instance`. A fault on one of them is a failure of Orders or of a dependency the order
+cannot proceed without, not of a subject. A task that the failure stage raised for it would have
+to re-enter a stage checkpoint through another stage's arms, which is how a resume consumed by
+the failure stage once stranded an order in the hold's resume wait. **Precedent**: the
+platform's invocation status machine (`failed → dead_lettered` with no `on_failure` handler,
+[serverless-runtime `DESIGN.md:458`](../../../../serverless-runtime/docs/DESIGN.md#invocation-status-state-machine))
+and the liveness pass that observes it (D-105). **Rationale**: a swallowed failure of `reflect-verdict`, `begin-fulfillment`,
 `report-spawn-signal` or `report-outcome` is precisely the divergence between process state and
 order state the dual-authority principle exists to prevent; Orders' record would show the step
 failed while the definition proceeds as if it had not.
