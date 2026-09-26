@@ -4,7 +4,7 @@
 //! sites cannot accidentally pass an AM-forwarded ctx to `inner.get`
 //! (DESIGN "Component Model", "Security and Data Protection"). The wrapper exposes a minimal `get` surface that
 //! drops the response metadata (`owner_tenant_id`, `sharing`, `is_inherited`)
-//! per DESIGN "Component Model" — the plugin only consumes `r.value`.
+//! per DESIGN "Component Model" — the plugin only consumes `r.secret`.
 
 use std::sync::Arc;
 
@@ -43,11 +43,11 @@ impl CredStoreReader {
     ///   (the plugin only stores UTF-8 client secrets — non-UTF-8 indicates
     ///   storage corruption or a key collision with another consumer).
     pub async fn get(&self, key: &SecretRef) -> Result<Option<SecretString>, CredStoreError> {
-        let response = self.inner.get(&self.system_ctx, key).await?;
+        let response = self.inner.get_secret(&self.system_ctx, key).await?;
         let Some(response) = response else {
             return Ok(None);
         };
-        let value = std::str::from_utf8(response.value.as_bytes())
+        let value = std::str::from_utf8(response.secret.as_bytes())
             .map_err(|e| CredStoreError::internal(format!("invalid UTF-8 in secret value: {e}")))?;
         Ok(Some(SecretString::from(value.to_owned())))
     }

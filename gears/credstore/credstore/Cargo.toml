@@ -25,6 +25,7 @@ toolkit-macros = { workspace = true }
 toolkit-security = { workspace = true }
 toolkit-db = { workspace = true }
 toolkit-canonical-errors = { workspace = true }
+toolkit-odata = { workspace = true, features = ["with-utoipa"] }
 authz-resolver-sdk = { workspace = true }
 authz-resolver = { workspace = true }
 tenant-resolver-sdk = { workspace = true }
@@ -34,6 +35,9 @@ types-registry = { workspace = true }
 
 async-trait = { workspace = true }
 axum = { workspace = true }
+# Bounded-concurrency value reads in secret-mode list (ADR-0005 §4.6):
+# `stream::iter(...).buffer_unordered(SECRET_READ_CONCURRENCY)`.
+futures = { workspace = true }
 # Value-fingerprint fence (docs/features/001-value-fingerprint-fence.md):
 # HMAC-SHA256 over the backend value + fence-key generation via AWS-LC
 # (aws-lc-rs) — the workspace's FIPS-capable crypto backend, so the fence runs
@@ -58,9 +62,18 @@ anyhow = { workspace = true }
 time = { workspace = true }
 utoipa = { workspace = true }
 opentelemetry = { workspace = true, features = ["metrics"] }
+# Link-time GTS permission catalog (`src/gts/permissions.rs`): declares
+# AuthzPermissionV1 instances into the toolkit-gts inventory that
+# types-registry aggregates at boot.
+toolkit-gts = { workspace = true }
+# Direct dep needed because `gts_instance!` expansions reference `::gts::*`
+# paths (the compile-time `<S as GtsSchema>::SCHEMA_ID` prefix asserts).
+# Without this the proc-macro emits `::gts::…` identifiers that cannot be
+# resolved.
+gts = { workspace = true }
+inventory = { workspace = true }
 
 [dev-dependencies]
-toolkit-gts = { workspace = true }
 tower = { workspace = true }
 toolkit-db = { workspace = true, features = ["sqlite"] }
 tokio = { workspace = true, features = ["rt", "macros", "test-util"] }

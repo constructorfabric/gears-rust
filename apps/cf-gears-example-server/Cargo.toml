@@ -32,6 +32,7 @@ static-license = ["dep:static-license-plugin"]
 tr-authz = ["dep:tr-authz-plugin"]
 tenant-resolver-rg = ["dep:rg-tr-plugin"]
 static-credstore = ["credstore", "dep:static-credstore-plugin"]
+vault-credstore = ["credstore", "dep:vault-credstore-plugin"]
 mini-chat = ["dep:mini-chat"]
 chat-engine = ["dep:chat-engine"]
 k8s = ["mini-chat/k8s", "chat-engine?/k8s"]
@@ -86,6 +87,7 @@ static-license-plugin = { package = "cf-gears-static-license-plugin", path = "..
 
 # Optional credstore plugins
 static-credstore-plugin = { package = "cf-gears-static-credstore-plugin", path = "../../gears/credstore/plugins/static-credstore-plugin", optional = true }
+vault-credstore-plugin = { package = "cf-gears-vault-credstore-plugin", path = "../../gears/credstore/plugins/vault-credstore-plugin", optional = true }
 
 resource_group = { package = "cf-gears-resource-group", path = "../../gears/system/resource-group/resource-group", optional = true }
 

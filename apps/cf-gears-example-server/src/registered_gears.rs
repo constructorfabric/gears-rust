@@ -54,6 +54,9 @@ use static_license_plugin as _;
 #[cfg(feature = "static-credstore")]
 use static_credstore_plugin as _;
 
+#[cfg(feature = "vault-credstore")]
+use vault_credstore_plugin as _;
+
 // === Optional Gears ===
 
 #[cfg(feature = "mini-chat")]

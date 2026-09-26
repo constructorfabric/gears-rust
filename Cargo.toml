@@ -88,6 +88,7 @@ members = [
     "gears/credstore/credstore-sdk",
     "gears/credstore/credstore",
     "gears/credstore/plugins/static-credstore-plugin",
+    "gears/credstore/plugins/vault-credstore-plugin",
     "gears/file-parser/file-parser-sdk",
     "gears/file-parser/file-parser",
     "gears/file-storage/file-storage-sdk",

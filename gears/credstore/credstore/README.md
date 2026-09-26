@@ -5,41 +5,79 @@ database, enforces authorization in SQL, resolves secrets hierarchically across
 the tenant tree, and stores the secret **value** in a backend plugin discovered
 via the types registry.
 
-> Design: the [technical design](https://github.com/constructorfabric/gears-rust/blob/main/gears/credstore/docs/DESIGN.md) is the baseline; the shipped
-> implementation is described in the [design addendum](https://github.com/constructorfabric/gears-rust/blob/main/gears/credstore/docs/DESIGN-ADDENDUM.md)
-> (stateful gear, `credstore_secrets` table, PDP-scope authz, versioning/ETag,
-> write saga).
+> Design: the [technical design](https://github.com/constructorfabric/gears-rust/blob/main/gears/credstore/docs/DESIGN.md) is the baseline; the decision to
+> ship a stateful gear (`credstore_secrets` table, PDP-scope authz,
+> versioning/ETag, write saga) instead of the original stateless design is
+> recorded in [ADR-0001](https://github.com/constructorfabric/gears-rust/blob/main/gears/credstore/docs/ADR/0001-cpt-cf-credstore-adr-stateful-gear.md);
+> the addendum document that used to carry this history was folded into that
+> ADR and removed (see git history for its prior content).
 
 ## Overview
 
 The `cf-gears-credstore` module provides:
 
 - **Local metadata** — a gear-owned `credstore_secrets` table (`SecureORM` /
-  sea-orm, migration `m0001`) holding sharing, owner, status, `version`, and
-  the value-fingerprint fence
-- **PDP authorization** — `AccessScope` enforced in SQL via `SecureORM` clamps;
-  out-of-scope access is fail-closed (canonical 404, anti-enumeration)
+  sea-orm, migrations `m0001` + `m0002`) holding sharing, owner, status,
+  `version`, `fallback`, a `value_id` pointer to the row's current
+  immutable backend version, and the value-fingerprint fence
+- **One item shape for the record and its secret** — the point read and the
+  collection return the same shape; `secret` is present only when the
+  caller's `$select` names it, under `read_secret`; a credential can be
+  created without a secret, by an explicit `null`, which is also how a
+  tenant suppresses an inherited credential with no row of its own
+  ([ADR-0004](https://github.com/constructorfabric/gears-rust/blob/main/gears/credstore/docs/ADR/0004-cpt-cf-credstore-adr-secret-value-exposure.md),
+  [ADR-0007](https://github.com/constructorfabric/gears-rust/blob/main/gears/credstore/docs/ADR/0007-cpt-cf-credstore-adr-record-write-verbs.md),
+  [ADR-0008](https://github.com/constructorfabric/gears-rust/blob/main/gears/credstore/docs/ADR/0008-cpt-cf-credstore-adr-suppression-fallback.md))
+- **PDP authorization** — six actions on the credential type (`list`,
+  `read`, `write`, `delete` on the record; `read_secret`, `write_secret` on
+  the secret, [ADR-0010](https://github.com/constructorfabric/gears-rust/blob/main/gears/credstore/docs/ADR/0010-cpt-cf-credstore-adr-type-scoped-authorization.md)),
+  `AccessScope` enforced in SQL via `SecureORM` clamps; out-of-scope access
+  is fail-closed (canonical 404, anti-enumeration)
 - **Hierarchical resolution** — a single indexed query over the ancestor chain
   (TTL+LRU cached, barriers ignored — `shared` inherits through them); the backend is read once for the winner's value
 - **Value-fingerprint fence** — every read verifies the backend value against a
   per-row `HMAC-SHA256` (key auto-stored in the backend, never on the wire), so
   a metadata/value desync from a concurrent write fails closed instead of
-  disclosing a value under a foreign sharing label (DESIGN §4.10, ADR-0003)
+  disclosing a value under a foreign sharing label (DESIGN §4.10, ADR-0003);
+  an integrity check with no healing path — recovery is an ordinary new write
 - **Versioning** — strong generation-bound `ETag` (`"<id>.<version>"`) on `GET`,
   mandatory `If-Match` on `PUT`/`DELETE` (a validator, or `*` for explicit
   last-writer-wins; no ABA across recreation)
-- **Crash-safe writes** — provisioning→backend→active saga with rollback and a reaper
+- **Crash-safe writes** — each value is a new immutable version under a fresh
+  id; the row's pointer switches in one transaction after the bytes are
+  written; old versions are deleted by the writer right after the switch —
+  that is the cleanup path; leftovers (a failed writer-side delete, or a
+  crash) and expired records are removed by a periodic maintenance job, not
+  an in-process reaper
 - **Backend plugin** — value-only store discovered via the types registry (vendor)
-- **`ClientHub` + REST** — registers `CredStoreClientV1`; exposes `/credstore/v1/secrets`
+- **`ClientHub` + REST** — registers `CredStoreClientV1` and `CredStoreMaintenanceV1`; exposes `/credstore/v1/credentials`
 
 This module depends on `types-registry`, `tenant-resolver`, and `authz-resolver`,
 and **requires a database**. The secret value is stored in a plugin (e.g.
-`cf-gears-static-credstore-plugin`, or an OpenBao-backed plugin).
+`cf-gears-static-credstore-plugin`, or
+[`cf-gears-vault-credstore-plugin`](../plugins/vault-credstore-plugin/README.md)
+(prototype), backed by Vault/OpenBao).
+
+A credential is created in one request — a `PUT` on the record address
+carries the record and a tri-state `secret` together: a string writes it,
+and an explicit `null` creates the record without one (`declared`), which
+is also how a tenant suppresses an inherited credential without a row of
+its own. A merge-`PATCH` on the same address edits metadata or
+rotates/removes the secret without touching the rest of the record; and the
+secret is read by naming it in `$select` on that same address or on the
+collection — there is no dedicated secret address. Every value write mints
+a fresh version id, switches the row's pointer to it in one transaction,
+and deletes the version it replaced right after — the model of Vault KV v2
+and the cloud secret managers, shadow paging with a `git gc`-style
+collector; a periodic maintenance job, run on an operator-chosen schedule
+outside the gear (no resident reaper), collects whatever that best-effort
+delete missed.
 
 ## Usage
 
 After the gear initializes, consumers obtain its client from `ClientHub`. This
-example retrieves a secret without formatting or logging its value:
+example reads a secret value (`get_secret`, the `read_secret` action) without
+formatting or logging it; the record itself is read with `get` (`read`):
 
 ```no_run
 use std::error::Error;
@@ -54,9 +92,9 @@ async fn secret_length(
 ) -> Result<Option<usize>, Box<dyn Error>> {
     let credstore = hub.get::<dyn CredStoreClientV1>()?;
     let key = SecretRef::new("my-api-key")?;
-    let response = credstore.get(security, &key).await?;
+    let secret = credstore.get_secret(security, &key).await?;
 
-    Ok(response.map(|secret| secret.value.as_bytes().len()))
+    Ok(secret.map(|s| s.secret.as_bytes().len()))
 }
 ```
 
@@ -73,9 +111,12 @@ credstore:
     vendor: "constructorfabric" # GTS vendor used to discover the value-store plugin
     hierarchy:
       ancestor_cache_ttl_secs: 300
-    reaper:
-      tick_secs: 60
-      provisioning_timeout_secs: 300
+    gc:                          # settings of the maintenance job (ADR-0006); no resident reaper
+      pending_max_age_secs: 3600 # a pending write intent older than this is reclaimed by the job
+      batch_size: 256            # rows per batch in the job's expiry and gc passes
+    list:
+      max_limit: 200             # metadata-mode page-size cap
+      secret_mode_cap: 25        # secret-mode ($select=…,secret) match-set cap
 ```
 
 ## License
