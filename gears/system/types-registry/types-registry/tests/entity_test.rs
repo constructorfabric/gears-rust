@@ -550,7 +550,7 @@ async fn type_schema_revision_and_current_pointer_round_trip() {
 
 #[test]
 fn every_core_entity_is_declared_unrestricted_while_ceiling_c6_stands() {
-    use toolkit_db::secure::ScopableEntity;
+    use toolkit_db::secure::{ScopableEntity, ScopeProperties};
 
     fn assert_unrestricted<E: ScopableEntity>(table: &str) {
         assert!(

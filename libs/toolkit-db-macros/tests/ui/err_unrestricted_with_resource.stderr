@@ -1,4 +1,4 @@
-error: Cannot use 'resource_col' with 'unrestricted'
+error: secure: 'resource_col' cannot be used with 'unrestricted'
  --> tests/ui/err_unrestricted_with_resource.rs:6:24
   |
 6 | #[secure(unrestricted, resource_col = "id")]

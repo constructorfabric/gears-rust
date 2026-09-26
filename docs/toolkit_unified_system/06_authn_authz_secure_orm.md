@@ -272,7 +272,7 @@ Available dimension attributes:
 
 ### Standard property auto-mapping
 
-The `Scopable` derive macro automatically maps dimension columns to well-known PEP property names via `resolve_property()`:
+The `Scopable` derive macro maps dimension columns to well-known PEP property names in the `SCOPE_PROPERTIES` table:
 
 | Dimension attribute | PEP property name | Constant |
 |---------------------|-------------------|----------|
@@ -283,15 +283,23 @@ The `Scopable` derive macro automatically maps dimension columns to well-known P
 This means if you declare `tenant_col = "tenant_id"`, the macro generates:
 
 ```rust
-fn resolve_property(property: &str) -> Option<Self::Column> {
-    match property {
-        "owner_tenant_id" => Some(Column::TenantId),
-        "id"              => Some(Column::Id),
-        // ...
-        _ => None,
-    }
-}
+const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)] = &[
+    ("owner_tenant_id", Column::TenantId),
+    ("id", Column::Id),
+    // ...
+];
+
+// And the other half of the same decision: the dimensions answered `no_*`.
+const UNSCOPED_DIMENSIONS: &'static [&'static str] = &["owner_id"];
 ```
+
+That table is the only place the mapping is written. `resolve_property()`, `scope_columns()` and the `tenant_col()` / `resource_col()` / `owner_col()` accessors are all provided by the `ScopeProperties` trait, which reads them back out of it; none of them can be implemented per entity, because `ScopeProperties` is blanket-implemented for every `ScopableEntity` and a second implementation is a coherence error. Before this, the lookup and the column list were separate hand-written methods that could — and did — describe different sets (issue #4726).
+
+`type_col` is the exception: it gets no table entry, because no property name addresses it, and it stays a method of `ScopableEntity`.
+
+`UNSCOPED_DIMENSIONS` is the table's complement, and it is what makes the rule above enforceable for a hand-written implementation. It names no column, so it is not the duplication #4726 was about; what it records is which of the three dimensions the entity was asked about and answered "no" to. Every one of `owner_tenant_id`, `id` and `owner_id` must appear in exactly one of the two lists, checked by `ScopeProperties::DIMENSIONS_ARE_DECLARED` when the entity is compiled.
+
+The reason it is needed at all is that `tenant_col()` returns `None` both for an entity with no tenant column and for one whose table forgot the row, and the write-side guards — `tenant_id is required` in `secure_insert`, `tenant_id is immutable` in `secure_update` and in the upsert and bulk-update builders — all skip themselves on `None`. Reads fail closed in that situation (`SimpleTenantFilter` emits `WHERE false`), and so do inserts and updates under a tenant-constrained scope, because the unresolvable property fails every constraint. What was left open was every guard that checks an invariant rather than asking the scope, and no runtime check can close it, because at runtime the two cases are the same `None`.
 
 When the PDP returns a constraint like `In("owner_tenant_id", [uuid1, uuid2])`, `SecureConn` calls `resolve_property("owner_tenant_id")`, gets `Column::TenantId`, and generates `WHERE tenant_id IN (uuid1, uuid2)`.
 
@@ -320,7 +328,7 @@ pub struct Model {
 }
 ```
 
-This adds `"city_id" => Some(Column::CityId)` to the generated `resolve_property()` match.
+This adds `("city_id", Column::CityId)` to the generated `SCOPE_PROPERTIES` table.
 
 To use the custom property, include it in both `ResourceType.supported_properties` and the PDP policy:
 

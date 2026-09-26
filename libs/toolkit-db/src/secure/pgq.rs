@@ -11,7 +11,7 @@
 //! # What the declaration guarantees
 //!
 //! * **Every element exposes its scope columns as properties.** Derived from
-//!   [`ScopableEntity::scope_columns`], not from a list the caller repeats, so
+//!   [`ScopeProperties::scope_columns`], not from a list the caller repeats, so
 //!   the precondition for Policy 2 cannot be forgotten.
 //! * **One label per element table.** Sharing a label across tables is legal
 //!   SQL/PGQ and unsafe here: security is decided per entity, so a shared label
@@ -43,7 +43,9 @@ use toolkit_sea_orm_pgq::{EdgeTable, EndpointRef, PropertyGraph as GraphDdl, Ver
 
 use crate::secure::cond::{ColumnAddress, SiblingSupport, build_scope_predicate};
 use crate::secure::select::{Scoped, SecureSelect};
-use crate::secure::{AccessScope, DBRunner, DBRunnerInternal, ScopableEntity, ScopeError};
+use crate::secure::{
+    AccessScope, DBRunner, DBRunnerInternal, ScopableEntity, ScopeError, ScopeProperties,
+};
 
 /// A property graph the platform declares.
 ///
@@ -156,8 +158,9 @@ impl GraphDeclaration {
         // entity that resolves no scope column compiles to exactly the same
         // predicate under a real scope as a legitimate deny-all does, so by the
         // time there is a `Condition` the two are indistinguishable.
-        let scope_columns = J::scope_columns();
-        if scope_columns.is_empty() {
+        // Read the table, not the list: emptiness is a const fact, and building
+        // a Vec to ask about it would allocate for something the compiler knows.
+        if J::SCOPE_PROPERTIES.is_empty() {
             return Err(ScopeError::Invalid(
                 "a property-graph element must resolve at least one scope column; \
                  an element that resolves none would traverse as a silent deny-all",
@@ -176,7 +179,7 @@ impl GraphDeclaration {
         // column. The key is there so an endpoint reference can resolve; the
         // scope columns are there so a pattern can be scoped at all.
         let mut properties: Vec<String> = key.iter().map(|c| (*c).to_owned()).collect();
-        for column in scope_columns {
+        for column in J::scope_columns() {
             let name = sea_orm::IdenStatic::as_str(&column).to_owned();
             if !properties.contains(&name) {
                 properties.push(name);
@@ -565,7 +568,8 @@ impl<G: PropertyGraph> PathBuilder<G> {
         J: ScopableEntity + EntityTrait,
         J::Column: sea_orm::ColumnTrait + Copy,
     {
-        if J::scope_columns().is_empty() {
+        // Per element, per query: the const answers without allocating.
+        if J::SCOPE_PROPERTIES.is_empty() {
             return Err(ScopeError::Invalid(
                 "a graph element must resolve at least one scope column; \
                  an element that resolves none would traverse as a silent deny-all",
