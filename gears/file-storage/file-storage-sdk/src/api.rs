@@ -160,7 +160,6 @@ pub trait FileStorageClientV1: Send + Sync {
         declared_mime: &str,
         declared_size: u64,
         preferred_part_size: Option<u64>,
-        concurrency: Option<u32>,
     ) -> Result<MultipartPlan, FileStorageError>;
 
     /// Introspect a multipart upload session: current state, parts already

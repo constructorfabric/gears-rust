@@ -442,7 +442,6 @@ impl MultipartService {
         declared_mime: &str,
         declared_size: u64,
         preferred_part_size: Option<u64>,
-        _concurrency: Option<u32>,
         auto_bind: bool,
     ) -> Result<MultipartPlan, DomainError> {
         let prefetch = Self::tenant_scope(ctx);

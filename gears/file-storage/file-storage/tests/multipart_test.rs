@@ -567,7 +567,6 @@ async fn multipart_happy_path_in_memory() {
             "application/octet-stream",
             declared_size,
             None,
-            None,
             false,
         )
         .await
@@ -685,7 +684,6 @@ async fn multipart_complete_retry_is_idempotent() {
             "application/octet-stream",
             declared_size,
             None,
-            None,
             false,
         )
         .await
@@ -789,7 +787,6 @@ async fn abort_multipart_upload_deletes_part_rows_and_pending_version() {
             ticket.file_id,
             "application/octet-stream",
             declared_size,
-            None,
             None,
             false,
         )
@@ -914,7 +911,6 @@ async fn multipart_complete_rejects_content_not_matching_declared_mime() {
             "image/png",
             declared_size,
             None,
-            None,
             false,
         )
         .await
@@ -1028,7 +1024,6 @@ async fn multipart_complete_persists_validated_mime_and_flag() {
             "text/plain",
             declared_size,
             None,
-            None,
             false,
         )
         .await
@@ -1134,7 +1129,6 @@ async fn multipart_full_lifecycle_create_to_delete() {
             ticket.file_id,
             "application/octet-stream",
             declared_size,
-            None,
             None,
             false,
         )
@@ -1245,7 +1239,6 @@ async fn multipart_rejected_on_local_fs() {
             "application/octet-stream",
             1024,
             None,
-            None,
             false,
         )
         .await
@@ -1285,7 +1278,6 @@ async fn initiate_returns_coherent_parts_plan() {
             "application/octet-stream",
             declared_size,
             preferred_part_size,
-            Some(3),
             false,
         )
         .await
@@ -1346,7 +1338,6 @@ async fn initiate_multipart_upload_persists_backend_id_and_path_on_the_session()
             ticket.file_id,
             "application/octet-stream",
             1024,
-            None,
             None,
             false,
         )
@@ -1754,7 +1745,6 @@ async fn initiate_multipart_rejected_when_declared_size_exceeds_policy_limit() {
             "application/octet-stream",
             11,
             None,
-            None,
             false,
         )
         .await
@@ -1814,7 +1804,6 @@ async fn initiate_multipart_allowed_when_declared_size_within_policy_limit() {
             "application/octet-stream",
             50,
             None,
-            None,
             false,
         )
         .await
@@ -1844,7 +1833,6 @@ async fn initiate_multipart_rejects_absurd_preferred_part_size() {
             "application/octet-stream",
             1024,
             Some(u64::MAX),
-            None,
             false,
         )
         .await
@@ -1917,7 +1905,6 @@ async fn initiate_plan_urls_carry_valid_multipart_tokens() {
             "application/octet-stream",
             declared_size,
             Some(part_size),
-            None,
             false,
         )
         .await
@@ -2037,7 +2024,6 @@ async fn multipart_initiate_against_real_default_topology_is_rejected_until_back
             "application/octet-stream",
             1024,
             None,
-            None,
             false,
         )
         .await
@@ -2131,7 +2117,6 @@ async fn multipart_complete_uses_reported_parts_not_empty_list() {
             ticket.file_id,
             "application/octet-stream",
             declared_size,
-            None,
             None,
             false,
         )
@@ -2336,7 +2321,6 @@ async fn report_part_rejects_forged_size() {
             "application/octet-stream",
             declared_size,
             None,
-            None,
             false,
         )
         .await
@@ -2476,7 +2460,6 @@ async fn report_part_rejects_short_hash() {
             ticket.file_id,
             "application/octet-stream",
             declared_size,
-            None,
             None,
             false,
         )
@@ -2627,7 +2610,6 @@ async fn multipart_initiate_rejected_when_backend_not_multipart_native() {
                 ticket.file_id,
                 "application/octet-stream",
                 1024,
-                None,
                 None,
                 false,
             )
@@ -2820,7 +2802,6 @@ async fn complete_returns_version_size_and_composite_hash() {
             "application/octet-stream",
             declared_size,
             None,
-            None,
             false,
         )
         .await
@@ -2936,7 +2917,6 @@ async fn complete_with_stale_if_match_is_rejected() {
             "application/octet-stream",
             5,
             None,
-            None,
             false,
         )
         .await
@@ -2977,7 +2957,6 @@ async fn complete_with_stale_if_match_is_rejected() {
             ticket.file_id,
             "application/octet-stream",
             5,
-            None,
             None,
             false,
         )
@@ -3021,7 +3000,6 @@ async fn complete_with_stale_if_match_is_rejected() {
             ticket.file_id,
             "application/octet-stream",
             5,
-            None,
             None,
             false,
         )
@@ -3123,7 +3101,6 @@ async fn complete_wildcard_if_match_succeeds() {
             "application/octet-stream",
             5,
             None,
-            None,
             false,
         )
         .await
@@ -3161,7 +3138,6 @@ async fn complete_wildcard_if_match_succeeds() {
             ticket.file_id,
             "application/octet-stream",
             5,
-            None,
             None,
             false,
         )
@@ -3251,7 +3227,6 @@ async fn complete_with_missing_parts_lists_them() {
             ticket.file_id,
             "application/octet-stream",
             declared_size,
-            None,
             None,
             false,
         )
@@ -3373,7 +3348,6 @@ async fn introspect_reports_received_and_missing_parts() {
             "application/octet-stream",
             declared_size,
             None,
-            None,
             false,
         )
         .await
@@ -3466,7 +3440,6 @@ async fn introspect_foreign_upload_id_is_not_found() {
             "application/octet-stream",
             13,
             None,
-            None,
             false,
         )
         .await
@@ -3537,7 +3510,6 @@ async fn introspect_expired_session_returns_state_without_urls() {
             ticket.file_id,
             "application/octet-stream",
             13,
-            None,
             None,
             false,
         )
@@ -3631,7 +3603,6 @@ async fn introspect_resume_urls_expire_with_session() {
             "application/octet-stream",
             13,
             None,
-            None,
             false,
         )
         .await
@@ -3707,7 +3678,6 @@ async fn initiate_multipart_rejects_absurd_declared_size_quickly() {
             "application/octet-stream",
             u64::MAX,
             None,
-            None,
             false,
         )
         .await
@@ -3748,7 +3718,6 @@ async fn initiate_widens_part_size_to_stay_within_max_part_count() {
             ticket.file_id,
             "application/octet-stream",
             declared_size,
-            None, // preferred_part_size: falls back to DEFAULT_MIN_PART_SIZE
             None,
             false,
         )
@@ -3805,7 +3774,6 @@ async fn initiate_rejects_declared_size_beyond_max_part_size_times_max_part_coun
             ticket.file_id,
             "application/octet-stream",
             declared_size,
-            None,
             None,
             false,
         )
@@ -3891,7 +3859,6 @@ async fn initiate_session_expiry_uses_dedicated_session_ttl_not_url_ttl() {
             ticket.file_id,
             "application/octet-stream",
             13,
-            None,
             None,
             false,
         )
@@ -4037,15 +4004,7 @@ async fn auto_bind_complete_binds_and_returns_etag() {
     let (svc, msvc, multipart_store, backend, store, ctx) = build_redesign_env().await;
     let file_id = svc.create_file_bare(&ctx, new_file()).await.unwrap();
     let plan = msvc
-        .initiate_multipart_upload(
-            &ctx,
-            file_id,
-            "application/octet-stream",
-            13,
-            None,
-            None,
-            true,
-        )
+        .initiate_multipart_upload(&ctx, file_id, "application/octet-stream", 13, None, true)
         .await
         .unwrap();
     let session = multipart_store
@@ -4100,15 +4059,7 @@ async fn manual_session_complete_does_not_bind() {
     let (svc, msvc, multipart_store, backend, store, ctx) = build_redesign_env().await;
     let file_id = svc.create_file_bare(&ctx, new_file()).await.unwrap();
     let plan = msvc
-        .initiate_multipart_upload(
-            &ctx,
-            file_id,
-            "application/octet-stream",
-            5,
-            None,
-            None,
-            false,
-        )
+        .initiate_multipart_upload(&ctx, file_id, "application/octet-stream", 5, None, false)
         .await
         .unwrap();
     let session = multipart_store
@@ -4155,15 +4106,7 @@ async fn complete_while_lease_held_returns_completing() {
     let (svc, msvc, multipart_store, backend, _store, ctx) = build_redesign_env().await;
     let file_id = svc.create_file_bare(&ctx, new_file()).await.unwrap();
     let plan = msvc
-        .initiate_multipart_upload(
-            &ctx,
-            file_id,
-            "application/octet-stream",
-            5,
-            None,
-            None,
-            true,
-        )
+        .initiate_multipart_upload(&ctx, file_id, "application/octet-stream", 5, None, true)
         .await
         .unwrap();
     let session = multipart_store
@@ -4218,15 +4161,7 @@ async fn complete_takes_over_expired_lease_and_finishes() {
     let (svc, msvc, multipart_store, backend, store, ctx) = build_redesign_env().await;
     let file_id = svc.create_file_bare(&ctx, new_file()).await.unwrap();
     let plan = msvc
-        .initiate_multipart_upload(
-            &ctx,
-            file_id,
-            "application/octet-stream",
-            5,
-            None,
-            None,
-            true,
-        )
+        .initiate_multipart_upload(&ctx, file_id, "application/octet-stream", 5, None, true)
         .await
         .unwrap();
     let session = multipart_store
@@ -4295,15 +4230,7 @@ async fn complete_on_expired_completing_session_returns_expired_not_completing()
     let (svc, msvc, multipart_store, backend, store, ctx) = build_redesign_env().await;
     let file_id = svc.create_file_bare(&ctx, new_file()).await.unwrap();
     let plan = msvc
-        .initiate_multipart_upload(
-            &ctx,
-            file_id,
-            "application/octet-stream",
-            5,
-            None,
-            None,
-            true,
-        )
+        .initiate_multipart_upload(&ctx, file_id, "application/octet-stream", 5, None, true)
         .await
         .unwrap();
     let session = multipart_store
@@ -4380,7 +4307,6 @@ async fn resume_missing_part_then_complete() {
             "application/octet-stream",
             declared,
             Some(part),
-            None,
             true,
         )
         .await
@@ -4622,7 +4548,6 @@ async fn initiate_multipart_upload_rejects_overflowing_session_ttl_instead_of_pa
             ticket.file_id,
             "application/octet-stream",
             13,
-            None,
             None,
             false,
         )

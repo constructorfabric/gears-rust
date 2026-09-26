@@ -244,7 +244,6 @@ async fn trace_multipart_complete() {
             "application/octet-stream",
             10 * 1024 * 1024,
             Some(5 * 1024 * 1024),
-            None,
             false,
         )
         .await
@@ -357,7 +356,6 @@ async fn multipart_initiate_capability_reject_leaves_orphan_bare_file() {
             "application/octet-stream",
             20,
             Some(10),
-            None,
             false,
         )
         .await
@@ -399,7 +397,6 @@ async fn multipart_initiate_capability_reject_with_compensation_reclaims_orphan(
         "application/octet-stream",
         20,
         Some(10),
-        None,
         false,
     )
     .await
@@ -466,15 +463,7 @@ async fn multipart_finish_complete_cas_omits_lease_owner_for_embedded_call() {
         .expect("create_file_bare");
     let plan = s
         .msvc
-        .initiate_multipart_upload(
-            &ctx,
-            file_id,
-            "application/octet-stream",
-            10,
-            None,
-            None,
-            false,
-        )
+        .initiate_multipart_upload(&ctx, file_id, "application/octet-stream", 10, None, false)
         .await
         .expect("initiate_multipart_upload");
     common::simulate_all_parts(&s.multipart_store, &s.backend, &plan, file_id).await;
@@ -576,7 +565,6 @@ async fn multipart_complete_auto_bind_no_if_match_cas_now_requires_content_id_is
             "application/octet-stream",
             10,
             None,
-            None,
             true,
         )
         .await
@@ -671,7 +659,6 @@ async fn negative_control_multipart_complete_auto_bind_with_if_match_still_binds
             ticket.file_id,
             "application/octet-stream",
             10,
-            None,
             None,
             true,
         )
@@ -867,7 +854,6 @@ async fn negative_control_multipart_native_backend_initiate_succeeds() {
             "application/octet-stream",
             10 * 1024 * 1024,
             Some(5 * 1024 * 1024),
-            None,
             false,
         )
         .await

@@ -618,7 +618,6 @@ async fn multipart_complete_leaves_audit_rows() {
             "application/octet-stream",
             declared_size,
             None,
-            None,
             false,
         )
         .await

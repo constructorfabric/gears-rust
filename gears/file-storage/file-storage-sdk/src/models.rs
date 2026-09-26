@@ -297,7 +297,6 @@ pub struct DownloadTicket {
 pub struct MultipartIntent {
     pub declared_size: u64,
     pub preferred_part_size: Option<u64>,
-    pub concurrency: Option<u32>,
 }
 
 /// Result of [`crate::FileStorageClientV1::create_file`]: either the ordinary

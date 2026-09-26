@@ -128,7 +128,6 @@ impl FileStorageClientV1 for StubClient {
         _declared_mime: &str,
         _declared_size: u64,
         _preferred_part_size: Option<u64>,
-        _concurrency: Option<u32>,
     ) -> Result<MultipartPlan, FileStorageError> {
         Err(stub_err())
     }

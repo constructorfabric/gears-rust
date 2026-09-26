@@ -268,7 +268,6 @@ async fn drive_multipart_upload(
             "application/octet-stream",
             declared_size,
             None,
-            None,
             false,
         )
         .await

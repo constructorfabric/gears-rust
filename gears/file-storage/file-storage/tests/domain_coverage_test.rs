@@ -2137,7 +2137,6 @@ async fn list_versions_endpoint_returns_composite_version_with_manifest() {
             "application/octet-stream",
             declared_size,
             None,
-            None,
             false,
         )
         .await

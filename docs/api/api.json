@@ -3473,15 +3473,6 @@
       "CreateMultipartIntentDto": {
         "description": "Multipart intent block on `POST /files` (upload-flow redesign): ask the\ncreate call to open the multipart session and return the parts plan in\nthe same response, saving the separate `POST /files/{id}/multipart`\nround-trip (and the orphan single-part pending version the old flow\npre-registered and then abandoned).",
         "properties": {
-          "concurrency": {
-            "description": "Advisory upload-concurrency hint; does not change the plan.",
-            "format": "int32",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
           "declared_size": {
             "description": "Declared total file size in bytes (validated against policy/quota at\ncreate time, exactly like `POST /files/{id}/multipart`).",
             "format": "int64",
@@ -7206,15 +7197,6 @@
       "InitiateMultipartReq": {
         "description": "Request to initiate a multipart upload (`POST /files/{id}/multipart`).\n\nThe server returns a server-authoritative parts plan with one signed sidecar\nURL per part (FEATURE §3, §4; DESIGN §4.6).",
         "properties": {
-          "concurrency": {
-            "description": "Advisory hint for upload concurrency; does not change the parts plan\n(FEATURE §3).",
-            "format": "int32",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
           "declared_mime": {
             "description": "Declared MIME type for the file content.",
             "type": "string"

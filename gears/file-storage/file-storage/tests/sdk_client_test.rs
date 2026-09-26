@@ -743,7 +743,6 @@ async fn initiate_multipart_success_and_invalid_part_size() {
             "application/octet-stream",
             12 * 1024 * 1024,
             None,
-            None,
         )
         .await
         .expect("initiate_multipart");
@@ -757,7 +756,6 @@ async fn initiate_multipart_success_and_invalid_part_size() {
             "application/octet-stream",
             1024,
             Some(1), // far below DEFAULT_MIN_PART_SIZE
-            None,
         )
         .await
         .unwrap_err();
@@ -788,7 +786,6 @@ async fn introspect_and_complete_multipart_success_and_failures() {
             file_id,
             "application/octet-stream",
             12 * 1024 * 1024,
-            None,
             None,
         )
         .await
@@ -890,7 +887,6 @@ async fn abort_multipart_success_and_not_in_progress() {
             file_id,
             "application/octet-stream",
             12 * 1024 * 1024,
-            None,
             None,
         )
         .await
