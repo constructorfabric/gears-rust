@@ -26,11 +26,9 @@ use crate::infra::storage::repo::AuditRow;
 use crate::infra::storage::store::Store;
 
 impl Store {
-    // ── idempotency keys (P2-M3) ──────────────────────────────────────────────
+    // ── idempotency keys ──────────────────────────────────────────────────────
 
     /// Fetch an idempotency record if it exists and has not expired.
-    ///
-    /// @cpt-cf-file-storage-fr-upload-idempotency
     pub async fn get_idempotency_key(
         &self,
         tenant_id: Uuid,
@@ -46,55 +44,72 @@ impl Store {
             .await
     }
 
-    // ── audit outbox (P2-M4) ──────────────────────────────────────────────────
+    // ── audit outbox ──────────────────────────────────────────────────────────
 
     /// List audit rows for a specific file, ordered by occurrence time.
     ///
     /// Intended for testing; not exposed on the REST API.
-    ///
-    /// @cpt-cf-file-storage-fr-audit-trail
     pub async fn list_audit(&self, file_id: Uuid) -> Result<Vec<AuditRow>, DomainError> {
         let conn = self.db.conn().map_err(db_err)?;
         self.repos.audit.list_for_file(&conn, file_id).await
     }
 
-    // ── cleanup engine (P2-M4 lifecycle) ─────────────────────────────────────
+    // ── cleanup engine ────────────────────────────────────────────────────────
 
     /// List all `pending` version rows older than `older_than` (system scope),
-    /// excluding versions still backing a live `in_progress` multipart session
-    /// (`expires_at > now`) -- see
+    /// excluding versions still backing an active multipart session (a live
+    /// `in_progress` one with `expires_at > now`, or any `completing` one) --
+    /// see
     /// [`VersionRepo::list_pending_older_than`][crate::infra::storage::repo::VersionRepo::list_pending_older_than]
-    /// for the invariant this protects.
-    ///
-    /// @cpt-cf-file-storage-fr-orphan-reconciliation
+    /// for the invariant this protects. Bounded to `limit` rows -- see that
+    /// method's doc comment.
     pub async fn list_abandoned_pending_versions(
         &self,
         older_than: OffsetDateTime,
         now: OffsetDateTime,
+        limit: u64,
     ) -> Result<Vec<FileVersion>, DomainError> {
         let conn = self.db.conn().map_err(db_err)?;
         self.repos
             .versions
-            .list_pending_older_than(&conn, &AccessScope::allow_all(), older_than, now)
+            .list_pending_older_than(&conn, &AccessScope::allow_all(), older_than, now, limit)
             .await
     }
 
-    /// List all `in_progress` multipart sessions whose `expires_at` is before `now`.
-    ///
-    /// @cpt-cf-file-storage-fr-orphan-reconciliation
+    /// List `files` rows that never received any version at all -- see
+    /// [`crate::domain::ports::CleanupStore::list_versionless_orphan_files`]
+    /// for the full contract and
+    /// [`crate::infra::storage::repo::FileRepo::list_versionless_orphan_files`]
+    /// for the query. Feeds the second phase of sweep step 1
+    /// ([`crate::domain::cleanup::CleanupEngine::sweep_versionless_files`]).
+    pub async fn list_versionless_orphan_files(
+        &self,
+        created_before: OffsetDateTime,
+        limit: u64,
+    ) -> Result<Vec<File>, DomainError> {
+        let conn = self.db.conn().map_err(db_err)?;
+        self.repos
+            .files
+            .list_versionless_orphan_files(&conn, &AccessScope::allow_all(), created_before, limit)
+            .await
+    }
+
+    /// List all `in_progress` multipart sessions whose `expires_at` is before
+    /// `now`, bounded to `limit` rows -- see
+    /// [`MultipartRepo::list_expired`][crate::infra::storage::repo::MultipartRepo::list_expired]'s
+    /// doc comment.
     pub async fn list_expired_multipart_uploads(
         &self,
         now: OffsetDateTime,
+        limit: u64,
     ) -> Result<Vec<MultipartUploadSession>, DomainError> {
         let conn = self.db.conn().map_err(db_err)?;
-        self.repos.multipart.list_expired(&conn, now).await
+        self.repos.multipart.list_expired(&conn, now, limit).await
     }
 
     /// List files across all tenants for the retention sweep, keyset-paginated
     /// by `file_id` (see [`FileRepo::list_all_for_sweep`]). `after = None` starts
     /// from the beginning; the caller loops until it gets fewer than `limit`.
-    ///
-    /// @cpt-cf-file-storage-fr-retention-policies
     pub async fn list_all_files_for_sweep(
         &self,
         after: Option<Uuid>,
@@ -109,8 +124,6 @@ impl Store {
 
     /// List retention rules for a specific file (`scope = 'file'`), across all
     /// tenants. Used by the retention sweep engine.
-    ///
-    /// @cpt-cf-file-storage-fr-retention-policies
     pub async fn list_file_retention_rules(
         &self,
         file_id: Uuid,
@@ -124,8 +137,6 @@ impl Store {
 
     /// List all retention rules across all tenants and scopes — for the sweep
     /// engine.
-    ///
-    /// @cpt-cf-file-storage-fr-retention-policies
     pub async fn list_all_retention_rules(&self) -> Result<Vec<StoredRetentionRule>, DomainError> {
         let conn = self.db.conn().map_err(db_err)?;
         self.repos
@@ -134,13 +145,20 @@ impl Store {
             .await
     }
 
-    /// Bulk-delete all `idempotency_keys` rows whose `expires_at` is at or
-    /// before `now` (P2 remediation 1.9). Returns the number of rows removed.
+    /// Delete at most `limit` expired `idempotency_keys` rows (`expires_at <=
+    /// now`), oldest-expired first -- see
+    /// [`IdempotencyRepo::delete_expired`][crate::infra::storage::repo::IdempotencyRepo::delete_expired]'s
+    /// doc comment for why this is batched like every other sweep phase.
+    /// Returns the number of rows removed.
     pub async fn delete_expired_idempotency_keys(
         &self,
         now: OffsetDateTime,
+        limit: u64,
     ) -> Result<u64, DomainError> {
         let conn = self.db.conn().map_err(db_err)?;
-        self.repos.idempotency_keys.delete_expired(&conn, now).await
+        self.repos
+            .idempotency_keys
+            .delete_expired(&conn, now, limit)
+            .await
     }
 }

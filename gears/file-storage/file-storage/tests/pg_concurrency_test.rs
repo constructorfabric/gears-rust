@@ -1,0 +1,2388 @@
+#![cfg(feature = "integration")]
+// Created: 2026-07-27 by Constructor Tech
+#![allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::doc_markdown,
+    clippy::too_many_lines,
+    clippy::too_many_arguments
+)]
+//! PostgreSQL concurrency harness for file-storage's CAS-based concurrency
+//! safety, structured after `resource-group`'s own PG suite (see
+//! `docs/toolkit_unified_system/14_db_behavior_testing.md` for the general
+//! methodology).
+//!
+//! Real PostgreSQL is required here for the same reason as in resource-group:
+//! SQLite's own "SERIALIZABLE" is a whole-database writer lock, not
+//! row/predicate-level SSI, and file-storage's concurrency-safety strategy is
+//! single-statement CAS `UPDATE ... WHERE` predicates whose *interleaving*
+//! behavior under a real connection pool and real wall-clock timing cannot be
+//! faithfully exercised against an in-memory SQLite connection.
+//!
+//! This file is gated behind `#![cfg(feature = "integration")]` (see the top
+//! of this file and this crate's `Cargo.toml`, where `default = []` and
+//! `integration = []`): a plain `cargo test -p cf-gears-file-storage` does
+//! **not** build or run this suite at all. It only runs when the
+//! `integration` feature is enabled explicitly, i.e. via `make test-fs-pg`
+//! (see the `Makefile`) or the "Test file-storage (pg concurrency,
+//! integration)" step in `.github/workflows/ci.yml`. When Docker isn't
+//! reachable, every test here still skips itself gracefully (passes, with a
+//! stderr message) *unless* `FS_PG_REQUIRE_DOCKER` is set (`"1"`/`"true"`),
+//! in which case a missing Docker daemon is a hard panic instead of a silent
+//! skip -- CI sets this so a broken Docker daemon can't produce a green step
+//! that checked nothing. See `require_docker`/`shared_pg` below.
+//!
+//! ## Running locally
+//!
+//! ```sh
+//! cargo nextest run -p cf-gears-file-storage --features integration \
+//!   --test pg_concurrency_test
+//! # or, equivalently:
+//! make test-fs-pg
+//! ```
+//!
+//! ## Scenarios
+//!
+//! - `f1_*` -- orphan file on multipart-initiate failure: a multipart-initiate
+//!   failure (capability reject on a non-`multipart_native` backend, or a
+//!   backend-level initiation error) leaves a version-less orphan `files` row
+//!   that step 1's abandoned-pending phase cannot reach (it only ever visits
+//!   rows returned by `list_abandoned_pending_versions`, and there is no
+//!   pending version here to trigger it). Fixed twice over: primarily at the
+//!   orchestration layer, where `api/rest/handlers.rs::create_file`'s
+//!   multipart branch calls `compensate_failed_multipart_initiate` on exactly
+//!   this failure, and as a backstop by step 1's dedicated versionless-files
+//!   phase (`CleanupEngine::sweep_versionless_files`), which reclaims such a
+//!   row once it ages past `orphan_grace_secs` even when no compensation ever
+//!   ran.
+//! - `f2_*` -- completion is not owner-fenced end-to-end (the most severe
+//!   scenario in this file): two completers, A and B, race the same
+//!   session's lease; deterministic checkpoints (`tokio::sync::Notify` gates
+//!   threaded through a `MultipartStore` decorator, not `sleep`-based timing)
+//!   force the exact interleaving where stale A wins the version-finalize
+//!   CAS, B's own (redundant) finalize attempt then fails and releases B's
+//!   *own* lease (owner-scoped, but the session is still `completing` at
+//!   that moment) back to `in_progress`, and A's own `finish_session` CAS
+//!   then fails too (the state it expected, `completing`, is gone) -- both
+//!   callers see an error, even though the content was, in fact, correctly
+//!   finalized and bound. The session is left stranded at `in_progress` with
+//!   no live lease and no missing parts, so a third caller re-attempts the
+//!   (already-done) assembly, fails again (the specific error shape varies --
+//!   a DB conflict or a backend "handle already consumed" error, depending on
+//!   how far the redundant attempt gets -- but it always fails), and
+//!   re-strands it -- this repeats until `expires_at` passes and the
+//!   background sweep aborts the session, permanently, with the content
+//!   already live underneath it. Fixed in
+//!   `multipart_service.rs::assemble_and_finish_inner`: a lost finalize CAS
+//!   now checks whether the version is `Available` (someone else's finalize
+//!   already won) and converges via the same `replay_completed` +
+//!   `finish_session` path the takeover fast-path already used, instead of
+//!   unconditionally erroring and releasing the lease.
+//! - `f9_*` -- auto-bind CAS fix verification: multipart auto-bind's CAS
+//!   target used to be whatever `content_id` was observed at the *start* of
+//!   `complete` (not `IS NULL`, unlike the single-part path), so a
+//!   legitimate rebind that happened *before* an auto-bind `complete` with
+//!   no `If-Match` was silently overwritten. Fixed by requiring
+//!   `content_id IS NULL` specifically when no `If-Match` was supplied (a
+//!   caller who *does* supply one already had it validated against the
+//!   observed pointer moments earlier, so proceeding with that pointer as
+//!   the CAS target is still safe). This was a **sequential temporal gap**
+//!   (the exploitable window is the ordinary, often long, user-driven span
+//!   between multipart *initiate* and its *complete*, not a tight
+//!   concurrent race), so this scenario never needed barrier/gate
+//!   synchronization -- deterministic by construction, both before and
+//!   after the fix. Included here (run against real PostgreSQL, not just
+//!   the SQLite unit-level pin in `db_behavior_audit_test.rs`) to confirm the
+//!   same CAS shape holds under the production dialect. A negative control
+//!   shows a *stale* `If-Match` (captured before the rebind, still supplied
+//!   on complete) is correctly rejected with a clean `PreconditionFailed` --
+//!   unrelated to this fix, pre-existing precondition-check behavior.
+//! - `f10_*` -- second path to the same orphan as `f1_*`: within a single
+//!   `run_sweep()` call, step 1 (`sweep_abandoned_pending`) reclaims an
+//!   abandoned pending version whose backing multipart session is
+//!   *expired-but-still-`in_progress`* -- `has_active_for_file` blocks
+//!   the parent-file deletion at that moment (the session hasn't been
+//!   aborted by step 2 yet), but the version row is deleted anyway. Step 2
+//!   then aborts the session. The parent `files` row survives this sweep
+//!   pass as a version-less orphan, and -- because the orphan-file check
+//!   only ever runs as a side effect of deleting *a version* -- no later
+//!   sweep pass ever revisits it: a second `run_sweep()` call confirms the
+//!   file is still stuck. Fixed by also running the orphan-file check from
+//!   step 2's own cleanup path (which runs after the session is already
+//!   aborted, so it is no longer blocked). Deterministic by construction
+//!   (backdated timestamps, no barrier needed), included here for parity and
+//!   to confirm the same fix holds against a real PostgreSQL FK/cascade
+//!   dialect.
+//! - `invariant_checker_*` -- post-state invariant checker: no version-less
+//!   `files` rows outside a documented window (a window this file's own
+//!   scenarios show is NOT actually bounded -- demonstrated directly against
+//!   the f1/f10 fixtures above), every non-`NULL` `files.content_id` points
+//!   at an `available` version, and no `pending` version older than a
+//!   threshold still has a live backing session. Usage-invariants are out of
+//!   scope for an executable check -- see the note below.
+//!
+//! ## Usage-invariant note
+//!
+//! `gear.rs` wires `FileService`/`MultipartService`/`CleanupEngine` with
+//! `usage_reporter: None` in the shipped build (`gear.rs:189-217,230,236,264`,
+//! confirmed by reading the gear wiring) -- no usage delta is emitted at all
+//! today. There is therefore no live usage-invariant to *check* against a
+//! real reporter in this suite; the accounting defects this would otherwise
+//! surface (overcounts/undercounts in the scenarios above) are latent until a
+//! reporter is wired. This suite does not simulate a reporter or assert on
+//! `report_usage`'s fire-and-forget calls -- doing so would test a code path
+//! with no observable effect in production today and risks masking the real
+//! gap (documented as latent, not "checked and fine").
+
+mod common;
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use async_trait::async_trait;
+use bytes::Bytes;
+use file_storage::domain::authz::TenantOnlyAuthorizer;
+use file_storage::domain::cleanup::{CleanupConfig, CleanupEngine};
+use file_storage::domain::error::DomainError;
+use file_storage::domain::multipart::{BindState, MultipartPart};
+use file_storage::domain::multipart_service::MultipartService;
+use file_storage::domain::policy::{PolicyScope, StoredPolicy};
+use file_storage::domain::ports::{
+    AutoBindOnFinalize, CleanupStore, DeleteVersionOutcome, FinalizeMultipartOutcome,
+    FinalizeVersionOutcome, MultipartFinishSnapshot, MultipartStore,
+};
+use file_storage::domain::service::{FileService, ServiceConfig};
+use file_storage::infra::backend::{
+    BackendRegistry, InMemoryBackend, LocalFsBackend, StorageBackend,
+};
+use file_storage::infra::content::{hash, mime};
+use file_storage::infra::signed_url::Issuer;
+use file_storage::infra::storage::Store;
+use file_storage::infra::storage::migrations::Migrator;
+use file_storage_sdk::VersionStatus;
+use sea_orm::sea_query::Expr;
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+use sea_orm_migration::MigratorTrait;
+use testcontainers::{ImageExt, runners::AsyncRunner};
+use testcontainers_modules::postgres::Postgres;
+use time::OffsetDateTime;
+use tokio::sync::{Mutex, Notify, OnceCell};
+use toolkit_db::migration_runner::run_migrations_for_testing;
+use toolkit_db::secure::{SecureEntityExt, SecureUpdateExt};
+use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
+use toolkit_security::{AccessScope, SecurityContext};
+use uuid::Uuid;
+
+/// Serializes every test in this file against every other one: they share
+/// one PostgreSQL database (started once, lazily), and while most scenarios
+/// here use uniquely-generated ids (no cross-test invariant), running them
+/// fully concurrently would make `eprintln!` diagnostics from different
+/// scenarios interleave confusingly and (for the `f2_*`/`f10_*` scenarios,
+/// which depend on real wall-clock lease/session expiry) could make one
+/// test's real sleep windows overlap another's timing-sensitive assertions
+/// under CI load. Mirrors resource-group's own `PG_TEST_LOCK`.
+static PG_TEST_LOCK: Mutex<()> = Mutex::const_new(());
+
+struct PgFixture {
+    dsn: String,
+    _container: testcontainers::ContainerAsync<Postgres>,
+}
+
+static PG: OnceCell<Option<Arc<PgFixture>>> = OnceCell::const_new();
+static MIGRATIONS_DONE: OnceCell<()> = OnceCell::const_new();
+
+/// Mirrors resource-group's own `pg_concurrency_test.rs::require_docker`:
+/// when set (`"1"`/`"true"`), a Docker/testcontainers failure is a hard
+/// panic instead of a graceful per-test skip. CI sets `FS_PG_REQUIRE_DOCKER=1`
+/// for exactly this reason -- see the module docs above and
+/// `.github/workflows/ci.yml`'s "Test file-storage (pg concurrency,
+/// integration)" step.
+fn require_docker() -> bool {
+    std::env::var("FS_PG_REQUIRE_DOCKER").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
+/// Bring up (once per process) a `testcontainers` PostgreSQL, mirroring
+/// resource-group's own `pg_concurrency_test.rs::shared_pg`. Returns `None`
+/// if Docker isn't reachable -- callers treat that as a graceful skip, unless
+/// `FS_PG_REQUIRE_DOCKER` is set, in which case that would silently assert
+/// nothing, so this panics instead.
+async fn shared_pg() -> Option<Arc<PgFixture>> {
+    PG.get_or_init(|| async {
+        // Image and tag come from `libs/test-containers`, the single place this
+        // workspace pins database images (docs/TESTING.md 4.4, enforced by
+        // `cargo xtask check-test-container-pins`). Constructing
+        // `Postgres::default()` here would take the tag from
+        // `testcontainers-modules` instead and re-introduce the transitive pin.
+        let request = test_containers::postgres()
+            .with_env_var("POSTGRES_PASSWORD", "pass")
+            .with_env_var("POSTGRES_USER", "user")
+            .with_env_var("POSTGRES_DB", "app");
+        match request.start().await {
+            Ok(container) => match container.get_host_port_ipv4(5432).await {
+                Ok(port) => Some(Arc::new(PgFixture {
+                    dsn: format!("postgres://user:pass@127.0.0.1:{port}/app"),
+                    _container: container,
+                })),
+                Err(e) => {
+                    assert!(
+                        !require_docker(),
+                        "Docker required (FS_PG_REQUIRE_DOCKER=1) but the PostgreSQL \
+                         container's port could not be resolved: {e}"
+                    );
+                    eprintln!(
+                        "skipping PostgreSQL concurrency tests: container started but its \
+                         port could not be resolved ({e}). Is Docker healthy?"
+                    );
+                    None
+                }
+            },
+            Err(e) => {
+                assert!(
+                    !require_docker(),
+                    "Docker required (FS_PG_REQUIRE_DOCKER=1) but the PostgreSQL container \
+                     failed to start: {e}"
+                );
+                eprintln!(
+                    "skipping PostgreSQL concurrency tests: could not start a PostgreSQL \
+                     container via testcontainers ({e}). Install/start Docker to run these \
+                     for real -- see this file's module docs."
+                );
+                None
+            }
+        }
+    })
+    .await
+    .clone()
+}
+
+/// Connect to the shared PostgreSQL fixture and ensure file-storage's
+/// migrations have run against it. Returns `None` when Docker isn't
+/// available.
+async fn pg_db() -> Option<Arc<DBProvider<DbError>>> {
+    let fixture = shared_pg().await?;
+    let opts = ConnectOpts {
+        max_conns: Some(10),
+        min_conns: Some(2),
+        ..Default::default()
+    };
+    let db = connect_db(&fixture.dsn, opts)
+        .await
+        .expect("connect to the testcontainers PostgreSQL");
+    MIGRATIONS_DONE
+        .get_or_init(|| async {
+            run_migrations_for_testing(&db, Migrator::migrations())
+                .await
+                .expect("run file-storage migrations against PostgreSQL");
+        })
+        .await;
+    Some(Arc::new(DBProvider::new(db)))
+}
+
+/// Shorthand for the common test-entry sequence, mirroring resource-group's
+/// own macro of the same name and purpose.
+macro_rules! pg_db_or_skip {
+    () => {{
+        let _guard = PG_TEST_LOCK.lock().await;
+        match pg_db().await {
+            Some(db) => (db, _guard),
+            None => return,
+        }
+    }};
+}
+
+// =========================================================================
+// Shared construction helpers
+// =========================================================================
+
+/// `Display`-based diagnostic summary of a fallible outcome, for `eprintln!`
+/// (avoids `clippy::use_debug` -- mirrors resource-group's own
+/// `describe_membership_result` in its `pg_concurrency_test.rs`).
+fn describe_result<T>(r: &Result<T, DomainError>) -> String {
+    match r {
+        Ok(_) => "Ok".to_owned(),
+        Err(e) => format!("Err({e})"),
+    }
+}
+
+/// `Display`-based diagnostic summary of a [`file_storage::domain::cleanup::SweepResult`]
+/// (its fields are all plain integers; this just avoids reaching for
+/// `clippy::use_debug`-denied `{:?}` on the struct itself).
+fn describe_sweep(r: &file_storage::domain::cleanup::SweepResult) -> String {
+    format!(
+        "pending_deleted={} files_deleted={} multipart_aborted={} retention_deleted={} idempotency_deleted={}",
+        r.abandoned_pending_deleted,
+        r.abandoned_files_deleted,
+        r.expired_multipart_aborted,
+        r.retention_expired_deleted,
+        r.idempotency_keys_deleted,
+    )
+}
+
+fn make_ctx(tenant_id: Uuid) -> SecurityContext {
+    SecurityContext::builder()
+        .subject_id(Uuid::now_v7())
+        .subject_tenant_id(tenant_id)
+        .build()
+        .expect("valid SecurityContext")
+}
+
+fn new_file() -> file_storage_sdk::NewFile {
+    file_storage_sdk::NewFile {
+        owner_kind: file_storage_sdk::OwnerKind::User,
+        owner_id: Uuid::now_v7(),
+        name: "pg-audit.bin".to_owned(),
+        gts_file_type: toolkit_gts::gts_id!("cf.fstorage.file.type.v1~x.test.file.type.v1~")
+            .to_owned(),
+        mime_type: "application/octet-stream".to_owned(),
+        custom_metadata: vec![],
+    }
+}
+
+fn service_config() -> ServiceConfig {
+    ServiceConfig {
+        default_url_ttl_secs: 3600,
+        sidecar_base_url: "http://sidecar.test".to_owned(),
+        default_page_size: 50,
+        max_page_size: 1000,
+        idempotency_ttl_secs: 86400,
+    }
+}
+
+/// Direct byte-path test double for what `DataPlaneService` used to provide
+/// (removed: production never constructed it — the sidecar is the only real
+/// byte path). Same steps `DataPlaneService::put_content` used to perform,
+/// but through `put_stream` rather than the whole-object `put` that no
+/// longer exists on `StorageBackend`.
+struct TestDataPlane {
+    svc: Arc<FileService>,
+    store: Store,
+    backends: BackendRegistry,
+}
+
+impl TestDataPlane {
+    fn new(svc: Arc<FileService>, store: Store, backends: BackendRegistry) -> Self {
+        Self {
+            svc,
+            store,
+            backends,
+        }
+    }
+
+    async fn put_content(
+        &self,
+        ctx: &SecurityContext,
+        file_id: Uuid,
+        version_id: Uuid,
+        declared_mime: &str,
+        bytes: Bytes,
+    ) -> Result<(), DomainError> {
+        mime::validate(declared_mime, &bytes)?;
+        self.svc.authorize_write(ctx, file_id).await?;
+        let version = self
+            .store
+            .get_version(file_id, version_id)
+            .await?
+            .ok_or_else(|| DomainError::version_not_found(file_id, version_id))?;
+        let backend = self.backends.get(&version.backend_id)?;
+        let len = bytes.len() as u64;
+        let digest = hash::sha256(&bytes);
+        let stream: futures::stream::BoxStream<'static, std::io::Result<Bytes>> =
+            Box::pin(futures::stream::once(async move { Ok(bytes) }));
+        backend
+            .put_stream(&version.backend_path, stream, Some(len))
+            .await?;
+        self.svc
+            .finalize_upload(
+                ctx,
+                file_id,
+                version_id,
+                i64::try_from(len).unwrap_or(i64::MAX),
+                digest,
+            )
+            .await
+    }
+}
+
+fn make_file_service(store: Store, backends: BackendRegistry) -> Arc<FileService> {
+    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let authorizer: Arc<dyn file_storage::domain::authz::Authorizer> =
+        Arc::new(TenantOnlyAuthorizer);
+    Arc::new(FileService::new(
+        store,
+        backends,
+        issuer,
+        authorizer,
+        service_config(),
+        None,
+        None,
+    ))
+}
+
+fn make_multipart_service(
+    store: Arc<dyn MultipartStore>,
+    backends: BackendRegistry,
+    complete_lease_secs: i64,
+) -> Arc<MultipartService> {
+    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let authorizer: Arc<dyn file_storage::domain::authz::Authorizer> =
+        Arc::new(TenantOnlyAuthorizer);
+    Arc::new(
+        MultipartService::new(
+            store,
+            backends,
+            authorizer,
+            None,
+            issuer,
+            "http://sidecar.test".to_owned(),
+            3600,
+        )
+        .with_complete_lease_secs(complete_lease_secs),
+    )
+}
+
+fn make_engine(store: Store, backends: BackendRegistry, orphan_grace_secs: u64) -> CleanupEngine {
+    let cleanup_store: Arc<dyn CleanupStore> = Arc::new(store);
+    CleanupEngine::new(cleanup_store, backends, CleanupConfig { orphan_grace_secs })
+}
+
+/// Drive every part in `plan` through the backend + `MultipartStore`
+/// directly, all-zero filler bytes -- mirrors
+/// `tests/common/mod.rs::simulate_all_parts`, duplicated here (rather than
+/// pulled in via `mod common`'s own copy) because this file's helpers build
+/// their own bespoke `MultipartService`/`Store` combinations per scenario,
+/// not `common::Services`.
+async fn simulate_all_parts(
+    multipart_store: &Arc<dyn MultipartStore>,
+    backend: &Arc<dyn StorageBackend>,
+    plan: &file_storage::domain::multipart::MultipartPlan,
+    file_id: Uuid,
+) {
+    let session = multipart_store
+        .get_multipart_upload(plan.upload_id)
+        .await
+        .expect("get_multipart_upload")
+        .expect("session must exist");
+    let backend_path = format!("/{file_id}/{}", plan.version_id);
+    for part in &plan.parts {
+        let data = Bytes::from(vec![
+            0u8;
+            usize::try_from(part.size).expect("part size fits")
+        ]);
+        let len = data.len() as u64;
+        let stream: futures::stream::BoxStream<'static, std::io::Result<Bytes>> =
+            Box::pin(futures::stream::once(async move { Ok(data) }));
+        let (backend_etag, part_hash) = backend
+            .upload_part_stream(
+                &backend_path,
+                &session.backend_upload_handle,
+                part.part_number,
+                part.offset,
+                stream,
+                len,
+            )
+            .await
+            .expect("backend upload_part_stream");
+        let size = i64::try_from(part.size).expect("part size fits in i64");
+        let part_number_i32 = i32::try_from(part.part_number).expect("part_number fits in i32");
+        multipart_store
+            .upsert_multipart_part(
+                plan.upload_id,
+                part_number_i32,
+                &backend_etag,
+                part_hash,
+                size,
+                OffsetDateTime::now_utc(),
+            )
+            .await
+            .expect("upsert_multipart_part");
+    }
+}
+
+// =========================================================================
+// Orphan file when multipart initiation fails; real sweep does not reclaim
+// it.
+// =========================================================================
+
+/// Capability-reject half: `LocalFsBackend` never advertises
+/// `multipart_native` (confirmed by reading `local_fs.rs`'s
+/// `BackendCapabilities::default()`), so initiate is rejected before any
+/// pending version is created, leaving a `files` row that never received a
+/// version at all (see the module doc's `f1_*` entry).
+///
+/// Two independent mechanisms now reclaim it, and this test pins the second
+/// one: the orchestration layer compensates immediately (see
+/// `f1_capability_reject_with_compensation_reclaims_orphan` below, the
+/// primary path -- only the caller that made the failed initiate attempt
+/// knows which file to clean up), and the sweep's dedicated versionless-files
+/// phase (`CleanupEngine::sweep_versionless_files`) is the backstop for a
+/// compensation that never ran or itself failed. This test calls
+/// `create_file_bare` + `initiate_multipart_upload` directly -- the same raw
+/// sequence the handler makes *before* its own error-handling branch -- so
+/// no compensation is invoked and the sweep is left to reclaim the row on
+/// its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn f1_capability_reject_orphan_reclaimed_by_versionless_sweep() {
+    let (db, _pg_guard) = pg_db_or_skip!();
+    let store = Store::new(Arc::clone(&db));
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let backend: Arc<dyn StorageBackend> = Arc::new(LocalFsBackend::new("fs", tmp.keep()));
+    let backends = BackendRegistry::new(vec![Arc::clone(&backend)], "fs").expect("registry");
+    let multipart_store: Arc<dyn MultipartStore> = Arc::new(store.clone());
+    let svc = make_file_service(store.clone(), backends.clone());
+    let msvc = make_multipart_service(multipart_store, backends.clone(), 120);
+    let engine = make_engine(store.clone(), backends, 0); // grace=0: everything eligible immediately
+
+    let tenant_id = Uuid::now_v7();
+    let ctx = make_ctx(tenant_id);
+    let file_id = svc
+        .create_file_bare(&ctx, new_file())
+        .await
+        .expect("create_file_bare commits the bare file row");
+
+    let err = msvc
+        .initiate_multipart_upload(
+            &ctx,
+            file_id,
+            "application/octet-stream",
+            20,
+            Some(10),
+            false,
+        )
+        .await
+        .expect_err("local-fs backend does not advertise multipart_native");
+    assert!(matches!(err, DomainError::MultipartNotSupported { .. }));
+
+    let result = engine.run_sweep().await;
+    eprintln!(
+        "f1_capability_reject_orphan_reclaimed_by_versionless_sweep: sweep result = {}",
+        describe_sweep(&result)
+    );
+    assert_eq!(
+        result.abandoned_files_deleted, 1,
+        "the versionless-files phase must reclaim the bare file in this same pass -- no pending \
+         version was ever created, so step 1's abandoned-pending phase cannot reach it and this \
+         is the phase that has to"
+    );
+
+    let file_after = svc.get_file(&ctx, file_id).await;
+    assert!(
+        matches!(file_after, Err(DomainError::FileNotFound { .. })),
+        "the orphaned bare file must be gone after a real sweep pass, even with no compensation \
+         invoked -- got: {file_after:?}"
+    );
+}
+
+/// End-to-end, against real PostgreSQL: mirrors exactly what
+/// `api/rest/handlers.rs::create_file`'s multipart branch now does on an
+/// initiate failure -- call `compensate_failed_multipart_initiate` with the
+/// same `file_id`, then confirm the orphan is gone (no sweep needed at
+/// all).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn f1_capability_reject_with_compensation_reclaims_orphan() {
+    let (db, _pg_guard) = pg_db_or_skip!();
+    let store = Store::new(Arc::clone(&db));
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let backend: Arc<dyn StorageBackend> = Arc::new(LocalFsBackend::new("fs", tmp.keep()));
+    let backends = BackendRegistry::new(vec![Arc::clone(&backend)], "fs").expect("registry");
+    let multipart_store: Arc<dyn MultipartStore> = Arc::new(store.clone());
+    let svc = make_file_service(store.clone(), backends.clone());
+    let msvc = make_multipart_service(multipart_store, backends, 120);
+
+    let tenant_id = Uuid::now_v7();
+    let ctx = make_ctx(tenant_id);
+    let file_id = svc
+        .create_file_bare(&ctx, new_file())
+        .await
+        .expect("create_file_bare commits the bare file row");
+    msvc.initiate_multipart_upload(
+        &ctx,
+        file_id,
+        "application/octet-stream",
+        20,
+        Some(10),
+        false,
+    )
+    .await
+    .expect_err("local-fs backend does not advertise multipart_native");
+
+    svc.compensate_failed_multipart_initiate(&ctx, file_id)
+        .await;
+
+    let gone = svc.get_file(&ctx, file_id).await;
+    assert!(
+        matches!(gone, Err(DomainError::FileNotFound { .. })),
+        "FS-01/F1 fix: the compensating delete must reclaim the orphan file against real \
+         PostgreSQL too, got: {gone:?}"
+    );
+}
+
+/// A `StorageBackend` decorator whose `initiate_multipart` always fails,
+/// even though `capabilities()` (delegated to the inner backend) genuinely
+/// advertises `multipart_native: true` -- the backend-initiation-failure
+/// half of the orphan scenario, distinct from the capability-reject half
+/// above.
+struct FailingInitiateBackend {
+    inner: Arc<dyn StorageBackend>,
+}
+
+#[async_trait]
+impl StorageBackend for FailingInitiateBackend {
+    fn id(&self) -> &str {
+        self.inner.id()
+    }
+    fn capabilities(&self) -> file_storage::infra::backend::BackendCapabilities {
+        self.inner.capabilities()
+    }
+    async fn put_stream(
+        &self,
+        path: &str,
+        stream: futures::stream::BoxStream<'_, std::io::Result<Bytes>>,
+        max_size: Option<u64>,
+    ) -> Result<(u64, [u8; 32]), DomainError> {
+        self.inner.put_stream(path, stream, max_size).await
+    }
+    async fn publish_exclusive(
+        &self,
+        path: &str,
+        stream: futures::stream::BoxStream<'_, std::io::Result<Bytes>>,
+        max_size: Option<u64>,
+    ) -> Result<file_storage::infra::backend::PublishOutcome, DomainError> {
+        self.inner.publish_exclusive(path, stream, max_size).await
+    }
+    async fn get_stream(
+        &self,
+        path: &str,
+        expected_len: u64,
+    ) -> Result<futures::stream::BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
+        self.inner.get_stream(path, expected_len).await
+    }
+    async fn read_prefix(&self, path: &str, max_bytes: u64) -> Result<Option<Bytes>, DomainError> {
+        self.inner.read_prefix(path, max_bytes).await
+    }
+    async fn get_range_stream(
+        &self,
+        path: &str,
+        range: file_storage_sdk::ByteRange,
+        expected_len: u64,
+    ) -> Result<futures::stream::BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
+        self.inner.get_range_stream(path, range, expected_len).await
+    }
+    async fn size(&self, path: &str) -> Result<u64, DomainError> {
+        self.inner.size(path).await
+    }
+    async fn delete(&self, path: &str) -> Result<(), DomainError> {
+        self.inner.delete(path).await
+    }
+    async fn exists(&self, path: &str) -> Result<bool, DomainError> {
+        self.inner.exists(path).await
+    }
+    async fn initiate_multipart(&self, _path: &str) -> Result<String, DomainError> {
+        Err(DomainError::database(
+            "simulated backend-initiation failure (e.g. an S3 CreateMultipartUpload error)",
+        ))
+    }
+    async fn upload_part_stream(
+        &self,
+        path: &str,
+        upload_handle: &str,
+        part_number: u32,
+        part_offset: u64,
+        stream: futures::stream::BoxStream<'static, std::io::Result<Bytes>>,
+        len: u64,
+    ) -> Result<(String, Vec<u8>), DomainError> {
+        self.inner
+            .upload_part_stream(path, upload_handle, part_number, part_offset, stream, len)
+            .await
+    }
+    async fn complete_multipart(
+        &self,
+        path: &str,
+        upload_handle: &str,
+        parts: &[file_storage::infra::backend::MultipartCompletionPart],
+    ) -> Result<(file_storage::infra::content::hash_mode::Manifest, [u8; 32]), DomainError> {
+        self.inner
+            .complete_multipart(path, upload_handle, parts)
+            .await
+    }
+    async fn abort_multipart(&self, path: &str, upload_handle: &str) -> Result<(), DomainError> {
+        self.inner.abort_multipart(path, upload_handle).await
+    }
+    async fn list_paths(&self) -> Result<Vec<String>, DomainError> {
+        self.inner.list_paths().await
+    }
+}
+
+/// Backend-initiation-failure half: the backend genuinely advertises
+/// `multipart_native`, but its `initiate_multipart` call itself fails (a
+/// transient S3-side error, say) -- same orphan shape as the
+/// capability-reject half, confirming neither the defect nor the sweep's
+/// backstop is specific to the capability check: both halves leave the very
+/// same versionless `files` row, and the versionless-files phase reclaims it
+/// either way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn f1_backend_initiation_failure_orphan_reclaimed_by_versionless_sweep() {
+    let (db, _pg_guard) = pg_db_or_skip!();
+    let store = Store::new(Arc::clone(&db));
+    let inner: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let backend: Arc<dyn StorageBackend> = Arc::new(FailingInitiateBackend { inner });
+    let backends = BackendRegistry::new(vec![Arc::clone(&backend)], "mem").expect("registry");
+    let multipart_store: Arc<dyn MultipartStore> = Arc::new(store.clone());
+    let svc = make_file_service(store.clone(), backends.clone());
+    let msvc = make_multipart_service(multipart_store, backends.clone(), 120);
+    let engine = make_engine(store.clone(), backends, 0);
+
+    let tenant_id = Uuid::now_v7();
+    let ctx = make_ctx(tenant_id);
+    let file_id = svc
+        .create_file_bare(&ctx, new_file())
+        .await
+        .expect("create_file_bare");
+
+    let err = msvc
+        .initiate_multipart_upload(
+            &ctx,
+            file_id,
+            "application/octet-stream",
+            20,
+            Some(10),
+            false,
+        )
+        .await
+        .expect_err("the backend's initiate_multipart is rigged to fail");
+    eprintln!("f1_backend_initiation_failure: initiate error = {err}");
+
+    let result = engine.run_sweep().await;
+    eprintln!(
+        "f1_backend_initiation_failure_orphan_reclaimed_by_versionless_sweep: sweep result = {}",
+        describe_sweep(&result)
+    );
+    assert_eq!(
+        result.abandoned_files_deleted, 1,
+        "the versionless-files phase must reclaim this half's orphan too -- the row is identical \
+         to the capability-reject half's, whatever made initiate fail"
+    );
+
+    let file_after = svc.get_file(&ctx, file_id).await;
+    assert!(
+        matches!(file_after, Err(DomainError::FileNotFound { .. })),
+        "FS-01/F1: the orphaned bare file must be reclaimed by a real sweep pass, got: \
+         {file_after:?}"
+    );
+}
+
+// =========================================================================
+// Completion is not owner-fenced end-to-end: deterministic two-completer
+// race via gated `MultipartStore` checkpoints.
+// =========================================================================
+
+/// Which of the two concurrent completers (`A`, the stale winner-then-loser,
+/// or `B`, the taker-over) a given [`GatedMultipartStore`] handle plays.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Role {
+    A,
+    B,
+}
+
+/// A `MultipartStore` decorator that pauses at two specific checkpoints via
+/// `tokio::sync::Notify` gates, instead of `sleep`-based timing, to force
+/// the *exact* interleaving that strands the session (see the module doc's
+/// `f2_*` entry) deterministically -- not "reproduces in N/M trials" the way
+/// a pure wall-clock race would (a real completer's assembly duration is not
+/// something a test can pin down to the millisecond, and -- confirmed
+/// empirically while building this harness -- even gating *when a call
+/// starts* is not enough to pin down *which side's commit lands first*: an
+/// already-running task and a freshly-woken one can race the scheduler in
+/// either direction).
+///
+/// Two handles (one per role) share the same two `Notify`s and wrap the
+/// *same* real, PostgreSQL-backed inner store:
+///
+/// - Role `B`'s **first** `get_version` call (the takeover fast-path check
+///   in `assemble_and_finish_inner`) notifies `b_checked_pending` right
+///   after it returns the (still-`pending`, since role `A` is gated below)
+///   real value.
+/// - Role `A`'s `finalize_multipart_version` call **waits** on
+///   `b_checked_pending` before delegating -- guaranteeing `A`'s real
+///   finalize commit cannot *start* before `B` has already observed the
+///   pre-finalize state, no matter how much real wall-clock time separates
+///   `A`'s lease acquisition (which must still genuinely expire before `B`'s
+///   own `acquire_complete_lease` CAS will match) from `B`'s own start --
+///   and notifies `a_finalized` right after its own commit *returns*.
+/// - Role `B`'s `finalize_multipart_version` call **waits** on `a_finalized`
+///   before even starting its own (redundant, doomed-to-lose) attempt --
+///   this is the gate that makes A's *win* deterministic, not just A's
+///   *start*: without it, B's task (already running, several steps into its
+///   own reassembly) can race ahead of A's freshly-woken one and commit
+///   first, which is a real, also-interesting outcome (the stale completer,
+///   not the fresh one, ends up needing to converge instead) but not the
+///   specific interleaving this test exists to pin down.
+///
+/// Post-fix, B's lost `finalize_multipart_version` no longer
+/// errors-and-releases the lease -- it converges (re-derives the response
+/// and calls `finish_session` directly, same as the takeover fast path).
+/// `finalize_multipart_version` also folds its own terminal
+/// `completing -> completed` transition into the SAME transaction as A's
+/// finalize commit (crash-consistency fix, DBS-05-adjacent), so by the time
+/// B's own (redundant) attempt even starts, A's session is already
+/// `completed` -- there is no third gate needed, and no genuine race left
+/// for `finish_session`'s own CAS-then-converge fallback to resolve; B's
+/// own converge attempt simply finds `state` already `Completed` and
+/// converges silently.
+///
+/// `tokio::sync::Notify::notify_one` buffers a permit if no waiter is
+/// registered yet, so there is no lost-wakeup risk regardless of which side
+/// reaches its gate first in wall-clock terms.
+struct GatedMultipartStore {
+    inner: Arc<dyn MultipartStore>,
+    role: Role,
+    b_checked_pending: Arc<Notify>,
+    /// Notified by role A's `finalize_multipart_version` right after its
+    /// real commit returns (success or not) -- role B's own
+    /// `finalize_multipart_version` waits on this before even starting, so
+    /// which side wins the real CAS is deterministic rather than left to
+    /// the scheduler.
+    a_finalized: Arc<Notify>,
+    b_first_get_version_seen: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl MultipartStore for GatedMultipartStore {
+    async fn require_file(
+        &self,
+        scope: &AccessScope,
+        file_id: Uuid,
+    ) -> Result<file_storage_sdk::File, DomainError> {
+        self.inner.require_file(scope, file_id).await
+    }
+
+    async fn get_policy(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        policy_scope: &PolicyScope,
+        scope_owner_id: Option<Uuid>,
+    ) -> Result<Option<StoredPolicy>, DomainError> {
+        self.inner
+            .get_policy(scope, tenant_id, policy_scope, scope_owner_id)
+            .await
+    }
+
+    async fn insert_pending_version(
+        &self,
+        file_id: Uuid,
+        version_id: Uuid,
+        mime_type: &str,
+        backend_id: &str,
+        backend_path: &str,
+        now: OffsetDateTime,
+    ) -> Result<(), DomainError> {
+        self.inner
+            .insert_pending_version(
+                file_id,
+                version_id,
+                mime_type,
+                backend_id,
+                backend_path,
+                now,
+            )
+            .await
+    }
+
+    async fn create_multipart_upload(
+        &self,
+        upload_id: Uuid,
+        file_id: Uuid,
+        version_id: Uuid,
+        backend_upload_handle: &str,
+        backend_id: Option<&str>,
+        backend_path: Option<&str>,
+        declared_mime: &str,
+        declared_size: u64,
+        part_size: u64,
+        auto_bind: bool,
+        expires_at: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> Result<(), DomainError> {
+        self.inner
+            .create_multipart_upload(
+                upload_id,
+                file_id,
+                version_id,
+                backend_upload_handle,
+                backend_id,
+                backend_path,
+                declared_mime,
+                declared_size,
+                part_size,
+                auto_bind,
+                expires_at,
+                now,
+            )
+            .await
+    }
+
+    async fn get_multipart_upload(
+        &self,
+        upload_id: Uuid,
+    ) -> Result<Option<file_storage::domain::multipart::MultipartUploadSession>, DomainError> {
+        self.inner.get_multipart_upload(upload_id).await
+    }
+
+    async fn get_version(
+        &self,
+        file_id: Uuid,
+        version_id: Uuid,
+    ) -> Result<Option<file_storage_sdk::FileVersion>, DomainError> {
+        let result = self.inner.get_version(file_id, version_id).await;
+        if self.role == Role::B && !self.b_first_get_version_seen.swap(true, Ordering::SeqCst) {
+            // This is B's takeover fast-path check -- notify A's gated
+            // finalize_multipart_version that it may now proceed, only after
+            // this (real, pre-finalize) read has already completed.
+            self.b_checked_pending.notify_one();
+        }
+        result
+    }
+
+    async fn get_version_manifest(&self, version_id: Uuid) -> Result<Option<String>, DomainError> {
+        self.inner.get_version_manifest(version_id).await
+    }
+
+    async fn upsert_multipart_part(
+        &self,
+        upload_id: Uuid,
+        part_number: i32,
+        backend_etag: &str,
+        part_hash: Vec<u8>,
+        size: i64,
+        now: OffsetDateTime,
+    ) -> Result<(), DomainError> {
+        self.inner
+            .upsert_multipart_part(upload_id, part_number, backend_etag, part_hash, size, now)
+            .await
+    }
+
+    async fn list_multipart_parts(
+        &self,
+        upload_id: Uuid,
+    ) -> Result<Vec<MultipartPart>, DomainError> {
+        self.inner.list_multipart_parts(upload_id).await
+    }
+
+    async fn finalize_version(
+        &self,
+        file_id: Uuid,
+        version_id: Uuid,
+        size: i64,
+        hash_value: Vec<u8>,
+        hash_mode: file_storage::infra::content::hash_mode::HashMode,
+        part_count: Option<i32>,
+        manifest: Option<String>,
+        validated_mime: Option<String>,
+        audit: file_storage::domain::audit::AuditEntry,
+        auto_bind: Option<AutoBindOnFinalize>,
+    ) -> Result<FinalizeVersionOutcome, DomainError> {
+        // Never called by the real multipart-complete flow (which calls
+        // `finalize_multipart_version` below, where this test's gating now
+        // lives) -- a plain, ungated passthrough, kept only because the
+        // trait still requires an implementation.
+        self.inner
+            .finalize_version(
+                file_id,
+                version_id,
+                size,
+                hash_value,
+                hash_mode,
+                part_count,
+                manifest,
+                validated_mime,
+                audit,
+                auto_bind,
+            )
+            .await
+    }
+
+    async fn finalize_multipart_version(
+        &self,
+        file_id: Uuid,
+        manifest: Option<String>,
+        validated_mime: Option<String>,
+        finalize_audit: file_storage::domain::audit::AuditEntry,
+        auto_bind: Option<AutoBindOnFinalize>,
+        finish: MultipartFinishSnapshot,
+    ) -> Result<FinalizeMultipartOutcome, DomainError> {
+        if self.role == Role::A {
+            self.b_checked_pending.notified().await;
+        } else {
+            // Role B: B's own (redundant, ultimately-losing) finalize attempt
+            // must not even START until A's has definitely finished --
+            // otherwise which of the two physically wins the real CAS
+            // commit is at the mercy of tokio's scheduler (a freshly-woken
+            // task vs. one that never yielded since triggering the wake),
+            // which is not the specific interleaving this test exists to
+            // pin down. Waiting here (rather than relying on A merely
+            // having "started" its call) makes A's win deterministic.
+            self.a_finalized.notified().await;
+        }
+        let result = self
+            .inner
+            .finalize_multipart_version(
+                file_id,
+                manifest,
+                validated_mime,
+                finalize_audit,
+                auto_bind,
+                finish,
+            )
+            .await;
+        if self.role == Role::A {
+            self.a_finalized.notify_one();
+        }
+        result
+    }
+
+    async fn complete_multipart_upload(
+        &self,
+        upload_id: Uuid,
+        lease_owner: &str,
+        result_json: &str,
+        audit: file_storage::domain::audit::AuditEntry,
+    ) -> Result<bool, DomainError> {
+        self.inner
+            .complete_multipart_upload(upload_id, lease_owner, result_json, audit)
+            .await
+    }
+
+    async fn acquire_multipart_complete_lease(
+        &self,
+        upload_id: Uuid,
+        owner: &str,
+        lease_until: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> Result<bool, DomainError> {
+        self.inner
+            .acquire_multipart_complete_lease(upload_id, owner, lease_until, now)
+            .await
+    }
+
+    async fn release_multipart_complete_lease(
+        &self,
+        upload_id: Uuid,
+        owner: &str,
+    ) -> Result<bool, DomainError> {
+        self.inner
+            .release_multipart_complete_lease(upload_id, owner)
+            .await
+    }
+
+    async fn abort_multipart_upload(
+        &self,
+        upload_id: Uuid,
+        audit: file_storage::domain::audit::AuditEntry,
+    ) -> Result<bool, DomainError> {
+        self.inner.abort_multipart_upload(upload_id, audit).await
+    }
+
+    async fn delete_version(
+        &self,
+        file_id: Uuid,
+        version_id: Uuid,
+        audit: file_storage::domain::audit::AuditEntry,
+    ) -> Result<bool, DomainError> {
+        self.inner.delete_version(file_id, version_id, audit).await
+    }
+}
+
+/// The most severe scenario in this file: two completers race to finish the
+/// same multipart session. After the fix
+/// (`multipart_service.rs::assemble_and_finish_inner`: a lost finalize CAS
+/// now checks whether the version is `Available` -- i.e. someone else's
+/// finalize already won -- and, if so, converges via the same
+/// `replay_completed` + `finish_session` path the takeover fast-path already
+/// used, instead of unconditionally erroring and releasing the lease), the
+/// interleaving below converges cleanly. Mechanism:
+///
+/// 1. A acquires the completion lease (fresh) with a 1-second lease.
+/// 2. The test waits >1s of real wall-clock time -- A's lease genuinely
+///    expires (this is not simulated; `acquire_multipart_complete_lease`'s
+///    CAS compares against real `OffsetDateTime::now_utc()`).
+/// 3. B calls complete: takes over the (really) expired lease
+///    (`takeover = true`), then hits its gated `get_version` takeover-check
+///    -- the version is still `pending` (A is gated below, hasn't finalized
+///    yet) -- so B does NOT take the "already finalized, just finish" fast
+///    path; B proceeds through its own full (redundant) reassembly.
+/// 4. A's gated `finalize_multipart_version` was released the instant B's
+///    check above completed; A -- which has zero remaining `.await`s before
+///    that call -- wins the real finalize CAS: the version flips
+///    `pending -> available` (+ bind, for an `auto_bind` session), for
+///    real, in PostgreSQL, AND (crash-consistency fix: the terminal session
+///    transition is folded into this SAME transaction) the session flips
+///    `completing -> completed` right there too -- deterministically, since
+///    that embedded transition is not itself owner-fenced (see
+///    `MultipartRepo::finish_complete`'s doc: it is protected by the
+///    finalize CAS's own single-winner guarantee instead, precisely so this
+///    scenario cannot re-strand). A's whole call returns `Ok(Completed(...))`
+///    before B's own attempt below even starts.
+/// 5. B, having finished its own (redundant, slower) reassembly, calls its
+///    own `finalize_multipart_version` -- sees `updated = false` (no longer
+///    `pending`) -- **post-fix**, checks the version's real status, sees
+///    `Available`, and converges: re-derives the response via
+///    `replay_completed` and calls `finish_session` directly, same as a
+///    genuine takeover fast path. `finish_session`'s own CAS (DBS-05: now
+///    additionally fenced on B's own, still-current `lease_owner`) finds
+///    `state` already `Completed` (A got there first, per step 4) --
+///    `finished = false` for a completely mundane reason (nothing left to
+///    finish), re-reads the session, finds `state == Completed`, and
+///    converges silently (the *pre-existing* convergence branch
+///    `finish_session` already had for "someone else already finished it" --
+///    it did not need to change).
+///
+/// End state: **both** A's and B's original callers get `Ok(Completed(...))`
+/// -- no stranding, no spurious error, exactly once assembly's worth of
+/// content, correctly available and bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn f2_stale_completer_converges_instead_of_stranding_after_owner_fencing_fix() {
+    let (db, _pg_guard) = pg_db_or_skip!();
+    let store = Store::new(Arc::clone(&db));
+    let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let backends = BackendRegistry::new(vec![Arc::clone(&backend)], "mem").expect("registry");
+    let real_multipart_store: Arc<dyn MultipartStore> = Arc::new(store.clone());
+    let svc = make_file_service(store.clone(), backends.clone());
+
+    let tenant_id = Uuid::now_v7();
+    let ctx = make_ctx(tenant_id);
+    let file_id = svc
+        .create_file_bare(&ctx, new_file())
+        .await
+        .expect("create_file_bare");
+    let plan = {
+        let msvc_setup =
+            make_multipart_service(Arc::clone(&real_multipart_store), backends.clone(), 120);
+        msvc_setup
+            .initiate_multipart_upload(
+                &ctx,
+                file_id,
+                "application/octet-stream",
+                10 * 1024 * 1024,
+                Some(5 * 1024 * 1024),
+                true, // auto_bind
+            )
+            .await
+            .expect("initiate_multipart_upload (in-memory backend supports multipart_native)")
+    };
+    simulate_all_parts(&real_multipart_store, &backend, &plan, file_id).await;
+
+    let b_checked_pending = Arc::new(Notify::new());
+    let a_finalized = Arc::new(Notify::new());
+    let b_first_get_version_seen = Arc::new(AtomicBool::new(false));
+
+    let store_a: Arc<dyn MultipartStore> = Arc::new(GatedMultipartStore {
+        inner: Arc::clone(&real_multipart_store),
+        role: Role::A,
+        b_checked_pending: Arc::clone(&b_checked_pending),
+        a_finalized: Arc::clone(&a_finalized),
+        b_first_get_version_seen: Arc::clone(&b_first_get_version_seen),
+    });
+    let store_b: Arc<dyn MultipartStore> = Arc::new(GatedMultipartStore {
+        inner: Arc::clone(&real_multipart_store),
+        role: Role::B,
+        b_checked_pending: Arc::clone(&b_checked_pending),
+        a_finalized: Arc::clone(&a_finalized),
+        b_first_get_version_seen: Arc::clone(&b_first_get_version_seen),
+    });
+
+    // A's lease is the shortest the code allows (`.max(1)`), so a real,
+    // just-over-a-second wait genuinely expires it -- no simulated time.
+    let msvc_a = make_multipart_service(store_a, backends.clone(), 1);
+    let msvc_b = make_multipart_service(store_b, backends.clone(), 120);
+
+    let ctx_a = ctx.clone();
+    let upload_id = plan.upload_id;
+    let task_a = tokio::spawn(async move {
+        msvc_a
+            .complete_multipart_upload(&ctx_a, file_id, upload_id, None)
+            .await
+    });
+
+    // Real wall-clock wait for A's 1-second lease to actually expire --
+    // `acquire_multipart_complete_lease`'s CAS compares against real
+    // `OffsetDateTime::now_utc()`, so this cannot be faked with
+    // `tokio::time::pause`.
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+
+    let ctx_b = ctx.clone();
+    let task_b = tokio::spawn(async move {
+        msvc_b
+            .complete_multipart_upload(&ctx_b, file_id, upload_id, None)
+            .await
+    });
+
+    let (result_a, result_b) = tokio::join!(task_a, task_b);
+    let result_a = result_a.expect("task A join");
+    let result_b = result_b.expect("task B join");
+
+    eprintln!(
+        "f2_stale_completer_converges: A={} B={}",
+        describe_result(&result_a),
+        describe_result(&result_b),
+    );
+    if let Err(e) = &result_a {
+        eprintln!("f2: A's error = {e}");
+    }
+    if let Err(e) = &result_b {
+        eprintln!("f2: B's error = {e}");
+    }
+
+    assert!(
+        result_a.is_ok() && result_b.is_ok(),
+        "FS-02/F2 fix: both completers must now converge to Ok(Completed(...)) instead of \
+         stranding the session -- A={result_a:?} B={result_b:?}"
+    );
+    let completed_a = result_a.expect("checked above").unwrap_completed();
+    let completed_b = result_b.expect("checked above").unwrap_completed();
+    assert_eq!(
+        completed_a.version_id, completed_b.version_id,
+        "both completers must agree on the same finalized version"
+    );
+    assert_eq!(
+        completed_a.bind_state,
+        BindState::Bound,
+        "the auto-bind CAS must have won for the winner's caller"
+    );
+
+    let version = store
+        .get_version(file_id, plan.version_id)
+        .await
+        .expect("get_version")
+        .expect("version row must still exist");
+    assert_eq!(
+        version.status,
+        VersionStatus::Available,
+        "the version must be correctly finalized exactly once"
+    );
+    let file = svc.get_file(&ctx, file_id).await.expect("get_file");
+    assert_eq!(
+        file.content_id,
+        Some(plan.version_id),
+        "the auto-bind CAS won for real -- the file's content_id must point at this version"
+    );
+    let session = real_multipart_store
+        .get_multipart_upload(upload_id)
+        .await
+        .expect("get_multipart_upload")
+        .expect("session row must still exist");
+    assert_eq!(
+        session.state,
+        file_storage::domain::multipart::MultipartUploadState::Completed,
+        "FS-02/F2 fix: the session must reach Completed, not be stranded at in_progress"
+    );
+    assert!(
+        session.lease_until.is_none(),
+        "a completed session has no live lease -- got {}",
+        session
+            .lease_until
+            .as_ref()
+            .map_or_else(|| "none".to_owned(), ToString::to_string)
+    );
+
+    // A third, honest retry (the idempotent-replay path) must now succeed
+    // too, replaying the same persisted result -- confirming the fix
+    // didn't just avoid the immediate race, it left the session in a
+    // normally-replayable terminal state.
+    let msvc_c = make_multipart_service(Arc::clone(&real_multipart_store), backends.clone(), 120);
+    let result_c = msvc_c
+        .complete_multipart_upload(&ctx, file_id, upload_id, None)
+        .await;
+    eprintln!("f2: third retry result = {}", describe_result(&result_c));
+    let completed_c = result_c
+        .expect(
+            "FS-02/F2 fix: a third retry against an already-Completed session must replay, \
+                 not error",
+        )
+        .unwrap_completed();
+    assert_eq!(
+        completed_c.version_id, completed_a.version_id,
+        "the replayed result must match the original completion"
+    );
+}
+
+/// Directly flip `multipart_uploads.expires_at` on a row -- no public API
+/// backdates an already-created session's expiry; mirrors
+/// `tests/cleanup_test.rs`'s own direct-entity backdating pattern.
+async fn backdate_multipart_expires_at(
+    db: &Arc<DBProvider<DbError>>,
+    upload_id: Uuid,
+    expires_at: OffsetDateTime,
+) {
+    use file_storage::infra::storage::entity::multipart_upload::{
+        Column as UploadColumn, Entity as UploadEntity,
+    };
+    let conn = db.conn().expect("conn");
+    UploadEntity::update_many()
+        .col_expr(UploadColumn::ExpiresAt, Expr::value(expires_at))
+        .filter(UploadColumn::UploadId.eq(upload_id))
+        .secure()
+        .scope_with(&AccessScope::allow_all())
+        .exec(&conn)
+        .await
+        .expect("backdate expires_at");
+}
+
+// =========================================================================
+// Auto-bind no longer clobbers a rebind that happened before complete
+// started, when no If-Match is supplied -- the CAS now requires
+// content_id IS NULL in that case. Deterministic/sequential by
+// construction (see the module doc) -- no barrier needed.
+// =========================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn f9_autobind_no_if_match_no_longer_clobbers_prior_rebind() {
+    let (db, _pg_guard) = pg_db_or_skip!();
+    let store = Store::new(Arc::clone(&db));
+    let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let backends = BackendRegistry::new(vec![Arc::clone(&backend)], "mem").expect("registry");
+    let multipart_store: Arc<dyn MultipartStore> = Arc::new(store.clone());
+    let svc = make_file_service(store.clone(), backends.clone());
+    let msvc = make_multipart_service(multipart_store.clone(), backends.clone(), 120);
+    let dp = TestDataPlane::new(Arc::clone(&svc), store.clone(), backends.clone());
+
+    let tenant_id = Uuid::now_v7();
+    let ctx = make_ctx(tenant_id);
+
+    // Bind an initial version so content_id is non-NULL going in.
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .expect("create_file");
+    dp.put_content(
+        &ctx,
+        ticket.file_id,
+        ticket.version_id,
+        "text/plain",
+        Bytes::from_static(b"first content"),
+    )
+    .await
+    .expect("put_content");
+    svc.bind(&ctx, ticket.file_id, ticket.version_id, None)
+        .await
+        .expect("bind first content");
+
+    // Multipart-initiate an auto_bind session for a NEW version (mirrors a
+    // client that started uploading before anyone else touched the file).
+    let plan = msvc
+        .initiate_multipart_upload(
+            &ctx,
+            ticket.file_id,
+            "application/octet-stream",
+            5,
+            None,
+            true,
+        )
+        .await
+        .expect("initiate_multipart_upload with auto_bind");
+    simulate_all_parts(&multipart_store, &backend, &plan, ticket.file_id).await;
+
+    // Someone else legitimately rebinds the file to a THIRD version while
+    // the multipart upload above is still in flight -- the ordinary,
+    // often-long user-driven gap between initiate and complete.
+    let rebind_ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .expect("create_file (rebind source)");
+    // Reuse the same file_id's version slot by binding a version created
+    // against `ticket.file_id` instead -- simplest: create a second version
+    // directly under the SAME file via the ordinary single-part path.
+    let _ = rebind_ticket; // (kept for clarity of narration; unused directly)
+    let second_ticket_version = svc
+        .presign_version(&ctx, ticket.file_id)
+        .await
+        .expect("presign_version for the legitimate rebind");
+    dp.put_content(
+        &ctx,
+        ticket.file_id,
+        second_ticket_version.version_id,
+        "text/plain",
+        Bytes::from_static(b"legitimately rebound content"),
+    )
+    .await
+    .expect("put_content (legitimate rebind)");
+    svc.bind(
+        &ctx,
+        ticket.file_id,
+        second_ticket_version.version_id,
+        Some("*"),
+    )
+    .await
+    .expect("legitimate rebind, unconditional CAS wildcard");
+
+    // Now complete the earlier multipart upload with NO If-Match.
+    let completed = msvc
+        .complete_multipart_upload(&ctx, ticket.file_id, plan.upload_id, None)
+        .await
+        .expect("complete_multipart_upload (no If-Match) must still succeed -- only the bind is conditional")
+        .unwrap_completed();
+
+    // The auto-bind CAS now requires content_id IS NULL when no If-Match
+    // was supplied -- it correctly loses here (content_id is the
+    // legitimate rebind's version, not NULL), leaving that rebind intact
+    // instead of silently clobbering it.
+    assert_eq!(
+        completed.bind_state,
+        BindState::Conflict,
+        "FS-04/F9 fix: the auto-bind CAS must lose (content_id IS NULL no longer matches) \
+         instead of clobbering the legitimate rebind"
+    );
+    let file_after = svc.get_file(&ctx, ticket.file_id).await.expect("get_file");
+    assert_eq!(
+        file_after.content_id,
+        Some(second_ticket_version.version_id),
+        "FS-04/F9 fix: the legitimate rebind must survive -- content_id must still point at it, \
+         not at the multipart upload's version"
+    );
+}
+
+/// Negative control: the SAME scenario, but the caller supplies the correct
+/// `If-Match` (the current ETag, captured right after initiating) -- the
+/// precondition check at the top of `complete_multipart_upload` (which runs
+/// BEFORE the auto-bind CAS, and against the file's CURRENT etag, not a
+/// snapshot) correctly rejects it as stale, proving the detector doesn't
+/// call every auto-bind completion "broken" -- only the no-If-Match case is
+/// the actual gap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn negative_control_f9_autobind_with_correct_if_match_rejects_stale_rebind() {
+    let (db, _pg_guard) = pg_db_or_skip!();
+    let store = Store::new(Arc::clone(&db));
+    let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let backends = BackendRegistry::new(vec![Arc::clone(&backend)], "mem").expect("registry");
+    let multipart_store: Arc<dyn MultipartStore> = Arc::new(store.clone());
+    let svc = make_file_service(store.clone(), backends.clone());
+    let msvc = make_multipart_service(multipart_store.clone(), backends.clone(), 120);
+    let dp = TestDataPlane::new(Arc::clone(&svc), store.clone(), backends.clone());
+
+    let tenant_id = Uuid::now_v7();
+    let ctx = make_ctx(tenant_id);
+
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .expect("create_file");
+    dp.put_content(
+        &ctx,
+        ticket.file_id,
+        ticket.version_id,
+        "text/plain",
+        Bytes::from_static(b"first content"),
+    )
+    .await
+    .expect("put_content");
+    let bound_file = svc
+        .bind(&ctx, ticket.file_id, ticket.version_id, None)
+        .await
+        .expect("bind first content");
+    let etag_at_initiate_time = file_storage::domain::etag::etag_for(&bound_file);
+
+    let plan = msvc
+        .initiate_multipart_upload(
+            &ctx,
+            ticket.file_id,
+            "application/octet-stream",
+            5,
+            None,
+            true,
+        )
+        .await
+        .expect("initiate_multipart_upload with auto_bind");
+    simulate_all_parts(&multipart_store, &backend, &plan, ticket.file_id).await;
+
+    let second_ticket_version = svc
+        .presign_version(&ctx, ticket.file_id)
+        .await
+        .expect("presign_version for the legitimate rebind");
+    dp.put_content(
+        &ctx,
+        ticket.file_id,
+        second_ticket_version.version_id,
+        "text/plain",
+        Bytes::from_static(b"legitimately rebound content"),
+    )
+    .await
+    .expect("put_content (legitimate rebind)");
+    svc.bind(
+        &ctx,
+        ticket.file_id,
+        second_ticket_version.version_id,
+        Some("*"),
+    )
+    .await
+    .expect("legitimate rebind");
+
+    // This time, supply the ETag observed at initiate time as If-Match.
+    let err = msvc
+        .complete_multipart_upload(
+            &ctx,
+            ticket.file_id,
+            plan.upload_id,
+            etag_at_initiate_time.as_deref(),
+        )
+        .await
+        .expect_err("a stale If-Match must be rejected, not silently overwritten");
+    assert!(
+        matches!(err, DomainError::PreconditionFailed { .. }),
+        "negative control: supplying the correct (now-stale) If-Match must turn F9's silent \
+         clobber into a clean PreconditionFailed, got: {err}"
+    );
+
+    let file_after = svc.get_file(&ctx, ticket.file_id).await.expect("get_file");
+    assert_eq!(
+        file_after.content_id,
+        Some(second_ticket_version.version_id),
+        "the legitimate rebind must survive when If-Match correctly protects it"
+    );
+}
+
+// =========================================================================
+// An expired multipart session used to block parent cleanup on the sweep
+// pass that reclaimed its version, and no later pass ever revisited it
+// either -- the same orphan shape as the module doc's `f1_*` entry, reached
+// a different way. Fixed by also running the orphan-file check from step
+// 2's own cleanup path (which runs after the session is already aborted,
+// so it is no longer blocked). Deterministic by construction -- no barrier
+// needed.
+// =========================================================================
+
+async fn backdate_version_created_at(
+    db: &Arc<DBProvider<DbError>>,
+    version_id: Uuid,
+    created_at: OffsetDateTime,
+) {
+    use file_storage::infra::storage::entity::file_version::{
+        Column as FileVersionColumn, Entity as FileVersionEntity,
+    };
+    let conn = db.conn().expect("conn");
+    FileVersionEntity::update_many()
+        .col_expr(FileVersionColumn::CreatedAt, Expr::value(created_at))
+        .filter(FileVersionColumn::VersionId.eq(version_id))
+        .secure()
+        .scope_with(&AccessScope::allow_all())
+        .exec(&conn)
+        .await
+        .expect("backdate version created_at");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn f10_expired_session_orphan_reclaimed_by_step2_in_same_sweep_pass() {
+    let (db, _pg_guard) = pg_db_or_skip!();
+    let store = Store::new(Arc::clone(&db));
+    let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let backends = BackendRegistry::new(vec![Arc::clone(&backend)], "mem").expect("registry");
+    let multipart_store: Arc<dyn MultipartStore> = Arc::new(store.clone());
+    let svc = make_file_service(store.clone(), backends.clone());
+    let msvc = make_multipart_service(multipart_store.clone(), backends.clone(), 120);
+    // grace = 1 hour so only the deliberately-backdated version below is
+    // sweep-eligible (mirrors cleanup_test.rs's own convention).
+    let engine = make_engine(store.clone(), backends, 3600);
+
+    let tenant_id = Uuid::now_v7();
+    let ctx = make_ctx(tenant_id);
+    let file_id = svc
+        .create_file_bare(&ctx, new_file())
+        .await
+        .expect("create_file_bare");
+    let plan = msvc
+        .initiate_multipart_upload(&ctx, file_id, "application/octet-stream", 1024, None, false)
+        .await
+        .expect("initiate_multipart_upload");
+
+    let now = OffsetDateTime::now_utc();
+    backdate_version_created_at(&db, plan.version_id, now - time::Duration::hours(2)).await;
+    backdate_multipart_expires_at(&db, plan.upload_id, now - time::Duration::seconds(10)).await;
+
+    let result = engine.run_sweep().await;
+    eprintln!("f10: sweep result = {}", describe_sweep(&result));
+    assert_eq!(
+        result.abandoned_pending_deleted, 1,
+        "the abandoned pending version must be reclaimed in this same pass"
+    );
+    assert_eq!(
+        result.expired_multipart_aborted, 1,
+        "the expired session must also be aborted in this same pass"
+    );
+    assert_eq!(
+        result.abandoned_files_deleted, 1,
+        "FS-05/F10 fix: the parent file must now ALSO be reclaimed in this same pass -- step 2's \
+         own cleanup_expired_session_version runs its own orphan-file check after the session \
+         is already aborted, so has_active_for_file no longer blocks it"
+    );
+
+    let version_after = store
+        .get_version(file_id, plan.version_id)
+        .await
+        .expect("get_version");
+    assert!(
+        version_after.is_none(),
+        "the pending version row must be gone -- step 1 deletes it regardless of the \
+         now-stale has_active_for_file snapshot"
+    );
+    let file_after = svc.get_file(&ctx, file_id).await;
+    assert!(
+        matches!(file_after, Err(DomainError::FileNotFound { .. })),
+        "FS-05/F10 fix: the file must be reclaimed within this same sweep pass, not left as a \
+         version-less orphan -- got: {file_after:?}"
+    );
+}
+
+// =========================================================================
+// Post-state invariant checker
+// =========================================================================
+
+/// Every `files.content_id` that is `Some` must point at a version that (a)
+/// exists and (b) is `Available`. Unlike the version-less-orphan check
+/// below, this invariant is expected to hold **unconditionally** --
+/// `bind_content_cas` only ever points at a version finalized `available` in
+/// the same transaction as the bind (see `finalize_version`'s `auto_bind`
+/// doc) -- so this function returns the list of violations found (empty is
+/// the healthy, expected result in every scenario in this file, including
+/// the defect scenarios above: they all leave `content_id` pointing at a
+/// perfectly valid, available version; the defects they demonstrate are
+/// elsewhere).
+async fn find_content_id_violations(db: &Arc<DBProvider<DbError>>, file_id: Uuid) -> Vec<String> {
+    use file_storage::infra::storage::entity::file::{Column as FileColumn, Entity as FileEntity};
+    use file_storage::infra::storage::entity::file_version::{
+        Column as FileVersionColumn, Entity as FileVersionEntity,
+    };
+    let conn = db.conn().expect("conn");
+    let scope = AccessScope::allow_all();
+    let mut violations = Vec::new();
+    let Some(file) = FileEntity::find()
+        .filter(FileColumn::FileId.eq(file_id))
+        .secure()
+        .scope_with(&scope)
+        .one(&conn)
+        .await
+        .expect("query files")
+    else {
+        return violations;
+    };
+    if let Some(content_id) = file.content_id {
+        let version = FileVersionEntity::find()
+            .filter(FileVersionColumn::VersionId.eq(content_id))
+            .secure()
+            .scope_with(&scope)
+            .one(&conn)
+            .await
+            .expect("query file_versions");
+        match version {
+            None => violations.push(format!(
+                "file {file_id} content_id={content_id} points at a version row that does not exist"
+            )),
+            Some(v) if v.status != "available" => violations.push(format!(
+                "file {file_id} content_id={content_id} points at a version whose status is \
+                 {}, not available",
+                v.status
+            )),
+            Some(_) => {}
+        }
+    }
+    violations
+}
+
+/// Whether `file_id` is currently a version-less orphan (zero `file_versions`
+/// rows and `content_id IS NULL`) -- the shape the orphan scenarios above
+/// leave behind. Returns `false` for a file that still has any version or
+/// bound content.
+async fn is_versionless_orphan(db: &Arc<DBProvider<DbError>>, file_id: Uuid) -> bool {
+    use file_storage::infra::storage::entity::file::{Column as FileColumn, Entity as FileEntity};
+    use file_storage::infra::storage::entity::file_version::{
+        Column as FileVersionColumn, Entity as FileVersionEntity,
+    };
+    let conn = db.conn().expect("conn");
+    let scope = AccessScope::allow_all();
+    let Some(file) = FileEntity::find()
+        .filter(FileColumn::FileId.eq(file_id))
+        .secure()
+        .scope_with(&scope)
+        .one(&conn)
+        .await
+        .expect("query files")
+    else {
+        return false;
+    };
+    if file.content_id.is_some() {
+        return false;
+    }
+    let version_count = FileVersionEntity::find()
+        .filter(FileVersionColumn::FileId.eq(file_id))
+        .secure()
+        .scope_with(&scope)
+        .count(&conn)
+        .await
+        .expect("count file_versions");
+    version_count == 0
+}
+
+/// The post-state invariant checker's own dedicated test: a healthy file
+/// (create + upload + bind) must show zero content_id violations and must
+/// NOT be a version-less orphan; a file put through the orphan reproduction
+/// above IS correctly flagged as a version-less orphan by the same checker
+/// -- proving the checker actually distinguishes the two, not just always
+/// reporting "clean" or always reporting "violation".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn invariant_checker_distinguishes_healthy_file_from_known_orphan() {
+    let (db, _pg_guard) = pg_db_or_skip!();
+    let store = Store::new(Arc::clone(&db));
+    let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let backends = BackendRegistry::new(vec![Arc::clone(&backend)], "mem").expect("registry");
+    let svc = make_file_service(store.clone(), backends.clone());
+    let dp = TestDataPlane::new(Arc::clone(&svc), store.clone(), backends.clone());
+    let tenant_id = Uuid::now_v7();
+    let ctx = make_ctx(tenant_id);
+
+    // Healthy file.
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .expect("create_file");
+    dp.put_content(
+        &ctx,
+        ticket.file_id,
+        ticket.version_id,
+        "text/plain",
+        Bytes::from_static(b"healthy"),
+    )
+    .await
+    .expect("put_content");
+    svc.bind(&ctx, ticket.file_id, ticket.version_id, None)
+        .await
+        .expect("bind");
+
+    let violations = find_content_id_violations(&db, ticket.file_id).await;
+    assert!(
+        violations.is_empty(),
+        "a healthy, correctly-bound file must have zero content_id invariant violations, got: \
+         {violations:?}"
+    );
+    assert!(
+        !is_versionless_orphan(&db, ticket.file_id).await,
+        "a healthy, bound file must not be flagged as a version-less orphan"
+    );
+
+    // Orphan reproduction: bare file, failed initiate, no cleanup path ever
+    // triggered.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let local_backend: Arc<dyn StorageBackend> = Arc::new(LocalFsBackend::new("fs", tmp.keep()));
+    let local_backends =
+        BackendRegistry::new(vec![Arc::clone(&local_backend)], "fs").expect("registry");
+    let svc_local = make_file_service(store.clone(), local_backends.clone());
+    let multipart_store: Arc<dyn MultipartStore> = Arc::new(store.clone());
+    let msvc_local = make_multipart_service(multipart_store, local_backends, 120);
+    let orphan_file_id = svc_local
+        .create_file_bare(&ctx, new_file())
+        .await
+        .expect("create_file_bare");
+    msvc_local
+        .initiate_multipart_upload(
+            &ctx,
+            orphan_file_id,
+            "application/octet-stream",
+            20,
+            Some(10),
+            false,
+        )
+        .await
+        .expect_err("capability reject");
+
+    assert!(
+        is_versionless_orphan(&db, orphan_file_id).await,
+        "known defect FS-01/F1: the invariant checker must flag this file as a version-less \
+         orphan -- if this starts failing, either F1 was fixed (update the report) or the \
+         checker itself regressed"
+    );
+    // A version-less orphan trivially has no content_id, so it is not a
+    // *content_id* violation by this checker's own definition (there is
+    // nothing to point anywhere yet) -- the orphan-ness is the finding, not
+    // a dangling pointer. Document that boundary directly rather than
+    // asserting something the checker was never designed to catch.
+    let orphan_violations = find_content_id_violations(&db, orphan_file_id).await;
+    assert!(
+        orphan_violations.is_empty(),
+        "a version-less orphan has no content_id to be invalid -- the orphan-ness itself is \
+         is_versionless_orphan's finding, not find_content_id_violations'; got unexpected \
+         content_id violations: {orphan_violations:?}"
+    );
+}
+
+// =========================================================================
+// FS-XX -- parent-row-lock races: delete/reclaim vs a concurrent new version
+// =========================================================================
+//
+// The three scenarios below exercise `FileRepo::lock_for_update` -- a
+// `SELECT ... FOR UPDATE` on the `files` row taken as the very first
+// statement of `delete_file_collecting_versions`/`delete_version_or_whole_file`/
+// `delete_orphan_file_with_event`'s transactions -- against real concurrent
+// tasks racing a plain `insert_pending_version` on the exact same `file_id`.
+// Real `tokio::spawn` + `tokio::join!` (not a `Notify`-gated interleaving, per
+// this file's own precedent in `resource-group/tests/pg_concurrency_test.rs::
+// concurrent_non_force_delete_and_create_child`): the row lock guarantees
+// exactly two clean outcomes regardless of which side actually wins the real
+// PostgreSQL lock queue, so there is no need to pin the winner -- only to
+// reject the third, dangerous outcome (insert reports success while its row
+// is silently cascade-removed, uncounted) that these tests exist to catch.
+// Each was confirmed to fail (reliably reproduce the dangerous outcome) with
+// the corresponding `FileRepo::lock_for_update` call temporarily removed from
+// production code, then pass again once restored -- see this task's report.
+//
+// Each scenario loops `RACE_ITERATIONS` times (fresh ids every iteration) and
+// gives the insert task a small, deliberate head-start delay before it issues
+// its `INSERT` -- calibrated empirically (against this suite's own
+// `testcontainers` PostgreSQL) to land inside the narrow single-statement gap
+// this test targets often enough for the loop to reliably reproduce the
+// dangerous interleaving on the pre-fix code within a handful of iterations,
+// without pinning an exact winner via a `Notify` gate (unlike `f2_*` above,
+// there is no fixed "which side must win" here -- both orderings are
+// legitimate; the delay only raises the odds of *sampling* the narrow one).
+// The delay is real-clock, not virtual (`tokio::time::pause` cannot govern
+// real Postgres network I/O), so it is a probabilistic aid to reproduction,
+// not the correctness mechanism itself -- the assertions below hold for
+// whichever interleaving actually occurs, delay or not.
+const RACE_ITERATIONS: usize = 24;
+
+/// Build a helper `AuditEntry` for the races below -- mirrors
+/// `delete_race_test.rs::audit`.
+fn race_audit(
+    tenant_id: Uuid,
+    file_id: Uuid,
+    op: file_storage::domain::audit::AuditOperation,
+    detail: serde_json::Value,
+) -> file_storage::domain::audit::AuditEntry {
+    file_storage::domain::audit::AuditEntry {
+        tenant_id,
+        actor_kind: "user".to_owned(),
+        actor_id: Uuid::now_v7(),
+        file_id: Some(file_id),
+        operation: op,
+        outcome: file_storage::domain::audit::AuditOutcome::Success,
+        detail,
+        occurred_at: OffsetDateTime::now_utc(),
+    }
+}
+
+/// Build a helper `FileEvent` for the races below -- mirrors
+/// `delete_race_test.rs::event`.
+fn race_event(
+    tenant_id: Uuid,
+    owner_id: Uuid,
+    file_id: Uuid,
+) -> file_storage::domain::audit::FileEvent {
+    file_storage::domain::audit::FileEvent {
+        tenant_id,
+        owner_id,
+        file_id,
+        event_type: "file.deleted".to_owned(),
+        payload: serde_json::json!({ "version_count": 0 }),
+    }
+}
+
+/// (a) `Store::delete_file_collecting_versions` vs a concurrent
+/// `insert_pending_version` on the same, about-to-be-deleted file.
+///
+/// The row lock leaves exactly two clean outcomes:
+/// - the insert commits before the delete's lock is granted -- the delete's
+///   fresh, post-lock version list then necessarily includes it, so it is
+///   removed AND collected for backend-blob cleanup along with `v1`;
+/// - the insert loses the lock race, blocks until the delete's transaction
+///   ends, then fails its own FK check against the now-deleted file --
+///   surfaced as `FileNotFound`, and no `v2` row is ever left behind.
+///
+/// The dangerous, pre-fix outcome this test rejects: the insert reports
+/// `Ok(())` (its row did commit) but the delete's collected list does not
+/// contain `v2` -- meaning `v2` was cascade-removed by the delete without
+/// ever being seen, a silent backend-blob leak with no record in the DB to
+/// find it by afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delete_file_vs_concurrent_insert_version_has_no_silent_loss() {
+    let (db, _pg_guard) = pg_db_or_skip!();
+    let store = Store::new(Arc::clone(&db));
+    let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+
+    for iteration in 0..RACE_ITERATIONS {
+        let tenant_id = Uuid::now_v7();
+        let owner_id = Uuid::now_v7();
+        let file_id = Uuid::now_v7();
+        let v1 = Uuid::now_v7();
+        let now = OffsetDateTime::now_utc();
+
+        store
+            .create_file_with_pending_version(
+                &new_file(),
+                file_id,
+                v1,
+                tenant_id,
+                "mem",
+                &format!("/{file_id}/{v1}"),
+                now,
+                race_audit(
+                    tenant_id,
+                    file_id,
+                    file_storage::domain::audit::AuditOperation::Create,
+                    serde_json::json!({}),
+                ),
+            )
+            .await
+            .expect("create file + v1");
+        common::write_all(
+            &backend,
+            &format!("/{file_id}/{v1}"),
+            Bytes::from_static(b"v1"),
+        )
+        .await;
+
+        let v2 = Uuid::now_v7();
+        let store_del = store.clone();
+        let store_ins = store.clone();
+        let del_task = tokio::spawn(async move {
+            store_del
+                .delete_file_collecting_versions(
+                    &AccessScope::allow_all(),
+                    file_id,
+                    race_audit(
+                        tenant_id,
+                        file_id,
+                        file_storage::domain::audit::AuditOperation::DeleteFile,
+                        serde_json::json!({ "version_count": 0 }),
+                    ),
+                    Some(race_event(tenant_id, owner_id, file_id)),
+                )
+                .await
+        });
+        let ins_task = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_micros(150)).await;
+            store_ins
+                .insert_pending_version(
+                    file_id,
+                    v2,
+                    "application/octet-stream",
+                    "mem",
+                    &format!("/{file_id}/{v2}"),
+                    now,
+                )
+                .await
+        });
+        let del_res = del_task.await.expect("delete task panicked");
+        let ins_res = ins_task.await.expect("insert task panicked");
+
+        eprintln!(
+            "delete_file_vs_concurrent_insert_version[{iteration}]: delete={} insert={}",
+            describe_result(&del_res),
+            describe_result(&ins_res)
+        );
+
+        match (del_res, ins_res) {
+            (Ok(deleted), Ok(())) => {
+                // Insert won the lock race -- the delete's fresh, post-lock
+                // version list must include v2.
+                assert!(deleted.removed, "the file row must have been removed");
+                let mut ids: Vec<Uuid> = deleted.versions.iter().map(|v| v.version_id).collect();
+                ids.sort_unstable();
+                let mut expected = vec![v1, v2];
+                expected.sort_unstable();
+                assert_eq!(
+                    ids, expected,
+                    "insert succeeded (v2 committed) but the delete's collected list does \
+                 not contain it -- SILENT BLOB LEAK: v2's row was cascade-removed \
+                 without ever being seen by the caller's cleanup"
+                );
+            }
+            (Ok(deleted), Err(e)) => {
+                // Delete won the lock race -- the insert must have failed on the
+                // now-deleted parent, and only v1 (which existed before the
+                // race) may have been collected.
+                assert!(deleted.removed, "the file row must have been removed");
+                let ids: Vec<Uuid> = deleted.versions.iter().map(|v| v.version_id).collect();
+                assert_eq!(
+                    ids,
+                    vec![v1],
+                    "delete won the race -- must have collected exactly v1 (v2 never \
+                 committed)"
+                );
+                assert!(
+                    matches!(&e, DomainError::FileNotFound { id } if *id == file_id),
+                    "insert lost the race -- expected FileNotFound, got: {e}"
+                );
+            }
+            (Err(e), ins_res) => panic!(
+                "delete_file_collecting_versions must not error in this scenario -- got \
+             {e}; insert result was {ins_res:?}",
+                ins_res = ins_res.map_err(|e| e.to_string())
+            ),
+        }
+
+        // Whichever branch fired, the DB must end up with no file, no v1, and no
+        // v2 row -- and no version left uncollected for blob cleanup.
+        assert!(
+            store
+                .get_file(&AccessScope::allow_all(), file_id)
+                .await
+                .expect("get_file")
+                .is_none(),
+            "the file must be gone"
+        );
+        assert!(
+            store
+                .get_version(file_id, v1)
+                .await
+                .expect("get_version v1")
+                .is_none(),
+            "v1 must be gone"
+        );
+        assert!(
+            store
+                .get_version(file_id, v2)
+                .await
+                .expect("get_version v2")
+                .is_none(),
+            "v2 must be gone (either never committed, or cascade-removed and collected)"
+        );
+        backend
+            .delete(&format!("/{file_id}/{v1}"))
+            .await
+            .expect("best-effort delete of v1's blob must succeed (no dangling row to block it)");
+        assert!(
+            !backend
+                .exists(&format!("/{file_id}/{v1}"))
+                .await
+                .expect("exists"),
+            "v1's blob must be gone -- no leaked backend storage"
+        );
+    }
+}
+
+/// (b) `Store::delete_version_or_whole_file` (deleting the file's ONLY
+/// version, so the whole-file branch fires) vs a concurrent
+/// `insert_pending_version` for a second version of the same file.
+///
+/// Two clean outcomes:
+/// - the insert commits before the delete's lock -- the delete's fresh,
+///   post-lock re-list then sees two versions, so only `v1` is removed
+///   (`VersionRemoved`) and the file, with `v2`, survives;
+/// - the insert loses the lock race -- the delete's re-list still shows only
+///   `v1`, so the whole file is removed (`FileRemoved`), and the insert then
+///   fails FK against the now-deleted file (`FileNotFound`).
+///
+/// The dangerous, pre-fix outcome this test rejects: `FileRemoved` (the
+/// whole file including `v1` gone) while the insert also reports `Ok(())` --
+/// meaning `v2` was cascade-removed along with the file the instant after
+/// its own caller was told it had been created.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delete_last_version_vs_concurrent_insert_second_version_has_no_silent_loss() {
+    let (db, _pg_guard) = pg_db_or_skip!();
+    let store = Store::new(Arc::clone(&db));
+
+    for iteration in 0..RACE_ITERATIONS {
+        let tenant_id = Uuid::now_v7();
+        let owner_id = Uuid::now_v7();
+        let file_id = Uuid::now_v7();
+        let v1 = Uuid::now_v7();
+        let now = OffsetDateTime::now_utc();
+
+        store
+            .create_file_with_pending_version(
+                &new_file(),
+                file_id,
+                v1,
+                tenant_id,
+                "mem",
+                &format!("/{file_id}/{v1}"),
+                now,
+                race_audit(
+                    tenant_id,
+                    file_id,
+                    file_storage::domain::audit::AuditOperation::Create,
+                    serde_json::json!({}),
+                ),
+            )
+            .await
+            .expect("create file + v1");
+
+        let v2 = Uuid::now_v7();
+        let store_del = store.clone();
+        let store_ins = store.clone();
+        let del_task = tokio::spawn(async move {
+            store_del
+                .delete_version_or_whole_file(
+                    file_id,
+                    v1,
+                    race_audit(
+                        tenant_id,
+                        file_id,
+                        file_storage::domain::audit::AuditOperation::DeleteVersion,
+                        serde_json::json!({ "version_id": v1 }),
+                    ),
+                    race_audit(
+                        tenant_id,
+                        file_id,
+                        file_storage::domain::audit::AuditOperation::DeleteFile,
+                        serde_json::json!({ "version_count": 1 }),
+                    ),
+                    Some(race_event(tenant_id, owner_id, file_id)),
+                )
+                .await
+        });
+        let ins_task = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_micros(150)).await;
+            store_ins
+                .insert_pending_version(
+                    file_id,
+                    v2,
+                    "application/octet-stream",
+                    "mem",
+                    &format!("/{file_id}/{v2}"),
+                    now,
+                )
+                .await
+        });
+        let del_res = del_task.await.expect("delete task panicked");
+        let ins_res = ins_task.await.expect("insert task panicked");
+
+        eprintln!(
+            "delete_last_version_vs_concurrent_insert_second_version[{iteration}]: delete={} insert={}",
+            describe_result(&del_res),
+            describe_result(&ins_res)
+        );
+
+        match (del_res, ins_res) {
+            (Ok(DeleteVersionOutcome::VersionRemoved(removed)), Ok(())) => {
+                assert_eq!(removed.version_id, v1, "the removed version must be v1");
+                let file = store
+                    .get_file(&AccessScope::allow_all(), file_id)
+                    .await
+                    .expect("get_file");
+                assert!(
+                    file.is_some(),
+                    "insert won the race -- the file must survive (v1 was not its only \
+                 version by delete time)"
+                );
+                assert!(
+                    store
+                        .get_version(file_id, v2)
+                        .await
+                        .expect("get_version v2")
+                        .is_some(),
+                    "v2 (the race version, never asked to be deleted) must still exist"
+                );
+                assert!(
+                    store
+                        .get_version(file_id, v1)
+                        .await
+                        .expect("get_version v1")
+                        .is_none(),
+                    "v1 (the requested version) must be gone"
+                );
+            }
+            (Ok(DeleteVersionOutcome::FileRemoved(removed)), Err(e)) => {
+                assert_eq!(removed.version_id, v1, "the removed version must be v1");
+                assert!(
+                    store
+                        .get_file(&AccessScope::allow_all(), file_id)
+                        .await
+                        .expect("get_file")
+                        .is_none(),
+                    "delete won the race -- the whole file must be gone"
+                );
+                assert!(
+                    store
+                        .get_version(file_id, v2)
+                        .await
+                        .expect("get_version v2")
+                        .is_none(),
+                    "the losing insert must not have left a v2 row behind"
+                );
+                assert!(
+                    matches!(&e, DomainError::FileNotFound { id } if *id == file_id),
+                    "insert lost the race -- expected FileNotFound, got: {e}"
+                );
+            }
+            (Ok(DeleteVersionOutcome::FileRemoved(_)), Ok(())) => panic!(
+                "SILENT DATA LOSS: the whole file (and v1) was deleted while the \
+             concurrent insert of v2 reported success -- v2 must have been \
+             cascade-removed without its own caller ever being told"
+            ),
+            (del_res, ins_res) => panic!(
+                "unexpected outcome combination: delete={del_res:?} insert={}",
+                describe_result(&ins_res)
+            ),
+        }
+
+        // Whichever branch fired, leave no residue in the shared PostgreSQL
+        // fixture: the `VersionRemoved` branch survives with `v2` still
+        // `pending` (never finalized), which -- unlike this test's own
+        // assertions -- other scenarios in this file that run a real
+        // `orphan_grace_secs = 0` sweep would otherwise pick up as extra,
+        // unrelated abandoned-pending/orphan-file counts. Best-effort,
+        // unconditional: a no-op if the file is already gone.
+        store
+            .delete_file_collecting_versions(
+                &AccessScope::allow_all(),
+                file_id,
+                race_audit(
+                    tenant_id,
+                    file_id,
+                    file_storage::domain::audit::AuditOperation::DeleteFile,
+                    serde_json::json!({ "reason": "test_cleanup" }),
+                ),
+                None,
+            )
+            .await
+            .ok();
+    }
+}
+
+/// (c) `Store::delete_orphan_file_with_event` (reclaiming a version-less
+/// orphan `files` row) vs a concurrent `insert_pending_version` for a first
+/// version of that same file.
+///
+/// Two clean outcomes:
+/// - the insert commits before the reclaim's lock -- the reclaim's fresh,
+///   post-lock "no versions" check then sees one version and declines
+///   (`Ok(false)`), leaving the file (with its new version) untouched;
+/// - the insert loses the lock race -- the reclaim's checks still see zero
+///   versions, so it removes the file (`Ok(true)`), and the insert then
+///   fails FK against the now-deleted file (`FileNotFound`).
+///
+/// The dangerous, pre-fix outcome this test rejects (see
+/// `FileRepo::delete_if_orphan`'s doc comment for the exact `PostgreSQL`
+/// `READ COMMITTED` mechanics): the reclaim reports `Ok(true)` (file
+/// removed) while the insert also reports `Ok(())` -- meaning the freshly
+/// inserted version was cascade-removed along with the file it was just
+/// attached to, with its own caller never told.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn orphan_reclaim_vs_concurrent_insert_version_has_no_silent_loss() {
+    let (db, _pg_guard) = pg_db_or_skip!();
+    let store = Store::new(Arc::clone(&db));
+    let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let backends = BackendRegistry::new(vec![Arc::clone(&backend)], "mem").expect("registry");
+    let svc = make_file_service(store.clone(), backends);
+
+    for iteration in 0..RACE_ITERATIONS {
+        let tenant_id = Uuid::now_v7();
+        let ctx = make_ctx(tenant_id);
+        let file_id = svc
+            .create_file_bare(&ctx, new_file())
+            .await
+            .expect("create_file_bare (version-less orphan)");
+        assert!(
+            is_versionless_orphan(&db, file_id).await,
+            "the freshly-created bare file must start out as a version-less orphan"
+        );
+
+        let now = OffsetDateTime::now_utc();
+        let v1 = Uuid::now_v7();
+        let store_del = store.clone();
+        let store_ins = store.clone();
+        let del_task = tokio::spawn(async move {
+            store_del
+                .delete_orphan_file_with_event(
+                    file_id,
+                    race_audit(
+                        tenant_id,
+                        file_id,
+                        file_storage::domain::audit::AuditOperation::OrphanReconcile,
+                        serde_json::json!({ "reason": "test" }),
+                    ),
+                    None,
+                )
+                .await
+        });
+        let ins_task = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_micros(150)).await;
+            store_ins
+                .insert_pending_version(
+                    file_id,
+                    v1,
+                    "application/octet-stream",
+                    "mem",
+                    &format!("/{file_id}/{v1}"),
+                    now,
+                )
+                .await
+        });
+        let del_res = del_task.await.expect("delete task panicked");
+        let ins_res = ins_task.await.expect("insert task panicked");
+
+        eprintln!(
+            "orphan_reclaim_vs_concurrent_insert_version[{iteration}]: reclaim={} insert={}",
+            describe_result(&del_res),
+            describe_result(&ins_res)
+        );
+
+        match (del_res, ins_res) {
+            (Ok(false), Ok(())) => {
+                // Insert won the lock race -- the reclaim's fresh check saw the
+                // new version and correctly declined.
+                let file = store
+                    .get_file(&AccessScope::allow_all(), file_id)
+                    .await
+                    .expect("get_file");
+                assert!(file.is_some(), "the file must survive");
+                assert!(
+                    store
+                        .get_version(file_id, v1)
+                        .await
+                        .expect("get_version v1")
+                        .is_some(),
+                    "v1 (the race version) must still exist"
+                );
+            }
+            (Ok(true), Err(e)) => {
+                // Reclaim won the lock race -- the insert must have failed on
+                // the now-deleted parent.
+                assert!(
+                    store
+                        .get_file(&AccessScope::allow_all(), file_id)
+                        .await
+                        .expect("get_file")
+                        .is_none(),
+                    "the file must be gone"
+                );
+                assert!(
+                    store
+                        .get_version(file_id, v1)
+                        .await
+                        .expect("get_version v1")
+                        .is_none(),
+                    "the losing insert must not have left a v1 row behind"
+                );
+                assert!(
+                    matches!(&e, DomainError::FileNotFound { id } if *id == file_id),
+                    "insert lost the race -- expected FileNotFound, got: {e}"
+                );
+            }
+            (Ok(true), Ok(())) => panic!(
+                "SILENT DATA LOSS: the orphan file was reclaimed while the concurrent \
+             insert of v1 reported success -- v1 must have been cascade-removed \
+             without its own caller ever being told"
+            ),
+            (del_res, ins_res) => panic!(
+                "unexpected outcome combination: reclaim={del_res:?} insert={}",
+                describe_result(&ins_res)
+            ),
+        }
+
+        // See test (b)'s own cleanup comment: the insert-won branch survives
+        // with `v1` still `pending`, which must not leak into a later
+        // `orphan_grace_secs = 0` scenario's sweep counts. Best-effort,
+        // unconditional: a no-op if the file is already gone.
+        store
+            .delete_file_collecting_versions(
+                &AccessScope::allow_all(),
+                file_id,
+                race_audit(
+                    tenant_id,
+                    file_id,
+                    file_storage::domain::audit::AuditOperation::DeleteFile,
+                    serde_json::json!({ "reason": "test_cleanup" }),
+                ),
+                None,
+            )
+            .await
+            .ok();
+    }
+}

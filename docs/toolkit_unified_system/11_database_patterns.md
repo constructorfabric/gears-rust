@@ -131,6 +131,71 @@ pub async fn transfer_user(
 }
 ```
 
+## Row locks (`SELECT … FOR UPDATE`)
+
+Secure ORM has no row-lock API of its own, and `DBRunner` is sealed — but a lock is a
+property of the sea-orm query built *before* the Secure ORM wrapper, so it composes
+normally: call `.lock(LockType::Update)` on the `Select` before `.secure().scope_with(..)`.
+The scope/tenant filter still applies to the locked rows.
+
+```rust
+use sea_orm::QuerySelect;
+
+ChatEntity::find()
+    .filter(chat::Column::Id.eq(id))
+    .lock(sea_orm::sea_query::LockType::Update)
+    .secure()
+    .scope_with(&scope)
+    .one(txn) // txn: &SecureTx, inside in_transaction_mapped
+    .await?
+```
+
+See `find_model_by_id_for_update` in
+`resource-group/src/infra/storage/group_repo.rs` and `get_for_update` in
+`mini-chat/src/infra/db/repo/chat_repo.rs` — both are called only with a transaction's
+runner, never with the outer `SecureConn`.
+
+**When you need it**: check-then-act inside a transaction, where the decision depends on
+rows a concurrent transaction could insert or change between the check and the act — "delete
+the parent only if it has no children", "last child of a container ⇒ delete the container
+too", or a CAS that must read several rows as a stable set. A plain `DELETE … WHERE NOT
+EXISTS (SELECT 1 FROM children …)` does **not** give this guarantee under PostgreSQL's
+default `READ COMMITTED`: the `NOT EXISTS` subquery sees the snapshot from the start of the
+`DELETE` statement, the concurrent `INSERT` of a child only takes `FOR KEY SHARE` on the
+parent row, and once that insert commits the `DELETE` proceeds without re-evaluating the
+subquery (no EvalPlanQual recheck — that machinery only reruns the statement's own `WHERE`,
+not a subquery inside it). Locking the parent with `FOR UPDATE` first closes the gap: it
+conflicts with the child insert's `FOR KEY SHARE` on the same row, so the two transactions
+serialize instead of interleaving.
+
+Rules:
+
+- Take the lock as the transaction's **first** statement, and always in the same order
+  (parent before children) — locking out of order across call sites is the standard way to
+  deadlock.
+- A lock only holds **inside a transaction**; outside one it is released as soon as the
+  `SELECT` completes, so it protects nothing.
+- Keep the transaction short: no external I/O (HTTP calls, other services) while a row lock
+  is held.
+- `NOWAIT` / `SKIP LOCKED` are for queue-style dequeue, not this pattern — see how the
+  outbox picks its next batch with raw `FOR UPDATE SKIP LOCKED` (`libs/toolkit-db/src/outbox/dialect.rs`,
+  `statements.rs`). Ordinary check-then-act should block and wait, not skip.
+- `LockType::Share` (`FOR SHARE`) is for "let others also read, but block writers" —
+  reading a row you depend on without modifying it. `NoKeyUpdate` locks a row you are about
+  to update without touching its key, so it does not conflict with a `FOR KEY SHARE` taken by
+  someone inserting a *referencing* row — used when you want your update to proceed
+  alongside child inserts rather than serialize with them.
+
+**Dialects**: on PostgreSQL and MySQL, `.lock(..)` renders `FOR UPDATE`/`FOR SHARE`/etc. and
+takes a real row lock (checked in `sea-query`'s `backend/{postgres,mysql}/query.rs`). On
+SQLite it renders **nothing** — `backend/sqlite/query.rs`'s `prepare_select_lock` is a
+literal no-op ("SQLite doesn't supports row locking"), so `.lock(..)` silently compiles to a
+plain `SELECT` there. Correctness on SQLite instead comes from having a single writer: any
+write takes a database-level `RESERVED` lock, serializing all writers regardless of what any
+`SELECT` asked for. Practically this means a race test for this pattern only proves anything
+against PostgreSQL (`testcontainers`) — running it against the SQLite backend passes for the
+wrong reason.
+
 ## Repository pattern
 
 ### Repository with `DBRunner` (works with both `SecureConn` and `SecureTx`)
@@ -248,3 +313,4 @@ Raw SQL is **allowed only in migration infrastructure** (migration runner + migr
 - Security data path (AuthN/AuthZ, SecureConn, AccessScope): [`06_authn_authz_secure_orm.md`](./06_authn_authz_secure_orm.md)
 - OData pagination / filtering: [`07_odata_pagination_select_filter.md`](./07_odata_pagination_select_filter.md)
 - Canonical example: `examples/toolkit/users-info/`
+- DB-behavior testing & audit (transaction/concurrency defect catalog, row-lock races, migration hazards): [`14_db_behavior_testing.md`](./14_db_behavior_testing.md)

@@ -85,8 +85,6 @@ impl RetentionRuleRepo {
 
     /// List retention rules for a specific file (`scope = 'file'`), across all
     /// tenants — for the retention sweep engine.
-    ///
-    /// @cpt-cf-file-storage-fr-retention-policies
     pub async fn list_by_file_scope<C: DBRunner>(
         &self,
         conn: &C,
@@ -110,8 +108,6 @@ impl RetentionRuleRepo {
 
     /// List every retention rule across all tenants and scopes — for the
     /// retention sweep engine.
-    ///
-    /// @cpt-cf-file-storage-fr-retention-policies
     pub async fn list_all<C: DBRunner>(
         &self,
         conn: &C,
@@ -125,6 +121,37 @@ impl RetentionRuleRepo {
             .map_err(db_err)?;
 
         rows.into_iter().map(map_model).collect()
+    }
+
+    /// Delete every `File`-scope retention rule targeting a specific file
+    /// (`scope = 'file' AND scope_target_id = file_id`), in the SAME
+    /// transaction that removes the `files` row itself -- see
+    /// `Store::delete_file_collecting_versions`/`delete_orphan_file_with_event`/
+    /// `delete_version_or_whole_file`'s callers. `retention_rules` has no FK
+    /// from `scope_target_id` to `files.file_id` (it is a polymorphic column,
+    /// also holding `user_id` for `User`-scope rows), so nothing else removes
+    /// these rows once their target file is gone.
+    ///
+    /// Returns the number of rows removed (`0` when the file had no
+    /// `File`-scope rule).
+    pub async fn delete_file_scope_rules<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        file_id: Uuid,
+    ) -> Result<u64, DomainError> {
+        let res = Entity::delete_many()
+            .filter(
+                Condition::all()
+                    .add(Column::Scope.eq("file"))
+                    .add(Column::ScopeTargetId.eq(file_id)),
+            )
+            .secure()
+            .scope_with(scope)
+            .exec(conn)
+            .await
+            .map_err(db_err)?;
+        Ok(res.rows_affected)
     }
 
     /// Delete a retention rule by `rule_id`. Returns `true` if a row was removed.

@@ -5,6 +5,7 @@ use file_storage_sdk::ByteRange;
 use futures::StreamExt;
 use futures::stream::{self, BoxStream};
 
+use crate::domain::error::DomainError;
 use crate::infra::content::hash;
 
 use super::*;
@@ -16,13 +17,68 @@ fn unique_root() -> std::path::PathBuf {
     p
 }
 
+/// Write the whole of `bytes` to `path` via `put_stream` (a one-shot stream)
+/// — the test-only stand-in for the whole-object `put` the trait no longer
+/// has, kept here rather than per-test-site so every test that used to call
+/// `backend.put(...)` directly can just call this instead.
+pub async fn write_all(backend: &dyn StorageBackend, path: &str, bytes: Bytes) {
+    let len = bytes.len() as u64;
+    let stream: BoxStream<'_, std::io::Result<Bytes>> =
+        Box::pin(stream::once(async move { Ok(bytes) }));
+    backend
+        .put_stream(path, stream, Some(len))
+        .await
+        .expect("put_stream");
+}
+
+/// Read the whole blob at `path` back via `get_stream` (collecting every
+/// chunk) — the test-only stand-in for the whole-object `get` the trait no
+/// longer has. `expected_len` is `get_stream`'s own required commitment;
+/// callers that don't already know it pass `stat`'s result instead.
+pub async fn read_all(backend: &dyn StorageBackend, path: &str, expected_len: u64) -> Bytes {
+    let mut stream = backend
+        .get_stream(path, expected_len)
+        .await
+        .expect("get_stream");
+    let mut buf = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        buf.extend_from_slice(&chunk.expect("chunk"));
+    }
+    Bytes::from(buf)
+}
+
 /// Assert that `backend.get_stream(path)`'s concatenated chunks are
-/// byte-for-byte equal to `backend.get(path)`'s result — the `get_stream`
-/// contract every `StorageBackend` implementation (default-fallback or a true
-/// chunked override) must satisfy. Factored out of `assert_backend_contract`
-/// to keep that function's own cognitive complexity down.
+/// byte-for-byte equal to `expected` — the `get_stream` contract every
+/// `StorageBackend` implementation must satisfy. Factored out of
+/// `assert_backend_contract` to keep that function's own cognitive
+/// complexity down.
 async fn assert_get_stream_matches_get(backend: &dyn StorageBackend, path: &str, expected: &[u8]) {
-    let mut stream = backend.get_stream(path).await.unwrap();
+    let mut stream = backend
+        .get_stream(path, expected.len() as u64)
+        .await
+        .unwrap();
+    let mut streamed = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        streamed.extend_from_slice(&chunk.unwrap());
+    }
+    assert_eq!(streamed, expected);
+}
+
+/// Assert that `backend.get_range_stream(path, range)`'s concatenated chunks
+/// are byte-for-byte equal to `expected` -- the `get_range_stream` contract
+/// every `StorageBackend` implementation (default-fallback or a true
+/// native override) must satisfy, mirroring `assert_get_stream_matches_get`
+/// for the ranged case.
+async fn assert_get_range_stream_matches_slice(
+    backend: &dyn StorageBackend,
+    path: &str,
+    range: ByteRange,
+    expected: &[u8],
+) {
+    let mut stream = backend
+        .get_range_stream(path, range, expected.len() as u64)
+        .await
+        .unwrap();
     let mut streamed = Vec::new();
     while let Some(chunk) = stream.next().await {
         streamed.extend_from_slice(&chunk.unwrap());
@@ -33,57 +89,242 @@ async fn assert_get_stream_matches_get(backend: &dyn StorageBackend, path: &str,
 /// Shared behavioral contract every `StorageBackend` implementation must
 /// satisfy, factored out of what used to be per-backend hand-written
 /// `put/get/delete/exists/get_range` assertions (`in_memory_*`/`local_fs_*`
-/// duplicated the same checks). Covers: put -> get round trip, `get_stream`
-/// (streamed chunks reassemble to the same bytes `get` returns), `get_range`
-/// correctness for both the `Inclusive` and `Suffix` variants (mirroring the
-/// former `default_get_range_slices_content`/`get_range_suffix_returns_tail`
+/// duplicated the same checks). Covers: write -> read round trip, `get_stream`
+/// (streamed chunks reassemble to the written bytes), `read_prefix`
+/// correctness (mirroring the former `get_range`-based
+/// `default_get_range_slices_content`/`get_range_suffix_returns_tail`
 /// assertions), idempotent `delete`, and `exists` distinguishing
 /// present/missing. Backend-specific behavior (atomicity, tmp-file cleanup,
 /// path-traversal rejection, etc.) stays in each backend's own tests.
 pub async fn assert_backend_contract(backend: &dyn StorageBackend) {
-    // put -> get round trip, and exists() reports present.
-    backend
-        .put("contract/put-get", Bytes::from_static(b"hello, contract"))
-        .await
-        .unwrap();
+    // write -> get_stream round trip, and exists() reports present.
+    write_all(
+        backend,
+        "contract/put-get",
+        Bytes::from_static(b"hello, contract"),
+    )
+    .await;
     assert_eq!(
-        backend.get("contract/put-get").await.unwrap(),
+        read_all(backend, "contract/put-get", 15).await,
         Bytes::from_static(b"hello, contract")
     );
     assert!(backend.exists("contract/put-get").await.unwrap());
 
-    // get_stream: concatenated chunks must equal get()'s bytes, for every
-    // backend regardless of whether it overrides the default single-chunk
-    // fallback with a true chunked read.
+    // get_stream: concatenated chunks must equal the written bytes, for
+    // every backend.
     assert_get_stream_matches_get(backend, "contract/put-get", b"hello, contract").await;
 
-    // get_range: Inclusive and Suffix variants.
-    backend
-        .put("contract/range", Bytes::from_static(b"0123456789"))
+    // The remaining groups live in their own functions so each stays under
+    // the crate's cognitive-complexity ceiling; all of them run for every
+    // backend the contract is asserted against.
+    assert_read_prefix_and_delete_contract(backend).await;
+    assert_read_prefix_ceiling_contract(backend).await;
+    assert_stat_contract(backend).await;
+    assert_range_stream_contract(backend).await;
+}
+
+/// The `read_prefix`, `delete` and `exists` groups of
+/// [`assert_backend_contract`].
+async fn assert_read_prefix_and_delete_contract(backend: &dyn StorageBackend) {
+    // read_prefix: a prefix shorter than the object, and one longer than it
+    // (must return the whole, shorter object rather than erroring).
+    write_all(
+        backend,
+        "contract/prefix",
+        Bytes::from_static(b"0123456789"),
+    )
+    .await;
+    let short_prefix = backend
+        .read_prefix("contract/prefix", 3)
         .await
+        .unwrap()
         .unwrap();
-    let slice = backend
-        .get_range("contract/range", ByteRange::Inclusive { start: 2, end: 4 })
+    assert_eq!(short_prefix, Bytes::from_static(b"012"));
+    let over_long_prefix = backend
+        .read_prefix("contract/prefix", 100)
         .await
+        .unwrap()
         .unwrap();
-    assert_eq!(slice, Bytes::from_static(b"234"));
-    let tail = backend
-        .get_range("contract/range", ByteRange::Suffix { length: 3 })
-        .await
-        .unwrap();
-    assert_eq!(tail, Bytes::from_static(b"789"));
+    assert_eq!(over_long_prefix, Bytes::from_static(b"0123456789"));
+
+    // read_prefix of a missing object is Ok(None), never an error.
+    assert!(
+        backend
+            .read_prefix("contract/prefix-never-existed", 3)
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     // delete is idempotent.
-    backend
-        .put("contract/delete", Bytes::from_static(b"x"))
-        .await
-        .unwrap();
+    write_all(backend, "contract/delete", Bytes::from_static(b"x")).await;
     backend.delete("contract/delete").await.unwrap();
     backend.delete("contract/delete").await.unwrap();
     assert!(!backend.exists("contract/delete").await.unwrap());
 
     // exists distinguishes present from missing.
     assert!(!backend.exists("contract/never-existed").await.unwrap());
+}
+
+/// `read_prefix`'s `MAX_READ_PREFIX_BYTES` ceiling, at the exact boundary and
+/// one byte past it. The object is deliberately larger than the ceiling
+/// (`MAX_READ_PREFIX_BYTES + 10` bytes) so a ceiling-sized `read_prefix`
+/// returns a real, non-degenerate prefix rather than the whole object --
+/// distinct from `assert_read_prefix_and_delete_contract`'s existing
+/// short/over-long checks, which only exercise `max_bytes` values (3, 100)
+/// far below this ceiling. A regression that widens, off-by-ones, or drops
+/// `check_read_prefix_budget`'s enforcement must fail this test.
+async fn assert_read_prefix_ceiling_contract(backend: &dyn StorageBackend) {
+    let size = usize::try_from(MAX_READ_PREFIX_BYTES + 10).unwrap();
+    let content: Vec<u8> = (0..size).map(|i| u8::try_from(i % 256).unwrap()).collect();
+    write_all(
+        backend,
+        "contract/prefix-ceiling",
+        Bytes::from(content.clone()),
+    )
+    .await;
+
+    // Exactly at the ceiling: Ok, exactly MAX_READ_PREFIX_BYTES bytes,
+    // matching the object's start.
+    let at_ceiling = backend
+        .read_prefix("contract/prefix-ceiling", MAX_READ_PREFIX_BYTES)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(at_ceiling.len() as u64, MAX_READ_PREFIX_BYTES);
+    assert_eq!(
+        at_ceiling,
+        Bytes::from(content[..usize::try_from(MAX_READ_PREFIX_BYTES).unwrap()].to_vec())
+    );
+
+    // One byte past the ceiling: rejected as a caller-bug validation error,
+    // never silently clamped or streamed.
+    match backend
+        .read_prefix("contract/prefix-ceiling", MAX_READ_PREFIX_BYTES + 1)
+        .await
+    {
+        Err(DomainError::Validation { .. }) => {}
+        other => panic!(
+            "read_prefix(max_bytes = MAX_READ_PREFIX_BYTES + 1) must be rejected with \
+             DomainError::Validation, got {other:?}"
+        ),
+    }
+}
+
+/// The `stat` and `get_range_stream` half of [`assert_backend_contract`].
+///
+/// Kept separate purely for readability and lint budget -- callers should use
+/// `assert_backend_contract`, which runs both halves.
+/// The `stat` half of [`assert_backend_contract`]: `Some(len)` for a present
+/// object (including an empty one), `Ok(None)` for an absent one, and
+/// agreement with the `exists` + `size` composition the trait's default
+/// implementation is built from.
+async fn assert_stat_contract(backend: &dyn StorageBackend) {
+    // stat: an existing non-empty object returns Some(len) matching the
+    // actual byte length written.
+    write_all(
+        backend,
+        "contract/stat-nonempty",
+        Bytes::from_static(b"twelve bytes"),
+    )
+    .await;
+    assert_eq!(
+        backend.stat("contract/stat-nonempty").await.unwrap(),
+        Some(12),
+        "stat of an existing object must report its real byte length"
+    );
+
+    // stat: an existing EMPTY object still returns Some(0), never None --
+    // "present with zero bytes" and "absent" must not collapse together.
+    write_all(backend, "contract/stat-empty", Bytes::new()).await;
+    assert_eq!(
+        backend.stat("contract/stat-empty").await.unwrap(),
+        Some(0),
+        "stat of an empty object must report Some(0), not None"
+    );
+
+    // stat: a missing object returns Ok(None), never an Err.
+    assert_eq!(
+        backend.stat("contract/stat-never-existed").await.unwrap(),
+        None,
+        "stat of a missing object must be Ok(None), not an error"
+    );
+
+    // stat must agree with the exists()+size() combination for both a
+    // present and an absent path -- the exact contract the default
+    // (exists-then-size) implementation defines and every native override
+    // must preserve.
+    for path in [
+        "contract/stat-nonempty",
+        "contract/stat-empty",
+        "contract/stat-never-existed",
+    ] {
+        let composed = if backend.exists(path).await.unwrap() {
+            Some(backend.size(path).await.unwrap())
+        } else {
+            None
+        };
+        assert_eq!(
+            backend.stat(path).await.unwrap(),
+            composed,
+            "stat must agree with exists()+size() for path {path}"
+        );
+    }
+}
+
+/// The `get_range_stream` half of [`assert_backend_contract`]: every
+/// `ByteRange` variant streams exactly the requested slice, and an
+/// unsatisfiable range is refused rather than silently truncated.
+async fn assert_range_stream_contract(backend: &dyn StorageBackend) {
+    // get_range_stream: Inclusive (narrow), OpenEnded (tail), and Suffix
+    // variants must each stream exactly the bytes get_range resolves for the
+    // same ByteRange.
+    write_all(
+        backend,
+        "contract/range-stream",
+        Bytes::from_static(b"0123456789"),
+    )
+    .await;
+    assert_get_range_stream_matches_slice(
+        backend,
+        "contract/range-stream",
+        ByteRange::Inclusive { start: 2, end: 4 },
+        b"234",
+    )
+    .await;
+    assert_get_range_stream_matches_slice(
+        backend,
+        "contract/range-stream",
+        ByteRange::OpenEnded { start: 7 },
+        b"789",
+    )
+    .await;
+    assert_get_range_stream_matches_slice(
+        backend,
+        "contract/range-stream",
+        ByteRange::Suffix { length: 4 },
+        b"6789",
+    )
+    .await;
+
+    // An unsatisfiable range must surface a validation error, not panic or
+    // silently truncate.
+    // `expect_err` is not available here: the `Ok` variant is a boxed stream,
+    // which does not implement `Debug`. Match the result instead.
+    let range_result = backend
+        .get_range_stream(
+            "contract/range-stream",
+            ByteRange::Inclusive { start: 20, end: 30 },
+            11,
+        )
+        .await;
+    match range_result {
+        Ok(_) => panic!("an out-of-bounds range must be rejected, not silently resolved"),
+        Err(err) => assert!(
+            matches!(err, DomainError::Validation { .. }),
+            "an unsatisfiable range must produce a Validation error, got {err:?}"
+        ),
+    }
 }
 
 #[tokio::test]
@@ -93,10 +334,51 @@ async fn in_memory_satisfies_backend_contract() {
 }
 
 #[tokio::test]
-async fn in_memory_get_missing_errors() {
+async fn in_memory_read_prefix_and_stat_missing_report_absent() {
     let b = InMemoryBackend::new("mem");
-    assert!(b.get("nope").await.is_err());
+    assert!(b.read_prefix("nope", 1).await.unwrap().is_none());
+    assert_eq!(b.stat("nope").await.unwrap(), None);
     assert!(!b.exists("nope").await.unwrap());
+}
+
+/// `InMemoryBackend` mirror of `local_fs_get_stream_errors_before_first_byte_when_*`:
+/// a caller that committed to a length no longer matching the stored blob
+/// must be refused before any byte is returned, not silently handed the
+/// blob's current (different) length.
+#[tokio::test]
+async fn in_memory_get_stream_errors_when_expected_len_disagrees_with_stored_blob() {
+    let b = InMemoryBackend::new("mem");
+    write_all(&b, "fid/vid", Bytes::from_static(b"twelve bytes")).await;
+
+    // Caller already committed to a length (e.g. 5) that disagrees with what
+    // is actually stored (12) -- as if the blob had been rewritten after the
+    // caller's own earlier observation.
+    let result = b.get_stream("fid/vid", 5).await;
+    match result {
+        Ok(_) => panic!("a length mismatch must be refused, not silently streamed"),
+        Err(DomainError::Conflict { .. }) => {}
+        Err(e) => panic!("expected DomainError::Conflict, got {e:?}"),
+    }
+}
+
+/// `get_range_stream` counterpart of the above: a resolved range whose
+/// length disagrees with what the caller already committed to must be
+/// refused before any byte is returned.
+#[tokio::test]
+async fn in_memory_get_range_stream_errors_when_expected_len_disagrees_with_resolved_range() {
+    let b = InMemoryBackend::new("mem");
+    write_all(&b, "fid/vid", Bytes::from_static(b"0123456789")).await;
+
+    // `Inclusive { start: 2, end: 4 }` resolves to 3 bytes; the caller
+    // claims it already committed to 10.
+    let result = b
+        .get_range_stream("fid/vid", ByteRange::Inclusive { start: 2, end: 4 }, 10)
+        .await;
+    match result {
+        Ok(_) => panic!("a resolved-length mismatch must be refused, not silently streamed"),
+        Err(DomainError::Conflict { .. }) => {}
+        Err(e) => panic!("expected DomainError::Conflict, got {e:?}"),
+    }
 }
 
 #[tokio::test]
@@ -111,7 +393,9 @@ async fn local_fs_satisfies_backend_contract() {
 async fn local_fs_rejects_path_traversal() {
     let root = unique_root();
     let b = LocalFsBackend::new("fs", &root);
-    let res = b.put("../escape", Bytes::from_static(b"x")).await;
+    let stream: BoxStream<'_, std::io::Result<Bytes>> =
+        Box::pin(stream::once(async { Ok(Bytes::from_static(b"x")) }));
+    let res = b.put_stream("../escape", stream, None).await;
     assert!(res.is_err(), "path traversal must be rejected");
 }
 
@@ -132,7 +416,12 @@ async fn local_fs_put_is_atomic_under_concurrent_writers() {
         .cloned()
         .map(|payload| {
             let backend = Arc::clone(&backend);
-            tokio::spawn(async move { backend.put("fid/vid", payload).await })
+            tokio::spawn(async move {
+                let len = payload.len() as u64;
+                let stream: BoxStream<'_, std::io::Result<Bytes>> =
+                    Box::pin(stream::once(async move { Ok(payload) }));
+                backend.put_stream("fid/vid", stream, Some(len)).await
+            })
         })
         .collect();
 
@@ -140,7 +429,7 @@ async fn local_fs_put_is_atomic_under_concurrent_writers() {
         handle.await.unwrap().unwrap();
     }
 
-    let got = backend.get("fid/vid").await.unwrap();
+    let got = read_all(backend.as_ref(), "fid/vid", SIZE as u64).await;
     assert_eq!(got.len(), SIZE, "result must be a full, untorn write");
     assert!(
         payloads.iter().any(|p| p == &got),
@@ -154,9 +443,7 @@ async fn local_fs_put_is_atomic_under_concurrent_writers() {
 async fn local_fs_put_leaves_no_tmp_file_after_success() {
     let root = unique_root();
     let b = LocalFsBackend::new("fs", &root);
-    b.put("fid/vid", Bytes::from_static(b"hello"))
-        .await
-        .unwrap();
+    write_all(&b, "fid/vid", Bytes::from_static(b"hello")).await;
 
     let parent = root.join("fid");
     let mut entries = tokio::fs::read_dir(&parent).await.unwrap();
@@ -185,10 +472,12 @@ async fn local_fs_put_cleans_up_tmp_file_on_write_failure() {
     tokio::fs::create_dir_all(&parent).await.unwrap();
     std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o555)).unwrap();
 
-    let result = b.put("fid/vid", Bytes::from_static(b"data")).await;
+    let stream: BoxStream<'_, std::io::Result<Bytes>> =
+        Box::pin(stream::once(async { Ok(Bytes::from_static(b"data")) }));
+    let result = b.put_stream("fid/vid", stream, None).await;
     assert!(
         result.is_err(),
-        "put must fail when the temp-file create fails"
+        "put_stream must fail when the temp-file create fails"
     );
 
     let mut entries = tokio::fs::read_dir(&parent).await.unwrap();
@@ -206,9 +495,9 @@ async fn local_fs_put_cleans_up_tmp_file_on_write_failure() {
     drop(tokio::fs::remove_dir_all(&root).await);
 }
 
-/// P2 1.2(b): a stream whose cumulative size crosses `max_size` partway
-/// through must be rejected *and* leave no file (partial or final) at the
-/// target path — the memory-DoS fix's "abort mid-stream, clean up" contract.
+/// A stream whose cumulative size crosses `max_size` partway through must
+/// be rejected *and* leave no file (partial or final) at the target path —
+/// abort mid-stream, clean up.
 #[tokio::test]
 async fn local_fs_put_stream_enforces_max_size_mid_stream() {
     let root = unique_root();
@@ -247,9 +536,9 @@ async fn local_fs_put_stream_enforces_max_size_mid_stream() {
     drop(tokio::fs::remove_dir_all(&root).await);
 }
 
-/// P2 1.2(b): `put_stream`'s incremental hash (fed chunk-by-chunk as they are
-/// written) must equal `hash::sha256` computed over the fully concatenated
-/// bytes, and `bytes_written` must equal the total chunk length.
+/// `put_stream`'s incremental hash (fed chunk-by-chunk as they are written)
+/// must equal `hash::sha256` computed over the fully concatenated bytes, and
+/// `bytes_written` must equal the total chunk length.
 #[tokio::test]
 async fn local_fs_put_stream_computes_hash_incrementally_matches_full_buffer_hash() {
     let root = unique_root();
@@ -275,7 +564,10 @@ async fn local_fs_put_stream_computes_hash_incrementally_matches_full_buffer_has
     assert_eq!(digest, expected_digest);
 
     // Sanity: the bytes actually landed at the target path too.
-    assert_eq!(b.get("fid2/vid2").await.unwrap(), Bytes::from(concatenated));
+    assert_eq!(
+        read_all(&b, "fid2/vid2", total_len).await,
+        Bytes::from(concatenated)
+    );
 
     drop(tokio::fs::remove_dir_all(&root).await);
 }
@@ -292,11 +584,9 @@ async fn local_fs_get_stream_reassembles_multi_chunk_blob() {
     let payload: Vec<u8> = (0..200_000)
         .map(|i| u8::try_from(i % 256).unwrap())
         .collect();
-    b.put("fid/vid", Bytes::from(payload.clone()))
-        .await
-        .unwrap();
+    write_all(&b, "fid/vid", Bytes::from(payload.clone())).await;
 
-    let mut stream = b.get_stream("fid/vid").await.unwrap();
+    let mut stream = b.get_stream("fid/vid", payload.len() as u64).await.unwrap();
     let mut collected = Vec::new();
     let mut chunk_count = 0u32;
     while let Some(chunk) = stream.next().await {
@@ -316,7 +606,433 @@ async fn local_fs_get_stream_reassembles_multi_chunk_blob() {
 async fn local_fs_get_stream_missing_errors() {
     let root = unique_root();
     let b = LocalFsBackend::new("fs", &root);
-    assert!(b.get_stream("nope/nope").await.is_err());
+    assert!(b.get_stream("nope/nope", 0).await.is_err());
+    drop(tokio::fs::remove_dir_all(&root).await);
+}
+
+/// The first `publish_exclusive` call to a fresh path must create it; a
+/// second call to the SAME path with DIFFERENT bytes must report
+/// `created: false` and must leave the
+/// already-published bytes completely untouched — the core integrity
+/// guarantee `StorageBackend::publish_exclusive` exists for.
+#[tokio::test]
+async fn local_fs_publish_exclusive_rejects_second_write_to_same_path() {
+    let root = unique_root();
+    let b = LocalFsBackend::new("fs", &root);
+
+    let stream1: BoxStream<'_, std::io::Result<Bytes>> =
+        Box::pin(stream::iter(vec![Ok(Bytes::from_static(b"first"))]));
+    let outcome1 = b
+        .publish_exclusive("fid/vid", stream1, None)
+        .await
+        .expect("first publish_exclusive call must succeed");
+    assert!(
+        outcome1.created,
+        "first publish_exclusive call to a fresh path must create it"
+    );
+    assert_eq!(
+        read_all(&b, "fid/vid", 5).await,
+        Bytes::from_static(b"first")
+    );
+
+    let stream2: BoxStream<'_, std::io::Result<Bytes>> = Box::pin(stream::iter(vec![Ok(
+        Bytes::from_static(b"second-different-bytes"),
+    )]));
+    let outcome2 = b
+        .publish_exclusive("fid/vid", stream2, None)
+        .await
+        .expect("second publish_exclusive call must not error, just report created=false");
+    assert!(
+        !outcome2.created,
+        "a second publish_exclusive call to an already-published path must not overwrite it"
+    );
+    // The measured bytes/digest of THIS (rejected) attempt are still
+    // reported, so a caller can still run a server-side idempotency check.
+    assert_eq!(
+        outcome2.bytes_written,
+        "second-different-bytes".len() as u64
+    );
+
+    // The backend must still hold the FIRST call's bytes, byte for byte —
+    // this is the actual immutability guarantee under test.
+    assert_eq!(
+        read_all(&b, "fid/vid", 5).await,
+        Bytes::from_static(b"first"),
+        "an already-published blob must never be overwritten by publish_exclusive"
+    );
+
+    drop(tokio::fs::remove_dir_all(&root).await);
+}
+
+/// Same guarantee as `local_fs_publish_exclusive_rejects_second_write_to_same_path`,
+/// for `InMemoryBackend` (the check-then-insert happens under one lock guard,
+/// so it is atomic rather than the trait default's TOCTOU fallback).
+#[tokio::test]
+async fn in_memory_publish_exclusive_rejects_second_write_to_same_path() {
+    let b = InMemoryBackend::new("mem");
+
+    let stream1: BoxStream<'_, std::io::Result<Bytes>> =
+        Box::pin(stream::iter(vec![Ok(Bytes::from_static(b"first"))]));
+    let outcome1 = b
+        .publish_exclusive("fid/vid", stream1, None)
+        .await
+        .expect("first publish_exclusive call must succeed");
+    assert!(
+        outcome1.created,
+        "first publish_exclusive call to a fresh path must create it"
+    );
+
+    let stream2: BoxStream<'_, std::io::Result<Bytes>> = Box::pin(stream::iter(vec![Ok(
+        Bytes::from_static(b"second-different-bytes"),
+    )]));
+    let outcome2 = b
+        .publish_exclusive("fid/vid", stream2, None)
+        .await
+        .expect("second publish_exclusive call must not error, just report created=false");
+    assert!(
+        !outcome2.created,
+        "a second publish_exclusive call to an already-published path must not overwrite it"
+    );
+
+    assert_eq!(
+        read_all(&b, "fid/vid", 5).await,
+        Bytes::from_static(b"first"),
+        "an already-published blob must never be overwritten by publish_exclusive"
+    );
+}
+
+/// Drive two `publish_exclusive` calls to the SAME path with DIFFERENT
+/// full-size payloads, released at the same instant by a two-party
+/// `tokio::sync::Barrier` so both racers' writes genuinely overlap rather
+/// than merely being scheduled back-to-back. Asserts the invariant
+/// `publish_exclusive`'s doc comment promises: exactly one racer reports
+/// `created: true`, the other `created: false`, and the object a caller
+/// reads back afterwards is byte-for-byte one racer's payload in full —
+/// never a torn mix of both. Repeated several times to raise the odds of
+/// actually hitting the overlap window a single iteration might miss.
+async fn assert_publish_exclusive_concurrent_racers_never_mix(
+    make_backend: impl Fn() -> Arc<dyn StorageBackend>,
+) {
+    const SIZE: usize = 64 * 1024;
+    const ITERATIONS: u32 = 20;
+
+    for iteration in 0..ITERATIONS {
+        let backend = make_backend();
+        let path = format!("fid/vid-{iteration}");
+
+        let payload_a = Bytes::from(vec![0xAAu8; SIZE]);
+        let payload_b = Bytes::from(vec![0xBBu8; SIZE]);
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+        let task = |payload: Bytes,
+                    backend: Arc<dyn StorageBackend>,
+                    path: String,
+                    barrier: Arc<tokio::sync::Barrier>| async move {
+            let len = payload.len() as u64;
+            let stream: BoxStream<'_, std::io::Result<Bytes>> =
+                Box::pin(stream::once(async move { Ok(payload) }));
+            // Both racers build their stream first, then rendezvous here so
+            // the actual `publish_exclusive` calls start as close to
+            // simultaneously as two independently scheduled tasks can.
+            barrier.wait().await;
+            backend.publish_exclusive(&path, stream, Some(len)).await
+        };
+
+        let handle_a = tokio::spawn(task(
+            payload_a.clone(),
+            Arc::clone(&backend),
+            path.clone(),
+            Arc::clone(&barrier),
+        ));
+        let handle_b = tokio::spawn(task(
+            payload_b.clone(),
+            Arc::clone(&backend),
+            path.clone(),
+            Arc::clone(&barrier),
+        ));
+
+        let outcome_a = handle_a
+            .await
+            .expect("racer A task must not panic")
+            .expect("racer A's publish_exclusive must not error");
+        let outcome_b = handle_b
+            .await
+            .expect("racer B task must not panic")
+            .expect("racer B's publish_exclusive must not error");
+
+        assert_ne!(
+            outcome_a.created, outcome_b.created,
+            "iteration {iteration}: exactly one racer must report created:true and the \
+             other created:false, got ({}, {})",
+            outcome_a.created, outcome_b.created
+        );
+
+        let got = read_all(backend.as_ref(), &path, SIZE as u64).await;
+        assert!(
+            got == payload_a || got == payload_b,
+            "iteration {iteration}: the stored object must equal exactly one racer's full \
+             payload, never a mix of both"
+        );
+        // Cross-check that the `created` flags and the actually-stored bytes
+        // agree on the same winner.
+        if outcome_a.created {
+            assert_eq!(
+                got, payload_a,
+                "iteration {iteration}: racer A reported created:true but the stored \
+                 object does not match its payload"
+            );
+        } else {
+            assert_eq!(
+                got, payload_b,
+                "iteration {iteration}: racer B reported created:true but the stored \
+                 object does not match its payload"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn local_fs_publish_exclusive_concurrent_racers_never_mix() {
+    let root = unique_root();
+    assert_publish_exclusive_concurrent_racers_never_mix(|| {
+        Arc::new(LocalFsBackend::new("fs", &root)) as Arc<dyn StorageBackend>
+    })
+    .await;
+    drop(tokio::fs::remove_dir_all(&root).await);
+}
+
+#[tokio::test]
+async fn in_memory_publish_exclusive_concurrent_racers_never_mix() {
+    assert_publish_exclusive_concurrent_racers_never_mix(|| {
+        Arc::new(InMemoryBackend::new("mem")) as Arc<dyn StorageBackend>
+    })
+    .await;
+}
+
+/// `InMemoryBackend::publish_exclusive` must surface a chunk-level I/O error
+/// as `DomainError::Backend` (the `map_err` closure on the failing chunk)
+/// rather than panicking, and must not publish anything when the stream
+/// fails partway through.
+#[tokio::test]
+async fn in_memory_publish_exclusive_propagates_chunk_error_and_publishes_nothing() {
+    let b = InMemoryBackend::new("mem");
+
+    let chunks: Vec<std::io::Result<Bytes>> = vec![
+        Ok(Bytes::from_static(b"good-chunk-1")),
+        Err(std::io::Error::other("simulated stream failure")),
+    ];
+    let stream: BoxStream<'_, std::io::Result<Bytes>> = Box::pin(stream::iter(chunks));
+
+    let result = b.publish_exclusive("fid/vid", stream, None).await;
+    match result {
+        Ok(_) => panic!("a stream that errors partway through must not be published successfully"),
+        Err(DomainError::Backend { backend_id, .. }) => {
+            assert_eq!(
+                backend_id, "mem",
+                "the backend error must be attributed to the failing backend's id"
+            );
+        }
+        Err(e) => panic!("expected a DomainError::Backend, got {e:?}"),
+    }
+
+    assert!(
+        !b.exists("fid/vid").await.unwrap(),
+        "a publish_exclusive call whose stream errors must not leave a partial object behind"
+    );
+}
+
+/// `InMemoryBackend::publish_exclusive` must enforce `max_size` as chunks
+/// arrive, rejecting with `DomainError::Validation` on the `size` field and
+/// leaving nothing published when the running total crosses the limit.
+#[tokio::test]
+async fn in_memory_publish_exclusive_enforces_max_size_and_publishes_nothing() {
+    let b = InMemoryBackend::new("mem");
+
+    // Two 10-byte chunks (20 bytes total) against a 15-byte max_size: the
+    // limit is crossed on the second chunk, before the stream ends.
+    let chunks: Vec<std::io::Result<Bytes>> = vec![
+        Ok(Bytes::from_static(b"0123456789")),
+        Ok(Bytes::from_static(b"0123456789")),
+    ];
+    let stream: BoxStream<'_, std::io::Result<Bytes>> = Box::pin(stream::iter(chunks));
+
+    let result = b.publish_exclusive("fid/vid", stream, Some(15)).await;
+    match result {
+        Ok(_) => panic!("a stream exceeding max_size must be rejected, not published"),
+        Err(DomainError::Validation { field, .. }) => {
+            assert_eq!(
+                field, "size",
+                "the rejection must be attributed to the size field"
+            );
+        }
+        Err(e) => panic!("expected a DomainError::Validation, got {e:?}"),
+    }
+
+    assert!(
+        !b.exists("fid/vid").await.unwrap(),
+        "a rejected publish_exclusive must not leave a partial object behind"
+    );
+}
+
+/// Simulates a file truncated on disk between `get_stream`'s open (which
+/// observes the length via `file.metadata()`) and the stream actually being
+/// read: `LocalFsBackend` must surface `UnexpectedEof` on the resulting short
+/// read rather than silently ending the body short of the length it already
+/// committed to. No race here: a second, independent file handle truncates
+/// the file while the stream's own handle is untouched, so its later read
+/// deterministically lands past the new end-of-file.
+#[tokio::test]
+async fn local_fs_get_stream_errors_on_truncation_after_open() {
+    let root = unique_root();
+    let b = LocalFsBackend::new("fs", &root);
+
+    write_all(&b, "fid/vid", Bytes::from(vec![7u8; 100])).await;
+
+    // Open the stream: the caller already committed to the 100-byte length
+    // it observed itself (e.g. via an earlier `stat`), which matches the
+    // file's length at open time, so the open-time check passes.
+    let mut stream = b.get_stream("fid/vid", 100).await.unwrap();
+
+    // Truncate the underlying file via a separate handle, after the stream
+    // was opened but before anything is read from it.
+    let target = root.join("fid").join("vid");
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&target)
+        .unwrap();
+    file.set_len(10).unwrap();
+    drop(file);
+
+    let mut collected = Vec::new();
+    let mut saw_eof_error = false;
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(bytes) => collected.extend_from_slice(&bytes),
+            Err(e) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::UnexpectedEof);
+                saw_eof_error = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        saw_eof_error,
+        "a file truncated after get_stream opened it must error, not end silently short"
+    );
+    assert_eq!(
+        collected.len(),
+        10,
+        "bytes actually readable before the truncated end must still be yielded"
+    );
+
+    drop(tokio::fs::remove_dir_all(&root).await);
+}
+
+/// The race `get_stream`'s `expected_len` parameter closes: a file truncated
+/// **before** `get_stream` is even called (i.e. strictly between the
+/// caller's own earlier `stat`/observation and this call's `open`) must be
+/// refused up front -- no stream is ever returned, no byte is ever yielded --
+/// rather than silently streamed at its new, shorter length. Distinct from
+/// `local_fs_get_stream_errors_on_truncation_after_open` above, which covers
+/// a change landing *after* `get_stream` has already opened the file.
+#[tokio::test]
+async fn local_fs_get_stream_errors_before_first_byte_when_truncated_before_open() {
+    let root = unique_root();
+    let b = LocalFsBackend::new("fs", &root);
+
+    write_all(&b, "fid/vid", Bytes::from(vec![7u8; 100])).await;
+
+    // The caller already observed 100 bytes (e.g. via an earlier `stat`) and
+    // committed to that length -- but by the time `get_stream` is actually
+    // called, a concurrent writer has truncated the file to 10 bytes.
+    let target = root.join("fid").join("vid");
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&target)
+        .unwrap();
+    file.set_len(10).unwrap();
+    drop(file);
+
+    let result = b.get_stream("fid/vid", 100).await;
+    match result {
+        Ok(_) => panic!(
+            "a file that changed size before get_stream opened it must be refused, not streamed"
+        ),
+        Err(DomainError::Conflict { .. }) => {}
+        Err(e) => panic!("expected DomainError::Conflict, got {e:?}"),
+    }
+
+    drop(tokio::fs::remove_dir_all(&root).await);
+}
+
+/// Same guarantee as the truncation case above, but for a file that *grew*
+/// before `get_stream` opened it -- both directions of "changed size" must
+/// be caught, not just a shrink.
+#[tokio::test]
+async fn local_fs_get_stream_errors_before_first_byte_when_grown_before_open() {
+    let root = unique_root();
+    let b = LocalFsBackend::new("fs", &root);
+
+    write_all(&b, "fid/vid", Bytes::from(vec![7u8; 100])).await;
+
+    // A concurrent writer appends to the file before get_stream opens it, so
+    // by open time it is 150 bytes -- larger than the 100 the caller already
+    // committed to.
+    let target = root.join("fid").join("vid");
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&target)
+        .unwrap();
+    file.set_len(150).unwrap();
+    drop(file);
+
+    let result = b.get_stream("fid/vid", 100).await;
+    match result {
+        Ok(_) => {
+            panic!("a file that grew before get_stream opened it must be refused, not streamed")
+        }
+        Err(DomainError::Conflict { .. }) => {}
+        Err(e) => panic!("expected DomainError::Conflict, got {e:?}"),
+    }
+
+    drop(tokio::fs::remove_dir_all(&root).await);
+}
+
+/// The `get_range_stream` mirror of the whole-object pre-open checks above:
+/// a file that changed size before `get_range_stream` re-resolves `range`
+/// against it must be refused up front when that re-resolution yields a
+/// different length than the caller already committed to, rather than
+/// silently streaming a range of the wrong length.
+#[tokio::test]
+async fn local_fs_get_range_stream_errors_before_first_byte_when_resolved_length_changes() {
+    let root = unique_root();
+    let b = LocalFsBackend::new("fs", &root);
+
+    // 100 bytes; the caller resolves `OpenEnded { start: 0 }` against this
+    // length and commits to a 100-byte `Content-Length`.
+    write_all(&b, "fid/vid", Bytes::from(vec![7u8; 100])).await;
+
+    // Grown to 150 bytes before get_range_stream re-resolves the same
+    // OpenEnded range -- it would now resolve to a 150-byte range, not 100.
+    let target = root.join("fid").join("vid");
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&target)
+        .unwrap();
+    file.set_len(150).unwrap();
+    drop(file);
+
+    let result = b
+        .get_range_stream("fid/vid", ByteRange::OpenEnded { start: 0 }, 100)
+        .await;
+    match result {
+        Ok(_) => panic!(
+            "a range whose resolved length changed before get_range_stream read it must be refused"
+        ),
+        Err(DomainError::Conflict { .. }) => {}
+        Err(e) => panic!("expected DomainError::Conflict, got {e:?}"),
+    }
+
     drop(tokio::fs::remove_dir_all(&root).await);
 }
 

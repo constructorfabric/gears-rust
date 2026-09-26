@@ -35,6 +35,11 @@ following the structure set by `features/multipart-coordinator.md`. A further en
 content-hash-modes design — formalized in ADR-0006 and implemented alongside the rest of this feature set (see
 [features/content-hash-modes.md](features/content-hash-modes.md)'s "implemented" status).
 
+**Not started**: owner deletion / disposition workflow (`cpt-cf-file-storage-fr-owner-deletion`,
+`cpt-cf-file-storage-contract-serverless-runtime`) has no DECOMPOSITION entry and no implementation in this
+release — there is no EventBroker owner-deletion consumer and no Serverless Runtime invocation anywhere in this
+gear's code. It remains a planned P2 requirement (see PRD.md/DESIGN.md).
+
 **Decomposition Strategy**:
 
 - The multipart upload lifecycle (initiate, upload-part via sidecar, complete, abort, and introspect/resume) has a
@@ -88,17 +93,30 @@ content-hash-modes design — formalized in ADR-0006 and implemented alongside t
   non-primary key). Acceptance criterion: the token carries a key identifier, the sidecar selects the verifier in
   O(1), the keyset size is bounded by configuration, and a PASETO wrapper sits on the same `SignatureProvider` seam
   without changing the Token Opacity Contract (ADR-0004). Phase: P3.
+- **Schema-level `part_count >= 2` floor on `file_versions`** — deliberately not implemented. The application never
+  writes `part_count = 1` (a one-part multipart plan degenerates to `whole-sha256` instead, ADR-0006 single-part
+  amendment), but versions finalized by releases before that amendment legitimately persisted one-part multipart
+  completions as `multipart-composite-sha256` with `part_count = 1` (ADR-0006, Compatibility). A `CHECK`/trigger
+  floor added now would reject those legacy rows outright, and, worse, would reject any write from an
+  old-version instance still serving traffic against an already-migrated database during a rolling deploy. Add
+  the floor as its own, later release once every instance is confirmed running the degenerating code — an
+  expand/contract rollout: PostgreSQL — `ALTER TABLE ... ADD CONSTRAINT ... NOT VALID` (does not validate
+  existing rows, so legacy `part_count = 1` rows are left alone) followed by a separate `VALIDATE CONSTRAINT`
+  once no instance can write `part_count = 1` anymore; SQLite — `BEFORE INSERT`/`BEFORE UPDATE OF part_count`
+  triggers (guard only future writes, the same as Postgres's `NOT VALID` window). Acceptance criterion: no
+  instance older than the single-part amendment is still writing to the database (verified operationally, e.g. a
+  deploy-generation check), then the floor migration ships.
 
 ## 2. Entries
 
 ### 2.1 [Multipart Upload Coordinator](features/multipart-coordinator.md) - HIGH
 
-- [ ] `p2` - **ID**: `cpt-cf-file-storage-feature-multipart-coordinator`
+- [x] `p2` - **ID**: `cpt-cf-file-storage-feature-multipart-coordinator`
 
 - **Type**: Core
 - **Phases**: Single-phase implementation
 
-- **Purpose**: Provide a safe, resumable, server-controlled multipart upload path. The client declares total size and a preferred part size; the control plane computes the exact parts plan and returns one signed sidecar URL per part. The sidecar enforces the per-part size claim (buffered length check before the backend write on `multipart_native` paths; a streaming `max_size` abort plus post-write exact-length check on offset-object paths). The control plane assembles and hashes the parts at complete and finalizes the new file version; binding it as the file's current content is either part of that finalize (auto-bind sessions, `bind: "auto"`) or a separate, client-issued request (manual sessions).
+- **Purpose**: Provide a safe, resumable, server-controlled multipart upload path. The client declares total size and a preferred part size; the control plane computes the exact parts plan and returns one signed sidecar URL per part. The sidecar streams each part straight into the backend without ever buffering it whole, and enforces the per-part size claim (a streaming length counter ahead of the backend write, plus the backend's own exact-length contract, on `multipart_native` paths; a streaming `max_size` abort plus post-write exact-length check on offset-object paths). The control plane assembles and hashes the parts at complete and finalizes the new file version; binding it as the file's current content is either part of that finalize (auto-bind sessions, `bind: "auto"`) or a separate, client-issued request (manual sessions).
 
 - **Depends On**: the upload and versioning foundation (single-shot upload, file_versions table, signed-URL infrastructure -- codec-equivalent Ed25519, not literal PASETO, see ADR-0004's Implementation note -- not a formal DECOMPOSITION feature)
 
@@ -119,26 +137,39 @@ content-hash-modes design — formalized in ADR-0006 and implemented alongside t
 
 - **Requirements Covered**:
 
-  - [ ] `p2` - `cpt-cf-file-storage-fr-multipart-upload`
-  - [ ] `p2` - `cpt-cf-file-storage-fr-size-limits-policy`
-  - [ ] `p2` - `cpt-cf-file-storage-fr-storage-quota` — the `check_quota_bytes` call site exists in
-    `multipart_service.rs`, but `gear.rs` wires `quota_client: None`, so quota is not enforced on multipart
-    initiate — permissive/fail-open, blocked on a Quota Enforcement SDK crate (`gears/system/quota-enforcement/`
-    is docs-only)
+  - [x] `p2` - `cpt-cf-file-storage-fr-multipart-upload`
+  - [x] `p2` - `cpt-cf-file-storage-fr-size-limits-policy`
+  - [ ] `p2` - `cpt-cf-file-storage-fr-storage-quota` — the quota check runs at multipart initiate, but no quota
+    client is configured, so quota is not enforced on multipart initiate — permissive/fail-open, blocked on a
+    Quota Enforcement SDK crate (docs-only today)
+  - [x] `p2` - `cpt-cf-file-storage-fr-auto-bind`
+  - [x] `p2` - `cpt-cf-file-storage-fr-multipart-complete-lease`
+  - [x] `p2` - `cpt-cf-file-storage-fr-sidecar-callbacks`
+  - [x] `p2` - `cpt-cf-file-storage-fr-callback-internal-token`
 
 - **Design Principles Covered**:
 
-  - [ ] `p2` - `cpt-cf-file-storage-principle-control-no-content`
-  - [ ] `p2` - `cpt-cf-file-storage-principle-signed-urls`
+  - [x] `p2` - `cpt-cf-file-storage-principle-control-no-content`
+  - [x] `p2` - `cpt-cf-file-storage-principle-signed-urls`
 
 - **Design Constraints Covered**:
 
-  - [ ] `p2` - `cpt-cf-file-storage-constraint-sidecar`
-  - [ ] `p2` - `cpt-cf-file-storage-constraint-postgres`
+  - [x] `p2` - `cpt-cf-file-storage-constraint-sidecar`
+  - [x] `p2` - `cpt-cf-file-storage-constraint-postgres`
 
 - **Domain Model Entities**:
   - MultipartUpload (session)
   - MultipartUploadPart
+
+- **Design Components**:
+
+  - [x] `p2` - `cpt-cf-file-storage-component-http-gateway`
+  - [x] `p2` - `cpt-cf-file-storage-component-signed-url-issuer`
+  - [x] `p2` - `cpt-cf-file-storage-component-bind-service`
+  - [x] `p2` - `cpt-cf-file-storage-component-sidecar-gateway`
+  - [x] `p2` - `cpt-cf-file-storage-component-stream-proxy`
+  - [x] `p2` - `cpt-cf-file-storage-component-content-pipeline`
+  - [x] `p2` - `cpt-cf-file-storage-component-backend-abstraction`
 
 - **API**:
   - `POST /api/file-storage/v1/files/{id}/multipart` -- initiate multipart upload
@@ -153,12 +184,12 @@ content-hash-modes design — formalized in ADR-0006 and implemented alongside t
 
 - **Data**:
 
-  - None (tables multipart_uploads and multipart_upload_parts are created by the foundational upload/versioning migration; this feature extends multipart_uploads via migration m20260701_000002_multipart_plan_columns)
+  - None (tables multipart_uploads and multipart_upload_parts are created by the foundational upload/versioning migration; this feature extends multipart_uploads with `version_id`/`declared_size`/`part_size` columns)
 
 
 ### 2.2 [Content-Hash Modes](features/content-hash-modes.md) - MEDIUM
 
-- [ ] `p2` - **ID**: `cpt-cf-file-storage-feature-content-hash-modes`
+- [x] `p2` - **ID**: `cpt-cf-file-storage-feature-content-hash-modes`
 
 - **Type**: Core
 - **Phases**: Staged implementation (see [features/content-hash-modes.md](features/content-hash-modes.md) §5/§7 -- groundwork, schema migration, multipart-composite-sha256 implementation, docs) -- all stages complete
@@ -183,22 +214,28 @@ content-hash-modes design — formalized in ADR-0006 and implemented alongside t
 
 - **Requirements Covered**:
 
-  - [ ] `p2` - `cpt-cf-file-storage-fr-multipart-upload`
-  - [ ] `p2` - `cpt-cf-file-storage-fr-metadata-storage`
-  - [ ] `p1` - `cpt-cf-file-storage-fr-get-metadata`
+  - [x] `p2` - `cpt-cf-file-storage-fr-multipart-upload`
+  - [x] `p2` - `cpt-cf-file-storage-fr-metadata-storage`
+  - [x] `p1` - `cpt-cf-file-storage-fr-get-metadata`
 
 - **Design Principles Covered**:
 
-  - [ ] `p2` - `cpt-cf-file-storage-principle-streaming`
-  - [ ] `p2` - `cpt-cf-file-storage-principle-control-no-content`
+  - [x] `p2` - `cpt-cf-file-storage-principle-streaming`
+  - [x] `p2` - `cpt-cf-file-storage-principle-control-no-content`
 
 - **Design Constraints Covered**:
 
-  - [ ] `p2` - `cpt-cf-file-storage-constraint-postgres`
+  - [x] `p2` - `cpt-cf-file-storage-constraint-postgres`
 
 - **Domain Model Entities**:
   - HashMode (enum)
   - Manifest / ManifestEntry
+
+- **Design Components**:
+
+  - [x] `p2` - `cpt-cf-file-storage-component-bind-service`
+  - [x] `p2` - `cpt-cf-file-storage-component-content-pipeline`
+  - [x] `p2` - `cpt-cf-file-storage-component-metadata-service`
 
 - **API**:
   - `POST /api/file-storage/v1/files/{id}/multipart/{upload_id}/complete` -- response fields only (`hash_mode`, `part_count`, `manifest`); method/path unchanged
@@ -214,7 +251,7 @@ content-hash-modes design — formalized in ADR-0006 and implemented alongside t
 
 ### 2.3 [Policy Engine](features/policy-engine.md) - HIGH
 
-- [ ] `p2` - **ID**: `cpt-cf-file-storage-feature-policy-engine`
+- [x] `p2` - **ID**: `cpt-cf-file-storage-feature-policy-engine`
 
 - **Type**: Core
 - **Phases**: Single-phase implementation
@@ -228,37 +265,41 @@ content-hash-modes design — formalized in ADR-0006 and implemented alongside t
   `presign_version`, `update_metadata`) call into `PolicyResolver`'s enforcement helpers
 
 - **Scope**:
-  - `PolicyBody`/`SizeLimits`/`MimeSizeOverride`/`MetadataLimits` domain types and the `PolicyResolver`
-    most-restrictive-wins merge algorithm (`src/domain/policy.rs`)
+  - `PolicyBody`/`SizeLimits`/`MimeSizeOverride`/`MetadataLimits` domain types and the most-restrictive-wins
+    merge algorithm that resolves them into one effective policy
   - `GET`/`PUT /policy` (tenant or user scope) and `GET /policy/effective` (the resolved effective policy for the
     caller's context)
   - Enforcement call sites: allowed-MIME check, effective size-limit check, metadata-limit check, wired into
-    `domain/service/create.rs` and the multipart-initiate path
+    the create-file and multipart-initiate paths
 
 - **Out of scope**:
   - Storage quota enforcement (a related but separate control -- `cpt-cf-file-storage-fr-storage-quota`, not
     enforced in any deployment today, see [multipart-coordinator.md](features/multipart-coordinator.md)'s quota
     caveat)
-  - Retention policies (a distinct policy *type*, owned by §2.4 despite living in the same `policy.rs` module and
-    sharing the tenant/user/file scope model)
+  - Retention policies (a distinct policy *type*, owned by §2.4 despite sharing the same domain module and
+    the tenant/user/file scope model)
 
 - **Requirements Covered**:
 
-  - [ ] `p2` - `cpt-cf-file-storage-fr-allowed-types-policy`
-  - [ ] `p2` - `cpt-cf-file-storage-fr-size-limits-policy`
-  - [ ] `p2` - `cpt-cf-file-storage-fr-metadata-limits`
+  - [x] `p2` - `cpt-cf-file-storage-fr-allowed-types-policy`
+  - [x] `p2` - `cpt-cf-file-storage-fr-size-limits-policy`
+  - [x] `p2` - `cpt-cf-file-storage-fr-metadata-limits`
 
 - **Design Principles Covered**:
 
-  - [ ] `p2` - `cpt-cf-file-storage-principle-control-no-content`
+  - [x] `p2` - `cpt-cf-file-storage-principle-control-no-content`
 
 - **Design Constraints Covered**:
 
-  - [ ] `p2` - `cpt-cf-file-storage-constraint-postgres`
+  - [x] `p2` - `cpt-cf-file-storage-constraint-postgres`
 
 - **Domain Model Entities**:
   - StoredPolicy
   - EffectivePolicy
+
+- **Design Components**:
+
+  - [x] `p2` - `cpt-cf-file-storage-component-http-gateway`
 
 - **API**:
   - `GET /api/file-storage/v1/policy` -- read a policy (tenant or user scope)
@@ -267,7 +308,7 @@ content-hash-modes design — formalized in ADR-0006 and implemented alongside t
 
 - **Sequences**:
 
-  - None (resolution documented inline in `src/domain/policy.rs::PolicyResolver::resolve`)
+  - None (resolution algorithm documented inline in [features/policy-engine.md](features/policy-engine.md))
 
 - **Data**:
 
@@ -277,7 +318,7 @@ content-hash-modes design — formalized in ADR-0006 and implemented alongside t
 
 ### 2.4 [Retention Rules & Cleanup Sweep](features/retention-cleanup.md) - MEDIUM
 
-- [ ] `p2` - **ID**: `cpt-cf-file-storage-feature-retention-cleanup`
+- [x] `p2` - **ID**: `cpt-cf-file-storage-feature-retention-cleanup`
 
 - **Type**: Core
 - **Phases**: Single-phase implementation
@@ -292,10 +333,10 @@ content-hash-modes design — formalized in ADR-0006 and implemented alongside t
   or `OrphanReconcile` audit row through the same transactional-outbox mechanism)
 
 - **Scope**:
-  - `RetentionRuleBody`/`AgeRetention`/`InactivityRetention`/`MetadataRetention` domain types (`src/domain/policy.rs`)
+  - `RetentionRuleBody`/`AgeRetention`/`InactivityRetention`/`MetadataRetention` domain types
   - `GET`/`POST /retention-rules`, `DELETE /retention-rules/{rule_id}`
-  - `CleanupEngine::run_sweep` (`src/domain/cleanup.rs`): abandoned-pending-version reclamation (skips versions still
-    backing a live in-progress multipart session), expired-multipart-session abort,
+  - The background cleanup sweep: abandoned-pending-version reclamation (skips versions still
+    backing a live in-progress or any completing multipart session), expired-multipart-session abort,
     retention-policy expiry (keyset-paginated file scan), expired idempotency-key purge
   - Per-instance sweep scheduling; cross-instance coordination is not implemented
 
@@ -307,20 +348,24 @@ content-hash-modes design — formalized in ADR-0006 and implemented alongside t
 
 - **Requirements Covered**:
 
-  - [ ] `p2` - `cpt-cf-file-storage-fr-retention-policies`
-  - [ ] `p2` - `cpt-cf-file-storage-fr-orphan-reconciliation`
+  - [x] `p2` - `cpt-cf-file-storage-fr-retention-policies`
+  - [x] `p2` - `cpt-cf-file-storage-fr-orphan-reconciliation`
 
 - **Design Principles Covered**:
 
-  - [ ] `p2` - `cpt-cf-file-storage-principle-control-no-content`
+  - [x] `p2` - `cpt-cf-file-storage-principle-control-no-content`
 
 - **Design Constraints Covered**:
 
-  - [ ] `p2` - `cpt-cf-file-storage-constraint-postgres`
+  - [x] `p2` - `cpt-cf-file-storage-constraint-postgres`
 
 - **Domain Model Entities**:
   - StoredRetentionRule
   - SweepResult (tally, not persisted)
+
+- **Design Components**:
+
+  - [x] `p2` - `cpt-cf-file-storage-component-http-gateway`
 
 - **API**:
   - `GET /api/file-storage/v1/retention-rules` -- list retention rules
@@ -329,7 +374,7 @@ content-hash-modes design — formalized in ADR-0006 and implemented alongside t
 
 - **Sequences**:
 
-  - None (sweep order documented inline in `src/domain/cleanup.rs::CleanupEngine::run_sweep`)
+  - None (sweep order documented inline in [features/retention-cleanup.md](features/retention-cleanup.md))
 
 - **Data**:
 
@@ -356,9 +401,9 @@ content-hash-modes design — formalized in ADR-0006 and implemented alongside t
   than depending on any one of them
 
 - **Scope**:
-  - `AuditEntry`/`AuditOperation`/`AuditOutcome` domain types (`src/domain/audit.rs`)
-  - `AuditRepo::insert`, called inside the same transaction as every audited mutation across
-    `domain/service/{write,create,read_ops,backend}.rs`, `domain/multipart_service.rs`, and `domain/cleanup.rs`
+  - `AuditEntry`/`AuditOperation`/`AuditOutcome` domain types
+  - One audit-outbox row insert, in the same transaction as every audited mutation, across every write path
+    (create, single-shot upload, read/metadata, backend migration, multipart, and the cleanup sweep)
 
 - **Out of scope**:
   - Draining/relaying `audit_outbox` rows to any downstream sink -- **not implemented**
@@ -373,11 +418,11 @@ content-hash-modes design — formalized in ADR-0006 and implemented alongside t
 
 - **Design Principles Covered**:
 
-  - [ ] `p2` - `cpt-cf-file-storage-principle-control-no-content`
+  - [x] `p2` - `cpt-cf-file-storage-principle-control-no-content`
 
 - **Design Constraints Covered**:
 
-  - [ ] `p2` - `cpt-cf-file-storage-constraint-postgres`
+  - [x] `p2` - `cpt-cf-file-storage-constraint-postgres`
 
 - **Domain Model Entities**:
   - AuditEntry
@@ -416,7 +461,7 @@ content-hash-modes design — formalized in ADR-0006 and implemented alongside t
 
 - **Scope**:
   - `POST /files/{id}/transfer`: nil-UUID rejection, atomic `owner_kind`/`owner_id` swap, audit row, file event,
-    post-commit usage-delta debit/credit (`src/domain/service/write.rs::transfer_ownership`)
+    post-commit usage-delta debit/credit
 
 - **Out of scope**:
   - Full target-owner existence/tenant-membership validation -- **NOT IMPLEMENTED**, blocked on an
@@ -426,7 +471,8 @@ content-hash-modes design — formalized in ADR-0006 and implemented alongside t
 
 - **Requirements Covered**:
 
-  - [ ] `p2` - `cpt-cf-file-storage-fr-ownership-transfer` -- PARTIAL, see the status note above
+  - [ ] `p2` - `cpt-cf-file-storage-fr-ownership-transfer`
+    (PARTIAL — see the status note above.)
 
 - **Design Principles Covered**:
 
@@ -434,10 +480,16 @@ content-hash-modes design — formalized in ADR-0006 and implemented alongside t
 
 - **Design Constraints Covered**:
 
-  - [ ] `p2` - `cpt-cf-file-storage-constraint-postgres`
+  - [x] `p2` - `cpt-cf-file-storage-constraint-postgres`
 
 - **Domain Model Entities**:
   - None new -- mutates the existing `File` entity's `owner_kind`/`owner_id` fields
+
+- **Design Components**:
+
+  - [x] `p2` - `cpt-cf-file-storage-component-http-gateway`
+  - [x] `p2` - `cpt-cf-file-storage-component-metadata-service`
+  - [x] `p2` - `cpt-cf-file-storage-component-authz-adapter`
 
 - **API**:
   - `POST /api/file-storage/v1/files/{id}/transfer` -- transfer ownership
@@ -453,7 +505,7 @@ content-hash-modes design — formalized in ADR-0006 and implemented alongside t
 
 ### 2.7 [Backend Migration](features/backend-migration.md) - MEDIUM
 
-- [ ] `p2` - **ID**: `cpt-cf-file-storage-feature-backend-migration`
+- [x] `p2` - **ID**: `cpt-cf-file-storage-feature-backend-migration`
 
 - **Type**: Core
 - **Phases**: Single-phase implementation
@@ -468,7 +520,7 @@ content-hash-modes design — formalized in ADR-0006 and implemented alongside t
 - **Scope**:
   - `POST /files/{id}/migrate`: single-version-only guard, non-durable-target admin gate, source read + mode-aware
     hash verify + destination write, CAS-guarded version-row rebind, concurrent-migration race resolution,
-    best-effort source cleanup (`src/domain/service/backend.rs::migrate_backend`)
+    best-effort source cleanup
 
 - **Out of scope**:
   - Versioned files (more than 1 version) -- migration is restricted to non-versioned files by design, a permanent
@@ -477,7 +529,7 @@ content-hash-modes design — formalized in ADR-0006 and implemented alongside t
 
 - **Requirements Covered**:
 
-  - [ ] `p2` - `cpt-cf-file-storage-fr-backend-migration`
+  - [x] `p2` - `cpt-cf-file-storage-fr-backend-migration`
 
 - **Design Principles Covered**:
 
@@ -487,10 +539,16 @@ content-hash-modes design — formalized in ADR-0006 and implemented alongside t
 
 - **Design Constraints Covered**:
 
-  - [ ] `p2` - `cpt-cf-file-storage-constraint-postgres`
+  - [x] `p2` - `cpt-cf-file-storage-constraint-postgres`
 
 - **Domain Model Entities**:
   - None new -- mutates the existing `FileVersion` entity's `backend_id`/`backend_path` fields
+
+- **Design Components**:
+
+  - [x] `p2` - `cpt-cf-file-storage-component-http-gateway`
+  - [x] `p2` - `cpt-cf-file-storage-component-backend-abstraction`
+  - [x] `p2` - `cpt-cf-file-storage-component-authz-adapter`
 
 - **API**:
   - `POST /api/file-storage/v1/files/{id}/migrate` -- migrate a file's content to a different backend

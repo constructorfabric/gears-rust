@@ -31,7 +31,7 @@ date: 2026-07-07
 ## Context and Problem Statement
 
 Tier 1 item 1.7 of the P2 remediation plan ("No durable/distributed storage backend (S3) despite doc claims")
-requires an `S3Backend` implementing the `StorageBackend` trait (`src/infra/backend/mod.rs`), the seam every backend
+requires an `S3Backend` implementing the `StorageBackend` trait, the seam every backend
 type must satisfy. Before this ADR, the crate shipped two backend types: `LocalFsBackend` (sets `durable: true` —
 writes survive a process restart on a single machine — but has no native multipart support) and `InMemoryBackend`
 (sets `multipart_native: true`, but is explicitly non-durable — content is lost on restart). Neither, on its own,
@@ -43,8 +43,8 @@ An `S3Backend` needs, at minimum, the following operations, all invoked from **a
 
 * `PutObject`
 * `GetObject`
-* `GetObject` **with `Range`** (backs `StorageBackend::get_range`, native-range reads instead of the default
-  read-whole-then-slice fallback)
+* `GetObject` **with `Range`** (backs `StorageBackend::get_range_stream`/`read_prefix`, native-range streamed
+  reads — the trait has no whole-object fallback for either)
 * `HeadObject` (backs `StorageBackend::size` / `StorageBackend::exists` without materializing the blob)
 * `DeleteObject`
 * `ListObjectsV2` **with continuation-token pagination** (backend enumeration)
@@ -81,7 +81,7 @@ This ADR chooses which S3 client crate backs `S3Backend`.
   four multipart operations, without hand-rolled request construction
 * **Maintenance / community health** — release cadence, maintainer count, issue responsiveness; this becomes the
   gear's exposure if the crate stalls
-* **Security-review burden for an external SDK** — `src/infra/backend/mod.rs:11` already flags that "S3/GCS/etc. are
+* **Security-review burden for an external SDK** — the backend trait's own documentation already flags that "S3/GCS/etc. are
   deferred (they require an external SDK + security review)"; ADR-0003 establishes the same posture (external
   dependencies that touch the data plane get reviewed, not rubber-stamped)
 * **FIPS posture** — consistency with the rustls / `aws-lc-rs` posture the rest of the gear is converging on (see
@@ -151,7 +151,7 @@ rather than a rejected option.
   `rusty-s3` (request construction as well as response parsing) for comparatively little additional size saving
   (+5.6% vs. `rusty-s3`'s +11.7%).
 
-**Security-review gate.** Per `src/infra/backend/mod.rs:11` ("S3/GCS/etc. are deferred (they require an external SDK
+**Security-review gate.** Per the backend trait's own documented posture ("S3/GCS/etc. are deferred (they require an external SDK
 + security review)") and the external-dependency review posture ADR-0003 establishes for data-plane-adjacent code,
 whichever client is ultimately vendored — `rusty-s3` (+ `quick-xml`) per this decision, or `object_store` if the team
 later invokes the documented fallback — **must clear a team security review before being merged as a real
@@ -179,11 +179,12 @@ off.
   bucket/credentials/action builders, translating `StorageBackend`'s path/range/multipart vocabulary onto presigned
   `PutObject`/`GetObject`/`HeadObject`/`DeleteObject`/`ListObjectsV2`/multipart-action URLs that this gear executes
   via `reqwest` and whose XML responses it parses via `quick-xml`.
-* `StorageBackend::get_range` gets a real native implementation for the S3 backend: `rusty-s3` builds the presigned
-  `GetObject` URL, and the gear layers an unsigned `Range` header onto the executed request (valid because `Range` is
-  not part of SigV4's signed canonical request), instead of falling back to the default whole-object-read-then-slice.
+* `StorageBackend::get_range_stream` gets a real native implementation for the S3 backend: `rusty-s3` builds the
+  presigned `GetObject` URL, and the gear layers an unsigned `Range` header onto the executed request (valid because
+  `Range` is not part of SigV4's signed canonical request) — the trait has no whole-object-read-then-slice fallback
+  to fall back to. `read_prefix` uses the same unsigned-`Range` technique for its own small, capped reads.
   `BackendCapabilities::range_native = true` for `S3Backend`.
-* `StorageBackend::size`/`exists` are backed by a presigned `HeadObject` request, avoiding a full-object `get` per the
+* `StorageBackend::size`/`exists` are backed by a presigned `HeadObject` request, avoiding a full-object read per the
   trait's documented intent.
 * Multipart (item 1.7.4) is implemented via `rusty-s3`'s `CreateMultipartUpload`/`UploadPart`/
   `CompleteMultipartUpload`/`AbortMultipartUpload` presigned-request builders, executed via `reqwest`, with
@@ -196,8 +197,9 @@ off.
   abstraction, this pagination loop is code this gear owns and tests directly.
 * `StorageBackend::publish_exclusive` (the sidecar's single-shot upload path, ADR-0003) is implemented for `S3Backend`
   as an atomic conditional write: `If-None-Match: *` on the terminal `PutObject`/`CompleteMultipartUpload`, mapping
-  S3's `412 Precondition Failed` to a `created: false` outcome instead of the trait's non-atomic `exists`-then-`put`
-  default. Like the rest of `S3Backend`, this is opt-in (only exercised once a deployment configures `s3_backends`)
+  S3's `412 Precondition Failed` to a `created: false` outcome — the trait has no non-atomic `exists`-then-write
+  fallback to fall back to; every backend implements its own atomic (or best-effort) `publish_exclusive`. Like the
+  rest of `S3Backend`, this is opt-in (only exercised once a deployment configures `s3_backends`)
   and its guarantee is provider-dependent — see the Security-review gate above and ADR-0003's "Known gap" discussion.
 * **In-house XML/error-handling burden.** Because `rusty-s3` is sign-only, this gear — not the crate — owns parsing
   every S3 XML response body (`ListObjectsV2`, `CompleteMultipartUpload`) and mapping S3's XML error schema to
@@ -205,7 +207,7 @@ off.
   duplication, not a hidden one, and it is a real, ongoing maintenance item (including tracking `quick-xml`'s own
   CVEs, as the pinned-version note above already reflects).
 * This is still a **new external dependency pair** regardless of which of the five options is chosen; it does not
-  skip the security-review gate flagged in `src/infra/backend/mod.rs:11`, and this ADR cannot itself close that gate.
+  skip the security-review gate flagged in the backend trait's own documentation, and this ADR cannot itself close that gate.
 * **FIPS posture.** Executing `rusty-s3`'s presigned requests over our existing `reqwest`/rustls/`aws-lc-rs` chain
   means no *second* crypto/TLS backend is introduced — consistent with the FIPS-posture direction ADR-0004 sets for
   the rest of the gear (route through a single, swappable, eventually FIPS-validatable module rather than accumulate
@@ -222,15 +224,15 @@ off.
   `quick-xml` version).
 * Code review confirming `S3Backend` sets `durable: true` (already set by `LocalFsBackend`) **and**
   `multipart_native: true` (already set by `InMemoryBackend`) — the first backend type to combine both in a way that
-  also survives a distributed, multi-replica deployment — and that it implements `get_range` and `size`/`exists`
-  natively rather than via the trait's default (whole-object) fallbacks.
+  also survives a distributed, multi-replica deployment — and that it implements `get_range_stream`/`read_prefix`
+  and `size`/`exists` natively (the trait has no whole-object fallback for any of these).
 * Confirming, against the specific target S3-compatible endpoint(s) a deployment intends to use, that conditional
   writes (`If-None-Match: *`) are actually enforced rather than silently ignored — required before `S3Backend`'s
   `publish_exclusive` override can be relied on for the create-exclusive guarantee ADR-0003 describes.
 * `cargo tree` (or equivalent) run against the crate with `rusty-s3` and `quick-xml` added, confirming no second
   `reqwest`/`hyper`/TLS major version is pulled in beyond what the crate already links.
-* Integration tests (item 1.7's test strategy, `s3s-fs`-backed) covering: `put`/`get` round-trip, `Range` `get`,
-  `head`-based `size`/`exists`, `delete`, paginated `list` over more objects than one `ListObjectsV2` page, the full
+* Integration tests (item 1.7's test strategy, `s3s-fs`-backed) covering: streamed write/read round-trip, `Range`
+  read, `head`-based `size`/`exists`, `delete`, paginated `list` over more objects than one `ListObjectsV2` page, the full
   multipart lifecycle (`CreateMultipartUpload` → `UploadPart` × N → `CompleteMultipartUpload`, plus
   `AbortMultipartUpload` on a cancelled upload), and at least one test exercising the in-house `quick-xml` parsing of
   an S3 XML error response.
@@ -286,7 +288,7 @@ off.
   gap for a caller that needs manual page-by-page control, though **not one this gear has**, since
   `StorageBackend`'s own enumeration contract already returns a flat, fully-drained list
 * Bad, because it is still a new external dependency requiring the security review flagged in
-  `src/infra/backend/mod.rs:11` — fallback status is not a review exemption
+  the backend trait's own documented posture — fallback status is not a review exemption
 
 ### `aws-sdk-s3` (+ `aws-config`)
 
@@ -375,7 +377,7 @@ turns on.
 | Raw HTTP (`aws-sigv4` + `quick-xml`) | 3,720,608 bytes | +198,704 B (+5.6%) | +49 (187) |
 
 These are the measured numbers underlying the Decision Outcome above. The ADR's `status` remains `proposed` not
-because sizes are unmeasured, but because the security review required by `src/infra/backend/mod.rs:11` / ADR-0003
+because sizes are unmeasured, but because the security review required by the backend trait's own documented posture / ADR-0003
 has not yet run against the chosen `rusty-s3` + `quick-xml` pair (see [Confirmation](#confirmation)).
 
 ## Traceability
@@ -389,7 +391,8 @@ has not yet run against the chosen `rusty-s3` + `quick-xml` pair (see [Confirmat
 This decision directly addresses the following requirements or design elements:
 
 * `cpt-cf-file-storage-fr-backend-abstraction` — `S3Backend` is a new `StorageBackend` implementation, chosen client
-  determines how cleanly it fits the trait's `put`/`get`/`get_range`/`size`/`exists`/`delete`/multipart surface
+  determines how cleanly it fits the trait's `put_stream`/`publish_exclusive`/`get_stream`/`get_range_stream`/
+  `read_prefix`/`size`/`exists`/`delete`/multipart surface
 * `cpt-cf-file-storage-fr-backend-capabilities` — `S3Backend` sets both `durable: true` (also set by
   `LocalFsBackend`) and `multipart_native: true` (also set by `InMemoryBackend`); it is the first backend to combine
   both while also surviving a distributed, multi-replica deployment

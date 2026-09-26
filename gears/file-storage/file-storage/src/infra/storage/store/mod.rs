@@ -13,16 +13,13 @@
 //! they are persistence concerns (which scope to use when querying each table),
 //! not authorization decisions (those stay in `FileService`).
 //!
-//! P2-M1 adds policy store intent-level methods (`get_policy`, `upsert_policy`,
+//! Policy store intent-level methods (`get_policy`, `upsert_policy`,
 //! `list_retention_rules`, `get_retention_rule`, `insert_retention_rule`,
-//! `delete_retention_rule`).
+//! `delete_retention_rule`) live alongside the rest.
 //!
-//! P2-M4 adds transactional audit recording. Every mutating method that runs
-//! (or wraps) a DB transaction inserts an [`AuditEntry`] row in the **same**
-//! transaction, guaranteeing 100% coverage with no silent drops.
-//!
-//! @cpt-cf-file-storage-fr-audit-trail
-//! @cpt-cf-file-storage-nfr-audit-completeness
+//! Every mutating method that runs (or wraps) a DB transaction inserts an
+//! [`AuditEntry`] row in the **same** transaction, guaranteeing 100% coverage
+//! with no silent drops.
 //!
 //! ## Accepted Henry-Kafura hub (do not fragment further)
 //!
@@ -92,7 +89,7 @@ pub struct IdempotencyInsert {
     pub key: String,
     /// The authenticated subject (`ctx.subject_id()`) creating this record —
     /// verified against on replay so one caller's key can never surface
-    /// another caller's ticket (P2 remediation 0.10).
+    /// another caller's ticket.
     pub subject_id: Uuid,
     pub response_status: i32,
     pub response_body: String,
@@ -100,7 +97,7 @@ pub struct IdempotencyInsert {
     /// SHA-256 over `domain::idempotency::compute_request_hash`'s
     /// canonicalized encoding of the request — compared against on replay so
     /// a caller can never surface a stored ticket for a materially different
-    /// request body (P2 remediation 2.1).
+    /// request body.
     pub request_hash: Vec<u8>,
     pub expires_at: OffsetDateTime,
 }
@@ -127,132 +124,6 @@ impl Store {
             db,
             repos: Repos::default(),
         }
-    }
-
-    /// Mode-aware content-hash verification (ADR-0006
-    /// `cpt-cf-file-storage-algo-content-hash-modes-verify`).
-    ///
-    /// - `whole-sha256`: `manifest` must be `None`; compute `sha256(blob)` and
-    ///   compare to `hash_value` — unchanged from the original whole-object
-    ///   behaviour.
-    /// - `multipart-composite-sha256`: `manifest` is **required** (`None` is a
-    ///   caller bug — every such version has exactly one `version_hash_manifest`
-    ///   row by construction). Split `blob` at the manifest's recorded offsets
-    ///   (the final part's length follows from the blob's own length), `sha256`
-    ///   each part and confirm it matches the manifest's recorded digest for
-    ///   that slice, rebuild the manifest from the recomputed digests, and
-    ///   confirm `sha256(rebuilt_manifest) == hash_value` (`root`).
-    ///
-    /// Returns `Ok(())` on a match; `Err(DomainError::hash_mismatch)` (or a
-    /// validation error for a malformed/absent manifest) otherwise. The hash
-    /// computation is confined here because this module already owns the
-    /// SHA-256 allow-list usage (see `hash.rs` docs), keeping `FileService`
-    /// free of a direct `hash` import.
-    ///
-    /// @cpt-cf-file-storage-fr-backend-migration
-    /// @cpt-cf-file-storage-algo-content-hash-modes-verify
-    pub fn verify_content_hash(
-        blob: &[u8],
-        hash_mode: HashMode,
-        hash_value: &[u8],
-        manifest: Option<&str>,
-    ) -> Result<(), crate::domain::error::DomainError> {
-        use crate::domain::error::DomainError;
-        match hash_mode {
-            // @cpt-begin:cpt-cf-file-storage-algo-content-hash-modes-verify:p1:inst-verify-whole
-            HashMode::WholeSha256 => {
-                if manifest.is_some() {
-                    return Err(DomainError::validation(
-                        "manifest",
-                        "whole-sha256 versions carry no manifest",
-                    ));
-                }
-                let computed = hash::sha256(blob);
-                if computed != hash_value {
-                    return Err(DomainError::hash_mismatch(
-                        hex::encode(hash_value),
-                        hex::encode(&computed),
-                    ));
-                }
-                Ok(())
-            }
-            // @cpt-end:cpt-cf-file-storage-algo-content-hash-modes-verify:p1:inst-verify-whole
-            HashMode::MultipartCompositeSha256 => {
-                let manifest = manifest.ok_or_else(|| {
-                    DomainError::validation(
-                        "manifest",
-                        "multipart-composite-sha256 verification requires the stored manifest",
-                    )
-                })?;
-                Self::verify_multipart_composite(blob, hash_value, manifest)
-            }
-        }
-    }
-
-    /// Split-rehash-rebuild-compare sequence for `multipart-composite-sha256`
-    /// (ADR-0006 §6). Re-derives everything from `blob` + the stored
-    /// `manifest` alone, with no dependency on `multipart_upload_parts`.
-    fn verify_multipart_composite(
-        blob: &[u8],
-        root: &[u8],
-        manifest: &str,
-    ) -> Result<(), crate::domain::error::DomainError> {
-        use crate::domain::error::DomainError;
-        use crate::infra::content::hash_mode::{Manifest, ManifestEntry};
-
-        // @cpt-begin:cpt-cf-file-storage-algo-content-hash-modes-verify:p1:inst-verify-parse-manifest
-        let parsed = Manifest::from_wire_string(manifest)?;
-        let entries = parsed.entries();
-        let blob_len = blob.len() as u64;
-        // @cpt-end:cpt-cf-file-storage-algo-content-hash-modes-verify:p1:inst-verify-parse-manifest
-
-        // @cpt-begin:cpt-cf-file-storage-algo-content-hash-modes-verify:p1:inst-verify-per-part
-        let mut rebuilt = Vec::with_capacity(entries.len());
-        for (i, entry) in entries.iter().enumerate() {
-            // Each part spans [offset, next_offset) — the final part runs to
-            // the end of the blob (its length derives from the object's known
-            // size, exactly as a client re-verifier would compute it).
-            let start = entry.offset;
-            let end = entries.get(i + 1).map_or(blob_len, |next| next.offset);
-            if start > end || end > blob_len {
-                return Err(DomainError::hash_mismatch(
-                    hex::encode(root),
-                    format!("manifest offset {start} out of range for object of {blob_len} bytes"),
-                ));
-            }
-            let slice = &blob[usize::try_from(start).unwrap_or(usize::MAX)
-                ..usize::try_from(end).unwrap_or(usize::MAX)];
-            let digest = hash::digest_to_array(hash::sha256(slice));
-            if digest != entry.digest {
-                return Err(DomainError::hash_mismatch(
-                    hex::encode(entry.digest),
-                    format!(
-                        "recomputed part digest at offset {start}: {}",
-                        hex::encode(digest)
-                    ),
-                ));
-            }
-            rebuilt.push(ManifestEntry {
-                offset: entry.offset,
-                digest,
-            });
-        }
-        // @cpt-end:cpt-cf-file-storage-algo-content-hash-modes-verify:p1:inst-verify-per-part
-
-        // @cpt-begin:cpt-cf-file-storage-algo-content-hash-modes-verify:p1:inst-verify-reserialize
-        let rebuilt_root = Manifest::new(rebuilt)?.root();
-        // @cpt-end:cpt-cf-file-storage-algo-content-hash-modes-verify:p1:inst-verify-reserialize
-        // @cpt-begin:cpt-cf-file-storage-algo-content-hash-modes-verify:p1:inst-verify-root-compare
-        if rebuilt_root.as_slice() != root {
-            return Err(DomainError::hash_mismatch(
-                hex::encode(root),
-                hex::encode(rebuilt_root),
-            ));
-        }
-        // @cpt-end:cpt-cf-file-storage-algo-content-hash-modes-verify:p1:inst-verify-root-compare
-        // @cpt-begin:cpt-cf-file-storage-algo-content-hash-modes-verify:p1:inst-verify-return
-        Ok(())
-        // @cpt-end:cpt-cf-file-storage-algo-content-hash-modes-verify:p1:inst-verify-return
     }
 }
 
@@ -288,5 +159,8 @@ pub(super) fn pending_version(
         backend_id: backend_id.to_owned(),
         backend_path: backend_path.to_owned(),
         created_at: now,
+        // A pending row has not been through finalize yet, let alone won a
+        // bind CAS there.
+        bound_on_finalize: false,
     }
 }

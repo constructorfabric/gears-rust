@@ -14,9 +14,9 @@
 //! - `create.rs`   — create_file, presign_version, policy/quota helpers
 //! - `write.rs`    — authorize_write, finalize_upload, bind, update_metadata,
 //!   transfer_ownership, best_effort_blob_delete
-//! - `read_ops.rs` — get_file, get_file_with_metadata, list_files, get_version,
-//!   download_url, list_versions, restore_version,
-//!   delete_file, delete_file_inner, delete_version
+//! - `read_ops.rs` — get_file, get_file_with_metadata, list_files,
+//!   list_files_with_metadata, get_version, download_url, list_versions,
+//!   restore_version, delete_file, delete_file_inner, delete_version
 //! - `backend.rs`  — migrate_backend, list_backends, get_backend,
 //!   DataPlanePort trait impl
 
@@ -57,8 +57,6 @@ pub struct ServiceConfig {
     pub max_page_size: u64,
     /// Window (seconds) for which an idempotency key is retained.
     /// After this window, a retry with the same key is treated as a fresh request.
-    ///
-    /// @cpt-cf-file-storage-fr-upload-idempotency
     pub idempotency_ttl_secs: u64,
 }
 
@@ -72,6 +70,29 @@ pub struct UploadTicket {
     pub upload_url: String,
 }
 
+/// Outcome of the token-authenticated finalize callback (upload-flow
+/// redesign) — the single-part half of the ONE shared bind-state model
+/// (`domain::multipart::BindState`): surfaced to the uploading client by the
+/// sidecar as fixed `PUT`-response headers — `X-FS-Bound: true` + `ETag` on
+/// a won CAS, `X-FS-Bound: conflict` + `X-FS-Current-ETag` on a lost one.
+#[allow(unknown_lints, de0309_must_have_domain_model)]
+#[derive(Debug, Clone)]
+pub struct FinalizeByTokenOutcome {
+    /// `None` — the token did not request a bind (staged/manual mode) and
+    /// this is that finalize's first, non-retried call. `Some(Bound)` /
+    /// `Some(Conflict)` for an auto-bind token (a won or lost
+    /// `content_id IS NULL` CAS). `Some(Manual)` only from the
+    /// idempotent-retry convergence path: a manual-mode token's finalize
+    /// retried against an already-`Available`, still-unbound version —
+    /// the handler treats it the same as `None` (no bind headers).
+    pub bind_state: Option<crate::domain::multipart::BindState>,
+    /// Content ETag after a successful bind (`Bound` only).
+    pub etag: Option<String>,
+    /// The file's CURRENT content ETag on a lost CAS (`Conflict` only) —
+    /// what a manual rebind's `If-Match` needs, no re-upload required.
+    pub current_etag: Option<String>,
+}
+
 /// Result of `download-url`: the signed URL plus the content ETag.
 #[allow(unknown_lints, de0309_must_have_domain_model)]
 #[derive(Debug, Clone)]
@@ -82,7 +103,6 @@ pub struct DownloadTicket {
 }
 
 /// Quota metric name used for storage preflight checks.
-/// @cpt-cf-file-storage-fr-storage-quota
 pub(super) const QUOTA_METRIC_NAME: &str =
     gts_id!("cf.qe.metric.type.v1~cf.qe.metric.file_storage_bytes.v1");
 
@@ -101,13 +121,19 @@ pub struct FileService {
     pub(super) quota_client: Option<Arc<dyn QuotaClient>>,
     /// Optional usage reporter. `None` means no usage deltas are reported.
     /// Failures are fire-and-forget: the adapter logs and swallows them.
-    ///
-    /// @cpt-cf-file-storage-fr-usage-reporting
     pub(super) usage_reporter: Option<Arc<dyn UsageReporter>>,
     /// Metrics port (P2 1.8 remediation). Defaults to a no-op implementation
     /// (see [`Self::new`]); `gear.rs` opts into the real OTel-backed meter via
     /// [`Self::with_metrics`].
     pub(super) metrics: Arc<dyn FileStorageMetricsPort>,
+    /// The verifier the s2s finalize/report-part callback routes use (see
+    /// [`Self::verifier`]). Defaults in [`Self::new`] to `issuer.verifier()`
+    /// — a single key, the issuer's current one; `gear.rs` extends it via
+    /// [`Self::with_previous_signing_public_keys`] with
+    /// `FileStorageConfig::previous_signing_public_keys` so a
+    /// `signing_key_seed` rotation doesn't reject an in-flight upload's
+    /// callback the moment the control plane restarts on the new seed.
+    pub(super) callback_verifier: crate::infra::signed_url::Verifier,
 }
 
 impl FileService {
@@ -120,6 +146,7 @@ impl FileService {
         quota_client: Option<Arc<dyn QuotaClient>>,
         usage_reporter: Option<Arc<dyn UsageReporter>>,
     ) -> Self {
+        let callback_verifier = issuer.verifier();
         Self {
             store,
             backends,
@@ -129,6 +156,7 @@ impl FileService {
             quota_client,
             usage_reporter,
             metrics: Arc::new(NoopMetrics),
+            callback_verifier,
         }
     }
 
@@ -142,14 +170,56 @@ impl FileService {
         self
     }
 
+    /// Extend the finalize/report-part callback verifier (returned by
+    /// [`Self::verifier`]) to additionally accept `previous_keys` — raw
+    /// public-key bytes of `signing_key_seed`s that used to be current — on
+    /// top of the issuer's own current key. A no-op when `previous_keys` is
+    /// empty, so every existing call site that doesn't care keeps the
+    /// `new()` default (the issuer's single current key) unchanged.
+    ///
+    /// This only widens what the control plane still **accepts** on those
+    /// two callback routes — minting is unaffected: `Issuer::issue` always
+    /// signs a fresh token with the current key only. See
+    /// `FileStorageConfig::previous_signing_public_keys` and
+    /// `docs/operations.md`'s `signing_key_seed` → Rotation procedure for
+    /// why this exists.
+    ///
+    /// A duplicate of the current key (or within `previous_keys` itself) is
+    /// silently deduped with a `tracing::warn!` — see
+    /// `infra::signed_url::dedupe_public_keys` — rather than rejected;
+    /// `gear.rs` calls this only after `FileStorageConfig::validate()` has
+    /// already rejected a malformed entry, so the only error this can
+    /// plausibly return here is defense in depth, not the primary place a
+    /// misconfiguration is expected to be caught.
+    ///
+    /// # Errors
+    /// Returns an error if any key in `previous_keys` is not a valid-length
+    /// Ed25519 public key (32 bytes).
+    pub fn with_previous_signing_public_keys(
+        mut self,
+        previous_keys: Vec<Vec<u8>>,
+    ) -> Result<Self, DomainError> {
+        if previous_keys.is_empty() {
+            return Ok(self);
+        }
+        let (keys, dropped) =
+            crate::infra::signed_url::dedupe_public_keys(self.issuer.public_key(), previous_keys);
+        if dropped > 0 {
+            tracing::warn!(
+                dropped_duplicates = dropped,
+                "file-storage: previous_signing_public_keys contains keys already accepted by \
+                 the current signing key; dropped \u{2014} a completed signing_key_seed rotation \
+                 usually means the list should be cleared"
+            );
+        }
+        self.callback_verifier = crate::infra::signed_url::Verifier::from_public_keys(keys)?;
+        Ok(self)
+    }
+
     // ── helpers ─────────────────────────────────────────────────────────────
 
     pub(super) fn tenant_scope(ctx: &SecurityContext) -> AccessScope {
         AccessScope::for_tenant(ctx.subject_tenant_id())
-    }
-
-    pub(super) fn backend_path(file_id: Uuid, version_id: Uuid) -> String {
-        format!("/{file_id}/{version_id}")
     }
 
     pub(super) fn validate_gts_type(t: &str) -> Result<(), DomainError> {
@@ -160,12 +230,17 @@ impl FileService {
         }
     }
 
-    /// Return the token verifier backed by the control plane's signing key.
-    /// The data-plane finalize handler uses this to validate the sidecar's
-    /// upload token without knowing the private key.
+    /// Return the token verifier the finalize/report-part callback routes
+    /// use to validate the sidecar's upload token without knowing the
+    /// private key. Accepts the issuer's current key plus, once
+    /// [`Self::with_previous_signing_public_keys`] has been called (as
+    /// `gear.rs` does from `FileStorageConfig::previous_signing_public_keys`),
+    /// any still-retained previous `signing_key_seed` keys — so a rotation
+    /// doesn't reject an in-flight upload's callback the moment the control
+    /// plane restarts on the new seed.
     #[must_use]
     pub fn verifier(&self) -> crate::infra::signed_url::Verifier {
-        self.issuer.verifier()
+        self.callback_verifier.clone()
     }
 
     /// Mint a signed URL for `op` against `v`.
@@ -182,6 +257,20 @@ impl FileService {
         constraints: UploadConstraints,
         download_meta: Option<(String, String)>,
     ) -> Result<String, DomainError> {
+        self.sign_url_with_bind(op, v, constraints, download_meta, false)
+    }
+
+    /// [`Self::sign_url`] with an explicit `bind_on_finalize` claim
+    /// (upload-flow redesign). Only the new-file `create_file` path with
+    /// `bind: "auto"` passes `true` — see `Claims::bind_on_finalize`.
+    pub(super) fn sign_url_with_bind(
+        &self,
+        op: Op,
+        v: &VersionRef,
+        constraints: UploadConstraints,
+        download_meta: Option<(String, String)>,
+        bind_on_finalize: bool,
+    ) -> Result<String, DomainError> {
         // P2 2.13: resolve (and validate) the path segment before doing any
         // signing work, so a rejected `op` never wastes a token mint.
         let verb = content_verb(op)?;
@@ -194,18 +283,30 @@ impl FileService {
         // P2 1.8: mint a fresh correlation id per signed URL. The sidecar
         // echoes it back as `x-request-id` on its finalize callback so both
         // planes' logs can be joined on the same id.
+        // `checked_add`, not a plain `+`: `FileStorageConfig::validate()`
+        // already bounds `default_url_ttl_secs` (transitively, via
+        // `max_url_ttl_secs` <= `MAX_URL_TTL_CEILING`, 30 days), so this
+        // should never actually overflow `i64` -- defense in depth, same
+        // reasoning as `Issuer::issue`'s own `max_exp` computation.
+        let exp = now
+            .unix_timestamp()
+            .checked_add(self.cfg.default_url_ttl_secs)
+            .ok_or_else(|| {
+                DomainError::database("default_url_ttl_secs overflowed computing the token expiry")
+            })?;
         let claims = Claims {
             op,
             file_id: v.file_id,
             version_id: v.version_id,
             backend_id: v.backend_id.clone(),
             backend_path: v.backend_path.clone(),
-            exp: now.unix_timestamp() + self.cfg.default_url_ttl_secs,
+            exp,
             upload: constraints,
             multipart: MultipartClaims::default(),
             request_id: Uuid::now_v7().to_string(),
             content_type,
             etag,
+            bind_on_finalize,
         };
         let token = self.issuer.issue(claims, now)?;
         Ok(format!(
@@ -221,20 +322,14 @@ impl FileService {
     // ── audit helpers (P2-M4) ────────────────────────────────────────────────
 
     /// Extract a stable actor kind string from the `SecurityContext`.
-    // @cpt-begin:cpt-cf-file-storage-algo-audit-trail-build-entry:p1:inst-buildentry-actor-kind
     pub(super) fn actor_kind(ctx: &SecurityContext) -> &'static str {
         match ctx.subject_type() {
             Some("app") => "app",
             _ => "user",
         }
     }
-    // @cpt-end:cpt-cf-file-storage-algo-audit-trail-build-entry:p1:inst-buildentry-actor-kind
 
     /// Build a success audit entry for a file-scoped write operation.
-    ///
-    /// @cpt-cf-file-storage-fr-audit-trail
-    /// @cpt-dod:cpt-cf-file-storage-dod-audit-trail-transactional-write:p1
-    // @cpt-begin:cpt-cf-file-storage-algo-audit-trail-build-entry:p1:inst-buildentry-identity
     pub(super) fn audit_ok(
         ctx: &SecurityContext,
         file_id: Option<Uuid>,
@@ -250,15 +345,11 @@ impl FileService {
             detail,
         )
     }
-    // @cpt-end:cpt-cf-file-storage-algo-audit-trail-build-entry:p1:inst-buildentry-identity
 
     // ── usage reporting helpers (P2-M5) ──────────────────────────────────────
 
     /// Fire-and-forget usage delta report. Failures are logged but never
     /// propagated — a failing usage reporter must not block file operations.
-    ///
-    /// @cpt-cf-file-storage-fr-usage-reporting
-    // @cpt-begin:cpt-cf-file-storage-algo-ownership-transfer-usage-rebalance:p1:inst-rebalance-noop-if-unwired
     pub(super) fn report_usage(&self, delta: UsageDelta) {
         if let Some(reporter) = self.usage_reporter.clone() {
             tokio::spawn(async move {
@@ -266,11 +357,8 @@ impl FileService {
             });
         }
     }
-    // @cpt-end:cpt-cf-file-storage-algo-ownership-transfer-usage-rebalance:p1:inst-rebalance-noop-if-unwired
 
     /// Build a [`FileEvent`] for a write operation.
-    ///
-    /// @cpt-cf-file-storage-fr-file-events
     pub(super) fn make_file_event(
         tenant_id: Uuid,
         owner_id: Uuid,
@@ -328,6 +416,16 @@ pub(super) struct IdempotencyTicket {
     pub(super) file_id: Uuid,
     pub(super) version_id: Uuid,
     pub(super) upload_url: String,
+    /// The `bind` mode actually minted into `upload_url`'s token at the
+    /// original `create_file` call. A replay re-mints the URL with THIS
+    /// value, never with whatever `bind` the retry supplies — see
+    /// `create_file`'s doc comment and its idempotency-replay branch.
+    /// `#[serde(default)]` so a ticket stored before this field existed
+    /// deserializes as `false`: auto-bind did not exist yet when it was
+    /// written, so `false` is the correct historical value, not a
+    /// best-effort guess.
+    #[serde(default)]
+    pub(super) auto_bind: bool,
 }
 
 impl From<IdempotencyTicket> for UploadTicket {

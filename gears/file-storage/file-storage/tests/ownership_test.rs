@@ -10,17 +10,16 @@
 //! 5. A `file.deleted` event is enqueued when a file is deleted.
 //! 6. A `file.content_updated` event is enqueued when content is bound.
 //! 7. Transferring a non-existent file returns `FileNotFound`.
-//!
-//! @cpt-cf-file-storage-fr-ownership-transfer
-//! @cpt-cf-file-storage-fr-file-events
-//! @cpt-cf-file-storage-fr-usage-reporting
-//! @cpt-cf-file-storage-fr-audit-trail
+//! 8. A file deleted between the transfer's commit and its post-commit
+//!    re-read surfaces `FileNotFound`, not a stale patched pre-transfer
+//!    snapshot.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::doc_markdown)]
 
 use std::sync::Arc;
 
 use bytes::Bytes;
+use sea_orm::{ConnectionTrait, Database};
 use sea_orm_migration::MigratorTrait;
 use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
@@ -29,15 +28,69 @@ use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use file_storage::domain::authz::TenantOnlyAuthorizer;
-use file_storage::domain::data_plane::DataPlaneService;
 use file_storage::domain::error::DomainError;
-use file_storage::domain::ports::DataPlanePort;
 use file_storage::domain::service::{FileService, ServiceConfig};
 use file_storage::infra::backend::{BackendRegistry, InMemoryBackend, StorageBackend};
+use file_storage::infra::content::{hash, mime};
 use file_storage::infra::signed_url::Issuer;
 use file_storage::infra::storage::Store;
 use file_storage::infra::storage::migrations::Migrator;
 use file_storage_sdk::{NewFile, OwnerKind};
+
+/// Direct byte-path test double for what `DataPlaneService` used to provide
+/// (removed: production never constructed it — the sidecar is the only real
+/// byte path). Same steps `DataPlaneService::put_content` used to perform,
+/// but through `put_stream` rather than the whole-object `put` that no
+/// longer exists on `StorageBackend`.
+struct TestDataPlane {
+    svc: Arc<FileService>,
+    store: Store,
+    backends: BackendRegistry,
+}
+
+impl TestDataPlane {
+    fn new(svc: Arc<FileService>, store: Store, backends: BackendRegistry) -> Self {
+        Self {
+            svc,
+            store,
+            backends,
+        }
+    }
+
+    async fn put_content(
+        &self,
+        ctx: &SecurityContext,
+        file_id: Uuid,
+        version_id: Uuid,
+        declared_mime: &str,
+        bytes: Bytes,
+    ) -> Result<(), DomainError> {
+        mime::validate(declared_mime, &bytes)?;
+        self.svc.authorize_write(ctx, file_id).await?;
+        let version = self
+            .store
+            .get_version(file_id, version_id)
+            .await?
+            .ok_or_else(|| DomainError::version_not_found(file_id, version_id))?;
+        let backend = self.backends.get(&version.backend_id)?;
+        let len = bytes.len() as u64;
+        let digest = hash::sha256(&bytes);
+        let stream: futures::stream::BoxStream<'static, std::io::Result<Bytes>> =
+            Box::pin(futures::stream::once(async move { Ok(bytes) }));
+        backend
+            .put_stream(&version.backend_path, stream, Some(len))
+            .await?;
+        self.svc
+            .finalize_upload(
+                ctx,
+                file_id,
+                version_id,
+                i64::try_from(len).unwrap_or(i64::MAX),
+                digest,
+            )
+            .await
+    }
+}
 
 const GTS: &str = gts_id!("cf.fstorage.file.type.v1~x.test.file.type.v1~");
 
@@ -60,7 +113,7 @@ async fn build_db() -> Arc<DBProvider<DbError>> {
     Arc::new(DBProvider::new(db))
 }
 
-async fn build_service() -> (Arc<FileService>, DataPlaneService, Store) {
+async fn build_service() -> (Arc<FileService>, TestDataPlane, Store) {
     let db = build_db().await;
     let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
     let backends = BackendRegistry::new(vec![backend], "mem").expect("registry");
@@ -76,14 +129,14 @@ async fn build_service() -> (Arc<FileService>, DataPlaneService, Store) {
     let store = Store::new(Arc::clone(&db));
     let svc = Arc::new(FileService::new(
         store.clone(),
-        backends,
+        backends.clone(),
         issuer,
         authorizer,
         cfg,
         None,
         None,
     ));
-    let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
+    let dp = TestDataPlane::new(Arc::clone(&svc), store.clone(), backends);
     (svc, dp, store)
 }
 
@@ -108,7 +161,6 @@ fn new_file_for(owner_id: Uuid) -> NewFile {
 
 // ── 1. transfer_ownership updates the file row ─────────────────────────────────
 
-/// @cpt-cf-file-storage-fr-ownership-transfer
 #[tokio::test]
 async fn transfer_ownership_updates_owner_fields() {
     let (svc, _dp, _store) = build_service().await;
@@ -118,13 +170,13 @@ async fn transfer_ownership_updates_owner_fields() {
     let new_owner = Uuid::now_v7();
 
     let ticket = svc
-        .create_file(&ctx, new_file_for(original_owner), None)
+        .create_file(&ctx, new_file_for(original_owner), None, false)
         .await
         .unwrap();
     let file_id = ticket.file_id;
 
     // Transfer ownership.
-    let updated = svc
+    let (updated, _meta) = svc
         .transfer_ownership(&ctx, file_id, OwnerKind::App, new_owner)
         .await
         .unwrap();
@@ -141,8 +193,6 @@ async fn transfer_ownership_updates_owner_fields() {
 
 // ── 2. transfer_ownership writes a TransferOwnership audit row ─────────────────
 
-/// @cpt-cf-file-storage-fr-audit-trail
-/// @cpt-cf-file-storage-fr-ownership-transfer
 #[tokio::test]
 async fn transfer_ownership_leaves_audit_row() {
     let (svc, _dp, store) = build_service().await;
@@ -152,7 +202,7 @@ async fn transfer_ownership_leaves_audit_row() {
     let new_owner = Uuid::now_v7();
 
     let ticket = svc
-        .create_file(&ctx, new_file_for(original_owner), None)
+        .create_file(&ctx, new_file_for(original_owner), None, false)
         .await
         .unwrap();
     let file_id = ticket.file_id;
@@ -178,8 +228,6 @@ async fn transfer_ownership_leaves_audit_row() {
 
 // ── 3. transfer_ownership enqueues a file event ────────────────────────────────
 
-/// @cpt-cf-file-storage-fr-file-events
-/// @cpt-cf-file-storage-fr-ownership-transfer
 #[tokio::test]
 async fn transfer_ownership_enqueues_file_event() {
     let (svc, _dp, store) = build_service().await;
@@ -189,7 +237,7 @@ async fn transfer_ownership_enqueues_file_event() {
     let new_owner = Uuid::now_v7();
 
     let ticket = svc
-        .create_file(&ctx, new_file_for(original_owner), None)
+        .create_file(&ctx, new_file_for(original_owner), None, false)
         .await
         .unwrap();
     let file_id = ticket.file_id;
@@ -220,7 +268,6 @@ async fn transfer_ownership_enqueues_file_event() {
 
 // ── 4. create_file enqueues a file.created event ──────────────────────────────
 
-/// @cpt-cf-file-storage-fr-file-events
 #[tokio::test]
 async fn create_file_enqueues_created_event() {
     let (svc, _dp, store) = build_service().await;
@@ -229,7 +276,7 @@ async fn create_file_enqueues_created_event() {
     let owner = Uuid::now_v7();
 
     let ticket = svc
-        .create_file(&ctx, new_file_for(owner), None)
+        .create_file(&ctx, new_file_for(owner), None, false)
         .await
         .unwrap();
     let file_id = ticket.file_id;
@@ -251,7 +298,6 @@ async fn create_file_enqueues_created_event() {
 
 // ── 5. delete_file enqueues a file.deleted event ──────────────────────────────
 
-/// @cpt-cf-file-storage-fr-file-events
 #[tokio::test]
 async fn delete_file_enqueues_deleted_event() {
     let (svc, dp, store) = build_service().await;
@@ -260,7 +306,7 @@ async fn delete_file_enqueues_deleted_event() {
     let owner = Uuid::now_v7();
 
     let ticket = svc
-        .create_file(&ctx, new_file_for(owner), None)
+        .create_file(&ctx, new_file_for(owner), None, false)
         .await
         .unwrap();
     let file_id = ticket.file_id;
@@ -305,7 +351,6 @@ async fn delete_file_enqueues_deleted_event() {
 
 // ── 6. bind enqueues a file.content_updated event ────────────────────────────
 
-/// @cpt-cf-file-storage-fr-file-events
 #[tokio::test]
 async fn bind_enqueues_content_updated_event() {
     let (svc, dp, store) = build_service().await;
@@ -314,7 +359,7 @@ async fn bind_enqueues_content_updated_event() {
     let owner = Uuid::now_v7();
 
     let ticket = svc
-        .create_file(&ctx, new_file_for(owner), None)
+        .create_file(&ctx, new_file_for(owner), None, false)
         .await
         .unwrap();
     let file_id = ticket.file_id;
@@ -350,7 +395,6 @@ async fn bind_enqueues_content_updated_event() {
 
 // ── 7. transfer_ownership on a non-existent file returns FileNotFound ──────────
 
-/// @cpt-cf-file-storage-fr-ownership-transfer
 #[tokio::test]
 async fn transfer_ownership_non_existent_file_returns_not_found() {
     let (svc, _dp, _store) = build_service().await;
@@ -373,9 +417,6 @@ async fn transfer_ownership_non_existent_file_returns_not_found() {
 
 /// Verify the transactional invariant: if the update returns false (no row
 /// found), neither an audit row nor an event row is written.
-///
-/// @cpt-cf-file-storage-fr-ownership-transfer
-/// @cpt-cf-file-storage-fr-file-events
 #[tokio::test]
 async fn transfer_ownership_no_row_means_no_audit_and_no_event() {
     let (svc, _dp, store) = build_service().await;
@@ -409,8 +450,6 @@ async fn transfer_ownership_no_row_means_no_audit_and_no_event() {
 /// SDK), so it cannot verify `new_owner_id` names a real, same-tenant
 /// principal. The minimal guard it can enforce is rejecting the nil UUID as
 /// an obviously malformed target owner.
-///
-/// @cpt-cf-file-storage-fr-ownership-transfer
 #[tokio::test]
 async fn transfer_to_malformed_owner_is_rejected() {
     let (svc, _dp, _store) = build_service().await;
@@ -419,7 +458,7 @@ async fn transfer_to_malformed_owner_is_rejected() {
     let original_owner = Uuid::now_v7();
 
     let ticket = svc
-        .create_file(&ctx, new_file_for(original_owner), None)
+        .create_file(&ctx, new_file_for(original_owner), None, false)
         .await
         .unwrap();
     let file_id = ticket.file_id;
@@ -445,8 +484,6 @@ async fn transfer_to_malformed_owner_is_rejected() {
 /// Positive control: a well-formed `new_owner_id` — which, on this endpoint,
 /// is always recorded under the caller's own tenant since `tenant_id` comes
 /// from the existing file/`ctx`, never from the request — is accepted.
-///
-/// @cpt-cf-file-storage-fr-ownership-transfer
 #[tokio::test]
 async fn transfer_to_same_tenant_member_succeeds() {
     let (svc, _dp, _store) = build_service().await;
@@ -456,12 +493,12 @@ async fn transfer_to_same_tenant_member_succeeds() {
     let new_owner = Uuid::now_v7();
 
     let ticket = svc
-        .create_file(&ctx, new_file_for(original_owner), None)
+        .create_file(&ctx, new_file_for(original_owner), None, false)
         .await
         .unwrap();
     let file_id = ticket.file_id;
 
-    let updated = svc
+    let (updated, _meta) = svc
         .transfer_ownership(&ctx, file_id, OwnerKind::User, new_owner)
         .await
         .unwrap();
@@ -470,5 +507,174 @@ async fn transfer_to_same_tenant_member_succeeds() {
     assert_eq!(
         updated.tenant_id, tenant,
         "the transferred file stays in the caller's tenant"
+    );
+}
+
+// ── 11. transfer_ownership's response reflects the committed swap ─────────────
+
+/// The `(File, custom metadata)` returned by `transfer_ownership` must reflect
+/// the just-*committed* state — read back after the transaction under the
+/// tenant-only `prefetch` scope — rather than the pre-transfer snapshot
+/// patched in memory. Regression test for a verifier finding: the prior
+/// implementation returned the pre-transfer row with only `owner_kind`/
+/// `owner_id`/`last_modified_at` patched locally, so a concurrent
+/// `PATCH /files/{id}` landing between the prefetch and the transfer's commit
+/// would have its `meta_version`/`content_id`/custom-metadata changes
+/// silently dropped from the transfer response. This test forces exactly
+/// that: it bumps `meta_version` and attaches custom metadata via
+/// `update_metadata` *before* calling `transfer_ownership`, then asserts the
+/// transfer response carries that state and matches an independent re-read
+/// of the row/metadata.
+#[tokio::test]
+async fn transfer_ownership_response_reflects_committed_swap() {
+    let (svc, _dp, store) = build_service().await;
+    let tenant = Uuid::now_v7();
+    let ctx = ctx(tenant);
+    let original_owner = Uuid::now_v7();
+    let new_owner = Uuid::now_v7();
+
+    let ticket = svc
+        .create_file(&ctx, new_file_for(original_owner), None, false)
+        .await
+        .unwrap();
+    let file_id = ticket.file_id;
+    let before = svc.get_file(&ctx, file_id).await.unwrap();
+
+    // Bump meta_version and attach custom metadata ahead of the transfer, so
+    // a response built from the pre-transfer snapshot is distinguishable
+    // from one built from a post-commit re-read.
+    svc.update_metadata(
+        &ctx,
+        file_id,
+        file_storage_sdk::CustomMetadataPatch {
+            entries: vec![("k1".to_owned(), Some("v1".to_owned()))],
+        },
+        None,
+    )
+    .await
+    .unwrap();
+
+    let (updated, updated_meta) = svc
+        .transfer_ownership(&ctx, file_id, OwnerKind::App, new_owner)
+        .await
+        .unwrap();
+
+    assert_eq!(updated.owner_kind.as_str(), "app");
+    assert_eq!(updated.owner_id, new_owner);
+    assert!(
+        updated.last_modified_at >= before.last_modified_at,
+        "last_modified_at must be bumped (or at least not regress) by the transfer"
+    );
+    assert!(
+        updated.meta_version > before.meta_version,
+        "meta_version must reflect the pre-transfer metadata update, not the original snapshot"
+    );
+
+    // Independent re-read of the row (same tenant-only scope the service
+    // itself re-reads under) and of the metadata table must agree with what
+    // transfer_ownership returned.
+    let tenant_scope = toolkit_security::AccessScope::for_tenant(tenant);
+    let reread = store.require_file(&tenant_scope, file_id).await.unwrap();
+    assert_eq!(reread.owner_id, updated.owner_id);
+    assert_eq!(reread.owner_kind, updated.owner_kind);
+    assert_eq!(reread.last_modified_at, updated.last_modified_at);
+    assert_eq!(reread.meta_version, updated.meta_version);
+    assert_eq!(reread.content_id, updated.content_id);
+
+    let stored_meta = store.list_metadata(file_id).await.unwrap();
+    assert!(
+        !stored_meta.is_empty(),
+        "test setup must have written metadata"
+    );
+    assert_eq!(updated_meta, stored_meta);
+}
+
+// ── 12. transfer_ownership must not return stale data for a file deleted ───────
+//        mid-transfer ──────────────────────────────────────────────────────────
+
+/// Regression test for a verifier finding: if a concurrent `DELETE` removes
+/// the file row between `transfer_ownership_atomic`'s commit and
+/// `transfer_ownership`'s subsequent re-read, the transfer is already
+/// committed (audit row, usage deltas) but the resource it describes no
+/// longer exists. The prior implementation's fallback patched the
+/// pre-transfer in-memory snapshot (owner fields swapped) and returned it as
+/// an ordinary success — indistinguishable from a genuine, still-existing
+/// transfer.
+///
+/// This simulates the race deterministically (rather than via a flaky
+/// wall-clock/thread race) with a `SQLite` trigger that deletes the file row
+/// as part of the very same `UPDATE ... SET owner_id = ...` statement
+/// `transfer_ownership_atomic` issues: by the time that statement's
+/// transaction commits, the row is already gone, exactly as a genuinely
+/// concurrent `DELETE` racing the commit would leave it. `AFTER UPDATE OF
+/// owner_id` only fires for the ownership-transfer `UPDATE`, not the file's
+/// initial `INSERT` (`create_file` above).
+#[tokio::test]
+async fn transfer_ownership_returns_not_found_when_file_deleted_mid_transfer() {
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "cf-fs-ownership-race-test-{}.db",
+        Uuid::now_v7().simple()
+    ));
+    let dsn = format!("sqlite://{}?mode=rwc", path.display());
+    let opts = ConnectOpts {
+        max_conns: Some(1),
+        min_conns: Some(1),
+        ..Default::default()
+    };
+    let db = connect_db(&dsn, opts).await.expect("connect sqlite");
+    run_migrations_for_testing(&db, Migrator::migrations())
+        .await
+        .expect("migrations");
+    let db = Arc::new(DBProvider::new(db));
+
+    let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let backends = BackendRegistry::new(vec![backend], "mem").expect("registry");
+    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let authorizer = Arc::new(TenantOnlyAuthorizer);
+    let cfg = ServiceConfig {
+        default_url_ttl_secs: 3600,
+        sidecar_base_url: "http://sidecar.test".to_owned(),
+        default_page_size: 50,
+        max_page_size: 1000,
+        idempotency_ttl_secs: 86400,
+    };
+    let store = Store::new(Arc::clone(&db));
+    let svc = Arc::new(FileService::new(
+        store, backends, issuer, authorizer, cfg, None, None,
+    ));
+
+    let tenant = Uuid::now_v7();
+    let ctx = ctx(tenant);
+    let original_owner = Uuid::now_v7();
+    let new_owner = Uuid::now_v7();
+
+    let ticket = svc
+        .create_file(&ctx, new_file_for(original_owner), None, false)
+        .await
+        .unwrap();
+    let file_id = ticket.file_id;
+
+    // A separate raw connection to the same database file, used only to
+    // install the race-simulating trigger -- the service itself keeps using
+    // its own pooled connection (`db`/`store` above).
+    let conn = Database::connect(&dsn).await.expect("raw connect");
+    conn.execute_unprepared(
+        "CREATE TRIGGER trg_delete_after_owner_transfer \
+         AFTER UPDATE OF owner_id ON files \
+         FOR EACH ROW \
+         BEGIN DELETE FROM files WHERE file_id = NEW.file_id; END;",
+    )
+    .await
+    .expect("install race-simulating trigger");
+
+    let result = svc
+        .transfer_ownership(&ctx, file_id, OwnerKind::App, new_owner)
+        .await;
+
+    assert!(
+        matches!(result, Err(DomainError::FileNotFound { .. })),
+        "a file deleted between the transfer's commit and its post-commit re-read must \
+         surface FileNotFound, not a patched stale success: {result:?}"
     );
 }

@@ -8,9 +8,11 @@ use file_storage_sdk::ByteRange;
 use futures::stream::{self, BoxStream};
 use tempfile::TempDir;
 
-use super::S3Backend;
+use reqwest::StatusCode;
+
+use super::{S3Backend, is_transient_s3};
 use crate::infra::backend::StorageBackend;
-use crate::infra::backend::backend_tests::assert_backend_contract;
+use crate::infra::backend::backend_tests::{assert_backend_contract, read_all, write_all};
 use crate::infra::content::hash;
 
 const TEST_ACCESS_KEY: &str = "test-access-key";
@@ -116,12 +118,12 @@ async fn s3_backend_get_stream_reassembles_large_object() {
     let payload: Vec<u8> = (0..300_000)
         .map(|i| u8::try_from(i % 256).unwrap())
         .collect();
-    backend
-        .put("large/obj", Bytes::from(payload.clone()))
+    write_all(&backend, "large/obj", Bytes::from(payload.clone())).await;
+
+    let mut stream = backend
+        .get_stream("large/obj", payload.len() as u64)
         .await
         .unwrap();
-
-    let mut stream = backend.get_stream("large/obj").await.unwrap();
     let mut collected = Vec::new();
     while let Some(chunk) = stream.next().await {
         collected.extend_from_slice(&chunk.unwrap());
@@ -135,7 +137,23 @@ async fn s3_backend_get_stream_missing_object_errors() {
     let bucket = unique_bucket();
     let backend = make_backend(addr, &dir, &bucket).await;
 
-    assert!(backend.get_stream("nope/nope").await.is_err());
+    assert!(backend.get_stream("nope/nope", 0).await.is_err());
+}
+
+/// Collect `backend.get_range_stream(path, range, expected_len)`'s chunks
+/// into one `Bytes` — the test-only stand-in for the whole-range `get_range`
+/// the trait no longer has.
+async fn range_all(backend: &S3Backend, path: &str, range: ByteRange, expected_len: u64) -> Bytes {
+    use futures::StreamExt;
+    let mut stream = backend
+        .get_range_stream(path, range, expected_len)
+        .await
+        .unwrap();
+    let mut buf = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        buf.extend_from_slice(&chunk.unwrap());
+    }
+    Bytes::from(buf)
 }
 
 #[tokio::test]
@@ -144,27 +162,26 @@ async fn s3_backend_get_range_returns_native_partial_content() {
     let bucket = unique_bucket();
     let backend = make_backend(addr, &dir, &bucket).await;
 
-    backend
-        .put("range-obj", Bytes::from_static(b"0123456789abcdef"))
-        .await
-        .unwrap();
+    write_all(
+        &backend,
+        "range-obj",
+        Bytes::from_static(b"0123456789abcdef"),
+    )
+    .await;
 
-    let inclusive = backend
-        .get_range("range-obj", ByteRange::Inclusive { start: 3, end: 7 })
-        .await
-        .unwrap();
+    let inclusive = range_all(
+        &backend,
+        "range-obj",
+        ByteRange::Inclusive { start: 3, end: 7 },
+        5,
+    )
+    .await;
     assert_eq!(inclusive, Bytes::from_static(b"34567"));
 
-    let suffix = backend
-        .get_range("range-obj", ByteRange::Suffix { length: 4 })
-        .await
-        .unwrap();
+    let suffix = range_all(&backend, "range-obj", ByteRange::Suffix { length: 4 }, 4).await;
     assert_eq!(suffix, Bytes::from_static(b"cdef"));
 
-    let open_ended = backend
-        .get_range("range-obj", ByteRange::OpenEnded { start: 12 })
-        .await
-        .unwrap();
+    let open_ended = range_all(&backend, "range-obj", ByteRange::OpenEnded { start: 12 }, 4).await;
     assert_eq!(open_ended, Bytes::from_static(b"cdef"));
 }
 
@@ -174,10 +191,7 @@ async fn s3_backend_delete_is_idempotent() {
     let bucket = unique_bucket();
     let backend = make_backend(addr, &dir, &bucket).await;
 
-    backend
-        .put("to-delete", Bytes::from_static(b"gone soon"))
-        .await
-        .unwrap();
+    write_all(&backend, "to-delete", Bytes::from_static(b"gone soon")).await;
     backend.delete("to-delete").await.unwrap();
     // Second delete on an already-missing key: S3's DeleteObject returns a
     // success status regardless, so this must still be `Ok`.
@@ -193,14 +207,11 @@ async fn s3_backend_exists_distinguishes_missing_from_error() {
 
     assert!(!backend.exists("never-uploaded").await.unwrap());
 
-    backend
-        .put("now-present", Bytes::from_static(b"x"))
-        .await
-        .unwrap();
+    write_all(&backend, "now-present", Bytes::from_static(b"x")).await;
     assert!(backend.exists("now-present").await.unwrap());
 }
 
-/// P2 1.6: `is_ready` against a reachable, correctly-authenticated `s3s-fs`
+/// `is_ready` against a reachable, correctly-authenticated `s3s-fs`
 /// endpoint with an existing (empty) bucket must succeed — `ListObjectsV2`
 /// returns `200` with an empty listing, which `is_ready` must treat as
 /// "ready".
@@ -216,7 +227,7 @@ async fn s3_is_ready_ok_against_s3s_fs() {
         .expect("is_ready must succeed against a reachable, authenticated endpoint");
 }
 
-/// P2 1.6: `is_ready` against an endpoint nothing listens on must fail
+/// `is_ready` against an endpoint nothing listens on must fail
 /// (transport error), not silently report ready.
 #[tokio::test]
 async fn s3_is_ready_err_against_closed_port() {
@@ -291,10 +302,12 @@ async fn s3_backend_list_paths_paginates_across_continuation_token() {
     let mut expected: Vec<String> = Vec::new();
     for i in 0..5 {
         let path = format!("file-{i}/version-{i}");
-        backend
-            .put(&path, Bytes::from(format!("payload-{i}").into_bytes()))
-            .await
-            .unwrap();
+        write_all(
+            &backend,
+            &path,
+            Bytes::from(format!("payload-{i}").into_bytes()),
+        )
+        .await;
         expected.push(format!("/{path}"));
     }
 
@@ -321,21 +334,54 @@ async fn s3_backend_multipart_initiate_upload_complete_round_trip() {
     let path = "multipart/round-trip";
     let upload_handle = backend.initiate_multipart(path).await.unwrap();
 
-    // ADR-0006: `upload_part` now takes each part's byte offset within the
-    // assembled object (part1 @ 0, part2 @ 5 MiB, part3 @ 10 MiB).
+    // ADR-0006: `upload_part_stream` takes each part's byte offset within the
+    // assembled object (part1 @ 0, part2 @ 5 MiB, part3 @ 10 MiB), and now
+    // streams the part rather than taking it as one `Bytes` buffer — each
+    // part here is fed through as two chunks, proving the streaming path
+    // assembles/hashes multi-chunk input correctly, not just a single-chunk
+    // stream.
     let off1 = 0u64;
     let off2 = part_size as u64;
     let off3 = 2 * part_size as u64;
+    let split_stream = |data: &[u8]| -> BoxStream<'static, std::io::Result<Bytes>> {
+        #[allow(clippy::integer_division)]
+        let mid = data.len() / 2;
+        chunk_stream(vec![
+            Bytes::from(data[..mid].to_vec()),
+            Bytes::from(data[mid..].to_vec()),
+        ])
+    };
     let (etag1, hash1) = backend
-        .upload_part(path, &upload_handle, 1, off1, Bytes::from(part1.clone()))
+        .upload_part_stream(
+            path,
+            &upload_handle,
+            1,
+            off1,
+            split_stream(&part1),
+            part1.len() as u64,
+        )
         .await
         .unwrap();
     let (etag2, hash2) = backend
-        .upload_part(path, &upload_handle, 2, off2, Bytes::from(part2.clone()))
+        .upload_part_stream(
+            path,
+            &upload_handle,
+            2,
+            off2,
+            split_stream(&part2),
+            part2.len() as u64,
+        )
         .await
         .unwrap();
     let (etag3, hash3) = backend
-        .upload_part(path, &upload_handle, 3, off3, Bytes::from(part3.clone()))
+        .upload_part_stream(
+            path,
+            &upload_handle,
+            3,
+            off3,
+            split_stream(&part3),
+            part3.len() as u64,
+        )
         .await
         .unwrap();
 
@@ -381,12 +427,12 @@ async fn s3_backend_multipart_initiate_upload_complete_round_trip() {
     );
     assert_eq!(root, expected_manifest.root());
 
-    // A subsequent `get()` returns the full assembled object.
+    // A subsequent read-back returns the full assembled object.
     let mut expected_bytes = Vec::with_capacity(part1.len() + part2.len() + part3.len());
     expected_bytes.extend_from_slice(&part1);
     expected_bytes.extend_from_slice(&part2);
     expected_bytes.extend_from_slice(&part3);
-    let got = backend.get(path).await.unwrap();
+    let got = read_all(&backend, path, expected_bytes.len() as u64).await;
     assert_eq!(got.as_ref(), expected_bytes.as_slice());
 
     // Secondary/state-artifact check: the s3s-fs backing file matches.
@@ -401,6 +447,59 @@ async fn s3_backend_multipart_initiate_upload_complete_round_trip() {
     assert_eq!(raw, expected_bytes);
 }
 
+/// A part stream that yields fewer bytes than its declared `len` must be
+/// rejected -- `upload_part_stream` must never report a part uploaded off of
+/// an unverified length, since S3's own `UploadPart` needs the declared
+/// length to be exact (this gear's `hashing_length_guard` is what actually
+/// enforces it, layered under the HTTP request body).
+#[tokio::test]
+async fn s3_backend_upload_part_stream_rejects_undersized_stream() {
+    let (addr, dir) = start_s3s_fs().await;
+    let bucket = unique_bucket();
+    let backend = make_backend(addr, &dir, &bucket).await;
+
+    let path = "multipart/undersized";
+    let upload_handle = backend.initiate_multipart(path).await.unwrap();
+
+    // Declares 5 MiB (S3's minimum part size) but the stream only ever
+    // yields 10 bytes -- the request body ends far short of the
+    // `Content-Length` this backend sent, which must surface as an error
+    // rather than a "successfully uploaded" part.
+    let declared_len = 5 * 1024 * 1024;
+    let short_stream = chunk_stream(vec![Bytes::from_static(b"0123456789")]);
+    let result = backend
+        .upload_part_stream(path, &upload_handle, 1, 0, short_stream, declared_len)
+        .await;
+    assert!(
+        result.is_err(),
+        "a part stream shorter than its declared len must be rejected, not treated as uploaded"
+    );
+}
+
+/// A part stream that yields more bytes than its declared `len` must be
+/// rejected the same way -- `hashing_length_guard` withholds any byte past
+/// the declared boundary, so the request body itself ends up short against
+/// its own `Content-Length` and the part must not be treated as uploaded.
+#[tokio::test]
+async fn s3_backend_upload_part_stream_rejects_oversized_stream() {
+    let (addr, dir) = start_s3s_fs().await;
+    let bucket = unique_bucket();
+    let backend = make_backend(addr, &dir, &bucket).await;
+
+    let path = "multipart/oversized";
+    let upload_handle = backend.initiate_multipart(path).await.unwrap();
+
+    let declared_len = 5u64;
+    let long_stream = chunk_stream(vec![Bytes::from_static(b"0123456789")]); // 10 bytes > 5
+    let result = backend
+        .upload_part_stream(path, &upload_handle, 1, 0, long_stream, declared_len)
+        .await;
+    assert!(
+        result.is_err(),
+        "a part stream longer than its declared len must be rejected, not treated as uploaded"
+    );
+}
+
 #[tokio::test]
 async fn s3_backend_multipart_abort_discards_parts() {
     let (addr, dir) = start_s3s_fs().await;
@@ -409,21 +508,17 @@ async fn s3_backend_multipart_abort_discards_parts() {
 
     let path = "multipart/aborted";
     let upload_handle = backend.initiate_multipart(path).await.unwrap();
+    let data = Bytes::from_static(b"never completed");
+    let len = data.len() as u64;
     backend
-        .upload_part(
-            path,
-            &upload_handle,
-            1,
-            0,
-            Bytes::from_static(b"never completed"),
-        )
+        .upload_part_stream(path, &upload_handle, 1, 0, chunk_stream(vec![data]), len)
         .await
         .unwrap();
 
     backend.abort_multipart(path, &upload_handle).await.unwrap();
 
     // The object was never completed, so it must not exist.
-    assert!(backend.get(path).await.is_err());
+    assert_eq!(backend.stat(path).await.unwrap(), None);
     assert!(!backend.exists(path).await.unwrap());
 }
 
@@ -444,7 +539,14 @@ async fn s3_backend_upload_part_rejects_part_number_outside_s3_limits() {
     .expect("construct S3Backend");
 
     let over_limit = backend
-        .upload_part("some/path", "handle", 10_001, 0, Bytes::from_static(b"x"))
+        .upload_part_stream(
+            "some/path",
+            "handle",
+            10_001,
+            0,
+            chunk_stream(vec![Bytes::from_static(b"x")]),
+            1,
+        )
         .await;
     assert!(
         over_limit.is_err(),
@@ -452,7 +554,14 @@ async fn s3_backend_upload_part_rejects_part_number_outside_s3_limits() {
     );
 
     let zero = backend
-        .upload_part("some/path", "handle", 0, 0, Bytes::from_static(b"x"))
+        .upload_part_stream(
+            "some/path",
+            "handle",
+            0,
+            0,
+            chunk_stream(vec![Bytes::from_static(b"x")]),
+            1,
+        )
         .await;
     assert!(
         zero.is_err(),
@@ -460,7 +569,8 @@ async fn s3_backend_upload_part_rejects_part_number_outside_s3_limits() {
     );
 }
 
-/// Box a fixed set of chunks into the `BoxStream` shape `put_stream` expects.
+/// Box a fixed set of chunks into the `BoxStream` shape `put_stream`/
+/// `upload_part_stream` expect.
 fn chunk_stream(chunks: Vec<Bytes>) -> BoxStream<'static, std::io::Result<Bytes>> {
     Box::pin(stream::iter(chunks.into_iter().map(Ok)))
 }
@@ -487,7 +597,7 @@ async fn s3_backend_put_stream_small_uses_single_put() {
     assert_eq!(bytes_written, total_len);
     assert_eq!(digest, hash::digest_to_array(hash::sha256(&concatenated)));
 
-    let got = backend.get(path).await.unwrap();
+    let got = read_all(&backend, path, total_len).await;
     assert_eq!(got.as_ref(), concatenated.as_slice());
 
     // Secondary/state-artifact check: a single plain object landed on disk
@@ -531,9 +641,9 @@ async fn s3_backend_put_stream_large_uses_multipart() {
     assert_eq!(bytes_written, total_len);
     assert_eq!(digest, hash::digest_to_array(hash::sha256(&concatenated)));
 
-    // `get()` returns the fully assembled object, matching the concatenated
-    // input exactly.
-    let got = backend.get(path).await.unwrap();
+    // A read-back returns the fully assembled object, matching the
+    // concatenated input exactly.
+    let got = read_all(&backend, path, total_len).await;
     assert_eq!(got.as_ref(), concatenated.as_slice());
 
     // The incrementally-computed digest `put_stream` returned must agree
@@ -576,5 +686,182 @@ async fn s3_backend_put_stream_enforces_max_size_mid_stream() {
     // multipart session initiated for the first chunk was aborted rather
     // than left dangling.
     assert!(!backend.exists(path).await.unwrap());
-    assert!(backend.get(path).await.is_err());
+    assert_eq!(backend.stat(path).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn s3_backend_publish_exclusive_single_put_rejects_overwrite() {
+    let (addr, dir) = start_s3s_fs().await;
+    let bucket = unique_bucket();
+    // Stays under the default 8 MiB threshold → single-`PutObject` path with
+    // `If-None-Match: *`.
+    let backend = make_backend(addr, &dir, &bucket).await;
+
+    let path = "publish-exclusive/small";
+    let first: &[u8] = b"the original immutable blob";
+    let second: &[u8] = b"a replay attempt with different bytes";
+
+    // First publish to a fresh path creates the object.
+    let outcome = backend
+        .publish_exclusive(path, chunk_stream(vec![Bytes::from_static(first)]), None)
+        .await
+        .expect("first publish_exclusive should succeed");
+    assert!(outcome.created, "first publish must report created = true");
+    assert_eq!(outcome.bytes_written, first.len() as u64);
+    assert_eq!(outcome.digest, hash::digest_to_array(hash::sha256(first)));
+
+    // A second publish to the same path (a replayed PUT token) must NOT
+    // overwrite: s3s-fs honours `If-None-Match: *` with a 412, which maps to
+    // `created = false`. `bytes_written`/`digest` still describe this attempt.
+    let outcome2 = backend
+        .publish_exclusive(path, chunk_stream(vec![Bytes::from_static(second)]), None)
+        .await
+        .expect("second publish_exclusive must return Ok(created=false), not an error");
+    assert!(
+        !outcome2.created,
+        "second publish to an existing path must report created = false"
+    );
+    assert_eq!(outcome2.bytes_written, second.len() as u64);
+
+    // The immutability guarantee: the stored bytes are still the FIRST blob.
+    let got = read_all(&backend, path, first.len() as u64).await;
+    assert_eq!(
+        got.as_ref(),
+        first,
+        "the original bytes must survive the rejected overwrite"
+    );
+}
+
+#[tokio::test]
+async fn s3_backend_publish_exclusive_multipart_rejects_overwrite() {
+    let (addr, dir) = start_s3s_fs().await;
+    let bucket = unique_bucket();
+    // Small threshold so an 11 MiB stream takes the native-multipart path,
+    // whose terminal `CompleteMultipartUpload` carries `If-None-Match: *`.
+    let part_size: u64 = 5 * 1024 * 1024;
+    let backend = make_backend(addr, &dir, &bucket)
+        .await
+        .with_multipart_threshold_bytes(part_size);
+
+    let chunk_size = 1024 * 1024;
+    let num_chunks: u8 = 11;
+    let first_chunks: Vec<Bytes> = (0..num_chunks)
+        .map(|i| Bytes::from(vec![b'a' + i; chunk_size]))
+        .collect();
+    let first_concat: Vec<u8> = first_chunks.iter().flat_map(|c| c.to_vec()).collect();
+
+    let path = "publish-exclusive/large";
+    let outcome = backend
+        .publish_exclusive(path, chunk_stream(first_chunks), None)
+        .await
+        .expect("first multipart publish_exclusive should succeed");
+    assert!(outcome.created, "first multipart publish must create");
+    assert_eq!(outcome.bytes_written, first_concat.len() as u64);
+
+    // Second multipart publish to the same path: `CompleteMultipartUpload`
+    // gets a 412, and the just-opened multipart session is aborted rather than
+    // leaked (no orphan session/parts left behind).
+    let second_chunks: Vec<Bytes> = (0..num_chunks)
+        .map(|i| Bytes::from(vec![b'z' - i; chunk_size]))
+        .collect();
+    let outcome2 = backend
+        .publish_exclusive(path, chunk_stream(second_chunks), None)
+        .await
+        .expect("second multipart publish must return Ok(created=false)");
+    assert!(
+        !outcome2.created,
+        "second multipart publish to an existing path must report created = false"
+    );
+
+    // The original assembled object is intact.
+    let got = read_all(&backend, path, first_concat.len() as u64).await;
+    assert_eq!(
+        got.as_ref(),
+        first_concat.as_slice(),
+        "the original multipart object must survive the rejected overwrite"
+    );
+}
+
+// A genuinely-concurrent (barrier-synchronized) `publish_exclusive` racer
+// test, mirroring `local_fs_publish_exclusive_concurrent_racers_never_mix` /
+// `in_memory_publish_exclusive_concurrent_racers_never_mix` above, is
+// deliberately NOT included here: `s3s-fs`'s own `PutObject` handler checks
+// `If-None-Match: *` via a plain `object_path.exists()` call and only writes
+// the file afterwards, with no lock spanning the two -- the same
+// check-then-write race `StorageBackend::publish_exclusive`'s own doc comment
+// describes as its non-atomic fallback shape. Two truly concurrent
+// `publish_exclusive` calls against `s3s-fs` can both observe "does not
+// exist" and both report `created: true`, which is a limitation of this
+// in-process test double, not of `S3Backend` (which sends the same
+// conditional header real S3 relies on) -- so a hard "exactly one winner"
+// assertion here would test `s3s-fs`'s own race, not this crate's code, and
+// would be flaky by construction. `S3Backend`'s conditional-write header is
+// still covered sequentially by
+// `s3_backend_publish_exclusive_single_put_rejects_overwrite` /
+// `s3_backend_publish_exclusive_multipart_rejects_overwrite` above; genuine
+// concurrent-write atomicity against a real S3-compatible endpoint is a
+// deployment-specific property validated as part of ADR-0005's release gate
+// (see `StorageBackend::publish_exclusive`'s doc comment), not something an
+// in-process unit test can establish.
+
+// ── `is_transient_s3` classification ───────────────────────────────────────
+
+#[test]
+fn is_transient_s3_true_for_5xx_and_throttling_status() {
+    assert!(is_transient_s3(StatusCode::SERVICE_UNAVAILABLE, None));
+    assert!(is_transient_s3(StatusCode::INTERNAL_SERVER_ERROR, None));
+    assert!(is_transient_s3(StatusCode::BAD_GATEWAY, None));
+    assert!(is_transient_s3(StatusCode::GATEWAY_TIMEOUT, None));
+    assert!(is_transient_s3(StatusCode::TOO_MANY_REQUESTS, None));
+}
+
+#[test]
+fn is_transient_s3_true_for_transient_s3_error_codes() {
+    // A transient S3 error code can arrive under a non-5xx status too (S3
+    // itself uses `503` for `SlowDown`/`ServiceUnavailable`, but the string
+    // code is the authoritative signal `s3_error` classifies on when a body
+    // is present).
+    assert!(is_transient_s3(
+        StatusCode::SERVICE_UNAVAILABLE,
+        Some("SlowDown")
+    ));
+    assert!(is_transient_s3(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Some("InternalError")
+    ));
+    assert!(is_transient_s3(
+        StatusCode::SERVICE_UNAVAILABLE,
+        Some("ServiceUnavailable")
+    ));
+    assert!(is_transient_s3(
+        StatusCode::BAD_REQUEST,
+        Some("RequestTimeout")
+    ));
+    assert!(is_transient_s3(
+        StatusCode::TOO_MANY_REQUESTS,
+        Some("ThrottlingException")
+    ));
+}
+
+#[test]
+fn is_transient_s3_false_for_permanent_faults() {
+    assert!(!is_transient_s3(
+        StatusCode::FORBIDDEN,
+        Some("AccessDenied")
+    ));
+    assert!(!is_transient_s3(StatusCode::NOT_FOUND, Some("NoSuchKey")));
+    assert!(!is_transient_s3(StatusCode::BAD_REQUEST, None));
+    assert!(!is_transient_s3(StatusCode::FORBIDDEN, None));
+    assert!(!is_transient_s3(StatusCode::NOT_FOUND, None));
+}
+
+#[test]
+fn is_transient_s3_false_for_clock_skew() {
+    // A retry re-signs with the same skewed clock, so this must NOT be
+    // treated as transient even though it is a real, retryable-sounding
+    // failure in spirit.
+    assert!(!is_transient_s3(
+        StatusCode::FORBIDDEN,
+        Some("RequestTimeTooSkewed")
+    ));
 }

@@ -33,6 +33,37 @@ pub struct Model {
     /// lets `P2-5` (introspect) reconstitute the full parts plan without
     /// persisting every per-part planned row.
     pub part_size: i64,
+    /// Whether `complete` should bind the finalized version as the file's
+    /// current content itself (upload-flow redesign; set only by the merged
+    /// `POST /files` create+plan path with `bind: "auto"`). `FALSE` = the
+    /// pre-redesign staged behaviour (client binds manually).
+    ///
+    /// Added by `m20260924_000001_upload_flow_redesign`.
+    #[sea_orm(default_value = false)]
+    pub auto_bind: bool,
+    /// Completion-lease expiry (`state = 'completing'` only) — a later
+    /// `complete` takes over once this passes. Same migration as `auto_bind`.
+    #[sea_orm(nullable)]
+    pub lease_until: Option<OffsetDateTime>,
+    /// Opaque id of the completer currently holding the lease (diagnostics +
+    /// scoped lease release). Same migration as `auto_bind`.
+    #[sea_orm(nullable)]
+    pub lease_owner: Option<String>,
+    /// Persisted JSON of the successful complete response
+    /// (`domain::multipart::StoredCompleteResult`) once `state = 'completed'`.
+    /// Same migration as `auto_bind`.
+    #[sea_orm(nullable)]
+    pub complete_result: Option<String>,
+    /// The backend this session's upload actually targets, set once at
+    /// initiate time. `NULL` only for a session created before
+    /// `m20260924_000001_upload_flow_redesign` added this column (backfilled
+    /// from `file_versions` where a matching row still existed).
+    #[sea_orm(nullable)]
+    pub backend_id: Option<String>,
+    /// The backend object path this session's upload actually targets, same
+    /// provenance as `backend_id`.
+    #[sea_orm(nullable)]
+    pub backend_path: Option<String>,
     pub created_at: OffsetDateTime,
     pub expires_at: OffsetDateTime,
 }

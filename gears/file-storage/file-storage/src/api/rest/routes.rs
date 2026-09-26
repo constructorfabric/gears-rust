@@ -68,9 +68,18 @@ pub(crate) fn register_routes(
     .path_param("version_id", "Version UUID")
     .handler(handlers::finalize_version)
     .json_response(StatusCode::NO_CONTENT, "Version finalized")
+    // 400: the reported hash/size does not match what the sidecar observed
+    // (see handlers::finalize_version's mismatch check).
+    .error_400(openapi)
     .error_403(openapi)
     .error_404(openapi)
+    // 409: the version was already finalized (double-finalize callback).
+    .error_409(openapi)
     .error_500(openapi)
+    // 503: `finalize_upload_by_token`'s read-back (`stat`/`get_stream`/
+    // `exists` against the version's backend path) surfaces a transient
+    // `BackendUnavailable` as 503 + Retry-After (categories/14).
+    .error_503(openapi)
     .register(router, openapi);
 
     // ── Data-plane report-part (s2s, token-authenticated) ───────────────────
@@ -97,17 +106,26 @@ pub(crate) fn register_routes(
     .path_param("part_number", "1-based part number")
     .handler(handlers::report_multipart_part)
     .json_response(StatusCode::NO_CONTENT, "Part reported")
+    // 400: malformed/wrong-length hash_hex, or a reported size that does not
+    // match the planned per-part size from the token.
+    .error_400(openapi)
     .error_403(openapi)
     .error_404(openapi)
+    // 409: the session is no longer `in_progress` (already completed/aborted/expired).
+    .error_409(openapi)
     .error_500(openapi)
     .register(router, openapi);
 
-    // POST /files — create + presign upload
+    // POST /files — create + presign upload (single-part URL or, with the
+    // `multipart` intent block, the full parts plan — upload-flow redesign)
     router = OperationBuilder::post(format!("{BASE}/files"))
         .operation_id("file_storage.create_file")
         .authenticated()
         .require_license_features::<License>([])
-        .summary("Create a file and presign its first content upload")
+        .summary(
+            "Create a file and presign its first content upload \
+             (single-part URL, or the multipart parts plan with the `multipart` block)",
+        )
         .tag(API_TAG)
         .json_request::<dto::CreateFileReq>(openapi, "File metadata")
         .handler(handlers::create_file)
@@ -115,7 +133,15 @@ pub(crate) fn register_routes(
         .error_400(openapi)
         .error_401(openapi)
         .error_403(openapi)
+        // 409: an idempotency key was reused with a different request body.
+        .error_409(openapi)
         .error_500(openapi)
+        // 503: with a `multipart` intent block whose plan has >=2 parts, this
+        // calls `MultipartService::initiate_multipart_upload`, which calls
+        // `StorageBackend::initiate_multipart` -- a transient backend fault
+        // surfaces as 503 + Retry-After (categories/14). The plain single-part
+        // path never touches the backend (only sync `capabilities()`/`id()`).
+        .error_503(openapi)
         .register(router, openapi);
 
     // POST /files/{id}/versions — presign a new version
@@ -128,6 +154,8 @@ pub(crate) fn register_routes(
         .path_param("id", "File UUID")
         .handler(handlers::presign_version)
         .json_response_with_schema::<dto::UploadTicketDto>(openapi, StatusCode::OK, "Presigned")
+        // 400: the requested MIME type is rejected by the effective policy.
+        .error_400(openapi)
         .error_401(openapi)
         .error_403(openapi)
         .error_404(openapi)
@@ -467,6 +495,9 @@ pub(crate) fn register_routes(
         .error_403(openapi)
         .error_404(openapi)
         .error_500(openapi)
+        // 503: calls `StorageBackend::initiate_multipart` -- a transient
+        // backend fault surfaces as 503 + Retry-After (categories/14).
+        .error_503(openapi)
         .register(router, openapi);
 
     // NOTE: The control-plane PUT .../parts/{part_number} byte route is intentionally
@@ -481,11 +512,16 @@ pub(crate) fn register_routes(
     .operation_id("file_storage.complete_multipart")
     .authenticated()
     .require_license_features::<License>([])
-    .summary("Finalize a multipart upload (assemble all parts)")
+    .summary("Finalize a multipart upload (assemble all parts; idempotent)")
     .description(
-        "Returns the bound version id, size, and ADR-0006 composite hash/manifest (item \
-         3.3). Optional If-Match carries the current content ETag; `*`/absent is \
-         unconditional, a mismatch is a 400.",
+        "Returns the version id, size, ADR-0006 hash (composite root + manifest for plans \
+         of two or more parts; plain whole-sha256 with no manifest for a one-part plan), \
+         and the bind outcome (`bind_state`: bound/conflict/manual \u{2014} auto-bind sessions \
+         bind here, in the same transaction as the finalize). Optional If-Match carries \
+         the current content ETag; `*`/absent is unconditional, a mismatch is a 400. \
+         Idempotent: a retry of an already-completed session replays the stored result; \
+         while another caller holds the completion lease the response is `202 completing` \
+         (poll by re-issuing the same call).",
     )
     .tag(API_TAG)
     .path_param("id", "File UUID")
@@ -494,7 +530,12 @@ pub(crate) fn register_routes(
     .json_response_with_schema::<dto::MultipartCompleteDto>(
         openapi,
         StatusCode::OK,
-        "Completed \u{2014} version id, size, composite hash, manifest",
+        "Completed \u{2014} version id, size, composite hash, manifest, bind outcome",
+    )
+    .json_response_with_schema::<dto::MultipartCompletingDto>(
+        openapi,
+        StatusCode::ACCEPTED,
+        "Another caller is completing \u{2014} poll by re-issuing the same complete",
     )
     .error_401(openapi)
     .error_403(openapi)
@@ -506,6 +547,11 @@ pub(crate) fn register_routes(
     // to 400 by house convention (mirrors `bind`'s route above).
     .error_400(openapi)
     .error_500(openapi)
+    // 503: the winning completer's detached assembly task calls
+    // `StorageBackend::complete_multipart` (its result is awaited and
+    // returned to this same request) -- a transient backend fault surfaces
+    // as 503 + Retry-After (categories/14).
+    .error_503(openapi)
     .register(router, openapi);
 
     // GET /files/{id}/multipart/{upload_id} — introspect/resume (item 3.4)
@@ -576,6 +622,12 @@ pub(crate) fn register_routes(
         .error_404(openapi)
         .error_409(openapi)
         .error_500(openapi)
+        // 503: the streaming transfer/verify/re-verify/pre-commit-stat steps
+        // all call `StorageBackend` methods (`get_stream`/`publish_exclusive`/
+        // `stat`) -- a transient backend fault, or a losing side of a
+        // concurrent object change, surfaces as 503 + Retry-After
+        // (categories/14; `domain/service/backend.rs`).
+        .error_503(openapi)
         .register(router, openapi);
 
     // ── Ownership transfer (P2-M5) ─────────────────────────────────────────────

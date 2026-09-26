@@ -113,16 +113,27 @@ def test_s3_single_part_full_lifecycle(
     assert upload_resp.status_code == 200, (
         f"PUT {upload_url!r} failed: {upload_resp.status_code}\n{upload_resp.text}"
     )
+    # api.md §"Single-part bind outcome headers": the sidecar's own PUT
+    # response must forward the won-CAS outcome transparently -- the real
+    # two-process HTTP hop (sidecar → control-plane finalize → sidecar →
+    # client), not just the control-plane handler's own response.
+    assert upload_resp.headers.get("x-fs-bound") == "true", (
+        f"Expected X-FS-Bound: true on a won auto-bind, got headers: {dict(upload_resp.headers)}"
+    )
+    assert upload_resp.headers.get("etag"), (
+        f"Expected an ETag header on a won auto-bind, got headers: {dict(upload_resp.headers)}"
+    )
 
-    # ── 3. Bind the version (first bind — no If-Match required) ──────────
-    bind_resp = client.post(
-        f"{API_BASE}/files/{file_id}/bind",
-        json={"version_id": version_id},
+    # ── 3. The upload already bound the content (auto-bind) ──────────────
+    # `bind: "auto"` is the default, so the sidecar's finalize callback swaps
+    # the content pointer in the same transaction that marks the version
+    # available. A separate `POST /bind` is no longer part of this flow and
+    # would be rejected without `If-Match`, content being already bound.
+    bound_resp = client.get(f"{API_BASE}/files/{file_id}")
+    assert bound_resp.status_code == 200, (
+        f"GET /files/{file_id} failed: {bound_resp.status_code}\n{bound_resp.text}"
     )
-    assert bind_resp.status_code == 200, (
-        f"POST /files/{file_id}/bind failed: {bind_resp.status_code}\n{bind_resp.text}"
-    )
-    bound_file = bind_resp.json()
+    bound_file = bound_resp.json()
     assert bound_file.get("content_id") == version_id
 
     # ── 4. Get a signed download URL from the control plane ───────────────
@@ -143,6 +154,83 @@ def test_s3_single_part_full_lifecycle(
         "Downloaded content mismatch — bytes did not round-trip via S3!\n"
         f"  expected: {SINGLE_PART_PAYLOAD!r}\n"
         f"  got:      {dl_resp.content!r}"
+    )
+
+
+@pytest.mark.timeout(60)
+def test_s3_replay_put_with_different_bytes_does_not_overwrite(
+    lifecycle_s3_base_url: str,
+    lifecycle_s3_auth_headers: dict,
+    gts_file_type: str,
+):
+    """A second `PUT` on the same signed upload URL, carrying DIFFERENT bytes
+    than the first, must not overwrite the already-published version.
+
+    Per `docs/api.md` ("An honest PUT retry ... is idempotent: `publish_exclusive`
+    is replay-safe and finalize converges an already-`available` version with
+    matching size/hash to the same headers — never a 409") a retry with the
+    SAME bytes converges silently; this test is the other half of that
+    contract — a retry with DIFFERENT bytes cannot converge (the measured
+    hash no longer matches the already-`available` version), so
+    `bin/sidecar.rs::upload`'s `!created` branch reports `409` (see
+    `docs/operations.md`'s "conditional writes" section and the `upload`
+    decision table) rather than silently replacing the stored object.
+    `publish_exclusive`'s own create-exclusive write (`If-None-Match: *`,
+    verified against `s3s-fs` in this crate's `s3_tests.rs`) is what makes the
+    second PUT's bytes never reach the backend at all.
+    """
+    client = httpx.Client(
+        base_url=lifecycle_s3_base_url,
+        headers=lifecycle_s3_auth_headers,
+        timeout=REQUEST_TIMEOUT,
+        follow_redirects=False,
+    )
+
+    first_payload = b"first-publish-wins: \xca\xfe\xba\xbe"
+    replay_payload = b"a completely different, and longer, second attempt"
+    assert replay_payload != first_payload
+    assert len(replay_payload) != len(first_payload)
+
+    # ── 1. Create a file and get the signed upload URL ────────────────────
+    ticket = _create_file(client, gts_file_type)
+    file_id: str = ticket["file_id"]
+    upload_url: str = ticket["upload_url"]
+
+    # ── 2. First PUT succeeds and auto-binds ──────────────────────────────
+    first_resp = httpx.put(upload_url, content=first_payload, timeout=REQUEST_TIMEOUT)
+    assert first_resp.status_code == 200, (
+        f"first PUT {upload_url!r} failed: {first_resp.status_code}\n{first_resp.text}"
+    )
+    assert first_resp.headers.get("x-fs-bound") == "true", (
+        f"expected X-FS-Bound: true on the first, winning PUT, "
+        f"got headers: {dict(first_resp.headers)}"
+    )
+
+    # ── 3. Replay the same signed URL with DIFFERENT bytes — must fail,
+    #        not overwrite ───────────────────────────────────────────────
+    replay_resp = httpx.put(upload_url, content=replay_payload, timeout=REQUEST_TIMEOUT)
+    assert replay_resp.status_code == 409, (
+        f"replay PUT {upload_url!r} with different bytes should be rejected "
+        f"with 409 (see docs/api.md/operations.md), got: "
+        f"{replay_resp.status_code}\n{replay_resp.text}"
+    )
+
+    # ── 4. Downloaded bytes are still the FIRST payload, never the replay ─
+    dl_ticket_resp = client.get(f"{API_BASE}/files/{file_id}/download-url")
+    assert dl_ticket_resp.status_code == 200, (
+        f"GET /files/{file_id}/download-url failed: "
+        f"{dl_ticket_resp.status_code}\n{dl_ticket_resp.text}"
+    )
+    download_url = dl_ticket_resp.json()["download_url"]
+
+    dl_resp = httpx.get(download_url, timeout=REQUEST_TIMEOUT)
+    assert dl_resp.status_code == 200, (
+        f"GET {download_url!r} failed: {dl_resp.status_code}\n{dl_resp.text}"
+    )
+    assert dl_resp.content == first_payload, (
+        "published bytes were overwritten by the rejected replay PUT!\n"
+        f"  expected (first payload): {first_payload!r}\n"
+        f"  got:                      {dl_resp.content!r}"
     )
 
 

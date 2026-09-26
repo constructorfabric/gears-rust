@@ -216,9 +216,72 @@ jobs:
       # (launcher: e2e-launcher) against a single server. Self-managed suites
       # (launcher: pytest — mini-chat, usage-collector) and profile lanes
       # (tr-authz) are NOT covered by it, so they run as their own steps below.
+      #
+      # file-storage's lifecycle_s3 sub-suite (multipart against a real S3
+      # backend) is part of the file-storage e2e-launcher suite that
+      # `make e2e-local` below runs, but it SKIPS ITSELF ENTIRELY at pytest
+      # collection time unless FS_E2E_S3_ENDPOINT is set (see
+      # testing/e2e/suites/file_storage/lifecycle_s3/conftest.py's module
+      # docstring, "Prerequisites" / "Running the S3 e2e locally") — local-fs
+      # cannot do multipart at all, so without this double the suite's only
+      # multipart-over-S3 coverage never actually runs. `s3s-fs` is the same
+      # in-process, filesystem-backed double the crate's own dev-dependency
+      # tests use (`s3s`/`s3s-fs` 0.14.1 in
+      # gears/file-storage/file-storage/Cargo.toml), so its conditional-write
+      # behaviour (`If-None-Match: *` -> 412, see docs/operations.md) is
+      # already exercised by the crate's own test suite. It also isn't
+      # fetched from any external image registry, unlike a container image.
+      - name: Cache s3s-fs binary
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/s3s-fs-install
+          key: s3s-fs-0.14.1-${{ runner.os }}
+
+      - name: Install s3s-fs (S3 test double for file-storage e2e)
+        # --locked, same as this workflow's other pinned crates.io binaries
+        # (see gts-validation.yml's gts-validator install). On a cache hit
+        # cargo detects the existing install under --root and skips the
+        # compile.
+        run: |
+          cargo install s3s-fs --version 0.14.1 --locked --features binary \
+            --root "${{ runner.temp }}/s3s-fs-install"
+
+      - name: Start S3 test double (s3s-fs) for file-storage e2e
+        run: |
+          set -euo pipefail
+          mkdir -p testing/e2e/logs
+          DATA_DIR="${{ runner.temp }}/s3s-fs-data"
+          mkdir -p "$DATA_DIR/file-storage-e2e"
+          "${{ runner.temp }}/s3s-fs-install/bin/s3s-fs" --host 127.0.0.1 --port 19099 \
+            --access-key test-access-key --secret-key test-secret-key \
+            "$DATA_DIR" > testing/e2e/logs/s3s-fs.log 2>&1 &
+          echo "S3S_FS_PID=$!" >> "$GITHUB_ENV"
+          disown
+          # Ready means s3s-fs itself is answering: an unsigned request gets its
+          # S3 `AccessDenied` error, not merely any HTTP response on the port.
+          for i in $(seq 1 30); do
+            if curl -s http://127.0.0.1:19099/ 2>/dev/null | grep -q '<Code>AccessDenied</Code>'; then
+              break
+            fi
+            if [ "$i" -eq 30 ]; then
+              echo "s3s-fs did not become ready on 127.0.0.1:19099 within 30s" >&2
+              tail -n 50 testing/e2e/logs/s3s-fs.log >&2 || true
+              exit 1
+            fi
+            sleep 1
+          done
+
       - name: Run E2E tests
         env:
           INPUT_MODE: ${{ inputs.mode }}
+          # See "Start S3 test double (s3s-fs)" above — values match
+          # conftest.py's own defaults, set explicitly so this doesn't
+          # silently drift.
+          FS_E2E_S3_ENDPOINT: "http://127.0.0.1:19099"
+          FS_E2E_S3_BUCKET: "file-storage-e2e"
+          FS_E2E_S3_ACCESS_KEY: "test-access-key"
+          FS_E2E_S3_SECRET_KEY: "test-secret-key"
+          FS_E2E_S3_REGION: "us-east-1"
         run: |
           if [ "${{ github.event_name }}" = "schedule" ]; then
             make e2e-local            # nightly — full suite
@@ -226,6 +289,13 @@ jobs:
             make e2e-local            # manual — full suite
           else
             make e2e-local            # PR / manual-smoke, TODO: switch to e2e-local-smoke later
+          fi
+
+      - name: Stop S3 test double (s3s-fs)
+        if: always()
+        run: |
+          if [ -n "${S3S_FS_PID:-}" ]; then
+            kill "$S3S_FS_PID" 2>/dev/null || true
           fi
 
       # Self-managed suite (launcher: pytest): owns its own offline server.

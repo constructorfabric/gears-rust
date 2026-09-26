@@ -20,13 +20,14 @@ use file_storage_sdk::{CustomMetadataPatch, NewFile, OwnerFilter, OwnerKind};
 use super::dto::{
     BindReq, CreateFileReq, CreateRetentionRuleReq, DownloadTicketDto, EffectivePolicyDto, FileDto,
     FileDtoList, InitiateMultipartReq, MigrateBackendReq, MissingPartDto, MultipartCompleteDto,
-    MultipartPartPlanDto, MultipartPlanDto, MultipartStatusDto, PolicyDto, ReceivedPartDto,
-    RetentionRuleDto, RetentionRuleDtoList, SetPolicyReq, StorageDto, StorageDtoList,
-    TransferOwnershipReq, UpdateMetadataReq, UploadTicketDto, VersionDto, VersionDtoList,
+    MultipartCompletingDto, MultipartPartPlanDto, MultipartPlanDto, MultipartStatusDto, PolicyDto,
+    ReceivedPartDto, RetentionRuleDto, RetentionRuleDtoList, SetPolicyReq, StorageDto,
+    StorageDtoList, TransferOwnershipReq, UpdateMetadataReq, UploadTicketDto, VersionDto,
+    VersionDtoList,
 };
 use crate::domain::error::DomainError;
 use crate::domain::etag;
-use crate::domain::multipart::{MultipartPlan, MultipartUploadStatus};
+use crate::domain::multipart::{MultipartCompleteOutcome, MultipartPlan, MultipartUploadStatus};
 use crate::domain::multipart_service::MultipartService;
 use crate::domain::policy::{PolicyScope, RetentionScope};
 use crate::domain::policy_service::PolicyService;
@@ -67,26 +68,47 @@ fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Interim gear-local shared-secret credential for the s2s finalize/
-/// report-part callback routes (P2 0.1 remaining — see
-/// `docs/ADR/0003-…-sidecar-data-plane.md`'s trust-model section). This is a
-/// stop-gap until the platform's `toolkit-security::internal_auth` profiles
-/// are deployable in this gear; swap the comparator below for
-/// `InternalAuthenticator` when that lands.
+/// Bundles the two s2s policies the finalize/report-part callback routes
+/// apply on top of the signed upload token itself:
 ///
-/// When `secret` is `None` (the default — `FileStorageConfig::finalize_internal_secret`
-/// unset), [`FinalizeAuth::verify`] is a no-op: the signed upload token
-/// (already verified by the caller) remains the sole authorization,
-/// preserving pre-0.1 behavior. When `Some`, callers must additionally
-/// present a matching `x-fs-internal-token` header.
+/// * An interim gear-local shared-secret credential (P2 0.1 remaining — see
+///   `docs/ADR/0003-…-sidecar-data-plane.md`'s trust-model section). This is
+///   a stop-gap until the platform's `toolkit-security::internal_auth`
+///   profiles are deployable in this gear; swap the comparator below for
+///   `InternalAuthenticator` when that lands.
+///
+///   When `secret` is `None` (the default — `FileStorageConfig::finalize_internal_secret`
+///   unset), [`FinalizeAuth::verify`] is a no-op: the signed upload token
+///   (already verified by the caller) remains the sole authorization,
+///   preserving pre-0.1 behavior. When `Some`, callers must additionally
+///   present a matching `x-fs-internal-token` header.
+///
+/// * A grace window (`FileStorageConfig::finalize_token_grace_secs`) applied
+///   to the signed upload token's `exp` when these routes re-check it via
+///   `Verifier::verify_with_grace`. The sidecar checks the same token once
+///   at the start of the upload and never again; a slow-but-live upload can
+///   legitimately outlast the token's TTL and only reach finalize/report-part
+///   afterwards, with the bytes already durably written. `0` disables the
+///   grace, restoring strict `exp` enforcement on these routes.
 pub struct FinalizeAuth {
     secret: Option<String>,
+    token_grace: time::Duration,
 }
 
 impl FinalizeAuth {
     #[must_use]
-    pub fn new(secret: Option<String>) -> Self {
-        Self { secret }
+    pub fn new(secret: Option<String>, token_grace: time::Duration) -> Self {
+        Self {
+            secret,
+            token_grace,
+        }
+    }
+
+    /// Grace window applied to the signed upload token's `exp` on the
+    /// finalize/report-part callbacks (see the struct-level doc comment).
+    #[must_use]
+    pub fn token_grace(&self) -> time::Duration {
+        self.token_grace
     }
 
     /// Verify the `x-fs-internal-token` header against the configured
@@ -124,21 +146,43 @@ impl FinalizeAuth {
 
 // ── create + presign ─────────────────────────────────────────────────────────
 
+/// `POST /files` — create a file and presign its first content upload
+/// (upload-flow redesign).
+///
+/// * No `multipart` block (or a plan that collapses to one part): the
+///   response carries a single-part `upload_url` (as before). With
+///   `bind: "auto"` (the default) the token instructs the sidecar's finalize
+///   to bind the first content itself under a `content_id IS NULL` CAS — the
+///   whole upload is 2 requests (`POST /files` + `PUT`); the `PUT` response
+///   echoes the outcome as `X-FS-Bound`/`ETag` headers.
+/// * `multipart` block with a ≥2-part plan: the response carries the full
+///   parts plan (`multipart` field — same shape as
+///   `POST /files/{id}/multipart`), no single-part version is
+///   pre-registered, and `complete` binds (for `bind: "auto"`) — N+2
+///   requests total. Resume stays `GET /files/{id}/multipart/{upload_id}`.
 pub async fn create_file(
     uri: Uri,
     Extension(ctx): Ctx,
     Extension(svc): Svc,
+    Extension(msvc): MultiSvc,
     Json(req): Json<CreateFileReq>,
 ) -> ApiResult<impl IntoResponse> {
     let owner_kind = req
         .parse_owner_kind()
         .ok_or_else(|| DomainError::validation("owner_kind", "must be 'user' or 'app'"))?;
+    let auto_bind = match req.bind.as_deref() {
+        None | Some("auto") => true,
+        Some("manual") => false,
+        Some(_) => {
+            return Err(DomainError::validation("bind", "must be 'auto' or 'manual'").into());
+        }
+    };
     let new = NewFile {
         owner_kind,
         owner_id: req.owner_id,
         name: req.name,
         gts_file_type: req.gts_file_type,
-        mime_type: req.mime_type,
+        mime_type: req.mime_type.clone(),
         custom_metadata: req
             .custom_metadata
             .into_iter()
@@ -148,18 +192,58 @@ pub async fn create_file(
             })
             .collect(),
     };
-    let ticket = svc.create_file(&ctx, new, req.idempotency_key).await?;
-    let id = ticket.file_id.to_string();
-    Ok(created_json(
-        UploadTicketDto {
-            file_id: ticket.file_id,
-            version_id: ticket.version_id,
-            upload_url: ticket.upload_url,
-        },
-        &uri,
-        &id,
+
+    let multipart_intent =
+        req.multipart
+            .as_ref()
+            .map(|mp| crate::domain::create_flow::MultipartIntent {
+                declared_size: mp.declared_size,
+                preferred_part_size: mp.preferred_part_size,
+            });
+
+    // Shared with the SDK local client — see `domain::create_flow`'s doc.
+    let outcome = crate::domain::create_flow::create_file(
+        &svc,
+        &msvc,
+        &ctx,
+        new,
+        req.idempotency_key,
+        auto_bind,
+        multipart_intent,
     )
-    .into_response())
+    .await?;
+
+    match outcome {
+        crate::domain::create_flow::CreateFileOutcome::SinglePart(ticket) => {
+            let id = ticket.file_id.to_string();
+            Ok(created_json(
+                UploadTicketDto {
+                    file_id: ticket.file_id,
+                    version_id: ticket.version_id,
+                    upload_url: Some(ticket.upload_url),
+                    multipart: None,
+                },
+                &uri,
+                &id,
+            )
+            .into_response())
+        }
+        crate::domain::create_flow::CreateFileOutcome::Multipart { file_id, plan } => {
+            let id = file_id.to_string();
+            let version_id = plan.version_id;
+            Ok(created_json(
+                UploadTicketDto {
+                    file_id,
+                    version_id,
+                    upload_url: None,
+                    multipart: Some(plan_to_dto(plan)),
+                },
+                &uri,
+                &id,
+            )
+            .into_response())
+        }
+    }
 }
 
 pub async fn presign_version(
@@ -171,7 +255,8 @@ pub async fn presign_version(
     Ok(Json(UploadTicketDto {
         file_id: ticket.file_id,
         version_id: ticket.version_id,
-        upload_url: ticket.upload_url,
+        upload_url: Some(ticket.upload_url),
+        multipart: None,
     }))
 }
 
@@ -206,15 +291,16 @@ pub async fn get_file(
         .and_then(|tag| HeaderValue::from_str(tag).ok());
 
     // Conditional GET: If-None-Match → 304 (still carrying the ETag header).
-    if let (Some(inm), Some(tag)) = (header_str(&headers, "if-none-match"), etag.as_deref()) {
-        let inm = inm.trim();
-        if inm == "*" || inm == tag {
-            let mut resp = StatusCode::NOT_MODIFIED.into_response();
-            if let Some(v) = etag_header {
-                resp.headers_mut().insert(header::ETAG, v);
-            }
-            return Ok(resp);
+    // Shared with the SDK local client's `get_file` — see `etag::if_none_match_satisfied`.
+    if etag::if_none_match_satisfied(
+        header_str(&headers, "if-none-match").as_deref(),
+        etag.as_deref(),
+    ) {
+        let mut resp = StatusCode::NOT_MODIFIED.into_response();
+        if let Some(v) = etag_header {
+            resp.headers_mut().insert(header::ETAG, v);
         }
+        return Ok(resp);
     }
 
     let dto = FileDto::from_parts(file, meta);
@@ -236,12 +322,15 @@ pub async fn list_files(
         owner_kind,
         owner_id: q.owner_id,
     };
-    let files = svc
-        .list_files(&ctx, owner, q.limit, q.offset.unwrap_or(0))
+    // Shared with the SDK local client — see `FileService::list_files_with_metadata`
+    // (batched: one `IN (...)` query for the whole page rather than one
+    // `list_metadata` call per file).
+    let files_with_metadata = svc
+        .list_files_with_metadata(&ctx, owner, q.limit, q.offset.unwrap_or(0))
         .await?;
-    let items = files
+    let items = files_with_metadata
         .into_iter()
-        .map(|f| FileDto::from_parts(f, vec![]))
+        .map(|(f, meta)| FileDto::from_parts(f, meta))
         .collect();
     Ok(Json(FileDtoList(items)))
 }
@@ -252,11 +341,16 @@ pub async fn list_versions(
     Path(file_id): Path<Uuid>,
     Query(q): Query<ListVersionsQuery>,
 ) -> ApiResult<JsonBody<VersionDtoList>> {
+    // The manifest-byte budget (and its batched-fetch/truncation) is shared
+    // with the SDK local client -- see `FileService::list_versions_with_manifests`.
     let versions = svc
-        .list_versions(&ctx, file_id, q.limit, q.offset.unwrap_or(0))
+        .list_versions_with_manifests(&ctx, file_id, q.limit, q.offset.unwrap_or(0))
         .await?;
     Ok(Json(VersionDtoList(
-        versions.into_iter().map(VersionDto::from).collect(),
+        versions
+            .into_iter()
+            .map(|(v, manifest)| VersionDto::from_parts(v, manifest))
+            .collect(),
     )))
 }
 
@@ -321,7 +415,16 @@ pub async fn delete_version(
 
 // ── storages ────────────────────────────────────────────────────────────────────
 
-pub async fn list_storages(Extension(svc): Svc) -> ApiResult<JsonBody<StorageDtoList>> {
+pub async fn list_storages(
+    Extension(ctx): Ctx,
+    Extension(svc): Svc,
+) -> ApiResult<JsonBody<StorageDtoList>> {
+    // `list_backends` itself is a synchronous, authz-free lookup (see
+    // `domain/service/backend.rs`) — this handler used to call it directly
+    // with no `SecurityContext` at all, so any authenticated subject of any
+    // tenant could enumerate backend ids and capabilities. Gate it behind
+    // the same coarse `READ` check the rest of this gear's read paths use.
+    svc.authorize_backends_read(&ctx).await?;
     let items = svc
         .list_backends()
         .into_iter()
@@ -331,9 +434,12 @@ pub async fn list_storages(Extension(svc): Svc) -> ApiResult<JsonBody<StorageDto
 }
 
 pub async fn get_storage(
+    Extension(ctx): Ctx,
     Extension(svc): Svc,
     Path(storage_id): Path<String>,
 ) -> ApiResult<JsonBody<StorageDto>> {
+    // Same authz gap as `list_storages` above — see its comment.
+    svc.authorize_backends_read(&ctx).await?;
     let (id, caps) = svc.get_backend(&storage_id)?;
     Ok(Json(StorageDto::new(id, caps)))
 }
@@ -357,102 +463,67 @@ pub struct EffectivePolicyQuery {
 }
 
 /// `GET /policy` — return the raw own policy for a scope.
-///
-/// @cpt-cf-file-storage-usecase-configure-policy
-/// @cpt-dod:cpt-cf-file-storage-dod-policy-get-put-endpoints:p1
-// @cpt-begin:cpt-cf-file-storage-flow-policy-get-own:p1:inst-policy-get-request
 pub async fn get_policy(
     Extension(ctx): Ctx,
     Extension(svc): PolicySvc,
     Query(q): Query<GetPolicyQuery>,
 ) -> ApiResult<impl axum::response::IntoResponse> {
-    // @cpt-end:cpt-cf-file-storage-flow-policy-get-own:p1:inst-policy-get-request
-    // @cpt-begin:cpt-cf-file-storage-flow-policy-get-own:p1:inst-policy-get-parse-scope
     let policy_scope = PolicyScope::parse(&q.scope)
         .ok_or_else(|| DomainError::validation("scope", "must be 'tenant' or 'user'"))?;
-    // @cpt-end:cpt-cf-file-storage-flow-policy-get-own:p1:inst-policy-get-parse-scope
     let stored = svc
         .get_own_policy(&ctx, policy_scope, q.scope_owner_id)
         .await?;
-    // @cpt-begin:cpt-cf-file-storage-flow-policy-get-own:p1:inst-policy-get-return
     match stored {
         Some(p) => Ok((StatusCode::OK, Json(PolicyDto::from(p))).into_response()),
         None => Ok(StatusCode::NO_CONTENT.into_response()),
     }
-    // @cpt-end:cpt-cf-file-storage-flow-policy-get-own:p1:inst-policy-get-return
 }
 
 /// `PUT /policy` — upsert the policy for a scope.
-///
-/// @cpt-cf-file-storage-usecase-configure-policy
-// @cpt-begin:cpt-cf-file-storage-flow-policy-set:p1:inst-policy-set-request
 pub async fn set_policy(
     Extension(ctx): Ctx,
     Extension(svc): PolicySvc,
     Json(req): Json<SetPolicyReq>,
 ) -> ApiResult<JsonBody<PolicyDto>> {
-    // @cpt-end:cpt-cf-file-storage-flow-policy-set:p1:inst-policy-set-request
-    // @cpt-begin:cpt-cf-file-storage-flow-policy-set:p1:inst-policy-set-parse-scope
     let policy_scope = PolicyScope::parse(&req.scope)
         .ok_or_else(|| DomainError::validation("scope", "must be 'tenant' or 'user'"))?;
-    // @cpt-end:cpt-cf-file-storage-flow-policy-set:p1:inst-policy-set-parse-scope
     let body = req.body.into();
     let stored = svc
         .set_policy(&ctx, policy_scope, req.scope_owner_id, body)
         .await?;
-    // @cpt-begin:cpt-cf-file-storage-flow-policy-set:p1:inst-policy-set-return
     Ok(Json(PolicyDto::from(stored)))
-    // @cpt-end:cpt-cf-file-storage-flow-policy-set:p1:inst-policy-set-return
 }
 
 /// `GET /policy/effective` — compute the effective (most-restrictive) policy.
-///
-/// @cpt-cf-file-storage-usecase-configure-policy
-/// @cpt-dod:cpt-cf-file-storage-dod-policy-effective-endpoint:p1
-// @cpt-begin:cpt-cf-file-storage-flow-policy-get-effective:p1:inst-policy-eff-request
 pub async fn get_effective_policy(
     Extension(ctx): Ctx,
     Extension(svc): PolicySvc,
     Query(q): Query<EffectivePolicyQuery>,
 ) -> ApiResult<JsonBody<EffectivePolicyDto>> {
-    // @cpt-end:cpt-cf-file-storage-flow-policy-get-effective:p1:inst-policy-eff-request
     let ep = svc.get_effective_policy(&ctx, q.user_owner_id).await?;
-    // @cpt-begin:cpt-cf-file-storage-flow-policy-get-effective:p1:inst-policy-eff-return
     Ok(Json(EffectivePolicyDto::from(ep)))
-    // @cpt-end:cpt-cf-file-storage-flow-policy-get-effective:p1:inst-policy-eff-return
 }
 
 // ── retention rules (P2-M1) ────────────────────────────────────────────────────
 
 /// `GET /retention-rules` — list all retention rules for the caller's tenant.
-///
-/// @cpt-cf-file-storage-fr-retention-policies
-/// @cpt-dod:cpt-cf-file-storage-dod-retention-rule-endpoints:p1
-// @cpt-begin:cpt-cf-file-storage-flow-retention-list:p1:inst-retention-list-request
 pub async fn list_retention_rules(
     Extension(ctx): Ctx,
     Extension(svc): PolicySvc,
 ) -> ApiResult<JsonBody<RetentionRuleDtoList>> {
-    // @cpt-end:cpt-cf-file-storage-flow-retention-list:p1:inst-retention-list-request
     let rules = svc.list_retention_rules(&ctx).await?;
-    // @cpt-begin:cpt-cf-file-storage-flow-retention-list:p1:inst-retention-list-return
     Ok(Json(RetentionRuleDtoList(
         rules.into_iter().map(RetentionRuleDto::from).collect(),
     )))
-    // @cpt-end:cpt-cf-file-storage-flow-retention-list:p1:inst-retention-list-return
 }
 
 /// `POST /retention-rules` — create a new retention rule.
-///
-/// @cpt-cf-file-storage-fr-retention-policies
-// @cpt-begin:cpt-cf-file-storage-flow-retention-create:p1:inst-retention-create-request
 pub async fn create_retention_rule(
     uri: Uri,
     Extension(ctx): Ctx,
     Extension(svc): PolicySvc,
     Json(req): Json<CreateRetentionRuleReq>,
 ) -> ApiResult<impl axum::response::IntoResponse> {
-    // @cpt-end:cpt-cf-file-storage-flow-retention-create:p1:inst-retention-create-request
     let retention_scope = RetentionScope::parse(&req.scope)
         .ok_or_else(|| DomainError::validation("scope", "must be 'tenant', 'user', or 'file'"))?;
     let body = req.body.into();
@@ -460,29 +531,21 @@ pub async fn create_retention_rule(
         .create_retention_rule(&ctx, retention_scope, req.scope_target_id, body)
         .await?;
     let id = rule.rule_id.to_string();
-    // @cpt-begin:cpt-cf-file-storage-flow-retention-create:p1:inst-retention-create-return
     Ok(created_json(RetentionRuleDto::from(rule), &uri, &id).into_response())
-    // @cpt-end:cpt-cf-file-storage-flow-retention-create:p1:inst-retention-create-return
 }
 
 /// `DELETE /retention-rules/{rule_id}` — delete a retention rule.
-///
-/// @cpt-cf-file-storage-fr-retention-policies
-// @cpt-begin:cpt-cf-file-storage-flow-retention-delete:p1:inst-retention-delete-request
 pub async fn delete_retention_rule(
     Extension(ctx): Ctx,
     Extension(svc): PolicySvc,
     Path(rule_id): Path<Uuid>,
 ) -> ApiResult<impl axum::response::IntoResponse> {
-    // @cpt-end:cpt-cf-file-storage-flow-retention-delete:p1:inst-retention-delete-request
     let removed = svc.delete_retention_rule(&ctx, rule_id).await?;
-    // @cpt-begin:cpt-cf-file-storage-flow-retention-delete:p1:inst-retention-delete-return
     if removed {
         Ok(no_content().into_response())
     } else {
         Err(DomainError::retention_rule_not_found(rule_id).into())
     }
-    // @cpt-end:cpt-cf-file-storage-flow-retention-delete:p1:inst-retention-delete-return
 }
 
 // ── multipart upload (multipart-coordinator feature) ──────────────────────────
@@ -509,10 +572,6 @@ fn plan_to_dto(p: MultipartPlan) -> MultipartPlanDto {
 
 /// `POST /files/{id}/multipart` — initiate a server-authoritative multipart
 /// upload session and return the parts plan with per-part signed sidecar URLs.
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
-/// @cpt-cf-file-storage-fr-size-limits-policy
-/// @cpt-cf-file-storage-fr-storage-quota
 pub async fn initiate_multipart(
     Extension(ctx): Ctx,
     Extension(svc): MultiSvc,
@@ -526,7 +585,11 @@ pub async fn initiate_multipart(
             &req.declared_mime,
             req.declared_size,
             req.preferred_part_size,
-            req.concurrency,
+            // Standalone initiate keeps the staged pre-redesign behaviour:
+            // complete never binds; the client binds manually (this is the
+            // "new version of an existing file" path, where the CAS target
+            // is caller-controlled via bind's If-Match).
+            false,
         )
         .await?;
     Ok(Json(plan_to_dto(plan)))
@@ -538,29 +601,47 @@ pub async fn initiate_multipart(
 /// 3.3) instead of the previous bare `204`. `If-Match` is optional: a
 /// concrete value is checked against the file's current content `ETag`; `*`
 /// (or omission) is unconditional.
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
 pub async fn complete_multipart(
     Extension(ctx): Ctx,
     Extension(svc): MultiSvc,
     Path((file_id, upload_id)): Path<(Uuid, Uuid)>,
     headers: HeaderMap,
-) -> ApiResult<JsonBody<MultipartCompleteDto>> {
+) -> ApiResult<axum::response::Response> {
     let if_match = header_str(&headers, "if-match");
-    let completed = svc
+    let outcome = svc
         .complete_multipart_upload(&ctx, file_id, upload_id, if_match.as_deref())
         .await?;
-    // @cpt-begin:cpt-cf-file-storage-flow-multipart-complete:p1:inst-complete-return
-    Ok(Json(MultipartCompleteDto {
-        version_id: completed.version_id,
-        size: completed.size,
-        hash_algorithm: completed.hash_algorithm.to_owned(),
-        content_hash: hex::encode(&completed.content_hash),
-        hash_mode: completed.hash_mode.as_str().to_owned(),
-        part_count: completed.part_count,
-        manifest: completed.manifest,
-    }))
-    // @cpt-end:cpt-cf-file-storage-flow-multipart-complete:p1:inst-complete-return
+    Ok(match outcome {
+        MultipartCompleteOutcome::Completed(completed) => Json(MultipartCompleteDto {
+            version_id: completed.version_id,
+            size: completed.size,
+            hash_algorithm: completed.hash_algorithm.to_owned(),
+            content_hash: hex::encode(&completed.content_hash),
+            hash_mode: completed.hash_mode.as_str().to_owned(),
+            part_count: completed.part_count,
+            manifest: completed.manifest,
+            bind_state: completed.bind_state.as_str().to_owned(),
+            etag: completed.etag,
+            current_etag: completed.current_etag,
+        })
+        .into_response(),
+        // Another caller holds the completion lease — poll by re-issuing
+        // the same idempotent complete (Retry-After mirrors the body hint).
+        MultipartCompleteOutcome::Completing { retry_after_secs } => {
+            let mut resp = (
+                StatusCode::ACCEPTED,
+                Json(MultipartCompletingDto {
+                    state: "completing".to_owned(),
+                    retry_after_secs,
+                }),
+            )
+                .into_response();
+            if let Ok(v) = HeaderValue::from_str(&retry_after_secs.to_string()) {
+                resp.headers_mut().insert(header::RETRY_AFTER, v);
+            }
+            resp
+        }
+    })
 }
 
 fn status_to_dto(s: MultipartUploadStatus) -> MultipartStatusDto {
@@ -598,10 +679,6 @@ fn status_to_dto(s: MultipartUploadStatus) -> MultipartStatusDto {
 /// `GET /files/{id}/multipart/{upload_id}` — introspect a multipart upload
 /// (item 3.4): current state, received parts, and (while resumable) fresh
 /// resume URLs for the missing parts.
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
-/// @cpt-dod:cpt-cf-file-storage-dod-multipart-introspect:p2
-// @cpt-begin:cpt-cf-file-storage-flow-multipart-introspect:p1:inst-introspect-request
 pub async fn introspect_multipart(
     Extension(ctx): Ctx,
     Extension(svc): MultiSvc,
@@ -612,11 +689,8 @@ pub async fn introspect_multipart(
         .await?;
     Ok(Json(status_to_dto(status)))
 }
-// @cpt-end:cpt-cf-file-storage-flow-multipart-introspect:p1:inst-introspect-request
 
 /// `DELETE /files/{id}/multipart/{upload_id}` — abort a multipart upload.
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
 pub async fn abort_multipart(
     Extension(ctx): Ctx,
     Extension(svc): MultiSvc,
@@ -631,8 +705,6 @@ pub async fn abort_multipart(
 /// `POST /files/{id}/migrate` — migrate a file's content to a different backend.
 ///
 /// Non-versioned files only. Preserves identity and verifies content hash.
-///
-/// @cpt-cf-file-storage-fr-backend-migration
 pub async fn migrate_backend(
     Extension(ctx): Ctx,
     Extension(svc): Svc,
@@ -647,33 +719,18 @@ pub async fn migrate_backend(
 // ── ownership transfer (P2-M5) ────────────────────────────────────────────────
 
 /// `POST /files/{id}/transfer` — transfer ownership of a file to a new owner.
-///
-/// @cpt-cf-file-storage-fr-ownership-transfer
-// @cpt-begin:cpt-cf-file-storage-flow-ownership-transfer:p1:inst-transfer-request
 pub async fn transfer_ownership(
     Extension(ctx): Ctx,
     Extension(svc): Svc,
     Path(file_id): Path<Uuid>,
     Json(req): Json<TransferOwnershipReq>,
 ) -> ApiResult<JsonBody<FileDto>> {
-    // @cpt-end:cpt-cf-file-storage-flow-ownership-transfer:p1:inst-transfer-request
-    // @cpt-begin:cpt-cf-file-storage-flow-ownership-transfer:p1:inst-transfer-kind-parse
     let new_owner_kind = file_storage_sdk::OwnerKind::parse(&req.new_owner_kind)
         .ok_or_else(|| DomainError::validation("new_owner_kind", "must be 'user' or 'app'"))?;
-    // @cpt-end:cpt-cf-file-storage-flow-ownership-transfer:p1:inst-transfer-kind-parse
-    // Capture metadata BEFORE the transfer. A transfer does not change custom
-    // metadata, but afterwards the caller may no longer have read access under
-    // the new owner — re-reading then and defaulting on failure would return a
-    // 200 with empty `custom_metadata` for a file that actually has some.
-    // @cpt-begin:cpt-cf-file-storage-flow-ownership-transfer:p1:inst-transfer-capture-meta
-    let (_, meta) = svc.get_file_with_metadata(&ctx, file_id).await?;
-    // @cpt-end:cpt-cf-file-storage-flow-ownership-transfer:p1:inst-transfer-capture-meta
-    let file = svc
+    let (file, meta) = svc
         .transfer_ownership(&ctx, file_id, new_owner_kind, req.new_owner_id)
         .await?;
-    // @cpt-begin:cpt-cf-file-storage-flow-ownership-transfer:p1:inst-transfer-return
     Ok(Json(FileDto::from_parts(file, meta)))
-    // @cpt-end:cpt-cf-file-storage-flow-ownership-transfer:p1:inst-transfer-return
 }
 
 // ── data-plane finalize (s2s, token-authenticated) ────────────────────────────
@@ -697,8 +754,6 @@ pub struct FinalizeUploadReq {
 ///
 /// Called by the sidecar immediately after a successful `PUT` to report the
 /// measured size + hash and transition the version from `pending` to `available`.
-///
-/// @cpt-cf-file-storage-fr-audit-trail
 pub async fn finalize_version(
     Extension(svc): Svc,
     Extension(verifier): Extension<Arc<Verifier>>,
@@ -714,8 +769,18 @@ pub async fn finalize_version(
         .map(str::to_owned)
         .ok_or_else(|| DomainError::token_invalid("missing x-fs-token header"))?;
 
+    // Grace on `exp` only: the sidecar already checked this same token
+    // strictly at the start of the PUT and does not re-check it for the
+    // rest of the stream, so a slow-but-live upload can legitimately reach
+    // this callback after the token's `exp` with its bytes already durably
+    // written. The signature and the (file_id, version_id) binding below
+    // are still checked exactly as before -- only the deadline gets slack.
     let claims = verifier
-        .verify(&token, OffsetDateTime::now_utc())
+        .verify_with_grace(
+            &token,
+            OffsetDateTime::now_utc(),
+            finalize_auth.token_grace(),
+        )
         .map_err(|e| DomainError::token_invalid(e.to_string()))?;
 
     // The token must authorize a PUT to exactly this (file_id, version_id).
@@ -757,10 +822,39 @@ pub async fn finalize_version(
         .into());
     }
 
-    svc.finalize_upload_by_token(&claims, req.size, hash_value)
+    let outcome = svc
+        .finalize_upload_by_token(&claims, req.size, hash_value)
         .await?;
 
-    Ok(StatusCode::NO_CONTENT.into_response())
+    // Upload-flow redesign: surface the auto-bind outcome to the sidecar,
+    // which forwards it TRANSPARENTLY to the uploading client on its `PUT`
+    // response (fixed contract, the single-part half of the shared
+    // bind-state model): `X-FS-Bound: true` + `ETag: <new>` on a won CAS;
+    // `X-FS-Bound: conflict` + `X-FS-Current-ETag: <current>` on a lost one.
+    // No headers at all when the token requested no bind (manual mode).
+    let mut resp = StatusCode::NO_CONTENT.into_response();
+    match outcome.bind_state {
+        Some(crate::domain::multipart::BindState::Bound) => {
+            resp.headers_mut()
+                .insert("x-fs-bound", HeaderValue::from_static("true"));
+            if let Some(etag) = outcome.etag
+                && let Ok(v) = HeaderValue::from_str(&etag)
+            {
+                resp.headers_mut().insert(header::ETAG, v);
+            }
+        }
+        Some(crate::domain::multipart::BindState::Conflict) => {
+            resp.headers_mut()
+                .insert("x-fs-bound", HeaderValue::from_static("conflict"));
+            if let Some(cur) = outcome.current_etag
+                && let Ok(v) = HeaderValue::from_str(&cur)
+            {
+                resp.headers_mut().insert("x-fs-current-etag", v);
+            }
+        }
+        _ => {}
+    }
+    Ok(resp)
 }
 
 /// Request body for the data-plane report-part endpoint.
@@ -783,8 +877,6 @@ pub struct ReportPartReq {
 /// the signed `multipart_part` upload token in the `x-fs-token` request
 /// header. Called by the sidecar immediately after a successful part write to
 /// record the part row that `complete_multipart_upload` assembles from.
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
 pub async fn report_multipart_part(
     Extension(msvc): MultiSvc,
     Extension(verifier): Extension<Arc<Verifier>>,
@@ -800,8 +892,17 @@ pub async fn report_multipart_part(
         .map(str::to_owned)
         .ok_or_else(|| DomainError::token_invalid("missing x-fs-token header"))?;
 
+    // Grace on `exp` only: same reasoning as `finalize_version` -- the
+    // sidecar's report-part callback can legitimately arrive after the
+    // token's `exp` for a slow-but-live multipart upload, and the part has
+    // already been durably written. Signature and claim-binding checks
+    // below are unchanged.
     let claims = verifier
-        .verify(&token, OffsetDateTime::now_utc())
+        .verify_with_grace(
+            &token,
+            OffsetDateTime::now_utc(),
+            finalize_auth.token_grace(),
+        )
         .map_err(|e| DomainError::token_invalid(e.to_string()))?;
 
     // The token must authorize a report for exactly this
@@ -836,6 +937,20 @@ pub async fn report_multipart_part(
 
     let hash_value = hex::decode(&req.hash_hex)
         .map_err(|_| DomainError::validation("hash_hex", "must be valid hex-encoded SHA-256"))?;
+    // Bug fix (integrity remediation): `finalize_version` above already
+    // rejects a hash that does not decode to exactly 32 bytes; this route
+    // must mirror that check — otherwise a wrong-length hash is accepted
+    // here with a `204`, gets persisted unchecked by
+    // `MultipartService::report_part`, and only surfaces later as an opaque
+    // `400` at `complete` (against the wrong actor: whoever happens to call
+    // `complete`, not the caller that actually reported the bad hash).
+    if hash_value.len() != 32 {
+        return Err(DomainError::validation(
+            "hash_hex",
+            "must decode to exactly 32 bytes (SHA-256)",
+        )
+        .into());
+    }
 
     msvc.report_part(&claims, req.backend_etag, hash_value, req.size)
         .await?;

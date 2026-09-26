@@ -4,7 +4,7 @@
 //! record is inserted; on a retry the stored record is returned unchanged.
 //! All queries are scoped by `(tenant_id, owner_kind, owner_id, key)`.
 
-use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter, Set};
+use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set};
 use time::OffsetDateTime;
 use toolkit_db::secure::{DBRunner, SecureDeleteExt, SecureEntityExt, secure_insert};
 use toolkit_security::AccessScope;
@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 use crate::domain::idempotency::IdempotencyRecord;
-use crate::infra::storage::db::db_err;
+use crate::infra::storage::db::{conflict_on_unique_violation, db_err};
 use crate::infra::storage::entity::idempotency_key::{ActiveModel, Column, Entity, Model};
 use crate::infra::storage::store::IdempotencyInsert;
 
@@ -110,25 +110,107 @@ impl IdempotencyRepo {
             created_at: Set(now),
             expires_at: Set(idem.expires_at),
         };
+        // The design documented above *relies on* this insert losing the
+        // primary-key race against a concurrent identical request: that is
+        // how a duplicate `POST /files` retried after a client-side timeout
+        // is turned away without creating a second file. Classify that race
+        // as a conflict rather than an opaque `db_err` 500, so the racing
+        // caller gets a 409 it can react to (re-fetch via `get` and replay
+        // the winner's stored response) rather than a request that looks
+        // like it failed outright.
         secure_insert::<Entity>(am, &AccessScope::allow_all(), conn)
             .await
-            .map_err(db_err)?;
+            .map_err(|e| {
+                conflict_on_unique_violation(
+                    e,
+                    "a request with this idempotency key is already being processed or has \
+                     already completed",
+                )
+            })?;
         Ok(())
     }
 
-    /// Bulk-delete all rows whose `expires_at` is at or before `now`.
+    /// Delete at most `limit` rows whose `expires_at` is at or before `now`,
+    /// ordered `(expires_at, tenant_id, owner_kind, owner_id,
+    /// idempotency_key)` ascending -- oldest-expired first.
     ///
-    /// Called by the cleanup sweep (P2 remediation 1.9) so the
-    /// `idempotency_keys` table doesn't grow unboundedly — previously only a
-    /// lapsed row *for the same key* was ever removed (in [`Self::insert`]),
-    /// never a table-wide sweep. Returns the number of rows removed.
+    /// Called by the cleanup sweep so the `idempotency_keys` table doesn't
+    /// grow unboundedly -- [`Self::insert`] only ever removes a lapsed row
+    /// *for the same key*, never sweeps the whole table. Unlike a plain
+    /// `DELETE ... WHERE expires_at <= now`, this is batched, same as every
+    /// other sweep phase in this gear (`list_abandoned_pending_versions`,
+    /// `list_versionless_orphan_files`, `list_expired_multipart_uploads`):
+    /// an unbounded single statement here would hold one long-running
+    /// transaction/lock on `PostgreSQL` and one large single-writer
+    /// transaction on `SQLite` if the sweep had ever stopped running for a
+    /// while and let a large backlog accumulate. Returns the number of rows
+    /// removed; a short result (fewer than `limit`) means the whole backlog
+    /// was cleared, and any remainder is picked up by the next sweep pass.
+    ///
+    /// The composite primary key (`tenant_id`, `owner_kind`, `owner_id`,
+    /// `idempotency_key`) has no single surrogate column a `DELETE ...
+    /// WHERE pk IN (SELECT pk ... LIMIT n)` subquery could target directly
+    /// through `secure-ORM`'s delete builder (which has no `RETURNING`/
+    /// tuple-`IN` support -- see `file_repo.rs::delete_if_orphan`'s doc
+    /// comment on the same limitation), so this selects the batch's exact
+    /// keys first, then deletes by an OR of exact 4-column matches. Safe
+    /// here specifically because `expires_at` never "un-expires": a row
+    /// selected as an expiry candidate stays one for the rest of this
+    /// method's lifetime, unlike the delete-file/version races elsewhere in
+    /// this gear where a concurrent insert can invalidate a pre-transaction
+    /// read.
     pub async fn delete_expired<C: DBRunner>(
         &self,
         conn: &C,
         now: OffsetDateTime,
+        limit: u64,
     ) -> Result<u64, DomainError> {
-        let res = Entity::delete_many()
+        #[derive(sea_orm::FromQueryResult)]
+        struct ExpiredKey {
+            tenant_id: Uuid,
+            owner_kind: String,
+            owner_id: Uuid,
+            idempotency_key: String,
+        }
+
+        let candidates = Entity::find()
             .filter(Column::ExpiresAt.lte(now))
+            .secure()
+            .scope_with(&AccessScope::allow_all())
+            .project_all(conn, |q| {
+                q.select_only()
+                    .column(Column::TenantId)
+                    .column(Column::OwnerKind)
+                    .column(Column::OwnerId)
+                    .column(Column::IdempotencyKey)
+                    .order_by_asc(Column::ExpiresAt)
+                    .order_by_asc(Column::TenantId)
+                    .order_by_asc(Column::OwnerKind)
+                    .order_by_asc(Column::OwnerId)
+                    .order_by_asc(Column::IdempotencyKey)
+                    .limit(limit)
+                    .into_model::<ExpiredKey>()
+            })
+            .await
+            .map_err(db_err)?;
+
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+
+        let mut matches = Condition::any();
+        for c in &candidates {
+            matches = matches.add(
+                Condition::all()
+                    .add(Column::TenantId.eq(c.tenant_id))
+                    .add(Column::OwnerKind.eq(c.owner_kind.clone()))
+                    .add(Column::OwnerId.eq(c.owner_id))
+                    .add(Column::IdempotencyKey.eq(c.idempotency_key.clone())),
+            );
+        }
+
+        let res = Entity::delete_many()
+            .filter(matches)
             .secure()
             .scope_with(&AccessScope::allow_all())
             .exec(conn)

@@ -1,12 +1,20 @@
 """E2E integration-seam tests for the file-storage control plane.
 
 Each test targets exactly one seam that unit tests cannot see (real HTTP +
-real PostgreSQL + real AuthZ wiring). Domain invariants, CHECK constraints, and
-the migration SQL are covered by the Rust unit/integration suite
-(``gears/file-storage/file-storage``) and are deliberately NOT retested here.
+real AuthN/AuthZ wiring against the shared CI server -- gear registration,
+route mounting, error middleware, auth enforcement). Domain invariants, CHECK
+constraints, and the migration SQL are covered by the Rust unit/integration
+suite (``gears/file-storage/file-storage``) and are deliberately NOT retested
+here; content-bearing flows (upload/download bytes, multipart, S3) live in the
+sibling ``lifecycle``/``lifecycle_s3`` packages, which run against their own
+private server + sidecar rather than this module's shared one (see
+``docs/DESIGN.md`` §"Testing" for why the split, and for the full e2e/crate
+coverage map).
 
 The whole module is gated by ``require_file_storage_mounted`` (see conftest):
-it skips until the M5 endpoints are mounted, then runs for real.
+it skips (never fails) if the shared CI server does not have the gear's
+routes mounted or is unreachable, so this file safely no-ops on a build that
+does not include ``file-storage`` as a cargo feature.
 
 Seam map (api.md §"P1 — Control plane"):
   - route registration                → test_route_smoke_endpoints_registered

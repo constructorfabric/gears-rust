@@ -94,6 +94,28 @@ async fn migration_creates_all_three_tables() {
 async fn migration_up_down_up_roundtrip() {
     let db = migrated_db().await;
 
+    // Sanity anchor for the redesign columns, checked *before* anything is
+    // rolled back. `m20260924_000001_upload_flow_redesign`'s `down()` used to
+    // be a `SELECT 1` no-op on both dialects: a full `Migrator::down` rolled
+    // back every other migration's schema while silently leaving
+    // `multipart_uploads.auto_bind` (plus its three lease siblings and the
+    // widened `state` CHECK) in place, so migration history claimed the
+    // redesign was reverted when it was not. This roundtrip cannot prove the
+    // fix on its own -- `p2_initial::down()` drops `multipart_uploads`
+    // outright, so "the column is gone afterwards" would hold even for a
+    // no-op `down()`. That proof lives in
+    // `upload_flow_redesign_down_actually_drops_the_new_columns_and_indexes`,
+    // which rolls back only the last migration; all this assertion does is
+    // pin that the column exists on the fully-migrated schema the rest of
+    // the test starts from.
+    let auto_bind_before_down = db
+        .execute_raw(stmt(&db, "SELECT auto_bind FROM multipart_uploads LIMIT 0"))
+        .await;
+    assert!(
+        auto_bind_before_down.is_ok(),
+        "sanity: auto_bind must exist on the fully-migrated schema: {auto_bind_before_down:?}"
+    );
+
     Migrator::down(&db, None).await.expect("roll back");
     let gone = db
         .execute_raw(stmt(&db, "SELECT * FROM files LIMIT 0"))
@@ -105,6 +127,348 @@ async fn migration_up_down_up_roundtrip() {
         .execute_raw(stmt(&db, "SELECT * FROM files LIMIT 0"))
         .await;
     assert!(back.is_ok(), "files must exist again after re-up: {back:?}");
+}
+
+/// Directly exercises the `upload_flow_redesign` migration's own up/down/up
+/// round trip (as opposed to the full-migrator roundtrip above, which
+/// dropped and recreated `multipart_uploads` from scratch via the other
+/// migrations' `down()`s and so could not tell a real column drop from a
+/// no-op). Asserts that a single `down()` actually removes `auto_bind` and
+/// the other new `multipart_uploads` columns — i.e. is not the old `SELECT
+/// 1` no-op — and reverses the index-hardening half too (drops the five new
+/// indexes, restores `files_owner_listing_idx`), and that a subsequent
+/// `up()` restores everything.
+#[tokio::test]
+async fn upload_flow_redesign_down_actually_drops_the_new_columns_and_indexes() {
+    let db = migrated_db().await;
+
+    let before = db
+        .execute_raw(stmt(&db, "SELECT auto_bind FROM multipart_uploads LIMIT 0"))
+        .await;
+    assert!(
+        before.is_ok(),
+        "auto_bind must exist after the full up(): {before:?}"
+    );
+    let backend_cols_before = db
+        .execute_raw(stmt(
+            &db,
+            "SELECT backend_id, backend_path FROM multipart_uploads LIMIT 0",
+        ))
+        .await;
+    assert!(
+        backend_cols_before.is_ok(),
+        "backend_id/backend_path must exist after the full up(): {backend_cols_before:?}"
+    );
+    assert!(index_exists(&db, "files_owner_listing_v2_idx").await);
+    assert!(!index_exists(&db, "files_owner_listing_idx").await);
+
+    // Roll back only the last-registered migration, rather than the whole
+    // history, so this test is independent of how many migrations precede
+    // upload_flow_redesign.
+    Migrator::down(&db, Some(1))
+        .await
+        .expect("roll back upload_flow_redesign");
+
+    let after_down = db
+        .execute_raw(stmt(&db, "SELECT auto_bind FROM multipart_uploads LIMIT 0"))
+        .await;
+    assert!(
+        after_down.is_err(),
+        "auto_bind must be gone after a real (non-no-op) down(): {after_down:?}"
+    );
+    let backend_cols_after_down = db
+        .execute_raw(stmt(
+            &db,
+            "SELECT backend_id, backend_path FROM multipart_uploads LIMIT 0",
+        ))
+        .await;
+    assert!(
+        backend_cols_after_down.is_err(),
+        "backend_id/backend_path must be gone after a real (non-no-op) down(): \
+         {backend_cols_after_down:?}"
+    );
+    assert!(
+        !index_exists(&db, "files_owner_listing_v2_idx").await,
+        "files_owner_listing_v2_idx must be dropped by down()"
+    );
+    assert!(
+        index_exists(&db, "files_owner_listing_idx").await,
+        "files_owner_listing_idx must be recreated by down()"
+    );
+    assert!(!index_exists(&db, "idempotency_keys_file_idx").await);
+    assert!(!index_exists(&db, "multipart_uploads_sweep_idx").await);
+    assert!(!index_exists(&db, "files_versionless_sweep_idx").await);
+    assert!(!index_exists(&db, "file_versions_file_created_idx").await);
+
+    Migrator::up(&db, Some(1))
+        .await
+        .expect("re-apply upload_flow_redesign");
+    let after_up = db
+        .execute_raw(stmt(&db, "SELECT auto_bind FROM multipart_uploads LIMIT 0"))
+        .await;
+    assert!(
+        after_up.is_ok(),
+        "auto_bind must exist again after re-up(): {after_up:?}"
+    );
+    let backend_cols_after_up = db
+        .execute_raw(stmt(
+            &db,
+            "SELECT backend_id, backend_path FROM multipart_uploads LIMIT 0",
+        ))
+        .await;
+    assert!(
+        backend_cols_after_up.is_ok(),
+        "backend_id/backend_path must exist again after re-up(): {backend_cols_after_up:?}"
+    );
+    assert!(index_exists(&db, "files_owner_listing_v2_idx").await);
+    assert!(!index_exists(&db, "files_owner_listing_idx").await);
+}
+
+// ── upload_flow_redesign: backend_id/backend_path backfill ──────────────────
+
+/// A second upload id, distinct from `UPLOAD` above, used only by the
+/// backend_id/backend_path backfill test below for the session with no
+/// matching `file_versions` row.
+const UPLOAD_NO_VERSION: &str = "00000000-0000-0000-0000-0000000000f3";
+/// A version id that is deliberately never inserted into `file_versions` --
+/// models a session whose version was already reclaimed (or one from the
+/// standalone initiate path that never got one) by the time this migration's
+/// backfill runs.
+const ORPHAN_VERSION: &str = "00000000-0000-0000-0000-0000000000f4";
+
+/// A session whose `(file_id, version_id)` matches an existing
+/// `file_versions` row must have `backend_id`/`backend_path` backfilled from
+/// it; a session with no matching version must be left `NULL` (the legacy
+/// case cleanup's own fallback still covers -- see
+/// `CleanupEngine::cleanup_expired_session_version_with_file`).
+#[tokio::test]
+async fn upload_flow_redesign_backfills_backend_id_and_path_from_matching_version() {
+    let db = Database::connect("sqlite::memory:")
+        .await
+        .expect("connect in-memory sqlite");
+    db.execute_raw(stmt(&db, "PRAGMA foreign_keys = ON;"))
+        .await
+        .expect("enable foreign keys");
+
+    // Every migration up to (not including) upload_flow_redesign -- the "old"
+    // schema, before backend_id/backend_path existed on multipart_uploads.
+    Migrator::up(&db, Some(7))
+        .await
+        .expect("apply every migration up to (not including) upload_flow_redesign");
+
+    insert_file(&db, FILE).await;
+    insert_version(&db, FILE, VERSION, 1).await;
+
+    // A session whose version_id matches the file_versions row just
+    // inserted -- must be backfilled from it.
+    db.execute_raw(stmt(
+        &db,
+        format!(
+            "INSERT INTO multipart_uploads \
+             (upload_id, file_id, version_id, backend_upload_handle, declared_mime, expires_at) \
+             VALUES ('{UPLOAD}', '{FILE}', '{VERSION}', 'handle-1', 'text/plain', '2999-01-01T00:00:00Z')"
+        ),
+    ))
+    .await
+    .expect("insert multipart session with a matching version, before the backfill migration");
+
+    // A second session whose version_id has NO matching file_versions row --
+    // must stay NULL after the backfill.
+    db.execute_raw(stmt(
+        &db,
+        format!(
+            "INSERT INTO multipart_uploads \
+             (upload_id, file_id, version_id, backend_upload_handle, declared_mime, expires_at) \
+             VALUES ('{UPLOAD_NO_VERSION}', '{FILE}', '{ORPHAN_VERSION}', 'handle-2', \
+             'text/plain', '2999-01-01T00:00:00Z')"
+        ),
+    ))
+    .await
+    .expect("insert multipart session with no matching version, before the backfill migration");
+
+    Migrator::up(&db, None)
+        .await
+        .expect("apply the remaining migration (upload_flow_redesign)");
+
+    let row = db
+        .query_one_raw(stmt(
+            &db,
+            format!(
+                "SELECT backend_id AS bid, backend_path AS bpath FROM multipart_uploads \
+                 WHERE upload_id = '{UPLOAD}'"
+            ),
+        ))
+        .await
+        .expect("query")
+        .expect("one row");
+    assert_eq!(
+        row.try_get::<String>("", "bid").expect("backend_id"),
+        "local",
+        "backend_id must be backfilled from the matching file_versions row"
+    );
+    assert_eq!(
+        row.try_get::<String>("", "bpath").expect("backend_path"),
+        format!("/{FILE}/{VERSION}"),
+        "backend_path must be backfilled from the matching file_versions row"
+    );
+
+    assert_eq!(
+        count(
+            &db,
+            &format!(
+                "SELECT COUNT(*) AS c FROM multipart_uploads WHERE upload_id = '{UPLOAD_NO_VERSION}' \
+                 AND backend_id IS NULL AND backend_path IS NULL"
+            )
+        )
+        .await,
+        1,
+        "a session with no matching version must be left NULL, not backfilled"
+    );
+}
+
+// ── upload_flow_redesign rebuild: child rows and indexes survive ────────────
+
+/// Upload id used only by the `upload_flow_redesign` rebuild-survival test
+/// below.
+const UPLOAD: &str = "00000000-0000-0000-0000-0000000000f1";
+
+async fn index_exists(db: &DatabaseConnection, name: &str) -> bool {
+    count(
+        db,
+        &format!(
+            "SELECT COUNT(*) AS c FROM sqlite_master WHERE type = 'index' AND name = '{name}'"
+        ),
+    )
+    .await
+        == 1
+}
+
+/// Reproduces the bug fixed in `m20260924_000001_upload_flow_redesign`'s
+/// `SQLITE_UP`: that migration rebuilds `multipart_uploads` (SQLite cannot
+/// widen a `CHECK` constraint in place) by creating a new table, copying the
+/// parent rows, then `DROP TABLE multipart_uploads`. `multipart_upload_parts
+/// .upload_id` carries `REFERENCES multipart_uploads (upload_id) ON DELETE
+/// CASCADE` (`m20260701_000001_p2_initial`), and this test suite runs with
+/// `PRAGMA foreign_keys = ON` — exactly like the production sqlx pool
+/// defaults — so the naive rebuild's `DROP TABLE` cascades and silently
+/// deletes every `multipart_upload_parts` row, and the rebuild never
+/// recreates `multipart_uploads_file_idx` / `multipart_uploads_expired_idx`
+/// either.
+///
+/// This test applies every migration up to (but not including)
+/// `upload_flow_redesign` — the 8th and last of the 8 registered migrations,
+/// so `Some(7)` pending migrations — inserts a file, a multipart session,
+/// and two parts referencing it, then applies the remaining migration
+/// (`upload_flow_redesign`) and asserts the parts and the session are both
+/// still there, and both indexes exist.
+#[tokio::test]
+async fn upload_flow_redesign_data_and_indexes_survive_rebuild() {
+    let db = Database::connect("sqlite::memory:")
+        .await
+        .expect("connect in-memory sqlite");
+    db.execute_raw(stmt(&db, "PRAGMA foreign_keys = ON;"))
+        .await
+        .expect("enable foreign keys");
+
+    Migrator::up(&db, Some(7))
+        .await
+        .expect("apply every migration up to (not including) upload_flow_redesign");
+
+    insert_file(&db, FILE).await;
+    db.execute_raw(stmt(
+        &db,
+        format!(
+            "INSERT INTO multipart_uploads \
+             (upload_id, file_id, version_id, backend_upload_handle, declared_mime, expires_at) \
+             VALUES ('{UPLOAD}', '{FILE}', '{VERSION}', 'handle-1', 'text/plain', '2999-01-01T00:00:00Z')"
+        ),
+    ))
+    .await
+    .expect("insert multipart session before the rebuild migration");
+    db.execute_raw(stmt(
+        &db,
+        format!(
+            "INSERT INTO multipart_upload_parts \
+             (upload_id, part_number, backend_etag, part_hash, size) VALUES \
+             ('{UPLOAD}', 1, 'etag-1', X'{HASH32}', 100), \
+             ('{UPLOAD}', 2, 'etag-2', X'{HASH32}', 200)"
+        ),
+    ))
+    .await
+    .expect("insert two parts before the rebuild migration");
+
+    Migrator::up(&db, None)
+        .await
+        .expect("apply the remaining migration (upload_flow_redesign)");
+
+    assert_eq!(
+        count(
+            &db,
+            &format!(
+                "SELECT COUNT(*) AS c FROM multipart_upload_parts WHERE upload_id = '{UPLOAD}'"
+            )
+        )
+        .await,
+        2,
+        "both parts must survive the multipart_uploads rebuild"
+    );
+    assert_eq!(
+        count(
+            &db,
+            &format!("SELECT COUNT(*) AS c FROM multipart_uploads WHERE upload_id = '{UPLOAD}'")
+        )
+        .await,
+        1,
+        "the session row must survive the rebuild"
+    );
+    assert!(
+        index_exists(&db, "multipart_uploads_file_idx").await,
+        "multipart_uploads_file_idx must be recreated by the rebuild"
+    );
+    assert!(
+        index_exists(&db, "multipart_uploads_expired_idx").await,
+        "multipart_uploads_expired_idx must be recreated by the rebuild"
+    );
+}
+
+// ── upload_flow_redesign: index hardening ────────────────────────────────────
+
+/// All covering indexes added by `m20260924_000001_upload_flow_redesign`'s
+/// index-hardening half must exist after a full `up()`, and the superseded
+/// `files_owner_listing_idx` (from `m20260624_000001_p1_initial`, replaced by
+/// `files_owner_listing_v2_idx`) must be gone. `down()`'s mirror-image
+/// assertions (indexes dropped, `files_owner_listing_idx` restored) live in
+/// `upload_flow_redesign_down_actually_drops_the_new_columns_and_indexes`
+/// above, alongside the column-drop assertions -- one migration, one down()
+/// test.
+#[tokio::test]
+async fn upload_flow_redesign_indexes_exist_after_up() {
+    let db = migrated_db().await;
+    assert!(
+        index_exists(&db, "idempotency_keys_file_idx").await,
+        "idempotency_keys_file_idx must exist after up()"
+    );
+    assert!(
+        index_exists(&db, "multipart_uploads_sweep_idx").await,
+        "multipart_uploads_sweep_idx must exist after up()"
+    );
+    assert!(
+        index_exists(&db, "files_versionless_sweep_idx").await,
+        "files_versionless_sweep_idx must exist after up()"
+    );
+    assert!(
+        index_exists(&db, "file_versions_file_created_idx").await,
+        "file_versions_file_created_idx must exist after up()"
+    );
+    assert!(
+        index_exists(&db, "files_owner_listing_v2_idx").await,
+        "files_owner_listing_v2_idx must exist after up()"
+    );
+    assert!(
+        !index_exists(&db, "files_owner_listing_idx").await,
+        "files_owner_listing_idx must be dropped after up() -- superseded by \
+         files_owner_listing_v2_idx"
+    );
 }
 
 // ── files CHECK constraints ──────────────────────────────────────────────────
@@ -779,6 +1143,89 @@ async fn content_hash_modes_rejects_whole_with_part_count() {
         res.is_err(),
         "whole-sha256 with a non-NULL part_count must violate the presence CHECK"
     );
+}
+
+/// The presence CHECK alone does not pin a `>= 2` floor on `part_count`: a
+/// `multipart-composite-sha256` row with `part_count = 1` satisfies it.
+/// ADR-0006's single-part amendment degenerates a one-part multipart plan to
+/// `whole-sha256` instead (`multipart_service.rs::assemble_and_finish_inner`,
+/// `single_part`/`WholeSha256` branch), so the application itself never
+/// writes such a row going forward — but ADR-0006's Compatibility note
+/// records that releases before that amendment legitimately persisted
+/// one-part multipart completions this way, so the schema must keep
+/// accepting the shape already sitting in production, not just the shape new
+/// writes take.
+#[tokio::test]
+async fn content_hash_modes_accepts_legacy_single_part_composite() {
+    let db = migrated_db().await;
+    insert_file(&db, FILE).await;
+    db.execute_raw(stmt(
+        &db,
+        format!(
+            "INSERT INTO file_versions \
+             (file_id, version_id, mime_type, size, hash_value, hash_mode, part_count, \
+              status, is_current, backend_id, backend_path) \
+             VALUES ('{FILE}', '{VERSION}', 'text/plain', 0, X'{HASH32}', \
+             'multipart-composite-sha256', 1, 'available', 0, 'local', '/x')"
+        ),
+    ))
+    .await
+    .expect(
+        "multipart-composite-sha256 with part_count = 1 must satisfy the CHECK \
+         (legacy pre-amendment rows, ADR-0006)",
+    );
+}
+
+/// A `multipart-composite-sha256` row with `part_count = 2` (the minimum a
+/// composite row may carry) satisfies the CHECK.
+#[tokio::test]
+async fn content_hash_modes_accepts_multipart_with_two_parts() {
+    let db = migrated_db().await;
+    insert_file(&db, FILE).await;
+    db.execute_raw(stmt(
+        &db,
+        format!(
+            "INSERT INTO file_versions \
+             (file_id, version_id, mime_type, size, hash_value, hash_mode, part_count, \
+              status, is_current, backend_id, backend_path) \
+             VALUES ('{FILE}', '{VERSION}', 'text/plain', 0, X'{HASH32}', \
+             'multipart-composite-sha256', 2, 'available', 0, 'local', '/x')"
+        ),
+    ))
+    .await
+    .expect("multipart-composite-sha256 with part_count = 2 must satisfy the CHECK");
+
+    assert_eq!(
+        count(
+            &db,
+            &format!(
+                "SELECT COUNT(*) AS c FROM file_versions \
+                 WHERE version_id = '{VERSION}' AND part_count = 2"
+            )
+        )
+        .await,
+        1
+    );
+}
+
+/// A `whole-sha256` row with `part_count = NULL` — the ordinary,
+/// non-multipart case — satisfies the CHECK.
+#[tokio::test]
+async fn content_hash_modes_accepts_whole_with_null_part_count() {
+    let db = migrated_db().await;
+    insert_file(&db, FILE).await;
+    db.execute_raw(stmt(
+        &db,
+        format!(
+            "INSERT INTO file_versions \
+             (file_id, version_id, mime_type, size, hash_value, hash_mode, part_count, \
+              status, is_current, backend_id, backend_path) \
+             VALUES ('{FILE}', '{VERSION}', 'text/plain', 0, X'{HASH32}', \
+             'whole-sha256', NULL, 'available', 0, 'local', '/x')"
+        ),
+    ))
+    .await
+    .expect("whole-sha256 with a NULL part_count must satisfy the CHECK");
 }
 
 /// The `hash_mode` CHECK rejects any value outside the two shipped modes.

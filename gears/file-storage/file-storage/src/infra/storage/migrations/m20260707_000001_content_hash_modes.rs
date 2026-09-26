@@ -22,8 +22,6 @@
 //! `hash_algorithm`'s existing `CHECK (hash_algorithm = 'SHA-256')` is left
 //! **untouched** — both modes use SHA-256 as their only underlying
 //! primitive, so there is nothing to widen.
-//!
-//! @cpt-dod:cpt-cf-file-storage-dod-content-hash-modes-schema:p2
 
 use sea_orm_migration::prelude::*;
 use sea_orm_migration::sea_orm::ConnectionTrait;

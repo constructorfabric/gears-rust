@@ -29,6 +29,9 @@ use uuid::Uuid;
 
 use file_storage::domain::authz::{Authorizer, actions};
 use file_storage::domain::error::DomainError;
+use file_storage::domain::policy::{PolicyBody, PolicyScope};
+use file_storage::domain::policy_service::PolicyService;
+use file_storage::domain::ports::PolicyStore;
 use file_storage::domain::service::{FileService, ServiceConfig};
 use file_storage::infra::backend::{BackendRegistry, InMemoryBackend, StorageBackend};
 use file_storage::infra::signed_url::Issuer;
@@ -108,6 +111,7 @@ async fn build_db() -> Arc<DBProvider<DbError>> {
 
 struct Harness {
     file_svc: Arc<FileService>,
+    policy_svc: Arc<PolicyService>,
     authz: Arc<ScopedTestAuthorizer>,
 }
 
@@ -126,10 +130,22 @@ async fn build_harness() -> Harness {
         idempotency_ttl_secs: 86400,
     };
     let store = Store::new(Arc::clone(&db));
+    let policy_store: Arc<dyn PolicyStore> = Arc::new(store.clone());
     let file_svc = Arc::new(FileService::new(
-        store, backends, issuer, authorizer, cfg, None, None,
+        store,
+        backends,
+        issuer,
+        Arc::clone(&authorizer),
+        cfg,
+        None,
+        None,
     ));
-    Harness { file_svc, authz }
+    let policy_svc = Arc::new(PolicyService::new(policy_store, authorizer));
+    Harness {
+        file_svc,
+        policy_svc,
+        authz,
+    }
 }
 
 fn ctx(tenant: Uuid, subject: Uuid) -> SecurityContext {
@@ -168,7 +184,7 @@ async fn idempotency_replay_requires_authorization() {
     // Seed a ticket while WRITE is still granted.
     let first = h
         .file_svc
-        .create_file(&ctx_caller, new_file(subject), Some(key.clone()))
+        .create_file(&ctx_caller, new_file(subject), Some(key.clone()), false)
         .await
         .expect("initial create should succeed while authorized");
 
@@ -176,7 +192,7 @@ async fn idempotency_replay_requires_authorization() {
     h.authz.deny_write_for_subject(subject);
     let replay = h
         .file_svc
-        .create_file(&ctx_caller, new_file(subject), Some(key))
+        .create_file(&ctx_caller, new_file(subject), Some(key), false)
         .await;
 
     assert!(
@@ -210,7 +226,7 @@ async fn idempotency_key_scoped_to_subject() {
 
     let ticket_a = h
         .file_svc
-        .create_file(&ctx_a, new_file(owner_id), Some(key.clone()))
+        .create_file(&ctx_a, new_file(owner_id), Some(key.clone()), false)
         .await
         .expect("caller A creates and stores the idempotency ticket");
 
@@ -218,7 +234,7 @@ async fn idempotency_key_scoped_to_subject() {
     // ticket.
     let result_b = h
         .file_svc
-        .create_file(&ctx_b, new_file(owner_id), Some(key.clone()))
+        .create_file(&ctx_b, new_file(owner_id), Some(key.clone()), false)
         .await;
     match &result_b {
         Ok(ticket_b) => assert_ne!(
@@ -232,11 +248,292 @@ async fn idempotency_key_scoped_to_subject() {
     // Caller A's own replay must still work unchanged.
     let replay_a = h
         .file_svc
-        .create_file(&ctx_a, new_file(owner_id), Some(key))
+        .create_file(&ctx_a, new_file(owner_id), Some(key), false)
         .await
         .expect("caller A's own replay must still succeed");
     assert_eq!(
         replay_a.file_id, ticket_a.file_id,
         "caller A's replay must return A's original ticket"
     );
+}
+
+// ── idempotency_replay_rejected_after_policy_tightened ──────────────────────
+
+/// A policy tightened *after* the original `create_file` must also reject a
+/// replay of a stored idempotency ticket — not just a fresh request. Before
+/// the fix, the replay path (`create.rs`, the `idempotency_key` branch)
+/// returned the stored ticket unconditionally once the request-hash and
+/// subject checks passed, entirely before the policy-resolution block that
+/// runs for a fresh create — bypassing a tightened policy for the whole
+/// idempotency TTL (24h default).
+#[tokio::test]
+async fn idempotency_replay_rejected_after_policy_tightened() {
+    let h = build_harness().await;
+    let tenant = Uuid::now_v7();
+    let subject = Uuid::now_v7();
+    let ctx_caller = ctx(tenant, subject);
+    let key = "idem-policy-tighten-1".to_owned();
+
+    // No policy configured yet: the original create succeeds (mime type is
+    // "application/octet-stream", see `new_file`).
+    let first = h
+        .file_svc
+        .create_file(&ctx_caller, new_file(subject), Some(key.clone()), false)
+        .await
+        .expect("initial create should succeed with no policy configured");
+
+    // Tighten the tenant policy to allow only a different mime type.
+    h.policy_svc
+        .set_policy(
+            &ctx_caller,
+            PolicyScope::Tenant,
+            None,
+            PolicyBody {
+                allowed_mime_types: vec!["image/png".to_owned()],
+                ..PolicyBody::default()
+            },
+        )
+        .await
+        .expect("tighten tenant policy");
+
+    // Replaying the same key must now be rejected: the stored request's mime
+    // type is no longer permitted by the CURRENT effective policy.
+    let replay = h
+        .file_svc
+        .create_file(&ctx_caller, new_file(subject), Some(key), false)
+        .await;
+    assert!(
+        matches!(
+            replay,
+            Err(DomainError::PolicyMimeNotAllowed { ref mime_type }) if mime_type == "application/octet-stream"
+        ),
+        "expected PolicyMimeNotAllowed on replay after policy tightened, got {replay:?}"
+    );
+    assert_ne!(first.file_id, Uuid::nil());
+}
+
+// ── helpers for the `auto_bind`/ownership replay tests below ───────────────
+
+/// Pull the `fs-token` query value out of a signed sidecar URL, matching the
+/// extraction pattern used in `api_handlers_test.rs`/`enforce_test.rs`.
+fn token_from_url(url: &str) -> &str {
+    let start = url.find("fs-token=").expect("fs-token in URL") + "fs-token=".len();
+    &url[start..]
+}
+
+// ── idempotency_replay_rejects_changed_bind_mode (t19) ──────────────────────
+
+/// A replay that supplies a different `bind` than the original request must
+/// be rejected with the *same* conflict as a `request_hash` mismatch — not
+/// silently re-mint a token under the new mode. `bind` is deliberately
+/// excluded from `request_hash` (so a stored ticket predating the flag still
+/// hashes the same), which is exactly why this needs its own check.
+#[tokio::test]
+async fn idempotency_replay_rejects_changed_bind_mode() {
+    let h = build_harness().await;
+    let tenant = Uuid::now_v7();
+    let subject = Uuid::now_v7();
+    let ctx_caller = ctx(tenant, subject);
+
+    // Capture the wording of an actual `request_hash` mismatch, so this test
+    // doesn't hardcode a message string that could drift independently of
+    // the production code it's supposed to mirror.
+    let hash_mismatch_key = "idem-hash-mismatch-1".to_owned();
+    h.file_svc
+        .create_file(
+            &ctx_caller,
+            new_file(subject),
+            Some(hash_mismatch_key.clone()),
+            false,
+        )
+        .await
+        .expect("initial create for hash-mismatch reference");
+    let mut renamed = new_file(subject);
+    renamed.name = "different-name.bin".to_owned();
+    let hash_mismatch_err = h
+        .file_svc
+        .create_file(&ctx_caller, renamed, Some(hash_mismatch_key), false)
+        .await
+        .expect_err("a different request body must conflict");
+    let DomainError::Conflict {
+        message: hash_mismatch_message,
+    } = hash_mismatch_err
+    else {
+        panic!("expected Conflict, got {hash_mismatch_err:?}");
+    };
+
+    // Now the actual case under test: same request body, only `bind` flips.
+    let bind_key = "idem-bind-mismatch-1".to_owned();
+    h.file_svc
+        .create_file(
+            &ctx_caller,
+            new_file(subject),
+            Some(bind_key.clone()),
+            false,
+        )
+        .await
+        .expect("initial create with bind=false");
+    let bind_replay_err = h
+        .file_svc
+        .create_file(&ctx_caller, new_file(subject), Some(bind_key), true)
+        .await
+        .expect_err("a replay with a different bind mode must conflict");
+    let DomainError::Conflict {
+        message: bind_mismatch_message,
+    } = bind_replay_err
+    else {
+        panic!("expected Conflict, got {bind_replay_err:?}");
+    };
+
+    assert_eq!(
+        bind_mismatch_message, hash_mismatch_message,
+        "a bind-mode mismatch must produce the exact same conflict as a request_hash mismatch"
+    );
+}
+
+// ── idempotency_replay_same_bind_reissues_original_mode (t19) ───────────────
+
+/// A replay with the SAME `bind` as the original request must succeed, and
+/// the re-minted token must carry the originally-recorded `bind_on_finalize`
+/// — not whatever the (matching) retry happened to pass in.
+#[tokio::test]
+async fn idempotency_replay_same_bind_reissues_original_mode() {
+    let h = build_harness().await;
+    let tenant = Uuid::now_v7();
+    let subject = Uuid::now_v7();
+    let ctx_caller = ctx(tenant, subject);
+    let key = "idem-bind-same-1".to_owned();
+
+    let first = h
+        .file_svc
+        .create_file(&ctx_caller, new_file(subject), Some(key.clone()), true)
+        .await
+        .expect("initial create with bind=true");
+
+    let replay = h
+        .file_svc
+        .create_file(&ctx_caller, new_file(subject), Some(key), true)
+        .await
+        .expect("replay with the same bind mode must succeed");
+
+    assert_eq!(replay.file_id, first.file_id);
+    assert_eq!(replay.version_id, first.version_id);
+
+    let now = time::OffsetDateTime::now_utc();
+    let claims = h
+        .file_svc
+        .verifier()
+        .verify(token_from_url(&replay.upload_url), now)
+        .expect("replayed token must verify");
+    assert!(
+        claims.bind_on_finalize,
+        "replayed token must keep the originally-recorded auto_bind=true"
+    );
+}
+
+// ── ownership-transfer / deletion invalidate an in-flight replay (t20) ─────
+
+/// After the file is transferred to a new owner, a replay of the ORIGINAL
+/// owner's idempotency key must be rejected rather than mint a fresh upload
+/// token — a former owner must not retain write capability past a transfer.
+#[tokio::test]
+async fn idempotency_replay_rejected_after_ownership_transfer() {
+    let h = build_harness().await;
+    let tenant = Uuid::now_v7();
+    let subject = Uuid::now_v7();
+    let new_owner = Uuid::now_v7();
+    let ctx_caller = ctx(tenant, subject);
+    let key = "idem-transfer-1".to_owned();
+
+    let first = h
+        .file_svc
+        .create_file(&ctx_caller, new_file(subject), Some(key.clone()), false)
+        .await
+        .expect("initial create should succeed");
+
+    h.file_svc
+        .transfer_ownership(&ctx_caller, first.file_id, OwnerKind::User, new_owner)
+        .await
+        .expect("transfer_ownership should succeed");
+
+    let replay = h
+        .file_svc
+        .create_file(&ctx_caller, new_file(subject), Some(key), false)
+        .await;
+    assert!(
+        matches!(replay, Err(DomainError::Conflict { .. })),
+        "expected Conflict after the file changed owner, got {replay:?}"
+    );
+}
+
+/// If the file was deleted before the replay, the replay must never mint a
+/// token against the dead file.
+///
+/// `idempotency_keys.file_id REFERENCES files (file_id) ON DELETE CASCADE`
+/// (`m20260701_000001_p2_initial`) means `delete_file` already removes the
+/// stored ticket in the very same transaction as the file — so by the time a
+/// replay runs, `get_idempotency_key` finds no record at all, and
+/// `create_file` correctly falls through to its fresh-create path instead of
+/// its replay branch. That is what's asserted here: the "replay" mints an
+/// entirely independent file, never a token pointing at `first.file_id`.
+/// `create_file`'s own live-file recheck in its replay branch (added
+/// alongside the ownership-transfer guard) is a defense-in-depth backstop
+/// for the narrower race where a record is read just before a concurrent
+/// delete removes both rows — not exercisable through this service-level
+/// API, since the cascade already closes the ordinary case.
+#[tokio::test]
+async fn idempotency_replay_after_delete_mints_an_independent_file() {
+    let h = build_harness().await;
+    let tenant = Uuid::now_v7();
+    let subject = Uuid::now_v7();
+    let ctx_caller = ctx(tenant, subject);
+    let key = "idem-delete-1".to_owned();
+
+    let first = h
+        .file_svc
+        .create_file(&ctx_caller, new_file(subject), Some(key.clone()), false)
+        .await
+        .expect("initial create should succeed");
+
+    h.file_svc
+        .delete_file(&ctx_caller, first.file_id, Some("*"))
+        .await
+        .expect("delete_file should succeed");
+
+    let replay = h
+        .file_svc
+        .create_file(&ctx_caller, new_file(subject), Some(key), false)
+        .await
+        .expect("replay after delete must still succeed as a fresh create");
+    assert_ne!(
+        replay.file_id, first.file_id,
+        "must never mint a token against the deleted file"
+    );
+}
+
+/// Regression: an ordinary replay with nothing changed must still succeed
+/// and return the original file/version — the ownership/version-status
+/// re-checks above must not affect the unmodified happy path.
+#[tokio::test]
+async fn idempotency_replay_unchanged_still_succeeds() {
+    let h = build_harness().await;
+    let tenant = Uuid::now_v7();
+    let subject = Uuid::now_v7();
+    let ctx_caller = ctx(tenant, subject);
+    let key = "idem-regress-1".to_owned();
+
+    let first = h
+        .file_svc
+        .create_file(&ctx_caller, new_file(subject), Some(key.clone()), false)
+        .await
+        .expect("initial create should succeed");
+
+    let replay = h
+        .file_svc
+        .create_file(&ctx_caller, new_file(subject), Some(key), false)
+        .await
+        .expect("unchanged replay must still succeed");
+
+    assert_eq!(replay.file_id, first.file_id);
+    assert_eq!(replay.version_id, first.version_id);
 }

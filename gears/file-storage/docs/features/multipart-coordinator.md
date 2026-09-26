@@ -2,7 +2,7 @@ Created:  2026-07-02 by Constructor Tech
 Updated:  2026-07-02 by Constructor Tech
 # Feature: Multipart Upload Coordinator
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-featstatus-multipart-coordinator-implemented`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-featstatus-multipart-coordinator-implemented`
 
 
 
@@ -38,17 +38,17 @@ Updated:  2026-07-02 by Constructor Tech
 
 ## 1. Feature Context
 
-- [ ] `p2` - `cpt-cf-file-storage-feature-multipart-coordinator`
+- [x] `p2` - `cpt-cf-file-storage-feature-multipart-coordinator`
 
 ### 1.1 Overview
 
-Server-authoritative multipart upload coordinator for file-storage: the client declares total size and a preferred part size; the control plane computes the exact parts plan (part_number, offset, size) and returns one signed sidecar URL per part. The client uploads each part directly to the sidecar, which enforces the declared size — a buffered length check against the token claim **before** any backend write on `multipart_native` paths, plus a streaming `max_size` abort (HTTP 413) that can fire mid-read and after backend I/O on non-native (offset-object) paths (see [Sidecar Per-Part Enforcement](#sidecar-per-part-enforcement)). The control plane then combines per-part hashes into the root hash at complete and finalizes the new file version — binding it as live content only for auto-bind sessions (`session.auto_bind`), else leaving `content_id` untouched for a separate client `bind`.
+Server-authoritative multipart upload coordinator for file-storage: the client declares total size and a preferred part size; the control plane computes the exact parts plan (part_number, offset, size) and returns one signed sidecar URL per part. The client uploads each part directly to the sidecar, which streams the part straight into the backend on both write paths — never buffering a whole part — and enforces the declared size: a streaming `max_size` abort (HTTP 413) on `multipart_native` paths (a sidecar-side counter ahead of the backend's own `upload_part_stream`, which itself takes the claim as an exact, authoritative length rather than a ceiling), and the same streaming `max_size` abort (HTTP 413) that can fire mid-read and after backend I/O on non-native (offset-object) paths (see [Sidecar Per-Part Enforcement](#sidecar-per-part-enforcement)). The control plane then combines per-part hashes into the root hash at complete and finalizes the new file version — binding it as live content only for auto-bind sessions (`session.auto_bind`), else leaving `content_id` untouched for a separate client `bind`.
 
 **Traces to**: `cpt-cf-file-storage-fr-multipart-upload`, `cpt-cf-file-storage-fr-size-limits-policy`, `cpt-cf-file-storage-fr-storage-quota`
 
 ### 1.2 Purpose
 
-Provide a safe, resumable, server-controlled multipart upload path. Each part's exact byte length is a claim inside its signed URL, and the sidecar enforces that claim — on `multipart_native` paths the whole part body is buffered and its length checked against the claim before any backend write; on non-native (offset-object) paths exceeding the claim aborts mid-stream with HTTP 413 as soon as the byte count passes the claim (possibly after some bytes reached the backend, which then requires cleanup), while a body that ends short of the claim fails the post-write exact-length check with HTTP 400. The part hash is always computed from the received bytes but a part whose length is correct is recorded as-is — the assembled content's root is computed at `complete` from the stored part hashes, not derived by re-verifying the part bytes at part-write. So a client cannot get oversized bytes recorded as a valid part regardless of the `declared_size` it declares up front.
+Provide a safe, resumable, server-controlled multipart upload path. Each part's exact byte length is a claim inside its signed URL, and the sidecar enforces that claim without ever buffering a whole part on either write path: on `multipart_native` paths a sidecar-side streaming counter (`part_size_guard`) aborts mid-stream with HTTP 413 as soon as the byte count would exceed the claim, and the claim is also what the sidecar declares as the backend request's exact `Content-Length`, so an undersized body fails that backend write directly (nothing is ever stored, nothing needs cleanup); on non-native (offset-object) paths exceeding the claim aborts mid-stream with HTTP 413 as soon as the byte count passes the claim (possibly after some bytes reached the backend, which then requires cleanup), while a body that ends short of the claim fails the post-write exact-length check with HTTP 400. The part hash is always computed from the received bytes but a part whose length is correct is recorded as-is — the assembled content's root is computed at `complete` from the stored part hashes, not derived by re-verifying the part bytes at part-write. So a client cannot get oversized bytes recorded as a valid part regardless of the `declared_size` it declares up front.
 
 All part bytes flow exclusively through sidecar signed URLs (ADR-0004); there is no control-plane byte route (ADR-0003) -- part bytes are never PUT to the control plane. See [Combine Part Hashes at Complete](#combine-part-hashes-at-complete) for how the content hash is computed.
 
@@ -63,7 +63,7 @@ All part bytes flow exclusively through sidecar signed URLs (ADR-0004); there is
 > `MultipartService` with `quota_client: None`. No `QuotaClient` is wired in any deployment, so
 > the quota check is a permissive/fail-**open** no-op — the `declared_size exceeds available storage quota` error
 > scenario below and the quota DoD line further down are exercised only by unit tests that inject a mock
-> `QuotaClient` (`tests/enforce_test.rs`), not by any real deployment. There is no Quota Enforcement SDK crate wired
+> `QuotaClient` in a unit test, not by any real deployment. There is no Quota Enforcement SDK crate wired
 > up yet; `gears/system/quota-enforcement/` is docs-only. See `../operations.md#storage-quota-not-enforced`.
 
 
@@ -92,7 +92,7 @@ User-facing interactions that start with an actor (human or external system) and
 
 ### Initiate Multipart Upload
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-flow-multipart-initiate`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-flow-multipart-initiate`
 
 **Actor**: `cpt-cf-file-storage-actor-platform-user`
 
@@ -100,21 +100,30 @@ User-facing interactions that start with an actor (human or external system) and
 - Client receives the exact parts plan (part_number, offset, size) and one signed sidecar URL per part; a pending version is pre-registered; multipart session is in_progress
 
 **Error Scenarios**:
-- `declared_mime` rejected by effective allowed-types policy -- 415 Unsupported Media Type
-- `declared_size` exceeds effective size limit -- 413 Content Too Large
+- `declared_mime` rejected by effective allowed-types policy -- `400` (`PolicyMimeNotAllowed`; see the status-code
+  note below -- not `415`)
+- `declared_size` exceeds effective size limit -- `400` (`PolicySizeExceeded`; see the status-code note below --
+  not `413`, which is reserved for the sidecar's own per-part transfer-size enforcement, a distinct mechanism)
 - `declared_size` exceeds available storage quota -- 429 Too Many Requests
 - File not found or client lacks write permission -- 404 / 403
 
+> **Status code note.** `DomainError::PolicyMimeNotAllowed` and `DomainError::PolicySizeExceeded` both map to HTTP
+> `400` at the REST boundary, exactly as for single-part upload -- see
+> [policy-engine.md](./policy-engine.md#enforce-allowed-types-and-size-limits-at-upload)'s status code note. Their
+> own `domain/error.rs` doc-comments say `415`/`413`, but no canonical-error variant on this platform resolves to
+> `415`, and `413` here would collide with the sidecar's own, unrelated per-part `max_size` enforcement (see
+> [Sidecar Per-Part Enforcement](#sidecar-per-part-enforcement) below).
+
 **Steps**:
-1. [ ] - `p1` - Client: POST /api/file-storage/v1/files/{id}/multipart with body {declared_mime, declared_size, preferred_part_size?, concurrency?} - `inst-init-request`
-2. [ ] - `p1` - API: validate declared_mime against the effective allowed-types policy; RETURN 415 if rejected - `inst-init-mime-check`
-3. [ ] - `p1` - API: validate declared_size <= effective per-file size limit; RETURN 413 if exceeded - `inst-init-size-check`
-4. [ ] - `p1` - API: validate declared_size against storage quota; RETURN 429 if exceeded - `inst-init-quota-check`
-5. [ ] - `p1` - Algorithm: compute parts plan using `cpt-cf-file-storage-algo-compute-parts-plan` - `inst-init-plan`
-6. [ ] - `p1` - DB: INSERT into multipart_uploads (upload_id, file_id, version_id, declared_size, part_size, status=in_progress, expires_at) - `inst-init-db-session`
-7. [ ] - `p1` - DB: INSERT pending version row into file_versions (version_id, file_id, status=pending) - `inst-init-db-version`
-8. [ ] - `p1` - FOR EACH part in the plan: mint a signed URL (Ed25519, codec-equivalent to PASETO v4.public -- ADR-0004's Implementation note) with claims {upload_id, file_id, version_id, part_number, offset, size, op="multipart_part", exp} - `inst-init-sign-urls`
-9. [ ] - `p1` - RETURN 200 {upload_id, version_id, part_hash_algorithm, part_size, parts: [{part_number, offset, size, upload_url}], expires_at} - `inst-init-return`
+1. [x] - `p1` - Client: POST /api/file-storage/v1/files/{id}/multipart with body {declared_mime, declared_size, preferred_part_size?} - `inst-init-request`
+2. [x] - `p1` - API: validate declared_mime against the effective allowed-types policy; RETURN 400 if rejected - `inst-init-mime-check`
+3. [x] - `p1` - API: validate declared_size <= effective per-file size limit; RETURN 400 if exceeded - `inst-init-size-check`
+4. [x] - `p1` - API: validate declared_size against storage quota; RETURN 429 if exceeded - `inst-init-quota-check`
+5. [x] - `p1` - Algorithm: compute parts plan using `cpt-cf-file-storage-algo-compute-parts-plan` - `inst-init-plan`
+6. [x] - `p1` - DB: INSERT into multipart_uploads (upload_id, file_id, version_id, declared_size, part_size, state=in_progress, expires_at) - `inst-init-db-session`
+7. [x] - `p1` - DB: INSERT pending version row into file_versions (version_id, file_id, status=pending) - `inst-init-db-version`
+8. [x] - `p1` - FOR EACH part in the plan: mint a signed URL (Ed25519, codec-equivalent to PASETO v4.public -- ADR-0004's Implementation note) with claims {upload_id, file_id, version_id, part_number, offset, size, op="multipart_part", exp} - `inst-init-sign-urls`
+9. [x] - `p1` - RETURN 200 {upload_id, version_id, part_hash_algorithm, part_size, parts: [{part_number, offset, size, upload_url}], expires_at} - `inst-init-return`
 
 ### Upload a Part
 
@@ -126,6 +135,15 @@ User-facing interactions that start with an actor (human or external system) and
 - Part body is accepted, written, and its hash is persisted (via the sidecar's report-part callback to the control
   plane -- the sidecar itself has no DB connection, ADR-0003); re-PUT of same (upload_id, part_number) is idempotent
   (overwrite)
+- **Known gap: no fencing against out-of-order concurrent reports for the same part.** `upsert_multipart_part` is an
+  unconditional last-write-wins UPDATE keyed on `(upload_id, part_number)` -- it carries no sequence number or
+  timestamp guard. If two attempts at the same part race (e.g. a client-side retry overlapping the original,
+  still-in-flight request), the backend write and the report callback for each attempt travel independently, so
+  whichever report's callback happens to reach the control plane last decides what is persisted, regardless of
+  which attempt's backend write actually landed last. A legitimate retry of identical bytes is harmless either way,
+  but the persisted `part_hash` is not otherwise guaranteed to correspond to whatever object bytes the backend ends
+  up holding for that part number if the two orders diverge. Deliberately left unaddressed: not implemented, not
+  merely undocumented.
 
 **Error Scenarios**:
 - Request body length does not match the size claim in the signed token -- 413 before any bytes written
@@ -147,7 +165,7 @@ User-facing interactions that start with an actor (human or external system) and
 
 ### Complete Multipart Upload
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-flow-multipart-complete`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-flow-multipart-complete`
 
 **Actor**: `cpt-cf-file-storage-actor-platform-user`
 
@@ -172,7 +190,7 @@ absent, in front of the generic `SUM(part.size) != declared_size` check. `comple
   file's content pointer moving out from under a concurrent complete before that later bind, not the bind itself.
 - **Auto-bind session** (`auto_bind = true` -- the default for `POST /files`'s multipart block, `bind: "auto"`):
   the bind runs **inside the same database transaction** that finalizes the version
-  (`Store::finalize_version`, `src/infra/storage/store/versions.rs`) under a `content_id IS NULL` CAS -- no
+  under a `content_id IS NULL` CAS -- no
   separate client `bind` request. A won CAS returns `bind_state: "bound"` with `etag` set to the new content
   `ETag`. A lost CAS (e.g. two create-tokens racing on the same brand-new file) still finalizes the version but
   leaves `content_id` untouched, returning `bind_state: "conflict"` with `current_etag` set to the ETag a manual
@@ -198,30 +216,44 @@ returned.
   reports a lost CAS without binding (`bind_state: "conflict"`, resolved by a manual `bind` call)
 
 **Error Scenarios**:
+- Another caller already holds the completion lease (a concurrent `complete` is assembling) -- **not an error**:
+  `202 Accepted` `{state: "completing", retry_after_secs}`; the caller polls by re-issuing the same idempotent call
 - One or more planned parts have not been reported yet -- `409 Conflict` with the missing part numbers in the error
   detail (checked **before** the size-mismatch guard below)
 - Assembled `SUM(part.size)` != `declared_size` (residual guard, e.g. an over-reported part) -- `409 Conflict`
 - Policy size limit exceeded by the assembled total -- policy-size-exceeded error
-- Session not `in_progress` (already completed/aborted, or foreign to this `file_id`) -- `404`-shaped "not found" / conflict
+- Session `aborted` or expired, or `upload_id` foreign to this `file_id` -- `404`-shaped "not found"
 - `If-Match` supplied and it does not match the file's current content ETag -- `400` (`FailedPrecondition`)
 
 **Steps**:
-1. [x] - `p1` - Client: POST /api/file-storage/v1/files/{id}/multipart/{upload_id}/complete (no request body; optional `If-Match` header). Control plane: authorize `write`; if `If-Match` is present and not `*`, compare it against the file's current content ETag and reject on mismatch - `inst-complete-request`
-2. [x] - `p1` - Control plane: load the session by `upload_id`; verify it belongs to `file_id` and is `in_progress` and not expired - `inst-complete-load-session`
-3. [x] - `p1` - DB: SELECT all reported rows from multipart_upload_parts WHERE upload_id = ? - `inst-complete-load-parts`
-4. [x] - `p1` - Diff the plan's expected part numbers (`ceil(declared_size / part_size)`) against the reported part numbers; RETURN 409 with the missing part numbers if any are absent - `inst-complete-missing-parts`
-5. [x] - `p1` - Verify `SUM(part.size) == declared_size` (residual guard); RETURN 409 (generic) if mismatch - `inst-complete-size-verify`
-6. [x] - `p1` - Policy size check against the assembled total - `inst-complete-policy-check`
-7. [x] - `p1` - Backend: `CompleteMultipartUpload`, building the ADR-0006 offset-manifest and its root hash from the already-persisted per-part digests+offsets -- **no re-read** of the assembled object - `inst-complete-assemble`
-8. [x] - `p1` - Post-assembly, pre-finalize: sniff the assembled object's leading bytes and validate against `session.declared_mime` (`cpt-cf-file-storage-fr-content-type-validation`); re-check the policy size ceiling against the resolved MIME; on mismatch fail **before** any DB finalize (the assembled blob becomes an orphan reclaimed by the orphan-reconciliation sweep) - `inst-complete-mime-validate`
-9. [x] - `p1` - DB: finalize the version row (`status: pending -> available`, real assembled `size`/composite `content_hash`/`hash_mode`/`part_count`/`manifest`) transactionally; for a **manual** session (`auto_bind = false`) this leaves `content_id` untouched; for an **auto-bind** session (`auto_bind = true`) the same transaction also attempts the `content_id IS NULL` CAS bind (`Store::finalize_version`), touching `content_id` only if it wins - `inst-complete-finalize-version`
-10. [x] - `p1` - DB: UPDATE multipart_uploads SET status=completed WHERE upload_id = ? - `inst-complete-db-session`
-11. [x] - `p1` - RETURN **200** `{version_id, size, hash_algorithm, content_hash, hash_mode, part_count, manifest, bind_state, etag?, current_etag?}` - `inst-complete-return`
-12. [ ] - `p2` - For a **manual** session (`bind_state: "manual"`) or a lost auto-bind CAS (`bind_state: "conflict"`), the client separately calls `POST /files/{id}/bind {version_id}` under `If-Match` to swap `content_id` and make the content live; a won auto-bind CAS (`bind_state: "bound"`) needs no follow-up call - `inst-complete-bind-followup`
+1. [x] - `p1` - Client: POST /api/file-storage/v1/files/{id}/multipart/{upload_id}/complete (no request body; optional `If-Match` header). Control plane: authorize `write` - `inst-complete-request`
+2. [x] - `p1` - Control plane: load the session by `upload_id`; verify it belongs to `file_id` - `inst-complete-load-session`
+3. [x] - `p1` - **IF** the session is already `completed`: RETURN **200** by replaying the persisted `complete_result` -- or, only for a session that predates the `complete_result`/`auto_bind` migration (`m20260924_000001_upload_flow_redesign`) and so has no such JSON to replay, rebuilding the response from the finalized version row instead -- idempotent convergence, no re-assembly, no DB write; this check runs **before** the `If-Match` precondition below - `inst-complete-replay`
+4. [x] - `p1` - **ELSE IF** the session is `aborted`, or its `expires_at` has passed: RETURN `404`-shaped "not found" - `inst-complete-terminal-reject`
+5. [x] - `p1` - **ELSE**: if `If-Match` is present and not `*`, compare it against the file's current content ETag and reject on mismatch (`400`) - `inst-complete-ifmatch`
+6. [x] - `p1` - DB: attempt to win the completion lease via one conditional UPDATE -- `state='completing', lease_until=now+multipart_complete_lease_secs, lease_owner=:me WHERE state='in_progress' OR (state='completing' AND lease_until < now)` (the second arm is a takeover of a dead lease owner, the same operation as a fresh acquire); the read-only checks above (session lookup, terminal-state check, `If-Match`) run **before** this CAS so a deterministic rejection never occupies the lease - `inst-complete-lease-acquire`
+7. [x] - `p1` - **IF** the lease CAS is lost (another caller holds a live lease): RETURN **202** `{state: "completing", retry_after_secs}` - `inst-complete-lease-lost`
+8. [x] - `p1` - DB: SELECT all reported rows from multipart_upload_parts WHERE upload_id = ? - `inst-complete-load-parts`
+9. [x] - `p1` - Diff the plan's expected part numbers (`ceil(declared_size / part_size)`) against the reported part numbers; on a miss, release the lease CAS (`completing -> in_progress`) and RETURN 409 with the missing part numbers - `inst-complete-missing-parts`
+10. [x] - `p1` - Verify `SUM(part.size) == declared_size` (residual guard); on mismatch release the lease and RETURN 409 (generic) - `inst-complete-size-verify`
+11. [x] - `p1` - Policy size check against the assembled total; on a violation release the lease and RETURN the policy error - `inst-complete-policy-check`
+12. [x] - `p1` - Detached backend task (the client's HTTP request is open but expendable -- a dropped connection does not cancel it): `CompleteMultipartUpload`, building the ADR-0006 offset-manifest and its root hash from the already-persisted per-part digests+offsets -- **no re-read** of the assembled object - `inst-complete-assemble`
+13. [x] - `p1` - Post-assembly, pre-finalize: sniff the assembled object's leading bytes and validate against `session.declared_mime` (`cpt-cf-file-storage-fr-content-type-validation`); re-check the policy size ceiling against the resolved MIME; on mismatch release the lease CAS (`completing -> in_progress`, so the next `complete` retries immediately) and fail **before** any DB finalize (the assembled blob becomes an orphan reclaimed by the orphan-reconciliation sweep) - `inst-complete-mime-validate`
+14. [x] - `p1` - **One DB transaction**: finalize the version row (`status: pending -> available`, real assembled `size`/composite `content_hash`/`hash_mode`/`part_count`/`manifest`) -- for a **manual** session (`auto_bind = false`) this leaves `content_id` untouched; for an **auto-bind** session (`auto_bind = true`) the same transaction also attempts the `content_id IS NULL` CAS bind, touching `content_id` only if it wins -- **plus**, in the same transaction, the session CAS `completing -> completed` and the persisted `complete_result` JSON -- **on this fast (first-attempt) path** the audit row is written in this same transaction too; on a takeover or converge path (see below) the audit row is instead written via a separate step - `inst-complete-finalize-version`
+15. [x] - `p1` - RETURN **200** `{version_id, size, hash_algorithm, content_hash, hash_mode, part_count, manifest, bind_state, etag?, current_etag?}` - `inst-complete-return`
+16. [ ] - `p2` - For a **manual** session (`bind_state: "manual"`) or a lost auto-bind CAS (`bind_state: "conflict"`), the client separately calls `POST /files/{id}/bind {version_id}` under `If-Match` to swap `content_id` and make the content live; a won auto-bind CAS (`bind_state: "bound"`) needs no follow-up call - `inst-complete-bind-followup`
+
+A completer that **dies** mid-`completing` (control-plane crash after winning the lease, before the finalize
+transaction commits) leaves the session at `completing` until `lease_until` passes; the next `complete` call (from
+any caller) then wins the same takeover CAS (step 6's second arm) and re-derives progress from durable state --
+version already `available` takes the finish-only fast path, a consumed-but-unassembled backend handle is rebuilt
+locally from the reported part rows, otherwise full re-assembly runs again. The full state/race/failure analysis
+(takeover, F7/F8, the two-clock resume model) lives in
+[concurrency-and-failure-model.md](../concurrency-and-failure-model.md) §2.2/§4.
 
 ### Abort Multipart Upload
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-flow-multipart-abort`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-flow-multipart-abort`
 
 **Actor**: `cpt-cf-file-storage-actor-platform-user`
 
@@ -238,12 +270,12 @@ returned.
 - Session not found or client lacks write permission -- 404 / 403
 
 **Steps**:
-1. [ ] - `p1` - Client: DELETE /api/file-storage/v1/files/{id}/multipart/{upload_id} - `inst-abort-request`
-2. [ ] - `p1` - Authorize per-file `WRITE` on the path `file_id`; load the session by `upload_id` and verify it belongs to `file_id` (a foreign or missing `upload_id` is masked as `404`); RETURN 409 if the session's snapshot state is not `in_progress` - `inst-abort-check-status`
-3. [x] - `p1` - DB, one transaction (CAS-first, runs BEFORE any backend call): flip `multipart_uploads.status` `in_progress -> aborted`; on success, DELETE FROM `multipart_upload_parts` WHERE `upload_id = ?` and insert the audit row; if the CAS does not win (state already changed under us), RETURN 409 and stop here, before touching the backend or the pending version. A `completing` session is **not** aborted by the client path (step 2 rejects it with `409`) -- an expired `completing` lease is reclaimed by the cleanup sweep's `abort_expired_completing`, never by a client `DELETE` - `inst-abort-delete-parts`
-4. [ ] - `p1` - Best-effort, now that the CAS has won: call backend `AbortMultipart(upload_handle)` to discard backend-side parts. A failure here is logged (`tracing::warn!`) and recorded via `record_backend_error`, then swallowed — never propagated to the client — leaving the backend-side upload for its own garbage collection - `inst-abort-backend`
-5. [ ] - `p1` - DB: DELETE the pending version row from `file_versions` WHERE `version_id = ?` AND `status = pending` (a missing row is fine — that is the desired end state) - `inst-abort-delete-version`
-6. [ ] - `p1` - RETURN 204 No Content - `inst-abort-return`
+1. [x] - `p1` - Client: DELETE /api/file-storage/v1/files/{id}/multipart/{upload_id} - `inst-abort-request`
+2. [x] - `p1` - Authorize per-file `WRITE` on the path `file_id`; load the session by `upload_id` and verify it belongs to `file_id` (a foreign or missing `upload_id` is masked as `404`); RETURN 409 if the session's snapshot state is not `in_progress` - `inst-abort-check-status`
+3. [x] - `p1` - DB, one transaction (CAS-first, runs BEFORE any backend call): flip `multipart_uploads.state` `in_progress -> aborted`; on success, DELETE FROM `multipart_upload_parts` WHERE `upload_id = ?` and insert the audit row; if the CAS does not win (state already changed under us), RETURN 409 and stop here, before touching the backend or the pending version. A `completing` session is **not** aborted by the client path (step 2 rejects it with `409`) -- an expired `completing` lease is reclaimed by the cleanup sweep's `abort_expired_completing`, never by a client `DELETE` - `inst-abort-delete-parts`
+4. [x] - `p1` - Best-effort, now that the CAS has won: call backend `AbortMultipart(upload_handle)` to discard backend-side parts. A failure here is logged (`tracing::warn!`) and recorded via `record_backend_error`, then swallowed — never propagated to the client — leaving the backend-side upload for its own garbage collection - `inst-abort-backend`
+5. [x] - `p1` - DB: DELETE the pending version row from `file_versions` WHERE `version_id = ?` AND `status = pending` (a missing row is fine — that is the desired end state) - `inst-abort-delete-version`
+6. [x] - `p1` - RETURN 204 No Content - `inst-abort-return`
 
 ### Introspect and Resume Multipart Upload
 
@@ -279,7 +311,7 @@ Internal system functions that do not interact with actors directly; called by a
 
 ### Compute Parts Plan
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-algo-compute-parts-plan`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-algo-compute-parts-plan`
 
 **Input**: declared_size (uint64), preferred_part_size (uint64 or null), backend.min_part_size (uint64)
 **Output**: {part_size, parts: [{part_number, offset, size}], part_hash_algorithm}
@@ -291,35 +323,40 @@ count implied by `declared_size` and the computed `part_size` would exceed the c
 `MAX_PART_SIZE` cannot fit it within `MAX_PART_COUNT` parts, the plan is rejected rather than minted.
 
 **Steps**:
-1. [ ] - `p1` - Compute candidate_part_size = max(preferred_part_size ?? backend.min_part_size, backend.min_part_size) - `inst-plan-candidate`
-2. [ ] - `p1` - Round candidate_part_size up to backend.min_part_size's granularity - `inst-plan-round`
-3. [ ] - `p1` - Compute part_count = ceil(declared_size / part_size) - `inst-plan-count`
-4. [ ] - `p1` - FOR EACH i in [1..part_count]: compute offset = (i-1) * part_size; size = min(part_size, declared_size - offset) - `inst-plan-parts`
-5. [ ] - `p1` - Set part_hash_algorithm = SHA-256 - `inst-plan-algo-fallback`
-6. [ ] - `p1` - RETURN {part_size, parts, part_hash_algorithm} -- the plan is deterministic from (declared_size, part_size) and can be recomputed for resume from the persisted columns - `inst-plan-return`
+1. [x] - `p1` - Compute candidate_part_size = max(preferred_part_size ?? backend.min_part_size, backend.min_part_size) - `inst-plan-candidate`
+2. [x] - `p1` - Round candidate_part_size up to backend.min_part_size's granularity - `inst-plan-round`
+3. [x] - `p1` - Compute part_count = ceil(declared_size / part_size) - `inst-plan-count`
+4. [x] - `p1` - FOR EACH i in [1..part_count]: compute offset = (i-1) * part_size; size = min(part_size, declared_size - offset) - `inst-plan-parts`
+5. [x] - `p1` - Set part_hash_algorithm = SHA-256 - `inst-plan-algo-fallback`
+6. [x] - `p1` - RETURN {part_size, parts, part_hash_algorithm} -- the plan is deterministic from (declared_size, part_size) and can be recomputed for resume from the persisted columns - `inst-plan-return`
 
 ### Enforce Per-Part Size Claim at Sidecar
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-algo-enforce-part-size`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-algo-enforce-part-size`
 
 **Input**: request body (stream), size_claim (uint64 from signed token)
 **Output**: accepted body bytes, or a 413/400 rejection
 
-> **Note (matches implementation):** the sidecar does **not** read the `Content-Length`
-> header. Enforcement is by received body length: on `multipart_native` the whole
-> part is buffered and the buffered length is checked against `size_claim`
-> **before** the backend write; on offset-object (non-native) paths the body streams
-> to the object with a mid-stream `max_size` guard and a post-write exact-length
-> check. Steps below describe the streamed counter the offset path uses; the
-> buffered native path reaches the same accept/reject outcomes without partial
-> backend I/O.
+> **Note (matches implementation):** the sidecar does **not** read the client's
+> `Content-Length` header. Enforcement is by received body length, and neither write
+> path buffers a whole part: on `multipart_native`, a sidecar-side streaming guard
+> (`part_size_guard`) counts bytes as they pass through to the backend's own
+> `upload_part_stream`, rejecting mid-stream (413) the moment the running count
+> would exceed `size_claim` — `size_claim` itself is also what the sidecar declares
+> as the backend request's exact `Content-Length` (S3's `UploadPart` needs the exact
+> length up front, not a flexible ceiling), so an undersized stream fails that
+> backend write outright rather than needing a separate post-write check; on
+> offset-object (non-native) paths the body streams to the object with a
+> mid-stream `max_size` guard and a post-write exact-length check. Both paths reach
+> the same accept/reject outcomes without ever buffering a whole part in the
+> sidecar process.
 
 **Steps**:
-1. [ ] - `p1` - Stream the body; count bytes as they arrive (the native path buffers them; the offset path streams them to the object) - `inst-enforce-stream`
-2. [ ] - `p1` - **IF** byte count exceeds size_claim before body ends: RETURN HTTP 413 -- abort the write mid-stream; rollback any partially written bytes (on the offset path the write may already have reached the backend, requiring cleanup) - `inst-enforce-oversize`
-3. [ ] - `p1` - **IF** body ends before size_claim bytes received: RETURN HTTP 400 Bad Request (short body) - `inst-enforce-undersize`
-4. [ ] - `p1` - On `multipart_native`, verify buffered length == size_claim **before** the backend write - `inst-enforce-cl-reject` (no-op on the offset path, where the counter above already enforced it)
-5. [ ] - `p1` - RETURN accepted bytes (exactly size_claim bytes) -- proceed to write - `inst-enforce-accept`
+1. [x] - `p1` - Stream the body; count bytes as they arrive on both paths - `inst-enforce-stream`
+2. [x] - `p1` - **IF** byte count exceeds size_claim before body ends: RETURN HTTP 413 -- abort the write mid-stream; rollback any partially written bytes (on the offset path the write may already have reached the backend, requiring cleanup) - `inst-enforce-oversize`
+3. [x] - `p1` - **IF** body ends before size_claim bytes received: RETURN HTTP 400 Bad Request (short body) - `inst-enforce-undersize`
+4. [x] - `p1` - On `multipart_native`, the backend's own exact-length contract (`size_claim` sent as `Content-Length`) rejects an undersized stream as part of the backend write itself - `inst-enforce-cl-reject` (no-op on the offset path, where the counter above already enforced it)
+5. [x] - `p1` - RETURN accepted bytes (exactly size_claim bytes) -- proceed to write - `inst-enforce-accept`
 
 ### Combine Part Hashes at Complete
 
@@ -345,22 +382,33 @@ offset-manifest from the already-persisted per-part digests+offsets and computes
 
 ### Multipart Session State Machine
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-state-multipart-session`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-state-multipart-session`
 
-**States**: in_progress, completed, aborted
+**States**: in_progress, completing, completed, aborted
 
 **Initial State**: in_progress
 
+`completing` is a lease-guarded, transient state: a `complete` call holds it while it assembles the parts on the
+backend and finalizes the version. `lease_until` bounds how long one caller may hold it before another `complete`
+call may take over (same CAS as a fresh acquire, `cpt-cf-file-storage-algo-combine-part-hashes`'s host flow, §2
+"Complete Multipart Upload"). A session in `completing` is never reaped by the orphan/expiry sweep while its lease
+is still live, and its target `pending` version is never treated as orphaned while the session is `completing`,
+regardless of lease state.
+
 **Transitions**:
-1. [ ] - `p1` - **FROM** in_progress **TO** completed **WHEN** complete flow verifies all parts and activates the file version - `inst-st-to-completed`
-2. [ ] - `p1` - **FROM** in_progress **TO** aborted **WHEN** abort flow is called explicitly by the client - `inst-st-to-aborted`
-3. [ ] - `p1` - **FROM** in_progress **TO** aborted **WHEN** TTL/orphan-reconciliation sweep expires an unfinished session (`cpt-cf-file-storage-fr-orphan-reconciliation`) - `inst-st-ttl-abort`
+1. [x] - `p1` - **FROM** in_progress **TO** completing **WHEN** a `complete` call wins the completion-lease CAS (fresh acquire) - `inst-st-to-completing`
+2. [x] - `p1` - **FROM** completing **TO** completing **WHEN** a `complete` call takes over a `completing` session whose `lease_until` has already passed (dead lease owner) - `inst-st-completing-takeover`
+3. [x] - `p1` - **FROM** completing **TO** in_progress **WHEN** the lease holder's assembly/finalize attempt fails (missing parts, size mismatch, policy violation, MIME mismatch, backend error) -- releases the lease so the next `complete` retries immediately - `inst-st-completing-release`
+4. [x] - `p1` - **FROM** completing **TO** completed **WHEN** the lease holder's finalize transaction commits (version `available` [+ bind], `complete_result` persisted, plus the audit row on the fast (first-attempt) path -- a takeover or converge path writes the audit row via a separate step instead) - `inst-st-to-completed`
+5. [x] - `p1` - **FROM** in_progress **TO** aborted **WHEN** abort flow is called explicitly by the client - `inst-st-to-aborted`
+6. [x] - `p1` - **FROM** in_progress **TO** aborted **WHEN** TTL/orphan-reconciliation sweep expires an unfinished session (`cpt-cf-file-storage-fr-orphan-reconciliation`) - `inst-st-ttl-abort`
+7. [x] - `p1` - **FROM** completing **TO** aborted **WHEN** the orphan-reconciliation sweep finds the session's `expires_at` **and** its `lease_until` both already past (a live lease is never reaped mid-assembly) - `inst-st-completing-ttl-abort`
 
 ## 5. Definitions of Done
 
 ### Initiate Endpoint with Server-Authoritative Plan
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-dod-multipart-initiate`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-dod-multipart-initiate`
 
 The system **MUST** implement `POST /api/file-storage/v1/files/{id}/multipart` on the control plane. The endpoint validates declared_mime, declared_size, and storage quota; calls `cpt-cf-file-storage-algo-compute-parts-plan`; pre-registers a pending version; persists the multipart session with declared_size and part_size; mints one signed URL per part (Ed25519, codec-equivalent to PASETO v4.public -- ADR-0004) (claims: upload_id, file_id, version_id, part_number, offset, size, op, exp); and returns the full parts plan. The parts plan enforces a hard ceiling of 10,000 parts (`MAX_PART_COUNT`), widening the part size (up to `MAX_PART_SIZE`, 5 GiB) before rejecting a `declared_size` that cannot fit even at the maximum part size.
 
@@ -379,14 +427,17 @@ The system **MUST** implement `POST /api/file-storage/v1/files/{id}/multipart` o
 
 The sidecar part-upload handler verifies the signed token (Ed25519, codec-equivalent to but not literal
 PASETO -- ADR-0004's Implementation note); calls `cpt-cf-file-storage-algo-enforce-part-size` to reject with HTTP 413
-if the body length does not match the size claim — on `multipart_native` paths the whole part body is buffered and
-the length checked **before** the backend write; on offset-object (non-native) paths enforcement is a streaming
-`max_size` abort (which may fire after some bytes reached the object) plus a post-write exact-length check; there is
-no pre-write `Content-Length` check. The handler then writes the part bytes to the backend (`PutPart` for
-`multipart_native`, or a separate `{backend_path}.part.{n}` object for non-native backends -- not an offset-write into
-the shared version object); computes the per-part hash; and reports it to the control plane over a token-authenticated
-callback, which upserts the part row (the sidecar itself never touches the DB). Re-PUT of the same (upload_id,
-part_number) is idempotent.
+if the body length does not match the size claim — neither write path buffers a whole part: on `multipart_native`
+paths a sidecar-side streaming counter (`part_size_guard`) enforces the ceiling ahead of the backend write, and the
+claim is separately sent as the backend request's exact `Content-Length` (S3's `UploadPart` requires the length up
+front), so an undersized body fails that backend write directly rather than needing its own pre-write check; on
+offset-object (non-native) paths enforcement is a streaming `max_size` abort (which may fire after some bytes
+reached the object) plus a post-write exact-length check; there is no pre-write client-supplied `Content-Length`
+check on either path (the client's own header is never read). The handler then writes the part bytes to the backend
+(`UploadPart` for `multipart_native`, or a separate `{backend_path}.part.{n}` object for non-native backends -- not
+an offset-write into the shared version object); computes the per-part hash on the same streamed pass; and reports
+it to the control plane over a token-authenticated callback, which upserts the part row (the sidecar itself never
+touches the DB). Re-PUT of the same (upload_id, part_number) is idempotent.
 
 **Implements**:
 - `cpt-cf-file-storage-flow-multipart-upload-part`
@@ -400,14 +451,25 @@ part_number) is idempotent.
 
 - [x] `p1` - **ID**: `cpt-cf-file-storage-dod-multipart-complete`
 
-`POST /api/file-storage/v1/files/{id}/multipart/{upload_id}/complete` diffs the plan's expected part
-numbers against the reported ones and rejects with `409` + the missing part numbers if any are absent;
-then verifies `SUM(reported part sizes) == declared_size` as a residual guard (generic `409` on mismatch); asks the
-backend to build the ADR-0006 offset-manifest and compute its composite root hash from the already-persisted
-per-part digests (no re-read of the assembled object); **finalizes** the version (`pending -> available`) with the
-real size + composite hash/mode/part-count/manifest; marks the session completed; returns **`200`** with
+`POST /api/file-storage/v1/files/{id}/multipart/{upload_id}/complete` first wins a completion-lease CAS
+(`in_progress -> completing`, or takeover of a `completing` session whose lease has expired); a caller that loses
+the CAS gets `202 {state: "completing", retry_after_secs}` and polls by re-issuing the same call. The lease holder
+then diffs the plan's expected part numbers against the reported ones and rejects with `409` + the missing part
+numbers if any are absent; verifies `SUM(reported part sizes) == declared_size` as a residual guard (generic `409`
+on mismatch); asks the backend to build the ADR-0006 offset-manifest and compute its composite root hash from the
+already-persisted per-part digests (no re-read of the assembled object). **One DB transaction** then **finalizes**
+the version (`pending -> available`) with the real size + composite hash/mode/part-count/manifest, flips the
+session `completing -> completed`, and persists the `complete_result` JSON -- plus, on the fast (first-attempt)
+path, the audit row too (a takeover or converge path instead writes the audit row via a separate step). A crash
+between winning the lease and this transaction committing leaves the session at `completing` for the next `complete`
+call to take over (§4's state machine), never a half-finalized version. A failed assembly/verification instead
+releases the lease (`completing -> in_progress`) so the next `complete` retries immediately. Returns **`200`** with
 `{version_id, size, hash_algorithm, content_hash, hash_mode, part_count, manifest, bind_state, etag?,
-current_etag?}`. It accepts an **optional**
+current_etag?}`. A retry against an already-`completed` session **converges**: it replays the persisted
+`complete_result` verbatim -- or, only for a session that predates the `complete_result`/`auto_bind` migration
+(`m20260924_000001_upload_flow_redesign`) and so never got one, rebuilds it from the finalized version row instead --
+without re-running assembly or any CAS, and it never returns `409` (the audit row for this converge case is written
+via a separate step, not as part of a repeated finalize transaction). It accepts an **optional**
 `If-Match` header (a concrete value is checked against the file's current content ETag, `*`/absent is unconditional).
 Whether it also binds the version depends on the session's `auto_bind` flag, fixed at initiate time: a **manual**
 session (`bind_state: "manual"`) does **not bind** -- binding is a separate, later client-issued
@@ -427,7 +489,7 @@ bind call needed in the `"bound"` case).
 
 ### Abort Endpoint
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-dod-multipart-abort`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-dod-multipart-abort`
 
 The system **MUST** implement `DELETE /api/file-storage/v1/files/{id}/multipart/{upload_id}`: verify session is
 in_progress; win the DB CAS marking the session aborted and deleting part rows (in one transaction) BEFORE touching
@@ -473,7 +535,7 @@ missing `upload_id` is masked as `404`, identical to `complete`'s guard.
 
 ### Schema: multipart_uploads Plan Columns
 
-- [ ] `p1` - **ID**: `cpt-cf-file-storage-dod-multipart-schema-plan-columns`
+- [x] `p1` - **ID**: `cpt-cf-file-storage-dod-multipart-schema-plan-columns`
 
 The system **MUST** add `version_id uuid NOT NULL`, `declared_size bigint NOT NULL CHECK (declared_size >= 0)`, and `part_size bigint NOT NULL` to the `multipart_uploads` table via migration `m20260701_000002_multipart_plan_columns`. These three columns make the plan deterministic from the session row (no per-part plan table needed), enable complete-time size verification without re-summing parts, and allow the introspect endpoint to reconstruct the plan for resume.
 
@@ -490,7 +552,7 @@ The system **MUST** add `version_id uuid NOT NULL`, `declared_size bigint NOT NU
 - [x] `POST /api/file-storage/v1/files/{id}/multipart` returns a parts plan with one signed sidecar URL per part; each URL token includes part_number, offset, size, op, and exp claims
 - [x] The parts plan is server-computed from declared_size and the effective part_size; clients cannot choose part boundaries
 - [x] The control-plane route `PUT /files/{id}/multipart/{upload_id}/parts/{part_number}` does not exist; all part bytes flow through sidecar signed URLs only (ADR-0003)
-- [x] The sidecar rejects a part PUT whose body length violates the size claim -- on `multipart_native` paths the buffered body is length-checked before the backend write; on non-native (offset-object) paths the body streams and an oversize fires HTTP 413 immediately (mid-stream), while a short body fails the post-write exact-length check with HTTP 400 (the part hash is computed but not re-verified at part-write; the assembled root is computed at `complete` from the stored part hashes)
+- [x] The sidecar rejects a part PUT whose body length violates the size claim -- neither write path buffers a whole part: on `multipart_native` paths a sidecar-side streaming counter enforces an oversize rejection (HTTP 413) ahead of the backend write, and the backend's own exact-`Content-Length` contract rejects an undersized stream as part of that write itself; on non-native (offset-object) paths the body streams and an oversize fires HTTP 413 immediately (mid-stream), while a short body fails the post-write exact-length check with HTTP 400 (the part hash is computed but not re-verified at part-write; the assembled root is computed at `complete` from the stored part hashes)
 - [x] Re-PUT of the same (upload_id, part_number) is idempotent; the part row is overwritten and no duplicate rows are created
 - [x] `POST .../complete` rejects with `409 Conflict` and the missing part numbers in the error detail when one or
   more planned parts have not been reported yet; a residual generic `409` still guards
@@ -504,12 +566,20 @@ The system **MUST** add `version_id uuid NOT NULL`, `declared_size bigint NOT NU
   **optional** `If-Match` header (checked against the file's current content ETag; `400`
   on mismatch, `FailedPrecondition` collapses to `400` on this platform -- there is no `412`-mapped canonical-error
   variant; `*`/absent is unconditional)
+- [x] Concurrent `complete` calls serialize through a single completion-lease CAS (`in_progress`/expired-lease
+  `completing` `-> completing`): exactly one caller assembles; every other caller gets `202
+  {state: "completing", retry_after_secs}` and polls by re-issuing the same call; a dead lease owner's session is
+  taken over, never left stuck past `lease_until`
+- [x] Finalize (version `available` [+ bind]), the session's `completing -> completed` transition, and
+  `complete_result` are one DB transaction, plus the audit row on the fast (first-attempt) path (a takeover or
+  converge path writes the audit row via a separate step instead); a retry against an already-`completed` session
+  replays that persisted result instead of re-assembling, re-running any CAS, or returning `409`
 - [x] `DELETE .../multipart/{upload_id}` wins a DB CAS marking the session aborted and deletes part rows (one
   transaction, before any backend call); deletes the pending version; then best-effort aborts the backend handle for
   multipart_native backends -- a backend abort failure at that point is logged and metered rather than returned to
   the client, since the DB-side abort is already committed
-- [x] Initiating a multipart upload with declared_size exceeding the effective size-limit policy returns 413; exceeding storage quota returns 429; unsupported MIME returns 415
-  (this `[x]` is exercised only by `tests/enforce_test.rs` injecting a mock `QuotaClient` — no real deployment has
+- [x] Initiating a multipart upload with declared_size exceeding the effective size-limit policy returns 400; exceeding storage quota returns 429; unsupported MIME returns 400 (not 413/415 -- see the status code note under [Initiate Multipart Upload](#initiate-multipart-upload))
+  (this `[x]` is exercised only by a unit test injecting a mock `QuotaClient` — no real deployment has
   one wired (`gear.rs`'s `quota_client: None`), so this rejection path does not fire in production; see
   `../operations.md#storage-quota-not-enforced`)
 - [x] multipart_uploads rows carry version_id, declared_size, and part_size columns (migration m20260701_000002_multipart_plan_columns)
@@ -526,5 +596,8 @@ The system **MUST** add `version_id uuid NOT NULL`, `declared_size bigint NOT NU
 - [x] `POST .../complete` returns `200 {version_id, size, hash_algorithm, content_hash, hash_mode, part_count, manifest}`
   instead of `204`
 - [x] `POST .../complete` enumerates missing part numbers in its `409` body instead of a bare size comparison
-- [ ] Non-native backends write parts as offset-writes into the shared version object instead of per-part objects
-- [ ] `GET .../multipart/{upload_id}` returns the plan recomputed from persisted columns and re-issues fresh signed URLs for missing parts
+- [x] Non-native (non-`multipart_native`) backends write each part as a separate per-part backend object
+  (`{backend_path}.part.{part_number}`) rather than an offset-write into the shared version object (see
+  [Upload a Part](#upload-a-part), step `inst-part-write-offset`); no currently-registered backend takes this branch
+  in production, since `local-fs` (the only non-`multipart_native` backend) rejects multipart at initiate
+- [x] `GET .../multipart/{upload_id}` returns the plan recomputed from persisted columns and re-issues fresh signed URLs for missing parts

@@ -1,6 +1,4 @@
 //! Gear entry point and capability wiring.
-//!
-//! @cpt-cf-file-storage-component-http-gateway
 
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -30,7 +28,7 @@ use crate::infra::backend::{
     BackendRegistry, InMemoryBackend, LocalFsBackend, S3Backend, StorageBackend,
 };
 use crate::infra::metrics::FileStorageMetricsMeter;
-use crate::infra::signed_url::Issuer;
+use crate::infra::signed_url::{Issuer, decode_public_key_entry};
 use crate::infra::storage::Store;
 
 /// Default + in-memory backend ids configured in P1 (static).
@@ -98,10 +96,22 @@ impl Gear for FileStorageGear {
         // pre-0.1 token-only trust model). `cfg.validate()` above already
         // rejected an absent secret when `require_finalize_internal_secret`
         // is set, so this is a plain construction.
+        // The grace absorbs a slow-but-live upload that legitimately outlasts
+        // the signed token's TTL before reaching finalize/report-part -- see
+        // `FileStorageConfig::finalize_token_grace_secs`. `cfg.validate()`
+        // above already rejected anything past `MAX_FINALIZE_TOKEN_GRACE_SECS`
+        // (7 days), which fits `i64` with room to spare, so `unwrap_or` never
+        // actually saturates here; kept (rather than `.expect(..)`, which
+        // `clippy::expect_used` denies workspace-wide) as a defensive
+        // fallback, consistent with every other `*_secs` field below.
+        let finalize_token_grace = time::Duration::seconds(
+            i64::try_from(cfg.finalize_token_grace_secs).unwrap_or(i64::MAX),
+        );
         let finalize_auth = Arc::new(crate::api::rest::handlers::FinalizeAuth::new(
             cfg.finalize_internal_secret
                 .as_ref()
                 .map(|s| s.expose().to_owned()),
+            finalize_token_grace,
         ));
         self.finalize_auth
             .set(Arc::clone(&finalize_auth))
@@ -121,6 +131,12 @@ impl Gear for FileStorageGear {
         // URL-signing key. A configured seed yields a keypair that is stable
         // across restarts (so the sidecar's public key keeps verifying issued
         // URLs); without one we fall back to an ephemeral key for local dev.
+        // `cfg.validate()` above already rejected anything past
+        // `MAX_URL_TTL_CEILING` (30 days), which fits `i64` with room to
+        // spare, so `unwrap_or` never actually saturates here; kept (rather
+        // than `.expect(..)`, which `clippy::expect_used` denies
+        // workspace-wide) as a defensive fallback, same as
+        // `finalize_token_grace` above.
         let max_ttl = i64::try_from(cfg.max_url_ttl_secs).unwrap_or(i64::MAX);
         let issuer = Arc::new(if let Some(seed_b64) = &cfg.signing_key_seed {
             let seed = URL_SAFE_NO_PAD
@@ -141,6 +157,22 @@ impl Gear for FileStorageGear {
             "file-storage URL-signing public key (configure FS_SIDECAR_PUBLIC_KEY with this)"
         );
 
+        // signing_key_seed rotation without an outage for in-flight uploads'
+        // finalize/report-part callbacks (docs/operations.md's Rotation
+        // procedure): the sidecar's own FS_SIDECAR_PREVIOUS_PUBLIC_KEYS only
+        // widens what the SIDECAR accepts; this is what lets the control
+        // plane's OWN callback verification (`FileService::verifier`) keep
+        // accepting a token signed under a seed that was current before this
+        // restart. `cfg.validate()` above already rejected a malformed
+        // entry, so this decode cannot plausibly fail here.
+        let previous_signing_public_keys: Vec<Vec<u8>> = cfg
+            .previous_signing_public_keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| decode_public_key_entry(k, i))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| anyhow::anyhow!("previous_signing_public_keys: {e}"))?;
+
         // Per-type access decisions via the platform Authorization Service
         // (`cpt-cf-file-storage-fr-authorization`). Tenant-boundary enforcement
         // is independent of the PDP (point ops prefetch within the tenant;
@@ -151,6 +183,10 @@ impl Gear for FileStorageGear {
             .map_err(|e| anyhow::anyhow!("failed to resolve AuthZ resolver: {e}"))?;
         let authorizer: Arc<dyn Authorizer> = Arc::new(PolicyEnforcerAuthorizer::new(authz));
 
+        // `cfg.validate()` above already rejected `default_url_ttl_secs` past
+        // `max_url_ttl_secs`, itself capped at `MAX_URL_TTL_CEILING` (30
+        // days), so `unwrap_or` never actually saturates here; kept as a
+        // defensive fallback, same as `finalize_token_grace` above.
         let svc_cfg = ServiceConfig {
             default_url_ttl_secs: i64::try_from(cfg.default_url_ttl_secs).unwrap_or(i64::MAX),
             sidecar_base_url: cfg.sidecar_base_url,
@@ -181,6 +217,16 @@ impl Gear for FileStorageGear {
         // Extract values needed by both services before moving svc_cfg.
         let sidecar_base_url = svc_cfg.sidecar_base_url.clone();
         let url_ttl_secs = svc_cfg.default_url_ttl_secs;
+        // Multipart sessions get their own, much longer-lived TTL, decoupled
+        // from the short per-part signed-URL TTL above (`multipart-session-ttl`
+        // remediation -- see `MultipartService::session_ttl_secs`'s doc).
+        // `cfg.validate()` above already rejected anything past
+        // `MAX_MULTIPART_SESSION_TTL_SECS` (30 days), which fits `i64` with
+        // room to spare, so `unwrap_or` never actually saturates here; kept
+        // (rather than `.expect(..)`, which `clippy::expect_used` denies
+        // workspace-wide) as a defensive fallback, same as
+        // `finalize_token_grace` above.
+        let session_ttl_secs = i64::try_from(cfg.multipart_session_ttl_secs).unwrap_or(i64::MAX);
 
         // TODO(P2): wire the quota-enforcement client once the Quota Enforcement
         // gear exposes an SDK crate. For now, no quota checks are performed.
@@ -212,7 +258,9 @@ impl Gear for FileStorageGear {
                 None, // quota_client
                 None, // usage_reporter -- see TODO above
             )
-            .with_metrics(Arc::clone(&metrics)),
+            .with_metrics(Arc::clone(&metrics))
+            .with_previous_signing_public_keys(previous_signing_public_keys)
+            .map_err(|e| anyhow::anyhow!("file-storage previous_signing_public_keys: {e}"))?,
         );
         self.service
             .set(Arc::clone(&service))
@@ -229,19 +277,32 @@ impl Gear for FileStorageGear {
                 url_ttl_secs,
             )
             .with_metrics(Arc::clone(&metrics))
-            .with_usage_reporter(None), // see TODO above `service`
+            .with_usage_reporter(None) // see TODO above `service`
+            .with_session_ttl_secs(session_ttl_secs)
+            // `cfg.validate()` above already rejected anything past
+            // `MAX_MULTIPART_COMPLETE_LEASE_SECS` (1 day), which fits `i64`
+            // with room to spare, so `unwrap_or` never actually saturates
+            // here; kept as a defensive fallback, same as
+            // `finalize_token_grace` above.
+            .with_complete_lease_secs(
+                i64::try_from(cfg.multipart_complete_lease_secs).unwrap_or(120),
+            ),
         );
-        self.multipart_service.set(multipart_svc).map_err(|_| {
-            anyhow::anyhow!(
-                "{} multipart service already initialized",
-                Self::MODULE_NAME
-            )
-        })?;
+        self.multipart_service
+            .set(Arc::clone(&multipart_svc))
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "{} multipart service already initialized",
+                    Self::MODULE_NAME
+                )
+            })?;
 
         let policy_svc = Arc::new(PolicyService::new(policy_store, authorizer));
-        self.policy_service.set(policy_svc).map_err(|_| {
-            anyhow::anyhow!("{} policy service already initialized", Self::MODULE_NAME)
-        })?;
+        self.policy_service
+            .set(Arc::clone(&policy_svc))
+            .map_err(|_| {
+                anyhow::anyhow!("{} policy service already initialized", Self::MODULE_NAME)
+            })?;
 
         let cleanup_deferred = if cfg.enable_background_sweep {
             Some(CleanupDeferred {
@@ -268,7 +329,11 @@ impl Gear for FileStorageGear {
 
         ctx.client_hub()
             .register::<dyn file_storage_sdk::FileStorageClientV1>(Arc::new(
-                FileStorageLocalClient::new(),
+                FileStorageLocalClient::new(
+                    Arc::clone(&service),
+                    Arc::clone(&multipart_svc),
+                    Arc::clone(&policy_svc),
+                ),
             ));
 
         info!("{} gear initialized", Self::MODULE_NAME);

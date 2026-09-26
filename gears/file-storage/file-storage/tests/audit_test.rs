@@ -6,9 +6,6 @@
 //!    primary operation.
 //! 2. A rolled-back mutation (failed metadata CAS) leaves **zero** audit rows —
 //!    proving that the audit row and the mutation share a single transaction.
-//!
-//! @cpt-cf-file-storage-fr-audit-trail
-//! @cpt-cf-file-storage-nfr-audit-completeness
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::doc_markdown)]
 
@@ -23,16 +20,71 @@ use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use file_storage::domain::authz::TenantOnlyAuthorizer;
-use file_storage::domain::data_plane::DataPlaneService;
 use file_storage::domain::error::DomainError;
 use file_storage::domain::multipart_service::MultipartService;
-use file_storage::domain::ports::{DataPlanePort, MultipartStore};
+use file_storage::domain::ports::MultipartStore;
 use file_storage::domain::service::{FileService, ServiceConfig};
 use file_storage::infra::backend::{BackendRegistry, InMemoryBackend, StorageBackend};
+use file_storage::infra::content::{hash, mime};
 use file_storage::infra::signed_url::Issuer;
 use file_storage::infra::storage::Store;
 use file_storage::infra::storage::migrations::Migrator;
 use file_storage_sdk::{CustomMetadataPatch, NewFile, OwnerKind};
+
+/// Direct byte-path test double for what `DataPlaneService` used to provide
+/// (removed: production never constructed it — the sidecar is the only real
+/// byte path). Same steps `DataPlaneService::put_content` used to perform,
+/// but through `put_stream` rather than the whole-object `put` that no
+/// longer exists on `StorageBackend`.
+struct TestDataPlane {
+    svc: Arc<FileService>,
+    store: Store,
+    backends: BackendRegistry,
+}
+
+impl TestDataPlane {
+    fn new(svc: Arc<FileService>, store: Store, backends: BackendRegistry) -> Self {
+        Self {
+            svc,
+            store,
+            backends,
+        }
+    }
+
+    async fn put_content(
+        &self,
+        ctx: &SecurityContext,
+        file_id: Uuid,
+        version_id: Uuid,
+        declared_mime: &str,
+        bytes: Bytes,
+    ) -> Result<(), DomainError> {
+        mime::validate(declared_mime, &bytes)?;
+        self.svc.authorize_write(ctx, file_id).await?;
+        let version = self
+            .store
+            .get_version(file_id, version_id)
+            .await?
+            .ok_or_else(|| DomainError::version_not_found(file_id, version_id))?;
+        let backend = self.backends.get(&version.backend_id)?;
+        let len = bytes.len() as u64;
+        let digest = hash::sha256(&bytes);
+        let stream: futures::stream::BoxStream<'static, std::io::Result<Bytes>> =
+            Box::pin(futures::stream::once(async move { Ok(bytes) }));
+        backend
+            .put_stream(&version.backend_path, stream, Some(len))
+            .await?;
+        self.svc
+            .finalize_upload(
+                ctx,
+                file_id,
+                version_id,
+                i64::try_from(len).unwrap_or(i64::MAX),
+                digest,
+            )
+            .await
+    }
+}
 
 const GTS: &str = gts_id!("cf.fstorage.file.type.v1~x.test.file.type.v1~");
 
@@ -55,7 +107,7 @@ async fn build_db() -> Arc<DBProvider<DbError>> {
 async fn build_service() -> (
     Arc<FileService>,
     Arc<MultipartService>,
-    DataPlaneService,
+    TestDataPlane,
     Store,
 ) {
     let db = build_db().await;
@@ -81,6 +133,7 @@ async fn build_service() -> (
         None,
         None,
     ));
+    let dp = TestDataPlane::new(Arc::clone(&svc), store.clone(), backends.clone());
     let msvc = Arc::new(MultipartService::new(
         Arc::new(store.clone()) as Arc<dyn MultipartStore>,
         backends,
@@ -90,7 +143,6 @@ async fn build_service() -> (
         "http://sidecar.test".to_owned(),
         3600,
     ));
-    let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
     (svc, msvc, dp, store)
 }
 
@@ -115,14 +167,15 @@ fn new_file() -> NewFile {
 
 // ── 1. create_file leaves exactly one "create" audit row ───────────────────────
 
-/// @cpt-cf-file-storage-fr-audit-trail
-/// @cpt-cf-file-storage-nfr-audit-completeness
 #[tokio::test]
 async fn create_file_leaves_one_audit_row() {
     let (svc, _msvc, _dp, store) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
 
     let rows = store.list_audit(ticket.file_id).await.unwrap();
     assert_eq!(rows.len(), 1, "expected exactly 1 audit row after create");
@@ -133,14 +186,15 @@ async fn create_file_leaves_one_audit_row() {
 
 // ── 2. finalize_upload leaves a "finalize_version" audit row ──────────────────
 
-/// @cpt-cf-file-storage-fr-audit-trail
-/// @cpt-cf-file-storage-nfr-audit-completeness
 #[tokio::test]
 async fn finalize_upload_leaves_audit_row() {
     let (svc, _msvc, dp, store) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     // put_content calls finalize_upload internally.
     dp.put_content(
         &ctx,
@@ -167,14 +221,15 @@ async fn finalize_upload_leaves_audit_row() {
 
 // ── 3. bind leaves a "patch_content" audit row ────────────────────────────────
 
-/// @cpt-cf-file-storage-fr-audit-trail
-/// @cpt-cf-file-storage-nfr-audit-completeness
 #[tokio::test]
 async fn bind_leaves_audit_row() {
     let (svc, _msvc, dp, store) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     dp.put_content(
         &ctx,
         ticket.file_id,
@@ -204,14 +259,15 @@ async fn bind_leaves_audit_row() {
 
 // ── 4. update_metadata leaves a "patch_metadata" audit row ────────────────────
 
-/// @cpt-cf-file-storage-fr-audit-trail
-/// @cpt-cf-file-storage-nfr-audit-completeness
 #[tokio::test]
 async fn update_metadata_leaves_audit_row() {
     let (svc, _msvc, _dp, store) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     let patch = CustomMetadataPatch {
         entries: vec![("k".to_owned(), Some("v".to_owned()))],
     };
@@ -232,16 +288,114 @@ async fn update_metadata_leaves_audit_row() {
     assert_eq!(meta_rows[0].outcome, "success");
 }
 
+// ── 4b. update_metadata enqueues a "file.metadata_updated" event ────────────
+
+/// Regression test: `patch_metadata_atomic` previously wrote only the audit
+/// row, silently skipping the `file.metadata_updated` event required by
+/// `cpt-cf-file-storage-fr-file-events` (docs/migration.sql's `events_outbox`
+/// catalog lists the event type, but nothing ever enqueued it). This proves
+/// the event is now enqueued exactly once, in the same transaction as the
+/// audit row and the metadata mutation.
+#[tokio::test]
+async fn update_metadata_enqueues_metadata_updated_event() {
+    let (svc, _msvc, _dp, store) = build_service().await;
+    let tenant = Uuid::now_v7();
+    let ctx = ctx(tenant);
+
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+    let patch = CustomMetadataPatch {
+        entries: vec![("k".to_owned(), Some("v".to_owned()))],
+    };
+    svc.update_metadata(&ctx, ticket.file_id, patch, None)
+        .await
+        .unwrap();
+
+    let events = store.list_file_events(ticket.file_id).await.unwrap();
+    let meta_events: Vec<_> = events
+        .iter()
+        .filter(|e| e.event_type == "file.metadata_updated")
+        .collect();
+    assert_eq!(
+        meta_events.len(),
+        1,
+        "expected exactly 1 file.metadata_updated event"
+    );
+    assert_eq!(meta_events[0].file_id, ticket.file_id);
+    assert_eq!(meta_events[0].tenant_id, tenant);
+    assert!(
+        meta_events[0].published_at.is_none(),
+        "event must not be published yet"
+    );
+
+    // The event's `meta_version` payload is the authoritative committed
+    // revision stamped inside the transaction — it must equal the file's
+    // actual current revision, not a pre-read guess.
+    let (file, _) = svc
+        .get_file_with_metadata(&ctx, ticket.file_id)
+        .await
+        .unwrap();
+    let ev_mv = meta_events[0]
+        .payload
+        .get("meta_version")
+        .and_then(serde_json::Value::as_i64);
+    assert_eq!(
+        ev_mv,
+        Some(file.meta_version),
+        "event meta_version must equal the committed revision"
+    );
+
+    // A second unconditional patch stamps the next committed revision, proving
+    // the value tracks the real row rather than a fixed snapshot+1.
+    svc.update_metadata(
+        &ctx,
+        ticket.file_id,
+        CustomMetadataPatch {
+            entries: vec![("k2".to_owned(), Some("v2".to_owned()))],
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    let (file2, _) = svc
+        .get_file_with_metadata(&ctx, ticket.file_id)
+        .await
+        .unwrap();
+    let events2 = store.list_file_events(ticket.file_id).await.unwrap();
+    let latest_mv = events2
+        .iter()
+        .filter(|e| e.event_type == "file.metadata_updated")
+        .filter_map(|e| {
+            e.payload
+                .get("meta_version")
+                .and_then(serde_json::Value::as_i64)
+        })
+        .max();
+    assert_eq!(
+        latest_mv,
+        Some(file2.meta_version),
+        "the second event must carry the new committed revision"
+    );
+    assert_eq!(
+        file2.meta_version,
+        file.meta_version + 1,
+        "two sequential patches bump the revision by exactly one each"
+    );
+}
+
 // ── 5. delete_file leaves a "delete_file" audit row ──────────────────────────
 
-/// @cpt-cf-file-storage-fr-audit-trail
-/// @cpt-cf-file-storage-nfr-audit-completeness
 #[tokio::test]
 async fn delete_file_leaves_audit_row() {
     let (svc, _msvc, _dp, store) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     let file_id = ticket.file_id;
 
     // Use wildcard If-Match (file has no bound content yet).
@@ -264,15 +418,16 @@ async fn delete_file_leaves_audit_row() {
 
 // ── 6. delete_version leaves a "delete_version" audit row ────────────────────
 
-/// @cpt-cf-file-storage-fr-audit-trail
-/// @cpt-cf-file-storage-nfr-audit-completeness
 #[tokio::test]
 async fn delete_version_leaves_audit_row() {
     let (svc, _msvc, dp, store) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
 
     // Create + upload v1 and bind it.
-    let t1 = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let t1 = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     dp.put_content(
         &ctx,
         t1.file_id,
@@ -329,14 +484,15 @@ async fn delete_version_leaves_audit_row() {
 
 /// A file with exactly one version must 404 on a random/non-existent
 /// `version_id` instead of silently deleting the whole file.
-///
-/// @cpt-cf-file-storage-fr-audit-trail
 #[tokio::test]
 async fn delete_version_single_version_file_wrong_id_returns_not_found() {
     let (svc, _msvc, dp, store) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
 
-    let t1 = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let t1 = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     dp.put_content(
         &ctx,
         t1.file_id,
@@ -371,14 +527,15 @@ async fn delete_version_single_version_file_wrong_id_returns_not_found() {
 
 /// Positive control: deleting the only version by its real id still deletes
 /// the whole file (today's intended behavior).
-///
-/// @cpt-cf-file-storage-fr-audit-trail
 #[tokio::test]
 async fn delete_version_single_version_file_matching_id_deletes_whole_file() {
     let (svc, _msvc, dp, store) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
 
-    let t1 = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let t1 = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     dp.put_content(
         &ctx,
         t1.file_id,
@@ -402,8 +559,6 @@ async fn delete_version_single_version_file_matching_id_deletes_whole_file() {
 
 // -- 7. multipart complete leaves audit rows ----------------------------------
 
-/// @cpt-cf-file-storage-fr-audit-trail
-/// @cpt-cf-file-storage-nfr-audit-completeness
 #[tokio::test]
 async fn multipart_complete_leaves_audit_rows() {
     // Build a custom setup that exposes both the MultipartStore and the
@@ -444,10 +599,13 @@ async fn multipart_complete_leaves_audit_rows() {
         "http://sidecar.test".to_owned(),
         3600,
     ));
-    let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
+    let dp = TestDataPlane::new(Arc::clone(&svc), store.clone(), backends.clone());
 
     let ctx = ctx(Uuid::now_v7());
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
 
     // Declare total size = 5 bytes ("part1").
     let part_data = Bytes::from_static(b"part1");
@@ -460,7 +618,7 @@ async fn multipart_complete_leaves_audit_rows() {
             "application/octet-stream",
             declared_size,
             None,
-            None,
+            false,
         )
         .await
         .unwrap();
@@ -473,13 +631,17 @@ async fn multipart_complete_leaves_audit_rows() {
         .expect("session must exist");
     let backend_path = format!("/{}/{}", ticket.file_id, plan.version_id);
 
+    let part_data_len = part_data.len() as u64;
+    let part_data_stream: futures::stream::BoxStream<'static, std::io::Result<bytes::Bytes>> =
+        Box::pin(futures::stream::once(async move { Ok(part_data) }));
     let (backend_etag, part_hash) = backend
-        .upload_part(
+        .upload_part_stream(
             &backend_path,
             &session.backend_upload_handle,
             1,
             0,
-            part_data,
+            part_data_stream,
+            part_data_len,
         )
         .await
         .unwrap();
@@ -496,9 +658,11 @@ async fn multipart_complete_leaves_audit_rows() {
         .await
         .unwrap();
 
-    msvc.complete_multipart_upload(&ctx, ticket.file_id, plan.upload_id, None)
+    let _completed = msvc
+        .complete_multipart_upload(&ctx, ticket.file_id, plan.upload_id, None)
         .await
-        .unwrap();
+        .unwrap()
+        .unwrap_completed();
 
     let rows = store.list_audit(ticket.file_id).await.unwrap();
     let complete_rows: Vec<_> = rows
@@ -544,14 +708,15 @@ async fn multipart_complete_leaves_audit_rows() {
 /// A stale `expected_meta_version` causes the CAS to roll back the entire
 /// transaction (both the `meta_version` bump and the audit row). This proves
 /// the same-transaction guarantee of `cpt-cf-file-storage-nfr-audit-completeness`.
-///
-/// @cpt-cf-file-storage-nfr-audit-completeness
 #[tokio::test]
 async fn failed_metadata_cas_leaves_no_audit_row() {
     let (svc, _msvc, _dp, store) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     // There is 1 audit row: the "create".
     let rows_before = store.list_audit(ticket.file_id).await.unwrap();
     assert_eq!(rows_before.len(), 1);
@@ -582,15 +747,16 @@ async fn failed_metadata_cas_leaves_no_audit_row() {
 
 /// A stale ETag on bind rolls back the whole transaction; no audit row should
 /// be emitted.
-///
-/// @cpt-cf-file-storage-nfr-audit-completeness
 #[tokio::test]
 async fn failed_bind_cas_leaves_no_audit_row() {
     let (svc, _msvc, dp, store) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
 
     // Bind v1 successfully.
-    let t1 = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let t1 = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     dp.put_content(
         &ctx,
         t1.file_id,

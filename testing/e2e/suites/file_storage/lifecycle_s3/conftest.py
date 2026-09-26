@@ -50,10 +50,11 @@ Prerequisites
 
 Running the S3 e2e locally
 ---------------------------
-Option A — ``s3s-fs`` (matches this gear's own Rust dev-dependency test
-double, `gears/file-storage/file-storage/src/infra/backend/s3_tests.rs`)::
+``s3s-fs`` (matches this gear's own Rust dev-dependency test double,
+`gears/file-storage/file-storage/src/infra/backend/s3_tests.rs`) — the only
+test double this suite (and CI) uses::
 
-    cargo install s3s-fs --version 0.14.1 --features binary --root /tmp/s3s-fs-install
+    cargo install s3s-fs --version 0.14.1 --features binary --locked --root /tmp/s3s-fs-install
     mkdir -p /tmp/s3-e2e-data/file-storage-e2e     # pre-create the bucket dir
     /tmp/s3s-fs-install/bin/s3s-fs --host 127.0.0.1 --port 19099 \\
         --access-key test-access-key --secret-key test-secret-key \\
@@ -68,16 +69,6 @@ double, `gears/file-storage/file-storage/src/infra/backend/s3_tests.rs`)::
     export FS_E2E_S3_ACCESS_KEY=test-access-key
     export FS_E2E_S3_SECRET_KEY=test-secret-key
     python -m pytest -vv testing/e2e/suites/file_storage/lifecycle_s3
-
-Option B — MinIO (docker), as an alternative test double::
-
-    docker run -d --name fs-e2e-minio -p 19099:9000 \\
-        -e MINIO_ROOT_USER=test-access-key -e MINIO_ROOT_PASSWORD=test-secret-key \\
-        minio/minio server /data
-    docker run --rm --network host --entrypoint sh minio/mc -c \\
-        "mc alias set local http://127.0.0.1:19099 test-access-key test-secret-key && \\
-         mc mb local/file-storage-e2e"
-    # then export the same FS_E2E_S3_* vars as Option A and run pytest.
 
 Without ``FS_E2E_S3_ENDPOINT`` set, the whole package skips cleanly (verified
 via ``pytest --collect-only`` + a run with the var unset — see plan.md).
@@ -428,7 +419,12 @@ def lifecycle_s3_auth_headers() -> dict:
 @pytest.fixture
 def gts_file_type():
     """A syntactically valid GTS file type accepted at upload time."""
+    # Same type the sibling suites use (`../conftest.py`, `../lifecycle/`).
+    # `validate_gts_type` is purely syntactic (`GtsTypeId::try_new`), and
+    # `x.e2e.test.v1~` does not satisfy the grammar -- this suite never caught
+    # it because it skipped whenever `FS_E2E_S3_ENDPOINT` was unset, which was
+    # always, until CI started providing an S3 double.
     return os.getenv(
         "E2E_FS_GTS_TYPE",
-        "gts.cf.fstorage.file.type.v1~x.e2e.test.v1~",
+        "gts.cf.fstorage.file.type.v1~x.e2e.file.type.v1~",
     )

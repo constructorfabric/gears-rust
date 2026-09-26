@@ -81,9 +81,15 @@ impl ScopeError {
 /// Check whether a `sea_orm::DbErr` represents a unique-constraint violation.
 ///
 /// First tries `SeaORM`'s built-in `sql_err()` detection (SQLSTATE-based).
-/// Falls back to string matching on the error message for cases where
-/// `sql_err()` fails to classify the error (e.g. certain connection proxies
-/// or driver wrappers that strip the SQLSTATE code).
+/// Falls back to string matching on the error message **only when
+/// `sql_err()` couldn't classify the error at all** (`None` -- e.g. certain
+/// connection proxies or driver wrappers that strip the SQLSTATE code). When
+/// `sql_err()` *did* resolve to some other, authoritative variant (e.g.
+/// `ForeignKeyConstraintViolation`), that answer is trusted outright and the
+/// fallback is skipped -- falling through to substring matching in that case
+/// would let an unrelated violation get misclassified as "unique" merely
+/// because its message text happens to contain a matching phrase (e.g. an
+/// echoed constraint/column name).
 ///
 /// Recognized patterns across backends:
 /// - **Postgres** SQLSTATE `23505` — "`unique_violation`" / "duplicate key"
@@ -91,28 +97,36 @@ impl ScopeError {
 /// - **`MySQL`** error `1062` — "Duplicate entry"
 #[must_use]
 pub fn is_unique_violation(err: &sea_orm::DbErr) -> bool {
-    // Fast path: SeaORM parsed the SQLSTATE / vendor code correctly.
-    if matches!(
-        err.sql_err(),
-        Some(sea_orm::SqlErr::UniqueConstraintViolation(_))
-    ) {
-        return true;
+    match err.sql_err() {
+        // Fast path: SeaORM parsed the SQLSTATE / vendor code correctly.
+        Some(sea_orm::SqlErr::UniqueConstraintViolation(_)) => true,
+        // Some other, authoritative classification -- trust it and stop
+        // here, rather than falling through to a weaker text match that
+        // could contradict it.
+        Some(_) => false,
+        // No structured classification available -- string-based detection
+        // for wrapped / proxied errors is all that's left.
+        None => {
+            let msg = err.to_string().to_lowercase();
+            msg.contains("unique constraint")
+                || msg.contains("duplicate key")
+                || msg.contains("unique_violation")
+                || msg.contains("duplicate entry")
+                || msg.contains("unique constraint failed")
+        }
     }
-
-    // Fallback: string-based detection for wrapped / proxied errors.
-    let msg = err.to_string().to_lowercase();
-    msg.contains("unique constraint")
-        || msg.contains("duplicate key")
-        || msg.contains("unique_violation")
-        || msg.contains("duplicate entry")
-        || msg.contains("unique constraint failed")
 }
 
 /// Check whether a `sea_orm::DbErr` represents a foreign-key violation.
 ///
 /// The counterpart of [`is_unique_violation`], and detected the same way: the
-/// SQLSTATE fast path first, then a message match for errors that were
-/// re-wrapped on the way here and lost their typed shape.
+/// SQLSTATE fast path first, then -- **only when `sql_err()` returned
+/// `None`** -- a message match for errors that were re-wrapped on the way
+/// here and lost their typed shape. As with [`is_unique_violation`], a
+/// `sql_err()` that resolved to some other authoritative variant (e.g.
+/// `UniqueConstraintViolation`) is trusted as a definitive "no" and skips the
+/// fallback, rather than letting a matching substring in the message
+/// override it.
 ///
 /// Useful where a referencing row is the invariant and the `RESTRICT` on the
 /// foreign key is what actually enforces it -- a preceding count is a nicer
@@ -127,17 +141,16 @@ pub fn is_unique_violation(err: &sea_orm::DbErr) -> bool {
 /// - **`MySQL`** errors `1451`/`1452` — "a foreign key constraint fails"
 #[must_use]
 pub fn is_foreign_key_violation(err: &sea_orm::DbErr) -> bool {
-    if matches!(
-        err.sql_err(),
-        Some(sea_orm::SqlErr::ForeignKeyConstraintViolation(_))
-    ) {
-        return true;
+    match err.sql_err() {
+        Some(sea_orm::SqlErr::ForeignKeyConstraintViolation(_)) => true,
+        Some(_) => false,
+        None => {
+            let msg = err.to_string().to_lowercase();
+            msg.contains("foreign key constraint")
+                || msg.contains("foreign_key_violation")
+                || msg.contains("violates foreign key")
+        }
     }
-
-    let msg = err.to_string().to_lowercase();
-    msg.contains("foreign key constraint")
-        || msg.contains("foreign_key_violation")
-        || msg.contains("violates foreign key")
 }
 
 #[cfg(test)]
@@ -162,6 +175,16 @@ mod tests {
     // covered end-to-end instead, by tests that provoke a genuine violation
     // against live SQLite. What is left for a unit test is the message
     // matching below, per backend.
+    //
+    // The one typed-path behavior that specifically needs a *live*, real
+    // `sql_err()` result -- an authoritative, non-matching classification
+    // (e.g. `ForeignKeyConstraintViolation`) must short-circuit to `false`
+    // rather than still falling through to the message match below, even
+    // when the message text would otherwise match -- is covered by
+    // `pg_foreign_key_violation_with_confusable_message_is_not_unique_violation`
+    // in `tests/error_classification.rs`, which provokes a real Postgres FK
+    // violation whose constraint name is deliberately chosen to contain a
+    // unique-violation-sounding phrase.
 
     #[test]
     fn foreign_key_violation_detected_per_backend_message() {

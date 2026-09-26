@@ -29,6 +29,15 @@ workspace = true
 [features]
 default = []
 
+# Gates RUNNING the Postgres-backed real-DB concurrency suite
+# (tests/pg_concurrency_test.rs), which spins up a `testcontainers` Docker
+# container; enable with `--features integration` when Docker is available
+# locally or in CI. Cargo has no way to make a dev-dependency itself optional,
+# so the `testcontainers`/`testcontainers-modules` dev-dependencies below are
+# always compiled in a dev build regardless of this feature — it only skips
+# actually running the container-backed tests.
+integration = []
+
 [dependencies]
 # SDK - public API, models, and errors
 cf-gears-file-storage-sdk = { version = "0.1.3", path = "../file-storage-sdk" }
@@ -111,6 +120,12 @@ gts = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 tower = { workspace = true }
+# "test-util" enables `#[tokio::test(start_paused = true)]` / `tokio::time::advance`
+# (used by `sidecar_tests.rs`'s idle-timeout tests to avoid real sleeps) --
+# a test-only addition on top of the `[dependencies]` tokio above (which stays
+# on plain `workspace = true`/"full", never pulling test-only APIs into the
+# production binary).
+tokio = { workspace = true, features = ["test-util"] }
 
 # S3 backend test double (Stage 1+): an in-process, filesystem-backed S3-compatible
 # HTTP server. Versions re-verified against crates.io in Stage 0 (matched pair).
@@ -118,3 +133,27 @@ s3s = "0.14.1"
 s3s-fs = "0.14.1"
 hyper-util = { workspace = true, features = ["server-auto", "tokio"] }
 tempfile = { workspace = true }
+
+# "test-support" enables toolkit_db::connect_db_with_metric_callback and
+# secure::in_transaction_for_testing, used by the DB-behavior audit's
+# QueryRecorder (tests/common/query_recorder.rs). Test-only; never built
+# into the production library (this crate's own [dependencies] above pulls
+# in toolkit-db without this feature).
+# "pg" (on top of the "sqlite" already needed by the SQLite audit tests) lets
+# tests/pg_concurrency_test.rs connect to a real PostgreSQL via connect_db().
+toolkit-db = { workspace = true, features = ["sqlite", "pg", "test-support"] }
+# SQL normalization for the QueryRecorder (tests/common/query_recorder.rs) --
+# already a workspace dependency (see root Cargo.toml), used here as a
+# test-only dev-dependency.
+regex = { workspace = true }
+# PostgreSQL concurrency harness (tests/pg_concurrency_test.rs) -- brings up a
+# real PostgreSQL via Docker, mirroring resource-group's own
+# tests/pg_concurrency_test.rs (audit/rg-db-behavior). Both already workspace
+# dependencies (root Cargo.toml), used here as test-only dev-dependencies.
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true }
+# Database image + tag come from one place workspace-wide (docs/TESTING.md 4.4,
+# enforced by `cargo xtask check-test-container-pins`): constructing
+# `Postgres::default()` directly would take the tag from `testcontainers-modules`
+# and re-introduce the transitive pin this crate exists to remove.
+test-containers = { workspace = true }

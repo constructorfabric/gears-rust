@@ -25,18 +25,73 @@ use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use file_storage::domain::authz::TenantOnlyAuthorizer;
-use file_storage::domain::data_plane::DataPlaneService;
 use file_storage::domain::error::DomainError;
 use file_storage::domain::policy::{MetadataLimits, PolicyBody, PolicyScope, SizeLimits};
 use file_storage::domain::policy_service::PolicyService;
-use file_storage::domain::ports::{DataPlanePort, PolicyStore};
+use file_storage::domain::ports::PolicyStore;
 use file_storage::domain::service::{FileService, ServiceConfig};
 use file_storage::infra::backend::{BackendRegistry, InMemoryBackend, StorageBackend};
+use file_storage::infra::content::{hash, mime};
 use file_storage::infra::external_clients::{QuotaClient, QuotaDecision};
 use file_storage::infra::signed_url::Issuer;
 use file_storage::infra::storage::Store;
 use file_storage::infra::storage::migrations::Migrator;
 use file_storage_sdk::{CustomMetadataEntry, CustomMetadataPatch, NewFile, OwnerKind};
+
+/// Direct byte-path test double for what `DataPlaneService` used to provide
+/// (removed: production never constructed it — the sidecar is the only real
+/// byte path). Same steps `DataPlaneService::put_content` used to perform,
+/// but through `put_stream` rather than the whole-object `put` that no
+/// longer exists on `StorageBackend`.
+struct TestDataPlane {
+    svc: Arc<FileService>,
+    store: Store,
+    backends: BackendRegistry,
+}
+
+impl TestDataPlane {
+    fn new(svc: Arc<FileService>, store: Store, backends: BackendRegistry) -> Self {
+        Self {
+            svc,
+            store,
+            backends,
+        }
+    }
+
+    async fn put_content(
+        &self,
+        ctx: &SecurityContext,
+        file_id: Uuid,
+        version_id: Uuid,
+        declared_mime: &str,
+        bytes: Bytes,
+    ) -> Result<(), DomainError> {
+        mime::validate(declared_mime, &bytes)?;
+        self.svc.authorize_write(ctx, file_id).await?;
+        let version = self
+            .store
+            .get_version(file_id, version_id)
+            .await?
+            .ok_or_else(|| DomainError::version_not_found(file_id, version_id))?;
+        let backend = self.backends.get(&version.backend_id)?;
+        let len = bytes.len() as u64;
+        let digest = hash::sha256(&bytes);
+        let stream: futures::stream::BoxStream<'static, std::io::Result<Bytes>> =
+            Box::pin(futures::stream::once(async move { Ok(bytes) }));
+        backend
+            .put_stream(&version.backend_path, stream, Some(len))
+            .await?;
+        self.svc
+            .finalize_upload(
+                ctx,
+                file_id,
+                version_id,
+                i64::try_from(len).unwrap_or(i64::MAX),
+                digest,
+            )
+            .await
+    }
+}
 
 const GTS: &str = gts_id!("cf.fstorage.file.type.v1~x.test.file.type.v1~");
 
@@ -110,12 +165,7 @@ async fn build_db() -> Arc<DBProvider<DbError>> {
 
 async fn build_service(
     quota: Option<Arc<dyn QuotaClient>>,
-) -> (
-    Arc<FileService>,
-    Arc<PolicyService>,
-    DataPlaneService,
-    Store,
-) {
+) -> (Arc<FileService>, Arc<PolicyService>, TestDataPlane, Store) {
     let db = build_db().await;
     let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
     let backends = BackendRegistry::new(vec![backend], "mem").expect("registry");
@@ -133,15 +183,15 @@ async fn build_service(
     let policy_store: Arc<dyn PolicyStore> = Arc::new(store.clone());
     let store_handle = store.clone();
     let svc = Arc::new(FileService::new(
-        store,
-        backends,
+        store.clone(),
+        backends.clone(),
         issuer,
         Arc::clone(&authorizer),
         cfg,
         quota,
         None,
     ));
-    let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
+    let dp = TestDataPlane::new(Arc::clone(&svc), store, backends);
     let psvc = Arc::new(PolicyService::new(policy_store, authorizer));
     (svc, psvc, dp, store_handle)
 }
@@ -187,7 +237,7 @@ async fn create_file_with_disallowed_mime_is_rejected() {
 
     // text/plain is not allowed → reject.
     let err = svc
-        .create_file(&ctx, new_file(Uuid::now_v7(), "text/plain"), None)
+        .create_file(&ctx, new_file(Uuid::now_v7(), "text/plain"), None, false)
         .await
         .unwrap_err();
     assert!(
@@ -196,7 +246,7 @@ async fn create_file_with_disallowed_mime_is_rejected() {
     );
 
     // image/png matches image/* → allowed.
-    svc.create_file(&ctx, new_file(Uuid::now_v7(), "image/png"), None)
+    svc.create_file(&ctx, new_file(Uuid::now_v7(), "image/png"), None, false)
         .await
         .expect("image/png should be allowed");
 }
@@ -226,7 +276,7 @@ async fn finalize_oversized_upload_is_rejected() {
     .unwrap();
 
     let t = svc
-        .create_file(&ctx, new_file(owner, "text/plain"), None)
+        .create_file(&ctx, new_file(owner, "text/plain"), None, false)
         .await
         .unwrap();
 
@@ -277,7 +327,7 @@ async fn finalize_negative_size_is_rejected_with_400_not_500() {
     let owner = Uuid::now_v7();
 
     let t = svc
-        .create_file(&ctx, new_file(owner, "text/plain"), None)
+        .create_file(&ctx, new_file(owner, "text/plain"), None, false)
         .await
         .unwrap();
 
@@ -316,6 +366,7 @@ async fn finalize_negative_size_is_rejected_with_400_not_500() {
         request_id: "test-request-id".to_owned(),
         content_type: String::new(),
         etag: String::new(),
+        bind_on_finalize: false,
     };
     let err = svc
         .finalize_upload_by_token(&claims, -1, vec![0u8; 32])
@@ -382,7 +433,7 @@ async fn finalize_via_router_with_hash_len(hash_byte_len: usize) -> (StatusCode,
 
     let ctx = ctx(Uuid::now_v7());
     let ticket = svc
-        .create_file(&ctx, new_file(Uuid::now_v7(), "text/plain"), None)
+        .create_file(&ctx, new_file(Uuid::now_v7(), "text/plain"), None, false)
         .await
         .unwrap();
 
@@ -396,7 +447,7 @@ async fn finalize_via_router_with_hash_len(hash_byte_len: usize) -> (StatusCode,
     // P2 0.1 remaining: `finalize_version` now also requires a `FinalizeAuth`
     // extension. `None` reproduces this test's pre-existing behavior (no
     // internal-secret gate configured, token-only trust model).
-    let finalize_auth = Arc::new(handlers::FinalizeAuth::new(None));
+    let finalize_auth = Arc::new(handlers::FinalizeAuth::new(None, time::Duration::ZERO));
 
     let router = Router::new()
         .route(
@@ -489,7 +540,7 @@ async fn update_metadata_via_router(if_match_header: Option<&str>) -> (StatusCod
     let owner = Uuid::now_v7();
 
     let ticket = svc
-        .create_file(&ctx, new_file(owner, "text/plain"), None)
+        .create_file(&ctx, new_file(owner, "text/plain"), None, false)
         .await
         .unwrap();
 
@@ -597,7 +648,7 @@ async fn create_file_bakes_max_size_into_upload_url() {
     .await
     .unwrap();
     let t = svc
-        .create_file(&ctx, new_file(Uuid::now_v7(), "text/plain"), None)
+        .create_file(&ctx, new_file(Uuid::now_v7(), "text/plain"), None, false)
         .await
         .unwrap();
     assert!(t.upload_url.contains("fs-token="));
@@ -635,7 +686,7 @@ async fn create_file_with_too_many_metadata_pairs_is_rejected() {
             value: "2".to_owned(),
         },
     ];
-    let err = svc.create_file(&ctx, nf, None).await.unwrap_err();
+    let err = svc.create_file(&ctx, nf, None, false).await.unwrap_err();
     assert!(
         matches!(err, DomainError::PolicyMetadataExceeded { .. }),
         "got {err:?}"
@@ -667,7 +718,7 @@ async fn update_metadata_over_limit_is_rejected_on_resulting_total() {
         key: "a".to_owned(),
         value: "1".to_owned(),
     }];
-    let t = svc.create_file(&ctx, nf, None).await.unwrap();
+    let t = svc.create_file(&ctx, nf, None, false).await.unwrap();
 
     // Patch adds two more keys → resulting total of 3 pairs > 2 → reject.
     let patch = CustomMetadataPatch {
@@ -719,7 +770,7 @@ async fn quota_exceeded_rejects_create_when_client_present() {
     .unwrap();
 
     let err = svc
-        .create_file(&ctx, new_file(Uuid::now_v7(), "text/plain"), None)
+        .create_file(&ctx, new_file(Uuid::now_v7(), "text/plain"), None, false)
         .await
         .unwrap_err();
     assert!(
@@ -752,7 +803,7 @@ async fn quota_gates_version_creation_not_just_first_upload() {
     .unwrap();
 
     let t = svc
-        .create_file(&ctx, new_file(Uuid::now_v7(), "text/plain"), None)
+        .create_file(&ctx, new_file(Uuid::now_v7(), "text/plain"), None, false)
         .await
         .expect("first create within quota");
 
@@ -771,7 +822,7 @@ async fn quota_client_error_fails_closed() {
 
     // No policy configured, but the quota client errors → fail closed (deny).
     let err = svc
-        .create_file(&ctx, new_file(Uuid::now_v7(), "text/plain"), None)
+        .create_file(&ctx, new_file(Uuid::now_v7(), "text/plain"), None, false)
         .await
         .unwrap_err();
     assert!(
@@ -796,7 +847,7 @@ async fn no_policy_and_no_quota_is_fully_permissive() {
         })
         .collect();
     let t = svc
-        .create_file(&ctx, nf, None)
+        .create_file(&ctx, nf, None, false)
         .await
         .expect("permissive create");
 
