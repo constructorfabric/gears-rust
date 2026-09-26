@@ -200,13 +200,17 @@ pub struct ConsumerRegistration {
 }
 
 /// The wiring function pointer emitted by `#[toolkit::consumes]`. Registers the
-/// client into the `ClientHub`, given the endpoint resolver and the process's
-/// platform-plane credential source (threaded onto a directory-resolving remote
-/// client). Aliased to keep the fn-pointer type readable.
+/// client into the `ClientHub`, given the endpoint resolver and a prepared
+/// [`ClientTuning`](toolkit_contract::wiring::ClientTuning). The tuning carries
+/// both the per-deployment `consumer_wiring` knobs (timeout/retry/pool/
+/// concurrency) and the process's platform-plane credential source (threaded
+/// onto a directory-resolving remote client via
+/// `ClientTuning::with_internal_token_provider`). Aliased to keep the
+/// fn-pointer type readable.
 pub type WireFn = fn(
     &ClientHub,
     Arc<dyn EndpointResolver>,
-    Option<&toolkit_contract::runtime::config::InternalTokenProvider>,
+    toolkit_contract::wiring::ClientTuning,
 ) -> anyhow::Result<WireOutcome>;
 
 inventory::collect!(ConsumerRegistration);

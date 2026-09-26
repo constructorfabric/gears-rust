@@ -218,6 +218,79 @@ fn rest_only_knobs_set_reports_which_were_set() {
     );
 }
 
+/// `ConsumerWiring` — the consumer-side (`#[toolkit::consumes]`) schema:
+/// an object with an optional `endpoint` (omit to keep discovery) plus flattened
+/// `ClientTuning`. No `transport` tag (the consumer path is REST-only). The
+/// bare-string form earlier drafts accepted is deliberately rejected.
+mod consumer_wiring {
+    use super::*;
+    use toolkit_contract::wiring::ConsumerWiring;
+
+    fn parse_consumer(json: &str) -> Result<ConsumerWiring, serde_json::Error> {
+        serde_json::from_str(json)
+    }
+
+    #[test]
+    fn bare_string_is_rejected() {
+        // The legacy bare-string escape hatch is no longer a valid shape — it
+        // must fail loudly rather than be silently honoured or dropped. Use
+        // `{ "endpoint": "..." }` instead.
+        assert!(parse_consumer(r#""http://billing:8080""#).is_err());
+    }
+
+    #[test]
+    fn object_form_with_endpoint_and_tuning() {
+        let json = r#"{
+            "endpoint": "http://billing:8080",
+            "timeout": "5s",
+            "max_concurrent_requests": 256,
+            "pool_max_idle_per_host": 256
+        }"#;
+        let w = parse_consumer(json).expect("object form parses");
+        let (endpoint, tuning) = w.into_parts();
+        assert_eq!(endpoint.as_deref(), Some("http://billing:8080"));
+        assert_eq!(tuning.timeout, Some(Duration::from_secs(5)));
+        assert_eq!(tuning.max_concurrent_requests, Some(256));
+        assert_eq!(tuning.pool_max_idle_per_host, Some(256));
+    }
+
+    #[test]
+    fn object_form_without_endpoint_keeps_discovery() {
+        // Omitting `endpoint` leaves discovery in place while still tuning.
+        let w = parse_consumer(r#"{ "timeout": "1s", "max_concurrent_requests": 1 }"#)
+            .expect("tuning-only object parses");
+        let (endpoint, tuning) = w.into_parts();
+        assert_eq!(endpoint, None, "no endpoint => discovery is untouched");
+        assert_eq!(tuning.timeout, Some(Duration::from_secs(1)));
+        assert_eq!(tuning.max_concurrent_requests, Some(1));
+    }
+
+    #[test]
+    fn empty_object_is_all_defaults_and_no_endpoint() {
+        let w = parse_consumer(r"{}").expect("empty object parses");
+        let (endpoint, tuning) = w.into_parts();
+        assert_eq!(endpoint, None);
+        assert!(tuning.timeout.is_none());
+        assert!(tuning.retry.is_none());
+        assert!(tuning.max_concurrent_requests.is_none());
+    }
+
+    #[test]
+    fn object_form_accepts_retry_overrides() {
+        let json = r#"{ "endpoint": "http://x", "retry": { "max_attempts": 5 } }"#;
+        let w = parse_consumer(json).expect("retry override parses");
+        let (_endpoint, tuning) = w.into_parts();
+        assert_eq!(tuning.retry.expect("retry present").max_attempts, Some(5));
+    }
+
+    #[test]
+    fn a_non_object_is_rejected() {
+        // Only an object is a valid `ConsumerWiring`; a list (or any scalar) is
+        // a parse error.
+        assert!(parse_consumer(r"[1, 2, 3]").is_err());
+    }
+}
+
 #[cfg(feature = "runtime-client")]
 mod runtime_conversion {
     use super::*;
