@@ -30,3 +30,4 @@ Use `secret_ref` that does not exist.
 
 Expected:
 - `500 Internal Server Error` with `type` = `...secret.not_found...`.
+- Applies the same way to any auth plugin backed by a `cred_store` reference, not just `apikey` — e.g. OAuth2 client-credentials' `client_id_ref`/`client_secret_ref` pointing at nonexistent secrets fails identically.
