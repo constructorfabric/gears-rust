@@ -164,6 +164,22 @@ rather than one task, fails closed before a definition can be executed, and stil
   > checked as a walk to `dispatch-wave2-activate` that passes the pinned `released = true`
   > (`design/10-process-definition.md` §2.2 rule 1, §4.1).
 
+  > **Amended 2026-09-26 by D-161**: the routing members add `ceilingReturnBack`, the interrupted
+  > stage's `returnStage` that `ceilingEntry` records and `backToProcess` restores. The D-144 block
+  > above stated the pinned-member writes more broadly than rule 1 and the canonical allow; they
+  > are rule 1's forms: `spawned`, `planFailed` and `preAdmitted` are boolean literals, each
+  > `false` where it is initialised or consumed (`preAdmitted` also in every arm that writes
+  > `lifecycleEventId`) and `true` only in the task one case of a `switch` over an operation's
+  > closed enum routes to; `failureScope` is one of the literals `line`, `plan` and `order` in the
+  > task that enters the failure stage, whatever case routes there
+  > (`design/10-process-definition.md` §2.2 rule 1).
+
+  > **Amended 2026-09-26 by D-162**: Rule 4 has one computed sum. A task under the `gate` timeout,
+  > a term of the escalation bound, carries the `gate` retry policy, whose backoff is `constant`,
+  > and the check computes attempts × the largest `deadline_ms` + (attempts − 1) × (delay + jitter
+  > maximum) < the `gate` timeout — 55 s < 60 s in the canonical
+  > (`design/10-process-definition.md` §2.2 rule 4).
+
   The `protected` list is closed and fixed here; adding to it or removing from it is an Orders
   release and an amendment of this ADR: `start-instance`, `settle-from-lookup` (sweep-only),
   `terminate-instance`, `admit-trigger`, `terminate-on-terminal-event`, `obtain-verdict`,
@@ -317,7 +333,7 @@ apply by reference.
   [`design/10-process-definition.md`](../design/10-process-definition.md);
   [`design/01-foundation.md`](../design/01-foundation.md) §3.7 (`owf_definition_binding`,
   `owf_step_operation`)
-- **Decisions register**: [`DECISIONS.md`](../DECISIONS.md) — D-02, D-53, D-67, D-68, D-105, D-106, D-126, D-135, D-136, D-137, D-138, D-142, D-143, D-144, D-158, D-159, Q-10
+- **Decisions register**: [`DECISIONS.md`](../DECISIONS.md) — D-02, D-53, D-67, D-68, D-105, D-106, D-126, D-135, D-136, D-137, D-138, D-142, D-143, D-144, D-158, D-159, D-161, D-162, Q-10
 - **Upstream asks**: [`UPSTREAM_REQS.md`](../UPSTREAM_REQS.md) — serverless-runtime section
   (pre-publish validation hook, publish audit, version retention while bound)
 - **Platform**: serverless-runtime [DESIGN.md](../../../../serverless-runtime/docs/DESIGN.md)

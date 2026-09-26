@@ -1311,7 +1311,7 @@ it would shorten (D-105).
       (`design/05-provisioning-intents.md` §3.7, `DECISIONS.md` D-97, D-125).
 
 13. **§1.4, §6.2, §6.3, §12, §14, §16 and §17.1 — the engine is selected and its timers are the
-    plugin's.** Items 5 and 6 amend §6.1 and the §13 dependency row only. Six more passages keep
+    plugin's.** Items 5 and 6 amend §6.1 and the §13 dependency row only. Seven more passages keep
     the pre-ADR-0011 wording and **MUST** be amended the same way: §6.2 *Escalation Timer*
     (`PRD.md:297`) makes Workflow "the **single owner** of scheduling, persisting, and firing
     escalation timers", and the §1.4 glossary entry *Escalation* (`PRD.md:107`) has escalation

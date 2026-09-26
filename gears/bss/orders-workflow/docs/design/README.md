@@ -105,7 +105,8 @@ in-process, or reads or writes its table. The definition's `call` to an operatio
 every slice needs `10`, and the definition is exercised end to end only by the publish job's
 behavioural gate (`10 §4.2`), once every operation exists. The *Depends on* column lists the
 earlier slices a slice needs; the *Back-edges* column lists the places where a slice needs a later
-one: the foundation's workers and `terminate-instance` calling slices 05, 06, 07 and 08; slice
+one: the foundation's workers and `terminate-instance` calling slices 05, 06, 07 and 08, and its
+`retention-purge` worker deleting rows from the tables of slices 03 through 09 (`01 §3.8`); slice
 07 reading slice 06's fence row; and slices 06, 07 and 08 using slice 09's catalogue, scope
 predicate, cancel request record and request-delivery port. `retry-step` re-running a named
 step's operation is not an edge: it dispatches through the operation registry (`01 §3.2`), as
@@ -113,11 +114,12 @@ the step route does. Each back-edge is a port the later slice owns: the earlier 
 unit-tested against a double of that port, and its integration test runs once the owner lands —
 the way Orders Lifecycle builds capture against an `EventBrokerApi` double
 ([`../../../orders-lifecycle/docs/design/README.md`](../../../orders-lifecycle/docs/design/README.md),
-*Phase 0/1*).
+*Phase 0/1*). The purge's edges are table deletes, not ports: each slice's purge predicate and
+retention index join the worker's roster in that slice's own build step, where their test runs.
 
 | Order | Doc | PRD § | Phase | Depends on | Back-edges (built against a double) |
 |-------|-----|-------|-------|------------|-------------------------------------|
-| 1 | `01-foundation` | process engine core — step operations and the record | 0/1 | — | 05 (`reconcile-intent`, run in-process by the reconciliation sweep's intent pass); 06 (`run-cancellation-fence`, `compensate-order`, `report-outcome`, driven by the liveness pass's dead-instance unwind); 07 (the closure port `close_open_tasks` in `terminate-instance`; the creation port for the `invocation-dead` task; `resolve-manual-task` for the pass's scoped `sla-check` and the unwind's task resolutions); 08 (`authorize-cancel` in the dead-instance unwind) |
+| 1 | `01-foundation` | process engine core — step operations and the record | 0/1 | — | 05 (`reconcile-intent`, run in-process by the reconciliation sweep's intent pass); 06 (`run-cancellation-fence`, `compensate-order`, `report-outcome`, driven by the liveness pass's dead-instance unwind); 07 (the closure port `close_open_tasks` in `terminate-instance`; the creation port for the `invocation-dead` task; `resolve-manual-task` for the pass's scoped `sla-check` and the unwind's task resolutions); 08 (`authorize-cancel` in the dead-instance unwind); and 03, 04, 05, 06, 07, 08 and 09 (the `retention-purge` worker's bounded deletes over their tables, each table's window and retention index declared in its slice's §3.7 and rostered in `DESIGN.md` §3.7) |
 | 2 | `10-process-definition` | the flow (§6.1–§6.4 paths, §17.1) | 0/1 | 01 | — |
 | 3 | `02-triggers-and-start` | trigger + start | 1 | 01, 10 | — |
 | 4 | `03-approval-execution` | approval | 1 | 01, 10, 02 | — |
@@ -148,9 +150,11 @@ path of the definition, not an edge. `09` depends on `01` through `08` and `10` 
 authorizes every route and every step operation the others declare; nothing here is separable from
 the whole set.
 
-**The cycles, stated.** Eight pairs call each other, and the back-edges above are where each is
-broken: `01` with each of `05`, `06`, `07` and `08` (every slice registers its operations under
-`01`'s envelope and contract; `01`'s workers and `terminate-instance` call into them); `06` and `07` (06 calls 07's creation port; 07's retry re-check reads 06's fence row); and
+**The cycles, stated.** Eleven pairs depend on each other, and the back-edges above are where each is
+broken: `01` with each of `03`, `04`, `05`, `06`, `07`, `08` and `09` (every slice registers its
+operations under `01`'s envelope and contract; `01`'s workers and `terminate-instance` call into
+05–08, and its `retention-purge` worker deletes from the tables of 03–09, which is an edge by the
+table rule above even though no port is called); `06` and `07` (06 calls 07's creation port; 07's retry re-check reads 06's fence row); and
 `06`, `07` and `08` each with `09` (09 enumerates their routes and operations; they declare their
 routes against 09's catalogue and scope predicate, and 06 and 08 reach 09's cancel request record
 through its request-delivery port or by a read). A back-edge double is replaced by the owner's port in

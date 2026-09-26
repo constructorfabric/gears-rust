@@ -99,6 +99,12 @@ Chosen option: **nine slice documents numbered by implementation build order**, 
 > `07`↔`09` and `08`↔`09` (the block first said three), and the foundation adds four more, because its workers and `terminate-instance` call slices `05`, `06`, `07` and `08`
 > in-process (`design/01-foundation.md` §3.3, §3.8). Those calls are `01`'s back-edges, built
 > against doubles like the others, so eight pairs are stated in `design/README.md`.
+>
+> **Amended 2026-09-26 by D-139 (second amendment)**: the foundation's `retention-purge` worker
+> deletes rows from the tables of slices `03` through `09` (`design/01-foundation.md` §3.8), and
+> a table write is an edge (`design/README.md` *What an edge is*), so `01` also has back-edges to
+> `03`, `04` and `09`, and the stated cycles are eleven: `01` with each of `03`–`09`, and the four
+> above.
 
 ### Confirmation
 

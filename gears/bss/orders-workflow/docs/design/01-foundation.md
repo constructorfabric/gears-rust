@@ -258,8 +258,8 @@ Every value that crosses the engine boundary — a task input, a task output, a 
 member the definition keeps — is a member of the **closed vocabulary** of
 [`../ADR/0013`](../ADR/0013-cpt-cf-bss-orders-workflow-adr-references-not-payloads.md) as amended
 by D-131. The vocabulary has six types: identities (`correlationId`, `orderId`, `orderVersion`,
-`resourceTenantId`, the platform `invocationId` and `attemptId`, the binding members, consumed-event
-ids); opaque record references (`stepRef`, `gateRef`, `taskRef`, `lineRef`, `planRef`, `parkRef`,
+`supersededByOrderVersion`, `resourceTenantId`, the platform `invocationId` and `attemptId`, the
+binding members, consumed-event ids — the full list is ADR-0013 item 1); opaque record references (`stepRef`, `gateRef`, `taskRef`, `lineRef`, `planRef`, `parkRef`,
 `requestRef`, `cancelRequestRef`, `suspensionRef`, `subjectRef`, and arrays of them); counters;
 closed enums and booleans (an outcome class, a wave number, a catalogue reason); instants and
 durations; and `stepsBase`. Each type is a registered GTS schema with a format. A step
@@ -378,8 +378,9 @@ to bound; a throttle-induced delay inside an operation never counts as a failed 
 
 Process artifacts owned by this engine — step log entries, idempotency records, definition
 bindings and the process audit log — carry commercial order context and are tenant-scoped by a
-**column, not by convention**: every engine table except the configuration-only
-`owf_step_operation` carries `resource_tenant_id` NOT NULL, and the tables backing an operator- or
+**column, not by convention**: every engine table except the three configuration tables
+`owf_step_operation`, `owf_seller_policy` and `owf_configuration_revision` (the D-48 exemptions of
+§3.7) carries `resource_tenant_id` NOT NULL, and the tables backing an operator- or
 seller-scoped surface carry `seller_tenant_id` as well (§3.7, §4.11). They are retained at audit
 grade by this gear independently of platform history, and must never carry payment-card data.
 Classification is aligned with the underlying order record owned by Orders Lifecycle. The same
@@ -1335,7 +1336,10 @@ The canonical schema for every engine-owned table — **ten**: `owf_process_inst
 `owf_audit_checkpoint_member`, `owf_definition_binding`, `owf_step_operation`,
 `owf_seller_policy` (decision D-140) and `owf_configuration_revision` (decision D-160). Each table's
 ownership rule below names the single component that may write it; no slice writes any of these
-tables outside the envelope.
+tables outside the envelope, except that the three configuration tables (`owf_step_operation`,
+`owf_seller_policy`, `owf_configuration_revision`) are written by the configuration loads, not the
+envelope, and slice 09's startup catalogue check appends to `owf_configuration_revision` only
+through the foundation's `record_configuration` port (decision D-160).
 
 **Tenancy is a column on every process table here, not a convention.** Every table except the
 three configuration tables carries `resource_tenant_id uuid NOT NULL` — the
@@ -1753,7 +1757,7 @@ set of process kinds.
 | subject_id | uuid, nullable | The `policy_id` for `seller-policy`; NULL for the two set kinds |
 | revision | bigint, NOT NULL | The row's new `policy_revision` for `seller-policy`; for a set kind, one above the kind's previous row, from 1 |
 | content | jsonb, NOT NULL | The whole configuration as it stood after the change: every column of the promoted `owf_seller_policy` row, or the loaded set in its canonical form. Configuration only: windows, policies, operation contracts, catalogue pairs; no process value |
-| content_hash | bytea, NOT NULL | SHA-256 over `content` in canonical JSON; a load compares it with the kind's latest row to decide whether the content changed |
+| content_hash | bytea, NOT NULL | SHA-256 over `content` in canonical JSON. A set-kind load compares it with the latest row of the same `(kind, subject_id)` — `subject_id` NULL for a set kind — to decide whether the content changed; the policy load decides a `seller-policy` change by the promoted row's `policy_revision` bump instead, and appends one row for each row whose revision it bumps |
 | release_version | text, NOT NULL | The Orders release that ran the load — the version the deployed gear carries. This is what the text before D-160 called the gear's "deployment marker" |
 | changed_by | text, NOT NULL | The promotion's change identity (the `updated_by` of the row, Lifecycle D-133) for `seller-policy`; the configured Workflow worker identity (§3.8) for a startup load |
 | recorded_at | timestamptz, NOT NULL | Database time of the load transaction |
@@ -1768,13 +1772,15 @@ inserted only inside the load transaction that makes the change — the operatio
 the policy load and the catalogue conformance check at startup, and the migration that seeds the
 platform policy row — so a change commits with its history row or not at all.
 
-**Additional info**: **Ownership**: the foundation's configuration loads are the sole writers;
-slice 09's catalogue check appends through the foundation's load, as it already runs after the
-operation registry's load (§3.2). **Tenant axis**: none — configuration, the third table §4.11's
+**Additional info**: **Ownership**: one writer, the foundation port
+`record_configuration(kind, subject_id, content)`, which inserts the row inside its caller's
+transaction after the change test above; the operation registry's load, the policy load and the
+seeding migration call it, and so does slice 09's catalogue check at startup, a forward `09 → 01`
+edge like 09's other uses of the foundation ([`README.md`](./README.md) row 10). **Tenant axis**: none — configuration, the third table §4.11's
 column rule exempts; a `seller-policy` row names its seller inside `content`. **Retention**: never
 purged. The table is small — a row per changed load or promoted policy row — and a pinned value
 must stay resolvable for as long as the record that pinned it. **Read by**: an auditor resolving a
-`sellerPolicyRevision`, and the loads themselves (the latest `content_hash` of a kind). The
+`sellerPolicyRevision`, and the loads themselves (the latest `content_hash` of the same kind and subject). The
 **precedent** is Pricing's price history, kept as retained superseded rows under append-only
 protection ([Pricing `01-foundation.md:562`](../../../pricing/docs/design/01-foundation.md));
 Lifecycle keeps no revision history for its policy rows, only `updated_by` and `updated_at`
@@ -1912,7 +1918,7 @@ Workflow defines no `owf_event_outbox` table. Service migrations run the
 their registration, queue, body, partition and dead-letter tables are owned and migrated by those
 libraries and **MUST NOT** be forked into Workflow-specific DDL. They are operational
 infrastructure, are excluded from the Workflow-owned inventory in `DESIGN.md §3.7`, and are not
-counted among the engine's nine tables. This mirrors
+counted among the engine's ten tables. This mirrors
 [Lifecycle `01 §3.7` *Platform-managed producer persistence*](../../../orders-lifecycle/docs/design/01-foundation.md#37-database-schemas-and-tables).
 
 The producer queue name is `bss-orders-workflow-events`, with `Partitions::of(16)` and
@@ -2030,7 +2036,7 @@ invocation is this pass, keyed on the instance, not the intents. Per row:
 2. [ ] - `p1` - **Not live** — `failed`, `dead_lettered`, `canceled`, `compensating`, `compensated` or `succeeded`, or a `404` for the bound id: in one transaction under the instance row lock, recheck that the row is non-terminal and still bound to that invocation, create through slice 07's creation port one order-scope manual task with reason `invocation-dead` and cause `invocation-ended` ([`07 §3.3`](./07-manual-tasks.md#33-api-contracts)), write a `sweep` audit entry naming the platform status, and set `next_liveness_at` = now + 5 min — the `waitSla` tick, so the SLA observation of item 5 keeps the definition's granularity while no definition runs (decision D-151). The task's uniqueness (`07 §3.7`) absorbs the task on every later pass while it is open and reopens it when an invocation that a re-drive revived dies again. `canceled` is how a platform `:control` `cancel` issued outside this gear surfaces (`10 §4.4`) - `inst-owf-live-dead`
 3. [ ] - `p1` - **Unreadable** — the status read times out or answers `5xx`: write nothing, leave `next_liveness_at`, count the failure; the next pass reads again - `inst-owf-live-unreadable`
 4. [ ] - `p1` - **Dead-instance unwind.** For an instance whose `invocation-dead` task holds an applied `cancel` resolution, the pass drives the fallback unwind of D-105 (§4.16) one operation per pass - `inst-owf-live-unwind`
-5. [ ] - `p1` - **SLA observation with no live waiter.** For an instance read not live, each pass calls `resolve-manual-task` in-process through the envelope with `trigger: sla-check`, scoped by `taskRef` to each open task of the instance whose only waiter was the definition and that is escalate-only — the `invocation-dead` task itself, and every compensation-reason or order-scope task (`draft-void-failed`, `activated-cancel-failed`, `authority-withdrawn`) the dead-instance unwind of item 4 raised — each under its own scoped family `…:resolve-manual-task:sla:{taskRef}:{slaRound}` from round 0, the round taken from that family's previous settled answer in Orders' record, as item 4 takes its keys ([`07 §4.2`](./07-manual-tasks.md#42-remediation-exhausted-and-the-consequence-of-a-breach-normative)). A scoped check never exhausts, so a breach stamps `sla_breached_at`, raises `severity` to `escalated` and routes to `seller-operator` exactly as the definition's `PT5M` branch would. A forward (`line` or `plan`) task left open when the invocation died is **not** checked here: its exhaustion would enter compensation, which only a running definition or the operator's `cancel` can drive; a re-drive resumes its fork, whose next `sla-check` compares the stored `sla_deadline` with database time and breaches late rather than never, and the dead-instance unwind's fence closes it (`06 §3.6` fencing step 1). This is the precedent of the ceiling's scoped check (decision D-129) applied to the one waiter the platform cannot run (decision D-151) - `inst-owf-live-sla`
+5. [ ] - `p1` - **SLA observation with no live waiter.** For an instance read not live, each pass calls `resolve-manual-task` in-process through the envelope with `trigger: sla-check`, scoped by `taskRef` to each open escalate-only task of the instance — the `invocation-dead` task itself, and every compensation-reason or order-scope task whenever it was raised: by the live definition before the invocation died (a compensation task in `awaitCompensationResolution`, an `approval-reflection-refused` or `authority-withdrawn` task, an open `lifetime-ceiling-reached` task) or by the dead-instance unwind of item 4 (`draft-void-failed`, `activated-cancel-failed`, `authority-withdrawn`) — each under its own scoped family `…:resolve-manual-task:sla:{taskRef}:{slaRound}` from round 0, the round taken from that family's previous settled answer in Orders' record, as item 4 takes its keys ([`07 §4.2`](./07-manual-tasks.md#42-remediation-exhausted-and-the-consequence-of-a-breach-normative)). A scoped check never exhausts, so a breach stamps `sla_breached_at`, raises `severity` to `escalated` and routes to `seller-operator` exactly as the definition's `PT5M` branch would. A forward (`line` or `plan`) task left open when the invocation died is **not** checked here: its exhaustion would enter compensation, which only a running definition or the operator's `cancel` can drive; a re-drive resumes its fork, whose next `sla-check` compares the stored `sla_deadline` with database time and breaches late rather than never, and the dead-instance unwind's fence closes it (`06 §3.6` fencing step 1). This is the precedent of the ceiling's scoped check (decision D-129) applied to the one waiter the platform cannot run (decision D-151) - `inst-owf-live-sla`
 
 A platform `:control` `suspend` issued outside this gear is indistinguishable from the `suspended`
 of a `listen` or `wait` and is detected only when the suspension times out into `failed`
@@ -2143,7 +2149,7 @@ each is recorded here so an unset value is a visible choice.
 | Per-operation deadline | operation (`deadline`) | 10 s for a dispatch operation; 5 s for a record-only operation | Set from the downstream's service objective, not from caller patience: 3-10x its p99 |
 | Task timeout, **wave-2 (activation) tasks** | definition | 3 min | The p95 ≤ 15 min clock starts at activation-wave eligibility, so the window bounds wave 2, the barrier release and the acknowledgement |
 | Task timeout, **wave-1 (draft-create) tasks** | definition | 10 min | Wave 1 sits outside the measured window |
-| Retry budget | definition (`use.retries`) | 5 attempts, exponential from 1 s, jitter 0-30 s (`10 §3.6` `use.retries.transient`) | The curve of §4.5; the cumulative backoff is the plugin's draw, typically tens of seconds; the 3 min wave-2 timeout on the same `try` bounds it whatever curve the plugin applies, so the validation hook checks only that one attempt's deadline fits the timeout (`10 §2.2` rule 4, D-126) |
+| Retry budget | definition (`use.retries`) | 5 attempts, exponential from 1 s, jitter 0-30 s (`10 §3.6` `use.retries.transient`); the four gate-loop calls instead 4 attempts, constant 2 s, jitter 0-3 s (`use.retries.gate`, D-162) | The curve of §4.5; the cumulative backoff is the plugin's draw, typically tens of seconds; the 3 min wave-2 timeout on the same `try` bounds it whatever curve the plugin applies, so the validation hook checks only that one attempt's deadline fits the timeout (`10 §2.2` rule 4, D-126). The 60 s `gate` timeout is a term of the ± 5 min escalation bound, so there the retry limit must end first: the `gate` policy's worst case is 4 × 10 s + 3 × 5 s = 55 s < 60 s, which rule 4 computes because its backoff is constant (D-162) |
 | Overdue window | seller policy, pinned on the plan by `construct-and-freeze-plan` (`04 §3.7`); the definition owns only the `PT1H` re-check tick (D-134) | 24 h past expected fulfillment time, the default a seller's policy starts from | The PRD's business default for commercial policy (`cpt-cf-bss-orders-workflow-fr-owf-overdue-escalation`); a seller's value is bounded where the policy is written (`07 §4.8` item 8) |
 | Max process lifetime | definition (top-level `wait` arm) | 90 days from process start, never cancelled by a hold | Accepted (`DECISIONS.md` D-53) |
 
@@ -2254,7 +2260,9 @@ that calls a downstream):
 **Backoff curve and jitter (working baseline, declared on the definition)**: a 1 s base delay,
 exponential backoff, a jitter range of 0-30 s and a maximum of **5** attempts — exactly the
 `use.retries.transient` policy of `10 §3.6` (`delay: 1 s`, `backoff: exponential`,
-`jitter: 0 s to 30 s`, `limit.attempt.count: 5`). A 1.0.0 retry policy expresses delay, backoff
+`jitter: 0 s to 30 s`, `limit.attempt.count: 5`). The four gate-loop calls of `10 §3.6` (a) use
+`use.retries.gate` instead — 2 s constant delay, jitter 0-3 s, 4 attempts — because their 60 s
+timeout is a term of the escalation bound and must not end their retries (D-162). A 1.0.0 retry policy expresses delay, backoff
 kind, a jitter range and limits, and nothing more (dsl-reference.md *Retry*, *Backoff*,
 *Jitter*): it has no cap on a single delay and no full-jitter form, so this design claims none.
 The exponential multiplier and how the jitter draw composes with the delay are the plugin's —

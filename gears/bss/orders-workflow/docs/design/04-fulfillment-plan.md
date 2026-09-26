@@ -562,8 +562,10 @@ gear's authority — the caller supplies references, never authority (ADR-0013, 
 `released: true` or `proceed` advances the path. `pending`, `begin-fulfillment`'s `withheld` and
 `released: false` are **settled successes** that select a waiting arm, never failures. A
 `planState` other than `frozen` and a `verdict` of `abort` are settled successes that select the
-failure or unwind branch of §4.8. `not-dispatchable` is a settled success that returns the path to
-the barrier loop, whose hold, amendment and cancel arms consume what the operation observed
+failure or unwind branch of §4.8. `not-dispatchable` is a settled success that sends the path to
+the held-spawn wait (`heldWait`, stage loop `heldSpawn`, a `PT5M` tick that runs this operation
+again), whose resume, amendment and cancel arms consume what the operation observed, never the
+`PT30S` barrier poll (§4.8 item 4, decision D-145)
 (Lifecycle [`03-gate-and-pin.md`](../../../orders-lifecycle/docs/design/03-gate-and-pin.md#re-check-before-first-activation)
 *What Workflow does with each outcome*). Transient downstream failures are `retryable-failure`
 (503/504) under the key left `open`; the definition's `catch.retry` re-issues the same key.

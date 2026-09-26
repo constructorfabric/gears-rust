@@ -179,6 +179,8 @@
   - [D-158 (M) The rollback document carries its new version; a failed gate is rolled back; ticks are compared statically](#d-158-m-the-rollback-document-carries-its-new-version-a-failed-gate-is-rolled-back-ticks-are-compared-statically)
   - [D-159 (M) The overdue-window bound is checked on both sides over a defined version set](#d-159-m-the-overdue-window-bound-is-checked-on-both-sides-over-a-defined-version-set)
   - [D-160 (M) Configuration changes are recorded in an append-only revision table, not the audit chain](#d-160-m-configuration-changes-are-recorded-in-an-append-only-revision-table-not-the-audit-chain)
+  - [D-161 (H) An admission answers only for its own event, and a ceiling restores the return stage it interrupted](#d-161-h-an-admission-answers-only-for-its-own-event-and-a-ceiling-restores-the-return-stage-it-interrupted)
+  - [D-162 (M) The gate-loop calls retry under a policy whose worst case fits their timeout](#d-162-m-the-gate-loop-calls-retry-under-a-policy-whose-worst-case-fits-their-timeout)
 - [Open Questions](#open-questions)
   - [Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?](#q-01-which-durable-execution-substrate-backs-the-process--the-oss-workflow-engine-or-a-bss-local-mechanism)
   - [Q-02: The Generic Approval escalation threshold — the one PRD-deferred numeric value this design deliberately leaves unset](#q-02-the-generic-approval-escalation-threshold--the-one-prd-deferred-numeric-value-this-design-deliberately-leaves-unset)
@@ -1669,7 +1671,7 @@ The decisions in this section were taken when the order process flow moved from 
 gear to a versioned platform workflow definition (`ADR/0011`, `ADR/0012`, `ADR/0013`), and when
 each slice was restructured into step operations and a definition fragment. D-65…D-72 carry the
 three ADRs and their cross-cutting consequences; D-73…D-101 are the decisions the slice
-restructurings recorded, and D-102…D-160 the decisions taken on the second review of
+restructurings recorded, and D-102…D-162 the decisions taken on the second review of
 2026-09-26. Each names the entries it amends; the amended entries carry a dated
 **Amended by** note. D-65…D-101 were taken on 2026-09-24.
 
@@ -2799,6 +2801,12 @@ SLA breaches. The control-surface algorithm (`09 §3.6` `inst-cs-deliver`) issue
 only as the `invocation-dead` task's `retry` and only under D-86's confirmation condition
 (re-review R-2).
 
+**Amended (2026-09-26, third re-review S-9)**: the control-surface algorithm decides liveness
+before it records anything (`09 §3.6` new step `inst-cs-live`): on a not-live invocation a step
+retry is the `invocation-dead` task's `retry`, refused `action-not-offered` with no row written
+unless D-86's condition holds, and a cancel is that task's `cancel`, recorded for the dead-instance
+unwind; the request row names the task it resolves.
+
 ### D-106 (H) Every step call is bound to the instance's invocation, and the fence needs a recorded cause
 
 **Accepted (2026-09-26).** *(amends D-67)*
@@ -3313,6 +3321,10 @@ round is the same shape); `01 §3.7`'s transition table as the authority for whi
 §2.1; `design/08-hold-and-cancel.md` §4.5; D-53, D-82.
 
 **Amended by D-147 and D-149 (2026-09-26)**: a call that consumes an arm's payload is recorded as the stage's checkpoint before it runs, so the re-entry after a ceiling re-issues it (D-147); each ceiling's task is its own row (`scope_ref = ceiling:{round}`), which the creation port's uniqueness had denied (D-149).
+
+**Amended by D-161 (2026-09-26)**: `ceilingEntry` also records the interrupted stage's
+`returnStage` as `ceilingReturnBack`, and `backToProcess` restores it, so a lifecycle, hold, resume
+or cancel stage the ceiling interrupted returns where it would have, not to the ceiling stage.
 
 ### D-122 (H) The ceiling wait consumes only its own task, and no unrecorded signal unparks
 
@@ -3963,6 +3975,15 @@ closure port; each is built against a double. The stated cycles are eight: `01` 
 *Confirmation* forbade every later dependency; both are amended (re-review R-27, R-34).
 **Propagated**: `design/README.md` (row 1, *What an edge is*, the cycles); `ADR/0002`.
 
+**Amended (2026-09-26, second)**: the count of eight omitted the foundation's `retention-purge`
+worker, whose bounded deletes reach the tables of slices 03 through 09 (`01 §3.8`); by the
+README's own rule a table write is an edge. Row 1 now lists 03, 04, 05, 06, 07, 08 and 09 for the
+purge, and the stated cycles are **eleven**: `01` with each of `03`–`09` (seven), plus `06`↔`07`,
+`06`↔`09`, `07`↔`09` and `08`↔`09`. These edges are table deletes, not ports: each slice's purge
+predicate joins the worker's roster in that slice's own build step, where its test runs (third
+re-review S-7). **Propagated**: `design/README.md`
+(row 1, *What an edge is*, the cycles); `ADR/0002`.
+
 ### D-140 (H) The per-seller policy is a foundation table on the policy channel, read through one port and pinned with its revision
 
 **Accepted (2026-09-26).** *(amends D-48, D-59, D-63, D-69, D-104, D-134)*
@@ -4183,6 +4204,19 @@ none in the platform, whose registry validates no definition.
 `design/07-manual-tasks.md` §3.6, §4.7, §4.8 item 4; `design/05-provisioning-intents.md` §4.5
 item 6; `ADR/0012`; D-126, D-135, D-143.
 
+**Amended by D-161 (2026-09-26)**: the hand-walk's "unless `preAdmitted` is true, which only
+an admission sets" held only for the event that was admitted: a ceiling during the lifecycle stage
+followed by the ceiling wait's lifecycle arm routed a new event on the earlier event's admission
+(third re-review S-1). Every arm that writes `lifecycleEventId` now sets `preAdmitted: false`, and
+D-161 carries the re-walk of every entry into the lifecycle stage. The Decision's wording of the
+four literal members was broader than rule 1 and the canonical allow (S-6); it reads as rule 1
+does: `spawned`, `planFailed` and `preAdmitted` are boolean literals, each `false` where it is
+initialised or consumed (`preAdmitted` also in every arm that writes `lifecycleEventId`) and `true`
+only in the task one case of a `switch` over an operation's closed enum routes to; `failureScope`
+is one of the literals `line`, `plan` and `order` in the task that enters the failure stage,
+whatever case routes there (`lineFailure1`, `sweepFailure`, `lineFailure2`, `heldPollFailure` and
+`resumeFailure` are reached by cases over list lengths).
+
 ### D-145 (M) A sent spawn signal leaves the held-spawn loop; a not-dispatchable re-check waits there
 
 **Accepted (2026-09-26).**
@@ -4276,6 +4310,13 @@ the SLA they must fit, and rule 4's `deadline_ms` < timeout.
 `design/03-approval-execution.md` §1.2, §4.5 item 4; `design/08-hold-and-cancel.md` §1.2;
 `DESIGN.md` §1.2; D-123.
 
+**Amended by D-162 (2026-09-26)**: the 60 s `gate` timeout was shorter than the `transient`
+curve it bounded (worst case about 185 s), so it, not the retry limit, ended a spent call and
+faulted the invocation with an uncaught 408. The four gate-loop calls — `recordDecision`,
+`escalateGate`, `probeGate` and now `probeOutage` — retry under their own `gate` policy (4
+attempts, constant 2 s, jitter 0–3 s; worst case 55 s), and the outage arm's `available` answer
+fires before it waits. The 30 s + 4 × 60 s bound is unchanged.
+
 ### D-149 (H) Each ceiling's task is its own row, and the fence closes it
 
 **Accepted (2026-09-26).** *(amends D-121, D-122, D-129)*
@@ -4350,6 +4391,14 @@ operations in-process from the pass under the keys the definition would present.
 (`inst-owf-live-dead`, `inst-owf-live-sla`); `design/07-manual-tasks.md` §3.3, §3.6
 (`inst-rmt-sla`), §4.2, §4.8 item 3; D-105.
 
+**Amended (2026-09-26)**: the pass's scope named only the tasks the dead-instance unwind raised,
+while its lead-in described every task whose only waiter was the definition. It is every open
+escalate-only task of the instance — compensation reason or order scope, whenever raised,
+including a compensation task in `awaitCompensationResolution` and an open
+`lifetime-ceiling-reached` task opened before the invocation died; forward tasks stay excluded
+and are observed on re-drive (`01 §3.8` `inst-owf-live-sla`, `07 §4.2`, §4.8 item 3; third
+re-review S-8).
+
 ### D-152 (M) The quarantine counts only presented attempts
 
 **Accepted (2026-09-26).** *(amends D-119; refines `01 §4.13`)*
@@ -4415,6 +4464,13 @@ a subject that is not this instance's or a route the record does not show.
 **Propagated**: `design/07-manual-tasks.md` §3.6 (`inst-cmt-verify`, `inst-rmt-retry`); D-116,
 D-119.
 
+**Amended (2026-09-26)**: the exhausted-call branch checked nothing in the record, against the
+rationale's "a route the record does not show" (third re-review S-10). It now also requires that
+the idempotency registry hold no `settled` record under the wave dispatch key `sourceStep` and
+`sourceAttempt` name: a call that never answered leaves it absent, `open` or `in_flight`, while a
+settled key means the call answered and its stored outcome is the route (`07 §3.6`
+`inst-cmt-verify`).
+
 ### D-155 (M) `supersededByOrderVersion` is admit-trigger's `currentOrderVersion`
 
 **Accepted (2026-09-26).** *(realises `02 §4.3` in the definition)*
@@ -4435,6 +4491,11 @@ supersession sequence of `02 §3.6`, which already carry `currentOrderVersion = 
 
 **Propagated**: `design/10-process-definition.md` §3.6 (b), (e), (f); `design/02-triggers-and-start.md`
 §4.3; `ADR/0013`.
+
+**Amended (2026-09-26)**: the vocabulary restatements in `design/01-foundation.md` §1.2
+*References, not payloads* and `design/10-process-definition.md` §1.1 now list
+`supersededByOrderVersion` and point to ADR-0013 item 1 for the full identity list (third
+re-review S-11).
 
 ### D-156 (L) The reference vocabulary names the formats of every identity member it lists
 
@@ -4487,6 +4548,13 @@ residency figures are this design's own (`DESIGN.md` §4.1).
 **Propagated**: `design/10-process-definition.md` §3.1; `DESIGN.md` §4.1 (*Concurrent in-flight
 processes*, *Cost*); `UPSTREAM_REQS.md` §2.9 (readiness (a′), history growth); D-127.
 
+**Amended (2026-09-26)**: the unit of the sizing is the `P90D` window, not the ceiling park: an
+expiry `afterLifetime` absorbs through its `unwinding` or `verdictPark` case uses up one of the
+three windows. An order whose first window expires in the verdict park and which then proceeds
+reaches its only ceiling park at 25 h + 180 d; a second would fall after the guardrail. That path
+is the accepted limit, stated in `design/10-process-definition.md` §3.1, rather than a fourth
+window (third re-review S-12).
+
 ### D-158 (M) The rollback document carries its new version; a failed gate is rolled back; ticks are compared statically
 
 **Accepted (2026-09-26).** *(amends D-138)*
@@ -4511,6 +4579,15 @@ no BSS gear publishes a platform definition.
 
 **Propagated**: `design/10-process-definition.md` §3.8, §4.2, §4.7; `DESIGN.md` §3.6; `ADR/0012`;
 D-138.
+
+**Amended (2026-09-26)**: (1) a rollback minor, the gate's included, is the next minor above the
+highest version the first non-production environment lists; the job commits the re-versioned
+document to `definitions/` in the same run (its only commit) and publishes it through the normal
+job in promotion order without the behavioural gate, so every environment holds the same content
+under each semver, and CI refuses a candidate not versioned above every document in
+`definitions/` (third re-review S-13). (2) In the first environment step 2 also applies the
+trigger bindings, so a major bump's gate drives the new callable id, and the failure rollback
+restores them (S-14). **Propagated**: `design/10-process-definition.md` §4.2.
 
 ### D-159 (M) The overdue-window bound is checked on both sides over a defined version set
 
@@ -4565,6 +4642,103 @@ tables are exempt from D-48.
 **Propagated**: `design/01-foundation.md` §3.2, §3.7 (*owf_step_operation*, *owf_seller_policy*,
 *Table: owf_configuration_revision*, tenancy, retention, immutability), §3.8, §4.11;
 `design/09-read-and-authz.md` §3.7; `DESIGN.md` §3.7, §4.7, §4.8; D-48, D-63, D-69, D-104, D-140.
+
+**Amended (2026-09-26)**: the table has one writer, the foundation port
+`record_configuration(kind, subject_id, content)`, called by the three loads, the seeding migration
+and slice 09's startup catalogue check (a forward `09 → 01` edge); 01 §3.7's engine-schema rule
+names the configuration loads, not the envelope, as the writers of the three configuration tables
+(third re-review S-17). The change test compares with the latest row of the same `(kind,
+subject_id)`; for `seller-policy` a row is appended for each row whose `policy_revision` the load
+bumps (S-16). The two sentences that still said nine engine tables and the tenancy sentence that
+named one exemption now say ten and three (S-18, S-19). **Propagated**: `design/01-foundation.md`
+§1.2, §3.7, §3.8; `design/09-read-and-authz.md` §3.7; `DESIGN.md` §3.7, §3.8.
+
+### D-161 (H) An admission answers only for its own event, and a ceiling restores the return stage it interrupted
+
+**Accepted (2026-09-26).** *(amends D-121, D-144)*
+
+**Decision**: (1) every arm that writes `lifecycleEventId` — the acceptance, hold, resume and
+lifecycle arms — sets `preAdmitted: false`, so `preAdmitted` is true only while `lifecycleEventId`
+is the event whose admission set it, and the lifecycle stage's `enter` routes a new event through
+`admitLifecycle`. (2) `ceilingEntry` records the interrupted stage's `returnStage` in a new routing
+member, `ceilingReturnBack` (with the same nested-ceiling `if` as its two siblings), and
+`backToProcess` restores it. (3) Rule 1's routing members add `ceilingReturnBack`; its pinned-member
+wording is the one the ADR-0012 and D-144 texts now copy.
+
+**Re-walk of rule 1 over every entry into the lifecycle stage** (canonical, by hand; no tool runs
+rule 1 yet):
+- *A lifecycle arm's `leave`*, from any stage fork or the ceiling wait: the arm wrote
+  `lifecycleEventId` and the literal `preAdmitted: false`, so `enter` takes `fresh` →
+  `admitLifecycle` → `onLifecycleAdmission`; `supersedePath` and `terminalEvent` follow
+  `admit-trigger` on both ways of the untracked `admission`. PASS.
+- *A `toLifecycle`* in the fulfillment (acceptance), hold and resume stages: each follows
+  `admitAcceptance`, `admitHold` or `admitResume` of the event its arm wrote (the resume arm writes
+  `resumeEventId` and `lifecycleEventId` together), on the `onward` case of the same untracked
+  `admission`; `enter` takes `preAdmitted`, and the admission already on the walk is the one for
+  `lifecycleEventId`. PASS.
+- *`backToProcess` with `ceilingReturnStage = lifecycle`* — a ceiling during `admitLifecycle` or
+  `terminalEvent`: between `ceilingEntry` and `backToProcess` only the ceiling wait's lifecycle arm
+  writes `lifecycleEventId`, and it writes `preAdmitted: false`; its cancel arm writes neither. So
+  the stage re-enters either with `preAdmitted` true and the event its admission answered, or at
+  `admitLifecycle` (a replay under the unchanged key, or the new event's first admission). The new
+  event's admission loses nothing of the earlier one: `supersede` and `terminate` are read from
+  Lifecycle's order state, which never leaves superseded or terminal (`02 §3.3`
+  *Trigger-to-outcome table*), so it answers one of them whenever the earlier admission did. With
+  `returnStage` restored, the stage's `back` reaches the stage the lifecycle stage was entered
+  from, not the ceiling stage. PASS — this is the walk S-1 found failing.
+- *A re-entry of the fork through `afterLifetime`'s `unwinding` or `verdictPark` case* while
+  `nextStage = lifecycle`: no member is written, so the dispatcher re-enters the stage with the
+  state it had. PASS.
+- *No other route*: `returnStage`, `heldStage` and `ceilingReturnBack` are never `lifecycle`,
+  because the lifecycle stage has no `leave` and each of them copies `returnStage` or a stage's
+  `leave` literal.
+
+**The same fault outside the lifecycle stage.** Before (2), any stage whose `back` reads
+`returnStage` — lifecycle, hold (and `enterResumeWait`'s copy into `heldStage`), resume, cancel —
+went back to the ceiling stage if a ceiling interrupted it and an arm was then taken from the
+ceiling wait, since that arm's `leave` sets `returnStage: ceiling`; the ceiling stage then read a
+foreign `stageLoop` and escalated a new ceiling round. The restore closes it for all four.
+
+**Rationale**: rule 1 tracks `preAdmitted` as a literal, and a literal set by one admission and
+read after another event was consumed decided the route of an unadmitted event: at run time the
+fence's `inst-fence-cause` finds no supersede admission for it and refuses `not-found`, faulting
+the invocation, or `terminate-on-terminal-event` consumes an unadmitted event (third re-review
+S-1). Clearing it in `ceilingEntry` alone would have left the ceiling wait's arm the only writer,
+so the arm is where the literal belongs. **Precedent**: the `false` literals rule 1 already
+requires where a pinned member is consumed (D-144), and `ceilingReturnLoop`, the sibling member
+`ceilingEntry` already records.
+
+**Propagated**: `design/10-process-definition.md` §2.2 rule 1, §3.6 (a), (d), (e), (f) and their
+descriptions; `ADR/0012` (amendment block after the D-144 block); D-121, D-144.
+
+### D-162 (M) The gate-loop calls retry under a policy whose worst case fits their timeout
+
+**Accepted (2026-09-26).** *(amends D-148)*
+
+**Decision**: `use.retries.gate` is 4 attempts, `constant` backoff with a 2 s delay and jitter 0–3
+s. `recordDecision`, `escalateGate`, `probeGate` and `probeOutage` carry `catch: *gateTransient`
+(the `*transient` status set under that policy) and the 60 s `gate` timeout; `probeOutage` moves
+from `step` to `gate`, and the outage arm's `available` answer goes through `outageOver` to
+`escalateGate`, so every return into the gate loop fires first. Rule 4 requires a task under the
+`gate` timeout to carry the `gate` policy and computes its worst case: 4 × 10 s (the largest
+`deadline_ms`) + 3 × (2 s + 3 s) = 55 s < 60 s. The escalation bound is unchanged: 30 s tick +
+4 × 60 s = 270 s = 4 min 30 s, 30 s inside the ± 5 min of `nfr-owf-escalation-timer`.
+
+**Rationale**: the bound is a sum of timeouts only if a timeout is the most a call can take and the
+retry limit, not the timeout, ends its retries. Under `transient` — 5 attempts × 10 s plus four
+gaps of 1, 2, 4 and 8 s backoff and up to 30 s jitter each, about 185 s — the 60 s timeout fired
+after two or three attempts with a 408 that `*transient` does not catch, so a short blip faulted
+every gated instance (third re-review S-2). A larger timeout breaks the bound (4 × 185 s > 5 min);
+a catch for 408 would add a failure route to §4.6's table. The price is a shorter absorption
+window, about 6–15 s of spacing for fast failures instead of about a minute, stated in
+`10 §3.6` (a). A constant backoff also makes the policy's worst case computable, which the
+`exponential` form, whose multiplier is the plugin's, is not. **Precedent**: the `recheck` policy
+of `use.retries`, sized for its window (`04 §4.8` item 4), and D-70's derivation of timeouts from
+the SLA they fit.
+
+**Propagated**: `design/10-process-definition.md` §1.2, §2.2 rule 4, §3.6 (a) and *Retry and
+timeout*, *Fixed waits*; `design/01-foundation.md` §4.2, §4.5; `design/03-approval-execution.md`
+§1.2, §4.5 item 4; `ADR/0012` (amendment block after the D-161 block); D-148.
 
 ## Open Questions
 
@@ -4989,6 +5163,8 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-158 | M Rollback document carries its version; failed gate rolled back; ticks compared | `design/10-process-definition.md` §3.8, §4.2, §4.7, `DESIGN.md` §3.6, `ADR/0012`; D-138 |
 | D-159 | M Overdue bound checked both ways over the live version set | `design/01-foundation.md` §3.7, §4.2, `design/07-manual-tasks.md` §4.8, `design/10-process-definition.md` §2.2, §4.2, §4.7, `ADR/0012`; D-134, D-140 |
 | D-160 | M Configuration revisions in an append-only table | `design/01-foundation.md` §3.2, §3.7, §3.8, §4.11, `design/09-read-and-authz.md` §3.7, `DESIGN.md` §3.7, §4.7, §4.8; D-48, D-63, D-69, D-104, D-140 |
+| D-161 | H Admission answers only its own event; ceiling restores the return stage | `design/10-process-definition.md` §2.2, §3.6, `ADR/0012`; D-121, D-144 |
+| D-162 | M Gate-loop calls retry under a policy that fits their timeout | `design/10-process-definition.md` §1.2, §2.2, §3.6, `design/01-foundation.md` §4.2, §4.5, `design/03-approval-execution.md` §1.2, §4.5, `ADR/0012`; D-148 |
 
-Highest decision number used: **D-160**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
+Highest decision number used: **D-162**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
 register; there are no parts.

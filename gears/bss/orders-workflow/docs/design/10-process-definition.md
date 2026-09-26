@@ -72,8 +72,9 @@ table of which change needs which (decision D-136).
 
 **What crosses the boundary is references.** A definition task carries only members of the
 closed vocabulary of [`../ADR/0013`](../ADR/0013-cpt-cf-bss-orders-workflow-adr-references-not-payloads.md)
-as amended by D-131: identities (`correlationId`, `orderId`, `orderVersion`, `resourceTenantId`,
-the platform `invocationId`, consumed-event ids), opaque record references (`gateRef`, `taskRef`,
+as amended by D-131: identities (`correlationId`, `orderId`, `orderVersion`,
+`supersededByOrderVersion`, `resourceTenantId`, the platform `invocationId` and `attemptId`, the
+binding members, consumed-event ids; the full list is ADR-0013 item 1), opaque record references (`gateRef`, `taskRef`,
 `lineRef`, `stepRef`, `planRef`, `parkRef`, `requestRef`, `suspensionRef` and their arrays),
 counters, closed enums an operation returned, instants and durations, and `stepsBase`. It never
 carries a resolved total, an approver identity, a seller or payer tenant axis, a justification or
@@ -117,7 +118,7 @@ be unless the gate is declared failed
 | NFR ID | NFR Summary | Allocated To | Design Response | Verification Approach |
 |--------|-------------|--------------|-----------------|----------------------|
 | `cpt-cf-bss-orders-workflow-nfr-owf-durability` | Zero in-flight workflows lost across restarts | Platform plugin (invocation history) + `01` envelope | The plugin resumes the invocation; every re-issued call is absorbed under the same key | Platform worker kill/restart with the canonical definitions; no duplicate effect, no lost step |
-| `cpt-cf-bss-orders-workflow-nfr-owf-escalation-timer` | Per-gate window from the seller's policy, default 72 h, pinned on the gate row (D-134), ± 5 min | Definition re-check loop (plugin durable timer) + `03` stored deadline | The gate loop's fixed `PT30S` `waitProbe` tick re-checks the gate's stored escalation deadline through `escalate-gate` `mode: fire` before it probes (§3.6 *Fixed waits and re-check loops*); between one fire's database read and the next the gate loop runs at most the rest of that fire, the probe, the tick — or `record-decision` when a decision wins the tick — and the next fire, each call under the 60-second `gate` timeout, so the worst case with every call's retries running to its timeout is 30 s + 4 × 60 s = 4 min 30 s, inside ± 5 min (decision D-148); a hold pauses the window in Orders' record and `apply-resume` re-bases it | Timer-accuracy test across a plugin worker restart; hold/resume test asserting the remainder |
+| `cpt-cf-bss-orders-workflow-nfr-owf-escalation-timer` | Per-gate window from the seller's policy, default 72 h, pinned on the gate row (D-134), ± 5 min | Definition re-check loop (plugin durable timer) + `03` stored deadline | The gate loop's fixed `PT30S` `waitProbe` tick re-checks the gate's stored escalation deadline through `escalate-gate` `mode: fire` before it probes (§3.6 *Fixed waits and re-check loops*); between one fire's database read and the next the gate loop runs at most the rest of that fire, the probe, the tick — or `record-decision` when a decision wins the tick — and the next fire, each call under the 60-second `gate` timeout, which its own `gate` retry policy's 55 s worst case fits (4 × 10 s + 3 × 5 s), so the worst case with every call's retries running to its timeout is 30 s + 4 × 60 s = 4 min 30 s, inside ± 5 min (decisions D-148, D-162); a hold pauses the window in Orders' record and `apply-resume` re-bases it | Timer-accuracy test across a plugin worker restart; hold/resume test asserting the remainder |
 | `cpt-cf-bss-orders-workflow-nfr-owf-fulfillment-sla` | p95 ≤ 15 min from activation eligibility to terminal outcome | Definition task timeouts and retry policy; `05` admission | Wave-2 task timeout 3 min, which bounds the call's retries; each attempt's deadline is nested inside it by validation (§2.2 rule 4); the barrier releases on the first evaluation after both conjuncts hold | Load test over the canonical definition |
 | `cpt-cf-bss-orders-workflow-nfr-owf-audit` | 100 % of transitions recorded independently of engine history | `01` audit writer | The definition performs no effect outside a step operation, so every transition with an Orders consequence is audited by construction | Definition validation rule (§2): no `run`, no `emit`, every `call` a registered operation |
 | `cpt-cf-bss-orders-workflow-nfr-owf-retention` | Gear-owned record ≥ 400 days independent of engine purge | `01` tables | Platform history retention (`TenantRuntimePolicy`, [`DESIGN.md:735`](../../../../serverless-runtime/docs/DESIGN.md#tenantruntimepolicy)) is set independently and may be shorter; nothing Orders needs lives only there | Purge-independence test |
@@ -261,7 +262,7 @@ the same test without 409. `begin-fulfillment` owns no 409: its version conflict
 refusal are settled successes (`version-conflict`, `held`), so its every 409 is a same-key
 retry (`04 §3.6`). Every task that calls an
 operation declares a `timeout` (`use.timeouts`: `step` 3 min, `wave1` 10 min, `wave2` 3 min,
-`admission` 25 h) on the `try` that carries its retry. The timeout bounds the retries themselves, so rule 4 checks only that one attempt fits in it; whichever of the timeout and the retry limit is spent first faults the invocation alike (§4.6). A 409 `idempotency-key-conflict`
+`admission` 25 h, `gate` 60 s) on the `try` that carries its retry. The timeout bounds the retries themselves, so rule 4 checks only that one attempt fits in it; whichever of the timeout and the retry limit is spent first faults the invocation alike (§4.6). A 409 `idempotency-key-conflict`
 is a caller defect the same-key retry cannot fix; it exhausts the budget bounded and faults the
 invocation, or lands on a named failure route where §4.6 names one. Whether the plugin surfaces the Problem body's `error_code` on
 `$error` so the two 409s can be told apart before the budget is spent is part of Q-11. That a `catch` carrying only `retry` re-raises the last error once its limit is spent — the premise of rule 6 and of §4.6 — is not stated by the DSL either (dsl.md *Retries*, dsl-reference.md *Catch*): it is Q-11 (vi), assumed until the plugin answers.
@@ -301,10 +302,10 @@ consumer-supplied hook before publish — a pending ask
 (`cpt-cf-bss-orders-workflow-upreq-serverless-runtime-definition-versioning-validation-hook`,
 [`../UPSTREAM_REQS.md`](../UPSTREAM_REQS.md) §2.9) — in that hook (§3.2):
 
-1. [ ] - `p1` - Every `protected` operation of each path appears exactly where §4 *The fence* orders it; `settle-from-lookup` and `retry-step`, which run only in-process (`01 §3.3`, D-108), never appear. A path is a walk of the **routing graph**, whose states are a task position plus the values of the routing members `nextStage`, `stageLoop`, `returnStage`, `taskReturnStage`, `taskReturnLoop`, `ceilingReturnStage`, `ceilingReturnLoop`, `heldStage`, `heldLoop` and `arm`. Every write of a routing member **MUST** be a string literal, a copy of another routing member, or an `if … then … else` over routing members that yields one of those — never an operation's output or another `$context` member — so each member ranges over a finite set of literals the check enumerates. Ten **pinned members** are tracked the same way (decisions D-135, D-144): `verdict`, written only as a copy of `obtain-verdict`'s `verdict`; `reflected`, only as a copy of `reflect-verdict`'s `reflected` or the literal `refused` its `catch` sets; `policy`, only as a copy of `construct-and-freeze-plan`'s `policy`, the seller's partial-failure policy pinned at freeze (`04 §2.2`); `forceTask`, only as a boolean literal; `beginResult`, only as a copy of `begin-fulfillment`'s `result`, null until the first call (decision D-143); `released`, only as a copy of `evaluate-activation-eligibility`'s `released`; `spawned`, `planFailed` and `preAdmitted`, only as boolean literals, each `false` where it is initialised or consumed and `true` only in the task one case of a `switch` over an operation's closed enum routes to (`spawnSent` after a sent spawn signal, `enterPlanFailedWait` after a `planFailFast` that did not begin, a `toLifecycle` after a hold, resume or acceptance admission answered `supersede` or `terminate`); and `failureScope`, only as one of the literals `line`, `plan` and `order` in the task that enters the failure stage. At each write of a pinned member copied from an output the walk forks once per value of its closed enum; a literal write is decided. The canonical version routes every `switch` that leads towards a protected operation, a stage exit or a `p1` composable of §4.1 on routing and pinned members only, or on a member both of whose ways satisfy §4.1 (decision D-144). A `switch` case over routing and pinned members is decided by the state; a case over any other member is taken both ways, and a §4.1 condition written *on some walk* is checked as reachability from the task it names. The check explores every state reachable from `admitTrigger` and refuses the version if any walk to `end` breaks §4.1 or leaves a stage by a `nextStage` no `dispatch` case names; a walk it cannot decide is refused, never assumed (decision D-126) - `inst-def-protected-present`
+1. [ ] - `p1` - Every `protected` operation of each path appears exactly where §4 *The fence* orders it; `settle-from-lookup` and `retry-step`, which run only in-process (`01 §3.3`, D-108), never appear. A path is a walk of the **routing graph**, whose states are a task position plus the values of the routing members `nextStage`, `stageLoop`, `returnStage`, `taskReturnStage`, `taskReturnLoop`, `ceilingReturnStage`, `ceilingReturnLoop`, `ceilingReturnBack`, `heldStage`, `heldLoop` and `arm`. Every write of a routing member **MUST** be a string literal, a copy of another routing member, or an `if … then … else` over routing members that yields one of those — never an operation's output or another `$context` member — so each member ranges over a finite set of literals the check enumerates. Ten **pinned members** are tracked the same way (decisions D-135, D-144): `verdict`, written only as a copy of `obtain-verdict`'s `verdict`; `reflected`, only as a copy of `reflect-verdict`'s `reflected` or the literal `refused` its `catch` sets; `policy`, only as a copy of `construct-and-freeze-plan`'s `policy`, the seller's partial-failure policy pinned at freeze (`04 §2.2`); `forceTask`, only as a boolean literal; `beginResult`, only as a copy of `begin-fulfillment`'s `result`, null until the first call (decision D-143); `released`, only as a copy of `evaluate-activation-eligibility`'s `released`; `spawned`, `planFailed` and `preAdmitted`, only as boolean literals, each `false` where it is initialised or consumed (`preAdmitted` also in every arm that writes `lifecycleEventId`, decision D-161) and `true` only in the task one case of a `switch` over an operation's closed enum routes to (`spawnSent` after a sent spawn signal, `enterPlanFailedWait` after a `planFailFast` that did not begin, a `toLifecycle` after a hold, resume or acceptance admission answered `supersede` or `terminate`); and `failureScope`, only as one of the literals `line`, `plan` and `order` in the task that enters the failure stage. At each write of a pinned member copied from an output the walk forks once per value of its closed enum; a literal write is decided. The canonical version routes every `switch` that leads towards a protected operation, a stage exit or a `p1` composable of §4.1 on routing and pinned members only, or on a member both of whose ways satisfy §4.1 (decision D-144). A `switch` case over routing and pinned members is decided by the state; a case over any other member is taken both ways, and a §4.1 condition written *on some walk* is checked as reachability from the task it names. The check explores every state reachable from `admitTrigger` and refuses the version if any walk to `end` breaks §4.1 or leaves a stage by a `nextStage` no `dispatch` case names; a walk it cannot decide is refused, never assumed (decision D-126) - `inst-def-protected-present`
 2. [ ] - `p1` - Every `call: http` targets `POST /bss-orders-workflow/v1/steps/{operation}` with `{operation}` a row of `owf_step_operation`, and its `endpoint` is exactly `${ $context.stepsBase + "/<operation>" }` with the operation name a literal. `stepsBase` is written only by `input.from`; no `set`, `output` or `export` **MAY** name it, so no version can send its calls, or the credential the plugin attaches to them, to another host, and the CI test and the hook compare the `input.from` value with the environment's step-surface base (§3.7). No `call` **MAY** target a registered Function, `composable` operation or not (decision D-136) - `inst-def-call-targets`
 3. [ ] - `p1` - Every `listen` filter type is in the closed set above and carries the two correlations, except the `OrderAmended` filter, which correlates on `orderId` only (the closed set above, `02 §4.7` item 8); a filter **MAY** add a correlation, as the ceiling wait's `taskRef` does - `inst-def-listen-targets`
-4. [ ] - `p1` - Bounds nest, over values the definition holds: every task that calls an operation declares a `timeout` from `use.timeouts`; the operation's `deadline_ms` **<** that timeout, so one attempt fits; every task timeout and every literal `wait` **<** the literal `P90D` lifetime `wait`. The check computes no cumulative backoff, because the DSL gives `backoff.exponential` no multiplier (dsl-reference.md *Retry*) and the timeout bounds the retries whatever their curve. The escalation window, the overdue window and the SLA classes are not definition values — each is a per-seller policy value that an operation pins on the order's record (decision D-134) — so their bounds are checked where the seller's policy is written (`07 §4.8` item 8) and, for the overdue window against the `wave1` timeout, also by the publish job (§4.2 step 1, decision D-159), not here (decision D-126) - `inst-def-bounds-nest`
+4. [ ] - `p1` - Bounds nest, over values the definition holds: every task that calls an operation declares a `timeout` from `use.timeouts`; the operation's `deadline_ms` **<** that timeout, so one attempt fits; every task timeout and every literal `wait` **<** the literal `P90D` lifetime `wait`. The check computes no cumulative backoff, because the DSL gives `backoff.exponential` no multiplier (dsl-reference.md *Retry*) and the timeout bounds the retries whatever their curve. The one exception is a task under the `gate` timeout, whose timeout is a term of the escalation bound and so must never be what ends its retries: it **MUST** carry the `gate` retry policy, whose backoff is `constant`, and the check computes attempts × the largest `deadline_ms` called + (attempts − 1) × (delay + the jitter maximum) **<** the `gate` timeout — 4 × 10 s + 3 × 5 s = 55 s < 60 s in the canonical (decision D-162). The escalation window, the overdue window and the SLA classes are not definition values — each is a per-seller policy value that an operation pins on the order's record (decision D-134) — so their bounds are checked where the seller's policy is written (`07 §4.8` item 8) and, for the overdue window against the `wave1` timeout, also by the publish job (§4.2 step 1, decision D-159), not here (decision D-126) - `inst-def-bounds-nest`
 5. [ ] - `p1` - Every task `input`, `output`, `export` and every `body` member validates against the operation's registered reference schemas; no member outside them. Every member the definition writes into `$context`, including by `set` and `input.from`, is of one of the six vocabulary types of ADR-0013 as amended by D-131 (identity, opaque record reference, counter, closed enum or boolean, instant or duration, `stepsBase`), a string member in one of the formats that ADR lists, including the invocation, attempt and GTS callable identifier formats D-156 added; a string member of no such type or format is refused. No `set`, `output` or `export` **MAY** read an `$error` member other than `status` (`error_code` once Q-11 (ii) answers) - `inst-def-references-only`
 6. [ ] - `p1` - No `protected` operation is inside a `try` whose `catch` continues the forward path: a `catch` either only retries, so exhaustion faults the invocation, or routes to one of the named failure routes of §4.6; that a retry-only `catch` re-raises the last error once its limit is spent is Q-11 (vi), assumed until the plugin answers - `inst-def-no-swallowing-catch`
 7. [ ] - `p1` - No `run`, no `emit`, no `for`, no `schedule`: the start mechanism is exactly the two platform event triggers of §3.3, `OrderSubmitted` and `OrderAmended` — Lifecycle publishes no `OrderSubmitted` after an amendment ([Lifecycle `04 §4.3`](../../../orders-lifecycle/docs/design/04-versioning.md#43-re-approval-is-a-two-step-seam-interaction-normative), `02 §4.7` item 9); every `wait` is a literal duration (§3.6 *Fixed waits and re-check loops*) - `inst-def-grammar-subset`
@@ -371,8 +372,17 @@ lines 1136–1230), so no member falls to a schema default (decision D-127):
     after admission, whose timeout is 25 h (`use.timeouts.admission`), so it fires by 25 h + 90 d;
     the fresh ceiling the re-entered fork arms (§3.6 (a), D-121) fires by 25 h + 180 d; the rest,
     about 89 days, carries the second ceiling's park, the operator's action on it and an unwind
-    that continues under the next fresh ceiling. Two ceilings are therefore reachable; a third
-    would fire after the guardrail, so an invocation still live at 270 days is ended by the
+    that continues under the next fresh ceiling. The unit is the `P90D` window, not the ceiling
+    park: an expiry that `afterLifetime` absorbs through its `unwinding` or `verdictPark` case
+    (§3.6 (a)) re-arms the fork without parking and uses up one of the three windows as a ceiling
+    does. Two ceilings are reachable on a path that absorbs no expiry. An order whose first window
+    expires in the verdict park — unverdicted across day 90 — and which then proceeds reaches its
+    first ceiling park at 25 h + 180 d and cannot reach a second, whose window would end after the
+    guardrail; that path is the accepted limit (decision D-157 as amended), not a fourth window,
+    because it needs a verdict park across day 90, and on it the one ceiling park still escalates
+    and raises its task; only what outlives that park is cut by the guardrail and raised as
+    `invocation-dead`. A third ceiling is never reachable, so an
+    invocation still live at 270 days is ended by the
     platform's duration guardrail (BR-028, [serverless-runtime PRD.md](../../../../serverless-runtime/docs/PRD.md)
     line 483) and the instance liveness pass raises it as `invocation-dead`, whose remedies are
     the platform re-drive and the order cancel (D-105).
@@ -678,9 +688,11 @@ events*.
 
 **Retry and timeout.** `catch: *transient` retries under `use.retries.transient` when
 `$error.status` is in {429, 503, 504, 409}; `catch: *transientNo409` is the same set without 409,
-used where an outer `catch` owns the 409 (§2.2). Every task that calls an operation declares a
+used where an outer `catch` owns the 409 (§2.2); `catch: *gateTransient` is `*transient`'s set
+under `use.retries.gate`, on the four gate-loop calls `recordDecision`, `escalateGate`,
+`probeGate` and `probeOutage` (decision D-162). Every task that calls an operation declares a
 `timeout` from `use.timeouts` — `step` (3 min), `wave1` (10 min), `wave2` (3 min), `admission`
-(25 h) — on the `try` that carries its retry, so it bounds the call's retries (§2.2 rule 4). A
+(25 h), `gate` (60 s) — on the `try` that carries its retry, so it bounds the call's retries (§2.2 rule 4). A
 timeout raises the DSL's timeout error, whose `type` is `…/errors/timeout` and whose `status`
 should be 408 (dsl.md *Timeouts*); it is caught only where an outer `catch` names 408 **and**
 carries no `errors.with.type` filter, since a filter on the communication type drops it before
@@ -732,7 +744,7 @@ it only for records pinned after the write (decision D-134).
 | `waitCeiling` — lifetime ceiling | (a) | `P90D`, literal; no re-check | — | — |
 | `waitTtlMargin` — park escalation, also the verdict retry interval | (a) | `PT5M` | `arm-park-escalation` (03) | `due` |
 | `waitHeldReflect` — reflection refused while the order is held, or answered `moved` | (a) | `PT5M`; the resume arm re-enters at once | `reflect-verdict` (03), under the next round | `reflected` |
-| `waitProbe` in `gateLoop` — approval escalation window, then the approval-service probe | (a) | `PT30S` (`03 §4.5` items 4, 5) — worst-case escalation lateness 30 s + 4 × 60 s = 4 min 30 s, inside the ± 5 min of `nfr-owf-escalation-timer`: the rest of a fire, the probe or `record-decision`, the tick and the next fire, each under the 60-second `gate` timeout; every return into the loop fires first (D-123, D-148) | `escalate-gate` `mode: fire`, then `mode: probe` (03) | `due` (fire, routes nothing), then `serviceState` |
+| `waitProbe` in `gateLoop` — approval escalation window, then the approval-service probe | (a) | `PT30S` (`03 §4.5` items 4, 5) — worst-case escalation lateness 30 s + 4 × 60 s = 4 min 30 s, inside the ± 5 min of `nfr-owf-escalation-timer`: the rest of a fire, the probe or `record-decision`, the tick and the next fire, each under the 60-second `gate` timeout, which the `gate` retry policy's 55 s worst case fits; every return into the loop — from another stage, after a `pending` decision, from the outage arm — fires first (D-123, D-148, D-162) | `escalate-gate` `mode: fire`, then `mode: probe` (03) | `due` (fire, routes nothing), then `serviceState` |
 | `waitProbe` in `outageArm` — approval-service probe and the outage threshold | (a) | `PT30S` (`03 §4.5` item 5) | `escalate-gate` `mode: probe` (03) | `serviceState`; `due` on `outage` |
 | resumed escalation window | (e) | none of its own: the first answer is `apply-resume`'s | `apply-resume` (08), then `waitProbe` | `due` |
 | `waitEligibility` — eligibility poll | (b) | `PT5M` (`04 §4.8` item 5) | `evaluate-payment-auth-eligibility` (04) | `eligibility` |
@@ -795,12 +807,17 @@ use:
       delay: { seconds: 10 }
       backoff: { constant: {} }
       limit: { attempt: { count: 5 }, duration: { seconds: 60 } }
+    gate:                               # the gate loop's calls (D-162): worst case 4 attempts × 10 s deadline_ms + 3 gaps × (2 s + 3 s jitter) = 55 s, under the 60 s gate timeout, so the limit, not the timeout, ends the retries
+      delay: { seconds: 2 }
+      backoff: { constant: {} }
+      jitter: { from: { seconds: 0 }, to: { seconds: 3 } }
+      limit: { attempt: { count: 4 } }
   timeouts:                             # §2.2 rule 4: each above the deadline_ms of every operation called under it, and below the P90D lifetime wait
     step:      { after: { minutes: 3 } }
     wave1:     { after: { minutes: 10 } }    # 01 §4.2 (D-70)
     wave2:     { after: { minutes: 3 } }     # nfr-owf-fulfillment-sla (D-70)
     admission: { after: { hours: 25 } }      # above the 24 h supersession budget
-    gate:      { after: { seconds: 60 } }    # the calls between two escalation fires (D-148): 30 s tick + 3 × 60 s, inside ± 5 min; each above escalate-gate's and record-decision's 10 s deadline_ms
+    gate:      { after: { seconds: 60 } }    # the calls between two escalation fires (D-148): 30 s tick + 4 × 60 s = 4 min 30 s, inside ± 5 min; above the gate retry policy's 55 s worst case (D-162), and so above escalate-gate's and record-decision's 10 s deadline_ms
 # no `schedule`: the only start mechanism is the two platform event triggers of §3.3
 # triggerKind is looked up from the exact event type (D-107): any other type yields null, which admit-trigger's schema refuses
 input:
@@ -910,6 +927,7 @@ do:
       set:
         ceilingReturnStage: '${ if $context.nextStage == "ceiling" then $context.ceilingReturnStage else $context.nextStage end }'
         ceilingReturnLoop:  '${ if $context.nextStage == "ceiling" then $context.ceilingReturnLoop else $context.stageLoop end }'
+        ceilingReturnBack:  '${ if $context.nextStage == "ceiling" then $context.ceilingReturnBack else $context.returnStage end }'   # the interrupted stage's own return: the ceiling stage's leave overwrites returnStage, and backToProcess restores it (D-161)
         nextStage: ceiling
       then: lifetime
 ```
@@ -1076,7 +1094,10 @@ The approval stage, the `do` list of `process.approval`:
     timeout: gate
     try:
       - call: { step: record-decision } # body: ref + gateRef, decisionEventId, outcome ∈ approved | rejected
-    catch: *transient
+    catch: &gateTransient               # *transient's status set under the gate retry policy, whose worst case fits the gate timeout (D-162)
+      errors: { with: { type: https://serverlessworkflow.io/spec/1.0.0/errors/communication } }
+      when: '${ $error.status as $s | any((429, 503, 504, 409); . == $s) }'
+      retry: gate
     export: { as: '${ $context + { gateState: .gateState, position: .nextPosition } }' }
 - afterDecision:
     switch:
@@ -1088,14 +1109,14 @@ The approval stage, the `do` list of `process.approval`:
     timeout: gate
     try:
       - call: { step: escalate-gate }   # body: ref + position, mode: fire, round: $context.escalationRound; output: due, escalationRound
-    catch: *transient
+    catch: *gateTransient
     export: { as: '${ $context + { escalationRound: .escalationRound, resumeDue: false } }' }
     then: probeGate                     # due routes nothing: true has escalated inside the operation, false is a settled success of its round; the next tick carries the next escalationRound
 - probeGate:
     timeout: gate
     try:
       - call: { step: escalate-gate }   # body: ref + position, mode: probe, round: $context.probeRound; output: serviceState, due, probeRound
-    catch: *transient
+    catch: *gateTransient
     export: { as: '${ $context + { serviceState: .serviceState, probeRound: .probeRound } }' }
 - afterProbe:
     switch:
@@ -1115,17 +1136,18 @@ The approval stage, the `do` list of `process.approval`:
     switch:
       - probe: { when: '${ .arm == "probe" }', then: probeOutage }
       - other: { then: leave }
-- probeOutage:
-    timeout: step
+- probeOutage:                          # under the gate timeout and policy: its available answer is followed by a fire, so it is one of the calls between two fires (D-162)
+    timeout: gate
     try:
       - call: { step: escalate-gate }   # body: ref + position, mode: probe, round: $context.probeRound; due: the outage-threshold deadline on outage
-    catch: *transient
+    catch: *gateTransient
     export: { as: '${ $context + { serviceState: .serviceState, outageDue: (.due // false), probeRound: .probeRound } }' }
 - afterProbeOutage:
     switch:
-      - available: { when: '${ $context.serviceState == "available" }', then: enterGateLoop }
+      - available: { when: '${ $context.serviceState == "available" }', then: outageOver }
       - threshold: { when: '${ $context.outageDue and ($context.outageEscalated | not) }', then: escalateOutage }
       - still:     { then: outageArm }
+- outageOver: { set: { stageLoop: gateLoop, holdPauses: true }, then: escalateGate }   # the return from the outage arm fires before it waits, like every other return into the gate loop (D-162)
 - escalateOutage:                       # recorded once per outage
     timeout: step
     try:
@@ -1171,10 +1193,21 @@ of one competing fork let the shorter always win, so a separate `PT5M` escalatio
 fired (decision D-123). The lateness bound counts every call that can run between two fires:
 the rest of the fire whose read the deadline just missed, the probe, the tick — or, when a
 decision wins the tick, `record-decision` — and the next fire. Those calls carry the 60-second
-`gate` timeout, a pending decision goes straight to `escalateGate` (`reenterGateLoop`), and every
-re-entry of the stage at `gateLoop` fires before it waits, so the worst case with every call's
-retries running to its timeout is 30 s + 4 × 60 s = 4 min 30 s, inside the ± 5 min of
-`nfr-owf-escalation-timer`. An arm that leaves the stage and returns — a denied cancel, an
+`gate` timeout, a pending decision goes straight to `escalateGate` (`reenterGateLoop`), the
+outage arm's `available` answer goes to `escalateGate` through `outageOver`, and every re-entry of
+the stage at `gateLoop` fires before it waits, so the worst case with every call's retries running
+to its timeout is 30 s + 4 × 60 s = 4 min 30 s, inside the ± 5 min of
+`nfr-owf-escalation-timer`. The timeout is the bound only if it, not the retry limit, is what a
+spent call can reach, and the `transient` curve does not fit it: 5 attempts of up to the 10 s
+`deadline_ms` plus four gaps of 1–8 s backoff and up to 30 s of jitter each reach about 185 s, so
+the 60 s timeout would fire after two or three attempts and fault the invocation with a 408 that
+no `catch` takes. These four calls therefore retry under their own `gate` policy — 4 attempts,
+constant 2 s delay, jitter 0–3 s — whose worst case, 4 × 10 s + 3 × (2 s + 3 s) = 55 s, is under
+the timeout, so the retry limit ends a spent call first and the 4 × 60 s sum still bounds every
+call (decision D-162). The price is a shorter absorption window: an Orders step-surface or
+approval-service blip that outlasts four attempts, about 6–15 s of spacing when the failures are
+fast, faults the invocation as any spent step call does (§4.6) and is re-driven, where the
+`transient` curve would have absorbed about a minute. An arm that leaves the stage and returns — a denied cancel, an
 absorbed lifecycle event, an early resume — adds only the calls of the stage it visited, each
 normally inside its 5–10 s `deadline_ms`; only with those calls' retries running to the 3-minute
 `step` timeout can the bound be exceeded, the residual of a degraded Orders, and a hold pauses the
@@ -1273,7 +1306,7 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
                           orderVersion: { from: '${ .data.orderVersion }', expect: '${ $context.orderVersion }' }
                     read: envelope
                   output: { as: '${ .[0] | { eventId: .id } }' }
-              - arm: { set: { arm: acceptance, lifecycleEventId: '${ .eventId }', triggerKind: OrderAcceptanceRecorded } }
+              - arm: { set: { arm: acceptance, lifecycleEventId: '${ .eventId }', triggerKind: OrderAcceptanceRecorded, preAdmitted: false } }
         - reauthorize:
             do:
               - listenReauth:
@@ -2141,7 +2174,7 @@ The ceiling stage, the `do` list of `process.ceiling`, entered from `ceilingEntr
     try:
       - call: { step: unpark }          # body: ref + subjectRef: $context.ceilingSubject; refused not-found unless this ceiling's task is resolved retry (01 §3.3); output: phase = the pre-park phase
     catch: *transient
-- backToProcess: { set: { nextStage: '${ $context.ceilingReturnStage }', stageLoop: '${ $context.ceilingReturnLoop }' }, then: exit }
+- backToProcess: { set: { nextStage: '${ $context.ceilingReturnStage }', stageLoop: '${ $context.ceilingReturnLoop }', returnStage: '${ $context.ceilingReturnBack }' }, then: exit }   # the routing state the ceiling interrupted, returnStage included, so a lifecycle, hold, resume or cancel stage it interrupted goes back where it would have (D-161)
 - leave: { set: { nextStage: '${ .arm }', returnStage: ceiling }, then: exit }
 ```
 
@@ -2192,7 +2225,12 @@ resolution `listen` cannot take the ceiling task's `retry` for a compensation re
 `inst-fence-step1`). Each ceiling's task is its own row, keyed by its `ceiling:{round}` subject
 (`07 §3.7`), so a second ceiling neither reopens the first one's task nor replays its SLA rounds
 (decision D-149). `unpark` restores the pre-park phase and the process resumes at the stage
-and checkpoint `ceilingEntry` recorded, under the fresh ceiling of the re-entered fork. The
+and checkpoint `ceilingEntry` recorded, under the fresh ceiling of the re-entered fork.
+`ceilingEntry` also records the interrupted stage's `returnStage` as `ceilingReturnBack`, and
+`backToProcess` restores it: the ceiling stage's own `leave` sets `returnStage` to `ceiling` so
+that a cancel or lifecycle arm taken from its wait comes back to it, and without the restore a
+lifecycle, hold, resume or cancel stage the ceiling interrupted would go back to the ceiling stage
+and escalate a new ceiling round instead of returning where it came from (decision D-161). The
 canonical version has **no `unpark-requested` arm**: `:plugin-control` is authorized
 platform-side (`../ADR/0010`), so a signal with no Orders origin route is not a signal no one can
 send, and the arm is removed until Q-13 gives it an origin route and a request row
@@ -2220,7 +2258,7 @@ send, and the arm is removed until Q-13 gives it an origin route and a request r
             orderVersion: { from: '${ .data.orderVersion }', expect: '${ $context.orderVersion }' }
       read: envelope
     output: { as: '${ .[0] | { eventId: .id } }' }
-- arm: { set: { arm: hold, lifecycleEventId: '${ .eventId }', triggerKind: OrderHeld } }
+- arm: { set: { arm: hold, lifecycleEventId: '${ .eventId }', triggerKind: OrderHeld, preAdmitted: false } }   # every arm that writes lifecycleEventId clears preAdmitted: an admission answers only for its own event (D-161)
 # the stage-level (early) resume arm beside it: a resume delivered before its hold is not lost (08 §4.7 item 3)
 - awaitResume:
     listen:
@@ -2232,7 +2270,7 @@ send, and the arm is removed until Q-13 gives it an origin route and a request r
             orderVersion: { from: '${ .data.orderVersion }', expect: '${ $context.orderVersion }' }
       read: envelope
     output: { as: '${ .[0] | { eventId: .id } }' }
-- arm: { set: { arm: resume, lifecycleEventId: '${ .eventId }', resumeEventId: '${ .eventId }', triggerKind: OrderResumed } }   # suspensionRef is kept: the resume stage clears it only once a suspension is closed (D-141)
+- arm: { set: { arm: resume, lifecycleEventId: '${ .eventId }', resumeEventId: '${ .eventId }', triggerKind: OrderResumed, preAdmitted: false } }   # suspensionRef is kept: the resume stage clears it only once a suspension is closed (D-141)
 ```
 
 The hold stage, the `do` list of `process.hold`:
@@ -2434,7 +2472,7 @@ spawn signal or completion report is called again after the resume (`01 §3.3` *
                                     "gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.cancelled.v1~": "OrderCancelled",
                                     "gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.expired.v1~": "OrderExpired",
                                     "gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.rejected.v1~": "OrderRejected" }[.type]) } }
-- arm: { set: { arm: lifecycle, lifecycleEventId: '${ .eventId }', triggerKind: '${ .triggerKind }' } }   # no version is copied from the event: an OrderCancelled at the pinned version carries the instance's own (D-155)
+- arm: { set: { arm: lifecycle, lifecycleEventId: '${ .eventId }', triggerKind: '${ .triggerKind }', preAdmitted: false } }   # preAdmitted false: a new event is admitted by the stage, never routed on an earlier event's admission (D-161); no version is copied from the event: an OrderCancelled at the pinned version carries the instance's own (D-155)
 ```
 
 The lifecycle stage, the `do` list of `process.lifecycle` — admission first, and the admission
@@ -2498,7 +2536,14 @@ listened Lifecycle trigger — here, and `OrderAcceptanceRecorded`, `OrderHeld` 
 in fragments (b) and (e) — passes `admit-trigger` with `role: listen` before any consuming
 operation, and the returned `admission`, never event data, selects the path; a hold, resume or
 acceptance admission that answers `supersede` or `terminate` enters this stage with
-`preAdmitted` and is routed without a second admission. Termination is symmetric with start: a
+`preAdmitted` and is routed without a second admission. Every arm that writes `lifecycleEventId`
+— acceptance, hold, resume and lifecycle — sets `preAdmitted: false`, so `preAdmitted` is true
+only while `lifecycleEventId` is the event whose admission set it: a ceiling that interrupts this
+stage, followed by a lifecycle arm in the ceiling wait, sends the new event through
+`admitLifecycle` rather than routing it on the earlier event's answer. Nothing is lost by the
+overwrite, because `supersede` and `terminate` are read from Lifecycle's order state, which never
+leaves superseded or terminal, so the new event's admission answers `supersede` or `terminate`
+whenever the earlier one did (`02 §3.3` *Trigger-to-outcome table*, decision D-161). Termination is symmetric with start: a
 terminal order event and a superseding version both run the cancellation fence and the
 compensation walk before `terminate-instance`, and neither leaves a wave-1 draft for a platform
 TTL this gear does not own. The admission decision — is this event for a superseded, current or
@@ -2610,7 +2655,9 @@ order, the job:
    guidance item of §4.7 fixes for it (the fixed-waits table of §3.6), and refuses a difference
    unless the same change amends that slice item (decision D-158);
 2. in the first non-production environment only, runs the **behavioural gate**: it publishes the
-   candidate there and deprecates the version it replaces, as step 3 does, and drives a scenario suite with one order per path of §3.6 — approval
+   candidate there, deprecates the version it replaces and applies the two trigger bindings, all
+   as step 3 does — so the suite's trigger-started orders reach the candidate, including a major
+   bump's new callable id, and never an old major left with no `active` version — and drives a scenario suite with one order per path of §3.6 — approval
    not required, required and unobtainable (a); fulfillment through both waves (b); a partial
    failure under each policy (c); a cancel (d); a hold and resume (e); an amendment and each
    terminal event (f) — against that environment's real step surface, with test doubles for
@@ -2620,12 +2667,12 @@ order, the job:
    windows for its test seller; a tick longer than the suite's budget, and the `P90D` ceiling, are
    not exercised, and the suite reports them so: their values are held by the static comparison
    of step 1 and by rules 4 and 7. A failing scenario stops the job before any other environment
-   is touched, and the job rolls that environment back forward, as *Rollback* below does, so its
-   triggers start no further order on the failed candidate; the suite's own orders still running
+   is touched, and the job rolls that environment back forward, as *Rollback* below does, bindings
+   included, so its triggers start no further order on the failed candidate; the suite's own orders still running
    on it are ended with the order cancel (decision D-158);
 3. publishes the version, deprecates the version it replaces in the same run, and applies the two
    trigger bindings of §3.8; in the first non-production environment, where step 2 has already
-   published the candidate, it only applies the bindings;
+   done all three, it does nothing more;
 4. never archives or deletes a version.
 
 **Which version starts new orders.** One version per callable id is `active` in an environment
@@ -2639,7 +2686,17 @@ binding to any version other than the one the job left `active` (§3.8).
 
 **Rollback** is forward. The job rolls a bad version back by publishing the last good
 document **with its `document.version` set to the new minor** as a new minor version, which
-deprecates the bad one; the document is otherwise unchanged. Its `version` must be the new one,
+deprecates the bad one; the document is otherwise unchanged. The rollback version is the next
+minor above the highest version the first non-production environment's registry lists — every
+candidate is published there first, so it holds the highest, the failed gate's included — and
+the job commits the re-versioned document to `definitions/` in the same run, its only commit: a
+copy of a reviewed, gated document whose `document.version` alone changed. The rollback is then
+published through the normal job in promotion order, without the behavioural gate its content has
+passed, so every environment holds the same content under each semver; an environment that never
+held the failed candidate only skips that number. CI refuses a candidate whose `document.version`
+is not above every version in `definitions/`, so the next fix is versioned above the rollback and
+cannot collide with it (decision D-158 as amended). For a major bump the rollback is a new minor of
+the old major, and the job re-points both bindings back to it. Its `version` must be the new one,
 because `start-instance` refuses `definition-not-bound` when the document's own `version` differs
 from the version the platform pinned (§4.3, decision D-137), so a document republished under its
 old `version` would stop every new order from starting. The registry does allow a two-step return
