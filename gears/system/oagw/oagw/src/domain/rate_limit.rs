@@ -510,6 +510,8 @@ impl RateLimiter {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use crate::domain::model::{
         BurstConfig, RateLimitAlgorithm, RateLimitScope, RateLimitStrategy, SustainedRate,
     };
@@ -532,8 +534,44 @@ mod tests {
         }
     }
 
+    /// Freezes the clock read by [`now`] for the lifetime of the guard.
+    ///
+    /// Every test that asserts on token counts, remaining quota or retry/reset
+    /// hints holds one. On the real clock those assertions race the refill
+    /// rate — a 100 tok/s bucket regains a token every 10 ms — which made them
+    /// fail under the instrumented `cargo llvm-cov` build while passing in the
+    /// plain test jobs.
+    ///
+    /// `Drop` restores the real clock, so a panicking test cannot leak the
+    /// frozen instant into anything else running on the same thread.
+    struct FrozenClock {
+        at: Instant,
+    }
+
+    impl FrozenClock {
+        /// Freeze at the current instant.
+        fn new() -> Self {
+            let at = Instant::now();
+            MOCK_NOW.with(|cell| cell.set(Some(at)));
+            Self { at }
+        }
+
+        /// Move the frozen instant forward by `delta`.
+        fn advance(&mut self, delta: Duration) {
+            self.at += delta;
+            MOCK_NOW.with(|cell| cell.set(Some(self.at)));
+        }
+    }
+
+    impl Drop for FrozenClock {
+        fn drop(&mut self) {
+            MOCK_NOW.with(|cell| cell.set(None));
+        }
+    }
+
     #[test]
     fn allows_within_capacity() {
+        let _clock = FrozenClock::new();
         let limiter = RateLimiter::new();
         let config = make_config(10, Window::Second, None);
         for _ in 0..10 {
@@ -543,6 +581,7 @@ mod tests {
 
     #[test]
     fn denies_when_exhausted() {
+        let _clock = FrozenClock::new();
         let limiter = RateLimiter::new();
         let config = make_config(2, Window::Second, None);
         assert!(limiter.try_consume("test", &config, "/test").is_ok());
@@ -553,6 +592,7 @@ mod tests {
 
     #[test]
     fn retry_after_is_calculated() {
+        let _clock = FrozenClock::new();
         let limiter = RateLimiter::new();
         let config = make_config(1, Window::Minute, None);
         assert!(limiter.try_consume("test", &config, "/test").is_ok());
@@ -570,6 +610,7 @@ mod tests {
 
     #[test]
     fn burst_capacity_used() {
+        let _clock = FrozenClock::new();
         let limiter = RateLimiter::new();
         let config = make_config(1, Window::Second, Some(5));
         for _ in 0..5 {
@@ -580,6 +621,7 @@ mod tests {
 
     #[test]
     fn separate_keys_independent() {
+        let _clock = FrozenClock::new();
         let limiter = RateLimiter::new();
         let config = make_config(1, Window::Second, None);
         assert!(limiter.try_consume("key-a", &config, "/test").is_ok());
@@ -590,6 +632,7 @@ mod tests {
 
     #[test]
     fn purge_removes_stale_entries() {
+        let _clock = FrozenClock::new();
         let limiter = RateLimiter::new();
         let config = make_config(10, Window::Second, None);
         limiter.try_consume("a", &config, "/test").unwrap();
@@ -607,6 +650,7 @@ mod tests {
 
     #[test]
     fn purge_with_empty_set_removes_all() {
+        let _clock = FrozenClock::new();
         let limiter = RateLimiter::new();
         let config = make_config(10, Window::Second, None);
         limiter.try_consume("x", &config, "/test").unwrap();
@@ -619,6 +663,7 @@ mod tests {
 
     #[test]
     fn try_consume_returns_outcome_metadata() {
+        let _clock = FrozenClock::new();
         let limiter = RateLimiter::new();
         let config = make_config(10, Window::Second, Some(10));
 
@@ -640,6 +685,7 @@ mod tests {
 
     #[test]
     fn error_includes_rate_limit_metadata() {
+        let _clock = FrozenClock::new();
         let limiter = RateLimiter::new();
         let config = make_config(1, Window::Second, Some(1));
         limiter.try_consume("test", &config, "/test").unwrap();
@@ -665,6 +711,7 @@ mod tests {
 
     #[test]
     fn outcome_limit_falls_back_to_sustained_rate_without_burst() {
+        let _clock = FrozenClock::new();
         let limiter = RateLimiter::new();
         let config = make_config(5, Window::Second, None); // no burst
         let outcome = limiter.try_consume("test", &config, "/test").unwrap();
@@ -676,6 +723,7 @@ mod tests {
 
     #[test]
     fn outcome_reset_epoch_in_future() {
+        let _clock = FrozenClock::new();
         let limiter = RateLimiter::new();
         let config = make_config(10, Window::Second, Some(10));
         // Consume 5 tokens so the bucket is partially drained.
@@ -695,6 +743,7 @@ mod tests {
 
     #[test]
     fn error_reset_epoch_is_time_until_full() {
+        let _clock = FrozenClock::new();
         let limiter = RateLimiter::new();
         // capacity=5, rate=5/min → refill_rate ≈ 0.083 tok/s.
         // Consuming all 5 means secs_to_full ≈ 60s, but retry_after ≈ 12s (1 token).
@@ -733,6 +782,7 @@ mod tests {
 
     #[test]
     fn cost_greater_than_one_consumes_multiple_tokens() {
+        let _clock = FrozenClock::new();
         let limiter = RateLimiter::new();
         let mut config = make_config(100, Window::Second, Some(10));
         config.cost = 3;
@@ -753,6 +803,7 @@ mod tests {
 
     #[test]
     fn error_omits_metadata_when_response_headers_false() {
+        let _clock = FrozenClock::new();
         let limiter = RateLimiter::new();
         let mut config = make_config(1, Window::Minute, Some(1));
         config.response_headers = false;
@@ -956,6 +1007,7 @@ mod tests {
 
     #[test]
     fn remove_keys_for_upstream_cleans_all_scopes() {
+        let _clock = FrozenClock::new();
         const UID: &str = "00000000-0000-0000-0000-000000000001";
 
         let limiter = RateLimiter::new();
@@ -989,6 +1041,7 @@ mod tests {
 
     #[test]
     fn remove_keys_for_route_cleans_only_route() {
+        let _clock = FrozenClock::new();
         let limiter = RateLimiter::new();
         let config = make_config(10, Window::Second, None);
         let rid = Uuid::parse_str("00000000-0000-0000-0000-000000000004").unwrap();
@@ -1022,16 +1075,9 @@ mod tests {
         }
     }
 
-    fn set_mock_time(t: Instant) {
-        MOCK_NOW.with(|cell| cell.set(Some(t)));
-    }
-
-    fn clear_mock_time() {
-        MOCK_NOW.with(|cell| cell.set(None));
-    }
-
     #[test]
     fn sliding_window_allows_within_rate() {
+        let _clock = FrozenClock::new();
         let limiter = RateLimiter::new();
         let config = make_sliding_config(10, Window::Second);
         for _ in 0..10 {
@@ -1041,6 +1087,7 @@ mod tests {
 
     #[test]
     fn sliding_window_denies_when_exhausted() {
+        let _clock = FrozenClock::new();
         let limiter = RateLimiter::new();
         let config = make_sliding_config(2, Window::Second);
         assert!(limiter.try_consume("sw", &config, "/test").is_ok());
@@ -1051,8 +1098,7 @@ mod tests {
 
     #[test]
     fn sliding_window_boundary_burst_prevented() {
-        let t0 = Instant::now();
-        set_mock_time(t0);
+        let mut clock = FrozenClock::new();
 
         let limiter = RateLimiter::new();
         let config = make_sliding_config(10, Window::Second);
@@ -1064,20 +1110,18 @@ mod tests {
 
         // Advance just past one sub-window boundary (100ms for Second/10 sub-windows).
         // Only sub-window 0 is active with 10 counts; the window hasn't expired.
-        let one_sub = std::time::Duration::from_millis(100);
-        set_mock_time(t0 + one_sub);
+        clock.advance(Duration::from_millis(100));
 
         // New requests should be rejected — the 10 counts from sub-window 0 haven't
         // expired yet (only 1 of 10 sub-windows has rotated, but sub-window 0's
         // counts are still within the sliding window).
         let err = limiter.try_consume("sw", &config, "/test").unwrap_err();
         assert!(matches!(err, DomainError::RateLimitExceeded { .. }));
-
-        clear_mock_time();
     }
 
     #[test]
     fn sliding_window_ignores_burst_config() {
+        let _clock = FrozenClock::new();
         let limiter = RateLimiter::new();
         let mut config = make_sliding_config(10, Window::Second);
         config.burst = Some(BurstConfig { capacity: 50 });
@@ -1092,6 +1136,7 @@ mod tests {
 
     #[test]
     fn sliding_window_retry_after_calculated() {
+        let _clock = FrozenClock::new();
         let limiter = RateLimiter::new();
         let config = make_sliding_config(1, Window::Minute);
         assert!(limiter.try_consume("sw", &config, "/test").is_ok());
@@ -1109,6 +1154,7 @@ mod tests {
 
     #[test]
     fn sliding_window_remaining_decreases() {
+        let _clock = FrozenClock::new();
         let limiter = RateLimiter::new();
         let config = make_sliding_config(10, Window::Second);
 
@@ -1122,6 +1168,7 @@ mod tests {
 
     #[test]
     fn sliding_window_success_reset_epoch_reflects_full_window() {
+        let _clock = FrozenClock::new();
         let limiter = RateLimiter::new();
         let config = make_sliding_config(10, Window::Minute);
 
@@ -1153,6 +1200,7 @@ mod tests {
 
     #[test]
     fn sliding_window_cost_greater_than_one() {
+        let _clock = FrozenClock::new();
         let limiter = RateLimiter::new();
         let mut config = make_sliding_config(10, Window::Second);
         config.cost = 3;
@@ -1169,6 +1217,7 @@ mod tests {
 
     #[test]
     fn sliding_window_separate_keys_independent() {
+        let _clock = FrozenClock::new();
         let limiter = RateLimiter::new();
         let config = make_sliding_config(1, Window::Second);
         assert!(limiter.try_consume("sw-a", &config, "/test").is_ok());
@@ -1179,8 +1228,7 @@ mod tests {
 
     #[test]
     fn sliding_window_recovery_after_full_window() {
-        let t0 = Instant::now();
-        set_mock_time(t0);
+        let mut clock = FrozenClock::new();
 
         let limiter = RateLimiter::new();
         let config = make_sliding_config(5, Window::Second);
@@ -1192,18 +1240,15 @@ mod tests {
         assert!(limiter.try_consume("sw", &config, "/test").is_err());
 
         // Advance past the full window — all sub-windows expire.
-        set_mock_time(t0 + std::time::Duration::from_secs(2));
+        clock.advance(Duration::from_secs(2));
         for _ in 0..5 {
             assert!(limiter.try_consume("sw", &config, "/test").is_ok());
         }
-
-        clear_mock_time();
     }
 
     #[test]
     fn sliding_window_sub_window_granular_recovery() {
-        let t0 = Instant::now();
-        set_mock_time(t0);
+        let mut clock = FrozenClock::new();
 
         let limiter = RateLimiter::new();
         // 10 per second, 10 sub-windows → each sub-window is 100ms.
@@ -1214,7 +1259,7 @@ mod tests {
         for _ in 0..5 {
             assert!(limiter.try_consume("sw", &config, "/test").is_ok());
         }
-        set_mock_time(t0 + std::time::Duration::from_millis(100));
+        clock.advance(Duration::from_millis(100));
         for _ in 0..5 {
             assert!(limiter.try_consume("sw", &config, "/test").is_ok());
         }
@@ -1223,8 +1268,9 @@ mod tests {
         // Advance so sub-window 0 (with 5 counts) rotates out.
         // We need to be at sub-window index 10 relative to start, which means
         // 10 sub-windows = 1000ms from t0. But only 9 more sub-windows need to
-        // pass from the current position (sub-window 1). So advance to t0 + 1000ms.
-        set_mock_time(t0 + std::time::Duration::from_millis(1000));
+        // pass from the current position (sub-window 1). So advance a further
+        // 900ms to reach t0 + 1000ms.
+        clock.advance(Duration::from_millis(900));
 
         // Sub-window 0's 5 counts have expired, freeing 5 capacity.
         // Sub-window 1's 5 counts are still active. So we have 5 remaining.
@@ -1232,8 +1278,6 @@ mod tests {
             assert!(limiter.try_consume("sw", &config, "/test").is_ok());
         }
         assert!(limiter.try_consume("sw", &config, "/test").is_err());
-
-        clear_mock_time();
     }
 
     // -- Bucket::matches_config tests --
@@ -1303,6 +1347,7 @@ mod tests {
 
     #[test]
     fn bucket_reinitializes_on_config_change() {
+        let _clock = FrozenClock::new();
         let limiter = RateLimiter::new();
         let config = make_config(2, Window::Second, None);
 
