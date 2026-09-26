@@ -85,7 +85,111 @@ pub fn register_routes(
         .error_500(openapi)
         .register(router, openapi);
 
+    router = register_named_routes(router, openapi);
+
     router = router.layer(Extension(service));
+
+    router
+}
+
+/// Keyed JSON values next to the fixed fields, one resource per key.
+fn register_named_routes(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
+    const KEY_DOC: &str = "Setting key: 1-128 characters from A-Z a-z 0-9 . _ - :";
+
+    router = OperationBuilder::get("/simple-user-settings/v1/named-settings")
+        .operation_id("simple_user_settings.list_named_settings")
+        .summary("List named settings")
+        .description("Every named setting of the authenticated user, ordered by key")
+        .tag("Settings")
+        .authenticated()
+        .require_license_features::<License>([])
+        .handler(handlers::list_named_settings)
+        .json_response_with_schema::<dto::NamedSettingsListDto>(
+            openapi,
+            StatusCode::OK,
+            "Named settings",
+        )
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_500(openapi)
+        .register(router, openapi);
+
+    router = OperationBuilder::get("/simple-user-settings/v1/named-settings/{key}")
+        .operation_id("simple_user_settings.get_named_setting")
+        .summary("Get a named setting")
+        .description("One named setting of the authenticated user; 404 if it is not set")
+        .tag("Settings")
+        .path_param("key", KEY_DOC)
+        .authenticated()
+        .require_license_features::<License>([])
+        .handler(handlers::get_named_setting)
+        .json_response_with_schema::<dto::NamedSettingDto>(openapi, StatusCode::OK, "Named setting")
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_404(openapi)
+        .error_500(openapi)
+        .register(router, openapi);
+
+    router = OperationBuilder::put("/simple-user-settings/v1/named-settings/{key}")
+        .operation_id("simple_user_settings.put_named_setting")
+        .summary("Set a named setting")
+        .description(
+            "Create or replace one named setting. The value is any JSON value within \
+             the configured size bound; a new key past the per-user count bound is refused with 429.",
+        )
+        .tag("Settings")
+        .path_param("key", KEY_DOC)
+        .authenticated()
+        .require_license_features::<License>([])
+        .json_request::<dto::PutNamedSettingRequest>(openapi, "The value to store")
+        .handler(handlers::put_named_setting)
+        .json_response_with_schema::<dto::NamedSettingDto>(
+            openapi,
+            StatusCode::OK,
+            "Named setting stored",
+        )
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_422(openapi)
+        .error_429(openapi)
+        .error_500(openapi)
+        .register(router, openapi);
+
+    router = OperationBuilder::delete("/simple-user-settings/v1/named-settings/{key}")
+        .operation_id("simple_user_settings.delete_named_setting")
+        .summary("Delete a named setting")
+        .description("Forget one named setting. Deleting a key that is not set also answers 204.")
+        .tag("Settings")
+        .path_param("key", KEY_DOC)
+        .authenticated()
+        .require_license_features::<License>([])
+        .handler(handlers::delete_named_setting)
+        .no_content_response(StatusCode::NO_CONTENT, "Named setting deleted (no body)")
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_500(openapi)
+        .register(router, openapi);
+
+    router = OperationBuilder::delete("/simple-user-settings/v1/named-settings")
+        .operation_id("simple_user_settings.delete_all_named_settings")
+        .summary("Delete all named settings")
+        .description(
+            "Forget every named setting of the authenticated user in one call, e.g. on \
+             offboarding or an erasure request. Answers 204 whether or not any were set; \
+             the fixed theme/language fields are not touched.",
+        )
+        .tag("Settings")
+        .authenticated()
+        .require_license_features::<License>([])
+        .handler(handlers::delete_all_named_settings)
+        .no_content_response(StatusCode::NO_CONTENT, "Named settings deleted (no body)")
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_500(openapi)
+        .register(router, openapi);
 
     router
 }

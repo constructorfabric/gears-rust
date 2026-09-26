@@ -22,5 +22,7 @@
 pub mod api;
 pub mod models;
 
-pub use api::SimpleUserSettingsClientV1;
-pub use models::{SimpleUserSettings, SimpleUserSettingsPatch, SimpleUserSettingsUpdate};
+pub use api::{NamedSettingsClientV1, SimpleUserSettingsClientV1};
+pub use models::{
+    NamedSetting, SimpleUserSettings, SimpleUserSettingsPatch, SimpleUserSettingsUpdate,
+};

@@ -29,6 +29,8 @@ pub(crate) mod actions {
     pub const UPDATE: &str = "update";
 }
 
+mod named;
+
 // ============================================================================
 // Service Configuration
 // ============================================================================
@@ -36,12 +38,18 @@ pub(crate) mod actions {
 #[domain_model]
 pub struct ServiceConfig {
     pub max_field_length: usize,
+    /// How many named settings one user may hold in one tenant.
+    pub named_settings_per_user: usize,
+    /// Upper bound on one named setting's value, as serialized JSON bytes.
+    pub named_value_max_bytes: usize,
 }
 
 impl Default for ServiceConfig {
     fn default() -> Self {
         Self {
             max_field_length: 100,
+            named_settings_per_user: 256,
+            named_value_max_bytes: 4096,
         }
     }
 }

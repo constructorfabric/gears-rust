@@ -9154,6 +9154,37 @@
         ],
         "type": "object"
       },
+      "NamedSettingDto": {
+        "description": "One named setting on the wire.",
+        "properties": {
+          "key": {
+            "type": "string"
+          },
+          "value": {
+            "description": "Any JSON value."
+          }
+        },
+        "required": [
+          "key",
+          "value"
+        ],
+        "type": "object"
+      },
+      "NamedSettingsListDto": {
+        "description": "Every named setting the caller has, ordered by key.",
+        "properties": {
+          "settings": {
+            "items": {
+              "$ref": "#/components/schemas/NamedSettingDto"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "settings"
+        ],
+        "type": "object"
+      },
       "NewUserPasswordDto": {
         "description": "Mirrors [`NewUserPassword`](account_management_sdk::NewUserPassword).\n`value` is redacted in `Debug`; do not log this struct directly.",
         "properties": {
@@ -13871,6 +13902,18 @@
         },
         "required": [
           "values"
+        ],
+        "type": "object"
+      },
+      "PutNamedSettingRequest": {
+        "description": "Body of `PUT /named-settings/{key}`: the value to store under the key.",
+        "properties": {
+          "value": {
+            "description": "Any JSON value."
+          }
+        },
+        "required": [
+          "value"
         ],
         "type": "object"
       },
@@ -52308,6 +52351,375 @@
         "summary": "Add membership",
         "tags": [
           "Resource Group Memberships"
+        ]
+      }
+    },
+    "/simple-user-settings/v1/named-settings": {
+      "delete": {
+        "description": "Forget every named setting of the authenticated user in one call, e.g. on offboarding or an erasure request. Answers 204 whether or not any were set; the fixed theme/language fields are not touched.",
+        "operationId": "simple_user_settings.delete_all_named_settings",
+        "responses": {
+          "204": {
+            "description": "Named settings deleted (no body)"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Delete all named settings",
+        "tags": [
+          "Settings"
+        ]
+      },
+      "get": {
+        "description": "Every named setting of the authenticated user, ordered by key",
+        "operationId": "simple_user_settings.list_named_settings",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NamedSettingsListDto"
+                }
+              }
+            },
+            "description": "Named settings"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "List named settings",
+        "tags": [
+          "Settings"
+        ]
+      }
+    },
+    "/simple-user-settings/v1/named-settings/{key}": {
+      "delete": {
+        "description": "Forget one named setting. Deleting a key that is not set also answers 204.",
+        "operationId": "simple_user_settings.delete_named_setting",
+        "parameters": [
+          {
+            "description": "Setting key: 1-128 characters from A-Z a-z 0-9 . _ - :",
+            "in": "path",
+            "name": "key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Named setting deleted (no body)"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Delete a named setting",
+        "tags": [
+          "Settings"
+        ]
+      },
+      "get": {
+        "description": "One named setting of the authenticated user; 404 if it is not set",
+        "operationId": "simple_user_settings.get_named_setting",
+        "parameters": [
+          {
+            "description": "Setting key: 1-128 characters from A-Z a-z 0-9 . _ - :",
+            "in": "path",
+            "name": "key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NamedSettingDto"
+                }
+              }
+            },
+            "description": "Named setting"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Get a named setting",
+        "tags": [
+          "Settings"
+        ]
+      },
+      "put": {
+        "description": "Create or replace one named setting. The value is any JSON value within the configured size bound; a new key past the per-user count bound is refused with 429.",
+        "operationId": "simple_user_settings.put_named_setting",
+        "parameters": [
+          {
+            "description": "Setting key: 1-128 characters from A-Z a-z 0-9 . _ - :",
+            "in": "path",
+            "name": "key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PutNamedSettingRequest"
+              }
+            }
+          },
+          "description": "The value to store",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NamedSettingDto"
+                }
+              }
+            },
+            "description": "Named setting stored"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Set a named setting",
+        "tags": [
+          "Settings"
         ]
       }
     },

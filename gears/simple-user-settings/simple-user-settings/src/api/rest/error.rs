@@ -29,6 +29,12 @@ impl From<DomainError> for CanonicalError {
                     .with_resource("self")
                     .create()
             }
+            // Distinct from `Validation` on purpose: the request is fine, the
+            // caller has to free room first. The quota code lets a client tell
+            // "delete something" apart from "fix the key".
+            DomainError::LimitReached(msg) => UserSettingsError::resource_exhausted(msg.clone())
+                .with_quota_violation("NAMED_SETTINGS_PER_USER", msg)
+                .create(),
             DomainError::Internal(msg) => {
                 tracing::error!(msg = %msg, "simple-user-settings internal error");
                 CanonicalError::internal(msg).create()

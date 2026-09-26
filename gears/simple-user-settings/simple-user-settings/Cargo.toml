@@ -47,3 +47,4 @@ toolkit-macros = { workspace = true }
 
 [dev-dependencies]
 toolkit-gts = { workspace = true }
+tower = { workspace = true, features = ["util"] }

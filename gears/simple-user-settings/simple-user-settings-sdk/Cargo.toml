@@ -18,6 +18,7 @@ workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
+serde_json = { workspace = true }
 uuid = { workspace = true }
 
 toolkit = { workspace = true }

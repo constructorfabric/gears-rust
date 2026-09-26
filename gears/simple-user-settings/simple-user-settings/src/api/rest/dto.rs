@@ -1,4 +1,4 @@
-use simple_user_settings_sdk::models::{SimpleUserSettings, SimpleUserSettingsPatch};
+use simple_user_settings_sdk::models::{NamedSetting, SimpleUserSettings, SimpleUserSettingsPatch};
 use uuid::Uuid;
 
 #[derive(Debug)]
@@ -46,4 +46,37 @@ impl From<PatchSimpleUserSettingsRequest> for SimpleUserSettingsPatch {
             language: req.language,
         }
     }
+}
+
+/// One named setting on the wire.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct NamedSettingDto {
+    pub key: String,
+    /// Any JSON value.
+    pub value: serde_json::Value,
+}
+
+impl From<NamedSetting> for NamedSettingDto {
+    fn from(setting: NamedSetting) -> Self {
+        Self {
+            key: setting.key,
+            value: setting.value,
+        }
+    }
+}
+
+/// Every named setting the caller has, ordered by key.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct NamedSettingsListDto {
+    pub settings: Vec<NamedSettingDto>,
+}
+
+/// Body of `PUT /named-settings/{key}`: the value to store under the key.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(request)]
+pub struct PutNamedSettingRequest {
+    /// Any JSON value.
+    pub value: serde_json::Value,
 }
