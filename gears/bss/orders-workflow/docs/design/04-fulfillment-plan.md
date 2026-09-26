@@ -187,7 +187,8 @@ order has reached `activated`. There is no partial completion state; an order wi
 unactivated line **MUST NOT** be acknowledged `completed` under any partial-failure policy. The
 acknowledgement itself is slice 06's `report-outcome`; this slice owns the **completion
 predicate** it evaluates — every task of the frozen plan `activated` with a non-null
-`subscription_id` — and `report-outcome` **MUST** refuse `outcome: completed` when the predicate
+`subscription_id`, and those identifiers distinct across the plan's tasks (the Orders-side check
+for Lifecycle's `acknowledgement-subscription-duplicated`, [06 §4.9](./06-saga-and-compensation.md#49-every-lifecycle-answer-to-report-outcome-normative)) — and `report-outcome` **MUST** refuse `outcome: completed` when the predicate
 does not hold (Lifecycle PRD §6.1).
 
 **ADRs**: `cpt-cf-bss-orders-workflow-adr-two-wave-activation-barrier`
@@ -298,7 +299,7 @@ below are normative in this slice, with their columns in §3.7.
 | `FulfillmentPlan` | Per `orderId` + `orderVersion` container of all `FulfillmentTask`s: the observed payment-authorization outcome and instant, the validated dependency graph, the pinned partial-failure policy, the Catalog topology revision, the expected-fulfillment instant and the construction-time re-check observation. Created unfrozen by the first `evaluate-payment-auth-eligibility`; its graph, policy and revision are immutable once frozen. | `owf_fulfillment_plan` (§3.7) |
 | `FulfillmentTask` | One per order line item (bundle lines never expanded). Carries wave-aligned state (`pending`, `draft_created`, `activated`, `failed`) under the transition table of §3.7, its topological rank, the downstream transition-request identifier (join key only), the resulting `subscription_id` once `activated`, and the per-terminal-entry emission counters. Its opaque row reference is the `lineRef` (a `taskRef` in ADR-0013's terms) the definition carries. | `owf_fulfillment_task` (§3.7) |
 | `DependencyEdge` | A directed edge between two `FulfillmentTask`s within the same plan, resolved from Catalog topology at construction time. | Embedded in `owf_fulfillment_plan.dependency_graph` (§3.7) |
-| `ActivationAbortRecord` | The machine-readable reason of a pre-activation abort (`overlap-collision`, `market-divergence`, `payment-authorization-stale`, `overlap-read-unevaluable`) or of a plan that did not freeze (`invalid-dependency-graph`, `catalog-topology-unavailable`), with per-line reasons where the re-check names lines, the evidence reference, the recording instant and the platform `attempt_id`. The void evidence and void outcome are slice 06's compensation record, not this record. | `owf_fulfillment_plan.abort_record` (§3.7) |
+| `ActivationAbortRecord` | The machine-readable reason of a pre-activation abort (`overlap-collision`, `market-divergence`, `payment-authorization-stale`, `overlap-read-unevaluable`, `identity-party-unavailable`) or of a plan that did not freeze (`invalid-dependency-graph`, `catalog-topology-unavailable`), with per-line reasons where the re-check names lines, the evidence reference, the recording instant and the platform `attempt_id`. The void evidence and void outcome are slice 06's compensation record, not this record. | `owf_fulfillment_plan.abort_record` (§3.7) |
 
 **Relationships**:
 - `FulfillmentPlan` -> `FulfillmentTask`: one plan owns one task per order line item.
@@ -962,7 +963,7 @@ table is lost; no table in this slice holds a timer.
 | recheck_first_defer_at | timestamptz nullable | Database time of the first `defer` in the current ladder. |
 | frozen_at | timestamptz nullable | When the plan was frozen; an unfrozen row is never dispatched against. |
 | frozen_by_attempt_id | text nullable | The platform `attempt_id` of the call that froze the plan (`01 §3.3` *Attempt identity*). |
-| abort_record | jsonb nullable | `ActivationAbortRecord`: `reason` (`overlap-collision` \| `market-divergence` \| `payment-authorization-stale` \| `overlap-read-unevaluable` \| `invalid-dependency-graph` \| `catalog-topology-unavailable`), per-line reasons, evidence reference, `recorded_at`, `attempt_id`. |
+| abort_record | jsonb nullable | `ActivationAbortRecord`: `reason` (`overlap-collision` \| `market-divergence` \| `payment-authorization-stale` \| `overlap-read-unevaluable` \| `identity-party-unavailable` \| `invalid-dependency-graph` \| `catalog-topology-unavailable`), per-line reasons, evidence reference, `recorded_at`, `attempt_id`. |
 | created_at | timestamptz | Row creation time; the retention index's column. |
 
 **PK**: (order_id, order_version)

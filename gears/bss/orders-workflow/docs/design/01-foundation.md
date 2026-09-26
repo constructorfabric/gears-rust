@@ -904,7 +904,8 @@ next round out, a per-instance counter, an attempt only from an operator retry):
    in `owf_process_instance.key_rounds` (§3.7). A family is the operation name plus the subject
    its key names (the stage, gate position and mode, park, plan or wave). The counter advances by
    one in the transaction that settles a round's key with success, under the instance row lock the
-   audit append already takes (§4.17). At `inst-owf-step-shape` the envelope compares the
+   audit append already takes (§4.17) — whether the envelope settles it or `settle-from-lookup`
+   settles a dead-lease key with `success` (§3.3 `settle-from-lookup`). At `inst-owf-step-shape` the envelope compares the
    presented round with the counter: equal is the next round; lower is a replay, which the
    registry resolves under its retained record (§3.7 *Retention*); higher is
    `idempotency-key-mismatch` (400). The round is never counted from `owf_step_log` rows, which the
@@ -1028,7 +1029,12 @@ Effect: under the registry row's lock, re-read `status`, `lease_expires_at` and 
 if the row is still `in_flight` with a dead lease held by `leaseHolder`, or `open`, write the step record for the stuck attempt with
 the looked-up result — for a multi-line dispatch key, the operation's full output built from
 Orders' record ([`05 §3.6`](./05-provisioning-intents.md#36-interactions--sequences)
-`inst-ri-settle-key`) — settle the key (`settled/success` or `settled/failure` on a terminal lookup),
+`inst-ri-settle-key`) — settle the key (`settled/success` or `settled/failure` on a terminal lookup;
+a `settled/success` of a round-keyed family also advances that family's `round` counter in
+`owf_process_instance.key_rounds` by one, in the same transaction and under the instance row lock,
+exactly as rule 2 of §3.3 *Rounds and attempts* does for an envelope settlement, so the
+`nextDispatchRound` the stored output returns is the counter's next round and not
+`idempotency-key-mismatch`),
 or leave it `open` — on `non-terminal` inside the key lifetime, and on `absent` (nothing the
 attempt would have sent was sent, so the dispatching operation's same-key re-run is safe by
 construction, [`05 §4.4`](./05-provisioning-intents.md#44-operation-rules-normative)) — and write
@@ -1042,7 +1048,7 @@ nothing. This is the only path that may settle a key whose closure it did not ru
 
 | Field | Value |
 |-------|-------|
-| `protection` | `composable` (operator), **in-process only**: it is never a definition `call` target (the validation hook rejects one, `10 §2.2` rule 1) and no principal holds its `process_step × execute` value ([`09 §3.1`](./09-read-and-authz.md#31-domain-model)); it runs only inside `resolve-manual-task`'s `retry` resolution (slice 07), exactly as `settle-from-lookup` runs only inside the sweep (decision D-108) |
+| `protection` | `composable` (operator), **in-process only**: it is never a definition `call` target (the validation hook rejects one, `10 §2.2` rule 1) and no principal holds its `process_step × execute` value ([`09 §3.1`](./09-read-and-authz.md#31-domain-model)); it runs only inside `resolve-manual-task`'s `retry` resolution (slice 07), exactly as `settle-from-lookup` runs only in-process inside its three named callers — `reconcile-intent`, `compensate-order` (`inst-co-settle-prior`) and the `reconciliation-sweep` worker — and never as a definition `call` (decision D-108) |
 | `input` | `correlationId`, `stepRef` (operation name plus subject reference), `taskRef` (the manual task whose `retry` resolution invokes it), `requestRef` (the applied `owf_task_resolution_request` row, [`07 §3.7`](./07-manual-tasks.md#37-database-schemas--tables)), `attemptId` |
 | `output` | `attemptKey` (the minted `attempt` the definition passes to the re-entered operation, which appends it to its key after the round, §3.3 *Rounds and attempts*), `quarantined` |
 | `idempotency_key` | instance-scoped: `{tenant}:{correlationId}:retry-step:{taskRef}:{resolutionSeq}` |
@@ -1054,8 +1060,8 @@ nothing. This is the only path that may settle a key whose closure it did not ru
 | `deadline` | 5 s |
 
 Effect: verify the instance `row_version` the caller presents, apply the Orders-side quarantine
-of §4.13 (three consecutive retries of one `stepRef` whose attempts terminated without a settled
-outcome trip `poison-step`), mint the next `attempt` of the step's family in
+of §4.13 (three consecutive **presented** attempts of one `stepRef` that terminated without a settled
+outcome trip `poison-step`; an attempt no call ever presented is skipped), mint the next `attempt` of the step's family in
 `owf_process_instance.key_rounds` (§3.3 *Rounds and attempts*, rule 3), and record the operator's retry as a `retry` audit entry whose actor is the request row's `requested_by`, never the `SecurityContext` of the call that carries it, which is the serverless-runtime principal's ([`07 §4.6`](./07-manual-tasks.md#46-operation-rules-normative) rule 3).
 The re-dispatch itself is the definition's resume arm (`10 §3.6` (c)).
 
@@ -1356,13 +1362,13 @@ has no enforcing predicate.
 | seller_tenant_id | uuid, NOT NULL | Selling-party axis; the key the operator surfaces scope by |
 | definition_version | text, NOT NULL | Denormalised from the binding for reads; equal to the binding's value by CHECK-on-insert and never rewritten |
 | invocation_id | text, nullable | The platform invocation driving this instance (`DESIGN.md:865`); the handle the sweep's status read and the signal delivery of `10 §3.3` use, and the value every step route call is bound to (§3.3 step 3, *Invocation binding*); never re-bound (D-86); NULL only under `definition_source = code` |
-| next_liveness_at | timestamptz, NOT NULL | When the instance liveness pass of §3.8 next reads the invocation's platform status; set by `start-instance` to now + 15 min and advanced by each pass (D-105) |
+| next_liveness_at | timestamptz, NOT NULL | When the instance liveness pass of §3.8 next reads the invocation's platform status; set by `start-instance` to now + 15 min and advanced by each pass — 15 min while the invocation is live, 5 min while it is not, so the pass observes the SLA of the tasks no definition waits on (D-105, D-151) |
 | phase | enum | `started`, `suspended`, `parked`, `compensating`, `terminated` — a **recorded projection** written by step operations, see the transition table below |
 | suspended | boolean | Set by `apply-hold`, cleared by `apply-resume`; redundant with `phase = suspended` and kept as the hold predicate the dispatch operations read |
 | last_settled_step | text, nullable | The last settled **protected** operation and its subject; a read-side marker, not a resume pointer — the platform resumes from its own history |
 | row_version | bigint, NOT NULL, DEFAULT 0 | Optimistic-concurrency version, incremented on **every** write to this row; surfaced to operator callers as an ETag and required as `If-Match` on the mutating operations of `09 §3.3` |
 | audit_sequence | bigint, NOT NULL, DEFAULT 0 | The instance's committed audit-chain head: incremented under this row's lock in the same transaction as every `owf_audit_entry` append for this `correlation_id` (§4.17). The `start-instance` transaction that inserts this row also writes the `instance-start` entry |
-| key_rounds | jsonb, NOT NULL, DEFAULT `{}` | The per-family round and attempt counters of §3.3 *Rounds and attempts*: one entry `{round, attempt}` per family (operation name plus the subject its key names). Written only by the envelope, under this row's lock, in the transaction that settles a round with success (`round`) or that `retry-step` commits (`attempt`); never decremented, never purged while the row exists |
+| key_rounds | jsonb, NOT NULL, DEFAULT `{}` | The per-family round and attempt counters of §3.3 *Rounds and attempts*: one entry `{round, attempt}` per family (operation name plus the subject its key names). Written only by the envelope, under this row's lock, in the transaction that settles a round with success (`round`, including a `settle-from-lookup` settlement with `success`, §3.3) or that `retry-step` commits (`attempt`); never decremented, never purged while the row exists |
 | terminal_outcome | enum, nullable | `completed`, `aborted`, or NULL while non-terminal |
 | created_at, updated_at | timestamptz | Bookkeeping |
 
@@ -1526,7 +1532,7 @@ for `reconcile-intent`'s check of a dispatching step key (§3.8).
 | Value | Working baseline | Derivation |
 |-------|------------------|------------|
 | Key lifetime (`expires_at`) | **30 days** from creation | At or above the maximum retry horizon, which includes manual-task resolution and one or more hold/resume cycles and is therefore measured in days, not hours |
-| In-flight lease (`lease_expires_at`) | **15 s** | Above the longest per-operation deadline (10 s, §4.2), so a live holder never loses its lease before its own deadline cuts it; below the retry horizon (~15-30 s of cumulative backoff, §4.5), so the later same-key retries of a crashed holder land on a dead lease, which §4.3 resolves, instead of all landing on a live one and exhausting into the failure arm |
+| In-flight lease (`lease_expires_at`) | **15 s** | Above the longest per-operation deadline (10 s, §4.2), so a live holder never loses its lease before its own deadline cuts it; short enough that the later same-key retries of a crashed holder **usually** land on a dead lease, which §4.3 resolves: the lease dies 10-15 s after the crash (the last heartbeat plus the lease), and the declared retry policy (§4.5) spaces the attempts by an exponential delay from 1 s plus a 0-30 s jitter draw, so most retry trains outlast it. The claim is probabilistic, not a bound: the draw is the plugin's, and a train whose every attempt meets the live lease settles `still-processing` each time, exhausts and faults the invocation. That fault is the stated fallback — the liveness pass raises the `invocation-dead` task and the operator re-drives (§4.16, [`07 §4.4`](./07-manual-tasks.md#44-resolution-actions-by-reason-and-the-two-operator-roles-normative)) — and no longer lease, which would make every retry meet a live one (D-103), avoids it |
 | Lease heartbeat | **5 s** | One third of the lease, so two consecutive missed heartbeats are needed before a lease is considered dead |
 
 **The heartbeat rule is normative.** While an effect runs under an `in_flight` record, the holder
@@ -1956,9 +1962,10 @@ past the retry budget at `report-outcome` leaves exactly that — so the backsto
 invocation is this pass, keyed on the instance, not the intents. Per row:
 
 1. [ ] - `p1` - **Live** — `queued`, `running` or `suspended` ([`DESIGN.md:445-458`](../../../../serverless-runtime/docs/DESIGN.md#invocation-status-state-machine)): set `next_liveness_at` = now + 15 min; nothing else is written - `inst-owf-live-ok`
-2. [ ] - `p1` - **Not live** — `failed`, `dead_lettered`, `canceled`, `compensating`, `compensated` or `succeeded`, or a `404` for the bound id: in one transaction under the instance row lock, recheck that the row is non-terminal and still bound to that invocation, create through slice 07's creation port one order-scope manual task with reason `invocation-dead` and cause `invocation-ended` ([`07 §3.3`](./07-manual-tasks.md#33-api-contracts)), write a `sweep` audit entry naming the platform status, and set `next_liveness_at` = now + 15 min. The task's uniqueness (`07 §3.7`) absorbs the task on every later pass while it is open and reopens it when an invocation that a re-drive revived dies again. `canceled` is how a platform `:control` `cancel` issued outside this gear surfaces (`10 §4.4`) - `inst-owf-live-dead`
+2. [ ] - `p1` - **Not live** — `failed`, `dead_lettered`, `canceled`, `compensating`, `compensated` or `succeeded`, or a `404` for the bound id: in one transaction under the instance row lock, recheck that the row is non-terminal and still bound to that invocation, create through slice 07's creation port one order-scope manual task with reason `invocation-dead` and cause `invocation-ended` ([`07 §3.3`](./07-manual-tasks.md#33-api-contracts)), write a `sweep` audit entry naming the platform status, and set `next_liveness_at` = now + 5 min — the `waitSla` tick, so the SLA observation of item 5 keeps the definition's granularity while no definition runs (decision D-151). The task's uniqueness (`07 §3.7`) absorbs the task on every later pass while it is open and reopens it when an invocation that a re-drive revived dies again. `canceled` is how a platform `:control` `cancel` issued outside this gear surfaces (`10 §4.4`) - `inst-owf-live-dead`
 3. [ ] - `p1` - **Unreadable** — the status read times out or answers `5xx`: write nothing, leave `next_liveness_at`, count the failure; the next pass reads again - `inst-owf-live-unreadable`
 4. [ ] - `p1` - **Dead-instance unwind.** For an instance whose `invocation-dead` task holds an applied `cancel` resolution, the pass drives the fallback unwind of D-105 (§4.16) one operation per pass - `inst-owf-live-unwind`
+5. [ ] - `p1` - **SLA observation with no live waiter.** For an instance read not live, each pass calls `resolve-manual-task` in-process through the envelope with `trigger: sla-check`, scoped by `taskRef` to each open task of the instance whose only waiter was the definition and that is escalate-only — the `invocation-dead` task itself, and every compensation-reason or order-scope task (`draft-void-failed`, `activated-cancel-failed`, `authority-withdrawn`) the dead-instance unwind of item 4 raised — each under its own scoped family `…:resolve-manual-task:sla:{taskRef}:{slaRound}` from round 0, the round taken from that family's previous settled answer in Orders' record, as item 4 takes its keys ([`07 §4.2`](./07-manual-tasks.md#42-remediation-exhausted-and-the-consequence-of-a-breach-normative)). A scoped check never exhausts, so a breach stamps `sla_breached_at`, raises `severity` to `escalated` and routes to `seller-operator` exactly as the definition's `PT5M` branch would. A forward (`line` or `plan`) task left open when the invocation died is **not** checked here: its exhaustion would enter compensation, which only a running definition or the operator's `cancel` can drive; a re-drive resumes its fork, whose next `sla-check` compares the stored `sla_deadline` with database time and breaches late rather than never, and the dead-instance unwind's fence closes it (`06 §3.6` fencing step 1). This is the precedent of the ceiling's scoped check (decision D-129) applied to the one waiter the platform cannot run (decision D-151) - `inst-owf-live-sla`
 
 A platform `:control` `suspend` issued outside this gear is indistinguishable from the `suspended`
 of a `listen` or `wait` and is detected only when the suspension times out into `failed`
@@ -2071,7 +2078,7 @@ each is recorded here so an unset value is a visible choice.
 | Per-operation deadline | operation (`deadline`) | 10 s for a dispatch operation; 5 s for a record-only operation | Set from the downstream's service objective, not from caller patience: 3-10x its p99 |
 | Task timeout, **wave-2 (activation) tasks** | definition | 3 min | The p95 ≤ 15 min clock starts at activation-wave eligibility, so the window bounds wave 2, the barrier release and the acknowledgement |
 | Task timeout, **wave-1 (draft-create) tasks** | definition | 10 min | Wave 1 sits outside the measured window |
-| Retry budget | definition (`use.retries`) | 5 attempts, exponential from 1 s, capped 30 s, full jitter | With the curve of §4.5 this spends ~15-30 s of cumulative backoff; the 3 min wave-2 timeout on the same `try` bounds it whatever curve the plugin applies, so the validation hook checks only that one attempt's deadline fits the timeout (`10 §2.2` rule 4, D-126) |
+| Retry budget | definition (`use.retries`) | 5 attempts, exponential from 1 s, jitter 0-30 s (`10 §3.6` `use.retries.transient`) | The curve of §4.5; the cumulative backoff is the plugin's draw, typically tens of seconds; the 3 min wave-2 timeout on the same `try` bounds it whatever curve the plugin applies, so the validation hook checks only that one attempt's deadline fits the timeout (`10 §2.2` rule 4, D-126) |
 | Overdue window | seller policy, pinned on the plan by `construct-and-freeze-plan` (`04 §3.7`); the definition owns only the `PT1H` re-check tick (D-134) | 24 h past expected fulfillment time, the default a seller's policy starts from | The PRD's business default for commercial policy (`cpt-cf-bss-orders-workflow-fr-owf-overdue-escalation`); a seller's value is bounded where the policy is written (`07 §4.8` item 8) |
 | Max process lifetime | definition (top-level `wait` arm) | 90 days from process start, never cancelled by a hold | Accepted (`DECISIONS.md` D-53) |
 
@@ -2129,13 +2136,16 @@ are executed by the plugin's
 durable timers, which survive a platform worker restart by the plugin's own history
 ([serverless-runtime ADR-0004](../../../../serverless-runtime/docs/ADR/0004-cpt-cf-serverless-runtime-adr-temporal-workflow-engine.md)
 *Consequences*). Orders **MUST** record, through a step operation, every arm, pause, re-arm and
-fire that has an audit consequence — `open-gates` (arm), `apply-hold` (pause, returning the
-remainder), `apply-resume` (re-arm with that remainder), `escalate-gate` and
+fire that has an audit consequence — `open-gates` (arm), `apply-hold` (pause: slice 03's gate-window port captures the
+remainder into `owf_approval_gate.window_remaining_ms`, and nothing is returned), `apply-resume`
+(re-arm: the port re-bases the escalation deadline from that stored value), `escalate-gate` and
 `raise-overdue-escalation` (fire) — so the audit trail says what the timers did without reading
 the platform's history. A hold **MUST** pause only the approval-escalation wait and **MUST NOT**
 pause the overdue window, the lifetime ceiling, the barrier or the sweep, which is the definition
-pattern of `10 §4`; the remainder has exactly one authority, the value `apply-hold` computes and
-records from the gate's `opened_at` and window (slice 08), and no table in this slice restates it.
+pattern of `10 §4`; the remainder has exactly one authority, `owf_approval_gate.window_remaining_ms`, which slice
+03's gate-window port captures against database time when `apply-hold` (slice 08) calls it
+([`03 §4.2`](./03-approval-execution.md#42-the-outage-threshold-the-ttl-lead-time-and-the-paused-window), [`08 §2.2`](./08-hold-and-cancel.md#22-constraints));
+it is never returned to the definition, and no table in this slice restates it.
 
 ### 4.5 The envelope's bound and the caller-side duplicate protocol
 
@@ -2164,11 +2174,16 @@ that calls a downstream):
 - A duplicate success response **MUST** be absorbed without double-advancing the
   `FulfillmentTask` or any other process-owned field.
 
-**Backoff curve and jitter (working baseline, declared on the definition)**: exponential with
-base 1 s, coefficient 2.0, capped at 30 s, and **full jitter** — the delay before attempt *n* is
-drawn uniformly from `[0, min(30 s, 1 s * 2^n)]`; maximum **5** attempts. The spec's retry
-policy expresses delay, exponential backoff, a jitter range and an attempt limit (`10 §2`), and
-the draw is the plugin's — inside its own deterministic replay, not Orders' concern (§4.14).
+**Backoff curve and jitter (working baseline, declared on the definition)**: a 1 s base delay,
+exponential backoff, a jitter range of 0-30 s and a maximum of **5** attempts — exactly the
+`use.retries.transient` policy of `10 §3.6` (`delay: 1 s`, `backoff: exponential`,
+`jitter: 0 s to 30 s`, `limit.attempt.count: 5`). A 1.0.0 retry policy expresses delay, backoff
+kind, a jitter range and limits, and nothing more (dsl-reference.md *Retry*, *Backoff*,
+*Jitter*): it has no cap on a single delay and no full-jitter form, so this design claims none.
+The exponential multiplier and how the jitter draw composes with the delay are the plugin's —
+inside its own deterministic replay, not Orders' concern (§4.14) — and every Orders sizing that
+depends on the spread is stated as probable, never as a bound (the lease, §3.7); the bound on the
+whole train is the task timeout on the same `try` (§4.2, `10 §2.2` rule 4).
 
 **Circuit breakers on every outbound dependency.** A retry budget throttles *retries*; it does
 nothing about first attempts. Every outbound dependency an operation calls — Subscriptions, Orders
@@ -2634,11 +2649,20 @@ plugin's poison handling and ends in the invocation's `failed` or `dead_lettered
 and its instance liveness pass raises the instance as an `invocation-dead` task. This slice keeps
 exactly one crash-loop guard of its own: **`retry-step` MUST quarantine** a step whose operator
 retries keep terminating without a settled outcome — working baseline **3** consecutive retries of
-one `stepRef` whose attempts left the key `in_flight` with a dead lease or produced no step record
-— by refusing the fourth with `poison-step`, writing the `retry` audit entry with that reason and
+one `stepRef` whose attempts were **presented** — a call of the family arrived under the attempt's
+key, so the registry holds a record for it — and left that key `in_flight` with a dead lease or
+produced no step record — by refusing the fourth with `poison-step`, writing the `retry` audit entry with that reason and
 leaving the manual task open for escalation. The guard is deliberately separate from the
 definition's retry budget: sharing one counter would let an ordinary retry train exhaust the
-quarantine allowance.
+quarantine allowance. For the same reason an attempt that no call presented is **skipped** — it
+neither counts nor breaks the consecutive run. Under D-119 every line task of a wave mints into
+the wave's one dispatch family, and the definition carries only the wave's latest attempt, so the
+attempts minted by several line retries before the next dispatch are overwritten unused, and a
+retry of a `submitted` or `unresolved` line mints one that causes no dispatch
+([`05 §4.4`](./05-provisioning-intents.md#44-operation-rules-normative)). None of those is a crash,
+so an operator retrying four lines of one wave under the remediation hold is never refused
+`poison-step` for them; the one attempt the next dispatch presents settles and resets the run
+(decision D-152).
 
 ### 4.14 Determinism discipline: what is computed on which side of the boundary
 

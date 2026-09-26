@@ -646,15 +646,24 @@ sequenceDiagram
     LC -->> AT: submitted, version v
     AT ->> RC: step record (result: start, v); settle key; step-completion
     AT -->> PL: admission = start, correlationId
-    PL ->> SI: task startInstance (correlationId, definition version)
-    SI ->> RC: insert instance + binding (partial unique index arbitrates); instance-start
-    SI -->> PL: correlationId, definitionVersion, invocationId (bound)
+    PL ->> SI: task startInstance (correlationId, definitionId, definitionVersion, invocationId)
+    SI ->> PL: GET /invocations/{invocationId} (platform invocation record)
+    PL -->> SI: function_id, function_version
+    alt callable not a major of order_process, or function_version differs from definitionVersion
+        SI -->> PL: 400 definition-not-bound (no instance, no binding)
+    else bound
+        SI ->> RC: insert instance + binding from the invocation record (partial unique index arbitrates); instance-start
+        SI -->> PL: correlationId, definitionVersion, invocationId (bound)
+    end
 ```
 
 **Description**: The platform event trigger starts an invocation of the bound definition version;
 its first task calls `admit-trigger` with the event's references only. The operation derives the
-`correlationId`, reads the order under R1 and settles `start`. `start-instance` then inserts the
-instance, and the partial unique index — not the read — decides single occupancy. Its answer
+`correlationId`, reads the order under R1 and settles `start`. `start-instance` then reads the
+platform's invocation record for its `invocationId` and binds the `function_id` and
+`function_version` it names, never a version the task input declares; a record that names another
+callable or version refuses `definition-not-bound` (decision D-137, [`01 §3.6`](./01-foundation.md#start-instance-binds-the-definition-version)).
+It inserts the instance and the binding, and the partial unique index — not the read — decides single occupancy. Its answer
 carries the invocation the instance is bound to; an invocation that reads back another
 invocation's id is a duplicate and ends itself (`01 §3.3` `start-instance`). The approval
 stage of fragment (a) follows.
@@ -865,7 +874,12 @@ Supersession on `OrderAmended` is **two invocations and an ordering**, not one t
 prior version's invocation admits the event under the listen role, receives `supersede`, and runs
 `run-cancellation-fence` (trigger `supersede`) → `compensate-order` → `report-outcome`
 (`outcome: superseded`) → `terminate-instance` with `terminalOutcome = aborted`,
-`terminationKind = superseded` and `supersededByOrderVersion = currentOrderVersion`. The new
+`terminationKind = superseded` and `supersededByOrderVersion = currentOrderVersion`, the version
+the admitting call's Lifecycle read returned. Every listen admission of the definition — the
+lifecycle, hold, resume and acceptance arms — exports that value as `supersededByOrderVersion` on a
+`supersede` answer (null otherwise), so the pre-admitted routes carry it as well; no version is
+copied from the consumed event, whose own `orderVersion` is the instance's for an `OrderCancelled`
+correlated on the pinned version (`10 §3.6` (f), decision D-155). The new
 version's invocation, started by the `OrderAmended` trigger, admits the same event under the start
 role; while an active instance for the order is pinned to an older version, `admit-trigger`
 **MUST** answer `retryable-failure` with `prior-instance-active` and leave the key `open`, and it

@@ -169,6 +169,11 @@
   - [D-148 (M) The escalation bound counts every call between two fires](#d-148-m-the-escalation-bound-counts-every-call-between-two-fires)
   - [D-149 (H) Each ceiling's task is its own row, and the fence closes it](#d-149-h-each-ceilings-task-is-its-own-row-and-the-fence-closes-it)
   - [D-150 (L) The poll's task tail names its suspension; only `apply-hold` resets the poll round](#d-150-l-the-polls-task-tail-names-its-suspension-only-apply-hold-resets-the-poll-round)
+  - [D-151 (M) The liveness pass observes the SLA of the tasks no definition waits on](#d-151-m-the-liveness-pass-observes-the-sla-of-the-tasks-no-definition-waits-on)
+  - [D-152 (M) The quarantine counts only presented attempts](#d-152-m-the-quarantine-counts-only-presented-attempts)
+  - [D-153 (M) Slice 05 re-arms an unresolved intent through its own port](#d-153-m-slice-05-re-arms-an-unresolved-intent-through-its-own-port)
+  - [D-154 (M) `create-manual-task` verifies the route that names a subject, not only a failed task](#d-154-m-create-manual-task-verifies-the-route-that-names-a-subject-not-only-a-failed-task)
+  - [D-155 (M) `supersededByOrderVersion` is admit-trigger's `currentOrderVersion`](#d-155-m-supersededbyorderversion-is-admit-triggers-currentorderversion)
 - [Open Questions](#open-questions)
   - [Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?](#q-01-which-durable-execution-substrate-backs-the-process--the-oss-workflow-engine-or-a-bss-local-mechanism)
   - [Q-02: The Generic Approval escalation threshold — the one PRD-deferred numeric value this design deliberately leaves unset](#q-02-the-generic-approval-escalation-threshold--the-one-prd-deferred-numeric-value-this-design-deliberately-leaves-unset)
@@ -947,6 +952,14 @@ with it.
 
 **Propagates to**: `design/01-foundation.md` §4.5 (backoff curve and jitter working baseline)
 
+**Amended (2026-09-26)**: a 1.0.0 retry policy has a delay, a backoff kind, a jitter range and
+limits, and no cap on one delay and no full-jitter form (dsl-reference.md *Retry*, *Backoff*,
+*Jitter*), so the curve above cannot be declared. `01 §4.5` now states exactly what
+`use.retries.transient` declares — 1 s, exponential, jitter 0-30 s, 5 attempts — and leaves the
+multiplier and how the draw composes to the plugin; the sizings that depend on the spread (the
+registry lease, D-103) are stated as probable, and the bound on a whole train is the task timeout
+on the same `try` (re-review R-3).
+
 ### D-40: The per-attempt timeout is 10 s, set from the downstream's service objective rather than from caller patience
 
 **Amended by D-70 (2026-09-24).** The 10 s per-attempt timeout is the per-operation `deadline` of a dispatch operation inside the envelope (`01 §4.2`); record-only operations take 5 s.
@@ -1651,7 +1664,7 @@ The decisions in this section were taken when the order process flow moved from 
 gear to a versioned platform workflow definition (`ADR/0011`, `ADR/0012`, `ADR/0013`), and when
 each slice was restructured into step operations and a definition fragment. D-65…D-72 carry the
 three ADRs and their cross-cutting consequences; D-73…D-101 are the decisions the slice
-restructurings recorded, and D-102…D-150 the decisions taken on the second review of
+restructurings recorded, and D-102…D-155 the decisions taken on the second review of
 2026-09-26. Each names the entries it amends; the amended entries carry a dated
 **Amended by** note. D-65…D-101 were taken on 2026-09-24.
 
@@ -2669,6 +2682,12 @@ settled-attempt count collided with the rule that every receipt writes a row (OW
 §3.7 (`owf_step_log`, `owf_idempotency_registry`), §3.8, §4.3; `design/05-provisioning-intents.md`
 §3.2, §3.6, §4.4; `design/06-saga-and-compensation.md` §3.6; `DESIGN.md` §3.7, §3.8; D-03, D-71.
 
+**Amended (2026-09-26)**: "sized below the retry horizon" holds for most retry trains, not all
+of them. The lease dies 10-15 s after a crash, and a train whose every attempt meets the live
+lease exhausts and faults the invocation; that fault is the stated fallback (`invocation-dead` and
+the re-drive, D-105), and a longer lease would make every train meet it. `01 §3.7` states the
+lease rationale as probabilistic (re-review R-3, D-39 as amended).
+
 ### D-104 (M) No Workflow-owned table is partitioned; registry rows are kept as tombstones until no replay can arrive
 
 **Accepted (2026-09-26).** *(mirrors Lifecycle D-91)*
@@ -2768,6 +2787,13 @@ does not catch. Retry exhaustion of a listen-arm admission, `apply-hold`, `apply
 `authorize-cancel`, the fence or `report-outcome` reaches the operator only as `invocation-dead`
 (D-114).
 
+**Amended by D-151 (2026-09-26)**: while the platform reports the invocation not live, the
+pass runs every 5 min and calls `resolve-manual-task` (`sla-check`) in-process, scoped to the
+`invocation-dead` task and to the escalate-only tasks the dead-instance unwind raised, so their
+SLA breaches. The control-surface algorithm (`09 §3.6` `inst-cs-deliver`) issues `:control retry`
+only as the `invocation-dead` task's `retry` and only under D-86's confirmation condition
+(re-review R-2).
+
 ### D-106 (H) Every step call is bound to the instance's invocation, and the fence needs a recorded cause
 
 **Accepted (2026-09-26).** *(amends D-67)*
@@ -2859,6 +2885,12 @@ actor-from-the-request-row rule.
 **Propagated**: `design/01-foundation.md` §3.3; `design/07-manual-tasks.md` §4.6;
 `design/09-read-and-authz.md` §3.1, §4.2, §4.5; `design/10-process-definition.md` §2.2, §4.1;
 `DESIGN.md` §3.3, §3.5, §4.2; `UPSTREAM_REQS.md` §2.8; D-67, D-69.
+
+**Amended (2026-09-26)**: "exactly as `settle-from-lookup` runs only inside the sweep" was
+wrong since `compensate-order` settles its own previous pass through it (`06 §3.6`
+`inst-co-settle-prior`). The comparison is with `settle-from-lookup` running only in-process inside
+its three named callers — `reconcile-intent`, `compensate-order`, the sweep worker (re-review
+R-24).
 
 ### D-109 (H) Orders reports to Lifecycle only from fulfillment; a cancel before it is Lifecycle's own
 
@@ -3214,6 +3246,13 @@ cited above. No sibling gear re-dispatches a multi-line submit after an operator
 `design/06-saga-and-compensation.md` §2.1; `design/10-process-definition.md` §3.6 (b), (c);
 `DESIGN.md` §1.2; ADR-0006 as amended.
 
+**Amended by D-152, D-153 and D-154 (2026-09-26)**: the quarantine skips an attempt no call
+presented, so the attempts several line retries mint into the wave's one family are never counted
+(D-152); the re-arm of an `unresolved` row is slice 05's port `rearm_unresolved`, not a write by
+slice 07 (D-153); and `create-manual-task` accepts the subjects this entry's retry branch serves —
+an `unresolved` intent and every line an exhausted call named — rather than only `failed` tasks
+(D-154).
+
 ### D-120 (M) The read after a dispatch 409 is routed, and the call is re-issued only after a wait
 
 **Accepted (2026-09-26).**
@@ -3382,6 +3421,9 @@ not followed.
 **Propagated**: `design/05-provisioning-intents.md` §3.2, §3.3, §3.6, §3.7, §4.5;
 `design/07-manual-tasks.md` §3.6; `design/08-hold-and-cancel.md` §3.2, §3.6;
 `design/10-process-definition.md` §3.6 (b).
+
+**Amended by D-153 (2026-09-26)**: the operator's re-arm of an `unresolved` row, which clears
+`handed_off_at`, is made through slice 05's re-arm port, not by slice 07 writing the row.
 
 ### D-126 (H) The validation rules are stated over values the definition holds and a routing graph the check can enumerate
 
@@ -3815,6 +3857,9 @@ operator can write proves nothing. The publish restriction is an ask, not a plat
 `design/10-process-definition.md` §2.2, §3.1, §3.3, §3.6, §4.2, §4.3; `DESIGN.md` §3.1, §3.6,
 §4.2; `UPSTREAM_REQS.md` §2.9; `ADR/0012`; D-68, D-105.
 
+**Amended (2026-09-26)**: the start sequence of `02 §3.6` now shows the invocation-record read
+and the `definition-not-bound` branch, as `01 §3.6` does (re-review R-31).
+
 ### D-138 (M) A definition is published by a job of its own, behind a behavioural gate, and rolled back forward
 
 **Accepted (2026-09-26).** *(amends D-68, D-107)*
@@ -4232,6 +4277,119 @@ suspension already polled in another wait, so a lost resume was found up to k ×
 `design/07-manual-tasks.md` §3.3; `design/08-hold-and-cancel.md` §4.7 item 10; `ADR/0013`;
 D-116, D-130, D-133.
 
+### D-151 (M) The liveness pass observes the SLA of the tasks no definition waits on
+
+**Accepted (2026-09-26).** *(amends D-105)*
+
+**Decision**: for an instance the liveness pass reads not live, `next_liveness_at` advances by
+5 min instead of 15, and each pass calls `resolve-manual-task` with `trigger: sla-check`
+in-process through the envelope, scoped by `taskRef` to each open escalate-only task whose only
+waiter was the definition: the `invocation-dead` task, and the compensation-reason or order-scope
+tasks the dead-instance unwind raised. Each scoped check has its own family
+`…:resolve-manual-task:sla:{taskRef}:{slaRound}` from round 0, and the pass takes its round from
+the previous settled answer, as the dead-instance unwind takes its keys. A scoped check never
+exhausts, and one naming a forward task is refused `action-not-offered`. Forward tasks left open
+by the dead invocation are not checked: exhausting them would enter compensation, which only a
+running definition or the operator's `cancel` drives.
+
+**Rationale**: the `invocation-dead` task carries the 4 h window its own row calls the most
+urgent, but the only breach detector was the definition's `PT5M` branch, and for this task no
+definition runs; the pass only created the task and advanced `next_liveness_at`. The breach and
+the `seller-operator` escalation never happened (re-review R-1). **Precedent**: the ceiling
+wait's scoped check (D-129, `07 §3.3`), which already scopes `sla-check` to one escalate-only task
+under its own family; the dead-instance unwind (`01 §4.16` item 2), which already drives
+operations in-process from the pass under the keys the definition would present.
+
+**Propagated**: `design/01-foundation.md` §3.7 (`next_liveness_at`), §3.8
+(`inst-owf-live-dead`, `inst-owf-live-sla`); `design/07-manual-tasks.md` §3.3, §3.6
+(`inst-rmt-sla`), §4.2, §4.8 item 3; D-105.
+
+### D-152 (M) The quarantine counts only presented attempts
+
+**Accepted (2026-09-26).** *(amends D-119; refines `01 §4.13`)*
+
+**Decision**: `retry-step`'s quarantine counts an attempt toward the three only when a call of the
+family arrived under that attempt's key (the registry holds a record for it) and left it
+`in_flight` with a dead lease or produced no step record. An attempt no call presented is skipped:
+it neither counts nor breaks the consecutive run.
+
+**Rationale**: under D-119 every line task of a wave mints into the wave's one dispatch family and
+the definition carries only the latest attempt, so the attempts of several line retries resolved
+together are overwritten unused, and a retry of a `submitted` or `unresolved` line mints one that
+dispatches nothing. None produced a step record, so the fourth line retry of one wave was refused
+`poison-step` and its task waited for SLA exhaustion (re-review R-13). The guard exists for crash
+loops, and an unpresented attempt is not a crash. **Precedent**: none in the platform or the BSS
+gears for an operator-retry quarantine; the rule keeps `01 §4.13`'s own intent that an ordinary
+retry train must not exhaust the quarantine allowance.
+
+**Propagated**: `design/01-foundation.md` §3.3 (`retry-step`), §4.13; D-119.
+
+### D-153 (M) Slice 05 re-arms an unresolved intent through its own port
+
+**Accepted (2026-09-26).** *(amends D-119, D-125)*
+
+**Decision**: slice 05 owns the in-process re-arm port `rearm_unresolved(lineRef, wave)`. In the
+caller's unit of work, under the intent row lock, it sets an `unresolved` forward intent back to
+`submitted` with `next_sweep_at` now and `handed_off_at` null, on the same row and key, and
+answers every other status as it stands. Slice 07's line `retry` calls it and writes no
+`owf_provisioning_intent` column.
+
+**Rationale**: 05 §3.7 had named slice 07's retry as "the one other writer" of the intent table,
+against `DESIGN.md` §3.7's sole-writer rule, which OW2-56 had restored elsewhere, and gave the
+builder no port for the write (re-review R-14). **Precedent**: slice 05's own deferral port
+`take_deferred_failures(correlationId)` (`05 §3.2`), the door through which slice 08's
+`apply-resume` takes and clears deferred failures in its own unit of work.
+
+**Propagated**: `design/05-provisioning-intents.md` §3.2, §3.7, §4.4;
+`design/07-manual-tasks.md` §3.4, §3.6 (`inst-rmt-retry`); D-119, D-125.
+
+### D-154 (M) `create-manual-task` verifies the route that names a subject, not only a failed task
+
+**Accepted (2026-09-26).** *(amends D-116, D-119)*
+
+**Decision**: `inst-cmt-verify` accepts a `line` subject of the instance's frozen plan when the
+record shows the route that names it: a `failed-pending-escalation` compensation record for a
+compensation reason; the line's current forward intent recorded `unresolved` for
+`intent-unresolved`; any task of the plan for a wave reason with cause `retry-budget-exhausted` or
+`step-deadline-exceeded` (the exhausted call, which names every line of a call that never
+answered); and the task in `failed` for every other forward reason. A line an exhausted call did
+land gets a task whose `retry` moves nothing and returns it to the barrier, and whose `cancel`
+closes it (D-146's `lastClosed`).
+
+**Rationale**: the verify step refused every line subject that was not a `failed` task, but
+`sweepFailure`'s `intent-unresolved` subjects and `wave1Exhausted` / `wave2Exhausted` name lines
+that are never `failed` — an intent that may be live is never moved to `failed` (`04 §2.1`). The
+400 faulted the invocation under the bare `*transient` catch, so D-119's retry branch for a line
+not in `failed` served tasks that could not exist (re-review R-15, and the older finding that a
+wave-exhaustion task lists subjects not recorded failed). Moving such lines to `failed` first was
+rejected: it would allow a second submit for an intent that may be live (`01 §4.5`). **Precedent**:
+none for the exhausted-call case; the verification keeps its purpose — the definition cannot name
+a subject that is not this instance's or a route the record does not show.
+
+**Propagated**: `design/07-manual-tasks.md` §3.6 (`inst-cmt-verify`, `inst-rmt-retry`); D-116,
+D-119.
+
+### D-155 (M) `supersededByOrderVersion` is admit-trigger's `currentOrderVersion`
+
+**Accepted (2026-09-26).** *(realises `02 §4.3` in the definition)*
+
+**Decision**: every listen admission of the definition (the lifecycle, hold, resume and acceptance
+arms) exports `supersededByOrderVersion` = the answer's `currentOrderVersion` on `supersede`, and
+null otherwise; `terminateAborted` passes it to `terminate-instance`. The lifecycle arm no longer
+copies the event's `orderVersion` (`newOrderVersion` is removed). `supersededByOrderVersion` is an
+identity member of ADR-0013's vocabulary.
+
+**Rationale**: 02 §4.3 fixes the value as admit-trigger's `currentOrderVersion`, but no admission
+exported it; the only version the definition wrote was the lifecycle arm's copy of any event's
+own version — the instance's own for an `OrderCancelled` correlated on the pinned version — and a
+supersede reached through the hold, resume or acceptance admission set nothing. The terminal record
+named the wrong superseding version or none (re-review R-43). **Precedent**: `02 §4.3` and the
+supersession sequence of `02 §3.6`, which already carry `currentOrderVersion = N+1` into
+`terminate-instance`.
+
+**Propagated**: `design/10-process-definition.md` §3.6 (b), (e), (f); `design/02-triggers-and-start.md`
+§4.3; `ADR/0013`.
+
 ## Open Questions
 
 ### Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?
@@ -4645,6 +4803,11 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-148 | M Escalation bound counts every call between two fires | `design/10-process-definition.md` §1.2, §3.6, `design/03-approval-execution.md` §1.2, §4.5, `design/08-hold-and-cancel.md` §1.2, `DESIGN.md` §1.2; D-123 |
 | D-149 | H Each ceiling's task is its own row, closed by the fence | `design/07-manual-tasks.md` §3.2, §3.6, §3.7, §4.3, §4.4, §4.7, `design/06-saga-and-compensation.md` §3.4, §3.6, `design/10-process-definition.md` §3.6; D-121, D-122, D-129 |
 | D-150 | L Poll task tail names its suspension; only apply-hold resets the round | `design/10-process-definition.md` §3.6, `design/07-manual-tasks.md` §3.3, `design/08-hold-and-cancel.md` §4.7, `ADR/0013`; D-116, D-130, D-133 |
+| D-151 | M Liveness pass observes the SLA of tasks with no live waiter | `design/01-foundation.md` §3.7, §3.8, `design/07-manual-tasks.md` §3.3, §3.6, §4.2, §4.8; D-105 |
+| D-152 | M Quarantine counts only presented attempts | `design/01-foundation.md` §3.3, §4.13; D-119 |
+| D-153 | M Re-arm of an unresolved intent is slice 05's port | `design/05-provisioning-intents.md` §3.2, §3.7, §4.4, `design/07-manual-tasks.md` §3.4, §3.6; D-119, D-125 |
+| D-154 | M `create-manual-task` verifies the naming route | `design/07-manual-tasks.md` §3.6; D-116, D-119 |
+| D-155 | M `supersededByOrderVersion` from admit-trigger | `design/10-process-definition.md` §3.6, `design/02-triggers-and-start.md` §4.3, `ADR/0013` |
 
-Highest decision number used: **D-150**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
+Highest decision number used: **D-155**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
 register; there are no parts.

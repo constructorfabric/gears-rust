@@ -100,7 +100,8 @@ reach. Concretely:
   > task input, output, `export`, `body` or header, or of `$context`, **MUST** be one of these types,
   > and nothing else crosses:
   >
-  > 1. **Identity**: `correlationId`, `orderId`, `orderVersion` (integer), `resourceTenantId`
+  > 1. **Identity**: `correlationId`, `orderId`, `orderVersion` (integer) and
+  >    `supersededByOrderVersion` (integer, the version a `supersede` admission read, D-155), `resourceTenantId`
   >    (`resource_tenant_id`), the platform `invocationId` and `attemptId`, the binding members
   >    `definitionId`, `definitionVersion` and `definitionSource` that `start-instance` records, and
   >    the envelope `id` of a consumed event (`triggerEventId`, `lifecycleEventId`, `resumeEventId`,

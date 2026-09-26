@@ -1277,7 +1277,7 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
     try:
       - call: { step: admit-trigger }   # body: ref + triggerEventId: $context.lifecycleEventId, triggerKind, role: listen
     catch: *transient
-    export: { as: '${ $context + { admission: .admission } }' }
+    export: { as: '${ $context + { admission: .admission, supersededByOrderVersion: (if .admission == "supersede" then .currentOrderVersion else null end) } }' }   # the version Lifecycle's read returned, the only source of the supersession audit (02 §4.3, D-155)
 - onAcceptanceAdmission:
     switch:
       - advance:  { when: '${ $context.admission == "advance" }', then: acceptanceRecorded }
@@ -1944,7 +1944,7 @@ report):
       - call: { step: report-outcome }  # body: ref + outcome: $context.reportAs ∈ failed | cancelled | superseded | terminal-event, from the fence's effectiveTrigger, round: ($context.reportRound // 0); reportedOutcome is terminal-event where Lifecycle already holds the order terminal (06 §4.9)
     catch: *transient
     export: { as: '${ $context + { reportRound: .nextRound } }' }   # the family's round carries over from a held completion report; held cannot arise here (06 §4.9: rows 26 and 27 admit failed and cancelled from a held order), so no switch follows
-- terminateAborted:                     # protected (01); terminationKind: $context.terminationKind, supersededByOrderVersion on supersede
+- terminateAborted:                     # protected (01); body: ref + terminationKind: $context.terminationKind, supersededByOrderVersion: $context.supersededByOrderVersion (admit-trigger's currentOrderVersion on a supersede admission, null otherwise, D-155)
     timeout: step
     try:
       - call: { step: terminate-instance }
@@ -2221,7 +2221,7 @@ The hold stage, the `do` list of `process.hold`:
     try:
       - call: { step: admit-trigger }   # body: ref + triggerEventId: $context.lifecycleEventId, triggerKind: OrderHeld, role: listen
     catch: *transient
-    export: { as: '${ $context + { admission: .admission } }' }
+    export: { as: '${ $context + { admission: .admission, supersededByOrderVersion: (if .admission == "supersede" then .currentOrderVersion else null end) } }' }   # the version Lifecycle's read returned, the only source of the supersession audit (02 §4.3, D-155)
 - onHoldAdmission:
     switch:
       - advance: { when: '${ $context.admission == "advance" }', then: applyHold }
@@ -2281,7 +2281,7 @@ the stage holds it; the call passes null and the operation resolves the order's 
     try:
       - call: { step: admit-trigger }   # body: ref + triggerEventId: $context.resumeEventId, triggerKind: OrderResumed, role: listen
     catch: *transient
-    export: { as: '${ $context + { admission: .admission } }' }
+    export: { as: '${ $context + { admission: .admission, supersededByOrderVersion: (if .admission == "supersede" then .currentOrderVersion else null end) } }' }   # the version Lifecycle's read returned, the only source of the supersession audit (02 §4.3, D-155)
 - onResumeAdmission:
     switch:
       - advance: { when: '${ $context.admission == "advance" }', then: applyResume }
@@ -2403,12 +2403,12 @@ spawn signal or completion report is called again after the resume (`01 §3.3` *
       read: envelope
     output:                             # triggerKind by exact-type lookup into admit-trigger's closed nine-value enum (02 §3.3), as input.from does for the start (D-107); nothing branches on it
       as: >-
-        ${ .[0] | { eventId: .id, orderVersion: .data.orderVersion,
+        ${ .[0] | { eventId: .id,
                     triggerKind: ({ "gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.amended.v1~": "OrderAmended",
                                     "gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.cancelled.v1~": "OrderCancelled",
                                     "gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.expired.v1~": "OrderExpired",
                                     "gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.rejected.v1~": "OrderRejected" }[.type]) } }
-- arm: { set: { arm: lifecycle, lifecycleEventId: '${ .eventId }', triggerKind: '${ .triggerKind }', newOrderVersion: '${ .orderVersion }' } }
+- arm: { set: { arm: lifecycle, lifecycleEventId: '${ .eventId }', triggerKind: '${ .triggerKind }' } }   # no version is copied from the event: an OrderCancelled at the pinned version carries the instance's own (D-155)
 ```
 
 The lifecycle stage, the `do` list of `process.lifecycle` — admission first, and the admission
@@ -2424,7 +2424,7 @@ alone decides (`02 §4.7` items 1 and 3):
     try:
       - call: { step: admit-trigger }   # body: ref + triggerEventId: $context.lifecycleEventId, triggerKind, role: listen; output: admission ∈ advance | supersede | terminate | absorbed-duplicate | ignored-superseded | ignored-terminated
     catch: *transient
-    export: { as: '${ $context + { admission: .admission } }' }
+    export: { as: '${ $context + { admission: .admission, supersededByOrderVersion: (if .admission == "supersede" then .currentOrderVersion else null end) } }' }   # the version Lifecycle's read returned, the only source of the supersession audit (02 §4.3, D-155)
 - onLifecycleAdmission:
     switch:
       - supersede: { when: '${ $context.admission == "supersede" }', then: supersedePath }

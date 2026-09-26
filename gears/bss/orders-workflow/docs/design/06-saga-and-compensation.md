@@ -1074,9 +1074,10 @@ compensation. With the reference in the key:
   own key, which runs the operation and reaches the losing insert below. A supersede or a
   terminal event arrives at most once per order version, so its `triggerEventId` changes nothing
   today; it keeps the rule uniform, so a trigger kind added later cannot reintroduce the collision;
-- a `failure` run carries no request reference. The definition's three failure exits
-  (`planFailFastUnwind`, `preActivationAbort` and `failFastUnwind`, `10 §3.6` fragment (b)) all
-  leave the fulfillment stage, and after the fence the phase is `compensating`, so a version gets
+- a `failure` run carries no request reference. The definition's three tasks that set `unwind: failure`
+  (`planFailFastUnwind` and `preActivationAbort` in `10 §3.6` fragment (b), and `toFailureUnwind`,
+  reached through the failure stage's `failFastUnwind` switch, in fragment (c)) all leave for the
+  unwind stage, and after the fence the phase is `compensating`, so a version gets
   at most one `failure` fence call. A failed compensation leg is `compensate-order`'s, not a new
   fence call. A replay therefore presents the same body — the failure reason is resolved from the
   record (§3.6 `inst-fence-cause`, §4.8), never presented — and is absorbed.
