@@ -74,6 +74,10 @@ const PG_DEADLOCK_MSG: &str = "deadlock detected";
 /// sqlx surfaces these as `"error returned from database: (code: N) database is locked"`.
 const SQLITE_BUSY_CODE: &str = "(code: 5)";
 const SQLITE_BUSY_SNAPSHOT_CODE: &str = "(code: 517)";
+/// The same two, as the driver reports them rather than as a message renders
+/// them.
+const SQLITE_BUSY: &str = "5";
+const SQLITE_BUSY_SNAPSHOT: &str = "517";
 const SQLITE_LOCKED_MSG: &str = "database is locked";
 
 /// Returns `true` if the error is a transient lock-contention error that is
@@ -85,8 +89,9 @@ const SQLITE_LOCKED_MSG: &str = "database is locked";
 /// * `SQLite` `SQLITE_BUSY` (code 5) — `busy_timeout` expired
 /// * `SQLite` `SQLITE_BUSY_SNAPSHOT` (code 517) — WAL snapshot conflict
 ///
-/// Detection is based on the error's string representation, which avoids a
-/// direct dependency on `sqlx` types.
+/// Detection prefers the code the driver reported ([`crate::db_error`]), and
+/// falls back to the error's string representation when there is none. Neither
+/// puts a `sqlx` type in this signature.
 ///
 /// # Why `DbErr::Custom` is also checked
 ///
@@ -104,12 +109,96 @@ const SQLITE_LOCKED_MSG: &str = "database is locked";
 /// match.
 #[must_use]
 pub fn is_retryable_contention(backend: DbBackend, err: &DbErr) -> bool {
+    // The server's own code, when it gave one: no locale, no rendering, and no
+    // interpolated identifier that happens to contain `40001`. Pulling the
+    // SQLSTATE back out of the rendered message is the path `crate::db_error`
+    // exists to replace, and `PostgreSQL` 18 already showed the server can
+    // renumber and reword what this module reads.
+    if let Some(code) = crate::db_error::driver_code(err) {
+        if is_contention_code(backend, &code) {
+            return true;
+        }
+        // The code the driver gave us settles the question -- except on
+        // `MySQL`, where Galera reports a certification conflict in wording and
+        // a build we have not measured may do so under a generic code such as
+        // `HY000`. Everywhere else every contention condition has a code of its
+        // own, and letting the rendered text answer after the code has spoken
+        // only invites the value the statement supplied to answer for it:
+        // `PostgreSQL` prints that value into the message of a `22P02` just as
+        // it does into a `23505`, so a row carrying the text `deadlock
+        // detected` would be retried forever instead of reported as the
+        // deterministic refusal it is.
+        //
+        // The same reasoning bounds the `MySQL` exception: Class 23 ends the
+        // question there too, because a duplicate-key message also quotes the
+        // offending value.
+        return backend == DbBackend::MySql
+            && !mysql_names_a_refusal(&code)
+            && is_contention_wording(backend, &err.to_string());
+    }
+
+    // No code to read: a `DbErr::Custom` a caller composed, or a driver error
+    // that carried none. The message is all there is, numeric shapes included.
     match err {
         DbErr::Exec(runtime_err) | DbErr::Query(runtime_err) => {
             let msg = runtime_err.to_string();
             is_contention_message(backend, &msg)
         }
         DbErr::Custom(msg) => is_contention_message(backend, msg),
+        _ => false,
+    }
+}
+
+/// Whether `code` names a deterministic refusal on `MySQL` -- something the
+/// statement did wrong, which retrying cannot fix.
+///
+/// Class 23 (`integrity_constraint_violation`) entire, wider than
+/// [`crate::db_error::constraint_violation`] on purpose: that table names only
+/// the conditions a caller in this workspace branches on, while this question
+/// is the cruder one of whether retrying could possibly help.
+///
+/// `MySQL` is the only backend that has to ask. On the others a code that is
+/// not a contention code already ends the question, so a refusal never reaches
+/// the wording tier.
+fn mysql_names_a_refusal(code: &str) -> bool {
+    code.starts_with("23")
+}
+
+/// Whether `code`, as the driver reported it, is a contention condition.
+///
+/// `PostgreSQL` and `MySQL` report a SQLSTATE; `SQLite` reports its extended
+/// result code, which is what `(code: 5)` renders in a message.
+fn is_contention_code(backend: DbBackend, code: &str) -> bool {
+    match backend {
+        DbBackend::MySql => code == MYSQL_DEADLOCK_SQLSTATE,
+        DbBackend::Postgres => code == PG_SERIALIZATION_FAILURE || code == PG_DEADLOCK_DETECTED,
+        DbBackend::Sqlite => code == SQLITE_BUSY || code == SQLITE_BUSY_SNAPSHOT,
+        _ => false,
+    }
+}
+
+/// The message signals that are *words*, not codes.
+///
+/// Kept for an error that carried a code we do not recognise: Galera surfaces
+/// certification conflicts in wording, and a serialization failure says so in
+/// its text. What is deliberately absent is the numeric matching in
+/// `contains_sqlstate` -- when the driver handed us a code, digging a different
+/// one out of the rendered text can only be a coincidence, and a UUID in an
+/// interpolated message supplies those.
+fn is_contention_wording(backend: DbBackend, msg: &str) -> bool {
+    match backend {
+        DbBackend::MySql => {
+            let msg = msg.to_ascii_lowercase();
+            msg.contains(MYSQL_DEADLOCK_MSG)
+                || msg.contains(MYSQL_WSREP_DEADLOCK_MSG)
+                || msg.contains(MYSQL_WSREP_CERTIFICATION_ERROR_MSG)
+                || msg.contains(MYSQL_WSREP_CANNOT_CERTIFY_MSG)
+                || msg.contains(MYSQL_WSREP_WRITE_SET_CONFLICT_MSG)
+                || msg.contains(MYSQL_WSREP_CERTIFICATION_FAILURE_MSG)
+                || msg.contains(MYSQL_RESTART_MSG)
+        }
+        DbBackend::Postgres => msg.contains(PG_SERIALIZATION_MSG) || msg.contains(PG_DEADLOCK_MSG),
+        DbBackend::Sqlite => is_sqlite_busy(msg),
         _ => false,
     }
 }
@@ -178,6 +267,157 @@ mod tests {
     use sea_orm::RuntimeErr;
 
     use super::*;
+
+    /// A driver error whose code says one thing and whose rendered message
+    /// carries another, which is the shape the code path exists to get right.
+    #[cfg(any(feature = "pg", feature = "mysql", feature = "sqlite"))]
+    use crate::db_error::driver_shaped::refused;
+
+    /// The hazard `contains_sqlstate` was narrowed for, closed at the source.
+    ///
+    /// A `DbErr` a caller composed can interpolate an id, and `40001` is a run
+    /// of digits a UUID produces by chance -- the existing doc says so. When
+    /// the driver gave us a code, that guesswork is not needed at all: this
+    /// refusal is a unique violation whose message happens to render `(40001)`,
+    /// and it is not retryable.
+    #[test]
+    #[cfg(any(feature = "pg", feature = "mysql", feature = "sqlite"))]
+    fn a_code_the_driver_gave_beats_a_sqlstate_shape_in_the_text() {
+        let err = refused(
+            "23505",
+            "duplicate key value violates unique constraint \"orders_pkey\" \
+             for group 8f3c40001a2b4d5e9f00040001bbccdd (40001)",
+        );
+        assert!(
+            !is_retryable_contention(DbBackend::Postgres, &err),
+            "a unique violation must not be retried because its text renders a SQLSTATE shape"
+        );
+    }
+
+    /// The code path is per backend, and each backend spells contention
+    /// differently: a SQLSTATE on `MySQL`, an extended result code on `SQLite`.
+    #[test]
+    #[cfg(any(feature = "pg", feature = "mysql", feature = "sqlite"))]
+    fn every_backend_recognises_its_own_contention_code() {
+        let mysql = refused("40001", "Deadlock found when trying to get lock");
+        assert!(is_retryable_contention(DbBackend::MySql, &mysql));
+
+        // SQLITE_BUSY and SQLITE_BUSY_SNAPSHOT, as the driver reports them
+        // rather than as `(code: 5)` in a rendered message.
+        for code in ["5", "517"] {
+            let sqlite = refused(code, "database is locked");
+            assert!(
+                is_retryable_contention(DbBackend::Sqlite, &sqlite),
+                "SQLite code {code} must be retryable"
+            );
+        }
+
+        // A refusal is not contention, on any of them.
+        let refusal = refused("23505", "duplicate key value violates unique constraint");
+        for backend in [DbBackend::MySql, DbBackend::Postgres, DbBackend::Sqlite] {
+            assert!(!is_retryable_contention(backend, &refusal), "{backend:?}");
+        }
+    }
+
+    /// A refusal stays a refusal, whatever its message happens to say.
+    ///
+    /// `PostgreSQL` prints the rejected value into a unique violation's detail,
+    /// so the text of a `23505` is partly written by whoever supplied the row.
+    /// Retrying a constraint violation cannot help, and a transaction that
+    /// retries one spins until it gives up.
+    #[test]
+    #[cfg(any(feature = "pg", feature = "mysql", feature = "sqlite"))]
+    fn a_refusal_is_not_contention_however_its_message_reads() {
+        let err = refused("23505", "duplicate key: deadlock detected");
+        assert!(
+            !is_retryable_contention(DbBackend::Postgres, &err),
+            "a unique violation must not be retried because its value spells contention"
+        );
+
+        // Class 23 entire, not only the two codes `constraint_violation` names.
+        for code in ["23505", "23503", "23001", "23514", "23502", "23P01"] {
+            let err = refused(code, "could not serialize access due to concurrent update");
+            assert!(
+                !is_retryable_contention(DbBackend::Postgres, &err),
+                "{code} is a refusal"
+            );
+        }
+
+        // SQLite carries the primary code in the low byte of the extended one.
+        for code in ["787", "1555", "2067"] {
+            let err = refused(code, "database is locked");
+            assert!(
+                !is_retryable_contention(DbBackend::Sqlite, &err),
+                "SQLite {code} is a constraint refusal"
+            );
+        }
+
+        // `MySQL` is where the guard earns its keep, because `MySQL` is the one
+        // backend whose wording is still consulted after a code. A duplicate
+        // key quotes the offending value the same way.
+        let duplicate = refused("23000", "Duplicate entry 'deadlock' for key 'PRIMARY'");
+        assert!(
+            !is_retryable_contention(DbBackend::MySql, &duplicate),
+            "a duplicate key must not be retried because its value spells contention"
+        );
+    }
+
+    /// Galera says it in words. The code path keeps those, and they are the
+    /// reason the wording tier survives a driver error with a code.
+    #[test]
+    #[cfg(any(feature = "pg", feature = "mysql", feature = "sqlite"))]
+    fn a_wsrep_conflict_is_retryable_on_a_code_we_do_not_name() {
+        let err = refused(
+            "HY000",
+            "WSREP detected deadlock/conflict and aborted the transaction",
+        );
+        assert!(is_retryable_contention(DbBackend::MySql, &err));
+    }
+
+    /// And the wording tier is `MySQL`'s alone. `PostgreSQL` and `SQLite` name
+    /// every contention condition with a code, so once a code has spoken the
+    /// text cannot answer over it -- which matters because the text is partly
+    /// written by whoever supplied the row.
+    ///
+    /// `22P02` (`invalid_text_representation`) is the witness: `PostgreSQL`
+    /// quotes the rejected value, so a column fed the literal string
+    /// `deadlock detected` renders a message that reads like a conflict and is
+    /// nothing of the sort. Retrying it cannot change the value.
+    #[test]
+    #[cfg(any(feature = "pg", feature = "mysql", feature = "sqlite"))]
+    fn wording_cannot_answer_over_a_code_outside_mysql() {
+        let bad_value = refused(
+            "22P02",
+            "invalid input syntax for type uuid: \"deadlock detected\"",
+        );
+        assert!(
+            !is_retryable_contention(DbBackend::Postgres, &bad_value),
+            "a data exception must not be retried because its value spells contention"
+        );
+
+        // `SQLITE_ERROR`, the generic code, with the busy wording in its text.
+        let generic = refused("1", "database is locked");
+        assert!(
+            !is_retryable_contention(DbBackend::Sqlite, &generic),
+            "SQLite reports a busy database as code 5 or 517, not as wording under code 1"
+        );
+    }
+
+    /// And the structured path recognises a real one, on a code sea-orm's own
+    /// table has nothing to say about.
+    #[test]
+    #[cfg(any(feature = "pg", feature = "mysql", feature = "sqlite"))]
+    fn a_serialization_failure_is_recognised_by_its_code() {
+        let err = refused(
+            "40001",
+            "could not serialize access due to concurrent update",
+        );
+        assert!(is_retryable_contention(DbBackend::Postgres, &err));
+
+        // Wording gone, code intact: still retryable.
+        let terse = refused("40P01", "deadlock");
+        assert!(is_retryable_contention(DbBackend::Postgres, &terse));
+    }
 
     fn exec_err(msg: &str) -> DbErr {
         DbErr::Exec(RuntimeErr::Internal(msg.to_owned()))
