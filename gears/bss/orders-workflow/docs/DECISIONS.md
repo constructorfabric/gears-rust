@@ -137,6 +137,8 @@
   - [D-116 (M) Each task subject carries its reason and cause, and the task key ends in the failing call's tail](#d-116-m-each-task-subject-carries-its-reason-and-cause-and-the-task-key-ends-in-the-failing-calls-tail)
   - [D-117 (M) The remediation hold lasts until the order's last open task resolves](#d-117-m-the-remediation-hold-lasts-until-the-orders-last-open-task-resolves)
   - [D-118 (M) `escalate-gate` and `arm-park-escalation` have algorithms; every answer returns the next round, and a fire during an outage pauses](#d-118-m-escalate-gate-and-arm-park-escalation-have-algorithms-every-answer-returns-the-next-round-and-a-fire-during-an-outage-pauses)
+  - [D-119 (H) A retried or never-written line is re-dispatched from Orders' record: a per-line wave attempt on the task row, one dispatch attempt per wave, and the barrier's undispatched set](#d-119-h-a-retried-or-never-written-line-is-re-dispatched-from-orders-record-a-per-line-wave-attempt-on-the-task-row-one-dispatch-attempt-per-wave-and-the-barriers-undispatched-set)
+  - [D-120 (M) The read after a dispatch 409 is routed, and the call is re-issued only after a wait](#d-120-m-the-read-after-a-dispatch-409-is-routed-and-the-call-is-re-issued-only-after-a-wait)
 - [Open Questions](#open-questions)
   - [Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?](#q-01-which-durable-execution-substrate-backs-the-process--the-oss-workflow-engine-or-a-bss-local-mechanism)
   - [Q-02: The Generic Approval escalation threshold — the one PRD-deferred numeric value this design deliberately leaves unset](#q-02-the-generic-approval-escalation-threshold--the-one-prd-deferred-numeric-value-this-design-deliberately-leaves-unset)
@@ -553,6 +555,10 @@ tracing) diverge in lifetime and semantics, so conflating them would let an aged
 to resubmit or lose traceability once the key expires. The `attempt` component exists because a
 deterministic composition otherwise re-derives an identical key for the rebuild, which the design
 forbids resubmitting.
+
+**Amended (2026-09-26)** by D-119: the sixth component is per line and per wave, kept on the task
+row, and appended to the `activation` key too. It is also minted by an operator's retry of an
+intent recorded `failed`, so it is no longer only the component a rebuild changes.
 
 **ADR**: ADR-0006 (`cpt-cf-bss-orders-workflow-adr-idempotency-key-composition`) — the five-component key composition this entry restates.
 
@@ -2349,6 +2355,10 @@ wave-2 retry and forces a new draft for a wave-1 retry.
 **Propagated**: `design/04-fulfillment-plan.md` §3.7; `design/05-provisioning-intents.md` §3.3;
 `design/07-manual-tasks.md` §3.3.
 
+**Amended (2026-09-26)** by D-119: the transition out of `failed` increments the line's attempt
+for that wave, so the line is sent again under a new intent key. `evaluate-activation-eligibility`
+names a retried wave-1 line in `undispatchedLineRefs`, the route that sends it.
+
 ### D-96 (M) An admission deferral is a settled success, over a slice-05 admission table
 
 **Accepted.** *(amends `01 §4.12`'s first rule; D-44)*
@@ -2495,6 +2505,11 @@ attempts*, *Attempt identity*, `retry-step`), §3.7 (`owf_process_instance`, the
 §3.6, §4.5; `design/06-saga-and-compensation.md` §3.3, §3.6; `design/07-manual-tasks.md` §3.3,
 §3.6, §4.2; `design/08-hold-and-cancel.md` §3.3, §3.6; `design/10-process-definition.md` §3.1,
 §3.6 (a), (b), (e); `UPSTREAM_REQS.md` §2.9; ADR-0006 as amended; D-74, D-78.
+
+**Amended (2026-09-26)** by D-119: for a line task the attempt belongs to the dispatch family of
+the line's wave, and the definition keeps one attempt per wave (`wave1AttemptKey`,
+`wave2AttemptKey`). The dispatch step keys end `{dispatchRound}[:{attempt}]`. The intent key's
+`wave_attempt` is a separate, per-line counter on the task row.
 
 ### D-103 (M) The registry lease is fenced by a holder token, sized below the retry horizon, and resolved per key family
 
@@ -2998,6 +3013,84 @@ The round rule is D-102.
 
 **Propagated**: `design/03-approval-execution.md` §3.2, §3.3, §3.6, §3.7.
 
+### D-119 (H) A retried or never-written line is re-dispatched from Orders' record: a per-line wave attempt on the task row, one dispatch attempt per wave, and the barrier's undispatched set
+
+**Accepted (2026-09-26).** *(amends D-21, D-95, D-102; ADR-0006 as amended)*
+
+**Decision**:
+
+- **Per-line attempts on the task row.** `owf_fulfillment_task` gains `wave1_attempt` and
+  `wave2_attempt` (from 1). The intent key of either wave appends the line's attempt once it is
+  above 1. `rebuild-wave1` increments `wave1_attempt` for a lapsed draft. An operator's line
+  `retry` increments the attempt of the line's wave in the transition out of `failed`, and only
+  when the intent is recorded `failed` (a synchronous refusal, a confirmed failure, or
+  `never-dispatched`).
+- **No new key for a live intent.** A retried line whose intent is `submitted` or `unresolved`
+  keeps its key. A `submitted` row stays the sweep's. An `unresolved` row is set back to
+  `submitted` with `next_sweep_at` now for one on-demand read. A line with no row is sent under
+  its unchanged key.
+- **One dispatch attempt per wave.** For a line task, `retry-step` mints the `attempt` of the
+  dispatch family of the line's wave, whatever step raised the task. `resolve-manual-task` answers
+  `retryWave`, and the definition files the attempt as `wave1AttemptKey` or `wave2AttemptKey`.
+  Both dispatch step keys end `{dispatchRound}[:{attempt}]`. A wave call passes only its own
+  attempt and spends it once the call answers. Wave calls no longer pass the generic `attemptKey`.
+- **The barrier's undispatched set.** `evaluate-activation-eligibility` answers
+  `undispatchedLineRefs`: every `pending` line with no wave-1 intent row under its current
+  attempt, or only a never-sent row. `onEvaluate` sends them to `dispatch-wave1-create` before
+  acting on anything else. A retried wave-2 line is `draft_created` again and returns through
+  `eligibleLineRefs`.
+- **Lookup-settled dispatch output.** A dispatch key that `settle-from-lookup` settles `success`
+  stores the operation's full output built from Orders' record. That output lists every row
+  written under the key by its recorded state, an empty `deferred[]`, and the next round. A line
+  the crashed attempt never wrote is recovered through the undispatched set (wave 1) or through
+  `eligibleLineRefs` (wave 2).
+
+**Rationale**: a line retry moved the line back to `pending` or `draft_created`, but nothing sent
+it again. `toBarrier` only re-entered the barrier loop. Wave 1 is reached from there only through
+`reconcile-intent`'s `redispatch[]`, which lists never-sent rows. `evaluate-activation-eligibility`
+never releases while a line is `pending`. A re-dispatch would have skipped the failed row anyway,
+because `wave_attempt` was minted only by a rebuild. Subscriptions returns the original outcome
+for a seen key before any guard runs
+([Subscriptions `01-foundation-lifecycle.md:314`](../../subscriptions/docs/design/01-foundation-lifecycle.md#42-transitionrequest-envelope-idempotency-ordering-normative)),
+so a re-send under the refused key would get the refusal back (second review OW2-21). Keeping the
+attempts on the task rows lets several retries resolved together under the remediation hold keep
+their own attempts (D-117); the definition holds only the latest attempt per wave. The call
+attempt is still needed: the round of an exhausted call is still `open`, and its fingerprint named
+other lines, so re-presenting that key with a different `lineRefs[]` is `idempotency-key-conflict`
+(`01 §4.3`). Wave calls passed the generic `attemptKey`, so a leftover attempt minted for another
+family could exceed the dispatch family's counter and be refused `idempotency-key-mismatch`. A
+lookup that settled a dispatch key left the stored lists undefined, and a line with no row was in
+no list and had no route (OW2-32). The undispatched set covers it from the record, so no list of
+named lines has to be stored. **Precedent**: `rebuild-wave1`'s own minting rule
+(`05 §3.6` *Wave-1 Rebuild*) and D-102 rule 3. The caller-side duplicate protocol of `01 §4.5`
+forbids a second submit under a new key while an intent may be live. Subscriptions' replay rule is
+cited above. No sibling gear re-dispatches a multi-line submit after an operator's retry.
+
+**Propagated**: `design/04-fulfillment-plan.md` §3.3, §3.6, §3.7, §4.8;
+`design/05-provisioning-intents.md` §1.1, §1.2, §2.2, §3.2, §3.3, §3.6, §3.7, §4.2, §4.4, §4.5,
+§4.6; `design/07-manual-tasks.md` §3.3, §3.6; `design/01-foundation.md` §3.3, §4.3;
+`design/06-saga-and-compensation.md` §2.1; `design/10-process-definition.md` §3.6 (b), (c);
+`DESIGN.md` §1.2; ADR-0006 as amended.
+
+### D-120 (M) The read after a dispatch 409 is routed, and the call is re-issued only after a wait
+
+**Accepted (2026-09-26).**
+
+**Decision**: `wave1Reread` and `wave2Reread` export `reconcile-intent`'s `failed[]`,
+`unresolved[]`, `redispatch[]` and `nextSweepRound` as the poll arm does. Failures and unresolved
+intents go to fragment (c). Otherwise wave 1 waits the fixed `PT30S` `waitReread1` and re-issues
+the same key, and wave 2 waits in the barrier loop. A never-sent row keeps `not_found_at`, so the
+same-key re-run or the next evaluation sends it, and `redispatch[]` stays a routing hint.
+
+**Rationale**: both reads discarded their output and passed no round back. The next read under
+the same round was an absorbed replay, and failures the read found never reached fragment (c).
+Wave 1 looped `wave1 → 409 → wave1Reread → wave1` with no wait against a key held by a live lease
+(second review OW2-23). **Precedent**: the poll arm's export and `onSweep` in the same fragment,
+and D-102's round rule.
+
+**Propagated**: `design/10-process-definition.md` §3.6 (*Fixed waits and re-check loops*, (b));
+`design/05-provisioning-intents.md` §3.3, §4.5.
+
 ## Open Questions
 
 ### Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?
@@ -3341,6 +3434,8 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-116 | M Task body: subject reason and cause, failing call's tail | `design/07-manual-tasks.md` §3.2, §3.3, §3.6, §3.7, `design/08-hold-and-cancel.md` §3.3, §3.6, `design/10-process-definition.md` §3.6, `design/06-saga-and-compensation.md` §4.8 |
 | D-117 | M Remediation hold until the last open task | `design/07-manual-tasks.md` §3.3, §3.6, §4.3, §4.8, `design/05-provisioning-intents.md` §4.5, `design/10-process-definition.md` §3.6; D-99 |
 | D-118 | M Escalation and park-clock algorithms | `design/03-approval-execution.md` §3.2, §3.3, §3.6, §3.7; D-87, D-102 |
+| D-119 | H Retried and never-written lines re-dispatched from the record | `design/04-fulfillment-plan.md` §3.3, §3.6, §3.7, §4.8, `design/05-provisioning-intents.md` §1.1, §1.2, §2.2, §3.2, §3.3, §3.6, §3.7, §4.2, §4.4, §4.5, §4.6, `design/07-manual-tasks.md` §3.3, §3.6, `design/01-foundation.md` §3.3, §4.3, `design/06-saga-and-compensation.md` §2.1, `design/10-process-definition.md` §3.6, `DESIGN.md` §1.2, `ADR/0006`; D-21, D-95, D-102, D-117 |
+| D-120 | M The read after a dispatch 409 is routed | `design/10-process-definition.md` §3.6, `design/05-provisioning-intents.md` §3.3, §4.5; D-102 |
 
 Highest decision number used: **D-118**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
 register; there are no parts.

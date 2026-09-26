@@ -72,9 +72,11 @@ idempotency key, composed from `orderId` + `orderVersion` + `orderLineId` + wave
 tenant-namespaced by `resource_tenant_id` — governs de-duplication of the submission itself and is
 never reused as the `correlationId`. `intentKind` is load-bearing: without it a `draft_void` key
 is byte-identical to the `draft_create` key it undoes. A sixth component, `wave_attempt`, is
-appended on a wave-1 rebuild; `rebuild-wave1` is the only operation that mints it
+appended once a line's intent of a wave has to be sent again under a new key: `rebuild-wave1`
+mints it for a lapsed draft, and an operator's line `retry` mints it for an intent recorded
+`failed`, never for one that may still be live
 ([`../ADR/0006`](../ADR/0006-cpt-cf-bss-orders-workflow-adr-idempotency-key-composition.md) as
-amended). None of these values crosses the engine boundary: the definition passes `lineRefs` and
+amended; decision D-119). None of these values crosses the engine boundary: the definition passes `lineRefs` and
 the operation resolves them to lines, keys and envelopes inside Orders
 (`cpt-cf-bss-orders-workflow-adr-references-not-payloads`).
 
@@ -98,7 +100,7 @@ built on this sweep as its discovery mechanism.
 | `cpt-cf-bss-orders-workflow-fr-owf-provisioning-intent` | `dispatch-wave1-create` and `dispatch-wave2-activate` (§3.3) stamp the identity envelope and the intent key on every line; the draft-liveness re-read runs inside `dispatch-wave2-activate` immediately before each activation submit; a lapsed draft routes to `rebuild-wave1` (§3.6). The wait for expected fulfillment time is the definition's durable `wait` (`10 §3.6` (b)), whose wake-up depends on no external trigger. |
 | `cpt-cf-bss-orders-workflow-fr-owf-intent-sweep` | `reconcile-intent` (§3.3) driven by the `reconciliation-sweep` worker on `next_sweep_at` and by the definition's poll and confirmation arms; settlement of a stuck step key only through `settle-from-lookup` (`01 §3.3`); read-only past the key lifetime (§4.4). |
 | `cpt-cf-bss-orders-workflow-fr-owf-backpressure` | Admission on dispatch — per-order parallelism, the aggregate in-flight cap, the per-seller allowance, the cold-start ramp and the downstream throttle — inside the two dispatch operations (§4.3, moved here from `01 §4.12`); a deferral is a settled success, never a spent retry. |
-| `cpt-cf-bss-orders-workflow-fr-owf-retry` | Caller-side duplicate protocol of `01 §4.5` applied per line inside the dispatch operations; the platform's retry policy re-issues the same step key, whose re-run skips every line that already has an intent row (§4.4). |
+| `cpt-cf-bss-orders-workflow-fr-owf-retry` | Caller-side duplicate protocol of `01 §4.5` applied per line inside the dispatch operations; the platform's retry policy re-issues the same step key, whose re-run skips every line that already has an intent row (§4.4); an operator's line retry re-dispatches the line under its next wave attempt (§4.4 *A retry mints a new intent key only for a failed intent*). |
 | `cpt-cf-bss-orders-workflow-fr-owf-dead-letter` | This slice has no dead-letter path: an intent that exhausts the sweep floor is recorded `unresolved` and handed to a manual task through the definition's failure arm (§4.2, `01 §4.8`). |
 
 #### NFR Allocation
@@ -113,7 +115,7 @@ built on this sweep as its discovery mechanism.
 
 | ADR ID | Decision Summary |
 |--------|-----------------|
-| `cpt-cf-bss-orders-workflow-adr-idempotency-key-composition` | Intent key = `orderId` + `orderVersion` + `orderLineId` + wave + `intentKind`, tenant-namespaced, with `wave_attempt` appended on a rebuild; distinct from `correlationId`. As amended: a platform retry is the same logical submit and never increments `wave_attempt`; only `rebuild-wave1` mints it. |
+| `cpt-cf-bss-orders-workflow-adr-idempotency-key-composition` | Intent key = `orderId` + `orderVersion` + `orderLineId` + wave + `intentKind`, tenant-namespaced, with `wave_attempt` appended on a rebuild; distinct from `correlationId`. As amended: a platform retry is the same logical submit and never increments `wave_attempt`; `rebuild-wave1` mints it for a lapsed draft and an operator's line retry for a `failed` intent (D-119). |
 | `cpt-cf-bss-orders-workflow-adr-two-wave-activation-barrier` | As amended: the barrier is a definition pattern; `dispatch-wave2-activate` (`protected`) refuses at run time unless this gear's record shows every task `draft_created` and the expected-fulfillment instant passed. |
 | `cpt-cf-bss-orders-workflow-adr-flow-as-platform-definition` | The flow is a platform definition; this slice provides operations and the intent record; timers, retry policy and event listening are the platform's. |
 | `cpt-cf-bss-orders-workflow-adr-definition-versioning-and-protected-steps` | The three `protected` operations here are ordered by the fence and never omitted; §4.5 states this slice's inputs to the validation rules. |
@@ -215,7 +217,7 @@ first rule of `01 §4.12`, which settles a non-admitted dispatch as `retryable-f
 - [ ] `p2` - **ID**: `cpt-cf-bss-orders-workflow-constraint-key-not-correlation-id`
 
 The intent idempotency key (`resource_tenant_id` + `orderId` + `orderVersion` + `orderLineId` +
-wave + `intentKind`, plus `wave_attempt` on a rebuild), the **step** idempotency key of the
+wave + `intentKind`, plus `wave_attempt` after a rebuild or a retry of a failed intent), the **step** idempotency key of the
 operation call that dispatched it (instance-scoped, §3.3), the process `correlationId` and the
 platform's `invocationId`/`attemptId` are structurally distinct and must never be interchanged
 (`01 §2.2`). The intent key governs submission de-duplication at Subscriptions and has a bounded
@@ -230,7 +232,12 @@ compensating key structurally distinct from the forward key, so `UNIQUE(idempote
 both rows and Subscriptions cannot answer a void with the create's stored outcome. `wave_attempt`
 is what makes a fresh key for the wave-1 rebuild expressible at all: without it, a deterministic
 composition re-derives the identical string on every rebuild, which the uniqueness constraint
-rejects and the read-only-past-key-lifetime rule forbids resubmitting.
+rejects and the read-only-past-key-lifetime rule forbids resubmitting. The same holds for an
+operator's retry of a refused line: Subscriptions returns the original outcome for a seen
+`(subscriptionId, idempotencyKey)` before any guard runs
+([Subscriptions `01 §4.2`](../../../subscriptions/docs/design/01-foundation-lifecycle.md#42-transitionrequest-envelope-idempotency-ordering-normative),
+`01-foundation-lifecycle.md:314`), so a retry under the refused key would be answered with the
+refusal.
 
 **ADRs**: `cpt-cf-bss-orders-workflow-adr-idempotency-key-composition`
 
@@ -256,8 +263,8 @@ the definition's clock.
 
 Every operation of this slice takes `planRef`, `lineRefs[]` (the `taskRef`s of slice 04's
 `FulfillmentTask` rows), dispatch and sweep rounds and closed enums, and nothing else. It
-resolves each `lineRef` to the frozen line, its `orderLineId`, its current `wave_attempt`, its
-binding reference and its intent key from this gear's record, and it reads Subscriptions under
+resolves each `lineRef` to the frozen line, its `orderLineId`, its current `wave_attempt` for the
+wave (`owf_fulfillment_task.wave1_attempt` or `wave2_attempt`, `04 §3.7`), its binding reference and its intent key from this gear's record, and it reads Subscriptions under
 this gear's configured authority narrowed to the instance's `resource_tenant_id` and
 `seller_tenant_id` (ADR-0010 as amended). A `subscriptionId`, a `transition_request_id`, a
 binding reference, a line's commercial content or the seller axis **MUST NOT** appear in any
@@ -453,7 +460,8 @@ exists as a draft, and not to skip the line.
 ##### Responsibility scope
 
 Owns `rebuild-wave1` (§3.3). For each line whose current `draft_create` intent is recorded
-`lapsed`, mints the next `wave_attempt` (the only minting site, ADR-0006 as amended) and returns
+`lapsed`, mints the line's next wave-1 attempt (`owf_fulfillment_task.wave1_attempt`, ADR-0006 as
+amended; the other minting site is an operator's retry of a `failed` intent, D-119) and returns
 the task to `pending` with reason `draft-voided` through 04's transition rule. It submits nothing:
 the new draft-create is `dispatch-wave1-create`'s, which the definition calls next with the
 rebuilt lines, so the envelope, key and admission are applied in the one place they live.
@@ -571,9 +579,9 @@ in `unresolved` and a manual task created by the definition's failure arm.
 | `dispatch-wave1-create` | `protected` | Intent Dispatcher | `wave1` |
 | `dispatch-wave2-activate` | `protected` | Intent Dispatcher | `wave2` |
 | `report-spawn-signal` | `protected` | Spawn Signal Reporter | `spawnSignal` |
-| `reread-draft-liveness` | `composable` | Draft-Liveness Re-reader | optional, after `waitExpected` (§4.5) |
+| `reread-draft-liveness` | `composable` | Draft-Liveness Re-reader | none — the canonical version does not call it, because the gate is inside `wave2`; a version **MAY** place it after `waitExpected` as an early read (§4.5) |
 | `rebuild-wave1` | `composable` | Wave-1 Rebuilder | the lapsed-line arm (§4.5) |
-| `reconcile-intent` | `composable` | Reconciliation Sweep | `reconcile` (poll arm), the confirmation arm (§4.5); in-process from the `reconciliation-sweep` worker |
+| `reconcile-intent` | `composable` | Reconciliation Sweep | `reconcilePoll` (poll arm), `reconcileHint` (confirmation arm), `wave1Reread` and `wave2Reread` (after a dispatch 409) (§4.5); in-process from the `reconciliation-sweep` worker |
 
 In every input below, `ref` is the reference tuple of `10 §3.6` — `correlationId`, `orderId`,
 `orderVersion`, `resourceTenantId`, `invocationId`, `attemptId` — and `lineRefs[]` are `taskRef`s of
@@ -594,9 +602,9 @@ operation's round. Every step key is recomposed server-side from the body
 | Field | Value |
 |-------|-------|
 | `protection` | `protected` — Waves stage: after `begin-fulfillment`, before `re-check-pre-activation` (`10 §4.1`) |
-| `input` | `ref`, `planRef`, `lineRefs[]` (the whole plan on first entry; the rebuilt lines after `rebuild-wave1`; the deferred lines of the previous round), `dispatchRound`, `attemptKey` (nullable; the key `retry-step` minted for a manual `retry` of one line) |
+| `input` | `ref`, `planRef`, `lineRefs[]` (the whole plan on first entry; the rebuilt lines after `rebuild-wave1`; the deferred lines of the previous round), `dispatchRound`, `attemptKey` (nullable; the `attempt` of this operation's family that `retry-step` minted on an operator's line retry of wave 1, `wave1AttemptKey` in `10 §3.6` (b); it keys the call, never a line, D-119) |
 | `output` | `accepted[]` (lineRef), `failed[]` (lineRef + reason code), `deferred[]` (lineRef), `deferReason` (`admission` · `throttle` · `held`, nullable), `retryAfterMs` (nullable; advisory — it sets the recorded deferral instant and is not read by the definition, never a `wait` value), `due: true\|false` on a non-empty `deferred[]` — database time against the deferral instant this operation records with the round (`now + retryAfterMs`), the answer the definition's `PT1M` deferral re-check loop switches on (`10 §3.6` (b)); a call before that instant re-defers with `due: false`, `nextDispatchRound` |
-| `idempotency_key` | step key, instance-scoped: `{tenant}:{correlationId}:dispatch-wave1-create:{planRef}:{dispatchRound}`; per line, the intent key `{tenant}:{orderId}:{orderVersion}:{orderLineId}:wave1_create:draft_create[:{wave_attempt}]` resolved from the record, never supplied |
+| `idempotency_key` | step key, instance-scoped: `{tenant}:{correlationId}:dispatch-wave1-create:{planRef}:{dispatchRound}[:{attempt}]`, the attempt omitted when `attemptKey` is null ([`01 §3.3` *Rounds and attempts*](./01-foundation.md#rounds-and-attempts-the-one-rule-for-re-invokable-operations) rule 3); per line, the intent key `{tenant}:{orderId}:{orderVersion}:{orderLineId}:wave1_create:draft_create[:{wave_attempt}]`, the line's `owf_fulfillment_task.wave1_attempt` appended when above 1, resolved from the record, never supplied |
 | `declared_event` | `OrderFulfillmentStepCompleted`, once per line a synchronous Subscriptions refusal moves `pending → failed` (04's terminal-state rule); none for an accepted line |
 | `compensation` | `compensate-order` (06) — the draft-void leg for every `draft_created` line |
 | `reasons` | `wave1-create-failed` (per line, in `failed[]`), `circuit-breaker-open`, `per-attempt-timeout`, `idempotency-key-conflict`, `idempotency-key-mismatch`, `version-mismatch`, `not-found` |
@@ -609,9 +617,9 @@ operation's round. Every step key is recomposed server-side from the body
 | Field | Value |
 |-------|-------|
 | `protection` | `protected` — Waves stage: after `report-spawn-signal` (`10 §4.1`); the only route to `report-outcome` with `outcome: completed` |
-| `input` | `ref`, `planRef`, `lineRefs[]` (the eligible set `evaluate-activation-eligibility` returned; empty is permitted and is the completion check), `dispatchRound`, `attemptKey` (nullable) |
+| `input` | `ref`, `planRef`, `lineRefs[]` (the eligible set `evaluate-activation-eligibility` returned; empty is permitted and is the completion check), `dispatchRound`, `attemptKey` (nullable; as for wave 1, this operation's own family, `wave2AttemptKey`) |
 | `output` | `accepted[]`, `activated[]`, `failed[]` (lineRef + reason code), `pending[]`, `lapsed[]`, `deferred[]` (all lineRef), `deferReason`, `retryAfterMs` (advisory, as for wave 1; never a `wait` value), `due: true\|false` on a non-empty `deferred[]` — database time against the deferral instant this operation records with the round (`now + retryAfterMs`), the answer the definition's `PT1M` deferral re-check loop switches on (`10 §3.6` (b)); a call before that instant re-defers with `due: false`, `nextDispatchRound`. `pending[]` names **every** plan line not yet recorded `activated` or `failed` — in flight, not yet eligible, lapsed or deferred — so an empty `pending[]` and an empty `failed[]` together mean the order is complete; `lapsed[]` and `deferred[]` are subsets of `pending[]` that name why |
-| `idempotency_key` | step key, instance-scoped: `{tenant}:{correlationId}:dispatch-wave2-activate:{planRef}:{dispatchRound}`; per line, the intent key `{tenant}:{orderId}:{orderVersion}:{orderLineId}:wave2_activate:activation` |
+| `idempotency_key` | step key, instance-scoped: `{tenant}:{correlationId}:dispatch-wave2-activate:{planRef}:{dispatchRound}[:{attempt}]`; per line, the intent key `{tenant}:{orderId}:{orderVersion}:{orderLineId}:wave2_activate:activation[:{wave_attempt}]`, the line's `owf_fulfillment_task.wave2_attempt` appended when above 1 |
 | `declared_event` | `OrderFulfillmentStepCompleted`, once per line a synchronous refusal moves `draft_created → failed` |
 | `compensation` | `compensate-order` (06) — the activated-cancel leg for every line whose activation was accepted |
 | `reasons` | `wave2-activation-failed` (per line), `activation-precondition-unmet` (the run-time barrier guard; registered in `01 §4.9`, §4.6), `circuit-breaker-open`, `per-attempt-timeout`, `idempotency-key-conflict`, `idempotency-key-mismatch`, `version-mismatch`, `not-found` |
@@ -789,7 +797,7 @@ draft-create acceptance.
 
 1. [ ] - `p1` - Resolve `planRef` and each `lineRef` to the frozen plan and its `FulfillmentTask` rows under the instance's `resource_tenant_id`; a line not on the plan is refused `not-found`; a terminal instance is `version-mismatch` - `inst-pi-resolve`
 2. [ ] - `p1` - **IF** `dispatch-wave2-activate`: **IF** the record does not show every plan task at `draft_created` or beyond, **OR** `expectedFulfillmentAt` is after database time, **OR** no `report-spawn-signal` settlement exists for this order version, refuse the whole call `activation-precondition-unmet` (409, retryable) - `inst-pi-wave2-guard`
-3. [ ] - `p1` - Skip every line that already has an intent row of this wave and kind under its current `wave_attempt`, unless that row carries `not_found_at`; report a skipped line by its recorded state (this is what makes the platform's same-key re-run of an `open` key safe) - `inst-pi-skip-existing`
+3. [ ] - `p1` - Skip every line that already has an intent row of this wave and kind under its current `wave_attempt` (the task row's `wave1_attempt` or `wave2_attempt`), unless that row carries `not_found_at`; report a skipped line by its recorded state (this is what makes the platform's same-key re-run of an `open` key safe). A line an operator retried after its intent was recorded `failed` has a new attempt and no row under it, so it is sent; a line whose row is `submitted` or `unresolved` keeps its attempt and is skipped, because that intent may be live downstream (§4.4) - `inst-pi-skip-existing`
 4. [ ] - `p1` - **IF** `owf_process_instance.suspended` is true for the instance (read under the instance row lock; not `owf_process_suspension`, whose rows are slice 08's record), defer every remaining line with `deferReason = held`; a same-key re-issue of a call already settled is absorbed as usual while suspended - `inst-pi-held`
 5. [ ] - `p1` - For each remaining line, ask Dispatch Admission Control (§4.3); a line not admitted joins `deferred[]` with the hint - `inst-pi-admit`
 6. [ ] - `p1` - **IF** `dispatch-wave2-activate`: for each admitted line, immediately before its row is written and its activation submitted, run the Draft-Liveness Re-reader; `lapsed` → record the line's draft row `lapsed`, send nothing for the line and add it to `lapsed[]`; unevaluable → send nothing further and answer the canonical 503 for the call after settling what was already submitted (fail-closed) - `inst-pi-reread-gate`
@@ -836,7 +844,7 @@ pending`, reason `draft-voided`, driven only by `rebuild-wave1`).
 **Algorithm: rebuild-wave1**
 
 1. [ ] - `p1` - For each `lineRef`, read the line's current `draft_create` intent; **IF** its status is not `lapsed`, add the line to `refused[]` - `inst-rb-verify`
-2. [ ] - `p1` - Set the line's next `wave_attempt` to the recorded attempt plus one, read inside the unit of work (never re-minted on replay, `01 §4.14`) - `inst-rb-mint`
+2. [ ] - `p1` - Set `owf_fulfillment_task.wave1_attempt` to the recorded attempt plus one, read inside the unit of work (never re-minted on replay, `01 §4.14`) - `inst-rb-mint`
 3. [ ] - `p1` - Apply 04's transition `draft_created → pending` with reason `draft-voided` and write the `step-completion` entry - `inst-rb-reset`
 4. [ ] - `p1` - **RETURN** `rebuilt[]`, `refused[]`, `nextRebuildRound` - `inst-rb-return`
 
@@ -891,7 +899,7 @@ requirement.
 4. [ ] - `p1` - **IF** compensating outcome (`voided`, `cancelled`, or its failure): write it on the compensating row; 06's `compensate-order` reads it on its next pass - `inst-ri-compensating`
 5. [ ] - `p1` - **IF** not found: apply the never-dispatched branch of §4.4 - `inst-ri-not-found`
 6. [ ] - `p1` - **IF** still non-terminal: advance `sweep_tier`, `sweep_reads`, `next_sweep_at` on the ladder of §4.2; at the floor set `status = unresolved`, `next_sweep_at` null, and report the line in `unresolved[]` - `inst-ri-ladder`
-7. [ ] - `p1` - **IF** the step key recorded for the dispatching call is `in_flight` with a dead lease, call `settle-from-lookup` in-process with the record's `lease_holder` and the looked-up outcome (`success` once every intent row that attempt wrote has a known downstream state, `absent` when none was sent, `non-terminal` otherwise) - `inst-ri-settle-key`
+7. [ ] - `p1` - **IF** the step key recorded for the dispatching call is `in_flight` with a dead lease, call `settle-from-lookup` in-process with the record's `lease_holder` and the looked-up outcome (`success` once every intent row that attempt wrote has a known downstream state, `absent` when none was sent, `non-terminal` otherwise). For a dispatch key settled `success`, the step record `settle-from-lookup` writes carries the dispatch operation's output built from Orders' record: every row carrying that `step_idempotency_key`, listed by its recorded state as `inst-pi-skip-existing` reports it (`accepted[]`, `activated[]`, `failed[]`, `lapsed[]`, and for wave 2 `pending[]` over the whole plan), an empty `deferred[]`, and `nextDispatchRound` = the key's round plus one, so the definition's same-key re-issue receives a complete answer. A line the crashed attempt never wrote is in none of those lists and needs none: it is still `pending` with no row, so the next `evaluate-activation-eligibility` names it in `undispatchedLineRefs` (wave 1, `04 §3.6`), or it is still `draft_created` and eligible (wave 2), and the next dispatch sends it (decision D-119) - `inst-ri-settle-key`
 8. [ ] - `p1` - Write the `sweep` audit entry for the read - `inst-ri-audit`
 
 **Caller-Side Duplicate Protocol** (applied per line inside the dispatch operations, conforming to
@@ -933,7 +941,7 @@ by row locks, not an in-memory controller). It writes no `owf_durable_timer` row
 | `seller_tenant_id` | uuid | Selling party; the admission and operator-view axis. |
 | `wave` | enum(`wave1_create`, `wave2_activate`) | Wave; key component. |
 | `intent_kind` | enum(`draft_create`, `activation`, `draft_void`, `activated_cancel`) | Kind; the fifth key component. |
-| `wave_attempt` | integer | Rebuild attempt, starting at 1; minted only by `rebuild-wave1`. |
+| `wave_attempt` | integer | The line's attempt for this wave, starting at 1, copied at insert from `owf_fulfillment_task.wave1_attempt` or `wave2_attempt`; the task's attempt is minted by `rebuild-wave1` (wave 1, lapsed draft) and by an operator's line retry of an intent recorded `failed` (either wave, `07 §3.6` `inst-rmt-retry`), never by a platform retry (D-119). |
 | `idempotency_key` | text | The intent key of §2.2; never reused as `correlation_id`. |
 | `binding_reference` | text | Opaque, caller-owned; never interpreted by Subscriptions or OSS. |
 | `dispatched_by` | text | The operation that wrote the row: `dispatch-wave1-create`, `dispatch-wave2-activate` or `compensate-order`. |
@@ -977,7 +985,11 @@ are written only by the dispatcher in the settlement unit of work of the call th
 row. `status`, `subscription_id` and the sweep columns are written only by `reconcile-intent`
 (from either driver), except `status = lapsed`, written only by the Draft-Liveness Re-reader, and
 a synchronous refusal's `failed`, written by the dispatcher. `wave_attempt` of a new row is read
-from the line's state that `rebuild-wave1` wrote. No other component writes this table.
+from the task row's attempt for the wave (`04 §3.7`), which `rebuild-wave1` and an operator's line
+retry of a `failed` intent mint. The one other writer is that retry (`07 §3.6` `inst-rmt-retry`)
+on an `unresolved` row: it sets `status = submitted` and `next_sweep_at` to now, on the same row
+and key, so the worker re-reads the intent once — the on-demand read of §4.2 — and nothing is
+resubmitted. No other component writes this table.
 
 **Mutability**: deliberately **mutable** — `status`, the acceptance columns, `subscription_id` and
 the sweep columns are updated in place; the audit chain (`01 §3.7`) is the history. A row is never
@@ -1103,7 +1115,7 @@ magnitude, and it is selected by **`(wave, intent_kind)`**, not by `wave` alone:
 
 | Bound | Baseline | Derivation |
 |-------|----------|------------|
-| Sweep floor | **30 reads or 23 h from `created_at`, whichever comes first** | Applies to both ladders. 23 h sits inside the 24 h overdue window so the sweep has always resolved an intent or handed it to a manual task before the overdue escalation fires. At the floor the intent becomes `unresolved`, scheduled reads stop, and `reconcile-intent` reports it in `unresolved[]` so the definition's failure arm creates a manual task (`intent-unresolved`); on-demand reads — a confirmation hint, the fence of 06, a manual `retry` — continue. There is no dead-letter terminus (`01 §4.8`). |
+| Sweep floor | **30 reads or 23 h from `created_at`, whichever comes first** | Applies to both ladders. 23 h sits inside the 24 h overdue window so the sweep has always resolved an intent or handed it to a manual task before the overdue escalation fires. At the floor the intent becomes `unresolved`, scheduled reads stop, and `reconcile-intent` reports it in `unresolved[]` so the definition's failure arm creates a manual task (`intent-unresolved`); on-demand reads — a confirmation hint, the fence of 06, a manual `retry` (which re-arms the `unresolved` row for one scheduled read, §3.7; a read that is still non-terminal returns it to `unresolved` and lists it again, D-119) — continue. There is no dead-letter terminus (`01 §4.8`). |
 | Worker page size | **500 rows per pass, 30 s transaction budget** | Keeps one pass from holding a long transaction against the process tables. |
 | Jitter | full jitter on every `next_sweep_at` | An unjittered interval re-reads every in-flight intent in lockstep and the sweep becomes the load spike it exists to recover from. |
 
@@ -1175,7 +1187,23 @@ throttle-induced delay never extends the per-operation deadline (`01 §4.12`).
   succeeded and we missed the confirmation".
 - **Read-only past the lifetime.** No operation of this slice **MAY** submit under an intent key
   whose `key_expires_at` has passed; a next attempt for that line is a new key, minted by
-  `rebuild-wave1` (lapsed draft) or `retry-step` (manual retry, `01 §3.3`).
+  `rebuild-wave1` (lapsed draft) or an operator's line retry once the intent is recorded `failed`
+  (`never-dispatched` included).
+- **A retry mints a new intent key only for a failed intent.** An operator's line `retry`
+  (`07 §3.6` `inst-rmt-retry`) **MUST** mint the line's next wave attempt when, and only when, the
+  line's current intent of that wave is recorded `failed` — a synchronous refusal, a failure the
+  status read confirmed, or `never-dispatched` — because Subscriptions replays a refusal under its
+  key (§2.2) and a failed intent has no live effect. It **MUST NOT** mint one for a line whose
+  intent is `submitted` or `unresolved`, which may be live downstream: a second submit under a new
+  key is forbidden (`01 §4.5`). Such a line keeps its key; a line with no row is sent under it by
+  the next dispatch, a `submitted` row stays the sweep's, and an `unresolved` row is re-armed for
+  one on-demand read. The retry also mints the next `attempt` of the wave's dispatch family, which
+  keys only the next call of that wave (`01 §3.3` *Rounds and attempts* rule 3): the round of an
+  exhausted call is still `open` under a fingerprint that named other lines, and re-presenting it
+  with a different `lineRefs[]` would be `idempotency-key-conflict` (`01 §4.3`). Per-line attempts
+  live on the task rows, so several retries resolved together under the remediation hold
+  (`07 §4.3`, D-117) each keep their own, and the call carries only its wave's latest `attempt`
+  (decision D-119).
 - **The draft-liveness gate.** `dispatch-wave2-activate` **MUST** re-read each line's draft
   immediately before its activation submit, and **MUST NOT** submit for a line whose read is
   `lapsed` or unevaluable.
@@ -1213,7 +1241,10 @@ slice operations (D-80, D-81).
    failure (`10 §4.6`); a `catch.retry` retries only 429, 503, 504 and 409.
 3. **A 409 is followed by a read.** After a 409 from a dispatch operation (which may be
    `idempotency-lease-expired`, Q-11 (ii)) the definition **MUST** call `reconcile-intent` before
-   re-issuing the same call †.
+   re-issuing the same call †, **MUST** pass back its `nextSweepRound` and route its `failed[]`
+   and `unresolved[]` to fragment (c) as item 6 requires, and **MUST NOT** re-issue the call
+   without a fixed wait between the read and the re-issue (`waitReread1` for wave 1; the barrier
+   loop for wave 2), so a key held by a live lease is not polled in a loop (decision D-120).
 4. **Deferral routes to a wait, never to failure.** A non-empty `deferred[]` **MUST** route to
    the deferral re-check loop and then the same operation with `nextDispatchRound`; it **MUST
    NOT** route to fragment (c) and **MUST NOT** be raised as an error †. A 1.0.0 `wait` takes no
@@ -1228,7 +1259,10 @@ slice operations (D-80, D-81).
 6. **Failures and unresolved intents route to the failure arm.** A non-empty `failed[]` from any
    operation of this slice, and a non-empty `unresolved[]` from `reconcile-intent`, **MUST** route
    to fragment (c), each line with its reason; a non-empty `redispatch[]` **MUST** route to the
-   named wave's dispatch operation with the next round. A line is listed in `failed[]` or
+   named wave's dispatch operation with the next round, and a non-empty `undispatchedLineRefs`
+   from `evaluate-activation-eligibility` **MUST** route to `dispatch-wave1-create` before any
+   other answer of the evaluation is acted on — the route an operator's wave-1 retry and a line a
+   crashed dispatch never wrote come back through (D-119). A line is listed in `failed[]` or
    `unresolved[]` only by the round whose settlement records that failure — an already-terminal
    intent read again (`inst-ri-lock`) is not listed again — so routing failures first never
    starves `redispatch[]`. The poll arm **MUST NOT** discard `reconcile-intent`'s output †.
@@ -1239,7 +1273,9 @@ slice operations (D-80, D-81).
    own operation's previous call returned — `nextDispatchRound` per wave, `nextRereadRound`,
    `nextRebuildRound`, `nextSweepRound`, `report-spawn-signal`'s `nextRound` — or 0 on first
    entry, and **MUST NOT** pass one operation's round to another (`rebuild-wave1` never receives
-   or writes back wave 1's `dispatchRound`). A `held` answer of `report-spawn-signal` **MUST**
+   or writes back wave 1's `dispatchRound`). A dispatch call **MUST** pass only its own wave's
+   `attempt` (`wave1AttemptKey`, `wave2AttemptKey`) and **MUST** stop passing it once the call
+   has answered; no dispatch call carries an `attempt` minted for another operation (D-119). A `held` answer of `report-spawn-signal` **MUST**
    route to the held wait (`heldWait`, `10 §3.6` (b)), whose resume arm and `PT5M` tick lead back
    through `re-check-pre-activation` to the next round, never to a failure arm;
    a `not-dispatchable` answer **MUST** route to the barrier loop too, whose lifecycle arm consumes
@@ -1270,7 +1306,8 @@ slice operations (D-80, D-81).
   (§3.8, aligns `01 §3.8`); `settle-from-lookup`'s `absent` outcome leaves a step key `open` for
   the dispatch re-run (§4.4, clarifies `01 §3.3`).
 - **Deviations from `04`**: the `draft_created → pending` transition (reason `draft-voided`) that
-  `rebuild-wave1` drives; `evaluate-activation-eligibility`'s `released` meaning "the conjunction
+  `rebuild-wave1` drives; the task row's `wave1_attempt` and `wave2_attempt` this slice's keys
+  read, and `evaluate-activation-eligibility`'s `undispatchedLineRefs` (D-119); `evaluate-activation-eligibility`'s `released` meaning "the conjunction
   holds and either a non-empty eligible set exists or every line is terminal", which constraint 9
   relies on.
 - **Deviation from ADR-0004 as amended**, which describes wave 1 as "a `fork` of

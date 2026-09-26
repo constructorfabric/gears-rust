@@ -649,6 +649,7 @@ deadline stays the owning slice's stored value, so no definition version can mov
 | resumed escalation window | (e) | none of its own: the first answer is `apply-resume`'s | `apply-resume` (08), then `waitEscalation` | `due` |
 | `waitEligibility` — eligibility poll | (b) | `PT5M` (`04 §4.8` item 5) | `evaluate-payment-auth-eligibility` (04) | `eligibility` |
 | `waitDeferral1`, `waitDeferral2` — wave-1 and wave-2 deferral | (b) | `PT1M` | `dispatch-wave1-create` / `dispatch-wave2-activate` (05), under the next `dispatchRound` | `due` on a non-empty `deferred[]` |
+| `waitReread1` — wave-1 re-issue after a 409 and its read | (b) | `PT30S`, the barrier's poll interval | `dispatch-wave1-create` (05), under the unchanged key (D-120) | `waveOutcome` |
 | `waitExpected` — the barrier's timer half | (b) | `PT1H` | `evaluate-activation-eligibility` (04) | `due` |
 | `waitPoll` — barrier confirmation poll | (b) | `PT30S` | `reconcile-intent` (05), then `evaluate-activation-eligibility` | `released` |
 | `waitOverdue` — overdue window (`expected_fulfillment_at` + 24 h) | (b) | `PT1H` | `raise-overdue-escalation` `overdue-fulfillment` (07), under the next round | `due`, `raised` |
@@ -1096,7 +1097,7 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
       - held:            { when: '${ $context.stageLoop == "heldWait" }',               then: retryHeld }   # after a resume (or a recorded hold): call the held operation again under its next round
       - planFailFast:    { when: '${ $context.stageLoop == "planFailFast" }',           then: planFailFast }   # from the failure stage: an exhausted plan task passes begin-fulfillment before its unwind (D-109)
       - fresh:           { then: initEligibility }
-- initEligibility: { set: { eligibilityTrigger: initial, requestRef: null, evaluationSeq: 0, barrierSeq: 0, recheckSeq: 0, wave1Round: 0, wave2Round: 0, rebuildRound: 0, sweepRound: 0, spawnRound: 0, reportRound: 0, planAttempt: 0, wave1Failed: [], wave2Failed: [], spawned: false, planFailed: false } }
+- initEligibility: { set: { eligibilityTrigger: initial, requestRef: null, evaluationSeq: 0, barrierSeq: 0, recheckSeq: 0, wave1Round: 0, wave2Round: 0, rebuildRound: 0, sweepRound: 0, spawnRound: 0, reportRound: 0, planAttempt: 0, wave1Failed: [], wave2Failed: [], spawned: false, planFailed: false, wave1AttemptKey: null, wave2AttemptKey: null } }
 - eligibility:                          # protected (04)
     timeout: step
     try:
@@ -1206,13 +1207,13 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
       - dispatchWave1:
           timeout: wave1
           try:
-            - call: { step: dispatch-wave1-create }   # body: ref + planRef, lineRefs: $context.wave1LineRefs, dispatchRound: $context.wave1Round, attemptKey: $context.attemptKey; output: accepted[], failed[], deferred[], due, nextDispatchRound
+            - call: { step: dispatch-wave1-create }   # body: ref + planRef, lineRefs: $context.wave1LineRefs, dispatchRound: $context.wave1Round, attemptKey: $context.wave1AttemptKey (this wave's own attempt, D-119); output: accepted[], failed[], deferred[], due, nextDispatchRound
           catch: *transientNo409
     catch:                              # 409: still-processing | idempotency-lease-expired (Q-11 (ii)), read before re-issuing (05 §4.5 item 3); otherwise the budget or the timeout is spent
       as: waveError
       when: '${ $waveError.status as $s | any((409, 408, 429, 503, 504); . == $s) }'
       do: [ { classify: { set: { waveOutcome: '${ if $waveError.status == 409 then "reread" else "exhausted" end }', waveCause: '${ if $waveError.status == 408 then "step-deadline-exceeded" else "retry-budget-exhausted" end }' } } } ]
-    export: { as: '${ $context + { waveOutcome: (.waveOutcome // "answered"), waveCause: (.waveCause // null), wave1Failed: ($context.wave1Failed + (.failed // [])), wave1Deferred: (.deferred // []), wave1Round: (.nextDispatchRound // $context.wave1Round), wave1Attempt: (($context.wave1Round | tostring) + (if $context.attemptKey then ":" + ($context.attemptKey | tostring) else "" end)) } }' }   # wave1Attempt: the call's key tail, the task's sourceAttempt
+    export: { as: '${ $context + { waveOutcome: (.waveOutcome // "answered"), waveCause: (.waveCause // null), wave1Failed: ($context.wave1Failed + (.failed // [])), wave1Deferred: (.deferred // []), wave1Round: (.nextDispatchRound // $context.wave1Round), wave1Attempt: (($context.wave1Round | tostring) + (if $context.wave1AttemptKey then ":" + ($context.wave1AttemptKey | tostring) else "" end)), wave1AttemptKey: (if (.waveOutcome // "answered") == "answered" then null else $context.wave1AttemptKey end) } }' }   # wave1Attempt: the call's key tail, the task's sourceAttempt; the attempt is spent once the call answers, kept for the re-issue after a 409
 - onWave1:
     switch:
       - reread:    { when: '${ $context.waveOutcome == "reread" }',    then: wave1Reread }
@@ -1220,12 +1221,17 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
       - deferred:  { when: '${ ($context.wave1Deferred | length) > 0 }', then: waitDeferral1 }   # a settled success, never a failure (05 §4.5 item 4); due: false until the recorded instant
       - anyFailed: { when: '${ ($context.wave1Failed | length) > 0 }', then: lineFailure1 }
       - accepted:  { then: enterAwaitExpected }
-- wave1Reread:
+- wave1Reread:                         # 05 §4.5 item 3: read before re-issuing; the read's output is routed, never discarded (D-120)
     timeout: step
     try:
       - call: { step: reconcile-intent }   # body: ref + sweepRound
     catch: *transient
-    then: wave1
+    export: { as: '${ $context + { sweepFailed: .failed, sweepUnresolved: .unresolved, redispatch: .redispatch, sweepAttempt: ($context.sweepRound | tostring), sweepRound: .nextSweepRound } }' }
+- onWave1Reread:
+    switch:
+      - failed: { when: '${ (($context.sweepFailed + $context.sweepUnresolved) | length) > 0 }', then: sweepFailure }
+      - again:  { then: waitReread1 }   # a never-sent row keeps not_found_at, which the same-key re-run sends (05 §4.4)
+- waitReread1: { wait: PT30S, then: wave1 }   # the same key again after the barrier's poll interval, never at once
 - wave1Exhausted:
     set: { failureScope: line, failureSubjects: '${ [ $context.wave1LineRefs[] | { subjectRef: ., reason: "wave1-create-failed", cause: $context.waveCause } ] }', sourceStep: dispatch-wave1-create, sourceAttempt: '${ $context.wave1Attempt }', nextStage: failure, stageLoop: null }
     then: exit
@@ -1238,11 +1244,12 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
 - evaluate:                             # composable (04): both halves from Orders' record — due (database time against expected_fulfillment_at) and every create confirmed
     timeout: step
     try:
-      - call: { step: evaluate-activation-eligibility }   # body: ref + planRef, evaluationSeq: $context.barrierSeq; output: due, released, eligibleLineRefs[], pendingLineRefs[], nextEvaluationSeq
+      - call: { step: evaluate-activation-eligibility }   # body: ref + planRef, evaluationSeq: $context.barrierSeq; output: due, released, eligibleLineRefs[], pendingLineRefs[], undispatchedLineRefs[], nextEvaluationSeq
     catch: *transient
-    export: { as: '${ $context + { expectedDue: .due, released: .released, eligibleLineRefs: .eligibleLineRefs, barrierSeq: .nextEvaluationSeq } }' }
+    export: { as: '${ $context + { expectedDue: .due, released: .released, eligibleLineRefs: .eligibleLineRefs, undispatched: (.undispatchedLineRefs // []), barrierSeq: .nextEvaluationSeq } }' }
 - onEvaluate:
     switch:
+      - undispatched:  { when: '${ ($context.undispatched | length) > 0 }', then: redispatchUndispatched }   # a pending line with no live wave-1 intent: a retried or rowless line (05 §4.5 item 6, D-119)
       - releasedFirst: { when: '${ $context.released and ($context.spawned | not) }', then: preActivation }
       - releasedAgain: { when: '${ $context.released }', then: wave2 }   # the spawn signal is recorded once
       - notDue:        { when: '${ $context.expectedDue | not }', then: awaitExpected }
@@ -1311,6 +1318,7 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
     set: { failureScope: line, failureSubjects: '${ [ $context.sweepFailed[] | { subjectRef: .lineRef, reason: .reason, cause: "sweep-discovered-terminal-failure" } ] + [ $context.sweepUnresolved[] | { subjectRef: ., reason: "intent-unresolved", cause: "sweep-floor-reached" } ] }', sourceStep: reconcile-intent, sourceAttempt: '${ $context.sweepAttempt }', nextStage: failure, stageLoop: null }
     then: exit
 - redispatchWave1: { set: { wave1LineRefs: '${ [ $context.redispatch[] | select(.wave == "wave1_create") | .lineRef ] }' }, then: enterWave1 }
+- redispatchUndispatched: { set: { wave1LineRefs: '${ $context.undispatched }' }, then: enterWave1 }
 - preActivation:                        # protected (04): SUB-O5 overlap presence + market + authorization freshness, immediately before the first activation
     timeout: step
     try:
@@ -1342,13 +1350,13 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
       - dispatchWave2:
           timeout: wave2
           try:
-            - call: { step: dispatch-wave2-activate }   # body: ref + planRef, lineRefs: $context.eligibleLineRefs, dispatchRound: $context.wave2Round, attemptKey; output: accepted[], activated[], failed[], pending[], lapsed[], deferred[], due, nextDispatchRound
+            - call: { step: dispatch-wave2-activate }   # body: ref + planRef, lineRefs: $context.eligibleLineRefs, dispatchRound: $context.wave2Round, attemptKey: $context.wave2AttemptKey (this wave's own attempt, D-119); output: accepted[], activated[], failed[], pending[], lapsed[], deferred[], due, nextDispatchRound
           catch: *transientNo409
     catch:                              # 409: activation-precondition-unmet, still-processing or idempotency-lease-expired — read, then back to the barrier
       as: waveError
       when: '${ $waveError.status as $s | any((409, 408, 429, 503, 504); . == $s) }'
       do: [ { classify: { set: { waveOutcome: '${ if $waveError.status == 409 then "reread" else "exhausted" end }', waveCause: '${ if $waveError.status == 408 then "step-deadline-exceeded" else "retry-budget-exhausted" end }' } } } ]
-    export: { as: '${ $context + { waveOutcome: (.waveOutcome // "answered"), waveCause: (.waveCause // null), wave2Attempt: (($context.wave2Round | tostring) + (if $context.attemptKey then ":" + ($context.attemptKey | tostring) else "" end)), wave2Failed: ($context.wave2Failed + (.failed // [])), wave2Pending: (.pending // []), lapsed: (.lapsed // []), wave2Deferred: (.deferred // []), wave2Round: (.nextDispatchRound // $context.wave2Round) } }' }
+    export: { as: '${ $context + { waveOutcome: (.waveOutcome // "answered"), waveCause: (.waveCause // null), wave2Attempt: (($context.wave2Round | tostring) + (if $context.wave2AttemptKey then ":" + ($context.wave2AttemptKey | tostring) else "" end)), wave2AttemptKey: (if (.waveOutcome // "answered") == "answered" then null else $context.wave2AttemptKey end), wave2Failed: ($context.wave2Failed + (.failed // [])), wave2Pending: (.pending // []), lapsed: (.lapsed // []), wave2Deferred: (.deferred // []), wave2Round: (.nextDispatchRound // $context.wave2Round) } }' }
 - onWave2:                              # 05 §4.5 items 4–6 and 9
     switch:
       - reread:     { when: '${ $context.waveOutcome == "reread" }',    then: wave2Reread }
@@ -1358,12 +1366,16 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
       - anyFailed:  { when: '${ ($context.wave2Failed | length) > 0 }', then: lineFailure2 }   # D-54
       - anyPending: { when: '${ ($context.wave2Pending | length) > 0 }', then: enterBarrierLoop }  # dependents wait for their dependencies; the same conjunction
       - complete:   { then: reportCompleted }                                                     # pending[] and failed[] both empty
-- wave2Reread:
+- wave2Reread:                         # 05 §4.5 item 3: read, route what it found, then wait in the barrier loop, whose poll re-issues nothing blind (D-120)
     timeout: step
     try:
       - call: { step: reconcile-intent }   # body: ref + sweepRound
     catch: *transient
-    then: enterBarrierLoop
+    export: { as: '${ $context + { sweepFailed: .failed, sweepUnresolved: .unresolved, redispatch: .redispatch, sweepAttempt: ($context.sweepRound | tostring), sweepRound: .nextSweepRound } }' }
+- onWave2Reread:
+    switch:
+      - failed: { when: '${ (($context.sweepFailed + $context.sweepUnresolved) | length) > 0 }', then: sweepFailure }
+      - wait:   { then: enterBarrierLoop }   # a never-sent row keeps not_found_at: the next evaluate names a wave-2 line again, and names a wave-1 line in undispatchedLineRefs
 - wave2Exhausted:
     set: { failureScope: line, failureSubjects: '${ [ $context.eligibleLineRefs[] | { subjectRef: ., reason: "wave2-activation-failed", cause: $context.waveCause } ] }', sourceStep: dispatch-wave2-activate, sourceAttempt: '${ $context.wave2Attempt }', nextStage: failure, stageLoop: null }
     then: exit
@@ -1462,8 +1474,19 @@ the definition waits the fixed `PT1M` of `waitDeferral1` or `waitDeferral2` and 
 it recorded; `retryAfterMs` is the operation's, never a `wait` value. A `lapsed[]` line goes to
 `rebuild-wave1` — under its own `rebuildRound`, never wave 1's round — and back through wave 1 and
 the barrier; a `failed[]` line, an exhausted budget
-and a spent wave timeout go to fragment (c); a 409 is followed by a `reconcile-intent` read before
-the call is re-issued. **The barrier is a conjunction and is re-evaluated on every contributing
+and a spent wave timeout go to fragment (c); a 409 is followed by a `reconcile-intent` read
+before the call is re-issued, and that read is routed like the poll arm's: its `failed[]` and
+`unresolved[]` go to fragment (c), its round is passed back, and wave 1 is re-issued under the
+unchanged key only after the `PT30S` `waitReread1`, while wave 2 waits in the barrier loop
+(decision D-120). **Re-dispatch after a retry** (decision D-119). An operator's line retry mints
+the line's next wave attempt in Orders' record when its intent is recorded `failed`, and the next
+`attempt` of its wave's dispatch family, which the failure stage files by `retryWave` as
+`wave1AttemptKey` or `wave2AttemptKey`; each wave call passes only its own and spends it once the
+call answers. `evaluate-activation-eligibility` answers `undispatchedLineRefs` — every `pending`
+line with no live wave-1 intent under its current attempt, which is a retried wave-1 line, a
+line a crashed dispatch never wrote, or a never-sent row — and `onEvaluate` sends them to wave 1
+before anything else; a retried wave-2 line is `draft_created` again and returns through
+`eligibleLineRefs`. **The barrier is a conjunction and is re-evaluated on every contributing
 signal**: `evaluate-activation-eligibility` answers both halves from Orders' record — `due`,
 database time against the plan's stored `expected_fulfillment_at`, which `awaitExpected`
 re-checks on the `PT1H` `waitExpected` tick, and the all-creates half, which Orders' own
@@ -1579,7 +1602,7 @@ order-scope task, `taskReturnStage` and `taskReturnLoop`:
     try:
       - call: { step: resolve-manual-task }   # body: ref + trigger: request, taskRef, requestRef
     catch: *transient
-    export: { as: '${ $context + { resolution: .resolution, resumeAt: .resumeAt, attemptKey: .attemptKey, openTaskCount: .openTaskCount, slaRound: .slaRound } }' }
+    export: { as: '${ $context + { resolution: .resolution, resumeAt: .resumeAt, attemptKey: (if .retryWave then $context.attemptKey else .attemptKey end), wave1AttemptKey: (if .retryWave == "wave1_create" then .attemptKey else $context.wave1AttemptKey end), wave2AttemptKey: (if .retryWave == "wave2_activate" then .attemptKey else $context.wave2AttemptKey end), openTaskCount: .openTaskCount, slaRound: .slaRound } }' }   # a line retry's attempt belongs to its wave's dispatch family (retryWave); the latest per wave is that family's counter, so several retries under the remediation hold keep one member per wave (D-117, D-119)
     then: onResolution
 - slaCheck:                             # composable (07): the SLA re-check; escalates inside the operation only once the stored SLA deadline has passed
     timeout: step
@@ -1600,7 +1623,7 @@ order-scope task, `taskReturnStage` and `taskReturnLoop`:
       - plan:         { when: '${ $context.resumeAt == "plan" }',         then: toPlan }
       - compensation: { when: '${ $context.resumeAt == "compensation" }', then: toCompensation }
       - stage:        { then: retryStage }   # an order-scope task: the stage whose operation failed
-- toBarrier: { set: { nextStage: fulfillment, stageLoop: barrierLoop }, then: exit }   # every retried line re-enters the conjunction; the wave re-dispatches it under attemptKey
+- toBarrier: { set: { nextStage: fulfillment, stageLoop: barrierLoop }, then: exit }   # evaluate names every retried wave-1 line in undispatchedLineRefs and every retried wave-2 line in eligibleLineRefs; each is sent under its line's new wave attempt, the call under its wave's attemptKey (D-119)
 - toPlan: { set: { nextStage: fulfillment, stageLoop: freezePlan, planAttempt: '${ $context.attemptKey }' }, then: exit }   # a new attempt of construct-and-freeze-plan
 - toCompensation: { set: { nextStage: unwind, stageLoop: compensate }, then: exit }   # a new pass of compensate-order
 - retryStage: { set: { nextStage: '${ $context.taskReturnStage }', stageLoop: '${ $context.taskReturnLoop }' }, then: exit }   # reflect-verdict → approval at reflectVerdict, the one order-scope task the definition creates (D-114)
@@ -1720,7 +1743,7 @@ re-check and no remainder is carried. A non-empty `exhaustedTaskRefs`, an `exhau
 and an `exhausted: true` override route to the unwind; a `retry` routes by `resumeAt` — `barrier`
 (a line), `plan` (a new `construct-and-freeze-plan` attempt), `compensation` (a new
 `compensate-order` pass) or `stage` (an order-scope task, back to the `taskReturnStage` and
-`taskReturnLoop` the failing stage recorded) — and carries `attemptKey`; `closed`, `escalated`,
+`taskReturnLoop` the failing stage recorded) — and carries `attemptKey`, which a line retry files per wave as `wave1AttemptKey` or `wave2AttemptKey` (D-119); `closed`, `escalated`,
 `refused` and `none` return to the waiting fork. **The reverse walk is one operation**:
 `compensate-order` owns `compensation_sequence`, the descending walk, the per-subject phase
 resolution and the `failed-pending-escalation` records

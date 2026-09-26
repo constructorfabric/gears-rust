@@ -195,9 +195,10 @@ undoes. The key composition is the **five-component** form slice 05 owns:
     resource_tenant_id : orderId + orderVersion + orderLineId + wave + intentKind
 
 where `intentKind` is `owf_provisioning_intent.intent_kind`
-(`draft_create | activation | draft_void | activated_cancel`), with `wave_attempt` appended as a
-sixth component where the forward create was rebuilt, so the void of rebuild attempt 2 is distinct
-from the void of attempt 1. The tenant prefix namespaces every key.
+(`draft_create | activation | draft_void | activated_cancel`), with the forward intent's
+`wave_attempt` appended as a sixth component where it is above 1 — a rebuilt create, or a line an
+operator retried after its intent was recorded `failed` (decision D-119) — so the void of attempt 2
+is distinct from the void of attempt 1. The tenant prefix namespaces every key.
 
 Reusing the forward key is a correctness failure with three compounding effects: the local
 `UNIQUE(idempotency_key)` constraint (`05-provisioning-intents.md` §3.7) rejects the compensating

@@ -901,7 +901,10 @@ next round out, a per-instance counter, an attempt only from an operator retry):
    the failed step's family (a second counter in the same `key_rounds` entry) and returns it as
    `attemptKey`. The definition passes it to the operation the retry re-enters, whose key ends in
    `:{attempt}` after the round, and clears it once that operation settles; attempt `0` is
-   omitted from the key. A round is the definition's loop; an attempt is an operator's decision
+   omitted from the key. For a line task the family is the dispatch operation of the line's wave,
+   whatever step raised the task, and the definition keeps one attempt per wave; the line's own
+   re-send is keyed by the per-line `wave_attempt` on its task row, which the retry increments
+   only for an intent recorded `failed` (`05 §4.4`, decision D-119). A round is the definition's loop; an attempt is an operator's decision
    that a failed step runs again, and it is the only way past a settled refusal of the same round.
    An attempt above the family's minted counter is `idempotency-key-mismatch` - `inst-owf-attempt`
 4. [ ] - `p1` - **A Lifecycle-transition key carries the round.** The key Orders passes to
@@ -932,7 +935,7 @@ this table is the index the validation hook of `10 §2.2` and the envelope's cou
 | `escalate-gate` (03), per position and mode | `round` → `escalationRound` · `probeRound` | `…:escalate-gate:{orderVersion}:{position}:{mode}:{round}` |
 | `evaluate-payment-auth-eligibility`, `evaluate-activation-eligibility`, `re-check-pre-activation` (04) | `evaluationSeq` → `nextEvaluationSeq` | `…:{evaluationSeq}` |
 | `begin-fulfillment` (04) | `eligibilitySeq` — the round of the `eligible` answer it follows, validated against that settled answer (`04 §3.6` `inst-bf-guard-frozen`) rather than a counter of its own; it returns no round | `…:begin-fulfillment:{eligibilitySeq}`, step and Lifecycle alike |
-| `dispatch-wave1-create`, `dispatch-wave2-activate` (05), per wave | `dispatchRound` → `nextDispatchRound`; `attemptKey` | `…:{planRef}:{dispatchRound}` |
+| `dispatch-wave1-create`, `dispatch-wave2-activate` (05), per wave | `dispatchRound` → `nextDispatchRound`; `attemptKey`, the wave's own (`wave1AttemptKey`, `wave2AttemptKey`, D-119) | `…:{planRef}:{dispatchRound}[:{attempt}]`; the intent key's per-line `wave_attempt` is a separate counter on the task row (`05 §4.4`) |
 | `reread-draft-liveness` (05) | `rereadRound` → `nextRereadRound` | `…:reread-draft-liveness:{planRef}:{rereadRound}` |
 | `rebuild-wave1` (05) | `rebuildRound` → `nextRebuildRound` | `…:rebuild-wave1:{planRef}:{rebuildRound}` |
 | `reconcile-intent` (05) | `sweepRound` → `nextSweepRound` | `…:reconcile-intent:{sweepRound}` |
@@ -998,7 +1001,9 @@ invocation (D-86, D-105) reads its own `invocationId` back and continues.
 
 Effect: under the registry row's lock, re-read `status`, `lease_expires_at` and `lease_holder`;
 if the row is still `in_flight` with a dead lease held by `leaseHolder`, or `open`, write the step record for the stuck attempt with
-the looked-up result, settle the key (`settled/success` or `settled/failure` on a terminal lookup),
+the looked-up result — for a multi-line dispatch key, the operation's full output built from
+Orders' record ([`05 §3.6`](./05-provisioning-intents.md#36-interactions--sequences)
+`inst-ri-settle-key`) — settle the key (`settled/success` or `settled/failure` on a terminal lookup),
 or leave it `open` — on `non-terminal` inside the key lifetime, and on `absent` (nothing the
 attempt would have sent was sent, so the dispatching operation's same-key re-run is safe by
 construction, [`05 §4.4`](./05-provisioning-intents.md#44-operation-rules-normative)) — and write
@@ -1958,7 +1963,7 @@ exactly one of them:
 | **Key conflict** | Any state, `request_fingerprint` does **not** match | Refuse the call (`idempotency-key-conflict`, `permanent-failure`). The same key was presented for a materially different request, which is a caller defect — a wrongly authored definition input — not a duplicate. |
 | **Still-processing** | `in_flight`, lease **live** | **MUST NOT** be inferred as success and **MUST NOT** be resubmitted under a new key; the definition re-issues the same key after backoff (`still-processing`, 409 `Aborted`). |
 | **Lease-expired** | `in_flight`, `lease_expires_at` passed, `expires_at` **not** passed | Resolved by the key's family (D-103). **The intent-submitting operations** — `dispatch-wave1-create`, `dispatch-wave2-activate` and `compensate-order` — treat it as **still-processing** (`idempotency-lease-expired`, 409 `Aborted`): the real outcome is confirmed by lookup and settled only by `settle-from-lookup` (§3.3); the effect is **never** re-run blind, because the holder may have crashed *after* Subscriptions accepted an intent. **Every other operation** re-runs it as a re-run under a new `lease_holder`: its outbound call is either a read or a submission the downstream de-duplicates under the key the step derives — Lifecycle answers a committed transition with its stored outcome ([Lifecycle `01 §4.2`](../../../orders-lifecycle/docs/design/01-foundation.md#42-idempotency-semantics-normative), first row), and the approval-request key does the same at Generic Approval (`../ADR/0006`) — so a crash after the downstream accepted is absorbed downstream, and the old holder's late settlement fails the fence. A record-only operation never leaves this state behind (§3.7). |
-| **Aged-out key** | `expires_at` passed with no settled record | Evaluated on the retained row — the tombstone rule of §3.7 keeps it until no replay can arrive, so expiry is logical and never inferred from a missing row. `settle-from-lookup` is read-only past this point. The next attempt is a **new operation under a new key** — it appends the key's `attempt` component (minted by `retry-step` or by the rebuild path of slice 05) — never a resume of the old one and never a replay of the identical key string. |
+| **Aged-out key** | `expires_at` passed with no settled record | Evaluated on the retained row — the tombstone rule of §3.7 keeps it until no replay can arrive, so expiry is logical and never inferred from a missing row. `settle-from-lookup` is read-only past this point. The next attempt is a **new operation under a new key** — it appends the key's `attempt` component (minted by `retry-step`; for an intent key, the per-line `wave_attempt` minted by the rebuild path or by an operator's retry of a `failed` intent, slice 05) — never a resume of the old one and never a replay of the identical key string. |
 
 No seventh outcome exists. **These six are registry outcomes, not additional step outcomes.**
 They are what resolving a key yields *inside* the envelope; the definition still sees only the

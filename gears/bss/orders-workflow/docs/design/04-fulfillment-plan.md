@@ -499,8 +499,8 @@ compensation, not order state.
   slice 06 (`compensate-order`, `report-outcome`).
 - The immediate void of succeeded wave-1 drafts on a wave-1 line failure — retired. Under
   `fail-fast` the drafts are voided by `compensate-order`; under `remediate` they stay, and their
-  liveness is re-read and rebuilt by slice 05 (`reread-draft-liveness`, `rebuild-wave1`) before
-  wave 2.
+  liveness is re-read inside `dispatch-wave2-activate` and a lapsed draft rebuilt by
+  `rebuild-wave1` (slice 05) before wave 2.
 - The process-level `remediation-hold` suspension — retired; the remediation hold is the open
   manual task (§4.4), not an instance phase.
 - The Catalog read's wrapping by slice 08's Dependency Retry Governor — retired with the governor;
@@ -545,7 +545,7 @@ gear's authority — the caller supplies references, never authority (ADR-0013, 
 |-------|-------------------------------------|-----------------------------|---------------------|-----------------------------------|---------------------------|
 | `protection` | `protected` | `protected` | `protected` — the R1 seam call | `composable` | `protected` |
 | `input` (beyond the common members) | `trigger` ∈ `initial` · `acceptance-recorded` · `reauthorize-requested` · `poll`; `requestRef` (the signal's request, nullable); `evaluationSeq` | `attempt` (default 0; minted by `retry-step` on a plan-level task's retry) | `planRef`, `eligibilitySeq` (the `evaluationSeq` of the `eligible` answer) | `planRef`, `evaluationSeq` | `planRef`, `evaluationSeq` |
-| `output` | `eligibility` ∈ `eligible` · `pending`; `nextEvaluationSeq` | `planRef`, `lineRefs[]`, `expectedFulfillmentAt` (instant), `policy` ∈ `remediate` · `fail-fast`, `planState` ∈ `frozen` · `invalid-graph` · `topology-unavailable`, `reason` (catalogue code, nullable) | `result` ∈ `in-fulfillment` · `withheld` · `held` (Lifecycle `not-admissible` and the order read shows `on_hold`) · `version-conflict` (Lifecycle `version-conflict`: the order moved; the amendment arm resolves it) — every one a settled success, so no answer of this operation is a 409 the definition must interpret; `withheldCause` ∈ `authorization-pending` · `authorization-failed` · `acceptance-required-not-recorded` · `acceptance-requirement-unevaluable` · `null` | `due: true\|false` — database time against the plan's stored `expected_fulfillment_at`, the answer the barrier's re-check loop switches on (`10 §3.6` (b)); `released` (bool), `eligibleLineRefs[]`, `pendingLineRefs[]`, `nextEvaluationSeq` | `verdict` ∈ `proceed` · `abort` · `not-dispatchable`; `abortReason` (catalogue code, nullable); `observed` ∈ `on-hold` · `superseded` · `terminal` · `null`; `nextEvaluationSeq` |
+| `output` | `eligibility` ∈ `eligible` · `pending`; `nextEvaluationSeq` | `planRef`, `lineRefs[]`, `expectedFulfillmentAt` (instant), `policy` ∈ `remediate` · `fail-fast`, `planState` ∈ `frozen` · `invalid-graph` · `topology-unavailable`, `reason` (catalogue code, nullable) | `result` ∈ `in-fulfillment` · `withheld` · `held` (Lifecycle `not-admissible` and the order read shows `on_hold`) · `version-conflict` (Lifecycle `version-conflict`: the order moved; the amendment arm resolves it) — every one a settled success, so no answer of this operation is a 409 the definition must interpret; `withheldCause` ∈ `authorization-pending` · `authorization-failed` · `acceptance-required-not-recorded` · `acceptance-requirement-unevaluable` · `null` | `due: true\|false` — database time against the plan's stored `expected_fulfillment_at`, the answer the barrier's re-check loop switches on (`10 §3.6` (b)); `released` (bool), `eligibleLineRefs[]`, `pendingLineRefs[]`, `undispatchedLineRefs[]` (every `pending` task with no live wave-1 intent under its current `wave1_attempt`, which the definition sends to `dispatch-wave1-create` first, `05 §4.5` item 6), `nextEvaluationSeq` | `verdict` ∈ `proceed` · `abort` · `not-dispatchable`; `abortReason` (catalogue code, nullable); `observed` ∈ `on-hold` · `superseded` · `terminal` · `null`; `nextEvaluationSeq` |
 | `idempotency_key` | instance-scoped `{tenant}:{correlationId}:evaluate-payment-auth-eligibility:{evaluationSeq}` | instance-scoped `{tenant}:{correlationId}:construct-and-freeze-plan:{attempt}` | lifecycle-transition `{tenant}:{orderId}:{orderVersion}:begin-fulfillment:{eligibilitySeq}` (§4.1) | instance-scoped `{tenant}:{correlationId}:evaluate-activation-eligibility:{planRef}:{evaluationSeq}` | instance-scoped `{tenant}:{correlationId}:re-check-pre-activation:{planRef}:{evaluationSeq}` |
 | `declared_event` | none | none | `OrderFulfillmentStarted` on `result = in-fulfillment` | none | none |
 | `compensation` | none | none — a frozen plan is superseded by a new order version, never undone | none — the unwind of an order in fulfillment is `run-cancellation-fence` → `compensate-order` → `report-outcome` (06), a path, not a paired undo | none (read-only) | none |
@@ -785,13 +785,14 @@ own key handling, so the transition is applied once.
 **Algorithm: Evaluate Activation Eligibility**
 
 Input: correlationId, planRef, evaluationSeq, attemptId
-Output: due, released, eligibleLineRefs[], pendingLineRefs[], nextEvaluationSeq
+Output: due, released, eligibleLineRefs[], pendingLineRefs[], undispatchedLineRefs[], nextEvaluationSeq
 
 1. [ ] - `p1` - Read the frozen plan and every task in one snapshot at database time; set `due` to whether database now has reached `expected_fulfillment_at`, returned on every answer below; **IF** the plan is not frozen or carries an `abort_record`: **RETURN** `released: false` with empty lists - `inst-ae-read`
 2. [ ] - `p1` - **IF** `owf_process_instance.suspended` is true: **RETURN** `released: false` — a hold never releases the barrier, though it does not stop its evaluation - `inst-ae-if-suspended`
-3. [ ] - `p1` - **IF** database now is before `expected_fulfillment_at`, or any task is still `pending` or `failed`: **RETURN** `released: false` with `pendingLineRefs` = the tasks not yet `draft_created` - `inst-ae-if-conjunction-false`
-4. [ ] - `p1` - Otherwise the conjunction holds; `eligibleLineRefs` = every `draft_created` task whose dependencies in the frozen graph are all `activated`; `pendingLineRefs` = every `draft_created` task with an unactivated dependency; **RETURN** `released: true` - `inst-ae-released`
-5. [ ] - `p1` - Record the evaluation, including the first `released: true` instant per plan as the SLA window opening (§1.2) - `inst-ae-record`
+3. [ ] - `p1` - **IF** any task is `pending` with no `draft_create` intent row under its current `wave1_attempt`, or only a row carrying `not_found_at` (`05 §3.7`): **RETURN** `released: false` with `undispatchedLineRefs` = those tasks. They are a line an operator retried after its wave-1 intent was recorded `failed` (a new attempt, no row yet), a line a crashed dispatch never wrote, and a never-sent row; nothing else sends them (decision D-119). A deferred line is never among them here, because the definition leaves wave 1 only once its deferral loop has sent every line (`10 §3.6` (b)) - `inst-ae-undispatched`
+4. [ ] - `p1` - **IF** database now is before `expected_fulfillment_at`, or any task is still `pending` or `failed`: **RETURN** `released: false` with `pendingLineRefs` = the tasks not yet `draft_created` - `inst-ae-if-conjunction-false`
+5. [ ] - `p1` - Otherwise the conjunction holds; `eligibleLineRefs` = every `draft_created` task whose dependencies in the frozen graph are all `activated`; `pendingLineRefs` = every `draft_created` task with an unactivated dependency; **RETURN** `released: true` - `inst-ae-released`
+6. [ ] - `p1` - Record the evaluation, including the first `released: true` instant per plan as the SLA window opening (§1.2) - `inst-ae-record`
 
 **Description**: The definition's barrier loop calls this operation after every `PT1H`
 `waitExpected` tick until `due` is `true`, and again on **every** contributing signal — a Subscriptions draft-create outcome event or the
@@ -1008,6 +1009,8 @@ none (`01 §3.7`, D-104); purged row-wise through a `created_at` index.
 | transition_request_id | text | Downstream Subscriptions transition-request identifier; join key only, never mirrored into order state and never returned to the definition. |
 | subscription_id | text nullable | The subscription Subscriptions created for this line, captured on the activation confirmation (and on a verified override). It is what the completion acknowledgement passes to Lifecycle (`PRD.md` AC 8) and what compensation enumerates. NOT NULL once `state = activated`. |
 | failed_wave | smallint nullable | `1` or `2`: the wave whose failure put the task in `failed`; selects the retry target below. |
+| wave1_attempt | integer | The line's wave-1 attempt, the `wave_attempt` of its `draft_create` intent key (`05 §2.2`). Starts at 1; incremented by `rebuild-wave1` for a lapsed draft and by an operator's `retry` of a line whose wave-1 intent is recorded `failed` (slice 07); never by a platform retry (decision D-119). |
+| wave2_attempt | integer | The line's wave-2 attempt, the `wave_attempt` of its `activation` intent key. Starts at 1; incremented only by an operator's `retry` of a line whose activation intent is recorded `failed` (D-119). |
 | terminal_entry_seq | integer | Incremented on every entry into `activated` or `failed`. Starts at 0. |
 | terminal_event_emitted_seq | integer | Highest `terminal_entry_seq` for which `OrderFulfillmentStepCompleted` has been enqueued; the guard is `terminal_event_emitted_seq < terminal_entry_seq`. |
 | terminal_event_emitted_at | timestamptz | When that emission was enqueued. |
@@ -1017,8 +1020,8 @@ none (`01 §3.7`, D-104); purged row-wise through a `created_at` index.
 **PK**: (order_id, order_version, order_line_id)
 
 **Constraints**: NOT NULL on order_id, order_version, order_line_id, line_ref,
-resource_tenant_id, seller_tenant_id, state, dependency_rank, terminal_entry_seq,
-terminal_event_emitted_seq, created_at; `line_ref` UNIQUE; `failed_wave` NOT NULL exactly when
+resource_tenant_id, seller_tenant_id, state, dependency_rank, wave1_attempt, wave2_attempt,
+terminal_entry_seq, terminal_event_emitted_seq, created_at; `line_ref` UNIQUE; `failed_wave` NOT NULL exactly when
 `state = failed`.
 
 `state` is a schema-level enum with this **declared transition table**:
@@ -1027,8 +1030,8 @@ terminal_event_emitted_seq, created_at; `line_ref` UNIQUE; `failed_wave` NOT NUL
 |------|--------------|-----------|
 | `pending` | `draft_created`, `failed` | Wave-1 draft-create confirmation / failure (slice 05). `pending -> failed` sets `failed_wave = 1`. |
 | `draft_created` | `activated`, `failed`, `pending` | Wave-2 activation confirmation / failure (slice 05). `draft_created -> failed` sets `failed_wave = 2`. `draft_created -> pending` is the **machine** transition with reason `draft-voided`, driven only by `rebuild-wave1` (slice 05) when the line's draft is recorded `lapsed`; the line's next wave-1 create is a new intent under a new `wave_attempt` ([`05 §3.6` *Wave-1 Rebuild*](./05-provisioning-intents.md#36-interactions--sequences)). |
-| `failed` (`failed_wave = 1`) | `pending` | **Operator-driven only** — `resolve-manual-task` `retry` (slice 07): the line returns to the state before the failed wave, and slice 05 re-dispatches its create under the new `attempt`; the later `pending -> draft_created` is machine-driven as usual. |
-| `failed` (`failed_wave = 2`) | `draft_created`, `activated` | **Operator-driven only** — `retry` returns the line to `draft_created` (slice 05 re-reads the draft's liveness and rebuilds it if it lapsed) so the next barrier pass may activate it; a verified `override` (`verify-override`, slice 07) lands `activated` with the verified `subscription_id`. |
+| `failed` (`failed_wave = 1`) | `pending` | **Operator-driven only** — `resolve-manual-task` `retry` (slice 07): the line returns to the state before the failed wave with `wave1_attempt` incremented in the same transition, `evaluate-activation-eligibility` names it in `undispatchedLineRefs`, and slice 05 re-dispatches its create under the new intent key; the later `pending -> draft_created` is machine-driven as usual. |
+| `failed` (`failed_wave = 2`) | `draft_created`, `activated` | **Operator-driven only** — `retry` returns the line to `draft_created` with `wave2_attempt` incremented in the same transition (slice 05 re-reads the draft's liveness inside `dispatch-wave2-activate` and rebuilds it if it lapsed) so the next barrier pass activates it under the new intent key; a verified `override` (`verify-override`, slice 07) lands `activated` with the verified `subscription_id`. |
 
 Every exit from `failed` requires `last_transition_actor`; a machine-driven exit is refused.
 `activated` has no outgoing transition: an activated line is undone only by compensation
@@ -1245,7 +1248,10 @@ the fragment now carries each rule, and the note is kept as the reason the rule 
    expression, `10 §3.6` *Fixed waits and re-check loops*); the overdue deadline is
    the same instant plus 24 h, owned by slice 07; `evaluate-activation-eligibility` **MUST** be re-invoked on every
    Subscriptions draft-create outcome event **and** on the poll interval; the definition **MUST
-   NOT** decide release from its own memory of confirmations.
+   NOT** decide release from its own memory of confirmations; a non-empty `undispatchedLineRefs`
+   **MUST** route to `dispatch-wave1-create` with those lines, so a retried or never-written
+   wave-1 line is sent from Orders' record rather than from the definition's memory of retries
+   (decision D-119).
 8. **No swallowing `catch`** — `evaluate-payment-auth-eligibility`, `construct-and-freeze-plan`,
    `begin-fulfillment` and `re-check-pre-activation` **MUST NOT** be inside a `catch` that returns
    normally after a permanent failure (`10 §4.6`); their retry-only `catch` lets exhaustion
