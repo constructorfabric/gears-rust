@@ -641,15 +641,7 @@ async fn replay_completed_fallback_rebuilds_result_from_version_row() {
     let (svc, msvc, multipart_store, backend, _store, ctx, dsn) = build_env().await;
     let file_id = svc.create_file_bare(&ctx, new_file()).await.unwrap();
     let plan = msvc
-        .initiate_multipart_upload(
-            &ctx,
-            file_id,
-            "application/octet-stream",
-            13,
-            None,
-            None,
-            false,
-        )
+        .initiate_multipart_upload(&ctx, file_id, "application/octet-stream", 13, None, false)
         .await
         .unwrap();
     let session = multipart_store
@@ -716,15 +708,7 @@ async fn replay_completed_fallback_errors_when_version_row_is_gone() {
     let (svc, msvc, multipart_store, backend, _store, ctx, dsn) = build_env().await;
     let file_id = svc.create_file_bare(&ctx, new_file()).await.unwrap();
     let plan = msvc
-        .initiate_multipart_upload(
-            &ctx,
-            file_id,
-            "application/octet-stream",
-            5,
-            None,
-            None,
-            false,
-        )
+        .initiate_multipart_upload(&ctx, file_id, "application/octet-stream", 5, None, false)
         .await
         .unwrap();
     let session = multipart_store
@@ -790,15 +774,7 @@ async fn replay_completed_fallback_errors_when_version_not_available() {
     let (svc, msvc, multipart_store, backend, _store, ctx, dsn) = build_env().await;
     let file_id = svc.create_file_bare(&ctx, new_file()).await.unwrap();
     let plan = msvc
-        .initiate_multipart_upload(
-            &ctx,
-            file_id,
-            "application/octet-stream",
-            5,
-            None,
-            None,
-            false,
-        )
+        .initiate_multipart_upload(&ctx, file_id, "application/octet-stream", 5, None, false)
         .await
         .unwrap();
     let session = multipart_store
@@ -862,15 +838,7 @@ async fn replay_completed_fallback_errors_on_unrecognized_hash_mode() {
     let (svc, msvc, multipart_store, backend, _store, ctx, dsn) = build_env().await;
     let file_id = svc.create_file_bare(&ctx, new_file()).await.unwrap();
     let plan = msvc
-        .initiate_multipart_upload(
-            &ctx,
-            file_id,
-            "application/octet-stream",
-            5,
-            None,
-            None,
-            false,
-        )
+        .initiate_multipart_upload(&ctx, file_id, "application/octet-stream", 5, None, false)
         .await
         .unwrap();
     let session = multipart_store
@@ -924,15 +892,7 @@ async fn replay_completed_fallback_reports_bound_state_when_still_bound() {
     let (svc, msvc, multipart_store, backend, _store, ctx, dsn) = build_env().await;
     let file_id = svc.create_file_bare(&ctx, new_file()).await.unwrap();
     let plan = msvc
-        .initiate_multipart_upload(
-            &ctx,
-            file_id,
-            "application/octet-stream",
-            5,
-            None,
-            None,
-            true,
-        )
+        .initiate_multipart_upload(&ctx, file_id, "application/octet-stream", 5, None, true)
         .await
         .unwrap();
     let session = multipart_store
@@ -991,15 +951,7 @@ async fn replay_completed_fallback_reports_conflict_when_content_rebound_elsewhe
 
     // Session A: auto_bind, binds the file to version A.
     let plan_a = msvc
-        .initiate_multipart_upload(
-            &ctx,
-            file_id,
-            "application/octet-stream",
-            5,
-            None,
-            None,
-            true,
-        )
+        .initiate_multipart_upload(&ctx, file_id, "application/octet-stream", 5, None, true)
         .await
         .unwrap();
     let session_a = multipart_store
@@ -1028,15 +980,7 @@ async fn replay_completed_fallback_reports_conflict_when_content_rebound_elsewhe
     // Session B: a second, independent (manual) upload on the same file,
     // then an explicit rebind moves `files.content_id` to version B.
     let plan_b = msvc
-        .initiate_multipart_upload(
-            &ctx,
-            file_id,
-            "application/octet-stream",
-            5,
-            None,
-            None,
-            false,
-        )
+        .initiate_multipart_upload(&ctx, file_id, "application/octet-stream", 5, None, false)
         .await
         .unwrap();
     let session_b = multipart_store
@@ -1107,15 +1051,7 @@ async fn replay_completed_snapshot_survives_a_later_rebind_without_tampering() {
 
     // Session A: auto_bind, binds the file to version A.
     let plan_a = msvc
-        .initiate_multipart_upload(
-            &ctx,
-            file_id,
-            "application/octet-stream",
-            5,
-            None,
-            None,
-            true,
-        )
+        .initiate_multipart_upload(&ctx, file_id, "application/octet-stream", 5, None, true)
         .await
         .unwrap();
     let session_a = multipart_store
@@ -1149,15 +1085,7 @@ async fn replay_completed_snapshot_survives_a_later_rebind_without_tampering() {
     // explicit rebind moves `files.content_id` to version B -- a completely
     // legitimate, unrelated operation, not a crash or tamper.
     let plan_b = msvc
-        .initiate_multipart_upload(
-            &ctx,
-            file_id,
-            "application/octet-stream",
-            5,
-            None,
-            None,
-            false,
-        )
+        .initiate_multipart_upload(&ctx, file_id, "application/octet-stream", 5, None, false)
         .await
         .unwrap();
     let session_b = multipart_store
@@ -1280,15 +1208,7 @@ async fn complete_reports_transaction_bind_outcome_when_own_session_cas_is_lost(
     // (`bound: true`) regardless of the session-row tamper below (a
     // different table, untouched by it).
     let plan = msvc
-        .initiate_multipart_upload(
-            &ctx,
-            file_id,
-            "application/octet-stream",
-            13,
-            None,
-            None,
-            true,
-        )
+        .initiate_multipart_upload(&ctx, file_id, "application/octet-stream", 13, None, true)
         .await
         .unwrap();
     let session = real_multipart_store
@@ -1365,7 +1285,6 @@ async fn replay_completed_snapshot_404s_when_its_composite_version_is_deleted() 
             "application/octet-stream",
             declared_size,
             None,
-            None,
             false,
         )
         .await
@@ -1418,15 +1337,7 @@ async fn replay_completed_snapshot_404s_when_its_composite_version_is_deleted() 
         .await
         .expect("first bind");
     let plan2 = msvc
-        .initiate_multipart_upload(
-            &ctx,
-            file_id,
-            "application/octet-stream",
-            5,
-            None,
-            None,
-            false,
-        )
+        .initiate_multipart_upload(&ctx, file_id, "application/octet-stream", 5, None, false)
         .await
         .unwrap();
     let session2 = multipart_store
@@ -1500,15 +1411,7 @@ async fn complete_takeover_finishes_without_reassembly_when_version_already_avai
     let (svc, msvc, multipart_store, backend, store, ctx, _dsn) = build_env().await;
     let file_id = svc.create_file_bare(&ctx, new_file()).await.unwrap();
     let plan = msvc
-        .initiate_multipart_upload(
-            &ctx,
-            file_id,
-            "application/octet-stream",
-            5,
-            None,
-            None,
-            false,
-        )
+        .initiate_multipart_upload(&ctx, file_id, "application/octet-stream", 5, None, false)
         .await
         .unwrap();
     let session = multipart_store
@@ -1656,15 +1559,7 @@ async fn complete_converges_after_in_progress_reset_instead_of_reinvoking_consum
     let (svc, msvc, multipart_store, backend, _store, ctx, dsn) = build_env().await;
     let file_id = svc.create_file_bare(&ctx, new_file()).await.unwrap();
     let plan = msvc
-        .initiate_multipart_upload(
-            &ctx,
-            file_id,
-            "application/octet-stream",
-            5,
-            None,
-            None,
-            false,
-        )
+        .initiate_multipart_upload(&ctx, file_id, "application/octet-stream", 5, None, false)
         .await
         .unwrap();
     let session = multipart_store

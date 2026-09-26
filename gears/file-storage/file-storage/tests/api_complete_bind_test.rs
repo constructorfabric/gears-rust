@@ -231,7 +231,6 @@ async fn complete_multipart_completed_returns_200_with_full_dto() {
             "application/octet-stream",
             declared_size,
             Some(part_size),
-            None,
             true, // auto_bind
         )
         .await
@@ -340,15 +339,7 @@ async fn complete_multipart_while_lease_held_returns_202_with_matching_retry_aft
     let file_id = svc.create_file_bare(&ctx, new_file()).await.unwrap();
 
     let plan = msvc
-        .initiate_multipart_upload(
-            &ctx,
-            file_id,
-            "application/octet-stream",
-            5,
-            None,
-            None,
-            false,
-        )
+        .initiate_multipart_upload(&ctx, file_id, "application/octet-stream", 5, None, false)
         .await
         .unwrap();
 

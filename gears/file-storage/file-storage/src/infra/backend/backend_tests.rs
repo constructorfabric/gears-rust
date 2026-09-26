@@ -118,6 +118,7 @@ pub async fn assert_backend_contract(backend: &dyn StorageBackend) {
     // the crate's cognitive-complexity ceiling; all of them run for every
     // backend the contract is asserted against.
     assert_read_prefix_and_delete_contract(backend).await;
+    assert_read_prefix_ceiling_contract(backend).await;
     assert_stat_contract(backend).await;
     assert_range_stream_contract(backend).await;
 }
@@ -163,6 +164,51 @@ async fn assert_read_prefix_and_delete_contract(backend: &dyn StorageBackend) {
 
     // exists distinguishes present from missing.
     assert!(!backend.exists("contract/never-existed").await.unwrap());
+}
+
+/// `read_prefix`'s `MAX_READ_PREFIX_BYTES` ceiling, at the exact boundary and
+/// one byte past it. The object is deliberately larger than the ceiling
+/// (`MAX_READ_PREFIX_BYTES + 10` bytes) so a ceiling-sized `read_prefix`
+/// returns a real, non-degenerate prefix rather than the whole object --
+/// distinct from `assert_read_prefix_and_delete_contract`'s existing
+/// short/over-long checks, which only exercise `max_bytes` values (3, 100)
+/// far below this ceiling. A regression that widens, off-by-ones, or drops
+/// `check_read_prefix_budget`'s enforcement must fail this test.
+async fn assert_read_prefix_ceiling_contract(backend: &dyn StorageBackend) {
+    let size = usize::try_from(MAX_READ_PREFIX_BYTES + 10).unwrap();
+    let content: Vec<u8> = (0..size).map(|i| u8::try_from(i % 256).unwrap()).collect();
+    write_all(
+        backend,
+        "contract/prefix-ceiling",
+        Bytes::from(content.clone()),
+    )
+    .await;
+
+    // Exactly at the ceiling: Ok, exactly MAX_READ_PREFIX_BYTES bytes,
+    // matching the object's start.
+    let at_ceiling = backend
+        .read_prefix("contract/prefix-ceiling", MAX_READ_PREFIX_BYTES)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(at_ceiling.len() as u64, MAX_READ_PREFIX_BYTES);
+    assert_eq!(
+        at_ceiling,
+        Bytes::from(content[..usize::try_from(MAX_READ_PREFIX_BYTES).unwrap()].to_vec())
+    );
+
+    // One byte past the ceiling: rejected as a caller-bug validation error,
+    // never silently clamped or streamed.
+    match backend
+        .read_prefix("contract/prefix-ceiling", MAX_READ_PREFIX_BYTES + 1)
+        .await
+    {
+        Err(DomainError::Validation { .. }) => {}
+        other => panic!(
+            "read_prefix(max_bytes = MAX_READ_PREFIX_BYTES + 1) must be rejected with \
+             DomainError::Validation, got {other:?}"
+        ),
+    }
 }
 
 /// The `stat` and `get_range_stream` half of [`assert_backend_contract`].

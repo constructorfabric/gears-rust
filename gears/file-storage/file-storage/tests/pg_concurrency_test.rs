@@ -546,7 +546,6 @@ async fn f1_capability_reject_orphan_reclaimed_by_versionless_sweep() {
             "application/octet-stream",
             20,
             Some(10),
-            None,
             false,
         )
         .await
@@ -601,7 +600,6 @@ async fn f1_capability_reject_with_compensation_reclaims_orphan() {
         "application/octet-stream",
         20,
         Some(10),
-        None,
         false,
     )
     .await
@@ -747,7 +745,6 @@ async fn f1_backend_initiation_failure_orphan_reclaimed_by_versionless_sweep() {
             "application/octet-stream",
             20,
             Some(10),
-            None,
             false,
         )
         .await
@@ -1167,7 +1164,6 @@ async fn f2_stale_completer_converges_instead_of_stranding_after_owner_fencing_f
                 "application/octet-stream",
                 10 * 1024 * 1024,
                 Some(5 * 1024 * 1024),
-                None,
                 true, // auto_bind
             )
             .await
@@ -1379,7 +1375,6 @@ async fn f9_autobind_no_if_match_no_longer_clobbers_prior_rebind() {
             "application/octet-stream",
             5,
             None,
-            None,
             true,
         )
         .await
@@ -1492,7 +1487,6 @@ async fn negative_control_f9_autobind_with_correct_if_match_rejects_stale_rebind
             "application/octet-stream",
             5,
             None,
-            None,
             true,
         )
         .await
@@ -1594,15 +1588,7 @@ async fn f10_expired_session_orphan_reclaimed_by_step2_in_same_sweep_pass() {
         .await
         .expect("create_file_bare");
     let plan = msvc
-        .initiate_multipart_upload(
-            &ctx,
-            file_id,
-            "application/octet-stream",
-            1024,
-            None,
-            None,
-            false,
-        )
+        .initiate_multipart_upload(&ctx, file_id, "application/octet-stream", 1024, None, false)
         .await
         .expect("initiate_multipart_upload");
 
@@ -1799,7 +1785,6 @@ async fn invariant_checker_distinguishes_healthy_file_from_known_orphan() {
             "application/octet-stream",
             20,
             Some(10),
-            None,
             false,
         )
         .await

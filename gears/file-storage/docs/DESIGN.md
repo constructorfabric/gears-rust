@@ -905,7 +905,7 @@ The detailed multipart contract is **owned by the P2 FEATURE for `multipart-coor
 ([features/multipart-coordinator.md](./features/multipart-coordinator.md)), implementing the resumable
 multipart-upload requirement (see [§1.2 Architecture Drivers](#12-architecture-drivers)); only its shape is fixed
 here. Multipart is **server-authoritative**: the
-client sends its desired parameters (total size, preferred part size, concurrency) and the control plane returns the
+client sends its desired parameters (total size, preferred part size) and the control plane returns the
 **exact** plan — part sizes/offsets plus a **signed URL per part** pointing at the sidecar; the server, not the
 client, owns the plan.
 
@@ -1928,7 +1928,7 @@ resumes without re-uploading what already landed.
 
 #### Phase A — Initiate (server-authoritative plan)
 
-1. The LMS proxies the student's desired parameters (total size, preferred part size, concurrency) to
+1. The LMS proxies the student's desired parameters (total size, preferred part size) to
    `POST /files/{id}/multipart`. The control plane authorizes, allocates a `version_id`, pre-registers a `pending`
    version, opens the sidecar's multipart session (`CreateMultipartUpload` on a `multipart_native` backend), and
    returns the exact, server-authoritative parts plan plus one signed `PUT` URL per part (shape: "P2 — Multipart

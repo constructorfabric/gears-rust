@@ -1573,7 +1573,7 @@ async fn expired_multipart_session_is_aborted_by_sweep() {
         .await
         .unwrap();
     let session = msvc
-        .initiate_multipart_upload(&ctx, ticket.file_id, "text/plain", 1024, None, None, false)
+        .initiate_multipart_upload(&ctx, ticket.file_id, "text/plain", 1024, None, false)
         .await
         .unwrap();
 
@@ -1716,7 +1716,7 @@ async fn sweep_aborts_expired_completing_session() {
         .await
         .unwrap();
     let session = msvc
-        .initiate_multipart_upload(&ctx, ticket.file_id, "text/plain", 1024, None, None, false)
+        .initiate_multipart_upload(&ctx, ticket.file_id, "text/plain", 1024, None, false)
         .await
         .unwrap();
 
@@ -1884,7 +1884,7 @@ async fn abort_expired_session_logs_warning_on_transient_file_batch_load_error()
         .await
         .unwrap();
     let _live_session = msvc
-        .initiate_multipart_upload(&ctx, ticket.file_id, "text/plain", 1024, None, None, false)
+        .initiate_multipart_upload(&ctx, ticket.file_id, "text/plain", 1024, None, false)
         .await
         .unwrap();
 
@@ -2199,7 +2199,7 @@ async fn sweep_skips_pending_version_of_active_multipart_session() {
         .await
         .unwrap();
     let plan = msvc
-        .initiate_multipart_upload(&ctx, ticket.file_id, "text/plain", 1024, None, None, false)
+        .initiate_multipart_upload(&ctx, ticket.file_id, "text/plain", 1024, None, false)
         .await
         .unwrap();
 
@@ -2280,7 +2280,7 @@ async fn sweep_skips_pending_version_of_completing_session() {
         .await
         .unwrap();
     let plan = msvc
-        .initiate_multipart_upload(&ctx, ticket.file_id, "text/plain", 1024, None, None, false)
+        .initiate_multipart_upload(&ctx, ticket.file_id, "text/plain", 1024, None, false)
         .await
         .unwrap();
 
@@ -2378,7 +2378,7 @@ async fn sweep_reclaims_version_after_session_expires() {
         .await
         .unwrap();
     let plan = msvc
-        .initiate_multipart_upload(&ctx, ticket.file_id, "text/plain", 1024, None, None, false)
+        .initiate_multipart_upload(&ctx, ticket.file_id, "text/plain", 1024, None, false)
         .await
         .unwrap();
 
@@ -2475,7 +2475,7 @@ async fn sweep_reclaims_version_after_session_expires_still_aborts_backend_and_d
         .await
         .unwrap();
     let plan = msvc
-        .initiate_multipart_upload(&ctx, ticket.file_id, "text/plain", 1024, None, None, false)
+        .initiate_multipart_upload(&ctx, ticket.file_id, "text/plain", 1024, None, false)
         .await
         .unwrap();
 
@@ -3416,7 +3416,6 @@ async fn complete_one_part_multipart_upload(
             "application/octet-stream",
             declared_size,
             None,
-            None,
             false,
         )
         .await
@@ -3575,7 +3574,6 @@ async fn sweep_before_complete_wins_cleans_up_expired_session() {
             "application/octet-stream",
             13,
             None,
-            None,
             false,
         )
         .await
@@ -3666,7 +3664,6 @@ async fn complete_after_session_expired_is_rejected() {
             "application/octet-stream",
             13,
             None,
-            None,
             false,
         )
         .await
@@ -3721,7 +3718,6 @@ async fn sweep_mid_flight_after_finalize_but_before_session_cas_does_not_delete_
             ticket.file_id,
             "application/octet-stream",
             5,
-            None,
             None,
             false,
         )
@@ -4969,7 +4965,6 @@ async fn migrate_backend_rejects_corrupted_preexisting_destination_object_compos
             "application/octet-stream",
             declared_size,
             Some(DEFAULT_MIN_PART_SIZE),
-            None,
             false,
         )
         .await

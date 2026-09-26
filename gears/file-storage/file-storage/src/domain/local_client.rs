@@ -90,7 +90,6 @@ impl FileStorageClientV1 for FileStorageLocalClient {
         let intent = multipart.map(|m| create_flow::MultipartIntent {
             declared_size: m.declared_size,
             preferred_part_size: m.preferred_part_size,
-            concurrency: m.concurrency,
         });
         let outcome = create_flow::create_file(
             &self.service,
@@ -264,7 +263,6 @@ impl FileStorageClientV1 for FileStorageLocalClient {
         declared_mime: &str,
         declared_size: u64,
         preferred_part_size: Option<u64>,
-        concurrency: Option<u32>,
     ) -> Result<MultipartPlan, FileStorageError> {
         let plan = self
             .multipart_service
@@ -274,7 +272,6 @@ impl FileStorageClientV1 for FileStorageLocalClient {
                 declared_mime,
                 declared_size,
                 preferred_part_size,
-                concurrency,
                 // Standalone initiate keeps the staged (manual-bind) behavior
                 // — mirrors `api::rest::handlers::initiate_multipart`. The
                 // merged create+plan path's `auto_bind` only applies via

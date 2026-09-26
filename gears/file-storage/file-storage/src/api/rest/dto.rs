@@ -87,9 +87,6 @@ pub struct CreateMultipartIntentDto {
     /// plan is authoritative (5 MiB..5 GiB, see `InitiateMultipartReq`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preferred_part_size: Option<u64>,
-    /// Advisory upload-concurrency hint; does not change the plan.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub concurrency: Option<u32>,
 }
 
 /// Request to create a file (`POST /files`).
@@ -700,10 +697,6 @@ pub struct InitiateMultipartReq {
     /// it to satisfy the backend's minimum part size requirements (FEATURE §3).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preferred_part_size: Option<u64>,
-    /// Advisory hint for upload concurrency; does not change the parts plan
-    /// (FEATURE §3).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub concurrency: Option<u32>,
 }
 
 /// One part in the server-authoritative parts plan.

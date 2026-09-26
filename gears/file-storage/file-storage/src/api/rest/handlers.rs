@@ -199,7 +199,6 @@ pub async fn create_file(
             .map(|mp| crate::domain::create_flow::MultipartIntent {
                 declared_size: mp.declared_size,
                 preferred_part_size: mp.preferred_part_size,
-                concurrency: mp.concurrency,
             });
 
     // Shared with the SDK local client — see `domain::create_flow`'s doc.
@@ -586,7 +585,6 @@ pub async fn initiate_multipart(
             &req.declared_mime,
             req.declared_size,
             req.preferred_part_size,
-            req.concurrency,
             // Standalone initiate keeps the staged pre-redesign behaviour:
             // complete never binds; the client binds manually (this is the
             // "new version of an existing file" path, where the CAS target

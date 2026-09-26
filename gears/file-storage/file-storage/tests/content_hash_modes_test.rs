@@ -307,7 +307,6 @@ async fn drive_multipart(
             "application/octet-stream",
             declared_size,
             None,
-            None,
             false,
         )
         .await

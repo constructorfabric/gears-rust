@@ -136,7 +136,6 @@ async fn fs06_f4_completed_retry_with_stale_if_match_now_replays_instead_of_fail
             "application/octet-stream",
             10,
             None,
-            None,
             true, // auto_bind
         )
         .await
@@ -210,15 +209,7 @@ async fn negative_control_fs06_completed_retry_without_if_match_replays_correctl
         .expect("create_file_bare");
     let plan = s
         .msvc
-        .initiate_multipart_upload(
-            &ctx,
-            file_id,
-            "application/octet-stream",
-            10,
-            None,
-            None,
-            true,
-        )
+        .initiate_multipart_upload(&ctx, file_id, "application/octet-stream", 10, None, true)
         .await
         .expect("initiate_multipart_upload with auto_bind");
     common::simulate_all_parts(&s.multipart_store, &s.backend, &plan, file_id).await;

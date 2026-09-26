@@ -146,7 +146,6 @@ async fn one_part_multipart_plan_falls_back_to_single_part() {
         Some(MultipartIntent {
             declared_size: 1024, // well under the 5 MiB minimum part size
             preferred_part_size: None,
-            concurrency: None,
         }),
     )
     .await
@@ -174,7 +173,6 @@ async fn multi_part_plan_returns_multipart_outcome() {
         Some(MultipartIntent {
             declared_size: 12 * 1024 * 1024, // 12 MiB -> multiple 5 MiB parts
             preferred_part_size: None,
-            concurrency: None,
         }),
     )
     .await
@@ -215,7 +213,6 @@ async fn idempotency_key_with_multipart_intent_is_rejected() {
         Some(MultipartIntent {
             declared_size: 12 * 1024 * 1024,
             preferred_part_size: None,
-            concurrency: None,
         }),
     )
     .await;
@@ -306,7 +303,6 @@ async fn failed_initiate_compensates_the_orphaned_bare_file() {
         Some(MultipartIntent {
             declared_size: 12 * 1024 * 1024,
             preferred_part_size: None,
-            concurrency: None,
         }),
     )
     .await;

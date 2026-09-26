@@ -26,7 +26,6 @@ use crate::domain::service::{FileService, UploadTicket};
 pub struct MultipartIntent {
     pub declared_size: u64,
     pub preferred_part_size: Option<u64>,
-    pub concurrency: Option<u32>,
 }
 
 /// Result of [`create_file`]: either the ordinary single-part ticket, or —
@@ -89,7 +88,6 @@ pub async fn create_file(
                     &mime_type,
                     mp.declared_size,
                     mp.preferred_part_size,
-                    mp.concurrency,
                     auto_bind,
                 )
                 .await

@@ -115,7 +115,7 @@ User-facing interactions that start with an actor (human or external system) and
 > [Sidecar Per-Part Enforcement](#sidecar-per-part-enforcement) below).
 
 **Steps**:
-1. [x] - `p1` - Client: POST /api/file-storage/v1/files/{id}/multipart with body {declared_mime, declared_size, preferred_part_size?, concurrency?} - `inst-init-request`
+1. [x] - `p1` - Client: POST /api/file-storage/v1/files/{id}/multipart with body {declared_mime, declared_size, preferred_part_size?} - `inst-init-request`
 2. [x] - `p1` - API: validate declared_mime against the effective allowed-types policy; RETURN 400 if rejected - `inst-init-mime-check`
 3. [x] - `p1` - API: validate declared_size <= effective per-file size limit; RETURN 400 if exceeded - `inst-init-size-check`
 4. [x] - `p1` - API: validate declared_size against storage quota; RETURN 429 if exceeded - `inst-init-quota-check`

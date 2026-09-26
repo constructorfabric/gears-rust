@@ -779,7 +779,6 @@ async fn plan_with_three_parts(
             "application/octet-stream",
             declared_size,
             None,
-            None,
             false,
         )
         .await
@@ -839,15 +838,7 @@ async fn finalize_version_wrong_op_token_returns_403() {
     // the `claims.op != Op::Put` check.
     let plan = h
         .msvc
-        .initiate_multipart_upload(
-            &subject,
-            ticket.file_id,
-            "text/plain",
-            10,
-            None,
-            None,
-            false,
-        )
+        .initiate_multipart_upload(&subject, ticket.file_id, "text/plain", 10, None, false)
         .await
         .expect("initiate_multipart_upload");
     let token = token_from_url(&plan.parts[0].upload_url);

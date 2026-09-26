@@ -88,7 +88,7 @@ Notes:
 - `POST /files` request body (`application/json`, `CreateFileReq`): `{ "owner_kind": "user"|"app", "owner_id":
   "<uuid>", "name": "<string>", "gts_file_type": "<gts uri>", "mime_type": "<string>", "custom_metadata":
   [{"key": "...", "value": "..."}] (optional, default []), "idempotency_key": "<string>" (optional),
-  "multipart": { "declared_size": <u64>, "preferred_part_size": <u64>? , "concurrency": <u32>? } (optional),
+  "multipart": { "declared_size": <u64>, "preferred_part_size": <u64>? } (optional),
   "bind": "auto"|"manual" (optional, default "auto") }`. `idempotency_key`
   is the field documented under "Idempotent-create semantics" (`operations.md`) — see the `409` cause in "Status code
   summary" for what happens on a reused key with a different body; it is rejected (`400`) together with `multipart`.
@@ -291,7 +291,7 @@ Multipart is **server-authoritative**: the client sends desired parameters and t
 parts plan (sizes/offsets) with **one signed URL per part** pointing at the sidecar.
 
 ```text
-P2-1. POST /files/{id}/multipart            initiate (JSON: declared_mime, declared_size, preferred part size, concurrency); returns the parts plan + per-part signed URLs
+P2-1. POST /files/{id}/multipart            initiate (JSON: declared_mime, declared_size, preferred part size); returns the parts plan + per-part signed URLs
 P2-2. PUT  <signed part url>                upload one part to the sidecar (raw body)
 P2-3. POST /files/{id}/multipart/{upload_id}/complete   assemble all reported parts into the final object, mark the version `available`, and return version/size/composite-hash
 P2-4. DELETE /files/{id}/multipart/{upload_id}          abort; parts discarded
@@ -328,7 +328,6 @@ Notes:
 | `declared_mime` | `string` | yes | MIME type of the file being uploaded (e.g. `video/mp4`). Validated against the effective allowed-types policy. |
 | `declared_size` | `uint64` | yes | Total file size in bytes. The control plane validates this against the effective policy size limit and storage quota at initiate time — exactly like single-part upload does at presign time — so that oversized or quota-exceeding uploads are rejected before any bytes are transferred. `400` if it exceeds the policy size limit; `429` if it would exceed the storage quota. The `429` quota path only fires when a `QuotaClient` is configured; none is wired in any deployment (`gear.rs`'s `quota_client: None`), so callers do not currently observe quota rejections — see [operations.md](./operations.md#storage-quota-not-enforced). |
 | `preferred_part_size` | `uint64` | no | Client hint for the part size in bytes; the server may widen it (see the `MAX_PART_COUNT` note below) or otherwise adjust it to satisfy backend minimums. Rejected with `400` if outside `[DEFAULT_MIN_PART_SIZE (5 MiB), MAX_PART_SIZE (5 GiB)]`. |
-| `concurrency` | `uint32` | no | Advisory hint for client-side upload concurrency; does not change the parts plan itself. |
 
 The server-computed parts plan is capped at `MAX_PART_COUNT = 10_000` parts. If
 the chosen part size would produce more parts than that, `part_size` is **widened** (never past `MAX_PART_SIZE`, 5
