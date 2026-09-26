@@ -103,10 +103,13 @@ under ([serverless-runtime DESIGN `DESIGN.md:614`](../../../../serverless-runtim
 is what makes that pin hold on the executing side too; migration of a running instance is out of
 scope (PRD §5.2). Second, **references, not payloads, cross the engine boundary**
 ([`../ADR/0013`](../ADR/0013-cpt-cf-bss-orders-workflow-adr-references-not-payloads.md)): a task
-input or output is `correlationId`, `orderId`, `orderVersion`, a `stepRef`/`gateRef`/`taskRef`/
-`lineRef` identifier and small enums — never a resolved total, an approver identity, a tenant axis
-beyond `resource_tenant_id`, or a downstream payload — so nothing commercial sits in engine
-history and the PRD §15 Q-01 criteria are met by construction. Third, **the engine's own record,
+input or output is made of the closed vocabulary ADR-0013 types (as amended by D-131): identities,
+opaque record references, counters, closed enums, instants and durations. It is never a resolved
+total, an approver identity, a tenant axis beyond `resource_tenant_id`, or a downstream payload.
+So no commercial content sits in engine history **through task data**. What does sit there is
+identifiers (the resource tenant among them), counters and cardinalities, plus the consumed events
+as published until the member-storage or thin-event ask lands, and the PRD §15 Q-01 evaluation is
+still open on the residency and retention of that history (Q-12). Third, **the engine's own record,
 not the platform's history, is what audit and recovery reconstruct from**: the platform replays
 the definition after a crash, and every replayed call lands on an envelope that absorbs it under
 the same idempotency key, so a platform-side purge or a plugin migration cannot erase what this
@@ -251,10 +254,15 @@ is bound to it (`10 §4`).
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-principle-references-not-payloads`
 
-Every value that crosses the engine boundary — a task input, a task output, an event the
-definition correlates on — is a **reference**: `correlationId`, `orderId`, `orderVersion`,
-`resourceTenantId`, `stepRef`, `gateRef`, `taskRef`, `lineRef`, the platform `invocationId` and
-`attemptId`, and small closed enums (an outcome class, a wave number, a catalogue reason). A step
+Every value that crosses the engine boundary — a task input, a task output, a header, an event
+member the definition keeps — is a member of the **closed vocabulary** of
+[`../ADR/0013`](../ADR/0013-cpt-cf-bss-orders-workflow-adr-references-not-payloads.md) as amended
+by D-131. The vocabulary has six types: identities (`correlationId`, `orderId`, `orderVersion`,
+`resourceTenantId`, the platform `invocationId` and `attemptId`, the binding members, consumed-event
+ids); opaque record references (`stepRef`, `gateRef`, `taskRef`, `lineRef`, `planRef`, `parkRef`,
+`requestRef`, `cancelRequestRef`, `suspensionRef`, `subjectRef`, and arrays of them); counters;
+closed enums and booleans (an outcome class, a wave number, a catalogue reason); instants and
+durations; and `stepsBase`. Each type is a registered GTS schema with a format. A step
 operation resolves a reference against Orders' own record or against the authoritative gear
 inside its transaction. The resolved total, an approver's identity, the payer and seller tenant
 axes, a manual-task justification and any downstream payload **MUST NOT** appear in a task input
@@ -944,7 +952,7 @@ this table is the index the validation hook of `10 §2.2` and the envelope's cou
 | `report-outcome` (06) | `round` → `nextRound` | step `…:report-outcome:{round}`; Lifecycle `…:{trigger}:{round}` |
 | `resolve-manual-task` `sla-check` (07) | `slaRound` → `slaRound` | `…:resolve-manual-task:sla:{slaRound}` |
 | `resolve-manual-task` `sla-check` scoped to one task (07), the ceiling wait's | `slaRound` → `slaRound`, the definition's `ceilingSlaRound`, 0 for each ceiling task (D-129) | `…:resolve-manual-task:sla:{taskRef}:{slaRound}` |
-| `apply-resume` `trigger: poll` (08), per suspension | `round` → `nextRound`, the definition's `resumePollRound`, 0 for each resume wait (D-130) | `…:apply-resume:poll:{suspensionRef}:{round}` |
+| `apply-resume` `trigger: poll` (08), per suspension | `round` → `nextRound`, the definition's `resumePollRound`, 0 for each new `suspensionRef` `apply-hold` answers and shared by the resume wait and every other wait that polls the hold (D-130, D-133) | `…:apply-resume:poll:{suspensionRef}:{round}` |
 | `raise-overdue-escalation` `overdue-fulfillment` (07) | `round` → `nextRound` | `…:raise-overdue-escalation:overdue-fulfillment:{orderVersion}:-:{round}` |
 | `raise-overdue-escalation` `lifetime-ceiling` (07) | `round` → `nextRound`, the definition's `ceilingRound`: each ceiling of one instance is a new round (D-121) | `…:raise-overdue-escalation:lifetime-ceiling:{orderVersion}:-:{round}` |
 
@@ -2317,8 +2325,9 @@ no custom `type` URI, no Problem extension member for the reason and no gear-min
 | `status`, `title` | The same category's SDK-defined HTTP status and title; this gear declares no same-class status override |
 | `error_domain` | `orders-workflow.v1` for every Workflow-owned reason |
 | `error_code` | The explicit stable code in the table below, not the GTS identifier |
-| `detail` | Sanitized explanation; never a discriminator for client logic and never downstream error text (`../DESIGN.md` §4.2 *Diagnostic leakage*) |
-| `context.data` | Only explicitly permitted variant fields — the reason's owning slice names them — after the applicable authorization and non-disclosure checks; never raw upstream errors, PDP diagnostics or commercial detail the caller's scope excludes |
+| `detail` | Sanitized explanation; never a discriminator for client logic and never downstream error text (`../DESIGN.md` §4.2 *Diagnostic leakage*). **On the step route** (`/v1/steps/{operation}`), the fixed text registered for the `error_code`, with no variable content (decision D-132) |
+| `context.data` | Only explicitly permitted variant fields — the reason's owning slice names them — after the applicable authorization and non-disclosure checks; never raw upstream errors, PDP diagnostics or commercial detail the caller's scope excludes. **On the step route**, empty (`{}`), and `context` carries nothing else: no field violation that echoes a body member (decision D-132) |
+| `instance`, `trace_id` | Omitted on the step route (decision D-132) |
 
 #### The registered reasons
 
@@ -2462,6 +2471,14 @@ surface answers **MUST** carry a catalogue reason plus a bounded, sanitised diag
 downstream error text, stack traces, credentials, tokens, connection strings, request-body echoes
 or PII. The answer to a step call is recorded in the platform's timeline, so the rule that keeps
 internal diagnostics off the synchronous envelope is also what keeps them out of engine history.
+A **refused** step call is recorded there too: the DSL raises the 4xx or 5xx answer as the
+communication error the definition's `catch` sees as `$error`. Every answer the step route
+produces, whether a registered reason of the operation, the envelope's validation refusal or a PDP
+denial, **MUST** therefore carry only `type`, `status`, `title`, `error_domain`, `error_code`, the
+fixed `detail` registered for the code and an empty `context` (§4.9 *Canonical wire contract*,
+decision D-132). The operator-facing routes of [`09`](./09-read-and-authz.md) keep the full shape,
+because their answers are not engine data. The contract test of §4.9 asserts this shape for every
+reason the step route can answer.
 
 ### 4.12 Concurrency and back-pressure: admission on dispatch
 

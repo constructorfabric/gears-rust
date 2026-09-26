@@ -67,14 +67,19 @@ Orders therefore provides the operations and the record ([`01`](./01-foundation.
 the platform provide the sequencing. Adjusting the flow is publishing a new definition version
 through the platform registry; changing what a step does is an Orders release.
 
-**What crosses the boundary is references.** A definition task carries `correlationId`,
-`orderId`, `orderVersion`, `resourceTenantId`, the platform `invocationId`, a `gateRef`,
-`taskRef`, `lineRef` or `stepRef`, and small closed enums an operation returned. It never carries
-a resolved total, an approver identity, a seller or payer tenant axis, a justification or a
-downstream payload ([`../ADR/0013`](../ADR/0013-cpt-cf-bss-orders-workflow-adr-references-not-payloads.md)),
-which is what keeps commercial data out of the platform's history and satisfies the PRD §15 Q-01
-criteria — history isolation, retention independent of engine purge, the BSS/OSS boundary — by
-construction rather than by configuration.
+**What crosses the boundary is references.** A definition task carries only members of the
+closed vocabulary of [`../ADR/0013`](../ADR/0013-cpt-cf-bss-orders-workflow-adr-references-not-payloads.md)
+as amended by D-131: identities (`correlationId`, `orderId`, `orderVersion`, `resourceTenantId`,
+the platform `invocationId`, consumed-event ids), opaque record references (`gateRef`, `taskRef`,
+`lineRef`, `stepRef`, `planRef`, `parkRef`, `requestRef`, `suspensionRef` and their arrays),
+counters, closed enums an operation returned, instants and durations, and `stepsBase`. It never
+carries a resolved total, an approver identity, a seller or payer tenant axis, a justification or
+a downstream payload. That keeps commercial **content** out of task data by construction, and it
+keeps audit independent of engine purge by construction. It does not by itself satisfy the PRD §15
+Q-01 criteria. History still holds the identifiers (the resource tenant among them), the counters
+and cardinalities, and the consumed events as published until the member-storage or thin-event ask
+lands, and the isolation, retention and residency of that history are Q-12, pending on the
+platform.
 
 **Honesty disclosure.** `serverless-runtime` has **no code and no Temporal plugin today**: its
 design and ADRs exist, its SDK crate, host crate and `plugins/temporal-plugin/` do not. The
@@ -188,9 +193,12 @@ report, termination — stays whole.
 
 The input and output of every `call` validate against the operation's registered GTS reference
 schemas; a definition whose task `input`/`output`/`export` names a member outside them is refused
-before publish, and a call carrying one is refused at the envelope. `$context` holds only what an
-operation returned. The platform's timeline and stored task payloads therefore contain identifiers
-and enums and nothing an auditor would need Orders' retention policy for.
+before publish, and a call carrying one is refused at the envelope. `$context` holds only members of
+the ADR-0013 vocabulary (as amended by D-131): what an operation returned, routing literals the
+definition writes itself, and `stepsBase`. No `set` or `export` reads an `$error` member other than
+`status`, and the step route's error answers carry only fixed members (D-132). The platform's
+timeline and stored task payloads therefore contain identifiers, counters, cardinalities and enums,
+and no commercial content. What remains is the residual of ADR-0013.
 
 **ADRs**: `cpt-cf-bss-orders-workflow-adr-references-not-payloads`
 
@@ -287,7 +295,7 @@ consumer-supplied hook before publish — a pending ask
 2. [ ] - `p1` - Every `call: http` targets `POST /bss-orders-workflow/v1/steps/{operation}` with `{operation}` a row of `owf_step_operation`, and its `endpoint` is exactly `${ $context.stepsBase + "/<operation>" }` with the operation name a literal. `stepsBase` is written only by `input.from`; no `set`, `output` or `export` **MAY** name it, so no version can send its calls, or the credential the plugin attaches to them, to another host, and the CI test and the hook compare the `input.from` value with the environment's step-surface base (§3.7). A `call` to a Function is allowed only where the corresponding operation is `composable` - `inst-def-call-targets`
 3. [ ] - `p1` - Every `listen` filter type is in the closed set above and carries the two correlations, except the `OrderAmended` filter, which correlates on `orderId` only (the closed set above, `02 §4.7` item 8); a filter **MAY** add a correlation, as the ceiling wait's `taskRef` does - `inst-def-listen-targets`
 4. [ ] - `p1` - Bounds nest, over values the definition holds: every task that calls an operation declares a `timeout` from `use.timeouts`; the operation's `deadline_ms` **<** that timeout, so one attempt fits; every task timeout and every literal `wait` **<** the literal `P90D` lifetime `wait`. The check computes no cumulative backoff, because the DSL gives `backoff.exponential` no multiplier (dsl-reference.md *Retry*) and the timeout bounds the retries whatever their curve. The overdue window and the SLA classes are not definition values — each is stored per order from Orders' per-seller policy — so their bounds are checked where that policy value is validated (`07 §4.8` item 8), not here (decision D-126) - `inst-def-bounds-nest`
-5. [ ] - `p1` - Every task `input`, `output`, `export` and every `body` member validates against the operation's registered reference schemas; no member outside them - `inst-def-references-only`
+5. [ ] - `p1` - Every task `input`, `output`, `export` and every `body` member validates against the operation's registered reference schemas; no member outside them. Every member the definition writes into `$context`, including by `set` and `input.from`, is of one of the six vocabulary types of ADR-0013 as amended by D-131 (identity, opaque record reference, counter, closed enum or boolean, instant or duration, `stepsBase`); a string member of no such type is refused. No `set`, `output` or `export` **MAY** read an `$error` member other than `status` (`error_code` once Q-11 (ii) answers) - `inst-def-references-only`
 6. [ ] - `p1` - No `protected` operation is inside a `try` whose `catch` continues the forward path: a `catch` either only retries, so exhaustion faults the invocation, or routes to one of the named failure routes of §4.6; that a retry-only `catch` re-raises the last error once its limit is spent is Q-11 (vi), assumed until the plugin answers - `inst-def-no-swallowing-catch`
 7. [ ] - `p1` - No `run`, no `emit`, no `for`, no `schedule`: the start mechanism is exactly the two platform event triggers of §3.3, `OrderSubmitted` and `OrderAmended` — Lifecycle publishes no `OrderSubmitted` after an amendment ([Lifecycle `04 §4.3`](../../../orders-lifecycle/docs/design/04-versioning.md#43-re-approval-is-a-two-step-seam-interaction-normative), `02 §4.7` item 9); every `wait` is a literal duration (§3.6 *Fixed waits and re-check loops*) - `inst-def-grammar-subset`
 8. [ ] - `p1` - Every branch of a competing `fork` that can complete ends by `set`-ting `arm` so the sibling `switch` can route; every `fork` is followed by a `switch` on `arm`; every `then` names a task of its own `do` list, `exit` or `end` (the stage dispatcher of §3.6) - `inst-def-fork-routing`
@@ -691,6 +699,7 @@ deadline stays the owning slice's stored value, so no definition version can mov
 | `waitSla` — manual-task SLA | (c) | `PT5M` | `resolve-manual-task` `trigger: sla-check` (07) | `resolution` |
 | `waitSla` in `awaitOperatorAfterPark` — the ceiling task's SLA | (d) | `PT5M` | `resolve-manual-task` `trigger: sla-check` scoped to `ceilingTaskRef` (07), under that task's own `slaRound` (D-129) | `resolution` — `escalated` or `none` only: an order-scope task escalates and is never exhausted (`07 §4.2`) |
 | `waitResumePoll` — the resume wait's read of the hold | (e) | `PT15M` | `apply-resume` `trigger: poll` (08), under the next `resumePollRound` (D-130) | `resumeOutcome` |
+| held poll — every other wait while a suspension is recorded (`pollHeld`) | (a), (b) | none of its own: it rides the wait's tick, counted in `heldTicks` — every 30th `PT30S` tick of `waitPoll`, every 3rd `PT5M` tick (`waitTtlMargin`, `waitHeldReflect`, `waitEligibility`, `waitHeld`), every `PT1H` tick (`waitExpected`), every 15th `PT1M` tick of a `held` deferral (`waitDeferral1`, `waitDeferral2`), about `PT15M` (`PT1H` in `awaitExpected`), and once on leaving the park loop. `gateLoop` and `outageArm` do not poll: a hold there enters the resume wait, and their `PT30S` tick keeps the escalation fire's lateness bound of D-123 (D-133) | `apply-resume` `trigger: poll` (08), under the next `resumePollRound`, then the tick's own re-check | `resumeOutcome`, `failedTaskRefs` |
 | `waitRepoll`, `waitRetryLeg` — compensation re-poll and leg retry | (c) | `PT30S`, `PT1H` | `compensate-order` (06) | `compensationState` |
 
 Q-11 (i) now asks only whether the plugin accepts a runtime-expression duration as an extension
@@ -700,7 +709,7 @@ applies.
 **History growth.** Every tick is engine history: a `wait`, a competing `fork` of up to seven
 branches torn down and re-armed, and one or two activity calls. Per waiting instance and day, the
 `PT30S` ticks of `gateLoop` and of the barrier's `waitPoll` add 2,880 iterations each, a `PT5M`
-tick 288, `waitResumePoll` 96, and the overdue monitor 24 for the whole life of the invocation.
+tick 288, `waitResumePoll` 96, the held poll at most 96 while a suspension is recorded (it replaces a tick's re-check, so it adds one call, not one iteration), and the overdue monitor 24 for the whole life of the invocation.
 Serverless Workflow DSL 1.0.0 has no construct that truncates history, and the platform states no
 per-invocation history bound beyond the tenant quota `max_execution_history_mb`
 ([DESIGN_GTS_SCHEMAS.md](../../../../serverless-runtime/docs/DESIGN_GTS_SCHEMAS.md#tenantruntimepolicy)
@@ -889,13 +898,14 @@ The approval stage, the `do` list of `process.approval`:
     fork:
       compete: true
       branches:
-        - tick:      { do: [ { waitTtlMargin: { wait: PT5M } }, { arm: { set: { arm: tick } } } ] }
+        - tick:      { do: [ { waitTtlMargin: { wait: PT5M } }, { arm: { set: { arm: tick, heldTicks: '${ if $context.suspensionRef != null then ($context.heldTicks // 0) + 1 else 0 end }' } } } ] }   # heldTicks: ticks since a recorded suspension was last polled (D-133)
         - hold:      { do: [ ‹hold arm of (e)› ] }       # records the suspension on the parked instance (08); the park clock is not paused
         - resume:    { do: [ ‹resume arm of (e)› ] }
         - lifecycle: { do: [ ‹lifecycle arm of (f)› ] }
         - cancel:    { do: [ ‹cancel arm of (d)› ] }
 - afterParkLoop:
     switch:
+      - heldPoll: { when: '${ .arm == "tick" and $context.heldTicks >= 3 }', then: pollHeld }   # every third PT5M tick while a suspension is recorded (D-133)
       - tick:  { when: '${ .arm == "tick" }', then: retryVerdict }
       - other: { then: leave }                                   # hold | resume | lifecycle | cancel; hold and resume come back to parkLoop
 - retryVerdict:
@@ -929,7 +939,11 @@ The approval stage, the `do` list of `process.approval`:
     try:
       - call: { step: unpark }          # body: ref + subjectRef: $context.parkRef
     catch: *transient
-- leftPark: { set: { stageLoop: reflectVerdict }, then: reflectVerdict }   # out of the park loop: a ceiling from here parks (afterLifetime)
+- leftPark: { set: { stageLoop: reflectVerdict } }   # out of the park loop: a ceiling from here parks (afterLifetime)
+- onLeftPark:                           # a suspension recorded while parked is polled once more before the gates, so it is not carried into gateLoop, which does not poll (D-133)
+    switch:
+      - heldPoll: { when: '${ $context.suspensionRef != null }', then: pollHeld }
+      - reflect:  { then: reflectVerdict }
 - reflectVerdict:                       # protected (03): requirement stage submitted → pending_approval | approved; gate-outcome stage pending_approval → approved | rejected (R1)
     try:
       - reflect:
@@ -954,13 +968,14 @@ The approval stage, the `do` list of `process.approval`:
     fork:
       compete: true
       branches:
-        - tick:      { do: [ { waitHeldReflect: { wait: PT5M } }, { arm: { set: { arm: tick } } } ] }   # covers a resume consumed before this wait was armed
+        - tick:      { do: [ { waitHeldReflect: { wait: PT5M } }, { arm: { set: { arm: tick, heldTicks: '${ if $context.suspensionRef != null then ($context.heldTicks // 0) + 1 else 0 end }' } } } ] }   # covers a resume consumed before this wait was armed
         - hold:      { do: [ ‹hold arm of (e)› ] }
         - resume:    { do: [ ‹resume arm of (e)› ] }
         - lifecycle: { do: [ ‹lifecycle arm of (f)› ] }
         - cancel:    { do: [ ‹cancel arm of (d)› ] }
 - afterHeldReflect:
     switch:
+      - heldPoll: { when: '${ .arm == "tick" and $context.heldTicks >= 3 }', then: pollHeld }   # D-133
       - tick:  { when: '${ .arm == "tick" }', then: reflectVerdict }
       - other: { then: leave }          # hold | resume | lifecycle | cancel
 - toFulfillment: { set: { nextStage: fulfillment, stageLoop: null }, then: exit }   # Lifecycle emits OrderApproved; fragment (b) follows in the same invocation
@@ -1068,6 +1083,16 @@ The approval stage, the `do` list of `process.approval`:
     catch: *transient
     export: { as: '${ $context + { outageEscalated: true } }' }
     then: outageArm
+- pollHeld:                             # protected (08): the resume wait's poll, from the park loop, the held-reflection wait or the way out of the park (D-133); no intent exists before begin-fulfillment, so failedTaskRefs is empty here
+    timeout: step
+    try:
+      - call: { step: apply-resume }    # body: ref + trigger: poll, suspensionRef, round: $context.resumePollRound; output: resumeOutcome ∈ resumed-by-read | still-held, due, failedTaskRefs[], nextRound
+    catch: *transient
+    export: { as: '${ $context + { resumeOutcome: .resumeOutcome, resumePollRound: .nextRound, heldTicks: 0, suspensionRef: (if .resumeOutcome == "resumed-by-read" then null else $context.suspensionRef end) } }' }
+- afterHeldPoll:                        # either answer continues with the tick's own work; decided by stageLoop alone
+    switch:
+      - park:    { when: '${ $context.stageLoop == "parkLoop" }', then: retryVerdict }
+      - reflect: { then: reflectVerdict }   # awaitHeldReflect or leftPark: stageLoop reflectVerdict
 - leave: { set: { nextStage: '${ .arm }', returnStage: approval }, then: exit }
 ```
 
@@ -1202,7 +1227,7 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
                     read: envelope
                   output: { as: '${ .[0] | { requestRef: .data.requestRef } }' }
               - arm: { set: { arm: reevaluate, eligibilityTrigger: reauthorize-requested, requestRef: '${ .requestRef }' } }
-        - poll:      { do: [ { waitEligibility: { wait: PT5M } }, { arm: { set: { arm: reevaluate, eligibilityTrigger: poll, requestRef: null } } } ] }   # 04 §4.8 item 5: covers an event delivered before the listen was armed
+        - poll:      { do: [ { waitEligibility: { wait: PT5M } }, { arm: { set: { arm: reevaluate, eligibilityTrigger: poll, requestRef: null, heldTicks: '${ if $context.suspensionRef != null then ($context.heldTicks // 0) + 1 else 0 end }' } } } ] }   # 04 §4.8 item 5: covers an event delivered before the listen was armed
         - hold:      { do: [ ‹hold arm of (e)› ] }
         - resume:    { do: [ ‹resume arm of (e)› ] }
         - lifecycle: { do: [ ‹lifecycle arm of (f)› ] }
@@ -1210,6 +1235,7 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
 - afterEligibilityChange:
     switch:
       - acceptance: { when: '${ .arm == "acceptance" }', then: admitAcceptance }
+      - heldPoll:   { when: '${ .arm == "reevaluate" and $context.eligibilityTrigger == "poll" and $context.heldTicks >= 3 }', then: pollHeld }   # D-133
       - again:      { when: '${ .arm == "reevaluate" }', then: eligibility }
       - other:      { then: leave }
 - admitAcceptance:                      # protected (02): admission before consumption (02 §4.7 item 1)
@@ -1275,7 +1301,7 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
       as: waveError
       when: '${ $waveError.status as $s | any((409, 408, 429, 503, 504); . == $s) }'
       do: [ { classify: { set: { waveOutcome: '${ if $waveError.status == 409 then "reread" else "exhausted" end }', waveCause: '${ if $waveError.status == 408 then "step-deadline-exceeded" else "retry-budget-exhausted" end }' } } } ]
-    export: { as: '${ $context + { waveOutcome: (.waveOutcome // "answered"), waveCause: (.waveCause // null), wave1Failed: ($context.wave1Failed + (.failed // [])), wave1Deferred: (.deferred // []), wave1Round: (.nextDispatchRound // $context.wave1Round), wave1Attempt: (($context.wave1Round | tostring) + (if $context.wave1AttemptKey then ":" + ($context.wave1AttemptKey | tostring) else "" end)), wave1AttemptKey: (if (.waveOutcome // "answered") == "answered" then null else $context.wave1AttemptKey end) } }' }   # wave1Attempt: the call's key tail, the task's sourceAttempt; the attempt is spent once the call answers, kept for the re-issue after a 409
+    export: { as: '${ $context + { waveOutcome: (.waveOutcome // "answered"), waveCause: (.waveCause // null), wave1Failed: ($context.wave1Failed + (.failed // [])), wave1Deferred: (.deferred // []), wave1DeferReason: (.deferReason // null), wave1Round: (.nextDispatchRound // $context.wave1Round), wave1Attempt: (($context.wave1Round | tostring) + (if $context.wave1AttemptKey then ":" + ($context.wave1AttemptKey | tostring) else "" end)), wave1AttemptKey: (if (.waveOutcome // "answered") == "answered" then null else $context.wave1AttemptKey end) } }' }   # wave1Attempt: the call's key tail, the task's sourceAttempt; the attempt is spent once the call answers, kept for the re-issue after a 409
 - onWave1:
     switch:
       - reread:    { when: '${ $context.waveOutcome == "reread" }',    then: wave1Reread }
@@ -1298,6 +1324,11 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
     set: { failureScope: line, failureSubjects: '${ [ $context.wave1LineRefs[] | { subjectRef: ., reason: "wave1-create-failed", cause: $context.waveCause } ] }', sourceStep: dispatch-wave1-create, sourceAttempt: '${ $context.wave1Attempt }', nextStage: failure, stageLoop: null }
     then: exit
 - waitDeferral1: { wait: PT1M }         # the re-dispatch is the re-check: before the recorded instant it re-defers with due: false
+- deferralTick1: { set: { heldTicks: '${ if $context.suspensionRef != null and $context.wave1DeferReason == "held" then ($context.heldTicks // 0) + 1 else 0 end }' } }   # a deferral for a recorded suspension is a held wait (05 inst-pi-held)
+- onDeferralTick1:
+    switch:
+      - heldPoll: { when: '${ $context.heldTicks >= 15 }', then: pollHeld }   # every 15th PT1M tick (D-133)
+      - again:    { then: wave1Again }
 - wave1Again: { set: { wave1LineRefs: '${ $context.wave1Deferred }' }, then: wave1 }
 - lineFailure1:                         # fragment (c)
     set: { failureScope: line, failureSubjects: '${ [ $context.wave1Failed[] | { subjectRef: .lineRef, reason: .reason, cause: "explicit-failure-confirmation" } ] }', sourceStep: dispatch-wave1-create, sourceAttempt: '${ $context.wave1Attempt }', nextStage: failure, stageLoop: null }
@@ -1320,13 +1351,14 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
     fork:
       compete: true
       branches:
-        - tick:      { do: [ { waitExpected: { wait: PT1H } }, { arm: { set: { arm: tick } } } ] }
+        - tick:      { do: [ { waitExpected: { wait: PT1H } }, { arm: { set: { arm: tick, heldTicks: '${ if $context.suspensionRef != null then ($context.heldTicks // 0) + 1 else 0 end }' } } } ] }
         - hold:      { do: [ ‹hold arm of (e)› ] }       # recorded, not waited on: holdPauses is false here
         - resume:    { do: [ ‹resume arm of (e)› ] }
         - lifecycle: { do: [ ‹lifecycle arm of (f)› ] }
         - cancel:    { do: [ ‹cancel arm of (d)› ] }
 - afterExpected:
     switch:
+      - heldPoll: { when: '${ .arm == "tick" and $context.heldTicks >= 1 }', then: pollHeld }   # every PT1H tick while a suspension is recorded (D-133)
       - tick:  { when: '${ .arm == "tick" }', then: evaluate }
       - other: { then: leave }
 - enterBarrierLoop: { set: { stageLoop: barrierLoop } }
@@ -1347,7 +1379,7 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
                     read: envelope
                   output: { as: '${ .[0] | { lineRef: .data.lineRef, wave: .data.wave } }' }
               - arm: { set: { arm: confirmation, confirmedLineRef: '${ .lineRef }', confirmedWave: '${ .wave }' } }   # 05 §4.5 item 7: the line reference and wave only
-        - poll:      { do: [ { waitPoll: { wait: PT30S } }, { arm: { set: { arm: poll } } } ] }
+        - poll:      { do: [ { waitPoll: { wait: PT30S } }, { arm: { set: { arm: poll, heldTicks: '${ if $context.suspensionRef != null then ($context.heldTicks // 0) + 1 else 0 end }' } } } ] }
         - hold:      { do: [ ‹hold arm of (e)› ] }
         - resume:    { do: [ ‹resume arm of (e)› ] }
         - lifecycle: { do: [ ‹lifecycle arm of (f)› ] }
@@ -1355,6 +1387,7 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
 - afterSignal:
     switch:
       - confirmation: { when: '${ .arm == "confirmation" }', then: reconcileHint }
+      - heldPoll:     { when: '${ .arm == "poll" and $context.heldTicks >= 30 }', then: pollHeld }   # every 30th PT30S poll while a suspension is recorded (D-133)
       - poll:         { when: '${ .arm == "poll" }',         then: reconcilePoll }
       - other:        { then: leave }
 - reconcileHint:                        # composable (05): the confirmation is a wake-up; read the line before re-evaluating
@@ -1418,7 +1451,7 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
       as: waveError
       when: '${ $waveError.status as $s | any((409, 408, 429, 503, 504); . == $s) }'
       do: [ { classify: { set: { waveOutcome: '${ if $waveError.status == 409 then "reread" else "exhausted" end }', waveCause: '${ if $waveError.status == 408 then "step-deadline-exceeded" else "retry-budget-exhausted" end }' } } } ]
-    export: { as: '${ $context + { waveOutcome: (.waveOutcome // "answered"), waveCause: (.waveCause // null), wave2Attempt: (($context.wave2Round | tostring) + (if $context.wave2AttemptKey then ":" + ($context.wave2AttemptKey | tostring) else "" end)), wave2AttemptKey: (if (.waveOutcome // "answered") == "answered" then null else $context.wave2AttemptKey end), wave2Failed: ($context.wave2Failed + (.failed // [])), wave2Pending: (.pending // []), lapsed: (.lapsed // []), wave2Deferred: (.deferred // []), wave2Round: (.nextDispatchRound // $context.wave2Round) } }' }
+    export: { as: '${ $context + { waveOutcome: (.waveOutcome // "answered"), waveCause: (.waveCause // null), wave2Attempt: (($context.wave2Round | tostring) + (if $context.wave2AttemptKey then ":" + ($context.wave2AttemptKey | tostring) else "" end)), wave2AttemptKey: (if (.waveOutcome // "answered") == "answered" then null else $context.wave2AttemptKey end), wave2Failed: ($context.wave2Failed + (.failed // [])), wave2Pending: (.pending // []), lapsed: (.lapsed // []), wave2Deferred: (.deferred // []), wave2DeferReason: (.deferReason // null), wave2Round: (.nextDispatchRound // $context.wave2Round) } }' }
 - onWave2:                              # 05 §4.5 items 4–6 and 9
     switch:
       - reread:     { when: '${ $context.waveOutcome == "reread" }',    then: wave2Reread }
@@ -1449,6 +1482,11 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
     export: { as: '${ $context + { wave1LineRefs: .rebuilt, rebuildRound: .nextRebuildRound } }' }   # wave1Round is written only from dispatch-wave1-create answers
     then: enterWave1
 - waitDeferral2: { wait: PT1M }
+- deferralTick2: { set: { heldTicks: '${ if $context.suspensionRef != null and $context.wave2DeferReason == "held" then ($context.heldTicks // 0) + 1 else 0 end }' } }
+- onDeferralTick2:
+    switch:
+      - heldPoll: { when: '${ $context.heldTicks >= 15 }', then: pollHeld }   # D-133
+      - again:    { then: wave2Again }
 - wave2Again: { set: { eligibleLineRefs: '${ $context.wave2Deferred }' }, then: wave2 }
 - lineFailure2:
     set: { failureScope: line, failureSubjects: '${ [ $context.wave2Failed[] | { subjectRef: .lineRef, reason: .reason, cause: "explicit-failure-confirmation" } ] }', sourceStep: dispatch-wave2-activate, sourceAttempt: '${ $context.wave2Attempt }', nextStage: failure, stageLoop: null }
@@ -1474,19 +1512,37 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
     fork:
       compete: true
       branches:
-        - tick:      { do: [ { waitHeld: { wait: PT5M } }, { arm: { set: { arm: tick } } } ] }   # covers a resume consumed before this wait was armed
+        - tick:      { do: [ { waitHeld: { wait: PT5M } }, { arm: { set: { arm: tick, heldTicks: '${ if $context.suspensionRef != null then ($context.heldTicks // 0) + 1 else 0 end }' } } } ] }   # covers a resume consumed before this wait was armed
         - hold:      { do: [ ‹hold arm of (e)› ] }
         - resume:    { do: [ ‹resume arm of (e)› ] }
         - lifecycle: { do: [ ‹lifecycle arm of (f)› ] }
         - cancel:    { do: [ ‹cancel arm of (d)› ] }
 - afterHeldWait:
     switch:
+      - heldPoll: { when: '${ .arm == "tick" and $context.heldTicks >= 3 }', then: pollHeld }   # D-133
       - tick:  { when: '${ .arm == "tick" }', then: retryHeld }
       - other: { then: leave }          # hold | resume | lifecycle | cancel; a resume returns to retryHeld through enter
 - retryHeld:
     switch:
       - spawn:  { when: '${ $context.heldCall == "spawn" }', then: preActivation }   # Lifecycle re-runs the re-check after a hold (Lifecycle 06 §4.3), then the spawn signal under its next round
       - report: { then: reportCompleted }
+- pollHeld:                             # protected (08): the resume wait's poll, from a fulfillment wait or a held deferral where a hold was only recorded (D-133)
+    timeout: step
+    try:
+      - call: { step: apply-resume }    # body: ref + trigger: poll, suspensionRef, round: $context.resumePollRound; output: resumeOutcome ∈ resumed-by-read | still-held, due, failedTaskRefs[], nextRound
+    catch: *transient
+    export: { as: '${ $context + { resumeOutcome: .resumeOutcome, resumePollTail: ("poll:" + ($context.resumePollRound | tostring)), resumePollRound: .nextRound, resumeFailed: (.failedTaskRefs // []), heldTicks: 0, suspensionRef: (if .resumeOutcome == "resumed-by-read" then null else $context.suspensionRef end) } }' }
+- afterHeldPoll:                        # stageLoop first, so no walk takes the failure route before begin-fulfillment; either answer then continues with the tick's own work
+    switch:
+      - eligibility:      { when: '${ $context.stageLoop == "awaitEligibilityChange" }', then: eligibility }   # before begin-fulfillment no failure is deferred, so failedTaskRefs is empty
+      - deferredFailures: { when: '${ ($context.resumeFailed | length) > 0 }', then: heldPollFailure }   # 08 §4.7 item 8: before any dispatch
+      - expected:         { when: '${ $context.stageLoop == "awaitExpected" }', then: evaluate }        # also the held wave-2 deferral entered from awaitExpected
+      - barrier:          { when: '${ $context.stageLoop == "barrierLoop" }',   then: reconcilePoll }   # also the held wave-2 deferral entered from the barrier
+      - held:             { when: '${ $context.stageLoop == "heldWait" }',      then: retryHeld }
+      - wave1:            { then: wave1Again }   # stageLoop wave1: the held wave-1 deferral
+- heldPollFailure:                      # fragment (c); the failing call's key tail is the poll round
+    set: { failureScope: line, failureSubjects: '${ [ $context.resumeFailed[] | { subjectRef: .lineRef, reason: .reason, cause: (if .reason == "intent-unresolved" then "sweep-floor-reached" else "sweep-discovered-terminal-failure" end) } ] }', sourceStep: apply-resume, sourceAttempt: '${ $context.resumePollTail }', nextStage: failure, stageLoop: null }
+    then: exit
 - leave: { set: { nextStage: '${ .arm }', returnStage: fulfillment }, then: exit }
 ```
 
@@ -1563,7 +1619,16 @@ the `listen` cannot hang the barrier and the timer is never the sole trigger
 amended). The poll arm is an early read of the schedule the `reconciliation-sweep` worker runs on
 `next_sweep_at` for every instance (`01 §3.8`); a hold is recorded here and not waited on, so the
 poll, the `waitExpected` tick and the overdue monitor keep running while the dispatch operations
-defer on `owf_process_instance.suspended`. `re-check-pre-activation` runs before the first
+defer on `owf_process_instance.suspended`. While the definition holds a recorded `suspensionRef`,
+every wait of this stage — the eligibility, expected-time, barrier and held waits, and a wave
+deferral answered `deferReason = held` — calls `pollHeld` on its tick about every `PT15M`
+(`heldTicks`, §3.6 *Fixed waits and re-check loops*), which is the resume wait's `apply-resume`
+`trigger: poll` (decision D-133). A resume lost between listens is therefore applied from
+Lifecycle's order read, and a held deferral, which listens for nothing, cannot loop until the
+lifetime ceiling. `afterHeldPoll` decides on `stageLoop` first: the eligibility wait precedes
+`begin-fulfillment`, so it has no deferred failures and no failure route. Elsewhere a non-empty
+`failedTaskRefs[]` goes to fragment (c) before any dispatch, and either answer then runs the tick's
+own re-check. `re-check-pre-activation` runs before the first
 activation, and again only after a `held` spawn signal: `proceed` is the only case that reaches `report-spawn-signal`, `abort` goes to the
 unwind and `not-dispatchable` returns to the barrier loop. **Held.** A `report-spawn-signal` or a
 completion `report-outcome` that Lifecycle refuses `not-admissible` because the order is `on_hold`
@@ -2051,7 +2116,7 @@ The hold stage, the `do` list of `process.hold`:
     try:
       - call: { step: apply-hold }      # body: ref + holdEventId: $context.lifecycleEventId, gateRefs: ($context.gateRefs // []); output: holdOutcome, suspensionRef
     catch: *transient
-    export: { as: '${ $context + { holdOutcome: .holdOutcome, suspensionRef: .suspensionRef } }' }
+    export: { as: '${ $context + { holdOutcome: .holdOutcome, suspensionRef: .suspensionRef, resumePollRound: (if .suspensionRef != null and .suspensionRef == $context.suspensionRef then ($context.resumePollRound // 0) else 0 end), heldTicks: 0 } }' }   # the poll family is per suspension (D-133)
 - onHold:
     switch:
       - pause:  { when: '${ $context.holdOutcome == "suspended" and $context.holdPauses }', then: enterResumeWait }   # only the approval stage waits on the resume
@@ -2081,9 +2146,9 @@ The hold stage, the `do` list of `process.hold`:
       - deferredFailures: { when: '${ ($context.resumeFailed | length) > 0 }', then: pollResumeFailure }   # 08 §4.7 item 8, as after an event-driven resume
       - resumed:          { then: backFromPoll }
 - pollResumeFailure:                    # fragment (c); the failing call's key tail is the poll round
-    set: { failureScope: line, failureSubjects: '${ [ $context.resumeFailed[] | { subjectRef: .lineRef, reason: .reason, cause: (if .reason == "intent-unresolved" then "sweep-floor-reached" else "sweep-discovered-terminal-failure" end) } ] }', sourceStep: apply-resume, sourceAttempt: '${ $context.resumePollTail }', nextStage: failure, stageLoop: null }
+    set: { failureScope: line, failureSubjects: '${ [ $context.resumeFailed[] | { subjectRef: .lineRef, reason: .reason, cause: (if .reason == "intent-unresolved" then "sweep-floor-reached" else "sweep-discovered-terminal-failure" end) } ] }', sourceStep: apply-resume, sourceAttempt: '${ $context.resumePollTail }', nextStage: failure, stageLoop: null, suspensionRef: null }
     then: exit
-- backFromPoll: { set: { nextStage: '${ $context.heldStage }', returnStage: '${ $context.heldStage }', stageLoop: '${ $context.heldLoop }' }, then: exit }   # the stage and loop the hold interrupted; resumeDue is the escalation re-check's first answer
+- backFromPoll: { set: { nextStage: '${ $context.heldStage }', returnStage: '${ $context.heldStage }', stageLoop: '${ $context.heldLoop }', suspensionRef: null }, then: exit }   # the suspension is closed: no later wait polls it (D-133)   # the stage and loop the hold interrupted; resumeDue is the escalation re-check's first answer
 - leave: { set: { nextStage: '${ .arm }', returnStage: hold }, then: exit }
 - back: { set: { nextStage: '${ $context.returnStage }' }, then: exit }
 ```
@@ -2157,6 +2222,22 @@ it, it applies the resume as for an `OrderResumed` — closes the suspension, re
 windows, applies the deferred failures — and answers `resumed-by-read`, and the definition
 returns to the stage and loop the hold interrupted. A resume lost while the hold stage ran
 `admitHold` and `applyHold` therefore costs at most one poll interval, not the lifetime ceiling.
+**Every other wait polls a recorded suspension too** (decision D-133). Outside the resume wait a
+hold is only recorded: in the park loop, in the fulfillment waits and in a wave deferral answered
+`held`. There, a resume lost between listens would leave `owf_process_instance.suspended` set, the
+dispatch operations deferring, and a held deferral, which has no `listen` at all, looping until the
+ceiling. So while `$context.suspensionRef` is set, each such wait of fragments (a) and (b) counts
+its tick in `heldTicks` and calls `pollHeld` about every `PT15M`. The way out of the park loop
+polls once more, so a suspension recorded while parked is not carried into `gateLoop`. `gateLoop`
+and `outageArm` do not poll: a hold there enters the resume wait, and their tick carries the
+escalation fire's lateness bound (D-123). That is the same
+`apply-resume` `trigger: poll` under the same per-suspension `resumePollRound`, which `applyHold`
+resets whenever it answers a new `suspensionRef`. A `resumed-by-read` answer clears
+`suspensionRef`, as `backFromPoll` does after the resume wait's poll, so no closed suspension is
+polled again. The stage-level resume arm clears it too. A later `OrderResumed` for a suspension the
+poll closed is attached to it as an absorbed duplicate (`08` `inst-ar-ahead`), wherever it
+arrives. The failure stage's resolution wait does not poll, because an operator resolves it and
+every way out of it reaches a polled wait or the unwind.
 The poll consumes no Lifecycle event, so no `admit-trigger` precedes it; the order read inside
 `apply-resume` is its guard (§4.1). A cancel taken from the resume wait
 that `authorize-cancel` denies returns to the resume wait, because the instance is still
@@ -2322,7 +2403,7 @@ any of them:
 
 | Stage | Protected operations, in order | May be interleaved with (composable) |
 |-------|-------------------------------|--------------------------------------|
-| Admission | `admit-trigger` (`role: start`) **<** `start-instance`; on every arm that consumes a Lifecycle trigger, `admit-trigger` (`role: listen`) **<** the consuming operation (`evaluate-payment-auth-eligibility`, `apply-hold`, `apply-resume`, `terminate-on-terminal-event`, `run-cancellation-fence` on supersede); `apply-resume` with `trigger: poll` consumes no trigger and follows no admission — the Lifecycle order read inside it is its guard (D-130) | — |
+| Admission | `admit-trigger` (`role: start`) **<** `start-instance`; on every arm that consumes a Lifecycle trigger, `admit-trigger` (`role: listen`) **<** the consuming operation (`evaluate-payment-auth-eligibility`, `apply-hold`, `apply-resume`, `terminate-on-terminal-event`, `run-cancellation-fence` on supersede); `apply-resume` with `trigger: poll` consumes no trigger and follows no admission — the Lifecycle order read inside it is its guard (D-130), wherever it is called from (the resume wait, or `pollHeld` in another wait, D-133) | — |
 | Verdict | `obtain-verdict` **<** `reflect-verdict`; `record-decision` **<** `reflect-verdict` on the decision path | `open-gates`, `escalate-gate`, `arm-park-escalation`, `park`, `unpark` |
 | Plan | `evaluate-payment-auth-eligibility` **<** `construct-and-freeze-plan` **<** `begin-fulfillment` | `evaluate-activation-eligibility` |
 | Waves | `begin-fulfillment` **<** `dispatch-wave1-create` **<** `re-check-pre-activation` **<** `report-spawn-signal` **<** `dispatch-wave2-activate`; on every path to `dispatch-wave2-activate`, the barrier's `waitExpected` re-check loop and an `evaluate-activation-eligibility` answer `released` **<** `dispatch-wave2-activate` — the ADR-0004 conjunction, whose run-time guard is `05 §3.6` `inst-pi-wave2-guard` (`activation-precondition-unmet`); `evaluate-activation-eligibility` stays `composable` everywhere else | `evaluate-activation-eligibility` (beyond the conjunction), `reconcile-intent`, `reread-draft-liveness`, `rebuild-wave1` |
@@ -2402,11 +2483,12 @@ through `apply-resume` whether Lifecycle still holds the order, so a resume deli
 hold stage runs `admitHold` and `applyHold` is applied at most one poll interval late. Nothing
 re-reads a hold, a decision or an amendment. The stage-level resume arm covers only a resume
 delivered before its hold's `listen` (`08 §4.7` item 3), and the barrier and eligibility polls
-cover only the conditions they evaluate. Until the ask is answered, a resume lost outside the
-approval stage, which has no resume wait, leaves `owf_process_instance.suspended` set, so the
-dispatch operations defer and the barrier does not release until an operator cancels the order
-or the lifetime ceiling parks it; and a decision delivered during a probe is not recorded, so the
-gate escalates on its window.
+cover only the conditions they evaluate. A resume lost outside the approval stage's resume wait
+is covered by the same poll: every other wait that holds a recorded suspension calls `pollHeld`
+about every `PT15M` (decision D-133). It is applied at most one poll interval late (one `PT1H`
+tick in `awaitExpected`), not held until an operator cancels the order or the lifetime ceiling
+parks it. A decision delivered during a probe is still not recorded, so the gate escalates on its
+window.
 
 Orders issues no generic `cancel`, `suspend` or `resume`, and it **cannot prevent** another
 platform-authorized caller from issuing them (`../ADR/0010` *platform APIs are authorized
@@ -2448,8 +2530,9 @@ the fault of the invocation — the DSL says nothing about what follows the last
 *Retries*, dsl-reference.md *Catch*). Until Q-11 is answered, (i) is
 the re-check loop, (ii) is bounded by the retry budget, (iii) is settled as one `call` per wave
 carrying `lineRefs[]`, (iv) is the event-retention ask of §4.4 (D-124): until it is answered an
-event delivered between listens can be lost, and only a resume awaited in the approval stage's
-resume wait is recovered, by the stopgap poll of D-130; (v) is satisfied by the re-check loop,
+event delivered between listens can be lost, and only a lost resume is recovered — in the
+approval stage's resume wait by the stopgap poll of D-130, and in every other wait that holds a
+recorded suspension by the same poll on its tick (D-133); (v) is satisfied by the re-check loop,
 which needs no Function, and asks only whether a remainder could be armed directly, which is (i);
 and (vi) is assumed: every retry-only `catch` of §3.6 relies on it, and the CI test cannot observe
 it, so the plugin's answer is a readiness item (open question Q-11: Q-11 carries the six

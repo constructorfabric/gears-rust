@@ -90,6 +90,46 @@ reach. Concretely:
     a remaining escalation window), as a value without commercial meaning.
   Every operation declares its `input` and `output` as GTS reference schemas built from this list
   only; the schema is the closed contract, and ADR-0012 rule 5 checks the definition against it.
+
+  > **Amended 2026-09-26 by D-131**: the list above named too little. The canonical definition
+  > passes references it did not name (`lineRef`, `planRef`, `parkRef`, `requestRef`,
+  > `cancelRequestRef`, `suspensionRef`, `subjectRef`, the identities of consumed events) and
+  > counters, so a validator written from it would refuse the canonical definition, and one written
+  > from the definition would have no closed list at all. The permitted members are therefore a
+  > **closed vocabulary of six types**, each a registered GTS schema with a format. A member of a
+  > task input, output, `export`, `body` or header, or of `$context`, **MUST** be one of these types,
+  > and nothing else crosses:
+  >
+  > 1. **Identity**: `correlationId`, `orderId`, `orderVersion` (integer), `resourceTenantId`
+  >    (`resource_tenant_id`), the platform `invocationId` and `attemptId`, the binding members
+  >    `definitionId`, `definitionVersion` and `definitionSource` that `start-instance` records, and
+  >    the envelope `id` of a consumed event (`triggerEventId`, `lifecycleEventId`, `resumeEventId`,
+  >    `holdEventId`, `decisionEventId`);
+  > 2. **Opaque record reference**: a UUID naming a row of this gear's record, with one type per
+  >    kind: `stepRef`, `taskRef`, `gateRef`, `lineRef` (an `owf_fulfillment_task` row), `planRef`,
+  >    `parkRef`, `requestRef`, `cancelRequestRef` and `suspensionRef`. A `subjectRef` is one of
+  >    these, a `correlationId` or `ceiling:{round}`. An array of references is permitted, either
+  >    bare or paired with a reason code (`failed[]`, `failedTaskRefs[]`, `failureSubjects[]`);
+  > 3. **Counter**: a non-negative integer. This covers every round, sequence and position member
+  >    (`…Round`, `…Seq`, `position`, `pass`, `attemptKey`, `openTaskCount`, `rowVersion`), and also a
+  >    key tail made only of counters and a literal prefix (`{round}[:{attempt}]`, `poll:{round}`);
+  > 4. **Closed enumeration or boolean**, including a catalogue reason code (D-64) and a routing
+  >    literal the definition writes itself (`design/10-process-definition.md` §2.2 rule 1);
+  > 5. **Instant or duration**, as in the list above (RFC 3339 or ISO 8601);
+  > 6. **The step-surface base** `stepsBase`, a configuration literal that only the definition's
+  >    `input.from` writes (`design/10-process-definition.md` §2.2 rule 2).
+  >
+  > A string member is valid only in one of these formats: a UUID, the key-tail pattern, an
+  > enumeration member, RFC 3339 or ISO 8601, semver, or the `stepsBase` URL. The `Idempotency-Key`
+  > header is composed only of members of the vocabulary (`design/01-foundation.md` §3.3).
+  >
+  > **Accepted residual: cardinality and counters.** An array of `lineRef`s, `gateRef`s or
+  > `taskRef`s shows how many lines a wave carries, how many gates a position opens and how many
+  > tasks are open, and so shows the order's line count. A round shows how often an operation was
+  > re-invoked. That is process-shape metadata, and PRD §6.1 lists retry counters among the process
+  > artifacts. It is part of what remains in history, stated in *Residual* below. It shows no line's
+  > content: no product, offer, quantity, price or subscription. "Line counts" is therefore struck
+  > from the list below, and "line items" stays.
 * **What may never cross**: resolved totals, prices, currencies or any price-pin field; catalog,
   offer, plan or product references; line items or line counts; approver identities and any
   `subject_id`; buyer or seller identity, and any tenant axis beyond `resource_tenant_id`
@@ -98,6 +138,9 @@ reach. Concretely:
   lookup tuple); the frozen plan or any part of it; approval context; the saga/compensation log;
   free text of any kind — error messages, manual-task text, operator notes; and anything the PRD
   classifies as commercial order context (§6.1, line 263).
+
+  > **Amended 2026-09-26 by D-131**: "line counts" is struck. The count is the cardinality of the
+  > reference arrays above, an accepted residual. Line content still never crosses.
 * **Trigger inputs and consumed events.** The rule covers them as well as task data. The start
   trigger's input is the raw `$workflow.input` (Serverless Workflow DSL 1.0.0, dsl.md *Runtime
   expression arguments*) and a `listen` output is the array of consumed events (dsl-reference.md
@@ -127,6 +170,15 @@ reach. Concretely:
   PDP-authorized for the serverless-runtime service principal; the caller supplies references,
   never authority). The resolved total reaches the approval request from Lifecycle through
   `obtain-verdict`/`open-gates` and is never returned to the definition.
+* **Error answers** (added 2026-09-26 by D-132). A refused step call is task data too. The DSL
+  raises its 4xx or 5xx answer as the communication error the `catch` sees as `$error`, and the
+  engine records it. Every answer the step route (`/bss-orders-workflow/v1/steps/{operation}`)
+  produces **MUST** therefore carry only these RFC 9457 members: `type`, `status`, `title`,
+  `error_domain`, `error_code`, a `detail` equal to the fixed text registered for that
+  `error_code`, and an empty `context` (`context.data` `{}`). It carries no variable text, no
+  variant field, no `instance`, and no field violation that echoes a body member
+  (`design/01-foundation.md` §4.9, §4.11). The definition reads only `$error.status` (and
+  `error_code` once Q-11 (ii) answers), and never exports an `$error` member.
 * **How this bounds the PRD §15 criteria.** *Which commercial data would sit in engine history*:
   none in task inputs and outputs — identifiers and enums only; in trigger inputs and consumed
   events, none once one of the two routes above lands, and the events as published until then
@@ -137,6 +189,15 @@ reach. Concretely:
   boundary*: the engine is a platform gear, not an OSS store, and holds no commercial document.
   *Audit independent of engine purge*: the record is complete without the history by
   construction, since nothing crosses that is not already in the record.
+
+  > **Amended 2026-09-26 by D-131**: "for whom" was wrong. `resourceTenantId` is in every task
+  > input, in every `Idempotency-Key` header (`{tenant}:…`) and in the admission key, so the timeline
+  > discloses **which resource tenant owns each order**. It also discloses the cardinalities and
+  > counters above. It does not disclose what was ordered, the buyer or seller identity beyond that
+  > one axis, the price, or who approved it. PRD §15's first question is answered accordingly:
+  > *none* for commercial content in task data; in history, **identifiers (including the resource
+  > tenant), counters and cardinalities**, plus the consumed events as published until one of the
+  > two routes above lands. It is never an unqualified "none" (Q-01, Q-12, D-66 as amended).
 * **Residual.** Task inputs are still in engine history. `correlationId`, `orderId` and
   `orderVersion` are pseudonymous business keys stored, with their timestamps, in a Temporal
   persistence backend whose location and retention the platform sets (serverless-runtime ADR-0004
@@ -148,6 +209,12 @@ reach. Concretely:
   full**: the Lifecycle commercial fields listed above, the Subscriptions `subscriptionId`, and
   whatever the unspecified Generic Approval decision event carries. That is the stated residual of
   this decision, and the platform path is not ready for a tenant for whom it is disqualifying.
+
+  > **Amended 2026-09-26 by D-131**: the residual identifiers are the whole vocabulary above, not
+  > three of them. That is `correlationId`, `orderId`, `orderVersion` **and `resourceTenantId`**,
+  > carried in every task input and in the headers that embed it, together with the opaque record
+  > references, the counters and the cardinalities, and the fixed-text error answers of D-132, all
+  > with their timestamps.
 
 ### Consequences
 
@@ -162,9 +229,13 @@ reach. Concretely:
 
 Verified by: a schema test that every registered operation's `input` and `output` GTS schema is
 composed only of the permitted identifier and enum types and rejects any string field without a
-closed enumeration; the ADR-0012 rule-5 conformance test over the canonical definitions; a test
+closed enumeration (as amended by D-131: any string member not of one of the six vocabulary types
+and their formats); the ADR-0012 rule-5 conformance test over the canonical definitions; a test
 per operation asserting that its HTTP response body, serialized, contains no field outside its
-declared output schema (a golden-response check under the fixture corpus); a test that an
+declared output schema (a golden-response check under the fixture corpus), and, per D-132, that
+every refusal the step route can answer — each registered reason of the operation, the envelope's
+validation refusal, a PDP denial — serializes to the fixed members of *Error answers* and nothing
+else; a test that an
 operation given only `correlationId` and `resource_tenant_id` reconstructs the plan, the gate
 and the intent it needs from this gear's record; a test that `obtain-verdict` and `open-gates`
 pass the resolved total to the approval seam and return only a verdict class to the caller; a
@@ -212,7 +283,7 @@ D-65 onward.
 - **DESIGN**: [DESIGN.md](../DESIGN.md) §4.2, §4.3;
   [`design/10-process-definition.md`](../design/10-process-definition.md) (reference schemas);
   each slice §3.3 (`input`/`output` per operation)
-- **Decisions register**: [`DECISIONS.md`](../DECISIONS.md) — Q-01, D-61, D-64, D-66 (as amended), Q-12
+- **Decisions register**: [`DECISIONS.md`](../DECISIONS.md) — Q-01, D-61, D-64, D-66 (as amended), D-131, D-132, Q-12
 - **Upstream asks**: [`UPSTREAM_REQS.md`](../UPSTREAM_REQS.md) — serverless-runtime section
   (history residency and retention; member-only storage of trigger inputs and consumed events);
   Orders Lifecycle section (thin event variants); Generic Approval section (reference-only

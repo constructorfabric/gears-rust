@@ -149,6 +149,9 @@
   - [D-128 (M) Bounding one invocation's engine history is asked of the plugin; the ticks are not stretched to fit](#d-128-m-bounding-one-invocations-engine-history-is-asked-of-the-plugin-the-ticks-are-not-stretched-to-fit)
   - [D-129 (M) The ceiling task has an SLA tick, and a Seller Operator ends a ceiling park with the order cancel](#d-129-m-the-ceiling-task-has-an-sla-tick-and-a-seller-operator-ends-a-ceiling-park-with-the-order-cancel)
   - [D-130 (M) Until events are retained between listens, the resume wait polls whether Lifecycle still holds the order](#d-130-m-until-events-are-retained-between-listens-the-resume-wait-polls-whether-lifecycle-still-holds-the-order)
+  - [D-131 (H) The references that cross the engine are a closed six-type vocabulary; cardinality, counters and the resource tenant are the stated residual](#d-131-h-the-references-that-cross-the-engine-are-a-closed-six-type-vocabulary-cardinality-counters-and-the-resource-tenant-are-the-stated-residual)
+  - [D-132 (M) A step-route error answer carries fixed members only](#d-132-m-a-step-route-error-answer-carries-fixed-members-only)
+  - [D-133 (M) Every wait that holds a recorded suspension polls the hold](#d-133-m-every-wait-that-holds-a-recorded-suspension-polls-the-hold)
 - [Open Questions](#open-questions)
   - [Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?](#q-01-which-durable-execution-substrate-backs-the-process--the-oss-workflow-engine-or-a-bss-local-mechanism)
   - [Q-02: The Generic Approval escalation threshold — the one PRD-deferred numeric value this design deliberately leaves unset](#q-02-the-generic-approval-escalation-threshold--the-one-prd-deferred-numeric-value-this-design-deliberately-leaves-unset)
@@ -1671,6 +1674,13 @@ variants or confirms the full events may be stored (`…-upreq-lifecycle-thin-ev
 Generic Approval decision event reference-only by `…-upreq-generic-approval-expectations-contract`.
 Until one lands, "no commercial data in engine history" holds for task inputs and outputs only, and
 the consumed events as published are the stated residual of ADR-0013 and `DESIGN.md` §4.2.
+
+**Amended (2026-09-26)**: the permitted list is the closed six-type vocabulary of D-131, which
+names every reference and counter the canonical definition passes. "Line items" still never cross,
+and "line counts" is struck, because array cardinality is an accepted residual. The residual
+identifiers include `resource_tenant_id`, and the rationale's "none" holds for commercial content
+in task data only (Q-01 as amended). Refused step calls are task data too, with a fixed-member
+Problem shape (D-132).
 
 **ADR**: ADR-0013 (`cpt-cf-bss-orders-workflow-adr-references-not-payloads`).
 
@@ -3228,6 +3238,10 @@ lands: the approval stage's resume wait reads through `apply-resume` whether Lif
 the order, so a resume lost there is applied at most one `PT15M` poll late (D-130). A lost resume
 outside the approval stage, a lost hold, decision or amendment stay uncovered.
 
+**Amended (2026-09-26, second)**: a lost resume outside the approval stage is now covered by the
+same poll in every other wait that holds a recorded suspension (D-133). A lost hold, decision or
+amendment stays uncovered.
+
 ### D-125 (M) A failure or floor trip the sweep worker records reaches the definition through its next reconcile round
 
 **Accepted (2026-09-26).**
@@ -3400,6 +3414,117 @@ eligibility waits (`design/10` §3.6 (b)); the Lifecycle order read inside `refl
 `design/08-hold-and-cancel.md` §3.3, §3.6, §3.7, §4.7; `design/01-foundation.md` §3.3;
 `design/07-manual-tasks.md` §3.3; `UPSTREAM_REQS.md` §2.9; D-124, Q-11.
 
+**Amended (2026-09-26)**: "the stopgap covers that case only" no longer holds. D-133 extends the
+same poll to every other wait that holds a recorded suspension. The round family stays per
+suspension, and `apply-hold` resets it on each new `suspensionRef`. The absorption of a late
+`OrderResumed` into a `resumed-by-read` row is unchanged and now applies wherever the poll ran.
+
+### D-131 (H) The references that cross the engine are a closed six-type vocabulary; cardinality, counters and the resource tenant are the stated residual
+
+**Accepted (2026-09-26).**
+
+**Decision**: every member of a task input, output, `export`, `body` or header, and of `$context`,
+is of one of six types, each a registered GTS schema with a format. The types are: **identity**
+(`correlationId`, `orderId`, `orderVersion`, `resourceTenantId`, `invocationId`, `attemptId`, the
+binding members, consumed-event ids); **opaque record reference** (a UUID per kind: `stepRef`,
+`taskRef`, `gateRef`, `lineRef`, `planRef`, `parkRef`, `requestRef`, `cancelRequestRef`,
+`suspensionRef`; a `subjectRef` of one of these, `correlationId` or `ceiling:{round}`; arrays,
+bare or paired with a reason code); **counter** (a non-negative integer, or a key tail of counters
+and a literal prefix); **closed enumeration or boolean**; **instant or duration**; and
+`stepsBase`. A string member of no such type is refused by `design/10` §2.2 rule 5 and at the
+envelope. The residual in engine history is stated in full: the identifiers, **including
+`resource_tenant_id`**, which is in every task input and `Idempotency-Key` header, so the timeline
+shows which resource tenant owns each order; the record references; and the counters and array
+cardinalities, which show line, gate, task and retry counts but no line content. "Line counts" is
+struck from ADR-0013's never-cross list, and "line items" stays.
+
+**Rationale**: ADR-0013's list omitted `lineRef`, `planRef`, `parkRef`, `requestRef`,
+`suspensionRef`, the event ids and every counter, all of which the canonical definition passes.
+ADR-0012 rule 1 requires `lineRefs[]` on each wave. The confirmation test rejected every string
+without a closed enum, so a validator written from the ADR would refuse the canonical definition,
+and one written from the definition had no closed list (OW2-61). The residual named only three
+identifiers and claimed the timeline does not show "for whom", while `resourceTenantId` is in
+every body and key (OW2-64). The smallest consistent rule is to type what already crosses, and to
+state its disclosure, rather than redesign the wave calls to carry no line set. **Precedent**:
+Lifecycle's actor and resource references as lowercase UUID text, "an opaque, pseudonymous,
+immutable reference" (D-61 in this register, mirroring Lifecycle D-96 and D-103); 01 §3.3's per-operation
+GTS `input`/`output` types, which this vocabulary types member by member. No platform precedent
+exists: the serverless-runtime has no data-classification model for history (`NEXT_ADR_SCOPE.md`
+line 23, BR-017).
+
+**Propagated**: `ADR/0013` (amendment blocks, *Confirmation*); `design/01-foundation.md` §1.1,
+§2.1; `design/10-process-definition.md` §1.1, §2.1, §2.2 rule 5; `DESIGN.md` §4.2, §4.3;
+`UPSTREAM_REQS.md` §2.9, §4 item 7; D-66, Q-01, Q-12.
+
+### D-132 (M) A step-route error answer carries fixed members only
+
+**Accepted (2026-09-26).**
+
+**Decision**: every answer the step route `/bss-orders-workflow/v1/steps/{operation}` produces
+carries only `type`, `status`, `title`, `error_domain`, `error_code`, a `detail` equal to the fixed
+text registered for the `error_code`, and an empty `context` (`context.data` `{}`), with no
+`instance` and no `trace_id`. That covers a registered reason, the envelope's validation refusal
+and a PDP denial. The definition reads only `$error.status` (and `error_code` once Q-11 (ii)
+answers) and exports no `$error` member. The operator-facing routes keep the full RFC 9457 shape.
+ADR-0013's golden-response test is extended to every refusal the step route can answer.
+
+**Rationale**: the DSL raises a non-2xx answer as the communication error the `catch` sees as
+`$error`, and the engine records it. 01 let the Problem carry a free-text `detail` and variant
+`context.data`, which ADR-0013 forbids ("free text of any kind — error messages"). The golden test
+checked only success bodies (OW2-65). **Precedent**: the canonical-errors SDK's
+`Problem::contract_error` places variant data at `context.data`, so an empty `data` is the SDK's own
+empty variant ([`problem.rs`](../../../../libs/toolkit-canonical-errors/src/problem.rs)
+`contract_error`); 01 §4.11's rule that every `detail` is a bounded, sanitized diagnostic. No BSS
+gear restricts a machine surface's Problem further, so this is the smallest rule that closes the
+gap.
+
+**Propagated**: `ADR/0013` (*Error answers*, *Confirmation*); `design/01-foundation.md` §4.9,
+§4.11; `design/10-process-definition.md` §2.1, §2.2 rule 5; `DESIGN.md` §4.2; `UPSTREAM_REQS.md`
+§2.9; D-66.
+
+### D-133 (M) Every wait that holds a recorded suspension polls the hold
+
+**Accepted (2026-09-26).**
+
+**Decision**: while the definition holds a `suspensionRef`, which `apply-hold` answered and nothing
+has closed since, every wait other than the approval resume wait calls `apply-resume`
+`trigger: poll` (`pollHeld`) on its own tick, counted in `heldTicks`, about every `PT15M`. That
+covers the park loop, the held-reflection wait, the eligibility, expected-time, barrier and held
+waits, and a wave deferral answered `deferReason = held`. The cadence is every third `PT5M` tick,
+every thirtieth `PT30S` barrier poll, every fifteenth `PT1M` deferral tick, and every `PT1H`
+expected-time tick. The way out of the park loop polls once as well. The poll uses the resume
+wait's key family `…:apply-resume:poll:{suspensionRef}:{round}`, whose `resumePollRound`
+`apply-hold` resets whenever it answers a new `suspensionRef`. A `resumed-by-read` answer, the
+resume wait's `backFromPoll` and the stage-level resume arm clear `suspensionRef`. After the poll
+the definition decides on `stageLoop` first, then runs the tick's own re-check. In the eligibility
+wait, which precedes `begin-fulfillment`, there is no failure route. Elsewhere in fulfillment a
+non-empty `failedTaskRefs[]` goes to fragment (c) before any dispatch. `gateLoop` and `outageArm`
+do not poll: a hold there enters the resume wait, and their `PT30S` tick carries D-123's
+lateness bound. The failure stage's resolution wait does not poll, because every way out of it
+reaches a polled wait or the unwind. A late `OrderResumed` for a suspension the poll closed is
+still absorbed by `inst-ar-ahead` into that row, wherever it arrives.
+
+**Rationale**: outside the approval stage a hold is only recorded, and D-130 polled only the
+resume wait. A resume lost between listens therefore left `owf_process_instance.suspended` set.
+`evaluate-activation-eligibility` withheld release, and the dispatch operations deferred every
+line with `deferReason = held` (`design/05` `inst-pi-held`). A held wave deferral loops
+`dispatch` ↔ `PT1M` with no `listen` at all, so it could not consume even a retained
+`OrderResumed`, and it looped until an operator cancel or the lifetime ceiling (B7 open item 1). A
+suspension carried from the park loop into the gates also made the next hold `absorbed-duplicate`,
+so the gate windows went unpaused. The poll also heals the misattribution B7 noted: an
+out-of-order resume absorbed into an earlier `resumed-by-read` row leaves the next suspension open,
+and the next polled wait closes it by read. Counting ticks keeps the waits' literal durations, and
+it keeps the key count near the resume wait's 96 a day rather than one key per `PT30S` tick. No
+routing member is written from an operation output (`design/10` §2.2 rule 1): `afterHeldPoll`
+switches on `stageLoop`, and the counter and `suspensionRef` are data. **Precedent**: D-130's
+resume-wait poll, of which this is the same call in more places; the fixed-tick re-check loops of
+`design/10` §3.6 *Fixed waits and re-check loops*; Lifecycle's "re-read the order, wait for the
+resume" (Lifecycle `06 §4.3`).
+
+**Propagated**: `design/10-process-definition.md` §3.6 (a), (b), (e), *Fixed waits and re-check
+loops*, §4.1, §4.4, §4.5; `design/08-hold-and-cancel.md` §3.2, §3.3, §4.7 items 3, 9, 10;
+`design/01-foundation.md` §3.3; `DESIGN.md` §1.2; `UPSTREAM_REQS.md` §2.9; D-124, D-130, Q-11.
+
 ## Open Questions
 
 ### Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?
@@ -3418,6 +3543,17 @@ eligibility waits (`design/10` §3.6 (b)); the Lifecycle order read inside `refl
    gear holding no commercial document; *gear-owned audit independent of engine purge* is answered
    by the record being complete without the history. *Isolation and retention of that history* —
    with its residency — cannot be asserted from the platform's documents and is Q-12.
+
+**Amended (2026-09-26)**: part 2 overstated the first criterion. It was told three ways: "none"
+here and in `UPSTREAM_REQS.md` §4 item 7, "met by construction" in `design/01-foundation.md` §1.1
+and `design/10-process-definition.md` §1.1, and "bounded, not closed" in `DESIGN.md` §4.2. The one
+answer is this: *which commercial data would sit in engine history* is **none in task data**. In
+history there are identifiers (including `resource_tenant_id`), counters and array cardinalities
+(D-131), fixed-member error answers (D-132), and the consumed events as published until
+`…-upreq-serverless-runtime-consumed-event-member-storage` or `…-upreq-lifecycle-thin-events`
+lands (D-66 as amended). The "met by construction" claims are withdrawn from 01 and 10, and the
+registered PRD amendment now carries the qualifier. PRD §15 shows no answer yet, which is correct
+until the amendment is applied.
 
 *Superseded statement, retained for history:* no slice's saga-step, durable-timer, or
 engine-history-isolation implementation could be finalized until the substrate was chosen; target
@@ -3597,8 +3733,9 @@ settled as one `call` per wave carrying `lineRefs[]` (D-79); (iv) **no general f
 design depends on the platform retaining an event delivered between listens, the ask
 `cpt-cf-bss-orders-workflow-upreq-serverless-runtime-event-retention-between-listens` (D-124;
 the earlier "covered by the poll arms and the re-entry of every stage loop" was wrong and is
-withdrawn), and only a resume awaited in the approval stage's resume wait is recovered, by the
-stopgap poll of D-130; (vi) assumed, and a readiness item, because no CI test can observe it.
+withdrawn), and only a lost resume is recovered: by the stopgap poll of D-130 in the approval
+stage's resume wait, and by the same poll in every other wait that holds a recorded suspension
+(D-133); (vi) assumed, and a readiness item, because no CI test can observe it.
 
 **Review trigger**: the platform readiness gate (`…-upreq-serverless-runtime-readiness-gate`).
 
@@ -3606,8 +3743,9 @@ stopgap poll of D-130; (vi) assumed, and a readiness item, because no CI test ca
 
 **Owner**: Architecture (with the serverless-runtime owners and the residency owner).
 
-**Open.** ADR-0013 bounds engine history to references, but `correlationId`, `orderId` and
-`orderVersion` with their timestamps still sit in a Temporal persistence backend whose location and
+**Open.** ADR-0013 bounds engine history to references, but `correlationId`, `orderId`,
+`orderVersion` and `resource_tenant_id` (with the rest of the D-131 vocabulary: record references,
+counters, cardinalities) with their timestamps still sit in a Temporal persistence backend whose location and
 retention the platform sets (serverless-runtime ADR-0004 line 100; `TenantRuntimePolicy`,
 serverless-runtime DESIGN.md line 739), and the platform has no data-classification model for
 execution history (`NEXT_ADR_SCOPE.md` line 23). PRD §15 requires the isolation, retention and
@@ -3770,6 +3908,9 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-128 | M Engine history growth asked of the plugin | `design/10-process-definition.md` §3.1, §3.6, `UPSTREAM_REQS.md` §2.9, §3, `DESIGN.md` §4.1; D-123 |
 | D-129 | M Ceiling task SLA tick; ceiling park ended by the order cancel | `design/10-process-definition.md` §3.6, `design/07-manual-tasks.md` §3.3, §3.6, §4.4, §4.8, `design/01-foundation.md` §3.3; D-105, D-122 |
 | D-130 | M Resume-wait poll of the hold | `design/10-process-definition.md` §3.6, §4.1, §4.4, §4.5, `design/08-hold-and-cancel.md` §3.3, §3.6, §3.7, §4.7, `design/01-foundation.md` §3.3, `design/07-manual-tasks.md` §3.3, `UPSTREAM_REQS.md` §2.9; D-124, Q-11 |
+| D-131 | H Closed reference vocabulary; residual stated in full | `ADR/0013`, `design/01-foundation.md` §1.1, §2.1, `design/10-process-definition.md` §1.1, §2.1, §2.2, `DESIGN.md` §4.2, §4.3, `UPSTREAM_REQS.md` §2.9, §4; D-66, Q-01, Q-12 |
+| D-132 | M Step-route error answers carry fixed members only | `ADR/0013`, `design/01-foundation.md` §4.9, §4.11, `design/10-process-definition.md` §2.1, §2.2, `DESIGN.md` §4.2, `UPSTREAM_REQS.md` §2.9; D-66 |
+| D-133 | M Every wait holding a recorded suspension polls the hold | `design/10-process-definition.md` §3.6, §4.1, §4.4, §4.5, `design/08-hold-and-cancel.md` §3.2, §3.3, §4.7, `design/01-foundation.md` §3.3, `DESIGN.md` §1.2, `UPSTREAM_REQS.md` §2.9; D-124, D-130, Q-11 |
 
-Highest decision number used: **D-130**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
+Highest decision number used: **D-133**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
 register; there are no parts.

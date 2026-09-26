@@ -890,6 +890,10 @@ retention **MUST** be stated and bounded to the recovery window this gear needs 
 lifetime ceiling plus the sweep floor), and the platform **MUST** confirm that its timeline, debug
 and trace endpoints expose task inputs and outputs only to principals the platform authorizes for
 this gear's tenant. Task inputs and outputs are reference-only by this gear's own rule (ADR-0013);
+what remains in history from them is the ADR-0013 vocabulary as amended by D-131: identities,
+including `resource_tenant_id`, which is in every task input and `Idempotency-Key` header, so the
+timeline shows which resource tenant owns each order; opaque record references; counters and
+array cardinalities; and the fixed-member error answers of D-132;
 trigger inputs and consumed events are reference-only only once
 `…-upreq-serverless-runtime-consumed-event-member-storage` or the Lifecycle thin-event ask lands
 (ADR-0013 *Trigger inputs and consumed events*). This ask is about where and for how long what
@@ -994,16 +998,15 @@ same retention for `:plugin-control` signals; this ask extends it to broker even
 
 - **What the design cannot do until it lands**: guarantee that an `OrderHeld`, `OrderResumed`,
   approval decision, `OrderAmended`, terminal order event or Subscriptions outcome is consumed.
-  No poll covers the loss: the eligibility and barrier polls evaluate only their own conditions,
-  and nothing re-reads a hold, a resume, a decision or an amendment. A resume delivered while the
-  hold stage runs `admit-trigger` and `apply-hold` is applied only by the approval stage's
-  stopgap poll, at most one `PT15M` tick late (D-130), and outside the approval stage it leaves
-  the hold predicate set, so dispatch defers until an operator cancels the order or the lifetime
-  ceiling parks it; a decision delivered during a probe is not recorded, so the gate escalates on
+  Only a lost resume has a stopgap: the eligibility and barrier polls evaluate only their own
+  conditions, and nothing re-reads a hold, a decision or an amendment. A lost resume is applied
+  from the Lifecycle order read by `apply-resume` `trigger: poll`, from the approval stage's
+  resume wait (D-130) and from every other wait that holds a recorded suspension (D-133), at most
+  about one `PT15M` poll late (one `PT1H` tick in the expected-time wait). A decision delivered during a probe is not recorded, so the gate escalates on
   its window; a Subscriptions outcome is recovered by the sweep,
   which reads it whether or not the event arrives (`design/05-provisioning-intents.md` §2.1).
 - **Source**: `design/10-process-definition.md` §4.4 *Events delivered between listens*, §4.5
-  (Q-11 (iv)); `design/08-hold-and-cancel.md` §4.7 items 3 and 10; `DECISIONS.md` D-124, D-130,
+  (Q-11 (iv)); `design/08-hold-and-cancel.md` §4.7 items 3 and 10; `DECISIONS.md` D-124, D-130, D-133,
   Q-11.
 
 #### A bound on one invocation's engine history
@@ -1190,8 +1193,13 @@ it would shorten (D-105).
 7. **§15 — Q-01 answer, and a new question on tenant-authored steps.** The Q-01 row (line 1183)
    **MUST** record the answer in two parts: the substrate choice is made (serverless-runtime,
    `ADR/0011`, 2026-09-24); the evaluation of engine-history isolation, retention and residency is
-   pending on `…-upreq-serverless-runtime-history-residency-retention`, with commercial data in
-   history answered "none" by `ADR/0013` (`DECISIONS.md` Q-12 carries the pending half). A new §15
+   pending on `…-upreq-serverless-runtime-history-residency-retention` (`DECISIONS.md` Q-12
+   carries the pending half). The first criterion, *which commercial data would sit in engine
+   history*, **MUST** be recorded with its qualifier, never as a bare "none". Commercial content in
+   task data: none (`ADR/0013`). In history: identifiers (including `resource_tenant_id`), counters
+   and array cardinalities, and the consumed events as published until
+   `…-upreq-serverless-runtime-consumed-event-member-storage` or `…-upreq-lifecycle-thin-events`
+   lands (`ADR/0013` as amended by D-131; D-66 as amended). A new §15
    row **MUST** register whether a seller-scoped publish role or tenant-authored Functions may
    adjust the definition in phase 1 (`DECISIONS.md` Q-10; this design recommends no).
 
