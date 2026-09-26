@@ -304,8 +304,8 @@ consumer-supplied hook before publish — a pending ask
 1. [ ] - `p1` - Every `protected` operation of each path appears exactly where §4 *The fence* orders it; `settle-from-lookup` and `retry-step`, which run only in-process (`01 §3.3`, D-108), never appear. A path is a walk of the **routing graph**, whose states are a task position plus the values of the routing members `nextStage`, `stageLoop`, `returnStage`, `taskReturnStage`, `taskReturnLoop`, `ceilingReturnStage`, `ceilingReturnLoop`, `heldStage`, `heldLoop` and `arm`. Every write of a routing member **MUST** be a string literal, a copy of another routing member, or an `if … then … else` over routing members that yields one of those — never an operation's output or another `$context` member — so each member ranges over a finite set of literals the check enumerates. Ten **pinned members** are tracked the same way (decisions D-135, D-144): `verdict`, written only as a copy of `obtain-verdict`'s `verdict`; `reflected`, only as a copy of `reflect-verdict`'s `reflected` or the literal `refused` its `catch` sets; `policy`, only as a copy of `construct-and-freeze-plan`'s `policy`, the seller's partial-failure policy pinned at freeze (`04 §2.2`); `forceTask`, only as a boolean literal; `beginResult`, only as a copy of `begin-fulfillment`'s `result`, null until the first call (decision D-143); `released`, only as a copy of `evaluate-activation-eligibility`'s `released`; `spawned`, `planFailed` and `preAdmitted`, only as boolean literals, each `false` where it is initialised or consumed and `true` only in the task one case of a `switch` over an operation's closed enum routes to (`spawnSent` after a sent spawn signal, `enterPlanFailedWait` after a `planFailFast` that did not begin, a `toLifecycle` after a hold, resume or acceptance admission answered `supersede` or `terminate`); and `failureScope`, only as one of the literals `line`, `plan` and `order` in the task that enters the failure stage. At each write of a pinned member copied from an output the walk forks once per value of its closed enum; a literal write is decided. The canonical version routes every `switch` that leads towards a protected operation, a stage exit or a `p1` composable of §4.1 on routing and pinned members only, or on a member both of whose ways satisfy §4.1 (decision D-144). A `switch` case over routing and pinned members is decided by the state; a case over any other member is taken both ways, and a §4.1 condition written *on some walk* is checked as reachability from the task it names. The check explores every state reachable from `admitTrigger` and refuses the version if any walk to `end` breaks §4.1 or leaves a stage by a `nextStage` no `dispatch` case names; a walk it cannot decide is refused, never assumed (decision D-126) - `inst-def-protected-present`
 2. [ ] - `p1` - Every `call: http` targets `POST /bss-orders-workflow/v1/steps/{operation}` with `{operation}` a row of `owf_step_operation`, and its `endpoint` is exactly `${ $context.stepsBase + "/<operation>" }` with the operation name a literal. `stepsBase` is written only by `input.from`; no `set`, `output` or `export` **MAY** name it, so no version can send its calls, or the credential the plugin attaches to them, to another host, and the CI test and the hook compare the `input.from` value with the environment's step-surface base (§3.7). No `call` **MAY** target a registered Function, `composable` operation or not (decision D-136) - `inst-def-call-targets`
 3. [ ] - `p1` - Every `listen` filter type is in the closed set above and carries the two correlations, except the `OrderAmended` filter, which correlates on `orderId` only (the closed set above, `02 §4.7` item 8); a filter **MAY** add a correlation, as the ceiling wait's `taskRef` does - `inst-def-listen-targets`
-4. [ ] - `p1` - Bounds nest, over values the definition holds: every task that calls an operation declares a `timeout` from `use.timeouts`; the operation's `deadline_ms` **<** that timeout, so one attempt fits; every task timeout and every literal `wait` **<** the literal `P90D` lifetime `wait`. The check computes no cumulative backoff, because the DSL gives `backoff.exponential` no multiplier (dsl-reference.md *Retry*) and the timeout bounds the retries whatever their curve. The escalation window, the overdue window and the SLA classes are not definition values — each is a per-seller policy value that an operation pins on the order's record (decision D-134) — so their bounds are checked where the seller's policy is written (`07 §4.8` item 8), not here (decision D-126) - `inst-def-bounds-nest`
-5. [ ] - `p1` - Every task `input`, `output`, `export` and every `body` member validates against the operation's registered reference schemas; no member outside them. Every member the definition writes into `$context`, including by `set` and `input.from`, is of one of the six vocabulary types of ADR-0013 as amended by D-131 (identity, opaque record reference, counter, closed enum or boolean, instant or duration, `stepsBase`); a string member of no such type is refused. No `set`, `output` or `export` **MAY** read an `$error` member other than `status` (`error_code` once Q-11 (ii) answers) - `inst-def-references-only`
+4. [ ] - `p1` - Bounds nest, over values the definition holds: every task that calls an operation declares a `timeout` from `use.timeouts`; the operation's `deadline_ms` **<** that timeout, so one attempt fits; every task timeout and every literal `wait` **<** the literal `P90D` lifetime `wait`. The check computes no cumulative backoff, because the DSL gives `backoff.exponential` no multiplier (dsl-reference.md *Retry*) and the timeout bounds the retries whatever their curve. The escalation window, the overdue window and the SLA classes are not definition values — each is a per-seller policy value that an operation pins on the order's record (decision D-134) — so their bounds are checked where the seller's policy is written (`07 §4.8` item 8) and, for the overdue window against the `wave1` timeout, also by the publish job (§4.2 step 1, decision D-159), not here (decision D-126) - `inst-def-bounds-nest`
+5. [ ] - `p1` - Every task `input`, `output`, `export` and every `body` member validates against the operation's registered reference schemas; no member outside them. Every member the definition writes into `$context`, including by `set` and `input.from`, is of one of the six vocabulary types of ADR-0013 as amended by D-131 (identity, opaque record reference, counter, closed enum or boolean, instant or duration, `stepsBase`), a string member in one of the formats that ADR lists, including the invocation, attempt and GTS callable identifier formats D-156 added; a string member of no such type or format is refused. No `set`, `output` or `export` **MAY** read an `$error` member other than `status` (`error_code` once Q-11 (ii) answers) - `inst-def-references-only`
 6. [ ] - `p1` - No `protected` operation is inside a `try` whose `catch` continues the forward path: a `catch` either only retries, so exhaustion faults the invocation, or routes to one of the named failure routes of §4.6; that a retry-only `catch` re-raises the last error once its limit is spent is Q-11 (vi), assumed until the plugin answers - `inst-def-no-swallowing-catch`
 7. [ ] - `p1` - No `run`, no `emit`, no `for`, no `schedule`: the start mechanism is exactly the two platform event triggers of §3.3, `OrderSubmitted` and `OrderAmended` — Lifecycle publishes no `OrderSubmitted` after an amendment ([Lifecycle `04 §4.3`](../../../orders-lifecycle/docs/design/04-versioning.md#43-re-approval-is-a-two-step-seam-interaction-normative), `02 §4.7` item 9); every `wait` is a literal duration (§3.6 *Fixed waits and re-check loops*) - `inst-def-grammar-subset`
 8. [ ] - `p1` - Every branch of a competing `fork` that can complete ends by `set`-ting `arm` so the sibling `switch` can route; every `fork` is followed by a `switch` on `arm`; every `then` names a task of its own `do` list, `exit` or `end` (the stage dispatcher of §3.6). Every competing `fork` inside a stage carries the four shared arms of §3.6 — the hold arm and the stage-level resume arm of (e), the lifecycle arm of (f) and the cancel arm of (d) — except the unwind's forks, which carry the cancel arm and no other (`06 §4.7` item 7), the ceiling wait `awaitOperatorAfterPark`, which carries the lifecycle and cancel arms, and the resume wait `awaitResume`, which carries its resume `listen`, the lifecycle and cancel arms. **Every `wait` inside a stage is a branch of such a fork**: a stage **MUST NOT** contain a plain `wait` task, so no stage wait — a deferral, a re-issue after a read, a re-poll — leaves a hold, a resume, a lifecycle event or a cancel to signal retention for its duration; the `wait`s of the top-level `lifetimeCeiling` and `overdueMonitor` branches are outside every stage and are not covered (decision D-142); the top-level `lifetime` fork carries `process` and `lifetimeCeiling` with the literal `P90D` `wait` and **MAY** carry `overdueMonitor` (decision D-135) - `inst-def-fork-routing`
@@ -362,16 +362,42 @@ lines 1136–1230), so no member falls to a schema default (decision D-127):
   `entrypoint` keeps its default, because the platform does not say whether an event-trigger
   start is an external invocation; direct starts are the ask
   `…-upreq-serverless-runtime-invocation-control-restriction`.
-- **`limits: { timeout_seconds: 15552000, max_concurrent: 5000 }`**
+- **`limits: { timeout_seconds: 23328000, max_concurrent: 50000 }`**
   ([`#limits-base`](../../../../serverless-runtime/docs/DESIGN_GTS_SCHEMAS.md#limits-base), defaults
-  30 s and 100). 180 days is the `P90D` ceiling, the ceiling park and one fresh ceiling after an
-  operator's unpark (§3.6 (d)); an invocation that outlives it is ended by the platform's duration
-  guardrail (BR-028, [serverless-runtime PRD.md](../../../../serverless-runtime/docs/PRD.md) line
-  483), and the instance liveness pass raises it as `invocation-dead`, whose remedies are the
-  platform re-drive and the order cancel (D-105). 5,000 is the sized concurrent in-flight process count of
-  [`../DESIGN.md`](../DESIGN.md) §4.1. Whether `timeout_seconds` measures wall-clock time
-  including suspension, and whether `max_concurrent` counts suspended invocations, the platform
-  does not state; both are part of the readiness ask.
+  30 s and 100; the platform defines them only as "max execution duration in seconds" and "max
+  concurrent invocations", with no maximum). Both are sized from the residency this document and
+  [`../DESIGN.md`](../DESIGN.md) §4.1 state (decision D-157, amending D-127):
+  - **`timeout_seconds`** is three `P90D` ceilings, 270 days. The first ceiling is armed only
+    after admission, whose timeout is 25 h (`use.timeouts.admission`), so it fires by 25 h + 90 d;
+    the fresh ceiling the re-entered fork arms (§3.6 (a), D-121) fires by 25 h + 180 d; the rest,
+    about 89 days, carries the second ceiling's park, the operator's action on it and an unwind
+    that continues under the next fresh ceiling. Two ceilings are therefore reachable; a third
+    would fire after the guardrail, so an invocation still live at 270 days is ended by the
+    platform's duration guardrail (BR-028, [serverless-runtime PRD.md](../../../../serverless-runtime/docs/PRD.md)
+    line 483) and the instance liveness pass raises it as `invocation-dead`, whose remedies are
+    the platform re-drive and the order cancel (D-105).
+  - **`max_concurrent`** is sized for the reading that counts suspended invocations, because a
+    cap too low refuses order starts while one too high costs only runaway protection. From
+    DESIGN §4.1's figures: the standard path is 5 / s × ~360 s = **1,800**; manual-task waits are
+    at most 1 % of lines, so about 3 % of orders at p50 3 lines (1 − 0.99³), each held about 24 h
+    (the longer SLA class; a breach escalates rather than ends the wait), 5 × 0.0297 × 86,400 ≈
+    **12,830**. Phase 1 therefore needs about **14,630**, since no approval gate fires while
+    Generic Approval is inert (Q-05). Each further 1 % of orders held for a 72 h escalation window
+    adds 5 × 0.01 × 259,200 = **12,960**, and each 1 % of orders dated *d* days ahead in
+    `awaitExpected` adds 4,320 × *d*; the design does not fix either share, which is an input to
+    the NFR workshop. 50,000 covers phase 1 with about 35,000 to spare, for example 1 % gated at
+    72 h and 1 % dated five days ahead (34,560). If the platform answers that only running
+    invocations count, the running population is the calls in flight, about 750 / s at peak × the
+    10 s dispatch deadline = 7,500, so 50,000 is only a loose runaway cap and a later version
+    **MAY** lower it to 10,000.
+
+  Whether `timeout_seconds` measures wall-clock time including suspension and whether
+  `max_concurrent` counts suspended invocations, the platform does not state; both answers, with
+  the value to use under each, are a **gating** readiness item of the async-only ask
+  ([`../UPSTREAM_REQS.md`](../UPSTREAM_REQS.md) §2.9, (a′)), and so is the platform's capacity for
+  them: its stated regional target is "≥ 10,000 concurrent executions per region"
+  ([serverless-runtime PRD.md](../../../../serverless-runtime/docs/PRD.md) line 843, BR-208), below
+  the phase-1 figure above under the counts-suspended reading.
 - **`retry: { max_attempts: 0 }`**
   ([`#retrypolicy`](../../../../serverless-runtime/docs/DESIGN_GTS_SCHEMAS.md#retrypolicy),
   default 3). The platform `RetryPolicy` re-runs a failed invocation by SDK error category
@@ -2513,7 +2539,8 @@ for `order_process` with the repository's and reports any drift. A binding edite
 therefore a drift alert, and the run-time guard behind it is `admit-trigger`'s re-check. One
 definition version is **active for new instances** per environment at a time: the publish job
 publishes a version and deprecates the one it replaces in the same run, and rolls back by
-publishing the last good document as a new version (§4.2, decision D-138). Older versions stay
+publishing the last good document, with its `document.version` set to the new version, as a new
+version (§4.2, decisions D-138, D-158). Older versions stay
 published — `deprecated`, still callable by the instances pinned to them — and are never archived
 or deleted by the job.
 
@@ -2575,9 +2602,15 @@ that uses it is published once that release is deployed. In each environment, in
 order, the job:
 
 1. runs the rules of §2.2 over the candidate against the `owf_step_operation` declarations of the
-   Orders release deployed in that environment and against its step-surface base;
+   Orders release deployed in that environment and against its step-surface base, and refuses a
+   candidate whose `wave1` timeout is not below the smallest overdue window the environment's
+   `owf_seller_policy` rows hold, which is the smallest effective overdue window of any seller
+   (the policy side of the bound, [`01 §4.2`](./01-foundation.md#42-five-distinct-bounds-two-owners),
+   decision D-159); it also compares every literal tick of the candidate with the value the
+   guidance item of §4.7 fixes for it (the fixed-waits table of §3.6), and refuses a difference
+   unless the same change amends that slice item (decision D-158);
 2. in the first non-production environment only, runs the **behavioural gate**: it publishes the
-   candidate there and drives a scenario suite with one order per path of §3.6 — approval
+   candidate there and deprecates the version it replaces, as step 3 does, and drives a scenario suite with one order per path of §3.6 — approval
    not required, required and unobtainable (a); fulfillment through both waves (b); a partial
    failure under each policy (c); a cancel (d); a hold and resume (e); an amendment and each
    terminal event (f) — against that environment's real step surface, with test doubles for
@@ -2585,10 +2618,14 @@ order, the job:
    Orders' record, and at every route it asserts the slice items §4.7 lists as canonical-definition
    guidance. A business window is a seller-policy value (decision D-134), so the suite seeds short
    windows for its test seller; a tick longer than the suite's budget, and the `P90D` ceiling, are
-   covered by the rules only, and the suite reports them as not exercised. A failing scenario
-   stops the job before any other environment is touched;
+   not exercised, and the suite reports them so: their values are held by the static comparison
+   of step 1 and by rules 4 and 7. A failing scenario stops the job before any other environment
+   is touched, and the job rolls that environment back forward, as *Rollback* below does, so its
+   triggers start no further order on the failed candidate; the suite's own orders still running
+   on it are ended with the order cancel (decision D-158);
 3. publishes the version, deprecates the version it replaces in the same run, and applies the two
-   trigger bindings of §3.8;
+   trigger bindings of §3.8; in the first non-production environment, where step 2 has already
+   published the candidate, it only applies the bindings;
 4. never archives or deletes a version.
 
 **Which version starts new orders.** One version per callable id is `active` in an environment
@@ -2600,12 +2637,20 @@ offers no tenant-scoped or percentage activation; both are the ask
 only execution of a candidate before production, and the gear's readiness check alerts on a new
 binding to any version other than the one the job left `active` (§3.8).
 
-**Rollback** is forward. The registry has no transition from `deprecated` back to `active`
+**Rollback** is forward. The job rolls a bad version back by publishing the last good
+document **with its `document.version` set to the new minor** as a new minor version, which
+deprecates the bad one; the document is otherwise unchanged. Its `version` must be the new one,
+because `start-instance` refuses `definition-not-bound` when the document's own `version` differs
+from the version the platform pinned (§4.3, decision D-137), so a document republished under its
+old `version` would stop every new order from starting. The registry does allow a two-step return
+to an older version, `deprecated → disabled → active`
 ([serverless-runtime DESIGN](../../../../serverless-runtime/docs/DESIGN.md#function-status-state-machine)
-lines 588–607), so the job rolls a bad version back by publishing the last good document as a new
-minor version, which deprecates the bad one. Instances already pinned to the bad version run on
-it to termination (§4.3); an operator ends one that misbehaves with the order cancel or through its
-manual tasks.
+lines 588–607), and the design still prefers the forward version: that path passes the good
+version through `disabled` while instances pinned to it are live, and the platform does not say
+what disabling a version does to its running invocations, while a forward minor changes no
+version that has live instances except to deprecate the bad one (decision D-158). Instances
+already pinned to the bad version run on it to termination (§4.3); an operator ends one that
+misbehaves with the order cancel or through its manual tasks.
 
 **A major bump** changes the callable id (`…order_process.v<major>~`, §3.1). The job publishes the
 new major, re-points both trigger bindings to it and deprecates the old major's `active` version in
@@ -2788,7 +2833,7 @@ This table is the one statement of which change needs which vehicle (decision D-
 |--------|---------|------------|
 | The order of `composable` operations within a stage where no enforced item pins it; which manual-task or escalation arm an answer routes to; `switch` predicates over returned enums, other than the pinned members of rule 1 | A new definition version, published by the job of §4.2 | Rules of §2.2, the fence of §4.1, the behavioural gate |
 | Adding or dropping a `composable` operation, other than a `p1` composable on the path §4.1 requires it on | A new definition version | Same |
-| The tick of a re-check loop (§3.6 *Fixed waits and re-check loops*); retry attempts, backoff and jitter within the operation's `retry_class`; task timeouts | A new definition version | Rules 4 and 7, the behavioural gate |
+| The tick of a re-check loop (§3.6 *Fixed waits and re-check loops*); retry attempts, backoff and jitter within the operation's `retry_class`; task timeouts | A new definition version | Rules 4 and 7, the behavioural gate; a tick a slice item fixes, also the publish job's static tick comparison (§4.2 step 1, D-158); the `wave1` timeout, also the job's overdue-window check (D-159) |
 | Adding or removing a `listen` arm whose type is in the closed set, other than the shared arms rule 8 requires | A new definition version | Rules 3 and 8 |
 | The approval escalation window, the overdue window, the manual-task SLA classes, the partial-failure policy | A write of the seller's policy — a promotion of `owf_seller_policy` rows on the policy channel ([`01 §3.7`](./01-foundation.md#table-owf_seller_policy)), audited; it reaches only records pinned after it (decisions D-134, D-140) | The policy load's bounds check before commit (`07 §4.8` item 8) |
 | Approval gate parties, their count and order | The approval routing configuration, which `open-gates` reads (`03 §3.6`) | Not Orders' |
@@ -2803,7 +2848,9 @@ kinds of item (decision D-136). An **enforced** item restates a rule of §2.2 or
 the validator refuses a version that breaks it through that rule. Every other item is
 **canonical-definition guidance**: the canonical version of §3.6 carries it, the behavioural gate
 of §4.2 asserts it for every candidate, and a version departs from it only by amending the slice
-item in the same change. The validator does not refuse a version for a guidance item; the run-time
+item in the same change. A guidance item that fixes a tick value the gate cannot exercise within
+its budget is held by the publish job's static comparison of every literal tick with its guidance
+value (§4.2 step 1, decision D-158). The validator does not refuse a version for a guidance item; the run-time
 guards of the operations remain the backstop.
 
 | Slice | Enforced items (rule or §4.1 row) | Canonical-definition guidance |

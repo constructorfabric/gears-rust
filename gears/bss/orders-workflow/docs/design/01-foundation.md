@@ -296,8 +296,9 @@ task retry policy (budget, backoff, jitter), the task timeout that bounds a whol
 overdue re-check and the top-level lifetime `wait` — and the platform plugin executes them
 (`10 §2`, `10 §3.6`); the overdue **window's value** is not the definition's but the seller's
 policy value, pinned on the plan at freeze, and the definition owns only the tick that re-checks
-it (decision D-134). The nesting invariant — per-operation deadline **<** the task timeout **<**
-the overdue window **<** the lifetime ceiling — is checked in two places: over the values the
+it (decision D-134). The nesting invariant — per-operation deadline **<** the task timeout **<** the
+lifetime ceiling, and the longest fulfillment-stage task timeout **<** the overdue window **<** the
+lifetime ceiling (§4.2) — is checked in two places: over the values the
 definition holds by a **definition validation rule** enforced before publish
 (`cpt-cf-bss-orders-workflow-adr-definition-versioning-and-protected-steps`, `10 §2.2` rule 4),
 and for the overdue window at the audited write of the seller's policy, the policy load of
@@ -574,9 +575,10 @@ answer.
 
 Holding the compiled set of step-operation contracts (§3.3 fields) built from the registrations
 of every slice; loading that set into `owf_step_operation` at startup inside one transaction,
-replacing the previous content, and writing an audit entry under the gear's deployment marker when
-the loaded set differs from the stored one — the same shape as the routing-table conformance check
-of [`09 §3.7`](./09-read-and-authz.md#37-database-schemas--tables); serving the validation hook's
+replacing the previous content, and appending an `owf_configuration_revision` row (§3.7) that
+names the Orders release when the loaded set differs from the stored one — the same record the
+catalogue conformance check of [`09 §3.7`](./09-read-and-authz.md#37-database-schemas--tables)
+appends (decision D-160); serving the validation hook's
 lookup (`10 §3.3`) and the envelope's per-call contract resolution; refusing to become ready if
 the compiled set and the table disagree after load.
 
@@ -1328,19 +1330,21 @@ escalation and park are the ceiling stage of (d); Orders records the escalation 
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-db-engine-schema`
 
-The canonical schema for every engine-owned table — **nine**: `owf_process_instance`,
+The canonical schema for every engine-owned table — **ten**: `owf_process_instance`,
 `owf_step_log`, `owf_idempotency_registry`, `owf_audit_entry`, `owf_audit_checkpoint`,
-`owf_audit_checkpoint_member`, `owf_definition_binding`, `owf_step_operation`, and
-`owf_seller_policy` (decision D-140). Each table's
+`owf_audit_checkpoint_member`, `owf_definition_binding`, `owf_step_operation`,
+`owf_seller_policy` (decision D-140) and `owf_configuration_revision` (decision D-160). Each table's
 ownership rule below names the single component that may write it; no slice writes any of these
 tables outside the envelope.
 
 **Tenancy is a column on every process table here, not a convention.** Every table except the
-two configuration tables carries `resource_tenant_id uuid NOT NULL` — the
+three configuration tables carries `resource_tenant_id uuid NOT NULL` — the
 resource-recipient axis — and the tables backing an operator- or seller-scoped surface
-additionally carry `seller_tenant_id uuid NOT NULL`, the selling-party axis. The two
-configuration tables are `owf_step_operation`, which has no tenant column, and
-`owf_seller_policy`, which is keyed by `seller_tenant_id` alone (NULL on its platform row). `payer_tenant_id` is
+additionally carry `seller_tenant_id uuid NOT NULL`, the selling-party axis. The three
+configuration tables are `owf_step_operation`, which has no tenant column, `owf_seller_policy`,
+which is keyed by `seller_tenant_id` alone (NULL on its platform row), and
+`owf_configuration_revision`, the append-only history of both and of the authorization catalogue,
+which has no tenant column (decision D-160). `payer_tenant_id` is
 the billing axis and is carried only where a payment decision is recorded against the row; the
 engine tables record none. The axis names are the sibling gear's
 ([`orders-lifecycle` §3.7](../../../orders-lifecycle/docs/design/01-foundation.md)). Each table
@@ -1621,17 +1625,20 @@ after the purge finds an instance that answers every operation `version-mismatch
 **Constraints**: **no runtime write path** — INSERT only inside the startup load transaction of
 the operation registry (§3.2), which replaces the whole content; no UPDATE or DELETE grant to any
 other role; `deadline_ms` CHECK `> 0`; `compensation` FK self-referential and NULL-able. The load
-is audited: when the loaded content differs from the stored content, one `owf_audit_entry` is
-written under the gear's deployment marker, as [`09 §3.7`](./09-read-and-authz.md#37-database-schemas--tables)
-does for the routing table; a load that fails, or a compiled set that disagrees with the table
+is recorded: when the loaded content differs from the stored content, the load transaction appends
+one `owf_configuration_revision` row of kind `step-operation-set` carrying the loaded set and the
+Orders release that loaded it (decision D-160), as
+[`09 §3.7`](./09-read-and-authz.md#37-database-schemas--tables) does for the authorization
+catalogue; a load that fails, or a compiled set that disagrees with the table
 after load, halts readiness.
 
 **Additional info**: **Ownership**: the operation registry
 (`cpt-cf-bss-orders-workflow-component-operation-registry`). **Tenant axis**: none — this is
-configuration, not a process artifact, and it is one of the two tables §4.11's column rule exempts
-(the other is `owf_seller_policy`, decision D-140).
-**Retention**: replaced on every load; no history is kept here (the audit entry and the release
-are the history). The validation hook of `10 §3.3` reads it; the definition never does.
+configuration, not a process artifact, and it is one of the three tables §4.11's column rule
+exempts (the others are `owf_seller_policy`, decision D-140, and `owf_configuration_revision`,
+decision D-160).
+**Retention**: replaced on every load; no history is kept here (the `owf_configuration_revision`
+rows and the release are the history). The validation hook of `10 §3.3` reads it; the definition never does.
 
 #### Table: owf_seller_policy
 
@@ -1683,15 +1690,19 @@ release nor a definition change in the sense of `DESIGN.md` §4.7. The promotion
 the policy load, which follows the operation registry's load (above): one transaction. It first
 locks the platform row, then every seller row it changes (the lock order of Lifecycle's
 `orders_state_ttl_policy`, [Lifecycle `07 §3.7`](../../../orders-lifecycle/docs/design/07-hold-and-expiry.md#37-database-schemas-and-tables)).
-It bumps each changed row's `policy_revision` and writes one `owf_audit_entry` under the gear's
-deployment marker when the content changed.
+It bumps each changed row's `policy_revision` and appends, for each changed row, one
+`owf_configuration_revision` row of kind `seller-policy` keyed by the row's `policy_id` and new
+`policy_revision` and carrying the whole row as promoted and the promotion's change identity
+(decision D-160). The migration that seeds the platform row appends its revision 1 the same way.
 
 **Validation before commit.** Inside that transaction the load checks the effective policy of
 every seller the promotion affects against the bounds of `07 §4.8` item 8. A change to the
 platform row affects every seller that inherits the changed value. The checks are that each SLA
 class is within the overdue window; that the overdue window is above the longest
-fulfillment-stage task timeout (`wave1`) of every definition version that active bindings name
-(`owf_definition_binding`) and below the `P90D` lifetime ceiling; and that every escalation
+fulfillment-stage task timeout (`wave1`) of every version of the **live version set** (§4.2:
+the versions the registry lists as `active`, and the `deprecated` versions a non-terminal
+instance's binding names, each read with its document through the registry's version listing
+before the transaction opens, decision D-159) and below the `P90D` lifetime ceiling; and that every escalation
 window, default and per party, is below the ceiling. A violating promotion commits nothing, so
 the prior rows stay in force, and the load reports which seller and which bound failed. Every
 committed row set therefore satisfied the bounds when it was committed.
@@ -1717,8 +1728,60 @@ built after the foundation (`design/README.md`), so the port adds no back-edge. 
 `seller_tenant_id` only, nullable on the platform row. The table is configuration, keyed by the
 selling party whose policy it is, and it is the second table §4.11's column rule exempts
 (decision D-140). **Retention**: current rows only. They are replaced by promotion and never
-purged, and the history is the audit entry together with the promotion's change record.
+purged, and the history is `owf_configuration_revision`: every `sellerPolicyRevision` an
+operation recorded resolves there, by `policy_id` and `policy_revision`, to the values that were
+in force (decision D-160).
 **Mutability**: mutable, by promotion only.
+
+#### Table: owf_configuration_revision
+
+**ID**: `cpt-cf-bss-orders-workflow-dbtable-configuration-revision`
+
+The append-only history of this gear's configuration: one row for each content change of a
+configuration load (decision D-160). It is what gives a recorded `sellerPolicyRevision` its
+values, and what records a change of the operation set or of the authorization catalogue. A
+configuration change belongs to no process instance, so it cannot be an `owf_audit_entry`, whose
+rows are links of one instance's hash chain with NOT NULL instance and tenant columns and a closed
+set of process kinds.
+
+**Schema**:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| revision_id | uuid | Row identity |
+| kind | enum, NOT NULL | `seller-policy` (a promoted `owf_seller_policy` row), `step-operation-set` (the operation registry's load, §3.2), `authorization-catalogue` (the catalogue conformance check of [`09 §3.7`](./09-read-and-authz.md#37-database-schemas--tables)) |
+| subject_id | uuid, nullable | The `policy_id` for `seller-policy`; NULL for the two set kinds |
+| revision | bigint, NOT NULL | The row's new `policy_revision` for `seller-policy`; for a set kind, one above the kind's previous row, from 1 |
+| content | jsonb, NOT NULL | The whole configuration as it stood after the change: every column of the promoted `owf_seller_policy` row, or the loaded set in its canonical form. Configuration only: windows, policies, operation contracts, catalogue pairs; no process value |
+| content_hash | bytea, NOT NULL | SHA-256 over `content` in canonical JSON; a load compares it with the kind's latest row to decide whether the content changed |
+| release_version | text, NOT NULL | The Orders release that ran the load — the version the deployed gear carries. This is what the text before D-160 called the gear's "deployment marker" |
+| changed_by | text, NOT NULL | The promotion's change identity (the `updated_by` of the row, Lifecycle D-133) for `seller-policy`; the configured Workflow worker identity (§3.8) for a startup load |
+| recorded_at | timestamptz, NOT NULL | Database time of the load transaction |
+
+**PK**: revision_id
+
+**Constraints**: `(kind, subject_id, revision)` UNIQUE **with `NULLS NOT DISTINCT`**, so a
+revision is recorded once; `subject_id` NOT NULL exactly when `kind = 'seller-policy'`;
+`revision > 0`. Append-only: **no UPDATE and no DELETE grant to any role**, and triggers that
+reject every UPDATE and DELETE regardless of grant, as for `owf_audit_entry` (D-59). Rows are
+inserted only inside the load transaction that makes the change — the operation registry's load,
+the policy load and the catalogue conformance check at startup, and the migration that seeds the
+platform policy row — so a change commits with its history row or not at all.
+
+**Additional info**: **Ownership**: the foundation's configuration loads are the sole writers;
+slice 09's catalogue check appends through the foundation's load, as it already runs after the
+operation registry's load (§3.2). **Tenant axis**: none — configuration, the third table §4.11's
+column rule exempts; a `seller-policy` row names its seller inside `content`. **Retention**: never
+purged. The table is small — a row per changed load or promoted policy row — and a pinned value
+must stay resolvable for as long as the record that pinned it. **Read by**: an auditor resolving a
+`sellerPolicyRevision`, and the loads themselves (the latest `content_hash` of a kind). The
+**precedent** is Pricing's price history, kept as retained superseded rows under append-only
+protection ([Pricing `01-foundation.md:562`](../../../pricing/docs/design/01-foundation.md));
+Lifecycle keeps no revision history for its policy rows, only `updated_by` and `updated_at`
+([Lifecycle `07 §3.7`](../../../orders-lifecycle/docs/design/07-hold-and-expiry.md#37-database-schemas-and-tables)),
+which suffices there because the record that uses a policy captures the effective value next to
+its revision ([Lifecycle `07 §3.6`](../../../orders-lifecycle/docs/design/07-hold-and-expiry.md), the expiry capture),
+and no audit claim rests on resolving a revision to a full row.
 
 #### Table: owf_audit_entry
 
@@ -1905,6 +1968,7 @@ scaffolding, and an idempotency key is a short-lived deduplication token.
 | `owf_idempotency_registry` | Until `expires_at` has passed and the owning instance has been terminal for 30 days (the tombstone rule of `owf_idempotency_registry` above) | None — purged row-wise through the `(correlation_id, expires_at)` index |
 | `owf_step_operation` | Replaced on every load | None |
 | `owf_seller_policy` | Current rows only; replaced by promotion, never purged (decision D-140) | None |
+| `owf_configuration_revision` | Never purged: the provenance every recorded `sellerPolicyRevision` resolves to; small — one row per changed load or promoted row (decision D-160) | None |
 
 **No Workflow-owned table is partitioned** (decision D-104), in any slice. The rule is Lifecycle's
 D-91, adopted with its grounds ([Lifecycle `01 §3.7`](../../../orders-lifecycle/docs/design/01-foundation.md#37-database-schemas-and-tables)):
@@ -1923,7 +1987,8 @@ platform `toolkit_db::outbox` tables are outside this register.
 
 **Immutability is per table.** Append-only with **no UPDATE or DELETE grant**: `owf_audit_entry`,
 `owf_audit_checkpoint` and `owf_audit_checkpoint_member` (all three additionally
-trigger-protected, per D-59), `owf_step_log`, `owf_definition_binding`. Load-only:
+trigger-protected, per D-59), `owf_step_log`, `owf_definition_binding`,
+`owf_configuration_revision` (also trigger-protected, decision D-160). Load-only:
 `owf_step_operation`. Mutable by promotion only: `owf_seller_policy`. Deliberately mutable: `owf_process_instance` (recorded projection, row
 version, audit counter), `owf_idempotency_registry` (lease heartbeat, `open`, settlement).
 
@@ -1949,7 +2014,7 @@ workers** (D-62 as amended by ADR-0011), in the shape of
 | Worker | Advisory key within gear namespace `bss-orders-workflow` | Correctness check independent of scheduler ownership |
 |--------|-----------------------------------------------------------|-----------------------------------------------------|
 | Intent reconciliation sweep | `reconciliation-sweep` | Selects every due intent — `owf_provisioning_intent` rows with `next_sweep_at <= now()` over non-terminal intents, ordered by `next_sweep_at`, one bounded page per pass ([`05 §3.8`](./05-provisioning-intents.md#38-deployment-topology)) — **whether or not** the owning instance has a live invocation, and runs `reconcile-intent`'s effect for each in-process; the definition's poll and confirmation arms are early reads of the same rows, never a reason to skip one. The same pass runs the **instance liveness pass** below, which reads each non-terminal instance's invocation status and raises an instance whose invocation is no longer live as a manual task. Correctness check: the intent row lock of `reconcile-intent` and, for a stuck step key, settlement only through `settle-from-lookup`, which rechecks the registry row's `status` and lease under its row lock and writes `sweep-settlement` in that transaction; for the liveness pass, the instance row lock and the recheck that the row is still non-terminal and still bound to the invocation read |
-| Retention purge | `retention-purge` | Bounded conditional row-wise deletes — `DELETE … WHERE` predicates re-evaluated inside the deleting transaction, one bounded batch per pass, through each table's retention index (no table is partitioned, §3.7, D-104) — over the rows whose window has elapsed, the authoritative roster being every store of the `DESIGN.md` §3.7 retention register with a window: `owf_step_log` at 90 days and `owf_idempotency_registry` under its tombstone rule (§3.7); `owf_dispatch_admission` seller rows with no non-terminal intent for 30 days ([`05 §3.7`](./05-provisioning-intents.md#37-database-schemas--tables)); and, at the configured ≥ 400-day window, `owf_approval_verdict_cache`, `owf_approval_gate`, `owf_approval_request`, `owf_approval_park` ([`03 §3.7`](./03-approval-execution.md#37-database-schemas--tables)), `owf_fulfillment_plan` with its `owf_fulfillment_task` rows ([`04 §3.7`](./04-fulfillment-plan.md#37-database-schemas--tables)), `owf_provisioning_intent` ([`05 §3.7`](./05-provisioning-intents.md#37-database-schemas--tables)), `owf_compensation_record`, `owf_cancellation_fence` ([`06 §3.7`](./06-saga-and-compensation.md#37-database-schemas--tables)), `owf_manual_task`, `owf_task_resolution_request`, `owf_incident`, `owf_overdue_escalation` and, once created, `owf_dead_letter_triage` ([`07 §3.7`](./07-manual-tasks.md#37-database-schemas--tables)), `owf_process_suspension` ([`08 §3.7`](./08-hold-and-cancel.md#37-database-schemas--tables)) and `owf_cancel_request` ([`09 §3.7`](./09-read-and-authz.md#37-database-schemas--tables)) — never a row whose instance is not terminal. Never `owf_audit_entry`, `owf_audit_checkpoint`, `owf_audit_checkpoint_member`, `owf_definition_binding`, `owf_process_instance` or `owf_process_progress_view`, on which it holds no DELETE grant; `owf_step_operation` is replaced at startup |
+| Retention purge | `retention-purge` | Bounded conditional row-wise deletes — `DELETE … WHERE` predicates re-evaluated inside the deleting transaction, one bounded batch per pass, through each table's retention index (no table is partitioned, §3.7, D-104) — over the rows whose window has elapsed, the authoritative roster being every store of the `DESIGN.md` §3.7 retention register with a window: `owf_step_log` at 90 days and `owf_idempotency_registry` under its tombstone rule (§3.7); `owf_dispatch_admission` seller rows with no non-terminal intent for 30 days ([`05 §3.7`](./05-provisioning-intents.md#37-database-schemas--tables)); and, at the configured ≥ 400-day window, `owf_approval_verdict_cache`, `owf_approval_gate`, `owf_approval_request`, `owf_approval_park` ([`03 §3.7`](./03-approval-execution.md#37-database-schemas--tables)), `owf_fulfillment_plan` with its `owf_fulfillment_task` rows ([`04 §3.7`](./04-fulfillment-plan.md#37-database-schemas--tables)), `owf_provisioning_intent` ([`05 §3.7`](./05-provisioning-intents.md#37-database-schemas--tables)), `owf_compensation_record`, `owf_cancellation_fence` ([`06 §3.7`](./06-saga-and-compensation.md#37-database-schemas--tables)), `owf_manual_task`, `owf_task_resolution_request`, `owf_incident`, `owf_overdue_escalation` and, once created, `owf_dead_letter_triage` ([`07 §3.7`](./07-manual-tasks.md#37-database-schemas--tables)), `owf_process_suspension` ([`08 §3.7`](./08-hold-and-cancel.md#37-database-schemas--tables)) and `owf_cancel_request` ([`09 §3.7`](./09-read-and-authz.md#37-database-schemas--tables)) — never a row whose instance is not terminal. Never `owf_audit_entry`, `owf_audit_checkpoint`, `owf_audit_checkpoint_member`, `owf_definition_binding`, `owf_configuration_revision`, `owf_process_instance` or `owf_process_progress_view`, on which it holds no DELETE grant; `owf_step_operation` is replaced at startup |
 | Audit verification and checkpointing | `audit/<canonical audit-tenant UUID>` | SELECT-only verification of each chain (§4.17 *Verifier*); the checkpoint-append phase runs under its own INSERT grant, and the `(audit_tenant_id, checkpoint_sequence)` primary key rejects a competing checkpoint from a second replica |
 
 **Instance liveness pass** (decision D-105, amending D-71). Each `reconciliation-sweep` pass also
@@ -2082,16 +2147,28 @@ each is recorded here so an unset value is a visible choice.
 | Overdue window | seller policy, pinned on the plan by `construct-and-freeze-plan` (`04 §3.7`); the definition owns only the `PT1H` re-check tick (D-134) | 24 h past expected fulfillment time, the default a seller's policy starts from | The PRD's business default for commercial policy (`cpt-cf-bss-orders-workflow-fr-owf-overdue-escalation`); a seller's value is bounded where the policy is written (`07 §4.8` item 8) |
 | Max process lifetime | definition (top-level `wait` arm) | 90 days from process start, never cancelled by a hold | Accepted (`DECISIONS.md` D-53) |
 
-**The nesting invariant is normative and is enforced in three places.** Per-operation deadline
-**<** task timeout **<** overdue window **<** lifetime ceiling. The
+**The nesting invariant is normative and is enforced in four places.** Per-operation deadline
+**<** the timeout of the task that calls it **<** lifetime ceiling; and the longest
+fulfillment-stage task timeout (`wave1`) **<** overdue window **<** lifetime ceiling. The overdue
+window is compared only with the fulfillment-stage timeouts, because it runs from
+`expected_fulfillment_at`, which the plan fixes at freeze, so the approval and admission timeouts
+(the 25 h `admission` timeout included) are outside the window it bounds (decision D-126). The
+**live version set** of an environment is every version of `order_process` the platform registry
+lists as `active`, every `deprecated` version that the `owf_definition_binding` of a non-terminal
+instance names, and, while the publish job runs, its candidate (decision D-159). The
+ordering is enforced where either side changes. The
 validation hook of `10 §2` **MUST** refuse to publish a definition version whose declared values
 violate the ordering against the registered `deadline_ms` of every operation it calls, over the
 values the definition holds (`10 §2.2` rule 4,
-`cpt-cf-bss-orders-workflow-adr-definition-versioning-and-protected-steps`); the audited write of a
-seller's policy — the policy load of `owf_seller_policy` (§3.7, decision D-140) — **MUST** refuse an overdue window or SLA class outside the ordering (`07 §4.8`
+`cpt-cf-bss-orders-workflow-adr-definition-versioning-and-protected-steps`); the publish job **MUST**
+refuse a candidate whose `wave1` timeout is not below every effective overdue window of the
+environment (`10 §4.2` step 1, decision D-159); the audited write of a
+seller's policy — the policy load of `owf_seller_policy` (§3.7, decision D-140) — **MUST** refuse an overdue window or SLA class outside the ordering against the live version set (`07 §4.8`
 item 8, decision D-134); and the gear
 **MUST** refuse to become ready if a change to an operation's `deadline_ms` breaks the ordering
-against the definition versions active bindings name. A mis-ordered set does not fail loudly — it
+against the live version set, and its readiness check **MUST** alert when a publish and a
+promotion that raced leave a live version's `wave1` timeout at or above an effective overdue
+window. A mis-ordered set does not fail loudly — it
 silently disables the inner bound — which is precisely the failure this assertion exists to
 prevent.
 
@@ -2578,9 +2655,11 @@ definition (`10`); the engine contains no operation logic and no commercial poli
 
 Every process table in §3.7 is **tenant-scoped by a NOT NULL column**, not by convention: each
 carries `resource_tenant_id`, and `owf_process_instance` and `owf_audit_entry` additionally carry
-`seller_tenant_id` because each backs an operator- or seller-scoped surface. The two exemptions are
-configuration: `owf_step_operation`, which has no tenant column, and `owf_seller_policy`, which is
-keyed by `seller_tenant_id` alone and has no row per resource tenant (decision D-140). The platform `toolkit_db::outbox` tables and the
+`seller_tenant_id` because each backs an operator- or seller-scoped surface. The three exemptions are
+configuration: `owf_step_operation`, which has no tenant column, `owf_seller_policy`, which is
+keyed by `seller_tenant_id` alone and has no row per resource tenant (decision D-140), and
+`owf_configuration_revision`, their append-only history, which has no tenant column (decision
+D-160). The platform `toolkit_db::outbox` tables and the
 platform's own invocation index and history are not Workflow tables; the tenant axes ride the
 event `data` (§4.7) and the envelope tenancy is platform-root. Every read this gear exposes
 **MUST** carry the corresponding tenant predicate, and the platform's SecureORM

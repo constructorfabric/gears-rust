@@ -169,6 +169,15 @@ and audit grade. Concretely:
 * **Bounds nest, and the nesting is validated.** Per-operation deadline < task retry budget <
   task timeout < overdue window < lifetime ceiling (D-02, D-53, D-67, D-70). The ordering is a validation rule
   of ADR-0012, not a convention.
+
+  > **Amended 2026-09-26 by D-126**: the retry-budget term is dropped — the task timeout bounds
+  > the retries whatever their curve, so the rule checks only that one attempt's deadline fits in
+  > the timeout of the task that calls it — and the overdue window is ordered only against the
+  > longest fulfillment-stage task timeout (`wave1`), since it runs from `expected_fulfillment_at`
+  > and the approval and admission timeouts (25 h) lie outside it. The rule reads: per-operation
+  > deadline < task timeout < lifetime ceiling, and the longest fulfillment-stage task timeout <
+  > overdue window < lifetime ceiling (`design/01-foundation.md` §4.2). The overdue side is checked
+  > where the seller's policy is written and by the publish job (D-134, D-159), not by rule 4.
 * **Engine history is reference-only and non-authoritative.** Task inputs and outputs carry
   identifiers and small enums only, and the start trigger and every `listen` must keep only
   references of what they consume (ADR-0013, whose residual names the consumed events until the
@@ -394,7 +403,7 @@ its ADR-0003, ADR-0004 and ADR-0005, and its API surface is its DESIGN.md §3.3.
   [`design/10-process-definition.md`](../design/10-process-definition.md);
   [`design/01-foundation.md`](../design/01-foundation.md) §3.7, §3.8
 - **Decisions register**: [`DECISIONS.md`](../DECISIONS.md) — Q-01 (answered in two parts), D-02,
-  D-53, D-62 (amended), D-65, D-69, D-70 (as amended), D-80, D-86 (as amended), D-102, D-123, D-127, D-134, D-135, D-136, D-138, Q-10, Q-11
+  D-53, D-62 (amended), D-65, D-69, D-70 (as amended), D-80, D-86 (as amended), D-102, D-123, D-126, D-127, D-134, D-135, D-136, D-138, Q-10, Q-11
 - **Upstream asks**: [`UPSTREAM_REQS.md`](../UPSTREAM_REQS.md) — serverless-runtime section
 - **Platform**: serverless-runtime
   [ADR-0003](../../../../serverless-runtime/docs/ADR/0003-cpt-cf-serverless-runtime-adr-workflow-dsl.md),

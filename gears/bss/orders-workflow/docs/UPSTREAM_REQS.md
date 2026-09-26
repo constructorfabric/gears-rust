@@ -726,8 +726,11 @@ that suspends: the platform text says `workflow_traits` SHOULD declare it, but t
 type's required `traits.invocation` (DESIGN_GTS_SCHEMAS.md lines 1139–1159) already expresses
 it, and the callable declares it (`design/10-process-definition.md` §3.1, decision D-127);
 (a′) **the meaning of the declared limits**: whether `traits.limits.timeout_seconds` (declared
-15,552,000, 180 days) measures wall-clock time including suspension, whether
-`traits.limits.max_concurrent` (declared 5,000) counts suspended invocations, and that this gear's
+23,328,000, 270 days) measures wall-clock time including suspension, whether
+`traits.limits.max_concurrent` (declared 50,000) counts suspended invocations — the value to use
+under each answer is stated in `design/10-process-definition.md` §3.1 (decision D-157), and the
+answer gates readiness — whether the platform has capacity for them above its stated regional
+target of 10,000 concurrent executions (serverless-runtime PRD.md line 843), and that this gear's
 tenants are provisioned with `max_execution_duration_seconds`, `max_concurrent_executions` and
 `max_execution_history_mb` (DESIGN_GTS_SCHEMAS.md lines 1824–1855) that admit them — the schema
 defaults (30 s, 100) would end or throttle every order, and the platform's duration guardrail
@@ -1051,7 +1054,7 @@ same retention for `:plugin-control` signals; this ask extends it to broker even
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-upreq-serverless-runtime-history-growth`
 
 The plugin **MUST** bound the engine history of one `order_process` invocation over a life of 90
-days and more — up to the declared `timeout_seconds` of 180 days — while the definition loops on
+days and more — up to the declared `timeout_seconds` of 270 days (decision D-157) — while the definition loops on
 fixed ticks, either by truncating that history inside its DSL interpreter (carrying the
 invocation id, the workflow's `$context`, its task position and its pending signals and retained
 events across the cut) or by stating a per-invocation history budget in events and bytes, and
@@ -1281,7 +1284,7 @@ it would shorten (D-105).
     history survive — and not as a promise that execution continues without the platform
     (`design/01-foundation.md` §4.16).
 
-12. **§6.3, §7.1, §9.1 and §17 — dead letters are the platform's.** Under `ADR/0009` as amended
+12. **§6.3, §7.1, §9.1 and §12 — dead letters are the platform's.** Under `ADR/0009` as amended
     and `DECISIONS.md` D-72, an inbound delivery past its cap is the platform event-trigger path's
     dead letter, and Orders writes no dead-letter row. Seven PRD clauses still require an Orders
     record: `cpt-cf-bss-orders-workflow-fr-owf-dead-letter` (`PRD.md:381`, a record carrying
@@ -1289,7 +1292,7 @@ it would shorten (D-105).
     fulfillment-operator queue); `cpt-cf-bss-orders-workflow-fr-owf-task-queue` (`PRD.md:421`,
     dead letters in the task queue); *Query process progress* (`PRD.md:692`, dead-letter records
     in the progress read); `cpt-cf-bss-orders-workflow-nfr-owf-audit` (`PRD.md:622`, "dead-letter"
-    among the transitions this gear's audit log records); acceptance criteria 7c (`PRD.md:995`,
+    among the transitions this gear's audit log records); the §12 acceptance criteria 7c (`PRD.md:995`,
     "an inspectable dead-letter record **MUST** exist"), 7d (`PRD.md:1005`, an outcome still
     unknown after the sweep budget "**MUST** take the dead-letter path") and 8a (`PRD.md:1049`, a
     dead-letter record in the operator's scope appears). The PRD **MUST** restate them as follows:
@@ -1307,14 +1310,17 @@ it would shorten (D-105).
       raises a line manual task through the definition's failure stage, never a dead letter
       (`design/05-provisioning-intents.md` §3.7, `DECISIONS.md` D-97, D-125).
 
-13. **§6.2, §14, §16 and §17 — the engine is selected and its timers are the plugin's.** Items 5
-    and 6 amend §6.1 and the §13 dependency row only. Four more passages keep the pre-ADR-0011
-    wording and **MUST** be amended the same way: §6.2 *Escalation Timer* (`PRD.md:297`) makes
-    Workflow "the **single owner** of scheduling, persisting, and firing escalation timers" — it
-    **MUST** read that Workflow owns the escalation deadline on its record and the tick that
-    re-checks it is a plugin timer of the definition (`DECISIONS.md` D-70, D-134); §17
-    acceptance criterion (`PRD.md:910`, "keep a durable timer until expected fulfillment time") and
-    the §17.1 diagram's "durable timer" nodes (`PRD.md:1232`, `PRD.md:1253`) **MUST** name the
+13. **§1.4, §6.2, §6.3, §12, §14, §16 and §17.1 — the engine is selected and its timers are the
+    plugin's.** Items 5 and 6 amend §6.1 and the §13 dependency row only. Six more passages keep
+    the pre-ADR-0011 wording and **MUST** be amended the same way: §6.2 *Escalation Timer*
+    (`PRD.md:297`) makes Workflow "the **single owner** of scheduling, persisting, and firing
+    escalation timers", and the §1.4 glossary entry *Escalation* (`PRD.md:107`) has escalation
+    "triggered by a durable timer" — both **MUST** read that Workflow owns the escalation deadline
+    on its record and the tick that re-checks it is a plugin timer of the definition
+    (`DECISIONS.md` D-70, D-134); the §6.3 requirement
+    `cpt-cf-bss-orders-workflow-fr-owf-provisioning-intent` (`PRD.md:349`, "Workflow **MUST** set
+    a durable timer for that wait"), the §12 acceptance criterion (`PRD.md:910`, "keep a durable
+    timer until expected fulfillment time") and the §17.1 diagram's "durable timer" nodes (`PRD.md:1232`, `PRD.md:1253`) **MUST** name the
     definition's fixed-granularity `wait` over a deadline Orders stores; §14 (`PRD.md:1177`, the
     engine "will be selected via ADR; this PRD … is agnostic to the engine choice") **MUST** record
     the selection (serverless-runtime, `ADR/0011`); and the §16 risk *Engine decision pending*
@@ -1346,10 +1352,10 @@ it would shorten (D-105).
   `ADR/0008` and `DECISIONS.md` D-58 (platform producer outbox, §2.7 co-signature);
   `DECISIONS.md` D-16 (Catalog topology), D-46 and Q-02 (relational escalation threshold), D-50 and
   D-38 (audit retention and the privacy ask); `ADR/0010` and `DECISIONS.md` D-63 (platform PDP
-  authorization, §2.8); `ADR/0011`, `ADR/0012`, `ADR/0013` and `DECISIONS.md` D-65…D-138, Q-10…Q-13
+  authorization, §2.8); `ADR/0011`, `ADR/0012`, `ADR/0013` and `DECISIONS.md` D-65…D-157, Q-10…Q-13
   (serverless-runtime, §2.9); `DECISIONS.md` D-110 (the `failure_reason` coverage ask, §2.4);
   D-91 and Q-08 (the overlap read's fail-closed reason, §2.1); D-97 as amended (no further
-  Subscriptions ask, §2.1); D-72, D-65, D-105 as amended (PRD amendments 11–13, §4)
+  Subscriptions ask, §2.1); D-72, D-65, D-105 as amended, D-134 and D-140 (PRD amendments 11–14, §4)
 - **Platform register**: serverless-runtime has no upstream-requirements register; §2.9 cites its
   [DESIGN.md](../../../serverless-runtime/docs/DESIGN.md), [PRD.md](../../../serverless-runtime/docs/PRD.md),
   [NEXT_ADR_SCOPE.md](../../../serverless-runtime/docs/NEXT_ADR_SCOPE.md) and ADR-0004/0005 by line

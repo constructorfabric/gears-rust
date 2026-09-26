@@ -127,6 +127,22 @@ reach. Concretely:
   > enumeration member, RFC 3339 or ISO 8601, semver, or the `stepsBase` URL. The `Idempotency-Key`
   > header is composed only of members of the vocabulary (`design/01-foundation.md` §3.3).
   >
+  > **Amended 2026-09-26 by D-156**: that format list omitted the formats of three identity members
+  > the list names, so a validator built from it refused every step body. Three formats are added.
+  > (a) **The platform invocation identifier** (`invocationId`): the platform's opaque
+  > `invocation_id` string of the invocation record
+  > ([DESIGN_GTS_SCHEMAS.md](../../../../serverless-runtime/docs/DESIGN_GTS_SCHEMAS.md#invocationrecord),
+  > "Opaque unique identifier"), which the member schema references rather than restates; it is
+  > compared, never parsed. (b) **The attempt identifier** (`attemptId`): `{invocationId}:{taskReference}`,
+  > where the task reference is the JSON pointer of a `call` task of the bound document (Serverless
+  > Workflow DSL 1.0.0, dsl.md *Task Descriptor*, `reference`), as the definition composes it from
+  > `$workflow.id` and `$task.reference` (`design/01-foundation.md` §3.3 *Attempt identity*); it
+  > carries positions of this gear's own document and no commercial value. (c) **The GTS callable
+  > identifier** (`definitionId`): a GTS id under the platform's workflow base type, the pattern
+  > `gts.cf.core.sless.workflow.v1~*` the platform's own schemas declare
+  > ([DESIGN_GTS_SCHEMAS.md](../../../../serverless-runtime/docs/DESIGN_GTS_SCHEMAS.md) line 628,
+  > `x-gts-ref`). `supersededByOrderVersion` (D-155) is an integer and needs no string format.
+  >
   > **Accepted residual: cardinality and counters.** An array of `lineRef`s, `gateRef`s or
   > `taskRef`s shows how many lines a wave carries, how many gates a position opens and how many
   > tasks are open, and so shows the order's line count. A round shows how often an operation was
@@ -287,7 +303,7 @@ D-65 onward.
 - **DESIGN**: [DESIGN.md](../DESIGN.md) §4.2, §4.3;
   [`design/10-process-definition.md`](../design/10-process-definition.md) (reference schemas);
   each slice §3.3 (`input`/`output` per operation)
-- **Decisions register**: [`DECISIONS.md`](../DECISIONS.md) — Q-01, D-61, D-64, D-66 (as amended), D-131, D-132, D-150, Q-12
+- **Decisions register**: [`DECISIONS.md`](../DECISIONS.md) — Q-01, D-61, D-64, D-66 (as amended), D-131, D-132, D-150, D-155, D-156, Q-12
 - **Upstream asks**: [`UPSTREAM_REQS.md`](../UPSTREAM_REQS.md) — serverless-runtime section
   (history residency and retention; member-only storage of trigger inputs and consumed events);
   Orders Lifecycle section (thin event variants); Generic Approval section (reference-only

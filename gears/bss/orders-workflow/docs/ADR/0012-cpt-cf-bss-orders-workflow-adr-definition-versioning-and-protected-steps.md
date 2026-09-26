@@ -224,6 +224,15 @@ rather than one task, fails closed before a definition can be executed, and stil
   > trigger bindings on a major bump. Which version an event trigger starts, and a tenant-scoped
   > activation, are the ask `…-upreq-serverless-runtime-trigger-version-selection`
   > (`design/10-process-definition.md` §4.2).
+
+  > **Amended 2026-09-26 by D-158 and D-159**: the rollback's document carries the new version in
+  > its own `document.version`, since D-137 refuses a document whose `version` differs from the
+  > pinned one; the forward rollback is kept even though the registry allows
+  > `deprecated → disabled → active`, because that path disables a version while instances pinned
+  > to it are live. A failing behavioural gate rolls its environment back the same way, and the
+  > first environment is published once. The job also compares every literal tick with its
+  > guidance value, and refuses a candidate whose `wave1` timeout is not below every effective
+  > overdue window of the environment (`design/10-process-definition.md` §4.2).
 * **Audit of publishes.** Every publish must be attributable to an actor, a version and a
   validation result. The platform's audit of definition changes is unaddressed (NEXT_ADR_SCOPE.md
   line 26, BR-034) and is raised as an upstream ask; until it lands, the CI conformance run over
@@ -308,7 +317,7 @@ apply by reference.
   [`design/10-process-definition.md`](../design/10-process-definition.md);
   [`design/01-foundation.md`](../design/01-foundation.md) §3.7 (`owf_definition_binding`,
   `owf_step_operation`)
-- **Decisions register**: [`DECISIONS.md`](../DECISIONS.md) — D-02, D-53, D-67, D-68, D-105, D-106, D-126, D-135, D-136, D-137, D-138, D-142, D-143, D-144, Q-10
+- **Decisions register**: [`DECISIONS.md`](../DECISIONS.md) — D-02, D-53, D-67, D-68, D-105, D-106, D-126, D-135, D-136, D-137, D-138, D-142, D-143, D-144, D-158, D-159, Q-10
 - **Upstream asks**: [`UPSTREAM_REQS.md`](../UPSTREAM_REQS.md) — serverless-runtime section
   (pre-publish validation hook, publish audit, version retention while bound)
 - **Platform**: serverless-runtime [DESIGN.md](../../../../serverless-runtime/docs/DESIGN.md)

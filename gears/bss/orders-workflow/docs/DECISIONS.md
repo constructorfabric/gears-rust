@@ -174,6 +174,11 @@
   - [D-153 (M) Slice 05 re-arms an unresolved intent through its own port](#d-153-m-slice-05-re-arms-an-unresolved-intent-through-its-own-port)
   - [D-154 (M) `create-manual-task` verifies the route that names a subject, not only a failed task](#d-154-m-create-manual-task-verifies-the-route-that-names-a-subject-not-only-a-failed-task)
   - [D-155 (M) `supersededByOrderVersion` is admit-trigger's `currentOrderVersion`](#d-155-m-supersededbyorderversion-is-admit-triggers-currentorderversion)
+  - [D-156 (L) The reference vocabulary names the formats of every identity member it lists](#d-156-l-the-reference-vocabulary-names-the-formats-of-every-identity-member-it-lists)
+  - [D-157 (M) The callable's limits are sized from the residency of long waits and three ceilings](#d-157-m-the-callables-limits-are-sized-from-the-residency-of-long-waits-and-three-ceilings)
+  - [D-158 (M) The rollback document carries its new version; a failed gate is rolled back; ticks are compared statically](#d-158-m-the-rollback-document-carries-its-new-version-a-failed-gate-is-rolled-back-ticks-are-compared-statically)
+  - [D-159 (M) The overdue-window bound is checked on both sides over a defined version set](#d-159-m-the-overdue-window-bound-is-checked-on-both-sides-over-a-defined-version-set)
+  - [D-160 (M) Configuration changes are recorded in an append-only revision table, not the audit chain](#d-160-m-configuration-changes-are-recorded-in-an-append-only-revision-table-not-the-audit-chain)
 - [Open Questions](#open-questions)
   - [Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?](#q-01-which-durable-execution-substrate-backs-the-process--the-oss-workflow-engine-or-a-bss-local-mechanism)
   - [Q-02: The Generic Approval escalation threshold — the one PRD-deferred numeric value this design deliberately leaves unset](#q-02-the-generic-approval-escalation-threshold--the-one-prd-deferred-numeric-value-this-design-deliberately-leaves-unset)
@@ -1143,7 +1148,7 @@ composition, including this family set.
 
 **Amended by D-69 (2026-09-24).** `owf_step_operation` is load-only configuration and carries no tenant column — the one stated exemption to this entry.
 
-**Amended by D-140 (2026-09-26).** There are now two stated exemptions, both configuration: `owf_step_operation`, and `owf_seller_policy`, which is keyed by `seller_tenant_id` alone, NULL on its platform row (`design/01-foundation.md` §3.7).
+**Amended by D-140 (2026-09-26).** There are now two stated exemptions, both configuration: `owf_step_operation`, and `owf_seller_policy`, which is keyed by `seller_tenant_id` alone, NULL on its platform row (`design/01-foundation.md` §3.7). **Amended by D-160 (2026-09-26)**: a third, `owf_configuration_revision`, the append-only history of the configuration loads, which has no tenant column.
 
 **Decision**: this gear adopts the sibling Orders Lifecycle set's three tenant axes by name —
 `resource_tenant_id` (resource recipient), `payer_tenant_id` (billing party), `seller_tenant_id`
@@ -1427,7 +1432,7 @@ producer persistence* and the retention/immutability register, §3.8, §4.7, §4
 
 **Accepted.** *(mirrors Lifecycle D-97 and D-103; hardens D-50, which remains in force)*
 
-**Amended by D-68, D-69, D-70 and D-72 (2026-09-24).** The engine owns **eight** tables today, not nine: `owf_definition_binding` (D-68) and `owf_step_operation` (D-69) were added, and `owf_durable_timer`, `owf_retry_state` (D-70) and `owf_dead_letter_record` (D-72) retired (`DESIGN.md` §3.7). **Amended by D-140 (2026-09-26)**: `owf_seller_policy` makes it **nine**.
+**Amended by D-68, D-69, D-70 and D-72 (2026-09-24).** The engine owns **eight** tables today, not nine: `owf_definition_binding` (D-68) and `owf_step_operation` (D-69) were added, and `owf_durable_timer`, `owf_retry_state` (D-70) and `owf_dead_letter_record` (D-72) retired (`DESIGN.md` §3.7). **Amended by D-140 (2026-09-26)**: `owf_seller_policy` makes it **nine**. **Amended by D-160 (2026-09-26)**: `owf_configuration_revision` makes it **ten**.
 
 **Decision**: `owf_audit_entry` stays the authoritative process-audit record of this gear, written
 in the transaction of the transition it records on every path; a failed append aborts the step's
@@ -1565,7 +1570,7 @@ Q-09 lands on the fenced lease.
 
 **Accepted.** *(carries [`ADR/0010`](./ADR/0010-cpt-cf-bss-orders-workflow-adr-platform-pdp-authorization.md); mirrors Lifecycle D-34 as amended, D-111, D-114, D-141 and D-115; amends D-37)*
 
-**Amended (2026-09-26)**: the "twenty-five tables" of the propagation line below was the count at this decision; the registry now holds twenty-seven (`DESIGN.md` §3.7; twenty-six until D-140 added `owf_seller_policy`).
+**Amended (2026-09-26)**: the "twenty-five tables" of the propagation line below was the count at this decision; the registry now holds twenty-seven (`DESIGN.md` §3.7; twenty-six until D-140 added `owf_seller_policy`). **Amended by D-160 (2026-09-26)**: twenty-eight, with `owf_configuration_revision`.
 
 **Decision**: every authorization decision in this gear is made by the platform PDP
 (`authz-resolver`), reached through **one shared `PolicyEnforcer`** from `authz-resolver-sdk`
@@ -1664,7 +1669,7 @@ The decisions in this section were taken when the order process flow moved from 
 gear to a versioned platform workflow definition (`ADR/0011`, `ADR/0012`, `ADR/0013`), and when
 each slice was restructured into step operations and a definition fragment. D-65…D-72 carry the
 three ADRs and their cross-cutting consequences; D-73…D-101 are the decisions the slice
-restructurings recorded, and D-102…D-155 the decisions taken on the second review of
+restructurings recorded, and D-102…D-160 the decisions taken on the second review of
 2026-09-26. Each names the entries it amends; the amended entries carry a dated
 **Amended by** note. D-65…D-101 were taken on 2026-09-24.
 
@@ -1696,7 +1701,7 @@ audit grade.
 **Propagated**: `design/10-process-definition.md` (new); `design/01-foundation.md` §1.1, §3.2, §3.3;
 `DESIGN.md` §1, §2.1, §3.2, §3.5, §4.9; `design/README.md`; Q-01, Q-12; `UPSTREAM_REQS.md` §4.
 
-**Amended (2026-09-26)**: the PRD passages that still describe an unselected engine or Workflow-scheduled timers (§6.2 *Escalation Timer*, the §17 durable-timer criterion and diagram, §14, the §16 *Engine decision pending* risk) are registered for amendment as `UPSTREAM_REQS.md` §4 item 13, beside items 5 and 6 (second review OW2-99).
+**Amended (2026-09-26)**: the PRD passages that still describe an unselected engine or Workflow-scheduled timers (§6.2 *Escalation Timer*, the §12 durable-timer acceptance criterion and the §17.1 diagram, §14, the §16 *Engine decision pending* risk) are registered for amendment as `UPSTREAM_REQS.md` §4 item 13, beside items 5 and 6 (second review OW2-99). **Amended (2026-09-26)**: the criterion is in PRD §12, not §17, and item 13 now also covers the §1.4 glossary *Escalation* (`PRD.md:107`) and the §6.3 provisioning requirement (`PRD.md:349`), which the finding had named (re-review R-25, R-35).
 
 ### D-66 (H) References, not payloads, cross the engine boundary
 
@@ -1831,7 +1836,7 @@ rolls back forward (D-138).
 
 **Amended by D-108 (2026-09-26).** Thirty-three values are granted: `retry-step` joins `settle-from-lookup` as in-process only, granted to no principal (`design/09-read-and-authz.md` §3.1).
 
-**Amended by D-140 (2026-09-26).** "The one stated exemption to D-48" below is now one of two: `owf_seller_policy` is the other.
+**Amended by D-140 (2026-09-26).** "The one stated exemption to D-48" below is now one of two: `owf_seller_policy` is the other. **Amended by D-160 (2026-09-26)**: one of three, with `owf_configuration_revision`; and the registry load's audit is an `owf_configuration_revision` row, not an `owf_audit_entry`.
 
 **Decision**: every step the definition can order is an Orders operation on
 `POST /bss-orders-workflow/v1/steps/{operation}`, one route per registered operation, callable only
@@ -2716,7 +2721,7 @@ immutability*), §3.8; `design/03-approval-execution.md` §3.7; `design/04-fulfi
 `design/07-manual-tasks.md` §3.7; `design/08-hold-and-cancel.md` §3.7; `DESIGN.md` §3.7, §4.1; `design/09-read-and-authz.md` §3.7, §4.3.
 
 **Amended (2026-09-26)**: the retention register of `DESIGN.md` §3.7 now has a row for every one of
-the twenty-six tables (twenty-seven since D-140), with its window and what the `retention-purge` worker does with it, and the
+the twenty-six tables (twenty-seven since D-140, twenty-eight since D-160), with its window and what the `retention-purge` worker does with it, and the
 worker's roster in `design/01-foundation.md` §3.8 names every store with a window; the
 never-purged stores (the audit store and its checkpoints, the instance, the binding, the progress
 view) are listed as such. `design/09-read-and-authz.md` §4.3 cites the register instead of
@@ -3464,7 +3469,8 @@ lifecycle arm's `triggerKind` (OW2-6); none in the platform for a routing check,
 registration-validation hook states no rule of this kind (serverless-runtime `DESIGN.md:762`).
 
 **Propagated**: `design/10-process-definition.md` §1.2, §2.2, §3.2, §3.6, §4.1, §4.5, §4.6;
-`design/07-manual-tasks.md` §4.8; `ADR/0012`; D-67; Q-11.
+`design/07-manual-tasks.md` §4.8; `design/01-foundation.md` §4.2 (amended note); `ADR/0012`;
+`ADR/0011` (amended note); D-67; Q-11.
 
 **Amended (2026-09-26)**: rule 1 also tracks four pinned members (`verdict`, `reflected`,
 `policy`, `forceTask`), and §4.1 requires the `p1` composables on their paths; rule 8 requires the
@@ -3476,6 +3482,13 @@ and the §4.1 Waves row requires `beginResult = in-fulfillment` on every walk to
 (D-143). Rule 8 forbids a plain `wait` inside a stage (D-142).
 
 **Amended by D-144 (2026-09-26)**: rule 1 tracks ten pinned members, and the canonical definition routes every `switch` towards a protected operation on tracked members only; the ADR-0004 conjunction is a walk that passes the pinned `released = true`.
+
+**Amended (2026-09-26)**: the nesting invariant is qualified where it was still stated whole.
+`design/01-foundation.md` §4.2 now orders each operation's deadline below the timeout of the task
+that calls it and below the ceiling, and the longest fulfillment-stage timeout below the overdue
+window below the ceiling; the 25 h admission timeout is outside the overdue window's span. ADR-0011's
+*Bounds nest* bullet carries a dated block that drops the retry-budget term this decision removed
+(re-review R-23).
 
 ### D-127 (M) The Workflow callable declares every required trait: async-only, its limits, and no invocation retry
 
@@ -3502,6 +3515,11 @@ the platform's own schema (serverless-runtime `DESIGN_GTS_SCHEMAS.md` lines 142�
 1136–1230, 1799–1855) and its duration guardrail (serverless-runtime PRD BR-028).
 
 **Propagated**: `design/10-process-definition.md` §3.1; `UPSTREAM_REQS.md` §2.9; `ADR/0011`.
+
+**Amended by D-157 (2026-09-26)**: the limits are now `timeout_seconds: 23328000` (three `P90D`
+ceilings, because the fresh ceiling fires by 25 h + 180 d) and `max_concurrent: 50000`, sized from
+the residency of long waits rather than the ~360 s mean; the answers on what each limit counts gate
+readiness.
 
 ### D-128 (M) Bounding one invocation's engine history is asked of the plugin; the ticks are not stretched to fit
 
@@ -3631,6 +3649,10 @@ line 23, BR-017).
 §2.1; `design/10-process-definition.md` §1.1, §2.1, §2.2 rule 5; `DESIGN.md` §4.2, §4.3;
 `UPSTREAM_REQS.md` §2.9, §4 item 7; D-66, Q-01, Q-12.
 
+**Amended by D-156 (2026-09-26)**: the closed format list gains the platform invocation
+identifier, the attempt identifier and the GTS callable identifier, the formats of identity
+members the list already named.
+
 ### D-132 (M) A step-route error answer carries fixed members only
 
 **Accepted (2026-09-26).**
@@ -3740,7 +3762,8 @@ platform precedent applies: the platform has no per-tenant business-window store
 **Propagated**: `design/01-foundation.md` §2.1, §4.2, §4.4; `design/03-approval-execution.md`
 §3.2, §3.6, §3.7; `design/04-fulfillment-plan.md` §2.2, §3.6, §3.7, §4.7, §4.8;
 `design/07-manual-tasks.md` §1.2, §3.2, §3.6, §3.7, §4.1, §4.8; `design/10-process-definition.md`
-§1.1, §1.2, §2.2, §3.6, §4.7; `DESIGN.md` §1.2, §4.7, §4.8; `ADR/0011`; D-70, D-98, D-126.
+§1.1, §1.2, §2.2, §3.6, §4.7; `DESIGN.md` §1.2, §4.7, §4.8; `UPSTREAM_REQS.md` §4 item 14;
+`ADR/0011`; D-70, D-98, D-126.
 
 **Amended by D-140 (2026-09-26)**: "the per-seller policy rows of `DESIGN.md` §4.8" now have a
 store and an owner. They are the foundation's `owf_seller_policy` (`design/01-foundation.md`
@@ -3896,6 +3919,13 @@ the set.
 `design/01-foundation.md` §3.7; `DESIGN.md` §2.2, §3.6, §3.8, §4.7; `UPSTREAM_REQS.md` §2.9, §3;
 `ADR/0012`; `ADR/0011`; D-68, D-107.
 
+**Amended by D-158 and D-159 (2026-09-26)**: the rollback's document carries the new version in
+its own `document.version`; the premise "no `deprecated → active` transition" is corrected — a
+two-step return through `disabled` exists and is not used. A failing gate rolls its environment
+back forward, the first environment is published once, the job compares literal ticks with their
+guidance values, and it refuses a candidate whose `wave1` timeout is not below every effective
+overdue window.
+
 ### D-139 (M) The build order follows in-process calls; 07 and 08 precede 06, and the back-edges are built against doubles
 
 **Accepted (2026-09-26).** *(carries `ADR/0002` as amended)*
@@ -3924,6 +3954,14 @@ slices, which adds a build stage for a handful of edges.
 
 **Propagated**: `design/README.md` (the build-order table, the edge rationale, the cycles);
 `ADR/0002`; `DESIGN.md` §3.2.
+
+**Amended (2026-09-26)**: the foundation has back-edges too. Its reconciliation sweep runs slice
+05's `reconcile-intent`, its liveness pass drives slices 06 and 08 in the dead-instance unwind and
+calls slice 07's creation port and `resolve-manual-task`, and `terminate-instance` calls slice 07's
+closure port; each is built against a double. The stated cycles are eight: `01` with each of
+`05`, `06`, `07` and `08`, and the four above. ADR-0002's block said three cycles and its
+*Confirmation* forbade every later dependency; both are amended (re-review R-27, R-34).
+**Propagated**: `design/README.md` (row 1, *What an edge is*, the cycles); `ADR/0002`.
 
 ### D-140 (H) The per-seller policy is a foundation table on the policy channel, read through one port and pinned with its revision
 
@@ -3980,7 +4018,15 @@ tenant key nor a revision.
 tenancy, retention and immutability), §4.2, §4.11; `design/03-approval-execution.md` §3.6
 `inst-og-plan`; `design/04-fulfillment-plan.md` §3.6 `inst-pc-resolve-policy`;
 `design/07-manual-tasks.md` §4.1, §4.8 item 8; `design/10-process-definition.md` §4.7;
-`DESIGN.md` §3.7, §4.7, §4.8; D-48, D-59, D-63, D-69, D-104, D-134.
+`DESIGN.md` §3.7, §4.7, §4.8; `UPSTREAM_REQS.md` §4 item 14; D-48, D-59, D-63, D-69, D-104,
+D-134.
+
+**Amended by D-159 and D-160 (2026-09-26)**: "active bindings" named no set, since no binding is
+ever inactive; the check uses the **live version set** of `design/01-foundation.md` §4.2 (the
+registry's `active` versions and the `deprecated` versions a non-terminal instance is bound to),
+and the publish job checks the other direction. The "one audit entry under the deployment marker"
+could not be written: `owf_audit_entry` is one instance's chain. Each changed row is instead
+appended to `owf_configuration_revision`, which resolves every recorded `sellerPolicyRevision`.
 
 ### D-141 (M) A resume closes only a suspension Lifecycle no longer holds
 
@@ -4390,6 +4436,136 @@ supersession sequence of `02 §3.6`, which already carry `currentOrderVersion = 
 **Propagated**: `design/10-process-definition.md` §3.6 (b), (e), (f); `design/02-triggers-and-start.md`
 §4.3; `ADR/0013`.
 
+### D-156 (L) The reference vocabulary names the formats of every identity member it lists
+
+**Accepted (2026-09-26).** *(amends D-131)*
+
+**Decision**: ADR-0013's closed format list gains three formats: the platform invocation
+identifier (the opaque `invocation_id` string of the platform's invocation record, referenced and
+compared, never parsed); the attempt identifier `{invocationId}:{taskReference}`, where the task
+reference is the JSON pointer of a `call` task of the bound document; and the GTS callable
+identifier under `gts.cf.core.sless.workflow.v1~*`. Rule 5 refuses a string member of no listed
+type or format.
+
+**Rationale**: the D-131 list named `attemptId` and `definitionId` as identity members, but their
+values fit none of its formats, and neither does the platform's opaque `invocationId`; a validator
+built from the ADR refused every step body and `start-instance`'s input (re-review R-19).
+**Precedent**: the platform's own schemas — the invocation record's `invocation_id`, "Opaque unique
+identifier", and the `x-gts-ref` pattern `gts.cf.core.sless.workflow.v1~*`
+(serverless-runtime `DESIGN_GTS_SCHEMAS.md` lines 628, 1269–1272) — and the DSL's task
+`reference` (dsl.md *Task Descriptor*).
+
+**Propagated**: `ADR/0013` (amendment block after the format list); `design/10-process-definition.md`
+§2.2 rule 5; D-131.
+
+### D-157 (M) The callable's limits are sized from the residency of long waits and three ceilings
+
+**Accepted (2026-09-26).** *(amends D-127)*
+
+**Decision**: `traits.limits` is `{ timeout_seconds: 23328000, max_concurrent: 50000 }`. The
+timeout is three `P90D` ceilings, 270 days: the first ceiling fires by 25 h + 90 d (it is armed
+after admission), the fresh ceiling by 25 h + 180 d, and the rest carries the second ceiling's
+park and an unwind; a third ceiling is not reachable, and an invocation live at 270 days is ended
+by the guardrail and raised as `invocation-dead`. `max_concurrent` is sized for the reading that
+counts suspended invocations: 1,800 on the standard path (5 / s × ~360 s) plus ≈ 12,830 in
+manual-task waits (≤ 1 % of lines, about 3 % of orders at p50 3 lines, held ~24 h) gives ≈ 14,630
+in phase 1; each 1 % of orders in a 72 h approval window adds 12,960, and each 1 % dated *d* days
+ahead adds 4,320 × *d*. 50,000 leaves about 35,000 for those. If only running invocations count,
+the population is about 7,500 (750 calls / s at peak × the 10 s dispatch deadline) and a later
+version **MAY** lower the cap to 10,000. What each limit counts, and the platform's capacity above
+its stated regional target of 10,000 concurrent executions, gate readiness.
+
+**Rationale**: 180 days equalled two ceilings exactly, so the fresh ceiling D-121 arms could never
+fire before the guardrail ended the invocation (re-review R-20); 5,000 came from the ~360 s mean
+residency, while the design keeps invocations alive through multi-day waits, so under the
+counts-suspended reading the cap would refuse order starts once long waits accumulate (R-21).
+**Precedent**: the platform's limit semantics — "max execution duration in seconds" and "max
+concurrent invocations", with no maximum (serverless-runtime `DESIGN_GTS_SCHEMAS.md` lines
+142–174), the duration guardrail (PRD BR-028) and the regional target (PRD line 843, BR-208); the
+residency figures are this design's own (`DESIGN.md` §4.1).
+
+**Propagated**: `design/10-process-definition.md` §3.1; `DESIGN.md` §4.1 (*Concurrent in-flight
+processes*, *Cost*); `UPSTREAM_REQS.md` §2.9 (readiness (a′), history growth); D-127.
+
+### D-158 (M) The rollback document carries its new version; a failed gate is rolled back; ticks are compared statically
+
+**Accepted (2026-09-26).** *(amends D-138)*
+
+**Decision**: the forward rollback republishes the last good document with its `document.version`
+set to the new minor. The design keeps the forward version although the registry allows
+`deprecated → disabled → active`, because that path disables a version while instances pinned to
+it are live, and the platform does not say what disabling does to them. In the first
+non-production environment the behavioural gate's publish is the environment's publish (step 3
+only applies the bindings there), and a failing scenario rolls that environment back forward and
+ends the suite's own orders with the order cancel. Step 1 compares every literal tick of the
+candidate with the value its §4.7 guidance item fixes and refuses a difference unless the change
+amends that slice item.
+
+**Rationale**: republished unchanged, the last good document's old `version` would fail D-137's
+check at every `start-instance`, stopping every new order, and the stated premise misread the
+platform state machine (re-review R-26). The gate published the candidate before judging it and
+had no way to withdraw a failure, and published twice in the first environment (R-33). Tick
+guidance the gate cannot exercise was checked by nothing (R-32). **Precedent**: the platform
+function state machine (serverless-runtime `DESIGN.md` lines 588–607); D-137's own version check;
+no BSS gear publishes a platform definition.
+
+**Propagated**: `design/10-process-definition.md` §3.8, §4.2, §4.7; `DESIGN.md` §3.6; `ADR/0012`;
+D-138.
+
+### D-159 (M) The overdue-window bound is checked on both sides over a defined version set
+
+**Accepted (2026-09-26).** *(amends D-134, D-140)*
+
+**Decision**: the **live version set** of an environment is every version of `order_process` the
+registry lists as `active`, every `deprecated` version that a non-terminal instance's binding
+names, and, during a publish, the candidate. The policy load checks the overdue window against the
+`wave1` timeout of every version in the set, reading them through the registry's version listing
+before its transaction; the publish job refuses a candidate whose `wave1` timeout is not below
+the smallest overdue window of the environment's policy rows; and the readiness check alerts when
+a publish and a promotion that raced leave a live version at or above an effective window.
+
+**Rationale**: "every definition version that active bindings name" named no set — a binding is
+never inactive, and a published version with no instance yet is named by none — and 07 said "the
+active definition version"; the reverse direction was unchecked, so a version raising `wave1`
+above a seller's overdue window would publish (re-review R-28). **Precedent**: the gear's own
+readiness check of bound versions against the registry listing (D-138) and the registry's
+*list versions* and *get* (serverless-runtime `DESIGN.md` line 857); none in the BSS gears for a
+cross-store bound.
+
+**Propagated**: `design/01-foundation.md` §3.7 (*owf_seller_policy*), §4.2;
+`design/07-manual-tasks.md` §4.8 item 8; `design/10-process-definition.md` §2.2 rule 4, §4.2,
+§4.7; `ADR/0012`; D-134, D-140.
+
+### D-160 (M) Configuration changes are recorded in an append-only revision table, not the audit chain
+
+**Accepted (2026-09-26).** *(amends D-140, D-69)*
+
+**Decision**: a new foundation table, `owf_configuration_revision`, holds one append-only row per
+content change of a configuration load — kind `seller-policy` (keyed by `policy_id` and the new
+`policy_revision`, carrying the whole promoted row and the promotion's change identity),
+`step-operation-set` (the operation registry's load) or `authorization-catalogue` (slice 09's
+catalogue check) — with a content hash and the Orders release that ran the load, which is what
+"the gear's deployment marker" meant. Rows are inserted only in the load transaction that makes
+the change, have no UPDATE or DELETE grant and are trigger-protected, carry no tenant column (the
+third exemption to D-48) and are never purged. Every recorded `sellerPolicyRevision` resolves there
+to the values in force.
+
+**Rationale**: the loads were to write "one `owf_audit_entry` under the gear's deployment marker",
+but `owf_audit_entry` is one instance's hash chain with NOT NULL instance and tenant columns and a
+closed set of process kinds, and no marker was defined; the policy table keeps current rows only,
+so a pinned revision could not be resolved to its values (re-review R-29). **Precedent**: Pricing's
+price history, retained superseded rows under append-only protection
+(`pricing/docs/design/01-foundation.md:562`), and the audit tables' grant-plus-trigger protection
+(D-59). Lifecycle keeps no policy history, and needs none, because the record that uses a policy
+captures the value beside its revision (Lifecycle `07 §3.6`).
+
+**Counts**: tables 28 — ten engine, eighteen slice; mutable tables stay 19; three configuration
+tables are exempt from D-48.
+
+**Propagated**: `design/01-foundation.md` §3.2, §3.7 (*owf_step_operation*, *owf_seller_policy*,
+*Table: owf_configuration_revision*, tenancy, retention, immutability), §3.8, §4.11;
+`design/09-read-and-authz.md` §3.7; `DESIGN.md` §3.7, §4.7, §4.8; D-48, D-63, D-69, D-104, D-140.
+
 ## Open Questions
 
 ### Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?
@@ -4778,7 +4954,7 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-123 | M Escalation re-check on the probe tick | `design/10-process-definition.md` §1.2, §3.6, `design/03-approval-execution.md` §1.2, §3.6, §4.5, `design/08-hold-and-cancel.md` §1.2, §3.3, §3.6, §4.7, `DESIGN.md` §1.2, §4.1, `ADR/0011`; D-70, D-80 |
 | D-124 | M Events between listens: platform retention | `design/10-process-definition.md` §4.4, §4.5, `design/08-hold-and-cancel.md` §4.7, `DESIGN.md` §1.2, `UPSTREAM_REQS.md` §2.9, §3; Q-11 |
 | D-125 | M Worker trips handed to the definition | `design/05-provisioning-intents.md` §3.2, §3.3, §3.6, §3.7, §4.5, `design/07-manual-tasks.md` §3.6, `design/08-hold-and-cancel.md` §3.2, §3.6, `design/10-process-definition.md` §3.6; D-105, D-120 |
-| D-126 | H Validation rules over definition-held values and a routing graph | `design/10-process-definition.md` §1.2, §2.2, §3.2, §3.6, §4.1, §4.5, §4.6, `design/07-manual-tasks.md` §4.8, `ADR/0012`; D-67, Q-11 |
+| D-126 | H Validation rules over definition-held values and a routing graph | `design/10-process-definition.md` §1.2, §2.2, §3.2, §3.6, §4.1, §4.5, §4.6, `design/07-manual-tasks.md` §4.8, `design/01-foundation.md` §4.2, `ADR/0012`, `ADR/0011`; D-67, Q-11 |
 | D-127 | M Every required Workflow trait declared | `design/10-process-definition.md` §3.1, `UPSTREAM_REQS.md` §2.9, `ADR/0011`; D-86, D-105 |
 | D-128 | M Engine history growth asked of the plugin | `design/10-process-definition.md` §3.1, §3.6, `UPSTREAM_REQS.md` §2.9, §3, `DESIGN.md` §4.1; D-123 |
 | D-129 | M Ceiling task SLA tick; ceiling park ended by the order cancel | `design/10-process-definition.md` §3.6, `design/07-manual-tasks.md` §3.3, §3.6, §4.4, §4.8, `design/01-foundation.md` §3.3; D-105, D-122 |
@@ -4786,13 +4962,13 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-131 | H Closed reference vocabulary; residual stated in full | `ADR/0013`, `design/01-foundation.md` §1.1, §2.1, `design/10-process-definition.md` §1.1, §2.1, §2.2, `DESIGN.md` §4.2, §4.3, `UPSTREAM_REQS.md` §2.9, §4; D-66, Q-01, Q-12 |
 | D-132 | M Step-route error answers carry fixed members only | `ADR/0013`, `design/01-foundation.md` §4.9, §4.11, `design/10-process-definition.md` §2.1, §2.2, `DESIGN.md` §4.2, `UPSTREAM_REQS.md` §2.9; D-66 |
 | D-133 | M Every wait holding a recorded suspension polls the hold | `design/10-process-definition.md` §3.6, §4.1, §4.4, §4.5, `design/08-hold-and-cancel.md` §3.2, §3.3, §4.7, `design/01-foundation.md` §3.3, `DESIGN.md` §1.2, `UPSTREAM_REQS.md` §2.9; D-124, D-130, Q-11 |
-| D-134 | H Business windows are seller-policy values pinned on the record | `design/01-foundation.md` §2.1, §4.2, §4.4, `design/03-approval-execution.md` §3.2, §3.6, §3.7, `design/04-fulfillment-plan.md` §2.2, §3.6, §3.7, §4.7, §4.8, `design/07-manual-tasks.md` §1.2, §3.2, §3.6, §3.7, §4.1, §4.8, `design/10-process-definition.md` §1.1, §1.2, §2.2, §3.6, §4.7, `DESIGN.md` §1.2, §4.7, §4.8, `ADR/0011`; D-70, D-98, D-126 |
+| D-134 | H Business windows are seller-policy values pinned on the record | `design/01-foundation.md` §2.1, §4.2, §4.4, `design/03-approval-execution.md` §3.2, §3.6, §3.7, `design/04-fulfillment-plan.md` §2.2, §3.6, §3.7, §4.7, §4.8, `design/07-manual-tasks.md` §1.2, §3.2, §3.6, §3.7, §4.1, §4.8, `design/10-process-definition.md` §1.1, §1.2, §2.2, §3.6, §4.7, `DESIGN.md` §1.2, §4.7, §4.8, `UPSTREAM_REQS.md` §4 item 14, `ADR/0011`; D-70, D-98, D-126 |
 | D-135 | M `p1` composables and shared arms required on their paths; pinned enums tracked | `design/10-process-definition.md` §2.1, §2.2, §4.1, §4.7, `design/01-foundation.md` §3.1, §3.3, `design/03-approval-execution.md` §3.3, `design/07-manual-tasks.md` §3.3, `DESIGN.md` §2.2, `ADR/0011`, `ADR/0012`; D-126 |
 | D-136 | M One adjustability table; enforced items and guidance; no Function call | `design/10-process-definition.md` §1.1, §2.1, §2.2, §4.7, `design/02-triggers-and-start.md` §4.7, `design/03-approval-execution.md` §4.5, `design/04-fulfillment-plan.md` §4.8, `design/05-provisioning-intents.md` §4.5, `design/06-saga-and-compensation.md` §4.7, `design/07-manual-tasks.md` §4.8, `design/08-hold-and-cancel.md` §4.7, `design/09-read-and-authz.md` §4.6, `DESIGN.md` §4.7, `ADR/0011`, `ADR/0012`; Q-10 |
 | D-137 | H Binding version from the invocation record; publisher from the registry | `design/01-foundation.md` §3.3, §3.6, §3.7, `design/10-process-definition.md` §2.2, §3.1, §3.3, §3.6, §4.2, §4.3, `DESIGN.md` §3.1, §3.6, §4.2, `UPSTREAM_REQS.md` §2.9, `ADR/0012`; D-68, D-105 |
 | D-138 | M Publish job, behavioural gate, forward rollback | `design/10-process-definition.md` §2.2, §3.2, §3.3, §3.7, §3.8, §4.2, §4.3, `design/01-foundation.md` §3.7, `DESIGN.md` §2.2, §3.6, §3.8, §4.7, `UPSTREAM_REQS.md` §2.9, §3, `ADR/0011`, `ADR/0012`; D-68, D-107 |
 | D-139 | M Build order from in-process calls; back-edges | `design/README.md`, `ADR/0002`, `DESIGN.md` §3.2 |
-| D-140 | H Seller-policy store: foundation table, policy channel, one port, pinned revision | `design/01-foundation.md` §2.1, §3.4, §3.7, §4.2, §4.11, `design/03-approval-execution.md` §3.6, `design/04-fulfillment-plan.md` §3.6, `design/07-manual-tasks.md` §4.1, §4.8, `design/10-process-definition.md` §4.7, `DESIGN.md` §3.7, §4.7, §4.8; D-48, D-59, D-63, D-69, D-104, D-134 |
+| D-140 | H Seller-policy store: foundation table, policy channel, one port, pinned revision | `design/01-foundation.md` §2.1, §3.4, §3.7, §4.2, §4.11, `design/03-approval-execution.md` §3.6, `design/04-fulfillment-plan.md` §3.6, `design/07-manual-tasks.md` §4.1, §4.8, `design/10-process-definition.md` §4.7, `DESIGN.md` §3.7, §4.7, §4.8, `UPSTREAM_REQS.md` §4 item 14; D-48, D-59, D-63, D-69, D-104, D-134 |
 | D-141 | M A resume closes only a suspension Lifecycle no longer holds | `design/08-hold-and-cancel.md` §2.2, §3.3, §3.6, §4.2, §4.7, `design/10-process-definition.md` §3.6; D-87, D-130 |
 | D-142 | M Every stage wait is a fork with the shared arms | `design/10-process-definition.md` §2.2, §3.6, `ADR/0012`; D-120, D-133, D-135 |
 | D-143 | M No wave dispatch without begin-fulfillment; `beginResult` pinned | `design/10-process-definition.md` §2.2, §3.6, §4.1, `design/08-hold-and-cancel.md` §4.7, `ADR/0012`; D-126, D-130, D-133, D-135 |
@@ -4808,6 +4984,11 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-153 | M Re-arm of an unresolved intent is slice 05's port | `design/05-provisioning-intents.md` §3.2, §3.7, §4.4, `design/07-manual-tasks.md` §3.4, §3.6; D-119, D-125 |
 | D-154 | M `create-manual-task` verifies the naming route | `design/07-manual-tasks.md` §3.6; D-116, D-119 |
 | D-155 | M `supersededByOrderVersion` from admit-trigger | `design/10-process-definition.md` §3.6, `design/02-triggers-and-start.md` §4.3, `ADR/0013` |
+| D-156 | L Formats of every listed identity member | `ADR/0013`, `design/10-process-definition.md` §2.2; D-131 |
+| D-157 | M Limits sized from long-wait residency and three ceilings | `design/10-process-definition.md` §3.1, `DESIGN.md` §4.1, `UPSTREAM_REQS.md` §2.9; D-127 |
+| D-158 | M Rollback document carries its version; failed gate rolled back; ticks compared | `design/10-process-definition.md` §3.8, §4.2, §4.7, `DESIGN.md` §3.6, `ADR/0012`; D-138 |
+| D-159 | M Overdue bound checked both ways over the live version set | `design/01-foundation.md` §3.7, §4.2, `design/07-manual-tasks.md` §4.8, `design/10-process-definition.md` §2.2, §4.2, §4.7, `ADR/0012`; D-134, D-140 |
+| D-160 | M Configuration revisions in an append-only table | `design/01-foundation.md` §3.2, §3.7, §3.8, §4.11, `design/09-read-and-authz.md` §3.7, `DESIGN.md` §3.7, §4.7, §4.8; D-48, D-63, D-69, D-104, D-140 |
 
-Highest decision number used: **D-155**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
+Highest decision number used: **D-160**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
 register; there are no parts.

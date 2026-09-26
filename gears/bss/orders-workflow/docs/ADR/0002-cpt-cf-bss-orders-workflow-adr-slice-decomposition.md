@@ -82,7 +82,7 @@ Chosen option: **nine slice documents numbered by implementation build order**, 
 | 10 | `09-read-and-authz` | reads, the PDP catalogue including `process_step × execute`, control operations over the platform invocation API; no step operations | 10, 01–08 |
 
 > **Amended 2026-09-26 by D-139** (`DECISIONS.md`): the table above ordered `10` before `01`
-> and `06` before the `07` and `08` ports it calls, and hid three cycles. The build order is now
+> and `06` before the `07` and `08` ports it calls, and hid four cycles. The build order is now
 > **01, 10, 02, 03, 04, 05, 07, 08, 06, 09**, derived from in-process calls, port calls and table
 > reads, never from the definition's calls: `01` first, because the definition calls nothing but
 > operations registered under its contract; `07` and `08` before `06`, because `06` calls slice
@@ -94,10 +94,21 @@ Chosen option: **nine slice documents numbered by implementation build order**, 
 > slice earlier in the build order" holds for every edge except a stated back-edge.
 > `design/README.md` carries the table and the back-edges; the slice file names and ids are
 > unchanged.
+>
+> **Amended 2026-09-26 by D-139 (as amended)**: the four cycles above are `06`↔`07`, `06`↔`09`,
+> `07`↔`09` and `08`↔`09` (the block first said three), and the foundation adds four more, because its workers and `terminate-instance` call slices `05`, `06`, `07` and `08`
+> in-process (`design/01-foundation.md` §3.3, §3.8). Those calls are `01`'s back-edges, built
+> against doubles like the others, so eight pairs are stated in `design/README.md`.
 
 ### Confirmation
 
 Confirmed by a documentation-structure check that `design/README.md`'s slice table matches this ADR's nine slugs and order exactly, and by a dependency-direction review confirming no slice document declares a dependency on a higher-numbered slice.
+
+> **Amended 2026-09-26 by D-139**: the structure check compares `design/README.md`'s table with
+> **ten** documents (the nine slices and `10-process-definition`) in the build order of the block
+> above, and the dependency-direction review confirms that no document declares a dependency on
+> a document later in that order **except a back-edge the README states**, each of which must be
+> built against a double of the later document's port.
 
 ## Pros and Cons of the Options
 

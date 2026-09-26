@@ -1211,9 +1211,11 @@ table check is a check of the same shape over the routing table and the operatio
 3. [ ] - `p1` - **Enforcement tests.** A denied decision leaves business state, the producer queue, the idempotency registry and every request row unchanged; a missing constraint on a scoped path fails closed; a PDP timeout returns the sanitized 503 without settling a key; a step call whose `resource_tenant_id` disagrees with the bound instance is refused; on PostgreSQL, a mutating operation raced against a `seller_tenant_id` change affects zero rows and returns `not-found` - `inst-cc-enforcement`
 
 The compiled catalogue changes only with a deployment, so a change to the authorization surface is
-a reviewed code change and a redeploy, recorded in `owf_audit_entry` at first start under the
-gear's deployment marker rather than as a policy row — the same audited load the operation
-registry performs (`01 §3.7` `owf_step_operation`). The former declaration of subscribed broker
+a reviewed code change and a redeploy, recorded at first start as one `owf_configuration_revision`
+row of kind `authorization-catalogue` carrying the catalogue pairs and the Orders release, when
+they differ from the latest recorded ones, rather than as a policy row — the same recorded load
+the operation registry performs ([`01 §3.7`](./01-foundation.md#table-owf_configuration_revision),
+decision D-160). It cannot be an `owf_audit_entry`, which belongs to one process instance's chain. The former declaration of subscribed broker
 topics per handler is **retired** with the handlers: this gear subscribes to no topic, and the
 `listen` targets a definition may use are the closed set `10 §2.2` validates before publish.
 
