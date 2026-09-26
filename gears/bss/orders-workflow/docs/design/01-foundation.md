@@ -944,11 +944,15 @@ this table is the index the validation hook of `10 §2.2` and the envelope's cou
 | `report-outcome` (06) | `round` → `nextRound` | step `…:report-outcome:{round}`; Lifecycle `…:{trigger}:{round}` |
 | `resolve-manual-task` `sla-check` (07) | `slaRound` → `slaRound` | `…:resolve-manual-task:sla:{slaRound}` |
 | `raise-overdue-escalation` `overdue-fulfillment` (07) | `round` → `nextRound` | `…:raise-overdue-escalation:overdue-fulfillment:{orderVersion}:-:{round}` |
+| `raise-overdue-escalation` `lifetime-ceiling` (07) | `round` → `nextRound`, the definition's `ceilingRound`: each ceiling of one instance is a new round (D-121) | `…:raise-overdue-escalation:lifetime-ceiling:{orderVersion}:-:{round}` |
 
 `construct-and-freeze-plan` (04) carries only an `attempt`, because it is re-entered only by a
 plan-level task's retry. The other operations are called once per subject, or are keyed by the
 event or request that triggered them (`admit-trigger`, `apply-hold`, `apply-resume`,
-`record-decision`, `authorize-cancel`, `run-cancellation-fence`), and carry no round.
+`record-decision`, `authorize-cancel`, `run-cancellation-fence`), and carry no round. `park` and
+`unpark` are keyed by their subject, which is itself unique per park — a verdict park's `parkRef`,
+or `ceiling:{round}` for the lifetime-ceiling park of that ceiling round — and carry neither a
+round nor an attempt, because no manual-task retry re-enters them.
 
 #### The foundation's own operations
 
@@ -1039,12 +1043,12 @@ The re-dispatch itself is the definition's resume arm (`10 §3.6` (c)).
 | Field | `park` | `unpark` |
 |-------|--------|----------|
 | `protection` | `composable` | `composable` |
-| `input` | `correlationId`, `parkReason` (the closed park reasons of [`03 §3.7`](./03-approval-execution.md#37-database-schemas--tables), the fail-closed park of `cpt-cf-bss-orders-workflow-adr-fail-closed-verdict-park` as amended, or `lifetime-ceiling`), `subjectRef`, `attemptId` | `correlationId`, `subjectRef`, `attemptId` |
+| `input` | `correlationId`, `parkReason` (the closed park reasons of [`03 §3.7`](./03-approval-execution.md#37-database-schemas--tables), the fail-closed park of `cpt-cf-bss-orders-workflow-adr-fail-closed-verdict-park` as amended, or `lifetime-ceiling`), `subjectRef` (the verdict park's `parkRef`, or `ceiling:{round}` with the `round` the ceiling's `raise-overdue-escalation` was called under), `attemptId` | `correlationId`, `subjectRef` (as for `park`), `attemptId` |
 | `output` | `phase = parked`, `rowVersion` | `phase` = the pre-park phase (`started`, or `suspended` while the hold flag `suspended` is set), `rowVersion` |
-| `idempotency_key` | `{tenant}:{correlationId}:park:{subjectRef}:{attempt}` | `{tenant}:{correlationId}:unpark:{subjectRef}:{attempt}` |
+| `idempotency_key` | `{tenant}:{correlationId}:park:{subjectRef}` — one key per park, because the subject is unique per park (D-121) | `{tenant}:{correlationId}:unpark:{subjectRef}` |
 | `declared_event` | none | none |
 | `compensation` | `unpark` | none |
-| `reasons` | `version-mismatch` | `version-mismatch` |
+| `reasons` | `version-mismatch` | `version-mismatch`, `not-found` (a `ceiling:{round}` subject with no recorded operator retry, below) |
 | `audit_kind` | `phase-transition` | `phase-transition` |
 | `retry_class` | `retryable-on: transient` | `retryable-on: transient` |
 | `deadline` | 5 s | 5 s |
@@ -1054,7 +1058,13 @@ Effect: the `started → parked` and `parked → started` transitions of §3.7 �
 because the hold flag is still set — recorded as the phase projection. `unpark` restores the
 pre-park phase from the `suspended` flag and never clears the flag, which only `apply-resume`
 does (slice 08). Whether a verdict is obtainable, and when to try again, is the definition's park arm
-(`10 §3.6` (a)); Orders records the park and its reason.
+(`10 §3.6` (a)); Orders records the park and its reason. **An unpark of a lifetime-ceiling park
+needs a recorded cause** (decision D-122, following `run-cancellation-fence`'s
+`inst-fence-cause`, D-106): `unpark` with a `ceiling:{round}` subject **MUST** refuse `not-found`
+unless the `lifetime-ceiling-reached` task that round's `raise-overdue-escalation` opened is
+resolved `retry` by `resolve-manual-task` — which applies only a request row the task route wrote
+under the operator's authorization (`07 §4.6`) — so no signal Orders did not record can release a
+ceiling park.
 
 ##### `terminate-instance`
 
@@ -1359,8 +1369,11 @@ and resumable by an operator, a park is the fail-closed consequence of an unobta
 an exhausted lifetime ceiling and clears only when an operation records that it may. There is no
 `suspended → terminated` edge: every unwind from a hold passes `compensating` (decision D-82: the lifetime-ceiling park is permitted from `suspended` and leaves the suspension
 open; a parked instance is unwound only through the fence). There is no `compensating → parked`
-edge: a lifetime ceiling that fires during an unwind does not park, and the unwind continues under
-the fresh ceiling of the re-entered `lifetime` fork (`10 §3.6` (a)). After an `unpark` from a
+edge: a lifetime ceiling that fires anywhere inside an unwind does not park, and the unwind
+continues under the fresh ceiling of the re-entered `lifetime` fork (`10 §3.6` (a)). There is no
+`parked → parked` edge either: a ceiling that fires during the verdict park loop does not park
+again, and the verdict park keeps its own escalation and its three routes out (`03 §4.1`,
+decision D-121). After an `unpark` from a
 lifetime-ceiling park the process resumes the stage and checkpoint the ceiling interrupted, under a
 fresh `P90D` ceiling (`10 §3.6` (d)). No transition leaves `terminated`. **The projection never drives the definition**: no task reads `phase` to
 choose a branch; the definition's own state does that, and the projection exists so an operator

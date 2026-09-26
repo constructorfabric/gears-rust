@@ -815,13 +815,16 @@ REQUIRES `Idempotency-Key` `{tenant}:{taskId}:{action}:{rowVersion}`, and its `r
 and `cancel` routes record `owf_task_resolution_request` and signal `task-resolution-requested`
 while `assign` and `escalate` apply in-process (`07 §3.3`).
 
-**Signals with no registered origin route.** `10 §3.3` and `10 §3.6` (d) name two further
-operator signals, `reauthorize-requested` (payment re-authorisation, slice 04) and
-`unpark-requested` (after a lifetime-ceiling park). Neither has a route in this design set, so
-neither can be delivered by an authorized control operation today, and §2.1's exhaustiveness rule
-forbids delivering one from anywhere else (open question Q-13: the origin
-routes and catalogue pairs for `reauthorize-requested` and `unpark-requested`, or their removal
-from the canonical definition).
+**Signals with no registered origin route.** `10 §3.3` names two further operator signals,
+`reauthorize-requested` (payment re-authorisation, slice 04) and `unpark-requested` (after a
+lifetime-ceiling park). Neither has a route in this design set, so Orders never delivers either,
+and §2.1's exhaustiveness rule forbids Orders to deliver one from anywhere else. That rule binds
+only Orders: `:plugin-control` is authorized platform-side (`../ADR/0010`), so another
+platform-authorized caller could deliver either. The canonical definition therefore has no
+`unpark-requested` arm, and `unpark` of a ceiling park refuses without a recorded operator retry
+of the ceiling's task (`01 §3.3`, decision D-122); the `reauthorize-requested` arm only triggers an
+early re-read of Payments (open question Q-13: the origin routes and catalogue pairs for both
+signals, or the removal of `reauthorize-requested` too).
 
 Every list response carries `items`, `next_cursor` (null on the last page) and the effective
 `limit` actually applied, so a caller can tell a clamped page from a short one. Refusals on all
@@ -1185,7 +1188,7 @@ refused`); `(correlation_id, delivery_state)` indexed for the projection and the
 (`cpt-cf-bss-orders-workflow-component-control-operation-gateway`); `delivery_state` advanced
 only through the gateway's **request-delivery port** — the signal delivery of `10 §3.2` reports
 `delivered` or `delivery-failed` through it and never writes the row itself — and, with
-`last_recheck_point`, by slice 08's cancel-authority port inside `authorize-cancel` and `compensate-order` through the envelope; `authorize-cancel` also marks the request `refused` when it answers `preFulfillment` (`08 §3.6`).
+`last_recheck_point`, through the same port by slice 08's cancel-authority port inside `authorize-cancel` and `compensate-order` (`record_consumed`, `record_refused` with its catalogue reason, `record_recheck` with the point), which never writes the row itself either; `authorize-cancel` also marks the request `refused` through it when it answers `preFulfillment` (`08 §3.6`). The request-delivery port is therefore the one write path to these three columns (`DESIGN.md` §3.7 *sole writer*).
 **Mutability**: declared mutable in the three columns above, append-only otherwise. **Tenant
 axes**: all three. **Retention**: ≥ 400 days — it is the evidence of who asked for a destructive
 command and under what authority — never ahead of the audit entry that names it. It never crosses

@@ -527,6 +527,16 @@ null, and applies the answer: a terminal confirmation or failure to the intent r
 key of the call that dispatched the intent is `in_flight` with a dead lease, it settles that key
 only through `settle-from-lookup` (`01 §3.3`), in-process, naming the record's `lease_holder`.
 
+It hands every failure and floor trip to the definition exactly once, whichever driver recorded
+it: an intent recorded `failed` or `unresolved` carries `handed_off_at` null until a
+definition-called round lists it, so a trip the worker recorded in-process reaches `failed[]` or
+`unresolved[]` of the next definition-called round (`inst-ri-handoff`, decision D-125). It also
+owns the **deferral port** `take_deferred_failures(correlationId)`, the one door through which
+slice 08's `apply-resume` takes the failures recorded as deferred during a hold: in the caller's
+unit of work it returns them in observation order, clears `deferred_failure_reason` and
+`deferred_observed_at`, and stamps `handed_off_at`, because `apply-resume` hands them to the
+definition in its `failedTaskRefs[]` (`08 §3.6` `inst-ar-deferred`).
+
 ##### Responsibility boundaries
 
 Never resubmits: it only re-reads. The one exception is the hand-back of a never-dispatched intent
@@ -677,7 +687,7 @@ operation's round. Every step key is recomposed server-side from the body
 | Field | Value |
 |-------|-------|
 | `protection` | `composable` — the sweep's unit; also run in-process by the `reconciliation-sweep` worker, which is the schedule (§3.8) |
-| `input` | `ref`, `lineRef` (nullable), `wave` (`wave1_create` · `wave2_activate`, nullable), `sweepRound`. With `lineRef`, reads that line's non-terminal intents now, whatever their rung (a confirmation hint); without, reads the instance's intents whose `next_sweep_at` is due |
+| `input` | `ref`, `lineRef` (nullable), `wave` (`wave1_create` · `wave2_activate`, nullable), `sweepRound`. With `lineRef`, reads that line's non-terminal intents now, whatever their rung (a confirmation hint); without, reads the instance's intents whose `next_sweep_at` is due. Either way, a definition-called round also lists every failure or floor trip of the instance not yet handed to the definition (`inst-ri-handoff`) |
 | `output` | `settled[]`, `failed[]` (lineRef + reason code), `unresolved[]`, `redispatch[]` (lineRef + wave: never-sent rows inside the key lifetime), `pending[]` (all lineRef), `unmatched` (boolean), `nextSweepRound` |
 | `idempotency_key` | instance-scoped: `{tenant}:{correlationId}:reconcile-intent:{sweepRound}`; the worker's in-process run is not a step call and carries no step key — its settlements are keyed by `settle-from-lookup`'s own family |
 | `declared_event` | `OrderFulfillmentStepCompleted`, once per line whose task reaches a terminal state in the unit of work |
@@ -803,7 +813,7 @@ draft-create acceptance.
 6. [ ] - `p1` - **IF** `dispatch-wave2-activate`: for each admitted line, immediately before its row is written and its activation submitted, run the Draft-Liveness Re-reader; `lapsed` → record the line's draft row `lapsed`, send nothing for the line and add it to `lapsed[]`; unevaluable → send nothing further and answer the canonical 503 for the call after settling what was already submitted (fail-closed) - `inst-pi-reread-gate`
 7. [ ] - `p1` - Per admitted line, commit the pre-dispatch unit of work: one `owf_provisioning_intent` row at `status = submitted`, `transition_request_id` null, with intent key, envelope, `attempt_id`, `step_idempotency_key` and the ladder of §4.2 initialised; a line whose existing row carries `not_found_at` (§4.4) reuses that row and clears the marker - `inst-pi-pre-dispatch`
 8. [ ] - `p1` - Submit to Subscriptions with the effective deadline propagated; at most 8 of the order's intents in flight at once; on a throttle signal stop submitting, defer the rest with `deferReason = throttle` and `retryAfterMs = min(hint, 60 s)` - `inst-pi-submit`
-9. [ ] - `p1` - In the settlement unit of work: record acceptance (`transition_request_id`, `accepted_at`, `execution_seq` from the per-order sequence); apply a synchronous refusal to the intent (`failed`) and, through 04's rule, to the task, enqueuing `OrderFulfillmentStepCompleted`; on a client-side timeout leave the row `submitted` for the sweep — never infer success - `inst-pi-settle`
+9. [ ] - `p1` - In the settlement unit of work: record acceptance (`transition_request_id`, `accepted_at`, `execution_seq` from the per-order sequence); apply a synchronous refusal to the intent (`failed`, with `handed_off_at` stamped, because this call's `failed[]` lists it, D-125) and, through 04's rule, to the task, enqueuing `OrderFulfillmentStepCompleted`; on a client-side timeout leave the row `submitted` for the sweep — never infer success - `inst-pi-settle`
 10. [ ] - `p1` - **RETURN** the lists of §3.3 and `nextDispatchRound` - `inst-pi-return`
 
 #### Wave-1 Rebuild on Auto-Voided Draft
@@ -900,7 +910,8 @@ requirement.
 5. [ ] - `p1` - **IF** not found: apply the never-dispatched branch of §4.4 - `inst-ri-not-found`
 6. [ ] - `p1` - **IF** still non-terminal: advance `sweep_tier`, `sweep_reads`, `next_sweep_at` on the ladder of §4.2; at the floor set `status = unresolved`, `next_sweep_at` null, and report the line in `unresolved[]` - `inst-ri-ladder`
 7. [ ] - `p1` - **IF** the step key recorded for the dispatching call is `in_flight` with a dead lease, call `settle-from-lookup` in-process with the record's `lease_holder` and the looked-up outcome (`success` once every intent row that attempt wrote has a known downstream state, `absent` when none was sent, `non-terminal` otherwise). For a dispatch key settled `success`, the step record `settle-from-lookup` writes carries the dispatch operation's output built from Orders' record: every row carrying that `step_idempotency_key`, listed by its recorded state as `inst-pi-skip-existing` reports it (`accepted[]`, `activated[]`, `failed[]`, `lapsed[]`, and for wave 2 `pending[]` over the whole plan), an empty `deferred[]`, and `nextDispatchRound` = the key's round plus one, so the definition's same-key re-issue receives a complete answer. A line the crashed attempt never wrote is in none of those lists and needs none: it is still `pending` with no row, so the next `evaluate-activation-eligibility` names it in `undispatchedLineRefs` (wave 1, `04 §3.6`), or it is still `draft_created` and eligible (wave 2), and the next dispatch sends it (decision D-119) - `inst-ri-settle-key`
-8. [ ] - `p1` - Write the `sweep` audit entry for the read - `inst-ri-audit`
+8. [ ] - `p1` - **IF** the call is a definition-called round (never the worker's in-process run): add to `failed[]` every forward intent (`draft_create`, `activation`) of the instance recorded `failed` whose `handed_off_at` is null — with the reason its recording read derived (`never-dispatched` for a never-sent row past the key lifetime, §4.4, else `wave1-create-failed` or `wave2-activation-failed` by the row's wave) — and to `unresolved[]` every forward intent recorded `unresolved` whose `handed_off_at` is null, excluding a failure recorded as deferred (`inst-ri-terminal`), which `apply-resume` hands off; stamp `handed_off_at` on every intent this round lists, including the ones steps 3 and 6 listed, in this round's settlement. These are the worker's in-process trips and failures, and a re-armed `unresolved` row the worker read to the floor again; the stored output replays them, and no later round lists them again (decision D-125) - `inst-ri-handoff`
+9. [ ] - `p1` - Write the `sweep` audit entry for the read - `inst-ri-audit`
 
 **Caller-Side Duplicate Protocol** (applied per line inside the dispatch operations, conforming to
 `01 §4.5`): on a client-side timeout of a submit that may have been accepted, the row stays
@@ -958,7 +969,8 @@ by row locks, not an in-memory controller). It writes no `owf_durable_timer` row
 | `next_sweep_at` | timestamptz nullable | Next scheduled read — **the sweep's schedule**; null once terminal or `unresolved`. |
 | `key_expires_at` | timestamptz | `created_at` + 30 days; after it the sweep is read-only for this intent. |
 | `not_found_at` | timestamptz nullable | Set by `reconcile-intent` when the status read answers "no such transition request" inside the key lifetime; tells the next dispatch round to send this never-sent row under its unchanged key (§4.4); cleared by that send. |
-| `deferred_failure_reason` | text nullable | A catalogue reason (`wave1-create-failed` or `wave2-activation-failed`) for a terminal failure `reconcile-intent` read while the instance was suspended; the task is not advanced. Applied and cleared by `apply-resume` (slice 08) in its settlement transaction. |
+| `deferred_failure_reason` | text nullable | A catalogue reason (`wave1-create-failed` or `wave2-activation-failed`) for a terminal failure `reconcile-intent` read while the instance was suspended; the task is not advanced. Taken and cleared through this slice's deferral port by `apply-resume` (slice 08), in its settlement transaction. |
+| `handed_off_at` | timestamptz nullable | Database time a definition-called `reconcile-intent` round, a dispatch operation listing its synchronous refusal in its own `failed[]`, or `apply-resume` through the deferral port first listed this forward intent's failure or floor trip to the definition; null while a `failed` or `unresolved` status has not reached it — the worker's in-process run never sets it (`inst-ri-handoff`, D-125). Cleared when an operator's retry re-arms an `unresolved` row. |
 | `deferred_observed_at` | timestamptz nullable | Database time the deferred failure was read; `apply-resume` applies deferred failures in this order. NOT NULL exactly when `deferred_failure_reason` is. |
 | `created_at` | timestamptz | Row creation; the retention index's column. |
 
@@ -987,8 +999,8 @@ row. `status`, `subscription_id` and the sweep columns are written only by `reco
 a synchronous refusal's `failed`, written by the dispatcher. `wave_attempt` of a new row is read
 from the task row's attempt for the wave (`04 §3.7`), which `rebuild-wave1` and an operator's line
 retry of a `failed` intent mint. The one other writer is that retry (`07 §3.6` `inst-rmt-retry`)
-on an `unresolved` row: it sets `status = submitted` and `next_sweep_at` to now, on the same row
-and key, so the worker re-reads the intent once — the on-demand read of §4.2 — and nothing is
+on an `unresolved` row: it sets `status = submitted`, `next_sweep_at` to now and `handed_off_at`
+to null, on the same row and key, so the worker re-reads the intent once — the on-demand read of §4.2 — and nothing is
 resubmitted. No other component writes this table.
 
 **Mutability**: deliberately **mutable** — `status`, the acceptance columns, `subscription_id` and
@@ -1263,9 +1275,12 @@ slice operations (D-80, D-81).
    from `evaluate-activation-eligibility` **MUST** route to `dispatch-wave1-create` before any
    other answer of the evaluation is acted on — the route an operator's wave-1 retry and a line a
    crashed dispatch never wrote come back through (D-119). A line is listed in `failed[]` or
-   `unresolved[]` only by the round whose settlement records that failure — an already-terminal
-   intent read again (`inst-ri-lock`) is not listed again — so routing failures first never
-   starves `redispatch[]`. The poll arm **MUST NOT** discard `reconcile-intent`'s output †.
+   `unresolved[]` exactly once — by the round whose settlement records that failure or, when the
+   worker recorded it in-process, by the next definition-called round (`inst-ri-handoff`,
+   D-125); an intent already handed off and read again (`inst-ri-lock`) is not listed again — so
+   routing failures first never starves `redispatch[]`. A worker trip that lands while the
+   definition waits outside the barrier loop (in `awaitResolution` under the remediation hold) is
+   listed when the definition next polls. The poll arm **MUST NOT** discard `reconcile-intent`'s output †.
 7. **Confirmation arm.** The `listen` on the Subscriptions outcome events **MUST** export only the
    line reference and wave and **MUST** call `reconcile-intent` with them before re-entering
    `evaluate` †; `$context` **MUST NOT** hold any other member of the event.

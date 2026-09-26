@@ -82,7 +82,7 @@ Lifecycle `submitted` TTL can expire the order out from under it.
 |-------------|------------------|
 | `cpt-cf-bss-orders-workflow-fr-owf-approval-request` | §3.3 `obtain-verdict`, `reflect-verdict`, `open-gates`; verdict cached per `orderId`+`orderVersion`, authoritative once present, reflected from the stored row and never re-reflected |
 | `cpt-cf-bss-orders-workflow-fr-owf-approval-idempotency` | §3.1 `OrderApprovalRequest` with idempotency key `orderId`+`orderVersion`+`gateId`, submitted through the envelope's idempotency registry ([`01 §4.3`](./01-foundation.md#43-the-idempotency-registrys-non-success-outcomes-are-exhaustive)) inside `open-gates` |
-| `cpt-cf-bss-orders-workflow-fr-owf-approval-escalation` | The escalation window is Orders' stored deadline, re-checked by the definition's `PT5M` `waitEscalation` tick in the `gateLoop` fork (`10 §3.6` (a)); `open-gates` arms it, `escalate-gate` answers `due` on it and probes the service, slice 08's `apply-hold`/`apply-resume` pause and re-arm it through this slice's gate-window port (§3.2); the remainder is recorded on `owf_approval_gate` |
+| `cpt-cf-bss-orders-workflow-fr-owf-approval-escalation` | The escalation window is Orders' stored deadline, re-checked on every `PT30S` `waitProbe` tick of the `gateLoop` fork, before the probe (`10 §3.6` (a), D-123); `open-gates` arms it, `escalate-gate` answers `due` on it and probes the service, slice 08's `apply-hold`/`apply-resume` pause and re-arm it through this slice's gate-window port (§3.2); the remainder is recorded on `owf_approval_gate` |
 | `cpt-cf-bss-orders-workflow-fr-owf-approval-decision` | §3.3 `record-decision` (`protected`) then `reflect-verdict` with `stage = gate-outcome`; idempotent Lifecycle call on the `approval-reflection` seam |
 | `cpt-cf-bss-orders-workflow-fr-owf-approver-inbox` | §3.2 Approver Inbox Projection; §3.3 inbox read and decision endpoints scoped to assigned gates |
 
@@ -90,7 +90,7 @@ Lifecycle `submitted` TTL can expire the order out from under it.
 
 | NFR ID | NFR Summary | Allocated To | Design Response | Verification Approach |
 |--------|-------------|--------------|-----------------|----------------------|
-| `cpt-cf-bss-orders-workflow-nfr-owf-escalation-timer` | Escalation timers configurable per gate, default 72h, ±5 min accuracy, durable across restarts | The definition's escalation `wait` (plugin durable timer, `10 §2`); `open-gates`, `escalate-gate` and the gate-window port for the record | The fire instant is the first `waitEscalation` tick (a plugin durable timer of fixed `PT5M` granularity, `10 §3.6` *Fixed waits and re-check loops*) at which `escalate-gate` answers `due`, so its lateness is at most one tick plus one call; the timer survives worker restart by the plugin's own history ([`01 §4.4`](./01-foundation.md#44-timers-and-retry-policy-are-the-definitions)); the window, the remainder at pause and the arm instant are columns on `owf_approval_gate`, so every re-base of the deadline after a hold or an outage uses `window_remaining_ms` rather than restarting the window from zero | Timer-fire latency measured against `window_armed_at + window_remaining_ms` in the escalation suite; worker-kill test asserts no escalation is lost or recorded twice (the second `escalate-gate` under the same key is absorbed); pause/resume test asserts the returned remainder is honoured, not reset; two-party test asserts each gate's window is recorded independently |
+| `cpt-cf-bss-orders-workflow-nfr-owf-escalation-timer` | Escalation timers configurable per gate, default 72h, ±5 min accuracy, durable across restarts | The definition's escalation `wait` (plugin durable timer, `10 §2`); `open-gates`, `escalate-gate` and the gate-window port for the record | The fire instant is the first `waitProbe` tick (a plugin durable timer of fixed `PT30S` granularity, `10 §3.6` *Fixed waits and re-check loops*) at which `escalate-gate` `mode: fire` answers `due`, so its lateness is at most one tick plus one call — 30 s plus the 3-minute `step` timeout, inside ± 5 min (D-123); the timer survives worker restart by the plugin's own history ([`01 §4.4`](./01-foundation.md#44-timers-and-retry-policy-are-the-definitions)); the window, the remainder at pause and the arm instant are columns on `owf_approval_gate`, so every re-base of the deadline after a hold or an outage uses `window_remaining_ms` rather than restarting the window from zero | Timer-fire latency measured against `window_armed_at + window_remaining_ms` in the escalation suite; worker-kill test asserts no escalation is lost or recorded twice (the second `escalate-gate` under the same key is absorbed); pause/resume test asserts the returned remainder is honoured, not reset; two-party test asserts each gate's window is recorded independently |
 
 #### Key ADRs
 
@@ -190,7 +190,9 @@ force-approve, no force-verdict and no manual un-park operation, and `unpark` on
 is legal only after `obtain-verdict` has returned a verdict (§4.5). A parked process leaves
 `parked` by exactly three routes: the verdict becomes obtainable and the retry succeeds, a
 terminal Lifecycle event (typically `OrderExpired` at the `submitted` TTL) terminates the
-instance, or a workflow-mediated cancel (`authorize-cancel`, slice 08) takes the cancel path.
+instance, or a workflow-mediated cancel (`authorize-cancel`, slice 08) takes the cancel path. The
+lifetime ceiling adds no fourth route: a ceiling that fires in the park loop does not park again
+and calls no `unpark` (`10 §3.6` (a), decision D-121).
 Granting an operator an in-band override here would make this gear the deciding authority for a
 policy question §2.1 says it never decides. The absence is stated rather than left implicit
 because an undocumented absence does not remove the pressure — it relocates it to an out-of-band
@@ -603,7 +605,7 @@ calls a downstream, 5 s for a record-only one.
 | `open-gates` | `composable` | ref + `position` (0 on first entry, else `record-decision`'s `nextPosition`) | `gateRefs[]`, `position`, `escalationRound = 0` | step: instance-scoped `{tenant}:{correlationId}:open-gates:{orderVersion}:{position}`; downstream: approval-request `{tenant}:{orderId}:{orderVersion}:{gateId}` per gate | `OrderApprovalRequested`, one per gate opened in the settlement transaction | none — gates are closed by the closure port, not by an undo | `circuit-breaker-open`, `per-attempt-timeout`, `idempotency-key-conflict`, `version-mismatch` | `step-completion` | `retryable-on: transient` | 10 s |
 | `record-decision` | `protected` | ref + `gateRef`, `decisionEventId`, `outcome` ∈ `approved` · `rejected` | `applied` (boolean), `gateState` ∈ `approved` · `rejected` · `next-position` · `pending`, `nextPosition` (on `next-position`) | instance-scoped `{tenant}:{correlationId}:record-decision:{gateRef}:{decisionEventId}` | none | none | `gate-not-open`, `submitter-barred` (both recorded refusals, §4.4), `not-found`, `circuit-breaker-open`, `idempotency-key-conflict`, `version-mismatch` | `step-completion` | `retryable-on: transient` | 10 s |
 | `arm-park-escalation` | `composable` | ref + `parkRef`, `round` (0 on the park's first check, else the previous `nextRound`) | `due: true\|false` — database time against the park row's stored `escalation_due_at`, the answer the definition's re-check loop switches on (`10 §3.6` (a)), and `false` once the park has escalated; `nextRound`. Every answer is a settled success of its round, so the next re-check runs under the next key ([`01 §3.3` *Rounds and attempts*](./01-foundation.md#rounds-and-attempts-the-one-rule-for-re-invokable-operations)) | instance-scoped `{tenant}:{correlationId}:arm-park-escalation:{parkRef}:{round}` | none | none | `not-found`, `version-mismatch` | `step-completion` | `retryable-on: transient` | 5 s |
-| `escalate-gate` | `composable` | ref + `position`, `mode` ∈ `fire` · `probe`, `round` (the `escalationRound` or `probeRound` last returned) | `due: true\|false` — database time against the stored deadline (`fire`: the gate's escalation deadline, never due while a `pause_causes` member is set; `probe` on `outage`: the outage-threshold deadline), the answer the definition's re-check loop switches on (`10 §3.6` (a)); `fire` with `due: false` escalates nothing and is a settled success of its round; every answer returns the next round ([`01 §3.3` *Rounds and attempts*](./01-foundation.md#rounds-and-attempts-the-one-rule-for-re-invokable-operations)) — `fire`: `escalationRound`; `probe`: `serviceState` ∈ `available` · `outage`, `probeRound`. The definition reads only `due` and `serviceState` (and the round it passes back); no remaining duration is returned | instance-scoped `{tenant}:{correlationId}:escalate-gate:{orderVersion}:{position}:{mode}:{round}` | `OrderApprovalEscalated` per gate escalated (`fire` only) | none | `gate-not-open`, `per-attempt-timeout` (the escalation command's delivery, retried under the same key), `version-mismatch`; an open breaker is an answer, never a refusal (§3.6 `inst-eg-fire-outage`) | `escalation` (`fire`); `step-completion` (`probe`) | `retryable-on: transient` | 10 s |
+| `escalate-gate` | `composable` | ref + `position`, `mode` ∈ `fire` · `probe`, `round` (the `escalationRound` or `probeRound` last returned) | `due: true\|false` — database time against the stored deadline (`fire`: the gate's escalation deadline, never due while a `pause_causes` member is set; `probe` on `outage`: the outage-threshold deadline); the outage arm switches on the `probe` answer, while a `fire` escalates inside the operation and the definition routes nothing on its `due`, calling the probe next on the same tick (`10 §3.6` (a), D-123); `fire` with `due: false` escalates nothing and is a settled success of its round; every answer returns the next round ([`01 §3.3` *Rounds and attempts*](./01-foundation.md#rounds-and-attempts-the-one-rule-for-re-invokable-operations)) — `fire`: `escalationRound`; `probe`: `serviceState` ∈ `available` · `outage`, `probeRound`. The definition reads only `due` and `serviceState` (and the round it passes back); no remaining duration is returned | instance-scoped `{tenant}:{correlationId}:escalate-gate:{orderVersion}:{position}:{mode}:{round}` | `OrderApprovalEscalated` per gate escalated (`fire` only) | none | `gate-not-open`, `per-attempt-timeout` (the escalation command's delivery, retried under the same key), `version-mismatch`; an open breaker is an answer, never a refusal (§3.6 `inst-eg-fire-outage`) | `escalation` (`fire`); `step-completion` (`probe`) | `retryable-on: transient` | 10 s |
 
 `arm-park-escalation` and `escalate-gate` are `composable`: a definition version may reposition
 them inside the verdict stage, but the constraints of §4.5 still bind any version that contains
@@ -773,7 +775,7 @@ sequenceDiagram
     end
     OG ->> OG: enqueue OrderApprovalRequested per gate (settlement transaction)
     OG -->> D: gateRefs[], position, escalationRound 0
-    D ->> D: gateLoop fork: decision listen × escalation wait × probe × hold × amendment × cancel
+    D ->> D: gateLoop fork: decision listen × PT30S tick (fire re-check, then probe) × hold × amendment × cancel
 ```
 
 **Algorithm: `open-gates`**
@@ -806,28 +808,26 @@ sequenceDiagram
     participant D as Definition gateLoop
     participant EG as escalate-gate
     participant R as Record (gate windows)
-    par escalation branch
-        loop every PT5M (waitEscalation) while due is false
-            D ->> EG: escalate-gate (fire, position, escalationRound)
+    loop every PT30S (waitProbe): the escalation re-check, then the probe
+        D ->> EG: escalate-gate (fire, position, escalationRound)
+        alt no gate's window elapsed
             EG -->> D: due false, next escalationRound (nothing recorded; a settled round)
+        else a window elapsed
+            EG ->> R: gates whose window elapsed: escalated_at, re-arm window
+            EG ->> EG: OrderApprovalEscalated per gate; escalation command (breaker closed)
+            EG -->> D: due true, next escalationRound
         end
-        EG ->> R: gates whose window elapsed: escalated_at, re-arm window
-        EG ->> EG: OrderApprovalEscalated per gate; escalation command (breaker closed)
-        EG -->> D: due true, next escalationRound
-    and probe branch
-        loop every 30 s
-            D ->> EG: escalate-gate (probe, position, probeRound)
-            EG ->> EG: liveness probe through the breaker
-            EG -->> D: serviceState available, next probeRound (no change)
-        end
-        EG ->> R: breaker open: add approval-outage to pause_causes, capture remainder, outage_since
-        EG -->> D: serviceState outage, due (outage_since + threshold), next probeRound
+        D ->> EG: escalate-gate (probe, position, probeRound)
+        EG ->> EG: liveness probe through the breaker
+        EG -->> D: serviceState available, next probeRound (no change)
     end
+    EG ->> R: breaker open: add approval-outage to pause_causes, capture remainder, outage_since
+    EG -->> D: serviceState outage, due (outage_since + threshold), next probeRound
     D ->> D: outage arm: PT30S probe until available (due on outage: the threshold) → raise-overdue-escalation (approval-outage) once × hold × cancel
     D ->> EG: escalate-gate (probe) finds available
     EG ->> R: remove approval-outage, clear outage_since; re-base the deadline if no cause remains
     EG -->> D: serviceState available, next probeRound
-    D ->> D: re-enter gateLoop; the next PT5M tick re-checks the re-based deadline
+    D ->> D: re-enter gateLoop; the next PT30S tick re-checks the re-based deadline
 ```
 
 **Description**: The outage is detected by the probe branch, not by the escalation fire — that
@@ -1428,7 +1428,7 @@ that violates any of them **MUST** be refused.
 1. [ ] - `p1` - **Order.** `obtain-verdict` **<** `reflect-verdict` (`stage = requirement`) **<** `open-gates`; `record-decision` **<** `reflect-verdict` (`stage = gate-outcome`) on the decision path; `reflect-verdict` (`gate-outcome`) **<** `terminate-instance` on the rejected path and **<** the fulfillment stage on the approved path - `inst-c3-order`
 2. [ ] - `p1` - **Fail-closed routing.** The verdict class `unobtainable` **MUST** route only to the park arm (`park`, `arm-park-escalation`, the park loop); no branch **MAY** route it to `reflect-verdict`, `open-gates` or the fulfillment stage, and `unpark` on the verdict path **MUST** be reachable only after an `obtain-verdict` that answered `required` or `not-required` - `inst-c3-fail-closed`
 3. [ ] - `p1` - **No swallowing.** `obtain-verdict`, `reflect-verdict` and `record-decision` **MUST NOT** be inside a `catch` that continues the forward path (`10 §4.6`); a `permanent-failure` of `reflect-verdict` **MUST** reach `create-manual-task` (slice 07) and then an arm that waits on the amendment, terminal-event and cancel `listen`s, because the order state that refused the reflection is a commercial fact only a human or a Lifecycle event resolves - `inst-c3-no-swallow`
-4. [ ] - `p1` - **The escalation fork.** The escalation `wait` **MUST** be a branch of a competing `fork` that also contains the decision `listen`, the probe branch, the hold arm, the amendment arm and the cancel arm; it **MUST** be the fixed `PT5M` `waitEscalation` tick followed by `escalate-gate` `mode: fire`, looping while `due` is `false`; after a resume the first answer **MUST** be `apply-resume`'s `due`; the definition **MUST NOT** carry a remaining duration or compute the deadline - `inst-c3-escalation-fork`
+4. [ ] - `p1` - **The escalation fork.** The escalation re-check **MUST** ride the probe branch's tick in a competing `fork` that also contains the decision `listen`, the hold arm, the amendment arm and the cancel arm: each `PT30S` `waitProbe` tick **MUST** call `escalate-gate` `mode: fire` and then `mode: probe`, and the fork **MUST NOT** carry a second, longer escalation `wait`, which the probe tick would cancel on every pass so that it never fires (D-123); after a resume the first answer **MUST** be `apply-resume`'s `due`; the definition **MUST NOT** carry a remaining duration or compute the deadline - `inst-c3-escalation-fork`
 5. [ ] - `p1` - **The probe branch.** The `gateLoop` fork **MUST** carry a probe branch calling `escalate-gate` with `mode: probe` at an interval no longer than 30 s; on `serviceState = outage` the definition **MUST** enter an outage arm that competes a probe loop (until `available`), whose probe also re-checks the outage threshold (`due` on `outage`) and on `due` leads to one `raise-overdue-escalation` with `escalationKind: approval-outage`, the hold arm and the cancel arm, and on `available` **MUST** re-enter `gateLoop` - `inst-c3-probe`
 6. [ ] - `p1` - **The park clock.** The park-escalation `wait` **MUST** be the fixed `PT5M` `waitTtlMargin` tick followed by `arm-park-escalation`, looping while its `due` is `false` under the `nextRound` each answer returns; its fork **MUST** carry a hold and a resume arm that only record and return to the loop (`holdPauses` false), so a hold never pauses the park clock; and it **MUST NOT** be re-armed after `raise-overdue-escalation` has recorded the park escalation — a re-entry to the park loop after `escalated` runs only the verdict retry, cancel and terminal-event arms - `inst-c3-park-clock`
 7. [ ] - `p1` - **Positions and rounds.** `open-gates` **MUST** be called with `position = 0` first and thereafter only with `record-decision`'s `nextPosition`; `escalate-gate` **MUST** carry the `escalationRound` or `probeRound` the previous call returned, and `obtain-verdict`, `reflect-verdict` (per stage) and `arm-park-escalation` the `nextRound` of their previous answer, with `reflect-verdict` also carrying a retry's `attemptKey`; a `held` reflection **MUST** wait for the resume before the next round. These are re-keyed references, not computed values (`01 §4.14`) - `inst-c3-positions`

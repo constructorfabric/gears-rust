@@ -928,7 +928,8 @@ governance (line 48, BR-122).
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-upreq-serverless-runtime-signals`
 
 The Invocation API **MUST** deliver a **named signal** — `cancel-requested`,
-`reauthorize-requested`, `task-resolution-requested`, `unpark-requested`, each carrying only the
+`reauthorize-requested`, `task-resolution-requested`, `unpark-requested` (reserved: no arm consumes it until
+`DECISIONS.md` Q-13 gives it an origin route, D-122), each carrying only the
 reference tuple and a `requestRef` or `taskRef` — to a running invocation's `listen` arm through
 `…/invocations/{invocation_id}:plugin-control`, with a stated verb and payload shape, and **MUST**
 hold a delivered signal until an arm consumes it (or reject it synchronously so the originating
@@ -957,8 +958,8 @@ names one: `:control` actions are executed by the host directly and "never reach
 plugin, which owns the verb set (line 893).
 
 - **What the design cannot do until it lands**: hold and resume still arrive as Lifecycle events,
-  but an operator cancel, a payment re-authorisation, a manual-task resolution and an unpark after
-  the lifetime ceiling cannot reach the running definition; the control operations record the
+  but an operator cancel, a payment re-authorisation and a manual-task resolution — including the
+  lifetime-ceiling task's retry, the one unpark route — cannot reach the running definition; the control operations record the
   request and answer `still-processing` indefinitely. The generic `:control` `cancel` is never a
   substitute, because it ends the invocation without the cancellation fence
   (`design/10-process-definition.md` §4.4). Until a `retry` that keeps the invocation and resumes
@@ -967,6 +968,33 @@ plugin, which owns the verb set (line 893).
   D-105: a Seller Operator's cancel, carried out in-process by the sweep, and a new order to
   re-acquire the customer (§4 item 11).
 - **Source**: `design/10-process-definition.md` §3.2 *Signal delivery*, §3.3, §4.4; `design/09-read-and-authz.md` §3.3, §3.6; `design/07-manual-tasks.md` §3.3; `design/08-hold-and-cancel.md` §3.3.
+
+#### Retention of an event delivered between listens
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-upreq-serverless-runtime-event-retention-between-listens`
+
+The plugin **MUST** retain a broker event that matches a running invocation's correlation — the
+event type and correlation keys of a `listen` the definition declares — when it arrives while no
+matching `listen` is armed, and **MUST** deliver it, in arrival order, to the next `listen` that
+matches it, with no loss and no duplicate delivery. An invocation spends most of its time with no
+`listen` armed for a given type: during every step call a stage makes, and between a competing
+`fork`'s teardown and its re-arm, which the canonical definition passes through on every tick of
+every loop (`design/10-process-definition.md` §3.6). The DSL states how a `listen` consumes events
+while armed (dsl-reference.md *Listen*, *Event Consumption Strategy*) and nothing about an event
+that arrives between two `listen` tasks; the platform's event-broker integration is "TBD per
+deployment" (see *Event triggers over event-broker GTS events* above). The signals ask requires the
+same retention for `:plugin-control` signals; this ask extends it to broker events.
+
+- **What the design cannot do until it lands**: guarantee that an `OrderHeld`, `OrderResumed`,
+  approval decision, `OrderAmended`, terminal order event or Subscriptions outcome is consumed.
+  No poll covers the loss: the eligibility and barrier polls evaluate only their own conditions,
+  and nothing re-reads a hold, a resume, a decision or an amendment. A resume delivered while the
+  hold stage runs `admit-trigger` and `apply-hold` leaves the instance in the resume wait until an
+  operator cancels it or the lifetime ceiling parks it; a decision delivered during a probe is not
+  recorded, so the gate escalates on its window; a Subscriptions outcome is recovered by the sweep,
+  which reads it whether or not the event arrives (`design/05-provisioning-intents.md` §2.1).
+- **Source**: `design/10-process-definition.md` §4.4 *Events delivered between listens*, §4.5
+  (Q-11 (iv)); `design/08-hold-and-cancel.md` §4.7 item 3; `DECISIONS.md` D-124, Q-11.
 
 #### Start and generic control of the order process restricted to its owners
 
@@ -1051,7 +1079,7 @@ then have to accept.
 | Priority | Requirements |
 |----------|-------------|
 | `p1` (critical) | `…-upreq-overlap-presence-read`, `…-upreq-compensation-cancel-reason`, `…-upreq-explicit-start-instant`, `…-upreq-in-flight-rejection`, `…-upreq-cancel-accepted-transition`, `…-upreq-nonterminal-status-read`, `…-upreq-provisioning-latency-budget`, `…-upreq-identity-envelope-echo`, `…-upreq-payment-authorization-outcome`, `…-upreq-generic-approval-expectations-contract`, `…-upreq-submitted-ttl-visibility`, `…-upreq-lifecycle-thin-events`, `…-upreq-catalog-dependency-topology-read`, `…-upreq-pii-classification-ruling`, `…-upreq-event-broker-shared-prerequisites`, `…-upreq-pdp-policy-integration` |
-| `p1` (critical), platform path | `…-upreq-serverless-runtime-readiness-gate`, `…-upreq-serverless-runtime-event-triggers-gts`, `…-upreq-serverless-runtime-consumed-event-member-storage`, `…-upreq-serverless-runtime-pdp-guarded-call`, `…-upreq-serverless-runtime-attempt-and-deadline-propagation`, `…-upreq-serverless-runtime-history-residency-retention`, `…-upreq-serverless-runtime-definition-versioning-validation-hook`, `…-upreq-serverless-runtime-signals`, `…-upreq-serverless-runtime-invocation-control-restriction`, `…-upreq-serverless-runtime-dead-letter-operator-visibility` |
+| `p1` (critical), platform path | `…-upreq-serverless-runtime-readiness-gate`, `…-upreq-serverless-runtime-event-triggers-gts`, `…-upreq-serverless-runtime-consumed-event-member-storage`, `…-upreq-serverless-runtime-pdp-guarded-call`, `…-upreq-serverless-runtime-attempt-and-deadline-propagation`, `…-upreq-serverless-runtime-history-residency-retention`, `…-upreq-serverless-runtime-definition-versioning-validation-hook`, `…-upreq-serverless-runtime-signals`, `…-upreq-serverless-runtime-event-retention-between-listens`, `…-upreq-serverless-runtime-invocation-control-restriction`, `…-upreq-serverless-runtime-dead-letter-operator-visibility` |
 | `p2` (important) | `…-upreq-correlation-propagation`, `…-upreq-serverless-runtime-failure-handler-target`, `…-upreq-lifecycle-failure-reason-coverage` |
 
 `cpt-cf-bss-orders-workflow-upreq-pdp-policy-integration` is `p1` because every caller-driven

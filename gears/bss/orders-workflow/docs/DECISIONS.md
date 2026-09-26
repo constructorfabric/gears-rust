@@ -139,6 +139,11 @@
   - [D-118 (M) `escalate-gate` and `arm-park-escalation` have algorithms; every answer returns the next round, and a fire during an outage pauses](#d-118-m-escalate-gate-and-arm-park-escalation-have-algorithms-every-answer-returns-the-next-round-and-a-fire-during-an-outage-pauses)
   - [D-119 (H) A retried or never-written line is re-dispatched from Orders' record: a per-line wave attempt on the task row, one dispatch attempt per wave, and the barrier's undispatched set](#d-119-h-a-retried-or-never-written-line-is-re-dispatched-from-orders-record-a-per-line-wave-attempt-on-the-task-row-one-dispatch-attempt-per-wave-and-the-barriers-undispatched-set)
   - [D-120 (M) The read after a dispatch 409 is routed, and the call is re-issued only after a wait](#d-120-m-the-read-after-a-dispatch-409-is-routed-and-the-call-is-re-issued-only-after-a-wait)
+  - [D-121 (H) The lifetime ceiling parks only a running, unparked instance, and each ceiling is its own round](#d-121-h-the-lifetime-ceiling-parks-only-a-running-unparked-instance-and-each-ceiling-is-its-own-round)
+  - [D-122 (H) The ceiling wait consumes only its own task, and no unrecorded signal unparks](#d-122-h-the-ceiling-wait-consumes-only-its-own-task-and-no-unrecorded-signal-unparks)
+  - [D-123 (M) The escalation re-check rides the 30-second probe tick](#d-123-m-the-escalation-re-check-rides-the-30-second-probe-tick)
+  - [D-124 (M) An event delivered between listens needs platform retention; no poll covers it](#d-124-m-an-event-delivered-between-listens-needs-platform-retention-no-poll-covers-it)
+  - [D-125 (M) A failure or floor trip the sweep worker records reaches the definition through its next reconcile round](#d-125-m-a-failure-or-floor-trip-the-sweep-worker-records-reaches-the-definition-through-its-next-reconcile-round)
 - [Open Questions](#open-questions)
   - [Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?](#q-01-which-durable-execution-substrate-backs-the-process--the-oss-workflow-engine-or-a-bss-local-mechanism)
   - [Q-02: The Generic Approval escalation threshold — the one PRD-deferred numeric value this design deliberately leaves unset](#q-02-the-generic-approval-escalation-threshold--the-one-prd-deferred-numeric-value-this-design-deliberately-leaves-unset)
@@ -2074,6 +2079,14 @@ top-level list", read "the `process` branch's list". The hold carries no remaind
 escalation window is re-checked on a fixed `PT5M` tick and `apply-resume` answers the first `due`
 (D-70 as amended).
 
+**Amended (2026-09-26)** by D-121, D-123 and D-124. (1) "The remainder Orders returns" in the
+decision above is superseded: `apply-hold` and `apply-resume` return no remainder; the window
+stays on the gate row and the re-check continues against the re-based deadline. (2) The
+escalation window is re-checked on the gate loop's `PT30S` probe tick, not a `PT5M` tick (D-123).
+(3) The ceiling's exemption reads `$context.unwind` and the verdict park loop, not `nextStage`
+(D-121). (4) The re-entry of a stage loop does not recover an event delivered between listens;
+that is the platform retention of D-124.
+
 **Propagated**: `design/10-process-definition.md` §3.6, §4.5; `design/08-hold-and-cancel.md` §3.3,
 §3.6, §4.7; `design/01-foundation.md` §3.7; `design/03-approval-execution.md` §4.5;
 `design/07-manual-tasks.md` §4.8.
@@ -2109,6 +2122,12 @@ passes `compensating`.
 without closing the suspension keeps the two facts separate.
 
 **Propagated**: `design/01-foundation.md` §3.7 *phase*; `design/08-hold-and-cancel.md` §2.1, §4.8.
+
+**Amended (2026-09-26)** by D-121: the lifetime-ceiling park is taken only from `started` or
+`suspended`. A ceiling inside an unwind (`$context.unwind` set) or in the verdict park loop parks
+nothing, because the table has neither a `compensating → parked` nor a `parked → parked` edge.
+Each ceiling parks under its own subject `ceiling:{round}`, and its `unpark` requires that
+ceiling's task resolved `retry` (D-122).
 
 ### D-83 (H) `compensate-order` is one operation over the Orders-owned ordinal, resumable by pass
 
@@ -3091,6 +3110,131 @@ and D-102's round rule.
 **Propagated**: `design/10-process-definition.md` §3.6 (*Fixed waits and re-check loops*, (b));
 `design/05-provisioning-intents.md` §3.3, §4.5.
 
+### D-121 (H) The lifetime ceiling parks only a running, unparked instance, and each ceiling is its own round
+
+**Accepted (2026-09-26).**
+
+**Decision**: `afterLifetime` decides from the definition's own state. A ceiling that fires while
+`$context.unwind` is set — on every entry to the unwind, never cleared, so it covers a cancel or a
+task taken from inside the unwind — re-arms and parks nothing (no `compensating → parked` edge).
+A ceiling that fires while `stageLoop` is `parkLoop` — the verdict park, or a hold, resume,
+lifecycle or cancel stage taken from it — re-arms and parks nothing (no `parked → parked` edge);
+the verdict park keeps its own escalation and its three routes out. `enterParkLoop` is recorded
+before `park`, whose re-entry re-issues the call under its unchanged key, and `leftPark` after
+`unpark`. Every other ceiling is a new round: `raise-overdue-escalation` `lifetime-ceiling`
+carries `round` (the definition's `ceilingRound`, 0 first) and returns `nextRound`; its escalation
+row's subject is `ceiling:{round}`; `park` and `unpark` take that subject and are keyed by it, with
+no `{attempt}`, because the subject is unique per park and no manual-task retry re-enters them.
+
+**Rationale**: the exemption read only `nextStage == unwind`, so a ceiling during a cancel or task
+taken from an unwind, or during the verdict park, called a `park` the phase table refuses; the
+refusal exhausted `*transient` and faulted the invocation, and a successful park inside the
+verdict park would later have been undone by the ceiling's `unpark` while the verdict park stayed
+open. A second ceiling after an unpark presented the first ceiling's escalation, park and unpark
+keys, so nothing was raised or parked and the process waited on a closed task (second review
+OW2-50, OW2-51). **Precedent**: D-102's round rule (the overdue monitor's `raise-overdue-escalation`
+round is the same shape); `01 §3.7`'s transition table as the authority for which park is legal.
+
+**Propagated**: `design/10-process-definition.md` §3.6 (a), (d); `design/01-foundation.md` §3.3,
+§3.7; `design/07-manual-tasks.md` §3.2, §3.3, §3.6, §3.7, §4.8; `design/03-approval-execution.md`
+§2.1; `design/08-hold-and-cancel.md` §4.5; D-53, D-82.
+
+### D-122 (H) The ceiling wait consumes only its own task, and no unrecorded signal unparks
+
+**Accepted (2026-09-26).**
+
+**Decision**: the ceiling wait's task-resolution `listen` correlates on `ceilingTaskRef` as well
+as the order, and `resolveCeilingTask` resolves that task. While a `lifetime-ceiling-reached`
+task is open, every other task of the instance offers `escalate` only (`invocation-dead` exempt),
+so no other resolution is signalled into a wait that would consume it. `unpark` of a
+`ceiling:{round}` subject refuses `not-found` unless that ceiling's task is resolved `retry` by
+`resolve-manual-task`, which applies only a request row the task route wrote under the
+operator's authorization. The canonical definition has no `unpark-requested` arm; the signal type
+stays reserved, and no version may `listen` for it until Q-13 gives it an origin route and a
+request row.
+
+**Rationale**: the ceiling wait reused the generic resolution arm, correlated only on the order,
+so an operator's retry of a line task was applied by `resolve-manual-task` and then taken as the
+ceiling's retry, which unparked the order and lost the line's re-dispatch; an override landed on
+`wait` and was never verified (OW2-52). The `unpark-requested` arm unparked on a signal no Orders
+route records, while `:plugin-control` is authorized platform-side, so anyone the platform lets
+act on the invocation could release a ceiling park with no actor on the audit trail (OW2-60).
+**Precedent**: `run-cancellation-fence`'s recorded cause (D-106, `06 §3.6` `inst-fence-cause`);
+the task route's request row and `action-not-offered` refusal (`07 §3.3`, D-100).
+
+**Propagated**: `design/10-process-definition.md` §2.2, §3.1, §3.3, §3.6 (d);
+`design/01-foundation.md` §3.3; `design/07-manual-tasks.md` §4.4, §4.8; `DESIGN.md` §3.1; Q-13.
+
+### D-123 (M) The escalation re-check rides the 30-second probe tick
+
+**Accepted (2026-09-26).**
+
+**Decision**: the gate loop carries one tick, the `PT30S` `waitProbe`; each tick calls
+`escalate-gate` `mode: fire` and then `mode: probe`. There is no separate escalation `wait`. The
+worst-case escalation lateness is one tick plus one call: 30 s plus the 3-minute `step` timeout,
+inside the PRD's ± 5 min.
+
+**Rationale**: the canonical `PT5M` escalation tick admitted lateness of one tick plus one call,
+beyond ± 5 min once the call's retries are counted (OW2-91). Shortening it was not enough: the
+`PT5M` escalation `wait` and the `PT30S` probe `wait` were branches of one competing fork
+re-armed on every pass, so the probe won every race and the escalation `wait` never fired.
+**Precedent**: the park loop, whose one `PT5M` tick carries both the verdict retry and the park
+re-check (`03 §4.5` item 6); none in the platform, whose timers are the plugin's.
+
+**Propagated**: `design/10-process-definition.md` §1.2, §3.6 (a), (e); `design/03-approval-execution.md`
+§1.2, §3.6, §4.5; `design/08-hold-and-cancel.md` §1.2, §3.3, §3.6, §4.7; `DESIGN.md` §1.2, §4.1;
+D-70, D-80.
+
+### D-124 (M) An event delivered between listens needs platform retention; no poll covers it
+
+**Accepted (2026-09-26).**
+
+**Decision**: the canonical definition runs only on a platform that retains a broker event
+correlated to an invocation while no matching `listen` is armed — during a step call, or between
+a competing fork's teardown and re-arm — and delivers it, in order, to the next matching
+`listen`. That is a new upstream ask,
+`cpt-cf-bss-orders-workflow-upreq-serverless-runtime-event-retention-between-listens`. Q-11 (iv)'s
+fallback "covered by the poll arms and the re-entry of every stage loop" is withdrawn.
+
+**Rationale**: no poll re-reads a hold, a resume, a decision or an amendment; the only polls are
+eligibility and the barrier. A resume delivered while the hold stage runs `admitHold` and
+`applyHold` left the instance in `awaitResume` until the ceiling, and a decision delivered during
+a probe was lost, so the gate escalated on its window (OW2-53). The signals ask already requires
+the plugin to hold a signal until an arm consumes it; broker events had no such rule.
+**Precedent**: the signal-retention clause of `…-upreq-serverless-runtime-signals`; none in the
+DSL, which states no buffering between `listen` tasks (dsl-reference.md *Listen*).
+
+**Propagated**: `design/10-process-definition.md` §4.4, §4.5; `design/08-hold-and-cancel.md`
+§4.7; `DESIGN.md` §1.2; `UPSTREAM_REQS.md` §2.9, §3; Q-11.
+
+### D-125 (M) A failure or floor trip the sweep worker records reaches the definition through its next reconcile round
+
+**Accepted (2026-09-26).**
+
+**Decision**: a forward intent recorded `failed` or `unresolved` carries
+`owf_provisioning_intent.handed_off_at` null until the definition is told. A definition-called
+`reconcile-intent` round lists, besides what it records itself, every such intent of the
+instance with `handed_off_at` null — the worker's in-process failures and floor trips, and a
+re-armed `unresolved` row the worker read to the floor again — and stamps `handed_off_at` in its
+settlement. The dispatch operations stamp the synchronous refusals they list, `apply-resume`'s
+deferral port stamps the deferred failures it hands off, and an operator's retry of an
+`unresolved` row clears it. The definition's existing `sweepFailure` route creates the task.
+
+**Rationale**: the worker runs `reconcile-intent` in-process with no caller, so a floor trip or a
+failure it recorded never reached `unresolved[]` or `failed[]`, and the barrier waited on a line
+no task named (open item from the B5 fix of OW2-32). The dead-invocation pattern of D-105 — the
+worker raising the task in-process — was rejected here: the invocation is alive and waiting in
+the barrier loop, and a task raised behind its back would have no waiter
+(`07 §4.8` item 3) and would not count in the remediation hold's `openTaskCount`. The poll arm
+already reaches the definition every `PT30S`, so the hand-off rides it and the definition keeps
+creating every forward task.
+**Precedent**: the poll arm and `sweepFailure` (`10 §3.6` (b), D-120); D-105 considered and
+not followed.
+
+**Propagated**: `design/05-provisioning-intents.md` §3.2, §3.3, §3.6, §3.7, §4.5;
+`design/07-manual-tasks.md` §3.6; `design/08-hold-and-cancel.md` §3.2, §3.6;
+`design/10-process-definition.md` §3.6 (b).
+
 ## Open Questions
 
 ### Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?
@@ -3280,8 +3424,12 @@ re-check loop of D-70 as amended — a fixed-granularity `wait`, a `call` to the
 owns the deadline and a `switch` that loops while it answers `due: false`; no Function sleeps,
 because a Function is bounded by platform timeout limits and durable waits belong to Workflows
 (serverless-runtime DESIGN.md lines 579, 582); (ii) bounded by the retry budget; (iii)
-settled as one `call` per wave carrying `lineRefs[]` (D-79); (iv) covered by the poll arms and the
-re-entry of every stage loop (D-80).
+settled as one `call` per wave carrying `lineRefs[]` (D-79); (iv) **no fallback**: no poll
+re-reads a hold, a resume, a decision or an amendment, so the design depends on the platform
+retaining an event delivered between listens, the ask
+`cpt-cf-bss-orders-workflow-upreq-serverless-runtime-event-retention-between-listens` (D-124;
+the earlier "covered by the poll arms and the re-entry of every stage loop" was wrong and is
+withdrawn).
 
 **Review trigger**: the platform readiness gate (`…-upreq-serverless-runtime-readiness-gate`).
 
@@ -3308,8 +3456,15 @@ and the "commercial data in engine history" threat is *bounded, not closed* (`DE
 **Open.** The canonical definition has arms for two operator signals that no route in this design
 set can send: `reauthorize-requested` (a payment re-authorisation, slice 04) and `unpark-requested`
 (an operator's release of an instance parked at the lifetime ceiling). `design/09-read-and-authz.md`
-§2.1 forbids delivering a signal from anywhere but an authorized control operation, so today
-neither arm can fire. The question is which caller-facing route — with its catalogue pair, scope,
+§2.1 forbids Orders to deliver a signal from anywhere but an authorized control operation, but
+that binds only Orders: `:plugin-control` is authorized platform-side (`ADR/0010`), so any caller
+the platform authorizes on the invocation can deliver either signal. **Amended (2026-09-26)** by
+D-122: the `unpark-requested` arm is therefore removed from the canonical definition now, not at
+the readiness gate; the signal type stays reserved, `unpark` of a ceiling park refuses without a
+recorded operator retry of the ceiling's task, and the ceiling task's `retry` is the one route
+out besides the order cancel. The `reauthorize-requested` arm stays: what it calls,
+`evaluate-payment-auth-eligibility`, re-reads Payments, the authority for the outcome, so a
+signal no Orders route recorded can only cause an early re-evaluation. The question is which caller-facing route — with its catalogue pair, scope,
 idempotency key and request record — or which event sends each; this register does not invent
 them. **If neither has an origin by the platform readiness gate, both arms are removed from the
 canonical definition** and the corresponding cases fall back to the paths that exist (the
@@ -3436,6 +3591,11 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-118 | M Escalation and park-clock algorithms | `design/03-approval-execution.md` §3.2, §3.3, §3.6, §3.7; D-87, D-102 |
 | D-119 | H Retried and never-written lines re-dispatched from the record | `design/04-fulfillment-plan.md` §3.3, §3.6, §3.7, §4.8, `design/05-provisioning-intents.md` §1.1, §1.2, §2.2, §3.2, §3.3, §3.6, §3.7, §4.2, §4.4, §4.5, §4.6, `design/07-manual-tasks.md` §3.3, §3.6, `design/01-foundation.md` §3.3, §4.3, `design/06-saga-and-compensation.md` §2.1, `design/10-process-definition.md` §3.6, `DESIGN.md` §1.2, `ADR/0006`; D-21, D-95, D-102, D-117 |
 | D-120 | M The read after a dispatch 409 is routed | `design/10-process-definition.md` §3.6, `design/05-provisioning-intents.md` §3.3, §4.5; D-102 |
+| D-121 | H Ceiling parks only a running, unparked instance; ceiling rounds | `design/10-process-definition.md` §3.6, `design/01-foundation.md` §3.3, §3.7, `design/07-manual-tasks.md` §3.2, §3.3, §3.6, §3.7, §4.8, `design/03-approval-execution.md` §2.1, `design/08-hold-and-cancel.md` §4.5; D-53, D-82, D-102 |
+| D-122 | H Ceiling wait consumes only its task; no unrecorded unpark | `design/10-process-definition.md` §2.2, §3.1, §3.3, §3.6, `design/01-foundation.md` §3.3, `design/07-manual-tasks.md` §4.4, §4.8, `DESIGN.md` §3.1; D-106, Q-13 |
+| D-123 | M Escalation re-check on the probe tick | `design/10-process-definition.md` §1.2, §3.6, `design/03-approval-execution.md` §1.2, §3.6, §4.5, `design/08-hold-and-cancel.md` §1.2, §3.3, §3.6, §4.7, `DESIGN.md` §1.2, §4.1; D-70, D-80 |
+| D-124 | M Events between listens: platform retention | `design/10-process-definition.md` §4.4, §4.5, `design/08-hold-and-cancel.md` §4.7, `DESIGN.md` §1.2, `UPSTREAM_REQS.md` §2.9, §3; Q-11 |
+| D-125 | M Worker trips handed to the definition | `design/05-provisioning-intents.md` §3.2, §3.3, §3.6, §3.7, §4.5, `design/07-manual-tasks.md` §3.6, `design/08-hold-and-cancel.md` §3.2, §3.6, `design/10-process-definition.md` §3.6; D-105, D-120 |
 
-Highest decision number used: **D-118**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
+Highest decision number used: **D-125**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
 register; there are no parts.
