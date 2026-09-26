@@ -147,7 +147,7 @@ struct SidecarState {
     /// Gear-local shared secret (`FS_SIDECAR_INTERNAL_TOKEN`) sent as
     /// `x-fs-internal-token` on the finalize/report-part callbacks. `None` =
     /// header not sent (matches a control plane with the check disabled).
-    internal_token: Option<String>,
+    internal_token: Option<SecretString>,
     http: reqwest::Client,
     /// Ingress/egress bytes and route/method/status/latency for the
     /// sidecar's own HTTP routes. The control plane's routes are already
@@ -212,11 +212,11 @@ where
 /// client, no cgroup read, no `S3` backend construction — those stay in
 /// `main()`). Built by [`build_config`]; see that function's doc comment.
 ///
-/// `Debug` is implemented manually (rather than derived) solely because
-/// `Verifier` itself has no `Debug` impl (it holds `Arc<dyn
-/// SignatureVerifier>` trait objects) -- every other field is printed as-is,
-/// there is no secret here to redact (unlike, say,
-/// `FileStorageConfig::signing_key_seed`).
+/// `Debug` is implemented manually (rather than derived) because `Verifier`
+/// itself has no `Debug` impl (it holds `Arc<dyn SignatureVerifier>` trait
+/// objects), and because `internal_token` is a secret that must never be
+/// printed as-is -- mirroring `FileStorageConfig::signing_key_seed`'s own
+/// manual `Debug` impl.
 struct SidecarConfig {
     addr: SocketAddr,
     root: String,
@@ -234,7 +234,7 @@ struct SidecarConfig {
     finalize_timeout_secs: u64,
     finalize_connect_timeout_secs: u64,
     body_idle_timeout: Option<Duration>,
-    internal_token: Option<String>,
+    internal_token: Option<SecretString>,
 }
 
 impl std::fmt::Debug for SidecarConfig {
@@ -253,7 +253,11 @@ impl std::fmt::Debug for SidecarConfig {
                 &self.finalize_connect_timeout_secs,
             )
             .field("body_idle_timeout", &self.body_idle_timeout)
-            .field("internal_token", &self.internal_token)
+            // Never print the secret itself -- only whether one is configured.
+            .field(
+                "internal_token",
+                &self.internal_token.as_ref().map(|_| "<redacted>"),
+            )
             .finish()
     }
 }
@@ -365,7 +369,9 @@ fn build_config(lookup: impl Fn(&str) -> Option<String>) -> anyhow::Result<Sidec
 
     // Attached as `x-fs-internal-token` on both callbacks below. Unset/empty
     // = not sent.
-    let internal_token = lookup("FS_SIDECAR_INTERNAL_TOKEN").filter(|s| !s.is_empty());
+    let internal_token = lookup("FS_SIDECAR_INTERNAL_TOKEN")
+        .filter(|s| !s.is_empty())
+        .map(SecretString::new);
 
     Ok(SidecarConfig {
         addr,
@@ -1228,7 +1234,7 @@ async fn finalize_with_control_plane(
         &url,
         token,
         request_id,
-        state.internal_token.as_deref(),
+        state.internal_token.as_ref().map(SecretString::expose),
         &body_bytes,
         state.callback_retry_budget,
     )
@@ -1333,7 +1339,7 @@ async fn report_part_with_control_plane(
         &url,
         token,
         request_id,
-        state.internal_token.as_deref(),
+        state.internal_token.as_ref().map(SecretString::expose),
         &body_bytes,
         state.callback_retry_budget,
     )

@@ -1559,7 +1559,7 @@ async fn finalize_callback_sends_internal_token_header_when_configured() {
 
     let mut state = test_state();
     state.control_base_url = format!("http://{addr}");
-    state.internal_token = Some("interim-shared-secret".to_owned());
+    state.internal_token = Some(SecretString::new("interim-shared-secret"));
 
     let outcome = finalize_with_control_plane(
         &state,
@@ -3044,6 +3044,32 @@ fn build_config_previous_keys_above_max_is_rejected() {
     assert!(
         err.to_string().contains("MAX_PREVIOUS_SIGNING_PUBLIC_KEYS"),
         "error should name the exceeded ceiling: {err}"
+    );
+}
+
+/// `SidecarConfig`'s manual `Debug` impl must never print the raw
+/// `FS_SIDECAR_INTERNAL_TOKEN` value -- it's a shared secret that
+/// authenticates sidecar->control-plane finalize/report-part callbacks, and a
+/// `{config:?}` in a log line or panic message must not leak it. This test
+/// fails on the pre-fix code, where `internal_token: Option<String>` was
+/// printed as-is by the manual `Debug` impl.
+#[test]
+fn build_config_debug_redacts_internal_token() {
+    let (mut env, _issuer) = base_config_env();
+    env.insert(
+        "FS_SIDECAR_INTERNAL_TOKEN",
+        "super-secret-value-123".to_owned(),
+    );
+
+    let config = build_config(lookup_fn(env)).expect("valid config");
+    let debug_output = format!("{config:?}");
+    assert!(
+        !debug_output.contains("super-secret-value-123"),
+        "Debug must not print the raw internal token: {debug_output}"
+    );
+    assert!(
+        debug_output.contains("internal_token"),
+        "Debug should still name the field, just not its value: {debug_output}"
     );
 }
 
