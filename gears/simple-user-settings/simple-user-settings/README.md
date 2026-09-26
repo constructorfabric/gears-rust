@@ -14,7 +14,13 @@ gears:
   simple-user-settings:
     config:
       max_field_length: 100
+      # Bound on one call to the deployment's SettingsOwnerResolver, if one is
+      # registered; a call that runs over fails the request with 503.
+      owner_resolver_timeout_ms: 2000
 ```
+
+A deployment can decide which user key settings are filed under by registering
+a `SettingsOwnerResolver` on the `ClientHub`; see the SDK README.
 
 ## License
 

@@ -33,6 +33,12 @@ impl From<DomainError> for CanonicalError {
                 tracing::error!(msg = %msg, "simple-user-settings internal error");
                 CanonicalError::internal(msg).create()
             }
+            DomainError::Unavailable(msg) => {
+                tracing::warn!(msg = %msg, "simple-user-settings dependency unavailable");
+                // The default detail, not `msg`: the reason names another
+                // gear's failure and stays in the log.
+                CanonicalError::service_unavailable().create()
+            }
             DomainError::Database(db_err) => {
                 tracing::error!(error = ?db_err, "simple-user-settings database error");
                 CanonicalError::internal(db_err.to_string()).create()

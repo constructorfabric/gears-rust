@@ -16,6 +16,10 @@ pub enum DomainError {
     #[error("Internal error: {0}")]
     Internal(String),
 
+    /// A collaborator the request needs is down or too slow; worth retrying.
+    #[error("Service unavailable: {0}")]
+    Unavailable(String),
+
     #[error("Database error: {0}")]
     Database(#[from] DbError),
 }
@@ -34,6 +38,10 @@ impl DomainError {
 
     pub fn internal(message: impl Into<String>) -> Self {
         Self::Internal(message.into())
+    }
+
+    pub fn unavailable(message: impl Into<String>) -> Self {
+        Self::Unavailable(message.into())
     }
 }
 

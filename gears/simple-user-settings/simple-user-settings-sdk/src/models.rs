@@ -13,6 +13,9 @@ use uuid::Uuid;
 #[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SimpleUserSettings {
+    /// The user half of the key these settings are filed under: the caller's
+    /// token subject, or what the deployment's
+    /// [`SettingsOwnerResolver`](crate::SettingsOwnerResolver) resolved it to.
     pub user_id: Uuid,
     pub tenant_id: Uuid,
     pub theme: Option<String>,

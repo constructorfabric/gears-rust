@@ -101,4 +101,16 @@ mod tests {
         assert_eq!(problem.status, Some(500));
         assert!(!problem.detail.contains("db pool exhausted"));
     }
+
+    #[test]
+    fn test_unavailable_arm_is_503_without_the_reason() {
+        // The reason names another gear's failure (the owner resolver); it
+        // belongs in the log, and the caller only needs to know to retry.
+        let problem = wire(DomainError::Unavailable(
+            "settings owner resolver unavailable: directory down".to_owned(),
+        ));
+
+        assert_eq!(problem.status, Some(503));
+        assert!(!problem.detail.contains("directory down"));
+    }
 }
