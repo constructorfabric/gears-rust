@@ -1320,6 +1320,14 @@ it would shorten (D-105).
     the selection (serverless-runtime, `ADR/0011`); and the §16 risk *Engine decision pending*
     (`PRD.md:1200`, "Design cannot begin") **MUST** be closed and replaced by the platform
     readiness-gate risk (`…-upreq-serverless-runtime-readiness-gate`).
+14. **§6.2 — the escalation window is Orders' seller policy, not Generic Approval configuration.**
+    §6.2 *Escalation Timer* (`PRD.md:297`) says "the Generic Approval service provides the
+    escalation configuration". Under `DECISIONS.md` D-134 and D-140 the escalation window
+    **values** (the default and per-party windows) are read from Orders' seller policy
+    (`owf_seller_policy`, slice 01) and pinned on the gate row by `open-gates`. The sentence
+    **MUST** read that Generic Approval provides the escalation **path** (the target the
+    escalation command is routed to) and receives the command, while the escalation window is
+    Orders' per-seller policy.
 
 ## 5. Traceability
 

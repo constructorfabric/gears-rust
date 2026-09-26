@@ -685,7 +685,7 @@ granularity below, then a `call` to the Orders operation that owns the stored de
 compares database time with it and answers `due: true|false` — and a `switch` that loops while
 `due` is `false`, passing each answer's next round into the next call. No Function is used as a sleeper: serverless-runtime Functions are "bounded by
 platform timeout limits" and durable waits belong to Workflows
-([serverless-runtime DESIGN](../../../../serverless-runtime/docs/DESIGN.md#function) `DESIGN.md:579`,
+([serverless-runtime DESIGN](../../../../serverless-runtime/docs/DESIGN.md#function-base-type) `DESIGN.md:579`,
 `DESIGN.md:582`). A `due: false` answer from `arm-park-escalation`, `escalate-gate` `mode: fire`
 and `raise-overdue-escalation` records nothing and is a **settled success of its round** that
 returns the next round, the rule `obtain-verdict`'s `unobtainable` and `resolve-manual-task`'s
