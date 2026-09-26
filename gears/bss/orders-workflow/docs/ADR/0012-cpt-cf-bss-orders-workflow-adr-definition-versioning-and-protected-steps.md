@@ -103,6 +103,33 @@ rather than one task, fails closed before a definition can be executed, and stil
   adds the grammar subset (no `run`, `emit` or `for`; the two start triggers) and the fork-routing
   convention (every competing `fork` followed by a `switch` on `arm`) as rules 7 and 8, which
   restate this ADR's grammar and D-80's routing rule rather than adding a fence (D-67).
+
+  > **Amended 2026-09-26 by D-126**: the rules are restated where a validator could not check
+  > them as written (`design/10-process-definition.md` §2.2, §4.1, §4.6).
+  > **Rule 1**: `start-instance` is the first operation after `admit-trigger` (`role: start`),
+  > which precedes it; the ADR-0004 conjunction is a row of the §4.1 fence table, not only the
+  > run-time guard; and "the whole path" is every walk of a routing graph the check enumerates:
+  > the routing members (`nextStage`, `stageLoop`, the return members, `arm`) may be written only
+  > as literals or copies of one another, so their values form a finite set, and a walk the check
+  > cannot decide is refused. The run-time guards stay the backstop they were.
+  > **Rule 2**: every endpoint is `$context.stepsBase + "/<operation>"`, with `stepsBase` written
+  > only by the definition's `input.from` and compared with the environment's step-surface base.
+  > **Rule 3**: the `OrderAmended` filter correlates on `orderId` only.
+  > **Rule 4**: the nesting is checked over values the definition holds — each operation's
+  > deadline < the task timeout, and every task timeout and `wait` < the literal `P90D` lifetime
+  > ceiling; no cumulative backoff is computed, because the DSL gives exponential backoff no
+  > multiplier; the overdue window and the SLA classes are per-order policy values, bounded where
+  > the policy is validated (`design/07-manual-tasks.md` §4.8 item 8).
+  > **Rule 6**: a `catch` around a protected operation either carries only `retry` — exhaustion
+  > faults the invocation, which the instance liveness pass raises as the `invocation-dead` task
+  > (D-105, D-114); a `catch` that only `raise`s is the same — or routes to one of the named
+  > failure routes of `design/10-process-definition.md` §4.6: a wave's line tasks,
+  > `compensate-order`'s next pass, `reflect-verdict`'s order task, the start path's supersession
+  > retry. It may not route a protected failure to `park` (`design/08-hold-and-cancel.md` §4.7
+  > item 7). That a retry-only `catch` re-raises once its limit is spent is Q-11 (vi). The four
+  > destinations of *Consequences* are accordingly a fault of the invocation, a manual task, the
+  > compensation path's next pass and the supersession wait.
+
   The `protected` list is closed and fixed here; adding to it or removing from it is an Orders
   release and an amendment of this ADR: `start-instance`, `settle-from-lookup` (sweep-only),
   `terminate-instance`, `admit-trigger`, `terminate-on-terminal-event`, `obtain-verdict`,
@@ -218,7 +245,7 @@ apply by reference.
   [`design/10-process-definition.md`](../design/10-process-definition.md);
   [`design/01-foundation.md`](../design/01-foundation.md) §3.7 (`owf_definition_binding`,
   `owf_step_operation`)
-- **Decisions register**: [`DECISIONS.md`](../DECISIONS.md) — D-02, D-53, D-67, D-68, Q-10
+- **Decisions register**: [`DECISIONS.md`](../DECISIONS.md) — D-02, D-53, D-67, D-68, D-126, Q-10
 - **Upstream asks**: [`UPSTREAM_REQS.md`](../UPSTREAM_REQS.md) — serverless-runtime section
   (pre-publish validation hook, publish audit, version retention while bound)
 - **Platform**: serverless-runtime [DESIGN.md](../../../../serverless-runtime/docs/DESIGN.md)

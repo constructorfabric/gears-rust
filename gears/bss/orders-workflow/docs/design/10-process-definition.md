@@ -110,7 +110,7 @@ be unless the gate is declared failed
 |--------|-------------|--------------|-----------------|----------------------|
 | `cpt-cf-bss-orders-workflow-nfr-owf-durability` | Zero in-flight workflows lost across restarts | Platform plugin (invocation history) + `01` envelope | The plugin resumes the invocation; every re-issued call is absorbed under the same key | Platform worker kill/restart with the canonical definitions; no duplicate effect, no lost step |
 | `cpt-cf-bss-orders-workflow-nfr-owf-escalation-timer` | Per-gate window, default 72 h, ± 5 min | Definition re-check loop (plugin durable timer) + `03` stored deadline | The gate loop's fixed `PT30S` `waitProbe` tick re-checks the gate's stored escalation deadline through `escalate-gate` `mode: fire` before it probes (§3.6 *Fixed waits and re-check loops*), so the fire is at most one tick plus one call late — 30 s plus the 3-minute `step` timeout, inside ± 5 min (decision D-123); a hold pauses the window in Orders' record and `apply-resume` re-bases it | Timer-accuracy test across a plugin worker restart; hold/resume test asserting the remainder |
-| `cpt-cf-bss-orders-workflow-nfr-owf-fulfillment-sla` | p95 ≤ 15 min from activation eligibility to terminal outcome | Definition task timeouts and retry policy; `05` admission | Wave-2 task timeout 3 min, retry budget nested inside it by validation (§2); the barrier releases on the first evaluation after both conjuncts hold | Load test over the canonical definition |
+| `cpt-cf-bss-orders-workflow-nfr-owf-fulfillment-sla` | p95 ≤ 15 min from activation eligibility to terminal outcome | Definition task timeouts and retry policy; `05` admission | Wave-2 task timeout 3 min, which bounds the call's retries; each attempt's deadline is nested inside it by validation (§2.2 rule 4); the barrier releases on the first evaluation after both conjuncts hold | Load test over the canonical definition |
 | `cpt-cf-bss-orders-workflow-nfr-owf-audit` | 100 % of transitions recorded independently of engine history | `01` audit writer | The definition performs no effect outside a step operation, so every transition with an Orders consequence is audited by construction | Definition validation rule (§2): no `run`, no `emit`, every `call` a registered operation |
 | `cpt-cf-bss-orders-workflow-nfr-owf-retention` | Gear-owned record ≥ 400 days independent of engine purge | `01` tables | Platform history retention (`TenantRuntimePolicy`, [`DESIGN.md:735`](../../../../serverless-runtime/docs/DESIGN.md#tenantruntimepolicy)) is set independently and may be shorter; nothing Orders needs lives only there | Purge-independence test |
 
@@ -243,10 +243,10 @@ the same test without 409. `begin-fulfillment` owns no 409: its version conflict
 refusal are settled successes (`version-conflict`, `held`), so its every 409 is a same-key
 retry (`04 §3.6`). Every task that calls an
 operation declares a `timeout` (`use.timeouts`: `step` 3 min, `wave1` 10 min, `wave2` 3 min,
-`admission` 25 h) on the `try` that carries its retry, so rule 4's nesting is checkable per task. A 409 `idempotency-key-conflict`
+`admission` 25 h) on the `try` that carries its retry. The timeout bounds the retries themselves, so rule 4 checks only that one attempt fits in it; whichever of the timeout and the retry limit is spent first faults the invocation alike (§4.6). A 409 `idempotency-key-conflict`
 is a caller defect the same-key retry cannot fix; it exhausts the budget bounded and faults the
 invocation, or lands on a named failure route where §4.6 names one. Whether the plugin surfaces the Problem body's `error_code` on
-`$error` so the two 409s can be told apart before the budget is spent is part of Q-11.
+`$error` so the two 409s can be told apart before the budget is spent is part of Q-11. That a `catch` carrying only `retry` re-raises the last error once its limit is spent — the premise of rule 6 and of §4.6 — is not stated by the DSL either (dsl.md *Retries*, dsl-reference.md *Catch*): it is Q-11 (vi), assumed until the plugin answers.
 
 #### The closed trigger set
 
@@ -283,12 +283,12 @@ consumer-supplied hook before publish — a pending ask
 (`cpt-cf-bss-orders-workflow-upreq-serverless-runtime-definition-versioning-validation-hook`,
 [`../UPSTREAM_REQS.md`](../UPSTREAM_REQS.md) §2.9) — in that hook (§3.2):
 
-1. [ ] - `p1` - Every `protected` operation of each path appears exactly where §4 *The fence* orders it; `settle-from-lookup` and `retry-step`, which run only in-process (`01 §3.3`, D-108), never appear - `inst-def-protected-present`
-2. [ ] - `p1` - Every `call: http` targets `POST /bss-orders-workflow/v1/steps/{operation}` with `{operation}` a row of `owf_step_operation`; a `call` to a Function is allowed only where the corresponding operation is `composable` - `inst-def-call-targets`
-3. [ ] - `p1` - Every `listen` filter type is in the closed set above and carries the two correlations - `inst-def-listen-targets`
-4. [ ] - `p1` - Bounds nest: for every `call`, the operation's `deadline_ms` **<** the cumulative backoff of its retry policy **<** the task's `timeout` **<** the overdue `wait` **<** the lifetime `wait` - `inst-def-bounds-nest`
+1. [ ] - `p1` - Every `protected` operation of each path appears exactly where §4 *The fence* orders it; `settle-from-lookup` and `retry-step`, which run only in-process (`01 §3.3`, D-108), never appear. A path is a walk of the **routing graph**, whose states are a task position plus the values of the routing members `nextStage`, `stageLoop`, `returnStage`, `taskReturnStage`, `taskReturnLoop`, `ceilingReturnStage`, `ceilingReturnLoop`, `heldStage`, `heldLoop` and `arm`. Every write of a routing member **MUST** be a string literal, a copy of another routing member, or an `if … then … else` over routing members that yields one of those — never an operation's output or another `$context` member — so each member ranges over a finite set of literals the check enumerates. A `switch` case over routing members is decided by the state; a case over any other member is taken both ways. The check explores every state reachable from `admitTrigger` and refuses the version if any walk to `end` breaks §4.1 or leaves a stage by a `nextStage` no `dispatch` case names; a walk it cannot decide is refused, never assumed (decision D-126) - `inst-def-protected-present`
+2. [ ] - `p1` - Every `call: http` targets `POST /bss-orders-workflow/v1/steps/{operation}` with `{operation}` a row of `owf_step_operation`, and its `endpoint` is exactly `${ $context.stepsBase + "/<operation>" }` with the operation name a literal. `stepsBase` is written only by `input.from`; no `set`, `output` or `export` **MAY** name it, so no version can send its calls, or the credential the plugin attaches to them, to another host, and the CI test and the hook compare the `input.from` value with the environment's step-surface base (§3.7). A `call` to a Function is allowed only where the corresponding operation is `composable` - `inst-def-call-targets`
+3. [ ] - `p1` - Every `listen` filter type is in the closed set above and carries the two correlations, except the `OrderAmended` filter, which correlates on `orderId` only (the closed set above, `02 §4.7` item 8); a filter **MAY** add a correlation, as the ceiling wait's `taskRef` does - `inst-def-listen-targets`
+4. [ ] - `p1` - Bounds nest, over values the definition holds: every task that calls an operation declares a `timeout` from `use.timeouts`; the operation's `deadline_ms` **<** that timeout, so one attempt fits; every task timeout and every literal `wait` **<** the literal `P90D` lifetime `wait`. The check computes no cumulative backoff, because the DSL gives `backoff.exponential` no multiplier (dsl-reference.md *Retry*) and the timeout bounds the retries whatever their curve. The overdue window and the SLA classes are not definition values — each is stored per order from Orders' per-seller policy — so their bounds are checked where that policy value is validated (`07 §4.8` item 8), not here (decision D-126) - `inst-def-bounds-nest`
 5. [ ] - `p1` - Every task `input`, `output`, `export` and every `body` member validates against the operation's registered reference schemas; no member outside them - `inst-def-references-only`
-6. [ ] - `p1` - No `protected` operation is inside a `try` whose `catch` continues the forward path: a `catch` either only retries, so exhaustion faults the invocation, or routes to one of the named failure routes of §4.6 - `inst-def-no-swallowing-catch`
+6. [ ] - `p1` - No `protected` operation is inside a `try` whose `catch` continues the forward path: a `catch` either only retries, so exhaustion faults the invocation, or routes to one of the named failure routes of §4.6; that a retry-only `catch` re-raises the last error once its limit is spent is Q-11 (vi), assumed until the plugin answers - `inst-def-no-swallowing-catch`
 7. [ ] - `p1` - No `run`, no `emit`, no `for`, no `schedule`: the start mechanism is exactly the two platform event triggers of §3.3, `OrderSubmitted` and `OrderAmended` — Lifecycle publishes no `OrderSubmitted` after an amendment ([Lifecycle `04 §4.3`](../../../orders-lifecycle/docs/design/04-versioning.md#43-re-approval-is-a-two-step-seam-interaction-normative), `02 §4.7` item 9); every `wait` is a literal duration (§3.6 *Fixed waits and re-check loops*) - `inst-def-grammar-subset`
 8. [ ] - `p1` - Every branch of a competing `fork` that can complete ends by `set`-ting `arm` so the sibling `switch` can route; every `fork` is followed by a `switch` on `arm`; every `then` names a task of its own `do` list, `exit` or `end` (the stage dispatcher of §3.6) - `inst-def-fork-routing`
 
@@ -333,23 +333,52 @@ registry; GTS reference schemas from `01 §3.3` for every task boundary.
 
 The registered Workflow callable `gts.cf.core.sless.workflow.v1~cf.bss.orders_workflow.order_process.v1~`
 (derived from the platform's workflow base type, [`DESIGN.md:279`](../../../../serverless-runtime/docs/DESIGN.md#functions-and-workflows)):
-its `implementation` is the declarative `workflow_spec` of §3.6 (`DESIGN.md:388`). Its
-`workflow_traits` (`gts.cf.core.sless.workflow_traits.v1~`,
-[DESIGN_GTS_SCHEMAS.md](../../../../serverless-runtime/docs/DESIGN_GTS_SCHEMAS.md#workflowtraits)
-lines 466–530) declare the three required members: `compensation: { on_failure: null,
-on_cancel: null }` — **no function-level handler**, because compensation is a path through
-Orders' own operations (§3.6 (c), (d)), never a platform-invoked function that would act outside
-the record; `checkpointing: { strategy: automatic }`; and **`max_suspension_days: 90`**
-(schema default 30, lines 520–529), because a suspension longer than the cap moves the invocation
-`suspended → failed` (`DESIGN.md:455`) and the process may legitimately wait up to its lifetime
-ceiling. Whether tenant policy may cap `max_suspension_days` below 90, and whether the cap
-measures one suspension or accumulated suspended time, are upstream asks
+its `implementation` is the declarative `workflow_spec` of §3.6 (`DESIGN.md:388`). Its `traits`
+declare all four members the Workflow base type requires
+([DESIGN_GTS_SCHEMAS.md](../../../../serverless-runtime/docs/DESIGN_GTS_SCHEMAS.md#workflow-sibling-base-type)
+lines 1136–1230), so no member falls to a schema default (decision D-127):
+
+- **`invocation: { supported: [async], default: async }`** — the async-only declaration the
+  platform asks of a workflow that suspends or waits for events (`DESIGN.md:653`); a synchronous
+  start is refused instead of failing at its first suspension point with `sync_suspension` (409).
+  `entrypoint` keeps its default, because the platform does not say whether an event-trigger
+  start is an external invocation; direct starts are the ask
+  `…-upreq-serverless-runtime-invocation-control-restriction`.
+- **`limits: { timeout_seconds: 15552000, max_concurrent: 5000 }`**
+  ([`#limits-base`](../../../../serverless-runtime/docs/DESIGN_GTS_SCHEMAS.md#limits-base), defaults
+  30 s and 100). 180 days is the `P90D` ceiling, the ceiling park and one fresh ceiling after an
+  operator's unpark (§3.6 (d)); an invocation that outlives it is ended by the platform's duration
+  guardrail (BR-028, [serverless-runtime PRD.md](../../../../serverless-runtime/docs/PRD.md) line
+  483), and the instance liveness pass raises it as `invocation-dead`, whose remedies are the
+  platform re-drive and the order cancel (D-105). 5,000 is the sized concurrent in-flight process count of
+  [`../DESIGN.md`](../DESIGN.md) §4.1. Whether `timeout_seconds` measures wall-clock time
+  including suspension, and whether `max_concurrent` counts suspended invocations, the platform
+  does not state; both are part of the readiness ask.
+- **`retry: { max_attempts: 0 }`**
+  ([`#retrypolicy`](../../../../serverless-runtime/docs/DESIGN_GTS_SCHEMAS.md#retrypolicy),
+  default 3). The platform `RetryPolicy` re-runs a failed invocation by SDK error category
+  (`DESIGN.md:354`–`370`); a faulted order process is re-driven only by an operator, through the
+  `invocation-dead` task (D-86, D-105), so no automatic invocation retry runs behind it.
+- **`workflow`** (`gts.cf.core.sless.workflow_traits.v1~`,
+  [DESIGN_GTS_SCHEMAS.md](../../../../serverless-runtime/docs/DESIGN_GTS_SCHEMAS.md#workflowtraits)
+  lines 466–530) with its three required members: `compensation: { on_failure: null,
+  on_cancel: null }` — **no function-level handler**, because compensation is a path through
+  Orders' own operations (§3.6 (c), (d)), never a platform-invoked function that would act outside
+  the record; `checkpointing: { strategy: automatic }`; and **`max_suspension_days: 90`**
+  (schema default 30, lines 520–529), because a suspension longer than the cap moves the invocation
+  `suspended → failed` (`DESIGN.md:455`) and the process may legitimately wait up to its lifetime
+  ceiling.
+
+Whether tenant policy may cap `max_suspension_days` below 90, and whether the cap measures one
+suspension or accumulated suspended time, are upstream asks
 ([`../UPSTREAM_REQS.md`](../UPSTREAM_REQS.md) §2.9); with the re-check loops of §3.6 the
-invocation wakes at least hourly, so no single suspension approaches the cap. The platform says a
-workflow's traits SHOULD declare whether it is async-only (`DESIGN.md:653`), but the
-`WorkflowTraits` schema has no such member; how to declare it is an upstream ask, and until it is
-answered the only starts are the asynchronous trigger starts of §3.3. Its `schema.params` is the
-reference tuple of the start event. One callable, many versions.
+invocation wakes at least hourly, so no single suspension approaches the cap. The tenant runtime
+policy's quotas `max_execution_duration_seconds`, `max_concurrent_executions` and
+`max_execution_history_mb`
+([DESIGN_GTS_SCHEMAS.md](../../../../serverless-runtime/docs/DESIGN_GTS_SCHEMAS.md#tenantruntimepolicy)
+lines 1824–1855) cap these traits whatever they declare, so the readiness gate checks that the
+tenant's values admit them; the history quota is sized against the ask of §3.6 *History growth*.
+Its `schema.params` is the reference tuple of the start event. One callable, many versions.
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-entity-definition-version`
 
@@ -427,7 +456,7 @@ published — once the platform calls it; today it runs only as the CI test (bel
 
 Implementing the rules of §2.2 *Validation before publish* over a candidate version: walking the
 `do` tree, resolving every `call` endpoint to an `owf_step_operation` row, checking the fence
-order of §4, the closed `listen` set, the bound nesting against `deadline_ms`, the reference-only
+order of §4 over the routing graph of rule 1, the closed `listen` set, the bound nesting against `deadline_ms`, the reference-only
 schemas, the no-swallowing-`catch` rule and the grammar subset; returning the platform's
 `ValidationError` shape with a location per issue (`DESIGN.md:489`); refusing an archive or
 delete of a version an `owf_definition_binding` names. The same code runs as the CI test over the
@@ -605,9 +634,11 @@ events*.
 `$error.status` is in {429, 503, 504, 409}; `catch: *transientNo409` is the same set without 409,
 used where an outer `catch` owns the 409 (§2.2). Every task that calls an operation declares a
 `timeout` from `use.timeouts` — `step` (3 min), `wave1` (10 min), `wave2` (3 min), `admission`
-(25 h) — on the `try` that carries its retry, so the cumulative backoff nests inside it (§2.2
-rule 4). A timeout raises the DSL's timeout error (`status` 408, dsl.md *Errors*); it is caught
-only where an outer `catch` names 408, and otherwise faults the invocation.
+(25 h) — on the `try` that carries its retry, so it bounds the call's retries (§2.2 rule 4). A
+timeout raises the DSL's timeout error, whose `type` is `…/errors/timeout` and whose `status`
+should be 408 (dsl.md *Timeouts*); it is caught only where an outer `catch` names 408 **and**
+carries no `errors.with.type` filter, since a filter on the communication type drops it before
+`when` runs, and otherwise faults the invocation.
 
 **Two routing conventions keep the arms honest.** (1) Every branch of a **stage** `fork` only
 listens or waits and then `set`s `arm` (and the references the arm needs); no step operation runs
@@ -658,11 +689,27 @@ deadline stays the owning slice's stored value, so no definition version can mov
 | `waitOverdue` — overdue window (`expected_fulfillment_at` + 24 h) | (b) | `PT1H` | `raise-overdue-escalation` `overdue-fulfillment` (07), under the next round | `due`, `raised` |
 | `waitHeld` — spawn signal or completion report refused while the order is held | (b) | `PT5M`; the resume arm re-enters at once | `report-spawn-signal` (05) or `report-outcome` (06), under the next round | `spawnSignal`, `lifecycleCall` |
 | `waitSla` — manual-task SLA | (c) | `PT5M` | `resolve-manual-task` `trigger: sla-check` (07) | `resolution` |
+| `waitSla` in `awaitOperatorAfterPark` — the ceiling task's SLA | (d) | `PT5M` | `resolve-manual-task` `trigger: sla-check` scoped to `ceilingTaskRef` (07), under that task's own `slaRound` (D-129) | `resolution` — `escalated` or `none` only: an order-scope task escalates and is never exhausted (`07 §4.2`) |
+| `waitResumePoll` — the resume wait's read of the hold | (e) | `PT15M` | `apply-resume` `trigger: poll` (08), under the next `resumePollRound` (D-130) | `resumeOutcome` |
 | `waitRepoll`, `waitRetryLeg` — compensation re-poll and leg retry | (c) | `PT30S`, `PT1H` | `compensate-order` (06) | `compensationState` |
 
 Q-11 (i) now asks only whether the plugin accepts a runtime-expression duration as an extension
 (§4.5); until it is answered, and after it unless a new version says otherwise, the re-check loop
 applies.
+
+**History growth.** Every tick is engine history: a `wait`, a competing `fork` of up to seven
+branches torn down and re-armed, and one or two activity calls. Per waiting instance and day, the
+`PT30S` ticks of `gateLoop` and of the barrier's `waitPoll` add 2,880 iterations each, a `PT5M`
+tick 288, `waitResumePoll` 96, and the overdue monitor 24 for the whole life of the invocation.
+Serverless Workflow DSL 1.0.0 has no construct that truncates history, and the platform states no
+per-invocation history bound beyond the tenant quota `max_execution_history_mb`
+([DESIGN_GTS_SCHEMAS.md](../../../../serverless-runtime/docs/DESIGN_GTS_SCHEMAS.md#tenantruntimepolicy)
+line 1840). The ticks are not lengthened to fit a budget nobody has stated: the gate tick is bound
+by the ± 5 min escalation accuracy (D-123) and the barrier poll by the 15-minute fulfillment SLA.
+Bounding one invocation's history over a life of 90 days and more is therefore asked of the plugin
+(decision D-128, `cpt-cf-bss-orders-workflow-upreq-serverless-runtime-history-growth`,
+[`../UPSTREAM_REQS.md`](../UPSTREAM_REQS.md) §2.9), and the platform path is not ready until it
+answers.
 
 #### (a) Start and approval
 
@@ -693,7 +740,7 @@ use:
       delay: { seconds: 10 }
       backoff: { constant: {} }
       limit: { attempt: { count: 5 }, duration: { seconds: 60 } }
-  timeouts:                             # §2.2 rule 4: each above the cumulative backoff of the policy its try carries
+  timeouts:                             # §2.2 rule 4: each above the deadline_ms of every operation called under it, and below the P90D lifetime wait
     step:      { after: { minutes: 3 } }
     wave1:     { after: { minutes: 10 } }    # 01 §4.2 (D-70)
     wave2:     { after: { minutes: 3 } }     # nfr-owf-fulfillment-sla (D-70)
@@ -782,7 +829,7 @@ do:
                         type: https://serverlessworkflow.io/spec/1.0.0/errors/runtime
                         status: 500
                         title: unknown-stage
-                        detail: '${ "no stage named " + ($context.nextStage | tostring) }'
+                        detail: nextStage names no stage task of this version   # a literal: the 1.0.0 schema types error.detail as a plain string; the faulted task's position names the dispatcher
                 - approval:    { do: [ ‹approval stage, below› ],       then: dispatch }
                 - fulfillment: { do: [ ‹fragment (b)› ],               then: dispatch }
                 - failure:     { do: [ ‹failure stage, fragment (c)› ], then: dispatch }
@@ -1685,8 +1732,7 @@ report):
           try:
             - call: { step: compensate-order }   # body: ref + pass: $context.pass; output: compensationState ∈ complete | in-progress | pending-escalation, nextPass, taskRefs[]
           catch: *transient
-    catch:                              # the budget or the timeout spent: the next pass waits in awaitCompensationResolution (06 §4.7 item 5)
-      errors: { with: { type: https://serverlessworkflow.io/spec/1.0.0/errors/communication } }
+    catch:                              # the budget or the timeout spent: the next pass waits in awaitCompensationResolution (06 §4.7 item 5); no type filter, so the timeout error (…/errors/timeout, 408) reaches `when`, as in the wave catches
       when: '${ $error.status as $s | any((408, 429, 503, 504, 409); . == $s) }'
       do: [ { exhausted: { set: { compensationState: retry-exhausted } } } ]
     export: { as: '${ $context + { compensationState: .compensationState, pass: (.nextPass // ($context.pass + 1)) } }' }
@@ -1839,7 +1885,7 @@ The ceiling stage, the `do` list of `process.ceiling`, entered from `ceilingEntr
     try:
       - call: { step: raise-overdue-escalation }   # body: ref + escalationKind: lifetime-ceiling, round: $context.ceilingRound; output: taskRef, nextRound
     catch: *transient
-    export: { as: '${ $context + { ceilingTaskRef: .taskRef, ceilingSubject: ("ceiling:" + ($context.ceilingRound | tostring)), ceilingRound: .nextRound } }' }   # each ceiling is its own round: a new escalation, task and park subject (D-121)
+    export: { as: '${ $context + { ceilingTaskRef: .taskRef, ceilingSubject: ("ceiling:" + ($context.ceilingRound | tostring)), ceilingRound: .nextRound, ceilingSlaRound: 0 } }' }   # each ceiling is its own round: a new escalation, task and park subject (D-121); its task's SLA family starts at round 0 (D-129)
 - parkCeiling:                          # from started or suspended only (01 §3.7): afterLifetime routes neither an unwind nor the verdict park here
     timeout: step
     try:
@@ -1864,12 +1910,21 @@ The ceiling stage, the `do` list of `process.ceiling`, entered from `ceilingEntr
                     read: envelope
                   output: { as: '${ .[0] | { requestRef: .data.requestRef } }' }
               - arm: { set: { arm: resolution, requestRef: '${ .requestRef }' } }
+        - sla:       { do: [ { waitSla: { wait: PT5M } }, { arm: { set: { arm: sla } } } ] }   # 07 §4.8 item 3: the ceiling task has a waiter and an SLA tick like every task (D-129)
         - lifecycle: { do: [ ‹lifecycle arm of (f)› ] }
-        - cancel:    { do: [ ‹cancel arm of (d)› ] }
+        - cancel:    { do: [ ‹cancel arm of (d)› ] }   # the Seller Operator's way to end a ceiling park: the order cancel, not the task's cancel (07 §4.4, D-129)
 - afterOperatorPark:
     switch:
       - resolution: { when: '${ .arm == "resolution" }', then: resolveCeilingTask }
+      - sla:        { when: '${ .arm == "sla" }',        then: slaCheckCeiling }
       - other:      { then: leave }     # cancel: parked → compensating through the fence (01 §3.7); lifecycle
+- slaCheckCeiling:                      # composable (07): escalates the ceiling task to the Seller Operator once its stored deadline has passed; checks no other task, so it answers escalated or none, never exhausted
+    timeout: step
+    try:
+      - call: { step: resolve-manual-task }   # body: ref + trigger: sla-check, taskRef: $context.ceilingTaskRef, slaRound: $context.ceilingSlaRound
+    catch: *transient
+    export: { as: '${ $context + { ceilingSlaRound: .slaRound } }' }
+    then: awaitOperatorAfterPark
 - resolveCeilingTask:                   # composable (07)
     timeout: step
     try:
@@ -1879,7 +1934,7 @@ The ceiling stage, the `do` list of `process.ceiling`, entered from `ceilingEntr
 - onCeilingResolution:
     switch:
       - retry: { when: '${ $context.resolution == "retry" }', then: unparkAfterCeiling }
-      - wait:  { then: awaitOperatorAfterPark }
+      - wait:  { then: awaitOperatorAfterPark }   # refused (the task's cancel is not offered, 07 §4.4) | closed | none
 - unparkAfterCeiling:
     timeout: step
     try:
@@ -1919,7 +1974,16 @@ consumes no other task's resolution: while that task is open, `07 §4.4` offers 
 the unpark, in the stage that waits on them (decision D-122). `resolve-manual-task` records the
 retry against the request row the task route wrote under the operator's authorization; `unpark`
 refuses the ceiling's subject unless that recorded retry exists, so no unrecorded signal can
-release a ceiling park. `unpark` restores the pre-park phase and the process resumes at the stage
+release a ceiling park. The wait also carries the `PT5M` SLA tick every task waiter carries
+(`07 §4.8` item 3): `resolve-manual-task` `sla-check`, scoped to `ceilingTaskRef` and under that
+task's own `slaRound`, escalates the ceiling task to the Seller Operator once its stored 24 h
+deadline has passed and never resolves it; it checks no other task, whose deadlines the waiter of
+the stage that owns them re-checks after the unpark (decision D-129). The ceiling task offers no
+task `cancel` (`07 §4.4`), because closing it would leave the order parked with nothing to wait
+on: the Seller Operator ends a ceiling park with the order cancel of
+[`09 §3.3`](./09-read-and-authz.md#33-api-contracts), which this wait's cancel arm consumes and
+the fence unwinds (`parked → compensating`), or, before fulfillment has begun, where that route
+refuses, with Lifecycle's own cancel, whose `OrderCancelled` the lifecycle arm consumes (D-109). `unpark` restores the pre-park phase and the process resumes at the stage
 and checkpoint `ceilingEntry` recorded, under the fresh ceiling of the re-entered fork. The
 canonical version has **no `unpark-requested` arm**: `:plugin-control` is authorized
 platform-side (`../ADR/0010`), so a signal with no Orders origin route is not a signal no one can
@@ -1992,17 +2056,34 @@ The hold stage, the `do` list of `process.hold`:
     switch:
       - pause:  { when: '${ $context.holdOutcome == "suspended" and $context.holdPauses }', then: enterResumeWait }   # only the approval stage waits on the resume
       - record: { then: back }          # suspended elsewhere, or reconciled-out-of-order | absorbed-duplicate | not-applicable: the stage continues, dispatch defers while suspended
-- enterResumeWait: { set: { heldStage: '${ $context.returnStage }', heldLoop: '${ $context.stageLoop }', stageLoop: awaitResume } }
+- enterResumeWait: { set: { heldStage: '${ $context.returnStage }', heldLoop: '${ $context.stageLoop }', stageLoop: awaitResume, resumePollRound: 0 } }   # the poll family is per suspension, so it starts at round 0 (D-130)
 - awaitResume:
     fork:
       compete: true
       branches:
         - resume:    { do: [ ‹resume arm above› ] }   # 08 §4.7 item 4: resumeEventId exported from the listen
+        - resumePoll: { do: [ { waitResumePoll: { wait: PT15M } }, { arm: { set: { arm: resumePoll } } } ] }   # stopgap for a resume lost between listens (D-124, D-130)
         - lifecycle: { do: [ ‹lifecycle arm of (f)› ] }
         - cancel:    { do: [ ‹cancel arm of (d)› ] }  # a denied cancel returns here: stageLoop is awaitResume
 - afterResumeRace:
     switch:
-      - any: { then: leave }            # resume → the resume stage; lifecycle; cancel: an authorized cancel taken from hold, suspended → compensating
+      - poll: { when: '${ .arm == "resumePoll" }', then: pollResume }
+      - any:  { then: leave }           # resume → the resume stage; lifecycle; cancel: an authorized cancel taken from hold, suspended → compensating
+- pollResume:                           # protected (08): reads the order through Lifecycle; applies the resume only if Lifecycle no longer holds it, otherwise records nothing
+    timeout: step
+    try:
+      - call: { step: apply-resume }    # body: ref + trigger: poll, suspensionRef, round: $context.resumePollRound; output: resumeOutcome ∈ resumed-by-read | still-held, due, failedTaskRefs[], nextRound
+    catch: *transient
+    export: { as: '${ $context + { resumeOutcome: .resumeOutcome, resumePollTail: ("poll:" + ($context.resumePollRound | tostring)), resumePollRound: .nextRound, resumeDue: (.due // false), resumeFailed: (.failedTaskRefs // []) } }' }   # resumePollTail: the key tail of the round just called
+- onPollResume:
+    switch:
+      - stillHeld:        { when: '${ $context.resumeOutcome == "still-held" }', then: awaitResume }
+      - deferredFailures: { when: '${ ($context.resumeFailed | length) > 0 }', then: pollResumeFailure }   # 08 §4.7 item 8, as after an event-driven resume
+      - resumed:          { then: backFromPoll }
+- pollResumeFailure:                    # fragment (c); the failing call's key tail is the poll round
+    set: { failureScope: line, failureSubjects: '${ [ $context.resumeFailed[] | { subjectRef: .lineRef, reason: .reason, cause: (if .reason == "intent-unresolved" then "sweep-floor-reached" else "sweep-discovered-terminal-failure" end) } ] }', sourceStep: apply-resume, sourceAttempt: '${ $context.resumePollTail }', nextStage: failure, stageLoop: null }
+    then: exit
+- backFromPoll: { set: { nextStage: '${ $context.heldStage }', returnStage: '${ $context.heldStage }', stageLoop: '${ $context.heldLoop }' }, then: exit }   # the stage and loop the hold interrupted; resumeDue is the escalation re-check's first answer
 - leave: { set: { nextStage: '${ .arm }', returnStage: hold }, then: exit }
 - back: { set: { nextStage: '${ $context.returnStage }' }, then: exit }
 ```
@@ -2067,7 +2148,17 @@ the dispatch operations defer while `owf_process_instance.suspended` is set
 ([`01 §3.7`](./01-foundation.md#table-owf_process_instance)); the stage-level resume arm then
 records the resume. Every stage fork that carries a hold arm also carries that resume arm, so a
 resume delivered before its hold is recorded as `resume-ahead-recorded` and not lost, and the
-resume wait is entered only on `holdOutcome = suspended`. A cancel taken from the resume wait
+resume wait is entered only on `holdOutcome = suspended`. **The resume wait polls the hold**
+(decision D-130), a stopgap until the event-retention ask of §4.4 lands: its `PT15M`
+`waitResumePoll` branch calls `apply-resume` with `trigger: poll`, which reads the order through
+the Lifecycle PDP-authorized order read. While Lifecycle holds the order it records nothing and
+answers `still-held` with the next round, and the wait continues; once Lifecycle no longer holds
+it, it applies the resume as for an `OrderResumed` — closes the suspension, re-arms the gate
+windows, applies the deferred failures — and answers `resumed-by-read`, and the definition
+returns to the stage and loop the hold interrupted. A resume lost while the hold stage ran
+`admitHold` and `applyHold` therefore costs at most one poll interval, not the lifetime ceiling.
+The poll consumes no Lifecycle event, so no `admit-trigger` precedes it; the order read inside
+`apply-resume` is its guard (§4.1). A cancel taken from the resume wait
 that `authorize-cancel` denies returns to the resume wait, because the instance is still
 `suspended`. The ceiling wait and the unwind carry no hold arm (`06 §4.7` item 7); the park loop's
 hold and resume arms only record, because `holdPauses` is false there and the park clock is never
@@ -2097,8 +2188,14 @@ spawn signal or completion report is called again after the resume (`01 §3.3` *
           - with: { type: gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.rejected.v1~ }
             correlate: { orderId: { from: '${ .data.orderId }', expect: '${ $context.orderId }' }, orderVersion: { from: '${ .data.orderVersion }', expect: '${ $context.orderVersion }' } }
       read: envelope
-    output: { as: '${ .[0] | { eventId: .id, type: .type, orderVersion: .data.orderVersion } }' }
-- arm: { set: { arm: lifecycle, lifecycleEventId: '${ .eventId }', triggerKind: '${ .type }', newOrderVersion: '${ .orderVersion }' } }   # triggerKind is mapped to the closed nine-value enum; nothing branches on it
+    output:                             # triggerKind by exact-type lookup into admit-trigger's closed nine-value enum (02 §3.3), as input.from does for the start (D-107); nothing branches on it
+      as: >-
+        ${ .[0] | { eventId: .id, orderVersion: .data.orderVersion,
+                    triggerKind: ({ "gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.amended.v1~": "OrderAmended",
+                                    "gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.cancelled.v1~": "OrderCancelled",
+                                    "gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.expired.v1~": "OrderExpired",
+                                    "gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.rejected.v1~": "OrderRejected" }[.type]) } }
+- arm: { set: { arm: lifecycle, lifecycleEventId: '${ .eventId }', triggerKind: '${ .triggerKind }', newOrderVersion: '${ .orderVersion }' } }
 ```
 
 The lifecycle stage, the `do` list of `process.lifecycle` — admission first, and the admission
@@ -2225,10 +2322,10 @@ any of them:
 
 | Stage | Protected operations, in order | May be interleaved with (composable) |
 |-------|-------------------------------|--------------------------------------|
-| Admission | `admit-trigger` (`role: start`) **<** `start-instance`; on every arm that consumes a Lifecycle trigger, `admit-trigger` (`role: listen`) **<** the consuming operation (`evaluate-payment-auth-eligibility`, `apply-hold`, `apply-resume`, `terminate-on-terminal-event`, `run-cancellation-fence` on supersede) | — |
+| Admission | `admit-trigger` (`role: start`) **<** `start-instance`; on every arm that consumes a Lifecycle trigger, `admit-trigger` (`role: listen`) **<** the consuming operation (`evaluate-payment-auth-eligibility`, `apply-hold`, `apply-resume`, `terminate-on-terminal-event`, `run-cancellation-fence` on supersede); `apply-resume` with `trigger: poll` consumes no trigger and follows no admission — the Lifecycle order read inside it is its guard (D-130) | — |
 | Verdict | `obtain-verdict` **<** `reflect-verdict`; `record-decision` **<** `reflect-verdict` on the decision path | `open-gates`, `escalate-gate`, `arm-park-escalation`, `park`, `unpark` |
 | Plan | `evaluate-payment-auth-eligibility` **<** `construct-and-freeze-plan` **<** `begin-fulfillment` | `evaluate-activation-eligibility` |
-| Waves | `begin-fulfillment` **<** `dispatch-wave1-create` **<** `re-check-pre-activation` **<** `report-spawn-signal` **<** `dispatch-wave2-activate` | `evaluate-activation-eligibility`, `reconcile-intent`, `reread-draft-liveness`, `rebuild-wave1` |
+| Waves | `begin-fulfillment` **<** `dispatch-wave1-create` **<** `re-check-pre-activation` **<** `report-spawn-signal` **<** `dispatch-wave2-activate`; on every path to `dispatch-wave2-activate`, the barrier's `waitExpected` re-check loop and an `evaluate-activation-eligibility` answer `released` **<** `dispatch-wave2-activate` — the ADR-0004 conjunction, whose run-time guard is `05 §3.6` `inst-pi-wave2-guard` (`activation-precondition-unmet`); `evaluate-activation-eligibility` stays `composable` everywhere else | `evaluate-activation-eligibility` (beyond the conjunction), `reconcile-intent`, `reread-draft-liveness`, `rebuild-wave1` |
 | Failure | `create-manual-task` before any terminal outcome under `remediate` | `resolve-manual-task` (which runs `retry-step` in-process), `verify-override`, `raise-overdue-escalation` |
 | Unwind | `run-cancellation-fence` **<** `compensate-order` **<** `report-outcome` on every failure, cancel, supersede and terminal-event path; `authorize-cancel` **<** `run-cancellation-fence` on the cancel path; `terminate-on-terminal-event` **<** `run-cancellation-fence` on the terminal-event path | — |
 | Hold | `apply-hold` **<** `apply-resume`, in the arm that owns the escalation `wait` | — |
@@ -2299,13 +2396,17 @@ invocation while no `listen` for it is armed: during every step call a stage mak
 competing fork's teardown and its re-arm. The canonical definition **MUST** be run only on a
 platform that retains such an event for the invocation and delivers it, in order, to the next
 `listen` that matches it (decision D-124, ask
-`cpt-cf-bss-orders-workflow-upreq-serverless-runtime-event-retention-between-listens`). No poll
-covers the loss: nothing re-reads a hold, a resume, a decision or an amendment. The stage-level
-resume arm covers only a resume delivered before its hold's `listen` (`08 §4.7` item 3), and the
-barrier and eligibility polls cover only the conditions they evaluate. Until the ask is answered, a
-resume delivered while the hold stage runs `admitHold` and `applyHold` leaves the instance in
-`awaitResume` until an operator cancels it or the lifetime ceiling parks it, and a decision
-delivered during a probe is not recorded, so the gate escalates on its window.
+`cpt-cf-bss-orders-workflow-upreq-serverless-runtime-event-retention-between-listens`). One poll
+covers one loss, as a stopgap (decision D-130): the resume wait's `PT15M` `waitResumePoll` reads
+through `apply-resume` whether Lifecycle still holds the order, so a resume delivered while the
+hold stage runs `admitHold` and `applyHold` is applied at most one poll interval late. Nothing
+re-reads a hold, a decision or an amendment. The stage-level resume arm covers only a resume
+delivered before its hold's `listen` (`08 §4.7` item 3), and the barrier and eligibility polls
+cover only the conditions they evaluate. Until the ask is answered, a resume lost outside the
+approval stage, which has no resume wait, leaves `owf_process_instance.suspended` set, so the
+dispatch operations defer and the barrier does not release until an operator cancels the order
+or the lifetime ceiling parks it; and a decision delivered during a probe is not recorded, so the
+gate escalates on its window.
 
 Orders issues no generic `cancel`, `suspend` or `resume`, and it **cannot prevent** another
 platform-authorized caller from issuing them (`../ADR/0010` *platform APIs are authorized
@@ -2341,13 +2442,18 @@ the Problem body's `error_code` on `$error` so a `catch` can tell `idempotency-k
 `still-processing` before the retry budget is spent; (iii) offers any dynamic parallel construct,
 so a wave could fan out per line inside the definition rather than inside the operation; (iv)
 treats a `listen` inside a competing `fork` as cancellable without losing an event delivered
-during cancellation; and (v) expresses the hold pattern natively. Until Q-11 is answered, (i) is
+during cancellation; (v) expresses the hold pattern natively; and (vi) re-raises the last error
+when a `catch` that carries only `retry` spends its limit, which §4.6 and rule 6 of §2.2 take as
+the fault of the invocation — the DSL says nothing about what follows the last attempt (dsl.md
+*Retries*, dsl-reference.md *Catch*). Until Q-11 is answered, (i) is
 the re-check loop, (ii) is bounded by the retry budget, (iii) is settled as one `call` per wave
-carrying `lineRefs[]`, (iv) is **not** covered by any poll: it is the event-retention ask of §4.4
-(D-124), and until it is answered an event delivered between listens can be lost, and
-(v) is satisfied by the re-check loop, which needs no Function; (v) asks only whether a remainder
-could be armed directly, which is (i) (open question Q-11: Q-11 carries the five sub-questions
-(i)–(v)).
+carrying `lineRefs[]`, (iv) is the event-retention ask of §4.4 (D-124): until it is answered an
+event delivered between listens can be lost, and only a resume awaited in the approval stage's
+resume wait is recovered, by the stopgap poll of D-130; (v) is satisfied by the re-check loop,
+which needs no Function, and asks only whether a remainder could be armed directly, which is (i);
+and (vi) is assumed: every retry-only `catch` of §3.6 relies on it, and the CI test cannot observe
+it, so the plugin's answer is a readiness item (open question Q-11: Q-11 carries the six
+sub-questions (i)–(vi)).
 
 ### 4.6 Protected operations are never inside a swallowing `catch`
 
@@ -2356,7 +2462,11 @@ could be armed directly, which is (i) (open question Q-11: Q-11 carries the five
 A `try` whose task list contains a `protected` operation **MUST** have a `catch` that either
 carries only `retry` or routes to one of the named failure routes below. A `catch` that returns
 normally after a protected operation's permanent failure — continuing the path as if the step
-had settled — is refused before publish (§2.2 rule 6).
+had settled — is refused before publish (§2.2 rule 6). ADR-0012 rule 6 states the same rule
+(as amended by decision D-126). That a retry-only `catch` re-raises the last error once its limit
+is spent is Q-11 (vi); a route that catches a spent timeout names 408 and carries no
+`errors.with.type` filter, because the timeout error's type is `…/errors/timeout` (dsl.md
+*Timeouts*).
 
 **One failure rule** (decision D-114). A step call's spent retry budget, its spent timeout, and
 a permanent refusal the definition does not route **MUST** fault the invocation. The platform

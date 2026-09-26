@@ -280,6 +280,14 @@ section; stated here as asks because no platform document states them as facts):
   ADR-0004 line 100) whose location and retention this gear cannot pin.
 * **A consumer-registered pre-publish validation hook and audit of publishes**, per ADR-0012.
 
+> **Amended 2026-09-26 by D-127**: the async-only declaration needs no new field. The Workflow
+> base type's required `traits.invocation` (`supported`, `default`;
+> [DESIGN_GTS_SCHEMAS.md](../../../../serverless-runtime/docs/DESIGN_GTS_SCHEMAS.md) lines
+> 1139–1159) declared `{ supported: [async], default: async }` is it, and the callable now declares
+> it with the other required traits, `limits` and `retry` (`design/10-process-definition.md`
+> §3.1). The gate asks only that the platform confirm this is what DESIGN.md line 653 means, and
+> that the tenant quotas admit the declared limits.
+
 ### Confirmation
 
 Verified by: a CI test that parses every canonical definition against the Serverless Workflow

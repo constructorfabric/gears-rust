@@ -144,6 +144,11 @@
   - [D-123 (M) The escalation re-check rides the 30-second probe tick](#d-123-m-the-escalation-re-check-rides-the-30-second-probe-tick)
   - [D-124 (M) An event delivered between listens needs platform retention; no poll covers it](#d-124-m-an-event-delivered-between-listens-needs-platform-retention-no-poll-covers-it)
   - [D-125 (M) A failure or floor trip the sweep worker records reaches the definition through its next reconcile round](#d-125-m-a-failure-or-floor-trip-the-sweep-worker-records-reaches-the-definition-through-its-next-reconcile-round)
+  - [D-126 (H) The validation rules are stated over values the definition holds and a routing graph the check can enumerate](#d-126-h-the-validation-rules-are-stated-over-values-the-definition-holds-and-a-routing-graph-the-check-can-enumerate)
+  - [D-127 (M) The Workflow callable declares every required trait: async-only, its limits, and no invocation retry](#d-127-m-the-workflow-callable-declares-every-required-trait-async-only-its-limits-and-no-invocation-retry)
+  - [D-128 (M) Bounding one invocation's engine history is asked of the plugin; the ticks are not stretched to fit](#d-128-m-bounding-one-invocations-engine-history-is-asked-of-the-plugin-the-ticks-are-not-stretched-to-fit)
+  - [D-129 (M) The ceiling task has an SLA tick, and a Seller Operator ends a ceiling park with the order cancel](#d-129-m-the-ceiling-task-has-an-sla-tick-and-a-seller-operator-ends-a-ceiling-park-with-the-order-cancel)
+  - [D-130 (M) Until events are retained between listens, the resume wait polls whether Lifecycle still holds the order](#d-130-m-until-events-are-retained-between-listens-the-resume-wait-polls-whether-lifecycle-still-holds-the-order)
 - [Open Questions](#open-questions)
   - [Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?](#q-01-which-durable-execution-substrate-backs-the-process--the-oss-workflow-engine-or-a-bss-local-mechanism)
   - [Q-02: The Generic Approval escalation threshold — the one PRD-deferred numeric value this design deliberately leaves unset](#q-02-the-generic-approval-escalation-threshold--the-one-prd-deferred-numeric-value-this-design-deliberately-leaves-unset)
@@ -1711,6 +1716,13 @@ and the run-time guard makes the fence hold even for a publish outside the pipel
 `start-instance` is bound to the instance's invocation (D-106). `retry-step` and
 `settle-from-lookup` are never `call` targets (D-108); the counts are unchanged.
 
+**Amended (2026-09-26)**: the bounds rule no longer compares with the overdue window or sums a
+backoff: it checks each operation's deadline against the task timeout and every timeout and
+`wait` against the literal lifetime ceiling, and the policy-held windows are bounded where the
+policy is validated. The catch rule is one rule across `design/10` §2.2, §4.6 and ADR-0012 — a
+retry-only `catch` or a named failure route — and the path rule walks a routing graph of literal
+routing values (D-126). The counts are unchanged.
+
 ### D-68 (H) Instances are pinned to their definition version; the platform operator publishes
 
 **Accepted.** *(carries `ADR/0012`, versioning half)*
@@ -3165,6 +3177,10 @@ the task route's request row and `action-not-offered` refusal (`07 §3.3`, D-100
 **Propagated**: `design/10-process-definition.md` §2.2, §3.1, §3.3, §3.6 (d);
 `design/01-foundation.md` §3.3; `design/07-manual-tasks.md` §4.4, §4.8; `DESIGN.md` §3.1; Q-13.
 
+**Amended (2026-09-26)**: the ceiling wait also carries an SLA tick scoped to the ceiling task,
+and the ceiling task offers no task `cancel`; the Seller Operator's way out besides `retry` is the
+order cancel, which the wait's cancel arm consumes (D-129).
+
 ### D-123 (M) The escalation re-check rides the 30-second probe tick
 
 **Accepted (2026-09-26).**
@@ -3207,6 +3223,11 @@ DSL, which states no buffering between `listen` tasks (dsl-reference.md *Listen*
 **Propagated**: `design/10-process-definition.md` §4.4, §4.5; `design/08-hold-and-cancel.md`
 §4.7; `DESIGN.md` §1.2; `UPSTREAM_REQS.md` §2.9, §3; Q-11.
 
+**Amended (2026-09-26)**: "no poll covers it" now has one exception, a stopgap until the ask
+lands: the approval stage's resume wait reads through `apply-resume` whether Lifecycle still holds
+the order, so a resume lost there is applied at most one `PT15M` poll late (D-130). A lost resume
+outside the approval stage, a lost hold, decision or amendment stay uncovered.
+
 ### D-125 (M) A failure or floor trip the sweep worker records reaches the definition through its next reconcile round
 
 **Accepted (2026-09-26).**
@@ -3234,6 +3255,150 @@ not followed.
 **Propagated**: `design/05-provisioning-intents.md` §3.2, §3.3, §3.6, §3.7, §4.5;
 `design/07-manual-tasks.md` §3.6; `design/08-hold-and-cancel.md` §3.2, §3.6;
 `design/10-process-definition.md` §3.6 (b).
+
+### D-126 (H) The validation rules are stated over values the definition holds and a routing graph the check can enumerate
+
+**Accepted (2026-09-26).**
+
+**Decision**: the eight rules of `design/10` §2.2 are restated so a validator can be written
+without inventing a rule. **Rule 1** walks a routing graph: its states are a task position plus
+the routing members (`nextStage`, `stageLoop`, the return members, `heldStage`, `heldLoop`,
+`arm`), which may be written only as string literals, copies of one another or an
+`if … then … else` over them, so they range over a finite set of literals; a `switch` over any
+other member is taken both ways; every reachable walk to `end` must satisfy the §4.1 fence, and a
+walk the check cannot decide is refused. The §4.1 Waves row carries the ADR-0004 conjunction —
+the barrier's `waitExpected` loop and an `evaluate-activation-eligibility` answer `released`
+before `dispatch-wave2-activate` — and `start-instance` is the first operation after
+`admit-trigger` (`role: start`). **Rule 2** requires every endpoint to be
+`$context.stepsBase + "/<operation>"` with `stepsBase` written only by `input.from` and compared
+with the environment's step-surface base. **Rule 3** exempts the `OrderAmended` filter from the
+`orderVersion` correlation. **Rule 4** checks the operation's `deadline_ms` < the task timeout and
+every task timeout and `wait` < the literal `P90D` ceiling, and computes no cumulative backoff;
+the overdue window and the SLA classes are per-order policy values, bounded where the policy is
+validated (`design/07` §4.8 item 8). **Rule 6**, `design/10` §4.6 and ADR-0012 rule 6 now say the
+same thing: a `catch` around a protected operation only retries, so exhaustion faults the
+invocation, or routes to a named failure route of §4.6. That a retry-only `catch` re-raises the
+last error once its limit is spent is added to Q-11 as (vi). A `catch` that must see a spent
+timeout names 408 and carries no `errors.with.type` filter, because the DSL's timeout error has
+its own type; `compensate-order`'s catch loses its communication-type filter accordingly.
+
+**Rationale**: rule 6, §4.6 and ADR-0012 named three different catch rules, and rule 6 as written
+refused every retry-only catch in the canonical file (OW2-1). Rule 4 compared the 25 h admission
+timeout with a `PT1H` tick, or, in the ADR's wording, with a stored per-order window no definition
+holds, and summed an exponential backoff the DSL gives no multiplier for (OW2-2). Rule 1 promised
+a whole-path check over routing that runs on jq values in `$context`, with no method stated
+(OW2-4); the conjunction lived only in the run-time guard (OW2-82). Endpoints were expressions over
+a member any `set` could overwrite (OW2-62). The compensate catch filtered on the communication
+type, so its 408 case never matched (OW2-3). **Precedent**: the wave catches, which carry no type
+filter (`design/10` §3.6 (b)); the start path's exact-type lookup (D-107), reused for the
+lifecycle arm's `triggerKind` (OW2-6); none in the platform for a routing check, whose
+registration-validation hook states no rule of this kind (serverless-runtime `DESIGN.md:762`).
+
+**Propagated**: `design/10-process-definition.md` §1.2, §2.2, §3.2, §3.6, §4.1, §4.5, §4.6;
+`design/07-manual-tasks.md` §4.8; `ADR/0012`; D-67; Q-11.
+
+### D-127 (M) The Workflow callable declares every required trait: async-only, its limits, and no invocation retry
+
+**Accepted (2026-09-26).**
+
+**Decision**: the callable's `traits` declare the four members the Workflow base type requires.
+`invocation: { supported: [async], default: async }` is the async-only declaration.
+`limits: { timeout_seconds: 15552000, max_concurrent: 5000 }`: 180 days covers the `P90D`
+ceiling, the ceiling park and one fresh ceiling after an operator's unpark, and 5,000 is the sized
+in-flight process count of `DESIGN.md` §4.1. `retry: { max_attempts: 0 }`: no invocation-level
+retry, because a faulted order process is re-driven only by an operator through the
+`invocation-dead` task. `workflow` keeps its three members. An invocation that outlives the
+timeout is ended by the platform guardrail and raised as `invocation-dead` (D-105). The readiness
+gate checks that the tenant quotas `max_execution_duration_seconds`,
+`max_concurrent_executions` and `max_execution_history_mb` admit these values, and asks whether
+`timeout_seconds` counts suspended time and whether `max_concurrent` counts suspended
+invocations. The async-only ask is narrowed to confirming that `traits.invocation` is what
+serverless-runtime `DESIGN.md:653` means.
+
+**Rationale**: only `workflow_traits` was declared, so the schema defaults applied — a 30-second
+timeout, a cap of 100 concurrent invocations and three automatic whole-invocation retries — and
+the async-only ask waited on a field the base type already has (OW2-68, OW2-70). **Precedent**:
+the platform's own schema (serverless-runtime `DESIGN_GTS_SCHEMAS.md` lines 142–174, 250–292,
+1136–1230, 1799–1855) and its duration guardrail (serverless-runtime PRD BR-028).
+
+**Propagated**: `design/10-process-definition.md` §3.1; `UPSTREAM_REQS.md` §2.9; `ADR/0011`.
+
+### D-128 (M) Bounding one invocation's engine history is asked of the plugin; the ticks are not stretched to fit
+
+**Accepted (2026-09-26).**
+
+**Decision**: the re-check ticks stay as the NFRs set them — the gate loop and the barrier poll at
+`PT30S`, the SLA, park and eligibility ticks at `PT5M`, the resume poll at `PT15M`, the overdue
+monitor at `PT1H` — and `design/10` §3.6 states their growth per waiting instance and day. The
+plugin is asked to bound one invocation's history over a life of 90 days and more, by truncating
+it inside its DSL interpreter while keeping the invocation, its `$context`, its position and its
+pending events, or by stating a per-invocation budget and how `max_execution_history_mb` applies.
+The ask is `cpt-cf-bss-orders-workflow-upreq-serverless-runtime-history-growth`, `p1` on the
+platform path.
+
+**Rationale**: a `PT30S` tick adds 2,880 fork-and-call iterations a day, and a 72-hour approval
+or a long manual-task wait is ordinary; the DSL has no construct that truncates history, and
+neither document set said how long an invocation's history may grow (OW2-69). Lengthening the
+ticks would break the ± 5 min escalation accuracy (D-123) and the fulfillment SLA without knowing
+the budget they would have to fit. **Precedent**: the tenant history quota of the platform's own
+policy schema (serverless-runtime `DESIGN_GTS_SCHEMAS.md` line 1840); none for a per-invocation
+bound.
+
+**Propagated**: `design/10-process-definition.md` §3.1, §3.6; `UPSTREAM_REQS.md` §2.9, §3;
+`DESIGN.md` §4.1.
+
+### D-129 (M) The ceiling task has an SLA tick, and a Seller Operator ends a ceiling park with the order cancel
+
+**Accepted (2026-09-26).**
+
+**Decision**: the ceiling wait (`awaitOperatorAfterPark`) carries the `PT5M` SLA branch every
+task waiter carries. It calls `resolve-manual-task` `sla-check` scoped to `ceilingTaskRef`, under
+that task's own `slaRound` family (`…:resolve-manual-task:sla:{taskRef}:{slaRound}`, from round
+0), so it escalates the order-scope ceiling task once its 24 h deadline has passed and answers
+`escalated` or `none`, never `exhausted`; other open tasks are re-checked by the waiter of their
+own stage after the unpark. The `lifetime-ceiling-reached` task offers no task `cancel`: the
+route refuses `action-not-offered`, and the Seller Operator ends the park with the order cancel of
+`design/09` §3.3, which the ceiling wait's cancel arm consumes and the fence unwinds
+(`parked → compensating`), or, before fulfillment has begun, with Lifecycle's own cancel (D-109).
+
+**Rationale**: with no SLA tick the ceiling task's 24 h SLA never breached, and an unscoped
+`sla-check` could answer `exhausted` for another open forward task, which the ceiling stage has
+no route for. A task cancel resolved the ceiling task `closed` and left the order parked with
+nothing to wait on (open items of the B6 fix of OW2-50…57). **Precedent**: the `invocation-dead`
+task, whose `cancel` is the order cancel (`design/07` §4.4, D-105); the SLA waiter rule
+(`design/07` §4.8 item 3); an order-scope breach escalates without resolving (`design/07` §4.2).
+
+**Propagated**: `design/10-process-definition.md` §3.6 (d); `design/07-manual-tasks.md` §3.3,
+§3.6, §4.4, §4.8; `design/01-foundation.md` §3.3; D-122.
+
+### D-130 (M) Until events are retained between listens, the resume wait polls whether Lifecycle still holds the order
+
+**Accepted (2026-09-26).**
+
+**Decision**: the resume wait of the approval stage carries a `PT15M` `waitResumePoll` branch
+that calls `apply-resume` with `trigger: poll`, keyed
+`{tenant}:{correlationId}:apply-resume:poll:{suspensionRef}:{round}`. The operation reads the
+order through the Lifecycle PDP-authorized order read; while Lifecycle holds it the call records
+nothing and answers `still-held` with the next round; once Lifecycle no longer holds it at the
+instance's version it applies the resume exactly as for an `OrderResumed`, closing the suspension
+with `closed_reason = resumed-by-read`, and answers `resumed-by-read`. An `OrderResumed` that
+arrives later, with no open suspension, is attached to that suspension as an absorbed duplicate,
+not recorded as a resume ahead of the next hold. The poll follows no `admit-trigger`, because it
+consumes no event; the read is its guard.
+
+**Rationale**: a resume delivered while the hold stage ran `admit-trigger` and `apply-hold` was
+lost with no fallback, so the order waited in the resume wait until an operator cancelled it or
+the lifetime ceiling parked it (D-124; open item of the B6 fix). The stopgap covers that case
+only: a lost resume outside the approval stage, which has no resume wait, still leaves the hold
+predicate set until the event-retention ask lands. **Precedent**: the poll arms of the barrier and
+eligibility waits (`design/10` §3.6 (b)); the Lifecycle order read inside `reflect-verdict`,
+`begin-fulfillment` and `report-outcome` for a `not-admissible` answer (`design/01` §3.3
+*Rounds and attempts* rule 4); Lifecycle's own "re-read the order, wait for the resume"
+(Lifecycle `06 §4.3`).
+
+**Propagated**: `design/10-process-definition.md` §3.6 (e), §4.1, §4.4, §4.5;
+`design/08-hold-and-cancel.md` §3.3, §3.6, §3.7, §4.7; `design/01-foundation.md` §3.3;
+`design/07-manual-tasks.md` §3.3; `UPSTREAM_REQS.md` §2.9; D-124, Q-11.
 
 ## Open Questions
 
@@ -3400,7 +3565,7 @@ registered PRD amendment (`UPSTREAM_REQS.md` §4 item 7).
 
 **Owner**: Architecture (joint with the serverless-runtime owners).
 
-**Open.** The canonical definition of `design/10` relies on five things the Serverless Workflow
+**Open.** The canonical definition of `design/10` relies on six things the Serverless Workflow
 DSL 1.0.0 may or may not provide as the platform's plugin implements it
 (`design/10-process-definition.md` §4.5):
 
@@ -3417,19 +3582,23 @@ DSL 1.0.0 may or may not provide as the platform's plugin implements it
    delivered during cancellation;
 5. **(v)** **the hold pattern** as a whole — a hold arm that wins a competing `fork` and cancels
    the escalation `wait`, a resume wait, and a re-armed `wait` of the remainder Orders returns —
-   natively, without a Function.
+   natively, without a Function;
+6. **(vi)** that a `catch` carrying only `retry` re-raises the last error once its limit is spent,
+   so the task faults: the DSL states nothing about what follows the last attempt (dsl.md
+   *Retries*, dsl-reference.md *Catch*), and every retry-only `catch` of the canonical definition,
+   `design/10` §4.6 and §2.2 rule 6 rely on it (D-126).
 
 **Fallbacks in force until answered**: (i) and the re-armed remainder of (v) the bounded
 re-check loop of D-70 as amended — a fixed-granularity `wait`, a `call` to the operation that
 owns the deadline and a `switch` that loops while it answers `due: false`; no Function sleeps,
 because a Function is bounded by platform timeout limits and durable waits belong to Workflows
 (serverless-runtime DESIGN.md lines 579, 582); (ii) bounded by the retry budget; (iii)
-settled as one `call` per wave carrying `lineRefs[]` (D-79); (iv) **no fallback**: no poll
-re-reads a hold, a resume, a decision or an amendment, so the design depends on the platform
-retaining an event delivered between listens, the ask
+settled as one `call` per wave carrying `lineRefs[]` (D-79); (iv) **no general fallback**: the
+design depends on the platform retaining an event delivered between listens, the ask
 `cpt-cf-bss-orders-workflow-upreq-serverless-runtime-event-retention-between-listens` (D-124;
 the earlier "covered by the poll arms and the re-entry of every stage loop" was wrong and is
-withdrawn).
+withdrawn), and only a resume awaited in the approval stage's resume wait is recovered, by the
+stopgap poll of D-130; (vi) assumed, and a readiness item, because no CI test can observe it.
 
 **Review trigger**: the platform readiness gate (`…-upreq-serverless-runtime-readiness-gate`).
 
@@ -3596,6 +3765,11 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-123 | M Escalation re-check on the probe tick | `design/10-process-definition.md` §1.2, §3.6, `design/03-approval-execution.md` §1.2, §3.6, §4.5, `design/08-hold-and-cancel.md` §1.2, §3.3, §3.6, §4.7, `DESIGN.md` §1.2, §4.1; D-70, D-80 |
 | D-124 | M Events between listens: platform retention | `design/10-process-definition.md` §4.4, §4.5, `design/08-hold-and-cancel.md` §4.7, `DESIGN.md` §1.2, `UPSTREAM_REQS.md` §2.9, §3; Q-11 |
 | D-125 | M Worker trips handed to the definition | `design/05-provisioning-intents.md` §3.2, §3.3, §3.6, §3.7, §4.5, `design/07-manual-tasks.md` §3.6, `design/08-hold-and-cancel.md` §3.2, §3.6, `design/10-process-definition.md` §3.6; D-105, D-120 |
+| D-126 | H Validation rules over definition-held values and a routing graph | `design/10-process-definition.md` §1.2, §2.2, §3.2, §3.6, §4.1, §4.5, §4.6, `design/07-manual-tasks.md` §4.8, `ADR/0012`; D-67, Q-11 |
+| D-127 | M Every required Workflow trait declared | `design/10-process-definition.md` §3.1, `UPSTREAM_REQS.md` §2.9, `ADR/0011`; D-86, D-105 |
+| D-128 | M Engine history growth asked of the plugin | `design/10-process-definition.md` §3.1, §3.6, `UPSTREAM_REQS.md` §2.9, §3, `DESIGN.md` §4.1; D-123 |
+| D-129 | M Ceiling task SLA tick; ceiling park ended by the order cancel | `design/10-process-definition.md` §3.6, `design/07-manual-tasks.md` §3.3, §3.6, §4.4, §4.8, `design/01-foundation.md` §3.3; D-105, D-122 |
+| D-130 | M Resume-wait poll of the hold | `design/10-process-definition.md` §3.6, §4.1, §4.4, §4.5, `design/08-hold-and-cancel.md` §3.3, §3.6, §3.7, §4.7, `design/01-foundation.md` §3.3, `design/07-manual-tasks.md` §3.3, `UPSTREAM_REQS.md` §2.9; D-124, Q-11 |
 
-Highest decision number used: **D-125**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
+Highest decision number used: **D-130**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
 register; there are no parts.

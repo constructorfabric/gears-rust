@@ -943,12 +943,14 @@ this table is the index the validation hook of `10 §2.2` and the envelope's cou
 | `compensate-order` (06) | `pass` → `nextPass` | `…:compensate-order:{pass}` |
 | `report-outcome` (06) | `round` → `nextRound` | step `…:report-outcome:{round}`; Lifecycle `…:{trigger}:{round}` |
 | `resolve-manual-task` `sla-check` (07) | `slaRound` → `slaRound` | `…:resolve-manual-task:sla:{slaRound}` |
+| `resolve-manual-task` `sla-check` scoped to one task (07), the ceiling wait's | `slaRound` → `slaRound`, the definition's `ceilingSlaRound`, 0 for each ceiling task (D-129) | `…:resolve-manual-task:sla:{taskRef}:{slaRound}` |
+| `apply-resume` `trigger: poll` (08), per suspension | `round` → `nextRound`, the definition's `resumePollRound`, 0 for each resume wait (D-130) | `…:apply-resume:poll:{suspensionRef}:{round}` |
 | `raise-overdue-escalation` `overdue-fulfillment` (07) | `round` → `nextRound` | `…:raise-overdue-escalation:overdue-fulfillment:{orderVersion}:-:{round}` |
 | `raise-overdue-escalation` `lifetime-ceiling` (07) | `round` → `nextRound`, the definition's `ceilingRound`: each ceiling of one instance is a new round (D-121) | `…:raise-overdue-escalation:lifetime-ceiling:{orderVersion}:-:{round}` |
 
 `construct-and-freeze-plan` (04) carries only an `attempt`, because it is re-entered only by a
 plan-level task's retry. The other operations are called once per subject, or are keyed by the
-event or request that triggered them (`admit-trigger`, `apply-hold`, `apply-resume`,
+event or request that triggered them (`admit-trigger`, `apply-hold`, `apply-resume` on its event,
 `record-decision`, `authorize-cancel`, `run-cancellation-fence`), and carry no round. `park` and
 `unpark` are keyed by their subject, which is itself unique per park — a verdict park's `parkRef`,
 or `ceiling:{round}` for the lifetime-ceiling park of that ceiling round — and carry neither a
@@ -1950,7 +1952,7 @@ are declared on the definition and recorded here so an unset value is a visible 
 | Per-operation deadline | operation (`deadline`) | 10 s for a dispatch operation; 5 s for a record-only operation | Set from the downstream's service objective, not from caller patience: 3-10x its p99 |
 | Task timeout, **wave-2 (activation) tasks** | definition | 3 min | The p95 ≤ 15 min clock starts at activation-wave eligibility, so the window bounds wave 2, the barrier release and the acknowledgement |
 | Task timeout, **wave-1 (draft-create) tasks** | definition | 10 min | Wave 1 sits outside the measured window |
-| Retry budget | definition (`use.retries`) | 5 attempts, exponential from 1 s, capped 30 s, full jitter | With the curve of §4.5 this spends ~15-30 s of cumulative backoff, provably nested inside the 3 min wave-2 timeout |
+| Retry budget | definition (`use.retries`) | 5 attempts, exponential from 1 s, capped 30 s, full jitter | With the curve of §4.5 this spends ~15-30 s of cumulative backoff; the 3 min wave-2 timeout on the same `try` bounds it whatever curve the plugin applies, so the validation hook checks only that one attempt's deadline fits the timeout (`10 §2.2` rule 4, D-126) |
 | Overdue window | definition (`wait` arm) | 24 h past expected fulfillment time | Fixed by the PRD as commercial policy (`cpt-cf-bss-orders-workflow-fr-owf-overdue-escalation`) |
 | Max process lifetime | definition (top-level `wait` arm) | 90 days from process start, never cancelled by a hold | Accepted (`DECISIONS.md` D-53) |
 

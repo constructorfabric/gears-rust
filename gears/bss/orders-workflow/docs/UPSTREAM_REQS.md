@@ -718,19 +718,26 @@ suspension of at least 30 days with a tenant-configurable maximum
 ([serverless-runtime PRD.md](../../../serverless-runtime/docs/PRD.md) line 404; open as BR-009,
 [NEXT_ADR_SCOPE.md](../../../serverless-runtime/docs/NEXT_ADR_SCOPE.md) line 21) — and, if it may,
 that this gear's tenants are provisioned with a cap of at least 90 days, the `max_process_lifetime`
-of D-53. Delivery further includes (a) **a stated way for a Workflow to declare itself
-async-only** (the ask is how to declare it): the platform says `workflow_traits` SHOULD declare it and that a Workflow which
-suspends MUST be marked (DESIGN.md line 653), but the `workflow_traits` schema holds only
-`compensation`, `checkpointing` and `max_suspension_days` (DESIGN_GTS_SCHEMAS.md lines 466–530),
-so the canonical definition declares no such trait until the field exists, and a synchronous start
-would fail at its first suspension point with `sync_suspension` (409, DESIGN.md line 653); and
+of D-53. Delivery further includes (a) **confirmation that `traits.invocation: { supported:
+[async], default: async }` is the async-only declaration** DESIGN.md line 653 asks of a Workflow
+that suspends: the platform text says `workflow_traits` SHOULD declare it, but the Workflow base
+type's required `traits.invocation` (DESIGN_GTS_SCHEMAS.md lines 1139–1159) already expresses
+it, and the callable declares it (`design/10-process-definition.md` §3.1, decision D-127);
+(a′) **the meaning of the declared limits**: whether `traits.limits.timeout_seconds` (declared
+15,552,000, 180 days) measures wall-clock time including suspension, whether
+`traits.limits.max_concurrent` (declared 5,000) counts suspended invocations, and that this gear's
+tenants are provisioned with `max_execution_duration_seconds`, `max_concurrent_executions` and
+`max_execution_history_mb` (DESIGN_GTS_SCHEMAS.md lines 1824–1855) that admit them — the schema
+defaults (30 s, 100) would end or throttle every order, and the platform's duration guardrail
+applies "even if higher timeouts are requested" (serverless-runtime PRD.md line 483); and
 (b) an answer to the DSL expressiveness questions of `DECISIONS.md` Q-11 as the plugin implements
 them (whether it accepts a runtime-expression `wait` duration as an extension — Serverless
 Workflow DSL 1.0.0 admits only an inline duration object or an ISO 8601 string (dsl-reference.md,
 *Wait* and *Duration*), so until then the definition arms its computed waits as the bounded
 re-check loop of D-70 as amended; `error_code` visible on `$error`; a dynamic parallel construct;
 a cancellable `listen` inside a competing `fork` without event loss; the hold pattern without a
-Function). An aggregate retry cap, the gear-wide 10 % retry budget of D-43, is asked as a
+Function; whether a `catch` that carries only `retry` re-raises the last error once its limit is
+spent, Q-11 (vi), which every retry-only `catch` of the canonical definition relies on). An aggregate retry cap, the gear-wide 10 % retry budget of D-43, is asked as a
 platform-side property of the plugin's execution of the definition's task retries (`use.retries`)
 rather than rebuilt here.
 
@@ -989,12 +996,42 @@ same retention for `:plugin-control` signals; this ask extends it to broker even
   approval decision, `OrderAmended`, terminal order event or Subscriptions outcome is consumed.
   No poll covers the loss: the eligibility and barrier polls evaluate only their own conditions,
   and nothing re-reads a hold, a resume, a decision or an amendment. A resume delivered while the
-  hold stage runs `admit-trigger` and `apply-hold` leaves the instance in the resume wait until an
-  operator cancels it or the lifetime ceiling parks it; a decision delivered during a probe is not
-  recorded, so the gate escalates on its window; a Subscriptions outcome is recovered by the sweep,
+  hold stage runs `admit-trigger` and `apply-hold` is applied only by the approval stage's
+  stopgap poll, at most one `PT15M` tick late (D-130), and outside the approval stage it leaves
+  the hold predicate set, so dispatch defers until an operator cancels the order or the lifetime
+  ceiling parks it; a decision delivered during a probe is not recorded, so the gate escalates on
+  its window; a Subscriptions outcome is recovered by the sweep,
   which reads it whether or not the event arrives (`design/05-provisioning-intents.md` §2.1).
 - **Source**: `design/10-process-definition.md` §4.4 *Events delivered between listens*, §4.5
-  (Q-11 (iv)); `design/08-hold-and-cancel.md` §4.7 item 3; `DECISIONS.md` D-124, Q-11.
+  (Q-11 (iv)); `design/08-hold-and-cancel.md` §4.7 items 3 and 10; `DECISIONS.md` D-124, D-130,
+  Q-11.
+
+#### A bound on one invocation's engine history
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-upreq-serverless-runtime-history-growth`
+
+The plugin **MUST** bound the engine history of one `order_process` invocation over a life of 90
+days and more — up to the declared `timeout_seconds` of 180 days — while the definition loops on
+fixed ticks, either by truncating that history inside its DSL interpreter (carrying the
+invocation id, the workflow's `$context`, its task position and its pending signals and retained
+events across the cut) or by stating a per-invocation history budget in events and bytes, and
+**MUST** state how the tenant quota `max_execution_history_mb`
+([DESIGN_GTS_SCHEMAS.md](../../../serverless-runtime/docs/DESIGN_GTS_SCHEMAS.md) line 1840)
+applies: to one invocation or to the tenant's total. Every tick of the canonical definition is a
+`wait`, a competing `fork` of up to seven branches torn down and re-armed, and one or two activity
+calls; per waiting instance and day, the `PT30S` gate and barrier ticks add 2,880 iterations
+each, a `PT5M` tick 288 and the overdue monitor 24 for the whole life
+(`design/10-process-definition.md` §3.6 *History growth*). Serverless Workflow DSL 1.0.0 has no
+construct that truncates history, so the definition cannot do it, and its ticks are fixed by the
+± 5 min escalation accuracy (D-123) and the 15-minute fulfillment SLA.
+
+- **What the design cannot do until it lands**: guarantee that an order waiting days for an
+  approval, a manual task or its expected-fulfillment instant keeps its invocation. An invocation
+  whose history exceeds an engine limit is ended by the engine; the instance liveness pass raises
+  it as `invocation-dead`, and its re-drive, which resumes the same history, would reach the limit
+  again, so the remedy left is the order cancel (D-105). The platform path does not report ready
+  until this is answered.
+- **Source**: `design/10-process-definition.md` §3.1, §3.6; `DECISIONS.md` D-127, D-128.
 
 #### Start and generic control of the order process restricted to its owners
 
@@ -1079,7 +1116,7 @@ then have to accept.
 | Priority | Requirements |
 |----------|-------------|
 | `p1` (critical) | `…-upreq-overlap-presence-read`, `…-upreq-compensation-cancel-reason`, `…-upreq-explicit-start-instant`, `…-upreq-in-flight-rejection`, `…-upreq-cancel-accepted-transition`, `…-upreq-nonterminal-status-read`, `…-upreq-provisioning-latency-budget`, `…-upreq-identity-envelope-echo`, `…-upreq-payment-authorization-outcome`, `…-upreq-generic-approval-expectations-contract`, `…-upreq-submitted-ttl-visibility`, `…-upreq-lifecycle-thin-events`, `…-upreq-catalog-dependency-topology-read`, `…-upreq-pii-classification-ruling`, `…-upreq-event-broker-shared-prerequisites`, `…-upreq-pdp-policy-integration` |
-| `p1` (critical), platform path | `…-upreq-serverless-runtime-readiness-gate`, `…-upreq-serverless-runtime-event-triggers-gts`, `…-upreq-serverless-runtime-consumed-event-member-storage`, `…-upreq-serverless-runtime-pdp-guarded-call`, `…-upreq-serverless-runtime-attempt-and-deadline-propagation`, `…-upreq-serverless-runtime-history-residency-retention`, `…-upreq-serverless-runtime-definition-versioning-validation-hook`, `…-upreq-serverless-runtime-signals`, `…-upreq-serverless-runtime-event-retention-between-listens`, `…-upreq-serverless-runtime-invocation-control-restriction`, `…-upreq-serverless-runtime-dead-letter-operator-visibility` |
+| `p1` (critical), platform path | `…-upreq-serverless-runtime-readiness-gate`, `…-upreq-serverless-runtime-event-triggers-gts`, `…-upreq-serverless-runtime-consumed-event-member-storage`, `…-upreq-serverless-runtime-pdp-guarded-call`, `…-upreq-serverless-runtime-attempt-and-deadline-propagation`, `…-upreq-serverless-runtime-history-residency-retention`, `…-upreq-serverless-runtime-definition-versioning-validation-hook`, `…-upreq-serverless-runtime-signals`, `…-upreq-serverless-runtime-event-retention-between-listens`, `…-upreq-serverless-runtime-history-growth`, `…-upreq-serverless-runtime-invocation-control-restriction`, `…-upreq-serverless-runtime-dead-letter-operator-visibility` |
 | `p2` (important) | `…-upreq-correlation-propagation`, `…-upreq-serverless-runtime-failure-handler-target`, `…-upreq-lifecycle-failure-reason-coverage` |
 
 `cpt-cf-bss-orders-workflow-upreq-pdp-policy-integration` is `p1` because every caller-driven
