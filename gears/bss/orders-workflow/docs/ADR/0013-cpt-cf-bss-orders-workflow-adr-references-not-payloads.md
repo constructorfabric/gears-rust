@@ -112,7 +112,10 @@ reach. Concretely:
   >    bare or paired with a reason code (`failed[]`, `failedTaskRefs[]`, `failureSubjects[]`);
   > 3. **Counter**: a non-negative integer. This covers every round, sequence and position member
   >    (`…Round`, `…Seq`, `position`, `pass`, `attemptKey`, `openTaskCount`, `rowVersion`), and also a
-  >    key tail made only of counters and a literal prefix (`{round}[:{attempt}]`, `poll:{round}`);
+  >    key tail made only of counters and a literal prefix (`{round}[:{attempt}]`); **amended
+  >    2026-09-26 by D-150**: the apply-resume poll's tail also names its suspension,
+  >    `poll:{suspensionRef}:{round}` — a literal prefix, an opaque record reference and a counter,
+  >    each of this vocabulary — because that round family restarts for every suspension;
   > 4. **Closed enumeration or boolean**, including a catalogue reason code (D-64) and a routing
   >    literal the definition writes itself (`design/10-process-definition.md` §2.2 rule 1);
   > 5. **Instant or duration**, as in the list above (RFC 3339 or ISO 8601);
@@ -283,7 +286,7 @@ D-65 onward.
 - **DESIGN**: [DESIGN.md](../DESIGN.md) §4.2, §4.3;
   [`design/10-process-definition.md`](../design/10-process-definition.md) (reference schemas);
   each slice §3.3 (`input`/`output` per operation)
-- **Decisions register**: [`DECISIONS.md`](../DECISIONS.md) — Q-01, D-61, D-64, D-66 (as amended), D-131, D-132, Q-12
+- **Decisions register**: [`DECISIONS.md`](../DECISIONS.md) — Q-01, D-61, D-64, D-66 (as amended), D-131, D-132, D-150, Q-12
 - **Upstream asks**: [`UPSTREAM_REQS.md`](../UPSTREAM_REQS.md) — serverless-runtime section
   (history residency and retention; member-only storage of trigger inputs and consumed events);
   Orders Lifecycle section (thin event variants); Generic Approval section (reference-only

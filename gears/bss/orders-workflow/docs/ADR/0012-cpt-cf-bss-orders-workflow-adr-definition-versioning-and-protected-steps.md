@@ -152,6 +152,18 @@ rather than one task, fails closed before a definition can be executed, and stil
   > `wait` inside a stage, so every stage wait carries the shared arms
   > (`design/10-process-definition.md` §2.2 rules 1 and 8, §4.1).
 
+  > **Amended 2026-09-26 by D-144**: the routing members are the full list of rule 1 —
+  > `nextStage`, `stageLoop`, `returnStage`, `taskReturnStage`, `taskReturnLoop`,
+  > `ceilingReturnStage`, `ceilingReturnLoop`, `heldStage`, `heldLoop` and `arm` — and each may be
+  > written as a literal, a copy of another routing member, or an `if … then … else` over routing
+  > members that yields one of those, as the canonical `ceilingEntry` does; the D-126 block above
+  > named only the first two forms. The check tracks ten pinned members: the five above, plus
+  > `released` (a copy of `evaluate-activation-eligibility`'s answer), and `spawned`, `planFailed`,
+  > `preAdmitted` and `failureScope`, each written only as a literal in the task one case of a
+  > `switch` over an operation's closed enum routes to. The ADR-0004 conjunction of Rule 1 is
+  > checked as a walk to `dispatch-wave2-activate` that passes the pinned `released = true`
+  > (`design/10-process-definition.md` §2.2 rule 1, §4.1).
+
   The `protected` list is closed and fixed here; adding to it or removing from it is an Orders
   release and an amendment of this ADR: `start-instance`, `settle-from-lookup` (sweep-only),
   `terminate-instance`, `admit-trigger`, `terminate-on-terminal-event`, `obtain-verdict`,
@@ -296,7 +308,7 @@ apply by reference.
   [`design/10-process-definition.md`](../design/10-process-definition.md);
   [`design/01-foundation.md`](../design/01-foundation.md) §3.7 (`owf_definition_binding`,
   `owf_step_operation`)
-- **Decisions register**: [`DECISIONS.md`](../DECISIONS.md) — D-02, D-53, D-67, D-68, D-105, D-106, D-126, D-135, D-136, D-137, D-138, D-142, D-143, Q-10
+- **Decisions register**: [`DECISIONS.md`](../DECISIONS.md) — D-02, D-53, D-67, D-68, D-105, D-106, D-126, D-135, D-136, D-137, D-138, D-142, D-143, D-144, Q-10
 - **Upstream asks**: [`UPSTREAM_REQS.md`](../UPSTREAM_REQS.md) — serverless-runtime section
   (pre-publish validation hook, publish audit, version retention while bound)
 - **Platform**: serverless-runtime [DESIGN.md](../../../../serverless-runtime/docs/DESIGN.md)

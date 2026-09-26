@@ -1238,8 +1238,11 @@ the fragment now carries each rule, and the note is kept as the reason the rule 
    `create-manual-task` under either policy (**alignment**: the fragment routed every non-frozen
    state to `partialFailure`).
 4. **`re-check-pre-activation`** — `abort` → the unwind path (`run-cancellation-fence` →
-   `compensate-order` → `report-outcome`), **never** `partialFailure`; `not-dispatchable` → back
-   into the barrier loop, whose hold, amendment and cancel arms consume the observed state;
+   `compensate-order` → `report-outcome`), **never** `partialFailure`; `not-dispatchable` → the
+   held-spawn wait of `10 §3.6` (b), whose `PT5M` tick runs this operation again and whose resume,
+   amendment and cancel arms consume the observed state (`on-hold`, `superseded`, `terminal`),
+   never the `PT30S` barrier poll, which would re-run this protected read for the whole hold
+   (decision D-145);
    `proceed` only by an explicit case (**alignment**: the fragment's `onPreActivation` default
    case was `proceed`, which advanced a `not-dispatchable` answer to the spawn signal). Its
    `catch.retry` **MUST** allow at least 3 attempts within 60 s so the operation, not the retry

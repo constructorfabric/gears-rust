@@ -1277,7 +1277,12 @@ slice operations (D-80, D-81).
 6. **Failures and unresolved intents route to the failure arm.** A non-empty `failed[]` from any
    operation of this slice, and a non-empty `unresolved[]` from `reconcile-intent`, **MUST** route
    to fragment (c), each line with its reason; a non-empty `redispatch[]` **MUST** route to the
-   named wave's dispatch operation with the next round, and a non-empty `undispatchedLineRefs`
+   named wave's dispatch operation with the next round — a `wave2_activate` entry only once the
+   spawn signal was sent (`10 §3.6` (b), the pinned `spawned`, D-144) — except after the read that
+   follows a dispatch 409 (item 3), where `redispatch[]` is already covered: wave 1 is re-issued
+   under its unchanged key after `waitReread1`, which re-sends a never-sent row, and wave 2 waits in
+   the barrier, whose next evaluation names the line again, so that read routes only its
+   `failed[]` and `unresolved[]` (D-120 as amended); a non-empty `undispatchedLineRefs`
    from `evaluate-activation-eligibility` **MUST** route to `dispatch-wave1-create` before any
    other answer of the evaluation is acted on — the route an operator's wave-1 retry and a line a
    crashed dispatch never wrote come back through (D-119). A line is listed in `failed[]` or

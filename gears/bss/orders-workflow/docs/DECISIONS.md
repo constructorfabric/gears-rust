@@ -162,6 +162,13 @@
   - [D-141 (M) A resume closes only a suspension Lifecycle no longer holds](#d-141-m-a-resume-closes-only-a-suspension-lifecycle-no-longer-holds)
   - [D-142 (M) Every wait inside a stage is a competing fork carrying the shared arms](#d-142-m-every-wait-inside-a-stage-is-a-competing-fork-carrying-the-shared-arms)
   - [D-143 (M) No walk reaches a wave dispatch without `begin-fulfillment`; `beginResult` is a pinned member](#d-143-m-no-walk-reaches-a-wave-dispatch-without-begin-fulfillment-beginresult-is-a-pinned-member)
+  - [D-144 (H) Rule 1 decides every route on members it tracks; the canonical definition passes it](#d-144-h-rule-1-decides-every-route-on-members-it-tracks-the-canonical-definition-passes-it)
+  - [D-145 (M) A sent spawn signal leaves the held-spawn loop; a not-dispatchable re-check waits there](#d-145-m-a-sent-spawn-signal-leaves-the-held-spawn-loop-a-not-dispatchable-re-check-waits-there)
+  - [D-146 (H) The failure stage never waits with no open task](#d-146-h-the-failure-stage-never-waits-with-no-open-task)
+  - [D-147 (M) A call that consumes an arm's payload is its own checkpoint](#d-147-m-a-call-that-consumes-an-arms-payload-is-its-own-checkpoint)
+  - [D-148 (M) The escalation bound counts every call between two fires](#d-148-m-the-escalation-bound-counts-every-call-between-two-fires)
+  - [D-149 (H) Each ceiling's task is its own row, and the fence closes it](#d-149-h-each-ceilings-task-is-its-own-row-and-the-fence-closes-it)
+  - [D-150 (L) The poll's task tail names its suspension; only `apply-hold` resets the poll round](#d-150-l-the-polls-task-tail-names-its-suspension-only-apply-hold-resets-the-poll-round)
 - [Open Questions](#open-questions)
   - [Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?](#q-01-which-durable-execution-substrate-backs-the-process--the-oss-workflow-engine-or-a-bss-local-mechanism)
   - [Q-02: The Generic Approval escalation threshold — the one PRD-deferred numeric value this design deliberately leaves unset](#q-02-the-generic-approval-escalation-threshold--the-one-prd-deferred-numeric-value-this-design-deliberately-leaves-unset)
@@ -1644,7 +1651,7 @@ The decisions in this section were taken when the order process flow moved from 
 gear to a versioned platform workflow definition (`ADR/0011`, `ADR/0012`, `ADR/0013`), and when
 each slice was restructured into step operations and a definition fragment. D-65…D-72 carry the
 three ADRs and their cross-cutting consequences; D-73…D-101 are the decisions the slice
-restructurings recorded, and D-102…D-143 the decisions taken on the second review of
+restructurings recorded, and D-102…D-150 the decisions taken on the second review of
 2026-09-26. Each names the entries it amends; the amended entries carry a dated
 **Amended by** note. D-65…D-101 were taken on 2026-09-24.
 
@@ -3093,6 +3100,8 @@ per-row reason and cause.
 `design/08-hold-and-cancel.md` §3.3, §3.6; `design/10-process-definition.md` §3.6 (a), (b), (c),
 (e); `design/06-saga-and-compensation.md` §4.8.
 
+**Amended by D-150 (2026-09-26)**: the apply-resume poll's tail is `poll:{suspensionRef}:{round}`, not `poll:{round}`, because its round family restarts for every suspension; with the shorter tail two holds' deferred failures shared one key.
+
 ### D-117 (M) The remediation hold lasts until the order's last open task resolves
 
 **Accepted (2026-09-26).** *(amends D-99)*
@@ -3112,6 +3121,8 @@ remediation.
 
 **Propagated**: `design/07-manual-tasks.md` §3.3, §3.6, §4.3, §4.8;
 `design/05-provisioning-intents.md` §4.5; `design/10-process-definition.md` §3.6 (b), (c).
+
+**Amended by D-146 (2026-09-26)**: the last resolution that takes the held lines back to the barrier may also be a Seller Operator's `closed`, when it leaves no open task on a line entry; the failure stage never waits with no open task.
 
 ### D-118 (M) `escalate-gate` and `arm-park-escalation` have algorithms; every answer returns the next round, and a fire during an outage pauses
 
@@ -3226,6 +3237,8 @@ and D-102's round rule.
 `awaitReread1`, which also carries the hold, resume, lifecycle and cancel arms; an arm re-enters
 at `wave1` under the unchanged key.
 
+**Amended (2026-09-26)**: `05 §4.5` item 6 now carves out this read: after a dispatch 409, `redispatch[]` is covered by wave 1's same-key re-issue after `waitReread1` and by the barrier's next evaluation for wave 2, so the reread routes only `failed[]` and `unresolved[]` (R-16).
+
 ### D-121 (H) The lifetime ceiling parks only a running, unparked instance, and each ceiling is its own round
 
 **Accepted (2026-09-26).**
@@ -3254,6 +3267,8 @@ round is the same shape); `01 §3.7`'s transition table as the authority for whi
 **Propagated**: `design/10-process-definition.md` §3.6 (a), (d); `design/01-foundation.md` §3.3,
 §3.7; `design/07-manual-tasks.md` §3.2, §3.3, §3.6, §3.7, §4.8; `design/03-approval-execution.md`
 §2.1; `design/08-hold-and-cancel.md` §4.5; D-53, D-82.
+
+**Amended by D-147 and D-149 (2026-09-26)**: a call that consumes an arm's payload is recorded as the stage's checkpoint before it runs, so the re-entry after a ceiling re-issues it (D-147); each ceiling's task is its own row (`scope_ref = ceiling:{round}`), which the creation port's uniqueness had denied (D-149).
 
 ### D-122 (H) The ceiling wait consumes only its own task, and no unrecorded signal unparks
 
@@ -3285,6 +3300,8 @@ the task route's request row and `action-not-offered` refusal (`07 §3.3`, D-100
 and the ceiling task offers no task `cancel`; the Seller Operator's way out besides `retry` is the
 order cancel, which the wait's cancel arm consumes (D-129).
 
+**Amended by D-149 (2026-09-26)**: the fence closes the ceiling task in step 1, so its exclusivity lasts only while the instance is parked at that ceiling and never freezes the unwind's compensation tasks.
+
 ### D-123 (M) The escalation re-check rides the 30-second probe tick
 
 **Accepted (2026-09-26).**
@@ -3304,6 +3321,8 @@ re-check (`03 §4.5` item 6); none in the platform, whose timers are the plugin'
 **Propagated**: `design/10-process-definition.md` §1.2, §3.6 (a), (e); `design/03-approval-execution.md`
 §1.2, §3.6, §4.5; `design/08-hold-and-cancel.md` §1.2, §3.3, §3.6, §4.7; `DESIGN.md` §1.2, §4.1;
 D-70, D-80; `ADR/0011`.
+
+**Amended by D-148 (2026-09-26)**: "one tick plus one call" omitted the probe and every other call between two fires. The gate loop's calls carry a 60-second `gate` timeout, a pending decision and every re-entry fire first, and the worst case is 30 s + 4 × 60 s = 4 min 30 s.
 
 ### D-124 (M) An event delivered between listens needs platform retention; no poll covers it
 
@@ -3414,6 +3433,8 @@ leaves out are seller-policy values pinned on the record, bounded at the policy 
 and the §4.1 Waves row requires `beginResult = in-fulfillment` on every walk to a wave dispatch
 (D-143). Rule 8 forbids a plain `wait` inside a stage (D-142).
 
+**Amended by D-144 (2026-09-26)**: rule 1 tracks ten pinned members, and the canonical definition routes every `switch` towards a protected operation on tracked members only; the ADR-0004 conjunction is a walk that passes the pinned `released = true`.
+
 ### D-127 (M) The Workflow callable declares every required trait: async-only, its limits, and no invocation retry
 
 **Accepted (2026-09-26).**
@@ -3488,6 +3509,8 @@ task, whose `cancel` is the order cancel (`design/07` §4.4, D-105); the SLA wai
 **Propagated**: `design/10-process-definition.md` §3.6 (d); `design/07-manual-tasks.md` §3.3,
 §3.6, §4.4, §4.8; `design/01-foundation.md` §3.3; D-122.
 
+**Amended by D-146 and D-149 (2026-09-26)**: the `approval-reflection-refused` task, like the ceiling task, offers no task `cancel` (D-146); the ceiling task's SLA family starts at round 0 on a row of its own (D-149).
+
 ### D-130 (M) Until events are retained between listens, the resume wait polls whether Lifecycle still holds the order
 
 **Accepted (2026-09-26).**
@@ -3526,6 +3549,8 @@ suspension, and `apply-hold` resets it on each new `suspensionRef`. The absorpti
 resume Lifecycle has overtaken closes nothing (D-141). The resume wait's poll has no failure
 route, because the wait precedes `begin-fulfillment` and nothing is deferred there
 (`pollResumeFailure` is removed, D-143).
+
+**Amended by D-150 (2026-09-26)**: entering the resume wait no longer resets `resumePollRound`; only `applyHold` resets it, for a new `suspensionRef`.
 
 ### D-131 (H) The references that cross the engine are a closed six-type vocabulary; cardinality, counters and the resource tenant are the stated residual
 
@@ -3637,6 +3662,8 @@ loops*, §4.1, §4.4, §4.5; `design/08-hold-and-cancel.md` §3.2, §3.3, §4.7 
 rides the tick arms of the new `awaitDeferral1`/`awaitDeferral2` forks, which carry the four
 shared arms, so a held deferral now listens for a hold, a resume, a lifecycle event and a cancel.
 
+**Amended by D-150 (2026-09-26)**: the held poll's failure tail is `poll:{suspensionRef}:{round}`, and the resume wait continues the per-suspension round rather than restarting it.
+
 ### D-134 (H) The business windows are per-seller policy values pinned on the record; the definition owns only the tick
 
 **Accepted (2026-09-26).** *(amends D-70, D-98, D-126)*
@@ -3719,6 +3746,8 @@ pinned policy the switch must read.
 **Amended by D-142 and D-143 (2026-09-26)**: the pinned members are five; `beginResult`, a copy
 of `begin-fulfillment`'s `result`, joins them (D-143). Rule 8's shared arms now reach every wait
 inside a stage, because a stage may hold no plain `wait` (D-142).
+
+**Amended by D-144 (2026-09-26)**: the pinned members are ten: `released`, `spawned`, `planFailed`, `preAdmitted` and `failureScope` join the five.
 
 ### D-136 (M) One adjustability table; slice constraints are enforced items or canonical-definition guidance; no Function call
 
@@ -3942,6 +3971,8 @@ the read already decides every interleaving without it.
 §3.6 `inst-ah-consume-ahead` and `inst-ar-poll`, §4.2, §4.7 item 3;
 `design/10-process-definition.md` §3.6 (e); D-87, D-130.
 
+**Amended (2026-09-26)**: the resume stage's `apply-resume` body passes `if $context.returnStage == "hold" then $context.suspensionRef else null end`, so the stage-level arm still passes the null `suspensionRef` that `08 §4.7` item 3 requires now that the arm keeps the member (R-36).
+
 ### D-142 (M) Every wait inside a stage is a competing fork carrying the shared arms
 
 **Accepted (2026-09-26).** *(amends D-120, D-133, D-135)*
@@ -3971,6 +4002,8 @@ switch and needs no exception in the rule. **Precedent**: the barrier's own time
 **Propagated**: `design/10-process-definition.md` §2.2 rule 8, §3.6 (b) and (c), *Fixed waits
 and re-check loops*; `ADR/0012`; D-120, D-133, D-135.
 
+**Amended (2026-09-26)**: `08 §4.7` item 2 now names the resume wait `awaitResume` among the forks that carry no hold arm, as rule 8 already did (R-30).
+
 ### D-143 (M) No walk reaches a wave dispatch without `begin-fulfillment`; `beginResult` is a pinned member
 
 **Accepted (2026-09-26).** *(amends D-126, D-130, D-133, D-135)*
@@ -3998,6 +4031,206 @@ that the eligibility wait has no failure route (D-133), and the pinned `policy` 
 
 **Propagated**: `design/10-process-definition.md` §2.2 rule 1, §3.6 (c) and (e), §4.1;
 `design/08-hold-and-cancel.md` §4.7 items 8 and 10; `ADR/0012`; D-126, D-130, D-133, D-135.
+
+**Amended by D-144 (2026-09-26)**: the failure stage's routes and the Waves row are also decided on `failureScope`, `released` and `spawned`; the pinned members are ten.
+
+### D-144 (H) Rule 1 decides every route on members it tracks; the canonical definition passes it
+
+**Accepted (2026-09-26).** *(amends D-126, D-135, D-143)*
+
+**Decision**: `design/10` §2.2 rule 1 tracks ten pinned members. Beside `verdict`, `reflected`,
+`policy`, `forceTask` and `beginResult` it tracks `released`, a copy of
+`evaluate-activation-eligibility`'s `released`, and four members written only as literals in the
+task one case of a `switch` over an operation's closed enum routes to: `spawned` (`true` only in
+`spawnSent`, after a sent spawn signal), `planFailed` (`true` only in `enterPlanFailedWait`),
+`preAdmitted` (`true` only in a `toLifecycle` after a hold, resume or acceptance admission) and
+`failureScope` (`line`, `plan` or `order`, in the task that enters the failure stage). The
+canonical definition is restructured so that every `switch` leading towards a protected
+operation reads only routing and pinned members, or a member both of whose ways satisfy §4.1:
+
+1. `heldCall` is removed. The held wait's operation is the stage loop, `heldSpawn` or
+   `heldReport`, literals of a routing member; `retryHeld` and the fulfillment `enter` switch on it.
+2. `onEvaluate` decides `releasedFirst` and `releasedAgain` on the pinned `released` and
+   `spawned`; `onSweep`'s wave-2 redispatch is taken only once `spawned` is true.
+3. `routeRetry` routes by `failureScope` (line → barrier, plan → plan, order → stage), which
+   `07` maps one-to-one onto `resumeAt`; the compensation case is removed from the failure stage,
+   because a compensation task's retry is the unwind's. `failFastUnwind` routes `begun` on
+   `beginResult`, a plan-scope failure through `begin-fulfillment` first, and faults the
+   invocation (`orderTaskExhausted`, as `unknownStage`) for an order-scope task, which
+   `07 §4.2` never exhausts.
+4. The §4.1 Waves row states the ADR-0004 conjunction as a walk to `dispatch-wave2-activate`
+   that passes the pinned `released = true` and `spawned = true`: `released` implies `due`
+   (`04 §3.6` `inst-ae-if-conjunction-false`), so the `waitExpected` loop is where the walk waits,
+   not a separate constraint.
+5. ADR-0012's D-126 block named the routing members incompletely and allowed only literals and
+   copies; rule 1 and the canonical `ceilingEntry` also use an `if … then … else` over routing
+   members. The ADR now carries the full list and the third form.
+
+**Hand-walk of the canonical version** (every walk the second re-review named, R-38, R-18): the
+held spawn reaches `report-outcome` `completed` only through `dispatch-wave2-activate`
+(`retryHeld` is decided by `heldSpawn`); the first release reaches `re-check-pre-activation`
+and `report-spawn-signal` before wave 2 (`spawned` is false until `spawnSent`); the reflection
+task's retry reaches only `reflectVerdict` and its exhaustion only a fault (`failureScope =
+order`), never `construct-and-freeze-plan`, `compensate-order` or `begin-fulfillment`; the first
+eligible round reaches `construct-and-freeze-plan` (`planFailed` false); a lifecycle event is
+admitted before `run-cancellation-fence` or `terminate-on-terminal-event` unless `preAdmitted`
+is true, which only an admission sets; a wave-2 redispatch follows the spawn signal. Every other
+`switch` over an untracked member — `planState`, `eligibility`, the wave lists, `preActivation`,
+`spawnAnswer`, `lifecycleCall`, `compensationState`, `resolution`, `admission`, `terminate`,
+`cancelAuthorized`, `holdOutcome`, `unwind` — was taken both ways, and each way satisfies §4.1.
+
+**Rationale**: rule 1 takes a case over an untracked member both ways and refuses a version on
+which any walk breaks §4.1. The canonical definition routed on `heldCall`, `spawned`, `resumeAt`,
+`planFailed`, `exhaustedTaskRefs`, `released` and `preAdmitted` (R-38, R-18), so its own CI check
+refused it, and relaxing the check to pass it would have stopped it catching real violations.
+Tracking literals written under a decided case keeps B7's rule that no routing member is copied
+from an output, and the members stay within the six-type vocabulary of D-131 (booleans, a closed
+enum). **Precedent**: `forceTask`, the literal pinned member of D-135, and `beginResult` (D-143);
+none in the platform, whose registry validates no definition.
+
+**Propagated**: `design/10-process-definition.md` §2.2 rule 1, §3.6 (b), (c), §4.1, §4.7;
+`design/07-manual-tasks.md` §3.6, §4.7, §4.8 item 4; `design/05-provisioning-intents.md` §4.5
+item 6; `ADR/0012`; D-126, D-135, D-143.
+
+### D-145 (M) A sent spawn signal leaves the held-spawn loop; a not-dispatchable re-check waits there
+
+**Accepted (2026-09-26).**
+
+**Decision**: `spawnSent`, the `sent` case of `onSpawn`, sets `spawned` and the stage loop
+`barrierLoop` before `dispatch-wave2-activate`, so an arm taken from a wave-2 deferral, the held
+poll or a ceiling re-enters at the barrier's `evaluate`, never at `re-check-pre-activation`. A
+`not-dispatchable` answer of `re-check-pre-activation` (`observed` `on-hold`, `superseded` or
+`terminal`) goes to the held-spawn wait, `heldWait` with stage loop `heldSpawn`: its `PT5M`
+tick re-runs the re-check, and its resume, lifecycle and cancel arms consume what the operation
+observed. `report-spawn-signal`'s own `not-dispatchable` still returns to the barrier loop
+(D-109).
+
+**Rationale**: the held spawn's stage loop was never reset, so after wave 2 had dispatched, any
+arm re-entered through `retryHeld`, ran a protected re-check after activations were accepted
+(an `abort` would then have voided only wave-1 drafts with wave-2 lines live) and re-sent the
+stale `eligibleLineRefs` (R-39). A `not-dispatchable` re-check went to the barrier, whose
+`PT30S` poll re-ran the protected Lifecycle read some 2,880 times a day for the whole hold (R-42).
+**Precedent**: `onSpawn`'s `held` route to the same wait (`05 §3.3`, D-109), and the barrier's
+re-evaluation before any dispatch (`05 §4.5` item 3).
+
+**Propagated**: `design/10-process-definition.md` §3.6 *Fixed waits* and (b);
+`design/04-fulfillment-plan.md` §4.8 item 4; D-109.
+
+### D-146 (H) The failure stage never waits with no open task
+
+**Accepted (2026-09-26).** *(amends D-117, D-129)*
+
+**Decision**: a `resolve-manual-task` answer `closed` that leaves `openTaskCount` at 0 on a line
+entry, with `beginResult = in-fulfillment`, returns to the barrier exactly as the last retry
+does (`onResolution` `lastClosed` → `toBarrier`), taking with it every line an earlier retry held
+behind the remediation hold. The one order-scope task the failure stage creates,
+`approval-reflection-refused`, offers no task `cancel` (`07 §4.4`, and the task cancel route
+refuses `action-not-offered`): the order is not yet in fulfillment, so it is ended by Lifecycle's
+own cancel, whose `OrderCancelled` the stage's lifecycle arm consumes (D-109).
+
+**Rationale**: `closed` returned to `awaitResolution` whatever the count. A Seller Operator's
+cancel of the last open task — the sibling that held a retried line, or a lone `intent-unresolved`
+task — left the stage waiting with nothing but an SLA tick that answers `none`, and the retried
+lines were never re-dispatched until an order cancel or the ceiling (R-40). Cancelling the
+reflection task did the same before fulfillment (R-45). **Precedent**: D-129, which withdrew the
+task `cancel` from the ceiling task because closing it left the order parked with nothing to wait
+on; D-117's `toBarrier` on the last resolution.
+
+**Propagated**: `design/10-process-definition.md` §3.6 (c); `design/07-manual-tasks.md` §3.3,
+§4.4, §4.8 item 4; D-117, D-129.
+
+### D-147 (M) A call that consumes an arm's payload is its own checkpoint
+
+**Accepted (2026-09-26).** *(amends D-121)*
+
+**Decision**: `record-decision` after the decision arm, and `resolve-manual-task` after the
+failure stage's, the unwind's and the ceiling wait's task-resolution arms, are each preceded by a
+task that records the call in `stageLoop` (`recordDecision`, `resolveTask`,
+`resolveCompensationTask`, `resolveCeilingTask`), and the stage's `enter` switch re-issues the call
+under its unchanged key. The routes back to the waiting fork go through the stage's `enter…` task,
+so the checkpoint is replaced before the stage waits again.
+
+**Rationale**: the lifetime ceiling cancels `process` wherever it is, and the stage re-enters at
+its recorded `stageLoop`. The checkpoint was the fork, whose arm had already consumed the event,
+so a ceiling during the call either left the gate decided or the task resolved while the
+definition waited for a signal that would not come again, or dropped the operator's action
+(R-41). The shared stages did not have the defect because hold, resume and lifecycle re-admit the
+event id they stored. **Precedent**: `enterParkLoop` before `park` and `leftPark` after `unpark`
+(D-121), which record the checkpoint before the call for the same reason.
+
+**Propagated**: `design/10-process-definition.md` §3.6 intro, (a), (c), (d); D-121.
+
+### D-148 (M) The escalation bound counts every call between two fires
+
+**Accepted (2026-09-26).** *(amends D-123)*
+
+**Decision**: the calls that can run between two escalation fires — `escalate-gate` `mode: fire`
+and `mode: probe`, and `record-decision` — carry a 60-second `gate` timeout (above their 10 s
+`deadline_ms`, rule 4); a decision recorded `pending` goes straight to `escalateGate`
+(`reenterGateLoop`), and every re-entry of the approval stage at `gateLoop` fires before it
+waits. The worst case, with every call's retries running to its timeout, is the rest of the fire
+whose read the deadline just missed, the probe, the tick or a decision's `record-decision`, and
+the next fire: 30 s + 4 × 60 s = 4 min 30 s, inside ± 5 min. An arm that leaves the stage and
+returns adds only the calls of the stage it visited, normally inside their 5–10 s
+`deadline_ms`; only with those calls' retries running to the 3-minute `step` timeout can the bound
+be exceeded, which is stated as the residual of a degraded Orders. A hold pauses the window.
+
+**Rationale**: D-123's "one tick plus one call" omitted `probeGate`, which sits between one fire
+and the next, and every other call on that path; with 3-minute timeouts the worst case was about
+6.5–9.5 min (R-10). Moving the probe elsewhere does not help, because any order of fire, probe and
+tick puts one probe between two fires. **Precedent**: D-70's derivation of the wave timeouts from
+the SLA they must fit, and rule 4's `deadline_ms` < timeout.
+
+**Propagated**: `design/10-process-definition.md` §1.2, §3.6 (a) and *Fixed waits*;
+`design/03-approval-execution.md` §1.2, §4.5 item 4; `design/08-hold-and-cancel.md` §1.2;
+`DESIGN.md` §1.2; D-123.
+
+### D-149 (H) Each ceiling's task is its own row, and the fence closes it
+
+**Accepted (2026-09-26).** *(amends D-121, D-122, D-129)*
+
+**Decision**: `raise-overdue-escalation` `lifetime-ceiling` creates the `lifetime-ceiling-reached`
+task with `scope_ref = ceiling:{round}`, the escalation's subject, so the creation port's
+uniqueness tuple gives each ceiling its own row. `run-cancellation-fence`, in step 1, calls slice
+07's closure port scoped to `lifetime-ceiling-reached` (`outcome = closed-by-unwind`, a new
+`resolution_outcome`), which closes an open ceiling task and its `requested` request. Every way
+from the ceiling wait into an unwind — the order cancel, a supersession, a terminal order event —
+passes the fence, so the ceiling task is open only while the instance is parked at that ceiling,
+and 07 §4.4's exclusivity rule says so.
+
+**Rationale**: under the creation port's `(order_id, order_version, task_scope, scope_ref,
+failure_reason)` uniqueness, a second ceiling reopened the first ceiling's resolved row, returned
+the same `taskRef`, and replayed that task's stored SLA rounds from round 0, so its 24 h
+escalation was suppressed for as long as the first park had lasted (R-12). Nothing closed the
+ceiling task on an unwind, so the exclusivity rule froze every compensation task at `escalate`,
+and the unwind's resolution wait could take the ceiling task's `retry` for a compensation retry
+(R-11). **Precedent**: fence step 1 already calls slice 03's closure port for gates and parks and
+slice 08's for the suspension (`06 §3.6` `inst-fence-step1`); `terminate-instance` calls this
+same closure port (`07 §3.2`).
+
+**Propagated**: `design/07-manual-tasks.md` §3.2, §3.6, §3.7, §4.3, §4.4, §4.7;
+`design/06-saga-and-compensation.md` §3.4, §3.6; `design/10-process-definition.md` §3.6 (d);
+D-121, D-122, D-129.
+
+### D-150 (L) The poll's task tail names its suspension; only `apply-hold` resets the poll round
+
+**Accepted (2026-09-26).** *(amends D-116, D-130, D-133)*
+
+**Decision**: the `sourceAttempt` a held poll's failure presents to `create-manual-task` is
+`poll:{suspensionRef}:{round}`, and `enterResumeWait` no longer sets `resumePollRound` to 0:
+`applyHold` alone resets it, when it answers a new `suspensionRef`.
+
+**Rationale**: the round family is per suspension and restarts at 0, so two holds whose polls
+each found deferred failures presented the same tail `poll:0` with different subjects, and the
+second `create-manual-task` was refused `idempotency-key-conflict`, faulting the invocation
+(R-7). Resetting the round in `enterResumeWait` replayed the stored `still-held` answers of a
+suspension already polled in another wait, so a lost resume was found up to k × `PT15M` late
+(R-44). **Precedent**: apply-resume's own poll key, which already carries the suspension
+(`08 §3.3`); D-116's rule that every failing call has its own tail.
+
+**Propagated**: `design/10-process-definition.md` §3.6 (b), (c), (e);
+`design/07-manual-tasks.md` §3.3; `design/08-hold-and-cancel.md` §4.7 item 10; `ADR/0013`;
+D-116, D-130, D-133.
 
 ## Open Questions
 
@@ -4405,6 +4638,13 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-141 | M A resume closes only a suspension Lifecycle no longer holds | `design/08-hold-and-cancel.md` §2.2, §3.3, §3.6, §4.2, §4.7, `design/10-process-definition.md` §3.6; D-87, D-130 |
 | D-142 | M Every stage wait is a fork with the shared arms | `design/10-process-definition.md` §2.2, §3.6, `ADR/0012`; D-120, D-133, D-135 |
 | D-143 | M No wave dispatch without begin-fulfillment; `beginResult` pinned | `design/10-process-definition.md` §2.2, §3.6, §4.1, `design/08-hold-and-cancel.md` §4.7, `ADR/0012`; D-126, D-130, D-133, D-135 |
+| D-144 | H Rule 1 decides every route on tracked members; ten pinned members | `design/10-process-definition.md` §2.2, §3.6, §4.1, `design/07-manual-tasks.md` §3.6, §4.7, §4.8, `design/05-provisioning-intents.md` §4.5, `ADR/0012`; D-126, D-135, D-143 |
+| D-145 | M Sent spawn leaves the held-spawn loop; not-dispatchable re-check waits there | `design/10-process-definition.md` §3.6, `design/04-fulfillment-plan.md` §4.8; D-109 |
+| D-146 | H The failure stage never waits with no open task | `design/10-process-definition.md` §3.6, `design/07-manual-tasks.md` §3.3, §4.4, §4.8; D-117, D-129 |
+| D-147 | M A call that consumes an arm's payload is its own checkpoint | `design/10-process-definition.md` §3.6; D-121 |
+| D-148 | M Escalation bound counts every call between two fires | `design/10-process-definition.md` §1.2, §3.6, `design/03-approval-execution.md` §1.2, §4.5, `design/08-hold-and-cancel.md` §1.2, `DESIGN.md` §1.2; D-123 |
+| D-149 | H Each ceiling's task is its own row, closed by the fence | `design/07-manual-tasks.md` §3.2, §3.6, §3.7, §4.3, §4.4, §4.7, `design/06-saga-and-compensation.md` §3.4, §3.6, `design/10-process-definition.md` §3.6; D-121, D-122, D-129 |
+| D-150 | L Poll task tail names its suspension; only apply-hold resets the round | `design/10-process-definition.md` §3.6, `design/07-manual-tasks.md` §3.3, `design/08-hold-and-cancel.md` §4.7, `ADR/0013`; D-116, D-130, D-133 |
 
-Highest decision number used: **D-143**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
+Highest decision number used: **D-150**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
 register; there are no parts.

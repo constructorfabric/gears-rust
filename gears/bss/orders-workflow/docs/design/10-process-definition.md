@@ -117,7 +117,7 @@ be unless the gate is declared failed
 | NFR ID | NFR Summary | Allocated To | Design Response | Verification Approach |
 |--------|-------------|--------------|-----------------|----------------------|
 | `cpt-cf-bss-orders-workflow-nfr-owf-durability` | Zero in-flight workflows lost across restarts | Platform plugin (invocation history) + `01` envelope | The plugin resumes the invocation; every re-issued call is absorbed under the same key | Platform worker kill/restart with the canonical definitions; no duplicate effect, no lost step |
-| `cpt-cf-bss-orders-workflow-nfr-owf-escalation-timer` | Per-gate window from the seller's policy, default 72 h, pinned on the gate row (D-134), ± 5 min | Definition re-check loop (plugin durable timer) + `03` stored deadline | The gate loop's fixed `PT30S` `waitProbe` tick re-checks the gate's stored escalation deadline through `escalate-gate` `mode: fire` before it probes (§3.6 *Fixed waits and re-check loops*), so the fire is at most one tick plus one call late — 30 s plus the 3-minute `step` timeout, inside ± 5 min (decision D-123); a hold pauses the window in Orders' record and `apply-resume` re-bases it | Timer-accuracy test across a plugin worker restart; hold/resume test asserting the remainder |
+| `cpt-cf-bss-orders-workflow-nfr-owf-escalation-timer` | Per-gate window from the seller's policy, default 72 h, pinned on the gate row (D-134), ± 5 min | Definition re-check loop (plugin durable timer) + `03` stored deadline | The gate loop's fixed `PT30S` `waitProbe` tick re-checks the gate's stored escalation deadline through `escalate-gate` `mode: fire` before it probes (§3.6 *Fixed waits and re-check loops*); between one fire's database read and the next the gate loop runs at most the rest of that fire, the probe, the tick — or `record-decision` when a decision wins the tick — and the next fire, each call under the 60-second `gate` timeout, so the worst case with every call's retries running to its timeout is 30 s + 4 × 60 s = 4 min 30 s, inside ± 5 min (decision D-148); a hold pauses the window in Orders' record and `apply-resume` re-bases it | Timer-accuracy test across a plugin worker restart; hold/resume test asserting the remainder |
 | `cpt-cf-bss-orders-workflow-nfr-owf-fulfillment-sla` | p95 ≤ 15 min from activation eligibility to terminal outcome | Definition task timeouts and retry policy; `05` admission | Wave-2 task timeout 3 min, which bounds the call's retries; each attempt's deadline is nested inside it by validation (§2.2 rule 4); the barrier releases on the first evaluation after both conjuncts hold | Load test over the canonical definition |
 | `cpt-cf-bss-orders-workflow-nfr-owf-audit` | 100 % of transitions recorded independently of engine history | `01` audit writer | The definition performs no effect outside a step operation, so every transition with an Orders consequence is audited by construction | Definition validation rule (§2): no `run`, no `emit`, every `call` a registered operation |
 | `cpt-cf-bss-orders-workflow-nfr-owf-retention` | Gear-owned record ≥ 400 days independent of engine purge | `01` tables | Platform history retention (`TenantRuntimePolicy`, [`DESIGN.md:735`](../../../../serverless-runtime/docs/DESIGN.md#tenantruntimepolicy)) is set independently and may be shorter; nothing Orders needs lives only there | Purge-independence test |
@@ -301,7 +301,7 @@ consumer-supplied hook before publish — a pending ask
 (`cpt-cf-bss-orders-workflow-upreq-serverless-runtime-definition-versioning-validation-hook`,
 [`../UPSTREAM_REQS.md`](../UPSTREAM_REQS.md) §2.9) — in that hook (§3.2):
 
-1. [ ] - `p1` - Every `protected` operation of each path appears exactly where §4 *The fence* orders it; `settle-from-lookup` and `retry-step`, which run only in-process (`01 §3.3`, D-108), never appear. A path is a walk of the **routing graph**, whose states are a task position plus the values of the routing members `nextStage`, `stageLoop`, `returnStage`, `taskReturnStage`, `taskReturnLoop`, `ceilingReturnStage`, `ceilingReturnLoop`, `heldStage`, `heldLoop` and `arm`. Every write of a routing member **MUST** be a string literal, a copy of another routing member, or an `if … then … else` over routing members that yields one of those — never an operation's output or another `$context` member — so each member ranges over a finite set of literals the check enumerates. Five **pinned members** are tracked the same way (decision D-135): `verdict`, written only as a copy of `obtain-verdict`'s `verdict`; `reflected`, only as a copy of `reflect-verdict`'s `reflected` or the literal `refused` its `catch` sets; `policy`, only as a copy of `construct-and-freeze-plan`'s `policy`, the seller's partial-failure policy pinned at freeze (`04 §2.2`); `forceTask`, only as a boolean literal; and `beginResult`, only as a copy of `begin-fulfillment`'s `result`, null until the first call (decision D-143). At each write of a pinned member the walk forks once per value of its closed enum. A `switch` case over routing and pinned members is decided by the state; a case over any other member is taken both ways, and a §4.1 condition written *on some walk* is checked as reachability from the task it names. The check explores every state reachable from `admitTrigger` and refuses the version if any walk to `end` breaks §4.1 or leaves a stage by a `nextStage` no `dispatch` case names; a walk it cannot decide is refused, never assumed (decision D-126) - `inst-def-protected-present`
+1. [ ] - `p1` - Every `protected` operation of each path appears exactly where §4 *The fence* orders it; `settle-from-lookup` and `retry-step`, which run only in-process (`01 §3.3`, D-108), never appear. A path is a walk of the **routing graph**, whose states are a task position plus the values of the routing members `nextStage`, `stageLoop`, `returnStage`, `taskReturnStage`, `taskReturnLoop`, `ceilingReturnStage`, `ceilingReturnLoop`, `heldStage`, `heldLoop` and `arm`. Every write of a routing member **MUST** be a string literal, a copy of another routing member, or an `if … then … else` over routing members that yields one of those — never an operation's output or another `$context` member — so each member ranges over a finite set of literals the check enumerates. Ten **pinned members** are tracked the same way (decisions D-135, D-144): `verdict`, written only as a copy of `obtain-verdict`'s `verdict`; `reflected`, only as a copy of `reflect-verdict`'s `reflected` or the literal `refused` its `catch` sets; `policy`, only as a copy of `construct-and-freeze-plan`'s `policy`, the seller's partial-failure policy pinned at freeze (`04 §2.2`); `forceTask`, only as a boolean literal; `beginResult`, only as a copy of `begin-fulfillment`'s `result`, null until the first call (decision D-143); `released`, only as a copy of `evaluate-activation-eligibility`'s `released`; `spawned`, `planFailed` and `preAdmitted`, only as boolean literals, each `false` where it is initialised or consumed and `true` only in the task one case of a `switch` over an operation's closed enum routes to (`spawnSent` after a sent spawn signal, `enterPlanFailedWait` after a `planFailFast` that did not begin, a `toLifecycle` after a hold, resume or acceptance admission answered `supersede` or `terminate`); and `failureScope`, only as one of the literals `line`, `plan` and `order` in the task that enters the failure stage. At each write of a pinned member copied from an output the walk forks once per value of its closed enum; a literal write is decided. The canonical version routes every `switch` that leads towards a protected operation, a stage exit or a `p1` composable of §4.1 on routing and pinned members only, or on a member both of whose ways satisfy §4.1 (decision D-144). A `switch` case over routing and pinned members is decided by the state; a case over any other member is taken both ways, and a §4.1 condition written *on some walk* is checked as reachability from the task it names. The check explores every state reachable from `admitTrigger` and refuses the version if any walk to `end` breaks §4.1 or leaves a stage by a `nextStage` no `dispatch` case names; a walk it cannot decide is refused, never assumed (decision D-126) - `inst-def-protected-present`
 2. [ ] - `p1` - Every `call: http` targets `POST /bss-orders-workflow/v1/steps/{operation}` with `{operation}` a row of `owf_step_operation`, and its `endpoint` is exactly `${ $context.stepsBase + "/<operation>" }` with the operation name a literal. `stepsBase` is written only by `input.from`; no `set`, `output` or `export` **MAY** name it, so no version can send its calls, or the credential the plugin attaches to them, to another host, and the CI test and the hook compare the `input.from` value with the environment's step-surface base (§3.7). No `call` **MAY** target a registered Function, `composable` operation or not (decision D-136) - `inst-def-call-targets`
 3. [ ] - `p1` - Every `listen` filter type is in the closed set above and carries the two correlations, except the `OrderAmended` filter, which correlates on `orderId` only (the closed set above, `02 §4.7` item 8); a filter **MAY** add a correlation, as the ceiling wait's `taskRef` does - `inst-def-listen-targets`
 4. [ ] - `p1` - Bounds nest, over values the definition holds: every task that calls an operation declares a `timeout` from `use.timeouts`; the operation's `deadline_ms` **<** that timeout, so one attempt fits; every task timeout and every literal `wait` **<** the literal `P90D` lifetime `wait`. The check computes no cumulative backoff, because the DSL gives `backoff.exponential` no multiplier (dsl-reference.md *Retry*) and the timeout bounds the retries whatever their curve. The escalation window, the overdue window and the SLA classes are not definition values — each is a per-seller policy value that an operation pins on the order's record (decision D-134) — so their bounds are checked where the seller's policy is written (`07 §4.8` item 8), not here (decision D-126) - `inst-def-bounds-nest`
@@ -672,7 +672,12 @@ them to its own `leave` task, `{ set: { nextStage: '${ .arm }', returnStage: <th
 then: exit }`; the shared stage ends in `back`, `{ set: { nextStage: '${ $context.returnStage }' },
 then: exit }`, and the `enter` switch of the returning stage re-enters `$context.stageLoop`.
 Re-entry at a checkpoint re-issues the checkpoint's calls under their unchanged idempotency keys,
-which the envelope answers with the stored outcome (`01 §3.3`).
+which the envelope answers with the stored outcome (`01 §3.3`). A call that consumes an arm's
+payload after the fork — `record-decision` after the decision arm, `resolve-manual-task` after a
+task-resolution arm — is a checkpoint of its own: the stage records it in `stageLoop` before the
+call and its `enter` switch re-issues it, so a lifetime ceiling that cancels `process` during the
+call neither drops the consumed decision or resolution nor waits for a signal that will not come
+again (decision D-147).
 
 #### Fixed waits and re-check loops
 
@@ -701,7 +706,7 @@ it only for records pinned after the write (decision D-134).
 | `waitCeiling` — lifetime ceiling | (a) | `P90D`, literal; no re-check | — | — |
 | `waitTtlMargin` — park escalation, also the verdict retry interval | (a) | `PT5M` | `arm-park-escalation` (03) | `due` |
 | `waitHeldReflect` — reflection refused while the order is held, or answered `moved` | (a) | `PT5M`; the resume arm re-enters at once | `reflect-verdict` (03), under the next round | `reflected` |
-| `waitProbe` in `gateLoop` — approval escalation window, then the approval-service probe | (a) | `PT30S` (`03 §4.5` items 4, 5) — worst-case escalation lateness one tick plus one call, 30 s plus the 3-minute `step` timeout, inside the ± 5 min of `nfr-owf-escalation-timer` (D-123) | `escalate-gate` `mode: fire`, then `mode: probe` (03) | `due` (fire, routes nothing), then `serviceState` |
+| `waitProbe` in `gateLoop` — approval escalation window, then the approval-service probe | (a) | `PT30S` (`03 §4.5` items 4, 5) — worst-case escalation lateness 30 s + 4 × 60 s = 4 min 30 s, inside the ± 5 min of `nfr-owf-escalation-timer`: the rest of a fire, the probe or `record-decision`, the tick and the next fire, each under the 60-second `gate` timeout; every return into the loop fires first (D-123, D-148) | `escalate-gate` `mode: fire`, then `mode: probe` (03) | `due` (fire, routes nothing), then `serviceState` |
 | `waitProbe` in `outageArm` — approval-service probe and the outage threshold | (a) | `PT30S` (`03 §4.5` item 5) | `escalate-gate` `mode: probe` (03) | `serviceState`; `due` on `outage` |
 | resumed escalation window | (e) | none of its own: the first answer is `apply-resume`'s | `apply-resume` (08), then `waitProbe` | `due` |
 | `waitEligibility` — eligibility poll | (b) | `PT5M` (`04 §4.8` item 5) | `evaluate-payment-auth-eligibility` (04) | `eligibility` |
@@ -710,7 +715,7 @@ it only for records pinned after the write (decision D-134).
 | `waitExpected` — the barrier's timer half | (b) | `PT1H` | `evaluate-activation-eligibility` (04) | `due` |
 | `waitPoll` — barrier confirmation poll | (b) | `PT30S` | `reconcile-intent` (05), then `evaluate-activation-eligibility` | `released` |
 | `waitOverdue` — overdue window (`expected_fulfillment_at` + the plan's pinned overdue window, default 24 h, D-134) | (b) | `PT1H` | `raise-overdue-escalation` `overdue-fulfillment` (07), under the next round | `due`, `raised` |
-| `waitHeld` — spawn signal or completion report refused while the order is held | (b) | `PT5M`; the resume arm re-enters at once | `report-spawn-signal` (05) or `report-outcome` (06), under the next round | `spawnSignal`, `lifecycleCall` |
+| `waitHeld` — spawn signal or completion report refused while the order is held, or a re-check answered `not-dispatchable` (stage loop `heldSpawn` or `heldReport`, D-145) | (b) | `PT5M`; the resume arm re-enters at once | `re-check-pre-activation` (04) then `report-spawn-signal` (05), or `report-outcome` (06), under the next round | `preActivation`, `spawnSignal`, `lifecycleCall` |
 | `waitSla` — manual-task SLA | (c) | `PT5M` | `resolve-manual-task` `trigger: sla-check` (07) | `resolution` |
 | `waitSla` in `awaitOperatorAfterPark` — the ceiling task's SLA | (d) | `PT5M` | `resolve-manual-task` `trigger: sla-check` scoped to `ceilingTaskRef` (07), under that task's own `slaRound` (D-129) | `resolution` — `escalated` or `none` only: an order-scope task escalates and is never exhausted (`07 §4.2`) |
 | `waitResumePoll` — the resume wait's read of the hold | (e) | `PT15M` | `apply-resume` `trigger: poll` (08), under the next `resumePollRound` (D-130) | `resumeOutcome` |
@@ -769,6 +774,7 @@ use:
     wave1:     { after: { minutes: 10 } }    # 01 §4.2 (D-70)
     wave2:     { after: { minutes: 3 } }     # nfr-owf-fulfillment-sla (D-70)
     admission: { after: { hours: 25 } }      # above the 24 h supersession budget
+    gate:      { after: { seconds: 60 } }    # the calls between two escalation fires (D-148): 30 s tick + 3 × 60 s, inside ± 5 min; each above escalate-gate's and record-decision's 10 s deadline_ms
 # no `schedule`: the only start mechanism is the two platform event triggers of §3.3
 # triggerKind is looked up from the exact event type (D-107): any other type yields null, which admit-trigger's schema refuses
 input:
@@ -889,8 +895,9 @@ The approval stage, the `do` list of `process.approval`:
     switch:
       - resumedDue: { when: '${ $context.stageLoop == "gateLoop" and $context.resumeDue == true }', then: escalateGate }   # apply-resume's due is the first answer (08 §4.7 item 1)
       - parkLoop:   { when: '${ $context.stageLoop == "parkLoop" }',       then: park }        # the checkpoint's call re-issued under its unchanged key, then the loop
-      - gateLoop:   { when: '${ $context.stageLoop == "gateLoop" }',       then: gateLoop }
+      - gateLoop:   { when: '${ $context.stageLoop == "gateLoop" }',       then: escalateGate }   # every return into the gate loop fires first, so an arm taken between two fires adds only its own calls (D-148)
       - outageArm:  { when: '${ $context.stageLoop == "outageArm" }',      then: outageArm }
+      - decision:   { when: '${ $context.stageLoop == "recordDecision" }', then: recordDecision }   # a consumed decision is re-issued under its unchanged key, never dropped (D-147)
       - reflect:    { when: '${ $context.stageLoop == "reflectVerdict" }', then: reflectVerdict }
       - fresh:      { then: obtainVerdict }
 - obtainVerdict:                        # protected (03)
@@ -1035,11 +1042,12 @@ The approval stage, the `do` list of `process.approval`:
         - cancel:     { do: [ ‹cancel arm of (d)› ] }
 - afterGateLoop:
     switch:
-      - decision: { when: '${ .arm == "decision" }', then: recordDecision }
+      - decision: { when: '${ .arm == "decision" }', then: enterRecordDecision }
       - probe:    { when: '${ .arm == "probe" }',    then: escalateGate }
       - other:    { then: leave }       # hold | resume | lifecycle | cancel
+- enterRecordDecision: { set: { stageLoop: recordDecision } }   # the decision arm consumed its event: a checkpoint before the call, so a ceiling that interrupts it re-issues it (D-147)
 - recordDecision:                       # protected (03)
-    timeout: step
+    timeout: gate
     try:
       - call: { step: record-decision } # body: ref + gateRef, decisionEventId, outcome ∈ approved | rejected
     catch: *transient
@@ -1048,16 +1056,17 @@ The approval stage, the `do` list of `process.approval`:
     switch:
       - decided:      { when: '${ $context.gateState == "approved" or $context.gateState == "rejected" }', then: reflectVerdict }   # reflectStage: gate-outcome
       - nextPosition: { when: '${ $context.gateState == "next-position" }', then: openGates }
-      - pending:      { then: gateLoop }
+      - pending:      { then: reenterGateLoop }
+- reenterGateLoop: { set: { stageLoop: gateLoop }, then: escalateGate }   # a pending decision fires before the next tick (D-148)
 - escalateGate:                         # composable (03): the escalation re-check; fires, and enqueues OrderApprovalEscalated, only when due
-    timeout: step
+    timeout: gate
     try:
       - call: { step: escalate-gate }   # body: ref + position, mode: fire, round: $context.escalationRound; output: due, escalationRound
     catch: *transient
     export: { as: '${ $context + { escalationRound: .escalationRound, resumeDue: false } }' }
     then: probeGate                     # due routes nothing: true has escalated inside the operation, false is a settled success of its round; the next tick carries the next escalationRound
 - probeGate:
-    timeout: step
+    timeout: gate
     try:
       - call: { step: escalate-gate }   # body: ref + position, mode: probe, round: $context.probeRound; output: serviceState, due, probeRound
     catch: *transient
@@ -1133,8 +1142,17 @@ same. **Approval.** The escalation window is Orders' stored deadline, re-checked
 escalates nothing and is a settled success of its round, and the next tick calls the next round.
 The re-check rides the probe tick because two waits of different lengths re-armed on every pass
 of one competing fork let the shorter always win, so a separate `PT5M` escalation wait never
-fired; one tick plus one call is 30 s plus the `step` timeout, inside the ± 5 min of
-`nfr-owf-escalation-timer` (decision D-123). A decision, a hold or a cancel winning the race
+fired (decision D-123). The lateness bound counts every call that can run between two fires:
+the rest of the fire whose read the deadline just missed, the probe, the tick — or, when a
+decision wins the tick, `record-decision` — and the next fire. Those calls carry the 60-second
+`gate` timeout, a pending decision goes straight to `escalateGate` (`reenterGateLoop`), and every
+re-entry of the stage at `gateLoop` fires before it waits, so the worst case with every call's
+retries running to its timeout is 30 s + 4 × 60 s = 4 min 30 s, inside the ± 5 min of
+`nfr-owf-escalation-timer`. An arm that leaves the stage and returns — a denied cancel, an
+absorbed lifecycle event, an early resume — adds only the calls of the stage it visited, each
+normally inside its 5–10 s `deadline_ms`; only with those calls' retries running to the 3-minute
+`step` timeout can the bound be exceeded, the residual of a degraded Orders, and a hold pauses the
+window itself (decision D-148). A decision, a hold or a cancel winning the race
 cancels only the tick; the pause itself is in Orders' record, where
 `apply-hold` pauses the gate window through slice 03's gate-window port and `apply-resume`
 re-bases it, so the definition carries no remainder. `open-gates` receives `position = 0` first
@@ -1196,7 +1214,8 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
       - wave1:           { when: '${ $context.stageLoop == "wave1" }',                  then: wave1 }
       - expected:        { when: '${ $context.stageLoop == "awaitExpected" }',          then: evaluate }
       - barrier:         { when: '${ $context.stageLoop == "barrierLoop" }',            then: evaluate }
-      - held:            { when: '${ $context.stageLoop == "heldWait" }',               then: retryHeld }   # after a resume (or a recorded hold): call the held operation again under its next round
+      - heldSpawn:       { when: '${ $context.stageLoop == "heldSpawn" }',              then: preActivation }     # after a resume (or a recorded hold): Lifecycle re-runs the re-check after a hold, then the spawn signal under its next round
+      - heldReport:      { when: '${ $context.stageLoop == "heldReport" }',             then: reportCompleted }   # the completion report under its next round
       - planFailFast:    { when: '${ $context.stageLoop == "planFailFast" }',           then: planFailFast }   # from the failure stage: an exhausted plan task passes begin-fulfillment before its unwind (D-109)
       - fresh:           { then: initEligibility }
 - initEligibility: { set: { eligibilityTrigger: initial, requestRef: null, evaluationSeq: 0, barrierSeq: 0, recheckSeq: 0, wave1Round: 0, wave2Round: 0, rebuildRound: 0, sweepRound: 0, spawnRound: 0, reportRound: 0, planAttempt: 0, wave1Failed: [], wave2Failed: [], spawned: false, planFailed: false, wave1AttemptKey: null, wave2AttemptKey: null } }
@@ -1443,7 +1462,7 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
     switch:
       - failed:      { when: '${ (($context.sweepFailed + $context.sweepUnresolved) | length) > 0 }', then: sweepFailure }
       - redispatch1: { when: '${ [ $context.redispatch[] | select(.wave == "wave1_create") ] | length > 0 }', then: redispatchWave1 }
-      - redispatch2: { when: '${ [ $context.redispatch[] | select(.wave == "wave2_activate") ] | length > 0 }', then: wave2 }
+      - redispatch2: { when: '${ $context.spawned and ([ $context.redispatch[] | select(.wave == "wave2_activate") ] | length > 0) }', then: wave2 }   # only once the spawn signal was sent: spawned is pinned, so no walk reaches wave 2 by this case before the re-check and the signal (D-144)
       - reevaluate:  { then: evaluate }
 - sweepFailure:                         # fragment (c): never-dispatched | intent-unresolved | wave failures
     set: { failureScope: line, failureSubjects: '${ [ $context.sweepFailed[] | { subjectRef: .lineRef, reason: .reason, cause: "sweep-discovered-terminal-failure" } ] + [ $context.sweepUnresolved[] | { subjectRef: ., reason: "intent-unresolved", cause: "sweep-floor-reached" } ] }', sourceStep: reconcile-intent, sourceAttempt: '${ $context.sweepAttempt }', nextStage: failure, stageLoop: null }
@@ -1463,19 +1482,20 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
     switch:
       - proceed:         { when: '${ $context.preActivation == "proceed" }', then: spawnSignal }
       - abort:           { when: '${ $context.preActivation == "abort" }', then: preActivationAbort }
-      - notDispatchable: { then: enterBarrierLoop }   # the barrier's hold, lifecycle and cancel arms consume what the operation observed
+      - notDispatchable: { then: enterHeldSpawn }   # on-hold | superseded | terminal: the held-spawn wait's PT5M tick re-runs the re-check, and its resume, lifecycle and cancel arms consume what the operation observed; never the PT30S barrier poll (D-145)
 - preActivationAbort: { set: { unwind: failure, nextStage: unwind, stageLoop: null }, then: exit }   # never the failure stage; void wave-1 drafts, fulfillment_failed with the abort reason the fence maps (06 §4.8)
 - spawnSignal:                          # protected (05): the first activation intent is the Lifecycle spawn/fencing signal
     timeout: step
     try:
       - call: { step: report-spawn-signal }   # body: ref + round: $context.spawnRound; output: spawnSignal ∈ recorded | already-recorded | held | not-dispatchable, nextRound
     catch: *transient
-    export: { as: '${ $context + { spawnAnswer: .spawnSignal, spawned: (.spawnSignal == "recorded" or .spawnSignal == "already-recorded"), spawnRound: .nextRound, heldCall: "spawn" } }' }
+    export: { as: '${ $context + { spawnAnswer: .spawnSignal, spawnRound: .nextRound } }' }   # no pinned member is written from the answer: spawned is set by the case below (D-144)
 - onSpawn:
     switch:
-      - held:            { when: '${ $context.spawnAnswer == "held" }', then: enterHeldWait }   # Lifecycle not-admissible on an on_hold order (05 §3.3): wait for the resume, then the next round
+      - held:            { when: '${ $context.spawnAnswer == "held" }', then: enterHeldSpawn }   # Lifecycle not-admissible on an on_hold order (05 §3.3): wait for the resume, then the next round
       - notDispatchable: { when: '${ $context.spawnAnswer == "not-dispatchable" }', then: enterBarrierLoop }   # not-admissible on a terminal order: a cancel committed first (Lifecycle 06 §4.3); the barrier's lifecycle arm consumes OrderCancelled
-      - sent:            { then: wave2 }
+      - sent:            { then: spawnSent }   # recorded | already-recorded
+- spawnSent: { set: { spawned: true, stageLoop: barrierLoop }, then: wave2 }   # spawned is written only here, as a literal (rule 1); the loop leaves the held-spawn wait before wave 2, so an arm taken from a wave-2 deferral re-enters at the barrier, which re-evaluates, and never re-runs the re-check or the spawn signal (D-144, D-145)
 - wave2:                                # protected (05): ONE call, eligible lines as references; the draft-liveness re-read is inside
     try:
       - dispatchWave2:
@@ -1530,7 +1550,7 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
     switch:
       - heldPoll: { when: '${ .arm == "tick" and $context.heldTicks >= 15 }', then: pollHeld }   # D-133
       - tick:     { when: '${ .arm == "tick" }', then: wave2Again }
-      - other:    { then: leave }       # re-entered by stageLoop (awaitExpected, barrierLoop or heldWait), which re-evaluates before any dispatch
+      - other:    { then: leave }       # re-entered by stageLoop (awaitExpected or barrierLoop, never the held-spawn loop, which spawnSent left), which re-evaluates before any dispatch
 - wave2Again: { set: { eligibleLineRefs: '${ $context.wave2Deferred }' }, then: wave2 }
 - lineFailure2:
     set: { failureScope: line, failureSubjects: '${ [ $context.wave2Failed[] | { subjectRef: .lineRef, reason: .reason, cause: "explicit-failure-confirmation" } ] }', sourceStep: dispatch-wave2-activate, sourceAttempt: '${ $context.wave2Attempt }', nextStage: failure, stageLoop: null }
@@ -1540,10 +1560,10 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
     try:
       - call: { step: report-outcome }  # body: ref + outcome: completed, round: $context.reportRound; output: lifecycleCall ∈ acknowledged | held, nextRound
     catch: *transient
-    export: { as: '${ $context + { lifecycleCall: .lifecycleCall, reportRound: .nextRound, heldCall: "report" } }' }
+    export: { as: '${ $context + { lifecycleCall: .lifecycleCall, reportRound: .nextRound } }' }
 - onReport:
     switch:
-      - held:     { when: '${ $context.lifecycleCall == "held" }', then: enterHeldWait }   # a completed acknowledgement of an on_hold order (06 §3.3): resume first
+      - held:     { when: '${ $context.lifecycleCall == "held" }', then: enterHeldReport }   # a completed acknowledgement of an on_hold order (06 §3.3): resume first
       - reported: { then: terminateCompleted }
 - terminateCompleted:                   # protected (01); terminationKind: completed
     timeout: step
@@ -1551,7 +1571,8 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
       - call: { step: terminate-instance }
     catch: *transient
     then: end
-- enterHeldWait: { set: { stageLoop: heldWait, holdPauses: false } }   # heldCall names the operation to call again
+- enterHeldSpawn: { set: { stageLoop: heldSpawn, holdPauses: false }, then: heldWait }   # a held spawn signal or a not-dispatchable re-check: the stage loop, a routing member, names the call to repeat (D-144, D-145)
+- enterHeldReport: { set: { stageLoop: heldReport, holdPauses: false } }   # a held completion report
 - heldWait:
     fork:
       compete: true
@@ -1566,25 +1587,25 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
       - heldPoll: { when: '${ .arm == "tick" and $context.heldTicks >= 3 }', then: pollHeld }   # D-133
       - tick:  { when: '${ .arm == "tick" }', then: retryHeld }
       - other: { then: leave }          # hold | resume | lifecycle | cancel; a resume returns to retryHeld through enter
-- retryHeld:
+- retryHeld:                            # decided by the stage loop alone (rule 1, D-144)
     switch:
-      - spawn:  { when: '${ $context.heldCall == "spawn" }', then: preActivation }   # Lifecycle re-runs the re-check after a hold (Lifecycle 06 §4.3), then the spawn signal under its next round
-      - report: { then: reportCompleted }
+      - spawn:  { when: '${ $context.stageLoop == "heldSpawn" }', then: preActivation }   # Lifecycle re-runs the re-check after a hold (Lifecycle 06 §4.3), then the spawn signal under its next round
+      - report: { then: reportCompleted }   # stageLoop heldReport
 - pollHeld:                             # protected (08): the resume wait's poll, from a fulfillment wait or a held deferral where a hold was only recorded (D-133)
     timeout: step
     try:
       - call: { step: apply-resume }    # body: ref + trigger: poll, suspensionRef, round: $context.resumePollRound; output: resumeOutcome ∈ resumed-by-read | still-held, due, failedTaskRefs[], nextRound
     catch: *transient
-    export: { as: '${ $context + { resumeOutcome: .resumeOutcome, resumePollTail: ("poll:" + ($context.resumePollRound | tostring)), resumePollRound: .nextRound, resumeFailed: (.failedTaskRefs // []), heldTicks: 0, suspensionRef: (if .resumeOutcome == "resumed-by-read" then null else $context.suspensionRef end) } }' }
+    export: { as: '${ $context + { resumeOutcome: .resumeOutcome, resumePollTail: ("poll:" + $context.suspensionRef + ":" + ($context.resumePollRound | tostring)), resumePollRound: .nextRound, resumeFailed: (.failedTaskRefs // []), heldTicks: 0, suspensionRef: (if .resumeOutcome == "resumed-by-read" then null else $context.suspensionRef end) } }' }
 - afterHeldPoll:                        # stageLoop first, so no walk takes the failure route before begin-fulfillment; either answer then continues with the tick's own work
     switch:
       - eligibility:      { when: '${ $context.stageLoop == "awaitEligibilityChange" }', then: eligibility }   # before begin-fulfillment no failure is deferred, so failedTaskRefs is empty
       - deferredFailures: { when: '${ ($context.resumeFailed | length) > 0 }', then: heldPollFailure }   # 08 §4.7 item 8: before any dispatch
       - expected:         { when: '${ $context.stageLoop == "awaitExpected" }', then: evaluate }        # also the held wave-2 deferral entered from awaitExpected
       - barrier:          { when: '${ $context.stageLoop == "barrierLoop" }',   then: reconcilePoll }   # also the held wave-2 deferral entered from the barrier
-      - held:             { when: '${ $context.stageLoop == "heldWait" }',      then: retryHeld }
+      - held:             { when: '${ $context.stageLoop == "heldSpawn" or $context.stageLoop == "heldReport" }', then: retryHeld }
       - wave1:            { then: wave1Again }   # stageLoop wave1: the held wave-1 deferral
-- heldPollFailure:                      # fragment (c); the failing call's key tail is the poll round
+- heldPollFailure:                      # fragment (c); the failing call's key tail is poll:{suspensionRef}:{round}, unique across suspensions (07 §3.3)
     set: { failureScope: line, failureSubjects: '${ [ $context.resumeFailed[] | { subjectRef: .lineRef, reason: .reason, cause: (if .reason == "intent-unresolved" then "sweep-floor-reached" else "sweep-discovered-terminal-failure" end) } ] }', sourceStep: apply-resume, sourceAttempt: '${ $context.resumePollTail }', nextStage: failure, stageLoop: null }
     then: exit
 - leave: { set: { nextStage: '${ .arm }', returnStage: fulfillment }, then: exit }
@@ -1678,13 +1699,19 @@ resume it waits for was lost; since D-142 the deferral also carries the resume a
 `begin-fulfillment`, so it has no deferred failures and no failure route. Elsewhere a non-empty
 `failedTaskRefs[]` goes to fragment (c) before any dispatch, and either answer then runs the tick's
 own re-check. `re-check-pre-activation` runs before the first
-activation, and again only after a `held` spawn signal: `proceed` is the only case that reaches `report-spawn-signal`, `abort` goes to the
-unwind and `not-dispatchable` returns to the barrier loop. **Held.** A `report-spawn-signal` or a
+activation, and again only from the held-spawn wait: `proceed` is the only case that reaches `report-spawn-signal`, `abort` goes to the
+unwind and `not-dispatchable` — the order `on_hold`, superseded or terminal — waits in the
+held-spawn wait, whose `PT5M` tick runs the re-check again and whose resume, lifecycle and cancel
+arms consume what it observed, never the `PT30S` barrier poll (decision D-145). **Held.** A `report-spawn-signal` or a
 completion `report-outcome` that Lifecycle refuses `not-admissible` because the order is `on_hold`
 answers `held`, a settled success; the stage waits in `heldWait` for the resume (or the `PT5M`
 tick) and calls the same operation again under the next round — for the spawn signal after
 `re-check-pre-activation` runs again, as Lifecycle prescribes after a hold — because Lifecycle replays a
-refusal under its key and only a new round reaches it after the resume
+refusal under its key and only a new round reaches it after the resume. The stage loop names the
+call to repeat — `heldSpawn` or `heldReport`, literals of a routing member — so the walk of §2.2
+rule 1 decides it; a sent spawn signal (`spawnSent`) sets `spawned`, a pinned literal, and leaves
+the held-spawn loop for `barrierLoop` before wave 2, so an arm taken from a wave-2 deferral
+re-enters at the barrier's `evaluate`, never at the re-check (decisions D-144, D-145)
 ([`01 §3.3` *Rounds and attempts*](./01-foundation.md#rounds-and-attempts-the-one-rule-for-re-invokable-operations)). A spawn signal Lifecycle refuses `not-admissible` for an order it holds
 terminal answers `not-dispatchable`: a cancel committed before the signal, which Lifecycle
 declares the normal outcome of the race ("if cancellation commits first, the signal refuses and
@@ -1717,24 +1744,36 @@ The failure stage, the `do` list of `process.failure` — entered with the four 
 `failureScope`; `failureSubjects`, one `{ subjectRef, reason, cause }` per subject, with `reason`
 and `cause` the `failure_reason` and `failure_cause` enums of `07 §3.7`; `sourceStep`; and
 `sourceAttempt`, the failing call's key tail `{round}[:{attempt}]` (`01 §3.3` *Rounds and
-attempts*; `resumeEventId` for `apply-resume`, which is keyed by its event) — and, for an
-order-scope task, `taskReturnStage` and `taskReturnLoop`:
+attempts*; `resumeEventId` for `apply-resume`, which is keyed by its event, and
+`poll:{suspensionRef}:{round}` for its poll, whose round family is per suspension) — and, for an
+order-scope task, `taskReturnStage` and `taskReturnLoop`. `failureScope` is one of the literals
+`line`, `plan`, `order` and is a pinned member of §2.2 rule 1: the stage routes a retry and an
+exhaustion on it, never on the answer's `resumeAt` or a returned list (decision D-144):
 
 ```yaml
 - enter:
     switch:
-      - waiting: { when: '${ $context.stageLoop == "awaitResolution" }', then: awaitResolution }
-      - fresh:   { then: onPolicy }
+      - waiting:   { when: '${ $context.stageLoop == "awaitResolution" }', then: awaitResolution }
+      - resolving: { when: '${ $context.stageLoop == "resolveTask" }',     then: resolveTask }   # a consumed task resolution is re-issued under its unchanged key, never dropped (D-147)
+      - fresh:     { then: onPolicy }
 - onPolicy:                             # 07 §4.8 item 1
     switch:
       - remediate: { when: '${ $context.policy == "remediate" or $context.forceTask }', then: createTasks }
       - failFast:  { then: failFastUnwind }   # fail-fast records a tracked incident inside compensate-order's path; no actionable task
-- failFastUnwind:                       # every route to a failure unwind: a failure is acknowledged only from fulfillment (06 §3.2, D-109)
+- failFastUnwind:                       # every route to a failure unwind: a failure is acknowledged only from fulfillment (06 §3.2, D-109); decided on pinned members only (D-144)
     switch:
-      - notBegun: { when: '${ $context.beginResult != "in-fulfillment" }', then: toBeginFirst }   # only a plan-scope failure is reached before begin-fulfillment (07 §4.2)
-      - begun:    { then: toFailureUnwind }
+      - begun:    { when: '${ $context.beginResult == "in-fulfillment" }', then: toFailureUnwind }
+      - notBegun: { when: '${ $context.failureScope == "plan" }', then: toBeginFirst }   # only a plan-scope failure is reached before begin-fulfillment (07 §4.2)
+      - never:    { then: orderTaskExhausted }
 - toBeginFirst: { set: { nextStage: fulfillment, stageLoop: planFailFast }, then: exit }   # 04 §4.3: pass begin-fulfillment, then the unwind
 - toFailureUnwind: { set: { unwind: failure, nextStage: unwind, stageLoop: null }, then: exit }
+- orderTaskExhausted:                   # an order-scope task escalates and is never exhausted (07 §4.2): a defect of the version or the operation, never a business outcome, so it faults the invocation, as unknownStage does
+    raise:
+      error:
+        type: https://serverlessworkflow.io/spec/1.0.0/errors/runtime
+        status: 500
+        title: order-task-exhausted
+        detail: an order-scope manual task answered exhausted before begin-fulfillment
 - createTasks:                          # protected (07): exactly one actionable task per failed subject, reopen semantics inside
     timeout: step
     try:
@@ -1770,15 +1809,16 @@ order-scope task, `taskReturnStage` and `taskReturnLoop`:
         - cancel:    { do: [ ‹cancel arm of (d)› ] }
 - afterResolution:
     switch:
-      - resolution: { when: '${ .arm == "resolution" }', then: resolveTask }
+      - resolution: { when: '${ .arm == "resolution" }', then: enterResolveTask }
       - sla:        { when: '${ .arm == "sla" }',        then: slaCheck }
       - other:      { then: leave }
+- enterResolveTask: { set: { stageLoop: resolveTask } }   # the resolution arm consumed its signal: a checkpoint before the call (D-147)
 - resolveTask:                          # composable (07)
     timeout: step
     try:
       - call: { step: resolve-manual-task }   # body: ref + trigger: request, taskRef, requestRef
     catch: *transient
-    export: { as: '${ $context + { resolution: .resolution, resumeAt: .resumeAt, attemptKey: (if .retryWave then $context.attemptKey else .attemptKey end), wave1AttemptKey: (if .retryWave == "wave1_create" then .attemptKey else $context.wave1AttemptKey end), wave2AttemptKey: (if .retryWave == "wave2_activate" then .attemptKey else $context.wave2AttemptKey end), openTaskCount: .openTaskCount, slaRound: .slaRound } }' }   # a line retry's attempt belongs to its wave's dispatch family (retryWave); the latest per wave is that family's counter, so several retries under the remediation hold keep one member per wave (D-117, D-119)
+    export: { as: '${ $context + { resolution: .resolution, attemptKey: (if .retryWave then $context.attemptKey else .attemptKey end), wave1AttemptKey: (if .retryWave == "wave1_create" then .attemptKey else $context.wave1AttemptKey end), wave2AttemptKey: (if .retryWave == "wave2_activate" then .attemptKey else $context.wave2AttemptKey end), openTaskCount: .openTaskCount, slaRound: .slaRound } }' }   # a line retry's attempt belongs to its wave's dispatch family (retryWave); the latest per wave is that family's counter, so several retries under the remediation hold keep one member per wave (D-117, D-119)
     then: onResolution
 - slaCheck:                             # composable (07): the SLA re-check; escalates inside the operation only once the stored SLA deadline has passed
     timeout: step
@@ -1791,17 +1831,16 @@ order-scope task, `taskReturnStage` and `taskReturnLoop`:
       - exhausted: { when: '${ $context.resolution == "exhausted" }', then: failFastUnwind }
       - override:  { when: '${ $context.resolution == "override" }',  then: verifyOverride }
       - retry:     { when: '${ $context.resolution == "retry" }',     then: routeRetry }
-      - wait:      { then: awaitResolution }   # closed | escalated | refused | none: back to the waiting fork
-- routeRetry:                           # by resumeAt, carrying attemptKey
+      - lastClosed: { when: '${ $context.resolution == "closed" and $context.openTaskCount == 0 and $context.failureScope == "line" and $context.beginResult == "in-fulfillment" }', then: toBarrier }   # the last open task closed without a retry: every line an earlier retry held behind the remediation hold returns to the barrier with it (D-146)
+      - wait:      { then: enterAwaitResolution }   # closed with a task still open | escalated | refused | none: back to the waiting fork
+- routeRetry:                           # by the entry's failureScope, a pinned member, which 07 maps one-to-one onto resumeAt (line → barrier, plan → plan, order → stage); carrying attemptKey (D-144)
     switch:
-      - barrier:      { when: '${ $context.resumeAt == "barrier" and $context.openTaskCount == 0 and $context.beginResult == "in-fulfillment" }', then: toBarrier }   # beginResult is pinned: no walk reaches the barrier without begin-fulfillment (D-143)
-      - siblingsOpen: { when: '${ $context.resumeAt == "barrier" }',      then: awaitResolution }   # 07 §4.3 remediation hold: dispatch waits until the order's last open task resolves (D-117); a barrier retry before begin-fulfillment, which no line task produces, waits too
-      - plan:         { when: '${ $context.resumeAt == "plan" }',         then: toPlan }
-      - compensation: { when: '${ $context.resumeAt == "compensation" }', then: toCompensation }
-      - stage:        { then: retryStage }   # an order-scope task: the stage whose operation failed
+      - barrier:      { when: '${ $context.failureScope == "line" and $context.openTaskCount == 0 and $context.beginResult == "in-fulfillment" }', then: toBarrier }   # beginResult is pinned: no walk reaches the barrier without begin-fulfillment (D-143)
+      - siblingsOpen: { when: '${ $context.failureScope == "line" }', then: enterAwaitResolution }   # 07 §4.3 remediation hold: dispatch waits until the order's last open task resolves (D-117)
+      - plan:         { when: '${ $context.failureScope == "plan" }', then: toPlan }
+      - stage:        { then: retryStage }   # failureScope order: the stage whose operation failed
 - toBarrier: { set: { nextStage: fulfillment, stageLoop: barrierLoop }, then: exit }   # evaluate names every retried wave-1 line in undispatchedLineRefs and every retried wave-2 line in eligibleLineRefs; each is sent under its line's new wave attempt, the call under its wave's attemptKey (D-119)
 - toPlan: { set: { nextStage: fulfillment, stageLoop: freezePlan, planAttempt: '${ $context.attemptKey }' }, then: exit }   # a new attempt of construct-and-freeze-plan
-- toCompensation: { set: { nextStage: unwind, stageLoop: compensate }, then: exit }   # a new pass of compensate-order
 - retryStage: { set: { nextStage: '${ $context.taskReturnStage }', stageLoop: '${ $context.taskReturnLoop }' }, then: exit }   # reflect-verdict → approval at reflectVerdict, the one order-scope task the definition creates (D-114)
 - verifyOverride:                       # composable (07): follows only a resolve-manual-task that answered override for the same requestRef
     timeout: step
@@ -1812,9 +1851,9 @@ order-scope task, `taskReturnStage` and `taskReturnLoop`:
 - afterOverride:
     switch:
       - verified:  { when: '${ $context.overrideVerified and $context.openTaskCount == 0 and $context.beginResult == "in-fulfillment" }', then: toBarrier }   # the line is activated; the conjunction decides whether the order completes (D-143: never before begin-fulfillment)
-      - held:      { when: '${ $context.overrideVerified }', then: awaitResolution }                             # siblings still open: the remediation hold holds (D-117)
+      - held:      { when: '${ $context.overrideVerified }', then: enterAwaitResolution }                        # siblings still open: the remediation hold holds (D-117)
       - exhausted: { when: '${ $context.overrideExhausted }', then: failFastUnwind }
-      - rejected:  { then: awaitResolution }                                      # the task remains open
+      - rejected:  { then: enterAwaitResolution }                                 # the task remains open
 - leave: { set: { nextStage: '${ .arm }', returnStage: failure }, then: exit }
 ```
 
@@ -1830,6 +1869,7 @@ report):
 - enter:
     switch:
       - waiting:    { when: '${ $context.stageLoop == "awaitCompensationResolution" }', then: awaitCompensationResolution }
+      - resolving:  { when: '${ $context.stageLoop == "resolveCompensationTask" }', then: resolveCompensationTask }   # D-147
       - compensate: { when: '${ $context.stageLoop == "compensate" }', then: compensate }
       - fresh:      { then: fence }
 - fence:                                # protected (06): claims or absorbs, promotes failure → cancel (06 §4.3); a permanent failure faults the invocation
@@ -1876,7 +1916,7 @@ report):
         - cancel:     { do: [ ‹cancel arm of (d)› ] }   # authorize-cancel, then the fence absorbs and promotes, then compensate
 - afterCompensationResolution:
     switch:
-      - resolution: { when: '${ .arm == "resolution" }', then: resolveCompensationTask }
+      - resolution: { when: '${ .arm == "resolution" }', then: enterResolveCompensationTask }
       - sla:        { when: '${ .arm == "sla" }',        then: slaCheckUnwind }
       - retry:      { when: '${ .arm == "retry" }',      then: compensate }    # the next pass; already-settled legs are absorbed
       - other:      { then: leave }                                          # cancel
@@ -1887,6 +1927,7 @@ report):
     catch: *transient
     export: { as: '${ $context + { slaRound: .slaRound } }' }
     then: awaitCompensationResolution
+- enterResolveCompensationTask: { set: { stageLoop: resolveCompensationTask } }   # a checkpoint before the call that consumes the arm's signal (D-147)
 - resolveCompensationTask:
     timeout: step
     try:
@@ -1895,8 +1936,8 @@ report):
     export: { as: '${ $context + { resolution: .resolution, attemptKey: .attemptKey } }' }
 - onCompensationResolution:
     switch:
-      - again: { when: '${ $context.resolution == "retry" or $context.resolution == "exhausted" }', then: compensate }   # resumeAt: compensation
-      - wait:  { then: awaitCompensationResolution }                                                                    # closed | escalated | refused | none
+      - again: { when: '${ $context.resolution == "retry" or $context.resolution == "exhausted" }', then: enterCompensate }   # resumeAt: compensation
+      - wait:  { then: enterAwaitCompensationResolution }                                                                 # closed | escalated | refused | none
 - reportOutcome:                        # protected (06): the sole Lifecycle outcome caller; outcome-not-reportable or fence-not-claimed fault the invocation (§4.6)
     timeout: step
     try:
@@ -1924,11 +1965,16 @@ and `awaitCompensationResolution` compete the `task-resolution-requested` `liste
 `PT5M` `waitSla` tick, which calls `resolve-manual-task` with `trigger: sla-check`; the operation
 escalates only once the task's stored SLA deadline has passed in database time, so the tick is a
 re-check and no remainder is carried. A non-empty `exhaustedTaskRefs`, an `exhausted` resolution
-and an `exhausted: true` override route to the unwind; a `retry` routes by `resumeAt` — `barrier`
-(a line), `plan` (a new `construct-and-freeze-plan` attempt), `compensation` (a new
-`compensate-order` pass) or `stage` (an order-scope task, back to the `taskReturnStage` and
-`taskReturnLoop` the failing stage recorded) — and carries `attemptKey`, which a line retry files per wave as `wave1AttemptKey` or `wave2AttemptKey` (D-119); `closed`, `escalated`,
-`refused` and `none` return to the waiting fork. **The reverse walk is one operation**:
+and an `exhausted: true` override route to the unwind — through `begin-fulfillment` first for a
+plan-scope failure, and never for an order-scope task, which `07 §4.2` never exhausts, so that
+answer faults the invocation as a defect; a `retry` routes by the entry's `failureScope`, which
+`07` maps one-to-one onto the answer's `resumeAt` — `line` to the barrier, `plan` to a new
+`construct-and-freeze-plan` attempt, `order` back to the `taskReturnStage` and `taskReturnLoop`
+the failing stage recorded — and carries `attemptKey`, which a line retry files per wave as
+`wave1AttemptKey` or `wave2AttemptKey` (D-119). A compensation task's retry is the unwind's
+(`awaitCompensationResolution`), never this stage's. A `closed` answer that leaves no open task
+of a line entry returns to the barrier like the last retry (decision D-146); `closed` with a task
+still open, `escalated`, `refused` and `none` return to the waiting fork. **The reverse walk is one operation**:
 `compensate-order` owns `compensation_sequence`, the descending walk, the per-subject phase
 resolution and the `failed-pending-escalation` records
 ([`../ADR/0005`](../ADR/0005-cpt-cf-bss-orders-workflow-adr-saga-compensable-no-pivot.md) as
@@ -1950,8 +1996,12 @@ operator can act on: a wave call's exhaustion and a wave's `failed[]` (line task
 `reflect-verdict`'s refusal (an order-scope task). **The remediation hold holds**: a `retry`
 or a verified override of one line while the order still has open tasks
 (`openTaskCount > 0`) returns to `awaitResolution`, where every open task keeps its waiter, and
-the last resolution takes every retried line back to the barrier together (`07 §4.3`,
-decision D-117). `report-outcome` is called only when `compensate-order`
+the last resolution — a retry, a verified override or a Seller Operator's `closed` — takes every
+retried line back to the barrier together (`07 §4.3`, decisions D-117, D-146). The one
+order-scope task this stage creates, `approval-reflection-refused`, offers no task `cancel`
+(`07 §4.4`), because closing it would leave the stage with nothing to wait on: before fulfillment
+the order is ended by Lifecycle's own cancel, whose `OrderCancelled` the lifecycle arm consumes
+(D-109, D-146). `report-outcome` is called only when `compensate-order`
 reports `complete`, which is the PRD's "order remains non-terminal until operational compensation
 reaches a known outcome".
 
@@ -2001,8 +2051,9 @@ The ceiling stage, the `do` list of `process.ceiling`, entered from `ceilingEntr
 ```yaml
 - enter:
     switch:
-      - parked: { when: '${ $context.stageLoop == "awaitOperatorAfterPark" }', then: awaitOperatorAfterPark }
-      - fresh:  { then: escalateCeiling }
+      - parked:    { when: '${ $context.stageLoop == "awaitOperatorAfterPark" }', then: awaitOperatorAfterPark }
+      - resolving: { when: '${ $context.stageLoop == "resolveCeilingTask" }',     then: resolveCeilingTask }   # D-147
+      - fresh:     { then: escalateCeiling }
 - escalateCeiling:                      # 07 §4.8 item 7: the escalation before the park; it opens this ceiling's lifetime-ceiling-reached order task
     timeout: step
     try:
@@ -2038,7 +2089,7 @@ The ceiling stage, the `do` list of `process.ceiling`, entered from `ceilingEntr
         - cancel:    { do: [ ‹cancel arm of (d)› ] }   # the Seller Operator's way to end a ceiling park: the order cancel, not the task's cancel (07 §4.4, D-129)
 - afterOperatorPark:
     switch:
-      - resolution: { when: '${ .arm == "resolution" }', then: resolveCeilingTask }
+      - resolution: { when: '${ .arm == "resolution" }', then: enterResolveCeilingTask }
       - sla:        { when: '${ .arm == "sla" }',        then: slaCheckCeiling }
       - other:      { then: leave }     # cancel: parked → compensating through the fence (01 §3.7); lifecycle
 - slaCheckCeiling:                      # composable (07): escalates the ceiling task to the Seller Operator once its stored deadline has passed; checks no other task, so it answers escalated or none, never exhausted
@@ -2048,6 +2099,7 @@ The ceiling stage, the `do` list of `process.ceiling`, entered from `ceilingEntr
     catch: *transient
     export: { as: '${ $context + { ceilingSlaRound: .slaRound } }' }
     then: awaitOperatorAfterPark
+- enterResolveCeilingTask: { set: { stageLoop: resolveCeilingTask } }   # a checkpoint before the call that consumes the arm's signal (D-147)
 - resolveCeilingTask:                   # composable (07)
     timeout: step
     try:
@@ -2057,7 +2109,7 @@ The ceiling stage, the `do` list of `process.ceiling`, entered from `ceilingEntr
 - onCeilingResolution:
     switch:
       - retry: { when: '${ $context.resolution == "retry" }', then: unparkAfterCeiling }
-      - wait:  { then: awaitOperatorAfterPark }   # refused (the task's cancel is not offered, 07 §4.4) | closed | none
+      - wait:  { then: enterOperatorWait }   # refused (the task's cancel is not offered, 07 §4.4) | closed | none
 - unparkAfterCeiling:
     timeout: step
     try:
@@ -2106,7 +2158,14 @@ task `cancel` (`07 §4.4`), because closing it would leave the order parked with
 on: the Seller Operator ends a ceiling park with the order cancel of
 [`09 §3.3`](./09-read-and-authz.md#33-api-contracts), which this wait's cancel arm consumes and
 the fence unwinds (`parked → compensating`), or, before fulfillment has begun, where that route
-refuses, with Lifecycle's own cancel, whose `OrderCancelled` the lifecycle arm consumes (D-109). `unpark` restores the pre-park phase and the process resumes at the stage
+refuses, with Lifecycle's own cancel, whose `OrderCancelled` the lifecycle arm consumes (D-109).
+Every way from this wait into the unwind — that cancel, a supersession or a terminal order event —
+passes `run-cancellation-fence`, whose step 1 closes the open `lifetime-ceiling-reached` task
+through slice 07's closure port, so the unwind's compensation tasks are actionable and its
+resolution `listen` cannot take the ceiling task's `retry` for a compensation retry (`06 §3.6`
+`inst-fence-step1`). Each ceiling's task is its own row, keyed by its `ceiling:{round}` subject
+(`07 §3.7`), so a second ceiling neither reopens the first one's task nor replays its SLA rounds
+(decision D-149). `unpark` restores the pre-park phase and the process resumes at the stage
 and checkpoint `ceilingEntry` recorded, under the fresh ceiling of the re-entered fork. The
 canonical version has **no `unpark-requested` arm**: `:plugin-control` is authorized
 platform-side (`../ADR/0010`), so a signal with no Orders origin route is not a signal no one can
@@ -2179,7 +2238,7 @@ The hold stage, the `do` list of `process.hold`:
     switch:
       - pause:  { when: '${ $context.holdOutcome == "suspended" and $context.holdPauses }', then: enterResumeWait }   # only the approval stage waits on the resume
       - record: { then: back }          # suspended elsewhere, or reconciled-out-of-order | absorbed-duplicate | not-applicable: the stage continues, dispatch defers while suspended
-- enterResumeWait: { set: { heldStage: '${ $context.returnStage }', heldLoop: '${ $context.stageLoop }', stageLoop: awaitResume, resumePollRound: 0 } }   # the poll family is per suspension, so it starts at round 0 (D-130)
+- enterResumeWait: { set: { heldStage: '${ $context.returnStage }', heldLoop: '${ $context.stageLoop }', stageLoop: awaitResume } }   # resumePollRound as applyHold left it: the poll family is per suspension, reset only for a new suspensionRef, so a suspension already polled in another wait is not polled again from round 0 (D-130, D-133)
 - awaitResume:
     fork:
       compete: true
@@ -2232,7 +2291,7 @@ the stage holds it; the call passes null and the operation resolves the order's 
 - applyResume:                          # protected (08): phase → started; re-arms the gate windows through the gate-window port
     timeout: step
     try:
-      - call: { step: apply-resume }    # body: ref + resumeEventId, suspensionRef ($context.suspensionRef from the resume wait, null on the stage-level arm); the operation reads the order first (08 inst-ar-poll, D-141); output: resumeOutcome, due, failedTaskRefs[] (lineRef + reason)
+      - call: { step: apply-resume }    # body: ref + resumeEventId, suspensionRef: '${ if $context.returnStage == "hold" then $context.suspensionRef else null end }' — the recorded ref from the resume wait, null on the stage-level arm (08 §4.7 item 3); the operation reads the order first (08 inst-ar-poll, D-141); output: resumeOutcome, due, failedTaskRefs[] (lineRef + reason)
     catch: *transient
     export: { as: '${ $context + { resumeOutcome: .resumeOutcome, resumeDue: (.due // false), resumeFailed: (.failedTaskRefs // []) } }' }   # no routing member is written from the answer (rule 1)
 - onResume:                             # still-held first; then no failure route before begin-fulfillment (D-143); then 08 §4.7 item 8: deferred failures first, before any dispatch
@@ -2483,7 +2542,7 @@ any of them:
 | Admission | `admit-trigger` (`role: start`) **<** `start-instance`; on every arm that consumes a Lifecycle trigger, `admit-trigger` (`role: listen`) **<** the consuming operation (`evaluate-payment-auth-eligibility`, `apply-hold`, `apply-resume`, `terminate-on-terminal-event`, `run-cancellation-fence` on supersede); `apply-resume` with `trigger: poll` consumes no trigger and follows no admission — the Lifecycle order read inside it is its guard (D-130), wherever it is called from (the resume wait, or `pollHeld` in another wait, D-133) | — |
 | Verdict | `obtain-verdict` **<** `reflect-verdict`; `record-decision` **<** `reflect-verdict` on the decision path. The `p1` composables on their paths (decision D-135): on every walk where `verdict = unobtainable`, `park` **<** a park loop whose tick calls `arm-park-escalation`, with a walk from it to `raise-overdue-escalation` (`escalationKind: park`), and no `reflect-verdict`, `open-gates` or `nextStage: fulfillment` until a later `obtain-verdict` answers `required` or `not-required` (ADR-0007, `03 §4.5` items 2 and 6); on every walk where `reflected = pending_approval`, `open-gates` **<** `record-decision`, and the wait between them is a competing `fork` carrying the decision `listen` and a tick branch whose route calls `escalate-gate` `mode: fire` and then `mode: probe`, with a walk from a probe to `raise-overdue-escalation` (`escalationKind: approval-outage`) (`fr-owf-approval-request`, `fr-owf-approval-escalation`, `03 §4.5` items 1, 4 and 5) | `open-gates`, `escalate-gate`, `arm-park-escalation`, `park`, `unpark` (beyond those paths) |
 | Plan | `evaluate-payment-auth-eligibility` **<** `construct-and-freeze-plan` **<** `begin-fulfillment` | `evaluate-activation-eligibility` |
-| Waves | `begin-fulfillment` **<** `dispatch-wave1-create` **<** `re-check-pre-activation` **<** `report-spawn-signal` **<** `dispatch-wave2-activate`, and every walk that reaches either dispatch operation carries the pinned `beginResult = in-fulfillment` (decision D-143): the failure stage's return to the barrier and the resume stage's failure route are decided on it or on the interrupted stage, never on a returned list; on every path to `dispatch-wave2-activate`, the barrier's `waitExpected` re-check loop and an `evaluate-activation-eligibility` answer `released` **<** `dispatch-wave2-activate` — the ADR-0004 conjunction, whose run-time guard is `05 §3.6` `inst-pi-wave2-guard` (`activation-precondition-unmet`); `evaluate-activation-eligibility` stays `composable` everywhere else | `evaluate-activation-eligibility` (beyond the conjunction), `reconcile-intent`, `reread-draft-liveness`, `rebuild-wave1` |
+| Waves | `begin-fulfillment` **<** `dispatch-wave1-create` **<** `re-check-pre-activation` **<** `report-spawn-signal` **<** `dispatch-wave2-activate`, and every walk that reaches either dispatch operation carries the pinned `beginResult = in-fulfillment` (decision D-143): the failure stage's return to the barrier and the resume stage's failure route are decided on it or on the interrupted stage, never on a returned list; every walk to `dispatch-wave2-activate` passes an `evaluate-activation-eligibility` answer whose pinned `released` is `true`, and the pinned `spawned = true` of a sent spawn signal, before it — the ADR-0004 conjunction: `released` is true only once database time has reached `expected_fulfillment_at` and every create is confirmed (`04 §3.6` `inst-ae-if-conjunction-false`), so the `waitExpected` re-check loop is where a walk waits while `due` is false, not a separate order constraint, and the run-time guard is `05 §3.6` `inst-pi-wave2-guard` (`activation-precondition-unmet`) (decision D-144); `evaluate-activation-eligibility` stays `composable` everywhere else | `evaluate-activation-eligibility` (beyond the conjunction), `reconcile-intent`, `reread-draft-liveness`, `rebuild-wave1` |
 | Failure | `create-manual-task` before any terminal outcome on every walk where `policy = remediate` or `forceTask` is set; on a walk where `policy = fail-fast` and `forceTask` is not set, the failure route reaches the unwind with no `create-manual-task` (`07 §4.8` item 1), so the switch that picks the route reads the seller's pinned `policy` and no literal of its own (decision D-135). After every `create-manual-task`, and after the ceiling's `raise-overdue-escalation` (`lifetime-ceiling`), the wait that holds the task is a competing `fork` carrying the `task-resolution-requested` `listen`, whose route calls `resolve-manual-task` (`trigger: request`), and a tick branch whose route calls `resolve-manual-task` (`trigger: sla-check`) (`fr-owf-manual-task`, `nfr-owf-manual-task-sla`, `07 §4.8` item 3); `verify-override` only after a `resolve-manual-task` (`07 §4.8` item 5) | `resolve-manual-task` (which runs `retry-step` in-process), `verify-override`, `raise-overdue-escalation` (beyond those paths) |
 | Unwind | `run-cancellation-fence` **<** `compensate-order` **<** `report-outcome` on every failure, cancel, supersede and terminal-event path; `authorize-cancel` **<** `run-cancellation-fence` on the cancel path; `terminate-on-terminal-event` **<** `run-cancellation-fence` on the terminal-event path | — |
 | Hold | `apply-hold` **<** `apply-resume`, in the arm that owns the escalation `wait` | — |
@@ -2750,7 +2809,7 @@ guards of the operations remain the backstop.
 | Slice | Enforced items (rule or §4.1 row) | Canonical-definition guidance |
 |-------|-----------------------------------|-------------------------------|
 | [`02 §4.7`](./02-triggers-and-start.md#47-constraints-this-slice-places-on-the-definition) | 1 (rule 1, Admission); 4 (rule 1, Unwind); 6 (rule 6); 8, the amendment arm (rule 8); 9 (rule 7) | 2; 3; 5; 7; 8, the route of a `begin-fulfillment` refusal; 10 |
-| [`03 §4.5`](./03-approval-execution.md#45-constraints-this-slice-places-on-the-definition) | 1 and 2 (rule 1, Verdict); 3 (rule 6); 4 and 5, the fork, its arms and its calls (rules 1 and 8); 6, the park loop's calls (rule 1, Verdict); 8 (rules 3 and 8) | 4, 5 and 6, the tick values; 7 |
+| [`03 §4.5`](./03-approval-execution.md#45-constraints-this-slice-places-on-the-definition) | 1 and 2 (rule 1, Verdict); 3 (rule 6); 4 and 5, the fork, its arms and its calls (rules 1 and 8); 6, the park loop's calls (rule 1, Verdict); 8 (rules 3 and 8) | 4, 5 and 6, the tick values; 4, the fire on every return into the gate loop and the `gate` timeout (D-148); 7 |
 | [`04 §4.8`](./04-fulfillment-plan.md#48-constraints-this-slice-places-on-the-definition) | 1 (rule 1, Plan and Waves); 7, the conjunction (rule 1, Waves); 8 (rule 6); 9 (rule 5) | 2; 3; 4; 5; 6; 7, the `PT1H` tick and the undispatched route |
 | [`05 §4.5`](./05-provisioning-intents.md#45-constraints-this-slice-places-on-the-definition) | 1 (rule 1, Waves); 2, the `catch` (rule 6); 7, the exported members (rule 5); 9, the `completed` report (§4.1); 12 (rule 4) | 2, the status set; 3; 4; 5; 6; 8; 10; 11 |
 | [`06 §4.7`](./06-saga-and-compensation.md#47-constraints-this-slice-places-on-the-definition) | 1 (rule 1, Unwind); 4 (rule 2); 5 (rule 6); 6 (§4.1); 7 (rule 8) | 2; 3; 8 |
