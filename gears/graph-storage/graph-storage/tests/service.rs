@@ -1849,6 +1849,74 @@ async fn a_filtered_walk_near_its_budget_does_not_hydrate_row_by_row() {
     );
 }
 
+/// A node-type filter takes the edges of the nodes it removes with it.
+///
+/// The filter narrows the returned nodes (`fr-graph-traversal`: "node-type
+/// filtering of returned nodes"), and an edge is a statement about two nodes:
+/// one that names a filtered-out node draws a line to nothing and says the
+/// node exists, which is what the filter was asked not to say.
+#[tokio::test]
+async fn a_type_filter_drops_the_edges_of_the_nodes_it_filters() {
+    let store = Arc::new(graph_storage::infra::fake_store::FakeGraphStore::new());
+    let harness = Harness::configured_over(
+        Arc::clone(&store),
+        Arc::new(support::AllowInOwnTenant),
+        GraphStorageConfig::default(),
+    );
+    let ctx = harness.ctx();
+    harness.seed_ontology(&ctx).await;
+
+    // `kept` is owned like the seed; `ghost` exists only as a phantom
+    // endpoint, so a filter on the owned type removes it.
+    harness
+        .services
+        .ingest(
+            &ctx,
+            conformance::batch(
+                vec![
+                    conformance::node("seed", "seed"),
+                    conformance::node("kept", "kept"),
+                ],
+                vec![
+                    conformance::edge("seed", "kept"),
+                    conformance::edge("seed", "ghost"),
+                ],
+            ),
+        )
+        .await
+        .expect("the batch commits");
+
+    let walked = harness
+        .services
+        .traverse(
+            &ctx,
+            TraverseRequest {
+                seeds: vec!["seed".to_owned()],
+                depth: 1,
+                edge_type_patterns: Vec::new(),
+                node_type_patterns: vec![conformance::OWNED.to_owned()],
+                max_nodes: Some(1_000),
+            },
+        )
+        .await
+        .expect("the traversal answers");
+
+    let mut returned: Vec<&str> = walked.nodes.iter().map(|n| n.node_key.as_str()).collect();
+    returned.sort_unstable();
+    assert_eq!(returned, ["kept", "seed"], "the phantom is filtered");
+    let edges: Vec<(&str, &str)> = walked
+        .edges
+        .iter()
+        .map(|edge| (edge.src.as_str(), edge.dst.as_str()))
+        .collect();
+    assert_eq!(
+        edges,
+        [("seed", "kept")],
+        "the edge to the filtered phantom goes with it; only the edge between two \
+         returned nodes stays"
+    );
+}
+
 /// How many rows one piece asks for when the whole budget remains -- the
 /// widest a piece can be.
 fn budgeted_piece(budget: u64, item_ceiling: u64) -> u64 {
