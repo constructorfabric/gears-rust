@@ -5,9 +5,11 @@
 //! (Slice 7, design §4.3).
 
 use sea_orm::sea_query::Expr;
-use sea_orm::{ActiveValue::Set, ColumnTrait, Condition, EntityTrait};
+use sea_orm::{ActiveValue::Set, ColumnTrait, Condition, EntityTrait, QuerySelect};
 use serde_json::Value as JsonValue;
-use toolkit_db::secure::{AccessScope, DbTx, SecureEntityExt, SecureInsertExt, SecureUpdateExt};
+use toolkit_db::secure::{
+    AccessScope, DbTx, SecureDeleteExt, SecureEntityExt, SecureInsertExt, SecureUpdateExt,
+};
 use toolkit_db::{DBProvider, DbError};
 use uuid::Uuid;
 
@@ -15,6 +17,11 @@ use crate::domain::error::DomainError;
 use crate::domain::model::RepoError;
 use crate::infra::storage::entity::reconciliation_run;
 use time::OffsetDateTime;
+
+/// `status` literal for a finalized run (the value [`ReconciliationRunRepo::finalize`]
+/// is called with on the happy path). Named here because the purge predicate
+/// below has to match on it.
+const STATUS_DONE: &str = "DONE";
 
 /// SeaORM-backed reconciliation-run repository.
 #[derive(Clone)]
@@ -62,7 +69,7 @@ impl ReconciliationRunRepo {
         Ok(())
     }
 
-    /// Finalize a run with its variance result.
+        /// Finalize a run with its variance result.
     ///
     /// # Errors
     /// Returns [`RepoError::Db`] if the scoped update fails.
@@ -136,5 +143,74 @@ impl ReconciliationRunRepo {
             .await
             .map_err(|e| DomainError::Internal(format!("read ledger_reconciliation_run: {e}")))?;
         Ok(row)
+    }
+
+    /// Delete up to `limit` **uneventful** runs of ONE tenant — finalized
+    /// (`DONE`) runs that recorded no variance (`within_tolerance = true`).
+    /// Returns the number of rows actually deleted, so the caller can tell a
+    /// drained tenant (`< limit`) from one with more to give.
+    ///
+    /// Used by the reconciliation tick to reclaim the runs it accumulated for
+    /// tenants that have since left the platform registry (soft-deleted or
+    /// hard-deleted). Two properties make this safe to run on a multi-GB table:
+    ///
+    /// * **Evidence is never deleted.** A run that breached tolerance, or that
+    ///   never finalized (`RUNNING` / `FAILED`), is kept whatever the tenant's
+    ///   lifecycle — those are the rows that record that something was once
+    ///   wrong. Only the "checked it, nothing to see" rows go.
+    /// * **No sequential scan.** The delete is scoped to a single tenant, so it
+    ///   rides the `(tenant_id, run_id)` primary key. (The table has no index
+    ///   on `at_utc`, which is exactly why an age-based purge would have to
+    ///   scan the whole 23 GB heap instead.)
+    ///
+    /// # Errors
+    /// Returns [`RepoError::Db`] if acquiring a connection, selecting the batch,
+    /// or the scoped delete fails.
+    pub async fn purge_uneventful_runs(&self, tenant: Uuid, limit: u64) -> Result<u64, RepoError> {
+        #[derive(Debug, sea_orm::FromQueryResult)]
+        struct RunIdRow {
+            run_id: Uuid,
+        }
+
+        if limit == 0 {
+            return Ok(0);
+        }
+        let scope = AccessScope::for_tenant(tenant);
+        let conn = self
+            .db
+            .conn()
+            .map_err(|e| RepoError::Db(format!("conn: {e}")))?;
+        let purgeable = Condition::all()
+            .add(reconciliation_run::Column::Status.eq(STATUS_DONE))
+            .add(reconciliation_run::Column::WithinTolerance.eq(true));
+
+        // Pick the batch first, then delete it by key. Postgres has no
+        // `DELETE … LIMIT`, and an unbounded per-tenant delete would be
+        // unbounded WAL for a tenant that happens to hold millions of rows.
+        let batch = reconciliation_run::Entity::find()
+            .secure()
+            .scope_with(&scope)
+            .filter(purgeable)
+            .project_all(&conn, |q| {
+                q.select_only()
+                    .column(reconciliation_run::Column::RunId)
+                    .limit(limit)
+                    .into_model::<RunIdRow>()
+            })
+            .await
+            .map_err(|e| RepoError::Db(format!("select purgeable reconciliation runs: {e}")))?;
+        if batch.is_empty() {
+            return Ok(0);
+        }
+
+        let run_ids: Vec<Uuid> = batch.into_iter().map(|r| r.run_id).collect();
+        let deleted = reconciliation_run::Entity::delete_many()
+            .secure()
+            .scope_with(&scope)
+            .filter(Condition::all().add(reconciliation_run::Column::RunId.is_in(run_ids)))
+            .exec(&conn)
+            .await
+            .map_err(|e| RepoError::Db(format!("purge ledger_reconciliation_run: {e}")))?;
+        Ok(deleted.rows_affected)
     }
 }

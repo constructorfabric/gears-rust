@@ -111,6 +111,11 @@ const LEDGER_FX_RATE_SYNC_DURATION: &str = "ledger_fx_rate_sync_duration_seconds
 const LEDGER_RECONCILIATION_VARIANCE_MINOR: &str = "ledger_reconciliation_variance_minor";
 const LEDGER_RECONCILIATION_RUNS: &str = "ledger_reconciliation_runs_total";
 const LEDGER_RECONCILIATION_OUT_OF_TOLERANCE: &str = "ledger_reconciliation_out_of_tolerance_total";
+// The tenant-lifecycle pair: how many candidates the tick filtered out because
+// they have left the tenant registry, and how many of their accumulated runs it
+// has reclaimed (the only delete path on ledger_reconciliation_run).
+const LEDGER_RECONCILIATION_RETIRED_TENANTS: &str = "ledger_reconciliation_retired_tenants";
+const LEDGER_RECONCILIATION_RUNS_PURGED: &str = "ledger_reconciliation_runs_purged_total";
 const LEDGER_PERIOD_CLOSE_BLOCKED: &str = "ledger_period_close_blocked_total";
 const LEDGER_EXCEPTION_QUEUE_DEPTH: &str = "ledger_exception_queue_depth";
 
@@ -197,6 +202,8 @@ pub struct LedgerMetricsMeter {
     reconciliation_variance_minor: Gauge<i64>,
     reconciliation_runs: Counter<u64>,
     reconciliation_out_of_tolerance: Counter<u64>,
+    reconciliation_retired_tenants: Gauge<i64>,
+    reconciliation_runs_purged: Counter<u64>,
     period_close_blocked: Counter<u64>,
     exception_queue_depth: Gauge<i64>,
 }
@@ -446,6 +453,21 @@ impl LedgerMetricsMeter {
                 .u64_counter(LEDGER_RECONCILIATION_OUT_OF_TOLERANCE)
                 .with_description(
                     "Reconciliation checks whose variance breached tolerance, by check_type",
+                )
+                .build(),
+            reconciliation_retired_tenants: meter
+                .i64_gauge(LEDGER_RECONCILIATION_RETIRED_TENANTS)
+                .with_description(
+                    "Tenants in the reconciliation tick's ledger-derived candidate set that \
+                     have left the platform tenant registry (soft-deleted or absent), and are \
+                     therefore skipped",
+                )
+                .build(),
+            reconciliation_runs_purged: meter
+                .u64_counter(LEDGER_RECONCILIATION_RUNS_PURGED)
+                .with_description(
+                    "Reconciliation-run rows reclaimed for retired tenants (uneventful DONE \
+                     runs only; runs that recorded a variance are never purged)",
                 )
                 .build(),
             period_close_blocked: meter
@@ -726,6 +748,14 @@ impl LedgerMetricsPort for LedgerMetricsMeter {
     fn reconciliation_out_of_tolerance(&self, check_type: &str) {
         self.reconciliation_out_of_tolerance
             .add(1, &[KeyValue::new("check_type", check_type.to_owned())]);
+    }
+
+    fn reconciliation_retired_tenants(&self, retired: i64) {
+        self.reconciliation_retired_tenants.record(retired, &[]);
+    }
+
+    fn reconciliation_runs_purged(&self, rows: u64) {
+        self.reconciliation_runs_purged.add(rows, &[]);
     }
 
     fn period_close_blocked(&self, reason: &str) {

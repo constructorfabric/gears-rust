@@ -92,6 +92,13 @@ authz-resolver = { workspace = true }
 # (only a tenant whose type owns a billing ledger may be provisioned, §4.12).
 account-management-sdk = { workspace = true }
 account-management = { workspace = true }
+# Platform tenant registry (`get_tenants`, batched + status-filtered) — the
+# lifecycle gate on the reconciliation tick's ledger-derived tenant enumeration
+# (`infra::tenant_lifecycle`). Ledger data never shrinks, so without the
+# registry the tick reconciles every tenant that ever posted an entry, forever.
+# The batch read is the one the registry offers; AM's own client is per-tenant.
+tenant-resolver-sdk = { workspace = true }
+tenant-resolver = { workspace = true }
 # `AuthzPermissionV1` + `gts_instance!` for the permission catalog.
 toolkit-gts = { workspace = true }
 # `gts_instance!`'s expansion references the `gts` crate directly (same as rbac).

@@ -175,7 +175,7 @@ pub(crate) struct LedgerRuntime {
 // discovers it lazily from the types-registry each tick (see `resolve_rate_provider`),
 // so a late-registered adapter self-heals and the ledger stays decoupled from
 // (and schedulable without) the external `bss-rate-provider` gear.
-#[toolkit::gear(name = "bss-ledger", capabilities = [db, rest, stateful], deps = [types_registry, authz_resolver, account_management], lifecycle(entry = "serve", stop_timeout = "30s"))]
+#[toolkit::gear(name = "bss-ledger", capabilities = [db, rest, stateful], deps = [types_registry, authz_resolver, account_management, tenant_resolver], lifecycle(entry = "serve", stop_timeout = "30s"))]
 pub struct BssLedgerGear {
     /// Typed runtime built inside [`Gear::init`] and consumed by
     /// [`RestApiCapability::register_rest`] and [`BssLedgerGear::serve`].
@@ -1199,6 +1199,27 @@ impl Gear for BssLedgerGear {
             cfg.seller_tenant_types.clone(),
         ));
 
+        // The platform tenant registry, as the lifecycle gate on the
+        // reconciliation tick's tenant enumeration. Required, not optional:
+        // the tick enumerates from `journal_entry`, which is append-only and
+        // never cleaned, so a silently-absent registry means the tick
+        // reconciles every tenant that ever posted an entry — including the
+        // deleted ones — and appends a row per tenant per tick to a table with
+        // no delete path. That grew `ledger_reconciliation_run` to 29 GB / 61M
+        // rows on stage1, 99.9% of it for tenants that no longer exist, so a
+        // missing registry fails init loudly (like the AM client + enforcer)
+        // rather than degrading to unbounded growth.
+        let live_tenants: Arc<dyn crate::infra::tenant_lifecycle::LiveTenantFilter> = Arc::new(
+            crate::infra::tenant_lifecycle::ResolverLiveTenantFilter::new(
+                ctx.client_hub()
+                    .get::<dyn tenant_resolver_sdk::TenantResolverClient>()
+                    .context(
+                        "bss-ledger: TenantResolverClient absent from ClientHub; \
+                         tenant-resolver module must be registered",
+                    )?,
+            ),
+        );
+
         // Slice 5 Phase 3: the Mode-B revaluation runner (the REST trigger's
         // handle) — built BEFORE `db`/`publisher` are moved into the local client.
         let revaluation_run = Arc::new(
@@ -1479,9 +1500,9 @@ impl Gear for BssLedgerGear {
         });
         // Slice 7 Phase 3: the reconciliation framework (AR↔derived / Payments↔PSP /
         // invoice-completeness) over its own db/publisher clones + the shared metrics +
-        // exception router + the resolved control feeds + the recon config. Driven by the
-        // `ReconciliationJob` ticker (serve loop, via `reconciliation.framework`) + the
-        // `reconciliation-runs` REST trigger.
+        // exception router + the resolved control feeds + the tenant-registry lifecycle
+        // gate + the recon config. Driven by the `ReconciliationJob` ticker (serve loop,
+        // via `reconciliation.framework`) + the `reconciliation-runs` REST trigger.
         let reconciliation_framework =
             Arc::new(crate::infra::reconciliation::ReconciliationFramework::new(
                 recon_db,
@@ -1490,6 +1511,7 @@ impl Gear for BssLedgerGear {
                 Arc::clone(&exception_router),
                 Arc::clone(&manifest_feed),
                 Arc::clone(&psp_feed),
+                live_tenants,
                 cfg.recon.clone(),
             ));
         let reconciliation = Arc::new(crate::api::rest::reconciliation::ApiState {

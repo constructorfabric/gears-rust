@@ -356,6 +356,18 @@ pub trait LedgerMetricsPort: Send + Sync + 'static {
     /// (`ledger_reconciliation_out_of_tolerance_total{check_type}`, design §9 /
     /// spec §3.5 J4). `out_of_tolerance/runs` is the breach rate per check type.
     fn reconciliation_out_of_tolerance(&self, check_type: &str);
+    /// Record how many tenants the reconciliation tick found in its
+    /// ledger-derived candidate set that have since left the platform tenant
+    /// registry (`ledger_reconciliation_retired_tenants`). A gauge, unlabelled:
+    /// ledger data never shrinks, so this is the backlog of tenants the tick
+    /// must keep filtering out — and, once the purge has drained, the count of
+    /// tenants whose runs are already reclaimed.
+    fn reconciliation_retired_tenants(&self, retired: i64);
+    /// Increment the purged-run counter by the number of reconciliation-run
+    /// rows the tick reclaimed for retired tenants
+    /// (`ledger_reconciliation_runs_purged_total`). The drain-progress signal
+    /// for the one path that deletes from `ledger_reconciliation_run`.
+    fn reconciliation_runs_purged(&self, rows: u64);
     /// Increment the period-close-blocked counter for one close attempt rejected
     /// by a pre-close gate, labelled by `reason`
     /// (`ledger_period_close_blocked_total{reason}`, design §9 / spec §3.5 J4) —
@@ -420,6 +432,8 @@ impl LedgerMetricsPort for NoopLedgerMetrics {
     fn reconciliation_variance_minor(&self, _: &str, _: i64) {}
     fn reconciliation_run(&self, _: &str) {}
     fn reconciliation_out_of_tolerance(&self, _: &str) {}
+    fn reconciliation_retired_tenants(&self, _: i64) {}
+    fn reconciliation_runs_purged(&self, _: u64) {}
     fn period_close_blocked(&self, _: &str) {}
     fn exception_queue_depth(&self, _: &str, _: i64) {}
 }
