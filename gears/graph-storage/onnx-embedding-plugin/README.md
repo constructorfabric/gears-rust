@@ -13,6 +13,12 @@ downloads nothing. The embedding-space identity is the SHA-256 of the bytes
 actually loaded, so two deployments claiming one space either agree on that
 hash or are visibly different.
 
+The tokenizer, pooling and normalization settings fold into the identity too,
+and the shape of those blobs is frozen once the plugin is released: adding or
+renaming a field changes the identity of every deployment that upgrades, and
+the gear blocks vector search until the graph is re-embedded (see
+`EmbeddingSpaceId::new` in the SDK).
+
 ONNX Runtime is loaded with `dlopen` at first use (`ORT_DYLIB_PATH`), never
 linked at build time. Building needs no runtime headers; running needs the
 shared library. The pinned runtime version follows the workspace's `ort` crate.

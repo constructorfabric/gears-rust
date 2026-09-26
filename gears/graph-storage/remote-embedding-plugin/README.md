@@ -48,6 +48,11 @@ and the README used not to say it: a reader taking "model at endpoint at
 width" literally would expect a normalization change to be invisible, and
 would be surprised by a deployment that suddenly declares its space mismatched.
 
+The shape of what goes into the hash is frozen once the plugin is released:
+adding or renaming a field in the identity blobs changes the identity of every
+deployment that upgrades, exactly as a normalization change does (see
+`EmbeddingSpaceId::new` in the SDK).
+
 A vendor silently changing the weights behind a stable model name is still not
 detectable from this side — ADR-0004 places that under model governance and
 treats remote embedding as governed data egress.

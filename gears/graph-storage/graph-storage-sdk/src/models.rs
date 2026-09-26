@@ -1316,6 +1316,17 @@ impl EmbeddingSpaceId {
     /// readiness compares against: the ONNX plugin, a remote plugin and the
     /// deterministic fake must all arrive at the same string for the same
     /// space, and at different strings for different ones.
+    ///
+    /// A provider's `preprocessing`, `pooling` and `normalization` blobs are
+    /// frozen once it is released. Their shape is written in the provider's
+    /// code, and the hash is over the blob as built (after key order and
+    /// integral numbers are normalized), not over what it means: adding a
+    /// key, renaming one or changing how a value is spelled gives every
+    /// deployment of the new version a different identity, and the gear
+    /// blocks vector search over what the old version stored until it is
+    /// re-embedded. Values taken from configuration belong in a blob, since a
+    /// different setting there is a different space; a change of shape needs
+    /// the same deliberation as a change of model.
     #[must_use]
     pub fn new(
         model_artifact: impl Into<String>,
