@@ -69,9 +69,9 @@ Requirements that significantly influence architecture decisions.
 | `cpt-cf-bss-orders-workflow-fr-owf-payment-auth` | `evaluate-payment-auth-eligibility` reads the payment-authorization outcome from Payments on request, keeps pending and failed distinct, and is re-evaluated on `OrderAcceptanceRecorded` and on a definition poll `wait`; Lifecycle is the sole evaluator of the seller's tolerate-failure policy inside `begin-fulfillment`. |
 | `cpt-cf-bss-orders-workflow-fr-owf-retry` | The definition's task retry policy (`use.retries.transient`: exponential from 1 s, jitter to 30 s, 5 attempts) re-issues only operations registered `retryable-on: transient`, under the same idempotency key; the per-operation deadline inside the envelope is distinct from the task timeout, a hang after accept is handed to the reconciliation sweep, and the caller-side duplicate protocol makes a re-issued call resolve to the settled outcome rather than a second effect. |
 | `cpt-cf-bss-orders-workflow-fr-owf-dead-letter` | An inbound delivery that exhausts its cap is the platform event-trigger path's dead letter, never an Orders row and never an order state; operator visibility and re-drive are asked of the platform (`UPSTREAM_REQS.md` §2.9). A step-level failure's inspectable object is the manual task, so a failing compensation reuses the manual-task/incident path rather than a second channel. |
-| `cpt-cf-bss-orders-workflow-fr-owf-intent-sweep` | The `reconciliation-sweep` worker selects every due intent by `next_sweep_at` over every non-terminal intent, whether or not its instance has a live invocation, and settles a stuck step key only through `settle-from-lookup`; once the idempotency key's lifetime has elapsed it is strictly read-only and never resubmits under an aged-out key. The definition's poll arm is an early read of the same rows. |
+| `cpt-cf-bss-orders-workflow-fr-owf-intent-sweep` | The `reconciliation-sweep` worker selects every due intent by `next_sweep_at` over every non-terminal intent, whether or not its instance has a live invocation, and settles a stuck step key only through `settle-from-lookup`; its instance liveness pass reads each non-terminal instance's invocation status and raises an instance whose invocation is not live as one order-scope `invocation-dead` manual task (D-105); once the idempotency key's lifetime has elapsed it is strictly read-only and never resubmits under an aged-out key. The definition's poll arm is an early read of the same rows. |
 | `cpt-cf-bss-orders-workflow-fr-owf-backpressure` | Admission controls inside the dispatch operations — the per-order parallel-line cap, the aggregate in-flight cap and the per-seller bucket over `owf_dispatch_admission` — defer a line as a **settled success** carrying `deferred[]` and `retryAfterMs`, so a downstream throttle is a delay and never a retry-budget consumption. |
-| `cpt-cf-bss-orders-workflow-fr-owf-dependency-resilience` | Transient-dependency failures (Lifecycle, Subscriptions, Payments) are `retryable-failure` outcomes the definition's task retry policy re-issues within the step's own budget, escalating to a manual task on exhaustion; Generic Approval unavailability is excluded and follows the fail-closed park-and-escalate arm. |
+| `cpt-cf-bss-orders-workflow-fr-owf-dependency-resilience` | Transient-dependency failures (Lifecycle, Subscriptions, Payments) are `retryable-failure` outcomes the definition's task retry policy re-issues within the step's own budget, escalating to a manual task on exhaustion — through the failure stage where the definition catches the exhaustion, and through the sweep's `invocation-dead` task where exhaustion faults the invocation (`report-outcome`, `create-manual-task`, the start path; D-105), so no exhaustion stalls silently; Generic Approval unavailability is excluded and follows the fail-closed park-and-escalate arm. |
 | `cpt-cf-bss-orders-workflow-fr-owf-task-queue` | A read-side projection over manual tasks and incidents, scoped to the operator's seller tenancy and paged on the immutable `(created_at, task_id)` key, backs the Fulfillment Operator Task Queue; its per-action routes record an `owf_task_resolution_request` and signal the running invocation. Dead-letter rows join it only if the platform exposes its dead letters (pending). |
 | `cpt-cf-bss-orders-workflow-fr-owf-overdue-escalation` | A definition `wait` arm, distinct from every task timeout and from the lifetime ceiling, calls `raise-overdue-escalation` when `in_fulfillment` (or a hold taken from it) exceeds the configurable overdue window, without failing any line or auto-terminaling the order. |
 | `cpt-cf-bss-orders-workflow-fr-owf-hold-resume` | `OrderHeld`/`OrderResumed` are `listen` arms that call `apply-hold`/`apply-resume`; dispatch operations refuse new intents while suspended and let accepted intents run to their terminal outcome; only the approval-escalation `wait` is inside the arm a hold cancels, and it is re-armed with the remainder Orders returns, while the lifetime ceiling, the barrier and the overdue `wait` keep running. Whether the DSL expresses this natively is Q-11. |
@@ -596,8 +596,10 @@ definition's arm — never the gateway — calls the operation that applies it.
    (`subject_type` service, `token_scopes` naming this gear), authorized as
    `gts.cf.bss.orders_workflow.process_step.v1~` × `execute` with the operation name as a resource
    property. Thirty-five operations are registered — **22 `protected`, 13 `composable`**
-   (ADR-0012) — and thirty-four are granted to the platform principal; `settle-from-lookup` is
-   sweep-only, run in-process, and denied to every caller. Each operation is declared once, in
+   (ADR-0012) — and thirty-three are granted to the platform principal; `settle-from-lookup` is
+   sweep-only and `retry-step` runs only inside `resolve-manual-task` (D-108), both in-process
+   and denied to every caller. Every call after `start-instance` is bound to the instance's
+   invocation (`01 §3.3` step 3, D-106). Each operation is declared once, in
    its slice's §3.3, with the contract fields of `01 §3.3` (`name`, `protection`, `input`,
    `output`, `idempotency_key`, `declared_event`, `compensation`, `reasons`, `audit_kind`,
    `retry_class`, `deadline`).
@@ -673,8 +675,8 @@ per-variant `#[error_code(...)]` and `#[canonical(...)]`: `type`, `status` and `
 the canonical category, and the stable machine-readable business reason is the
 `error_domain`/`error_code` pair, with no internal diagnostics, stack traces or
 downstream-service error text on the wire (safe wire-error behaviour). The closed catalogue of
-`design/01-foundation.md` §4.9 registers **forty-two** reasons — ten engine families and
-thirty-two slice values (D-77) — so a caller, and a definition's `catch`, branches on the code,
+`design/01-foundation.md` §4.9 registers **forty-three** reasons — ten engine families and
+thirty-three slice values (D-77, D-105) — so a caller, and a definition's `catch`, branches on the code,
 never on `type` or `detail`. Refusal reasons are derived GTS error types under
 `gts.cf.bss.orders_workflow.err.v1~`; those identifiers are registry keys, not wire values
 (`DECISIONS.md` D-64).
@@ -714,11 +716,14 @@ checkpointing, suspend/resume and event-driven continuation
 ([serverless-runtime DESIGN](../../../serverless-runtime/docs/DESIGN.md#workflow), line 632), the
 `wait` timers, and replay after a crash. This gear uses exactly these platform APIs: the Function
 Registry to publish a definition version (line 857); the event triggers to start an invocation on
-`OrderSubmitted` and `OrderAmended` (lines 980–987); `GET …/invocations/{id}` for the sweep's
-no-live-invocation metric and the progress read (line 867); `…:plugin-control` to deliver a named
-signal (lines 869, 893); and `…:control` `retry` for an operator re-drive of a `failed`
-invocation only (line 888; valid from `dead_lettered` is asked, D-86 as amended) — never `cancel`, `suspend` or `resume`, because each would bypass the
-fence or pause the lifetime ceiling (`design/10-process-definition.md` §4.4). The platform
+`OrderSubmitted` and `OrderAmended` (lines 980–987), declared and released with the definition
+(D-107); `GET …/invocations/{id}` for the sweep's instance liveness pass and the progress read
+(line 867); `…:plugin-control` to deliver a named signal (lines 869, 893); and `…:control` `retry`
+for an operator re-drive of an `invocation-dead` task only (line 888; valid from `dead_lettered`,
+keeping the invocation and resuming at the faulted task, is asked, D-86 and D-105) — never
+`cancel`, `suspend` or `resume`, because each would bypass the fence or pause the lifetime ceiling
+(`design/10-process-definition.md` §4.4); that other callers may issue them is detected by the
+liveness pass and asked to be denied (`UPSTREAM_REQS.md` §2.9). The platform
 authorizes calls on its own API (line 847); this gear authorizes its operator first and calls as
 its own service principal. The engine's history is **not** the process-audit source of record
 (`cpt-cf-bss-orders-workflow-nfr-owf-retention`) and holds references only (ADR-0013).
@@ -752,7 +757,7 @@ the platform principal under the `process_step × execute` grant (`design/09-rea
 §4.1). Workflow registers its resource/action catalogue (`09 §3.1`), asks through one shared
 `PolicyEnforcer` and enforces the returned constraints; the platform policy owner provisions
 roles, the `assigned_principal` approver grant and the service-principal grants — the
-serverless-runtime `execute` grant enumerating its thirty-four operation values included — and
+serverless-runtime `execute` grant enumerating its thirty-three operation values included — and
 verifies them against the deployed provider before release (`UPSTREAM_REQS.md` §2.8). A PDP
 timeout or outage on a request path is a sanitized 503 with no mutation and no idempotency-key
 settlement — on a step route, a `retryable-failure` the definition re-issues; the three
@@ -1069,8 +1074,10 @@ namespace `bss-orders-workflow`:
 - `reconciliation-sweep` — the **intent reconciliation sweep**: selects every due intent by
   `next_sweep_at <= now()` over every non-terminal intent, whether or not its instance has a live
   invocation, runs `reconcile-intent`'s effect in-process and settles a stuck step key only
-  through `settle-from-lookup`; it reads invocation status only to report intents whose instance
-  has no live invocation.
+  through `settle-from-lookup`; its **instance liveness pass** reads each non-terminal instance's
+  invocation status, raises one whose invocation is not live as an order-scope `invocation-dead`
+  task, and — after a Seller Operator's cancel on that task — drives the dead-instance unwind
+  in-process (`design/01-foundation.md` §3.8, §4.16; D-105).
 - `retention-purge` — the **retention purge**, daily with a bounded batch per store, executing
   the per-store windows of §3.7 and holding no grant on the audit store, its checkpoints or the
   definition binding. A declared retention with no worker behind it is an unbounded store, which
@@ -1190,7 +1197,7 @@ service principal**, and it is the **sole caller of the step operations**: a ste
 caller only when `subject_type` is the platform service-subject type **and** `token_scopes`
 names this gear, refuses anything else with `not-authorized` before the PDP is asked, and then
 asks the PDP for `process_step × execute` with the operation name as a resource property; the
-policy owner grants `execute` to that principal only, enumerating the thirty-four granted
+policy owner grants `execute` to that principal only, enumerating the thirty-three granted
 operation values rather than the action unconditionally, so an operation registered later is
 denied until provisioned (`design/09-read-and-authz.md` §3.1, §4.1). That principal holds nothing
 else — it cannot read progress, act on a task, decide a gate or cancel. Orders Lifecycle's service
@@ -1247,7 +1254,8 @@ The gear stores no cardholder data and holds no payment instrument — it consum
 | Approver-inbox over-disclosure | An approver role string matches every gate of that kind across every order and seller | Assignment boundary | Scoping is the PDP `Eq` constraint on `owf_approval_gate.assigned_principal`, not the role; a gate outside it is not returned by the inbox query and not mutable by the decision `UPDATE` | An over-broad assignment written at gate-open from the routing configuration is honoured as written; assignment correctness is Generic Approval's |
 | Self-approval | The submitting identity decides its own gate | Commercial-control boundary | The decision endpoint refuses the submitting identity, and the SoD clause is carried in the §9.2 expectations contract | Two colluding principals inside one seller tenant; out of scope for a technical control |
 | Callback impersonation | A forged decision or provisioning outcome arrives on the event transport and reaches a `listen` arm | Service boundary | The broker's per-topic produce grant and platform-root tenancy; the event carries references only, and the consuming operation reads the decision or the intent status from its owner (`record-decision` by decision reference, `reconcile-intent` by the `SUB-O13` read) and re-reads the order from Lifecycle under the PDP before any effect | A compromised broker, platform plugin or PDP; out of this gear's control. Neither this gear nor the plugin sees a producer principal, so a mis-provisioned produce grant is invisible until the shared prerequisites of `UPSTREAM_REQS.md` §2.7 are verified |
-| Step-surface impersonation or a rogue definition | A caller other than the platform invokes a step route, or a published definition orders the operations to bypass a `p1` guard | Service boundary / publish boundary | Step routes admit only the serverless-runtime service principal with `token_scopes` naming this gear and the PDP's `process_step × execute` for the enumerated operation; the ADR-0012 fence runs before publish and in CI, and every protected operation re-checks its precondition in Orders' record at run time | A platform operator publishing outside the pipeline while the pre-publish hook is only an ask; bounded by the run-time guards, which fail closed at the first misordered protected operation |
+| Step-surface impersonation or a rogue definition | A caller other than the platform invokes a step route, or a published definition orders the operations to bypass a `p1` guard | Service boundary / publish boundary | Step routes admit only the serverless-runtime service principal with `token_scopes` naming this gear and the PDP's `process_step × execute` for the enumerated operation; the ADR-0012 fence runs before publish and in CI, and every protected operation re-checks its precondition in Orders' record at run time | Every call after `start-instance` must carry the instance's bound invocation (`01 §3.3` step 3), and every protected operation checks a record precondition — `run-cancellation-fence` included, which needs a recorded cause for its trigger (`06 §3.6`, D-106) — so a caller that is not the instance's invocation is refused `not-found`, and a misordered definition fails closed at the first protected operation whose precondition the record does not hold. Residual: a platform operator publishing outside the pipeline while the pre-publish hook is only an ask, and a principal holding the serverless-runtime scope that also learns an instance's invocation id, until the platform asserts the invocation on the call (`UPSTREAM_REQS.md` §2.9) |
+| Start or control of an order's invocation outside this gear | A mis-bound or hand-edited trigger, a direct `POST …/invocations` on `order_process`, or a generic `:control` `cancel`/`suspend` by another platform-authorized caller | Platform boundary | The bindings are released with the definition and drift-checked (`10 §3.8`); `admit-trigger` refuses an order whose `resource_tenant_id` is not the body's and starts only a `submitted` `new_sale` order (`02 §3.6`, D-107); the liveness pass raises a `canceled` or failed invocation as an `invocation-dead` task (`01 §3.8`, D-105) | A generic `suspend` is indistinguishable from a normal wait and freezes the order, lifetime ceiling included, until the platform's suspension limit fails it; closed only by `…-upreq-serverless-runtime-invocation-control-restriction` |
 | Order state driven directly by a system actor | A service principal calls a state-affecting operation, or a definition calls a seam directly | BSS seam (R1) | No `(resource, action)` pair a service principal holds writes order state — the catalogue has none; the gateway refuses a service `subject_type` on a human-actor arm before the PDP is asked; a definition may `call` only `/steps/{operation}` (ADR-0012 rule 2), so every Lifecycle transition is inside an Orders operation; no code path in this gear writes order state at all | A defect in Lifecycle's own guard; covered by that gear's PDP-authorized seam |
 | Audit tampering | A holder of database privilege edits or deletes trail rows | Data boundary | No UPDATE or DELETE grant to any role, database triggers rejecting both, a per-process predecessor-hash chain under the frozen contract of `01 §4.17`, the declared verifier alerting and never repairing, and per-namespace checkpoints reconciled against instance counters every 24 h (D-59, D-60) | Within Orders Lifecycle D-100's stated limits ([Lifecycle DECISIONS.md](../../orders-lifecycle/docs/DECISIONS.md)): a holder of the migration role can drop grant and trigger and rewrite all local evidence including the latest checkpoint suffix; a chain lost before its first checkpoint, or a suffix removed with its counter before capture, is not independently evidenced. Independent anchoring is optional hardening, not presumed |
 | Commercial data in engine history | Resolved totals, approver identities, tenant axes or payloads appear in Temporal history through task inputs and outputs, and are exposed through the platform timeline | Third-party / retention boundary | `cpt-cf-bss-orders-workflow-adr-references-not-payloads`: task inputs and outputs are identifiers and closed enums only, checked against each operation's reference schema before publish and on every request; engine history is non-citable (ADR-0003) and the record is complete without it | **Bounded, not closed.** `correlationId`, `orderId` and `orderVersion` with their timestamps still sit in a Temporal persistence backend whose location and retention the platform sets; residency pinning and stated retention are the upstream ask `…-upreq-serverless-runtime-history-residency-retention`, and Q-12 (the pending half of Q-01) closes on it. **Trigger inputs and consumed events are a further residual**: the start trigger's input and every consumed Lifecycle, Generic Approval and Subscriptions event may sit in history as published — Lifecycle's tenant axes, per-line net components, deciding authority, actor and reason fields, the Subscriptions `subscriptionId` — until the platform persists only the selected members (`…-upreq-serverless-runtime-consumed-event-member-storage`) or Lifecycle publishes thin events or confirms the full events may be stored (`…-upreq-lifecycle-thin-events`); ADR-0013 and D-66 as amended |
@@ -1349,7 +1357,7 @@ arrival nobody pages on:
 | Definition and signal health | any validation-hook or CI refusal on a publish; any signal request still undelivered past 5 minutes; any disagreement between the version an invocation reports and the active binding version (`10 §4.3`); any instance bound to a version the registry no longer resolves |
 | Producer-queue lag (platform metric) | p95 enqueue-to-broker-acceptance on `bss-orders-workflow-events` beyond the 30-second budget, sustained 5 minutes; any pending platform dead letter pages at low severity |
 | **Trigger-path dead letters** (platform metric, `…/event-triggers/{trigger_id}/metrics`) | any arrival pages at low severity; **> 5 in 15 minutes, or > 20 in 24 hours**, pages at high severity — a dead-lettered start trigger leaves an order in `submitted` with no instance and no manual task, so the platform's count is the only signal that exists until the dead-letter visibility ask lands |
-| **Invocations with no live instance** | any due intent whose instance has no live invocation (`01 §3.8` sweep metric, target zero); a non-zero rate means invocations are dying on the platform |
+| **Instances with no live invocation** | any bound non-terminal instance the liveness pass finds not live (`01 §3.8`, target zero) pages at high severity, because its `invocation-dead` task carries a 4 h SLA and nothing else drives the order; a rate by platform status (`failed`, `dead_lettered`, `canceled`, …) separates dying invocations from an outside `cancel`; any unreadable-status run of more than 15 minutes pages, because the pass is then blind |
 | **Overdue-window breach** | any process past its configured overdue window pages; **> 1 % of in-flight processes breaching over 1 hour** escalates, since a single breach is an order and a rate is a systemic fulfillment stall |
 | **Overdue-window breach while held** | any breach on a process whose order is on hold, reported separately — the overdue timer does not pause, so this distinguishes a stalled process from an intentionally suspended one |
 | Manual-task arrival rate | above the § 4.1 baseline of 1 % of lines; escalates at 5 % over 15 minutes |
@@ -1374,15 +1382,20 @@ effect; a step whose deadline has passed by database time when its call arrives 
 `retryable-failure` rather than executing late (`design/01-foundation.md` §4.16). Restart-under-load
 recovery of the record replays from the gear-owned record rather than trusting engine retention
 (`cpt-cf-bss-orders-workflow-nfr-owf-durability`), and an instance whose invocation ends without
-`terminate-instance` — `failed` or `dead_lettered` on the platform — is still found by the
-reconciliation sweep's `next_sweep_at` schedule, which runs whether or not an invocation is live,
-and is raised as a manual task. An operator re-drive of such an invocation is the platform's
-`:control` `retry` keeping the `invocation_id` once that ask lands; until then the instance is
-unwound and the order re-submitted (D-86).
+`terminate-instance` — `failed`, `dead_lettered`, `canceled` or any other non-live status on the
+platform — is found by the reconciliation sweep's **instance liveness pass**, which reads every
+bound non-terminal instance's invocation status on a 15-minute cycle, whatever the state of its
+intents, and raises it as one order-scope `invocation-dead` manual task (D-105). The recovery is
+the platform's `:control` `retry` keeping the `invocation_id` and resuming at the faulted task,
+offered on that task once the platform confirms those properties; until then the fallback is the
+task's cancel, which the sweep carries out as the dead-instance unwind of the cancel path, and the
+customer is re-acquired by a new order — a stated loss of the in-flight order, registered as a PRD
+amendment (`UPSTREAM_REQS.md` §4 item 11; `design/01-foundation.md` §4.16).
 
 Outbound dependency calls (Lifecycle, Subscriptions, Payments) that fail transiently answer
 `retryable-failure`, which the definition's task retry policy re-issues within the step's own
-budget, escalating to a manual task on exhaustion; Generic Approval unavailability is explicitly
+budget, escalating to a manual task on exhaustion — the failure stage's where the definition
+catches it, the `invocation-dead` task where it faults the invocation; Generic Approval unavailability is explicitly
 excluded from that retry path and instead follows the fail-closed park-and-escalate arm
 (`cpt-cf-bss-orders-workflow-adr-fail-closed-verdict-park`). The per-dependency circuit breaker
 stays in the envelope and answers `circuit-breaker-open`. An infrastructure fault aborts the step
@@ -1525,7 +1538,8 @@ here so a later reader can tell debt from oversight.
   holds documentation and a `gear.toml` and no crate: no host, no SDK, no Temporal plugin. The
   canonical definitions of `design/10` are documentation until the readiness gate of `01 §3.8`
   passes, and the platform capabilities of `UPSTREAM_REQS.md` §2.9 — execution identity on
-  outbound `call`, named signals and a re-drive from `dead_lettered`, event-trigger binding to the
+  outbound `call`, named signals and a re-drive from `dead_lettered` that keeps the invocation and
+  resumes at the faulted task, denial of generic control on `order_process`, event-trigger binding to the
   broker, member-only storage of trigger inputs and consumed events, attempt identity and
   deadline propagation, a consumer-registered pre-publish validation hook, history residency and
   retention, dead-letter operator visibility — are asks, not facts. Repaid when the gate passes
@@ -1537,7 +1551,12 @@ here so a later reader can tell debt from oversight.
   sequencing falls back to code: a sequencer in this gear calling the same operations in the order
   the canonical definition states, binding each instance with `definition_source = code`. This is
   a **stated property of the decomposition, not a plan**: no code sequencer is designed, and none
-  will be unless the gate is declared failed (ADR-0001 as rewritten, ADR-0011).
+  will be unless the gate is declared failed (ADR-0001 as rewritten, ADR-0011). The one
+  Orders-driven sequence that exists is narrower and is debt of its own: the **dead-instance
+  unwind** of `design/01-foundation.md` §4.16, which runs the cancel path's operations in-process
+  for an instance whose invocation the platform no longer runs, after a Seller Operator's cancel.
+  Repaid, and removed, when the platform confirms a re-drive that keeps the invocation and resumes
+  at the faulted task (D-105).
 - **The Generic Approval stand-in.** The phase-1 approval path is inert behind the §9.2
   expectations contract, and `OrderApprovalRequested` and `OrderApprovalEscalated` never fire.
   This is a *port with a double behind it*, not a shortcut: the deprecation path is to delete the

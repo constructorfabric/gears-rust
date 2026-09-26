@@ -130,10 +130,13 @@ rather than one task, fails closed before a definition can be executed, and stil
   operation checks its own precondition in this gear's record before acting and refuses with a
   catalogue reason if it does not hold — `dispatch-wave2-activate` refuses without a frozen plan
   and every task at `draft_created`; `compensate-order` refuses without a recorded cancellation
-  fence; `terminate-instance` refuses without a reported outcome or a recorded terminal event. A
-  definition that bypasses the static fence therefore fails closed at the first protected
-  operation it misorders, and an instance whose invocation ends without `terminate-instance` is
-  found by the reconciliation sweep (`settle-from-lookup`) and raised as a manual task.
+  fence; `run-cancellation-fence` refuses without a recorded cause for its trigger;
+  `terminate-instance` refuses without a reported outcome or a recorded terminal event; and every
+  step call after `start-instance` must carry the instance's bound invocation (`DECISIONS.md`
+  D-106). A definition that bypasses the static fence therefore fails closed at the first
+  protected operation it misorders, and an instance whose invocation ends without
+  `terminate-instance` is found by the reconciliation sweep's instance liveness pass and raised as
+  an `invocation-dead` manual task (D-105).
 * **Pinning.** `start-instance` writes `owf_definition_binding` (`correlation_id`,
   `definition_id`, `definition_version`, `definition_source`, `pinned_at`, `published_by`,
   `resource_tenant_id`) in the same transaction that creates the instance; the instance runs to
@@ -173,8 +176,8 @@ transaction and refuses a second binding for the same `correlation_id`; a test t
 bound to version *n* is driven to termination by version *n* after *n+1* is published and that no
 Orders code path reads any version but the bound one; a test per protected operation that its
 precondition guard refuses with the catalogue reason when its record precondition does not hold; a
-test that an invocation ending without `terminate-instance` is surfaced by `settle-from-lookup` as
-a manual task; and a startup test that `owf_step_operation` is loaded from the compiled registry,
+test that an invocation ending without `terminate-instance` is surfaced by the sweep's instance
+liveness pass as an `invocation-dead` manual task (D-105); and a startup test that `owf_step_operation` is loaded from the compiled registry,
 audited on load and rejects any runtime write.
 
 ## Pros and Cons of the Options

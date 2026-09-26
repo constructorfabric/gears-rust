@@ -772,7 +772,7 @@ Every call on this surface **MUST** satisfy, in this order, before the operation
 
 1. [ ] - `p1` - **Service principal.** The gateway-asserted `SecurityContext` **MUST** identify a service subject (`subject_type` service) whose `token_scopes` names this gear; anything else is `not-authorized` (403) before the PDP is asked, exactly as [`09 §3.6` *System-actor call on the REST surface*](./09-read-and-authz.md#36-interactions--sequences) states - `inst-owf-step-principal`
 2. [ ] - `p1` - **PDP decision.** The route requests resource `gts.cf.bss.orders_workflow.process_step.v1~` × action `execute` through the shared `PolicyEnforcer` adapter with the target `correlationId` and the resource property `operation = {operation}` (`cpt-cf-bss-orders-workflow-adr-platform-pdp-authorization`); a deny is `not-found` (404) per the existence-oracle rule of `09 §4.4`, a PDP outage the canonical 503 - `inst-owf-step-pdp`
-3. [ ] - `p1` - **Required headers and body.** `Idempotency-Key` is **REQUIRED** and is validated by server-side recomposition from the body per the operation's registered key family (`cpt-cf-bss-orders-workflow-constraint-tenant-namespaced-idempotency`, [`09 §2.2`](./09-read-and-authz.md#22-constraints)); a missing or non-matching key is `idempotency-key-mismatch` (400). The body **MUST** validate against the operation's registered `input` GTS reference schema; a body carrying a member the schema does not declare is a validation refusal (400), which is the runtime half of the references-not-payloads rule. The body **MUST** carry `invocationId` (the platform invocation, from the definition's `$workflow.id` runtime argument — that `$workflow.id` equals the platform `invocation_id` is part of the attempt-identity ask below) and `attemptId` (the platform attempt identifier, see *Attempt identity* below) - `inst-owf-step-shape`
+3. [ ] - `p1` - **Required headers and body.** `Idempotency-Key` is **REQUIRED** and is validated by server-side recomposition from the body per the operation's registered key family (`cpt-cf-bss-orders-workflow-constraint-tenant-namespaced-idempotency`, [`09 §2.2`](./09-read-and-authz.md#22-constraints)); a missing or non-matching key is `idempotency-key-mismatch` (400). The body **MUST** validate against the operation's registered `input` GTS reference schema; a body carrying a member the schema does not declare is a validation refusal (400), which is the runtime half of the references-not-payloads rule. The body **MUST** carry `invocationId` (the platform invocation, from the definition's `$workflow.id` runtime argument — that `$workflow.id` equals the platform `invocation_id` is part of the attempt-identity ask below) and `attemptId` (the platform attempt identifier, see *Attempt identity* below). **Invocation binding** (decision D-106): on every operation except `admit-trigger` in the `start` role and `start-instance`, whose instance does not exist yet or is being bound, the body's `invocationId` **MUST** equal `owf_process_instance.invocation_id` of the named `correlationId`, read under the instance row lock the operation takes; a mismatch, or a `correlationId` with no instance, is `not-found` (404) under the existence-oracle rule of [`09 §4.4`](./09-read-and-authz.md#44-authorized-invocation-resource-ownership-and-apply-time-re-check-normative), settles nothing and runs no effect. The bound invocation is the instance's fencing token, in the shape of the BSS `coord` lease, whose every write re-checks its holder inside the transaction ([`guard.rs:160-264`](../../../libs/coord/src/lease/guard.rs)); a caller that merely names a `correlationId` it can derive (a UUIDv5, [`02 §2.1`](./02-triggers-and-start.md#21-design-principles)) cannot drive the instance. The value is compared as the body carries it until the platform asserts the invocation on the call itself (`…-upreq-serverless-runtime-attempt-and-deadline-propagation`); an operation run in-process — by the sweep, by `reconcile-intent`, or inside another operation — is not a route call and is not subject to it - `inst-owf-step-shape`
 4. [ ] - `p1` - **Deadline.** The envelope computes the attempt's deadline as `min(now + operation.deadline_ms, caller deadline)` against database time, where the caller deadline is the remaining budget the platform propagates on the call when it does; the effective deadline is propagated on every outbound call the operation makes (§4.5 *Deadline propagation*) - `inst-owf-step-deadline`
 5. [ ] - `p1` - **Registry resolution.** Resolve the key to exactly one of the six registry outcomes of §4.3; only *first call / re-run* proceeds to the effect - `inst-owf-step-resolve`
 
@@ -958,7 +958,7 @@ about the instance the definition has established.
 |-------|-------|
 | `protection` | `protected` — the first operation of every path after `admit-trigger` |
 | `input` | `correlationId` (derived by `admit-trigger`, [`02 §2.1`](./02-triggers-and-start.md#21-design-principles)), `orderId`, `orderVersion`, `resourceTenantId`, `definitionId`, `definitionVersion`, `definitionSource`, `invocationId`, `triggerEventId`, `attemptId`. No seller axis: `resource_tenant_id` is the only tenant axis that crosses the engine boundary (`cpt-cf-bss-orders-workflow-adr-references-not-payloads`) |
-| `output` | `correlationId`, `phase = started`, `definitionVersion`, `rowVersion` |
+| `output` | `correlationId`, `phase = started`, `definitionVersion`, `invocationId` (the invocation **bound** to the instance: the caller's own on the call that inserts the row, the existing binding's on an absorbed duplicate), `rowVersion` |
 | `idempotency_key` | instance-scoped: `{tenant}:{correlationId}:start-instance`; the fingerprint **excludes** `invocationId` and `attemptId` |
 | `declared_event` | none (`OrderFulfillmentStarted` belongs to `begin-fulfillment`, slice 04) |
 | `compensation` | none (`terminate-instance` is a path step, not a paired undo) |
@@ -971,12 +971,15 @@ Effect, in one transaction: resolve `seller_tenant_id` **inside Orders**, from t
 record that the settled `admit-trigger` admission for `triggerEventId` read (`02 §3.6`
 `inst-at-read`), never from the task input (decision D-76: the seller axis
 is resolved inside Orders and `admit-trigger`'s settled result carries it for `start-instance`);
-insert `owf_process_instance` (the partial unique index
+insert `owf_process_instance` with `invocation_id = invocationId` and `next_liveness_at` = now +
+15 min (§3.8 *Instance liveness pass*) (the partial unique index
 `UNIQUE (order_id) WHERE terminal_outcome IS NULL` arbitrates a race, not a prior read), insert
 `owf_definition_binding`, write `instance-start` with `definition_version` set, settle the key.
 A second invocation presenting a different `invocationId` for a bound, non-terminal correlation
 is an absorbed duplicate that answers the **existing** binding; the caller detects the mismatch
-from `invocationId` in the output and the definition ends its own invocation (`10 §3.6` (f)).
+from `invocationId` in the output — the bound invocation, which differs from its own — and the
+definition ends its own invocation (`10 §3.6` (a) `onBinding`). A platform `retry` that keeps the
+invocation (D-86, D-105) reads its own `invocationId` back and continues.
 
 ##### `settle-from-lookup`
 
@@ -1009,8 +1012,8 @@ nothing. This is the only path that may settle a key whose closure it did not ru
 
 | Field | Value |
 |-------|-------|
-| `protection` | `composable` (operator) |
-| `input` | `correlationId`, `stepRef` (operation name plus subject reference), `taskRef` (the manual task whose `retry` resolution invokes it), `attemptId` |
+| `protection` | `composable` (operator), **in-process only**: it is never a definition `call` target (the validation hook rejects one, `10 §2.2` rule 1) and no principal holds its `process_step × execute` value ([`09 §3.1`](./09-read-and-authz.md#31-domain-model)); it runs only inside `resolve-manual-task`'s `retry` resolution (slice 07), exactly as `settle-from-lookup` runs only inside the sweep (decision D-108) |
+| `input` | `correlationId`, `stepRef` (operation name plus subject reference), `taskRef` (the manual task whose `retry` resolution invokes it), `requestRef` (the applied `owf_task_resolution_request` row, [`07 §3.7`](./07-manual-tasks.md#37-database-schemas--tables)), `attemptId` |
 | `output` | `attemptKey` (the minted `attempt` the definition passes to the re-entered operation, which appends it to its key after the round, §3.3 *Rounds and attempts*), `quarantined` |
 | `idempotency_key` | instance-scoped: `{tenant}:{correlationId}:retry-step:{taskRef}:{resolutionSeq}` |
 | `declared_event` | none |
@@ -1023,7 +1026,7 @@ nothing. This is the only path that may settle a key whose closure it did not ru
 Effect: verify the instance `row_version` the caller presents, apply the Orders-side quarantine
 of §4.13 (three consecutive retries of one `stepRef` whose attempts terminated without a settled
 outcome trip `poison-step`), mint the next `attempt` of the step's family in
-`owf_process_instance.key_rounds` (§3.3 *Rounds and attempts*, rule 3), and record the operator's retry as a `retry` audit entry with the actor from the `SecurityContext`.
+`owf_process_instance.key_rounds` (§3.3 *Rounds and attempts*, rule 3), and record the operator's retry as a `retry` audit entry whose actor is the request row's `requested_by`, never the `SecurityContext` of the call that carries it, which is the serverless-runtime principal's ([`07 §4.6`](./07-manual-tasks.md#46-operation-rules-normative) rule 3).
 The re-dispatch itself is the definition's resume arm (`10 §3.6` (c)).
 
 ##### `park` and `unpark`
@@ -1194,9 +1197,9 @@ sequenceDiagram
     SE ->> DB: INSERT instance (partial unique index arbitrates)
     SE ->> DB: INSERT binding (definition_id, vN, source = platform, pinned_at, published_by)
     SE ->> DB: audit instance-start (definition_version = vN, phase_to = started)
-    SE -->> PL: 200 correlationId, definitionVersion = vN
+    SE -->> PL: 200 correlationId, definitionVersion = vN, invocationId (bound)
     PL ->> SE: POST /steps/start-instance (same key) — replay or duplicate trigger
-    SE -->> PL: 200 existing binding (vN), effect not re-run
+    SE -->> PL: 200 existing binding (vN, bound invocationId), effect not re-run
 ```
 
 **Description**: The binding is written in the transaction that creates the instance and is never
@@ -1309,7 +1312,8 @@ has no enforcing predicate.
 | resource_tenant_id | uuid, NOT NULL | Resource-recipient axis |
 | seller_tenant_id | uuid, NOT NULL | Selling-party axis; the key the operator surfaces scope by |
 | definition_version | text, NOT NULL | Denormalised from the binding for reads; equal to the binding's value by CHECK-on-insert and never rewritten |
-| invocation_id | text, nullable | The platform invocation driving this instance (`DESIGN.md:865`); the handle the sweep's status read and the signal delivery of `10 §3.3` use; NULL only under `definition_source = code` |
+| invocation_id | text, nullable | The platform invocation driving this instance (`DESIGN.md:865`); the handle the sweep's status read and the signal delivery of `10 §3.3` use, and the value every step route call is bound to (§3.3 step 3, *Invocation binding*); never re-bound (D-86); NULL only under `definition_source = code` |
+| next_liveness_at | timestamptz, NOT NULL | When the instance liveness pass of §3.8 next reads the invocation's platform status; set by `start-instance` to now + 15 min and advanced by each pass (D-105) |
 | phase | enum | `started`, `suspended`, `parked`, `compensating`, `terminated` — a **recorded projection** written by step operations, see the transition table below |
 | suspended | boolean | Set by `apply-hold`, cleared by `apply-resume`; redundant with `phase = suspended` and kept as the hold predicate the dispatch operations read |
 | last_settled_step | text, nullable | The last settled **protected** operation and its subject; a read-side marker, not a resume pointer — the platform resumes from its own history |
@@ -1324,8 +1328,9 @@ has no enforcing predicate.
 **Constraints**: **`UNIQUE (order_id) WHERE terminal_outcome IS NULL`** — at most one active
 instance per order, enforced by the index rather than by a read-then-insert; `(order_id,
 order_version)` indexed for lookup; `(seller_tenant_id, phase, updated_at)` indexed for the
-tenancy-scoped operator list; `invocation_id` indexed for the sweep; FK relationship to Lifecycle
-is by reference only.
+tenancy-scoped operator list; `invocation_id` indexed for the sweep; `(next_liveness_at) WHERE
+terminal_outcome IS NULL` indexed for the instance liveness pass (§3.8); FK relationship to
+Lifecycle is by reference only.
 
 **The `phase` enum and its permitted transitions** — each written by the named operation:
 
@@ -1800,9 +1805,29 @@ workers** (D-62 as amended by ADR-0011), in the shape of
 
 | Worker | Advisory key within gear namespace `bss-orders-workflow` | Correctness check independent of scheduler ownership |
 |--------|-----------------------------------------------------------|-----------------------------------------------------|
-| Intent reconciliation sweep | `reconciliation-sweep` | Selects every due intent — `owf_provisioning_intent` rows with `next_sweep_at <= now()` over non-terminal intents, ordered by `next_sweep_at`, one bounded page per pass ([`05 §3.8`](./05-provisioning-intents.md#38-deployment-topology)) — **whether or not** the owning instance has a live invocation, and runs `reconcile-intent`'s effect for each in-process; the definition's poll and confirmation arms are early reads of the same rows, never a reason to skip one. It reads the owning invocation's status (`GET /api/serverless-runtime/v1/invocations/{invocation_id}`, [`DESIGN.md:867`](../../../../serverless-runtime/docs/DESIGN.md#invocation-api)) only to report, as a metric, intents whose instance has no live invocation. Correctness check: the intent row lock of `reconcile-intent` and, for a stuck step key, settlement only through `settle-from-lookup`, which rechecks the registry row's `status` and lease under its row lock and writes `sweep-settlement` in that transaction |
+| Intent reconciliation sweep | `reconciliation-sweep` | Selects every due intent — `owf_provisioning_intent` rows with `next_sweep_at <= now()` over non-terminal intents, ordered by `next_sweep_at`, one bounded page per pass ([`05 §3.8`](./05-provisioning-intents.md#38-deployment-topology)) — **whether or not** the owning instance has a live invocation, and runs `reconcile-intent`'s effect for each in-process; the definition's poll and confirmation arms are early reads of the same rows, never a reason to skip one. The same pass runs the **instance liveness pass** below, which reads each non-terminal instance's invocation status and raises an instance whose invocation is no longer live as a manual task. Correctness check: the intent row lock of `reconcile-intent` and, for a stuck step key, settlement only through `settle-from-lookup`, which rechecks the registry row's `status` and lease under its row lock and writes `sweep-settlement` in that transaction; for the liveness pass, the instance row lock and the recheck that the row is still non-terminal and still bound to the invocation read |
 | Retention purge | `retention-purge` | Bounded conditional row-wise deletes — `DELETE … WHERE` predicates re-evaluated inside the deleting transaction, one bounded batch per pass, through each table's retention index (no table is partitioned, §3.7, D-104) — over the rows whose window has elapsed: `owf_step_log` at 90 days and `owf_idempotency_registry` under its tombstone rule (§3.7); `owf_compensation_record` and `owf_cancellation_fence` at ≥ 400 days ([`06 §3.7`](./06-saga-and-compensation.md#37-database-schemas--tables)); `owf_task_resolution_request` at ≥ 400 days ([`07 §3.7`](./07-manual-tasks.md#37-database-schemas--tables)); and every other slice table at the retention its §3.7 states; and `owf_dispatch_admission` seller rows with no non-terminal intent for 30 days ([`05 §3.7`](./05-provisioning-intents.md#37-database-schemas--tables)). Never `owf_audit_entry`, `owf_audit_checkpoint`, `owf_audit_checkpoint_member` or `owf_definition_binding`, on which it holds no grant |
 | Audit verification and checkpointing | `audit/<canonical audit-tenant UUID>` | SELECT-only verification of each chain (§4.17 *Verifier*); the checkpoint-append phase runs under its own INSERT grant, and the `(audit_tenant_id, checkpoint_sequence)` primary key rejects a competing checkpoint from a second replica |
+
+**Instance liveness pass** (decision D-105, amending D-71). Each `reconciliation-sweep` pass also
+selects one bounded page (500 rows) of `owf_process_instance` rows with `terminal_outcome IS NULL`,
+`invocation_id IS NOT NULL` and `next_liveness_at <= now()`, ordered by `next_liveness_at`, and
+reads each invocation's status (`GET /api/serverless-runtime/v1/invocations/{invocation_id}`,
+[`DESIGN.md:867`](../../../../serverless-runtime/docs/DESIGN.md#invocation-api)). The intent
+candidate set above does not reach an instance whose intents are all terminal — a Lifecycle outage
+past the retry budget at `report-outcome` leaves exactly that — so the backstop for a dead
+invocation is this pass, keyed on the instance, not the intents. Per row:
+
+1. [ ] - `p1` - **Live** — `queued`, `running` or `suspended` ([`DESIGN.md:445-458`](../../../../serverless-runtime/docs/DESIGN.md#invocation-status-state-machine)): set `next_liveness_at` = now + 15 min; nothing else is written - `inst-owf-live-ok`
+2. [ ] - `p1` - **Not live** — `failed`, `dead_lettered`, `canceled`, `compensating`, `compensated` or `succeeded`, or a `404` for the bound id: in one transaction under the instance row lock, recheck that the row is non-terminal and still bound to that invocation, create through slice 07's creation port one order-scope manual task with reason `invocation-dead` and cause `invocation-ended` ([`07 §3.3`](./07-manual-tasks.md#33-api-contracts)), write a `sweep` audit entry naming the platform status, and set `next_liveness_at` = now + 15 min. The task's uniqueness (`07 §3.7`) absorbs the task on every later pass while it is open and reopens it when an invocation that a re-drive revived dies again. `canceled` is how a platform `:control` `cancel` issued outside this gear surfaces (`10 §4.4`) - `inst-owf-live-dead`
+3. [ ] - `p1` - **Unreadable** — the status read times out or answers `5xx`: write nothing, leave `next_liveness_at`, count the failure; the next pass reads again - `inst-owf-live-unreadable`
+4. [ ] - `p1` - **Dead-instance unwind.** For an instance whose `invocation-dead` task holds an applied `cancel` resolution, the pass drives the fallback unwind of D-105 (§4.16) one operation per pass - `inst-owf-live-unwind`
+
+A platform `:control` `suspend` issued outside this gear is indistinguishable from the `suspended`
+of a `listen` or `wait` and is detected only when the suspension times out into `failed`
+([`DESIGN.md:455`](../../../../serverless-runtime/docs/DESIGN.md#invocation-status-state-machine));
+denying generic control on `order_process` invocations is the upstream ask
+`…-upreq-serverless-runtime-invocation-control-restriction`.
 
 There is **no timer wake-up worker**: every timer is a definition `wait` executed by the plugin.
 There is **no dead-lease scan**: a dead lease on a dispatching step key is detected by
@@ -1849,9 +1874,10 @@ exceeds 30 days. Identity removal never changes what it verifies (D-61).
 still-processing, lease-expired, key-conflict, `open` re-run and aged-out counts; per-operation
 deadline exhaustion counts; `retry-step` quarantine count (§4.13, target zero); circuit-breaker
 state and open-duration per dependency (§4.5); measured clock offset against database time per
-replica and advisory-lock release-on-skew count (§4.15); sweep reads per pass, and the count of due
-intents whose instance has no live invocation (target zero while the platform is healthy — a
-non-zero rate means invocations are dying);
+replica and advisory-lock release-on-skew count (§4.15); sweep reads per pass; the liveness pass's
+count of bound non-terminal instances whose invocation is not live, by platform status (target
+zero while the platform is healthy — a non-zero rate means invocations are dying), its
+unreadable-status count, and the count of dead-instance unwinds in progress;
 producer-queue depth, oldest-message age and enqueue-to-acceptance lag plus pending platform dead
 letters for `bss-orders-workflow-events` (platform metrics, read rather than produced here);
 audit-append failure count (target zero), audit hash-chain verification failures (target zero),
@@ -2315,6 +2341,7 @@ example — and they are stated once so no slice chooses them again.
 | `action-not-offered` | `07-manual-tasks` | `ACTION_NOT_OFFERED` | FailedPrecondition | 400 |
 | `override-unverified` | `07-manual-tasks` | `OVERRIDE_UNVERIFIED` | FailedPrecondition | 400 |
 | `lifetime-ceiling-reached` | `07-manual-tasks` | `LIFETIME_CEILING_REACHED` | FailedPrecondition | 400 |
+| `invocation-dead` | `07-manual-tasks` | `INVOCATION_DEAD` | FailedPrecondition | 400 |
 | `submitter-barred` | `03-approval-execution` | `SUBMITTER_BARRED` | PermissionDenied | 403 |
 | `gate-not-open` | `03-approval-execution` | `GATE_NOT_OPEN` | Aborted | 409 |
 | `approval-reflection-refused` | `03-approval-execution` | `APPROVAL_REFLECTION_REFUSED` | FailedPrecondition | 400 |
@@ -2324,8 +2351,9 @@ example — and they are stated once so no slice chooses them again.
 | `not-found` | `09-read-and-authz` | `NOT_FOUND` | NotFound | 404 |
 | `authority-withdrawn` | `09-read-and-authz` | `AUTHORITY_WITHDRAWN` | FailedPrecondition | 400 |
 
-The table registers **42** reasons: the engine's ten and 32 contributed by slices 02–09 — two by
-02, three by 03, eight by 04, five by 05, five by 06, four by 07 and five by 09 (decision D-77: the twelve reasons the step-operation slices introduced —
+The table registers **43** reasons: the engine's ten and 33 contributed by slices 02–09 — two by
+02, three by 03, eight by 04, five by 05, five by 06, five by 07 and five by 09 (`invocation-dead`,
+the order-scope task reason of the instance liveness pass, added by D-105; decision D-77: the twelve reasons the step-operation slices introduced —
 `trigger-applicability-unverified`, `prior-instance-active`, `identity-party-unavailable`,
 `activation-precondition-unmet`, `intent-unresolved`, `fence-not-claimed`,
 `outcome-not-reportable`, `order-fenced`, `action-not-offered`, `override-unverified`,
@@ -2443,8 +2471,8 @@ canonical definition matches it, so the definition's failure arm runs. The platf
 `RetryPolicy` ([`DESIGN.md:354`–`370`](../../../../serverless-runtime/docs/DESIGN.md#retrypolicy))
 is invocation-level, by SDK error category, and is not a per-task policy. A crash loop of the **platform worker** itself is the
 plugin's poison handling and ends in the invocation's `failed` or `dead_lettered` status
-(`DESIGN.md:449`, `DESIGN.md:458`); the sweep of §3.8 keeps reading that instance's due intents
-and reports them as having no live invocation. This slice keeps
+(`DESIGN.md:449`, `DESIGN.md:458`); the sweep of §3.8 keeps reading that instance's due intents,
+and its instance liveness pass raises the instance as an `invocation-dead` task. This slice keeps
 exactly one crash-loop guard of its own: **`retry-step` MUST quarantine** a step whose operator
 retries keep terminating without a settled outcome — working baseline **3** consecutive retries of
 one `stepRef` whose attempts left the key `in_flight` with a dead lease or produced no step record
@@ -2506,6 +2534,39 @@ Subscriptions sees a ramp rather than a step — is an admission control on disp
 [`05`](./05-provisioning-intents.md) with the other admission rules (§4.12). The working baseline
 that remains this slice's: **time to full resumption p95 < 5 min** from Orders' process start to
 readiness (§3.8), which is the point from which re-issued calls are answered rather than refused.
+
+**An invocation the platform no longer runs** (decision D-105). The instance liveness pass (§3.8)
+raises it as one order-scope `invocation-dead` task within one pass interval. Two resolutions
+exist, and [`07 §4.4`](./07-manual-tasks.md#44-resolution-actions-by-reason-and-the-two-operator-roles-normative)
+offers them:
+
+1. [ ] - `p1` - **Recovery: the platform re-drive.** `retry` issues the platform's
+   `…:control` `retry` of the bound invocation, keeping `invocation_id`, so the instance continues
+   under the invocation it is bound to (D-86). The definition is written for a re-drive that
+   **resumes from the faulted task** with its history: a re-drive that restarts the document from
+   the top would re-enter the approval stage with every round at `0`, which the registry answers
+   from its retained records, but a `listen` whose event was consumed before the fault would wait
+   for an event that is not delivered again, and every fixed wait would restart. Which one the
+   platform does is part of `…-upreq-serverless-runtime-signals`; until the platform confirms both
+   properties — the invocation is kept and execution resumes at the faulted task — and `retry` is
+   valid from the state the invocation is in, `retry` is `action-not-offered` - `inst-owf-dead-redrive`
+2. [ ] - `p1` - **Fallback: the dead-instance unwind.** `cancel` (Seller Operator) records the
+   order cancel of [`09 §3.3`](./09-read-and-authz.md#33-api-contracts) as an `owf_cancel_request`
+   and, because no invocation can receive `cancel-requested`, the sweep's liveness pass drives the
+   definition's cancel path in-process through the envelope, one operation per pass —
+   `authorize-cancel`, `run-cancellation-fence` (`cancel`), `compensate-order` until it answers
+   `complete`, `report-outcome` (`cancelled`), `terminate-instance` (`aborted`, `compensated`) —
+   each under the key, round and pass the definition would present, taken from the previous
+   settled answer in Orders' record. A task one of them raises (a withdrawn authority, a
+   compensation leg) is resolved as usual; its `owf_task_resolution_request` is consumed by the
+   next pass, which calls `resolve-manual-task` in-process in place of the signal. The pass runs
+   only while the platform still reports the invocation not live; once the fence is claimed a
+   re-drive is refused `order-fenced`. The order ends as the cancel path ends it, and re-acquiring
+   the customer is a **new order** created and submitted through Lifecycle. This loses the
+   in-flight order, which the PRD's recover-and-continue rule does not allow; the amendment is
+   registered (`../UPSTREAM_REQS.md` §4 item 11) and the fallback is retired once the re-drive is
+   confirmed - `inst-owf-dead-unwind`
+
 ### 4.17 The audit contract (normative)
 
 Workflow retains its gear-owned transactional audit following Pricing and Orders Lifecycle

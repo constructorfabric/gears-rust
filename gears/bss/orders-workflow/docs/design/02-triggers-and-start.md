@@ -143,7 +143,11 @@ The process starts or advances on exactly nine Orders Lifecycle triggers and no 
 `OrderSubmitted`, and `OrderAmended` for the new version (§2.2) — and the other seven, plus
 `OrderAmended` for the running prior version, are `listen` targets of a running invocation. The
 `admit-trigger` input schema declares `triggerKind` as this closed enum, so an unlisted kind is a
-schema refusal at the envelope (`01 §3.3` step 3), and the validation hook refuses a definition
+schema refusal at the envelope (`01 §3.3` step 3). On the start path the definition derives
+`triggerKind` from the event's **exact** GTS type — `…cf.bss.orders.submitted.v1~` or
+`…cf.bss.orders.amended.v1~` ([Lifecycle `01 §4.4`](../../../orders-lifecycle/docs/design/01-foundation.md#44-events-audit-and-the-outbox-normative))
+— and any other type yields no value, which the schema refuses; it never defaults an unknown type
+to `OrderSubmitted` (`10 §3.6` (a), decision D-107). The validation hook refuses a definition
 whose `listen` names any other Lifecycle type (ADR-0012 rule 3). A closed list is what makes "does
 event X touch a process instance" answerable by table lookup instead of by reading code.
 
@@ -307,6 +311,21 @@ consumer group, no delivery counter and no dead-letter table for triggers. The o
 Orders Lifecycle are unchanged in kind — synchronous seam calls made inside step operations of
 slices 03, 04 and 06 — and this slice's own only outbound call is the R1 read.
 
+**The two bindings are the only start, and they are released like the definition** (decision
+D-107). `order_process` is started only by its two trigger bindings; no Orders route starts it
+(`09 §3.3`), and a start by any other caller is refused platform-side once
+`…-upreq-serverless-runtime-invocation-control-restriction` lands. The bindings — event type,
+the `category = new_sale` filter on `OrderSubmitted`, `callable_type`, `execution_context` — are
+repository artefacts in `definitions/` beside the definition, reviewed, CI-checked and applied by
+the release pipeline under the platform-operator publish role, never created or edited by hand
+(`10 §3.8`). A binding is a tenant-scoped platform object
+([serverless-runtime `DESIGN.md:1146`](../../../../serverless-runtime/docs/DESIGN.md#logical-tables)),
+so the filter is **not** the guard: `admit-trigger` re-derives it from the Lifecycle read —
+the order's `resource_tenant_id` must equal the body's, and a start admits only a `new_sale`
+order (§3.6 *Admit Trigger*) — so a mis-bound or hand-edited trigger, or a direct invocation,
+cannot start an instance for a wrong tenant or a wrong category. The same rule places the
+seller axis inside Orders (D-76).
+
 **ADRs**: `cpt-cf-bss-orders-workflow-adr-flow-as-platform-definition`
 
 #### No caching of order state across triggers
@@ -350,7 +369,7 @@ fall-through:
 | `terminate` | Listen role; the running instance is active and the read shows the order in a terminal state | `terminate-on-terminal-event`, then the terminal unwind |
 | `ignored-superseded` | The event's `orderVersion` is older than the order's current version and the consumer's instance is not behind it | Nothing: the start path ends its invocation; a `listen` arm returns to the stage it left |
 | `absorbed-duplicate` | The consumer already holds an instance at the event's version — a second start trigger for a version that already has an instance (active or terminated), or an amendment whose version equals the running instance's | As `ignored-superseded` |
-| `no-active-instance` | Start role; no instance has ever existed for the order at this version, yet the read shows the order in a state only a running process could have produced (`pending_approval`, `approved`, `in_fulfillment`), or in `held` | **Never** start an instance at that state; the start path ends its invocation. The settled record and the observability counter of §3.8 are the operator signal |
+| `no-active-instance` | Start role; no instance has ever existed for the order at this version, yet the read shows the order in a state only a running process could have produced (`pending_approval`, `approved`, `in_fulfillment`), or in `held`; or the read shows an order whose `category` is not `new_sale`, which this process does not start (D-107) | **Never** start an instance at that state; the start path ends its invocation. The settled record and the observability counter of §3.8 are the operator signal |
 | `ignored-terminated` | The read shows the order already terminal and the consumer has nothing to unwind — no instance (start role), or an instance whose `terminal_outcome` is already set | As `ignored-superseded`. A redelivered terminal event after termination is absorbed here, never re-running compensation |
 
 `no-active-instance` is reachable only on the start role: a `listen` arm runs only inside an
@@ -503,7 +522,7 @@ this gear.
 | `idempotency_key` | Event-scoped (§2.1): `{tenant}:{triggerEventId}:admit-trigger` on start, `{tenant}:{triggerEventId}:admit-trigger:listen` on listen; the fingerprint covers `triggerKind`, `role`, `orderId`, `orderVersion`, `resourceTenantId` and, on listen, `correlationId`; it excludes `invocationId` and `attemptId` | Instance-scoped: `{tenant}:{correlationId}:terminate-on-terminal-event` — one per instance |
 | `declared_event` | none | none (`OrderFulfillmentAborted` belongs to `report-outcome`, slice 06) |
 | `compensation` | none | none |
-| `reasons` | `idempotency-key-conflict`, `trigger-applicability-unverified`, `prior-instance-active`, `per-attempt-timeout`, `circuit-breaker-open` | `version-mismatch` (instance already terminal), `not-found` (no settled `terminate` admission for this event and instance) |
+| `reasons` | `idempotency-key-conflict`, `trigger-applicability-unverified`, `prior-instance-active`, `not-found` (the Lifecycle-read order's `resource_tenant_id` is not the body's, §3.6 `inst-at-tenant`), `per-attempt-timeout`, `circuit-breaker-open` | `version-mismatch` (instance already terminal), `not-found` (no settled `terminate` admission for this event and instance) |
 | `audit_kind` | `step-completion` (after a `step-start` per attempt), under the derived correlation's pre-admission chain when no instance exists yet (`01 §3.7` *Chain allocation*) | `step-completion`; `step_id` names the operation and the terminal event kind |
 | `retry_class` | `retryable-on: transient` | `retryable-on: transient` |
 | `deadline` | 5 s, including one Lifecycle `order × read` under the propagated deadline | 5 s; no outbound call |
@@ -629,13 +648,15 @@ sequenceDiagram
     AT -->> PL: admission = start, correlationId
     PL ->> SI: task startInstance (correlationId, definition version)
     SI ->> RC: insert instance + binding (partial unique index arbitrates); instance-start
-    SI -->> PL: correlationId, definitionVersion
+    SI -->> PL: correlationId, definitionVersion, invocationId (bound)
 ```
 
 **Description**: The platform event trigger starts an invocation of the bound definition version;
 its first task calls `admit-trigger` with the event's references only. The operation derives the
 `correlationId`, reads the order under R1 and settles `start`. `start-instance` then inserts the
-instance, and the partial unique index — not the read — decides single occupancy. The approval
+instance, and the partial unique index — not the read — decides single occupancy. Its answer
+carries the invocation the instance is bound to; an invocation that reads back another
+invocation's id is a duplicate and ends itself (`01 §3.3` `start-instance`). The approval
 stage of fragment (a) follows.
 
 **Algorithm: Admit Trigger**
@@ -648,16 +669,17 @@ Output: `admission`, `correlationId`, `currentOrderVersion`, or a retryable fail
 1. [ ] - `p1` - **IF** `role = start` **AND** `triggerKind` ∉ {`OrderSubmitted`, `OrderAmended`}, or `role = listen` **AND** `correlationId` is absent: **RETURN** a validation refusal (400); the input schema carries this rule - `inst-at-role-check`
 2. [ ] - `p1` - Derive `derivedCorrelationId` = UUIDv5(`resourceTenantId`, `orderId`, `orderVersion`); on `start` it is the output `correlationId`, on `listen` the output is the input `correlationId` - `inst-at-derive-correlation`
 3. [ ] - `p1` - Read the order through the Lifecycle SDK `order × read` under this gear's service principal and the propagated deadline; **IF** the read times out, answers 503, or is refused for authorization or configuration: **RETURN** `retryable-failure` with `trigger-applicability-unverified`, no outcome recorded - `inst-at-read`
-4. [ ] - `p1` - **IF** the event's `orderVersion` is greater than the read version: **RETURN** `retryable-failure` with `trigger-applicability-unverified` (divergence, §4.2) - `inst-at-ahead`
-5. [ ] - `p1` - Lock the order's instance rows (`owf_process_instance` by `order_id`) for the rest of the transaction; select the active instance, if any, and whether an instance ever existed at the event's version - `inst-at-lock-instances`
-6. [ ] - `p1` - **IF** `role = listen` **AND** the running instance's pinned `order_version` is less than the read version: **RETURN** `supersede` - `inst-at-supersede`
-7. [ ] - `p1` - **IF** the event's `orderVersion` is less than the read version: **RETURN** `ignored-superseded` - `inst-at-superseded`
-8. [ ] - `p1` - **IF** `role = listen`: **RETURN** `ignored-terminated` when the running instance's `terminal_outcome` is set, `terminate` when the read state is terminal, `absorbed-duplicate` for an `OrderAmended` at the pinned version, otherwise `advance` - `inst-at-listen-table`
-9. [ ] - `p1` - **IF** `role = start` **AND** an instance at the event's version exists (active or terminated): **RETURN** `absorbed-duplicate` - `inst-at-start-duplicate`
-10. [ ] - `p1` - **IF** `role = start` **AND** the read state is terminal: **RETURN** `ignored-terminated` - `inst-at-start-terminal`
-11. [ ] - `p1` - **IF** `role = start` **AND** an active instance exists at an older version: **RETURN** `retryable-failure` with `prior-instance-active`; the key stays `open` (§4.3) - `inst-at-prior-active`
-12. [ ] - `p1` - **IF** `role = start` **AND** the read state is `submitted`: **RETURN** `start`; otherwise **RETURN** `no-active-instance` - `inst-at-start`
-13. [ ] - `p1` - The envelope writes the step record (`result` carrying `admission`, the read version and state), the audit entry under the chain of `correlationId` (the derived one on a start attempt with no instance yet) and settles the key, in one transaction - `inst-at-settle`
+4. [ ] - `p1` - **IF** the read order's `resource_tenant_id` differs from `resourceTenantId`: **RETURN** `permanent-failure` with `not-found` (404), no outcome recorded and no instance started — the body's tenant is the axis the `correlationId` is derived from and the instance would be scoped by, so it **MUST** be the order's own, never the event's claim alone (D-107; the record-derived-axis rule of D-76, and Lifecycle's rule that identifier equality alone never confers cross-tenant access, [Lifecycle `08 §4`](../../../orders-lifecycle/docs/design/08-read-and-authz.md)) - `inst-at-tenant`
+5. [ ] - `p1` - **IF** the event's `orderVersion` is greater than the read version: **RETURN** `retryable-failure` with `trigger-applicability-unverified` (divergence, §4.2) - `inst-at-ahead`
+6. [ ] - `p1` - Lock the order's instance rows (`owf_process_instance` by `order_id`) for the rest of the transaction; select the active instance, if any, and whether an instance ever existed at the event's version - `inst-at-lock-instances`
+7. [ ] - `p1` - **IF** `role = listen` **AND** the running instance's pinned `order_version` is less than the read version: **RETURN** `supersede` - `inst-at-supersede`
+8. [ ] - `p1` - **IF** the event's `orderVersion` is less than the read version: **RETURN** `ignored-superseded` - `inst-at-superseded`
+9. [ ] - `p1` - **IF** `role = listen`: **RETURN** `ignored-terminated` when the running instance's `terminal_outcome` is set, `terminate` when the read state is terminal, `absorbed-duplicate` for an `OrderAmended` at the pinned version, otherwise `advance` - `inst-at-listen-table`
+10. [ ] - `p1` - **IF** `role = start` **AND** an instance at the event's version exists (active or terminated): **RETURN** `absorbed-duplicate` - `inst-at-start-duplicate`
+11. [ ] - `p1` - **IF** `role = start` **AND** the read state is terminal: **RETURN** `ignored-terminated` - `inst-at-start-terminal`
+12. [ ] - `p1` - **IF** `role = start` **AND** an active instance exists at an older version: **RETURN** `retryable-failure` with `prior-instance-active`; the key stays `open` (§4.3) - `inst-at-prior-active`
+13. [ ] - `p1` - **IF** `role = start` **AND** the read state is `submitted` **AND** the read order's `category` is `new_sale`: **RETURN** `start`; otherwise **RETURN** `no-active-instance` - `inst-at-start`
+14. [ ] - `p1` - The envelope writes the step record (`result` carrying `admission`, the read version and state), the audit entry under the chain of `correlationId` (the derived one on a start attempt with no instance yet) and settles the key, in one transaction - `inst-at-settle`
 
 #### Duplicate absorption
 
@@ -799,9 +821,12 @@ workflow — provisioned per environment and enabled only after the readiness ga
 **Observability owned here**: admission outcomes by outcome, trigger kind and role;
 `trigger-applicability-unverified` and `prior-instance-active` attempt counts; the age of the
 oldest `open` `admit-trigger` key (a rising age means a prior instance is not unwinding or
-Lifecycle reads are failing); and the `no-active-instance` count, **target zero** — a non-zero
+Lifecycle reads are failing); the `no-active-instance` count, **target zero** — a non-zero
 count alerts the fulfillment operator, because it means an order advanced in Lifecycle with no
-instance recorded here.
+instance recorded here, or a start trigger fired for an order this process does not start; and
+the `inst-at-tenant` refusal count, **target zero** — any refusal pages, because it means a trigger
+or a direct invocation named an order under a tenant that is not the order's. The bindings
+themselves are released with the definition (§2.2, `10 §3.8`).
 
 ## 4. Additional context
 
@@ -908,7 +933,7 @@ violates one **MUST** be refused.
 6. [ ] - `p1` - **No swallowing.** Neither operation may sit in a `try` whose `catch` continues the forward path. On the start path, retry exhaustion of `admit-trigger` **MUST** fail the invocation. On a listen arm it **MUST** `raise` into the stage's failure arm, whose `create-manual-task` (07) carries `trigger-applicability-unverified` - `inst-def02-no-swallow`
 7. [ ] - `p1` - **Supersession wait.** The start path's `try` around `admit-trigger` **MUST** retry `prior-instance-active` (409) under a policy whose horizon covers the prior instance's pre-fulfillment unwind and nests below the lifetime ceiling (working value: constant 5 min, `limit.duration` 24 h); the generic `transient` policy's five attempts do not suffice - `inst-def02-supersession-wait`
 8. [ ] - `p1` - **Amendment reachability.** Every competing `fork` before `begin-fulfillment` settles **MUST** contain the amendment `listen` arm (correlated on `orderId` only, since the amended version is newer), and a `begin-fulfillment` refusal caused by a concurrent amendment **MUST** route to that arm rather than to failure compensation that would report `failed` or `cancelled` - `inst-def02-amendment-reachable`
-9. [ ] - `p1` - **Start bindings.** The event-trigger set that starts the order-process workflow is exactly `{OrderSubmitted, OrderAmended}` (§2.2) - `inst-def02-start-bindings`
+9. [ ] - `p1` - **Start bindings.** The event-trigger set that starts the order-process workflow is exactly `{OrderSubmitted, OrderAmended}` (§2.2), declared in the repository beside the definition and applied only by the release pipeline; the start path derives `triggerKind` from the exact event type and never defaults an unknown type (D-107) - `inst-def02-start-bindings`
 10. [ ] - `p2` - **Signals.** This slice handles no operator signal; it handles the nine Lifecycle events only. `cancel-requested` and `reauthorize-requested` are slices 08 and 04 - `inst-def02-signals`
 
 ## 5. Traceability

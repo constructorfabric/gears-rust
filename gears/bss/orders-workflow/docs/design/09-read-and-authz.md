@@ -215,7 +215,11 @@ review (an unscoped `list` grant and an unscoped Preview row) before correcting 
 design is checked against the same failure mode in §4.1. The serverless-runtime principal acts for
 every tenant, and that is precisely why its `execute` grant is restricted per call to the
 `correlationId` and `resource_tenant_id` the call names (§3.1), never a standing cross-tenant
-allow. Disabling the constraint requirement is never a substitute for a missing policy
+allow. Naming a `correlationId` is not by itself a restriction — the caller chooses it, and it is
+a derivable UUIDv5 — so the envelope also binds every call after `start-instance` to the
+instance's own invocation: the body's `invocationId` must equal `owf_process_instance.invocation_id`
+or the call is `not-found` ([`01 §3.3`](./01-foundation.md#33-api-contracts) step 3, decision
+D-106). Disabling the constraint requirement is never a substitute for a missing policy
 ([Lifecycle `08 §3.5`](../../../orders-lifecycle/docs/design/08-read-and-authz.md#35-external-dependencies)).
 
 #### System-actor grants require a verified service principal
@@ -419,7 +423,7 @@ operation registered later is denied until its value is provisioned:
 |-------------|------------|-------------|-------------------------------|
 | `start-instance` | protected | [`01 §3.3`](./01-foundation.md#the-foundations-own-operations) | ✓ |
 | `settle-from-lookup` | protected, sweep-only | `01 §3.3` | **✗** — in-process only (`reconcile-intent`, `reconciliation-sweep`); the value is registered so the check is exhaustive, and its expected decision for every principal is a denial |
-| `retry-step` | composable (operator) | `01 §3.3` | ✓ — Failure stage; also run in-process inside the operator's `retry` resolution |
+| `retry-step` | composable (operator), in-process only | `01 §3.3` | **✗** — run in-process only, inside the operator's `retry` resolution (`resolve-manual-task`), with the actor from the request row; like `settle-from-lookup`, the value is registered so the check is exhaustive, and its expected decision for every principal is a denial (decision D-108) |
 | `park` | composable | `01 §3.3` | ✓ |
 | `unpark` | composable | `01 §3.3` | ✓ |
 | `terminate-instance` | protected | `01 §3.3` | ✓ |
@@ -453,7 +457,7 @@ operation registered later is denied until its value is provisioned:
 | `apply-resume` | protected | `08 §3.3` | ✓ |
 | `authorize-cancel` | protected | `08 §3.3` | ✓ |
 
-Thirty-five values, thirty-four granted. Permission instance ids follow the platform
+Thirty-five values, thirty-three granted (`settle-from-lookup` and `retry-step` are in-process only). Permission instance ids follow the platform
 `AuthzPermissionV1` schema prefix with the instance suffix
 `cf.bss.orders_workflow.<resource>_<action>.v1` — `approval_gate × approve` registers
 `…cf.bss.orders_workflow.approval_gate_approve.v1`, `process_step × execute` registers
@@ -781,8 +785,8 @@ catalogue rows of §3.1 and the `Gr` row of §4.1. There is therefore no operati
 |--------|------|--------------|-----------|
 | `POST` | `/bss-orders-workflow/v1/steps/{operation}` | The step surface of `01 §3.3`, authorized here as `process_step × execute` with `operation` as the resource property; serverless-runtime service principal only (`Gr`) | unstable — internal |
 | `GET` | `/bss-orders-workflow/v1/workflows/{orderId}/progress` | Query process progress (§4.1 read projection, §4.5 field projection). Unchanged | unstable |
-| `POST` | `/bss-orders-workflow/v1/workflows/{orderId}/steps/{stepId}/retry` | Retry failed step. `If-Match` with the process instance's `row_version` REQUIRED; `Idempotency-Key` REQUIRED, recomposed as `{tenant}:{orderId}:{stepId}:retry:{row_version}`. A failed step under `remediate` always holds an open manual task (`10 §4.1` *Failure*); the route is an **alias** of that task's `…/fulfillment-operator/tasks/{taskId}/retry` (`07 §3.3`): it writes the same `owf_task_resolution_request` row (action `retry`) and delivers the same `task-resolution-requested` signal, so `retry-step`'s quarantine and new attempt key (`01 §3.3`) run inside `resolve-manual-task`. A step with no open task is `not-found`; the task's own preconditions (`order-fenced`, `action-not-offered`) apply unchanged. Answers `202 Accepted` with `requestRef`. When the platform reports the invocation `failed`, the gateway issues `…/invocations/{invocation_id}:control` `retry` instead of a signal — valid only from `failed` ([`DESIGN.md:888`](../../../../serverless-runtime/docs/DESIGN.md#invocation-api)) — once the platform confirms that `retry` keeps `invocation_id` (decision D-86, `…-upreq-serverless-runtime-signals`). An invocation that fails with no `on_failure` handler moves on to `dead_lettered` ([`DESIGN.md:458`](../../../../serverless-runtime/docs/DESIGN.md#invocation-status-state-machine)), from which `retry` is not valid today; until the platform confirms both properties — `retry` keeps `invocation_id`, and `retry` is valid from `dead_lettered` — a dead invocation's instance is unwound through the fence and the order re-submitted (D-86) | unstable |
-| `POST` | `/bss-orders-workflow/v1/workflows/{orderId}/cancel` | Cancel workflow with compensation. `If-Match` REQUIRED; `Idempotency-Key` REQUIRED, recomposed as `{tenant}:{orderId}:{orderVersion}:cancel:{subject_id}`. Records an `owf_cancel_request` with the authorization snapshot (§4.4) and delivers `cancel-requested` carrying only the reference tuple and `requestRef` (`10 §3.3`); authority is re-checked at apply time by `authorize-cancel` and at the two later points of §4.4, because fencing can outlive the request by days. Never the platform's generic `:control` `cancel` (`10 §4.4`). Answers `202 Accepted` with `requestRef` | unstable |
+| `POST` | `/bss-orders-workflow/v1/workflows/{orderId}/steps/{stepId}/retry` | Retry failed step. `If-Match` with the process instance's `row_version` REQUIRED; `Idempotency-Key` REQUIRED, recomposed as `{tenant}:{orderId}:{stepId}:retry:{row_version}`. A failed step under `remediate` always holds an open manual task (`10 §4.1` *Failure*); the route is an **alias** of that task's `…/fulfillment-operator/tasks/{taskId}/retry` (`07 §3.3`): it writes the same `owf_task_resolution_request` row (action `retry`) and delivers the same `task-resolution-requested` signal, so `retry-step`'s quarantine and new attempt key (`01 §3.3`) run inside `resolve-manual-task`. A step with no open task is `not-found`; the task's own preconditions (`order-fenced`, `action-not-offered`) apply unchanged. Answers `202 Accepted` with `requestRef`. When the platform reports the invocation not live, the step is the instance's `invocation-dead` task ([`07 §4.4`](./07-manual-tasks.md#44-resolution-actions-by-reason-and-the-two-operator-roles-normative)), and the gateway issues `…/invocations/{invocation_id}:control` `retry` instead of a signal — valid only from `failed` today ([`DESIGN.md:888`](../../../../serverless-runtime/docs/DESIGN.md#invocation-api)) — once the platform confirms that `retry` keeps `invocation_id` and resumes at the faulted task (decisions D-86, D-105, `…-upreq-serverless-runtime-signals`). An invocation that fails with no `on_failure` handler moves on to `dead_lettered` ([`DESIGN.md:458`](../../../../serverless-runtime/docs/DESIGN.md#invocation-status-state-machine)), from which `retry` is not valid today; until the platform confirms those properties the re-drive is `action-not-offered`, and the fallback is the task's `cancel`, the dead-instance unwind of `01 §4.16` | unstable |
+| `POST` | `/bss-orders-workflow/v1/workflows/{orderId}/cancel` | Cancel workflow with compensation. `If-Match` REQUIRED; `Idempotency-Key` REQUIRED, recomposed as `{tenant}:{orderId}:{orderVersion}:cancel:{subject_id}`. Records an `owf_cancel_request` with the authorization snapshot (§4.4) and delivers `cancel-requested` carrying only the reference tuple and `requestRef` (`10 §3.3`); authority is re-checked at apply time by `authorize-cancel` and at the two later points of §4.4, because fencing can outlive the request by days. Never the platform's generic `:control` `cancel` (`10 §4.4`). For an instance whose invocation the platform reports not live (an open `invocation-dead` task), the request is recorded the same way and no signal is sent: the `reconciliation-sweep` worker carries it out as the dead-instance unwind, calling `authorize-cancel` and the rest of the cancel path in-process (`01 §4.16`, D-105). Answers `202 Accepted` with `requestRef` | unstable |
 
 **Removed.** `POST /bss-orders-workflow/v1/workflows` (start workflow) is **removed** in favour of
 the platform event trigger: PRD §9.1 *Start workflow* is realised by the serverless-runtime event
@@ -795,9 +799,11 @@ invocation ends itself (`01 §3.3`), so a platform re-start cannot adopt a bound
 platform's `:control` `retry` of the same invocation, valid from `failed` only
 ([`DESIGN.md:888`](../../../../serverless-runtime/docs/DESIGN.md#invocation-api)); a `dead_lettered` invocation
 ([`DESIGN.md:458`](../../../../serverless-runtime/docs/DESIGN.md#invocation-status-state-machine)) cannot be re-driven until the
-platform confirms `retry` from `dead_lettered` keeping `invocation_id`
-(`…-upreq-serverless-runtime-signals`), and until then its instance is unwound through the fence
-and the order re-submitted (D-86).
+platform confirms `retry` from `dead_lettered` keeping `invocation_id` and resuming at the faulted
+task (`…-upreq-serverless-runtime-signals`). Until then the fallback is the Seller Operator's
+cancel through the `invocation-dead` task: the instance is unwound in-process by the sweep, the
+order ends as the cancel path ends it, and the customer is re-acquired by a new order created and
+submitted through Lifecycle (`01 §4.16`, D-105).
 
 **The routes of other slices** — the approver inbox and decision of
 [`03 §3.3`](./03-approval-execution.md#33-api-contracts), the operator task queue and per-action
@@ -1245,7 +1251,7 @@ none resolves against a role string or a token claim:
 | `A` | PDP `Eq` constraint `assigned_principal = subject_id` on the target gate | assignment |
 | `A*` | read granted through the gate's order: the PDP constrains the read to the `order_id` values carrying a gate whose `assigned_principal` is the caller, supplied by the adapter as the resource-id property set | assignment |
 | `Gc` | service principal — `subject_type` is the platform service-subject type and `token_scopes` names this gear — and the PDP allows the pair for that subject, with the resource-id constraint restricted to the calling gear's own correlation (the order it was asked about); MUST NOT drive an order state transition directly | service-principal |
-| `Gr` | the **serverless-runtime** service principal, as `Gc` in its principal requirement, allowed `process_step × execute` only for an enumerated `operation` value (§3.1) and restricted to the call's `correlationId` within its `resource_tenant_id` | service-principal, tenant |
+| `Gr` | the **serverless-runtime** service principal, as `Gc` in its principal requirement, allowed `process_step × execute` only for an enumerated `operation` value (§3.1) and restricted to the call's `correlationId` within its `resource_tenant_id`; the envelope further requires the call's `invocationId` to be the instance's bound invocation (`01 §3.3` step 3, D-106) | service-principal, tenant, invocation |
 | `—` | expected denial | n/a |
 
 The former code `G` (a system actor driving the process by REST start or by event) is retired:
@@ -1262,7 +1268,7 @@ signal*); `+pg` = paged (`cpt-cf-bss-orders-workflow-constraint-bounded-page-siz
 
 | Operation (routing-table key) | Approver | Fulfillment Operator | Seller Operator | Orders Lifecycle | Generic Approval | Subscriptions | Payments | Events/Audit | serverless-runtime |
 |-----------|----------|-----------------------|------------------|-------------------|-------------------|----------------|----------|----------|----------|
-| `POST /bss-orders-workflow/v1/steps/{operation}` (every step route) | — | — | — | — | — | — | — | — | ✓ `Gr` `+key`; `settle-from-lookup` — |
+| `POST /bss-orders-workflow/v1/steps/{operation}` (every step route) | — | — | — | — | — | — | — | — | ✓ `Gr` `+key`; `settle-from-lookup`, `retry-step` — |
 | `GET /bss-orders-workflow/v1/workflows/{orderId}/progress` | ✓ `A*`, §4.5 projection | ✓ `S` | ✓ `S` | ✓ `Gc` | — | — | — | — | — |
 | `POST /bss-orders-workflow/v1/workflows/{orderId}/steps/{stepId}/retry` | — | ✓ `S` `+own+aud+ver+key+sig` | ✓ `S` `+own+aud+ver+key+sig` | — | — | — | — | — | — |
 | `POST /bss-orders-workflow/v1/workflows/{orderId}/cancel` | — | — | ✓ `S` `+own+aud+ver+key+sig+re` | — | — | — | — | — | — |
@@ -1360,7 +1366,12 @@ generalizes to every service principal following the sibling Orders Lifecycle de
 for its own workflow-seam operations (`DECISIONS.md` D-37 as amended by D-63). For `Gr` the
 consequence is sharp: a principal that could present the serverless-runtime scope could drive any
 step of any instance, which is why the grant is additionally restricted per call to the named
-`correlationId` and enumerated `operation`, and why `settle-from-lookup` is outside it.
+`correlationId` and enumerated `operation`, why the envelope binds each call to the instance's
+invocation and `run-cancellation-fence` requires a recorded cause for its trigger (D-106), and why
+`settle-from-lookup` and `retry-step` are outside it. The residual is a principal holding that
+scope that also learns an instance's invocation id (the progress read shows it to an operator);
+it closes when the platform asserts the invocation on the call itself
+(`…-upreq-serverless-runtime-attempt-and-deadline-propagation`).
 
 Three of the four PRD system actors — Generic Approval, Subscriptions, Payments — are restricted
 to reporting an outcome; none of the three may drive an order state transition directly, and none
@@ -1566,10 +1577,10 @@ the fence of [`10 §4.1`](./10-process-definition.md#41-the-fence)
 protected operation of its own, so it adds no ordering constraint; it constrains what a definition
 may call and what its signals may carry.
 
-1. [ ] - `p1` - **Call targets are the enumerated values.** Every `call` **MUST** target `POST /bss-orders-workflow/v1/steps/{operation}` with `{operation}` one of the thirty-four granted values of §3.1; `settle-from-lookup` **MUST NOT** appear; no `call` **MAY** target a control, read, task or approval route of this gear, since the `Gr` principal holds no pair on them and the call would be refused at run time rather than at publish (`10 §2.2` rules 1–2) - `inst-c9-call-targets`
+1. [ ] - `p1` - **Call targets are the enumerated values.** Every `call` **MUST** target `POST /bss-orders-workflow/v1/steps/{operation}` with `{operation}` one of the thirty-three granted values of §3.1; `settle-from-lookup` and `retry-step` **MUST NOT** appear; no `call` **MAY** target a control, read, task or approval route of this gear, since the `Gr` principal holds no pair on them and the call would be refused at run time rather than at publish (`10 §2.2` rules 1–2) - `inst-c9-call-targets`
 2. [ ] - `p1` - **Authority never crosses.** No task `input`, `output`, `export` or signal payload **MAY** carry a `subject_id`, `subject_type`, `token_scopes`, a PDP constraint, a justification or any snapshot field; a signal carries the reference tuple and `requestRef` (and `taskRef` for `task-resolution-requested`) only, and the consuming operation reads the request row by `requestRef` (`10 §2.2` rule 5, ADR-0013) - `inst-c9-no-authority`
 3. [ ] - `p1` - **Signals this slice originates.** `cancel-requested` (from `POST …/cancel`) **MUST** be consumable in every competing `fork` of the process and **MUST** route to `authorize-cancel` before `run-cancellation-fence` (`10 §3.6` (d), `08 §4.7` item 5); `task-resolution-requested` (from `POST …/steps/{stepId}/retry`, as from slice 07's routes) **MUST** be consumed by an arm that calls `resolve-manual-task` (`10 §3.6` (c), `07 §4.8`). A signal type with no authorized origin route (§3.3 *Signals with no registered origin route*) **MUST NOT** be relied on by a published version until its route is registered - `inst-c9-signals`
-4. [ ] - `p1` - **No platform lifecycle control for order semantics.** A definition **MUST NOT** depend on the platform's generic `:control` `cancel`, `suspend` or `resume` being issued for an order; this slice issues only `retry`, and only for an invocation the platform reports `failed` (§3.3, `10 §4.4`) - `inst-c9-no-generic-control`
+4. [ ] - `p1` - **No platform lifecycle control for order semantics.** A definition **MUST NOT** depend on the platform's generic `:control` `cancel`, `suspend` or `resume` being issued for an order; this slice issues only `retry`, only through an `invocation-dead` task and only from a state the platform offers it from (§3.3, `10 §4.4`, D-105) - `inst-c9-no-generic-control`
 5. [ ] - `p1` - **Refusals are not swallowed.** A step call refused under §4.2 (`not-authorized` 403 or `not-found` 404 from the PDP decision) is a permanent failure of that call; a `catch` **MUST NOT** convert it into a settled success, and a protected operation's refusal **MUST** reach the stage's failure arm (`10 §4.6`) - `inst-c9-refusals`
 
 ## 5. Traceability

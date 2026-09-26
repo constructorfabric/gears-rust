@@ -281,7 +281,7 @@ consumer-supplied hook before publish — a pending ask
 (`cpt-cf-bss-orders-workflow-upreq-serverless-runtime-definition-versioning-validation-hook`,
 [`../UPSTREAM_REQS.md`](../UPSTREAM_REQS.md) §2.9) — in that hook (§3.2):
 
-1. [ ] - `p1` - Every `protected` operation of each path appears exactly where §4 *The fence* orders it; `settle-from-lookup` never appears - `inst-def-protected-present`
+1. [ ] - `p1` - Every `protected` operation of each path appears exactly where §4 *The fence* orders it; `settle-from-lookup` and `retry-step`, which run only in-process (`01 §3.3`, D-108), never appear - `inst-def-protected-present`
 2. [ ] - `p1` - Every `call: http` targets `POST /bss-orders-workflow/v1/steps/{operation}` with `{operation}` a row of `owf_step_operation`; a `call` to a Function is allowed only where the corresponding operation is `composable` - `inst-def-call-targets`
 3. [ ] - `p1` - Every `listen` filter type is in the closed set above and carries the two correlations - `inst-def-listen-targets`
 4. [ ] - `p1` - Bounds nest: for every `call`, the operation's `deadline_ms` **<** the cumulative backoff of its retry policy **<** the task's `timeout` **<** the overdue `wait` **<** the lifetime `wait` - `inst-def-bounds-nest`
@@ -489,11 +489,11 @@ payload that deliver a Temporal signal are an **upstream ask** (§3.3).
 | Purpose | Platform endpoint | Reference | Orders' use |
 |---------|-------------------|-----------|-------------|
 | Register draft, validate, publish, list versions, deprecate | `/api/serverless-runtime/v1/functions` (CRUD over Function and Workflow entities) | `DESIGN.md:857` | Publishing a definition version from the release pipeline after the CI test of §3.2; the validation hook would run inside "validate" and "publish" once the platform calls a consumer hook (pending ask); `owf_definition_binding` is to block archive/delete of a bound version through that hook, and until then through the pipeline |
-| Start an invocation | `POST /api/serverless-runtime/v1/invocations` with `function_id`, `mode: async`, `params`, `Idempotency-Key` | `DESIGN.md:865`, `DESIGN.md:895`–`910` | Not called by Orders — the event trigger starts every invocation. An operator re-drive is `…:control` `retry` from `failed` keeping `invocation_id` (D-86), never a second start; with no function-level handler a failure goes on to `dead_lettered` (`DESIGN.md:458`), from which `retry` is not offered (`DESIGN.md:888`), and "retry from `dead_lettered`, keeping `invocation_id`" is part of the signals ask; until both are confirmed the instance is unwound and the order re-submitted, which starts through the trigger again |
-| Read invocation status | `GET /api/serverless-runtime/v1/invocations/{invocation_id}` | `DESIGN.md:867` | The `reconciliation-sweep` worker's no-live-invocation metric (`01 §3.8`) and the progress read (`09`) |
-| Generic control | `POST …/invocations/{invocation_id}:control` (`cancel`, `suspend`, `resume`, `retry`, `replay`) | `DESIGN.md:868`, `DESIGN.md:883`–`889` | `retry` from `failed` by an operator re-drive only (the only state the platform offers it from, `DESIGN.md:888`); `cancel` **never** for an order cancel (§3.2); `suspend`/`resume` **never** — hold is a definition arm, not a platform suspension |
+| Start an invocation | `POST /api/serverless-runtime/v1/invocations` with `function_id`, `mode: async`, `params`, `Idempotency-Key` | `DESIGN.md:865`, `DESIGN.md:895`–`910` | Not called by Orders — the two event triggers are the only start of `order_process` (`02 §2.2`, D-107), and a direct start by another caller is asked to be refused platform-side (`…-upreq-serverless-runtime-invocation-control-restriction`); one that happens anyway meets `admit-trigger`'s tenant, category and state checks. An operator re-drive is `…:control` `retry` keeping `invocation_id` (D-86), never a second start; with no function-level handler a failure goes on to `dead_lettered` (`DESIGN.md:458`), from which `retry` is not offered (`DESIGN.md:888`), and "retry from `dead_lettered`, keeping `invocation_id`, resuming at the faulted task" is part of the signals ask; until it is confirmed, the fallback is the dead-instance unwind of `01 §4.16` and a new order (D-105) |
+| Read invocation status | `GET /api/serverless-runtime/v1/invocations/{invocation_id}` | `DESIGN.md:867` | The instance liveness pass of the `reconciliation-sweep` worker, which raises an instance whose invocation is not live as an `invocation-dead` task (`01 §3.8`, D-105), and the progress read (`09`) |
+| Generic control | `POST …/invocations/{invocation_id}:control` (`cancel`, `suspend`, `resume`, `retry`, `replay`) | `DESIGN.md:868`, `DESIGN.md:883`–`889` | `retry` by an operator re-drive only, through the `invocation-dead` task (`07 §4.4`), from the states the platform offers it from (`failed` today, `DESIGN.md:888`); `cancel` **never** for an order cancel (§3.2); `suspend`/`resume` **never** — hold is a definition arm, not a platform suspension. Orders cannot stop another caller issuing them: a generic `cancel` surfaces as `canceled` and is raised by the liveness pass, a generic `suspend` only when it times out into `failed`; denying them on `order_process` is `…-upreq-serverless-runtime-invocation-control-restriction` (§4.4) |
 | Plugin control (signals) | `POST …/invocations/{invocation_id}:plugin-control` | `DESIGN.md:869`, `DESIGN.md:893` | Delivery of `cancel-requested`, `reauthorize-requested`, `task-resolution-requested` and `unpark-requested` to the running invocation's `listen` arms |
-| Event trigger binding | `/api/serverless-runtime/v1/event-triggers` (create, enable, disable, metrics) | `DESIGN.md:980`–`987` | Two trigger bindings to `order_process`, the one start mechanism (the document declares no `schedule`) — `OrderSubmitted`, filtered to `category = new_sale`, and `OrderAmended` (`02 §2.2`) — each with `callable_type: workflow` and `execution_context: system`, the platform identity ([DESIGN_GTS_SCHEMAS.md](../../../../serverless-runtime/docs/DESIGN_GTS_SCHEMAS.md) line 1697), because an `event_source` identity would be Lifecycle's producer principal, which the step route refuses; their dead-letter handling is the trigger's `dead_letter_queue` (line 1651; its management API is out of the platform's scope) (`01 §4.8`) |
+| Event trigger binding | `/api/serverless-runtime/v1/event-triggers` (create, enable, disable, metrics) | `DESIGN.md:980`–`987` | Two trigger bindings to `order_process`, the one start mechanism (the document declares no `schedule`), declared in the repository's `definitions/` beside the definition and applied only by the release pipeline (§3.8, D-107) — `OrderSubmitted`, filtered to `category = new_sale` (a routing filter; `admit-trigger` re-checks the category and the tenant from the Lifecycle read, `02 §3.6`), and `OrderAmended` (`02 §2.2`) — each with `callable_type: workflow` and `execution_context: system`, the platform identity ([DESIGN_GTS_SCHEMAS.md](../../../../serverless-runtime/docs/DESIGN_GTS_SCHEMAS.md) line 1697), because an `event_source` identity would be Lifecycle's producer principal, which the step route refuses; their dead-letter handling is the trigger's `dead_letter_queue` (line 1651; its management API is out of the platform's scope) (`01 §4.8`) |
 | Timeline (debug) | `GET …/invocations/{invocation_id}/timeline` | `DESIGN.md:1061` | Operator debugging only; never an Orders read path |
 
 **Signals.** The operator-facing instructions map as follows:
@@ -695,12 +695,14 @@ use:
     wave2:     { after: { minutes: 3 } }     # nfr-owf-fulfillment-sla (D-70)
     admission: { after: { hours: 25 } }      # above the 24 h supersession budget
 # no `schedule`: the only start mechanism is the two platform event triggers of §3.3
+# triggerKind is looked up from the exact event type (D-107): any other type yields null, which admit-trigger's schema refuses
 input:
   from: >-
     ${ { stepsBase: "‹the step surface base URL of this environment, 01 §3.3›",
          orderId: .data.orderId, orderVersion: .data.orderVersion,
          resourceTenantId: .data.resourceTenantId, triggerEventId: .id,
-         triggerKind: (if (.type | endswith("amended.v1~")) then "OrderAmended" else "OrderSubmitted" end),
+         triggerKind: ({ "gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.submitted.v1~": "OrderSubmitted",
+                         "gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.amended.v1~": "OrderAmended" }[.type]),
          nextStage: "approval", stageLoop: null, returnStage: null, preAdmitted: false,
          verdictRound: 0, reflectRound: 0, attemptKey: null, overdueRound: 0 } }
 do:
@@ -749,7 +751,7 @@ do:
       export: { as: '${ $context + { rowVersion: .rowVersion, boundInvocationId: .invocationId } }' }
   - onBinding:
       switch:
-        - notMine: { when: '${ $context.boundInvocationId != $workflow.id }', then: end }   # 01 §3.3: an existing binding answered; this invocation ends
+        - notMine: { when: '${ $context.boundInvocationId != $workflow.id }', then: end }   # 01 §3.3: start-instance answers the bound invocationId; another invocation's id means a duplicate, which ends
         - mine:    { then: lifetime }
   - lifetime:
       fork:
@@ -2099,7 +2101,14 @@ side of the topology is: the step surface of `01 §3.3` reachable from the plugi
 the service principal; the two event triggers of §3.3 (`execution_context: system`)
 provisioned once per environment and enabled only after the readiness gate; the validation hook of §3.2 registered with the platform registry once
 the platform calls a consumer hook (a pending ask; until then the CI test is the gate); and the repository
-`definitions/` directory published to the registry by the release pipeline, never by hand. One
+`definitions/` directory published to the registry by the release pipeline, never by hand. The two
+trigger bindings are part of that directory (decision D-107): their event type, filter,
+`callable_type` and `execution_context` are reviewed and CI-checked with the definition — the CI
+test asserts exactly the two bindings of `02 §2.2`, both `execution_context: system`, the
+`OrderSubmitted` one filtered to `new_sale` — and applied by the same pipeline under the same
+platform-operator publish role, and the readiness check compares the bindings the platform lists
+for `order_process` with the repository's and reports any drift. A binding edited by hand is
+therefore a drift alert, and the run-time guard behind it is `admit-trigger`'s re-check. One
 definition version is **active for new instances** per environment at a time; older versions stay
 published while bindings name them and are deprecated, never deleted, thereafter.
 
@@ -2107,8 +2116,9 @@ published while bindings name them and are deprecated, never deleted, thereafter
 bound per version (`01 §3.8`); validation-hook refusals by rule; signal deliveries by type and
 delivery outcome; the platform's invocation status distribution for `order_process` read from
 `GET /api/serverless-runtime/v1/invocations` (`DESIGN.md:866`) — `suspended` is the normal state
-of a healthy long-running instance; `failed` and `dead_lettered` are what the
-`reconciliation-sweep` worker reports as intents with no live invocation (`01 §3.8`).
+of a healthy long-running instance; `failed`, `dead_lettered`, `canceled`, `compensating`,
+`compensated` and `succeeded` on a bound non-terminal instance are what the `reconciliation-sweep`
+worker's instance liveness pass raises as an `invocation-dead` task (`01 §3.8`, D-105).
 
 ## 4. Definition Normative Rules
 
@@ -2127,12 +2137,12 @@ any of them:
 | Verdict | `obtain-verdict` **<** `reflect-verdict`; `record-decision` **<** `reflect-verdict` on the decision path | `open-gates`, `escalate-gate`, `arm-park-escalation`, `park`, `unpark` |
 | Plan | `evaluate-payment-auth-eligibility` **<** `construct-and-freeze-plan` **<** `begin-fulfillment` | `evaluate-activation-eligibility` |
 | Waves | `begin-fulfillment` **<** `dispatch-wave1-create` **<** `re-check-pre-activation` **<** `report-spawn-signal` **<** `dispatch-wave2-activate` | `evaluate-activation-eligibility`, `reconcile-intent`, `reread-draft-liveness`, `rebuild-wave1` |
-| Failure | `create-manual-task` before any terminal outcome under `remediate` | `resolve-manual-task`, `verify-override`, `retry-step`, `raise-overdue-escalation` |
+| Failure | `create-manual-task` before any terminal outcome under `remediate` | `resolve-manual-task` (which runs `retry-step` in-process), `verify-override`, `raise-overdue-escalation` |
 | Unwind | `run-cancellation-fence` **<** `compensate-order` **<** `report-outcome` on every failure, cancel, supersede and terminal-event path; `authorize-cancel` **<** `run-cancellation-fence` on the cancel path; `terminate-on-terminal-event` **<** `run-cancellation-fence` on the terminal-event path | — |
 | Hold | `apply-hold` **<** `apply-resume`, in the arm that owns the escalation `wait` | — |
 | Termination | `terminate-instance` last on every path; `report-outcome` **<** `terminate-instance` where an outcome is reported | — |
 
-`settle-from-lookup` **MUST NOT** appear. No path **MAY** reach `report-outcome` with
+`settle-from-lookup` and `retry-step` **MUST NOT** appear (D-108). No path **MAY** reach `report-outcome` with
 `outcome: completed` except through `dispatch-wave2-activate`, and none **MAY** reach it with
 `failed`, `cancelled` or `superseded` except through `compensate-order`. **Rationale**: these are
 the steps the PRD's acceptance criteria and the seam rules R1–R5 make non-negotiable; everything
@@ -2190,6 +2200,16 @@ the platform cannot guarantee that, the originating control operation **MUST** a
 `still-processing` until Orders observes the arm's recording operation (`authorize-cancel`,
 `evaluate-payment-auth-eligibility`, `resolve-manual-task`). The exact `:plugin-control` verb and payload are an
 upstream ask (§3.3); this rule binds regardless of their shape.
+
+Orders issues no generic `cancel`, `suspend` or `resume`, and it **cannot prevent** another
+platform-authorized caller from issuing them (`../ADR/0010` *platform APIs are authorized
+platform-side*). What it does instead (decision D-105): a `canceled` invocation, and a suspension
+that times out into `failed`, are raised by the instance liveness pass as an `invocation-dead`
+task (`01 §3.8`); the platform is asked to deny generic `cancel`, `suspend` and `resume` on
+`order_process` invocations to every caller and `retry` to all but this gear's control gateway
+(`…-upreq-serverless-runtime-invocation-control-restriction`). Until then a generic `suspend`
+freezes the order, including the lifetime ceiling, undetected until the platform's suspension
+limit fails it.
 
 ### 4.5 The hold pattern, and Q-11
 

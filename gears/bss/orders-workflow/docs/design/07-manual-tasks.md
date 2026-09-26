@@ -706,6 +706,7 @@ failed-entrance route is a change to this table.
 | Compensation leg `failed-pending-escalation` (06) | `compensate-order`, creation port, **either policy** | `line` | `draft-void-failed`, `activated-cancel-failed` |
 | Apply-time authority re-check fails (08, `09 §4`) | `authorize-cancel`, creation port | `order` | `authority-withdrawn` |
 | Lifetime ceiling (ceiling stage, fragment (d)) | `raise-overdue-escalation` `lifetime-ceiling`, creation port | `order` | `lifetime-ceiling-reached` |
+| Invocation no longer live (`01 §3.8` *Instance liveness pass*) | `reconciliation-sweep` worker, creation port, **either policy** — no definition runs to call `create-manual-task` | `order` | `invocation-dead` |
 
 Under `fail-fast` the definition does not call `create-manual-task` for a forward line or an
 `invalid-dependency-graph` plan; those subjects reach the incident port inside
@@ -1002,8 +1003,8 @@ it.
 | task_scope | enum | `line` \| `plan` \| `order` — the subject the task is about (slice 04 §4.7 ask) |
 | scope_ref | text | `lineRef`, `planRef` or `correlationId`, per `task_scope`; replaces the former `*plan*` sentinel |
 | line_ref | text, nullable | Line item reference; equals `scope_ref` when `task_scope = line`, NULL otherwise |
-| failure_reason | enum | **Enum, not text**; a catalogue reason (`01 §4.9`). Line: `wave1-create-failed`, `wave2-activation-failed`, `never-dispatched`, `intent-unresolved`; compensation (line): `draft-void-failed`, `activated-cancel-failed`, `blocked-upstream`; plan: `invalid-dependency-graph`, `catalog-topology-unavailable`; order: `trigger-applicability-unverified`, `approval-reflection-refused`, `authority-withdrawn`, `lifetime-ceiling-reached`. The wave pair is the **wave discriminator** the PRD requires. `overlap-collision` and `market-divergence` are **not** members: a pre-activation abort creates no task (04 §2.1) |
-| failure_cause | enum | Why, orthogonal to which step: `retry-budget-exhausted`, `step-deadline-exceeded`, `explicit-failure-confirmation`, `sweep-discovered-terminal-failure`, `sweep-floor-reached`, `permanent-refusal`, `plan-not-frozen`, `lifetime-elapsed` |
+| failure_reason | enum | **Enum, not text**; a catalogue reason (`01 §4.9`). Line: `wave1-create-failed`, `wave2-activation-failed`, `never-dispatched`, `intent-unresolved`; compensation (line): `draft-void-failed`, `activated-cancel-failed`, `blocked-upstream`; plan: `invalid-dependency-graph`, `catalog-topology-unavailable`; order: `trigger-applicability-unverified`, `approval-reflection-refused`, `authority-withdrawn`, `lifetime-ceiling-reached`, `invocation-dead`. The wave pair is the **wave discriminator** the PRD requires. `overlap-collision` and `market-divergence` are **not** members: a pre-activation abort creates no task (04 §2.1) |
+| failure_cause | enum | Why, orthogonal to which step: `retry-budget-exhausted`, `step-deadline-exceeded`, `explicit-failure-confirmation`, `sweep-discovered-terminal-failure`, `sweep-floor-reached`, `permanent-refusal`, `plan-not-frozen`, `lifetime-elapsed`, `invocation-ended` (the platform reports the bound invocation not live, `01 §3.8`) |
 | source_step | text | The operation whose failure produced the entrance (`sourceStep`) |
 | source_attempt | integer | That step's key `attempt` component at the entrance |
 | severity | enum | `normal` \| `urgent` \| `escalated`. `activated-cancel-failed` is created `urgent` |
@@ -1263,6 +1264,7 @@ where `class_window` is chosen by whether the stuck subject is **resource-affect
 | `draft-void-failed` | no — same reason, in reverse | **24 h** |
 | `invalid-dependency-graph`, `catalog-topology-unavailable` | no — nothing is provisioned before the plan freezes | **24 h** |
 | `trigger-applicability-unverified`, `approval-reflection-refused`, `authority-withdrawn`, `lifetime-ceiling-reached` | no — an order-scope decision, not a live resource | **24 h** |
+| `invocation-dead` | yes — nothing drives the order any more, and activated subscriptions may be live with no report pending (D-105) | **4 h** |
 | dead-letter triage (pending) | no — the delivery was not processed at all | **24 h** |
 
 These are working baselines proposed into the program-wide NFR workshop, not registered decisions
@@ -1335,6 +1337,7 @@ forward task under `remediate`, projected as a flag, not an assignment state).
 | `line`, compensation reason | yes while the fence is open; not on a terminal order | no — there is no fulfillment to confirm | yes | no while the subject is live |
 | `plan` | yes — a new `attempt` of `construct-and-freeze-plan` | no | yes | Seller Operator |
 | `order` | yes — re-enter the stage whose operation failed (`admit-trigger`, `reflect-verdict`, `authorize-cancel`); for `lifetime-ceiling-reached`, `unpark` through the task-resolution arm of the lifetime-ceiling park in `10 §3.6` (d), beside its unpark-requested arm | no | yes | Seller Operator |
+| `order`, `invocation-dead` | the platform re-drive — the control gateway issues `…:control` `retry` of the bound invocation instead of a signal ([`01 §4.16`](./01-foundation.md#416-recovery-is-the-platforms-invocation-and-orders-record) item 1); offered only from a platform state the platform confirms `retry` from, keeping `invocation_id` and resuming at the faulted task, and never once the fence is claimed (`order-fenced`) | no | yes | Seller Operator — the order cancel of `09 §3.3`, which, with no invocation to signal, the liveness pass carries out as the dead-instance unwind (`01 §4.16` item 2) |
 
 The Fulfillment Operator (`cpt-cf-bss-orders-workflow-actor-owf-fulfillment-operator`) views the
 queue within their seller scope and submits `assign` (self), `retry`, `override` and `escalate`.
@@ -1357,7 +1360,7 @@ reopen that leak with a longer retention.
 
 1. [ ] - `p1` - **Records before answers.** Each operation writes its rows, its audit entry and its step record in the unit of work that settles its key (`01 §3.3`); a creation-port or incident-port call writes in its caller's unit of work and inherits its caller's key - `inst-r7-uow`
 2. [ ] - `p1` - **Keys.** The keys are those of §3.3 and nothing else; `create-manual-task`'s key includes the source step's `attempt`, so a re-failure after a retry reaches the reopen branch, and a replay of the same failure is absorbed - `inst-r7-keys`
-3. [ ] - `p1` - **Actor from the request row.** `resolve-manual-task` and `verify-override` **MUST** take the actor from `owf_task_resolution_request.requested_by`; they **MUST NOT** record the serverless-runtime service principal as the actor of an operator's action - `inst-r7-actor`
+3. [ ] - `p1` - **Actor from the request row.** `resolve-manual-task`, `verify-override` and `retry-step` (run in-process inside the `retry` resolution with the request's `requestRef`, `01 §3.3`, D-108) **MUST** take the actor from `owf_task_resolution_request.requested_by`; they **MUST NOT** record the serverless-runtime service principal as the actor of an operator's action - `inst-r7-actor`
 4. [ ] - `p1` - **Authoritative fence check.** The fence and terminal preconditions **MUST** be re-checked inside `resolve-manual-task` and `verify-override`; the control endpoint's check is advisory - `inst-r7-fence`
 5. [ ] - `p1` - **Refusal codes.** Control endpoints: `not-found` (outside scope, 404), `version-mismatch` (`If-Match`, 409), `idempotency-key-mismatch` (400), `order-fenced` (400), `action-not-offered` (400), `not-authorized` (403, a Fulfillment Operator attempting a Seller Operator action on a row it may read). Operations: the `reasons` column of §3.3 - `inst-r7-refusals`
 6. [ ] - `p1` - **One pending request per task.** A second `retry`/`override`/`cancel` while one is `requested` is refused `version-mismatch` by the partial unique index, never queued - `inst-r7-one-request`
@@ -1375,11 +1378,11 @@ for the four operations; the per-action task routes of §3.3 are the resolution 
 `manual_task × escalate` and `assign` as in §4.4; `dead_letter × *` marked pending;
 (d) **slice 10** — `task-resolution-requested` joins the closed `listen` set and the signal table of
 §3.3; fragment (c) gains the SLA branch, the `exhaustedTaskRefs` and `exhausted` routing and the
-`resumeAt` routing of §4.8; (e) **reason catalogue** (`01 §4.9`) — four reasons owned by
+`resumeAt` routing of §4.8; (e) **reason catalogue** (`01 §4.9`) — five reasons owned by
 `07-manual-tasks`: `order-fenced` (`ORDER_FENCED`, FailedPrecondition, 400), `action-not-offered`
 (`ACTION_NOT_OFFERED`, FailedPrecondition, 400), `override-unverified` (`OVERRIDE_UNVERIFIED`,
 FailedPrecondition, 400), `lifetime-ceiling-reached` (`LIFETIME_CEILING_REACHED`,
-FailedPrecondition, 400) — and, used on its tasks but owned by `03-approval-execution`,
+FailedPrecondition, 400), `invocation-dead` (`INVOCATION_DEAD`, FailedPrecondition, 400; D-105) — and, used on its tasks but owned by `03-approval-execution`,
 `approval-reflection-refused` (`APPROVAL_REFLECTION_REFUSED`, FailedPrecondition, 400), with `intent-unresolved` as slice 05
 registers it (decision D-98: the manual-task reason enum is the catalogue
 subset of §3.7, covering plan-level, order-level and lifetime-ceiling subjects);
@@ -1395,7 +1398,7 @@ the items marked **alignment** are the ones folded into the canonical fragments 
 when the fragments were reconciled with the slice operations (D-80, D-81):
 
 1. [ ] - `p1` - **Creation before terminal.** On every failure path under `remediate`, and on the plan-level `topology-unavailable` path under either policy, `create-manual-task` **MUST** precede any `run-cancellation-fence`, `report-outcome` or `terminate-instance`; under `fail-fast` the definition **MUST NOT** call it for a forward line or `invalid-dependency-graph` subject - `inst-c7-create-first`
-2. [ ] - `p1` - **No swallowing.** `create-manual-task` **MUST NOT** be inside a `catch` that continues the forward path (`10 §4.6`); its retry exhaustion fails the invocation, whose platform status the backstop sweep observes (`01 §3.8`) - `inst-c7-no-swallow`
+2. [ ] - `p1` - **No swallowing.** `create-manual-task` **MUST NOT** be inside a `catch` that continues the forward path (`10 §4.6`); its retry exhaustion fails the invocation, which the sweep's instance liveness pass raises as an `invocation-dead` task within one pass interval (`01 §3.8`, D-105) - `inst-c7-no-swallow`
 3. [ ] - `p1` - **Every task has a waiter.** Every arm that follows `create-manual-task` — fragment (c)'s `awaitResolution` and `awaitCompensationResolution`, and the arms after a refused reflection (03), an unverified trigger (02) and a withdrawn authority (08) — **MUST** be a competing `fork` containing the `task-resolution-requested` `listen` followed by `resolve-manual-task`, and an SLA branch that waits the fixed `PT5M` `waitSla` tick and then calls `resolve-manual-task` with `trigger: sla-check` and the last `slaRound`, carrying no remainder; the call **MUST** be a no-op until the stored SLA deadline has passed - `inst-c7-waiter`
 4. [ ] - `p1` - **Routing on the answer.** `exhaustedTaskRefs` non-empty after `create-manual-task`, `exhausted` from `resolve-manual-task`, and `exhausted: true` from `verify-override` **MUST** route to `compensateOrder`; `retry` **MUST** route by `resumeAt` (`barrier`, `plan`, `compensation`, `stage`) and carry `attemptKey`; `closed`, `escalated`, `refused` and `none` **MUST** return to the waiting fork (**alignment**: fragment (c) routes every `retry` to `barrier` and does not read `exhaustedTaskRefs`) - `inst-c7-routing`
 5. [ ] - `p1` - **Override order.** `verify-override` **MUST** follow a `resolve-manual-task` that answered `override` for the same `requestRef`, and **MUST NOT** be called otherwise - `inst-c7-override-order`

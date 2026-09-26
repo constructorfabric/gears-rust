@@ -123,6 +123,10 @@
   - [D-102 (H) One rule for re-invokable operations: a round in, the next round out, a counter on the instance row, an attempt only from an operator retry](#d-102-h-one-rule-for-re-invokable-operations-a-round-in-the-next-round-out-a-counter-on-the-instance-row-an-attempt-only-from-an-operator-retry)
   - [D-103 (M) The registry lease is fenced by a holder token, sized below the retry horizon, and resolved per key family](#d-103-m-the-registry-lease-is-fenced-by-a-holder-token-sized-below-the-retry-horizon-and-resolved-per-key-family)
   - [D-104 (M) No Workflow-owned table is partitioned; registry rows are kept as tombstones until no replay can arrive](#d-104-m-no-workflow-owned-table-is-partitioned-registry-rows-are-kept-as-tombstones-until-no-replay-can-arrive)
+  - [D-105 (H) A dead invocation is raised as one order-scope task; the platform re-drive is the recovery, an Orders-driven cancel the fallback](#d-105-h-a-dead-invocation-is-raised-as-one-order-scope-task-the-platform-re-drive-is-the-recovery-an-orders-driven-cancel-the-fallback)
+  - [D-106 (H) Every step call is bound to the instance's invocation, and the fence needs a recorded cause](#d-106-h-every-step-call-is-bound-to-the-instances-invocation-and-the-fence-needs-a-recorded-cause)
+  - [D-107 (M) The start is checked against the Lifecycle order, and the bindings are released with the definition](#d-107-m-the-start-is-checked-against-the-lifecycle-order-and-the-bindings-are-released-with-the-definition)
+  - [D-108 (M) `retry-step` runs only in-process, with the actor from the request row](#d-108-m-retry-step-runs-only-in-process-with-the-actor-from-the-request-row)
 - [Open Questions](#open-questions)
   - [Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?](#q-01-which-durable-execution-substrate-backs-the-process--the-oss-workflow-engine-or-a-bss-local-mechanism)
   - [Q-02: The Generic Approval escalation threshold — the one PRD-deferred numeric value this design deliberately leaves unset](#q-02-the-generic-approval-escalation-threshold--the-one-prd-deferred-numeric-value-this-design-deliberately-leaves-unset)
@@ -1680,6 +1684,12 @@ and the run-time guard makes the fence hold even for a publish outside the pipel
 **Propagated**: `design/10-process-definition.md` §2.2, §4.1, §4.2, §4.6; each slice §3.3
 `protection`; `design/09-read-and-authz.md` §3.1; `DESIGN.md` §2.2, §4.2.
 
+**Amended (2026-09-26)**: the run-time guard did not hold for the unwind path —
+`run-cancellation-fence` with `trigger = failure` checked only that the instance was not terminal
+(OW2-58). It now requires a recorded cause for every trigger, and every step call after
+`start-instance` is bound to the instance's invocation (D-106). `retry-step` and
+`settle-from-lookup` are never `call` targets (D-108); the counts are unchanged.
+
 ### D-68 (H) Instances are pinned to their definition version; the platform operator publishes
 
 **Accepted.** *(carries `ADR/0012`, versioning half)*
@@ -1809,6 +1819,11 @@ a dead lease on any other key is re-run under a new holder by its next same-key 
 record-only operation leaves none (D-103). The roster is unchanged: still no dead-lease scan.
 The retention purge deletes row-wise; no table is partitioned (D-104).
 
+**Amended (2026-09-26), second**: reading invocation status "only to report" is withdrawn. The
+sweep's pass gains an **instance liveness pass** over non-terminal instances by
+`next_liveness_at`, which raises an instance whose invocation is not live as an `invocation-dead`
+task and drives the dead-instance unwind after a cancel (D-105). Still three workers.
+
 ### D-72 (M) Inbound dead letters are the platform trigger path's; `owf_dead_letter_record` is retired
 
 **Accepted.** *(amends D-04, D-05, D-44)*
@@ -1851,6 +1866,10 @@ the same protected operation on every path.
 **Propagated**: `design/02-triggers-and-start.md` §2.2, §3.3; `design/10-process-definition.md`
 §2.2 rule 7, §3.3; `design/09-read-and-authz.md` §3.1, §3.3, §4.1; `DESIGN.md` §3.3;
 `UPSTREAM_REQS.md` §2.8 item 4, §4 item 8.
+
+**Amended (2026-09-26)**: the `new_sale` filter is a routing filter, not the guard. The bindings
+are released with the definition, and `admit-trigger` re-checks the tenant and the category from
+the Lifecycle read (D-107).
 
 ### D-74 (M) The idempotency key families gain the trigger family and two round components
 
@@ -1942,6 +1961,9 @@ whose manual task slice 07 creates (`01 §4.9`). The engine contributes ten fami
 
 **Propagated**: `design/01-foundation.md` §3.3 *Error surface*, §4.9; slices 02, 03, 04, 05, 06, 07 §3.3;
 `DESIGN.md` §3.3 *Error envelope*.
+
+**Amended (2026-09-26)**: `invocation-dead` is registered for slice 07 (D-105); the catalogue is
+**43** reasons — ten engine, thirty-three slice.
 
 ### D-78 (M) The barrier and the park are definition patterns over Orders guards
 
@@ -2155,6 +2177,11 @@ own retry of the same invocation preserves the one-to-one binding the record dep
 
 **Propagated**: `design/09-read-and-authz.md` §3.3; `design/01-foundation.md` §3.3;
 `UPSTREAM_REQS.md` §2.9; `DESIGN.md` §4.5.
+
+**Amended (2026-09-26)**: "unwound and re-submitted" is replaced by D-105. The platform re-drive is
+the recovery, and it must also resume at the faulted task. The fallback is a Seller Operator's
+cancel, carried out in-process by the sweep. Re-acquiring the customer takes a new order, and the
+PRD amendment for that loss is registered.
 
 ### D-87 (M) One outage threshold governs the park clock, and the gate-open outage pause is a probe arm
 
@@ -2480,6 +2507,147 @@ timing" (`01 §4.2`) is the one kept here.
 immutability*), §3.8; `design/03-approval-execution.md` §3.7; `design/04-fulfillment-plan.md`
 §3.7; `design/05-provisioning-intents.md` §3.7; `design/06-saga-and-compensation.md` §3.7;
 `design/07-manual-tasks.md` §3.7; `design/08-hold-and-cancel.md` §3.7; `DESIGN.md` §3.7, §4.1.
+
+### D-105 (H) A dead invocation is raised as one order-scope task; the platform re-drive is the recovery, an Orders-driven cancel the fallback
+
+**Accepted (2026-09-26).** *(amends D-71 and D-86)*
+
+**Decision**: the `reconciliation-sweep` pass gains an **instance liveness pass**. It pages over
+`owf_process_instance` rows that are non-terminal and bound to an invocation, with
+`next_liveness_at <= now()` (a new column, set 15 min ahead at start and after every read). For
+each row it reads `GET …/invocations/{invocation_id}`. `queued`, `running` and `suspended` are
+live. For any other status, or a 404, it creates one order-scope manual task with reason
+`invocation-dead` (new catalogue reason, owner slice 07, 4 h SLA) and cause `invocation-ended`,
+under the instance row lock, with a `sweep` audit entry. The task's uniqueness absorbs the task on
+later passes, and a re-drive that dies again reopens it. An unreadable status writes nothing.
+The task offers two resolutions:
+
+- **`retry` is the recovery** (owner ruling R3): the platform's `:control` `retry`, keeping
+  `invocation_id`. The definition is written for a re-drive that **resumes at the faulted task**.
+  A restart from the top would replay settled rounds, but it would wait for events that were
+  consumed before the fault. So `retry` is offered only once the platform confirms that it keeps
+  the invocation, resumes at the faulted task, and is valid from the status the invocation is in
+  (today `failed` only).
+- **`cancel` (Seller Operator) is the fallback**: the order cancel of `09 §3.3`. With no
+  invocation to signal, the sweep runs the cancel path in-process, one operation per pass, under
+  the keys the definition would present: `authorize-cancel`, `run-cancellation-fence`,
+  `compensate-order` until `complete`, `report-outcome`, then `terminate-instance`. Task
+  resolutions raised on the way are consumed in-process. The customer is re-acquired by a **new
+  order**, and the PRD amendment for this loss is registered (`UPSTREAM_REQS.md` §4 item 11).
+
+A `canceled` invocation raises the task the same way. A generic `suspend` by another caller
+cannot be told apart from a wait. Denying generic control on `order_process` is a new upstream ask.
+
+**Rationale**: the sweep's candidate set was non-terminal intents. An instance whose intents were
+all terminal — a Lifecycle outage past the retry budget at `report-outcome` — was not even
+metered. Its order stayed in `in_fulfillment` with live subscriptions, no task and no escalation,
+which breaks `fr-owf-dependency-resilience` and `nfr-owf-manual-task-sla` (OW2-27). "Unwound and
+re-submitted" named no actor, no executor and no Lifecycle operation. A `fulfillment_failed` or
+`cancelled` order cannot be amended (Lifecycle `01 §3.7` transitions 13–27), so the only
+re-submission is a new order, and the PRD must accept that loss explicitly (OW2-28). The platform
+states only that `retry` runs "with same parameters" (serverless-runtime `DESIGN.md:888`), so the
+resume point has to be asked for and not assumed (OW2-35). Orders cannot stop generic control, so
+it must at least detect it (OW2-67). **No precedent exists** in the platform or in the BSS gears
+for detecting a dead platform invocation, because no sibling runs a platform workflow. The
+per-row transactional recheck is the roster rule this gear adopts from Lifecycle `01 §3.8`, and
+the status read is the platform's own `GET …/invocations/{id}` (`DESIGN.md:867`). This is the
+smallest rule: one read per bound instance per interval, and one task per dead invocation.
+
+**Propagated**: `design/01-foundation.md` §3.3 (`start-instance`), §3.7 (`owf_process_instance`),
+§3.8, §4.9, §4.13, §4.16; `design/05-provisioning-intents.md` §3.8;
+`design/06-saga-and-compensation.md` §3.2, §3.6, §3.8; `design/07-manual-tasks.md` §3.3, §3.7,
+§4.1, §4.4, §4.7, §4.8; `design/09-read-and-authz.md` §3.3; `design/10-process-definition.md`
+§3.3, §3.8, §4.4; `DESIGN.md` §1.2, §3.3, §3.8, §4.2, §4.4, §4.5, §4.9;
+`UPSTREAM_REQS.md` §2.9, §3, §4; `ADR/0001`, `ADR/0005`, `ADR/0012`; D-71, D-86.
+
+### D-106 (H) Every step call is bound to the instance's invocation, and the fence needs a recorded cause
+
+**Accepted (2026-09-26).** *(amends D-67)*
+
+**Decision**: `start-instance` returns `invocationId`, the invocation bound to the instance, and
+the definition's `onBinding` compares it with `$workflow.id`. Every later step-route call must
+carry that invocation. The exceptions are `admit-trigger` in the start role and `start-instance`
+itself. The envelope compares the body's `invocationId` with `owf_process_instance.invocation_id`
+under the instance row lock. A mismatch, or no instance, is `not-found` and runs no effect.
+In-process calls are not route calls and are exempt. `run-cancellation-fence` requires a recorded
+cause per trigger:
+
+- `cancel`: a settled `authorize-cancel` that answered `true`;
+- `supersede`: a settled `supersede` admission;
+- `terminal-event`: a settled `terminate-on-terminal-event`;
+- `failure`: an exhausted task, a fail-fast failure or a settled pre-activation abort.
+
+Otherwise it answers `not-found`. The attempt-identity ask gains a clause asking the platform to
+assert the invocation on the call.
+
+**Rationale**: `start-instance`'s output schema had no `invocationId`. Built to the table, the
+definition's inequality check read null and ended every invocation (OW2-29). The `Gr` grant
+restricted a call to the `correlationId` the caller named, which is a derivable UUIDv5. Nothing
+compared the call with the bound invocation, and a `failure` fence claimed on nothing. So any
+caller holding the platform identity could fence and compensate a healthy order, and
+`DESIGN.md`'s claim that the run-time guards bound a rogue definition was false for the unwind
+(OW2-58). Precedent: the BSS `coord` lease re-checks its holder inside every write's transaction
+(`gears/bss/libs/coord/src/lease/guard.rs:160-264`, D-103), and here the bound invocation is that
+holder. The per-trigger precondition follows `terminate-on-terminal-event`, which already refuses
+`not-found` without a settled `terminate` admission (`02 §3.3`).
+
+**Propagated**: `design/01-foundation.md` §3.3 step 3, `start-instance`, §3.6, §3.7;
+`design/02-triggers-and-start.md` §3.6; `design/06-saga-and-compensation.md` §3.3, §3.6;
+`design/09-read-and-authz.md` §2.2, §4.1, §4.2; `design/10-process-definition.md` §3.6 (a);
+`DESIGN.md` §3.3, §4.2; `UPSTREAM_REQS.md` §2.9; D-67.
+
+### D-107 (M) The start is checked against the Lifecycle order, and the bindings are released with the definition
+
+**Accepted (2026-09-26).** *(amends D-73)*
+
+**Decision**:
+
+- `admit-trigger` refuses `not-found` when the order it reads from Lifecycle has a
+  `resource_tenant_id` different from the body's.
+- On the start role it admits `start` only for a `submitted` order whose `category` is
+  `new_sale`; any other category is `no-active-instance`.
+- The definition derives `triggerKind` from the exact event type. Any other type is null, which
+  the schema refuses.
+- `order_process` is started only by its two bindings. They are repository artefacts in
+  `definitions/`, CI-checked and applied by the release pipeline under the publish role, and the
+  readiness check reports drift.
+- The platform is asked to refuse other starts and to deny generic control on `order_process`
+  (`…-upreq-serverless-runtime-invocation-control-restriction`).
+
+**Rationale**: the instance's tenant axis came from the event's `data.resourceTenantId`. Any
+type not ending in `amended.v1~` became `OrderSubmitted`, and no step compared the read order's
+tenant with the body's (OW2-59). The `new_sale` filter sat only on a tenant-scoped platform object
+that anyone with binding rights can edit, outside the fence (OW2-66). Precedent: this gear already
+resolves the seller axis from the Lifecycle read, never from the task input (D-76). Lifecycle
+states that identifier equality alone never confers cross-tenant access (`08 §4`). Lifecycle
+refuses a category other than `new_sale` at creation (`category-not-admitted`, Lifecycle
+`01-foundation.md:812-814`), so the check here is defence in depth.
+
+**Propagated**: `design/02-triggers-and-start.md` §2.1, §2.2, §3.1, §3.3, §3.6, §3.8, §4.7;
+`design/10-process-definition.md` §3.3, §3.6 (a), §3.8; `DESIGN.md` §3.5, §4.2;
+`UPSTREAM_REQS.md` §2.9; D-73.
+
+### D-108 (M) `retry-step` runs only in-process, with the actor from the request row
+
+**Accepted (2026-09-26).**
+
+**Decision**: `retry-step` stays a registered `composable` operation, and it is **in-process
+only**, like `settle-from-lookup`. It runs inside `resolve-manual-task`'s `retry` resolution. Its
+`process_step × execute` value is denied to every principal, and the validation hook rejects a
+`call` to it. Its input gains `requestRef`, and it records the actor from the request row's
+`requested_by`. Thirty-three values are granted, down from thirty-four. The protected and
+composable counts are unchanged at 22 and 13.
+
+**Rationale**: the operation was granted to the platform principal for the Failure stage, but no
+definition calls it. It recorded its actor from the `SecurityContext`, which on that route is the
+serverless-runtime principal, against `07 §4.6` rule 3. A direct call would mint an attempt with
+no operator request and audit the platform as the operator (OW2-63). Precedent: the in-process,
+denied-to-every-caller shape of `settle-from-lookup` (`01 §3.3`, `09 §3.1`), and slice 07's
+actor-from-the-request-row rule.
+
+**Propagated**: `design/01-foundation.md` §3.3; `design/07-manual-tasks.md` §4.6;
+`design/09-read-and-authz.md` §3.1, §4.2, §4.5; `design/10-process-definition.md` §2.2, §4.1;
+`DESIGN.md` §3.3, §3.5, §4.2; `UPSTREAM_REQS.md` §2.8; D-67.
 
 ## Open Questions
 
@@ -2810,6 +2978,10 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-102 | M Rounds and attempts for re-invokable operations | `design/01-foundation.md` §3.3, §3.7, §4.3, §4.14, `design/03-approval-execution.md` §3.3, §4.4, §4.5, `design/04-fulfillment-plan.md` §3.3, §3.6, §4.1, §4.8, `design/05-provisioning-intents.md` §3.3, §4.5, `design/06-saga-and-compensation.md` §3.3, `design/07-manual-tasks.md` §3.3, `design/08-hold-and-cancel.md` §3.3, `design/10-process-definition.md` §3.6, `ADR/0006`; D-74, D-78 |
 | D-103 | M Registry lease fence and dead-lease resolution | `design/01-foundation.md` §3.3, §3.7, §3.8, §4.3, `design/05-provisioning-intents.md` §3.6, `design/06-saga-and-compensation.md` §3.6, `DESIGN.md` §3.7, §3.8; D-03, D-71 |
 | D-104 | M No partitioned tables; registry tombstones | `design/01-foundation.md` §3.7, §3.8, every slice §3.7, `DESIGN.md` §3.7, §4.1; Lifecycle D-91 |
+| D-105 | M Dead invocation: liveness pass, re-drive, fallback unwind | `design/01-foundation.md` §3.3, §3.7, §3.8, §4.9, §4.13, §4.16, `design/05-provisioning-intents.md` §3.8, `design/06-saga-and-compensation.md` §3.2, §3.6, §3.8, `design/07-manual-tasks.md` §3.3, §3.7, §4.1, §4.4, §4.7, §4.8, `design/09-read-and-authz.md` §3.3, `design/10-process-definition.md` §3.3, §3.8, §4.4, `DESIGN.md` §1.2, §3.3, §3.8, §4.2, §4.4, §4.5, §4.9, `UPSTREAM_REQS.md` §2.9, §3, §4, `ADR/0001`, `ADR/0005`, `ADR/0012`; D-71, D-86 |
+| D-106 | M Invocation binding and the fence's recorded cause | `design/01-foundation.md` §3.3, §3.6, §3.7, `design/02-triggers-and-start.md` §3.6, `design/06-saga-and-compensation.md` §3.3, §3.6, `design/09-read-and-authz.md` §2.2, §4.1, §4.2, `design/10-process-definition.md` §3.6, `DESIGN.md` §3.3, §4.2, `UPSTREAM_REQS.md` §2.9; D-67 |
+| D-107 | M Start checked against the order; bindings released with the definition | `design/02-triggers-and-start.md` §2.1, §2.2, §3.1, §3.3, §3.6, §3.8, §4.7, `design/10-process-definition.md` §3.3, §3.6, §3.8, `DESIGN.md` §3.5, §4.2, `UPSTREAM_REQS.md` §2.9; D-73, D-76 |
+| D-108 | M `retry-step` in-process only | `design/01-foundation.md` §3.3, `design/07-manual-tasks.md` §4.6, `design/09-read-and-authz.md` §3.1, §4.2, §4.5, `design/10-process-definition.md` §2.2, §4.1, `DESIGN.md` §3.3, §3.5, §4.2, `UPSTREAM_REQS.md` §2.8; D-67 |
 
-Highest decision number used: **D-104**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
+Highest decision number used: **D-108**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
 register; there are no parts.

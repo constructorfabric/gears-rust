@@ -85,7 +85,8 @@ The distinction matters where a create is accepted **after** an activation, whic
 > (`…-upreq-serverless-runtime-failure-handler-target`, `p2`) is only that its outbound call runs
 > as the serverless-runtime service principal the step routes admit. The canonical definition
 > declares no handler; the safety net for an invocation that ends without `report-outcome` is the
-> reconciliation sweep's `settle-from-lookup`.
+> reconciliation sweep's instance liveness pass, which raises it as an `invocation-dead` manual
+> task whose fallback is the sweep-driven cancel unwind (`DECISIONS.md` D-105).
 
 ### Confirmation
 

@@ -94,7 +94,8 @@ Temporal plugin. Concretely:
 * **Recovery is defined against the record.** A crashed or restarted operation reconstructs its
   position from this gear's record alone; the platform's re-invocation of a task is absorbed by
   the idempotency registry (ADR-0006 as amended), and an instance whose invocation ends without
-  `terminate-instance` is found by the sweep from the record, not from the engine.
+  `terminate-instance` is found by the sweep's instance liveness pass from the record's bound
+  invocation and raised as a manual task, never inferred from engine history (`DECISIONS.md` D-105).
 
 ### Consequences
 

@@ -60,8 +60,9 @@ design depends on (§2.8, `ADR/0010`, `DECISIONS.md` D-63). Finally, it carries 
 platform gear **serverless-runtime**, which executes the order process definition since `ADR/0011`
 (§2.9, `DECISIONS.md` D-65…D-69): delivery and readiness, event triggers over the broker, member-only
 storage of trigger inputs and consumed events, the service identity of outbound calls, attempt and deadline propagation, engine-history residency and
-retention, definition versioning with a pre-publish validation hook, named signals, operator
-visibility of trigger-path dead letters and a failure-handler safety net.
+retention, definition versioning with a pre-publish validation hook, named signals and an
+invocation-preserving re-drive, restriction of start and generic control on the order process,
+operator visibility of trigger-path dead letters and a failure-handler safety net.
 
 ### 1.2 Requesting Gears
 
@@ -606,8 +607,8 @@ no REST, SDK or event-handler caller.
    assignment-directory inverse query is needed, because the assignment is a column on the gate.
 4. **Service-principal grants.** Confirm the service-subject `subject_type` identifier and the
    token scope that names this gear; grant the **serverless-runtime** service subject
-   `process_step × execute` for the thirty-four enumerated `operation` values of `09 §3.1` (never
-   `settle-from-lookup`, never the action unconditionally), restricted to the call's
+   `process_step × execute` for the thirty-three enumerated `operation` values of `09 §3.1` (never
+   `settle-from-lookup` or `retry-step`, which run only in-process, D-108; never the action unconditionally), restricted to the call's
    `correlationId` within its `resource_tenant_id`, and nothing else; grant Orders Lifecycle's
    service subject `progress × read` and `fulfillment_task × read` with a resource-id constraint
    to the named order (no `start`: the REST start route is removed, D-73); confirm that no service
@@ -814,7 +815,10 @@ BR-006, BR-013).
 
 Every HTTP `call` the plugin issues **MUST** carry, to the callee, the attempt that issued it and
 the remaining deadline of the enclosing task timeout, and the platform **MUST** confirm that the
-DSL's `$workflow.id` is the platform `invocation_id`. The values exist inside the platform: the
+DSL's `$workflow.id` is the platform `invocation_id`. The call **MUST** also carry the invocation that issued it as a
+platform-asserted value — one the callee can trust as the platform's statement, not a body member
+the definition computes — because every step call after `start-instance` is bound to the
+instance's invocation (`design/01-foundation.md` §3.3 step 3, `DECISIONS.md` D-106). The values exist inside the platform: the
 SDK `Context` carries `invocation_id`, `attempt_number` (1-indexed, adapter-tracked) and a
 `deadline` with `remaining_time()`
 ([serverless-sdk DESIGN.md](../../../serverless-runtime/serverless-sdk/docs/DESIGN.md) lines 123,
@@ -835,7 +839,10 @@ which binds `owf_process_instance.invocation_id` from it (`design/01-foundation.
   `deadline_ms` only, so an attempt started late in the task timeout can outlive it and be
   answered to a caller that has already given up (absorbed on the re-issue, but wasted). If
   `$workflow.id` is not the `invocation_id`, the binding holds an identifier no Invocation API call
-  accepts, so the sweep's status read and the operator re-drive of D-86 address nothing.
+  accepts, so the sweep's status read and the operator re-drive of D-86 address nothing. Until the
+  invocation is asserted on the call, the binding compares the body's `invocationId`, so a
+  principal holding the serverless-runtime scope that also learns an instance's invocation id
+  (the progress read shows it to an operator) can present it.
 - **Source**: `design/01-foundation.md` §3.3 step 4, *Attempt identity*, §4.5; `design/10-process-definition.md` §3.1.
 
 #### Engine-history residency, retention and reference-only task inputs
@@ -902,9 +909,16 @@ control operation can answer `still-processing`). The platform has generic
 ([DESIGN.md](../../../serverless-runtime/docs/DESIGN.md) lines 883–889) and a plugin-control
 passthrough whose verb set the plugin owns (line 893), but records "no signal delivery model"
 ([NEXT_ADR_SCOPE.md](../../../serverless-runtime/docs/NEXT_ADR_SCOPE.md) line 40, BR-108). In
-addition, for the operator re-drive of D-86: `:control` `retry` of a `failed` invocation (line 888)
+addition, for the operator re-drive of D-86 and D-105: `:control` `retry` of a `failed` invocation (line 888)
 **MUST** keep the `invocation_id`, so the re-drive resumes the instance Orders has bound rather
-than starting a second invocation the binding refuses; and `retry` **MUST** also be valid from
+than starting a second invocation the binding refuses; it **MUST** resume execution **at the
+faulted task** with the invocation's history, rather than re-running the document from its first
+task — the platform states only "retry a failed invocation with same parameters" (line 888), and
+the canonical definition is written for a resume: a restart from the top would re-enter the
+approval stage with every round at `0` (`design/10-process-definition.md` §3.6 (a) `input.from`),
+which the registry answers from its retained records, but a `listen` whose event was consumed
+before the fault would wait for an event that is not delivered again, and every fixed wait would
+restart (`design/01-foundation.md` §4.16); and `retry` **MUST** also be valid from
 `dead_lettered`, keeping the `invocation_id`. The second clause is needed because `retry` is
 listed as valid only from `failed` (line 888), while a failed invocation with no compensation
 handler — this definition declares none (`design/10-process-definition.md` §3.1) — moves
@@ -919,10 +933,41 @@ plugin, which owns the verb set (line 893).
   the lifetime ceiling cannot reach the running definition; the control operations record the
   request and answer `still-processing` indefinitely. The generic `:control` `cancel` is never a
   substitute, because it ends the invocation without the cancellation fence
-  (`design/10-process-definition.md` §4.4). Until an invocation-preserving `retry` is confirmed
-  from both `failed` and `dead_lettered`, a dead invocation's instance is unwound through the fence
-  and the order re-submitted (D-86 as amended).
+  (`design/10-process-definition.md` §4.4). Until a `retry` that keeps the invocation and resumes
+  at the faulted task is confirmed from both `failed` and `dead_lettered`, the `invocation-dead`
+  task offers no re-drive, and the only way out for a dead invocation's order is the fallback of
+  D-105: a Seller Operator's cancel, carried out in-process by the sweep, and a new order to
+  re-acquire the customer (§4 item 11).
 - **Source**: `design/10-process-definition.md` §3.2 *Signal delivery*, §3.3, §4.4; `design/09-read-and-authz.md` §3.3, §3.6; `design/07-manual-tasks.md` §3.3; `design/08-hold-and-cancel.md` §3.3.
+
+#### Start and generic control of the order process restricted to its owners
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-upreq-serverless-runtime-invocation-control-restriction`
+
+The platform **MUST** let the owner of a Workflow restrict who may act on its invocations:
+(1) **start** — `POST /api/serverless-runtime/v1/invocations` on `order_process` refused to every
+caller, so that its two event-trigger bindings are its only start
+([DESIGN.md](../../../serverless-runtime/docs/DESIGN.md) lines 865, 980–987);
+(2) **generic control** — `…:control` `cancel`, `suspend` and `resume` refused on `order_process`
+invocations to every caller, and `retry` admitted only for this gear's service principal, which
+issues it from the `invocation-dead` task (lines 883–889); and (3) **bindings** — create, update,
+enable and disable of an event trigger whose target is `order_process` restricted to the
+platform-operator publish role that publishes the definition (lines 976–987). The platform
+authorizes its own API (line 847) and states that the host "verifies tenant ownership of the
+invocation" on plugin control (line 893). It states no per-function restriction of these actions,
+and the event-trigger bindings are tenant-scoped platform objects (line 1146).
+
+- **What the design cannot do until it lands**: detect rather than prevent. A generic `cancel`
+  surfaces as `canceled`, which the instance liveness pass raises as an `invocation-dead` task
+  (`design/01-foundation.md` §3.8). A generic `suspend` is indistinguishable from the `suspended`
+  of a normal wait: it freezes the order, lifetime ceiling included, until the suspension times
+  out into `failed` (line 455), and only then is it raised. A direct start or a hand-edited
+  binding meets `admit-trigger`'s tenant, category and state checks and the one-active-instance
+  index (`design/02-triggers-and-start.md` §2.2, §3.6), and binding drift is reported by the
+  readiness check (`design/10-process-definition.md` §3.8, `DECISIONS.md` D-107).
+- **Source**: `design/10-process-definition.md` §3.3, §3.8, §4.4; `design/01-foundation.md` §3.8;
+  `design/02-triggers-and-start.md` §2.2; `DESIGN.md` §4.2 *Threat model*; `DECISIONS.md` D-105,
+  D-107.
 
 #### Operator visibility and re-drive of trigger-path dead letters
 
@@ -957,17 +1002,20 @@ instance, is therefore expressible today; nothing about targeting is asked. What
 **identity**: the outbound HTTP call that Function makes **SHOULD** be made as the
 serverless-runtime service principal under the same terms as
 `…-upreq-serverless-runtime-pdp-guarded-call`, carrying the failed invocation's
-`resource_tenant_id`, so the step route's principal check and the PDP's `process_step × execute`
-decision admit it. The canonical definition declares no handler today
+`resource_tenant_id` and its `invocation_id` from the `CompensationContext` — the value the
+envelope binds every step call to (`design/01-foundation.md` §3.3 step 3, D-106) — so the step
+route's principal check, the PDP's `process_step × execute` decision and the invocation binding
+admit it. The canonical definition declares no handler today
 (`design/10-process-definition.md` §3.1), because compensation is a path through Orders' own
 operations; declaring one also changes the platform path of a failure from `failed →
 dead_lettered` to `failed → compensating` (DESIGN.md line 457), which the re-drive of D-86 would
 then have to accept.
 
 - **What the design cannot do until it lands**: nothing it needs for correctness — the safety net
-  for an invocation that ends without `report-outcome` is the reconciliation sweep's
-  `settle-from-lookup` and the manual task it raises (`ADR/0005` as amended); the ask would only
-  shorten the time to unwind.
+  for an invocation that ends without `report-outcome` is the reconciliation sweep's instance
+  liveness pass and the `invocation-dead` task it raises, whose fallback is the sweep-driven
+  dead-instance unwind (`design/01-foundation.md` §3.8, §4.16, D-105; `ADR/0005` as amended); the
+  ask would only shorten the time to unwind.
 - **Source**: `ADR/0005` as amended; `design/06-saga-and-compensation.md` §1.3.
 
 ## 3. Priorities
@@ -975,7 +1023,7 @@ then have to accept.
 | Priority | Requirements |
 |----------|-------------|
 | `p1` (critical) | `…-upreq-overlap-presence-read`, `…-upreq-compensation-cancel-reason`, `…-upreq-explicit-start-instant`, `…-upreq-in-flight-rejection`, `…-upreq-cancel-accepted-transition`, `…-upreq-nonterminal-status-read`, `…-upreq-provisioning-latency-budget`, `…-upreq-identity-envelope-echo`, `…-upreq-payment-authorization-outcome`, `…-upreq-generic-approval-expectations-contract`, `…-upreq-submitted-ttl-visibility`, `…-upreq-lifecycle-thin-events`, `…-upreq-catalog-dependency-topology-read`, `…-upreq-pii-classification-ruling`, `…-upreq-event-broker-shared-prerequisites`, `…-upreq-pdp-policy-integration` |
-| `p1` (critical), platform path | `…-upreq-serverless-runtime-readiness-gate`, `…-upreq-serverless-runtime-event-triggers-gts`, `…-upreq-serverless-runtime-consumed-event-member-storage`, `…-upreq-serverless-runtime-pdp-guarded-call`, `…-upreq-serverless-runtime-attempt-and-deadline-propagation`, `…-upreq-serverless-runtime-history-residency-retention`, `…-upreq-serverless-runtime-definition-versioning-validation-hook`, `…-upreq-serverless-runtime-signals`, `…-upreq-serverless-runtime-dead-letter-operator-visibility` |
+| `p1` (critical), platform path | `…-upreq-serverless-runtime-readiness-gate`, `…-upreq-serverless-runtime-event-triggers-gts`, `…-upreq-serverless-runtime-consumed-event-member-storage`, `…-upreq-serverless-runtime-pdp-guarded-call`, `…-upreq-serverless-runtime-attempt-and-deadline-propagation`, `…-upreq-serverless-runtime-history-residency-retention`, `…-upreq-serverless-runtime-definition-versioning-validation-hook`, `…-upreq-serverless-runtime-signals`, `…-upreq-serverless-runtime-invocation-control-restriction`, `…-upreq-serverless-runtime-dead-letter-operator-visibility` |
 | `p2` (important) | `…-upreq-correlation-propagation`, `…-upreq-serverless-runtime-failure-handler-target` |
 
 `cpt-cf-bss-orders-workflow-upreq-pdp-policy-integration` is `p1` because every caller-driven
@@ -985,8 +1033,8 @@ provisioned and verified (`ADR/0010`, `DECISIONS.md` D-63).
 The serverless-runtime asks of §2.9 are `p1` for the **platform path** only: each gates whether
 the canonical definition can run, not whether the process record and the step operations are
 correct, which the fallback property keeps independent of them (`DESIGN.md` §4.9). The
-failure-handler target is `p2` because the reconciliation sweep already covers the case it would
-shorten.
+failure-handler target is `p2` because the sweep's instance liveness pass already covers the case
+it would shorten (D-105).
 
 ## 4. Required PRD Amendments
 
@@ -1068,6 +1116,29 @@ shorten.
     decision is read by `decisionEventId`, so no approver identity or reason crosses into engine
     history (`ADR/0013`).
 
+11. **§6.1 and §7.1 — the dead-invocation fallback loses the in-flight order.**
+    `cpt-cf-bss-orders-workflow-fr-owf-process-state-nonauth` (PRD §6.1, line 243) requires
+    execution state to be "recoverable/replayable from that gear-owned record", and
+    `cpt-cf-bss-orders-workflow-nfr-owf-durability` (PRD §7.1, line 562) requires an in-flight order
+    to "be recoverable and continue execution". Under `ADR/0011`, continuation after a platform
+    fault is the platform's re-drive of the same invocation (`DECISIONS.md` D-86, D-105). Until the
+    platform confirms a re-drive that keeps the invocation and resumes at the faulted task
+    (`…-upreq-serverless-runtime-signals`), an order whose invocation has died can only be
+    unwound. So the PRD **MUST** add to §7.1:
+
+    - *an in-flight order whose platform execution has ended and cannot be re-driven is raised as
+      an order-scope manual task, and is either re-driven by the platform or, by a Seller
+      Operator's decision, cancelled with compensation through the gear's own record*;
+    - *re-acquisition is then a new order* — a `cancelled` or `fulfillment_failed` order cannot be
+      amended (Orders Lifecycle `01 §3.7` transitions 13–27);
+    - *this is a counted exception to "zero lost in-flight workflows", reported and retired once
+      the platform re-drive is confirmed*.
+
+    §6.1 **MUST** read "recoverable/replayable" as recoverable **from the record** — which the
+    record still guarantees, because every committed step, the saga log and the manual-task
+    history survive — and not as a promise that execution continues without the platform
+    (`design/01-foundation.md` §4.16).
+
 ## 5. Traceability
 
 - **PRD**: [`./PRD.md`](./PRD.md) — §6.1 (Fulfillment Plan Construction), §6.2 (Approval
@@ -1085,7 +1156,7 @@ shorten.
   `ADR/0008` and `DECISIONS.md` D-58 (platform producer outbox, §2.7 co-signature);
   `DECISIONS.md` D-16 (Catalog topology), D-46 and Q-02 (relational escalation threshold), D-50 and
   D-38 (audit retention and the privacy ask); `ADR/0010` and `DECISIONS.md` D-63 (platform PDP
-  authorization, §2.8); `ADR/0011`, `ADR/0012`, `ADR/0013` and `DECISIONS.md` D-65…D-104, Q-10…Q-13
+  authorization, §2.8); `ADR/0011`, `ADR/0012`, `ADR/0013` and `DECISIONS.md` D-65…D-108, Q-10…Q-13
   (serverless-runtime, §2.9)
 - **Platform register**: serverless-runtime has no upstream-requirements register; §2.9 cites its
   [DESIGN.md](../../../serverless-runtime/docs/DESIGN.md), [PRD.md](../../../serverless-runtime/docs/PRD.md),

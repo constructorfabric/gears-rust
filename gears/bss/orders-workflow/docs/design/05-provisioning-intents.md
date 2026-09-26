@@ -1030,11 +1030,12 @@ selects one page (500 rows, 30 s transaction budget) of `owf_provisioning_intent
 `next_sweep_at <= now()`, ordered by `next_sweep_at`, and runs `reconcile-intent`'s effect for each
 in-process. Its correctness check is the row lock of step 1 and `settle-from-lookup`'s recheck,
 so two overlapping passes never double-apply. The worker selects due rows **whether or not** the
-instance has a live invocation; it reads invocation status only to report, as a metric, intents
-whose instance has no live invocation. (decision D-71: the worker's
-candidate set is `next_sweep_at <= now` over every non-terminal intent, and the definition's poll
-arm is an early read; `01 §3.8`'s worker row, which selects only dead-invocation registry rows, is
-aligned to this.)
+instance has a live invocation. Invocation status is read by the same worker's **instance
+liveness pass** of [`01 §3.8`](./01-foundation.md#38-deployment-topology), per instance rather than
+per intent, which raises an instance whose invocation is not live as an `invocation-dead` task —
+including one whose intents are all terminal, which this candidate set never reaches (decision
+D-105, amending D-71; D-71: the worker's candidate set is `next_sweep_at <= now` over every
+non-terminal intent, and the definition's poll arm is an early read).
 
 **Observability owned here**: intents by status and ladder; reads per pass; floor trips
 (`unresolved`, target near zero); never-dispatched count; lapsed-draft count; unmatched
