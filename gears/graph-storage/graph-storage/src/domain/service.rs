@@ -1039,16 +1039,21 @@ impl GraphServices {
         node_types: Option<TypeIdSet>,
         include_phantoms: bool,
     ) -> Result<TraversalResponse, DomainError> {
-        // One snapshot across the whole compound read: seed resolution, every
-        // hop, and the final hydration observe one graph state.
+        // Two paths, chosen by what the store declares.
         //
-        // Unless the store cannot hold one. It says so -- `snapshots = false`
-        // -- and this used to open a handle from it anyway and stamp the
-        // answer with the handle's revision, so the declaration protected
-        // nobody and the response named a state it never existed at. A store
-        // that declines is now taken at its word: no handle, and the walk is
-        // bracketed by a revision read instead, which turns "the arms may
-        // disagree" from an invisible property into a reported one.
+        // A store that cannot hold a snapshot says so (`snapshots = false`;
+        // the built-in `PostgreSQL` store is one). The walk then sees commits
+        // that land between hops, and is bracketed by two revision reads so
+        // the answer reports it: `consistent_snapshot` is false when a commit
+        // landed during the walk, and the revision named is the one read
+        // after it. This used to open a handle from such a store anyway and
+        // stamp the answer with the handle's revision, so the declaration
+        // protected nobody and the response named a state it never existed
+        // at.
+        //
+        // A store that can hold one gets it across the whole compound read:
+        // seed resolution, every hop and the final hydration observe one
+        // graph state.
         let snapshot_ctx = Self::store_ctx(auth, None);
         if !self.store.capabilities().snapshots {
             let before = self.store.revision(&snapshot_ctx).await?;
