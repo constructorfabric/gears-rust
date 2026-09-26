@@ -158,6 +158,10 @@
   - [D-137 (H) The binding records the version the platform pinned; the publisher waits on the registry](#d-137-h-the-binding-records-the-version-the-platform-pinned-the-publisher-waits-on-the-registry)
   - [D-138 (M) A definition is published by a job of its own, behind a behavioural gate, and rolled back forward](#d-138-m-a-definition-is-published-by-a-job-of-its-own-behind-a-behavioural-gate-and-rolled-back-forward)
   - [D-139 (M) The build order follows in-process calls; 07 and 08 precede 06, and the back-edges are built against doubles](#d-139-m-the-build-order-follows-in-process-calls-07-and-08-precede-06-and-the-back-edges-are-built-against-doubles)
+  - [D-140 (H) The per-seller policy is a foundation table on the policy channel, read through one port and pinned with its revision](#d-140-h-the-per-seller-policy-is-a-foundation-table-on-the-policy-channel-read-through-one-port-and-pinned-with-its-revision)
+  - [D-141 (M) A resume closes only a suspension Lifecycle no longer holds](#d-141-m-a-resume-closes-only-a-suspension-lifecycle-no-longer-holds)
+  - [D-142 (M) Every wait inside a stage is a competing fork carrying the shared arms](#d-142-m-every-wait-inside-a-stage-is-a-competing-fork-carrying-the-shared-arms)
+  - [D-143 (M) No walk reaches a wave dispatch without `begin-fulfillment`; `beginResult` is a pinned member](#d-143-m-no-walk-reaches-a-wave-dispatch-without-begin-fulfillment-beginresult-is-a-pinned-member)
 - [Open Questions](#open-questions)
   - [Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?](#q-01-which-durable-execution-substrate-backs-the-process--the-oss-workflow-engine-or-a-bss-local-mechanism)
   - [Q-02: The Generic Approval escalation threshold — the one PRD-deferred numeric value this design deliberately leaves unset](#q-02-the-generic-approval-escalation-threshold--the-one-prd-deferred-numeric-value-this-design-deliberately-leaves-unset)
@@ -1119,6 +1123,8 @@ composition, including this family set.
 
 **Amended by D-69 (2026-09-24).** `owf_step_operation` is load-only configuration and carries no tenant column — the one stated exemption to this entry.
 
+**Amended by D-140 (2026-09-26).** There are now two stated exemptions, both configuration: `owf_step_operation`, and `owf_seller_policy`, which is keyed by `seller_tenant_id` alone, NULL on its platform row (`design/01-foundation.md` §3.7).
+
 **Decision**: this gear adopts the sibling Orders Lifecycle set's three tenant axes by name —
 `resource_tenant_id` (resource recipient), `payer_tenant_id` (billing party), `seller_tenant_id`
 (selling party). Every one of the gear's `owf_*` tables carries **at least** `resource_tenant_id`,
@@ -1401,7 +1407,7 @@ producer persistence* and the retention/immutability register, §3.8, §4.7, §4
 
 **Accepted.** *(mirrors Lifecycle D-97 and D-103; hardens D-50, which remains in force)*
 
-**Amended by D-68, D-69, D-70 and D-72 (2026-09-24).** The engine owns **eight** tables today, not nine: `owf_definition_binding` (D-68) and `owf_step_operation` (D-69) were added, and `owf_durable_timer`, `owf_retry_state` (D-70) and `owf_dead_letter_record` (D-72) retired (`DESIGN.md` §3.7).
+**Amended by D-68, D-69, D-70 and D-72 (2026-09-24).** The engine owns **eight** tables today, not nine: `owf_definition_binding` (D-68) and `owf_step_operation` (D-69) were added, and `owf_durable_timer`, `owf_retry_state` (D-70) and `owf_dead_letter_record` (D-72) retired (`DESIGN.md` §3.7). **Amended by D-140 (2026-09-26)**: `owf_seller_policy` makes it **nine**.
 
 **Decision**: `owf_audit_entry` stays the authoritative process-audit record of this gear, written
 in the transaction of the transition it records on every path; a failed append aborts the step's
@@ -1539,7 +1545,7 @@ Q-09 lands on the fenced lease.
 
 **Accepted.** *(carries [`ADR/0010`](./ADR/0010-cpt-cf-bss-orders-workflow-adr-platform-pdp-authorization.md); mirrors Lifecycle D-34 as amended, D-111, D-114, D-141 and D-115; amends D-37)*
 
-**Amended (2026-09-26)**: the "twenty-five tables" of the propagation line below was the count at this decision; the registry now holds twenty-six (`DESIGN.md` §3.7).
+**Amended (2026-09-26)**: the "twenty-five tables" of the propagation line below was the count at this decision; the registry now holds twenty-seven (`DESIGN.md` §3.7; twenty-six until D-140 added `owf_seller_policy`).
 
 **Decision**: every authorization decision in this gear is made by the platform PDP
 (`authz-resolver`), reached through **one shared `PolicyEnforcer`** from `authz-resolver-sdk`
@@ -1638,7 +1644,7 @@ The decisions in this section were taken when the order process flow moved from 
 gear to a versioned platform workflow definition (`ADR/0011`, `ADR/0012`, `ADR/0013`), and when
 each slice was restructured into step operations and a definition fragment. D-65…D-72 carry the
 three ADRs and their cross-cutting consequences; D-73…D-101 are the decisions the slice
-restructurings recorded, and D-102…D-139 the decisions taken on the second review of
+restructurings recorded, and D-102…D-143 the decisions taken on the second review of
 2026-09-26. Each names the entries it amends; the amended entries carry a dated
 **Amended by** note. D-65…D-101 were taken on 2026-09-24.
 
@@ -1804,6 +1810,8 @@ rolls back forward (D-138).
 **Accepted.**
 
 **Amended by D-108 (2026-09-26).** Thirty-three values are granted: `retry-step` joins `settle-from-lookup` as in-process only, granted to no principal (`design/09-read-and-authz.md` §3.1).
+
+**Amended by D-140 (2026-09-26).** "The one stated exemption to D-48" below is now one of two: `owf_seller_policy` is the other.
 
 **Decision**: every step the definition can order is an Orders operation on
 `POST /bss-orders-workflow/v1/steps/{operation}`, one route per registered operation, callable only
@@ -2331,6 +2339,12 @@ off (Q-02); a probe arm keeps the pause decision in the definition and the evide
 `owf_approval_gate.outage_since`, set with the `approval-outage` cause and cleared with it. A
 fire that finds the breaker open pauses the due gates instead of refusing (D-118).
 
+**Amended by D-141 (2026-09-26)**: the resume-ahead reconciliation now reads the order. An
+`OrderResumed` closes a suspension, or leaves a `resume_ahead` row, only when Lifecycle no longer
+holds the order; otherwise it answers `still-held` and closes nothing. A hold that consumes a
+`resume_ahead` row still records its suspension when Lifecycle holds the order
+(`design/08-hold-and-cancel.md` §2.2).
+
 ### D-88 (L) The approval routing plan is saved at the first `open-gates`
 
 **Accepted.**
@@ -2676,7 +2690,7 @@ immutability*), §3.8; `design/03-approval-execution.md` §3.7; `design/04-fulfi
 `design/07-manual-tasks.md` §3.7; `design/08-hold-and-cancel.md` §3.7; `DESIGN.md` §3.7, §4.1; `design/09-read-and-authz.md` §3.7, §4.3.
 
 **Amended (2026-09-26)**: the retention register of `DESIGN.md` §3.7 now has a row for every one of
-the twenty-six tables, with its window and what the `retention-purge` worker does with it, and the
+the twenty-six tables (twenty-seven since D-140), with its window and what the `retention-purge` worker does with it, and the
 worker's roster in `design/01-foundation.md` §3.8 names every store with a window; the
 never-purged stores (the audit store and its checkpoints, the instance, the binding, the progress
 view) are listed as such. `design/09-read-and-authz.md` §4.3 cites the register instead of
@@ -3208,6 +3222,10 @@ and D-102's round rule.
 **Propagated**: `design/10-process-definition.md` §3.6 (*Fixed waits and re-check loops*, (b));
 `design/05-provisioning-intents.md` §3.3, §4.5.
 
+**Amended by D-142 (2026-09-26)**: the `PT30S` wait before the re-issue is the tick branch of
+`awaitReread1`, which also carries the hold, resume, lifecycle and cancel arms; an arm re-enters
+at `wave1` under the unchanged key.
+
 ### D-121 (H) The lifetime ceiling parks only a running, unparked instance, and each ceiling is its own round
 
 **Accepted (2026-09-26).**
@@ -3392,6 +3410,10 @@ registration-validation hook states no rule of this kind (serverless-runtime `DE
 shared arms (D-135). Rule 2 no longer allows a `call` to a Function (D-136). The windows rule 4
 leaves out are seller-policy values pinned on the record, bounded at the policy write (D-134).
 
+**Amended by D-142 and D-143 (2026-09-26)**: rule 1 tracks a fifth pinned member, `beginResult`,
+and the §4.1 Waves row requires `beginResult = in-fulfillment` on every walk to a wave dispatch
+(D-143). Rule 8 forbids a plain `wait` inside a stage (D-142).
+
 ### D-127 (M) The Workflow callable declares every required trait: async-only, its limits, and no invocation retry
 
 **Accepted (2026-09-26).**
@@ -3500,6 +3522,11 @@ same poll to every other wait that holds a recorded suspension. The round family
 suspension, and `apply-hold` resets it on each new `suspensionRef`. The absorption of a late
 `OrderResumed` into a `resumed-by-read` row is unchanged and now applies wherever the poll ran.
 
+**Amended by D-141 and D-143 (2026-09-26)**: the order read now guards the event path too, so a
+resume Lifecycle has overtaken closes nothing (D-141). The resume wait's poll has no failure
+route, because the wait precedes `begin-fulfillment` and nothing is deferred there
+(`pollResumeFailure` is removed, D-143).
+
 ### D-131 (H) The references that cross the engine are a closed six-type vocabulary; cardinality, counters and the resource tenant are the stated residual
 
 **Accepted (2026-09-26).**
@@ -3606,6 +3633,10 @@ resume" (Lifecycle `06 §4.3`).
 loops*, §4.1, §4.4, §4.5; `design/08-hold-and-cancel.md` §3.2, §3.3, §4.7 items 3, 9, 10;
 `design/01-foundation.md` §3.3; `DESIGN.md` §1.2; `UPSTREAM_REQS.md` §2.9; D-124, D-130, Q-11.
 
+**Amended by D-142 (2026-09-26)**: `deferralTick1`/`deferralTick2` are gone. The held count
+rides the tick arms of the new `awaitDeferral1`/`awaitDeferral2` forks, which carry the four
+shared arms, so a held deferral now listens for a hold, a resume, a lifecycle event and a cancel.
+
 ### D-134 (H) The business windows are per-seller policy values pinned on the record; the definition owns only the tick
 
 **Accepted (2026-09-26).** *(amends D-70, D-98, D-126)*
@@ -3641,6 +3672,12 @@ platform precedent applies: the platform has no per-tenant business-window store
 §3.2, §3.6, §3.7; `design/04-fulfillment-plan.md` §2.2, §3.6, §3.7, §4.7, §4.8;
 `design/07-manual-tasks.md` §1.2, §3.2, §3.6, §3.7, §4.1, §4.8; `design/10-process-definition.md`
 §1.1, §1.2, §2.2, §3.6, §4.7; `DESIGN.md` §1.2, §4.7, §4.8; `ADR/0011`; D-70, D-98, D-126.
+
+**Amended by D-140 (2026-09-26)**: "the per-seller policy rows of `DESIGN.md` §4.8" now have a
+store and an owner. They are the foundation's `owf_seller_policy` (`design/01-foundation.md`
+§3.7), written only by the policy load when a policy-channel promotion is applied. "An audited
+policy write" is that promotion, validated against the bounds before it commits. The operations
+read the effective policy through the seller-policy port and record the revision they pinned.
 
 ### D-135 (M) A version carries the `p1` composables and the shared arms on their paths; the check tracks the pinned enums
 
@@ -3678,6 +3715,10 @@ pinned policy the switch must read.
 **Propagated**: `design/10-process-definition.md` §2.1, §2.2, §4.1, §4.7;
 `design/01-foundation.md` §3.1, §3.3; `design/03-approval-execution.md` §3.3;
 `design/07-manual-tasks.md` §3.3; `ADR/0012`; `ADR/0011`; `DESIGN.md` §2.2; D-126.
+
+**Amended by D-142 and D-143 (2026-09-26)**: the pinned members are five; `beginResult`, a copy
+of `begin-fulfillment`'s `result`, joins them (D-143). Rule 8's shared arms now reach every wait
+inside a stage, because a stage may hold no plain `wait` (D-142).
 
 ### D-136 (M) One adjustability table; slice constraints are enforced items or canonical-definition guidance; no Function call
 
@@ -3809,6 +3850,154 @@ slices, which adds a build stage for a handful of edges.
 
 **Propagated**: `design/README.md` (the build-order table, the edge rationale, the cycles);
 `ADR/0002`; `DESIGN.md` §3.2.
+
+### D-140 (H) The per-seller policy is a foundation table on the policy channel, read through one port and pinned with its revision
+
+**Accepted (2026-09-26).** *(amends D-48, D-59, D-63, D-69, D-104, D-134)*
+
+**Decision**: the per-seller policy of D-134 lives in `owf_seller_policy`
+(`design/01-foundation.md` §3.7), a table the foundation owns. It holds one platform row, seeded
+by migration with the defaults (`remediate`, 72 h, 24 h, 4 h, 24 h) and never deleted. It holds
+one row per seller that overrides any value; a NULL value there inherits the platform row. The
+table carries the partial-failure policy, the default and per-party escalation windows, the
+overdue window and the two SLA class windows, each row with a positive monotonic
+`policy_revision` and the promotion's `updated_by`/`updated_at`. **Who writes it**: no Orders
+endpoint and no PDP action. Rows change only by promotion on the policy channel Lifecycle uses
+for its own policy rows, and a seller asks for a change through platform operations. A promotion
+carries rows only, builds no slice and publishes no definition version. The foundation's
+**policy load** applies it in one transaction. It locks the platform row, then each changed
+seller row, bumps the revisions and writes one audit entry under the deployment marker. Before it
+commits, it validates the effective policy of every affected seller against the bounds of
+`design/07` §4.8 item 8. The overdue window is checked against the `wave1` timeout of every
+definition version that active bindings name. A violating promotion commits nothing, so the
+prior rows stay in force. **How an operation reads and pins it**: `open-gates`,
+`construct-and-freeze-plan`, `create-manual-task` and the reopen read the effective policy once,
+inside their settlement transaction, through the foundation's seller-policy port. The effective
+policy is the seller's value, else the platform's; a gate takes its party's window, else the
+default. The operation pins the value on its record and writes the revision it read into its
+settled step-log `result` as `sellerPolicyRevision`. A replay answers from the record and never
+reads again. The table is keyed by `seller_tenant_id` alone, so it is the second configuration
+exemption from D-48's resource-axis rule. It is the engine's ninth table and the store count
+becomes 27.
+
+**Rationale**: D-134 moved the three windows into "the seller's policy", the per-seller policy
+rows of `DESIGN.md` §4.8, and B9 found that no slice specified that store, its writer, its audit
+or its validation point. An implementer would have invented all four. The foundation owns it
+because the three readers are slices 03, 04 and 07, and a table in any one of them would give
+the others a back-edge in the build order of D-139. The foundation precedes them all.
+**Precedent**: Orders Lifecycle keeps each tenant or seller policy as Orders-owned rows on its
+policy channel. `orders_state_ttl_policy` has platform and seller scope, `NULLS NOT DISTINCT`
+uniqueness, a positive revision and the platform-row-first lock order
+(Lifecycle `design/07-hold-and-expiry.md` §3.7). `orders_date_policy` has a revisioned platform
+default whose absence is a deployment failure (Lifecycle `design/02-capture.md` §3.7, D-121).
+`orders_policy_election` changes only by promotion, and a seller asks through platform
+operations (Lifecycle `design/05-preconditions.md` §3.7, D-133). The snapshot of the effective
+row with its revision, never re-read, is Lifecycle's `design/03-gate-and-pin.md` §4.2 item 8.
+Within this gear, the load follows `owf_step_operation`: one transaction, audited on change.
+**Rejected**: Pricing's runtime tenant configuration plane, `GET/PUT` routes under their own PDP
+resource (Pricing `design/05-governance.md`). It fits a seller-edited commercial surface, but here
+it would add routes, a catalogue resource and grants for rarely changed values, the trade-off
+Lifecycle D-133 rejected for its elections. Also rejected: the platform Settings Service
+(`gears/settings-service`), which has no implementation and would need an upstream ask, as
+Lifecycle D-121 found; and `get_gear_config`, which is static per gear and carries neither a
+tenant key nor a revision.
+
+**Propagated**: `design/01-foundation.md` §2.1, §3.4, §3.7 (*Table: owf_seller_policy*,
+tenancy, retention and immutability), §4.2, §4.11; `design/03-approval-execution.md` §3.6
+`inst-og-plan`; `design/04-fulfillment-plan.md` §3.6 `inst-pc-resolve-policy`;
+`design/07-manual-tasks.md` §4.1, §4.8 item 8; `design/10-process-definition.md` §4.7;
+`DESIGN.md` §3.7, §4.7, §4.8; D-48, D-59, D-63, D-69, D-104, D-134.
+
+### D-141 (M) A resume closes only a suspension Lifecycle no longer holds
+
+**Accepted (2026-09-26).** *(amends D-87, D-130)*
+
+**Decision**: `apply-resume` reads the order through the Lifecycle order read on an
+`OrderResumed` too, not only on the poll. If Lifecycle holds the order `on_hold`, the resume has
+been overtaken by a later hold. The operation closes nothing, records no `resume_ahead` row and
+answers `still-held`, with no `nextRound`. The definition returns to where the arm was taken:
+the resume wait with `suspensionRef` kept, or the stage. The open suspension now stands for the
+later hold and closes on its resume or by the poll. `apply-hold` that finds a `resume_ahead` row
+reads the order too. It consumes the row, and it still records the suspension when Lifecycle
+holds the order. The resume arm no longer clears `suspensionRef`; the resume stage clears it only
+after a suspension is closed. A transient read failure is `retryable-failure` under the open key.
+
+**Rationale**: a resume could close the wrong suspension (B8 open item 1). Take Lifecycle's order
+H1, R1, H2, delivered to this gear as H1, H2, R1. H2 was absorbed against S1 by the partial
+index, and R1 then closed S1, leaving Orders unsuspended while Lifecycle held the order. A
+resume must be matched to its own hold, but nothing on the wire makes that match. `OrderHeld`
+carries the outgoing state and `OrderResumed` the restored state, with event ids and neither a
+hold identity, a hold ordinal nor `resume_count` (Lifecycle `design/01-foundation.md` §4.4, *The
+event set*). The broker's per-partition sequence is not a per-order barrier, and a rejected
+message lets later events pass (Lifecycle `01 §2.2`, *Delivery is at-least-once; ordering is
+partition-scoped*). The match is therefore made against the one authority that knows which
+hold is in force. **Precedent**: Lifecycle's consumer rule in the same constraint: "Consumers
+**MUST** … validate the event's `orderVersion` and resulting state against authoritative Orders
+state before acting". Within this gear, the poll's read of the hold (D-130, `design/08`
+`inst-ar-poll`) is the read the event path now shares. **Rejected**: an upstream ask for a hold
+ordinal on both events. It would give an identity match but adds a Lifecycle schema change, and
+the read already decides every interleaving without it.
+
+**Propagated**: `design/08-hold-and-cancel.md` §2.2 *One Open Suspension Per Order*, §3.3,
+§3.6 `inst-ah-consume-ahead` and `inst-ar-poll`, §4.2, §4.7 item 3;
+`design/10-process-definition.md` §3.6 (e); D-87, D-130.
+
+### D-142 (M) Every wait inside a stage is a competing fork carrying the shared arms
+
+**Accepted (2026-09-26).** *(amends D-120, D-133, D-135)*
+
+**Decision**: `design/10` §2.2 rule 8 forbids a plain `wait` task inside a stage. The wave-1 and
+wave-2 deferral waits (`waitDeferral1`, `waitDeferral2`) become the tick branches of
+`awaitDeferral1` and `awaitDeferral2`, and the wave-1 re-issue wait (`waitReread1`) the tick
+branch of `awaitReread1`. Each carries the hold, stage-level resume, lifecycle and cancel arms.
+The unwind's re-poll (`waitRepoll`) becomes the tick branch of `awaitRepoll`, which carries the
+cancel arm only, as every unwind fork does. The held count of D-133 rides the deferral tick
+arms. An arm returns through the stage's `enter`. Wave 1 re-enters at `wave1`, which
+re-dispatches the deferred lines that `enterDeferral1` filed before the wait, or re-issues the
+unchanged key after a read. Wave 2 re-enters at its stage loop, which re-evaluates before any
+dispatch. `enterWave1` sets `holdPauses: false`, so a hold in a wave wait is recorded and never
+waited on. The waits of the top-level `lifetimeCeiling` and `overdueMonitor` branches are outside
+every stage and are not covered.
+
+**Rationale**: rule 8 required the shared arms in every stage fork, but these four waits were
+plain `wait` tasks and escaped it (B8 open item 2, B9 note). A cancel or a terminal order event
+sent during a long held deferral was left to signal retention for the whole wait. A cancel
+during the unwind's re-poll was not consumed before `report-outcome`, so a failure unwind could
+report `failed` although a cancel had been accepted. Wrapping each wait costs one fork and one
+switch and needs no exception in the rule. **Precedent**: the barrier's own timer half,
+`awaitExpected`, a tick branch beside the four arms (`design/10` §3.6 (b)), and the unwind's
+`awaitCompensationResolution`, which carries the cancel arm only.
+
+**Propagated**: `design/10-process-definition.md` §2.2 rule 8, §3.6 (b) and (c), *Fixed waits
+and re-check loops*; `ADR/0012`; D-120, D-133, D-135.
+
+### D-143 (M) No walk reaches a wave dispatch without `begin-fulfillment`; `beginResult` is a pinned member
+
+**Accepted (2026-09-26).** *(amends D-126, D-130, D-133, D-135)*
+
+**Decision**: `design/10` §2.2 rule 1 tracks a fifth pinned member, `beginResult`, written only
+as a copy of `begin-fulfillment`'s `result`. The §4.1 Waves row requires every walk that reaches
+`dispatch-wave1-create` or `dispatch-wave2-activate` to carry `beginResult = in-fulfillment`. The
+failure stage returns to the barrier (`routeRetry` `barrier`, `afterOverride` `verified`) only on
+`beginResult = in-fulfillment`; any other barrier retry, which no line task produces, stays in
+`awaitResolution`. The resume stage decides on the interrupted stage before it looks at
+`failedTaskRefs`. From the approval stage or the eligibility wait it returns without a failure
+route. The resume wait's poll has no failure route at all, so `pollResumeFailure` is removed:
+the resume wait is entered only from the approval stage, before any dispatch, where nothing is
+deferred.
+
+**Rationale**: rule 1 takes a `switch` case over a non-routing member both ways. B7's
+`pollResumeFailure` therefore gave the walk a route from the approval resume wait into the
+failure stage, and from there `toBarrier` into wave 2, with no `begin-fulfillment` on the walk
+(B8 open item 3). The event-driven resume and every pre-fulfillment failure entry had the same
+route through `toBarrier`. The walk could not prove the fence it is meant to prove, and a CI
+check written to rule 1 would have refused the canonical definition. Deciding on a member the
+walk tracks closes every such route, and no routing member is written from an operation output
+(B7's rule holds). **Precedent**: B8's `afterHeldPoll`, which decides on `stageLoop` first so
+that the eligibility wait has no failure route (D-133), and the pinned `policy` of D-135.
+
+**Propagated**: `design/10-process-definition.md` §2.2 rule 1, §3.6 (c) and (e), §4.1;
+`design/08-hold-and-cancel.md` §4.7 items 8 and 10; `ADR/0012`; D-126, D-130, D-133, D-135.
 
 ## Open Questions
 
@@ -4212,6 +4401,10 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-137 | H Binding version from the invocation record; publisher from the registry | `design/01-foundation.md` §3.3, §3.6, §3.7, `design/10-process-definition.md` §2.2, §3.1, §3.3, §3.6, §4.2, §4.3, `DESIGN.md` §3.1, §3.6, §4.2, `UPSTREAM_REQS.md` §2.9, `ADR/0012`; D-68, D-105 |
 | D-138 | M Publish job, behavioural gate, forward rollback | `design/10-process-definition.md` §2.2, §3.2, §3.3, §3.7, §3.8, §4.2, §4.3, `design/01-foundation.md` §3.7, `DESIGN.md` §2.2, §3.6, §3.8, §4.7, `UPSTREAM_REQS.md` §2.9, §3, `ADR/0011`, `ADR/0012`; D-68, D-107 |
 | D-139 | M Build order from in-process calls; back-edges | `design/README.md`, `ADR/0002`, `DESIGN.md` §3.2 |
+| D-140 | H Seller-policy store: foundation table, policy channel, one port, pinned revision | `design/01-foundation.md` §2.1, §3.4, §3.7, §4.2, §4.11, `design/03-approval-execution.md` §3.6, `design/04-fulfillment-plan.md` §3.6, `design/07-manual-tasks.md` §4.1, §4.8, `design/10-process-definition.md` §4.7, `DESIGN.md` §3.7, §4.7, §4.8; D-48, D-59, D-63, D-69, D-104, D-134 |
+| D-141 | M A resume closes only a suspension Lifecycle no longer holds | `design/08-hold-and-cancel.md` §2.2, §3.3, §3.6, §4.2, §4.7, `design/10-process-definition.md` §3.6; D-87, D-130 |
+| D-142 | M Every stage wait is a fork with the shared arms | `design/10-process-definition.md` §2.2, §3.6, `ADR/0012`; D-120, D-133, D-135 |
+| D-143 | M No wave dispatch without begin-fulfillment; `beginResult` pinned | `design/10-process-definition.md` §2.2, §3.6, §4.1, `design/08-hold-and-cancel.md` §4.7, `ADR/0012`; D-126, D-130, D-133, D-135 |
 
-Highest decision number used: **D-139**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
+Highest decision number used: **D-143**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
 register; there are no parts.

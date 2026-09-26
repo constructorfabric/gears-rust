@@ -146,6 +146,12 @@ rather than one task, fails closed before a definition can be executed, and stil
   > Each slice's constraints are split into items enforced through a rule and
   > canonical-definition guidance that the behavioural gate asserts (§4.7).
 
+  > **Amended 2026-09-26 by D-142 and D-143**: the check tracks a fifth pinned member,
+  > `beginResult`, a copy of `begin-fulfillment`'s answer, and refuses a version on which any walk
+  > reaches a wave dispatch without `beginResult = in-fulfillment`. Rule 8 also forbids a plain
+  > `wait` inside a stage, so every stage wait carries the shared arms
+  > (`design/10-process-definition.md` §2.2 rules 1 and 8, §4.1).
+
   The `protected` list is closed and fixed here; adding to it or removing from it is an Orders
   release and an amendment of this ADR: `start-instance`, `settle-from-lookup` (sweep-only),
   `terminate-instance`, `admit-trigger`, `terminate-on-terminal-event`, `obtain-verdict`,
@@ -290,7 +296,7 @@ apply by reference.
   [`design/10-process-definition.md`](../design/10-process-definition.md);
   [`design/01-foundation.md`](../design/01-foundation.md) §3.7 (`owf_definition_binding`,
   `owf_step_operation`)
-- **Decisions register**: [`DECISIONS.md`](../DECISIONS.md) — D-02, D-53, D-67, D-68, D-105, D-106, D-126, D-135, D-136, D-137, D-138, Q-10
+- **Decisions register**: [`DECISIONS.md`](../DECISIONS.md) — D-02, D-53, D-67, D-68, D-105, D-106, D-126, D-135, D-136, D-137, D-138, D-142, D-143, Q-10
 - **Upstream asks**: [`UPSTREAM_REQS.md`](../UPSTREAM_REQS.md) — serverless-runtime section
   (pre-publish validation hook, publish audit, version retention while bound)
 - **Platform**: serverless-runtime [DESIGN.md](../../../../serverless-runtime/docs/DESIGN.md)

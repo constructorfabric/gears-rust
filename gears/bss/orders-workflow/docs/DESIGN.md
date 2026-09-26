@@ -982,13 +982,14 @@ owner is the **sole writer**, writing only through its own step operations or in
 inside another operation's unit of work; no other component writes to a table it does not own, even
 on a compensating or remediation path. **Column-level definitions, keys, constraints, indexes and
 state enums are specified normatively in the document named in the "Specified in" column, and are
-not restated here.** Mutability is declared **per table** rather than globally, because eighteen of
-the twenty-six are deliberately mutable (one of them, `owf_dead_letter_triage`, pending); the platform producer-outbox tables are not in this
+not restated here.** Mutability is declared **per table** rather than globally, because nineteen of
+the twenty-seven are deliberately mutable (one of them, `owf_dead_letter_triage`, pending); the platform producer-outbox tables are not in this
 inventory (`design/01-foundation.md` §3.7 *Platform-managed producer persistence*), and neither is
 anything the platform engine stores — definition versions live in the platform function registry.
 
-Every table except the load-only `owf_step_operation` carries `resource_tenant_id` NOT NULL
-(the one stated exemption to D-48, D-69); tables backing an operator- or seller-scoped surface
+Every table except the two configuration tables carries `resource_tenant_id` NOT NULL. Those
+two are the stated exemptions to D-48: the load-only `owf_step_operation` (D-69) and
+`owf_seller_policy`, which is keyed by `seller_tenant_id` alone (D-140); tables backing an operator- or seller-scoped surface
 additionally carry `seller_tenant_id`, and per-tenant fairness and back-pressure key on
 `seller_tenant_id`. The axis choice is stated per table in the owning document.
 
@@ -999,6 +1000,7 @@ additionally carry `seller_tenant_id`, and per-tenant fairness and back-pressure
 | `owf_step_log` | `01 §3.7` | foundation — step envelope | append-only — one row per receipt with the platform `attempt_id`; recovery and join evidence, explicitly **not** the audit source of record |
 | `owf_idempotency_registry` | `01 §3.7` | foundation — idempotency registry | **mutable** — lease holder and heartbeat, `open`, settlement under the holder fence; keys age out at the key lifetime and rows stay as tombstones until the instance has been terminal for 30 days |
 | `owf_step_operation` | `01 §3.7` | foundation — operation registry | load-only — replaced from the compiled registry at startup and audited on load; no runtime write path; no tenant column |
+| `owf_seller_policy` | `01 §3.7` | foundation — policy load (the writer) and seller-policy port (the reader) | **mutable** by policy-channel promotion only — the platform row and one row per overriding seller carry the partial-failure policy and the business windows, validated against `07 §4.8` item 8 before commit; no Orders endpoint writes it (D-140) |
 | `owf_audit_entry` | `01 §3.7` | foundation — audit writer | append-only, hash-chained, trigger-protected — no UPDATE/DELETE grant to any role and triggers rejecting both (D-59) |
 | `owf_audit_checkpoint` | `01 §3.7` | foundation — audit writer, checkpoint phase | append-only, trigger-protected — per-namespace roll-up headers chained under `01 §4.17` (D-59) |
 | `owf_audit_checkpoint_member` | `01 §3.7` | foundation — audit writer, checkpoint phase | append-only, trigger-protected — the chain heads a checkpoint captured |
@@ -1026,10 +1028,10 @@ defined): `owf_durable_timer` and `owf_retry_state` — timers and retry policy 
 (ADR-0011, D-70), and `owf_step_log.attempt_id` records the platform attempt; `owf_timer_pause`
 — the pause is `owf_approval_gate.pause_causes` and the remainder `window_remaining_ms` (D-70,
 D-87); `owf_dead_letter_record` — an inbound delivery past its cap is the platform trigger path's
-dead letter (ADR-0009 as amended, D-72). Twenty-six tables remain: eight engine tables and
-eighteen slice tables, one of them pending.
+dead letter (ADR-0009 as amended, D-72). Twenty-seven tables remain: nine engine tables and
+eighteen slice tables, one of them pending (`owf_seller_policy` is the ninth engine table, D-140).
 
-**Retention, per store rather than as one global floor.** Every one of the twenty-six tables has
+**Retention, per store rather than as one global floor.** Every one of the twenty-seven tables has
 a row here, taken from the window its specifying slice's §3.7 declares; the *Purge* column is
 what the `retention-purge` worker of §3.8 does with it:
 
@@ -1040,6 +1042,7 @@ what the `retention-purge` worker of §3.8 does with it:
 | `owf_process_instance`, `owf_definition_binding` | the life of the order record | **never purged** by the worker — no DELETE grant; removed only when the order record is archived under the program retention policy |
 | `owf_process_progress_view` | the life of the process record it projects (`09 §3.7`) | **never purged** by the worker, for the same reason |
 | `owf_step_operation` | replaced on every load | not purged — replaced at startup |
+| `owf_seller_policy` | current rows only (`01 §3.7`, D-140) | not purged — replaced by promotion |
 | `owf_step_log` | 90 days | purged through its `received_at` index |
 | `owf_idempotency_registry` | a 30-day key lifetime — at or above the maximum retry horizon, which includes manual-task resolution and hold/resume — with each row kept as a tombstone until its instance has been terminal for 30 days, so an expired key is never read as a first call (`01 §3.7`, D-104) | purged under the tombstone rule |
 | `owf_dispatch_admission` | a seller row with no non-terminal intent for 30 days (`05 §3.7`) | purged under that rule |
@@ -1068,7 +1071,7 @@ library owns their retention and vacuum. The engine's history is outside it too:
 the platform's, and it holds references only (ADR-0013).
 
 **Migration and schema versioning.** Migrations are ordered by the build-order map in
-[`design/README.md`](./design/README.md): the engine's eight tables and the platform outbox
+[`design/README.md`](./design/README.md): the engine's nine tables and the platform outbox
 migrations land in phase 0/1 before any slice, and each slice's own tables land with it. `design/10`
 owns no table. Append-only tables need no backfill because a correction is a new row. The gear
 exposes migrations and the runtime applies them, so the schema version is the migration set the
@@ -1511,7 +1514,7 @@ owner and one release vehicle:
 | Change | Vehicle | Owner |
 |--------|---------|-------|
 | Reorder, insert or drop a `composable` step (except a `p1` composable on its required path); change a re-check tick, a retry policy, a `switch` predicate over returned enums or an escalation arm, inside the nesting rule — the full list is the one table of [`design/10`](./design/10-process-definition.md) §4.7 (D-136) | **A new definition version**, published by the definition publish job after the ADR-0012 fence and the behavioural gate pass; no Orders build or deploy (D-138) | Definition owners (code owners of `definitions/`); the publish job holds the platform-operator publish role (seller-scoped fragments: Q-10) |
-| An approval escalation window, the overdue window, a manual-task SLA class, the partial-failure policy | **A write of the seller's policy**, audited and bounds-checked; it reaches only records pinned after it (D-134) | The seller's policy owner |
+| An approval escalation window, the overdue window, a manual-task SLA class, the partial-failure policy | **A write of the seller's policy**: a promotion of `owf_seller_policy` rows on the policy channel, audited and bounds-checked before commit, with no slice build and no definition version; it reaches only records pinned after it (D-134, D-140) | Platform operations, on the seller's request; the foundation's policy load validates and writes (`design/01-foundation.md` §3.7) |
 | What a **step** does — a guard, a seam call, a record change, an input or output schema, a new operation, the `protected` list | **An Orders release** of the slice that owns the operation, plus a definition version that uses it | The owning slice |
 | A **task** — one named `call`, `listen`, `wait` or `switch` in the flow | Belongs to a **definition version**; it is never edited in place — a new version is published | `design/10` |
 | A **process event type** or a **Lifecycle trigger** | A **PRD-level** question, because the PRD enumerates both closed sets; the definition's closed `listen` set follows the PRD, never the reverse | PRD owner |
@@ -1541,9 +1544,13 @@ floor, the producer-queue partition count and profile, the clock-skew tolerance,
 circuit-breaker thresholds, the admission caps and the idempotency-key lifetime — are **gear
 configuration promoted through environments with the deployment**. **Per-seller policy values** —
 the partial-failure policy election, the approval escalation window, the overdue window and the
-manual-task SLA classes — live as policy rows in the owning slice's store, where a change is an
-audited, bounds-checked write rather than a redeploy or a publish. The operation that needs one
-resolves it from the seller's policy and pins it on the order's record — `open-gates` on the gate
+manual-task SLA classes — live as rows of the foundation's `owf_seller_policy`
+(`design/01-foundation.md` §3.7, decision D-140): a platform row carrying the defaults and one row
+per seller that overrides any of them. A change is a promotion on the policy channel that
+Lifecycle already uses for its own policy rows, audited and checked against the bounds before it
+commits, rather than an Orders release or a definition publish; no Orders endpoint writes the
+table. The operation that needs one
+resolves it through the foundation's seller-policy port and pins it on the order's record — `open-gates` on the gate
 row, `construct-and-freeze-plan` on the plan, `create-manual-task` in the task's `sla_deadline` —
 so a policy change reaches only records pinned after it, and the definition holds only the tick
 that re-checks the stored deadline (decision D-134; the precedent is the partial-failure policy
@@ -1619,6 +1626,6 @@ alone.
 - **PRD**: [`PRD.md`](./PRD.md)
 - **ADRs**: [`ADR/`](./ADR/) — thirteen decisions: `cpt-cf-bss-orders-workflow-adr-durable-execution-substrate`, `cpt-cf-bss-orders-workflow-adr-slice-decomposition`, `cpt-cf-bss-orders-workflow-adr-process-state-non-authoritative`, `cpt-cf-bss-orders-workflow-adr-two-wave-activation-barrier`, `cpt-cf-bss-orders-workflow-adr-saga-compensable-no-pivot`, `cpt-cf-bss-orders-workflow-adr-idempotency-key-composition`, `cpt-cf-bss-orders-workflow-adr-fail-closed-verdict-park`, `cpt-cf-bss-orders-workflow-adr-outbox-process-events`, `cpt-cf-bss-orders-workflow-adr-manual-task-dead-letter-separation`, `cpt-cf-bss-orders-workflow-adr-platform-pdp-authorization`, `cpt-cf-bss-orders-workflow-adr-flow-as-platform-definition`, `cpt-cf-bss-orders-workflow-adr-definition-versioning-and-protected-steps`, `cpt-cf-bss-orders-workflow-adr-references-not-payloads`
 - **Design set**: [`design/`](./design/) — the foundation, the process definition ([`design/10-process-definition.md`](./design/10-process-definition.md), first in build order after the foundation) and the capability slices; the phased build order is authored in [`design/README.md`](./design/README.md)
-- **Decisions register**: [`DECISIONS.md`](./DECISIONS.md) — D-65…D-101 carry the platform-definition decision and the slice decisions it produced, D-102…D-139 the second-review decisions; Q-01 answered in two parts, Q-10…Q-13 open
+- **Decisions register**: [`DECISIONS.md`](./DECISIONS.md) — D-65…D-101 carry the platform-definition decision and the slice decisions it produced, D-102…D-143 the second-review decisions; Q-01 answered in two parts, Q-10…Q-13 open
 - **Upstream requirements**: [`UPSTREAM_REQS.md`](./UPSTREAM_REQS.md) — the asks this gear raises on gears it does not own, serverless-runtime in §2.9
 - **Platform**: serverless-runtime [DESIGN.md](../../../serverless-runtime/docs/DESIGN.md) §1.1, §1.4, §3.1, §3.3; [ADR-0003](../../../serverless-runtime/docs/ADR/0003-cpt-cf-serverless-runtime-adr-workflow-dsl.md), [ADR-0004](../../../serverless-runtime/docs/ADR/0004-cpt-cf-serverless-runtime-adr-temporal-workflow-engine.md), [ADR-0005](../../../serverless-runtime/docs/ADR/0005-cpt-cf-serverless-runtime-adr-thin-host.md)
