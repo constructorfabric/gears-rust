@@ -136,8 +136,11 @@ compensation walk executes inside `compensate-order`, never inside a platform wo
 walk's ordinal is this gear's record (ADR-0005 as amended). The platform's function-level
 `on_failure` / `on_cancel` compensation layer
 ([serverless-runtime `DESIGN.md:402-409`](../../../../serverless-runtime/docs/DESIGN.md#compensation-design--two-layer-model))
-is not used as the compensation mechanism; whether it can target the `compensate-order` route as a
-safety net is an upstream ask (ADR-0005 amendment).
+is not used as the compensation mechanism. As a safety net a thin Function this gear registers can
+already be the handler and call the unwind step routes, so targeting is not asked; what is asked is
+the identity that call carries
+([`…-upreq-serverless-runtime-failure-handler-target`](../UPSTREAM_REQS.md#function-level-failure-handler-as-a-compensation-safety-net),
+ADR-0005 amendment).
 
 ## 2. Principles & Constraints
 
@@ -532,8 +535,8 @@ is refused (`outcome-not-reportable`, §3.3).
 The refusal is bounded. The order stays non-terminal under the escalated manual task whose SLA is
 the operator-facing clock (slice 07); remediation is declared exhausted after **3 failed operator
 resolution attempts on the same task, or the manual-task SLA deadline elapsing without
-resolution, whichever comes first** (`../DECISIONS.md` D-3). Above that sits the non-pausable
-`max_process_lifetime` of **90 days** (D-4), now the definition's top-level lifetime `wait`
+resolution, whichever comes first** (`../DECISIONS.md` D-55). Above that sits the non-pausable
+`max_process_lifetime` of **90 days** (D-53), now the definition's top-level lifetime `wait`
 (`10 §3.6` (a)). What lifts the refusal is always the same: the blocked leg reaches `succeeded`,
 by operator retry or verified override, and a later pass of `compensate-order` sets
 `no_active_verified_at`.
@@ -731,7 +734,7 @@ sequenceDiagram
 **Description**: The definition enters `compensateOrder` from the partial-failure arm (remediation
 exhausted under `remediate`, or immediately under `fail-fast`) or from the pre-activation abort
 (slice 04). *Remediation exhausted* is **3 failed operator resolution attempts on the same task, or
-the manual-task SLA deadline elapsing without resolution, whichever comes first** (D-3); it is
+the manual-task SLA deadline elapsing without resolution, whichever comes first** (D-55); it is
 `resolve-manual-task`'s `exhausted` answer (slice 07) on which fragment (c) routes. A
 `pending-escalation` answer never reaches `report-outcome`: the order stays non-terminal until a
 later pass answers `complete`.

@@ -126,10 +126,14 @@ already taken, so the two Orders gears share one authorization contract. Concret
   returns a sanitized 503, performs no mutation, settles no idempotency key and never falls back
   to a local decision; the workers continue because their authority is configured, not obtained
   from the PDP. The apply-time re-check of a long-running command (`09 §4.4`) re-runs the same PDP
-  decision on the same target; a refusal there refuses the command before the fence, or routes it
-  to a manual task with reason `authority-withdrawn` once the fence waits on it (decision D-115),
-  and leaves the process in its current phase — never `parked`, which is the verdict park of
-  ADR-0007.
+  decision on the same target; a refusal there routes the command to a manual task with reason
+  `authority-withdrawn` and the process left in its current phase — never to `parked`, which is
+  the verdict park of ADR-0007.
+
+  > **Amended 2026-09-26 by D-115**: a refusal at the `pre-fence` re-check refuses the cancel
+  > request, audited, and raises no task, because nothing waits on one there; the
+  > `authority-withdrawn` manual task is raised only at `pre-compensation`, where the fence waits
+  > on it. The process stays in its current phase in both cases, never `parked`.
 
 ### Consequences
 
@@ -172,8 +176,17 @@ no mutation and no key settlement, and that the workers continue; a PostgreSQL i
 racing a mutating operation against a `seller_tenant_id` change and asserting zero rows affected;
 a test that an approver whose `subject_id` is not the gate's `assigned_principal` receives 404 on
 the decision endpoint and an empty inbox page; and a test that the apply-time re-check refusal
-refuses the request with no task at `pre-fence`, raises one `authority-withdrawn` manual task at
-`pre-compensation`, and leaves `owf_process_instance.phase` unchanged in both.
+raises one `authority-withdrawn` manual task and leaves `owf_process_instance.phase` unchanged.
+
+> **Amended 2026-09-26 by D-115**: the last test becomes two: at `pre-fence` the re-check refusal
+> refuses the request with no task; at `pre-compensation` it raises one `authority-withdrawn`
+> manual task; `owf_process_instance.phase` is unchanged in both.
+
+> **Amended 2026-09-26 by D-69, D-73 and D-100**: "twenty-nine registered routes and handlers" is
+> the count before ADR-0011. The conformance test now covers the fifteen caller-facing routes of
+> `design/09-read-and-authz.md` §3.2 (three of them pending on the platform dead-letter ask) and
+> the step route once per registered operation (thirty-five, `09 §3.1`); there is no event
+> handler, because the triggers are the platform's.
 
 ## Pros and Cons of the Options
 
@@ -214,7 +227,7 @@ and D-95 (platform-root event tenancy) apply by reference.
   [`design/09-read-and-authz.md`](../design/09-read-and-authz.md) §2, §3.1, §3.2, §3.4, §3.5,
   §3.6, §3.7, §4.1, §4.2, §4.4; [`design/03-approval-execution.md`](../design/03-approval-execution.md)
   §3.2, §3.3; [`design/07-manual-tasks.md`](../design/07-manual-tasks.md) §3.2, §3.3
-- **Decisions register**: [`DECISIONS.md`](../DECISIONS.md) — D-37 (amended), D-56, D-63, D-64
+- **Decisions register**: [`DECISIONS.md`](../DECISIONS.md) — D-37 (amended), D-56, D-63, D-64, D-69, D-73, D-100, D-115
 - **Upstream asks**: [`UPSTREAM_REQS.md §2.8`](../UPSTREAM_REQS.md#28-platform-authorization-policy)
 - **Precedents**: Orders Lifecycle [`08-read-and-authz.md`](../../../orders-lifecycle/docs/design/08-read-and-authz.md)
   §3.5, §4.3; Pricing [`05-governance.md`](../../../pricing/docs/design/05-governance.md)

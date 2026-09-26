@@ -388,7 +388,7 @@ absorb.
 
 **ADRs**: `cpt-cf-bss-orders-workflow-adr-slice-decomposition`
 
-#### Standard ToolKit authorization posture, with one declared deviation
+#### Standard ToolKit authorization posture, with two declared deviations
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-constraint-platform-pdp-posture`
 
@@ -567,9 +567,11 @@ second declaration site. Resolve a component by opening that document's §3.2.
 **The definition hands off.** There are no cross-slice hand-offs in code any more: no slice calls
 another slice's operation, and every edge between slices is a sequence the definition expresses
 and the fence of ADR-0012 constrains. What the slices share is the record, reached through
-declared in-process **ports** (slice 03's gate-window port, slice 06's closure and cancel-authority
-ports, slice 07's manual-task creation port), each called inside the calling operation's unit of
-work. The edges that used to be stated here are now paths of `design/10` §3.6:
+declared in-process **ports** (slice 03's gate-window and closure ports, slice 04's transition
+function, slice 05's deferral port, slice 07's manual-task creation port, slice 08's
+suspension-closure and cancel-authority ports, slice 09's request-delivery port), each called inside the calling operation's unit of
+work; the build order these ports impose, and its back-edges, are `design/README.md`'s
+(D-139). The edges that used to be stated here are now paths of `design/10` §3.6:
 
 - (a) start and approval: `admit-trigger` → `start-instance` → `obtain-verdict` → `reflect-verdict` → gate loop (`open-gates`, `escalate-gate`, `record-decision`) or park loop (`park`, `arm-park-escalation`, `unpark`);
 - (b) fulfillment: `evaluate-payment-auth-eligibility` → `construct-and-freeze-plan` → `begin-fulfillment` → `dispatch-wave1-create` → barrier (`evaluate-activation-eligibility`, `rebuild-wave1`, `reconcile-intent`; `reread-draft-liveness` only in a version that places the optional early read) → `re-check-pre-activation` → `report-spawn-signal` → `dispatch-wave2-activate` → `report-outcome` → `terminate-instance`;
@@ -647,8 +649,11 @@ Idempotency requirements, concurrency tokens and stability markers are declared 
 by the owning slice. Cross-cutting rules hold over the whole surface and are stated here because no
 single slice owns them: every mutating route requires an `Idempotency-Key`, recomposed server-side
 from the request; *Resolve manual task*, *Retry failed step* and *Cancel workflow with
-compensation* additionally require the optimistic version check (`PRD.md:696,698`), carried as an
-ETag and required as `If-Match`, with a mismatch returned as `409` in the RFC 9457 envelope; a
+compensation* additionally require the optimistic version check, carried as an
+ETag and required as `If-Match`, with a mismatch returned as `409` in the RFC 9457 envelope (the
+PRD requires it of *Resolve manual task* and *Cancel workflow with compensation*, `PRD.md:693,695`;
+for *Retry failed step*, whose PRD row states no concurrency control, `PRD.md:694`, it is this
+design's choice, because a retry is a task resolution and races one, D-49, D-100); a
 control operation answers `202 Accepted` with a `requestRef` once the request is recorded and the
 signal delivered, and `still-processing` (409) while the platform has not accepted the signal.
 Every list operation is paginated with a keyset cursor — default page size 50, maximum 200 — as a
@@ -978,7 +983,7 @@ inside another operation's unit of work; no other component writes to a table it
 on a compensating or remediation path. **Column-level definitions, keys, constraints, indexes and
 state enums are specified normatively in the document named in the "Specified in" column, and are
 not restated here.** Mutability is declared **per table** rather than globally, because eighteen of
-the twenty-six are deliberately mutable; the platform producer-outbox tables are not in this
+the twenty-six are deliberately mutable (one of them, `owf_dead_letter_triage`, pending); the platform producer-outbox tables are not in this
 inventory (`design/01-foundation.md` §3.7 *Platform-managed producer persistence*), and neither is
 anything the platform engine stores — definition versions live in the platform function registry.
 
@@ -1024,22 +1029,36 @@ D-87); `owf_dead_letter_record` — an inbound delivery past its cap is the plat
 dead letter (ADR-0009 as amended, D-72). Twenty-six tables remain: eight engine tables and
 eighteen slice tables, one of them pending.
 
-**Retention, per store rather than as one global floor:**
+**Retention, per store rather than as one global floor.** Every one of the twenty-six tables has
+a row here, taken from the window its specifying slice's §3.7 declares; the *Purge* column is
+what the `retention-purge` worker of §3.8 does with it:
 
-| Store | Retention |
-|---|---|
-| `owf_audit_entry`, `owf_compensation_record`, `owf_cancellation_fence`, `owf_task_resolution_request`, `owf_manual_task`, `owf_incident`, `owf_fulfillment_plan`, `owf_fulfillment_task` | ≥ 400 days |
-| `owf_audit_checkpoint`, `owf_audit_checkpoint_member` | retained with the evidence they cover; never purged |
-| `owf_process_instance`, `owf_definition_binding` | retained for the life of the order record; no DELETE grant to the retention worker |
-| `owf_step_log` | 90 days |
-| `owf_idempotency_registry` | a 30-day key lifetime — at or above the maximum retry horizon, which includes manual-task resolution and hold/resume — with each row kept as a tombstone until its instance has been terminal for 30 days, so an expired key is never read as a first call (`01 §3.7`, D-104) |
-| `owf_dispatch_admission` | a seller row with no non-terminal intent for 30 days |
-| `owf_step_operation` | replaced on every load |
+| Store | Retention | Purge |
+|---|---|---|
+| `owf_audit_entry` | ≥ 400 days | **never purged** — no grant (D-59) |
+| `owf_audit_checkpoint`, `owf_audit_checkpoint_member` | retained with the evidence they cover | **never purged** — no grant |
+| `owf_process_instance`, `owf_definition_binding` | the life of the order record | **never purged** by the worker — no DELETE grant; removed only when the order record is archived under the program retention policy |
+| `owf_process_progress_view` | the life of the process record it projects (`09 §3.7`) | **never purged** by the worker, for the same reason |
+| `owf_step_operation` | replaced on every load | not purged — replaced at startup |
+| `owf_step_log` | 90 days | purged through its `received_at` index |
+| `owf_idempotency_registry` | a 30-day key lifetime — at or above the maximum retry horizon, which includes manual-task resolution and hold/resume — with each row kept as a tombstone until its instance has been terminal for 30 days, so an expired key is never read as a first call (`01 §3.7`, D-104) | purged under the tombstone rule |
+| `owf_dispatch_admission` | a seller row with no non-terminal intent for 30 days (`05 §3.7`) | purged under that rule |
+| `owf_approval_verdict_cache`, `owf_approval_gate`, `owf_approval_request`, `owf_approval_park` (`03 §3.7`) | ≥ 400 days | purged through the index each names |
+| `owf_fulfillment_plan`, `owf_fulfillment_task` (`04 §3.7`) | ≥ 400 days; a task with its plan row | purged through the plan's `created_at` index, tasks with their plan |
+| `owf_provisioning_intent` (`05 §3.7`) | ≥ 400 days | purged through its `created_at` index |
+| `owf_compensation_record`, `owf_cancellation_fence` (`06 §3.7`) | ≥ 400 days | purged through the index each names |
+| `owf_manual_task`, `owf_task_resolution_request`, `owf_incident`, `owf_overdue_escalation`, `owf_dead_letter_triage` (pending) (`07 §3.7`) | ≥ 400 days | purged through the index each names |
+| `owf_process_suspension` (`08 §3.7`) | ≥ 400 days | purged through its `created_at` index |
+| `owf_cancel_request` (`09 §3.7`) | ≥ 400 days, never ahead of the audit entry that names it | purged through a `decided_at` index |
+
+A ≥ 400-day window is a configurable floor, not a fixed age. The worker **MUST NOT** delete a row
+whose instance is not terminal: an instance older than the window exists only behind a
+lifetime-ceiling park, which ends by the order cancel (D-129), and its rows are live state.
 
 No Workflow-owned table is partitioned (D-104, following Lifecycle D-91): PostgreSQL would
 enforce the deduplication uniques of the growth tables — step log, registry, manual tasks,
 resolution requests, provisioning intents and compensation records — only within one partition.
-Every growth table is purged row-wise in bounded batches through its retention index, and a
+Every growth table above is purged row-wise in bounded batches through its retention index, and a
 declared retention window with no worker behind it is an unbounded store, so the retention purge
 in §3.8 is a condition of these numbers rather than a convenience. The audit store and its
 checkpoints are the exception in kind: nothing is ever purged from them and the purge worker holds
@@ -1152,7 +1171,7 @@ a workshop that disagrees has something specific to change.
 | Step-operation calls (definition task dispatch) | **~15 calls per standard order**; **~75 / second sustained, ~750 / second peak** on the step surface | A standard order with no approval gate calls `admit-trigger`, `start-instance`, `obtain-verdict`, `reflect-verdict`, `evaluate-payment-auth-eligibility`, `construct-and-freeze-plan`, `begin-fulfillment`, `dispatch-wave1-create`, `evaluate-activation-eligibility`, `reread-draft-liveness`, `re-check-pre-activation`, `report-spawn-signal`, `dispatch-wave2-activate`, `report-outcome`, `terminate-instance`; waves are one call each, so the count does not scale with lines. Poll arms, re-issued attempts and gate loops add to it and are sized by the platform, not here |
 | Provisioning intents dispatched | **~30 / second sustained** | Sustained rate × p50 lines × 2 waves (5 × 3 × 2), dispatched from inside the two wave operations |
 | Aggregate in-flight intent cap | **2,000**, per-order parallel-line cap **8** | The admission controls of `05 §4.3`; the aggregate cap is ~1 second of dispatch at peak, which is what makes back-pressure bind before the downstream does |
-| Process-event rate | **~40 / second sustained, ~400 / second peak** | Roughly `2 + 2 × lines` events per order (started, per-line step-completed, completed/aborted) at p50 lines |
+| Process-event rate | **~25 / second sustained, ~250 / second peak** | `2 + lines` events per order — `OrderFulfillmentStarted`, one `OrderFulfillmentStepCompleted` per line (only a line's terminal task transition emits it, §1.2), and one completed or aborted event — at p50 3 lines (5 × 5, 50 × 5); the two approval events add two per gated order and do not fire in phase 1 |
 | Producer-queue throughput | **≥ 500 events / second** | Must exceed peak emission; the `bss-orders-workflow-events` queue runs `Partitions::of(16)` under the toolkit high-throughput profile, and the platform workers' measured throughput at that configuration is the evidence, not a Workflow drain sizing |
 | Row growth | **~`5 + 3N` rows per order** (`N` = lines), plus one step-log and one audit row per settled call | One instance, one binding, one plan, one progress-view row and one fence at most; per line one task and two intents. One platform outbox message per event lands in the library-owned `toolkit_db::outbox` tables, outside the Workflow inventory |
 | Platform timers live | **~2 per in-flight process, plus one per open gate** — held by the plugin, not by this gear | The lifetime ceiling and the overdue/expected-fulfillment wait per process; one `PT30S` re-check tick per open gate position, which also carries the probe |
@@ -1600,6 +1619,6 @@ alone.
 - **PRD**: [`PRD.md`](./PRD.md)
 - **ADRs**: [`ADR/`](./ADR/) — thirteen decisions: `cpt-cf-bss-orders-workflow-adr-durable-execution-substrate`, `cpt-cf-bss-orders-workflow-adr-slice-decomposition`, `cpt-cf-bss-orders-workflow-adr-process-state-non-authoritative`, `cpt-cf-bss-orders-workflow-adr-two-wave-activation-barrier`, `cpt-cf-bss-orders-workflow-adr-saga-compensable-no-pivot`, `cpt-cf-bss-orders-workflow-adr-idempotency-key-composition`, `cpt-cf-bss-orders-workflow-adr-fail-closed-verdict-park`, `cpt-cf-bss-orders-workflow-adr-outbox-process-events`, `cpt-cf-bss-orders-workflow-adr-manual-task-dead-letter-separation`, `cpt-cf-bss-orders-workflow-adr-platform-pdp-authorization`, `cpt-cf-bss-orders-workflow-adr-flow-as-platform-definition`, `cpt-cf-bss-orders-workflow-adr-definition-versioning-and-protected-steps`, `cpt-cf-bss-orders-workflow-adr-references-not-payloads`
 - **Design set**: [`design/`](./design/) — the foundation, the process definition ([`design/10-process-definition.md`](./design/10-process-definition.md), first in build order after the foundation) and the capability slices; the phased build order is authored in [`design/README.md`](./design/README.md)
-- **Decisions register**: [`DECISIONS.md`](./DECISIONS.md) — D-65…D-101 carry the platform-definition decision and the slice decisions it produced, D-102…D-104 the second-review decisions; Q-01 answered in two parts, Q-10…Q-13 open
+- **Decisions register**: [`DECISIONS.md`](./DECISIONS.md) — D-65…D-101 carry the platform-definition decision and the slice decisions it produced, D-102…D-139 the second-review decisions; Q-01 answered in two parts, Q-10…Q-13 open
 - **Upstream requirements**: [`UPSTREAM_REQS.md`](./UPSTREAM_REQS.md) — the asks this gear raises on gears it does not own, serverless-runtime in §2.9
 - **Platform**: serverless-runtime [DESIGN.md](../../../serverless-runtime/docs/DESIGN.md) §1.1, §1.4, §3.1, §3.3; [ADR-0003](../../../serverless-runtime/docs/ADR/0003-cpt-cf-serverless-runtime-adr-workflow-dsl.md), [ADR-0004](../../../serverless-runtime/docs/ADR/0004-cpt-cf-serverless-runtime-adr-temporal-workflow-engine.md), [ADR-0005](../../../serverless-runtime/docs/ADR/0005-cpt-cf-serverless-runtime-adr-thin-host.md)

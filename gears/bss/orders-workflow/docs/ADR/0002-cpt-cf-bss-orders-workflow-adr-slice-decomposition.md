@@ -81,6 +81,20 @@ Chosen option: **nine slice documents numbered by implementation build order**, 
 | 9 | `08-hold-and-cancel` | `apply-hold`, `apply-resume`, `authorize-cancel` | 10, 01, 02, 03, 05, 06 |
 | 10 | `09-read-and-authz` | reads, the PDP catalogue including `process_step × execute`, control operations over the platform invocation API; no step operations | 10, 01–08 |
 
+> **Amended 2026-09-26 by D-139** (`DECISIONS.md`): the table above ordered `10` before `01`
+> and `06` before the `07` and `08` ports it calls, and hid three cycles. The build order is now
+> **01, 10, 02, 03, 04, 05, 07, 08, 06, 09**, derived from in-process calls, port calls and table
+> reads, never from the definition's calls: `01` first, because the definition calls nothing but
+> operations registered under its contract; `07` and `08` before `06`, because `06` calls slice
+> 07's creation port and Incident Recorder and slice 08's suspension-closure and cancel-authority
+> ports; `08` after `07`, whose manual-task creator it calls. The edges that still point later
+> — `07` reading `06`'s fence row, and `06`, `07` and `08` using `09`'s catalogue, scope predicate,
+> cancel request record and request-delivery port — are stated as **back-edges**: the earlier slice is built against a double of the
+> later slice's port and integrated when the owner lands. The rule "a slice depends only on a
+> slice earlier in the build order" holds for every edge except a stated back-edge.
+> `design/README.md` carries the table and the back-edges; the slice file names and ids are
+> unchanged.
+
 ### Confirmation
 
 Confirmed by a documentation-structure check that `design/README.md`'s slice table matches this ADR's nine slugs and order exactly, and by a dependency-direction review confirming no slice document declares a dependency on a higher-numbered slice.
@@ -115,6 +129,7 @@ This decomposition takes the same shape as `orders-lifecycle` ADR-0002 (foundati
 
 - **PRD**: [PRD.md](../PRD.md) — §6 (all subsections), §13
 - **DESIGN**: [DESIGN.md](../DESIGN.md)
+- **Decisions register**: [`DECISIONS.md`](../DECISIONS.md) — D-139 (the build order and its back-edges)
 
 This decision directly addresses the following requirements or design elements:
 

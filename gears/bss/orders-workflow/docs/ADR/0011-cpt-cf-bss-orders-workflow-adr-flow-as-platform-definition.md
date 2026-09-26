@@ -128,31 +128,40 @@ and audit grade. Concretely:
   table `owf_definition_binding` (`correlation_id` PK, `definition_id`, `definition_version`,
   `definition_source` ∈ `platform | code`, `pinned_at`, `published_by`, `resource_tenant_id`) is
   written by `start-instance`, and `owf_process_instance.definition_version` is a foreign key to
-  it. `owf_step_log` records an attempt identity on every row: the definition-derived stand-in
-  `$workflow.id + ":" + $task.reference` until the platform asserts an `attempt_id` on the call,
-  which is an upstream ask (`design/01-foundation.md` §3.3 *Attempt identity*).
+  it. `owf_step_log` records the platform `attempt_id` on every row.
+
+  > **Amended 2026-09-26 by D-102**: the platform asserts no `attempt_id` on the call today, so
+  > `owf_step_log` records the definition-derived stand-in `$workflow.id + ":" + $task.reference`
+  > until it does, which is an upstream ask (`design/01-foundation.md` §3.3 *Attempt identity*).
 * **Timers, retry policy, waits and signals are the platform's.** `owf_durable_timer`,
   `owf_retry_state` and slice 08's `owf_timer_pause` are removed. The per-task retry policy (the
   DSL's `use.retries` policy referenced from a `try`'s `catch.retry`, Serverless Workflow DSL
   1.0.0, dsl-reference.md *Try*, *Retry*), the waits (expected-fulfillment, escalation, overdue, lifetime ceiling) and the hold/resume/cancel
   signals are expressed in the definition and executed by the plugin (DESIGN.md line 632: the
   plugin owns step identification, retry scheduling, checkpointing, suspend/resume and
-  event-driven continuation). Hold and resume are the Lifecycle events `OrderHeld` and
-  `OrderResumed`, consumed by a `listen` arm, never platform `suspend`/`resume` control actions,
-  which would pause every `wait` including the lifetime ceiling (`design/10-process-definition.md`
-  §4.4); cancel, re-authorisation and a task resolution are `:plugin-control` signals recorded in
-  Orders before delivery. Each arm then calls `apply-hold`, `apply-resume`, `authorize-cancel` or
-  the recording operation so that Orders records it. The rule "only approval-escalation waits
-  pause on hold; the lifetime ceiling and the barrier keep running" is a definition pattern: the
-  escalation re-check tick sits inside the arm a hold cancels, and after the resume the re-check
-  continues against the deadline Orders re-based — the remainder stays on the gate row and is
-  never returned to the definition, whose first answer after a resume is `apply-resume`'s `due`;
-  the lifetime `wait` is at the top level. A
+  event-driven continuation). Hold, resume, cancel and re-authorisation are signals to the running
+  invocation (`:control` / `:plugin-control`), received by a `listen` arm that then calls
+  `apply-hold`, `apply-resume` or `authorize-cancel` so that Orders records them. The rule "only
+  approval-escalation waits pause on hold; the lifetime ceiling and the barrier keep running" is a
+  definition pattern: the escalation `wait` sits inside the arm a hold signal cancels and a resume
+  re-arms with the remaining window Orders returns; the lifetime `wait` is at the top level. A
   1.0.0 `wait` takes only a fixed duration, never a runtime expression (dsl-reference.md *Wait*,
-  *Duration*), so a deadline is re-checked by the bounded re-check loop of D-70 as amended — a
+  *Duration*), so a remainder is re-armed as the bounded re-check loop of D-70 as amended — a
   fixed-granularity `wait`, a `call` to the operation that owns the deadline, a `switch` that
   loops while it answers `due: false` — and never by a Function that sleeps; whether the plugin
   accepts a runtime-expression duration as an extension is Q-11 (i).
+
+  > **Amended 2026-09-26 by D-80 and D-123**: hold and resume are the Lifecycle events `OrderHeld`
+  > and `OrderResumed`, consumed by a `listen` arm, never platform `suspend`/`resume` control
+  > actions, which would pause every `wait` including the lifetime ceiling
+  > (`design/10-process-definition.md` §4.4); cancel, re-authorisation and a task resolution are
+  > `:plugin-control` signals recorded in Orders before delivery. Each arm then calls
+  > `apply-hold`, `apply-resume`, `authorize-cancel` or the recording operation so that Orders
+  > records it. The escalation re-check tick sits inside the arm a hold cancels, and after the
+  > resume the re-check continues against the deadline Orders re-based: the remainder stays on the
+  > gate row and is never returned to the definition, whose first answer after a resume is
+  > `apply-resume`'s `due`. What the bounded re-check loop re-checks is that deadline, not a
+  > returned remainder.
 * **Workers reduce to three.** `timer-wakeup` and `dead-lease-scan` are removed from the D-62
   roster; `reconciliation-sweep`, `retention-purge` and `audit/<tenant>` remain. A dead lease is
   detected by the sweep's status read, which the definition drives through a `wait`/retry rather
@@ -177,7 +186,7 @@ and audit grade. Concretely:
 | Timers and waits (expected-fulfillment, escalation, overdue, lifetime ceiling) | Platform definition (`wait`), plugin-native timers | `10` §2; D-02, D-53 as nesting bounds |
 | Per-task retry policy and attempt scheduling | Platform definition (`use.retries` referenced from `catch.retry`), executed by the plugin; not the platform `RetryPolicy`, which is invocation-level by SDK error category (DESIGN.md lines 354–370). Orders declares `retry_class` per operation | `owf_step_operation.retry_class`; ADR-0006 as amended; D-70 as amended |
 | Event listening (nine triggers, approval decision, Subscriptions confirmations) | Platform definition (`listen`) over the platform event-trigger path | `10` §2; ADR-0009 as amended |
-| Hold / resume events; cancel / re-authorisation / task-resolution signals | Lifecycle events over the platform event-trigger path, and `:plugin-control` signals, → definition `listen` arm; never `:control` `suspend`/`resume` | `10` §3.3, §4.4; ADR-0007 as amended; Q-11 |
+| Hold / resume / cancel / re-authorisation signals | Platform (`:control`, `:plugin-control`) → definition `listen` arm (**amended 2026-09-26 by D-80**: hold and resume are Lifecycle events over the platform event-trigger path; cancel, re-authorisation and task resolution are `:plugin-control` signals; never `:control` `suspend`/`resume`) | `10` §2, §3.3, §4.4; ADR-0007 as amended; Q-11 |
 | Compensation **structure** (`try`/`catch`) | Platform definition | ADR-0005 as amended |
 | What a step does; every seam call (R1–R5) | Orders step operations | each slice §3.3 |
 | Process record, phase projection, definition binding | Orders (`owf_process_instance`, `owf_step_log`, `owf_definition_binding`) | `design/01-foundation.md` |
@@ -385,7 +394,7 @@ its ADR-0003, ADR-0004 and ADR-0005, and its API surface is its DESIGN.md §3.3.
   [`design/10-process-definition.md`](../design/10-process-definition.md);
   [`design/01-foundation.md`](../design/01-foundation.md) §3.7, §3.8
 - **Decisions register**: [`DECISIONS.md`](../DECISIONS.md) — Q-01 (answered in two parts), D-02,
-  D-53, D-62 (amended), D-65, D-69, D-70 (as amended), D-86 (as amended), D-134, D-135, D-136, D-138, Q-10, Q-11
+  D-53, D-62 (amended), D-65, D-69, D-70 (as amended), D-80, D-86 (as amended), D-102, D-123, D-127, D-134, D-135, D-136, D-138, Q-10, Q-11
 - **Upstream asks**: [`UPSTREAM_REQS.md`](../UPSTREAM_REQS.md) — serverless-runtime section
 - **Platform**: serverless-runtime
   [ADR-0003](../../../../serverless-runtime/docs/ADR/0003-cpt-cf-serverless-runtime-adr-workflow-dsl.md),

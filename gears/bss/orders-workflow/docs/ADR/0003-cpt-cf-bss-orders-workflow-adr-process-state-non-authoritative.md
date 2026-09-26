@@ -101,6 +101,7 @@ This ADR complements ADR-0001 (durable-execution substrate) rather than restatin
 
 - **PRD**: [PRD.md](../PRD.md) — §6.1
 - **DESIGN**: [DESIGN.md](../DESIGN.md)
+- **Decisions register**: [`DECISIONS.md`](../DECISIONS.md) — D-06 (R1 applied to termination on a superseded version), D-18 (R5 applied to the downstream request id)
 
 This decision directly addresses the following requirements or design elements:
 

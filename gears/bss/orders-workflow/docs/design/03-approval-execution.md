@@ -977,7 +977,8 @@ authoritative once present. `reflected_at` is what the never-re-reflect rule rea
 existence (§3.2). **This table cannot hold a park**: `deciding_authority` is NOT NULL and a park is
 by definition the case where no authority answered, so the park has its own table below rather
 than a third `verdict` value. **Retention**: ≥ 400 days, alongside `owf_audit_entry` — the row is
-the evidence of who exempted a commercial decision from approval.
+the evidence of who exempted a commercial decision from approval — purged row-wise through a
+`created_at` index; not partitioned (`01 §3.7`, D-104).
 
 **Example**:
 
@@ -1122,7 +1123,8 @@ This is the "verdict unobtainable" state `cpt-cf-bss-orders-workflow-adr-fail-cl
 requires as distinct from `pending_approval`; it pairs with `owf_process_instance.phase = parked`,
 which `park` (01) writes. The `resolution` enum has no override value by construction — the
 absence is the design (§2.1), and adding a value here is the shape a future force-approve would
-take, so its absence is the thing to review. **Retention**: ≥ 400 days.
+take, so its absence is the thing to review. **Retention**: ≥ 400 days, purged row-wise through a
+`parked_at` index; not partitioned (`01 §3.7`, D-104).
 
 **Example**:
 

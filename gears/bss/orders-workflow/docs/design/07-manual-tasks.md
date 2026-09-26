@@ -762,7 +762,8 @@ the signal delivery component of `10 §3.2`, with the same upstream ask on its p
 other signals of `10 §3.3`. Its reference name is
 `gts.cf.core.events.event.v1~cf.bss.orders_workflow.signal.v1~cf.bss.orders_workflow.task_resolution_requested.v1~`;
 it is never published to the broker and carries no `data` beyond the reference tuple, `taskRef`
-and `requestRef`. It is to be added to the closed `listen` set of `10 §2.2` (§4.7).
+and `requestRef`. It is in `10 §2.2` *The closed trigger set* and in the signal table of
+`10 §3.3` (§4.7 item (d), satisfied).
 
 Every endpoint maps to a registered `(resource, action)` pair in slice 09's catalogue (`09 §3.2`),
 derived from this routing table; every mutation applies the caller's PDP-compiled `AccessScope`
@@ -1337,8 +1338,8 @@ success of its round ([`01 §3.3` *Rounds and attempts*](./01-foundation.md#roun
 alternative to `reopened` is a second competing row or no tracked object at all. It is final for
 `override`, `cancel`, `exhausted` and `auto-closed`.
 
-**The remediation hold is derived, not a state.** Slice 04 §4.4 asks for a `remediation-hold` task
-state. It is answered as a derived property: a task with `assignment_state <> resolved`, `task_scope
+**The remediation hold is derived, not a state.** Slice 04 §4.4 once asked for a `remediation-hold`
+task state; it now states the derived flag defined here: a task with `assignment_state <> resolved`, `task_scope
 ∈ {line, plan}`, a forward reason, under the pinned `remediate` policy, **is** the order's
 remediation hold, and the queue projects it as `remediationHold: true`. Dispatch is stopped
 structurally by the definition's position in `awaitResolution` (04 §4.4), not by a column this
@@ -1407,8 +1408,8 @@ override-attached subjects from this slice's verified-override columns — no as
 for the four operations; the per-action task routes of §3.3 are the resolution surface, so the
 `…/workflows/{orderId}/tasks/{taskId}/resolve` route is retired or becomes an alias of them;
 `manual_task × escalate` and `assign` as in §4.4; `dead_letter × *` marked pending;
-(d) **slice 10** — `task-resolution-requested` joins the closed `listen` set and the signal table of
-§3.3; fragment (c) gains the SLA branch, the `exhaustedTaskRefs` and `exhausted` routing and the
+(d) **slice 10** — `task-resolution-requested` is in the closed `listen` set and the signal table of
+§3.3 (satisfied); fragment (c) gains the SLA branch, the `exhaustedTaskRefs` and `exhausted` routing and the
 `resumeAt` routing of §4.8; (e) **reason catalogue** (`01 §4.9`) — five reasons owned by
 `07-manual-tasks`: `order-fenced` (`ORDER_FENCED`, FailedPrecondition, 400), `action-not-offered`
 (`ACTION_NOT_OFFERED`, FailedPrecondition, 400), `override-unverified` (`OVERRIDE_UNVERIFIED`,

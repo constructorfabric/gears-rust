@@ -199,7 +199,7 @@ escalation indefinitely without consuming the window in any single hold. The bac
 the overdue window (slice 07), which only runs once the order is in fulfillment, while the hazard
 is cycling in `pending_approval`.
 
-The backstop is the unconditional **`max_process_lifetime` of 90 days** (`DECISIONS.md` D-4,
+The backstop is the unconditional **`max_process_lifetime` of 90 days** (`DECISIONS.md` D-53,
 **Accepted**), which is now the literal `P90D` `wait` of the top-level
 `lifetimeCeiling` branch of
 [`10 §3.6` (a)](./10-process-definition.md#a-start-and-approval), outside every stage fork, so no
@@ -909,7 +909,7 @@ performs nor shadows either.
 
 The bounded-lifetime hazard (§2.2) is backstopped by the 90-day top-level `wait` of `10 §3.6` (a),
 never by the overdue window, which cannot see an order cycled through hold and resume while still
-`pending_approval`. The value is a product decision carried openly (D-4); the mechanism does not
+`pending_approval`. The value is a product decision carried openly (D-53); the mechanism does not
 depend on it: whatever ceiling is chosen, it is a literal of the definition version, is outside
 every hold arm, and parks the process for operator disposition rather than terminating it
 silently. After an unpark the process resumes its saved stage and checkpoint under a fresh `P90D`

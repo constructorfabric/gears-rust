@@ -1109,9 +1109,11 @@ serverless-runtime section): a `wait` whose duration is a runtime expression as 
 extension (Q-11 (i)), until which the re-check loop of §4.5 item 4 applies — and even then
 `retryAfterMs` stays advisory, because the deferral instant is the operation's recorded value; a `listen` whose stored event can be restricted to the
 exported members, because the Subscriptions outcome event as published carries a
-`subscriptionId`, which ADR-0013 keeps out of engine history (decision D-97: until the platform can filter a consumed event, the confirmation arm targets a
-reference-only Subscriptions notification — a further Subscriptions ask — or is dropped in favour
-of the poll arm alone); and the handling of a Subscriptions outcome event that correlates to no
+`subscriptionId`, which ADR-0013 keeps out of engine history (decision D-97 as amended: until the
+platform can filter a consumed event, the confirmation arm listens to the published event and the
+`subscriptionId` is part of ADR-0013's stated residual, D-131; no Subscriptions ask is raised for
+it, and if the member-storage ask is declined the confirmation arm is dropped in favour of the
+poll arm alone); and the handling of a Subscriptions outcome event that correlates to no
 running invocation, which is the platform trigger path's.
 
 ### 4.2 Reconciliation-sweep schedule (working baseline)
@@ -1160,7 +1162,7 @@ proposed into the program-wide NFR workshop.
 
 | Control | Working baseline | Derivation |
 |---------|------------------|------------|
-| Per-order parallelism | **8** of the order's intents in flight at once | Bounds one order's share of the shared path; with the 200-line cap of D-5 a 25-line order runs wave 2 in `ceil(25/8) = 4` batches, which is the arithmetic of `04 §4`. |
+| Per-order parallelism | **8** of the order's intents in flight at once | Bounds one order's share of the shared path; with the 200-line cap of D-93 a 25-line order runs wave 2 in `ceil(25/8) = 4` batches, which is the arithmetic of `04 §4`. |
 | Aggregate in-flight intents | **200**, a **placeholder for a measured value** | Re-derived from measured downstream capacity by Little's Law (`L = lambda * W`) and again when that capacity changes; stated so an unset value is a visible choice. An adaptive, gradient- or delay-based limit is preferred to the constant once measurements exist. |
 | Per-seller token bucket | **20** in flight sustained, burst **40**, refill **20 / s**, keyed on `seller_tenant_id` | 10 % of the aggregate sustained: ten active sellers fit without contention and no seller takes more than a tenth of the shared cap. The seller axis is the one that generates correlated bursts; bucketing on the resource tenant would spread one seller's campaign across thousands of buckets. |
 | Cold-start ramp | Effective aggregate cap opens at **10 %** from the replica's readiness and doubles every **30 s** to 100 % | Five doublings reach full admission in ≈ 2.5 min, inside the `01 §4.16` resumption target, and give a just-restarted Subscriptions a ramp rather than a step. Applies to first submits and re-runs alike. |

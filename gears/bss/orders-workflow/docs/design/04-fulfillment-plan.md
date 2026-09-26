@@ -25,7 +25,7 @@
   - [4.1 Idempotency keys and evaluation sequences](#41-idempotency-keys-and-evaluation-sequences)
   - [4.2 The re-check: advisory at construction, authoritative before wave 2](#42-the-re-check-advisory-at-construction-authoritative-before-wave-2)
   - [4.3 Plan-level failures](#43-plan-level-failures)
-  - [4.4 The remediation hold is a manual-task state](#44-the-remediation-hold-is-a-manual-task-state)
+  - [4.4 The remediation hold is a derived manual-task flag](#44-the-remediation-hold-is-a-derived-manual-task-flag)
   - [4.5 Remediation exhausted](#45-remediation-exhausted)
   - [4.6 SLA arithmetic and the bounds of this slice](#46-sla-arithmetic-and-the-bounds-of-this-slice)
   - [4.7 Cross-slice and upstream asks raised by this slice](#47-cross-slice-and-upstream-asks-raised-by-this-slice)
@@ -1137,7 +1137,7 @@ failure that must report `fulfillment_failed` passes `begin-fulfillment` first, 
 route and on every exhaustion route alike.) The plan-scope
 reference on `owf_manual_task` / `owf_incident` is asked of slice 07 (§4.7).
 
-### 4.4 The remediation hold is a manual-task state
+### 4.4 The remediation hold is a derived manual-task flag
 
 This gear has no outbound request-hold operation: `on_hold` is a Lifecycle order state, entered
 only when Lifecycle emits `OrderHeld`. What the remediate policy calls "the order is held" is, in
@@ -1146,15 +1146,18 @@ this design:
 1. Dispatch stops **structurally**: the definition is inside fragment (c)'s `awaitResolution`
    fork and calls no dispatch operation until a resolution returns it to the barrier; and
    `evaluate-activation-eligibility` never releases while any task is `failed`.
-2. The open manual task(s) carry the hold: the task in slice 07's `remediation-hold` state is the
-   operator-visible object, not an instance phase — `owf_process_instance.phase` stays `started`.
+2. The open manual task(s) carry the hold: an open forward task under `remediate` **is** the hold,
+   projected by slice 07 as the derived `remediationHold` flag (`07 §4.3`, `DECISIONS.md` D-99) —
+   the operator-visible object, not an instance phase and not a task state;
+   `owf_process_instance.phase` stays `started`.
 3. The lifetime ceiling keeps running (`01 §4.2`), so a forgotten hold is still bounded.
 4. The order remains `in_fulfillment` (or `approved`, for a plan-level task) at Lifecycle; it moves
    to `on_hold` only if an operator holds it through Lifecycle, which the definition's hold arm
    records through `apply-hold` (slice 08).
 
-The `remediation-hold` value is asked of slice 07's task-state enum (§4.7); until it is declared,
-the task's `open` state carries the meaning. This replaces the previous "instance suspended with
+No task-state value is asked: slice 07 keeps its five `assignment_state` members and derives the
+flag from an open forward task under the pinned `remediate` policy (D-99), and the hold lasts until
+the order's last open task resolves (D-117). This replaces the previous "instance suspended with
 reason `remediation-hold`", which had no phase transition, no column and no exit.
 
 ### 4.5 Remediation exhausted
@@ -1199,8 +1202,9 @@ revision-stamped topology read with per-line resolved/unresolved markers
 until it lands, every re-check defers and, after the ladder, aborts with
 `overlap-read-unevaluable`: **no order completes through this gear**, and the design offers no
 fail-open switch, because a silent pass would activate overlapping subscriptions; (e) **slice 07**
-— a plan-scope reference on `owf_manual_task` / `owf_incident`, the `remediation-hold` task state,
-and `retry` defined per failed wave (§3.7); (f) **slice 06** — `report-outcome` evaluates this
+— a plan-scope reference on `owf_manual_task` / `owf_incident` and `retry` defined per failed wave
+(§3.7); the remediation hold is slice 07's derived `remediationHold` flag, not a task state, so no
+state value is asked (§4.4, D-99); (f) **slice 06** — `report-outcome` evaluates this
 slice's completion predicate and accepts the plan-level abort path of §4.3; (g) **reason
 catalogue** (`01 §4.9`) — `identity-party-unavailable` (§3.6); (h) **`DESIGN.md` table registry**
 — `owf_fulfillment_plan` is mutable in the column groups of §3.7, not append-only;

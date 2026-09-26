@@ -422,7 +422,7 @@ operation registered later is denied until its value is provisioned:
 | `operation` | Protection | Declared in | Granted to serverless-runtime |
 |-------------|------------|-------------|-------------------------------|
 | `start-instance` | protected | [`01 §3.3`](./01-foundation.md#the-foundations-own-operations) | ✓ |
-| `settle-from-lookup` | protected, sweep-only | `01 §3.3` | **✗** — in-process only (`reconcile-intent`, `reconciliation-sweep`); the value is registered so the check is exhaustive, and its expected decision for every principal is a denial |
+| `settle-from-lookup` | protected, sweep-only | `01 §3.3` | **✗** — in-process only (`reconcile-intent`, `compensate-order`, `reconciliation-sweep`); the value is registered so the check is exhaustive, and its expected decision for every principal is a denial |
 | `retry-step` | composable (operator), in-process only | `01 §3.3` | **✗** — run in-process only, inside the operator's `retry` resolution (`resolve-manual-task`), with the actor from the request row; like `settle-from-lookup`, the value is registered so the check is exhaustive, and its expected decision for every principal is a denial (decision D-108) |
 | `park` | composable | `01 §3.3` | ✓ |
 | `unpark` | composable | `01 §3.3` | ✓ |
@@ -1191,7 +1191,8 @@ only through the gateway's **request-delivery port** — the signal delivery of 
 `last_recheck_point`, through the same port by slice 08's cancel-authority port inside `authorize-cancel` and `compensate-order` (`record_consumed`, `record_refused` with its catalogue reason, `record_recheck` with the point), which never writes the row itself either; `authorize-cancel` also marks the request `refused` through it when it answers `preFulfillment` (`08 §3.6`). The request-delivery port is therefore the one write path to these three columns (`DESIGN.md` §3.7 *sole writer*).
 **Mutability**: declared mutable in the three columns above, append-only otherwise. **Tenant
 axes**: all three. **Retention**: ≥ 400 days — it is the evidence of who asked for a destructive
-command and under what authority — never ahead of the audit entry that names it. It never crosses
+command and under what authority — never ahead of the audit entry that names it; purged row-wise
+through a `decided_at` index, not partitioned (`01 §3.7`, D-104). It never crosses
 the engine boundary: the definition sees `requestRef` only (ADR-0013). The request row for retry,
 override and task cancel is slice 07's
 [`owf_task_resolution_request`](./07-manual-tasks.md#37-database-schemas--tables), whose actor and
@@ -1443,16 +1444,12 @@ NFR workshop, not as settled numbers.
   this floor.
 
 - **Per-store retention**: the 400-day floor is a floor on *audit-grade* stores, not a single
-  global rule, and each store states its own so an operator can tell evidence from bookkeeping:
-
-  | Store | Retention |
-  |---|---|
-  | `owf_audit_entry`, `owf_compensation_record`, `owf_manual_task`, `owf_incident`, `owf_cancel_request`, `owf_task_resolution_request` (07) | ≥ 400 days |
-  | `owf_audit_checkpoint`, `owf_audit_checkpoint_member` | retained with the evidence they cover; never purged |
-  | `owf_process_instance`, `owf_definition_binding` | the life of the order record (`01 §3.7`) |
-  | `owf_step_log` | 90 days |
-  | `owf_idempotency_registry` | a 30-day key lifetime; each row kept as a tombstone until its instance has been terminal for 30 days (`01 §3.7`, D-104) |
-  | `owf_process_progress_view` | lives as long as the process record it projects; never purged ahead of it |
+  global rule, and each store states its own so an operator can tell evidence from bookkeeping.
+  The one register of every store's window, and of which stores the `retention-purge` worker
+  never touches, is [`../DESIGN.md`](../DESIGN.md) §3.7 *Retention*, executed by the roster of
+  [`01 §3.8`](./01-foundation.md#38-deployment-topology); this slice's two stores are
+  `owf_cancel_request` (≥ 400 days) and `owf_process_progress_view` (the life of the process
+  record it projects, never purged ahead of it).
 
   `owf_dead_letter_record` and `owf_retry_state` are retired (`01 §3.7` *Retired tables*); their
   former rows in this register are removed.

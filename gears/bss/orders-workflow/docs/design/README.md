@@ -97,20 +97,33 @@ slice's §3.6 is now a path through the definition it specifies, and every slice
 declared against the contract and the fence it fixes. A document is scoped by PRD decomposition but
 built when its dependencies exist.
 [`../ADR/0002`](../ADR/0002-cpt-cf-bss-orders-workflow-adr-slice-decomposition.md)
-(`cpt-cf-bss-orders-workflow-adr-slice-decomposition`) names this table the build-order authority.
+(`cpt-cf-bss-orders-workflow-adr-slice-decomposition`) names this table the build-order authority
+(as amended by `../DECISIONS.md` D-139).
 
-| Order | Doc | PRD § | Phase | Depends on |
-|-------|-----|-------|-------|------------|
-| 1 | `01-foundation` | process engine core — step operations and the record | 0/1 | — |
-| 2 | `10-process-definition` | the flow (§6.1–§6.4 paths, §17.1) | 0/1 | 01 |
-| 3 | `02-triggers-and-start` | trigger + start | 1 | 01, 10 |
-| 4 | `03-approval-execution` | approval | 1 | 01, 10, 02 |
-| 5 | `04-fulfillment-plan` | fulfillment planning | 1/2 | 01, 10, 02, 03 |
-| 6 | `05-provisioning-intents` | provisioning | 2 | 01, 10, 04 |
-| 7 | `06-saga-and-compensation` | saga / compensation | 2 | 01, 10, 05 |
-| 8 | `07-manual-tasks` | manual tasks | 2/3 | 01, 10, 05, 06 |
-| 9 | `08-hold-and-cancel` | hold / cancel | 3 | 01, 10, 02, 03, 05, 06 |
-| 10 | `09-read-and-authz` | reads / authz | 3/4 | 01–08, 10 |
+**What an edge is.** A slice depends on another when it calls that slice's operation or port
+in-process, or reads or writes its table. The definition's `call` to an operation is not an edge:
+every slice needs `10`, and the definition is exercised end to end only by the publish job's
+behavioural gate (`10 §4.2`), once every operation exists. The *Depends on* column lists the
+earlier slices a slice needs; the *Back-edges* column lists the places where a slice needs a later
+one: slice 07 reading slice 06's fence row, and slices 06, 07 and 08 using slice 09's catalogue,
+scope predicate, cancel request record and request-delivery port. Each back-edge is a port the later slice owns: the earlier slice is built and
+unit-tested against a double of that port, and its integration test runs once the owner lands —
+the way Orders Lifecycle builds capture against an `EventBrokerApi` double
+([`../../../orders-lifecycle/docs/design/README.md`](../../../orders-lifecycle/docs/design/README.md),
+*Phase 0/1*).
+
+| Order | Doc | PRD § | Phase | Depends on | Back-edges (built against a double) |
+|-------|-----|-------|-------|------------|-------------------------------------|
+| 1 | `01-foundation` | process engine core — step operations and the record | 0/1 | — | — |
+| 2 | `10-process-definition` | the flow (§6.1–§6.4 paths, §17.1) | 0/1 | 01 | — |
+| 3 | `02-triggers-and-start` | trigger + start | 1 | 01, 10 | — |
+| 4 | `03-approval-execution` | approval | 1 | 01, 10, 02 | — |
+| 5 | `04-fulfillment-plan` | fulfillment planning | 1/2 | 01, 10, 02, 03 | — |
+| 6 | `05-provisioning-intents` | provisioning | 2 | 01, 10, 04 | — |
+| 7 | `07-manual-tasks` | manual tasks | 2/3 | 01, 10, 03, 04, 05 | 06 (the fence-row read in `resolve-manual-task`'s re-check); 09 (catalogue rows, §4.4 scope predicate) |
+| 8 | `08-hold-and-cancel` | hold / cancel | 3 | 01, 10, 03, 04, 05, 07 | 09 (§4.4 authorization snapshot and apply-time re-check; the request-delivery port that writes `owf_cancel_request`) |
+| 9 | `06-saga-and-compensation` | saga / compensation | 2 | 01, 10, 02, 03, 04, 05, 07, 08 | 09 (the cancel request record's `cancel_reason`, read by `report-outcome`; the request-delivery port at `pre-compensation`) |
+| 10 | `09-read-and-authz` | reads / authz | 3/4 | 01–08, 10 | — |
 
 Several of these edges are less obvious than the rest and are stated because they were checked
 against the component, operation and table ownership established in `DESIGN.md` §3. `10` needs
@@ -120,13 +133,25 @@ its protected operations are ordered by `10`'s fence. `03` needs `02` because th
 only runs inside an admitted, version-pinned process instance. `04` needs `03` because the
 fulfillment plan is only built once the process has passed (or been made to bypass) the approval
 gate. `05` needs `04` because a provisioning intent is derived line-by-line from the frozen plan,
-not from the raw order. `06` needs `05` because the saga compensates provisioning intents, so the
-intents must exist before their reversal can be designed. `07` needs `05` and `06` because a manual
-task is raised on unresolved partial failure inside the provisioning/saga path, and its resolution
-re-enters that same path. `08` needs `02`, `03`, `05` and `06` because hold and cancel must be able
-to interrupt the process at start, at the approval step, and mid-saga, and cancel must reach the
-compensation path `06` owns. `09` depends on `01` through `08` and `10` because it authorizes every
-route and every step operation the others declare; nothing here is separable from the whole set.
+not from the raw order, and every outcome is applied through slice 04's transition function. `07`
+needs `03`, `04` and `05` because its operations call slice 03's park port, slice 04's transition
+function and slice 05's `binding_reference`. `08` needs `03`, `04`, `05` and `07` because it calls
+slice 03's gate-window port, slice 05's deferral port with slice 04's transition function, and
+slice 07's manual-task creator in the same unit of work. `06` comes after both: it calls slice
+03's closure port, slice 04's completion predicate, slice 05's intent dispatcher, slice 07's
+creation port and Incident Recorder, and slice 08's suspension-closure and cancel-authority ports
+(`06 §5`). The cancel path reaching `06`'s fence is a
+path of the definition, not an edge. `09` depends on `01` through `08` and `10` because it
+authorizes every route and every step operation the others declare; nothing here is separable from
+the whole set.
+
+**The cycles, stated.** Four pairs call each other, and the back-edges above are where each is
+broken: `06` and `07` (06 calls 07's creation port; 07's retry re-check reads 06's fence row); and
+`06`, `07` and `08` each with `09` (09 enumerates their routes and operations; they declare their
+routes against 09's catalogue and scope predicate, and 06 and 08 reach 09's cancel request record
+through its request-delivery port or by a read). A back-edge double is replaced by the owner's port in
+the owner's build step, and 09's conformance test (`09 §3.7` *No permission table: the catalogue conformance check*, `inst-cc-conformance`) is the check
+that every route 07 and 08 declared maps to the pair 09 registers.
 
 ## Honesty disclosures
 

@@ -101,8 +101,10 @@ partially evaluable without it.
 
 - **Rationale**: Registered upstream in `SEAMS.md` as `SUB-O5` (HIGH, "neighbour-extends"),
   unagreed. Until it lands, the against-existing-subscriptions half of the pre-activation abort
-  check is unevaluable and therefore fails closed (halt before activation, void wave-1 drafts,
-  record `overlap-collision`).
+  check is unevaluable and therefore fails closed: after Lifecycle's `defer` ladder the
+  pre-activation re-check halts before activation, voids the wave-1 drafts and records
+  `overlap-read-unevaluable`, never `overlap-collision` (`DECISIONS.md` D-91,
+  `design/04-fulfillment-plan.md` §4.2).
 - **Consequence if it does not land**: the pre-activation overlap check can only ever evaluate the
   within-basket half; the against-existing-subscriptions half remains permanently unevaluable and
   the design must keep treating that half as a fail-closed refusal.
@@ -1179,7 +1181,7 @@ it would shorten (D-105).
    with the canonical `SEAMS.md` meaning. The PRD is the current definition site for the colliding
    `SUB-O6` and the unregistered `SUB-O7`-`SUB-O9`, so it is the artifact that must carry the fix.
 
-2. **`OrderAmended` approval-verdict re-obtaining gap.** PRD §6.2 (line 280) requires Workflow to
+2. **`OrderAmended` approval-verdict re-obtaining gap.** PRD §6.2 *Approval Request and Multi-Party Gate* (`PRD.md:277`) requires Workflow to
    cancel open approval gates for the prior version on `OrderAmended` and open new
    `OrderApprovalRequest`(s) for the new version when approval is required, but no PRD section
    requires **re-obtaining the approval-requirement verdict** for the new order version before
@@ -1279,6 +1281,46 @@ it would shorten (D-105).
     history survive — and not as a promise that execution continues without the platform
     (`design/01-foundation.md` §4.16).
 
+12. **§6.3, §7.1, §9.1 and §17 — dead letters are the platform's.** Under `ADR/0009` as amended
+    and `DECISIONS.md` D-72, an inbound delivery past its cap is the platform event-trigger path's
+    dead letter, and Orders writes no dead-letter row. Seven PRD clauses still require an Orders
+    record: `cpt-cf-bss-orders-workflow-fr-owf-dead-letter` (`PRD.md:381`, a record carrying
+    `orderId`, `orderVersion`, `correlationId`, source id and last error, with an alert to the
+    fulfillment-operator queue); `cpt-cf-bss-orders-workflow-fr-owf-task-queue` (`PRD.md:421`,
+    dead letters in the task queue); *Query process progress* (`PRD.md:692`, dead-letter records
+    in the progress read); `cpt-cf-bss-orders-workflow-nfr-owf-audit` (`PRD.md:622`, "dead-letter"
+    among the transitions this gear's audit log records); acceptance criteria 7c (`PRD.md:995`,
+    "an inspectable dead-letter record **MUST** exist"), 7d (`PRD.md:1005`, an outcome still
+    unknown after the sweep budget "**MUST** take the dead-letter path") and 8a (`PRD.md:1049`, a
+    dead-letter record in the operator's scope appears). The PRD **MUST** restate them as follows:
+    - the inspectable dead-letter record, its alert and its re-drive are the platform trigger
+      path's, surfaced to this gear's operators through
+      `…-upreq-serverless-runtime-dead-letter-operator-visibility`; until that ask lands, a
+      dead-lettered trigger is visible only in the platform's trigger metrics, and a dead-lettered
+      start trigger leaves the order in `submitted` with no instance and no manual task (§2.9);
+    - the task queue and the progress read show platform dead letters once that ask lands, and
+      are otherwise silent on them (`design/09-read-and-authz.md` §3.1, §4.1);
+    - `nfr-owf-audit` covers the transitions this gear makes; a delivery the platform
+      dead-letters never reaches a step operation, so no Orders audit row records it, and the
+      platform's record is the evidence;
+    - 7d: an intent whose outcome is still unknown after the sweep budget becomes `unresolved` and
+      raises a line manual task through the definition's failure stage, never a dead letter
+      (`design/05-provisioning-intents.md` §3.7, `DECISIONS.md` D-97, D-125).
+
+13. **§6.2, §14, §16 and §17 — the engine is selected and its timers are the plugin's.** Items 5
+    and 6 amend §6.1 and the §13 dependency row only. Four more passages keep the pre-ADR-0011
+    wording and **MUST** be amended the same way: §6.2 *Escalation Timer* (`PRD.md:297`) makes
+    Workflow "the **single owner** of scheduling, persisting, and firing escalation timers" — it
+    **MUST** read that Workflow owns the escalation deadline on its record and the tick that
+    re-checks it is a plugin timer of the definition (`DECISIONS.md` D-70, D-134); §17
+    acceptance criterion (`PRD.md:910`, "keep a durable timer until expected fulfillment time") and
+    the §17.1 diagram's "durable timer" nodes (`PRD.md:1232`, `PRD.md:1253`) **MUST** name the
+    definition's fixed-granularity `wait` over a deadline Orders stores; §14 (`PRD.md:1177`, the
+    engine "will be selected via ADR; this PRD … is agnostic to the engine choice") **MUST** record
+    the selection (serverless-runtime, `ADR/0011`); and the §16 risk *Engine decision pending*
+    (`PRD.md:1200`, "Design cannot begin") **MUST** be closed and replaced by the platform
+    readiness-gate risk (`…-upreq-serverless-runtime-readiness-gate`).
+
 ## 5. Traceability
 
 - **PRD**: [`./PRD.md`](./PRD.md) — §6.1 (Fulfillment Plan Construction), §6.2 (Approval
@@ -1296,8 +1338,10 @@ it would shorten (D-105).
   `ADR/0008` and `DECISIONS.md` D-58 (platform producer outbox, §2.7 co-signature);
   `DECISIONS.md` D-16 (Catalog topology), D-46 and Q-02 (relational escalation threshold), D-50 and
   D-38 (audit retention and the privacy ask); `ADR/0010` and `DECISIONS.md` D-63 (platform PDP
-  authorization, §2.8); `ADR/0011`, `ADR/0012`, `ADR/0013` and `DECISIONS.md` D-65…D-108, Q-10…Q-13
-  (serverless-runtime, §2.9); `DECISIONS.md` D-110 (the `failure_reason` coverage ask, §2.4)
+  authorization, §2.8); `ADR/0011`, `ADR/0012`, `ADR/0013` and `DECISIONS.md` D-65…D-138, Q-10…Q-13
+  (serverless-runtime, §2.9); `DECISIONS.md` D-110 (the `failure_reason` coverage ask, §2.4);
+  D-91 and Q-08 (the overlap read's fail-closed reason, §2.1); D-97 as amended (no further
+  Subscriptions ask, §2.1); D-72, D-65, D-105 as amended (PRD amendments 11–13, §4)
 - **Platform register**: serverless-runtime has no upstream-requirements register; §2.9 cites its
   [DESIGN.md](../../../serverless-runtime/docs/DESIGN.md), [PRD.md](../../../serverless-runtime/docs/PRD.md),
   [NEXT_ADR_SCOPE.md](../../../serverless-runtime/docs/NEXT_ADR_SCOPE.md) and ADR-0004/0005 by line

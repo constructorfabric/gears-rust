@@ -94,8 +94,11 @@ Temporal plugin. Concretely:
 * **Recovery is defined against the record.** A crashed or restarted operation reconstructs its
   position from this gear's record alone; the platform's re-invocation of a task is absorbed by
   the idempotency registry (ADR-0006 as amended), and an instance whose invocation ends without
-  `terminate-instance` is found by the sweep's instance liveness pass from the record's bound
-  invocation and raised as a manual task, never inferred from engine history (`DECISIONS.md` D-105).
+  `terminate-instance` is found by the sweep from the record, not from the engine.
+
+  > **Amended 2026-09-26 by D-105**: the sweep finds it through its instance liveness pass, which
+  > reads the record's bound invocation from the platform and raises an `invocation-dead` manual
+  > task; nothing is inferred from engine history.
 
 ### Consequences
 
@@ -162,7 +165,7 @@ this ADR, together with ADR-0011, selects it. See the sibling `orders-lifecycle`
 - **DESIGN**: [DESIGN.md](../DESIGN.md) §1, §2.2, §4.2, §4.3, §4.9;
   [`design/01-foundation.md`](../design/01-foundation.md);
   [`design/10-process-definition.md`](../design/10-process-definition.md)
-- **Decisions register**: [`DECISIONS.md`](../DECISIONS.md) — D-01, Q-01 (answered by ADR-0011)
+- **Decisions register**: [`DECISIONS.md`](../DECISIONS.md) — D-01, D-105 (as amended), Q-01 (answered by ADR-0011)
 - **Related ADRs**: ADR-0011 (flow as platform definition), ADR-0012 (versioning and protected
   steps), ADR-0013 (references, not payloads), ADR-0003 (process state non-authoritative)
 - **Platform**: serverless-runtime

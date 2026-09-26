@@ -85,8 +85,11 @@ The distinction matters where a create is accepted **after** an activation, whic
 > (`…-upreq-serverless-runtime-failure-handler-target`, `p2`) is only that its outbound call runs
 > as the serverless-runtime service principal the step routes admit. The canonical definition
 > declares no handler; the safety net for an invocation that ends without `report-outcome` is the
-> reconciliation sweep's instance liveness pass, which raises it as an `invocation-dead` manual
-> task whose fallback is the sweep-driven cancel unwind (`DECISIONS.md` D-105).
+> reconciliation sweep's `settle-from-lookup`.
+
+> **Amended 2026-09-26 by D-105**: that safety net is the reconciliation sweep's instance liveness
+> pass, not `settle-from-lookup`: it raises an `invocation-dead` manual task, whose fallback is the
+> sweep-driven cancel unwind.
 
 ### Confirmation
 
@@ -123,6 +126,7 @@ This ADR assumes the two-wave structure recorded in ADR-0004 and the provisionin
 
 - **PRD**: [PRD.md](../PRD.md) — §6.4 Per-Step Compensation Declaration, §6.4 Compensation Execution on Permanent Failure
 - **DESIGN**: [DESIGN.md](../DESIGN.md)
+- **Decisions register**: [`DECISIONS.md`](../DECISIONS.md) — D-27, D-29, D-30 (restate this ADR), D-83 (`compensate-order`, as amended), D-105 (the safety net, as amended)
 
 This decision directly addresses the following requirements or design elements:
 
