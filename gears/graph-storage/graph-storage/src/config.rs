@@ -109,9 +109,12 @@ pub struct GraphStorageConfig {
     /// oversized one is paid for on every later read of that row, by every
     /// consumer, not only by the request that wrote it.
     ///
-    /// The same ceiling bounds every identifier a caller hands any other
-    /// call -- a seed, a key to read or delete, a type id or pattern, a
-    /// namespace -- since a longer one names nothing ingest could have stored.
+    /// The same ceiling bounds every identifier a caller hands any call --
+    /// a type id on ingest or registration, a seed, a key to read or delete,
+    /// a pattern, a namespace, a catalogue cursor, a migration path -- since
+    /// a longer one names nothing ingest could have stored. The admission
+    /// functions name every field of every request in exhaustive patterns, so
+    /// a new field is bounded or does not compile.
     pub identifier_max_bytes: u32,
     /// Ceiling on a search query's text. The lexical arm parses it and the
     /// vector arm embeds it; neither is work a caller should be able to ask

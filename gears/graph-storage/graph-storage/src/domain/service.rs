@@ -187,6 +187,7 @@ impl GraphServices {
         let auth = self
             .authorize(ctx, &authz::type_resource(), type_action)
             .await?;
+        admission::admit_registration(&self.config, &batch, &options.migrations)?;
         // Reading the tenant's rows — and a migration *writes* them — is not
         // something ontology administration authorizes. The data decision is
         // asked for separately and the call is served under its scope: the
@@ -868,7 +869,7 @@ impl GraphServices {
         let auth = self
             .authorize(ctx, &authz::node_resource(), authz::actions::READ)
             .await?;
-        admission::admit_projection(&self.config, &query)?;
+        admission::admit_projection(&self.config, type_patterns, &query)?;
         let type_set = self.resolve_patterns(&auth, type_patterns).await?;
         let page = self
             .store

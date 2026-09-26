@@ -30,7 +30,9 @@
 //! make the caller resume past rows it never saw.
 
 use graph_storage_sdk::models::{
-    IngestRequest, ItemFamily, NeighborhoodRequest, SearchRequest, TraverseRequest,
+    EdgeSpec, IngestOptions, IngestRequest, ItemFamily, MigrationSpec, MigrationStep,
+    NeighborhoodRequest, NodeSpec, ReplaceScope, SearchRequest, TraverseRequest, TypeQuery,
+    TypeRegistration,
 };
 
 use crate::config::GraphStorageConfig;
@@ -65,73 +67,67 @@ pub fn admit_identifier(
 }
 
 /// Bounds every ingest batch must clear before any validation work is spent.
+///
+/// Every field of the request, and of each node and edge in it, is named in
+/// the patterns below, and none of the patterns ends in `..`. That is the
+/// guard this module rests on: a field added to a request type that this
+/// function does not mention is a compile error here, not a string the
+/// database meets unbounded. The bound on `type_id` was missing for as long
+/// as this was a list of fields someone remembered to write down, while
+/// every field beside it was checked.
 pub fn admit_ingest(cfg: &GraphStorageConfig, request: &IngestRequest) -> Result<(), DomainError> {
-    if request.nodes.len() > cfg.ingest_max_nodes as usize {
+    let IngestRequest {
+        nodes,
+        edges,
+        options:
+            IngestOptions {
+                create_phantoms: _,
+                report_per_item: _,
+                embed: _,
+            },
+        replace_scope,
+        idempotency_key,
+    } = request;
+    if nodes.len() > cfg.ingest_max_nodes as usize {
         return Err(exceeded(format!(
             "batch carries {} nodes; ingest_max_nodes is {}",
-            request.nodes.len(),
+            nodes.len(),
             cfg.ingest_max_nodes
         )));
     }
-    if request.edges.len() > cfg.ingest_max_edges as usize {
+    if edges.len() > cfg.ingest_max_edges as usize {
         return Err(exceeded(format!(
             "batch carries {} edges; ingest_max_edges is {}",
-            request.edges.len(),
+            edges.len(),
             cfg.ingest_max_edges
         )));
     }
     // The idempotency key is the one caller-controlled string the batch
     // carries on its own, and it is the most durable of all of them: it is the
     // TEXT primary key of `ingest_idempotency`, kept for the retention window
-    // and read on every retry. Bounding the node keys and not this one leaves
-    // the cheapest oversized field unbounded, and an index entry is where it
-    // lands.
-    if let Some(key) = &request.idempotency_key
-        && key.len() > cfg.identifier_max_bytes as usize
-    {
-        return Err(exceeded(format!(
-            "idempotency_key is {} bytes; identifier_max_bytes is {}",
-            key.len(),
-            cfg.identifier_max_bytes
-        )));
+    // and read on every retry.
+    if let Some(key) = idempotency_key {
+        admit_identifier(cfg, "idempotency_key", key)?;
     }
-    // The two caller-controlled strings a node carries outside its payload.
-    // Bounding the payload and not these leaves the cheapest oversized field
-    // unbounded: `node_key` and `name` are indexed columns, and every read of
-    // the row carries them back to every consumer.
-    for (index, node) in request.nodes.iter().enumerate() {
-        for (what, value) in [("node_key", &node.node_key)]
-            .into_iter()
-            .chain(node.name.as_ref().map(|name| ("name", name)))
-        {
-            if value.len() > cfg.identifier_max_bytes as usize {
-                return Err(exceeded(format!(
-                    "node[{index}] {what} is {} bytes; identifier_max_bytes is {}",
-                    value.len(),
-                    cfg.identifier_max_bytes
-                )));
-            }
+    // Every string a node or an edge carries outside its payload is an
+    // identifier: `node_key` and `name` are indexed columns and come back on
+    // every read of the row, `type_id` is resolved against the catalogue and
+    // interned, an endpoint key names a row and a discriminator is part of
+    // the edge key. The payload has its own ceiling.
+    for (index, node) in nodes.iter().enumerate() {
+        let NodeSpec {
+            node_key,
+            type_id,
+            name,
+            payload,
+            expected_version: _,
+        } = node;
+        admit_identifier(cfg, &format!("node[{index}] node_key"), node_key)?;
+        admit_identifier(cfg, &format!("node[{index}] type_id"), type_id)?;
+        if let Some(name) = name {
+            admit_identifier(cfg, &format!("node[{index}] name"), name)?;
         }
-    }
-    for (index, edge) in request.edges.iter().enumerate() {
-        for (what, value) in [
-            ("src_node_key", &edge.src_node_key),
-            ("dst_node_key", &edge.dst_node_key),
-        ]
-        .into_iter()
-        .chain(edge.discriminator.as_ref().map(|d| ("discriminator", d)))
-        {
-            if value.len() > cfg.identifier_max_bytes as usize {
-                return Err(exceeded(format!(
-                    "edge[{index}] {what} is {} bytes; identifier_max_bytes is {}",
-                    value.len(),
-                    cfg.identifier_max_bytes
-                )));
-            }
-        }
-    }
-    for (index, node) in request.nodes.iter().enumerate() {
-        if let Some(payload) = &node.payload {
+        if let Some(payload) = payload {
             let bytes = serde_json::to_vec(payload).map_or(usize::MAX, |v| v.len());
             if bytes > cfg.payload_max_bytes as usize {
                 return Err(exceeded(format!(
@@ -141,8 +137,21 @@ pub fn admit_ingest(cfg: &GraphStorageConfig, request: &IngestRequest) -> Result
             }
         }
     }
-    for (index, edge) in request.edges.iter().enumerate() {
-        if let Some(payload) = &edge.payload {
+    for (index, edge) in edges.iter().enumerate() {
+        let EdgeSpec {
+            type_id,
+            src_node_key,
+            dst_node_key,
+            discriminator,
+            payload,
+        } = edge;
+        admit_identifier(cfg, &format!("edge[{index}] type_id"), type_id)?;
+        admit_identifier(cfg, &format!("edge[{index}] src_node_key"), src_node_key)?;
+        admit_identifier(cfg, &format!("edge[{index}] dst_node_key"), dst_node_key)?;
+        if let Some(discriminator) = discriminator {
+            admit_identifier(cfg, &format!("edge[{index}] discriminator"), discriminator)?;
+        }
+        if let Some(payload) = payload {
             let bytes = serde_json::to_vec(payload).map_or(usize::MAX, |v| v.len());
             if bytes > cfg.payload_max_bytes as usize {
                 return Err(exceeded(format!(
@@ -156,22 +165,15 @@ pub fn admit_ingest(cfg: &GraphStorageConfig, request: &IngestRequest) -> Result
     // The scope a replacement declares is caller-controlled too, and it is
     // the one that outlives the request: `attribute` and `value` become the
     // primary key of `scope_registry` and two indexed columns on every edge
-    // the scope owns. Bounding every key in the batch and not the key the
-    // batch is filed under left the one string that is written once and read
-    // by every later resync unbounded.
-    if let Some(replace) = &request.replace_scope {
-        for (what, value) in [
-            ("replace_scope.attribute", &replace.attribute),
-            ("replace_scope.value", &replace.value),
-        ] {
-            if value.len() > cfg.identifier_max_bytes as usize {
-                return Err(exceeded(format!(
-                    "{what} is {} bytes; identifier_max_bytes is {}",
-                    value.len(),
-                    cfg.identifier_max_bytes
-                )));
-            }
-        }
+    // the scope owns.
+    if let Some(ReplaceScope {
+        attribute,
+        value,
+        generation: _,
+    }) = replace_scope
+    {
+        admit_identifier(cfg, "replace_scope.attribute", attribute)?;
+        admit_identifier(cfg, "replace_scope.value", value)?;
     }
 
     // Counts and per-field ceilings are not a size bound on the batch, and
@@ -181,17 +183,15 @@ pub fn admit_ingest(cfg: &GraphStorageConfig, request: &IngestRequest) -> Result
     // Measured on the serialized form, because that is what is read, parsed,
     // held and written.
     // The scope's own bytes travel with the batch and are charged to it.
-    let mut total: u64 = request.replace_scope.as_ref().map_or(0, |replace| {
+    let mut total: u64 = replace_scope.as_ref().map_or(0, |replace| {
         (replace.attribute.len() as u64).saturating_add(replace.value.len() as u64)
     });
-    for (family, index, bytes) in request
-        .nodes
+    for (family, index, bytes) in nodes
         .iter()
         .enumerate()
         .map(|(index, node)| (ItemFamily::Node, index, node_bytes(node)))
         .chain(
-            request
-                .edges
+            edges
                 .iter()
                 .enumerate()
                 .map(|(index, edge)| (ItemFamily::Edge, index, edge_bytes(edge))),
@@ -249,28 +249,35 @@ fn json_bytes(value: &serde_json::Value) -> u64 {
 }
 
 pub fn admit_search(cfg: &GraphStorageConfig, request: &SearchRequest) -> Result<(), DomainError> {
-    if request.arm_limit == 0 || request.arm_limit > cfg.search_max_arm_limit {
+    let SearchRequest {
+        mode: _,
+        query,
+        arm_limit,
+        limit,
+        type_patterns,
+    } = request;
+    let (arm_limit, limit) = (*arm_limit, *limit);
+    if arm_limit == 0 || arm_limit > cfg.search_max_arm_limit {
         return Err(exceeded(format!(
-            "arm_limit {} is outside 1..={}",
-            request.arm_limit, cfg.search_max_arm_limit
+            "arm_limit {arm_limit} is outside 1..={}",
+            cfg.search_max_arm_limit
         )));
     }
-    if request.limit == 0 || request.limit > cfg.search_max_arm_limit * 2 {
+    if limit == 0 || limit > cfg.search_max_arm_limit * 2 {
         return Err(exceeded(format!(
-            "limit {} is outside 1..={}",
-            request.limit,
+            "limit {limit} is outside 1..={}",
             cfg.search_max_arm_limit * 2
         )));
     }
     // Every arm now starts from text: the vector arm embeds the same `query`
     // through the same provider ingest used, which is what makes a hit
     // comparable at all (`fr-vector-search`).
-    if request.query.as_deref().is_none_or(str::is_empty) {
+    if query.as_deref().is_none_or(str::is_empty) {
         return Err(DomainError::limit_combination(
             "this search mode requires `query`",
         ));
     }
-    if let Some(query) = &request.query
+    if let Some(query) = query
         && query.len() > cfg.search_query_max_bytes as usize
     {
         return Err(exceeded(format!(
@@ -279,32 +286,40 @@ pub fn admit_search(cfg: &GraphStorageConfig, request: &SearchRequest) -> Result
             cfg.search_query_max_bytes
         )));
     }
-    for (index, pattern) in request.type_patterns.iter().enumerate() {
+    for (index, pattern) in type_patterns.iter().enumerate() {
         admit_identifier(cfg, &format!("type_patterns[{index}]"), pattern)?;
     }
     Ok(())
 }
 
-/// The page bound on the type catalogue.
+/// The page bound on the type catalogue, and the strings it is asked with.
 ///
 /// Every other paged read is bounded and this one was not: a caller could ask
 /// for the whole catalogue in one response, which is a tenant's entire
 /// ontology in one allocation. Bounded by the same page size the projection
 /// uses, since it is the same question asked of a different collection.
-pub fn admit_type_query(
-    cfg: &GraphStorageConfig,
-    query: &graph_storage_sdk::models::TypeQuery,
-) -> Result<(), DomainError> {
-    if let Some(top) = query.top
-        && (top == 0 || top > cfg.projection_max_page)
+pub fn admit_type_query(cfg: &GraphStorageConfig, query: &TypeQuery) -> Result<(), DomainError> {
+    let TypeQuery {
+        kind: _,
+        pattern,
+        top,
+        cursor,
+    } = query;
+    if let Some(top) = top
+        && (*top == 0 || *top > cfg.projection_max_page)
     {
         return Err(exceeded(format!(
             "limit {top} is outside 1..={}",
             cfg.projection_max_page
         )));
     }
-    if let Some(pattern) = &query.pattern {
+    if let Some(pattern) = pattern {
         admit_identifier(cfg, "pattern", pattern)?;
+    }
+    // The catalogue's cursor is the type id the previous page ended on, so
+    // it is an identifier by the same rule: a longer one names no type.
+    if let Some(cursor) = cursor {
+        admit_identifier(cfg, "cursor", cursor)?;
     }
     Ok(())
 }
@@ -313,18 +328,26 @@ pub fn admit_traverse(
     cfg: &GraphStorageConfig,
     request: &TraverseRequest,
 ) -> Result<(), DomainError> {
-    if request.seeds.is_empty() {
+    let TraverseRequest {
+        seeds,
+        depth,
+        edge_type_patterns,
+        node_type_patterns,
+        max_nodes,
+    } = request;
+    let depth = *depth;
+    if seeds.is_empty() {
         return Err(DomainError::limit_combination(
             "traversal requires at least one seed",
         ));
     }
-    if request.depth == 0 || request.depth > cfg.traversal_max_depth {
+    if depth == 0 || depth > cfg.traversal_max_depth {
         return Err(exceeded(format!(
-            "depth {} is outside 1..={}",
-            request.depth, cfg.traversal_max_depth
+            "depth {depth} is outside 1..={}",
+            cfg.traversal_max_depth
         )));
     }
-    let max_nodes = request.max_nodes.unwrap_or(cfg.traversal_max_nodes);
+    let max_nodes = max_nodes.unwrap_or(cfg.traversal_max_nodes);
     if max_nodes == 0 || max_nodes > cfg.traversal_max_nodes {
         return Err(exceeded(format!(
             "max_nodes {max_nodes} is outside 1..={}",
@@ -338,8 +361,7 @@ pub fn admit_traverse(
     // "authorized", which cannot be known before a store read — admission
     // runs before any — so this bound is on what was asked for, and the
     // authorized set can only be smaller.
-    let distinct: std::collections::BTreeSet<&str> =
-        request.seeds.iter().map(String::as_str).collect();
+    let distinct: std::collections::BTreeSet<&str> = seeds.iter().map(String::as_str).collect();
     if distinct.len() > max_nodes as usize {
         return Err(exceeded(format!(
             "{} distinct seeds exceed the node budget {max_nodes}; seeds always survive \
@@ -349,13 +371,13 @@ pub fn admit_traverse(
     }
     // The count bounds how many seeds, not how long each is; every one of
     // them is bound into the resolution statement.
-    for (index, seed) in request.seeds.iter().enumerate() {
+    for (index, seed) in seeds.iter().enumerate() {
         admit_identifier(cfg, &format!("seeds[{index}]"), seed)?;
     }
-    for (index, pattern) in request.edge_type_patterns.iter().enumerate() {
+    for (index, pattern) in edge_type_patterns.iter().enumerate() {
         admit_identifier(cfg, &format!("edge_type_patterns[{index}]"), pattern)?;
     }
-    for (index, pattern) in request.node_type_patterns.iter().enumerate() {
+    for (index, pattern) in node_type_patterns.iter().enumerate() {
         admit_identifier(cfg, &format!("node_type_patterns[{index}]"), pattern)?;
     }
     Ok(())
@@ -365,6 +387,13 @@ pub fn admit_neighborhood(
     cfg: &GraphStorageConfig,
     request: &NeighborhoodRequest,
 ) -> Result<(), DomainError> {
+    let NeighborhoodRequest {
+        root,
+        depth,
+        node_budget,
+        include_phantoms: _,
+    } = request;
+    let depth = *depth;
     // The same ceiling bounded walks use, and for the same reason: both drive
     // one BFS, differing only in which nodes truncation keeps. A literal `3`
     // here made the operator's knob mean less than it says -- raising
@@ -377,36 +406,154 @@ pub fn admit_neighborhood(
     // The PRD's depth-3 reference scenario is a performance target, not a
     // cap: the NFR is that depth 3 answers within a second, and nothing in it
     // says depth 4 is refused.
-    if request.depth == 0 || request.depth > cfg.traversal_max_depth {
+    if depth == 0 || depth > cfg.traversal_max_depth {
         return Err(exceeded(format!(
-            "neighborhood depth {} is outside 1..={}",
-            request.depth, cfg.traversal_max_depth
+            "neighborhood depth {depth} is outside 1..={}",
+            cfg.traversal_max_depth
         )));
     }
-    let budget = request.node_budget.unwrap_or(cfg.traversal_max_nodes);
+    let budget = node_budget.unwrap_or(cfg.traversal_max_nodes);
     if budget == 0 || budget > cfg.traversal_max_nodes {
         return Err(exceeded(format!(
             "node_budget {budget} is outside 1..={}",
             cfg.traversal_max_nodes
         )));
     }
-    admit_identifier(cfg, "root", &request.root)
+    admit_identifier(cfg, "root", root)
 }
 
+/// The tabular projection: the type patterns it is narrowed to, and the
+/// `OData` query it is shaped by.
+///
+/// The REST extractor bounds the text of `$filter`, `$orderby` and `$select`
+/// before it parses them (`toolkit::api::odata`), and a query built
+/// in-process arrives already parsed, so those budgets never saw it. The same
+/// budgets are applied here to what the tree carries -- identifiers, function
+/// names and string values -- which is a lower bound on the text that would
+/// have spelled it, so nothing REST admits is refused.
 pub fn admit_projection(
     cfg: &GraphStorageConfig,
+    type_patterns: &[String],
     query: &toolkit_odata::ODataQuery,
 ) -> Result<(), DomainError> {
+    for (index, pattern) in type_patterns.iter().enumerate() {
+        admit_identifier(cfg, &format!("type_patterns[{index}]"), pattern)?;
+    }
+    let toolkit_odata::ODataQuery {
+        filter,
+        order,
+        limit,
+        cursor: _,
+        filter_hash: _,
+        select,
+    } = query;
     // The platform parser already rejected unknown options and the
     // cursor-with-orderby combination; what remains is this gear's page
     // ceiling, which the parser cannot know.
-    if let Some(limit) = query.limit
-        && (limit == 0 || limit > u64::from(cfg.projection_max_page))
+    if let Some(limit) = limit
+        && (*limit == 0 || *limit > u64::from(cfg.projection_max_page))
     {
         return Err(exceeded(format!(
             "$top {limit} is outside 1..={}",
             cfg.projection_max_page
         )));
+    }
+    if let Some(filter) = filter {
+        let bytes = filter_bytes(filter);
+        if bytes > toolkit::api::odata::MAX_FILTER_LEN {
+            return Err(exceeded(format!(
+                "$filter carries {bytes} bytes of names and values; the bound is {}",
+                toolkit::api::odata::MAX_FILTER_LEN
+            )));
+        }
+    }
+    let order_bytes: usize = order.0.iter().map(|key| key.field.len()).sum();
+    if order_bytes > toolkit::api::odata::MAX_ORDERBY_LEN {
+        return Err(exceeded(format!(
+            "$orderby names {order_bytes} bytes of fields; the bound is {}",
+            toolkit::api::odata::MAX_ORDERBY_LEN
+        )));
+    }
+    if let Some(select) = select {
+        let select_bytes: usize = select.iter().map(String::len).sum();
+        if select_bytes > toolkit::api::odata::MAX_SELECT_LEN {
+            return Err(exceeded(format!(
+                "$select names {select_bytes} bytes of fields; the bound is {}",
+                toolkit::api::odata::MAX_SELECT_LEN
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// What a parsed `$filter` carries: every identifier, function name and
+/// string value, plus one byte per operator so a tree of nothing but
+/// operators is not free. Walked with an explicit stack; a caller building
+/// the tree in-process can nest it as deeply as it likes.
+fn filter_bytes(root: &toolkit_odata::ast::Expr) -> usize {
+    use toolkit_odata::ast::{Expr, Value};
+    let mut bytes = 0usize;
+    let mut stack = vec![root];
+    while let Some(expr) = stack.pop() {
+        match expr {
+            Expr::And(left, right) | Expr::Or(left, right) | Expr::Compare(left, _, right) => {
+                bytes = bytes.saturating_add(1);
+                stack.push(left);
+                stack.push(right);
+            }
+            Expr::Not(inner) => {
+                bytes = bytes.saturating_add(1);
+                stack.push(inner);
+            }
+            Expr::In(subject, items) => {
+                bytes = bytes.saturating_add(1);
+                stack.push(subject);
+                stack.extend(items.iter());
+            }
+            Expr::Function(name, args) => {
+                bytes = bytes.saturating_add(1).saturating_add(name.len());
+                stack.extend(args.iter());
+            }
+            Expr::Identifier(name) => bytes = bytes.saturating_add(name.len()),
+            Expr::Value(Value::String(text)) => bytes = bytes.saturating_add(text.len()),
+            Expr::Value(_) => bytes = bytes.saturating_add(1),
+        }
+    }
+    bytes
+}
+
+/// A type registration, and the migrations filed with it.
+///
+/// The type id is the identifier the catalogue is keyed by, interned and
+/// carried on every row of that type; a migration names the type it rewrites
+/// and the payload paths it moves. Each is bounded like any other identifier.
+/// The schema itself is not measured here: it is admitted by validation
+/// against the GTS meta-schema, and a byte ceiling on it would be a setting
+/// the configuration does not have.
+pub fn admit_registration(
+    cfg: &GraphStorageConfig,
+    batch: &[TypeRegistration],
+    migrations: &[MigrationSpec],
+) -> Result<(), DomainError> {
+    for (index, registration) in batch.iter().enumerate() {
+        let TypeRegistration { type_id, schema: _ } = registration;
+        admit_identifier(cfg, &format!("types[{index}].type_id"), type_id)?;
+    }
+    for (index, migration) in migrations.iter().enumerate() {
+        let MigrationSpec { type_id, steps } = migration;
+        admit_identifier(cfg, &format!("migrations[{index}].type_id"), type_id)?;
+        for (step_index, step) in steps.iter().enumerate() {
+            let what = |field: &str| format!("migrations[{index}].steps[{step_index}].{field}");
+            match step {
+                MigrationStep::Rename { from, to } => {
+                    admit_identifier(cfg, &what("from"), from)?;
+                    admit_identifier(cfg, &what("to"), to)?;
+                }
+                MigrationStep::Default { path, value: _ } | MigrationStep::Drop { path } => {
+                    admit_identifier(cfg, &what("path"), path)?;
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -429,7 +576,10 @@ pub fn admit_adjacency_limit(
 mod tests {
     use graph_storage_sdk::models::NeighborhoodRequest;
 
-    use super::{GraphStorageConfig, admit_ingest, admit_neighborhood, admit_traverse};
+    use super::{
+        GraphStorageConfig, admit_ingest, admit_neighborhood, admit_projection, admit_registration,
+        admit_traverse, admit_type_query,
+    };
 
     fn neighborhood(depth: u8) -> NeighborhoodRequest {
         NeighborhoodRequest {
@@ -575,5 +725,134 @@ mod tests {
                 "depth {depth} is admitted by one and not the other"
             );
         }
+    }
+
+    /// Every identifier a request carries is bounded, whichever request it
+    /// is and whichever field carries it.
+    ///
+    /// Listed by field, and the list is what the exhaustive patterns in the
+    /// `admit_*` functions are read against. The bound on `type_id` was
+    /// missing for twelve review rounds while every neighbouring field was
+    /// checked, because each round added the one field that round had named.
+    #[test]
+    fn every_identifier_field_of_every_request_is_bounded() {
+        use graph_storage_sdk::models::{
+            EdgeSpec, IngestOptions, IngestRequest, MigrationSpec, MigrationStep, NodeSpec,
+            TypeQuery, TypeRegistration,
+        };
+
+        let cfg = GraphStorageConfig::default();
+        let fits = "x".repeat(cfg.identifier_max_bytes as usize);
+        let over = "x".repeat(cfg.identifier_max_bytes as usize + 1);
+        let ingest = |nodes: Vec<NodeSpec>, edges: Vec<EdgeSpec>| IngestRequest {
+            nodes,
+            edges,
+            options: IngestOptions::default(),
+            replace_scope: None,
+            idempotency_key: None,
+        };
+        let node = |type_id: &str| NodeSpec {
+            node_key: "k".to_owned(),
+            type_id: type_id.to_owned(),
+            ..NodeSpec::default()
+        };
+        let edge = |type_id: &str| EdgeSpec {
+            type_id: type_id.to_owned(),
+            src_node_key: "a".to_owned(),
+            dst_node_key: "b".to_owned(),
+            ..EdgeSpec::default()
+        };
+        let registration = |type_id: &str| TypeRegistration {
+            type_id: type_id.to_owned(),
+            schema: serde_json::json!({}),
+        };
+        let migration = |type_id: &str, from: &str| MigrationSpec {
+            type_id: type_id.to_owned(),
+            steps: vec![MigrationStep::Rename {
+                from: from.to_owned(),
+                to: "/payload/b".to_owned(),
+            }],
+        };
+        let type_query = |cursor: &str| TypeQuery {
+            kind: None,
+            pattern: None,
+            top: None,
+            cursor: Some(cursor.to_owned()),
+        };
+
+        let admitted = [
+            admit_ingest(&cfg, &ingest(vec![node(&fits)], vec![edge(&fits)])),
+            admit_type_query(&cfg, &type_query(&fits)),
+            admit_projection(
+                &cfg,
+                std::slice::from_ref(&fits),
+                &toolkit_odata::ODataQuery::default(),
+            ),
+            admit_registration(&cfg, &[registration(&fits)], &[migration(&fits, &fits)]),
+        ];
+        for outcome in admitted {
+            outcome.expect("at the ceiling every identifier is admitted");
+        }
+
+        let refused = [
+            (
+                "node[0] type_id",
+                admit_ingest(&cfg, &ingest(vec![node(&over)], Vec::new())),
+            ),
+            (
+                "edge[0] type_id",
+                admit_ingest(&cfg, &ingest(Vec::new(), vec![edge(&over)])),
+            ),
+            ("cursor", admit_type_query(&cfg, &type_query(&over))),
+            (
+                "type_patterns[0]",
+                admit_projection(
+                    &cfg,
+                    std::slice::from_ref(&over),
+                    &toolkit_odata::ODataQuery::default(),
+                ),
+            ),
+            (
+                "types[0].type_id",
+                admit_registration(&cfg, &[registration(&over)], &[]),
+            ),
+            (
+                "migrations[0].type_id",
+                admit_registration(&cfg, &[], &[migration(&over, "/payload/a")]),
+            ),
+            (
+                "migrations[0].steps[0].from",
+                admit_registration(&cfg, &[], &[migration("t", &over)]),
+            ),
+        ];
+        for (field, outcome) in refused {
+            let refusal = outcome.expect_err("one byte over the ceiling is refused");
+            assert!(
+                refusal.to_string().contains(field),
+                "the refusal names `{field}`: {refusal}"
+            );
+        }
+    }
+
+    /// A query built in-process is held to the budgets the REST extractor
+    /// applies to the text it never saw.
+    #[test]
+    fn an_in_process_projection_query_is_bounded_like_a_rest_one() {
+        use toolkit_odata::ast::Expr;
+
+        let cfg = GraphStorageConfig::default();
+        let wide = Expr::Identifier("f".repeat(toolkit::api::odata::MAX_FILTER_LEN + 1));
+        let query = toolkit_odata::ODataQuery::default().with_filter(wide);
+        let refused = admit_projection(&cfg, &[], &query)
+            .expect_err("a filter wider than the REST budget is refused here too");
+        assert!(refused.to_string().contains("$filter"), "{refused}");
+
+        let narrow = Expr::Identifier("name".to_owned());
+        admit_projection(
+            &cfg,
+            &[],
+            &toolkit_odata::ODataQuery::default().with_filter(narrow),
+        )
+        .expect("a filter REST would admit is admitted");
     }
 }
