@@ -916,17 +916,26 @@ mod tests {
 
     /// The check runs before the lookup, so a malformed name never reaches
     /// `std::env::var` or the error message it would land in.
+    ///
+    /// The values are generated rather than written as literals. Nothing
+    /// depends on what they are, and a string literal handed to something
+    /// named `password` is, to `CodeQL`'s hard-coded-credential rule, a
+    /// credential committed to the repository. Generating them removes the
+    /// finding instead of suppressing it, as the redis-cluster-plugin tests
+    /// do for their throwaway ACL password.
     #[test]
     fn a_malformed_placeholder_is_refused_rather_than_looked_up() {
-        let refused = resolve_password("${PG\nPASSWORD}")
+        let generated = uuid::Uuid::new_v4().simple().to_string();
+        let placeholder = format!("${{PG\n{generated}}}");
+        let refused = resolve_password(&placeholder)
             .expect_err("a placeholder with a newline in its name is not a variable");
         assert!(
             matches!(refused, DbError::InvalidParameter(_)),
             "the shape is refused before the lookup, got {refused}"
         );
         assert_eq!(
-            resolve_password("plain-text").expect("a literal password is not a placeholder"),
-            "plain-text"
+            resolve_password(&generated).expect("a value that is not a placeholder passes through"),
+            generated
         );
     }
 
