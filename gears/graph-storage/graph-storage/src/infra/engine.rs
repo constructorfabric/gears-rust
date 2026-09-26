@@ -51,6 +51,8 @@ use crate::infra::store::PgGraphStore;
 /// `false` and every hop is served by the fallback backend, which is what
 /// ADR-0001 promises. Without it the gear would attempt a pattern per request
 /// and answer `500` on a configuration the specification calls supported.
+/// A capability that goes away *after* init is not re-probed: the request
+/// that meets the failure records it on the store (`PgGraphStore::pgq_lost`).
 pub async fn probe_pgq(db: &toolkit_db::secure::Db) -> bool {
     let Ok(conn) = db.conn() else {
         warn!("cannot probe SQL/PGQ: no connection; assuming it is unavailable");
@@ -90,9 +92,9 @@ pub async fn probe_pgq(db: &toolkit_db::secure::Db) -> bool {
 /// What one attempt at the pattern hop produced.
 enum PatternOutcome {
     Answered(ExpandResponse),
-    /// The pattern did not execute here. The two-query hop answers the same
-    /// question, so the request falls back rather than failing — with the
-    /// reason logged, never silently.
+    /// The pattern did not execute here. What the request does with that is
+    /// the configuration's call -- served by the two-query hop under `auto`,
+    /// refused under `pgq` -- and the store learns of the loss either way.
     Unavailable(String),
 }
 
@@ -215,14 +217,40 @@ impl GraphEngineV1 for PgGraphEngine {
         match self.effective_backend()? {
             HopBackend::Pattern => match expand_pgq(&self.store, ctx, &req).await {
                 Ok(PatternOutcome::Answered(response)) => Ok(response),
-                // Two different reasons, one response: the pattern could not
-                // serve this request, and the two-query hop answers the same
-                // question. Falling back is never silent — the reason is
-                // logged either way.
+                // The pattern stopped executing after the probe said it
+                // would: the property graph is gone, or the server was
+                // replaced under the gear. The store records the loss, so
+                // readiness reports it from now on -- the probe at init was
+                // the last time anyone asked -- and this request gets what
+                // the configuration says. `auto` preferred the pattern and
+                // is served by the two-query hop with the reason logged;
+                // `pgq` demanded it and is refused, exactly as it would be
+                // after a restart, rather than quietly served by a backend
+                // the operator did not name. A refusal that readiness still
+                // called healthy was the gap.
                 Ok(PatternOutcome::Unavailable(reason)) => {
-                    warn!(reason = %reason, "graph pattern did not execute; serving the two-query hop");
-                    expand_two_query(&self.store, ctx, &req).await
+                    self.store.pgq_lost();
+                    match self.store.config().traversal_hop {
+                        HopStrategy::Pgq => Err(GraphEngineError::Unavailable {
+                            reason: format!(
+                                "traversal_hop is `pgq` and the declared property graph stopped \
+                                 answering a pattern: {reason}; readiness reports it, and no \
+                                 other backend is substituted for one configured by name"
+                            ),
+                        }),
+                        HopStrategy::Auto | HopStrategy::TwoQuery => {
+                            warn!(
+                                reason = %reason,
+                                "graph pattern did not execute; serving the two-query hop, and \
+                                 readiness reports the loss from now on"
+                            );
+                            expand_two_query(&self.store, ctx, &req).await
+                        }
+                    }
                 }
+                // A scope the pattern cannot enforce is about this request,
+                // not the server: the two-query hop answers it under either
+                // strategy, with the reason logged (DESIGN § 2.2).
                 Err(GraphEngineError::ScopeNotEnforceable { reason }) => {
                     warn!(reason = %reason, "graph pattern refused this scope; serving the two-query hop");
                     expand_two_query(&self.store, ctx, &req).await

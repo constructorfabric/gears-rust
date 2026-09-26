@@ -1548,7 +1548,7 @@ async fn a_hop_reports_the_reached_nodes_degree_only_when_asked() {
 /// got wrong: it attempted a pattern per request and answered `500` on a
 /// configuration the specification supports.
 #[tokio::test]
-async fn traversal_answers_on_a_server_without_the_property_graph() {
+async fn a_property_graph_lost_after_boot_is_reported_and_not_substituted_on_demand() {
     let Some(stand) = stand(HopStrategy::Pgq).await else {
         return;
     };
@@ -1588,6 +1588,34 @@ async fn traversal_answers_on_a_server_without_the_property_graph() {
         "the stand must start with a working property graph for this test to mean anything"
     );
 
+    let hop = || ExpandRequest {
+        frontier: vec![seed],
+        direction: Direction::Outgoing,
+        edge_types: None,
+        labels: None,
+        budget: HopBudget {
+            max_frontier: 100,
+            max_edges_scanned: 1_000,
+        },
+        with_degrees: false,
+    };
+    // And the running engine serves it on the pattern, which is what this
+    // test then takes away.
+    let served = stand
+        .engine
+        .expand(&ctx, hop())
+        .await
+        .expect("with the property graph present the pattern answers");
+    assert_eq!(
+        served.served_by,
+        graph_storage_sdk::plugin_api::HopBackend::Pattern,
+        "precondition: the pattern hop answers before the graph is dropped"
+    );
+    assert_eq!(
+        sqlpgq_row(stand.store.as_ref()).await.state,
+        graph_storage_sdk::models::ReadinessState::Healthy
+    );
+
     drop_property_graph(&stand).await;
 
     assert!(
@@ -1595,33 +1623,65 @@ async fn traversal_answers_on_a_server_without_the_property_graph() {
         "the probe must report the capability as absent once the graph is gone"
     );
 
-    // The engine was built while the capability was present, so this exercises
-    // the per-request path: the pattern fails, and the hop falls back rather
-    // than failing the request.
-    let response = stand
+    // The engine was built while the capability was present, so this is the
+    // per-request path. The stand demanded `pgq`, so the request is refused
+    // rather than served by a backend the operator did not name -- the same
+    // answer a restart would give -- and the store, having found out,
+    // reports the loss. It used to fall back here while readiness stayed
+    // healthy on the boot-time probe.
+    let refused = stand
         .engine
-        .expand(
-            &ctx,
-            ExpandRequest {
-                frontier: vec![seed],
-                direction: Direction::Outgoing,
-                edge_types: None,
-                labels: None,
-                budget: HopBudget {
-                    max_frontier: 100,
-                    max_edges_scanned: 1_000,
-                },
-                with_degrees: false,
-            },
-        )
+        .expand(&ctx, hop())
         .await
-        .expect("a server without SQL/PGQ must still answer, on the fallback backend");
+        .err()
+        .expect("`pgq` is a demand: a pattern that stopped executing is not quietly replaced");
+    assert!(
+        matches!(refused, graph_storage_sdk::plugin_api::GraphEngineError::Unavailable { ref reason } if reason.contains("traversal_hop")),
+        "the refusal names the setting, got {refused:?}"
+    );
+    let row = sqlpgq_row(stand.store.as_ref()).await;
+    assert_eq!(
+        row.state,
+        graph_storage_sdk::models::ReadinessState::Unhealthy,
+        "readiness reports the loss from the request that found it: {row:?}"
+    );
 
+    // A running engine that merely *preferred* the pattern is served by the
+    // two-query hop, and its readiness says so from then on. Built as init
+    // built it while the graph was there: the probe said yes.
+    let preferring = Arc::new(PgGraphStore::new(
+        Arc::clone(&stand.db),
+        GraphStorageConfig {
+            traversal_hop: HopStrategy::Auto,
+            ..GraphStorageConfig::default()
+        }
+        .validated()
+        .expect("the test configuration is valid"),
+        true,
+    ));
+    assert_eq!(
+        sqlpgq_row(preferring.as_ref()).await.state,
+        graph_storage_sdk::models::ReadinessState::Healthy,
+        "until a request meets the loss, the store believes the probe"
+    );
+    let response = PgGraphEngine::new(Arc::clone(&preferring))
+        .expand(&ctx, hop())
+        .await
+        .expect("`auto` is a preference, and the fallback backend answers");
+    assert_eq!(
+        response.served_by,
+        graph_storage_sdk::plugin_api::HopBackend::TwoQuery
+    );
     let reached: Vec<String> = response.edges.iter().map(|e| e.dst.clone()).collect();
     assert_eq!(
         reached,
         vec!["p-b".to_owned()],
         "the fallback backend answers the same question the pattern would have"
+    );
+    assert_eq!(
+        sqlpgq_row(preferring.as_ref()).await.state,
+        graph_storage_sdk::models::ReadinessState::Degraded,
+        "the loss is reported once a request has met it"
     );
 
     // And an engine constructed *after* the capability vanished resolves the
@@ -1642,18 +1702,6 @@ async fn traversal_answers_on_a_server_without_the_property_graph() {
             probed,
         ))
     };
-    let hop = || ExpandRequest {
-        frontier: vec![seed],
-        direction: Direction::Outgoing,
-        edge_types: None,
-        labels: None,
-        budget: HopBudget {
-            max_frontier: 100,
-            max_edges_scanned: 1_000,
-        },
-        with_degrees: false,
-    };
-
     let preferred = store_for(HopStrategy::Auto);
     let again = PgGraphEngine::new(Arc::clone(&preferred))
         .expand(&ctx, hop())
