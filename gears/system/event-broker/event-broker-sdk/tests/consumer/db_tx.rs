@@ -1,3 +1,4 @@
+use event_broker_sdk::Sequence;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -6,25 +7,22 @@ use async_trait::async_trait;
 use chrono::Utc;
 use event_broker_sdk::consumer::LOCAL_DB_OFFSET_STORE_MIGRATION_SQL;
 use event_broker_sdk::dlq::DeadLetterRecord;
+use event_broker_sdk::gts_id;
 use event_broker_sdk::{
     CommitOffsetInTx, ConsumerBatching, ConsumerBuilder, ConsumerError, ConsumerGroupRef,
     EventBatch, EventBrokerError, Fallback, HandlerOutcome, LocalDbOffsetManager, OffsetStore,
-    RawEvent, ResolvedPosition, TxCommitHandle, TxConsumerHandler, TxSingleEventHandler,
+    Position, RawEvent, TxCommitHandle, TxConsumerHandler, TxSingleEventHandler,
 };
 use sea_orm::{ConnectionTrait, Database, EntityTrait, PaginatorTrait, Set, Statement};
 use toolkit_db::secure::{AccessScope, SecureInsertExt};
 use uuid::Uuid;
 
-use super::common::{publish_json, topic_fixture, wait_until};
+use super::common::{publish_json, topic, topic_fixture, wait_until};
 
-const TX_SINGLE_TOPIC: &str = "gts.cf.core.events.topic.v1~example.mock.showcase.txsingle.v1";
-const TX_SINGLE_EVENT: &str = "gts.cf.core.events.event.v1~example.mock.showcase.txsingle.v1~";
-const TX_SINGLE_GROUP: &str =
-    "gts.cf.core.events.consumer_group.v1~example.mock.showcase.txsingle.v1";
-const TX_BATCH_TOPIC: &str = "gts.cf.core.events.topic.v1~example.mock.showcase.txbatch.v1";
-const TX_BATCH_EVENT: &str = "gts.cf.core.events.event.v1~example.mock.showcase.txbatch.v1~";
-const TX_BATCH_GROUP: &str =
-    "gts.cf.core.events.consumer_group.v1~example.mock.showcase.txbatch.v1";
+const TX_SINGLE_TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.showcase.txsingle.v1");
+const TX_SINGLE_EVENT: &str = gts_id!("cf.core.events.event.v1~example.mock.showcase.txsingle.v1~");
+const TX_BATCH_TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.showcase.txbatch.v1");
+const TX_BATCH_EVENT: &str = gts_id!("cf.core.events.event.v1~example.mock.showcase.txbatch.v1~");
 
 mod dlq_row {
     use sea_orm::entity::prelude::*;
@@ -103,7 +101,7 @@ impl TxSingleEventHandler<LocalDbOffsetManager> for TxSingleProjector {
         .await
         .map_err(|err| EventBrokerError::Internal(err.to_string()))?;
 
-        self.committed_offsets.lock().unwrap().push(offset);
+        self.committed_offsets.lock().unwrap().push(offset.as_i64());
         Ok(HandlerOutcome::Success)
     }
 }
@@ -140,7 +138,10 @@ impl TxConsumerHandler<LocalDbOffsetManager> for TxBatchProjector {
         .await
         .map_err(|err| EventBrokerError::Internal(err.to_string()))?;
 
-        self.committed_offsets.lock().unwrap().push(target_offset);
+        self.committed_offsets
+            .lock()
+            .unwrap()
+            .push(target_offset.as_i64());
         Ok(HandlerOutcome::Success)
     }
 }
@@ -192,14 +193,19 @@ CREATE TABLE IF NOT EXISTS showcase_dead_letters (
 fn raw_event_for_dead_letter() -> event_broker_sdk::RawEvent {
     event_broker_sdk::RawEvent {
         id: Uuid::new_v4(),
-        type_id: "gts.cf.core.events.event.v1~example.showcase.db.dlq.v1~".to_owned(),
-        topic: "gts.cf.core.events.topic.v1~example.showcase.db.dlq.v1".to_owned(),
+        type_id: event_broker_sdk::GtsTypeId::new(
+            "gts.cf.core.events.event.v1~example.showcase.db.dlq.v1~",
+        ),
+        topic: event_broker_sdk::GtsInstanceId::try_new(
+            "gts.cf.core.events.topic.v1~example.showcase.db.dlq.v1",
+        )
+        .unwrap(),
         tenant_id: Uuid::nil(),
         subject: "db-dlq-1".to_owned(),
-        subject_type: "test".to_owned(),
+        subject_type: event_broker_sdk::GtsTypeId::new("gts.x.eb.test.subject.v1~"),
         partition: 0,
-        sequence: 42,
-        offset: 42,
+        sequence: Sequence::assigned(42),
+        offset: Sequence::assigned(42),
         occurred_at: Utc::now(),
         sequence_time: Utc::now(),
         trace_parent: None,
@@ -216,10 +222,10 @@ where
 {
     dlq_row::Entity::insert(dlq_row::ActiveModel {
         event_id: Set(record.event_id),
-        topic: Set(record.topic.clone()),
-        event_type: Set(record.event_type.clone()),
+        topic: Set(record.topic.as_ref().to_owned()),
+        event_type: Set(record.event_type.as_ref().to_owned()),
         partition: Set(record.partition as i32),
-        offset: Set(record.offset),
+        offset: Set(record.offset.as_i64()),
         reason: Set(record.reason.clone()),
         payload: Set(record.payload.to_string()),
         occurred_at: Set(record.occurred_at),
@@ -244,15 +250,25 @@ async fn dead_letter_count(conn: &sea_orm::DatabaseConnection) -> u64 {
 async fn if_i_want_transactional_single_event_handling_i_commit_the_delivered_offset_in_my_tx() {
     let fixture = topic_fixture(TX_SINGLE_TOPIC, TX_SINGLE_EVENT, 1).await;
     let (_raw, db) = db_with_showcase_tables().await;
-    fixture.control.register_named_group(TX_SINGLE_GROUP).await;
-    let group = event_broker_sdk::ConsumerGroupId::from_gts(TX_SINGLE_GROUP);
-    let topic = event_broker_sdk::TopicId::from_gts(TX_SINGLE_TOPIC);
+    let group = fixture
+        .broker
+        .create_consumer_group(
+            &fixture.ctx,
+            event_broker_sdk::CreateConsumerGroupRequest {
+                client_agent: "db-tx-single".to_owned(),
+                description: None,
+            },
+        )
+        .await
+        .expect("consumer group created")
+        .id;
+    let topic_id = event_broker_sdk::TopicId::from_gts(TX_SINGLE_TOPIC);
     let committed_offsets = Arc::new(Mutex::new(Vec::new()));
     let assertion_manager = LocalDbOffsetManager::new(db.clone(), Fallback::Earliest);
 
     let handle = ConsumerBuilder::new(fixture.broker.clone())
         .group(ConsumerGroupRef::existing(group))
-        .topics([TX_SINGLE_TOPIC])
+        .topics([topic(TX_SINGLE_TOPIC)])
         .offset_manager(LocalDbOffsetManager::new(db.clone(), Fallback::Earliest))
         .handler(TxSingleProjector {
             db: db.clone(),
@@ -278,10 +294,10 @@ async fn if_i_want_transactional_single_event_handling_i_commit_the_delivered_of
     let committed = committed_offsets.lock().unwrap()[0];
     assert_eq!(
         assertion_manager
-            .load_position(&group, &topic, 0)
+            .load_position(&group, &topic_id, 0)
             .await
             .unwrap(),
-        ResolvedPosition::Exact(committed)
+        Position::Exact(Sequence::assigned(committed))
     );
 }
 
@@ -289,15 +305,25 @@ async fn if_i_want_transactional_single_event_handling_i_commit_the_delivered_of
 async fn if_i_want_transactional_batch_handling_i_commit_the_last_handled_offset_in_my_tx() {
     let fixture = topic_fixture(TX_BATCH_TOPIC, TX_BATCH_EVENT, 1).await;
     let (_raw, db) = db_with_showcase_tables().await;
-    fixture.control.register_named_group(TX_BATCH_GROUP).await;
-    let group = event_broker_sdk::ConsumerGroupId::from_gts(TX_BATCH_GROUP);
-    let topic = event_broker_sdk::TopicId::from_gts(TX_BATCH_TOPIC);
+    let group = fixture
+        .broker
+        .create_consumer_group(
+            &fixture.ctx,
+            event_broker_sdk::CreateConsumerGroupRequest {
+                client_agent: "db-tx-batch".to_owned(),
+                description: None,
+            },
+        )
+        .await
+        .expect("consumer group created")
+        .id;
+    let topic_id = event_broker_sdk::TopicId::from_gts(TX_BATCH_TOPIC);
     let committed_offsets = Arc::new(Mutex::new(Vec::new()));
     let assertion_manager = LocalDbOffsetManager::new(db.clone(), Fallback::Earliest);
 
     let handle = ConsumerBuilder::new(fixture.broker.clone())
         .group(ConsumerGroupRef::existing(group))
-        .topics([TX_BATCH_TOPIC])
+        .topics([topic(TX_BATCH_TOPIC)])
         .batching(ConsumerBatching {
             max_events: 8,
             max_wait: Duration::from_millis(20),
@@ -329,10 +355,10 @@ async fn if_i_want_transactional_batch_handling_i_commit_the_last_handled_offset
     let committed = *committed_offsets.lock().unwrap().last().unwrap();
     assert_eq!(
         assertion_manager
-            .load_position(&group, &topic, 0)
+            .load_position(&group, &topic_id, 0)
             .await
             .unwrap(),
-        ResolvedPosition::Exact(committed)
+        Position::Exact(Sequence::assigned(committed))
     );
 }
 
@@ -341,7 +367,7 @@ async fn if_i_want_db_transactional_progress_i_write_business_rows_and_offset_to
     let (_raw, db) = db_with_showcase_tables().await;
     let manager = Arc::new(LocalDbOffsetManager::new(db.clone(), Fallback::Earliest));
     let group = event_broker_sdk::ConsumerGroupId::from_gts("showcase-db-tx");
-    let topic = event_broker_sdk::TopicId::from_gts("showcase-db-tx-topic");
+    let topic_id = event_broker_sdk::TopicId::from_gts("showcase-db-tx-topic");
     let tx_manager = manager.clone();
 
     db.transaction_ref(move |tx| {
@@ -349,7 +375,7 @@ async fn if_i_want_db_transactional_progress_i_write_business_rows_and_offset_to
             // Application business writes should use secure repositories with
             // this same `tx`; the offset save joins that transaction.
             tx_manager
-                .commit_in_tx(tx, &group, &topic, 0, 41)
+                .commit_in_tx(tx, &group, &topic_id, 0, Sequence::assigned(41))
                 .await
                 .map_err(|err| toolkit_db::DbError::InvalidConfig(err.to_string()))?;
             Ok(())
@@ -359,8 +385,8 @@ async fn if_i_want_db_transactional_progress_i_write_business_rows_and_offset_to
     .expect("transaction commits");
 
     assert_eq!(
-        manager.load_position(&group, &topic, 0).await.unwrap(),
-        ResolvedPosition::Exact(41)
+        manager.load_position(&group, &topic_id, 0).await.unwrap(),
+        Position::Exact(Sequence::assigned(41))
     );
 }
 
@@ -369,14 +395,14 @@ async fn if_the_business_transaction_rolls_back_the_offset_rolls_back_too() {
     let (_raw, db) = db_with_showcase_tables().await;
     let manager = Arc::new(LocalDbOffsetManager::new(db.clone(), Fallback::Earliest));
     let group = event_broker_sdk::ConsumerGroupId::from_gts("showcase-db-tx-rollback");
-    let topic = event_broker_sdk::TopicId::from_gts("showcase-db-tx-rollback-topic");
+    let topic_id = event_broker_sdk::TopicId::from_gts("showcase-db-tx-rollback-topic");
     let tx_manager = manager.clone();
 
     let result: Result<(), toolkit_db::DbError> = db
         .transaction_ref(move |tx| {
             Box::pin(async move {
                 tx_manager
-                    .commit_in_tx(tx, &group, &topic, 0, 77)
+                    .commit_in_tx(tx, &group, &topic_id, 0, Sequence::assigned(77))
                     .await
                     .map_err(|err| toolkit_db::DbError::InvalidConfig(err.to_string()))?;
                 Err(toolkit_db::DbError::InvalidConfig(
@@ -388,8 +414,8 @@ async fn if_the_business_transaction_rolls_back_the_offset_rolls_back_too() {
 
     assert!(result.is_err());
     assert_eq!(
-        manager.load_position(&group, &topic, 0).await.unwrap(),
-        ResolvedPosition::Earliest
+        manager.load_position(&group, &topic_id, 0).await.unwrap(),
+        Position::Earliest
     );
 }
 
@@ -398,7 +424,7 @@ async fn if_i_want_transactional_dlq_i_write_the_record_and_offset_in_one_transa
     let (raw, db) = db_with_showcase_tables().await;
     let manager = Arc::new(LocalDbOffsetManager::new(db.clone(), Fallback::Earliest));
     let group = event_broker_sdk::ConsumerGroupId::from_gts("showcase-db-dlq");
-    let topic = event_broker_sdk::TopicId::from_gts("showcase-db-dlq-topic");
+    let topic_id = event_broker_sdk::TopicId::from_gts("showcase-db-dlq-topic");
     let tx_manager = manager.clone();
     let event = raw_event_for_dead_letter();
     let record = DeadLetterRecord::builder(&event, "permanent validation failure")
@@ -410,7 +436,7 @@ async fn if_i_want_transactional_dlq_i_write_the_record_and_offset_in_one_transa
         Box::pin(async move {
             insert_dead_letter(tx, &record).await?;
             tx_manager
-                .commit_in_tx(tx, &group, &topic, event.partition, event.offset)
+                .commit_in_tx(tx, &group, &topic_id, event.partition, event.offset)
                 .await
                 .map_err(|err| toolkit_db::DbError::InvalidConfig(err.to_string()))?;
             Ok(())
@@ -422,10 +448,10 @@ async fn if_i_want_transactional_dlq_i_write_the_record_and_offset_in_one_transa
     assert_eq!(dead_letter_count(&raw).await, 1);
     assert_eq!(
         manager
-            .load_position(&group, &topic, event.partition)
+            .load_position(&group, &topic_id, event.partition)
             .await
             .unwrap(),
-        ResolvedPosition::Exact(event.offset)
+        Position::Exact(event.offset)
     );
 }
 
@@ -434,7 +460,7 @@ async fn if_the_transactional_dlq_rolls_back_neither_parking_nor_offset_is_durab
     let (raw, db) = db_with_showcase_tables().await;
     let manager = Arc::new(LocalDbOffsetManager::new(db.clone(), Fallback::Earliest));
     let group = event_broker_sdk::ConsumerGroupId::from_gts("showcase-db-dlq-rollback");
-    let topic = event_broker_sdk::TopicId::from_gts("showcase-db-dlq-rollback-topic");
+    let topic_id = event_broker_sdk::TopicId::from_gts("showcase-db-dlq-rollback-topic");
     let tx_manager = manager.clone();
     let event = raw_event_for_dead_letter();
     let record = DeadLetterRecord::builder(&event, "permanent validation failure")
@@ -447,7 +473,7 @@ async fn if_the_transactional_dlq_rolls_back_neither_parking_nor_offset_is_durab
             Box::pin(async move {
                 insert_dead_letter(tx, &record).await?;
                 tx_manager
-                    .commit_in_tx(tx, &group, &topic, event.partition, event.offset)
+                    .commit_in_tx(tx, &group, &topic_id, event.partition, event.offset)
                     .await
                     .map_err(|err| toolkit_db::DbError::InvalidConfig(err.to_string()))?;
                 Err(toolkit_db::DbError::InvalidConfig(
@@ -461,9 +487,9 @@ async fn if_the_transactional_dlq_rolls_back_neither_parking_nor_offset_is_durab
     assert_eq!(dead_letter_count(&raw).await, 0);
     assert_eq!(
         manager
-            .load_position(&group, &topic, event.partition)
+            .load_position(&group, &topic_id, event.partition)
             .await
             .unwrap(),
-        ResolvedPosition::Earliest
+        Position::Earliest
     );
 }

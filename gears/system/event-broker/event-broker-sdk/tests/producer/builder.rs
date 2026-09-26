@@ -66,7 +66,6 @@ impl ProducerIdentityTestExt for ProducerIdentity {
         if self.source_ref().trim().is_empty() {
             Err(EventBrokerError::InvalidProducerOptions {
                 detail: "producer identity source is required".to_owned(),
-                instance: String::new(),
             })
         } else {
             Ok(())
@@ -98,7 +97,6 @@ impl DirectDeduplicationTestExt for DirectDeduplication {
             } => Err(EventBrokerError::InvalidProducerOptions {
                 detail: "registration-backed deduplication requires monotonic or chained mode"
                     .to_owned(),
-                instance: String::new(),
             }),
         }
     }

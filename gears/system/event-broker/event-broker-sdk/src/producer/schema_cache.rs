@@ -48,7 +48,6 @@ impl PreparedEventType {
                 type_id: self.type_id.clone(),
                 errors,
                 detail: "event payload failed schema validation".to_owned(),
-                instance: String::new(),
             })
         }
     }
@@ -108,7 +107,6 @@ impl ProducerSchemaCache {
             return Err(EventBrokerError::EventTypeUnknown {
                 type_id: patterns.join(","),
                 detail: "declared producer event type patterns matched zero event types".to_owned(),
-                instance: String::new(),
             });
         }
 
@@ -123,7 +121,6 @@ impl ProducerSchemaCache {
                     expected_topic: topics.join(","),
                     detail: "resolved event type belongs to a topic not declared on producer"
                         .to_owned(),
-                    instance: String::new(),
                 });
             }
             resolved.insert(prepared.type_id.clone());
@@ -149,7 +146,6 @@ impl ProducerSchemaCache {
                 type_id: type_id.to_owned(),
                 expected_topic: topics.join(","),
                 detail: "event type belongs to a topic not declared on producer".to_owned(),
-                instance: String::new(),
             });
         }
         self.resolved_type_ids
@@ -181,7 +177,6 @@ impl ProducerSchemaCache {
                 type_id: type_id.to_owned(),
                 detail: "this event type does not match any declared event_type_patterns"
                     .to_owned(),
-                instance: String::new(),
             })
         }
     }
@@ -220,7 +215,6 @@ impl ProducerSchemaCache {
             .ok_or_else(|| EventBrokerError::SchemaNotPrepared {
                 type_id: type_id.to_owned(),
                 detail: "schema must be prepared before validating this event".to_owned(),
-                instance: String::new(),
             })
     }
 
@@ -233,7 +227,6 @@ impl ProducerSchemaCache {
             .ok_or_else(|| EventBrokerError::TopicNotFound {
                 topic: topic.to_owned(),
                 detail: "topic was not prepared for this producer".to_owned(),
-                instance: String::new(),
             })
     }
 
@@ -267,7 +260,6 @@ impl ProducerSchemaCache {
                 return Err(EventBrokerError::TopicNotFound {
                     topic: topic.clone(),
                     detail: "declared producer topic was not returned by Event Broker".to_owned(),
-                    instance: String::new(),
                 });
             }
         }

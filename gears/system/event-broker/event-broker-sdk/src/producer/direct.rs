@@ -326,11 +326,13 @@ impl Producer {
             .iter()
             .map(|prepared| prepared.event.clone())
             .collect::<Vec<_>>();
-        let outcomes = self.broker.publish_batch(&self.ctx, &wire_events).await?;
-        for (prepared, outcome) in prepared.iter().zip(outcomes.iter()) {
-            self.advance_after_acceptance(prepared, *outcome).await;
+        // A batch is all-or-nothing: the broker reports one outcome for the
+        // whole batch. Apply it to every prepared event's local chain state.
+        let outcome = self.broker.publish_batch(&self.ctx, &wire_events).await?;
+        for prepared in &prepared {
+            self.advance_after_acceptance(prepared, outcome).await;
         }
-        Ok(outcomes)
+        Ok(vec![outcome; prepared.len()])
     }
 
     pub async fn reset_chain(&self, scope: ResetScope<'_>) -> Result<(), EventBrokerError> {
@@ -451,7 +453,7 @@ impl Producer {
             .write()
             .expect("producer sequence state lock poisoned")
             .extend(cursors.topics.into_iter().flat_map(|topic| {
-                let topic_id = topic.topic;
+                let topic_id = topic.topic.into_string();
                 topic.partitions.into_iter().map(move |p| {
                     (
                         (producer_id, topic_id.clone(), p.partition),
@@ -510,7 +512,6 @@ fn validate_non_empty(field: &'static str, values: &[String]) -> Result<(), Even
     if values.is_empty() || values.iter().any(|value| value.trim().is_empty()) {
         Err(EventBrokerError::InvalidProducerOptions {
             detail: format!("{field} must contain at least one non-empty entry"),
-            instance: String::new(),
         })
     } else {
         Ok(())

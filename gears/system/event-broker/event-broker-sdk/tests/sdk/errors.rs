@@ -4,8 +4,8 @@ use std::error::Error;
 
 use event_broker_sdk::error::{reasons, resources};
 use event_broker_sdk::{
-    ConsumerError, ConsumerGroupId, EventBrokerError, OffsetManagerError, ProducerId,
-    StorageBackendError, SubscriptionId,
+    ConsumerError, ConsumerGroupId, EventBrokerError, OffsetManagerError, OutOfRange,
+    PositionViolation, ProducerId, Sequence, StorageBackendError, SubscriptionId,
 };
 use serde_json::{Value, json};
 use toolkit_canonical_errors::{CanonicalError, Problem};
@@ -16,7 +16,6 @@ fn display_interpolates_fields() {
     let e = EventBrokerError::EventTypeNotDeclared {
         type_id: "gts.cf.core.events.event.v1~example.foo.v1~".into(),
         detail: "d".into(),
-        instance: String::new(),
     };
     assert!(
         e.to_string()
@@ -26,14 +25,12 @@ fn display_interpolates_fields() {
     let e = EventBrokerError::SequenceViolation {
         expected_previous: 42,
         detail: "d".into(),
-        instance: String::new(),
     };
     assert!(e.to_string().contains("42"));
 
     let e = EventBrokerError::RateLimitExceeded {
         retry_after_secs: 30,
         detail: "d".into(),
-        instance: String::new(),
     };
     assert!(e.to_string().contains("30"));
 }
@@ -104,7 +101,6 @@ fn top_level_event_broker_errors_have_full_canonical_representation() {
         (
             EventBrokerError::InvalidProducerOptions {
                 detail: "source is required".into(),
-                instance: "ignored".into(),
             },
             json!({
                 "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
@@ -126,7 +122,6 @@ fn top_level_event_broker_errors_have_full_canonical_representation() {
         (
             EventBrokerError::InvalidConsumerOptions {
                 detail: "group is required".into(),
-                instance: "ignored".into(),
             },
             json!({
                 "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
@@ -149,7 +144,6 @@ fn top_level_event_broker_errors_have_full_canonical_representation() {
             EventBrokerError::EventTypeNotDeclared {
                 type_id: "gts.cf.core.events.event.v1~example.orders.created.v1~".into(),
                 detail: "type is not declared".into(),
-                instance: "ignored".into(),
             },
             json!({
                 "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
@@ -173,7 +167,6 @@ fn top_level_event_broker_errors_have_full_canonical_representation() {
             EventBrokerError::EventTypeUnknown {
                 type_id: "gts.cf.core.events.event.v1~example.orders.created.v1~".into(),
                 detail: "event type not found".into(),
-                instance: "ignored".into(),
             },
             json!({
                 "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.not_found.v1~",
@@ -183,7 +176,7 @@ fn top_level_event_broker_errors_have_full_canonical_representation() {
                 "instance": "/v1/event-broker/test",
                 "trace_id": "trace-123",
                 "context": {
-                    "resource_type": resources::EVENT,
+                    "resource_type": resources::EVENT_TYPE,
                     "resource_name": "gts.cf.core.events.event.v1~example.orders.created.v1~"
                 }
             }),
@@ -193,7 +186,6 @@ fn top_level_event_broker_errors_have_full_canonical_representation() {
                 type_id: "gts.cf.core.events.event.v1~example.orders.created.v1~".into(),
                 expected_topic: "orders".into(),
                 detail: "type belongs to another topic".into(),
-                instance: "ignored".into(),
             },
             json!({
                 "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~",
@@ -217,7 +209,6 @@ fn top_level_event_broker_errors_have_full_canonical_representation() {
             EventBrokerError::SchemaNotPrepared {
                 type_id: "gts.cf.core.events.event.v1~example.orders.created.v1~".into(),
                 detail: "schema cache missing".into(),
-                instance: "ignored".into(),
             },
             json!({
                 "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~",
@@ -241,7 +232,6 @@ fn top_level_event_broker_errors_have_full_canonical_representation() {
             EventBrokerError::InvalidEventField {
                 field: "subject",
                 detail: "must not be empty".into(),
-                instance: "ignored".into(),
             },
             json!({
                 "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
@@ -261,11 +251,56 @@ fn top_level_event_broker_errors_have_full_canonical_representation() {
             }),
         ),
         (
+            EventBrokerError::InvalidTextField {
+                field: "description",
+                detail: "must contain only printable ASCII (0x20-0x7E)".into(),
+                reason: reasons::ASCII_ONLY,
+            },
+            json!({
+                "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+                "title": "Invalid Argument",
+                "status": 400,
+                "detail": "Request validation failed",
+                "instance": "/v1/event-broker/test",
+                "trace_id": "trace-123",
+                "context": {
+                    "field_violations": [{
+                        "field": "description",
+                        "description": "must contain only printable ASCII (0x20-0x7E)",
+                        "reason": reasons::ASCII_ONLY
+                    }],
+                    "resource_type": resources::REQUEST
+                }
+            }),
+        ),
+        (
+            EventBrokerError::InvalidTextField {
+                field: "client_agent",
+                detail: "must be 1-256 bytes, got 257".into(),
+                reason: reasons::FIELD_TOO_LONG,
+            },
+            json!({
+                "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+                "title": "Invalid Argument",
+                "status": 400,
+                "detail": "Request validation failed",
+                "instance": "/v1/event-broker/test",
+                "trace_id": "trace-123",
+                "context": {
+                    "field_violations": [{
+                        "field": "client_agent",
+                        "description": "must be 1-256 bytes, got 257",
+                        "reason": reasons::FIELD_TOO_LONG
+                    }],
+                    "resource_type": resources::REQUEST
+                }
+            }),
+        ),
+        (
             EventBrokerError::EventDataInvalid {
                 type_id: "gts.cf.core.events.event.v1~example.orders.created.v1~".into(),
                 errors: vec!["/amount must be >= 0".into()],
                 detail: "payload invalid".into(),
-                instance: "ignored".into(),
             },
             json!({
                 "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
@@ -289,7 +324,6 @@ fn top_level_event_broker_errors_have_full_canonical_representation() {
             EventBrokerError::TopicNotFound {
                 topic: "orders".into(),
                 detail: "topic not found".into(),
-                instance: "ignored".into(),
             },
             json!({
                 "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.not_found.v1~",
@@ -308,7 +342,6 @@ fn top_level_event_broker_errors_have_full_canonical_representation() {
             EventBrokerError::ConsumerGroupNotFound {
                 group_id,
                 detail: "consumer group not found".into(),
-                instance: "ignored".into(),
             },
             json!({
                 "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.not_found.v1~",
@@ -326,7 +359,6 @@ fn top_level_event_broker_errors_have_full_canonical_representation() {
         (
             EventBrokerError::ConsumerGroupHasActiveMembers {
                 detail: "group has active members".into(),
-                instance: "ignored".into(),
             },
             json!({
                 "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~",
@@ -349,7 +381,6 @@ fn top_level_event_broker_errors_have_full_canonical_representation() {
             EventBrokerError::SubscriptionNotFound {
                 id: subscription_id,
                 detail: "subscription not found".into(),
-                instance: "ignored".into(),
             },
             json!({
                 "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.not_found.v1~",
@@ -367,7 +398,6 @@ fn top_level_event_broker_errors_have_full_canonical_representation() {
         (
             EventBrokerError::Unauthorized {
                 detail: "tenant boundary violation".into(),
-                instance: "ignored".into(),
             },
             json!({
                 "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.permission_denied.v1~",
@@ -386,7 +416,6 @@ fn top_level_event_broker_errors_have_full_canonical_representation() {
             EventBrokerError::UnknownProducer {
                 producer_id,
                 detail: "producer not found".into(),
-                instance: "ignored".into(),
             },
             json!({
                 "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.not_found.v1~",
@@ -405,7 +434,6 @@ fn top_level_event_broker_errors_have_full_canonical_representation() {
             EventBrokerError::SequenceViolation {
                 expected_previous: 41,
                 detail: "sequence mismatch".into(),
-                instance: "ignored".into(),
             },
             json!({
                 "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~",
@@ -428,7 +456,6 @@ fn top_level_event_broker_errors_have_full_canonical_representation() {
             EventBrokerError::RateLimitExceeded {
                 retry_after_secs: 30,
                 detail: "rate limit exceeded".into(),
-                instance: "ignored".into(),
             },
             json!({
                 "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.resource_exhausted.v1~",
@@ -452,7 +479,6 @@ fn top_level_event_broker_errors_have_full_canonical_representation() {
                 active: 4,
                 partitions: 4,
                 detail: "group at capacity".into(),
-                instance: "ignored".into(),
             },
             json!({
                 "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.resource_exhausted.v1~",
@@ -474,7 +500,6 @@ fn top_level_event_broker_errors_have_full_canonical_representation() {
             EventBrokerError::RateLimited {
                 retry_after_secs: 15,
                 detail: "publish rate limited".into(),
-                instance: "ignored".into(),
             },
             json!({
                 "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.resource_exhausted.v1~",
@@ -500,7 +525,6 @@ fn top_level_event_broker_errors_have_full_canonical_representation() {
                 max_count: 100,
                 max_bytes: 1024,
                 detail: "batch too large".into(),
-                instance: "ignored".into(),
             },
             json!({
                 "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
@@ -530,7 +554,6 @@ fn top_level_event_broker_errors_have_full_canonical_representation() {
             EventBrokerError::SubscriptionRecoveryExhausted {
                 attempts: 3,
                 detail: "rejoin failed".into(),
-                instance: "ignored".into(),
             },
             json!({
                 "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~",
@@ -543,28 +566,45 @@ fn top_level_event_broker_errors_have_full_canonical_representation() {
             }),
         ),
         (
+            // Two offenders, one below its partition's floor and one above
+            // its ceiling: both are reported, each with the range it missed
+            // and no part of the value that was submitted.
             EventBrokerError::InvalidInitialPosition {
-                topic: "orders".into(),
-                partition: 7,
-                requested: "before-retention".into(),
-                detail: "initial position out of range".into(),
-                instance: "ignored".into(),
+                violations: vec![
+                    PositionViolation::builder("orders", 0)
+                        .floor(Sequence::assigned(99))
+                        .ceiling(Sequence::assigned(5000))
+                        .breached(OutOfRange::BelowFloor)
+                        .build(),
+                    PositionViolation::builder("orders", 2)
+                        .floor(Sequence::NONE)
+                        .ceiling(Sequence::assigned(12))
+                        .breached(OutOfRange::AboveCeiling)
+                        .build(),
+                ],
+                detail: "Request validation failed".into(),
             },
             json!({
-                "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.out_of_range.v1~",
-                "title": "Out of Range",
+                "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+                "title": "Invalid Argument",
                 "status": 400,
-                "detail": "initial position out of range",
+                "detail": "Request validation failed",
                 "instance": "/v1/event-broker/test",
                 "trace_id": "trace-123",
                 "context": {
-                    "field_violations": [{
-                        "field": "initial_position",
-                        "description": "initial position out of range; requested=before-retention",
-                        "reason": "invalid_initial_position"
-                    }],
-                    "resource_type": resources::PARTITION,
-                    "resource_name": "orders:7"
+                    "field_violations": [
+                        {
+                            "field": "positions",
+                            "description": "topic orders partition 0: the seek position is below the valid range [99, 5000]",
+                            "reason": reasons::BELOW_RETENTION_FLOOR
+                        },
+                        {
+                            "field": "positions",
+                            "description": "topic orders partition 2: the seek position is above the valid range [0, 12]",
+                            "reason": reasons::ABOVE_HIGH_WATER_MARK
+                        }
+                    ],
+                    "resource_type": resources::REQUEST
                 }
             }),
         ),
@@ -572,7 +612,6 @@ fn top_level_event_broker_errors_have_full_canonical_representation() {
             EventBrokerError::PositionsNotSet {
                 unseeded: vec![("orders".into(), 0), ("orders".into(), 1)],
                 detail: "positions not seeded".into(),
-                instance: "ignored".into(),
             },
             json!({
                 "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~",
@@ -603,7 +642,6 @@ fn top_level_event_broker_errors_have_full_canonical_representation() {
                 topic: "orders".into(),
                 partition: 2,
                 detail: "partition not assigned".into(),
-                instance: "ignored".into(),
             },
             json!({
                 "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~",
@@ -626,7 +664,6 @@ fn top_level_event_broker_errors_have_full_canonical_representation() {
         (
             EventBrokerError::StreamingInProgress {
                 detail: "stream already open".into(),
-                instance: "ignored".into(),
             },
             json!({
                 "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~",
@@ -683,7 +720,6 @@ fn nested_storage_backend_errors_have_full_canonical_representation() {
             StorageBackendError::Unavailable {
                 reason: "database refused connection".into(),
                 detail: "backend unavailable".into(),
-                instance: "ignored".into(),
             },
             json!({
                 "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~",
@@ -698,7 +734,6 @@ fn nested_storage_backend_errors_have_full_canonical_representation() {
         (
             StorageBackendError::InvalidConfig {
                 detail: "missing DSN".into(),
-                instance: "ignored".into(),
             },
             json!({
                 "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
@@ -719,23 +754,23 @@ fn nested_storage_backend_errors_have_full_canonical_representation() {
         ),
         (
             StorageBackendError::OffsetOutOfRange {
-                requested: 10,
-                oldest: 20,
-                detail: "offset too old".into(),
-                instance: "ignored".into(),
+                floor: Sequence::assigned(20),
+                ceiling: Sequence::assigned(90),
+                breached: OutOfRange::BelowFloor,
+                detail: "valid positions are [20, 90]".into(),
             },
             json!({
                 "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.out_of_range.v1~",
                 "title": "Out of Range",
                 "status": 400,
-                "detail": "offset too old",
+                "detail": "valid positions are [20, 90]",
                 "instance": "/v1/event-broker/test",
                 "trace_id": "trace-123",
                 "context": {
                     "field_violations": [{
                         "field": "offset",
-                        "description": "offset too old; requested=10; oldest=20",
-                        "reason": "offset_out_of_range"
+                        "description": "the position is below the valid range [20, 90]",
+                        "reason": reasons::BELOW_RETENTION_FLOOR
                     }],
                     "resource_type": resources::OFFSET
                 }
@@ -744,7 +779,6 @@ fn nested_storage_backend_errors_have_full_canonical_representation() {
         (
             StorageBackendError::PartitionNotFound {
                 detail: "partition missing".into(),
-                instance: "ignored".into(),
             },
             json!({
                 "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.not_found.v1~",
@@ -763,7 +797,6 @@ fn nested_storage_backend_errors_have_full_canonical_representation() {
             StorageBackendError::PersistFailed {
                 reason: "unique index detail".into(),
                 detail: "persist failed".into(),
-                instance: "ignored".into(),
             },
             json!({
                 "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~",
@@ -779,7 +812,6 @@ fn nested_storage_backend_errors_have_full_canonical_representation() {
             StorageBackendError::ReadFailed {
                 reason: "driver timeout".into(),
                 detail: "read failed".into(),
-                instance: "ignored".into(),
             },
             json!({
                 "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~",
@@ -816,7 +848,6 @@ fn nested_offset_manager_errors_have_full_canonical_representation() {
         (
             OffsetManagerError::InTxNotSupported {
                 detail: "store cannot join transaction".into(),
-                instance: "ignored".into(),
             },
             json!({
                 "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~",
@@ -901,7 +932,6 @@ fn private_diagnostics_do_not_leak_to_production_problem() {
 fn failed_precondition_uses_canonical_status_without_local_override() {
     let json = problem_json(EventBrokerError::StreamingInProgress {
         detail: "already open".into(),
-        instance: "ignored".into(),
     });
 
     assert_eq!(
@@ -916,7 +946,6 @@ fn canonical_to_event_broker_projection_preserves_modeled_and_unmodeled_cases() 
     let rate_limited = CanonicalError::from(EventBrokerError::RateLimitExceeded {
         retry_after_secs: 25,
         detail: "slow down".into(),
-        instance: String::new(),
     });
     match EventBrokerError::from(rate_limited) {
         EventBrokerError::RateLimitExceeded {
@@ -926,15 +955,44 @@ fn canonical_to_event_broker_projection_preserves_modeled_and_unmodeled_cases() 
         other => panic!("expected rate-limit projection, got {other:?}"),
     }
 
+    // A modeled not-found now round-trips to its typed variant (the inverse
+    // mapping was completed in the rest-client change).
     let not_found = CanonicalError::from(EventBrokerError::TopicNotFound {
         topic: "orders".into(),
         detail: "topic missing".into(),
-        instance: String::new(),
     });
     match EventBrokerError::from(not_found) {
-        EventBrokerError::Other { canonical } => {
-            assert!(matches!(canonical, CanonicalError::NotFound { .. }));
-        }
-        other => panic!("expected catch-all projection, got {other:?}"),
+        EventBrokerError::TopicNotFound { topic, .. } => assert_eq!(topic, "orders"),
+        other => panic!("expected TopicNotFound projection, got {other:?}"),
+    }
+
+    // A text-field validation reason now round-trips to its typed variant: the
+    // inverse decode was symmetrized with the forward map. The `field` name is
+    // not carried on the wire, so it recovers empty.
+    let text_field = CanonicalError::from(EventBrokerError::InvalidTextField {
+        field: "client_agent",
+        detail: "must be printable ASCII".into(),
+        reason: "ascii_only",
+    });
+    match EventBrokerError::from(text_field) {
+        EventBrokerError::InvalidTextField { reason, .. } => assert_eq!(reason, "ascii_only"),
+        other => panic!("expected InvalidTextField projection, got {other:?}"),
+    }
+}
+
+#[test]
+fn topology_version_mismatch_round_trips_to_its_typed_variant() {
+    // Forward: a FailedPrecondition carrying the topology_version_mismatch reason.
+    let canonical = CanonicalError::from(EventBrokerError::TopologyVersionMismatch {
+        detail: "subscription topology changed; re-read the subscription and re-seek".into(),
+    });
+    assert!(
+        matches!(canonical, CanonicalError::FailedPrecondition { .. }),
+        "topology_version_mismatch is a FailedPrecondition, got {canonical:?}"
+    );
+    // Reverse: recovered back to the typed variant (a stateless re-read signal).
+    match EventBrokerError::from(canonical) {
+        EventBrokerError::TopologyVersionMismatch { .. } => {}
+        other => panic!("expected TopologyVersionMismatch projection, got {other:?}"),
     }
 }

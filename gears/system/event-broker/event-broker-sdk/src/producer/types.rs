@@ -41,7 +41,6 @@ impl ProducerIdentity {
         if self.source.trim().is_empty() {
             return Err(crate::error::EventBrokerError::InvalidProducerOptions {
                 detail: "producer identity source is required".to_owned(),
-                instance: String::new(),
             });
         }
         Ok(())
@@ -102,7 +101,6 @@ impl DirectDeduplication {
             } => Err(crate::error::EventBrokerError::InvalidProducerOptions {
                 detail: "registration-backed deduplication requires monotonic or chained mode"
                     .to_owned(),
-                instance: String::new(),
             }),
             Self::RegisterOnStart { .. } | Self::Reuse { .. } => Ok(()),
         }
@@ -184,19 +182,16 @@ impl ManagedDeduplicationBuilder {
             return Err(crate::error::EventBrokerError::InvalidProducerOptions {
                 detail: "managed producer registration requires monotonic or chained mode"
                     .to_owned(),
-                instance: String::new(),
             });
         }
         let key =
             self.key
                 .ok_or_else(|| crate::error::EventBrokerError::InvalidProducerOptions {
                     detail: "managed producer registration key is required".to_owned(),
-                    instance: String::new(),
                 })?;
         if key.trim().is_empty() {
             return Err(crate::error::EventBrokerError::InvalidProducerOptions {
                 detail: "managed producer registration key must not be empty".to_owned(),
-                instance: String::new(),
             });
         }
         Ok(DbDeduplication::Managed(ManagedDeduplication {

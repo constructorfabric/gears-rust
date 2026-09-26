@@ -1,18 +1,19 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use event_broker_sdk::mock::stubs::test_ctx_for_tenant;
-use event_broker_sdk::mock::{MockBroker, MockBrokerHandle, PartitionKeyFixture};
-use event_broker_sdk::{Event, EventBrokerApi};
+use event_broker::test_support::{EventBrokerHarness, StaticTypesRegistry};
+use event_broker_sdk::{Event, EventBrokerApi, GtsIdPattern, GtsInstanceId, GtsTypeId};
+use serde_json::json;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
-pub const TENANT: &str = "00000000-0000-0000-0000-000000000001";
-
 pub struct TopicFixture {
     pub broker: Arc<dyn EventBrokerApi>,
-    pub control: MockBrokerHandle,
     pub ctx: SecurityContext,
+    /// Owns the running in-process broker. Its loader and ingest-outbox
+    /// background tasks must outlive the test, so the harness is held here and
+    /// dropped only when the fixture is.
+    _harness: EventBrokerHarness,
 }
 
 pub struct PublishJson<'a> {
@@ -35,33 +36,42 @@ pub struct PublishJson<'a> {
 /// payload - which tests do assert - exactly as the caller wrote them.
 const FIXTURE_PARTITION_POINTER: &str = "/source";
 
-pub async fn topic_fixture(topic: &str, event_type: &str, partitions: u32) -> TopicFixture {
-    let mock = MockBroker::new();
-    let control = MockBrokerHandle::from_broker(&mock);
-    control.register_topic(topic, partitions).await;
-    control
-        .register_event_type(
-            topic,
-            event_type,
-            serde_json::json!({ "type": "object" }),
-            &[],
-        )
-        .await;
-    control
-        .set_partition_key(PartitionKeyFixture {
-            event_type,
-            pointer: FIXTURE_PARTITION_POINTER,
-        })
-        .await;
-    control
-        .set_heartbeat_interval(Duration::from_millis(10))
-        .await;
+/// The subject type every fixture event carries. A real broker validates
+/// `subject_type` as a GTS id and rejects it unless the event type declares it
+/// in `allowed_subject_types`, so the fixtures publish this one and every
+/// catalog entry allows it.
+pub const SHOWCASE_SUBJECT_TYPE: &str = "gts.x.eb.showcase.subject.v1~";
 
+/// Builds a fixture over a real in-process broker seeded from `catalog`. The
+/// fixture publishes and consumes as the anonymous principal, the same
+/// `SecurityContext` a `ConsumerBuilder` defaults to, so a published event and
+/// the consumer that joins for it share a tenant and delivery matches.
+pub async fn fixture_from_catalog(catalog: StaticTypesRegistry) -> TopicFixture {
+    let harness = EventBrokerHarness::builder()
+        .with_type_registry(catalog)
+        .build()
+        .await;
+    let broker = harness.broker();
     TopicFixture {
-        broker: Arc::new(mock),
-        control,
-        ctx: test_ctx_for_tenant(Uuid::parse_str(TENANT).expect("tenant uuid")),
+        broker,
+        ctx: SecurityContext::anonymous(),
+        _harness: harness,
     }
+}
+
+/// One topic with one event type, the type partitioned by `/source`.
+pub async fn topic_fixture(topic: &str, event_type: &str, partitions: u32) -> TopicFixture {
+    fixture_from_catalog(StaticTypesRegistry::of(json!([
+        { "id": topic, "partitions": partitions },
+        {
+            "id": event_type,
+            "topic": topic,
+            "data_schema": { "type": "object" },
+            "allowed_subject_types": [SHOWCASE_SUBJECT_TYPE],
+            "partition_key": FIXTURE_PARTITION_POINTER,
+        },
+    ])))
+    .await
 }
 
 pub async fn publish_json(
@@ -103,20 +113,18 @@ pub async fn publish_json_with_partition_key(request: PublishJson<'_>) {
             ctx,
             &Event {
                 id: Uuid::new_v4(),
-                type_id: event_type.to_owned(),
+                type_id: GtsTypeId::new(event_type),
                 tenant_id: ctx.subject_tenant_id(),
                 // The fixture's types are partitioned by this member.
                 source: resolved_partition_key,
                 subject: subject.to_owned(),
-                subject_type: "showcase".to_owned(),
+                subject_type: GtsTypeId::new(SHOWCASE_SUBJECT_TYPE),
                 occurred_at: chrono::Utc::now(),
                 trace_parent: None,
                 data: Some(data),
                 partition: None,
                 sequence: None,
                 sequence_time: None,
-                offset: None,
-                offset_time: None,
                 meta: None,
             },
         )
@@ -131,6 +139,21 @@ fn partition_key_for_two_partition_fixture(target: u32) -> String {
         _ => panic!("two-partition fixture cannot target partition {target}"),
     }
     .to_owned()
+}
+
+/// Test-side constructors for typed GTS ids. Call sites pass a `gts_id!(...)`
+/// literal so the id is validated at compile time; these wrap it in the typed
+/// value the SDK consumer API requires (it never accepts a bare string).
+pub fn topic(id: &str) -> GtsInstanceId {
+    GtsInstanceId::try_new(id).expect("valid topic GTS instance id")
+}
+
+pub fn event_type(id: &str) -> GtsTypeId {
+    GtsTypeId::try_new(id).expect("valid event type GTS id")
+}
+
+pub fn event_pattern(id: &str) -> GtsIdPattern {
+    GtsIdPattern::try_new(id).expect("valid GTS pattern")
 }
 
 pub async fn wait_until(mut predicate: impl FnMut() -> bool) {
@@ -151,32 +174,25 @@ pub async fn two_topic_fixture(
     second: (&str, &str),
     partitions: u32,
 ) -> TopicFixture {
-    let mock = MockBroker::new();
-    let control = MockBrokerHandle::from_broker(&mock);
-    for (topic, event_type) in [first, second] {
-        control.register_topic(topic, partitions).await;
-        control
-            .register_event_type(
-                topic,
-                event_type,
-                serde_json::json!({ "type": "object" }),
-                &[],
-            )
-            .await;
-        control
-            .set_partition_key(PartitionKeyFixture {
-                event_type,
-                pointer: FIXTURE_PARTITION_POINTER,
-            })
-            .await;
-    }
-    control
-        .set_heartbeat_interval(Duration::from_millis(10))
-        .await;
-
-    TopicFixture {
-        broker: Arc::new(mock),
-        control,
-        ctx: test_ctx_for_tenant(Uuid::parse_str(TENANT).expect("tenant uuid")),
-    }
+    let (first_topic, first_type) = first;
+    let (second_topic, second_type) = second;
+    fixture_from_catalog(StaticTypesRegistry::of(json!([
+        { "id": first_topic, "partitions": partitions },
+        {
+            "id": first_type,
+            "topic": first_topic,
+            "data_schema": { "type": "object" },
+            "allowed_subject_types": [SHOWCASE_SUBJECT_TYPE],
+            "partition_key": FIXTURE_PARTITION_POINTER,
+        },
+        { "id": second_topic, "partitions": partitions },
+        {
+            "id": second_type,
+            "topic": second_topic,
+            "data_schema": { "type": "object" },
+            "allowed_subject_types": [SHOWCASE_SUBJECT_TYPE],
+            "partition_key": FIXTURE_PARTITION_POINTER,
+        },
+    ])))
+    .await
 }

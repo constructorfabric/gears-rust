@@ -241,7 +241,6 @@ impl DbProducerBuilder<Has, Has, Has, Has, Has, Has, Has> {
         if self.topics.is_empty() || self.event_type_patterns.is_empty() {
             return Err(EventBrokerError::InvalidProducerOptions {
                 detail: "topics and event_type_patterns are required".to_owned(),
-                instance: String::new(),
             });
         }
 
@@ -435,7 +434,6 @@ impl DbProducer {
                 type_id: E::TYPE_ID.to_owned(),
                 detail: "call producer.prepare::<E>() outside the business transaction first"
                     .to_owned(),
-                instance: String::new(),
             });
         }
         let mode = self.deduplication.mode();
@@ -535,7 +533,6 @@ async fn resolve_managed_registration(
         None if managed.on_missing == MissingProducerRegistration::Fail => {
             Err(EventBrokerError::InvalidProducerOptions {
                 detail: format!("managed producer registration '{}' is missing", managed.key),
-                instance: String::new(),
             })
         }
         None => {

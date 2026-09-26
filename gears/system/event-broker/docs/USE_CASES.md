@@ -53,12 +53,12 @@ The protocol is intentionally aligned with the **Confluent REST Proxy v2 / Strim
 
 The producer flows we have explicitly accounted for:
 
-| # | Producer profile | Producer-Id strategy | Idempotency story |
+| # | Producer profile | producer_id strategy | Idempotency story |
 |---|---|---|---|
 | **P1** | Has DB + uses outbox | Persistent UUID stored alongside business data | Outbox tracks `last_sent_sequence` per `(topic, partition)`; transactionally atomic with business writes; exactly-once via outbox replay on retry |
-| **P2** | Has DB, no outbox | Persistent UUID stored alongside business data | Application persists `last_sent_sequence` in own DB; idempotent producer protocol via Producer-Id header; reads broker's `last_sequence` on startup if local state is lost |
+| **P2** | Has DB, no outbox | Persistent UUID stored alongside business data | Application persists `last_sent_sequence` in own DB; idempotent producer protocol via `meta.producer_id`; reads broker's `last_sequence` on startup if local state is lost |
 | **P3** | Stateless single instance | Ephemeral (fresh UUID per process startup) | New PID each restart; can never deduplicate across restarts; relies on consumer-side idempotent processing |
-| **P4** | Stateless burst (lambda-like) | No `Producer-Id` header at all | Stateless mode — broker does no dedup; at-least-once delivery; consumer-side processing MUST be idempotent |
+| **P4** | Stateless burst (lambda-like) | No `meta.producer_id` at all | Stateless mode — broker does no dedup; at-least-once delivery; consumer-side processing MUST be idempotent |
 | **P5** | Multi-instance shared service | Each instance generates its OWN UUID at startup | No PID sharing — instances never collide; partition selection (key-hash) routes related events to consistent partitions |
 | **P6** | Bulk backfill / replay | Either ephemeral PID or no PID (mass writes) | Application-managed dedup; out-of-order events tolerable for backfill; consumer must be idempotent |
 
@@ -68,7 +68,7 @@ The producer flows we have explicitly accounted for:
 
 | # | Consumer profile | Behavior | Recovery / scale |
 |---|---|---|---|
-| **C1** | Single, DB-backed, solo | Joins group with itself as sole member, gets all partitions, processes & commits in own DB transaction (broker's `cursor.offset` is a checkpoint, consumer's own DB is source of truth) | On restart: same Producer-Id, server recreates assignment if `session_timeout` expired or resumes if still active |
+| **C1** | Single, DB-backed, solo | Joins group with itself as sole member, gets all partitions, processes & commits in own DB transaction (broker's `cursor.offset` is a checkpoint, consumer's own DB is source of truth) | On restart: same producer_id, server recreates assignment if `session_timeout` expired or resumes if still active |
 | **C2** | Single, stateless, solo | Joins group, polls, broker tracks only runtime cursor state | On crash: `session_timeout` expires; new instance joins → gets all partitions → re-initializes position from its chosen start point and may re-receive uncommitted events |
 | **C3** | Group, multiple instances | Each instance creates its own subscription with same `consumer_group` | Broker rebalances on each JOIN/LEAVE/expiry; partitions distributed round-robin (sticky-Kafka deferred to v2) |
 | **C4** | Group, planned upscale | New instance: `POST /v1/subscriptions` | Existing polls wake on topology change, return with new (smaller) `assignments`; new instance gets its share immediately |
@@ -193,7 +193,7 @@ T4: B processes events, seeks past them via:
     POST /v1/subscriptions/B:seek { "partition_positions": [{"topic":"T","partition":4,"value":130},{"topic":"T","partition":5,"value":78}] }
 ```
 
-**Scenario C — Producer DB restored from backup (Producer-Id rotation):**
+**Scenario C — Producer DB restored from backup (producer_id rotation):**
 
 ```
 T0: Producer running with UUID PID_1 = "550e8400-e29b-41d4-a716-446655440000"
@@ -212,7 +212,7 @@ T3: Application generates new UUID PID_2 = "a1b2c3d4-..."
     Persists alongside business data:
       producer's local DB: { producer_id: PID_2, last_sent_sequence[topic, 4] = 0 }
 
-T4: Producer publishes with Producer-Id: PID_2
+T4: Producer publishes with meta.producer_id = PID_2
     Broker has no state for PID_2 → first publish creates state at sequence 1
     Producer continues normally with fresh PID
     
@@ -234,7 +234,7 @@ rebalance(group G):  # G is the GTS-typed consumer_group identifier
   try:
     group_state = cache.get("evbk.group.{G}")
     active_subs = group_state.active_members.values()
-                    .filter(s => s.expires_at > now())
+                    .filter(s => not s.session_timeout_lapsed())
                     .sorted_by(s => (s.created_at, s.id))
 
     # Compute group's effective topic set: union of all members' topics
@@ -278,7 +278,7 @@ rebalance(group G):  # G is the GTS-typed consumer_group identifier
     # naturally reset when partitions migrate to a new subscription
     
     group_state.topology_version += 1
-    cache.put("evbk.group.{G}", group_state, ttl=max(member.expires_at))
+    cache.put("evbk.group.{G}", group_state, ttl=longest_remaining_session_window(active_subs))
     
     cluster.publish("evbk.group.{G}.topology",
                     { version: group_state.topology_version, changed_at })
@@ -286,7 +286,7 @@ rebalance(group G):  # G is the GTS-typed consumer_group identifier
     release lock
 ```
 
-**Triggers**: `POST /v1/subscriptions` (JOIN), `DELETE /v1/subscriptions/{id}` (LEAVE), Reaper detecting `expires_at < now()` (CRASH).
+**Triggers**: `POST /v1/subscriptions` (JOIN), `DELETE /v1/subscriptions/{id}` (LEAVE), Reaper detecting a lapsed `session_timeout` (CRASH).
 
 **Concurrency**: Multiple JOINs in flight serialize on the lock; each runs a fresh rebalance with the latest membership.
 
