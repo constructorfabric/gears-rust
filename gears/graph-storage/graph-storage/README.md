@@ -99,7 +99,9 @@ connections, aggregate response bounds); tenant offboarding and deletion
 monotonicity; the analytics topology role and metric annotation; the
 index-activation lifecycle and per-path index DDL; the re-embedding lifecycle
 that opens a new embedding epoch; observability counters; the retained
-type-revision history.
+type-revision history; runtime plugin registration and selection (the built-in
+store, engine and embedding provider are constructed directly, and no
+independently developed implementation can reach the service yet; #4873).
 
 **Narrower than documented** (built, with a stated gap):
 
