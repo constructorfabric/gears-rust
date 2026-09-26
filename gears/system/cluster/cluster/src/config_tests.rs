@@ -9,9 +9,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use cluster_sdk::lock::{DistributedLockBackend, LockFeatures, LockGuard};
 use cluster_sdk::{
-    CacheCapability, ClusterCacheBackend, ClusterCacheProvider, ClusterCacheV1, ClusterError,
-    ClusterLockProvider, ClusterProfile, DistributedLockV1, LeaderElectionV1, ProfileHealth,
-    StopHook, WireCacheConsistency,
+    CacheCapability, ClusterCacheBackend, ClusterCacheProvider, ClusterCacheV1, ClusterClient,
+    ClusterError, ClusterLockProvider, ClusterProfile, DistributedLockV1, LeaderElectionV1,
+    LeaseToken, ProfileHealth, StopHook, WireCacheConsistency,
 };
 use standalone_cluster_plugin::StandaloneCacheProvider;
 use toolkit::client_hub::ClientHub;
@@ -468,6 +468,44 @@ impl DistributedLockBackend for FakeNativeLock {
             name: name.to_owned(),
         })
     }
+
+    // Every entry point bumps the counter (see the type doc), the token half
+    // included, so the mixed-profile test proves the *native* backend serves the
+    // over-the-wire lock methods and not the CAS default the omit path would fill.
+    async fn acquire(
+        &self,
+        name: &str,
+        _owner: &str,
+        _ttl: Duration,
+    ) -> Result<LeaseToken, ClusterError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(ClusterError::LockContended {
+            name: name.to_owned(),
+        })
+    }
+
+    async fn acquire_waiting(
+        &self,
+        name: &str,
+        _owner: &str,
+        _ttl: Duration,
+        _timeout: Duration,
+    ) -> Result<LeaseToken, ClusterError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(ClusterError::LockContended {
+            name: name.to_owned(),
+        })
+    }
+
+    async fn renew(&self, _token: &LeaseToken, _ttl: Duration) -> Result<(), ClusterError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn release(&self, _token: &LeaseToken) -> Result<(), ClusterError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
 }
 
 #[tokio::test]
@@ -545,6 +583,33 @@ profiles:
         lock_calls.load(Ordering::SeqCst),
         1,
         "the native lock backend must be the registered instance"
+    );
+
+    // The token path the gRPC lock service routes: resolve the raw lock backend
+    // the way the serving gear does (`ClusterClient::lock_backend`) and drive
+    // `acquire`. It must land on `FakeNativeLock` too — its canned `LockContended`
+    // identifies the instance, since the CAS default would have granted the lease —
+    // so the native binding is proven to serve the over-the-wire methods, not only
+    // the guard-path `try_lock`.
+    let client = hub
+        .get::<dyn ClusterClient>()
+        .expect("a published profile registers a ClusterClient");
+    let lock_backend = client
+        .lock_backend(EventBroker::NAME)
+        .expect("the native lock backend resolves");
+    assert!(
+        matches!(
+            lock_backend
+                .acquire("shard-assignment", "owner-native", Duration::from_secs(5))
+                .await,
+            Err(ClusterError::LockContended { .. })
+        ),
+        "the natively-bound lock backend must serve the token path, not the CAS default"
+    );
+    assert_eq!(
+        lock_calls.load(Ordering::SeqCst),
+        2,
+        "the native lock backend must serve the token path as well as `try_lock`"
     );
 
     handle.stop().await;

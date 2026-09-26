@@ -138,6 +138,50 @@ pub fn is_reserved_key(key: &str) -> bool {
     key.starts_with(RESERVED_KEY_SIGIL)
 }
 
+/// The rejection reason a lease token presented to the wrong scoped view is
+/// refused with. A scoped wrapper pushes the prefix it minted a token under onto
+/// [`LeaseToken::scope`](crate::lease::LeaseToken::scope) and, on
+/// renew/release/resign, requires the *top* layer to equal its own prefix; a token
+/// from a *different* view (a sibling scope, the full chain handed to a sub-wrapper,
+/// or a raw-backend token whose scope is empty) fails this check. Reported as
+/// [`ClusterError::InvalidName`](crate::error::ClusterError::InvalidName) — not
+/// `LockExpired` — so the caller can tell "wrong scope" from "lease lapsed".
+pub const SCOPE_MISMATCH: &str = "lease token was minted under a different scope than this view";
+
+/// Verifies `token` was minted by the view whose effective `prefix` this is, then
+/// returns a clone ready to delegate to the inner backend: the prefix re-applied to
+/// [`LeaseToken::name`](crate::lease::LeaseToken::name) and this view's layer popped
+/// off [`LeaseToken::scope`](crate::lease::LeaseToken::scope).
+///
+/// The check is **exact top-of-stack equality**, not a byte-suffix match on a
+/// flattened scope string: a token minted under `.scoped("eu/team")` (scope
+/// `["eu/team/"]`) is rejected by a sibling `.scoped("team")` view, where a
+/// `"eu/team/".strip_suffix("team/")` on a flat string would have wrongly accepted
+/// it and re-derived the phantom key `team/<name>` that reports `LockExpired` — the
+/// exact silent failure [`SCOPE_MISMATCH`] exists to replace. A token from a
+/// different view — or a raw-backend token whose scope stack is empty — fails with
+/// [`ClusterError::InvalidName`](crate::error::ClusterError::InvalidName)/[`SCOPE_MISMATCH`]
+/// rather than being re-prefixed into a phantom key.
+///
+/// # Errors
+/// [`ClusterError::InvalidName`] carrying [`SCOPE_MISMATCH`] when `token`'s top
+/// scope layer is not this view's `prefix`.
+pub fn reapply_for_token(
+    prefix: &str,
+    token: &crate::lease::LeaseToken,
+) -> Result<crate::lease::LeaseToken, ClusterError> {
+    if token.scope.last().map(String::as_str) != Some(prefix) {
+        return Err(ClusterError::InvalidName {
+            name: token.name.clone(),
+            reason: SCOPE_MISMATCH,
+        });
+    }
+    let mut scoped = token.clone();
+    scoped.name = apply(prefix, &token.name);
+    scoped.scope.pop();
+    Ok(scoped)
+}
+
 /// Prepends the effective `prefix` to a coordination `name` for the write path.
 pub fn apply(prefix: &str, name: &str) -> String {
     format!("{prefix}{name}")
@@ -150,13 +194,95 @@ pub fn strip<'a>(prefix: &str, key: &'a str) -> &'a str {
     key.strip_prefix(prefix).unwrap_or(key)
 }
 
+/// Strips the effective `prefix` from the `name` carried by a name-bearing
+/// error, so the scoped path returns the *bare* consumer name on the error path
+/// exactly as it does on the success path.
+///
+/// Every variant that carries a coordination `name` is rewritten:
+/// [`LockContended`](crate::error::ClusterError::LockContended),
+/// [`LockTimeout`](crate::error::ClusterError::LockTimeout),
+/// [`LockExpired`](crate::error::ClusterError::LockExpired), and
+/// [`InvalidName`](crate::error::ClusterError::InvalidName) (which an inner backend
+/// can raise for a scoped key that only becomes invalid *after* the prefix is
+/// applied — e.g. one pushed past the length limit); every other variant is passed
+/// through untouched. The rewrite is lenient — it reuses [`strip`], so a name that
+/// does not carry the prefix is left as-is rather than corrupted — which means
+/// chaining wrappers each peel their own layer and a foreign error is never mangled.
+///
+/// Note this does *not* touch the wrapper's own [`SCOPE_MISMATCH`] rejection: that
+/// is minted with the *bare* `token.name` and returned by `?` before delegating, so
+/// it never reaches this function.
+#[must_use]
+pub fn strip_error_name(prefix: &str, error: ClusterError) -> ClusterError {
+    match error {
+        ClusterError::LockContended { name } => ClusterError::LockContended {
+            name: strip(prefix, &name).to_owned(),
+        },
+        ClusterError::LockTimeout { name, waited } => ClusterError::LockTimeout {
+            name: strip(prefix, &name).to_owned(),
+            waited,
+        },
+        ClusterError::LockExpired { name } => ClusterError::LockExpired {
+            name: strip(prefix, &name).to_owned(),
+        },
+        ClusterError::InvalidName { name, reason } => ClusterError::InvalidName {
+            name: strip(prefix, &name).to_owned(),
+            reason,
+        },
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         RESERVED_KEY_SIGIL, RESERVED_LEASE_PREFIX, SCOPE_PREFIX_RULE, apply, is_reserved_key,
-        strip, validate_cache_key, validated_prefix,
+        strip, strip_error_name, validate_cache_key, validated_prefix,
     };
     use crate::error::ClusterError;
+
+    #[test]
+    fn strip_error_name_peels_the_prefix_from_every_name_bearing_variant() {
+        let p = "event-broker/";
+        // All four name-bearing variants return the bare consumer name.
+        assert!(matches!(
+            strip_error_name(p, ClusterError::LockContended { name: "event-broker/ledger".into() }),
+            ClusterError::LockContended { name } if name == "ledger"
+        ));
+        assert!(matches!(
+            strip_error_name(p, ClusterError::LockExpired { name: "event-broker/ledger".into() }),
+            ClusterError::LockExpired { name } if name == "ledger"
+        ));
+        assert!(matches!(
+            strip_error_name(
+                p,
+                ClusterError::LockTimeout {
+                    name: "event-broker/ledger".into(),
+                    waited: std::time::Duration::from_secs(1),
+                },
+            ),
+            ClusterError::LockTimeout { name, .. } if name == "ledger"
+        ));
+        // InvalidName carries a name too — an inner backend can raise it for a
+        // scoped key that only becomes invalid after the prefix is applied.
+        assert!(matches!(
+            strip_error_name(
+                p,
+                ClusterError::InvalidName { name: "event-broker/ledger".into(), reason: "rule" },
+            ),
+            ClusterError::InvalidName { name, .. } if name == "ledger"
+        ));
+        // A variant that carries no name is passed through untouched.
+        assert!(matches!(
+            strip_error_name(p, ClusterError::Shutdown),
+            ClusterError::Shutdown
+        ));
+        // Lenient: a name without the prefix is left as-is, not corrupted.
+        assert!(matches!(
+            strip_error_name(p, ClusterError::LockContended { name: "other/key".into() }),
+            ClusterError::LockContended { name } if name == "other/key"
+        ));
+    }
 
     #[test]
     fn valid_prefix_gains_a_trailing_separator() {

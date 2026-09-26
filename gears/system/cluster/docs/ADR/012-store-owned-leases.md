@@ -9,6 +9,8 @@ date: 2026-08-12
 
 > Recorded with item `L2` (the Postgres liveness-beacon removal), which is the first change that could not be made without settling this. The model itself landed in `L1`; the decision predates both, in [DESIGN.md](../DESIGN.md) §3.19.
 
+> **Amendment (2026-09-18, PR #4863): the lease methods are now _required_, not defaulted.** Building the first *native* store-owned-lease backend (the Redis lock and leader election) showed that the defaulted-`Unsupported` shape described in [The model](#the-model) below let a provider ship serving the in-process guard path while silently lacking the token path that every Profile-3 lock/election RPC takes — a whole provider unusable once deployed, with only a per-call opaque `Unsupported { feature: "store-owned-leases" }` to show for it. The four lock lease methods (`acquire`/`acquire_waiting`/`renew`/`release`) and the three leader lease methods (`join`/`renew`/`resign`) are therefore now **required** on the plugin-facing traits, turning that silent runtime failure into a build error. This is a **deliberate, SemVer-breaking reversal of invariant I11 for these methods only** — an out-of-tree backend that omitted them stops compiling — chosen because Profile-3 correctness outweighs out-of-tree *source* compatibility for an extension a whole operating profile depends on; a compile-time guarantee is the stronger property. The `STORE_OWNED_LEASES` feature constant that named the removed `Unsupported` bodies is deleted with them. **Road not taken:** keep the methods defaulted but add a `features()`-declared `supports_store_owned_leases` capability the wiring validates at startup, turning the silent per-call `Unsupported` into a loud boot-time rejection while preserving I11 — rejected as the weaker guarantee. [DESIGN.md](../DESIGN.md) invariant I11 is amended to carve out these methods; the inline "defaulted and dyn-safe … I11 kept" statements below are superseded by this note.
+
 <!-- toc -->
 
 - [Context and Problem Statement](#context-and-problem-statement)
@@ -45,7 +47,7 @@ So the question this ADR settles is: where does a lease live, and what — if an
 - **A cluster replica must be replaceable** without revoking the fleet's locks (invariant I7). This is the requirement that rules out session ownership outright, not a preference.
 - **Coordination must scale past one process.** Holding lease state in the replica that issued it makes every second replica a correctness hazard, so `replicaCount > 1` would be permanently unavailable.
 - **Profile transparency (Goal 2, invariant I1).** One consumer source file must behave identically in Profile 1 (embedded) and Profile 3 (deployed). Lease expiry is not a defensible place to make an exception.
-- **The plugin-facing `*Backend` traits stay stable** (invariant I11). Whatever this costs, it cannot be a breaking change to every plugin.
+- **The plugin-facing `*Backend` traits stay stable** (invariant I11). Whatever this costs, it cannot be a breaking change to every plugin. *(Amended 2026-09-18: the lease methods are now required — a deliberate, scoped I11 reversal; see the amendment above.)*
 - **Renewal must remain the consumer-liveness proxy** (invariant I8). A wedged holder must still lose its claim.
 
 ## Considered Options
@@ -75,7 +77,7 @@ Every lease-bearing operation becomes a **conditional write predicated on state 
 
 The token is **token-only**: `renew(&token, ttl)`, `release(&token)`. No caller identity is threaded alongside it, following §3.19.1's normative table rather than §4.4's sketch. Cross-checking that the *transport* caller is `token.owner` is the serving gear's authorization decision (§3.17.5), not the backend's predicate — the backend will not do it.
 
-Two implementations, one algebra. The cache-backed defaults encode the record into an opaque cache value and CAS it on `CacheEntry::version` (`cluster/src/defaults/lease.rs`); the native Postgres lock holds the same three fields in columns and lets a guarded upsert be the CAS (`postgres-cluster-plugin` DESIGN §5.1). The four lease methods are **defaulted and dyn-safe** on the plugin-facing traits, so a backend that has not implemented them compiles and reports `Unsupported { feature: "store-owned-leases" }` — invariant I11 kept.
+Two implementations, one algebra. The cache-backed defaults encode the record into an opaque cache value and CAS it on `CacheEntry::version` (`cluster/src/defaults/lease.rs`); the native Postgres lock holds the same three fields in columns and lets a guarded upsert be the CAS (`postgres-cluster-plugin` DESIGN §5.1). The four lease methods are **defaulted and dyn-safe** on the plugin-facing traits, so a backend that has not implemented them compiles and reports `Unsupported { feature: "store-owned-leases" }` — invariant I11 kept. *(Superseded 2026-09-18: these methods are now **required** on the traits and this defaulted-`Unsupported` fallback is gone — see the amendment above.)*
 
 ### The fence, and exactly what it guarantees
 
@@ -204,5 +206,5 @@ Store-owned leases for brokered acquisitions; the beacon predicate retained when
 | `cpt-cf-clst-fr-lock-release` | Refines — the TTL safety net becomes the *only* liveness authority, in every profile |
 | `cpt-cf-clst-fr-shutdown-revoke` | Amends — a cluster restart is not a lease loss; shutdown closes subscriptions only |
 | `cpt-cf-clst-fr-shutdown-ttl-cleanup` | Confirms — held claims and locks lapse via their TTL once a holder stops renewing |
-| `cpt-cf-clst-nfr-plugin-stability` | Confirms — the four lease methods are defaulted and dyn-safe, so no shipped plugin breaks |
+| `cpt-cf-clst-nfr-plugin-stability` | Amends (2026-09-18) — the lease methods are now **required**, a deliberate SemVer-breaking exception to plugin stability for methods a whole profile depends on; see the amendment above |
 | `cpt-cf-nfr-oop-latency` | Supports — one conditional write per lease operation, and one fewer unindexed scan on the Postgres acquire path |

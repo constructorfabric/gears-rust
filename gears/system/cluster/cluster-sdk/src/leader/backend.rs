@@ -9,7 +9,6 @@ use crate::error::ClusterError;
 use crate::leader::types::{ElectionConfig, LeaderElectionFeatures};
 use crate::leader::watch::LeaderWatch;
 use crate::lease::LeaseToken;
-use crate::lock::STORE_OWNED_LEASES;
 
 /// The plugin contract a leader-election backend implements.
 ///
@@ -103,22 +102,20 @@ pub trait LeaderElectionBackend: Send + Sync {
     /// election is an ordinary outcome, not an error: the caller becomes a
     /// follower and retries on its own cadence.
     ///
+    /// Required, not defaulted: `elect` is built over this on both sides — the
+    /// in-process default's renewal loop and the remote client's election pump
+    /// both `join` then `renew` — and the gear serves every `Join`/`Renew`/`Resign`
+    /// RPC through the three lease methods, so a backend that implemented only
+    /// `elect` would be silently unusable in Profile 3. The compiler forbids that.
+    ///
     /// # Errors
-    /// - [`ClusterError::Unsupported`] from the default body: a backend that has
-    ///   not implemented store-owned leases. Defaulted rather than required so
-    ///   adding it does not break every plugin (invariant I11).
-    /// - Any other [`ClusterError`] the backend raises.
+    /// - Any [`ClusterError`] the backend raises.
     async fn join(
         &self,
         name: &str,
         owner: &str,
         config: ElectionConfig,
-    ) -> Result<Option<LeaseToken>, ClusterError> {
-        let _unused = (name, owner, config);
-        Err(ClusterError::Unsupported {
-            feature: STORE_OWNED_LEASES,
-        })
-    }
+    ) -> Result<Option<LeaseToken>, ClusterError>;
 
     /// Extends the claim `token` is authority over to `ttl` from now — **the
     /// operation that holds leadership** (§7.3).
@@ -134,15 +131,8 @@ pub trait LeaderElectionBackend: Send + Sync {
     ///   claim lapsed, was stolen, or was never this owner's. The lock variant is
     ///   reused deliberately: `ClusterError` is frozen (invariant I3) and the
     ///   meaning is identical.
-    /// - [`ClusterError::Unsupported`] from the default body, as
-    ///   [`join`](Self::join).
     /// - Any other [`ClusterError`] the backend raises.
-    async fn renew(&self, token: &LeaseToken, ttl: Duration) -> Result<(), ClusterError> {
-        let _unused = (token, ttl);
-        Err(ClusterError::Unsupported {
-            feature: STORE_OWNED_LEASES,
-        })
-    }
+    async fn renew(&self, token: &LeaseToken, ttl: Duration) -> Result<(), ClusterError>;
 
     /// Gives up the claim `token` is authority over — a conditional delete any
     /// replica can serve.
@@ -153,15 +143,9 @@ pub trait LeaderElectionBackend: Send + Sync {
     /// successfully and leaves the successor's claim untouched.
     ///
     /// # Errors
-    /// - [`ClusterError::Unsupported`] from the default body, as
-    ///   [`join`](Self::join).
-    /// - Any other [`ClusterError`] the backend raises.
-    async fn resign(&self, token: &LeaseToken) -> Result<(), ClusterError> {
-        let _unused = token;
-        Err(ClusterError::Unsupported {
-            feature: STORE_OWNED_LEASES,
-        })
-    }
+    /// - Any [`ClusterError`] the backend raises. Note that *nothing to resign* is
+    ///   not one of them.
+    async fn resign(&self, token: &LeaseToken) -> Result<(), ClusterError>;
 
     /// A cheap, non-mutating liveness check on the backend's own resources.
     ///
@@ -189,15 +173,21 @@ mod tests {
 
     use async_trait::async_trait;
 
-    use super::{LeaderElectionBackend, STORE_OWNED_LEASES};
+    use super::LeaderElectionBackend;
     use crate::error::ClusterError;
     use crate::leader::types::{ElectionConfig, LeaderElectionFeatures};
     use crate::leader::watch::LeaderWatch;
     use crate::leader::{LeaderStatus, ResignReceiver};
     use crate::lease::LeaseToken;
 
-    /// A backend implementing only the two required methods.
-    struct StubBackend;
+    /// A backend whose lease methods are now **required**, so it implements the
+    /// full store-owned-leases half. `join` returns a token when `wins` is set (a
+    /// leader) and `None` otherwise (a follower), so the test can drive both real
+    /// outcomes rather than a hardcoded one; `renew`/`resign` succeed against the
+    /// token it minted.
+    struct StubBackend {
+        wins: bool,
+    }
 
     #[async_trait]
     impl LeaderElectionBackend for StubBackend {
@@ -218,42 +208,59 @@ mod tests {
         ) -> Result<LeaderWatch, ClusterError> {
             self.elect(name).await
         }
+
+        async fn join(
+            &self,
+            name: &str,
+            owner: &str,
+            _config: ElectionConfig,
+        ) -> Result<Option<LeaseToken>, ClusterError> {
+            Ok(self.wins.then(|| LeaseToken::new(name, owner, 1)))
+        }
+
+        async fn renew(&self, _token: &LeaseToken, _ttl: Duration) -> Result<(), ClusterError> {
+            Ok(())
+        }
+
+        async fn resign(&self, _token: &LeaseToken) -> Result<(), ClusterError> {
+            Ok(())
+        }
     }
 
-    /// The lease methods are **defaulted**, so a backend that implements neither
-    /// still compiles — invariant I11.
-    #[tokio::test]
-    async fn the_lease_methods_are_defaulted_and_report_unsupported() {
-        let backend = StubBackend;
-        let token = LeaseToken::new("primary", "cand-a", 1);
-        assert!(matches!(
-            backend
-                .join("primary", "cand-a", ElectionConfig::default())
-                .await,
-            Err(ClusterError::Unsupported {
-                feature: STORE_OWNED_LEASES
-            })
-        ));
-        assert!(matches!(
-            backend.renew(&token, Duration::from_secs(30)).await,
-            Err(ClusterError::Unsupported { .. })
-        ));
-        assert!(matches!(
-            backend.resign(&token).await,
-            Err(ClusterError::Unsupported { .. })
-        ));
-    }
-
-    /// And they stay reachable through the trait object the facade holds.
+    /// The lease methods stay reachable through the trait object the facade holds
+    /// (the required methods must not have made the trait dyn-incompatible). The
+    /// **behavioural** assertions are the branches the stub actually decides: a winner
+    /// is handed `Some(token)` and a follower gets `Ok(None)` — which lifts this above a
+    /// restatement of the `assert_dyn_compatible!` compile-time check above. The
+    /// winner's `renew`/`resign` calls confirm those token methods are dyn-dispatchable
+    /// (their token fields would only echo the stub's own inputs, so they are not
+    /// asserted).
     #[tokio::test]
     async fn the_lease_methods_are_reachable_through_a_trait_object() {
-        let backend: Arc<dyn LeaderElectionBackend> = Arc::new(StubBackend);
-        assert!(matches!(
-            backend
-                .resign(&LeaseToken::new("primary", "cand-a", 1))
-                .await,
-            Err(ClusterError::Unsupported { .. })
-        ));
+        let winner: Arc<dyn LeaderElectionBackend> = Arc::new(StubBackend { wins: true });
+        let token = winner
+            .join("primary", "cand-a", ElectionConfig::default())
+            .await
+            .expect("join through the trait object")
+            .expect("a winner is handed a claim token");
+        winner
+            .renew(&token, Duration::from_secs(30))
+            .await
+            .expect("renew via the trait object");
+        winner
+            .resign(&token)
+            .await
+            .expect("resign via the trait object");
+
+        let follower: Arc<dyn LeaderElectionBackend> = Arc::new(StubBackend { wins: false });
+        assert!(
+            follower
+                .join("primary", "cand-b", ElectionConfig::default())
+                .await
+                .expect("join through the trait object")
+                .is_none(),
+            "a follower gets Ok(None) through the trait object"
+        );
     }
 
     /// `probe` is defaulted to `Ok(())` and dyn-reachable, on the same terms as the
@@ -261,8 +268,8 @@ mod tests {
     /// default is `Ok` rather than `Unsupported`.
     #[tokio::test]
     async fn probe_is_defaulted_to_ok_and_dyn_reachable() {
-        assert!(StubBackend.probe().await.is_ok());
-        let dynamic: Arc<dyn LeaderElectionBackend> = Arc::new(StubBackend);
+        assert!(StubBackend { wins: true }.probe().await.is_ok());
+        let dynamic: Arc<dyn LeaderElectionBackend> = Arc::new(StubBackend { wins: true });
         assert!(dynamic.probe().await.is_ok());
     }
 }

@@ -36,9 +36,13 @@ use crate::lock::types::LockFeatures;
 /// operate on that token. The second half exists because a remote caller must be
 /// able to renew from somewhere other than the acquiring task — and, once the lease
 /// is a record in the store, from a *replica that never saw the acquire* (§5.8.1,
-/// invariant I7). A backend should serve both from one lease rather than two
-/// mechanisms; the four lease methods are defaulted, so one that has not yet done
-/// so still compiles and reports [`ClusterError::Unsupported`] (invariant I11).
+/// invariant I7). A backend serves both from one lease rather than two mechanisms;
+/// the four lease methods are **required**, so the compiler forces every backend to
+/// provide the over-the-wire path. They were once defaulted to
+/// [`ClusterError::Unsupported`], which let a native backend ship serving `try_lock`
+/// in-process while silently lacking the token path every remote lock RPC takes —
+/// a whole provider unusable in Profile 3 with only a per-call opaque error to show
+/// for it. Requiring them makes that a build error instead.
 ///
 /// # Release-if-still-holder contract
 ///
@@ -125,27 +129,25 @@ pub trait DistributedLockBackend: Send + Sync {
     /// method so both paths share one lease.
     ///
     /// Acquisition is insert-or-steal-if-lapsed: a record whose `deadline` has
-    /// passed is taken over by CAS with `fence + 1`, so the previous holder's
-    /// token can never match again (§5.8.1).
+    /// passed is taken over, and the [`fence`](LeaseToken::fence) is redrawn so the
+    /// previous holder's token can never match the successor's lease (§5.8.1). That
+    /// non-match is the contract; how it is realized is the backend's to choose.
+    /// Where the store has a counter (this trait's Postgres backend; the cache-backed
+    /// default) the steal CAS writes `fence + 1` and the non-match is **certain**;
+    /// where it does not (the Redis `SET NX` lock) the fence is a fresh random `u64`
+    /// and the non-match is a **2⁻⁶⁴ probabilistic** bound. It is never a globally
+    /// monotonic third-party fencing token (ADR-002).
     ///
     /// # Errors
     /// - [`ClusterError::LockContended`] if a live lease is held — by anyone,
     ///   including `owner` itself.
-    /// - [`ClusterError::Unsupported`] from the default body: a backend that has
-    ///   not implemented store-owned leases. Defaulted rather than required so
-    ///   adding it does not break every plugin (invariant I11).
     /// - Any other [`ClusterError`] the backend raises.
     async fn acquire(
         &self,
         name: &str,
         owner: &str,
         ttl: Duration,
-    ) -> Result<LeaseToken, ClusterError> {
-        let _unused = (name, owner, ttl);
-        Err(ClusterError::Unsupported {
-            feature: STORE_OWNED_LEASES,
-        })
-    }
+    ) -> Result<LeaseToken, ClusterError>;
 
     /// Acquires `name` for `owner`, waiting up to `timeout` — the lease-token
     /// counterpart of [`lock`](Self::lock).
@@ -153,8 +155,6 @@ pub trait DistributedLockBackend: Send + Sync {
     /// # Errors
     /// - [`ClusterError::LockTimeout`] (reporting `waited`) if the lease is not
     ///   acquired within `timeout`.
-    /// - [`ClusterError::Unsupported`] from the default body, as
-    ///   [`acquire`](Self::acquire).
     /// - Any other [`ClusterError`] the backend raises.
     async fn acquire_waiting(
         &self,
@@ -162,12 +162,7 @@ pub trait DistributedLockBackend: Send + Sync {
         owner: &str,
         ttl: Duration,
         timeout: Duration,
-    ) -> Result<LeaseToken, ClusterError> {
-        let _unused = (name, owner, ttl, timeout);
-        Err(ClusterError::Unsupported {
-            feature: STORE_OWNED_LEASES,
-        })
-    }
+    ) -> Result<LeaseToken, ClusterError>;
 
     /// Extends the lease `token` is authority over to `ttl` from now.
     ///
@@ -185,15 +180,8 @@ pub trait DistributedLockBackend: Send + Sync {
     ///
     /// # Errors
     /// - [`ClusterError::LockExpired`] if the predicate matches no record.
-    /// - [`ClusterError::Unsupported`] from the default body, as
-    ///   [`acquire`](Self::acquire).
     /// - Any other [`ClusterError`] the backend raises.
-    async fn renew(&self, token: &LeaseToken, ttl: Duration) -> Result<(), ClusterError> {
-        let _unused = (token, ttl);
-        Err(ClusterError::Unsupported {
-            feature: STORE_OWNED_LEASES,
-        })
-    }
+    async fn renew(&self, token: &LeaseToken, ttl: Duration) -> Result<(), ClusterError>;
 
     /// Releases the lease `token` is authority over.
     ///
@@ -204,16 +192,9 @@ pub trait DistributedLockBackend: Send + Sync {
     /// left untouched.
     ///
     /// # Errors
-    /// - [`ClusterError::Unsupported`] from the default body, as
-    ///   [`acquire`](Self::acquire).
     /// - Any other [`ClusterError`] the backend raises. Note that *nothing to
     ///   release* is not one of them.
-    async fn release(&self, token: &LeaseToken) -> Result<(), ClusterError> {
-        let _unused = token;
-        Err(ClusterError::Unsupported {
-            feature: STORE_OWNED_LEASES,
-        })
-    }
+    async fn release(&self, token: &LeaseToken) -> Result<(), ClusterError>;
 
     /// A cheap, non-mutating liveness check on the backend's own resources.
     ///
@@ -240,13 +221,6 @@ pub trait DistributedLockBackend: Send + Sync {
         Ok(())
     }
 }
-
-/// The [`ClusterError::Unsupported`] feature name a backend without store-owned
-/// leases reports. Shared with [`LeaderElectionBackend`], since a provider
-/// implements the model for both primitives or neither.
-///
-/// [`LeaderElectionBackend`]: crate::leader::LeaderElectionBackend
-pub const STORE_OWNED_LEASES: &str = "store-owned-leases";
 
 assert_dyn_compatible!(DistributedLockBackend);
 
@@ -299,6 +273,47 @@ mod tests {
             let (_rx, guard) = LockGuard::channel(name.to_owned(), 1);
             Ok(guard)
         }
+
+        // The token half, now that it is required rather than defaulted: the stub
+        // mints a lease when the name is free and mirrors the guard path's
+        // contention answer otherwise, so the same `held` flag drives both halves.
+        async fn acquire(
+            &self,
+            name: &str,
+            owner: &str,
+            _ttl: Duration,
+        ) -> Result<LeaseToken, ClusterError> {
+            if self.held {
+                return Err(ClusterError::LockContended {
+                    name: name.to_owned(),
+                });
+            }
+            Ok(LeaseToken::new(name, owner, 1))
+        }
+
+        async fn acquire_waiting(
+            &self,
+            name: &str,
+            owner: &str,
+            _ttl: Duration,
+            timeout: Duration,
+        ) -> Result<LeaseToken, ClusterError> {
+            if self.held {
+                return Err(ClusterError::LockTimeout {
+                    name: name.to_owned(),
+                    waited: timeout,
+                });
+            }
+            Ok(LeaseToken::new(name, owner, 1))
+        }
+
+        async fn renew(&self, _token: &LeaseToken, _ttl: Duration) -> Result<(), ClusterError> {
+            Ok(())
+        }
+
+        async fn release(&self, _token: &LeaseToken) -> Result<(), ClusterError> {
+            Ok(())
+        }
     }
 
     #[tokio::test]
@@ -337,46 +352,37 @@ mod tests {
         assert!(backend.provider_name().contains("StubBackend"));
     }
 
-    /// The lease methods are **defaulted**, so `StubBackend` — which implements
-    /// neither — still compiles. That is invariant I11: extending the plugin-facing
-    /// trait must not break the plugins that already implement it.
-    #[tokio::test]
-    async fn the_lease_methods_are_defaulted_and_report_unsupported() {
-        let backend = StubBackend { held: false };
-        let ttl = Duration::from_secs(30);
-        let token = LeaseToken::new("ledger", "owner-a", 1);
-        assert!(matches!(
-            backend.acquire("ledger", "owner-a", ttl).await,
-            Err(ClusterError::Unsupported {
-                feature: super::STORE_OWNED_LEASES
-            })
-        ));
-        assert!(matches!(
-            backend.acquire_waiting("ledger", "owner-a", ttl, ttl).await,
-            Err(ClusterError::Unsupported { .. })
-        ));
-        assert!(matches!(
-            backend.renew(&token, ttl).await,
-            Err(ClusterError::Unsupported { .. })
-        ));
-        assert!(matches!(
-            backend.release(&token).await,
-            Err(ClusterError::Unsupported { .. })
-        ));
-    }
-
-    /// And they are reachable through the trait object every facade holds, which is
-    /// the other half of I11 — the defaults must not have made the trait
-    /// dyn-incompatible.
+    /// The lease methods are reachable through the trait object every facade holds
+    /// (the required methods must not have made the trait dyn-incompatible). The
+    /// **behavioural** assertion is the branch the stub actually decides: a *held*
+    /// backend contends rather than silently granting — which lifts this above a
+    /// restatement of the `assert_dyn_compatible!` compile-time check above. The
+    /// free-path `acquire`/`renew`/`release` calls confirm the full required set is
+    /// dyn-dispatchable (their token fields would only echo the stub's own inputs, so
+    /// they are not asserted).
     #[tokio::test]
     async fn the_lease_methods_are_reachable_through_a_trait_object() {
-        let backend: Arc<dyn DistributedLockBackend> = Arc::new(StubBackend { held: false });
-        assert!(matches!(
-            backend
-                .acquire("ledger", "owner-a", Duration::from_secs(30))
-                .await,
-            Err(ClusterError::Unsupported { .. })
-        ));
+        let free: Arc<dyn DistributedLockBackend> = Arc::new(StubBackend { held: false });
+        let token = free
+            .acquire("ledger", "owner-a", Duration::from_secs(30))
+            .await
+            .expect("a free backend mints a lease through the trait object");
+        // renew/release reach the backend through the vtable on the minted token.
+        free.renew(&token, Duration::from_secs(30))
+            .await
+            .expect("renew via the trait object");
+        free.release(&token)
+            .await
+            .expect("release via the trait object");
+
+        let held: Arc<dyn DistributedLockBackend> = Arc::new(StubBackend { held: true });
+        assert!(
+            matches!(
+                held.acquire("ledger", "owner-a", Duration::from_secs(30)).await,
+                Err(ClusterError::LockContended { name }) if name == "ledger"
+            ),
+            "a held backend must contend through the trait object, not silently Ok"
+        );
     }
 
     /// `probe` is defaulted on the same terms (I11), and its default is `Ok(())`

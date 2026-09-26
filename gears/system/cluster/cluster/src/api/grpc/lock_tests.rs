@@ -458,9 +458,84 @@ fn the_ttl_and_timeout_clamps_hold_at_the_boundary() {
     assert_eq!(super::checked_ttl(ceiling_ms + 1).unwrap(), ceiling);
     assert_eq!(super::checked_ttl(u64::MAX).unwrap(), ceiling);
 
-    let t_ceiling = super::MAX_LOCK_TIMEOUT;
+    let t_ceiling = super::MAX_LOCK_WAIT;
     let t_ceiling_ms = u64::try_from(t_ceiling.as_millis()).unwrap();
     assert_eq!(super::clamped_timeout(50), Duration::from_millis(50));
     assert_eq!(super::clamped_timeout(t_ceiling_ms), t_ceiling);
     assert_eq!(super::clamped_timeout(u64::MAX), t_ceiling);
+    // The blocking-wait ceiling is well below the fence-retention hour the TTL clamp
+    // uses: a wire waiter is sustained polling load, so its duration is bounded rather
+    // than able to pin a task for an hour.
+    assert!(
+        t_ceiling < cluster_sdk::lease::FENCE_RETENTION_DEFAULT,
+        "the blocking-wait ceiling must be well below the fence-retention TTL ceiling"
+    );
+}
+
+/// The per-profile concurrent-waiter cap: once a profile's
+/// [`MAX_CONCURRENT_LOCK_WAITERS`](super::MAX_CONCURRENT_LOCK_WAITERS) blocking waits
+/// are in flight, a further blocking `Lock` RPC *for that profile* is refused with
+/// `ResourceExhausted` (standard gRPC backpressure) rather than parking another poller
+/// — and the permit check runs *before* the backend is touched, so the refusal costs
+/// no store round trip. Crucially, the cap is **per profile**: a *different* profile's
+/// `Lock` is unaffected, so one busy tenant cannot starve another. Holding every
+/// permit of one profile's semaphore stands in for that many concurrent waiters.
+fn blocking_lock(profile: &str) -> stubs::LockRequest {
+    stubs::LockRequest {
+        profile: profile.to_owned(),
+        name: "ledger".to_owned(),
+        ttl_ms: 30_000,
+        timeout_ms: 30_000,
+        client_request_id: None,
+    }
+}
+
+#[tokio::test]
+async fn a_blocking_lock_over_the_per_profile_waiter_cap_is_refused_but_other_profiles_are_not() {
+    let harness = Harness::wired(&["orders", "audit"]).await;
+    let service = DistributedLockService::new(harness.ctx.clone());
+
+    // Exhaust the `orders` profile's own semaphore, standing in for MAX concurrent
+    // blocking waits on that profile.
+    let orders_waiters = service.profile_waiters("orders");
+    let _all = orders_waiters
+        .try_acquire_many(u32::try_from(super::MAX_CONCURRENT_LOCK_WAITERS).unwrap())
+        .expect("all of `orders`'s permits are free on a fresh service");
+
+    let status = service
+        .lock(request(blocking_lock("orders")))
+        .await
+        .expect_err("orders' waiter cap is full, so its blocking Lock is refused");
+    assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+
+    // The cap is shared across the per-connection clones tonic makes: a clone sees the
+    // *same* per-profile map (via the `Arc`), so `orders` is refused there too. If the
+    // map were per-clone, this clone would have its own free permits — the regression
+    // this pins.
+    let cloned = service.clone();
+    assert_eq!(
+        cloned
+            .lock(request(blocking_lock("orders")))
+            .await
+            .expect_err("a clone shares the exhausted per-profile cap")
+            .code(),
+        tonic::Code::ResourceExhausted,
+    );
+
+    // Per-profile isolation: `audit`'s cap is untouched, so its blocking Lock is NOT
+    // refused — it acquires the free lock. A service-wide cap would have refused this.
+    service
+        .lock(request(blocking_lock("audit")))
+        .await
+        .expect("a different profile's blocking Lock is unaffected by orders' full cap");
+
+    // A non-blocking `try_lock` on `orders` is unaffected by the blocking-waiter cap:
+    // it parks no poller, so it never takes a permit.
+    service
+        .try_lock(request(try_lock("orders", "ledger", 30_000)))
+        .await
+        .expect("try_lock does not consume a blocking-waiter permit");
+
+    // `_all` releases the held permits when it drops at the end of scope.
+    harness.stop().await;
 }

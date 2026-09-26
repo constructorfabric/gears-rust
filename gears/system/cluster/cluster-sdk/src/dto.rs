@@ -406,6 +406,11 @@ impl From<LeaseToken> for crate::lease::LeaseToken {
             // The wire carries no deadline; the holder arms it locally on the
             // first successful acquire/renew.
             deadline: None,
+            // The wire carries no scope either (scope is a client-local view
+            // identity, off the wire like `deadline`); a token reconstructed from
+            // its DTO is unscoped and only becomes scoped again by passing back out
+            // through a scoped wrapper.
+            scope: Vec::new(),
         }
     }
 }

@@ -114,15 +114,31 @@ pub fn validate_fence_retention(retention: Duration) -> Result<(), crate::error:
 /// the same convention as [`CacheFeatures`](crate::cache::CacheFeatures) versus
 /// [`WireCacheFeatures`](crate::dto::WireCacheFeatures). `From` impls in both
 /// directions live beside the DTO.
+///
+/// `#[non_exhaustive]`: this token carries client-local fields the wrappers manage
+/// (`deadline`, and the `scope` stack whose top-of-stack invariant only the scoped
+/// wrappers maintain), and it has already gained fields over time. Out-of-crate code
+/// must mint it through [`new`](Self::new) and read fields rather than construct or
+/// exhaustively match a literal, so a future client-local field cannot break a
+/// plugin's build and no caller can hand a backend a token with a hand-built scope
+/// stack.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct LeaseToken {
     /// Lock name or election name — the lease's identity within the profile.
     /// Unprefixed: the name the consumer used, not the backend's cache key.
     pub name: String,
     /// The holder's identity. Two holders never share one.
     pub owner: String,
-    /// Bumped on every acquisition of `name`, including a steal-on-expiry, so a
-    /// stale holder's predicate can never match again.
+    /// A fresh discriminator drawn on every acquisition of `name` (including a
+    /// steal-on-expiry) such that a *previous* holder's token can never match the
+    /// successor's lease. That non-match is the property the fence guarantees; the
+    /// mechanism realizing it differs by backend. Where the store has a counter —
+    /// the Postgres lock and the cache-backed default — it is a monotonic
+    /// `fence + 1` and the non-match is **certain**; where it does not — the Redis
+    /// `SET NX` lock — it is a fresh random `u64` and the non-match is a **2⁻⁶⁴
+    /// probabilistic** bound. It is not a globally monotonic third-party fencing
+    /// token in either case (ADR-002).
     pub fence: u64,
     /// When this claim's most recently written lease deadline falls, in the
     /// renewal task's own [`tokio::time::Instant`] domain — **not** on the wire
@@ -141,6 +157,38 @@ pub struct LeaseToken {
     ///
     /// [`matches`]: LeaseRecord::matches
     pub deadline: Option<tokio::time::Instant>,
+    /// The stack of scope-prefix layers this token was minted through — one entry
+    /// per chained scoped wrapper, innermost first, so
+    /// `["event-broker/", "shard-0/"]` for a `.scoped("event-broker").scoped("shard-0")`
+    /// view and empty for an unscoped token. Client-local like
+    /// [`deadline`](Self::deadline): it has **no wire representation**
+    /// ([`dto::LeaseToken`](crate::dto::LeaseToken) carries only `name`/`owner`/`fence`,
+    /// so the round trip through the DTO defaults it to empty), which keeps the proto
+    /// and invariant I12 unchanged.
+    ///
+    /// It is the token's *view identity*: a scoped wrapper pushes its prefix here on
+    /// acquire/join and, on renew/release/resign, requires the **top** layer to equal
+    /// its own prefix before popping it and delegating. A token presented to a
+    /// different scoped view — or to the raw backend — is rejected with
+    /// [`ClusterError::InvalidName`](crate::error::ClusterError::InvalidName) carrying
+    /// [`scope::SCOPE_MISMATCH`](crate::scope::SCOPE_MISMATCH) instead of being
+    /// silently re-prefixed into a phantom key that reports `LockExpired`.
+    ///
+    /// A **stack of layers**, not a flattened `String`, on purpose: a byte-suffix
+    /// match on a concatenated `"eu/team/"` would accept a sibling `.scoped("team")`
+    /// view (`"eu/team/".ends_with("team/")`) and re-derive the wrong key, quietly
+    /// reintroducing the phantom `LockExpired` this check exists to prevent. Exact
+    /// top-of-stack equality has no such boundary ambiguity. By construction the
+    /// layers concatenated onto `name` reconstitute the innermost backend's key.
+    ///
+    /// Unlike the authority predicate [`LeaseRecord::matches`] (which is owner +
+    /// fence only), `scope` **is** part of this token's derived
+    /// `PartialEq`/`Eq`/`Hash` — it is an ordinary field and shares the same
+    /// treatment as every other, including `deadline`. Every token minted by
+    /// [`new`](Self::new) or reconstructed from the wire is empty, so existing
+    /// equality is unaffected; only two tokens from *different* scoped views
+    /// compare unequal, which is the intended distinction.
+    pub scope: Vec<String>,
 }
 
 impl LeaseToken {
@@ -153,6 +201,8 @@ impl LeaseToken {
             owner: owner.into(),
             fence,
             deadline: None,
+            // Unscoped: the scoped wrappers push their prefix layer on the way out.
+            scope: Vec::new(),
         }
     }
 
