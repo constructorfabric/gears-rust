@@ -228,29 +228,36 @@ fn spawn_server(
     (child, logs)
 }
 
-/// Polls `GET /healthz` (unauthenticated, unprefixed - `api-gateway`'s main
+/// Polls `GET /readyz` (unauthenticated, unprefixed - `api-gateway`'s main
 /// router merges health routes outside the auth layer) until it answers
 /// `200`, the process exits early, or 15s elapse. Captured stdout/stderr is
 /// included in the panic message either way, so a boot failure is
 /// diagnosable without re-running under `-- --nocapture`.
-async fn wait_for_healthy(child: &mut Child, base_url: &str, logs: &Arc<Mutex<Vec<String>>>) {
+///
+/// Readiness, not `/healthz`: the listener accepts traffic as soon as the
+/// start phase spawns `serve()`, so `/healthz` - a liveness probe that is
+/// always `200` - says nothing about whether a publish can be accepted yet.
+/// `/readyz` folds in the gear's own check (`infra::health`), which reports
+/// `Starting` until the outbox and cluster cache are wired. Its report is
+/// cached for ~2s upstream, which the 15s deadline absorbs.
+async fn wait_for_ready(child: &mut Child, base_url: &str, logs: &Arc<Mutex<Vec<String>>>) {
     let client = reqwest::Client::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
         if let Ok(Some(status)) = child.try_wait() {
             let captured = logs.lock().expect("logs mutex").join("\n");
             panic!(
-                "server exited early ({status}) before becoming healthy; captured output:\n{captured}"
+                "server exited early ({status}) before becoming ready; captured output:\n{captured}"
             );
         }
-        if let Ok(resp) = client.get(format!("{base_url}/healthz")).send().await
+        if let Ok(resp) = client.get(format!("{base_url}/readyz")).send().await
             && resp.status().is_success()
         {
             return;
         }
         if tokio::time::Instant::now() >= deadline {
             let captured = logs.lock().expect("logs mutex").join("\n");
-            panic!("server never became healthy within 15s; captured output:\n{captured}");
+            panic!("server never became ready within 15s; captured output:\n{captured}");
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -275,7 +282,7 @@ impl TestServer {
         let port = alloc_port();
         let (mut child, logs) = spawn_server(home_dir.path(), port, &entities);
         let base_url = format!("http://127.0.0.1:{port}");
-        wait_for_healthy(&mut child, &base_url, &logs).await;
+        wait_for_ready(&mut child, &base_url, &logs).await;
         Self {
             child,
             logs,
@@ -299,7 +306,7 @@ impl TestServer {
         let port = alloc_port();
         let (mut child, logs) = spawn_server(self.home_dir.path(), port, &self.entities);
         let base_url = format!("http://127.0.0.1:{port}");
-        wait_for_healthy(&mut child, &base_url, &logs).await;
+        wait_for_ready(&mut child, &base_url, &logs).await;
         self.child = child;
         self.logs = logs;
         self.base_url = base_url;
@@ -310,8 +317,57 @@ impl TestServer {
     }
 }
 
+/// `POST`s an event, retrying while ingest answers `503`.
+///
+/// What a real producer does, and what the protocol is built to make safe:
+/// `docs/features/0001-idempotent-producers.md` has the producer retry after a
+/// transport failure or an ambiguous ack, and the broker's chain re-check
+/// decides the outcome - `200 OK` if the first attempt had landed, `202` if it
+/// had not. A `503` is that same ambiguous case (the ingest pipeline may not be
+/// wired yet, or storage may be briefly unreachable), so giving up on one is a
+/// producer this suite would never ship, not a broker defect.
+///
+/// Only `503` is retried, and the first other status is returned untouched, so
+/// a caller's own assertion about `200` vs `202` still decides the test.
+pub async fn publish_retrying_while_unavailable(
+    client: &reqwest::Client,
+    url: &str,
+    body: &Value,
+) -> reqwest::Response {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut attempts = 0_u32;
+    loop {
+        let resp = client
+            .post(url)
+            .json(body)
+            .send()
+            .await
+            .expect("publish request");
+        if resp.status() != 503 || tokio::time::Instant::now() >= deadline {
+            return resp;
+        }
+        // Logged, never swallowed: retrying is correct, but a silent retry
+        // would hide the fact that ingest was unavailable at all, which is the
+        // one signal worth having when this suite fails on a slow runner.
+        attempts += 1;
+        let body = resp.text().await.unwrap_or_default();
+        eprintln!("publish attempt {attempts} returned 503, retrying: {body}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 impl Drop for TestServer {
     fn drop(&mut self) {
+        // Surface the server's own output whenever a test is failing, not just
+        // when startup was what failed. Without this the subprocess's stdout
+        // and stderr are drained into `logs` and then discarded, so a failed
+        // assertion reaches CI as a bare status code with no way to tell which
+        // of the server's several 503 paths produced it - which is exactly how
+        // `gears-rust#4439` lost a Windows-only failure twice over.
+        if std::thread::panicking() {
+            let captured = self.logs.lock().expect("logs mutex").join("\n");
+            eprintln!("--- captured event-broker server output ---\n{captured}");
+        }
         drop(self.child.start_kill());
     }
 }

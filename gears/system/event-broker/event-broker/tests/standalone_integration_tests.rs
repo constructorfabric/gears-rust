@@ -107,9 +107,10 @@ async fn publish_then_consume_happy_path() {
 
     let event_id = Uuid::new_v4();
     let occurred_at = chrono::Utc::now().to_rfc3339();
-    let publish_resp = client
-        .post(server.url("/event-broker/v1/events"))
-        .json(&json!({
+    let publish_resp = common::publish_retrying_while_unavailable(
+        &client,
+        &server.url("/event-broker/v1/events"),
+        &json!({
             "id": event_id,
             "type": event_type,
             "tenant_id": tenant_id,
@@ -117,10 +118,9 @@ async fn publish_then_consume_happy_path() {
             "subject": "s1",
             "subject_type": subject_type,
             "occurred_at": occurred_at,
-        }))
-        .send()
-        .await
-        .expect("publish event");
+        }),
+    )
+    .await;
     assert_eq!(publish_resp.status(), 202);
     assert_eq!(
         publish_resp.text().await.expect("publish body"),
@@ -238,9 +238,10 @@ async fn restart_preserves_events_and_consumer_groups_but_not_subscriptions() {
     assert_eq!(topology1_kind, "topology");
 
     let event_id = Uuid::new_v4();
-    let publish_resp = client
-        .post(server.url("/event-broker/v1/events"))
-        .json(&json!({
+    let publish_resp = common::publish_retrying_while_unavailable(
+        &client,
+        &server.url("/event-broker/v1/events"),
+        &json!({
             "id": event_id,
             "type": event_type,
             "tenant_id": tenant_id,
@@ -248,10 +249,9 @@ async fn restart_preserves_events_and_consumer_groups_but_not_subscriptions() {
             "subject": "s1",
             "subject_type": subject_type,
             "occurred_at": chrono::Utc::now().to_rfc3339(),
-        }))
-        .send()
-        .await
-        .expect("publish event");
+        }),
+    )
+    .await;
     assert_eq!(publish_resp.status(), 202);
 
     // Consuming it (rather than just publishing) persists a real `Cursor`
@@ -390,25 +390,32 @@ async fn producer_chain_sequence_resubmission_is_deduped_not_double_persisted() 
         "meta": { "version": 1, "producer_id": producer_id, "previous": 0, "sequence": 1 },
     });
 
-    let first = client
-        .post(server.url("/event-broker/v1/events"))
-        .json(&body)
-        .send()
-        .await
-        .expect("first publish");
-    assert_eq!(first.status(), 202);
+    // Retried while unavailable, the way a real producer publishes: a `503`
+    // is ambiguous, not fatal. A retry after one still lands on `202` because
+    // nothing was enqueued - the guard that raises it runs before the write.
+    let first = common::publish_retrying_while_unavailable(
+        &client,
+        &server.url("/event-broker/v1/events"),
+        &body,
+    )
+    .await;
+    // Body in the message: `StorageUnavailable` has several sources that all
+    // render as 503 (the ingest pipeline not yet wired, a scope error, a DB
+    // failure), and a bare status tells a future reader which one it was.
+    let first_status = first.status();
     let first_text = first.text().await.expect("first body");
+    assert_eq!(first_status, 202, "body: {first_text}");
 
     // The exact same chained event, resubmitted (a real producer retrying
     // after e.g. a dropped response) - must be accepted (ignored), not
     // rejected as a chain-sequence violation, and must not be persisted a
     // second time.
-    let second = client
-        .post(server.url("/event-broker/v1/events"))
-        .json(&body)
-        .send()
-        .await
-        .expect("second publish");
+    let second = common::publish_retrying_while_unavailable(
+        &client,
+        &server.url("/event-broker/v1/events"),
+        &body,
+    )
+    .await;
     // A deduped resubmission is 200 OK (no new event persisted), distinct from
     // the 202 Accepted a fresh publish returns (ingest events.rs).
     assert_eq!(second.status(), 200);

@@ -3,6 +3,7 @@
 
 pub mod cluster;
 pub mod dispatcher;
+pub mod health;
 pub mod loader;
 pub mod partition_cache;
 pub mod specification;

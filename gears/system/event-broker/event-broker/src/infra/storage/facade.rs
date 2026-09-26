@@ -128,17 +128,19 @@ pub struct Storage {
     /// lifecycle entirely). Set once via [`Self::set_cache`], called from
     /// `serve()` after the start phase has begun (so `cluster`'s own
     /// `start()`, which the topo-sorted dep order runs first, has already
-    /// completed). Safe: every method that reads this is a request-path
-    /// call, reachable only once the server is fully up.
+    /// completed). A request can still arrive before that: the listener
+    /// accepts traffic as soon as the start phase *spawns* `serve()`, so
+    /// every reader goes through [`Self::cache`] and reports an unavailable
+    /// storage path rather than assuming the wiring is done.
     cache: OnceLock<ClusterCacheV1>,
     /// The ingest outbox pipeline - `None` until `EventBrokerModule::serve()`
     /// starts it (`Outbox::builder(..).start()` needs a running Tokio
     /// runtime and the leased handler's own dependencies, neither available
     /// yet at `Storage::new()` time in `init()`). Set once via
-    /// [`Self::set_outbox`]. `check_and_enqueue` panics if called before
-    /// it's set - matches `IngestService`'s own contract that no publish
-    /// traffic reaches it before `serve()` has started (`host_runtime.rs`'s
-    /// REST-phase-before-start-phase ordering).
+    /// [`Self::set_outbox`]. A publish arriving before then is reported as
+    /// an unavailable storage path, never a panic - the listener accepts
+    /// traffic as soon as the start phase spawns `serve()`, so the window is
+    /// reachable from outside.
     outbox: OnceLock<Arc<Outbox>>,
     /// This process's instance id - what a group marker names as the group's
     /// owner.
@@ -173,11 +175,34 @@ impl Storage {
         );
     }
 
-    #[allow(clippy::expect_used)]
-    fn cache(&self) -> &ClusterCacheV1 {
+    fn cache(&self) -> Result<&ClusterCacheV1, DomainError> {
+        if self.cache.get().is_none() {
+            // Same reason the publish path logs its refusal: without a line
+            // here, a request served in the startup window leaves no server-
+            // side trace of why it was turned away.
+            tracing::warn!("request refused: the cluster cache is not wired yet");
+        }
         self.cache
             .get()
-            .expect("Storage cluster-cache access before EventBrokerModule::serve() resolved it")
+            .ok_or_else(|| DomainError::StorageUnavailable {
+                reason: "the cluster cache is not wired yet".to_owned(),
+                source: None,
+            })
+    }
+
+    /// Whether `serve()` has started the ingest outbox. The publish path is
+    /// unavailable until it has, which is what the gear's readiness check
+    /// reports on.
+    #[must_use]
+    pub fn outbox_installed(&self) -> bool {
+        self.outbox.get().is_some()
+    }
+
+    /// Whether `serve()` has resolved the cluster cache. The subscription and
+    /// consumer-group routing markers are unavailable until it has.
+    #[must_use]
+    pub fn cache_installed(&self) -> bool {
+        self.cache.get().is_some()
     }
 
     /// Wires the ingest outbox pipeline in once `EventBrokerModule::serve()`
@@ -371,15 +396,17 @@ impl IdempotencyGuard for Storage {
         // never starts a pipeline at all. Both are retry-or-route-elsewhere
         // conditions for the caller, so they are reported as an unavailable
         // storage path rather than an internal failure.
-        let outbox =
-            Arc::clone(
-                self.outbox
-                    .get()
-                    .ok_or_else(|| DomainError::StorageUnavailable {
-                        reason: "the ingest outbox pipeline is not running yet".to_owned(),
-                        source: None,
-                    })?,
-            );
+        let Some(outbox) = self.outbox.get() else {
+            // Worth a line even though the caller gets a `503`: this is the
+            // one refusal that means the instance was advertised before it
+            // could serve, and it is otherwise invisible from the server side.
+            tracing::warn!("publish refused: the ingest outbox pipeline is not running yet");
+            return Err(DomainError::StorageUnavailable {
+                reason: "the ingest outbox pipeline is not running yet".to_owned(),
+                source: None,
+            });
+        };
+        let outbox = Arc::clone(outbox);
         let PublishEnqueue {
             chain,
             topic_partition,
@@ -524,20 +551,29 @@ impl DeliveryNotifier for Storage {
         // the first event) - `wait_for_notification`'s contract is "wait up
         // to `timeout` total", not up to `timeout` per step.
         let deadline = tokio::time::Instant::now() + timeout;
-        let mut watch =
-            match tokio::time::timeout_at(deadline, self.cache().watch_prefix(NOTIFICATION_PREFIX))
-                .await
-            {
-                Ok(Ok(watch)) => watch,
-                Ok(Err(err)) => {
-                    tracing::warn!(
-                        ?err,
-                        "notification watch_prefix failed; falling back to timeout"
-                    );
-                    return;
-                }
-                Err(_elapsed) => return,
-            };
+        let Ok(cache) = self.cache() else {
+            // Same degradation the trait documents for a backend failure: the
+            // delivery loop's own re-query decides what is new, so a missed
+            // wake costs one iteration. Returning early instead would spin it.
+            tokio::time::sleep_until(deadline).await;
+            return;
+        };
+        let mut watch = match tokio::time::timeout_at(
+            deadline,
+            cache.watch_prefix(NOTIFICATION_PREFIX),
+        )
+        .await
+        {
+            Ok(Ok(watch)) => watch,
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    ?err,
+                    "notification watch_prefix failed; falling back to timeout"
+                );
+                return;
+            }
+            Err(_elapsed) => return,
+        };
         // A `Lagged`/`Reset` event still just means "something changed, go
         // re-check", same as a real `Event`, and an elapsed deadline just
         // means "nothing changed in time" - either way there's nothing
@@ -691,7 +727,7 @@ impl RoutingMarkers for Storage {
     ) -> Result<(), DomainError> {
         // Indefinite: a marker is removed with the member it points at, never
         // aged out from under a member that is still here.
-        self.cache()
+        self.cache()?
             .put(PutRequest {
                 key: &subscription_marker_key(subscription_id),
                 value: group.as_ref().as_bytes(),
@@ -702,14 +738,14 @@ impl RoutingMarkers for Storage {
     }
 
     async fn unmark_subscription(&self, subscription_id: Uuid) -> Result<(), DomainError> {
-        self.cache()
+        self.cache()?
             .delete(&subscription_marker_key(subscription_id))
             .await?;
         Ok(())
     }
 
     async fn mark_group(&self, group: &GtsInstanceId) -> Result<(), DomainError> {
-        self.cache()
+        self.cache()?
             .put(PutRequest {
                 key: &group_marker_key(group)?,
                 value: self.instance_id.to_string().as_bytes(),
@@ -720,7 +756,7 @@ impl RoutingMarkers for Storage {
     }
 
     async fn unmark_group(&self, group: &GtsInstanceId) -> Result<(), DomainError> {
-        self.cache().delete(&group_marker_key(group)?).await?;
+        self.cache()?.delete(&group_marker_key(group)?).await?;
         Ok(())
     }
 }
@@ -981,6 +1017,35 @@ mod tests {
         );
     }
 
+    /// The routing markers sit in the same startup window as the publish path
+    /// above. They must report it the same way - a retryable status the caller
+    /// can act on, never a panicked request task.
+    #[tokio::test]
+    async fn marking_a_subscription_before_the_cache_is_wired_is_reported_as_unavailable() {
+        let (db, _dsn) = test_db().await;
+        let spec_manager = TypesRegistrySpecificationManager::new(Arc::clone(&db));
+        // No `set_cache`: the state `Storage` is in between `init()` and the
+        // point `serve()` resolves the cluster.
+        let storage = Storage::new(db, Arc::new(spec_manager), TEST_INSTANCE_ID);
+
+        let err = storage
+            .mark_subscription(
+                Uuid::now_v7(),
+                &GtsInstanceId::try_new(
+                    "gts.cf.core.events.consumer_group.v1~example.eb.storage.group.v1",
+                )
+                .unwrap(),
+            )
+            .await
+            .expect_err("marking before the cache is wired must not succeed");
+
+        assert!(
+            matches!(&err, DomainError::StorageUnavailable { reason, .. }
+                if reason == "the cluster cache is not wired yet"),
+            "expected a retryable StorageUnavailable, got {err:?}"
+        );
+    }
+
     fn test_consumer_group(id: &str, tenant_id: Uuid) -> ConsumerGroup {
         ConsumerGroup {
             id: GtsInstanceId::try_new(id).unwrap(),
@@ -1045,7 +1110,15 @@ mod tests {
         )
         .unwrap();
         let key = subscription_marker_key(id);
-        assert!(storage.cache().get(&key).await.expect("get").is_none());
+        assert!(
+            storage
+                .cache()
+                .expect("the test wired the cache")
+                .get(&key)
+                .await
+                .expect("get")
+                .is_none()
+        );
 
         storage
             .mark_subscription(id, &group)
@@ -1053,6 +1126,7 @@ mod tests {
             .expect("mark must succeed");
         let entry = storage
             .cache()
+            .expect("the test wired the cache")
             .get(&key)
             .await
             .expect("get")
@@ -1063,7 +1137,15 @@ mod tests {
             .unmark_subscription(id)
             .await
             .expect("unmark must succeed");
-        assert!(storage.cache().get(&key).await.expect("get").is_none());
+        assert!(
+            storage
+                .cache()
+                .expect("the test wired the cache")
+                .get(&key)
+                .await
+                .expect("get")
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -1140,6 +1222,7 @@ mod tests {
         storage.mark_group(&group).await.expect("mark must succeed");
         let entry = storage
             .cache()
+            .expect("the test wired the cache")
             .get(&key)
             .await
             .expect("get")
@@ -1150,7 +1233,15 @@ mod tests {
             .unmark_group(&group)
             .await
             .expect("unmark must succeed");
-        assert!(storage.cache().get(&key).await.expect("get").is_none());
+        assert!(
+            storage
+                .cache()
+                .expect("the test wired the cache")
+                .get(&key)
+                .await
+                .expect("get")
+                .is_none()
+        );
     }
 
     #[tokio::test]

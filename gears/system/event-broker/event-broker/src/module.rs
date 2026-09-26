@@ -26,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 use toolkit::api::OpenApiRegistry;
 use toolkit::client_hub::ClientHub;
 use toolkit::directory::{DirectoryClient, RegisterInstanceInfo, ServiceEndpoint};
-use toolkit::{DatabaseCapability, Gear, GearCtx, RestApiCapability};
+use toolkit::{DatabaseCapability, Gear, GearCtx, Healthcheck, RestApiCapability};
 use toolkit_db::outbox::{Outbox, Partitions};
 use uuid::Uuid;
 
@@ -37,6 +37,7 @@ use crate::domain::local_broker::LocalBroker;
 use crate::domain::outbox::INGEST_OUTBOX_PARTITIONS;
 use crate::infra::cluster::{AdvertiseAddressResolver, ConfigAdvertiseAddress};
 use crate::infra::dispatcher::DispatcherState;
+use crate::infra::health::EventBrokerReadiness;
 use crate::infra::storage::Storage;
 use crate::infra::workers::IngestOutboxHandler;
 
@@ -429,6 +430,51 @@ impl RestApiCapability for EventBrokerModule {
         let directory: Arc<dyn DirectoryClient> = ctx.client_hub().get::<dyn DirectoryClient>()?;
         let state = Arc::new(DispatcherState::new(directory));
         Ok(router.layer(Extension(state)))
+    }
+
+    /// Holds `/readyz` at `503` until `serve()` has wired the handles this
+    /// instance's roles need.
+    ///
+    /// Without it the platform advertises the pod the instant the start phase
+    /// *spawns* `serve()`, while `start_workers` is still resolving the
+    /// cluster cache and starting the outbox - so a publish can land on a pod
+    /// that reports itself ready and get a `503` from the storage facade.
+    ///
+    /// Captures the `Storage` rather than the handles themselves: it is
+    /// collected in the REST phase, a phase before either exists, and reads
+    /// them through `Storage`'s own `OnceLock`s at check time.
+    ///
+    /// Returning `None` would opt the gear out of readiness altogether, so the
+    /// unreachable no-`init` arm still yields a verdict - `Starting`, the
+    /// fail-safe direction - rather than reporting a pod with no storage ready.
+    fn healthcheck(&self, _ctx: &GearCtx) -> Option<Arc<dyn Healthcheck>> {
+        let (Some(storage), Some(mode)) = (self.storage.get(), self.mode.get()) else {
+            tracing::error!(
+                module = Self::MODULE_NAME,
+                "healthcheck collected before init - reporting Starting until it runs"
+            );
+            return Some(Arc::new(NotInitialised));
+        };
+        Some(Arc::new(EventBrokerReadiness::new(
+            Arc::clone(storage),
+            *mode,
+        )))
+    }
+}
+
+/// The verdict for a gear whose `init()` has not run: `init` precedes the REST
+/// phase, so this is unreachable, and it reports `Starting` rather than
+/// assuming health if it ever is reached.
+struct NotInitialised;
+
+#[async_trait::async_trait]
+impl Healthcheck for NotInitialised {
+    fn name(&self) -> &'static str {
+        "event-broker-readiness"
+    }
+
+    async fn check(&self) -> toolkit::HealthcheckResult {
+        toolkit::HealthcheckResult::unhealthy("event-broker init has not run").with_code("starting")
     }
 }
 
