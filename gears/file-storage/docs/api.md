@@ -265,7 +265,8 @@ each part write in the multipart case — see `D2`).
 - **Response**: `204 No Content`. Errors: `400` (validation/read-back mismatch), `403` (bad/expired/mismatched
   token, **or** missing/mismatched `x-fs-internal-token` when `finalize_internal_secret` is configured — see
   above), `404` (version not found), `409` (already finalized), `500` (a permanent backend fault reading the blob
-  back), `503` (a transient one — network, timeout, backend overload — carries `Retry-After`).
+  back), `503` (a transient one — network, timeout, a dropped connection partway through the read-back, backend
+  overload — carries `Retry-After`).
 - For a `bind: "manual"` upload (and `POST /files/{id}/versions`, which never auto-binds) this endpoint does **not**
   bind the version as current — `POST /files/{id}/bind` remains a separate, explicit client call. For the default
   `bind: "auto"` it binds inline under the same CAS and reports the outcome instead — see "Single-part bind outcome

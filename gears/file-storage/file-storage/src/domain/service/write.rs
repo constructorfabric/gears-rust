@@ -16,7 +16,7 @@ use crate::domain::etag;
 use crate::domain::policy::PolicyResolver;
 use crate::domain::ports::AutoBindOnFinalize;
 use crate::domain::service::{FileService, FinalizeByTokenOutcome, VersionRef};
-use crate::infra::backend::StorageBackend;
+use crate::infra::backend::{StorageBackend, classify_stream_io_error};
 use crate::infra::content::hash;
 use crate::infra::content::mime::{
     MIME_SNIFF_PREFIX_BYTES, enforce_size_ceiling_for_validated_mime, validate_and_resolve_mime,
@@ -92,9 +92,13 @@ async fn read_back_and_hash_streaming(
     while let Some(chunk) = stream.next().await {
         // A mid-stream read error means the object opened fine and then the
         // backend/transport failed partway through — it is never "not
-        // uploaded". Preserve it as a backend error (mirroring `put_stream`'s
-        // chunk handling) rather than collapsing it into the not-found case.
-        let chunk = chunk.map_err(|e| DomainError::backend(backend.id(), e.to_string()))?;
+        // uploaded". Classify it like any other backend I/O fault (a
+        // transient network hiccup is retryable, a permanent one is not)
+        // rather than collapsing it into the not-found case or always
+        // reporting a permanent fault.
+        let chunk = chunk.map_err(|e| {
+            classify_stream_io_error(backend.id(), "read-back stream read failed", &e)
+        })?;
         if prefix.len() < MIME_SNIFF_PREFIX_BYTES {
             let take = (MIME_SNIFF_PREFIX_BYTES - prefix.len()).min(chunk.len());
             prefix.extend_from_slice(&chunk[..take]);

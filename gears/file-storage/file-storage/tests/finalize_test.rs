@@ -12,11 +12,14 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use axum::extract::Path;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::{Extension, Json};
 use bytes::Bytes;
+use futures::StreamExt;
+use futures::stream::BoxStream;
 use sea_orm_migration::MigratorTrait;
 use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
@@ -32,13 +35,15 @@ use file_storage::domain::error::DomainError;
 use file_storage::domain::multipart_service::MultipartService;
 use file_storage::domain::ports::MultipartStore;
 use file_storage::domain::service::{FileService, ServiceConfig};
-use file_storage::infra::backend::{BackendRegistry, InMemoryBackend, StorageBackend};
+use file_storage::infra::backend::{
+    BackendCapabilities, BackendRegistry, InMemoryBackend, PublishOutcome, StorageBackend,
+};
 use file_storage::infra::content::hash;
 use file_storage::infra::signed_url::{Claims, Issuer, MultipartClaims, Op, UploadConstraints};
 use file_storage::infra::storage::Store;
 use file_storage::infra::storage::migrations::Migrator;
 use file_storage::infra::storage::repo::VersionRepo;
-use file_storage_sdk::{FileVersion, NewFile, OwnerKind, VersionStatus};
+use file_storage_sdk::{ByteRange, FileVersion, NewFile, OwnerKind, VersionStatus};
 
 mod common;
 use common::write_all;
@@ -720,6 +725,219 @@ async fn finalize_streams_readback_without_buffering_whole_blob() {
     assert_eq!(version.status, VersionStatus::Available);
     assert_eq!(version.size, true_size);
     assert_eq!(version.hash_value, true_hash);
+}
+
+// -- 10b. finalize_upload: mid-stream read-back errors are classified by kind
+
+/// A `StorageBackend` wrapper whose `get_stream` reads the wrapped backend's
+/// real object in full, then replays it as two chunks: the first half as
+/// `Ok`, the second replaced by a single `io::Error` of a caller-chosen
+/// `kind` -- modeling a backend/transport fault that surfaces partway
+/// through finalize's read-back verification
+/// (`read_back_and_hash_streaming`), after the object has already opened
+/// successfully. Everything else delegates straight to `inner`.
+struct MidReadFaultBackend {
+    inner: Arc<dyn StorageBackend>,
+    kind: std::io::ErrorKind,
+}
+
+#[async_trait]
+impl StorageBackend for MidReadFaultBackend {
+    fn id(&self) -> &str {
+        self.inner.id()
+    }
+    fn capabilities(&self) -> BackendCapabilities {
+        self.inner.capabilities()
+    }
+    async fn put_stream(
+        &self,
+        path: &str,
+        stream: BoxStream<'_, std::io::Result<Bytes>>,
+        max_size: Option<u64>,
+    ) -> Result<(u64, [u8; 32]), DomainError> {
+        self.inner.put_stream(path, stream, max_size).await
+    }
+    async fn publish_exclusive(
+        &self,
+        path: &str,
+        stream: BoxStream<'_, std::io::Result<Bytes>>,
+        max_size: Option<u64>,
+    ) -> Result<PublishOutcome, DomainError> {
+        self.inner.publish_exclusive(path, stream, max_size).await
+    }
+    async fn get_stream(
+        &self,
+        path: &str,
+        expected_len: u64,
+    ) -> Result<BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
+        let mut real = self.inner.get_stream(path, expected_len).await?;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = real.next().await {
+            bytes.extend_from_slice(
+                &chunk.map_err(|e| DomainError::backend(self.id(), e.to_string()))?,
+            );
+        }
+        let half = bytes.len() >> 1;
+        let kind = self.kind;
+        let chunks: Vec<std::io::Result<Bytes>> = vec![
+            Ok(Bytes::copy_from_slice(&bytes[..half])),
+            Err(std::io::Error::new(
+                kind,
+                "simulated mid-stream fault (test)",
+            )),
+        ];
+        Ok(Box::pin(futures::stream::iter(chunks)))
+    }
+    async fn read_prefix(&self, path: &str, max_bytes: u64) -> Result<Option<Bytes>, DomainError> {
+        self.inner.read_prefix(path, max_bytes).await
+    }
+    async fn get_range_stream(
+        &self,
+        path: &str,
+        range: ByteRange,
+        expected_len: u64,
+    ) -> Result<BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
+        self.inner.get_range_stream(path, range, expected_len).await
+    }
+    async fn size(&self, path: &str) -> Result<u64, DomainError> {
+        self.inner.size(path).await
+    }
+    async fn delete(&self, path: &str) -> Result<(), DomainError> {
+        self.inner.delete(path).await
+    }
+    async fn exists(&self, path: &str) -> Result<bool, DomainError> {
+        self.inner.exists(path).await
+    }
+    async fn stat(&self, path: &str) -> Result<Option<u64>, DomainError> {
+        self.inner.stat(path).await
+    }
+}
+
+/// A transient (`TimedOut`) mid-stream read-back fault during finalize must
+/// surface as a retryable `BackendUnavailable`, not the old always-`Backend`
+/// behavior, and must not persist the version as `available`.
+#[tokio::test]
+async fn finalize_readback_mid_stream_timeout_is_retryable_backend_unavailable() {
+    let db = build_db().await;
+    let store = Store::new(Arc::clone(&db));
+    let inner: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let authorizer: Arc<dyn file_storage::domain::authz::Authorizer> =
+        Arc::new(TenantOnlyAuthorizer);
+
+    let plain_backends = BackendRegistry::new(vec![Arc::clone(&inner)], "mem").expect("registry");
+    let plain_svc = service_over(
+        store.clone(),
+        plain_backends,
+        Arc::clone(&authorizer),
+        Arc::clone(&issuer),
+    );
+
+    let ctx = ctx(Uuid::now_v7());
+    let ticket = plain_svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+    let path = backend_path(ticket.file_id, ticket.version_id);
+    let content = Bytes::from_static(b"content read back mid-stream during finalize");
+    write_all(&inner, &path, content.clone()).await;
+
+    let faulty: Arc<dyn StorageBackend> = Arc::new(MidReadFaultBackend {
+        inner: Arc::clone(&inner),
+        kind: std::io::ErrorKind::TimedOut,
+    });
+    let faulty_backends = BackendRegistry::new(vec![faulty], "mem").expect("registry");
+    let faulty_svc = service_over(store.clone(), faulty_backends, authorizer, issuer);
+
+    let err = faulty_svc
+        .finalize_upload(
+            &ctx,
+            ticket.file_id,
+            ticket.version_id,
+            i64::try_from(content.len()).unwrap(),
+            hash::sha256(&content),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, DomainError::BackendUnavailable { .. }),
+        "a transient (TimedOut) mid-stream read-back error must be retryable, got {err:?}"
+    );
+
+    let version = store
+        .get_version(ticket.file_id, ticket.version_id)
+        .await
+        .unwrap()
+        .expect("version row must still exist");
+    assert_eq!(
+        version.status,
+        VersionStatus::Pending,
+        "finalize must not persist on a failed read-back"
+    );
+}
+
+/// A permanent (`InvalidData`) mid-stream read-back fault during finalize
+/// must still surface as `Backend` (not retryable), unlike the transient
+/// case above.
+#[tokio::test]
+async fn finalize_readback_mid_stream_invalid_data_is_permanent_backend_error() {
+    let db = build_db().await;
+    let store = Store::new(Arc::clone(&db));
+    let inner: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let authorizer: Arc<dyn file_storage::domain::authz::Authorizer> =
+        Arc::new(TenantOnlyAuthorizer);
+
+    let plain_backends = BackendRegistry::new(vec![Arc::clone(&inner)], "mem").expect("registry");
+    let plain_svc = service_over(
+        store.clone(),
+        plain_backends,
+        Arc::clone(&authorizer),
+        Arc::clone(&issuer),
+    );
+
+    let ctx = ctx(Uuid::now_v7());
+    let ticket = plain_svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+    let path = backend_path(ticket.file_id, ticket.version_id);
+    let content = Bytes::from_static(b"content read back mid-stream during finalize");
+    write_all(&inner, &path, content.clone()).await;
+
+    let faulty: Arc<dyn StorageBackend> = Arc::new(MidReadFaultBackend {
+        inner: Arc::clone(&inner),
+        kind: std::io::ErrorKind::InvalidData,
+    });
+    let faulty_backends = BackendRegistry::new(vec![faulty], "mem").expect("registry");
+    let faulty_svc = service_over(store.clone(), faulty_backends, authorizer, issuer);
+
+    let err = faulty_svc
+        .finalize_upload(
+            &ctx,
+            ticket.file_id,
+            ticket.version_id,
+            i64::try_from(content.len()).unwrap(),
+            hash::sha256(&content),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, DomainError::Backend { .. }),
+        "a permanent (InvalidData) mid-stream read-back error must not be classified \
+         as retryable, got {err:?}"
+    );
+
+    let version = store
+        .get_version(ticket.file_id, ticket.version_id)
+        .await
+        .unwrap()
+        .expect("version row must still exist");
+    assert_eq!(
+        version.status,
+        VersionStatus::Pending,
+        "finalize must not persist on a failed read-back"
+    );
 }
 
 // -- 11. handlers::finalize_version: internal-secret gate (P2 0.1 remaining) -

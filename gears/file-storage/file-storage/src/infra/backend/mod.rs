@@ -51,6 +51,52 @@ use crate::infra::content::hash_mode::ManifestEntry;
 /// bug, rejected as a validation error rather than silently clamped.
 pub(crate) const MAX_READ_PREFIX_BYTES: u64 = 64 * 1024;
 
+/// Whether a backend I/O error is transient (a retry is expected to
+/// succeed) as opposed to a persistent fault. Shared by every backend so a
+/// stalled read/write, a signal-interrupted syscall, a would-block on a
+/// non-blocking fd, or a dropped/reset connection are classified identically
+/// regardless of which backend observed them; a missing path, permission
+/// denied, disk full, or corrupt data is never transient — retrying changes
+/// nothing about any of those.
+///
+/// `UnexpectedEof` is included: every backend's chunked read (e.g.
+/// `LocalFsBackend::chunked_file_stream`) raises exactly this kind when a
+/// stream ends short of the length the caller already committed to, which is
+/// itself either a concurrent write racing the read or a dropped connection
+/// truncating the body — both retry-worthy, never a reason to report a
+/// permanent fault.
+pub(crate) fn is_transient_io_error(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::UnexpectedEof
+    )
+}
+
+/// Classify a mid-stream read failure (a chunk error from a `get_stream`-
+/// style `BoxStream` that already opened successfully) into a `DomainError`:
+/// [`is_transient_io_error`] picks `backend_unavailable` (retryable, REST
+/// `503` + `Retry-After`) over `backend` (permanent, `500`). `context`
+/// identifies which read this was (e.g. "read-back stream read failed") so
+/// the message stays specific without the caller hand-rolling it.
+pub(crate) fn classify_stream_io_error(
+    backend_id: &str,
+    context: &str,
+    e: &std::io::Error,
+) -> DomainError {
+    let msg = format!("{context}: {e}");
+    if is_transient_io_error(e.kind()) {
+        DomainError::backend_unavailable(backend_id, msg)
+    } else {
+        DomainError::backend(backend_id, msg)
+    }
+}
+
 /// Shared budget check every [`StorageBackend::read_prefix`] implementation
 /// runs before touching its backend, so the ceiling is enforced identically
 /// (and the error shape is identical) regardless of which backend answers.
@@ -537,6 +583,69 @@ impl BackendRegistry {
     /// [`StorageBackend::is_ready`] rather than just the default one.
     pub fn iter(&self) -> impl Iterator<Item = (&str, &Arc<dyn StorageBackend>)> {
         self.backends.iter().map(|(id, b)| (id.as_str(), b))
+    }
+}
+
+#[cfg(test)]
+mod classify_io_error_tests {
+    use std::io::ErrorKind;
+
+    use super::{classify_stream_io_error, is_transient_io_error};
+    use crate::domain::error::DomainError;
+
+    #[test]
+    fn classifies_timed_out_as_transient() {
+        assert!(is_transient_io_error(ErrorKind::TimedOut));
+    }
+
+    #[test]
+    fn classifies_interrupted_and_would_block_as_transient() {
+        assert!(is_transient_io_error(ErrorKind::Interrupted));
+        assert!(is_transient_io_error(ErrorKind::WouldBlock));
+    }
+
+    #[test]
+    fn classifies_dropped_connection_kinds_as_transient() {
+        assert!(is_transient_io_error(ErrorKind::ConnectionReset));
+        assert!(is_transient_io_error(ErrorKind::ConnectionAborted));
+        assert!(is_transient_io_error(ErrorKind::BrokenPipe));
+    }
+
+    #[test]
+    fn classifies_unexpected_eof_as_transient() {
+        assert!(is_transient_io_error(ErrorKind::UnexpectedEof));
+    }
+
+    #[test]
+    fn classifies_not_found_and_permission_denied_as_permanent() {
+        assert!(!is_transient_io_error(ErrorKind::NotFound));
+        assert!(!is_transient_io_error(ErrorKind::PermissionDenied));
+    }
+
+    #[test]
+    fn classifies_invalid_data_and_other_as_permanent() {
+        assert!(!is_transient_io_error(ErrorKind::InvalidData));
+        assert!(!is_transient_io_error(ErrorKind::Other));
+    }
+
+    #[test]
+    fn classify_stream_io_error_maps_transient_kind_to_backend_unavailable() {
+        let e = std::io::Error::new(ErrorKind::TimedOut, "connection timed out");
+        let err = classify_stream_io_error("s3-primary", "read-back stream read failed", &e);
+        assert!(
+            matches!(err, DomainError::BackendUnavailable { .. }),
+            "expected BackendUnavailable, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn classify_stream_io_error_maps_permanent_kind_to_backend() {
+        let e = std::io::Error::new(ErrorKind::InvalidData, "corrupt chunk");
+        let err = classify_stream_io_error("s3-primary", "read-back stream read failed", &e);
+        assert!(
+            matches!(err, DomainError::Backend { .. }),
+            "expected Backend, got {err:?}"
+        );
     }
 }
 

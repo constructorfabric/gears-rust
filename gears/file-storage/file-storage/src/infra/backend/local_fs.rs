@@ -80,13 +80,15 @@ impl LocalFsBackend {
         Ok(out)
     }
 
-    /// Classifies by `e.kind()`: a stalled read/write, a signal-interrupted
-    /// syscall, or a would-block on a non-blocking fd are transient (retrying
-    /// the same operation is expected to make progress); anything else (a
-    /// missing path, permission denied, disk full, ...) is a permanent fault.
+    /// Classifies by `e.kind()` via the shared
+    /// [`super::is_transient_io_error`]: a stalled read/write, a
+    /// signal-interrupted syscall, a would-block on a non-blocking fd, or a
+    /// dropped connection are transient (retrying the same operation is
+    /// expected to make progress); anything else (a missing path, permission
+    /// denied, disk full, ...) is a permanent fault.
     fn io_err(&self, e: &std::io::Error) -> DomainError {
         let msg = e.to_string();
-        if is_transient_io_error(e.kind()) {
+        if super::is_transient_io_error(e.kind()) {
             DomainError::backend_unavailable(&self.id, msg)
         } else {
             DomainError::backend(&self.id, msg)
@@ -642,41 +644,5 @@ impl StorageBackend for LocalFsBackend {
         } else {
             Err(DomainError::backend(&self.id, "root is not a directory"))
         }
-    }
-}
-
-/// Whether `kind` denotes a transient, expected-to-clear-on-retry I/O
-/// failure (a stalled read/write, a signal-interrupted syscall, a
-/// would-block on a non-blocking descriptor) as opposed to a persistent
-/// fault (missing path, permission denied, disk full, ...).
-fn is_transient_io_error(kind: std::io::ErrorKind) -> bool {
-    matches!(
-        kind,
-        std::io::ErrorKind::TimedOut
-            | std::io::ErrorKind::Interrupted
-            | std::io::ErrorKind::WouldBlock
-    )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::is_transient_io_error;
-    use std::io::ErrorKind;
-
-    #[test]
-    fn classifies_timed_out_as_transient() {
-        assert!(is_transient_io_error(ErrorKind::TimedOut));
-    }
-
-    #[test]
-    fn classifies_interrupted_and_would_block_as_transient() {
-        assert!(is_transient_io_error(ErrorKind::Interrupted));
-        assert!(is_transient_io_error(ErrorKind::WouldBlock));
-    }
-
-    #[test]
-    fn classifies_not_found_and_permission_denied_as_permanent() {
-        assert!(!is_transient_io_error(ErrorKind::NotFound));
-        assert!(!is_transient_io_error(ErrorKind::PermissionDenied));
     }
 }

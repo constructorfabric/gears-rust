@@ -9,7 +9,7 @@ use crate::domain::authz::actions;
 use crate::domain::error::DomainError;
 use crate::domain::service::FileService;
 use crate::domain::storage_layout;
-use crate::infra::backend::{BackendCapabilities, StorageBackend};
+use crate::infra::backend::{BackendCapabilities, StorageBackend, classify_stream_io_error};
 use crate::infra::content::hash_mode::{HashMode, Manifest};
 use crate::infra::content::stream_verify;
 
@@ -372,9 +372,11 @@ impl FileService {
     ///   momentarily unreachable (a dropped connection, a transient backend
     ///   fault) — so deleting it here would recreate exactly the data-loss
     ///   bug this function exists to prevent. It is left untouched and this
-    ///   returns the underlying `DomainError::Backend` unchanged: a
-    ///   retryable backend error at the REST boundary (`api/rest/error.rs`
-    ///   maps it to a 5xx), not a rejection of the migration itself.
+    ///   returns the underlying error unchanged: `DomainError::BackendUnavailable`
+    ///   when the cause was classified transient, `DomainError::Backend`
+    ///   otherwise — either way a rejection of this call, never of the
+    ///   migration itself, and `api/rest/error.rs` maps each to its own 5xx
+    ///   at the REST boundary.
     async fn verify_preexisting_dest_and_clean_on_confirmed_mismatch(
         &self,
         dest: &dyn StorageBackend,
@@ -476,10 +478,13 @@ async fn verify_existing_dest_object(
     // through to the (also-empty) slot check below.
     while let Some(chunk) = verified.next().await {
         if let Err(e) = chunk {
-            return Err(PreexistingDestVerdict::Unconfirmed(DomainError::backend(
-                dest.id(),
-                format!("failed reading back destination object for verification: {e}"),
-            )));
+            return Err(PreexistingDestVerdict::Unconfirmed(
+                classify_stream_io_error(
+                    dest.id(),
+                    "failed reading back destination object for verification",
+                    &e,
+                ),
+            ));
         }
     }
     let verdict = verify_slot

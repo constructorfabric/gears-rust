@@ -45,6 +45,22 @@ use super::{
     build_manifest_and_root, check_read_prefix_budget,
 };
 
+/// Map a mid-`bytes_stream()` `reqwest::Error` to an `io::Error` whose kind
+/// lets [`super::classify_stream_io_error`] tell transient from permanent
+/// (plain `io::Error::other` would make every failure `Other`). Timeout is
+/// checked first, since a timed-out request may also report connect/body;
+/// the original error is kept as the source.
+fn reqwest_to_io(e: reqwest::Error) -> std::io::Error {
+    let kind = if e.is_timeout() {
+        std::io::ErrorKind::TimedOut
+    } else if e.is_connect() || e.is_body() || e.is_request() || e.is_decode() {
+        std::io::ErrorKind::ConnectionReset
+    } else {
+        std::io::ErrorKind::Other
+    };
+    std::io::Error::new(kind, e)
+}
+
 /// Whether the terminal object-creating write of a streamed upload may
 /// overwrite an existing object or must fail if one already exists.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -790,9 +806,7 @@ impl StorageBackend for S3Backend {
             )));
         }
 
-        let stream = resp
-            .bytes_stream()
-            .map(|r| r.map_err(std::io::Error::other));
+        let stream = resp.bytes_stream().map(|r| r.map_err(reqwest_to_io));
         Ok(super::length_guard(Box::pin(stream), expected_len))
     }
 
@@ -874,9 +888,7 @@ impl StorageBackend for S3Backend {
             )));
         }
 
-        let stream = resp
-            .bytes_stream()
-            .map(|r| r.map_err(std::io::Error::other));
+        let stream = resp.bytes_stream().map(|r| r.map_err(reqwest_to_io));
         Ok(super::length_guard(Box::pin(stream), expected_len))
     }
 
