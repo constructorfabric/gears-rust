@@ -527,6 +527,9 @@ gears:
   oagw:
     config:
       proxy_timeout_secs: 2
+      # Below the api-gateway body_limit_bytes (64 MB) so OAGW's own 413 is
+      # reachable (scenario 8.1); the gateway limit is tested separately.
+      max_body_size_bytes: 1048576
       allow_http_upstream: true # Only for testing - do not enable in production without proper security controls
       ssrf_policy:
         enabled: false # Disabled for e2e tests (mock upstreams use 127.0.0.1)

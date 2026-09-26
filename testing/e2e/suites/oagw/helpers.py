@@ -60,33 +60,6 @@ OAGW_INSTANCES = [
 ALL_OAGW_GTS_IDS = OAGW_SCHEMAS + OAGW_INSTANCES
 
 
-async def register_oagw_types(
-    client: httpx.AsyncClient,
-    base_url: str,
-    headers: dict,
-) -> httpx.Response:
-    """Register all OAGW GTS schemas and instances via the types-registry REST API.
-
-    Idempotent — safe to call when types are already registered at startup.
-    """
-    entities = []
-    for gts_id in OAGW_SCHEMAS:
-        entities.append({
-            "$id": f"gts://{gts_id}",
-            "$schema": "http://json-schema.org/draft-07/schema#",
-            "type": "object",
-        })
-    for gts_id in OAGW_INSTANCES:
-        entities.append({"$id": gts_id})
-
-    resp = await client.post(
-        f"{base_url}/types-registry/v1/entities",
-        headers={**headers, "content-type": "application/json"},
-        json={"entities": entities},
-    )
-    return resp
-
-
 async def list_oagw_types(
     client: httpx.AsyncClient,
     base_url: str,
@@ -317,3 +290,118 @@ async def delete_upstream(
         f"{base_url}/oagw/v1/upstreams/{upstream_id}",
         headers=headers,
     )
+
+
+# ---------------------------------------------------------------------------
+# Error identity assertions
+# ---------------------------------------------------------------------------
+
+ERR_TYPE_PREFIX = "gts://gts.cf.core.errors.err.v1~cf.core.err."
+
+
+def err_type(category: str) -> str:
+    """Canonical Problem Details ``type`` URI for an error category."""
+    return f"{ERR_TYPE_PREFIX}{category}.v1~"
+
+
+def assert_problem(
+    resp: httpx.Response,
+    status: int,
+    *,
+    esrc: Optional[str] = "gateway",
+    category: Optional[str] = None,
+    reason: Optional[str] = None,
+    resource_type: Optional[str] = None,
+    detail_contains: Optional[str] = None,
+) -> dict:
+    """Assert ``resp`` is a Problem Details error with the given identity.
+
+    ``esrc=None`` asserts that ``x-oagw-error-source`` is absent, i.e. the
+    response was produced by a layer in front of OAGW. Returns the parsed body.
+    """
+    assert resp.status_code == status, (
+        f"expected {status}, got {resp.status_code}: {resp.text[:500]}"
+    )
+    ct = resp.headers.get("content-type", "")
+    assert ct.startswith("application/problem+json"), f"content-type {ct!r}: {resp.text[:300]}"
+    assert resp.headers.get("x-oagw-error-source") == esrc, (
+        f"x-oagw-error-source {resp.headers.get('x-oagw-error-source')!r} != {esrc!r}"
+    )
+    body = resp.json()
+    assert body.get("status") == status, body
+    if category is not None:
+        assert body.get("type") == err_type(category), body
+    context = body.get("context") or {}
+    if reason is not None:
+        reasons = [context.get("reason")] + [
+            v.get("reason") for v in context.get("field_violations") or []
+        ]
+        assert reason in reasons, body
+    if resource_type is not None:
+        assert context.get("resource_type") == resource_type, body
+    if detail_contains is not None:
+        assert detail_contains in (body.get("detail") or ""), body
+    return body
+
+
+# ---------------------------------------------------------------------------
+# Listing and cleanup
+# ---------------------------------------------------------------------------
+
+async def list_all(
+    client: httpx.AsyncClient,
+    base_url: str,
+    headers: dict,
+    collection: str,
+    page_size: int = 100,
+    **params,
+) -> list[dict]:
+    """Page through ``GET /oagw/v1/{collection}`` and return every item."""
+    # The server caps a page at 100; a bigger page_size would end after one page.
+    assert 0 < page_size <= 100, page_size
+    items: list[dict] = []
+    seen: set[str] = set()
+    skip = 0
+    while True:
+        resp = await client.get(
+            f"{base_url}/oagw/v1/{collection}",
+            headers=headers,
+            params={**params, "limit": page_size, "offset": skip},
+        )
+        assert resp.status_code == 200, resp.text[:500]
+        page = resp.json()
+        ids = {item["id"] for item in page}
+        assert not ids & seen, f"offset {skip} returned items already listed"
+        seen |= ids
+        items.extend(page)
+        if len(page) < page_size:
+            return items
+        skip += page_size
+
+
+class Cleanup:
+    """Collects upstreams to delete at teardown (see the ``cleanup`` fixture).
+
+    Deletion runs in reverse creation order so children go before parents,
+    and each delete must return 204 (or 404 when the test already deleted it).
+    """
+
+    def __init__(self) -> None:
+        self._upstreams: list[tuple[dict, str]] = []
+
+    def upstream(self, headers: dict, upstream: dict) -> dict:
+        self._upstreams.append((headers, upstream["id"]))
+        return upstream
+
+    async def run(self, base_url: str) -> None:
+        failures = []
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            for headers, uid in reversed(self._upstreams):
+                try:
+                    resp = await delete_upstream(client, base_url, headers, uid)
+                except httpx.HTTPError as exc:
+                    failures.append(f"{uid}: {exc!r}")
+                    continue
+                if resp.status_code not in (204, 404):
+                    failures.append(f"{uid}: {resp.status_code} {resp.text[:200]}")
+        assert not failures, f"cleanup failed: {failures}"

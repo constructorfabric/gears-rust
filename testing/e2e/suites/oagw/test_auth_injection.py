@@ -2,16 +2,19 @@
 import httpx
 import pytest
 
-from .helpers import create_route, create_upstream, delete_upstream, unique_alias
-
-APIKEY_AUTH_PLUGIN_ID = "gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.apikey.v1"
+from .helpers import APIKEY_AUTH_PLUGIN_ID, create_route, create_upstream, unique_alias
 
 
+@pytest.mark.scenario("positive-9.2-api-key-injection")
 @pytest.mark.asyncio
 async def test_apikey_auth_injects_bearer_header(
-    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream,
+    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream, cleanup,
 ):
-    """Auth plugin injects Authorization: Bearer <secret> into upstream request."""
+    """Scenario 9.2: the apikey plugin injects `<prefix><resolved secret>`.
+
+    The secret is provisioned by conftest (a failure there errors every test),
+    so any non-200 here is a plugin or pipeline failure, never a skip.
+    """
     alias = unique_alias("auth-key")
     auth_config = {
         "type": APIKEY_AUTH_PLUGIN_ID,
@@ -24,22 +27,12 @@ async def test_apikey_auth_injects_bearer_header(
     }
 
     async with httpx.AsyncClient(timeout=10.0) as client:
-        try:
-            upstream = await create_upstream(
-                client, oagw_base_url, oagw_headers, mock_upstream_url,
-                alias=alias, auth=auth_config,
-            )
-        except httpx.HTTPStatusError as exc:
-            if exc.response.status_code in (400, 500):
-                pytest.skip(
-                    f"Cannot create upstream with auth config (cred_store may not be available): "
-                    f"{exc.response.status_code} {exc.response.text[:200]}"
-                )
-            raise
-
-        uid = upstream["id"]
+        upstream = cleanup.upstream(oagw_headers, await create_upstream(
+            client, oagw_base_url, oagw_headers, mock_upstream_url,
+            alias=alias, auth=auth_config,
+        ))
         await create_route(
-            client, oagw_base_url, oagw_headers, uid, ["POST"], "/echo",
+            client, oagw_base_url, oagw_headers, upstream["id"], ["POST"], "/echo",
         )
 
         resp = await client.post(
@@ -47,23 +40,9 @@ async def test_apikey_auth_injects_bearer_header(
             headers={**oagw_headers, "content-type": "application/json"},
             json={"test": True},
         )
-
-        if resp.status_code in (401, 500):
-            await delete_upstream(client, oagw_base_url, oagw_headers, uid)
-            pytest.skip(
-                f"Auth injection failed (cred_store may not have test secret): "
-                f"{resp.status_code} {resp.text[:200]}"
-            )
-
         assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text[:500]}"
+        assert resp.headers.get("x-oagw-error-source") == "upstream"
 
-        echoed = resp.json().get("headers", {})
-        auth_header = echoed.get("authorization", "")
-        assert auth_header.startswith("Bearer "), (
-            f"Expected 'Bearer ...' in authorization header, got: {auth_header!r}"
-        )
-        # The value after "Bearer " should be a non-empty resolved secret.
-        secret_value = auth_header[len("Bearer "):]
-        assert len(secret_value) > 0, "Resolved secret is empty"
-
-        await delete_upstream(client, oagw_base_url, oagw_headers, uid)
+        echoed = resp.json()["headers"]
+        # The client's own gateway token must be replaced, not forwarded.
+        assert echoed.get("authorization") == "Bearer sk-test-e2e-fake-key"

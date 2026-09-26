@@ -1,195 +1,151 @@
-"""E2E tests for OAGW OAuth2 Client Credentials auth plugin."""
+"""E2E tests for OAGW OAuth2 Client Credentials auth plugin.
+
+The mock `/oauth2/token` endpoint issues `mock-e2e-token-form` or
+`mock-e2e-token-basic` depending on how the client authenticated, and
+rejects wrong credentials, so each test pins which variant ran.
+"""
+import uuid
+
 import httpx
 import pytest
 
-from .helpers import create_route, create_upstream, delete_upstream, unique_alias
-
-OAUTH2_CC_PLUGIN_ID = (
-    "gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.oauth2_client_cred.v1"
+from .helpers import (
+    OAUTH2_CLIENT_CRED_AUTH_PLUGIN_ID,
+    OAUTH2_CLIENT_CRED_BASIC_AUTH_PLUGIN_ID,
+    assert_problem,
+    create_route,
+    create_upstream,
+    create_upstream_raw,
+    unique_alias,
 )
-OAUTH2_CC_BASIC_PLUGIN_ID = (
-    "gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.oauth2_client_cred_basic.v1"
-)
 
 
-@pytest.mark.asyncio
-async def test_oauth2_client_cred_form_injects_bearer(
-    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream,
-):
-    """OAuth2 CC (Form) plugin obtains token and injects Authorization: Bearer."""
-    alias = unique_alias("oauth2-form")
-    auth_config = {
-        "type": OAUTH2_CC_PLUGIN_ID,
+def _oauth2_auth(plugin_id: str, mock_upstream_url: str, **refs) -> dict:
+    return {
+        "type": plugin_id,
         "sharing": "private",
         "config": {
             "token_endpoint": f"{mock_upstream_url}/oauth2/token",
-            "client_id_ref": "cred://test-oauth2-client-id",
-            "client_secret_ref": "cred://test-oauth2-client-secret",
-            "scopes": "read write",
+            "client_id_ref": refs.get("client_id_ref", "cred://test-oauth2-client-id"),
+            "client_secret_ref": refs.get("client_secret_ref", "cred://test-oauth2-client-secret"),
+            # A per-test scope makes the token cache key unique, so every run
+            # really calls the token endpoint.
+            "scopes": f"read write e2e-{uuid.uuid4().hex[:8]}",
         },
     }
 
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        try:
-            upstream = await create_upstream(
-                client, oagw_base_url, oagw_headers, mock_upstream_url,
-                alias=alias, auth=auth_config,
-            )
-        except httpx.HTTPStatusError as exc:
-            if exc.response.status_code == 500:
-                pytest.skip(
-                    f"Cannot create upstream with OAuth2 auth config "
-                    f"(cred_store may not be available): "
-                    f"{exc.response.status_code} {exc.response.text[:200]}"
-                )
-            raise
 
-        uid = upstream["id"]
-        await create_route(
-            client, oagw_base_url, oagw_headers, uid, ["POST"], "/echo",
-        )
-
-        resp = await client.post(
-            f"{oagw_base_url}/oagw/v1/proxy/{alias}/echo",
-            headers={**oagw_headers, "content-type": "application/json"},
-            json={"test": True},
-        )
-
-        if resp.status_code == 500:
-            await delete_upstream(client, oagw_base_url, oagw_headers, uid)
-            pytest.skip(
-                f"OAuth2 auth injection failed (cred_store may not have test secret): "
-                f"{resp.status_code} {resp.text[:200]}"
-            )
-
-        assert resp.status_code == 200, (
-            f"Expected 200, got {resp.status_code}: {resp.text[:500]}"
-        )
-
-        echoed = resp.json().get("headers", {})
-        auth_header = echoed.get("authorization", "")
-        assert auth_header.startswith("Bearer "), (
-            f"Expected 'Bearer ...' in authorization header, got: {auth_header!r}"
-        )
-        token_value = auth_header[len("Bearer "):]
-        assert len(token_value) > 0, "Resolved Bearer token is empty"
-
-        await delete_upstream(client, oagw_base_url, oagw_headers, uid)
+async def _proxy_echo(client, oagw_base_url, oagw_headers, alias):
+    return await client.post(
+        f"{oagw_base_url}/oagw/v1/proxy/{alias}/echo",
+        headers={**oagw_headers, "content-type": "application/json"},
+        json={"test": True},
+    )
 
 
 @pytest.mark.asyncio
-async def test_oauth2_client_cred_basic_injects_bearer(
-    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream,
+@pytest.mark.parametrize(
+    ("plugin_id", "expected_token"),
+    [
+        # Client credentials sent as form parameters.
+        pytest.param(
+            OAUTH2_CLIENT_CRED_AUTH_PLUGIN_ID, "mock-e2e-token-form", id="form",
+            marks=pytest.mark.scenario("positive-9.5-oauth2-client-credentials"),
+        ),
+        # Client authenticated with HTTP Basic, not form params.
+        pytest.param(
+            OAUTH2_CLIENT_CRED_BASIC_AUTH_PLUGIN_ID, "mock-e2e-token-basic", id="basic",
+            marks=pytest.mark.scenario("positive-9.6-oauth2-client-credentials"),
+        ),
+    ],
+)
+async def test_oauth2_client_cred_injects_bearer(
+    plugin_id, expected_token,
+    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream, cleanup,
 ):
-    """OAuth2 CC (Basic) plugin obtains token and injects Authorization: Bearer."""
-    alias = unique_alias("oauth2-basic")
-    auth_config = {
-        "type": OAUTH2_CC_BASIC_PLUGIN_ID,
-        "sharing": "private",
-        "config": {
-            "token_endpoint": f"{mock_upstream_url}/oauth2/token",
-            "client_id_ref": "cred://test-oauth2-client-id",
-            "client_secret_ref": "cred://test-oauth2-client-secret",
-            "scopes": "read write",
-        },
-    }
-
+    """The plugin fetches a token with the right client auth and injects it."""
+    alias = unique_alias("oauth2")
     async with httpx.AsyncClient(timeout=10.0) as client:
-        try:
-            upstream = await create_upstream(
-                client, oagw_base_url, oagw_headers, mock_upstream_url,
-                alias=alias, auth=auth_config,
-            )
-        except httpx.HTTPStatusError as exc:
-            if exc.response.status_code == 500:
-                pytest.skip(
-                    f"Cannot create upstream with OAuth2 Basic auth config "
-                    f"(cred_store may not be available): "
-                    f"{exc.response.status_code} {exc.response.text[:200]}"
-                )
-            raise
-
-        uid = upstream["id"]
+        upstream = cleanup.upstream(oagw_headers, await create_upstream(
+            client, oagw_base_url, oagw_headers, mock_upstream_url,
+            alias=alias, auth=_oauth2_auth(plugin_id, mock_upstream_url),
+        ))
         await create_route(
-            client, oagw_base_url, oagw_headers, uid, ["POST"], "/echo",
+            client, oagw_base_url, oagw_headers, upstream["id"], ["POST"], "/echo",
         )
 
-        resp = await client.post(
-            f"{oagw_base_url}/oagw/v1/proxy/{alias}/echo",
-            headers={**oagw_headers, "content-type": "application/json"},
-            json={"test": True},
-        )
-
-        if resp.status_code == 500:
-            await delete_upstream(client, oagw_base_url, oagw_headers, uid)
-            pytest.skip(
-                f"OAuth2 Basic auth injection failed "
-                f"(cred_store may not have test secret): "
-                f"{resp.status_code} {resp.text[:200]}"
-            )
-
-        assert resp.status_code == 200, (
-            f"Expected 200, got {resp.status_code}: {resp.text[:500]}"
-        )
-
-        echoed = resp.json().get("headers", {})
-        auth_header = echoed.get("authorization", "")
-        assert auth_header.startswith("Bearer "), (
-            f"Expected 'Bearer ...' in authorization header, got: {auth_header!r}"
-        )
-        token_value = auth_header[len("Bearer "):]
-        assert len(token_value) > 0, "Resolved Bearer token is empty"
-
-        await delete_upstream(client, oagw_base_url, oagw_headers, uid)
+        resp = await _proxy_echo(client, oagw_base_url, oagw_headers, alias)
+        assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text[:500]}"
+        assert resp.headers.get("x-oagw-error-source") == "upstream"
+        assert resp.json()["headers"].get("authorization") == f"Bearer {expected_token}"
 
 
-
+@pytest.mark.scenario("negative-9.7-secret-access-control-cred-store", part="B")
 @pytest.mark.asyncio
-async def test_oauth2_client_cred_missing_secret_returns_error(
-    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream,
+@pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason="M-10: OAuth2 *_ref keys are not resolved at write time "
+           "(today the create succeeds and the proxy call fails with 500)",
+)
+async def test_oauth2_client_cred_missing_secret_rejected_at_write(
+    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream, cleanup,
 ):
-    """OAuth2 CC with non-existent credential ref returns error gracefully."""
+    """Scenario 9.7-B: an upstream whose OAuth2 refs don't resolve is rejected on create."""
     alias = unique_alias("oauth2-nosecret")
-    auth_config = {
-        "type": OAUTH2_CC_PLUGIN_ID,
-        "sharing": "private",
-        "config": {
-            "token_endpoint": f"{mock_upstream_url}/oauth2/token",
-            "client_id_ref": "cred://nonexistent-client-id",
-            "client_secret_ref": "cred://nonexistent-client-secret",
-        },
-    }
-
+    auth = _oauth2_auth(
+        OAUTH2_CLIENT_CRED_AUTH_PLUGIN_ID, mock_upstream_url,
+        client_id_ref="cred://nonexistent-client-id",
+        client_secret_ref="cred://nonexistent-client-secret",
+    )
     async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await create_upstream_raw(
+            client, oagw_base_url, oagw_headers, mock_upstream_url, alias=alias, auth=auth,
+        )
+        if resp.status_code == 201:
+            cleanup.upstream(oagw_headers, resp.json())
+        assert_problem(resp, 400, esrc=None, category="failed_precondition")
+
+
+@pytest.mark.scenario("negative-9.7-secret-access-control-cred-store", part="B")
+@pytest.mark.asyncio
+@pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason="PLG-10: a credential that no longer resolves maps to "
+           "500 internal.v1 today; the decision is 401 unauthenticated",
+)
+async def test_oauth2_client_cred_secret_deleted_returns_401(
+    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream, cleanup,
+):
+    """Scenario 9.7-B at proxy time: the secret existed at write time, then was deleted."""
+    alias = unique_alias("oauth2-gone")
+    ref = f"e2e-oauth2-gone-{uuid.uuid4().hex[:8]}"
+    secrets_url = f"{oagw_base_url}/credstore/v1/secrets"
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        created = await client.post(
+            secrets_url, headers=oagw_headers,
+            json={"reference": ref, "value": "test-client-secret", "sharing": "tenant"},
+        )
+        if created.status_code not in (200, 201):
+            pytest.fail(f"could not create secret {ref!r}: HTTP {created.status_code}")
         try:
-            upstream = await create_upstream(
-                client, oagw_base_url, oagw_headers, mock_upstream_url,
-                alias=alias, auth=auth_config,
+            upstream = cleanup.upstream(oagw_headers, await create_upstream(
+                client, oagw_base_url, oagw_headers, mock_upstream_url, alias=alias,
+                auth=_oauth2_auth(
+                    OAUTH2_CLIENT_CRED_AUTH_PLUGIN_ID, mock_upstream_url,
+                    client_secret_ref=f"cred://{ref}",
+                ),
+            ))
+            await create_route(
+                client, oagw_base_url, oagw_headers, upstream["id"], ["POST"], "/echo",
             )
-        except httpx.HTTPStatusError as exc:
-            if exc.response.status_code == 500:
-                pytest.skip(
-                    f"Cannot create upstream with OAuth2 auth config "
-                    f"(cred_store may not be available): "
-                    f"{exc.response.status_code} {exc.response.text[:200]}"
-                )
-            raise
+        finally:
+            deleted = await client.delete(
+                f"{secrets_url}/{ref}", headers={**oagw_headers, "If-Match": "*"},
+            )
+        if deleted.status_code != 204:
+            pytest.fail(f"could not delete secret {ref!r}: HTTP {deleted.status_code}")
 
-        uid = upstream["id"]
-        await create_route(
-            client, oagw_base_url, oagw_headers, uid, ["POST"], "/echo",
-        )
-
-        resp = await client.post(
-            f"{oagw_base_url}/oagw/v1/proxy/{alias}/echo",
-            headers={**oagw_headers, "content-type": "application/json"},
-            json={"test": True},
-        )
-
-        # Should fail with an error status (500) because secrets don't exist.
-        assert resp.status_code == 500, (
-            f"Expected error status for missing secrets, got {resp.status_code}: "
-            f"{resp.text[:500]}"
-        )
-
-        await delete_upstream(client, oagw_base_url, oagw_headers, uid)
+        resp = await _proxy_echo(client, oagw_base_url, oagw_headers, alias)
+        assert_problem(resp, 401, category="unauthenticated")

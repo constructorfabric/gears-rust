@@ -501,8 +501,11 @@ async fn e2e_invalid_content_length_returns_400() {
         .expect_status(201)
         .await;
 
-    // Send request with non-integer Content-Length.
-    h.api_v1()
+    // Send request with non-integer Content-Length. Over REST hyper rejects
+    // this before OAGW runs (P-05), so only an in-process call reaches
+    // OAGW's own check.
+    let resp = h
+        .api_v1()
         .proxy_post("e2e-cl", "v1/test")
         .with_body(serde_json::json!({"test": true}))
         .with_header(
@@ -511,6 +514,9 @@ async fn e2e_invalid_content_length_returns_400() {
         )
         .expect_status(400)
         .await;
+    let violation = &resp.json()["context"]["field_violations"][0];
+    assert_eq!(violation["field"], "content-length");
+    assert_eq!(violation["reason"], oagw_sdk::field::INVALID_CONTENT_LENGTH);
 }
 
 // 8.11: Content-Length exceeding 100MB returns 413 PayloadTooLarge.
