@@ -4,10 +4,10 @@
 //! This gear provides a standalone `OpenAPI` registry that collects operation specs
 //! and schemas, and builds a complete `OpenAPI` document from them.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 use utoipa::openapi::{
     OpenApi, OpenApiBuilder, Ref, RefOr, Required,
@@ -32,13 +32,545 @@ use toolkit_contract::StreamFraming;
 /// Type alias for schema collections used in API operations.
 type SchemaCollection = Vec<(String, RefOr<Schema>)>;
 
+/// Longest a declared group name may be.
+const MAX_TAG_NAME_LEN: usize = 100;
+/// Longest a declared group description may be.
+const MAX_TAG_DESCRIPTION_LEN: usize = 1_000;
+/// Most groups one document may declare.
+const MAX_DECLARED_TAGS: usize = 200;
+/// Most `x-*` members one group may carry.
+const MAX_TAG_EXTENSIONS: usize = 32;
+/// Longest one extension value may be once serialised.
+const MAX_EXTENSION_VALUE_LEN: usize = 4_096;
+/// Deepest an extension value may nest.
+const MAX_EXTENSION_DEPTH: usize = 8;
+/// Longest one `x-*` member name may be.
+const MAX_EXTENSION_KEY_LEN: usize = 100;
+/// Most bytes the whole declared list may serialise to.
+///
+/// The per-field caps multiply: 200 groups each carrying 32 extensions of 4096
+/// bytes is tens of megabytes, re-serialised on every anonymous request to
+/// `/openapi.json`. Each field can be within its own bound and the list still
+/// be something no reader wants, so the total is bounded too.
+const MAX_DECLARED_TAGS_BYTES: usize = 256 * 1024;
+
+/// One entry of the document-level `tags` list.
+///
+/// An operation declares the tag it belongs to; this declares the *group* that
+/// tag names — the order it appears in, and what it is for. Documentation
+/// browsers read the document-level list to order and describe the groups in
+/// their sidebar, and fall back to first-appearance order when it is absent.
+///
+/// `name` is matched against an operation's tag by exact string equality: no
+/// trimming, no case folding. `Orders` and `orders` are two different groups,
+/// and one of them will be empty.
+///
+/// The fields are public because this type is deserialised straight from
+/// configuration. [`OpenApiTag::new`] is the checked way to build one in Rust,
+/// and [`validate_tags`] is what a config loader calls to reject a list that
+/// arrived some other way.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenApiTag {
+    /// Exact-match name of the group. Must equal the tag an operation declares.
+    pub name: String,
+    /// Shown under the group heading. Optional, and worth writing: it is the
+    /// only place a whole domain can be explained rather than an endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Where a reader goes for more than a description can hold.
+    ///
+    /// Aliased to `externalDocs` because that is how the `OpenAPI`
+    /// specification spells it, and an operator filling this in is usually
+    /// copying from a document that already exists. Without the alias
+    /// `deny_unknown_fields` turns that paste into a startup error naming a
+    /// field the specification says is correct.
+    #[serde(
+        default,
+        alias = "externalDocs",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub external_docs: Option<OpenApiExternalDocs>,
+    /// `x-*` members to emit on the group, for whatever reads the document.
+    ///
+    /// A named field rather than a flattened catch-all: serde cannot combine
+    /// `flatten` with `deny_unknown_fields`, and the deny is what turns a
+    /// mistyped `descrption:` into a startup error instead of a group that
+    /// silently lost its description. So an extension copied from an existing
+    /// spec is nested under this key rather than written beside `name`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extensions: BTreeMap<String, serde_json::Value>,
+}
+
+/// The `externalDocs` of a tag group: somewhere to send a reader.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenApiExternalDocs {
+    /// Target of the link. Required, and the only reason the object exists.
+    pub url: String,
+    /// What the reader will find there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+impl OpenApiTag {
+    /// A group with the given name and no description.
+    ///
+    /// # Errors
+    /// Returns an error if `name` is blank or longer than 100 characters.
+    pub fn new(name: impl Into<String>) -> Result<Self> {
+        let tag = Self {
+            name: name.into(),
+            description: None,
+            external_docs: None,
+            extensions: BTreeMap::new(),
+        };
+        tag.validate()?;
+        Ok(tag)
+    }
+
+    /// The same group, carrying a description.
+    ///
+    /// # Errors
+    /// Returns an error if the description is longer than 1000 characters.
+    pub fn with_description(mut self, description: impl Into<String>) -> Result<Self> {
+        self.description = Some(description.into());
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// The same group, pointing a reader at documentation of its own.
+    ///
+    /// # Errors
+    /// Returns an error if the link does not pass
+    /// [`OpenApiExternalDocs::validate`].
+    pub fn with_external_docs(mut self, docs: OpenApiExternalDocs) -> Result<Self> {
+        self.external_docs = Some(docs);
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// The same group, carrying one `x-*` member.
+    ///
+    /// # Errors
+    /// Returns an error if the key does not start with `x-`, if the group would
+    /// carry more than 32 extensions, or if the value is too large, too deeply
+    /// nested, or carries a character refused elsewhere on the group.
+    pub fn with_extension(
+        mut self,
+        key: impl Into<String>,
+        value: serde_json::Value,
+    ) -> Result<Self> {
+        self.extensions.insert(key.into(), value);
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// One group on its own: a usable name, a description within bounds, a link
+    /// that goes somewhere, and `x-*` members that are bounded and plain.
+    fn validate(&self) -> Result<()> {
+        self.validate_name()?;
+
+        if let Some(description) = &self.description {
+            if description.chars().count() > MAX_TAG_DESCRIPTION_LEN {
+                anyhow::bail!(
+                    "the description is longer than {MAX_TAG_DESCRIPTION_LEN} characters"
+                );
+            }
+            validate_document_text("description", description, TextKind::Prose)?;
+        }
+
+        if let Some(docs) = &self.external_docs {
+            docs.validate()?;
+        }
+
+        self.validate_extensions()
+    }
+
+    /// The name is what an operation's tag is matched against, so it carries the
+    /// invariants that matching depends on.
+    fn validate_name(&self) -> Result<()> {
+        // `trim().is_empty()` rather than `is_empty()`: a name of two spaces is
+        // blank, and telling the operator it "has leading or trailing
+        // whitespace" sends them to trim it and arrive at the same startup
+        // error with a different message.
+        if self.name.trim().is_empty() {
+            anyhow::bail!("the name is empty");
+        }
+        // A name that is not blank keeps its whitespace refused rather than
+        // trimmed: a name is matched against an operation's tag by exact
+        // equality, so ` Orders` is not `Orders`. Accepting it would silently
+        // produce an empty group beside the real one - and the real one would
+        // then be appended as undeclared, which is precisely the placement this
+        // feature exists to control.
+        if self.name.trim() != self.name {
+            anyhow::bail!(
+                "the name `{}` has leading or trailing whitespace; names are matched exactly",
+                self.name.escape_debug()
+            );
+        }
+        if self.name.chars().count() > MAX_TAG_NAME_LEN {
+            anyhow::bail!(
+                "the name `{}` is longer than {MAX_TAG_NAME_LEN} characters",
+                self.name.escape_debug()
+            );
+        }
+        validate_document_text("name", &self.name, TextKind::Exact)
+    }
+
+    /// `x-*` members are operator text too, and the one field of a group whose
+    /// shape is not ours: bounded in count, size and depth, and checked for the
+    /// characters refused everywhere else.
+    fn validate_extensions(&self) -> Result<()> {
+        if self.extensions.len() > MAX_TAG_EXTENSIONS {
+            anyhow::bail!(
+                "{} extensions declared, more than the {MAX_TAG_EXTENSIONS} allowed",
+                self.extensions.len()
+            );
+        }
+
+        for (key, value) in &self.extensions {
+            // `OpenAPI` reserves every non-`x-` member of an object for the
+            // specification, so a key without the prefix is not an extension -
+            // it is a member this document is not allowed to invent.
+            if !key.starts_with("x-") {
+                anyhow::bail!(
+                    "the extension `{}` does not start with `x-`",
+                    key.escape_debug()
+                );
+            }
+            if key.chars().count() > MAX_EXTENSION_KEY_LEN {
+                anyhow::bail!(
+                    "the extension `{}` has a name longer than \
+                     {MAX_EXTENSION_KEY_LEN} characters",
+                    key.escape_debug()
+                );
+            }
+            validate_document_text("extension name", key, TextKind::Exact)?;
+
+            let serialised = serde_json::to_string(value).with_context(|| {
+                format!(
+                    "the extension `{}` cannot be serialised",
+                    key.escape_debug()
+                )
+            })?;
+            if serialised.len() > MAX_EXTENSION_VALUE_LEN {
+                anyhow::bail!(
+                    "the extension `{}` is {} bytes serialised, more than the \
+                     {MAX_EXTENSION_VALUE_LEN} allowed",
+                    key.escape_debug(),
+                    serialised.len()
+                );
+            }
+            validate_extension_value(value, 0)
+                .with_context(|| format!("the extension `{}`", key.escape_debug()))?;
+        }
+        Ok(())
+    }
+}
+
+impl OpenApiExternalDocs {
+    /// A link to documentation of the group's own.
+    ///
+    /// # Errors
+    /// Returns an error if the url is blank, is not `http`/`https`, is longer
+    /// than 1000 characters, or carries a refused character.
+    pub fn new(url: impl Into<String>) -> Result<Self> {
+        let docs = Self {
+            url: url.into(),
+            description: None,
+        };
+        docs.validate()?;
+        Ok(docs)
+    }
+
+    /// The same link, saying what the reader will find there.
+    ///
+    /// # Errors
+    /// Returns an error if the description carries a refused character.
+    pub fn with_description(mut self, description: impl Into<String>) -> Result<Self> {
+        self.description = Some(description.into());
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// The url is served as a link, so what a usable one is lives on the type
+    /// that holds it rather than on whichever group happens to carry one.
+    ///
+    /// # Errors
+    /// Returns an error on a blank, over-long, non-http(s) or
+    /// control-character-bearing url, or a refused description.
+    pub fn validate(&self) -> Result<()> {
+        if self.url.trim().is_empty() {
+            anyhow::bail!("the external documentation has no url");
+        }
+        if self.url.chars().count() > MAX_TAG_DESCRIPTION_LEN {
+            anyhow::bail!(
+                "the external documentation url is longer than \
+                 {MAX_TAG_DESCRIPTION_LEN} characters"
+            );
+        }
+        // A documentation browser renders this as a link on the `/docs` page,
+        // which is the gateway's own origin: a `javascript:` or `data:` url
+        // here is a script one click away, written by whoever edits the
+        // assembly config. `ApiGateway::normalize_prefix_path` allow-lists the
+        // other operator string that reaches that page for the same reason.
+        // `http` stays for a deployment whose documentation is not on TLS yet.
+        if !DOC_URL_SCHEMES.iter().any(|scheme| {
+            self.url
+                .get(..scheme.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme))
+        }) {
+            anyhow::bail!(
+                "the external documentation url `{}` is not http(s)",
+                self.url.escape_debug()
+            );
+        }
+        validate_document_text("external documentation url", &self.url, TextKind::Exact)?;
+        if let Some(description) = &self.description {
+            if description.chars().count() > MAX_TAG_DESCRIPTION_LEN {
+                anyhow::bail!(
+                    "the external documentation description is longer than \
+                     {MAX_TAG_DESCRIPTION_LEN} characters"
+                );
+            }
+            validate_document_text(
+                "external documentation description",
+                description,
+                TextKind::Prose,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// Schemes an `externalDocs` url may use.
+const DOC_URL_SCHEMES: &[&str] = &["https://", "http://"];
+
+/// What a field is, which is what decides the characters it may carry.
+///
+/// The first cut of this was a `LineBreaks` flag, and it conflated two
+/// questions that turn out to be independent: whether a newline is content,
+/// and whether a character that renders as nothing is content. A tag name is
+/// matched against an operation's tag by exact equality, so an invisible
+/// character in one is a forgery; a description is prose, and a writer of
+/// Persian or Hindi cannot spell their language without U+200C.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextKind {
+    /// Matched by exact equality, or resolved as a link: the characters *are*
+    /// the identity, so one that renders as nothing is a forgery rather than a
+    /// flourish. A tag name, an `x-*` member name, a url.
+    Exact,
+    /// One line shown to a reader. A newline would forge a line in the startup
+    /// log; an emoji or a joiner is ordinary content. A title, a version.
+    Line,
+    /// `CommonMark` prose, where a newline, a carriage return and a tab are
+    /// content, and so is anything a writer needs to spell their language.
+    Prose,
+}
+
+/// Characters that reorder what a reader sees, or end a line for a consumer.
+///
+/// Refused in every field, whatever its kind. `char::is_control()` is Unicode
+/// `Cc` and nothing else, so none of these is caught by it. A bidirectional
+/// override reorders what a reader is shown without changing what is stored,
+/// which is a lie about the document in any field; U+2028 and U+2029 are line
+/// terminators to a `JavaScript` documentation browser or a JSON log viewer,
+/// which is the forged line a control character is refused for.
+const ALWAYS_REFUSED: &[char] = &[
+    // Bidirectional marks, embeddings, overrides and isolates.
+    '\u{061C}', '\u{200E}', '\u{200F}', '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}',
+    '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
+    // Line and paragraph separators.
+    '\u{2028}', '\u{2029}',
+];
+
+/// Unicode general category `Cf`, as ranges: characters that render as
+/// nothing, refused only where the bytes are an identity.
+///
+/// In a [`TextKind::Exact`] field these are forgeries: `Orders` followed by
+/// U+200B renders as `Orders`, matches no operation, and is the invisible ghost
+/// group the `trim()` check exists to prevent in its visible form.
+///
+/// In prose they are not. U+200C is a required orthographic character in
+/// Persian, Hindi and Bengali, and U+200D is what joins the parts of a single
+/// emoji, so refusing them in a description or a title would not be a security
+/// win — it would be a promise that this gateway's documentation may only be
+/// written in some languages.
+///
+/// A category rather than a hand-picked list, because a hand-picked list was
+/// the wrong shape twice: `Cf` has some 160 members scattered across a dozen
+/// blocks, and naming the ones somebody thought of leaves every other one
+/// accepted. U+E0020..=U+E007F alone is 96 tag characters, each of which
+/// renders as nothing, so `OpenApiTag::new("Orders\u{E0041}")` read as
+/// `Orders` and matched no operation. Transcribed from `UnicodeData.txt`.
+const FORMAT_CHARACTER_RANGES: &[(char, char)] = &[
+    ('\u{00AD}', '\u{00AD}'),
+    ('\u{0600}', '\u{0605}'),
+    ('\u{061C}', '\u{061C}'),
+    ('\u{06DD}', '\u{06DD}'),
+    ('\u{070F}', '\u{070F}'),
+    ('\u{0890}', '\u{0891}'),
+    ('\u{08E2}', '\u{08E2}'),
+    ('\u{180E}', '\u{180E}'),
+    ('\u{200B}', '\u{200F}'),
+    ('\u{202A}', '\u{202E}'),
+    ('\u{2060}', '\u{2064}'),
+    ('\u{2066}', '\u{206F}'),
+    ('\u{FEFF}', '\u{FEFF}'),
+    ('\u{FFF9}', '\u{FFFB}'),
+    ('\u{110BD}', '\u{110BD}'),
+    ('\u{110CD}', '\u{110CD}'),
+    ('\u{13430}', '\u{1343F}'),
+    ('\u{1BCA0}', '\u{1BCA3}'),
+    ('\u{1D173}', '\u{1D17A}'),
+    ('\u{E0001}', '\u{E0001}'),
+    ('\u{E0020}', '\u{E007F}'),
+];
+
+/// Whether `c` is a formatting character, and so a forgery in a field whose
+/// characters are its identity.
+fn is_format_character(c: char) -> bool {
+    FORMAT_CHARACTER_RANGES
+        .iter()
+        .any(|&(first, last)| (first..=last).contains(&c))
+}
+
+/// Refuse operator text that must not reach a served document or a log line.
+///
+/// These strings are copied verbatim into `/openapi.json`, which the gateway
+/// serves on an anonymous route, and rendered by a documentation browser on the
+/// unauthenticated `/docs` page. So a control character here is not a
+/// formatting nuisance: a newline in a tag name forges a line in the startup
+/// log, and a bidi override reorders what a reader is shown without changing
+/// what is stored. `ApiGateway::normalize_prefix_path` allow-lists another
+/// operator string that reaches HTML for the same reason.
+///
+/// `label` is `&'static str` so that it cannot be the value by mistake: the two
+/// are adjacent and both used to be `&str`, so passing the title as the label
+/// compiled and checked the literal instead.
+///
+/// # Errors
+/// Returns an error naming the first offending character and its code point.
+pub fn validate_document_text(label: &'static str, value: &str, kind: TextKind) -> Result<()> {
+    let offending = value.chars().find(|c| {
+        let break_ok = kind == TextKind::Prose && matches!(c, '\n' | '\r' | '\t');
+        let invisible = kind == TextKind::Exact && is_format_character(*c);
+        (c.is_control() && !break_ok) || ALWAYS_REFUSED.contains(c) || invisible
+    });
+
+    if let Some(c) = offending {
+        anyhow::bail!(
+            "the {label} contains U+{:04X}, a control or direction-override character",
+            c as u32
+        );
+    }
+    Ok(())
+}
+
+/// Check one `x-*` value, and whatever it nests, the way every other operator
+/// string on a group is checked.
+///
+/// The value is arbitrary JSON an operator wrote, cloned verbatim into the
+/// served document, so a string inside it reaches the same anonymous route as a
+/// description. Depth is bounded because nothing else bounds it.
+///
+/// # Errors
+/// Returns an error if the value nests deeper than 8 levels, or if any string
+/// or member name inside it carries a refused character.
+fn validate_extension_value(value: &serde_json::Value, depth: usize) -> Result<()> {
+    if depth > MAX_EXTENSION_DEPTH {
+        anyhow::bail!("nests deeper than the {MAX_EXTENSION_DEPTH} levels allowed");
+    }
+    match value {
+        serde_json::Value::String(text) => {
+            validate_document_text("extension value", text, TextKind::Prose)
+        }
+        serde_json::Value::Array(items) => items
+            .iter()
+            .try_for_each(|item| validate_extension_value(item, depth + 1)),
+        serde_json::Value::Object(members) => members.iter().try_for_each(|(name, item)| {
+            validate_document_text("extension member name", name, TextKind::Exact)?;
+            validate_extension_value(item, depth + 1)
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// Check a declared group list before it reaches a document.
+///
+/// Every entry has to stand on its own, and the names have to be unique:
+/// `OpenAPI` requires document-level `tags` names to be distinct, so two
+/// entries with one name produce a document that is invalid rather than merely
+/// odd. A config loader calls this, so the failure is a startup error naming
+/// the offending group instead of a served document nobody validates.
+///
+/// # Errors
+/// Returns an error on a blank or over-long name, an over-long description, a
+/// duplicate name, or more than 200 groups.
+pub fn validate_tags(tags: &[OpenApiTag]) -> Result<()> {
+    if tags.len() > MAX_DECLARED_TAGS {
+        anyhow::bail!(
+            "{} OpenAPI tag groups declared, more than the {MAX_DECLARED_TAGS} allowed",
+            tags.len()
+        );
+    }
+
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for (position, tag) in tags.iter().enumerate() {
+        // The position is the only handle an operator has on the offending
+        // entry when the problem is the name itself — there is nothing else to
+        // call it by, and a list of twenty in YAML is not searchable by eye.
+        tag.validate()
+            .with_context(|| format!("OpenAPI tag group #{position}"))?;
+        if !seen.insert(tag.name.as_str()) {
+            anyhow::bail!(
+                "OpenAPI tag group #{position} repeats the name `{}`; \
+                 document-level tag names must be unique",
+                tag.name
+            );
+        }
+    }
+
+    // Checked last, so that a list with something individually wrong is told
+    // which entry rather than told it is large.
+    let serialised = serde_json::to_string(tags)
+        .context("the declared OpenAPI tag groups cannot be serialised")?;
+    if serialised.len() > MAX_DECLARED_TAGS_BYTES {
+        anyhow::bail!(
+            "the declared OpenAPI tag groups serialise to {} bytes, more than the \
+             {MAX_DECLARED_TAGS_BYTES} allowed",
+            serialised.len()
+        );
+    }
+    Ok(())
+}
+
+/// Longest a document title or version may be.
+pub const MAX_DOCUMENT_TITLE_LEN: usize = 200;
+/// Longest a document description may be.
+pub const MAX_DOCUMENT_DESCRIPTION_LEN: usize = 4_000;
+
 /// `OpenAPI` document metadata (title, version, description)
+///
+/// `#[non_exhaustive]`, so a caller outside the toolkit builds one through
+/// [`OpenApiInfo::new`] and the `with_*` methods rather than a struct literal.
+/// `tags` was added to this type and every construction site in the workspace
+/// had to be edited to name a field it does not care about; this is what stops
+/// the next field from charging that again.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct OpenApiInfo {
     pub title: String,
     pub version: String,
     pub description: Option<String>,
     pub servers: Vec<String>,
+    /// Document-level tag groups, in the order a reader should meet them.
+    ///
+    /// Empty — as [`Default`] leaves it — means the document carries no `tags`
+    /// key at all, which is the document every caller had before this field
+    /// existed.
+    pub tags: Vec<OpenApiTag>,
 }
 
 impl Default for OpenApiInfo {
@@ -48,8 +580,186 @@ impl Default for OpenApiInfo {
             version: "0.1.0".to_owned(),
             description: None,
             servers: Vec::new(),
+            tags: Vec::new(),
         }
     }
+}
+
+impl OpenApiInfo {
+    /// A document with this title and version, declaring nothing else.
+    ///
+    /// Checked here as well as in [`OpenApiInfo::validate`], so that a caller
+    /// cannot hold an invalid value until something else happens to look —
+    /// which is what [`OpenApiTag::new`] and [`OpenApiExternalDocs::new`] do,
+    /// and there is no reason for this type to be the odd one out.
+    ///
+    /// # Errors
+    /// Returns an error if the title or version is blank, over-long or carries
+    /// a refused character.
+    pub fn new(title: impl Into<String>, version: impl Into<String>) -> Result<Self> {
+        let info = Self {
+            title: title.into(),
+            version: version.into(),
+            ..Self::default()
+        };
+        info.validate()?;
+        Ok(info)
+    }
+
+    /// The same document, described.
+    ///
+    /// # Errors
+    /// Returns an error if the description is over-long or carries a refused
+    /// character.
+    pub fn with_description(mut self, description: impl Into<String>) -> Result<Self> {
+        self.description = Some(description.into());
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// The same document, served from these urls.
+    ///
+    /// # Errors
+    /// Returns an error if the document this is added to is not itself valid.
+    pub fn with_servers(mut self, servers: Vec<String>) -> Result<Self> {
+        self.servers = servers;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// The same document, declaring the order its groups are read in.
+    ///
+    /// # Errors
+    /// Returns an error if the groups do not pass [`validate_tags`].
+    pub fn with_tags(mut self, tags: Vec<OpenApiTag>) -> Result<Self> {
+        self.tags = tags;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Everything an operator wrote into this document, checked before it is
+    /// built.
+    ///
+    /// # Errors
+    /// Returns an error on a blank, over-long or control-character-bearing
+    /// title, version or description, or on a tag list [`validate_tags`]
+    /// rejects.
+    pub fn validate(&self) -> Result<()> {
+        validate_document_metadata(&self.title, &self.version, self.description.as_deref())?;
+        validate_tags(&self.tags)
+    }
+}
+
+/// Check the `info` block an operator wrote.
+///
+/// `title` and `version` land in the document's `info` block and are read by
+/// every generated client, and all three strings reach `/openapi.json` on an
+/// anonymous route, so they are checked exactly like a tag group's text. The
+/// gateway calls this from `Gear::init` as well, so a bad one is a startup
+/// error naming the field rather than a served document nobody validates —
+/// but it is defined here so that a registry built by any other caller gets
+/// the same guarantee rather than half of it.
+///
+/// # Errors
+/// Returns an error on a blank, over-long or control-character-bearing title,
+/// version or description.
+pub fn validate_document_metadata(
+    title: &str,
+    version: &str,
+    description: Option<&str>,
+) -> Result<()> {
+    if title.trim().is_empty() {
+        anyhow::bail!("`title` is blank");
+    }
+    if version.trim().is_empty() {
+        anyhow::bail!("`version` is blank");
+    }
+    if title.chars().count() > MAX_DOCUMENT_TITLE_LEN {
+        anyhow::bail!("`title` is longer than {MAX_DOCUMENT_TITLE_LEN} characters");
+    }
+    if version.chars().count() > MAX_DOCUMENT_TITLE_LEN {
+        anyhow::bail!("`version` is longer than {MAX_DOCUMENT_TITLE_LEN} characters");
+    }
+    validate_document_text("title", title, TextKind::Line)?;
+    validate_document_text("version", version, TextKind::Line)?;
+
+    if let Some(description) = description {
+        if description.chars().count() > MAX_DOCUMENT_DESCRIPTION_LEN {
+            anyhow::bail!("`description` is longer than {MAX_DOCUMENT_DESCRIPTION_LEN} characters");
+        }
+        validate_document_text("description", description, TextKind::Prose)?;
+    }
+    Ok(())
+}
+
+/// The document-level `tags` list, or `None` when the caller declared no groups.
+///
+/// `None` rather than an empty vector on purpose: an empty list serialises as
+/// `tags: []`, which is not the same document as one with no `tags` key.
+/// [`OpenApiRegistryImpl::build_openapi`] passes an empty slice, so every
+/// caller that predates groups keeps the document it already had — an added
+/// empty array would surface as a diff in every committed `OpenAPI` snapshot
+/// downstream.
+///
+/// Once anything is declared, every tag an operation actually uses is listed:
+/// the declared ones first, in the order given, then the rest in name order.
+/// Leaving the others out would leave their placement to whatever a browser
+/// decides on its own, which is the thing this list exists to stop.
+///
+/// A declared group no operation uses is still emitted — an empty group is
+/// occasionally deliberate, and dropping it silently would be its own surprise
+/// — but it is logged, because the overwhelmingly likely cause is a typo in a
+/// name that is matched by exact string equality.
+///
+/// That cuts both ways, and the other edge is worth stating: what is emitted is
+/// served anonymously. A group declared ahead of the endpoints it will describe
+/// publishes its name, its description and its `externalDocs` on
+/// `/openapi.json` and `/docs` before anything implements it. Declaring a group
+/// is therefore a decision to announce it, which is the operator's to make —
+/// but it is a decision, so the README says so rather than leaving it to be
+/// discovered.
+fn document_tags(
+    declared: &[OpenApiTag],
+    in_use: &BTreeSet<String>,
+) -> Option<Vec<utoipa::openapi::Tag>> {
+    if declared.is_empty() {
+        return None;
+    }
+
+    let mut tags: Vec<utoipa::openapi::Tag> = Vec::with_capacity(declared.len() + in_use.len());
+    for tag in declared {
+        if !in_use.contains(&tag.name) {
+            tracing::warn!(
+                tag = %tag.name,
+                "declared OpenAPI tag group matches no operation; names are matched exactly, so check spelling and case"
+            );
+        }
+        let mut built = utoipa::openapi::Tag::new(&tag.name);
+        built.description.clone_from(&tag.description);
+        if let Some(docs) = &tag.external_docs {
+            let mut emitted = utoipa::openapi::external_docs::ExternalDocs::new(&docs.url);
+            emitted.description.clone_from(&docs.description);
+            built.external_docs = Some(emitted);
+        }
+        if !tag.extensions.is_empty() {
+            let mut emitted = utoipa::openapi::extensions::Extensions::default();
+            for (key, value) in &tag.extensions {
+                emitted.insert(key.clone(), value.clone());
+            }
+            built.extensions = Some(emitted);
+        }
+        tags.push(built);
+    }
+
+    let declared_names: BTreeSet<&str> = declared.iter().map(|tag| tag.name.as_str()).collect();
+    tags.extend(
+        in_use
+            .iter()
+            .filter(|name| !declared_names.contains(name.as_str()))
+            .map(utoipa::openapi::Tag::new),
+    );
+
+    Some(tags)
 }
 
 /// `OpenAPI` registry trait for operation and schema registration
@@ -197,16 +907,68 @@ impl OpenApiRegistryImpl {
         }
     }
 
+    /// Registered schemas, plus the one security scheme every document declares.
+    fn document_components(&self) -> ComponentsBuilder {
+        let reg = self.components_registry.load();
+        let mut components = ComponentsBuilder::new();
+        for (name, schema) in reg.iter() {
+            components = components.schema(name.clone(), schema.clone());
+        }
+
+        components.security_scheme(
+            "bearerAuth",
+            SecurityScheme::Http(
+                HttpBuilder::new()
+                    .scheme(HttpAuthScheme::Bearer)
+                    .bearer_format("JWT")
+                    .build(),
+            ),
+        )
+    }
+
     /// Build `OpenAPI` specification from registered operations and components.
     ///
+    /// An operation declares the tag it belongs to; [`OpenApiInfo::tags`]
+    /// declares the groups those tags name — the order a reader meets them in,
+    /// and what each is for. Documentation browsers read that list to order and
+    /// describe the groups, and fall back to the order the tags first appear in
+    /// when it is absent.
+    ///
+    /// The list is a preference, not a whitelist: a tag an operation uses but
+    /// the list omits is still emitted, after the declared ones, so its
+    /// placement stays ours rather than the browser's. Leave it empty — as
+    /// [`OpenApiInfo::default`] does — and the document carries no `tags` key at
+    /// all.
+    ///
     /// # Arguments
-    /// * `info` - `OpenAPI` document metadata (title, version, description)
+    /// * `info` - `OpenAPI` document metadata (title, version, description, tag groups)
     ///
     /// # Errors
-    /// Returns an error if the `OpenAPI` specification cannot be built.
-    #[allow(unknown_lints, de0205_operation_builder)]
+    /// Returns an error if the document metadata or the tag groups do not pass
+    /// [`OpenApiInfo::validate`], or if the `OpenAPI` specification cannot be
+    /// built.
+    // This is the registry that turns registered `OperationSpec`s into utoipa
+    // operations, so it necessarily constructs them here rather than through
+    // `OperationBuilder` — which is the very thing that feeds it. The lint is
+    // spelled with `unknown_lints` because it only exists under
+    // `cargo gears lint --dylint`.
+    #[allow(
+        unknown_lints,
+        de0205_operation_builder,
+        reason = "this function implements the registry OperationBuilder registers into"
+    )]
     pub fn build_openapi(&self, info: &OpenApiInfo) -> Result<OpenApi> {
         use http::Method;
+
+        let tags = info.tags.as_slice();
+        info.validate()?;
+
+        // Collected in the paths walk below rather than in a pass of its own:
+        // two walks of `operation_specs` are two snapshots of a `DashMap` that
+        // anything holding `&self` can insert into, and an operation registered
+        // between them lands in `paths` carrying a tag the document-level list
+        // never mentions — the one placement that list exists to fix.
+        let mut in_use: BTreeSet<String> = BTreeSet::new();
 
         // Log operation count for visibility
         let op_count = self.operation_specs.len();
@@ -223,6 +985,13 @@ impl OpenApiRegistryImpl {
 
             for tag in &spec.tags {
                 op = op.tag(tag.clone());
+                // Only collected when it will be read: `document_tags` returns
+                // early on an empty declaration, so a caller that declares no
+                // groups — plain `build_openapi` and the OoP runtime among them
+                // — does not pay to build a set that is thrown away.
+                if !tags.is_empty() {
+                    in_use.insert(tag.clone());
+                }
             }
 
             let ext = operation_vendor_extensions(&spec);
@@ -386,22 +1155,7 @@ impl OpenApiRegistryImpl {
         }
 
         // 2) Components (from our registry)
-        let reg = self.components_registry.load();
-        let mut components = ComponentsBuilder::new();
-        for (name, schema) in reg.iter() {
-            components = components.schema(name.clone(), schema.clone());
-        }
-
-        // Add bearer auth security scheme
-        components = components.security_scheme(
-            "bearerAuth",
-            SecurityScheme::Http(
-                HttpBuilder::new()
-                    .scheme(HttpAuthScheme::Bearer)
-                    .bearer_format("JWT")
-                    .build(),
-            ),
-        );
+        let components = self.document_components();
 
         // 3) Info & final OpenAPI doc
         let openapi_info = InfoBuilder::new()
@@ -423,6 +1177,7 @@ impl OpenApiRegistryImpl {
             .servers(servers)
             .paths(paths.build())
             .components(Some(components.build()))
+            .tags(document_tags(tags, &in_use))
             .build();
 
         // Document-level vendor extension: this spec is generated from Rust
@@ -720,12 +1475,27 @@ mod tests {
             .clone()
     }
 
+    /// A group built without passing `validate`, the way config can produce one.
+    ///
+    /// `OpenApiTag` deliberately has no `Default`: it would hand out a group
+    /// with an empty name, which is the one thing `validate` exists to refuse.
+    /// A test that wants an invalid group therefore writes it out.
+    fn unchecked_tag(name: &str) -> OpenApiTag {
+        OpenApiTag {
+            name: name.to_owned(),
+            description: None,
+            external_docs: None,
+            extensions: BTreeMap::new(),
+        }
+    }
+
     fn test_info() -> OpenApiInfo {
         OpenApiInfo {
             title: "T".to_owned(),
             version: "1".to_owned(),
             description: None,
             servers: Vec::new(),
+            tags: Vec::new(),
         }
     }
 
@@ -963,6 +1733,7 @@ mod tests {
             version: "1.0.0".to_owned(),
             description: Some("Test API Description".to_owned()),
             servers: Vec::new(),
+            tags: Vec::new(),
         };
         let doc = registry.build_openapi(&info).unwrap();
         let json = serde_json::to_value(&doc).unwrap();
@@ -979,6 +1750,873 @@ mod tests {
         assert_eq!(
             openapi_info.get("description").unwrap(),
             "Test API Description"
+        );
+    }
+
+    /// A document nobody gave groups to carries no `tags` key at all.
+    ///
+    /// Not `tags: []`. `build_openapi` is unchanged for every caller that had
+    /// it before groups existed, and "unchanged" has to mean the bytes too —
+    /// an added empty array is a diff in every committed snapshot downstream.
+    #[test]
+    fn no_declared_groups_means_no_tags_key() {
+        let registry = OpenApiRegistryImpl::new();
+        let doc = registry.build_openapi(&OpenApiInfo::default()).unwrap();
+        let json = serde_json::to_value(&doc).unwrap();
+
+        assert!(
+            json.get("tags").is_none(),
+            "an undeclared tag list must not appear in the document: {json}"
+        );
+    }
+
+    /// An operation carrying `tag`, enough of one to register.
+    fn tagged_operation(path: &str, tag: &str) -> OperationSpec {
+        OperationSpec {
+            method: Method::GET,
+            path: path.to_owned(),
+            operation_id: Some(format!("get_{tag}")),
+            summary: Some("Something".to_owned()),
+            description: Some("Something worth a sentence.".to_owned()),
+            tags: vec![tag.to_owned()],
+            params: vec![],
+            request_body: None,
+            responses: vec![ResponseSpec {
+                status: 200,
+                content_type: "application/json",
+                description: "OK".to_owned(),
+                schema: None,
+                headers: vec![],
+            }],
+            handler_id: format!("handler_{tag}"),
+            authenticated: false,
+            exposed: false,
+            throttling: None,
+            allowed_request_content_types: None,
+            vendor_extensions: VendorExtensions::default(),
+            license_requirement: None,
+        }
+    }
+
+    /// Declared groups reach the document in the order they were declared, and
+    /// a tag nobody declared lands after them rather than wherever.
+    ///
+    /// The order is the whole point: a browser presents the groups in document
+    /// order and falls back to first-appearance order when the list is absent,
+    /// which in an assembly means whatever the path alphabet produced. That
+    /// fallback is also why the undeclared tag has to be emitted rather than
+    /// left out — left out, its placement would be the browser's to choose.
+    #[test]
+    fn declared_groups_keep_their_order_and_undeclared_ones_follow() {
+        let registry = OpenApiRegistryImpl::new();
+        registry.register_operation(&tagged_operation("/zulu", "Zulu"));
+        registry.register_operation(&tagged_operation("/alpha", "Alpha"));
+        // Registered in an order that is not their name order, so the tail
+        // being sorted is what the assertion below proves, not a coincidence.
+        registry.register_operation(&tagged_operation("/stray", "Yankee"));
+        registry.register_operation(&tagged_operation("/other", "Charlie"));
+        registry.register_operation(&tagged_operation("/third", "Mike"));
+
+        let groups = [
+            OpenApiTag::new("Zulu")
+                .unwrap()
+                .with_description("Last alphabetically, first on purpose.")
+                .unwrap(),
+            OpenApiTag::new("Alpha").unwrap(),
+        ];
+
+        let info = OpenApiInfo {
+            tags: groups.to_vec(),
+            ..OpenApiInfo::default()
+        };
+        let doc = registry.build_openapi(&info).unwrap();
+        let json = serde_json::to_value(&doc).unwrap();
+        let tags = json
+            .get("tags")
+            .expect("declared groups reach the document");
+
+        let names: Vec<&str> = tags
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tag| tag.get("name").unwrap().as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            ["Zulu", "Alpha", "Charlie", "Mike", "Yankee"],
+            "declared order first, then the rest in name order"
+        );
+
+        // The feature must not touch an operation's own tag attribution: the
+        // top-level list says how groups are ordered, never which group an
+        // operation is in.
+        let stray_tags = json
+            .get("paths")
+            .and_then(|paths| paths.get("/stray"))
+            .and_then(|item| item.get("get"))
+            .and_then(|op| op.get("tags"))
+            .expect("the undeclared operation still carries its own tag");
+        assert_eq!(
+            stray_tags.as_array().map(Vec::as_slice),
+            Some([serde_json::json!("Yankee")].as_slice()),
+            "an omitted group is not hidden from its own operation: {stray_tags}"
+        );
+
+        assert_eq!(
+            tags[0].get("description").unwrap(),
+            "Last alphabetically, first on purpose."
+        );
+        assert!(
+            tags[1].get("description").is_none(),
+            "a group with nothing to say carries no description key: {tags}"
+        );
+    }
+
+    /// Two groups with one name make an invalid document, so it is not built.
+    #[test]
+    fn duplicate_group_names_are_rejected() {
+        let registry = OpenApiRegistryImpl::new();
+        let groups = [
+            OpenApiTag::new("Orders").unwrap(),
+            OpenApiTag::new("Orders").unwrap(),
+        ];
+
+        let info = OpenApiInfo {
+            tags: groups.to_vec(),
+            ..OpenApiInfo::default()
+        };
+        let Err(error) = registry.build_openapi(&info) else {
+            panic!("a duplicate group name must not reach a document");
+        };
+
+        let message = error.to_string();
+        assert!(
+            message.contains("Orders") && message.contains("#1"),
+            "the error names the offending group and where it is: {message}"
+        );
+    }
+
+    /// Matching is exact, which is the headline promise of the whole feature.
+    ///
+    /// Without this, a later switch to trimmed or case-folded matching would
+    /// pass every other test while quietly changing what an operator's config
+    /// means. It is also the only test that exercises the unmatched-group
+    /// warning.
+    #[test]
+    fn group_names_match_operation_tags_exactly() {
+        let registry = OpenApiRegistryImpl::new();
+        registry.register_operation(&tagged_operation("/orders", "orders"));
+
+        let info = OpenApiInfo {
+            tags: vec![OpenApiTag::new("Orders").unwrap()],
+            ..OpenApiInfo::default()
+        };
+        let doc = registry.build_openapi(&info).unwrap();
+        let json = serde_json::to_value(&doc).unwrap();
+
+        let names: Vec<&str> = json
+            .get("tags")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tag| tag.get("name").unwrap().as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            ["Orders", "orders"],
+            "case differs, so these are two groups: the declared one is empty \
+             and the real one is appended as undeclared"
+        );
+    }
+
+    /// A name that only looks like the operation's tag is refused, not accepted
+    /// as a second, empty group.
+    #[test]
+    fn a_padded_group_name_is_rejected() {
+        assert!(
+            OpenApiTag::new(" Orders").is_err(),
+            "leading whitespace survives exact matching and would make a ghost group"
+        );
+        assert!(OpenApiTag::new("Orders ").is_err());
+        assert!(OpenApiTag::new("Orders").is_ok());
+    }
+
+    /// The name cap holds at the boundary rather than somewhere near it.
+    #[test]
+    fn the_group_name_length_cap_is_enforced_at_the_boundary() {
+        let longest = "n".repeat(MAX_TAG_NAME_LEN);
+        assert!(OpenApiTag::new(longest).is_ok(), "the cap is inclusive");
+
+        let over = "n".repeat(MAX_TAG_NAME_LEN + 1);
+        assert!(OpenApiTag::new(over).is_err());
+    }
+
+    /// So does the description cap, and `with_description` reports it.
+    #[test]
+    fn the_description_length_cap_is_enforced_at_the_boundary() {
+        let longest = "d".repeat(MAX_TAG_DESCRIPTION_LEN);
+        assert!(
+            OpenApiTag::new("Orders")
+                .unwrap()
+                .with_description(longest)
+                .is_ok()
+        );
+
+        let over = "d".repeat(MAX_TAG_DESCRIPTION_LEN + 1);
+        let failed = OpenApiTag::new("Orders").unwrap().with_description(over);
+        assert!(
+            failed.is_err(),
+            "with_description has a documented error path"
+        );
+    }
+
+    /// More groups than a document may declare is refused.
+    #[test]
+    fn too_many_declared_groups_are_rejected() {
+        let at_cap: Vec<OpenApiTag> = (0..MAX_DECLARED_TAGS)
+            .map(|i| OpenApiTag::new(format!("Group{i}")).unwrap())
+            .collect();
+        assert!(validate_tags(&at_cap).is_ok(), "the cap is inclusive");
+
+        let over: Vec<OpenApiTag> = (0..=MAX_DECLARED_TAGS)
+            .map(|i| OpenApiTag::new(format!("Group{i}")).unwrap())
+            .collect();
+        assert!(validate_tags(&over).is_err());
+    }
+
+    /// Control characters never reach the served document or the startup log.
+    ///
+    /// Both strings are copied verbatim into `/openapi.json`, which is served
+    /// anonymously, and rendered on the unauthenticated `/docs` page. A newline
+    /// in a name also forges a line in the log that reports an unmatched group.
+    #[test]
+    fn control_and_direction_override_characters_are_rejected() {
+        assert!(OpenApiTag::new("Orders\nWARN: forged").is_err());
+        assert!(OpenApiTag::new("Orders\u{202E}sredrO").is_err());
+        assert!(OpenApiTag::new("Orders\u{1B}[31m").is_err());
+
+        let tag = OpenApiTag::new("Orders").unwrap();
+        assert!(
+            tag.clone()
+                .with_description("Two\nlines, and a\ttab.")
+                .is_ok(),
+            "a description is CommonMark, so line breaks are content"
+        );
+        assert!(tag.with_description("Bell\u{7}here").is_err());
+    }
+
+    /// U+061C reorders text and is not a control character, so it needs naming.
+    #[test]
+    fn the_arabic_letter_mark_is_rejected_like_the_other_overrides() {
+        assert!(
+            !'\u{061C}'.is_control(),
+            "if this ever becomes a control character the explicit entry is redundant"
+        );
+        assert!(OpenApiTag::new("Orders\u{061C}").is_err());
+        assert!(
+            OpenApiTag::new("Orders")
+                .unwrap()
+                .with_description("Fine\u{061C}print")
+                .is_err()
+        );
+    }
+
+    /// A group can carry `externalDocs` and `x-*`, and they reach the document.
+    #[test]
+    fn external_docs_and_extensions_reach_the_document() {
+        let registry = OpenApiRegistryImpl::new();
+        registry.register_operation(&tagged_operation("/orders", "Orders"));
+
+        let declared = OpenApiTag::new("Orders")
+            .unwrap()
+            .with_external_docs(
+                OpenApiExternalDocs::new("https://example.test/orders")
+                    .unwrap()
+                    .with_description("The long version.")
+                    .unwrap(),
+            )
+            .unwrap()
+            .with_extension("x-displayName", serde_json::json!("Orders"))
+            .unwrap();
+
+        let info = OpenApiInfo {
+            tags: vec![declared],
+            ..OpenApiInfo::default()
+        };
+        let json = serde_json::to_value(registry.build_openapi(&info).unwrap()).unwrap();
+        let tag = &json.get("tags").unwrap()[0];
+
+        assert_eq!(
+            tag.get("externalDocs").unwrap().get("url").unwrap(),
+            "https://example.test/orders"
+        );
+        assert_eq!(
+            tag.get("externalDocs").unwrap().get("description").unwrap(),
+            "The long version."
+        );
+        assert_eq!(
+            tag.get("x-displayName").unwrap(),
+            "Orders",
+            "an extension is emitted as a member of the tag: {tag}"
+        );
+    }
+
+    /// A member that is not an extension is refused rather than invented.
+    #[test]
+    fn an_extension_without_the_x_prefix_is_rejected() {
+        let mut tag = OpenApiTag::new("Orders").unwrap();
+        tag.extensions
+            .insert("displayName".to_owned(), serde_json::json!("Orders"));
+
+        assert!(
+            validate_tags(&[tag]).is_err(),
+            "every non-`x-` member of an OpenAPI object belongs to the specification"
+        );
+    }
+
+    /// The error points at the entry, since a bad name has nothing to call it by.
+    #[test]
+    fn a_rejected_group_is_identified_by_position() {
+        let tags = [OpenApiTag::new("Fine").unwrap(), unchecked_tag("")];
+
+        let Err(error) = validate_tags(&tags) else {
+            panic!("an empty name is not a group");
+        };
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("#1"),
+            "an operator with twenty groups needs the index: {message}"
+        );
+    }
+
+    /// A blank name groups nothing and matches nothing; it is a typo, not a group.
+    #[test]
+    fn a_blank_group_name_is_rejected() {
+        let Err(error) = OpenApiTag::new("   ") else {
+            panic!("two spaces is not a group name");
+        };
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("the name is empty"),
+            "a blank name is blank, not badly trimmed; trimming it as instructed \
+             would only produce this error next startup: {message}"
+        );
+        assert!(
+            validate_tags(&[unchecked_tag("")]).is_err(),
+            "a list that arrived from config is checked too, not just the constructor"
+        );
+    }
+
+    /// `is_control()` is `Cc` and nothing else, so the rest are listed by hand.
+    ///
+    /// A name is matched against an operation's tag character for character, so
+    /// one that renders as nothing is a forgery: the name reads as `Orders` in
+    /// a sidebar, matches no operation, and is the invisible ghost group the
+    /// `trim()` check refuses the visible form of.
+    #[test]
+    fn characters_that_hide_or_reorder_are_refused_in_a_name() {
+        for c in [
+            '\u{200B}', '\u{200C}', '\u{200D}', '\u{2060}', '\u{00AD}', '\u{FEFF}', '\u{2028}',
+            '\u{2029}', '\u{202E}',
+        ] {
+            assert!(
+                !c.is_control(),
+                "U+{:04X} is a control character, so the explicit entry is redundant",
+                c as u32
+            );
+            assert!(
+                OpenApiTag::new(format!("Orders{c}")).is_err(),
+                "U+{:04X} in a name is accepted",
+                c as u32
+            );
+        }
+    }
+
+    /// The whole category, not the members somebody happened to think of.
+    ///
+    /// Every character here is `Cf`, renders as nothing, and was accepted
+    /// before the check became a range table. U+E0041 is the one that shows
+    /// why it matters: `Orders` followed by it reads as `Orders` in a sidebar
+    /// and matches no operation, which is the ghost group again under a
+    /// different code point.
+    #[test]
+    fn a_format_character_is_refused_in_a_name_whether_or_not_it_is_a_familiar_one() {
+        for c in [
+            '\u{E0001}',
+            '\u{E0041}',
+            '\u{E007F}',
+            '\u{206A}',
+            '\u{206F}',
+            '\u{FFF9}',
+            '\u{FFFB}',
+            '\u{0600}',
+            '\u{110BD}',
+            '\u{1D173}',
+        ] {
+            assert!(
+                !c.is_control(),
+                "U+{:04X} is a control character, so the range is redundant",
+                c as u32
+            );
+            assert!(
+                OpenApiTag::new(format!("Orders{c}")).is_err(),
+                "U+{:04X} in a name is accepted",
+                c as u32
+            );
+            assert!(
+                OpenApiTag::new("Orders")
+                    .unwrap()
+                    .with_description(format!("Fine{c}print"))
+                    .is_ok(),
+                "U+{:04X} in prose is refused, and prose is not an identity",
+                c as u32
+            );
+        }
+    }
+
+    /// Reordering a reader's text, or ending a line for whatever consumes the
+    /// document, is a lie about it in any field — prose included.
+    #[test]
+    fn characters_that_reorder_or_end_a_line_are_refused_in_prose_too() {
+        for c in [
+            '\u{202E}', '\u{061C}', '\u{2066}', '\u{202A}', '\u{2028}', '\u{2029}',
+        ] {
+            assert!(
+                OpenApiTag::new("Orders")
+                    .unwrap()
+                    .with_description(format!("Fine{c}print"))
+                    .is_err(),
+                "U+{:04X} in a description is accepted",
+                c as u32
+            );
+        }
+    }
+
+    /// Prose is written in languages, and some of them need a joiner.
+    ///
+    /// U+200C is a required orthographic character in Persian, Hindi and
+    /// Bengali, and U+200D is what holds the parts of one emoji together.
+    /// Refusing them in prose would not be a security win — it would be a rule
+    /// about which languages this gateway's documentation may be written in.
+    #[test]
+    fn prose_may_carry_a_joiner_and_an_emoji_where_a_name_may_not() {
+        let tag = OpenApiTag::new("Orders").unwrap();
+        assert!(
+            tag.clone()
+                .with_description("a zero\u{200C}width non-joiner, as Persian is spelled")
+                .is_ok(),
+            "U+200C is an orthographic character, not an attack"
+        );
+        assert!(
+            tag.with_description("Orders, \u{1F468}\u{200D}\u{1F4BB} and who places them")
+                .is_ok(),
+            "U+200D is what makes one emoji out of three code points"
+        );
+
+        assert!(
+            validate_document_metadata(
+                "Example \u{1F468}\u{200D}\u{1F4BB}",
+                "0.1.0",
+                Some("Fine\u{200C}print")
+            )
+            .is_ok(),
+            "a title is a line shown to a reader, not an identity matched by equality"
+        );
+        assert!(
+            OpenApiTag::new("Orders\u{200D}Placed").is_err(),
+            "the same character in a name is still a forgery"
+        );
+    }
+
+    /// The `x-*` name is bounded like every other string on the group.
+    #[test]
+    fn an_extension_name_is_bounded() {
+        let tag = OpenApiTag::new("Orders").unwrap();
+
+        let at_cap = format!("x-{}", "o".repeat(MAX_EXTENSION_KEY_LEN - 2));
+        assert_eq!(at_cap.chars().count(), MAX_EXTENSION_KEY_LEN);
+        assert!(
+            tag.clone()
+                .with_extension(at_cap, serde_json::json!("v"))
+                .is_ok(),
+            "a name exactly at the cap is within it"
+        );
+        assert!(
+            tag.with_extension(
+                format!("x-{}", "o".repeat(MAX_EXTENSION_KEY_LEN - 1)),
+                serde_json::json!("v")
+            )
+            .is_err(),
+            "one character past it is past it"
+        );
+    }
+
+    /// The link's description was the one string here with no length of its own.
+    #[test]
+    fn an_external_documentation_description_is_bounded() {
+        let docs = OpenApiExternalDocs::new("https://example.test/orders").unwrap();
+        assert!(
+            docs.clone()
+                .with_description("d".repeat(MAX_TAG_DESCRIPTION_LEN))
+                .is_ok(),
+            "at the cap is within it"
+        );
+        assert!(
+            docs.with_description("d".repeat(MAX_TAG_DESCRIPTION_LEN + 1))
+                .is_err(),
+            "it is bounded like the url beside it and the description above it"
+        );
+    }
+
+    /// The aggregate cap, from both sides, like every other bound here.
+    ///
+    /// Landing on the byte exactly takes some construction: the list is filled
+    /// with full-size groups while another certainly fits, and then one last
+    /// group's `x-note` is sized to whatever room is left. An extension value
+    /// may be up to `MAX_EXTENSION_VALUE_LEN`, which is more than a whole
+    /// group costs, so the remainder is always reachable with one of them.
+    #[test]
+    fn the_declared_list_byte_cap_is_enforced_at_the_boundary() {
+        let filler = "d".repeat(MAX_TAG_DESCRIPTION_LEN);
+        let len_of = |tags: &[OpenApiTag]| serde_json::to_string(tags).unwrap().len();
+        let bulk = |i: usize| {
+            OpenApiTag::new(format!("Bulk{i}"))
+                .unwrap()
+                .with_description(filler.as_str())
+                .unwrap()
+                .with_extension("x-note", serde_json::json!(filler.as_str()))
+                .unwrap()
+        };
+
+        let mut tags: Vec<OpenApiTag> = Vec::new();
+        while MAX_DECLARED_TAGS_BYTES - len_of(&tags) > 2 * MAX_TAG_DESCRIPTION_LEN + 128 {
+            tags.push(bulk(tags.len()));
+        }
+
+        // What an `x-note` costs in syntax, measured rather than counted.
+        let syntax = r#","extensions":{"x-note":""}"#.len();
+        tags.push(OpenApiTag::new("Last").unwrap());
+        let room = MAX_DECLARED_TAGS_BYTES - len_of(&tags) - syntax;
+        let fill = |tags: &mut Vec<OpenApiTag>, bytes: usize| {
+            tags.last_mut()
+                .unwrap()
+                .extensions
+                .insert("x-note".to_owned(), serde_json::json!("n".repeat(bytes)));
+        };
+
+        fill(&mut tags, room);
+        assert_eq!(
+            len_of(&tags),
+            MAX_DECLARED_TAGS_BYTES,
+            "this is only a boundary test if the list is exactly at the cap"
+        );
+        assert!(
+            tags.len() <= MAX_DECLARED_TAGS,
+            "and only if the count cap is not what would refuse it"
+        );
+        assert!(
+            validate_tags(&tags).is_ok(),
+            "a list exactly at the cap is within it"
+        );
+
+        fill(&mut tags, room + 1);
+        assert_eq!(len_of(&tags), MAX_DECLARED_TAGS_BYTES + 1);
+        assert!(validate_tags(&tags).is_err(), "one byte past it is past it");
+    }
+
+    /// Every group can be within every one of its bounds and the list still be
+    /// something no reader wants served.
+    #[test]
+    fn the_whole_declared_list_is_bounded_even_when_each_group_is() {
+        let filler = "d".repeat(MAX_TAG_DESCRIPTION_LEN);
+        let groups: Vec<OpenApiTag> = (0..MAX_DECLARED_TAGS)
+            .map(|i| {
+                OpenApiTag::new(format!("Group{i}"))
+                    .unwrap()
+                    .with_description(filler.as_str())
+                    .unwrap()
+                    .with_extension("x-note", serde_json::json!(filler.as_str()))
+                    .unwrap()
+            })
+            .collect();
+
+        assert!(
+            groups
+                .iter()
+                .all(|group| validate_tags(std::slice::from_ref(group)).is_ok()),
+            "every group is individually inside every cap it has"
+        );
+        assert!(
+            validate_tags(&groups).is_err(),
+            "the per-field caps multiply, so the total is bounded too"
+        );
+    }
+
+    /// The url is rendered as a link on `/docs`, in the gateway's own origin.
+    #[test]
+    fn an_external_documentation_url_must_be_http() {
+        for url in [
+            "javascript:alert(1)",
+            "data:text/html,<script>alert(1)</script>",
+            "file:///etc/passwd",
+            "//example.test/orders",
+        ] {
+            assert!(
+                OpenApiExternalDocs::new(url).is_err(),
+                "`{url}` is served as a link a reader clicks"
+            );
+        }
+        assert!(
+            OpenApiExternalDocs::new("HTTPS://Example.test/orders").is_ok(),
+            "a scheme is case-insensitive"
+        );
+        assert!(OpenApiExternalDocs::new("http://localhost:8080/docs").is_ok());
+    }
+
+    /// The rest of what makes a link usable, none of which had a test.
+    #[test]
+    fn an_unusable_external_documentation_link_is_refused() {
+        assert!(
+            OpenApiExternalDocs::new("   ").is_err(),
+            "a blank url points nowhere"
+        );
+        assert!(
+            OpenApiExternalDocs::new(format!(
+                "https://example.test/{}",
+                "o".repeat(MAX_TAG_DESCRIPTION_LEN)
+            ))
+            .is_err(),
+            "an over-long url is bounded like every other operator string"
+        );
+        assert!(
+            OpenApiExternalDocs::new("https://example.test/o\u{202E}rders").is_err(),
+            "a direction override in a url reorders what the reader is shown"
+        );
+        assert!(
+            OpenApiExternalDocs::new("https://example.test/orders")
+                .unwrap()
+                .with_description("The long\u{202E} version.")
+                .is_err(),
+            "the description beside the url is operator text too"
+        );
+    }
+
+    /// An `x-*` value is operator text, cloned verbatim into a served document.
+    #[test]
+    fn extension_values_are_checked_like_every_other_string() {
+        let tag = OpenApiTag::new("Orders").unwrap();
+        assert!(
+            tag.clone()
+                .with_extension("x-displayName", serde_json::json!("Ord\u{202E}ers"))
+                .is_err(),
+            "a string value reaches `/openapi.json` exactly like a description"
+        );
+        assert!(
+            tag.clone()
+                .with_extension("x-logo", serde_json::json!({ "alt": "Or\u{202E}ders" }))
+                .is_err(),
+            "a string nested in an object is served just the same"
+        );
+        assert!(
+            tag.clone()
+                .with_extension("x-logo", serde_json::json!({ "al\u{200B}t": "Orders" }))
+                .is_err(),
+            "a member name is a name: an invisible character in one is a forgery"
+        );
+        assert!(
+            tag.clone()
+                .with_extension("x-displayName", serde_json::json!("Or\u{200C}ders"))
+                .is_ok(),
+            "but the value beside it is prose, and prose is spelled in languages"
+        );
+        assert!(
+            tag.clone()
+                .with_extension("x-aliases", serde_json::json!(["fine", "bro\u{202E}ken"]))
+                .is_err(),
+            "so is one nested in an array"
+        );
+        assert!(
+            tag.clone()
+                .with_extension("x-logo", serde_json::json!({ "al\nt": "Orders" }))
+                .is_err(),
+            "a member name is text in the document too"
+        );
+        assert!(
+            tag.with_extension(
+                "x-logo",
+                serde_json::json!({ "url": "https://example.test/l.png" })
+            )
+            .is_ok(),
+            "an ordinary extension is still accepted"
+        );
+    }
+
+    /// Every sibling field is bounded, so these are too — and each cap is
+    /// driven from both sides, because a `>` that became a `>=` would
+    /// otherwise ship green.
+    #[test]
+    fn an_extension_is_bounded_in_size_depth_and_count() {
+        let tag = OpenApiTag::new("Orders").unwrap();
+
+        // The bound is written in terms of the serialised length, and a JSON
+        // string serialises as its contents plus two quotes.
+        let at_cap = serde_json::json!("o".repeat(MAX_EXTENSION_VALUE_LEN - 2));
+        assert_eq!(
+            serde_json::to_string(&at_cap).unwrap().len(),
+            MAX_EXTENSION_VALUE_LEN,
+            "this is only a boundary test if the value is exactly at the cap"
+        );
+        assert!(
+            tag.clone().with_extension("x-blob", at_cap).is_ok(),
+            "a value exactly at the cap is within it"
+        );
+        assert!(
+            tag.clone()
+                .with_extension(
+                    "x-blob",
+                    serde_json::json!("o".repeat(MAX_EXTENSION_VALUE_LEN - 1))
+                )
+                .is_err(),
+            "one byte past it is past it: a pasted blob is re-serialised on \
+             every anonymous request"
+        );
+
+        let nested = |levels: usize| {
+            let mut value = serde_json::json!("deep");
+            for _ in 0..levels {
+                value = serde_json::Value::Array(vec![value]);
+            }
+            value
+        };
+        assert!(
+            tag.clone()
+                .with_extension("x-nest", nested(MAX_EXTENSION_DEPTH))
+                .is_ok(),
+            "the deepest value the documentation allows is allowed"
+        );
+        assert!(
+            tag.with_extension("x-nest", nested(MAX_EXTENSION_DEPTH + 1))
+                .is_err(),
+            "nothing else bounds how deep a value nests"
+        );
+
+        let carrying = |count: usize| {
+            let mut group = OpenApiTag::new("Orders").unwrap();
+            for i in 0..count {
+                group
+                    .extensions
+                    .insert(format!("x-{i}"), serde_json::json!(i));
+            }
+            group
+        };
+        assert!(
+            validate_tags(&[carrying(MAX_TAG_EXTENSIONS)]).is_ok(),
+            "a group carrying exactly the allowed number of members is a group"
+        );
+        assert!(
+            validate_tags(&[carrying(MAX_TAG_EXTENSIONS + 1)]).is_err(),
+            "the number of members a group may carry is bounded like the number of groups"
+        );
+    }
+
+    /// The warning is the operator's only signal that a name was mistyped.
+    #[test]
+    #[tracing_test::traced_test]
+    fn an_unmatched_group_is_logged() {
+        let registry = OpenApiRegistryImpl::new();
+        registry.register_operation(&tagged_operation("/orders", "Orders"));
+
+        let info = OpenApiInfo::default()
+            .with_tags(vec![
+                OpenApiTag::new("Orders").unwrap(),
+                OpenApiTag::new("orders").unwrap(),
+            ])
+            .unwrap();
+        registry.build_openapi(&info).unwrap();
+
+        assert!(
+            logs_contain("declared OpenAPI tag group matches no operation"),
+            "deleting the warning must not leave the suite green: it is the only \
+             signal that an exactly-matched name was mistyped"
+        );
+    }
+
+    /// The checked path covers the whole type, not only `name` and `description`.
+    #[test]
+    fn the_checked_constructors_reach_every_field() {
+        let tag = OpenApiTag::new("Orders")
+            .unwrap()
+            .with_description("Placing an order.")
+            .unwrap()
+            .with_external_docs(
+                OpenApiExternalDocs::new("https://example.test/orders")
+                    .unwrap()
+                    .with_description("The long version.")
+                    .unwrap(),
+            )
+            .unwrap()
+            .with_extension("x-displayName", serde_json::json!("Orders"))
+            .unwrap();
+
+        assert_eq!(
+            tag.external_docs.unwrap().url,
+            "https://example.test/orders"
+        );
+        assert_eq!(tag.extensions.len(), 1);
+
+        assert!(
+            OpenApiTag::new("Orders")
+                .unwrap()
+                .with_extension("displayName", serde_json::json!("Orders"))
+                .is_err(),
+            "the checked setter refuses what the field would have carried silently"
+        );
+    }
+
+    /// `title` and `version` reach every generated client, so they are checked
+    /// where the document is built and not only where the gateway loads config.
+    #[test]
+    fn document_metadata_is_checked_by_the_registry() {
+        assert!(
+            OpenApiInfo::new("", "0.1.0").is_err(),
+            "a blank title makes a document no client can name"
+        );
+        assert!(OpenApiInfo::new("Example", "  ").is_err());
+        assert!(
+            OpenApiInfo::new("Exa\nmple", "0.1.0").is_err(),
+            "a folded YAML title carries a newline into the info block"
+        );
+        assert!(OpenApiInfo::new("E".repeat(MAX_DOCUMENT_TITLE_LEN + 1), "0.1.0").is_err());
+        assert!(
+            OpenApiInfo::new("Example", "0.1.0")
+                .unwrap()
+                .with_description("d".repeat(MAX_DOCUMENT_DESCRIPTION_LEN + 1))
+                .is_err()
+        );
+        assert!(
+            OpenApiInfo::new(
+                "E".repeat(MAX_DOCUMENT_TITLE_LEN),
+                "v".repeat(MAX_DOCUMENT_TITLE_LEN)
+            )
+            .unwrap()
+            .with_description("d".repeat(MAX_DOCUMENT_DESCRIPTION_LEN))
+            .is_ok(),
+            "at the cap is within it"
+        );
+
+        // The constructor is the door, not the only lock: the fields are public
+        // because config deserialises straight into them, so the registry
+        // checks again on the way out.
+        let unchecked = OpenApiInfo {
+            title: "  ".to_owned(),
+            ..OpenApiInfo::default()
+        };
+        assert!(
+            OpenApiRegistryImpl::new()
+                .build_openapi(&unchecked)
+                .is_err(),
+            "an info that reached the registry some other way is checked there"
         );
     }
 

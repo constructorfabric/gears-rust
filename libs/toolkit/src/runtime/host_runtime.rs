@@ -1431,15 +1431,18 @@ impl HostRuntime {
             }
         }
 
-        let info = OpenApiInfo {
-            title: options.gear_name.clone(),
-            version: options
+        // Declaring the order of the documentation groups is deliberately out
+        // of scope here: the in-process gateway takes the list from its own
+        // config, and `OopServeOptions` has no equivalent operator-facing
+        // surface to read one from. Give it one and `with_tags` is the call.
+        let info = OpenApiInfo::new(
+            options.gear_name.clone(),
+            options
                 .version
                 .clone()
                 .unwrap_or_else(|| "0.0.0".to_owned()),
-            description: None,
-            servers: vec![],
-        };
+        )
+        .context("OoP router: OpenAPI document metadata")?;
         let openapi = registry
             .build_openapi(&info)
             .context("OoP router: build OpenAPI document")?;

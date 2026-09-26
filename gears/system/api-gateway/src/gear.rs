@@ -701,12 +701,15 @@ impl ApiGateway {
     pub fn build_openapi(&self) -> Result<utoipa::openapi::OpenApi> {
         let config = self.get_cached_config();
         let prefix = Self::normalize_prefix_path(&config.prefix_path)?;
-        let info = toolkit::api::OpenApiInfo {
-            title: config.openapi.title.clone(),
-            version: config.openapi.version.clone(),
-            description: config.openapi.description.clone(),
-            servers: (!prefix.is_empty()).then_some(prefix).into_iter().collect(),
-        };
+        let mut info = toolkit::api::OpenApiInfo::new(
+            config.openapi.title.clone(),
+            config.openapi.version.clone(),
+        )?
+        .with_servers((!prefix.is_empty()).then_some(prefix).into_iter().collect())?
+        .with_tags(config.openapi.tags.clone())?;
+        if let Some(description) = config.openapi.description.clone() {
+            info = info.with_description(description)?;
+        }
         let mut openapi = self.openapi_registry.build_openapi(&info)?;
         enrich_openapi_with_zone_limits(&mut openapi, &config);
         Ok(openapi)
@@ -1214,6 +1217,27 @@ impl toolkit::Gear for ApiGateway {
         cfg.gateway_proxy
             .validate()
             .map_err(|e| anyhow::anyhow!(e))?;
+        // Same reason for the whole `openapi` block: a blank or duplicated tag
+        // name, or a blank, over-long or control-character-bearing `title`,
+        // `version` or `description`, makes an invalid OpenAPI document, and the
+        // only place anyone would notice is a docs browser that quietly renders
+        // it wrong.
+        //
+        // Gated on `enable_docs` because that whole justification is about a
+        // document served on an anonymous route and rendered on `/docs`. With
+        // docs off there is no such document: `add_openapi_routes` is the only
+        // caller of `build_openapi`, and it is gated the same way. Refusing to
+        // start there would be a new crash loop over metadata nobody reads,
+        // which is a bad trade for a feature an assembly opted out of.
+        //
+        // With docs on this is still a new way for `init` to fail — an assembly
+        // booting today with `openapi.title: ""` stops booting — which the
+        // README says in as many words. Checking here rather than leaving it to
+        // `build_openapi` in `rest_finalize` keeps the error beside the config
+        // that caused it.
+        if cfg.enable_docs {
+            cfg.openapi.validate()?;
+        }
         self.config.store(Arc::new(cfg.clone()));
 
         debug!(
@@ -1597,6 +1621,24 @@ mod tests {
         );
     }
 
+    /// Gating the `init` check on `enable_docs` does not lose the guarantee.
+    ///
+    /// With docs disabled nothing is built and nothing is served, so `init` has
+    /// no reason to refuse the config. With docs enabled the document is built
+    /// here — and this is the path that serves it, so bad metadata is refused
+    /// on the way out even if the `init` check never ran.
+    #[test]
+    fn the_served_document_still_refuses_bad_metadata() {
+        let mut config = ApiGatewayConfig::default();
+        config.openapi.title = "  ".to_owned();
+        let api = ApiGateway::new(config);
+
+        assert!(
+            api.build_openapi().is_err(),
+            "the check that matters is the one on the path that builds the document"
+        );
+    }
+
     #[test]
     fn test_openapi_generation() {
         let mut config = ApiGatewayConfig::default();
@@ -1619,6 +1661,61 @@ mod tests {
         assert_eq!(info.get("title").unwrap(), "Test API");
         assert_eq!(info.get("version").unwrap(), "1.0.0");
         assert_eq!(info.get("description").unwrap(), "Test Description");
+    }
+
+    /// A gateway told about no groups serves the document it always did.
+    ///
+    /// The registry test for this passes an empty slice by hand. This one goes
+    /// through the config field and `ApiGateway::build_openapi`, which is the
+    /// path an actual deployment takes, so a wiring change that started
+    /// sending a non-empty list would be caught here.
+    #[test]
+    fn no_configured_groups_means_no_tags_key() {
+        let api = ApiGateway::new(ApiGatewayConfig::default());
+
+        let doc = api.build_openapi().unwrap();
+        let json = serde_json::to_value(&doc).unwrap();
+
+        assert!(json.get("openapi").is_some(), "still a document: {json:?}");
+        assert!(
+            json.get("tags").is_none(),
+            "an unconfigured tag list must not appear in the served document"
+        );
+    }
+
+    /// Configured groups reach the served document, in configured order.
+    ///
+    /// Without this, `build_openapi` could pass `&[]` instead of
+    /// `&config.openapi.tags` and every other test would still be green.
+    #[test]
+    fn configured_groups_reach_the_served_document() {
+        let mut config = ApiGatewayConfig::default();
+        config.openapi.tags = vec![
+            toolkit::api::OpenApiTag::new("Zulu")
+                .unwrap()
+                .with_description("Declared first on purpose.")
+                .unwrap(),
+            toolkit::api::OpenApiTag::new("Alpha").unwrap(),
+        ];
+        let api = ApiGateway::new(config);
+
+        let doc = api.build_openapi().unwrap();
+        let json = serde_json::to_value(&doc).unwrap();
+        let tags = json
+            .get("tags")
+            .expect("configured groups reach the served document");
+
+        let names: Vec<&str> = tags
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tag| tag.get("name").unwrap().as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["Zulu", "Alpha"], "configuration order is kept");
+        assert_eq!(
+            tags[0].get("description").unwrap(),
+            "Declared first on purpose."
+        );
     }
 
     #[test]
