@@ -34,12 +34,13 @@
 //! not about its absence.
 //!
 //! **What the platform actually has.**
-//! `toolkit::api::canonical_error_layer::extract_trace_id` reads
-//! **W3C `traceparent` → `x-trace-id` → `x-request-id`** (then a span-id
-//! fallback), and this gear already mounts that middleware around the whole
-//! merged router (`crate::module`). So there *is* an inbound convention, it is a
-//! standard rather than a local invention, and this gear is already inside it —
-//! `toolkit` is not without inbound request-id middleware.
+//! `toolkit::api::canonical_error_layer::extract_trace_id` reads the **W3C
+//! `traceparent`, falling back to the live `OTel` span context** — either way a
+//! real 32-hex trace-id, or absent when neither is in scope. This gear already
+//! mounts that middleware around the whole merged router (`crate::module`). So
+//! there *is* an inbound convention, it is a standard rather than a local
+//! invention, and this gear is already inside it — `toolkit` is not without
+//! inbound request-id middleware.
 //!
 //! Two of the old bullets survive as context and neither is load-bearing any
 //! more. `telemetry.http.inject_request_id_header: "x-request-id"` is declared in
@@ -52,9 +53,10 @@
 //! **And the primary spelling fits.** A W3C trace-id is 32 hex characters — 128
 //! bits, exactly a `uuid` column's width — and `Uuid::parse_str` accepts the
 //! simple form and renders it back byte-identically (verified in-crate:
-//! `ffffffffffffffffffffffffffffffff` round-trips). The old bullet "the shape
-//! does not fit" is true only of the two free-text *fallbacks*, and it is
-//! narrowed to them.
+//! `ffffffffffffffffffffffffffffffff` round-trips). With the free-text header
+//! fallbacks now gone, the value the platform extracts is *always* a 32-hex
+//! trace-id (or absent), so the old bullet "the shape does not fit" no longer
+//! applies to any value that could reach the column.
 //!
 //! **Why this edge still mints.** Three reasons, none of which is "there is
 //! nothing to read":
@@ -66,12 +68,12 @@
 //!    rather than of this gear, and there is no header that says which the caller
 //!    meant. That is a widening of the join the field exists for, and it is a
 //!    decision the design set has not taken.
-//! 2. **Partial adoption is a join that is right sometimes.** Only one of the
-//!    three spellings fits the column, so a caller sending `x-request-id` and no
-//!    `traceparent` would get a `problem.trace_id` on an error response and a
-//!    *different*, minted `correlation_id` on the trail — with nothing on either
-//!    saying they disagree. Consuming all three needs the free-text problem D-178
-//!    clause (a) already rejected.
+//! 2. **Partial adoption is a join that is right sometimes.** The platform value
+//!    exists only when the caller sent a `traceparent` or a span is in scope;
+//!    otherwise it is absent and this edge must mint regardless. Consuming it
+//!    would give some calls a trace-derived `correlation_id` and others a minted
+//!    one, with nothing on the record saying which — the split D-178 clause (a)
+//!    already rejected.
 //! 3. **A trace-id is 128 bits but not a UUID.** [`establish`] mints v7
 //!    deliberately (see its own note), and the column is read as time-ordered.
 //!    A parsed trace-id lands with an arbitrary version and variant — `Max` /
@@ -85,8 +87,8 @@
 //! is deliberately not taken; the docs wave that lands this phase's debt owes
 //! D-178 an answer on (1) and (3). What would close it cleanly on the platform
 //! side is `toolkit` exposing its already-extracted trace id as a request
-//! extension, so one place decides the three-spelling precedence and this gear
-//! reads a value rather than re-parsing a header into a third copy of
+//! extension, so one place decides the `traceparent`/span precedence and this
+//! gear reads a value rather than re-parsing a header into a third copy of
 //! `parse_w3c_trace_id`. [`establish`] is still the single site that changes.
 //!
 //! # Why a layer, and why extraction **fails** rather than mints

@@ -1,8 +1,8 @@
 //! Canonical error middleware (DESIGN.md §3.2 / §3.6 / §3.7).
 //!
 //! Post-processes responses with `Content-Type: application/problem+json`,
-//! filling missing `trace_id` (W3C `traceparent` → `x-trace-id` →
-//! `x-request-id` → span-id fallback) and `instance` (request URI path).
+//! filling missing `trace_id` (W3C `traceparent` → live `OTel` span context)
+//! and `instance` (request URI path).
 //! Logs at `warn!` for 4xx / `error!` for 5xx with structured fields.
 //!
 //! Any other error-status response whose body is genuinely unstructured (a
@@ -572,28 +572,23 @@ fn is_unstructured_error_body(response: &Response) -> bool {
     }
 }
 
-/// W3C `traceparent` → `x-trace-id` → `x-request-id` → span-id fallback.
+/// Resolve the wire `trace_id`: incoming W3C `traceparent` (32-hex segment, per
+/// `toolkit_http::otel::parse_trace_id`) → live `OTel` span context (via
+/// `crate::telemetry::trace_context`, the same source the log-correlation
+/// formatter uses).
 ///
-/// For `traceparent`, returns the 32-hex trace-id segment only — matching
-/// `toolkit_http::otel::parse_trace_id` and the access log / `OTel` span
-/// recording in this codebase, so the wire `trace_id` is grep-equal to the
-/// trace-id surfaced in logs and traces. A malformed traceparent falls
-/// through to `x-trace-id` / `x-request-id` (preserves the function's
-/// graceful-failure semantics).
+/// It deliberately does NOT fall back to `x-request-id` or a tracing span
+/// handle: those are different identifiers, and putting them under `trace_id`
+/// ships a value that looks like a trace id but resolves to nothing in a trace
+/// backend. When neither a `traceparent` nor an active span is in scope,
+/// `trace_id` is left absent rather than filled with a stand-in.
 fn extract_trace_id(headers: &HeaderMap) -> Option<String> {
     if let Some(tp) = headers.get("traceparent").and_then(|v| v.to_str().ok())
         && let Some(trace_id) = parse_w3c_trace_id(tp)
     {
         return Some(trace_id);
     }
-    for name in ["x-trace-id", "x-request-id"] {
-        if let Some(v) = headers.get(name).and_then(|v| v.to_str().ok()) {
-            return Some(v.to_owned());
-        }
-    }
-    tracing::Span::current()
-        .id()
-        .map(|id| id.into_u64().to_string())
+    crate::telemetry::trace_context::current_trace_id()
 }
 
 /// Mirror of `toolkit_http::otel::parse_trace_id`. Duplicated rather than
@@ -617,10 +612,13 @@ fn log_problem(problem: &Problem, canonical: Option<&CanonicalError>) {
     let status = problem.status.unwrap_or(0);
     let problem_type = problem.problem_type.as_str();
     let instance = problem.instance.as_deref().unwrap_or("");
-    let trace_id = problem.trace_id.as_deref().unwrap_or("");
+    // `trace_id` is intentionally NOT an event field: the log-correlation
+    // formatter splices the live span's `trace_id` onto the top level of every
+    // record (`bootstrap::host::log_correlation`), so a nested copy here would
+    // be a duplicate key.
     // `diagnostic()` returns Some only for `Internal` / `Unknown` (5xx-only
-    // categories). Surface it server-side so operators can correlate
-    // `trace_id` → root cause without exposing it on the wire.
+    // categories). Surface it server-side so operators can correlate root
+    // cause without exposing it on the wire.
     let description = canonical.and_then(CanonicalError::diagnostic).unwrap_or("");
 
     if (400..500).contains(&status) {
@@ -628,7 +626,6 @@ fn log_problem(problem: &Problem, canonical: Option<&CanonicalError>) {
             status,
             problem_type,
             instance,
-            trace_id,
             "canonical error response (client)"
         );
     } else if (500..600).contains(&status) {
@@ -636,7 +633,6 @@ fn log_problem(problem: &Problem, canonical: Option<&CanonicalError>) {
             status,
             problem_type,
             instance,
-            trace_id,
             description,
             "canonical error response (server)"
         );

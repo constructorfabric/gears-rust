@@ -82,10 +82,10 @@ Build the `CanonicalError` enum, context types, `Problem` mapping, and `#[resour
 > Traces to: `cpt-cf-errors-component-error-middleware`, `cpt-cf-errors-fr-mandatory-trace-id`
 
 - [ ] 2.1 Implement Axum error middleware that catches `CanonicalError` from handlers
-- [ ] 2.2 Set `trace_id` from the current tracing span context or request headers (`x-trace-id`, `x-request-id`, `traceparent`)
+- [ ] 2.2 Set `trace_id` from the W3C `traceparent`, falling back to the live OpenTelemetry span context (never from `x-request-id` or a span handle); leave it absent when neither is in scope
 - [ ] 2.3 Set `instance` from the request URI path
 - [ ] 2.4 Catch panics and unhandled errors, wrap as `CanonicalError::internal(...)` (catch-all behavior is out of scope for p1; deferred per PRD §4.2 and DESIGN §3.2 Error Middleware)
-- [ ] 2.5 Log error details server-side at WARN/ERROR with `trace_id` for correlation
+- [ ] 2.5 Log error details server-side at WARN/ERROR; the log-correlation formatter splices the live trace id onto the record for correlation
 
 ---
 
@@ -205,6 +205,6 @@ Update all documentation to reflect the canonical error architecture. Can run in
 
 The following items are independent of the canonical error migration and will be tracked separately:
 
-- **W3C trace ID extraction** — Replace `tracing::Span::current().id()` (u64 span ID) with a proper W3C trace ID from `opentelemetry` span context. Orthogonal; can be done before, during, or after migration.
+- **W3C trace ID extraction** — ✅ Done. `extract_trace_id` now resolves the W3C `traceparent`, falling back to the live `opentelemetry` span context, and no longer uses `tracing::Span::current().id()` (u64 span ID) or `x-request-id`.
 - **gRPC transport mapping** — `From<CanonicalError> for tonic::Status`. Depends on Phase 1 completion.
 - **SSE error event format** — Define error event structure for SSE streams. Depends on Phase 1 completion.

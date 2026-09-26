@@ -91,7 +91,12 @@ def assert_not_found(response, expected):
     actual = response.json()
     assert actual["instance"] == response.request.url.path, actual
     actual["instance"] = "<request_path>"
-    replace_text(actual, "trace_id")
+    expected = dict(expected)
+    if "trace_id" in actual:
+        replace_text(actual, "trace_id")
+        expected["trace_id"] = "<trace_id>"
+    else:
+        expected.pop("trace_id", None)
     replace_text(actual, "detail")
     assert_json(actual, expected)
 

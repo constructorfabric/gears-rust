@@ -5,7 +5,7 @@
 //! attached by `IntoResponse for CanonicalError` plus the
 //! `canonical_error_middleware` (`crate::api::canonical_error_layer`).
 
-use axum::{extract::Request, http::HeaderMap, middleware::Next, response::Response};
+use axum::{extract::Request, middleware::Next, response::Response};
 use std::any::Any;
 
 use crate::config::ConfigError;
@@ -17,23 +17,6 @@ use toolkit_odata::Error as ODataError;
 /// `instance`) is now done by `canonical_error_middleware`.
 pub async fn error_mapping_middleware(request: Request, next: Next) -> Response {
     next.run(request).await
-}
-
-/// Extract trace ID from headers or generate one
-pub fn extract_trace_id(headers: &HeaderMap) -> Option<String> {
-    // Try to get trace ID from various common headers
-    headers
-        .get("x-trace-id")
-        .or_else(|| headers.get("x-request-id"))
-        .or_else(|| headers.get("traceparent"))
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned)
-        .or_else(|| {
-            // Try to get from current tracing span
-            tracing::Span::current()
-                .id()
-                .map(|id| id.into_u64().to_string())
-        })
 }
 
 /// Centralized downcast-based error mapping.
@@ -198,14 +181,5 @@ mod tests {
         assert!(!problem.detail.contains("SECRET_API_KEY"));
         assert!(!problem.detail.contains("not present"));
         assert!(!problem.detail.contains("my_mod"));
-    }
-
-    #[test]
-    fn test_extract_trace_id_from_headers() {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-trace-id", "test-trace-123".parse().unwrap());
-
-        let trace_id = extract_trace_id(&headers);
-        assert_eq!(trace_id, Some("test-trace-123".to_owned()));
     }
 }

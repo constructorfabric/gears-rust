@@ -2,9 +2,17 @@
 //!
 //! Emits one `tracing::info!` event per completed request with the
 //! following fields:
-//! `msg`, `pid`, `request_id`, `trace_id`, `method`, `uri`, `remote_addr`,
+//! `msg`, `pid`, `request_id`, `method`, `uri`, `remote_addr`,
 //! `remote_addr_ip`, `remote_addr_port`, `content_length`, `user_agent`,
 //! `duration_ms`, `duration` (µs), `status`, `bytes_sent`.
+//!
+//! The event carries no `trace_id` field of its own: the JSON log-correlation
+//! formatter splices the live `OTel` span's `trace_id` / `span_id` onto the top
+//! level of every record, so a middleware-supplied copy would only duplicate
+//! it. The event is emitted inside the active `TraceLayer` span, so the splice
+//! resolves — except on the client-disconnect (`Drop`) path, where the span is
+//! gone; there the `OTel` context captured at request time is re-attached first
+//! (see `CountingBody`).
 
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -55,13 +63,6 @@ pub async fn access_log_middleware(req: axum::extract::Request, next: Next) -> R
         .get::<XRequestId>()
         .map_or_else(String::new, |x| x.0.clone());
 
-    let trace_id = req
-        .headers()
-        .get(toolkit_http::otel::TRACEPARENT)
-        .and_then(|v| v.to_str().ok())
-        .and_then(toolkit_http::otel::parse_trace_id)
-        .unwrap_or_default();
-
     let (remote_addr, remote_addr_ip, remote_addr_port) = req
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
@@ -87,7 +88,9 @@ pub async fn access_log_middleware(req: axum::extract::Request, next: Next) -> R
         start,
         pid: std::process::id(),
         request_id,
-        trace_id,
+        // Snapshot the active OTel context while still inside the `TraceLayer`
+        // span, so `emit` can restore it on the drop path (see the field doc).
+        otel_context: opentelemetry::Context::current(),
         method,
         uri,
         remote_addr,
@@ -112,7 +115,10 @@ struct AccessLogContext {
     start: std::time::Instant,
     pid: u32,
     request_id: String,
-    trace_id: String,
+    /// `OTel` context captured while the request was still inside the
+    /// `TraceLayer` span, re-attached in `emit` so the log-correlation
+    /// formatter can splice the live `trace_id` even on the drop path.
+    otel_context: opentelemetry::Context,
     method: String,
     uri: String,
     remote_addr: String,
@@ -129,12 +135,15 @@ impl AccessLogContext {
         let duration_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
         let duration_micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
 
+        // Restore the captured context so the formatter resolves the span's
+        // `trace_id` on the drop path; a no-op restore on the normal path.
+        let _guard = self.otel_context.attach();
+
         tracing::info!(
             target: "access_log",
             msg = "response completed",
             pid = self.pid,
             request_id = %self.request_id,
-            trace_id = %self.trace_id,
             method = %self.method,
             uri = %self.uri,
             remote_addr = %self.remote_addr,
