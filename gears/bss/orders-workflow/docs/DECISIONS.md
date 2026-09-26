@@ -152,6 +152,11 @@
   - [D-131 (H) The references that cross the engine are a closed six-type vocabulary; cardinality, counters and the resource tenant are the stated residual](#d-131-h-the-references-that-cross-the-engine-are-a-closed-six-type-vocabulary-cardinality-counters-and-the-resource-tenant-are-the-stated-residual)
   - [D-132 (M) A step-route error answer carries fixed members only](#d-132-m-a-step-route-error-answer-carries-fixed-members-only)
   - [D-133 (M) Every wait that holds a recorded suspension polls the hold](#d-133-m-every-wait-that-holds-a-recorded-suspension-polls-the-hold)
+  - [D-134 (H) The business windows are per-seller policy values pinned on the record; the definition owns only the tick](#d-134-h-the-business-windows-are-per-seller-policy-values-pinned-on-the-record-the-definition-owns-only-the-tick)
+  - [D-135 (M) A version carries the `p1` composables and the shared arms on their paths; the check tracks the pinned enums](#d-135-m-a-version-carries-the-p1-composables-and-the-shared-arms-on-their-paths-the-check-tracks-the-pinned-enums)
+  - [D-136 (M) One adjustability table; slice constraints are enforced items or canonical-definition guidance; no Function call](#d-136-m-one-adjustability-table-slice-constraints-are-enforced-items-or-canonical-definition-guidance-no-function-call)
+  - [D-137 (H) The binding records the version the platform pinned; the publisher waits on the registry](#d-137-h-the-binding-records-the-version-the-platform-pinned-the-publisher-waits-on-the-registry)
+  - [D-138 (M) A definition is published by a job of its own, behind a behavioural gate, and rolled back forward](#d-138-m-a-definition-is-published-by-a-job-of-its-own-behind-a-behavioural-gate-and-rolled-back-forward)
 - [Open Questions](#open-questions)
   - [Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?](#q-01-which-durable-execution-substrate-backs-the-process--the-oss-workflow-engine-or-a-bss-local-mechanism)
   - [Q-02: The Generic Approval escalation threshold — the one PRD-deferred numeric value this design deliberately leaves unset](#q-02-the-generic-approval-escalation-threshold--the-one-prd-deferred-numeric-value-this-design-deliberately-leaves-unset)
@@ -1733,6 +1738,10 @@ policy is validated. The catch rule is one rule across `design/10` §2.2, §4.6 
 retry-only `catch` or a named failure route — and the path rule walks a routing graph of literal
 routing values (D-126). The counts are unchanged.
 
+**Amended (2026-09-26)**: no `call` targets a Function any more, composable or not (D-136); the
+fence also requires the `p1` composables and the shared arms on their paths, which stay
+`composable`, so the counts are unchanged (D-135).
+
 ### D-68 (H) Instances are pinned to their definition version; the platform operator publishes
 
 **Accepted.** *(carries `ADR/0012`, versioning half)*
@@ -1756,6 +1765,13 @@ DESIGN.md line 614), and Orders must hold the same pin on its side.
 **Propagated**: `design/01-foundation.md` §3.3 *start-instance*, §3.7; `design/10-process-definition.md`
 §2.2 *Versioning, pinning, publish*, §4.3; `DESIGN.md` §3.6 *Publish a definition version and pin
 an instance*; `UPSTREAM_REQS.md` §2.9; Q-10.
+
+**Amended (2026-09-26)**: the binding records `definition_id` and `definition_version` from the
+platform's invocation record, never from the document, and `published_by` is nullable until the
+registry reports a publisher, since no registry read or publisher field existed to copy it from
+(D-137). The platform-operator publish role is held by one publisher, the definition publish job,
+which builds and deploys nothing, runs a behavioural gate, deprecates the version it replaces and
+rolls back forward (D-138).
 
 ### D-69 (H) The step operation is the unit of work, behind one internal step surface
 
@@ -1833,6 +1849,12 @@ requires Orders to hold of them is evidence — the attempt per step record and 
 **Propagated**: `design/01-foundation.md` §3.7 *Retired tables*, §4.2, §4.4; `design/03-approval-execution.md`
 §3.7; `design/08-hold-and-cancel.md` §3.2, §3.7; `design/10-process-definition.md` §2.2;
 `DESIGN.md` §3.7, §4.8.
+
+**Amended (2026-09-26)**: the escalation window, the overdue window and the SLA classes are not
+timers of the definition. They are values of the seller's policy, pinned on the order's record by
+the operation that needs them, and the definition owns only the tick of the re-check loop over
+each stored deadline (D-134). "Five bounds, two owners" keeps its five bounds; the overdue
+window's value moves to the seller's policy, bounded where the policy is written.
 
 ### D-71 (M) The worker roster is three workers, and the sweep selects every due intent
 
@@ -2451,6 +2473,10 @@ listen-arm admission faults the invocation and reaches the operator as `invocati
 It stays a catalogue reason, the retryable refusal of `admit-trigger`, so the catalogue count is
 unchanged.
 
+**Amended (2026-09-26)**: 4 h and 24 h are the defaults of the seller's policy, not fixed values.
+`create-manual-task` resolves the class window from the seller's policy and pins it into
+`sla_deadline`, and a policy write that puts a class above the overdue window is refused (D-134).
+
 ### D-99 (M) The remediation hold is a flag; cancelling the last open forward task exhausts remediation
 
 **Accepted.**
@@ -2740,6 +2766,9 @@ refuses a category other than `new_sale` at creation (`category-not-admitted`, L
 **Propagated**: `design/02-triggers-and-start.md` §2.1, §2.2, §3.1, §3.3, §3.6, §3.8, §4.7;
 `design/10-process-definition.md` §3.3, §3.6 (a), §3.8; `DESIGN.md` §3.5, §4.2;
 `UPSTREAM_REQS.md` §2.9; D-73.
+
+**Amended (2026-09-26)**: the bindings are applied by the definition publish job, which builds
+and deploys nothing and re-points both bindings on a major bump (D-138).
 
 ### D-108 (M) `retry-step` runs only in-process, with the actor from the request row
 
@@ -3311,6 +3340,11 @@ registration-validation hook states no rule of this kind (serverless-runtime `DE
 **Propagated**: `design/10-process-definition.md` §1.2, §2.2, §3.2, §3.6, §4.1, §4.5, §4.6;
 `design/07-manual-tasks.md` §4.8; `ADR/0012`; D-67; Q-11.
 
+**Amended (2026-09-26)**: rule 1 also tracks four pinned members (`verdict`, `reflected`,
+`policy`, `forceTask`), and §4.1 requires the `p1` composables on their paths; rule 8 requires the
+shared arms (D-135). Rule 2 no longer allows a `call` to a Function (D-136). The windows rule 4
+leaves out are seller-policy values pinned on the record, bounded at the policy write (D-134).
+
 ### D-127 (M) The Workflow callable declares every required trait: async-only, its limits, and no invocation retry
 
 **Accepted (2026-09-26).**
@@ -3525,6 +3559,181 @@ resume" (Lifecycle `06 §4.3`).
 loops*, §4.1, §4.4, §4.5; `design/08-hold-and-cancel.md` §3.2, §3.3, §4.7 items 3, 9, 10;
 `design/01-foundation.md` §3.3; `DESIGN.md` §1.2; `UPSTREAM_REQS.md` §2.9; D-124, D-130, Q-11.
 
+### D-134 (H) The business windows are per-seller policy values pinned on the record; the definition owns only the tick
+
+**Accepted (2026-09-26).** *(amends D-70, D-98, D-126)*
+
+**Decision**: the approval escalation window, the overdue window and the manual-task SLA classes
+are values of the **seller's policy** — the per-seller policy rows of `DESIGN.md` §4.8, the store
+the partial-failure policy election already lives in. The operation that needs a window resolves
+it from that policy and pins it on the order's record, as `construct-and-freeze-plan` pins the
+partial-failure policy (`design/04` §2.2 `inst-pc-resolve-policy`): `open-gates` pins each gate's
+`escalation_window_ms` (the party's window, else the seller default, 72 h);
+`construct-and-freeze-plan` pins the new `owf_fulfillment_plan.overdue_window_ms` (default 24 h),
+which `raise-overdue-escalation` reads in place of its hard-coded 24 h; `create-manual-task` and
+the reopen pin the class window into `sla_deadline` (defaults 4 h and 24 h). The definition owns
+only the tick of each re-check loop. Changing a window is an audited policy write: no Orders
+release and no new definition version, and it reaches only records pinned after the write. That
+write **MUST** refuse, and keep the prior value, a set in which an SLA class exceeds the overdue
+window, the overdue window is not between the active version's longest fulfillment-stage task
+timeout (`wave1`, 10 min) and the `P90D` ceiling, or the escalation window is not below the
+ceiling (`design/07` §4.8 item 8).
+
+**Rationale**: the windows had five homes — definition values in `DESIGN.md` §4.8, 01's bounds
+table and ADR-0011; routing configuration in 03; a hard-coded 24 h in 07's algorithm; per-seller
+policy rows in `DESIGN.md` §4.8 again; and "a definition input" in 07 §4.8 — and since the
+fixed-waits restructure (D-70 as amended) no definition could move any of them (OW2-75). The owner
+ruled that the values live in Orders' per-seller policy and the definition owns the tick (R1).
+**Precedent**: the partial-failure policy pinned at freeze (`design/04` §2.2), whose "never the
+live configuration" rule is the same guard against a mid-flight change; and Lifecycle's snapshot
+of the tenant's effective `orders_date_policy` row, stored with the admitted order version and
+never re-read from a later policy row (Lifecycle `design/03-gate-and-pin.md` §4.2 item 8). No
+platform precedent applies: the platform has no per-tenant business-window store.
+
+**Propagated**: `design/01-foundation.md` §2.1, §4.2, §4.4; `design/03-approval-execution.md`
+§3.2, §3.6, §3.7; `design/04-fulfillment-plan.md` §2.2, §3.6, §3.7, §4.7, §4.8;
+`design/07-manual-tasks.md` §1.2, §3.2, §3.6, §3.7, §4.1, §4.8; `design/10-process-definition.md`
+§1.1, §1.2, §2.2, §3.6, §4.7; `DESIGN.md` §1.2, §4.7, §4.8; `ADR/0011`; D-70, D-98, D-126.
+
+### D-135 (M) A version carries the `p1` composables and the shared arms on their paths; the check tracks the pinned enums
+
+**Accepted (2026-09-26).** *(amends D-126)*
+
+**Decision**: the operations stay `composable` (22 `protected`, 13 `composable` unchanged), but
+`design/10` §4.1 requires the `p1` ones on their paths, as the Waves row already requires
+`evaluate-activation-eligibility`. On an `unobtainable` verdict, `park` and a park loop whose tick
+calls `arm-park-escalation`, with a route to `raise-overdue-escalation` (`park`), and no
+reflection, gate or fulfillment until a later verdict is obtained. On a pending-approval
+reflection, `open-gates` before `record-decision`, with a gate wait carrying the decision `listen`
+and the `escalate-gate` fire and probe, and a route to `raise-overdue-escalation`
+(`approval-outage`). After every `create-manual-task`, and after the ceiling's escalation, a wait
+carrying the task's resolution `listen` and SLA check through `resolve-manual-task`.
+`verify-override` comes only after `resolve-manual-task`. Rule 1 now tracks four **pinned
+members** — `verdict`, `reflected`, `policy`, `forceTask` — each written only as a copy of its
+operation's output or as a literal, and forks the walk on their values. A `switch` over the
+seller's pinned partial-failure policy is therefore decided: `remediate` must reach
+`create-manual-task` before any terminal outcome, and `fail-fast` must reach the unwind without
+it, so a version that tests a literal instead of `policy` is refused. Rule 8 requires the four
+shared arms (hold, stage-level resume, lifecycle, cancel) in every stage `fork`, with the unwind,
+ceiling and resume waits' stated exceptions, and the top-level `lifetime` fork's `P90D` branch.
+
+**Rationale**: a version could drop `open-gates`, `escalate-gate`, `raise-overdue-escalation`
+or the resolution wait and pass validation, publishing a process with no approval requests, no
+escalations or no task resolution, or one that ignored the seller's pinned policy (OW2-80). It
+could also drop the hold or amendment arm that 08 and 02 require, since no rule checked arm
+presence (OW2-73). The owner ruled that the operations stay composable and a rule requires them on
+their paths (R2). No routing member is written from an operation output: the pinned members are
+tracked beside the routing members and never route a stage (`design/10` §2.2 rule 1).
+**Precedent**: the §4.1 Waves row of D-126, which requires the composable
+`evaluate-activation-eligibility` answering `released` before wave 2; `design/04` §2.2 for the
+pinned policy the switch must read.
+
+**Propagated**: `design/10-process-definition.md` §2.1, §2.2, §4.1, §4.7;
+`design/01-foundation.md` §3.1, §3.3; `design/03-approval-execution.md` §3.3;
+`design/07-manual-tasks.md` §3.3; `ADR/0012`; `ADR/0011`; `DESIGN.md` §2.2; D-126.
+
+### D-136 (M) One adjustability table; slice constraints are enforced items or canonical-definition guidance; no Function call
+
+**Accepted (2026-09-26).**
+
+**Decision**: `design/10` §4.7 is the one table of which change needs which vehicle: a definition
+version, a seller-policy write, an Orders release, a PRD change, or nothing. ADR-0011's
+adjustability contract, `DESIGN.md` §4.7 and `design/10` §1.1 and §2.2 point to it. The two
+examples the vision gave that the fence forbids — re-authorisation after plan freeze, parking a
+partial failure — are removed from §1.1 and §2.2 and listed as not permitted. Each slice's
+*Constraints this slice places on the definition* is mapped item by item in §4.7. An **enforced**
+item restates a rule of §2.2 or a §4.1 row, and the validator refuses a version through that rule.
+Every other item is **canonical-definition guidance**: the canonical version carries it, the
+publish job's behavioural gate (D-138) asserts it for every candidate, and a version departs from
+it only by amending the slice item in the same change. **No `call` targets a registered
+Function**, `composable` operation or not.
+
+**Rationale**: the slices said "a version that violates any of them MUST be refused" over about 70
+items, while 10 §4.7 permitted changing any wait, any listen arm and any composable, and the hook
+implemented only the eight rules (OW2-73). The vision's two headline examples were forbidden by
+the fence (OW2-76). Four lists of what may change disagreed (OW2-83). A Function in place of a
+composable would act outside the record and outside the step surface's authorization,
+contradicting "the definition never acts", with no identity, schema or record rule for it
+(OW2-81). **Precedent**: dropping the Function follows the principle
+`cpt-cf-bss-orders-workflow-principle-definition-orders-never-acts` and Q-10, which already
+declines tenant Functions. No platform precedent exists for splitting validator rules from
+guidance.
+
+**Propagated**: `design/10-process-definition.md` §1.1, §2.1, §2.2, §4.7;
+`design/02-triggers-and-start.md` §4.7; `design/03-approval-execution.md` §4.5;
+`design/04-fulfillment-plan.md` §4.8; `design/05-provisioning-intents.md` §4.5;
+`design/06-saga-and-compensation.md` §4.7; `design/07-manual-tasks.md` §4.8;
+`design/08-hold-and-cancel.md` §4.7; `design/09-read-and-authz.md` §4.6; `DESIGN.md` §4.7;
+`ADR/0011`; `ADR/0012`; Q-10.
+
+### D-137 (H) The binding records the version the platform pinned; the publisher waits on the registry
+
+**Accepted (2026-09-26).** *(amends D-68)*
+
+**Decision**: `start-instance` reads the platform's invocation record for the bound invocation
+(`GET /api/serverless-runtime/v1/invocations/{invocation_id}`, the read the instance liveness pass
+already makes) and records its `function_id` and `function_version` as `definition_id` and
+`definition_version`. The document's self-declared `version` is only compared with them.
+`definition-not-bound` now means that the invocation runs a callable other than a major of
+`order_process`, or a `function_version` other than the document's `version`; once the hook
+lands it also means a version the hook has not validated. `owf_definition_binding.published_by`
+becomes nullable and stays null until the registry reports a publisher per version, because a
+registered callable carries none and the definition must not name its own. Until the hook lands,
+the evidence of a publish is the publish job's run and the registry's version listing. The
+hook ask gains two parts: the registry reports each version's publisher, and until the hook exists,
+publishing and lifecycle transitions of `order_process` are restricted to the publish job's
+identity. The claim that the registry is the system of record for publishes is dropped from
+`design/10` §2.2.
+
+**Rationale**: `published_by` was "copied from the registry's record" with no registry read
+defined and no publisher field to read; `definitionVersion` was the document's own string; and
+`definition-not-bound` checked a hook that does not exist (OW2-74). A mistaken or malicious
+version could claim to be the canonical one. **Precedent**: the invocation record's required
+`function_version` (serverless-runtime DESIGN_GTS_SCHEMAS.md *InvocationRecord*) and the
+liveness pass's read of it (D-105). An Orders-side allow-list was considered and rejected: a
+compiled list needs a deploy, which D-138 rules out for a definition change, and a list any
+operator can write proves nothing. The publish restriction is an ask, not a platform fact.
+
+**Propagated**: `design/01-foundation.md` §3.3 *start-instance*, §3.6, §3.7;
+`design/10-process-definition.md` §2.2, §3.1, §3.3, §3.6, §4.2, §4.3; `DESIGN.md` §3.1, §3.6,
+§4.2; `UPSTREAM_REQS.md` §2.9; `ADR/0012`; D-68, D-105.
+
+### D-138 (M) A definition is published by a job of its own, behind a behavioural gate, and rolled back forward
+
+**Accepted (2026-09-26).** *(amends D-68, D-107)*
+
+**Decision**: definition publishing is a pipeline job of its own that **MUST NOT** build or deploy
+the gear. A merge to `definitions/` needs its code owners, who are the Orders definition owners,
+and a second reviewer; a change that touches an operation is an Orders release first. In each
+environment the job runs the §2.2 rules against that environment's deployed operation registry.
+In the first non-production environment it runs the **behavioural gate**: it publishes the
+candidate there and drives one order down each path (a)–(f) against the real step surface, with
+test doubles for Lifecycle, Subscriptions and the approval service, asserting the record and the
+guidance items of `design/10` §4.7. A failing scenario stops the job. The job then publishes,
+deprecates the version it replaces in the same run so one version per major is `active`, applies
+the trigger bindings, and never archives or deletes. A rollback publishes the last good document as
+a new minor version, because the registry has no `deprecated → active` transition. A major bump
+re-points both bindings in the same run. The bound-version check runs in the gear's readiness
+check in each environment, not in the repository's CI. Which version a trigger starts, and a
+canary or tenant-scoped activation, are the new ask
+`cpt-cf-bss-orders-workflow-upreq-serverless-runtime-trigger-version-selection`.
+
+**Rationale**: "the release pipeline publishes it" did not say whether a definition change builds
+or deploys the gear, which would defeat changing the process without a redeploy (OW2-79). No rule
+said how a version becomes the one triggers start, how a bad version is rolled back, or what a
+major bump does to the bindings, and CI was to read every environment's bindings with no access
+to them (OW2-77). The only gate was static, so a version that misroutes would reach every new
+order in the environment (OW2-78). **Precedent**: the platform function lifecycle, whose state
+machine has no way back from `deprecated` (serverless-runtime DESIGN.md lines 588–607), and its
+`dry_run`, which validates only and so is not a behavioural test (DESIGN.md, *Invocation API*);
+D-107 already applies the trigger bindings from `definitions/` through one pipeline. No BSS gear
+publishes a platform definition, so the job and the gate are the smallest rule consistent with
+the set.
+
+**Propagated**: `design/10-process-definition.md` §2.2, §3.2, §3.3, §3.7, §3.8, §4.2, §4.3;
+`design/01-foundation.md` §3.7; `DESIGN.md` §2.2, §3.6, §3.8, §4.7; `UPSTREAM_REQS.md` §2.9, §3;
+`ADR/0012`; `ADR/0011`; D-68, D-107.
+
 ## Open Questions
 
 ### Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?
@@ -3696,6 +3905,11 @@ audit asks of `UPSTREAM_REQS.md` §2.9 land. The PRD §15 row asking the same qu
 registered PRD amendment (`UPSTREAM_REQS.md` §4 item 7).
 
 **Review trigger**: the definition-versioning and validation-hook ask agreed by serverless-runtime.
+
+**Amended (2026-09-26)**: no `call` targets a Function at all now (D-136), so a tenant-authored
+Function would need a new rule, not only a role. A seller's escalation, overdue and SLA windows
+need no fragment: they are values of the seller's policy (D-134). The publish role is held by the
+definition publish job (D-138).
 
 ### Q-11: Does the platform's DSL express the hold pattern and the other constructs the definition needs, or do they need Functions?
 
@@ -3911,6 +4125,11 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-131 | H Closed reference vocabulary; residual stated in full | `ADR/0013`, `design/01-foundation.md` §1.1, §2.1, `design/10-process-definition.md` §1.1, §2.1, §2.2, `DESIGN.md` §4.2, §4.3, `UPSTREAM_REQS.md` §2.9, §4; D-66, Q-01, Q-12 |
 | D-132 | M Step-route error answers carry fixed members only | `ADR/0013`, `design/01-foundation.md` §4.9, §4.11, `design/10-process-definition.md` §2.1, §2.2, `DESIGN.md` §4.2, `UPSTREAM_REQS.md` §2.9; D-66 |
 | D-133 | M Every wait holding a recorded suspension polls the hold | `design/10-process-definition.md` §3.6, §4.1, §4.4, §4.5, `design/08-hold-and-cancel.md` §3.2, §3.3, §4.7, `design/01-foundation.md` §3.3, `DESIGN.md` §1.2, `UPSTREAM_REQS.md` §2.9; D-124, D-130, Q-11 |
+| D-134 | H Business windows are seller-policy values pinned on the record | `design/01-foundation.md` §2.1, §4.2, §4.4, `design/03-approval-execution.md` §3.2, §3.6, §3.7, `design/04-fulfillment-plan.md` §2.2, §3.6, §3.7, §4.7, §4.8, `design/07-manual-tasks.md` §1.2, §3.2, §3.6, §3.7, §4.1, §4.8, `design/10-process-definition.md` §1.1, §1.2, §2.2, §3.6, §4.7, `DESIGN.md` §1.2, §4.7, §4.8, `ADR/0011`; D-70, D-98, D-126 |
+| D-135 | M `p1` composables and shared arms required on their paths; pinned enums tracked | `design/10-process-definition.md` §2.1, §2.2, §4.1, §4.7, `design/01-foundation.md` §3.1, §3.3, `design/03-approval-execution.md` §3.3, `design/07-manual-tasks.md` §3.3, `DESIGN.md` §2.2, `ADR/0011`, `ADR/0012`; D-126 |
+| D-136 | M One adjustability table; enforced items and guidance; no Function call | `design/10-process-definition.md` §1.1, §2.1, §2.2, §4.7, `design/02-triggers-and-start.md` §4.7, `design/03-approval-execution.md` §4.5, `design/04-fulfillment-plan.md` §4.8, `design/05-provisioning-intents.md` §4.5, `design/06-saga-and-compensation.md` §4.7, `design/07-manual-tasks.md` §4.8, `design/08-hold-and-cancel.md` §4.7, `design/09-read-and-authz.md` §4.6, `DESIGN.md` §4.7, `ADR/0011`, `ADR/0012`; Q-10 |
+| D-137 | H Binding version from the invocation record; publisher from the registry | `design/01-foundation.md` §3.3, §3.6, §3.7, `design/10-process-definition.md` §2.2, §3.1, §3.3, §3.6, §4.2, §4.3, `DESIGN.md` §3.1, §3.6, §4.2, `UPSTREAM_REQS.md` §2.9, `ADR/0012`; D-68, D-105 |
+| D-138 | M Publish job, behavioural gate, forward rollback | `design/10-process-definition.md` §2.2, §3.2, §3.3, §3.7, §3.8, §4.2, §4.3, `design/01-foundation.md` §3.7, `DESIGN.md` §2.2, §3.6, §3.8, §4.7, `UPSTREAM_REQS.md` §2.9, §3, `ADR/0011`, `ADR/0012`; D-68, D-107 |
 
-Highest decision number used: **D-133**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
+Highest decision number used: **D-138**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
 register; there are no parts.

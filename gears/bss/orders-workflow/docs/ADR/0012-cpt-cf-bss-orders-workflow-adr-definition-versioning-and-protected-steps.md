@@ -130,6 +130,22 @@ rather than one task, fails closed before a definition can be executed, and stil
   > destinations of *Consequences* are accordingly a fault of the invocation, a manual task, the
   > compensation path's next pass and the supersession wait.
 
+  > **Amended 2026-09-26 by D-135 and D-136**: **Rule 1** also requires the `p1` composables on
+  > their paths, which stay `composable` (22 `protected`, 13 `composable` are unchanged): on an
+  > `unobtainable` verdict, `park` and a park loop calling `arm-park-escalation` with a route to
+  > `raise-overdue-escalation` (`park`); on a pending-approval reflection, `open-gates` before
+  > `record-decision` and a gate wait carrying the decision `listen` and the `escalate-gate` fire
+  > and probe, with a route to `raise-overdue-escalation` (`approval-outage`); after every manual
+  > task, a wait carrying its resolution `listen` and SLA check through `resolve-manual-task`. The
+  > check tracks four pinned members — `verdict`, `reflected`, `policy`, `forceTask` — written
+  > only as copies of their operation's output or as literals, so a `switch` over the seller's
+  > pinned partial-failure policy is decided, and `remediate` must reach `create-manual-task`
+  > before any terminal outcome (`design/10-process-definition.md` §2.2 rule 1, §4.1). Rule 8
+  > adds the shared arms every stage `fork` carries. **Rule 2**: a `call` to a registered
+  > Function is no longer allowed anywhere, so the "`composable` only" clause is withdrawn.
+  > Each slice's constraints are split into items enforced through a rule and
+  > canonical-definition guidance that the behavioural gate asserts (§4.7).
+
   The `protected` list is closed and fixed here; adding to it or removing from it is an Orders
   release and an amendment of this ADR: `start-instance`, `settle-from-lookup` (sweep-only),
   `terminate-instance`, `admit-trigger`, `terminate-on-terminal-event`, `obtain-verdict`,
@@ -176,12 +192,32 @@ rather than one task, fails closed before a definition can be executed, and stil
   platform on the Function Registry API (DESIGN.md line 847). A seller-scoped role that may
   publish a fragment of the definition — for example a seller's own escalation arms — is
   registered as Q-10 and is not granted by this decision.
+
+  > **Amended 2026-09-26 by D-138**: the platform-operator role is held by one publisher, the
+  > Orders definition publish job, a pipeline job of its own that builds and deploys nothing. A
+  > merge to `definitions/` needs its code owners (the Orders definition owners) and a second
+  > reviewer. The job runs the rules, then the **behavioural gate** — the candidate published
+  > in a non-production environment and driven down each path (a)–(f) against the real step
+  > surface — then publishes it and deprecates the version it replaces. It never archives or
+  > deletes, rolls back by publishing the last good document as a new version, and re-points both
+  > trigger bindings on a major bump. Which version an event trigger starts, and a tenant-scoped
+  > activation, are the ask `…-upreq-serverless-runtime-trigger-version-selection`
+  > (`design/10-process-definition.md` §4.2).
 * **Audit of publishes.** Every publish must be attributable to an actor, a version and a
   validation result. The platform's audit of definition changes is unaddressed (NEXT_ADR_SCOPE.md
   line 26, BR-034) and is raised as an upstream ask; until it lands, the CI conformance run over
   the canonical definitions and the registry's version listing (DESIGN.md line 857, *list
   versions*) are the evidence, and `owf_definition_binding.published_by` records, per instance,
   who published the version it was bound to.
+
+  > **Amended 2026-09-26 by D-137**: the registry carries no publisher per version (its callable
+  > entities have `owner`, `created_at` and `updated_at`), so `published_by` is nullable and stays
+  > null until the hook ask's publish audit reports one; the evidence meanwhile is the publish
+  > job's run and the version listing. `start-instance` records `definition_id` and
+  > `definition_version` from the platform's invocation record (`function_id`,
+  > `function_version`), never from the document's self-declared `version`, which it only
+  > compares; a mismatch is `definition-not-bound`. The hook ask also asks, as an interim, that
+  > only the publish job's identity may publish `order_process`.
 
 ### Consequences
 
@@ -190,7 +226,7 @@ rather than one task, fails closed before a definition can be executed, and stil
 * The `protected` list turns ADR-0004's conjunction rule, ADR-0005's fence-before-compensation order and ADR-0007's park exits into checkable statements about a document rather than conventions about code (those ADRs carry dated amendments saying so).
 * Operators lose nothing they had: `retry-step` remains an operator operation; the platform's `retry` and `replay` control actions (DESIGN.md lines 888–889) act on the invocation and are not a way around a protected operation's precondition, since the re-invoked operation re-checks it.
 * Because a `catch` around a protected operation may not continue the forward path, every failure of a protected operation has one of four destinations — `raise`, park, manual task or compensation — which is the same closed outcome set ADR-0009 and ADR-0005 already require.
-* A definition that passes validation can still be operationally wrong (a wait too short for a seller's approval practice, an escalation arm that pages the wrong queue); the fence bounds safety, not suitability. Suitability remains a publish-time review concern and, once the platform provides it, a BR-122 governance concern.
+* A definition that passes validation can still be operationally wrong (a wait too short for a seller's approval practice, an escalation arm that pages the wrong queue); the fence bounds safety, not suitability. Suitability remains a publish-time review concern and, once the platform provides it, a BR-122 governance concern. **Amended 2026-09-26 by D-138**: suitability is also exercised before production by the publish job's behavioural gate, a scenario run of the candidate per path; a window a seller's practice needs is a seller-policy value, not a definition value (D-134).
 
 ### Confirmation
 
@@ -205,7 +241,12 @@ Orders code path reads any version but the bound one; a test per protected opera
 precondition guard refuses with the catalogue reason when its record precondition does not hold; a
 test that an invocation ending without `terminate-instance` is surfaced by the sweep's instance
 liveness pass as an `invocation-dead` manual task (D-105); and a startup test that `owf_step_operation` is loaded from the compiled registry,
-audited on load and rejects any runtime write.
+audited on load and rejects any runtime write. **Amended 2026-09-26 by D-135, D-137 and D-138**:
+the mutation corpus adds, per `p1` composable, a mutant with it dropped from its required path, a
+mutant whose policy `switch` tests a literal instead of the pinned `policy`, one stage `fork`
+without its hold arm and one `call` to a Function; a test asserts that `start-instance` records
+the invocation record's `function_version` and refuses a document whose `version` differs; and
+the publish job's behavioural gate must pass before any production publish.
 
 ## Pros and Cons of the Options
 
@@ -245,7 +286,7 @@ apply by reference.
   [`design/10-process-definition.md`](../design/10-process-definition.md);
   [`design/01-foundation.md`](../design/01-foundation.md) §3.7 (`owf_definition_binding`,
   `owf_step_operation`)
-- **Decisions register**: [`DECISIONS.md`](../DECISIONS.md) — D-02, D-53, D-67, D-68, D-126, Q-10
+- **Decisions register**: [`DECISIONS.md`](../DECISIONS.md) — D-02, D-53, D-67, D-68, D-126, D-135, D-136, D-137, D-138, Q-10
 - **Upstream asks**: [`UPSTREAM_REQS.md`](../UPSTREAM_REQS.md) — serverless-runtime section
   (pre-publish validation hook, publish audit, version retention while bound)
 - **Platform**: serverless-runtime [DESIGN.md](../../../../serverless-runtime/docs/DESIGN.md)

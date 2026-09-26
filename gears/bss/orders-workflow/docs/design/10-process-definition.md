@@ -23,7 +23,7 @@
   - [3.8 Deployment Topology](#38-deployment-topology)
 - [4. Definition Normative Rules](#4-definition-normative-rules)
   - [4.1 The fence](#41-the-fence)
-  - [4.2 The validation hook contract](#42-the-validation-hook-contract)
+  - [4.2 The validation hook contract and the publish job](#42-the-validation-hook-contract-and-the-publish-job)
   - [4.3 Pinning](#43-pinning)
   - [4.4 Signal semantics](#44-signal-semantics)
   - [4.5 The hold pattern, and Q-11](#45-the-hold-pattern-and-q-11)
@@ -51,10 +51,12 @@ different rates and are reviewed by different people. What a step *does* — ref
 Lifecycle under seam rule R1, dispatch a draft-create intent under the idempotency key of ADR-0006,
 walk the compensation subjects in reverse ordinal — is commercial and integration logic with a
 gear-owned record behind it; it changes with an Orders release. How the steps are *ordered* —
-whether re-authorisation happens before or after plan freeze, how long an approval gate waits
-before escalating, whether a partial failure parks or compensates under a given policy — is
+the order of the `composable` arms, which manual-task or escalation arm an answer routes to, how
+often a stored deadline is re-checked, how many times a transient failure is retried — is
 process shape; it changes when the business changes its mind, and it should not need a Rust
-release to do so. The platform gear `serverless-runtime` exists for exactly that split: it
+release to do so. How long an approval gate waits before escalating, the overdue window and the
+manual-task SLA classes are neither: they are per-seller policy values pinned on Orders' record,
+changed by a policy write (decision D-134). The platform gear `serverless-runtime` exists for exactly that split: it
 registers Functions and Workflows as versioned definitions
 ([DESIGN §1.1](../../../../serverless-runtime/docs/DESIGN.md#11-architectural-vision)), its Temporal
 plugin interprets the CNCF Serverless Workflow DSL on durable execution primitives
@@ -65,7 +67,8 @@ checkpoints, replay and event subscription
 *Consequences*; [DESIGN `DESIGN.md:632`](../../../../serverless-runtime/docs/DESIGN.md#workflow)).
 Orders therefore provides the operations and the record ([`01`](./01-foundation.md)) and lets
 the platform provide the sequencing. Adjusting the flow is publishing a new definition version
-through the platform registry; changing what a step does is an Orders release.
+through the platform registry; changing what a step does is an Orders release; §4.7 is the one
+table of which change needs which (decision D-136).
 
 **What crosses the boundary is references.** A definition task carries only members of the
 closed vocabulary of [`../ADR/0013`](../ADR/0013-cpt-cf-bss-orders-workflow-adr-references-not-payloads.md)
@@ -106,7 +109,7 @@ be unless the gate is declared failed
 | `cpt-cf-bss-orders-workflow-fr-owf-retry`, `…-fr-owf-manual-task`, `…-fr-owf-compensation-execution` | Path (c): task retry policy on the dispatch calls, `try`/`catch` around them, `create-manual-task`, a `listen` for the resolution and either resume or `compensate-order` → `report-outcome`. |
 | `cpt-cf-bss-orders-workflow-fr-owf-terminal-order-events` | Path (d) for an authorised cancel and the terminal-event `listen` arm of path (f): `authorize-cancel` / `terminate-on-terminal-event` → `run-cancellation-fence` → `compensate-order` → `report-outcome` → `terminate-instance`. |
 | `cpt-cf-bss-orders-workflow-fr-owf-hold-resume` | Path (e): hold and resume as `listen` arms; the hold wins the gate loop's race, `apply-hold` pauses the gate window in Orders' record and `apply-resume` re-bases it and answers the first `due`; the lifetime ceiling as a top-level competing `P90D` `wait` that no hold cancels. |
-| `cpt-cf-bss-orders-workflow-fr-owf-overdue-escalation` | The overdue window as the top-level `overdueMonitor` branch: an hourly re-check through `raise-overdue-escalation`, which is due only past `expected_fulfillment_at` + 24 h and before a settled outcome, records the escalation once and nothing else, and is never paused by a hold. |
+| `cpt-cf-bss-orders-workflow-fr-owf-overdue-escalation` | The overdue window as the top-level `overdueMonitor` branch: an hourly re-check through `raise-overdue-escalation`, which is due only past `expected_fulfillment_at` + the overdue window pinned on the plan (default 24 h, D-134) and before a settled outcome, records the escalation once and nothing else, and is never paused by a hold. |
 | `cpt-cf-bss-orders-workflow-fr-owf-process-state-nonauth` | Every effect is a step operation that writes Orders' record; the definition holds no state Orders does not also record, and carries references only. |
 
 #### NFR Allocation
@@ -114,7 +117,7 @@ be unless the gate is declared failed
 | NFR ID | NFR Summary | Allocated To | Design Response | Verification Approach |
 |--------|-------------|--------------|-----------------|----------------------|
 | `cpt-cf-bss-orders-workflow-nfr-owf-durability` | Zero in-flight workflows lost across restarts | Platform plugin (invocation history) + `01` envelope | The plugin resumes the invocation; every re-issued call is absorbed under the same key | Platform worker kill/restart with the canonical definitions; no duplicate effect, no lost step |
-| `cpt-cf-bss-orders-workflow-nfr-owf-escalation-timer` | Per-gate window, default 72 h, ± 5 min | Definition re-check loop (plugin durable timer) + `03` stored deadline | The gate loop's fixed `PT30S` `waitProbe` tick re-checks the gate's stored escalation deadline through `escalate-gate` `mode: fire` before it probes (§3.6 *Fixed waits and re-check loops*), so the fire is at most one tick plus one call late — 30 s plus the 3-minute `step` timeout, inside ± 5 min (decision D-123); a hold pauses the window in Orders' record and `apply-resume` re-bases it | Timer-accuracy test across a plugin worker restart; hold/resume test asserting the remainder |
+| `cpt-cf-bss-orders-workflow-nfr-owf-escalation-timer` | Per-gate window from the seller's policy, default 72 h, pinned on the gate row (D-134), ± 5 min | Definition re-check loop (plugin durable timer) + `03` stored deadline | The gate loop's fixed `PT30S` `waitProbe` tick re-checks the gate's stored escalation deadline through `escalate-gate` `mode: fire` before it probes (§3.6 *Fixed waits and re-check loops*), so the fire is at most one tick plus one call late — 30 s plus the 3-minute `step` timeout, inside ± 5 min (decision D-123); a hold pauses the window in Orders' record and `apply-resume` re-bases it | Timer-accuracy test across a plugin worker restart; hold/resume test asserting the remainder |
 | `cpt-cf-bss-orders-workflow-nfr-owf-fulfillment-sla` | p95 ≤ 15 min from activation eligibility to terminal outcome | Definition task timeouts and retry policy; `05` admission | Wave-2 task timeout 3 min, which bounds the call's retries; each attempt's deadline is nested inside it by validation (§2.2 rule 4); the barrier releases on the first evaluation after both conjuncts hold | Load test over the canonical definition |
 | `cpt-cf-bss-orders-workflow-nfr-owf-audit` | 100 % of transitions recorded independently of engine history | `01` audit writer | The definition performs no effect outside a step operation, so every transition with an Orders consequence is audited by construction | Definition validation rule (§2): no `run`, no `emit`, every `call` a registered operation |
 | `cpt-cf-bss-orders-workflow-nfr-owf-retention` | Gear-owned record ≥ 400 days independent of engine purge | `01` tables | Platform history retention (`TenantRuntimePolicy`, [`DESIGN.md:735`](../../../../serverless-runtime/docs/DESIGN.md#tenantruntimepolicy)) is set independently and may be shorter; nothing Orders needs lives only there | Purge-independence test |
@@ -166,7 +169,9 @@ Every effect of the order process is a step operation of `01`–`09` invoked by 
 The definition uses **no `run`** task (containers, scripts, shell, sub-workflows would be effects
 outside Orders' record) and **no `emit`** task (Orders publishes its six process events through
 its own producer inside operations, [`01 §4.7`](./01-foundation.md#47-one-event-per-committed-step-outcome-and-the-six-named-process-events-only)).
-It never calls Orders Lifecycle, Subscriptions, Payments or the Generic Approval service
+No `call` targets a registered platform Function, because a Function's effect would be outside
+Orders' record and outside the step surface's authorization (decision D-136). It never calls
+Orders Lifecycle, Subscriptions, Payments or the Generic Approval service
 directly — seam rules R1–R5 bind the operations — and its jq expressions select and re-key
 references; they never compute a business value ([`01 §4.14`](./01-foundation.md#414-determinism-discipline-what-is-computed-on-which-side-of-the-boundary)).
 
@@ -180,7 +185,12 @@ An operation registered `protected` ([`01 §3.3`](./01-foundation.md#33-api-cont
 appear on every path that reaches its stage, in the order constraints of §4 *The fence*; a
 definition version that omits one, replaces one with a `composable` operation or a Function, or
 wraps one in a `catch` that swallows its failure **MUST** be refused by the validation hook. A
-`composable` operation may be omitted or re-positioned inside its stage. This is what lets the
+`composable` operation may be omitted or re-positioned inside its stage, except the `p1`
+composables §4.1 requires on their paths — `open-gates` and `escalate-gate` on the gate path,
+`park` and `arm-park-escalation` on the park path, `raise-overdue-escalation` for the park and
+outage escalations, `resolve-manual-task` after every task, `evaluate-activation-eligibility`
+before wave 2 — which stay `composable` in the operation registry
+and may be re-positioned, not dropped (decision D-135). This is what lets the
 flow change without an Orders release while the fence — admission, binding, verdict, plan freeze,
 begin-fulfillment, the waves, the spawn signal, the cancellation fence, compensation, outcome
 report, termination — stays whole.
@@ -219,7 +229,7 @@ suspend/resume, and event subscription … using its backend's native primitives
 | Construct | Spec meaning | Use in Orders definitions | Platform mapping |
 |-----------|--------------|---------------------------|------------------|
 | `do` | An ordered list of named tasks; a flow directive may target only a task of the same list (dsl.md *Task Flow*) | The stage dispatcher and its stage tasks; every stage is one flat `do` list that ends with `then: exit` back to `dispatch` (§3.6, D-80 as amended) | Sequential activities of the interpreted workflow |
-| `call: http` | Perform an HTTP request (`method`, `endpoint`, `headers`, `body`); a non-2xx answer raises a *communication* error carrying the HTTP `status` | Every step operation: `POST /bss-orders-workflow/v1/steps/{operation}` with `Idempotency-Key` derived from task inputs. A `call` to a registered Function is permitted **only** where the operation is `composable` | The plugin's activity for outbound HTTP; the 4xx/5xx answer is the `$error` the `catch` sees |
+| `call: http` | Perform an HTTP request (`method`, `endpoint`, `headers`, `body`); a non-2xx answer raises a *communication* error carrying the HTTP `status` | Every step operation: `POST /bss-orders-workflow/v1/steps/{operation}` with `Idempotency-Key` derived from task inputs. No `call` targets a registered Function (D-136) | The plugin's activity for outbound HTTP; the 4xx/5xx answer is the `$error` the `catch` sees |
 | `listen` | Consume one or more events matching filters (`to.one`, `to.any`, `to.all`), each filter `with` event properties and `correlate`-d on expressions; the output is the array of consumed events, read as `data` unless `read` says otherwise (dsl-reference.md *Listen*) | The eight non-start Lifecycle triggers, the approval decision, Subscriptions confirmations and operator signals, correlated on `orderId` and `orderVersion`; always `read: envelope` with an `output.as` over `.[0]` that keeps reference members only | Temporal signal / event subscription with event-driven continuation (ADR-0004 *Option A*, `DESIGN.md:630`) |
 | `wait` | Pause for a duration given as an inline duration object or an ISO 8601 string — never a runtime expression (dsl-reference.md *Wait*) | Fixed ticks of the re-check loops (§3.6 *Fixed waits and re-check loops*) and the literal `P90D` lifetime ceiling | Temporal durable timer; survives worker restart |
 | `switch` | Evaluate cases in order; the first `when` that holds (or the default case) selects a `then` | Verdict, reflection, admission, gate state, policy, resolution branching | Deterministic branch inside the interpreted workflow |
@@ -291,14 +301,14 @@ consumer-supplied hook before publish — a pending ask
 (`cpt-cf-bss-orders-workflow-upreq-serverless-runtime-definition-versioning-validation-hook`,
 [`../UPSTREAM_REQS.md`](../UPSTREAM_REQS.md) §2.9) — in that hook (§3.2):
 
-1. [ ] - `p1` - Every `protected` operation of each path appears exactly where §4 *The fence* orders it; `settle-from-lookup` and `retry-step`, which run only in-process (`01 §3.3`, D-108), never appear. A path is a walk of the **routing graph**, whose states are a task position plus the values of the routing members `nextStage`, `stageLoop`, `returnStage`, `taskReturnStage`, `taskReturnLoop`, `ceilingReturnStage`, `ceilingReturnLoop`, `heldStage`, `heldLoop` and `arm`. Every write of a routing member **MUST** be a string literal, a copy of another routing member, or an `if … then … else` over routing members that yields one of those — never an operation's output or another `$context` member — so each member ranges over a finite set of literals the check enumerates. A `switch` case over routing members is decided by the state; a case over any other member is taken both ways. The check explores every state reachable from `admitTrigger` and refuses the version if any walk to `end` breaks §4.1 or leaves a stage by a `nextStage` no `dispatch` case names; a walk it cannot decide is refused, never assumed (decision D-126) - `inst-def-protected-present`
-2. [ ] - `p1` - Every `call: http` targets `POST /bss-orders-workflow/v1/steps/{operation}` with `{operation}` a row of `owf_step_operation`, and its `endpoint` is exactly `${ $context.stepsBase + "/<operation>" }` with the operation name a literal. `stepsBase` is written only by `input.from`; no `set`, `output` or `export` **MAY** name it, so no version can send its calls, or the credential the plugin attaches to them, to another host, and the CI test and the hook compare the `input.from` value with the environment's step-surface base (§3.7). A `call` to a Function is allowed only where the corresponding operation is `composable` - `inst-def-call-targets`
+1. [ ] - `p1` - Every `protected` operation of each path appears exactly where §4 *The fence* orders it; `settle-from-lookup` and `retry-step`, which run only in-process (`01 §3.3`, D-108), never appear. A path is a walk of the **routing graph**, whose states are a task position plus the values of the routing members `nextStage`, `stageLoop`, `returnStage`, `taskReturnStage`, `taskReturnLoop`, `ceilingReturnStage`, `ceilingReturnLoop`, `heldStage`, `heldLoop` and `arm`. Every write of a routing member **MUST** be a string literal, a copy of another routing member, or an `if … then … else` over routing members that yields one of those — never an operation's output or another `$context` member — so each member ranges over a finite set of literals the check enumerates. Four **pinned members** are tracked the same way (decision D-135): `verdict`, written only as a copy of `obtain-verdict`'s `verdict`; `reflected`, only as a copy of `reflect-verdict`'s `reflected` or the literal `refused` its `catch` sets; `policy`, only as a copy of `construct-and-freeze-plan`'s `policy`, the seller's partial-failure policy pinned at freeze (`04 §2.2`); and `forceTask`, only as a boolean literal. At each write of a pinned member the walk forks once per value of its closed enum. A `switch` case over routing and pinned members is decided by the state; a case over any other member is taken both ways, and a §4.1 condition written *on some walk* is checked as reachability from the task it names. The check explores every state reachable from `admitTrigger` and refuses the version if any walk to `end` breaks §4.1 or leaves a stage by a `nextStage` no `dispatch` case names; a walk it cannot decide is refused, never assumed (decision D-126) - `inst-def-protected-present`
+2. [ ] - `p1` - Every `call: http` targets `POST /bss-orders-workflow/v1/steps/{operation}` with `{operation}` a row of `owf_step_operation`, and its `endpoint` is exactly `${ $context.stepsBase + "/<operation>" }` with the operation name a literal. `stepsBase` is written only by `input.from`; no `set`, `output` or `export` **MAY** name it, so no version can send its calls, or the credential the plugin attaches to them, to another host, and the CI test and the hook compare the `input.from` value with the environment's step-surface base (§3.7). No `call` **MAY** target a registered Function, `composable` operation or not (decision D-136) - `inst-def-call-targets`
 3. [ ] - `p1` - Every `listen` filter type is in the closed set above and carries the two correlations, except the `OrderAmended` filter, which correlates on `orderId` only (the closed set above, `02 §4.7` item 8); a filter **MAY** add a correlation, as the ceiling wait's `taskRef` does - `inst-def-listen-targets`
-4. [ ] - `p1` - Bounds nest, over values the definition holds: every task that calls an operation declares a `timeout` from `use.timeouts`; the operation's `deadline_ms` **<** that timeout, so one attempt fits; every task timeout and every literal `wait` **<** the literal `P90D` lifetime `wait`. The check computes no cumulative backoff, because the DSL gives `backoff.exponential` no multiplier (dsl-reference.md *Retry*) and the timeout bounds the retries whatever their curve. The overdue window and the SLA classes are not definition values — each is stored per order from Orders' per-seller policy — so their bounds are checked where that policy value is validated (`07 §4.8` item 8), not here (decision D-126) - `inst-def-bounds-nest`
+4. [ ] - `p1` - Bounds nest, over values the definition holds: every task that calls an operation declares a `timeout` from `use.timeouts`; the operation's `deadline_ms` **<** that timeout, so one attempt fits; every task timeout and every literal `wait` **<** the literal `P90D` lifetime `wait`. The check computes no cumulative backoff, because the DSL gives `backoff.exponential` no multiplier (dsl-reference.md *Retry*) and the timeout bounds the retries whatever their curve. The escalation window, the overdue window and the SLA classes are not definition values — each is a per-seller policy value that an operation pins on the order's record (decision D-134) — so their bounds are checked where the seller's policy is written (`07 §4.8` item 8), not here (decision D-126) - `inst-def-bounds-nest`
 5. [ ] - `p1` - Every task `input`, `output`, `export` and every `body` member validates against the operation's registered reference schemas; no member outside them. Every member the definition writes into `$context`, including by `set` and `input.from`, is of one of the six vocabulary types of ADR-0013 as amended by D-131 (identity, opaque record reference, counter, closed enum or boolean, instant or duration, `stepsBase`); a string member of no such type is refused. No `set`, `output` or `export` **MAY** read an `$error` member other than `status` (`error_code` once Q-11 (ii) answers) - `inst-def-references-only`
 6. [ ] - `p1` - No `protected` operation is inside a `try` whose `catch` continues the forward path: a `catch` either only retries, so exhaustion faults the invocation, or routes to one of the named failure routes of §4.6; that a retry-only `catch` re-raises the last error once its limit is spent is Q-11 (vi), assumed until the plugin answers - `inst-def-no-swallowing-catch`
 7. [ ] - `p1` - No `run`, no `emit`, no `for`, no `schedule`: the start mechanism is exactly the two platform event triggers of §3.3, `OrderSubmitted` and `OrderAmended` — Lifecycle publishes no `OrderSubmitted` after an amendment ([Lifecycle `04 §4.3`](../../../orders-lifecycle/docs/design/04-versioning.md#43-re-approval-is-a-two-step-seam-interaction-normative), `02 §4.7` item 9); every `wait` is a literal duration (§3.6 *Fixed waits and re-check loops*) - `inst-def-grammar-subset`
-8. [ ] - `p1` - Every branch of a competing `fork` that can complete ends by `set`-ting `arm` so the sibling `switch` can route; every `fork` is followed by a `switch` on `arm`; every `then` names a task of its own `do` list, `exit` or `end` (the stage dispatcher of §3.6) - `inst-def-fork-routing`
+8. [ ] - `p1` - Every branch of a competing `fork` that can complete ends by `set`-ting `arm` so the sibling `switch` can route; every `fork` is followed by a `switch` on `arm`; every `then` names a task of its own `do` list, `exit` or `end` (the stage dispatcher of §3.6). Every competing `fork` inside a stage carries the four shared arms of §3.6 — the hold arm and the stage-level resume arm of (e), the lifecycle arm of (f) and the cancel arm of (d) — except the unwind's forks, which carry the cancel arm and no other (`06 §4.7` item 7), the ceiling wait `awaitOperatorAfterPark`, which carries the lifecycle and cancel arms, and the resume wait `awaitResume`, which carries its resume `listen`, the lifecycle and cancel arms; the top-level `lifetime` fork carries `process` and `lifetimeCeiling` with the literal `P90D` `wait` and **MAY** carry `overdueMonitor` (decision D-135) - `inst-def-fork-routing`
 
 #### Versioning, pinning, publish
 
@@ -313,20 +323,20 @@ instance is **pinned** at `start-instance` to the version the invocation runs
 to termination on it; migration is out of scope (PRD §5.2); a version **MUST NOT** be archived or
 deleted while a binding names it; the platform registry's `archived`/`deleted` transitions
 (`DESIGN.md:599`–`610`) are to be gated by that check in the validation hook once the platform
-offers it (pending ask, §2.2), and until then by the release pipeline and the CI assertion of
-§4.2. **Publish roles**: the
-platform operator today, through the registry's publish operation under platform authorization;
-a seller-scoped fragment role is registered as **Q-10** (`../DECISIONS.md`). **Audit of
-publishes**: the registry is the platform's system of record for who published what and when;
-Orders copies `published_by` onto each binding at start (D-61 minimisation) so its own record
-answers the question for the instances it ran.
+offers it (pending ask, §2.2), and until then by the publish job, which never archives or
+deletes, and the readiness check of §4.2. **Publish roles**: the
+Orders publish job of §4.2 is the only publisher, running under the platform-operator publish role
+through the registry's publish operation; no person publishes by hand, and who may merge a change
+to `definitions/` is §4.2's (decision D-138). A seller-scoped fragment role is registered as
+**Q-10** (`../DECISIONS.md`). **Audit of publishes**: the platform records no publisher today — a
+registered callable carries `owner`, `created_at` and `updated_at`
+([DESIGN_GTS_SCHEMAS.md](../../../../serverless-runtime/docs/DESIGN_GTS_SCHEMAS.md) line 23), and
+the audit of definition changes is unaddressed (NEXT_ADR_SCOPE.md line 26) — so the evidence of a
+publish is the publish job's run and the registry's version listing, and
+`owf_definition_binding.published_by` stays null until the registry reports a publisher, which is
+part of the hook ask (decision D-137).
 
-**What changes without an Orders release**: the order of `composable` steps within a stage, every
-`wait` value inside the nesting rule, retry attempts and backoff, `switch` predicates over
-returned enums, which policy branch a partial failure takes, whether re-authorisation is asked
-before or after plan freeze. **What does not**: the operation set and their contracts, the
-protected order of §4, the closed trigger set, the six process events, the reason catalogue, any
-table, any seam call.
+**What a definition change may and may not do** is the one table of §4.7 (decision D-136).
 
 ## 3. Technical Architecture
 
@@ -391,7 +401,9 @@ Its `schema.params` is the reference tuple of the start event. One callable, man
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-entity-definition-version`
 
 One published, immutable revision of the process definition: the document of §3.6 at a semver,
-the validation result the hook returned, the publishing principal and instant (registry-held).
+whose document `version` equals the registry semver, and its publishing instant (registry-held);
+the validation result and the publishing principal are registry-held only once the hook ask lands
+(decision D-137).
 It is what an instance pins to and what the fence of §4 is checked against.
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-entity-definition-task`
@@ -430,7 +442,7 @@ the operation the arm calls.
 
 ```mermaid
 graph TB
-    AUTH[Definition author / platform operator]
+    AUTH[Orders publish job, platform-operator role §4.2]
     REG[serverless-runtime Function Registry<br/>/api/serverless-runtime/v1/functions]
     HOOK[Orders validation hook<br/>rules of §2.2 — pending ask; CI test until then]
     OPR[owf_step_operation<br/>01 §3.7]
@@ -528,12 +540,12 @@ payload that deliver a Temporal signal are an **upstream ask** (§3.3).
 
 | Purpose | Platform endpoint | Reference | Orders' use |
 |---------|-------------------|-----------|-------------|
-| Register draft, validate, publish, list versions, deprecate | `/api/serverless-runtime/v1/functions` (CRUD over Function and Workflow entities) | `DESIGN.md:857` | Publishing a definition version from the release pipeline after the CI test of §3.2; the validation hook would run inside "validate" and "publish" once the platform calls a consumer hook (pending ask); `owf_definition_binding` is to block archive/delete of a bound version through that hook, and until then through the pipeline |
+| Register draft, validate, publish, list versions, deprecate | `/api/serverless-runtime/v1/functions` (CRUD over Function and Workflow entities) | `DESIGN.md:857` | Publishing a definition version from the publish job of §4.2 after the CI test of §3.2 and the behavioural gate; deprecating the version it replaces (D-138); the validation hook would run inside "validate" and "publish" once the platform calls a consumer hook (pending ask); `owf_definition_binding` is to block archive/delete of a bound version through that hook, and until then through the pipeline |
 | Start an invocation | `POST /api/serverless-runtime/v1/invocations` with `function_id`, `mode: async`, `params`, `Idempotency-Key` | `DESIGN.md:865`, `DESIGN.md:895`–`910` | Not called by Orders — the two event triggers are the only start of `order_process` (`02 §2.2`, D-107), and a direct start by another caller is asked to be refused platform-side (`…-upreq-serverless-runtime-invocation-control-restriction`); one that happens anyway meets `admit-trigger`'s tenant, category and state checks. An operator re-drive is `…:control` `retry` keeping `invocation_id` (D-86), never a second start; with no function-level handler a failure goes on to `dead_lettered` (`DESIGN.md:458`), from which `retry` is not offered (`DESIGN.md:888`), and "retry from `dead_lettered`, keeping `invocation_id`, resuming at the faulted task" is part of the signals ask; until it is confirmed, the fallback is the dead-instance unwind of `01 §4.16` and a new order (D-105) |
-| Read invocation status | `GET /api/serverless-runtime/v1/invocations/{invocation_id}` | `DESIGN.md:867` | The instance liveness pass of the `reconciliation-sweep` worker, which raises an instance whose invocation is not live as an `invocation-dead` task (`01 §3.8`, D-105), and the progress read (`09`) |
+| Read invocation status | `GET /api/serverless-runtime/v1/invocations/{invocation_id}` | `DESIGN.md:867` | The instance liveness pass of the `reconciliation-sweep` worker, which raises an instance whose invocation is not live as an `invocation-dead` task (`01 §3.8`, D-105); `start-instance`, which records the `function_id` and `function_version` the invocation record reports as the binding (`01 §3.3`, D-137); and the progress read (`09`) |
 | Generic control | `POST …/invocations/{invocation_id}:control` (`cancel`, `suspend`, `resume`, `retry`, `replay`) | `DESIGN.md:868`, `DESIGN.md:883`–`889` | `retry` by an operator re-drive only, through the `invocation-dead` task (`07 §4.4`), from the states the platform offers it from (`failed` today, `DESIGN.md:888`); `cancel` **never** for an order cancel (§3.2); `suspend`/`resume` **never** — hold is a definition arm, not a platform suspension. Orders cannot stop another caller issuing them: a generic `cancel` surfaces as `canceled` and is raised by the liveness pass, a generic `suspend` only when it times out into `failed`; denying them on `order_process` is `…-upreq-serverless-runtime-invocation-control-restriction` (§4.4) |
 | Plugin control (signals) | `POST …/invocations/{invocation_id}:plugin-control` | `DESIGN.md:869`, `DESIGN.md:893` | Delivery of `cancel-requested`, `reauthorize-requested`, `task-resolution-requested` and `unpark-requested` to the running invocation's `listen` arms |
-| Event trigger binding | `/api/serverless-runtime/v1/event-triggers` (create, enable, disable, metrics) | `DESIGN.md:980`–`987` | Two trigger bindings to `order_process`, the one start mechanism (the document declares no `schedule`), declared in the repository's `definitions/` beside the definition and applied only by the release pipeline (§3.8, D-107) — `OrderSubmitted`, filtered to `category = new_sale` (a routing filter; `admit-trigger` re-checks the category and the tenant from the Lifecycle read, `02 §3.6`), and `OrderAmended` (`02 §2.2`) — each with `callable_type: workflow` and `execution_context: system`, the platform identity ([DESIGN_GTS_SCHEMAS.md](../../../../serverless-runtime/docs/DESIGN_GTS_SCHEMAS.md) line 1697), because an `event_source` identity would be Lifecycle's producer principal, which the step route refuses; their dead-letter handling is the trigger's `dead_letter_queue` (line 1651; its management API is out of the platform's scope) (`01 §4.8`) |
+| Event trigger binding | `/api/serverless-runtime/v1/event-triggers` (create, enable, disable, metrics) | `DESIGN.md:980`–`987` | Two trigger bindings to `order_process`, the one start mechanism (the document declares no `schedule`), declared in the repository's `definitions/` beside the definition and applied only by the publish job of §4.2 (§3.8, D-107, D-138) — `OrderSubmitted`, filtered to `category = new_sale` (a routing filter; `admit-trigger` re-checks the category and the tenant from the Lifecycle read, `02 §3.6`), and `OrderAmended` (`02 §2.2`) — each with `callable_type: workflow` and `execution_context: system`, the platform identity ([DESIGN_GTS_SCHEMAS.md](../../../../serverless-runtime/docs/DESIGN_GTS_SCHEMAS.md) line 1697), because an `event_source` identity would be Lifecycle's producer principal, which the step route refuses; their dead-letter handling is the trigger's `dead_letter_queue` (line 1651; its management API is out of the platform's scope) (`01 §4.8`) |
 | Timeline (debug) | `GET …/invocations/{invocation_id}/timeline` | `DESIGN.md:1061` | Operator debugging only; never an Orders read path |
 
 **Signals.** The operator-facing instructions map as follows:
@@ -679,7 +691,10 @@ and `raise-overdue-escalation` records nothing and is a **settled success of its
 returns the next round, the rule `obtain-verdict`'s `unobtainable` and `resolve-manual-task`'s
 `none` follow too ([`01 §3.3` *Rounds and attempts*](./01-foundation.md#rounds-and-attempts-the-one-rule-for-re-invokable-operations)): each tick calls a new key, so no loop keeps one key open
 towards the 30-day key lifetime, however far away its deadline is. The granularity is part of the definition version (§2.2 *Versioning*); the
-deadline stays the owning slice's stored value, so no definition version can move it.
+deadline stays the owning slice's stored value, and where it derives from a business window —
+the escalation window, the overdue window, an SLA class — the window is the seller's policy value
+the operation pinned on the record, so no definition version can move it and a policy write moves
+it only for records pinned after the write (decision D-134).
 
 | Wait (task name) | Fragment | Fixed granularity | Re-check operation (owner) | Answer the switch reads |
 |------------------|----------|-------------------|----------------------------|-------------------------|
@@ -694,7 +709,7 @@ deadline stays the owning slice's stored value, so no definition version can mov
 | `waitReread1` — wave-1 re-issue after a 409 and its read | (b) | `PT30S`, the barrier's poll interval | `dispatch-wave1-create` (05), under the unchanged key (D-120) | `waveOutcome` |
 | `waitExpected` — the barrier's timer half | (b) | `PT1H` | `evaluate-activation-eligibility` (04) | `due` |
 | `waitPoll` — barrier confirmation poll | (b) | `PT30S` | `reconcile-intent` (05), then `evaluate-activation-eligibility` | `released` |
-| `waitOverdue` — overdue window (`expected_fulfillment_at` + 24 h) | (b) | `PT1H` | `raise-overdue-escalation` `overdue-fulfillment` (07), under the next round | `due`, `raised` |
+| `waitOverdue` — overdue window (`expected_fulfillment_at` + the plan's pinned overdue window, default 24 h, D-134) | (b) | `PT1H` | `raise-overdue-escalation` `overdue-fulfillment` (07), under the next round | `due`, `raised` |
 | `waitHeld` — spawn signal or completion report refused while the order is held | (b) | `PT5M`; the resume arm re-enters at once | `report-spawn-signal` (05) or `report-outcome` (06), under the next round | `spawnSignal`, `lifecycleCall` |
 | `waitSla` — manual-task SLA | (c) | `PT5M` | `resolve-manual-task` `trigger: sla-check` (07) | `resolution` |
 | `waitSla` in `awaitOperatorAfterPark` — the ceiling task's SLA | (d) | `PT5M` | `resolve-manual-task` `trigger: sla-check` scoped to `ceilingTaskRef` (07), under that task's own `slaRound` (D-129) | `resolution` — `escalated` or `none` only: an order-scope task escalates and is never exhausted (`07 §4.2`) |
@@ -804,7 +819,7 @@ do:
   - startInstance:                      # protected (01)
       timeout: step
       try:
-        - call: { step: start-instance }   # ‹abridged call›; body: ref + definitionId, definitionVersion: $workflow.definition.document.version, definitionSource: platform, triggerEventId
+        - call: { step: start-instance }   # ‹abridged call›; body: ref + definitionId, definitionVersion: $workflow.definition.document.version (a cross-check: the binding records the function_version of the platform's invocation record, D-137), definitionSource: platform, triggerEventId
       catch: &transient
         errors: { with: { type: https://serverlessworkflow.io/spec/1.0.0/errors/communication } }
         when: '${ $error.status as $s | any((429, 503, 504, 409); . == $s) }'
@@ -1549,7 +1564,7 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
 The overdue monitor, the `do` list of the top-level `overdueMonitor` branch of fragment (a):
 
 ```yaml
-- waitOverdue: { wait: PT1H }           # the process deadline: expected_fulfillment_at + 24 h, owned by 07; a hold never pauses it
+- waitOverdue: { wait: PT1H }           # the process deadline: expected_fulfillment_at + the overdue window pinned on the plan (04, D-134), checked by 07; a hold never pauses it
 - overdueCheck:                         # composable (07): due only after begin-fulfillment, past the stored deadline, before a settled report-outcome
     try:
       - check:
@@ -1649,7 +1664,7 @@ unwind; an amendment or Lifecycle's `approved` expiry ends the wait through the 
 **Overdue.** The overdue window is the
 top-level `overdueMonitor` branch: every `PT1H` it calls `raise-overdue-escalation` with
 `escalationKind: overdue-fulfillment` under the round the previous tick returned, which answers
-`due: false`, records nothing and settles its round until database time passes `expected_fulfillment_at` + 24 h, answers `raised: false`
+`due: false`, records nothing and settles its round until database time passes `expected_fulfillment_at` + the plan's pinned overdue window (default 24 h, D-134), answers `raised: false`
 once `report-outcome` has settled, and otherwise records the escalation once. It raises an
 escalation and nothing else, never cancels fulfillment and is never paused by a hold
 ([`07`](./07-manual-tasks.md), `cpt-cf-bss-orders-workflow-fr-owf-overdue-escalation`); it stops
@@ -2041,7 +2056,7 @@ retry against the request row the task route wrote under the operator's authoriz
 refuses the ceiling's subject unless that recorded retry exists, so no unrecorded signal can
 release a ceiling park. The wait also carries the `PT5M` SLA tick every task waiter carries
 (`07 §4.8` item 3): `resolve-manual-task` `sla-check`, scoped to `ceilingTaskRef` and under that
-task's own `slaRound`, escalates the ceiling task to the Seller Operator once its stored 24 h
+task's own `slaRound`, escalates the ceiling task to the Seller Operator once its stored
 deadline has passed and never resolves it; it checks no other task, whose deadlines the waiter of
 the stage that owns them re-checks after the unpark (decision D-129). The ceiling task offers no
 task `cancel` (`07 §4.4`), because closing it would leave the order parked with nothing to wait
@@ -2356,7 +2371,7 @@ the binding of an instance to a version is `owf_definition_binding`
 call are `owf_step_operation` ([`01 §3.7`](./01-foundation.md#table-owf_step_operation)). The
 complete canonical definition is kept **in this repository** as `definitions/order-process.yaml`
 under the gear; it is the CI artefact that validates against the Serverless Workflow DSL 1.0.0
-schema and the rules of §2.2, and the release pipeline publishes it after writing the
+schema and the rules of §2.2, and the publish job of §4.2 publishes it after writing the
 environment's step base URL into `input.from`, asserting that nothing else differs. The fragments
 of §3.6 are an abridged review view of that file, not its bytes.
 
@@ -2371,7 +2386,7 @@ side of the topology is: the step surface of `01 §3.3` reachable from the plugi
 the service principal; the two event triggers of §3.3 (`execution_context: system`)
 provisioned once per environment and enabled only after the readiness gate; the validation hook of §3.2 registered with the platform registry once
 the platform calls a consumer hook (a pending ask; until then the CI test is the gate); and the repository
-`definitions/` directory published to the registry by the release pipeline, never by hand. The two
+`definitions/` directory published to the registry by the publish job of §4.2, never by hand. The two
 trigger bindings are part of that directory (decision D-107): their event type, filter,
 `callable_type` and `execution_context` are reviewed and CI-checked with the definition — the CI
 test asserts exactly the two bindings of `02 §2.2`, both `execution_context: system`, the
@@ -2379,11 +2394,15 @@ test asserts exactly the two bindings of `02 §2.2`, both `execution_context: sy
 platform-operator publish role, and the readiness check compares the bindings the platform lists
 for `order_process` with the repository's and reports any drift. A binding edited by hand is
 therefore a drift alert, and the run-time guard behind it is `admit-trigger`'s re-check. One
-definition version is **active for new instances** per environment at a time; older versions stay
-published while bindings name them and are deprecated, never deleted, thereafter.
+definition version is **active for new instances** per environment at a time: the publish job
+publishes a version and deprecates the one it replaces in the same run, and rolls back by
+publishing the last good document as a new version (§4.2, decision D-138). Older versions stay
+published — `deprecated`, still callable by the instances pinned to them — and are never archived
+or deleted by the job.
 
 **Observability owned here**: active definition version per environment; count of instances
-bound per version (`01 §3.8`); validation-hook refusals by rule; signal deliveries by type and
+bound per version (`01 §3.8`); new bindings in the last hour to any version other than the active
+one, and bound versions the registry no longer lists as `active` or `deprecated` (§4.2); validation-hook refusals by rule; signal deliveries by type and
 delivery outcome; the platform's invocation status distribution for `order_process` read from
 `GET /api/serverless-runtime/v1/invocations` (`DESIGN.md:866`) — `suspended` is the normal state
 of a healthy long-running instance; `failed`, `dead_lettered`, `canceled`, `compensating`,
@@ -2404,10 +2423,10 @@ any of them:
 | Stage | Protected operations, in order | May be interleaved with (composable) |
 |-------|-------------------------------|--------------------------------------|
 | Admission | `admit-trigger` (`role: start`) **<** `start-instance`; on every arm that consumes a Lifecycle trigger, `admit-trigger` (`role: listen`) **<** the consuming operation (`evaluate-payment-auth-eligibility`, `apply-hold`, `apply-resume`, `terminate-on-terminal-event`, `run-cancellation-fence` on supersede); `apply-resume` with `trigger: poll` consumes no trigger and follows no admission — the Lifecycle order read inside it is its guard (D-130), wherever it is called from (the resume wait, or `pollHeld` in another wait, D-133) | — |
-| Verdict | `obtain-verdict` **<** `reflect-verdict`; `record-decision` **<** `reflect-verdict` on the decision path | `open-gates`, `escalate-gate`, `arm-park-escalation`, `park`, `unpark` |
+| Verdict | `obtain-verdict` **<** `reflect-verdict`; `record-decision` **<** `reflect-verdict` on the decision path. The `p1` composables on their paths (decision D-135): on every walk where `verdict = unobtainable`, `park` **<** a park loop whose tick calls `arm-park-escalation`, with a walk from it to `raise-overdue-escalation` (`escalationKind: park`), and no `reflect-verdict`, `open-gates` or `nextStage: fulfillment` until a later `obtain-verdict` answers `required` or `not-required` (ADR-0007, `03 §4.5` items 2 and 6); on every walk where `reflected = pending_approval`, `open-gates` **<** `record-decision`, and the wait between them is a competing `fork` carrying the decision `listen` and a tick branch whose route calls `escalate-gate` `mode: fire` and then `mode: probe`, with a walk from a probe to `raise-overdue-escalation` (`escalationKind: approval-outage`) (`fr-owf-approval-request`, `fr-owf-approval-escalation`, `03 §4.5` items 1, 4 and 5) | `open-gates`, `escalate-gate`, `arm-park-escalation`, `park`, `unpark` (beyond those paths) |
 | Plan | `evaluate-payment-auth-eligibility` **<** `construct-and-freeze-plan` **<** `begin-fulfillment` | `evaluate-activation-eligibility` |
 | Waves | `begin-fulfillment` **<** `dispatch-wave1-create` **<** `re-check-pre-activation` **<** `report-spawn-signal` **<** `dispatch-wave2-activate`; on every path to `dispatch-wave2-activate`, the barrier's `waitExpected` re-check loop and an `evaluate-activation-eligibility` answer `released` **<** `dispatch-wave2-activate` — the ADR-0004 conjunction, whose run-time guard is `05 §3.6` `inst-pi-wave2-guard` (`activation-precondition-unmet`); `evaluate-activation-eligibility` stays `composable` everywhere else | `evaluate-activation-eligibility` (beyond the conjunction), `reconcile-intent`, `reread-draft-liveness`, `rebuild-wave1` |
-| Failure | `create-manual-task` before any terminal outcome under `remediate` | `resolve-manual-task` (which runs `retry-step` in-process), `verify-override`, `raise-overdue-escalation` |
+| Failure | `create-manual-task` before any terminal outcome on every walk where `policy = remediate` or `forceTask` is set; on a walk where `policy = fail-fast` and `forceTask` is not set, the failure route reaches the unwind with no `create-manual-task` (`07 §4.8` item 1), so the switch that picks the route reads the seller's pinned `policy` and no literal of its own (decision D-135). After every `create-manual-task`, and after the ceiling's `raise-overdue-escalation` (`lifetime-ceiling`), the wait that holds the task is a competing `fork` carrying the `task-resolution-requested` `listen`, whose route calls `resolve-manual-task` (`trigger: request`), and a tick branch whose route calls `resolve-manual-task` (`trigger: sla-check`) (`fr-owf-manual-task`, `nfr-owf-manual-task-sla`, `07 §4.8` item 3); `verify-override` only after a `resolve-manual-task` (`07 §4.8` item 5) | `resolve-manual-task` (which runs `retry-step` in-process), `verify-override`, `raise-overdue-escalation` (beyond those paths) |
 | Unwind | `run-cancellation-fence` **<** `compensate-order` **<** `report-outcome` on every failure, cancel, supersede and terminal-event path; `authorize-cancel` **<** `run-cancellation-fence` on the cancel path; `terminate-on-terminal-event` **<** `run-cancellation-fence` on the terminal-event path | — |
 | Hold | `apply-hold` **<** `apply-resume`, in the arm that owns the escalation `wait` | — |
 | Termination | `terminate-instance` last on every path; `report-outcome` **<** `terminate-instance` where an outcome is reported | — |
@@ -2415,18 +2434,73 @@ any of them:
 `settle-from-lookup` and `retry-step` **MUST NOT** appear (D-108). No path **MAY** reach `report-outcome` with
 `outcome: completed` except through `dispatch-wave2-activate`, and none **MAY** reach it with
 `failed`, `cancelled` or `superseded` except through `compensate-order`. **Rationale**: these are
-the steps the PRD's acceptance criteria and the seam rules R1–R5 make non-negotiable; everything
-else is the flow's to arrange.
+the steps the PRD's acceptance criteria and the seam rules R1–R5 make non-negotiable, and the
+`p1` composables on their paths are the ones without which a `p1` requirement has no realisation
+at all — the operations stay `composable`, so the counts of ADR-0012 (22 `protected`, 13
+`composable`) do not change; everything else is the flow's to arrange.
 
-### 4.2 The validation hook contract
+### 4.2 The validation hook contract and the publish job
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-constraint-definition-validation-hook`
 
 The eight rules of §2.2 *Validation before publish* **MUST** run as a CI test over the
 repository copy of every canonical definition on every change to `definitions/` or to any slice's
-§3.3 declaration, and a version **MUST NOT** be published from outside the pipeline that runs the
-test. The CI test **MUST** assert that every version named by a binding in each environment is
-still published there. Whether the platform registry calls a consumer-supplied hook before
+§3.3 declaration, and a version **MUST NOT** be published except by the publish job below
+(decision D-138).
+
+**The publish job.** Definition publishing is a pipeline job of its own. It runs on a merge to
+`definitions/` and **MUST NOT** build, package or deploy the gear, so a definition change reaches
+an environment without an Orders release. A merge to `definitions/` needs the approval of the
+repository's code owners for that directory, who are the Orders definition owners, and of a second
+reviewer. A change that also touches an operation — its code, its slice §3.3 declaration or the
+protected list — is an Orders release: it goes through the release pipeline, and the definition
+that uses it is published once that release is deployed. In each environment, in promotion
+order, the job:
+
+1. runs the rules of §2.2 over the candidate against the `owf_step_operation` declarations of the
+   Orders release deployed in that environment and against its step-surface base;
+2. in the first non-production environment only, runs the **behavioural gate**: it publishes the
+   candidate there and drives a scenario suite with one order per path of §3.6 — approval
+   not required, required and unobtainable (a); fulfillment through both waves (b); a partial
+   failure under each policy (c); a cancel (d); a hold and resume (e); an amendment and each
+   terminal event (f) — against that environment's real step surface, with test doubles for
+   Lifecycle, Subscriptions and the approval service. After every step operation the suite asserts
+   Orders' record, and at every route it asserts the slice items §4.7 lists as canonical-definition
+   guidance. A business window is a seller-policy value (decision D-134), so the suite seeds short
+   windows for its test seller; a tick longer than the suite's budget, and the `P90D` ceiling, are
+   covered by the rules only, and the suite reports them as not exercised. A failing scenario
+   stops the job before any other environment is touched;
+3. publishes the version, deprecates the version it replaces in the same run, and applies the two
+   trigger bindings of §3.8;
+4. never archives or deletes a version.
+
+**Which version starts new orders.** One version per callable id is `active` in an environment
+after each run. The platform does not state which version an event trigger starts — the newest
+`active` version of the major its `function_id` names, or a version pinned in the binding — and
+offers no tenant-scoped or percentage activation; both are the ask
+`cpt-cf-bss-orders-workflow-upreq-serverless-runtime-trigger-version-selection`
+([`../UPSTREAM_REQS.md`](../UPSTREAM_REQS.md) §2.9). Until it lands the behavioural gate is the
+only execution of a candidate before production, and the gear's readiness check alerts on a new
+binding to any version other than the one the job left `active` (§3.8).
+
+**Rollback** is forward. The registry has no transition from `deprecated` back to `active`
+([serverless-runtime DESIGN](../../../../serverless-runtime/docs/DESIGN.md#function-status-state-machine)
+lines 588–607), so the job rolls a bad version back by publishing the last good document as a new
+minor version, which deprecates the bad one. Instances already pinned to the bad version run on
+it to termination (§4.3); an operator ends one that misbehaves with the order cancel or through its
+manual tasks.
+
+**A major bump** changes the callable id (`…order_process.v<major>~`, §3.1). The job publishes the
+new major, re-points both trigger bindings to it and deprecates the old major's `active` version in
+the same run; instances of the old major run to termination on it.
+
+**Bound versions** are checked in each environment, not by the repository's CI, which cannot read
+an environment's `owf_definition_binding`. The gear's readiness check compares the versions its
+bindings name with the registry's version listing and alerts on one that is neither `active` nor
+`deprecated`; because the job never archives or deletes, such a version is the trace of a publish
+or transition outside the job.
+
+Whether the platform registry calls a consumer-supplied hook before
 publish is a **pending upstream ask**
 (`cpt-cf-bss-orders-workflow-upreq-serverless-runtime-definition-versioning-validation-hook`,
 [`../UPSTREAM_REQS.md`](../UPSTREAM_REQS.md) §2.9); the platform today has only the plugin's
@@ -2434,8 +2508,9 @@ registration-validation hook (`DESIGN.md:762`). When the ask lands, the validati
 **MUST** run the same rules over every candidate version before publish, **MUST** name the rule
 and the task location in the platform's `ValidationError` shape, and **MUST** refuse the
 platform's `archive` and `delete` transitions for a version an `owf_definition_binding` names;
-until then a publish outside the pipeline is an unvalidated publish this design does not
-permit.
+until then a publish outside the job is an unvalidated publish this design does not permit, which
+the same ask asks the platform to refuse by restricting publishes of `order_process` to the job's
+identity (decision D-137).
 
 ### 4.3 Pinning
 
@@ -2446,9 +2521,14 @@ An instance **MUST** run to termination on the version `start-instance` bound
 binding, no operator surface **MAY** migrate an instance (PRD §5.2), and a new version **MUST**
 affect only instances started after its publication. The platform's own pin of the invocation to
 the callable version ([`DESIGN.md:614`](../../../../serverless-runtime/docs/DESIGN.md#versioning-model))
-and Orders' binding **MUST** agree; `start-instance` records the version the invocation reports
-(`$workflow.definition.document.version`, dsl.md *Workflow Descriptor*) and a disagreement between that value and the version the
-release pipeline marked active is an alert, not a silent choice.
+and Orders' binding **MUST** agree: `start-instance` records the `function_id` and
+`function_version` that the platform's invocation record reports for the bound invocation
+(`GET /api/serverless-runtime/v1/invocations/{invocation_id}`,
+[DESIGN_GTS_SCHEMAS.md](../../../../serverless-runtime/docs/DESIGN_GTS_SCHEMAS.md#invocationrecord)),
+never the document's self-declared `version`, which it only compares. A document whose `version`
+differs from the registry semver the platform pinned, or an invocation of another callable, is
+refused `definition-not-bound` (decision D-137). A new binding to a version other than the one the
+publish job left `active` is an alert (§4.2), not a silent choice.
 
 ### 4.4 Signal semantics
 
@@ -2584,13 +2664,41 @@ failed while the definition proceeds as if it had not.
 
 - [ ] `p2` - **ID**: `cpt-cf-bss-orders-workflow-constraint-definition-change-scope`
 
-A new version **MAY** reorder `composable` operations within a stage, change any `wait` inside
-the nesting rule, change retry attempts and backoff, change `switch` predicates over returned
-enums, and add or remove a `listen` arm whose type is in the closed set. A new version **MUST
-NOT** introduce an operation name not in `owf_step_operation`, a `listen` type outside the closed
-set, a `run` or `emit` task, a `body` member outside the reference schemas, or an `emit` of any
-of the six process events. Anything in the second list is an Orders release and a change to the
-slice that owns it.
+This table is the one statement of which change needs which vehicle (decision D-136); §1.1,
+§2.2, ADR-0011's adjustability contract and `../DESIGN.md` §4.7 point here.
+
+| Change | Vehicle | Checked by |
+|--------|---------|------------|
+| The order of `composable` operations within a stage where no enforced item pins it; which manual-task or escalation arm an answer routes to; `switch` predicates over returned enums, other than the pinned members of rule 1 | A new definition version, published by the job of §4.2 | Rules of §2.2, the fence of §4.1, the behavioural gate |
+| Adding or dropping a `composable` operation, other than a `p1` composable on the path §4.1 requires it on | A new definition version | Same |
+| The tick of a re-check loop (§3.6 *Fixed waits and re-check loops*); retry attempts, backoff and jitter within the operation's `retry_class`; task timeouts | A new definition version | Rules 4 and 7, the behavioural gate |
+| Adding or removing a `listen` arm whose type is in the closed set, other than the shared arms rule 8 requires | A new definition version | Rules 3 and 8 |
+| The approval escalation window, the overdue window, the manual-task SLA classes, the partial-failure policy | A write of the seller's policy, audited; it reaches only records pinned after it (decision D-134) | The policy write's bounds check (`07 §4.8` item 8) |
+| Approval gate parties, their count and order | The approval routing configuration, which `open-gates` reads (`03 §3.6`) | Not Orders' |
+| A new operation; any operation's behaviour, input or output schema, `deadline_ms`, `retry_class` or `protection`; the protected list and its order; the path a `p1` composable is required on | An Orders release of the slice that owns it, then a definition version that uses it | The release pipeline; `owf_step_operation` is compiled (ADR-0012) |
+| A refusal or manual-task reason; a table or column, seam call, idempotency family, audit kind or PDP catalogue value | An Orders release | The release pipeline |
+| A `listen` type, operator signal, Lifecycle trigger or process event | A PRD-level change, then an Orders release | The release pipeline |
+| A `call` to a platform Function; a `run`, `emit`, `for` or `schedule` task | Not permitted by any vehicle | Rules 2 and 7 |
+| Re-authorisation after plan freeze; parking a partial failure | Not permitted: the fence orders `evaluate-payment-auth-eligibility` **<** `construct-and-freeze-plan` **<** `begin-fulfillment`, and park is for an unobtainable verdict only (`08 §4.7` item 7) | Rules 1 and 6 |
+
+**Slice constraints.** Each slice's *Constraints this slice places on the definition* has two
+kinds of item (decision D-136). An **enforced** item restates a rule of §2.2 or a row of §4.1, and
+the validator refuses a version that breaks it through that rule. Every other item is
+**canonical-definition guidance**: the canonical version of §3.6 carries it, the behavioural gate
+of §4.2 asserts it for every candidate, and a version departs from it only by amending the slice
+item in the same change. The validator does not refuse a version for a guidance item; the run-time
+guards of the operations remain the backstop.
+
+| Slice | Enforced items (rule or §4.1 row) | Canonical-definition guidance |
+|-------|-----------------------------------|-------------------------------|
+| [`02 §4.7`](./02-triggers-and-start.md#47-constraints-this-slice-places-on-the-definition) | 1 (rule 1, Admission); 4 (rule 1, Unwind); 6 (rule 6); 8, the amendment arm (rule 8); 9 (rule 7) | 2; 3; 5; 7; 8, the route of a `begin-fulfillment` refusal; 10 |
+| [`03 §4.5`](./03-approval-execution.md#45-constraints-this-slice-places-on-the-definition) | 1 and 2 (rule 1, Verdict); 3 (rule 6); 4 and 5, the fork, its arms and its calls (rules 1 and 8); 6, the park loop's calls (rule 1, Verdict); 8 (rules 3 and 8) | 4, 5 and 6, the tick values; 7 |
+| [`04 §4.8`](./04-fulfillment-plan.md#48-constraints-this-slice-places-on-the-definition) | 1 (rule 1, Plan and Waves); 7, the conjunction (rule 1, Waves); 8 (rule 6); 9 (rule 5) | 2; 3; 4; 5; 6; 7, the `PT1H` tick and the undispatched route |
+| [`05 §4.5`](./05-provisioning-intents.md#45-constraints-this-slice-places-on-the-definition) | 1 (rule 1, Waves); 2, the `catch` (rule 6); 7, the exported members (rule 5); 9, the `completed` report (§4.1); 12 (rule 4) | 2, the status set; 3; 4; 5; 6; 8; 10; 11 |
+| [`06 §4.7`](./06-saga-and-compensation.md#47-constraints-this-slice-places-on-the-definition) | 1 (rule 1, Unwind); 4 (rule 2); 5 (rule 6); 6 (§4.1); 7 (rule 8) | 2; 3; 8 |
+| [`07 §4.8`](./07-manual-tasks.md#48-constraints-this-slice-places-on-the-definition) | 1 (rule 1, Failure); 2 (rule 6); 3, the fork and its calls (rule 1, Failure); 5 (rule 1, Failure); 9 (rules 3 and 8) | 3, the `PT5M` tick; 4; 6; 7. Item 8 is checked where the seller's policy is written, not by the validator |
+| [`08 §4.7`](./08-hold-and-cancel.md#47-constraints-this-slice-places-on-the-definition) | 1, the order (rule 1, Hold); 2 and 3, the arms (rule 8); 4 (rule 5); 5, the order (rule 1, Unwind); 6 (rule 6); 7 (rules 1 and 6); 9 (rules 3 and 7) | 1, the tick; 2, the placement of the poll and expected-time branches; 5, the return route; 8; 10 |
+| [`09 §4.6`](./09-read-and-authz.md#46-constraints-this-slice-places-on-the-definition) | 1 (rule 2); 2 (rule 5); 3 (rules 1 and 8); 5 (rule 6) | 4 |
 
 ## 5. Traceability
 

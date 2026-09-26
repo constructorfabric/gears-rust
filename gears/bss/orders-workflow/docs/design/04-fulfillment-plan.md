@@ -254,7 +254,10 @@ and returned to the definition as the `policy` enum the fragment (c) `switch` br
 later failure on that order version uses the pinned value and never the live configuration; the
 definition carries the enum it was given and never re-derives it. Without the pin, a configuration
 change mid-flight would silently move a running order between "raise a manual task" and
-"compensate everything and acknowledge `fulfillment_failed`".
+"compensate everything and acknowledge `fulfillment_failed`". The same resolution pins the seller's
+**overdue window** as `owf_fulfillment_plan.overdue_window_ms` (business default 24 h), which
+slice 07's overdue check reads; the definition holds neither value's duration, and a change to the
+seller's policy reaches only plans frozen after it (decision D-134).
 
 **ADRs**: `cpt-cf-bss-orders-workflow-adr-saga-compensable-no-pivot`
 
@@ -727,14 +730,14 @@ Output: planRef, lineRefs[], expectedFulfillmentAt, policy, planState, reason
 1. [ ] - `p1` - **IF** the plan for (`orderId`, `orderVersion`) has `frozen_at` set: **RETURN** `frozen` with the stored `planRef`, `lineRefs`, `expected_fulfillment_at` and `partial_failure_policy`, under any `attempt` - `inst-pc-if-frozen`
 2. [ ] - `p1` - Read the order's lines, service-activation dates, frozen market and payer through the Lifecycle order read; **IF** unavailable: settle `retryable-failure` (503) - `inst-pc-read-order`
 3. [ ] - `p1` - **IF** the line count exceeds 200: settle `permanent-failure` with `line-count-exceeded` (a defensive re-assertion of the check `start-instance` delegates to this slice) - `inst-pc-if-line-count`
-4. [ ] - `p1` - Resolve the partial-failure policy from the seller's current configuration and hold it for pinning - `inst-pc-resolve-policy`
+4. [ ] - `p1` - Resolve the partial-failure policy and the overdue window from the seller's current policy and hold them for pinning (decision D-134) - `inst-pc-resolve-policy`
 5. [ ] - `p1` - Read Catalog topology for exactly these lines; **IF** the read fails transiently: settle `retryable-failure` (503) with `catalog-topology-unavailable`, leaving the key `open` - `inst-pc-read-topology`
 6. [ ] - `p1` - **IF** the response carries no topology revision or marks any line unresolved: write the unfrozen row with the pinned policy and `abort_record` (`catalog-topology-unavailable`, the unresolved line set as evidence); **RETURN** `topology-unavailable` - `inst-pc-if-incomplete`
 7. [ ] - `p1` - Build one `FulfillmentTask` per line (bundles never expanded), validate the graph acyclic and closed over the order's lines, compute `dependency_rank` - `inst-pc-build-validate`
 8. [ ] - `p1` - **IF** the graph is missing an edge target or is cyclic: write the unfrozen row with the pinned policy and `abort_record` (`invalid-dependency-graph`, the offending edge set); **RETURN** `invalid-graph` - `inst-pc-if-invalid`
 9. [ ] - `p1` - Read the payer's current commercial profile and the `SUB-O5` overlap presence for the lines, and record the observation in `construction_recheck` (`clear` · `collision` · `divergence` · `unevaluable`, with per-line codes); the observation **MUST NOT** block the freeze (§4.2) - `inst-pc-advisory-recheck`
 10. [ ] - `p1` - Compute `expected_fulfillment_at = max(database now, latest service-activation date among lines)` - `inst-pc-expected-time`
-11. [ ] - `p1` - In the settlement transaction: insert the tasks in `pending`, write `dependency_graph`, `catalog_topology_revision`, `partial_failure_policy`, `expected_fulfillment_at`, set `frozen_at` and `frozen_by_attempt_id`; **RETURN** `frozen` - `inst-pc-freeze`
+11. [ ] - `p1` - In the settlement transaction: insert the tasks in `pending`, write `dependency_graph`, `catalog_topology_revision`, `partial_failure_policy`, `overdue_window_ms`, `expected_fulfillment_at`, set `frozen_at` and `frozen_by_attempt_id`; **RETURN** `frozen` - `inst-pc-freeze`
 
 **Description**: Construction runs while the order is still `approved`. The advisory observation
 satisfies the PRD's "at plan construction … consume the same overlap-presence read" without
@@ -950,6 +953,7 @@ table is lost; no table in this slice holds a timer.
 | payment_auth_request_ref | text nullable | The Payments authorization request identity read by request; join key only, never returned to the definition. |
 | begin_fulfillment_committed_at | timestamptz nullable | Database time `begin-fulfillment` recorded a committed `in_fulfillment`. |
 | partial_failure_policy | text nullable | `remediate` \| `fail_fast`, pinned by `construct-and-freeze-plan` (§2.2); NULL only before construction. |
+| overdue_window_ms | bigint nullable | The seller's overdue window, pinned by `construct-and-freeze-plan` with the policy (§2.2, business default 24 h); the overdue deadline is `expected_fulfillment_at` + this value, read by `07`'s `raise-overdue-escalation`; NULL only before construction (decision D-134). |
 | catalog_topology_revision | text nullable | The Catalog topology revision the graph was resolved against. |
 | dependency_graph | jsonb nullable | Validated, acyclic dependency edges among this plan's tasks. |
 | expected_fulfillment_at | timestamptz nullable | `max(construction time, latest service-activation date among lines)`; returned as `expectedFulfillmentAt`. |
@@ -965,7 +969,7 @@ table is lost; no table in this slice holds a timer.
 
 **Constraints**: NOT NULL on order_id, order_version, plan_ref, resource_tenant_id,
 payer_tenant_id, seller_tenant_id, recheck_defer_count, created_at; `plan_ref` UNIQUE;
-`partial_failure_policy`, `catalog_topology_revision`, `dependency_graph`,
+`partial_failure_policy`, `overdue_window_ms`, `catalog_topology_revision`, `dependency_graph`,
 `expected_fulfillment_at` and `frozen_by_attempt_id` NOT NULL once `frozen_at` is set, and
 immutable thereafter; `abort_record` NULL whenever any task of the plan is `activated`; at most
 **200** tasks per plan (§4.6).
@@ -973,7 +977,7 @@ immutable thereafter; `abort_record` NULL whenever any task of the plan is `acti
 **Additional info**: **Ownership** — one writer per column group, each inside its operation's
 settlement transaction through the envelope: `evaluate-payment-auth-eligibility` creates the row
 and writes `payment_auth_*`; `begin-fulfillment` writes `begin_fulfillment_committed_at`;
-`construct-and-freeze-plan` writes the policy, graph, revision, expected instant, construction
+`construct-and-freeze-plan` writes the policy and overdue window, graph, revision, expected instant, construction
 observation, freeze columns and a construction `abort_record`; `re-check-pre-activation` writes
 `recheck_*` and a pre-activation `abort_record`. **Mutability**: deliberately mutable before
 freeze and in the listed post-freeze columns (`begin_fulfillment_committed_at`, `recheck_*`,
@@ -1173,7 +1177,7 @@ this slice derives, proposed into the program-wide NFR workshop:
 | Bound | Working baseline | Derivation |
 |-------|------------------|------------|
 | Wave-2 task timeout | **3 min** (`01 §4.2`) | The measured window is wave 2. With the per-order cap of 8 parallel lines inside `dispatch-wave2-activate`, the window holds `ceil(N / 8)` serial batches plus the acknowledgement; 3 min leaves room for 4 batches and the acknowledgement inside 15 min. |
-| Wave-1 task timeout | **10 min** (`01 §4.2`) | Outside the measured window; bounded by the overdue window (24 h past expected fulfillment) and by the need for a rebuild to fit inside it. |
+| Wave-1 task timeout | **10 min** (`01 §4.2`) | Outside the measured window; bounded by the overdue window (the seller's pinned window, default 24 h past expected fulfillment, D-134) and by the need for a rebuild to fit inside it. |
 | SLA population | orders with **N ≤ 40** lines | `ceil(N / 8) x 3 min ≤ 15 min` gives 4 batches, i.e. 40 lines, ignoring dependency depth. Orders above 40 lines are excluded from the p95 population, alongside the manual-step and future-dated-wait orders `PRD.md:586` excludes. A deep graph narrows this further for that order. |
 | Max lines per order | **200** | An admission bound on plan size: it bounds the frozen graph, the compensation fan-out and the largest `OrderFulfillmentCompleted` payload (`01 §4.7`). Refused at start with `line-count-exceeded` (delegated by `start-instance`) and re-asserted by `construct-and-freeze-plan`; 41–200 lines execute normally outside the SLA population. |
 | Authorization validity | **30 days** (`payment_auth_validity`) | The horizon the freshness leg of `re-check-pre-activation` applies; the barrier can defer wave 2 up to the future-dated horizon inside a 90-day lifetime. |
@@ -1206,7 +1210,10 @@ catalogue** (`01 §4.9`) — `identity-party-unavailable` (§3.6); (h) **`DESIGN
 
 These are inputs to the validation rules of
 [`10 §2.2` *Validation before publish*](./10-process-definition.md#validation-before-publish) and
-the fence of `10 §4.1`; the items marked **alignment** name a defect the canonical fragment of
+the fence of `10 §4.1`. [`10 §4.7`](./10-process-definition.md#47-what-a-definition-change-may-and-may-not-do) *Slice constraints* maps each item below: an
+enforced item is refused through the rule or fence row it restates; every other item is
+canonical-definition guidance, which the canonical version carries and the behavioural gate of
+`10 §4.2` asserts for every candidate version (decision D-136). The items marked **alignment** name a defect the canonical fragment of
 `10 §3.6` (b) had before the fragments were reconciled with the slice operations (D-80, D-81);
 the fragment now carries each rule, and the note is kept as the reason the rule exists:
 
@@ -1246,7 +1253,7 @@ the fragment now carries each rule, and the note is kept as the reason the rule 
    `false`; `due` is database time against the plan's stored `expected_fulfillment_at`, so the
    definition **MUST NOT** wait on `expectedFulfillmentAt` itself (a 1.0.0 `wait` takes no runtime
    expression, `10 §3.6` *Fixed waits and re-check loops*); the overdue deadline is
-   the same instant plus 24 h, owned by slice 07; `evaluate-activation-eligibility` **MUST** be re-invoked on every
+   the same instant plus the overdue window pinned on the plan (decision D-134), checked by slice 07; `evaluate-activation-eligibility` **MUST** be re-invoked on every
    Subscriptions draft-create outcome event **and** on the poll interval; the definition **MUST
    NOT** decide release from its own memory of confirmations; a non-empty `undispatchedLineRefs`
    **MUST** route to `dispatch-wave1-create` with those lines, so a retried or never-written

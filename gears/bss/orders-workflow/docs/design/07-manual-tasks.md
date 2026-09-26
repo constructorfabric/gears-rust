@@ -100,7 +100,7 @@ which is the platform trigger path's (`01 §4.8`).
 | `cpt-cf-bss-orders-workflow-fr-owf-manual-task` | `create-manual-task` (protected) is the definition's failure-arm call under `remediate`; its creation port is the in-process door for `compensate-order` (06), `raise-overdue-escalation` (`lifetime-ceiling`) and `authorize-cancel` (08). The Incident Recorder substitutes under fail-fast for **forward-execution** failures only — a compensation failure always produces an actionable task (§2.2). |
 | `cpt-cf-bss-orders-workflow-fr-owf-override-semantics` | `verify-override` calls Subscriptions inside Orders, binds the check to the line's `binding_reference`, takes the asserting operator from the request row the control endpoint wrote from `SecurityContext`, lands the line `activated` through slice 04's transition function with `provenance = operator-override`, and records the verified-override columns slice 06 freezes as a compensation subject. |
 | `cpt-cf-bss-orders-workflow-fr-owf-task-queue` | The Operator Task Queue projects manual tasks, incidents and escalations, seller-scoped and keyset-paginated, with the PDP-compiled scope applied inside every mutation; dead-letter rows are **pending** the platform's operator visibility (§3.7 `owf_dead_letter_triage`). |
-| `cpt-cf-bss-orders-workflow-fr-owf-overdue-escalation` | The overdue window is the top-level `overdueMonitor` branch of `10 §3.6` (a), its `do` list in (b): every `PT1H` it calls `raise-overdue-escalation`, which is due only past `expected_fulfillment_at` + 24 h; `raise-overdue-escalation` records the escalation with order **and step** context and never touches order or line state. |
+| `cpt-cf-bss-orders-workflow-fr-owf-overdue-escalation` | The overdue window is the top-level `overdueMonitor` branch of `10 §3.6` (a), its `do` list in (b): every `PT1H` it calls `raise-overdue-escalation`, which is due only past `expected_fulfillment_at` + the overdue window pinned on the plan (default 24 h, D-134); `raise-overdue-escalation` records the escalation with order **and step** context and never touches order or line state. |
 | `cpt-cf-bss-orders-workflow-fr-owf-dead-letter` | The manual-task-vs-dead-letter boundary is unchanged: a step failure has the manual task; an inbound delivery past its cap is the platform's dead letter (`01 §4.8`). |
 
 #### NFR Allocation
@@ -616,7 +616,7 @@ whose only effect is an operator escalation. This component is the one recorder 
 
 Owns `raise-overdue-escalation` (§3.3). **It owns no timer** (retired by ADR-0011): the clocks
 are the definition's — the `overdueMonitor` branch (`PT1H` `waitOverdue`, against the stored
-`expected_fulfillment_at` + 24 h), the `lifetimeCeiling` branch (a literal `P90D` `waitCeiling`,
+`expected_fulfillment_at` + the overdue window pinned on the plan, `04 §3.7`), the `lifetimeCeiling` branch (a literal `P90D` `waitCeiling`,
 whose firing enters the ceiling stage of fragment (d)), the park loop's `PT5M` `waitTtlMargin`
 against the park's `escalation_due_at`, and the outage arm's `PT30S` probe against the outage
 threshold of `03 §4.5` — and each calls this operation with its `escalationKind`. A 1.0.0 `wait`
@@ -695,7 +695,9 @@ calls a downstream, 5 s for a record-only one.
 
 `resolve-manual-task`, `verify-override` and `raise-overdue-escalation` are `composable`: a
 definition version may reposition them, but the constraints of §4.8 bind any version that contains
-the arms they serve. `create-manual-task` is `protected`.
+the arms they serve, and `10 §4.1` requires `resolve-manual-task` in the wait after every task and
+`raise-overdue-escalation` on the park and outage paths, so neither may be dropped there (decision
+D-135). `create-manual-task` is `protected`.
 
 **Callers of the creation path.** The route-coverage test enumerates exactly these; a new
 failed-entrance route is a change to this table.
@@ -961,7 +963,7 @@ sequenceDiagram
     participant D as Definition (10 §3.6 a, b, d)
     participant ROE as raise-overdue-escalation
     participant R as Record
-    D ->> D: overdueMonitor PT1H tick (due past expected_fulfillment_at + 24 h) | ceiling stage after waitCeiling (P90D) | park loop once arm-park-escalation is due | outage arm once the threshold is due
+    D ->> D: overdueMonitor PT1H tick (due past expected_fulfillment_at + the pinned overdue window) | ceiling stage after waitCeiling (P90D) | park loop once arm-park-escalation is due | outage arm once the threshold is due
     D ->> ROE: raise (ref, escalationKind, subjectRef, stepRef)
     ROE ->> R: read step context from the record (last settled step, wave, open lines, blocking object)
     alt park
@@ -979,7 +981,7 @@ sequenceDiagram
 1. [ ] - `p1` - Resolve the instance; refuse `version-mismatch` if terminal - `inst-roe-resolve`
 2. [ ] - `p1` - **IF** `escalationKind = park`: read the park by `subjectRef`; **IF** it is resolved or `escalated_at` is set **RETURN** `raised: false`; **ELSE** stamp `escalated_at` through slice 03's park port and record `park_reason` and the time remaining before the `submitted` TTL (D-57) - `inst-roe-park`
 3. [ ] - `p1` - **IF** `escalationKind = approval-outage`: record the paused gates at `subjectRef` as the blocking object - `inst-roe-outage`
-4. [ ] - `p1` - **IF** `escalationKind = overdue-fulfillment`: **IF** the instance already has a settled `report-outcome` **RETURN** `raised: false`; read `expected_fulfillment_at` from the plan (04); **IF** database now is before it plus 24 h **RETURN** `due: false`, `raised: false` and `nextRound` — a settled success of this round; **ELSE** set `due: true` and read the last settled step operation and the non-terminal lines and intents - `inst-roe-overdue`
+4. [ ] - `p1` - **IF** `escalationKind = overdue-fulfillment`: **IF** the instance already has a settled `report-outcome` **RETURN** `raised: false`; read `expected_fulfillment_at` and the pinned `overdue_window_ms` from the plan (04, decision D-134); **IF** database now is before their sum **RETURN** `due: false`, `raised: false` and `nextRound` — a settled success of this round; **ELSE** set `due: true` and read the last settled step operation and the non-terminal lines and intents - `inst-roe-overdue`
 5. [ ] - `p1` - **IF** `escalationKind = lifetime-ceiling`: set the escalation's subject to `ceiling:{round}`; create the order-scope `lifetime-ceiling-reached` task through the creation port - `inst-roe-lifetime`
 6. [ ] - `p1` - Insert `owf_overdue_escalation` under its uniqueness; write the `escalation` entry; settle the key; **RETURN** `escalationRef`, `raised: true`, `taskRef` and, on `overdue-fulfillment` and `lifetime-ceiling`, `nextRound` - `inst-roe-settle`
 
@@ -1020,7 +1022,7 @@ it.
 | source_step | text | The operation whose failure produced the entrance (`sourceStep`) |
 | source_attempt | text | The failing call's key tail at the entrance, `{round}[:{attempt}]` (or the event reference of an event-keyed operation, §3.3) |
 | severity | enum | `normal` \| `urgent` \| `escalated`. `activated-cancel-failed` is created `urgent` |
-| sla_deadline | timestamptz | Computed by §4.1 at creation and recomputed on `reopened` |
+| sla_deadline | timestamptz | Computed by §4.1 at creation and recomputed on `reopened`, from the class window of the seller's policy (D-134) |
 | sla_breached_at | timestamptz, nullable | Stamped by `resolve-manual-task` (`sla-check`) when the deadline was found elapsed |
 | assignment_state | enum | `unassigned` \| `assigned` \| `in_progress` \| `resolved` \| `reopened`; transitions in §4.3 |
 | assignee | text, nullable | Principal holding the task; NULL while `unassigned` |
@@ -1166,7 +1168,7 @@ purged row-wise through a `created_at` index.
 | escalation_kind | enum | `overdue-fulfillment` \| `lifetime-ceiling` \| `park` \| `approval-outage` |
 | subject_ref | text, nullable | `parkRef` (`park`), gate position (`approval-outage`), `ceiling:{round}` (`lifetime-ceiling`, the round the call carried); NULL otherwise |
 | expected_fulfillment_time | timestamptz, nullable | From the plan (04) on `overdue-fulfillment`; NULL for other kinds |
-| window_hours | int, nullable | The overdue window the definition armed (business default 24) on `overdue-fulfillment` |
+| window_hours | int, nullable | The overdue window pinned on the plan (`04 §3.7` `overdue_window_ms`, business default 24), in hours, on `overdue-fulfillment`; the definition arms no window (decision D-134) |
 | raised_at | timestamptz | When the escalation was recorded |
 | stuck_step | text | **Step context**: the last settled step operation of the instance, from `owf_step_log` |
 | definition_step_ref | text, nullable | The `stepRef` the definition supplied — its own position — recorded beside `stuck_step` |
@@ -1266,7 +1268,11 @@ versus 24 h SLA window.
 
     sla_deadline = task_created_at (or reopened_at) + class_window
 
-where `class_window` is chosen by whether the stuck subject is **resource-affecting**:
+where `class_window` is chosen by whether the stuck subject is **resource-affecting**, and its
+value is the seller's policy value for that class, which `create-manual-task` (or the reopen)
+resolves and pins into `sla_deadline`; the table gives the defaults a seller's policy starts from.
+A policy write reaches only tasks created or reopened after it, and no definition version holds or
+moves a class window (decision D-134):
 
 | Failure reason | Resource-affecting? | `class_window` |
 |----------------|---------------------|----------------|
@@ -1279,11 +1285,12 @@ where `class_window` is chosen by whether the stuck subject is **resource-affect
 | `invocation-dead` | yes — nothing drives the order any more, and activated subscriptions may be live with no report pending (D-105) | **4 h** |
 | dead-letter triage (pending) | no — the delivery was not processed at all | **24 h** |
 
-These are working baselines proposed into the program-wide NFR workshop, not registered decisions
-(decision D-98: the 4 h / 24 h SLA classes by resource-affecting subject).
+These defaults are working baselines proposed into the program-wide NFR workshop, not registered
+decisions (decision D-98: the 4 h / 24 h SLA classes by resource-affecting subject, as amended by
+D-134: per-seller policy values with these defaults).
 The 4 h window sits well inside the 24 h overdue window, so an SLA breach on a resource-affecting
 subject is visible before the order-level escalation fires; the 24 h window matches the overdue
-window.
+window. A seller's policy keeps both relations or is refused (§4.8 item 8).
 
 ### 4.2 Remediation exhausted, and the consequence of a breach (normative)
 
@@ -1417,8 +1424,12 @@ subset of §3.7, covering plan-level, order-level and lifetime-ceiling subjects)
 
 These are inputs to the validation rules of
 [`10 §2.2` *Validation before publish*](./10-process-definition.md#validation-before-publish) and
-the fence of `10 §4.1` (`cpt-cf-bss-orders-workflow-adr-definition-versioning-and-protected-steps`);
-the items marked **alignment** are the ones folded into the canonical fragments of `10 §3.6`
+the fence of `10 §4.1` (`cpt-cf-bss-orders-workflow-adr-definition-versioning-and-protected-steps`).
+[`10 §4.7`](./10-process-definition.md#47-what-a-definition-change-may-and-may-not-do) *Slice constraints* maps each item below: an
+enforced item is refused through the rule or fence row it restates; every other item is
+canonical-definition guidance, which the canonical version carries and the behavioural gate of
+`10 §4.2` asserts for every candidate version (decision D-136).
+The items marked **alignment** are the ones folded into the canonical fragments of `10 §3.6`
 when the fragments were reconciled with the slice operations (D-80, D-81):
 
 1. [ ] - `p1` - **Creation before terminal.** On every failure path under `remediate`, and on the plan-level `topology-unavailable` path under either policy, `create-manual-task` **MUST** precede any `run-cancellation-fence`, `report-outcome` or `terminate-instance`; under `fail-fast` the definition **MUST NOT** call it for a forward line or `invalid-dependency-graph` subject - `inst-c7-create-first`
@@ -1428,12 +1439,12 @@ when the fragments were reconciled with the slice operations (D-80, D-81):
 5. [ ] - `p1` - **Override order.** `verify-override` **MUST** follow a `resolve-manual-task` that answered `override` for the same `requestRef`, and **MUST NOT** be called otherwise - `inst-c7-override-order`
 6. [ ] - `p1` - **The overdue arm.** The overdue window **MUST** be the top-level `overdueMonitor` branch of the `lifetime` fork (`10 §3.6` (a)), outside every stage and with no hold arm (a hold does not pause it, `01 §4.4`), and **MUST NOT** be a `listen` in fragment (b): a fixed `PT1H` `waitOverdue` tick followed by `raise-overdue-escalation` with `escalationKind: overdue-fulfillment` and nothing else, looping while `due` and `raised` are both `false`; the deadline (`expected_fulfillment_at` + the overdue window) is the operation's stored value, never the definition's; the branch **MUST NOT** complete, so it never wins the outer race, and it stops with the invocation - `inst-c7-overdue`
 7. [ ] - `p1` - **The other escalation arms.** The ceiling stage of `10 §3.6` (d), entered when the top-level `P90D` ceiling fires outside an unwind and outside the verdict park loop, **MUST** call `raise-overdue-escalation` (`lifetime-ceiling`) under the ceiling's round before `park`, and its operator wait **MUST** carry a task-resolution arm correlated on that ceiling's `taskRef`, through which a `retry` of the `lifetime-ceiling-reached` task reaches `unpark`; the park arm **MUST** call it with `escalationKind: park` and the `parkRef`, and **MUST NOT** re-arm after it answered (`03 §4.5`); the outage arm with `approval-outage` and the gate position - `inst-c7-escalation-arms`
-8. [ ] - `p1` - **Bounds.** The SLA classes of §4.1 **MUST** be less than or equal to the overdue window, and the overdue window less than the lifetime ceiling and greater than the longest fulfillment-stage task timeout the active definition version declares (`wave1`, 10 min). The windows are stored per order, not held by the definition, so this is checked where their value is validated, not by `10 §2.2` rule 4, which bounds only definition-held values (decision D-126) - `inst-c7-bounds`
+8. [ ] - `p1` - **Bounds.** The business windows are the seller's policy values — the approval escalation window (`03 §3.7`), the overdue window (`04 §3.7`), the SLA classes of §4.1 — resolved and pinned on the record by `open-gates`, `construct-and-freeze-plan` and `create-manual-task` as the partial-failure policy is (`04 §2.2`, decision D-134). The audited write of a seller's policy **MUST** refuse, and keep the prior value, a value set in which an SLA class exceeds the overdue window, the overdue window is not less than the lifetime ceiling (`P90D`) or not greater than the longest fulfillment-stage task timeout the active definition version declares (`wave1`, 10 min), or the escalation window is not less than the lifetime ceiling. Every pinned value therefore satisfied the bounds when it was written. `10 §2.2` rule 4 bounds only definition-held values and does not check these (decision D-126) - `inst-c7-bounds`
 9. [ ] - `p1` - **Signals handled.** This slice's arms consume `task-resolution-requested` (correlated on `orderId` and `orderVersion`); they are left by `cancel-requested`, `OrderAmended` and the terminal order events, whose paths end in `terminate-instance`, which closes this slice's records through the closure port - `inst-c7-signals`
 
-Numeric values left for follow-up outside this slice: whether the overdue window is configurable per
-seller tenant (a definition `wait` value is a definition-version change, so a per-tenant window is a
-definition input, not an Orders release) — the business default of 24 hours is fixed by the PRD.
+The overdue window is configurable per seller: it is a value of the seller's policy, pinned on the
+plan at freeze (decision D-134), and the business default of 24 hours is the PRD's. The definition
+holds no window, only the `PT1H` tick that re-checks it.
 
 ## 5. Traceability
 

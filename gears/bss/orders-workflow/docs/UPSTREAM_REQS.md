@@ -921,18 +921,53 @@ the platform surface today has only the plugin's registration-validation hook
 ([DESIGN.md](../../../serverless-runtime/docs/DESIGN.md) lines 762, 792); (2) keep a published
 version **resolvable while any instance is bound to it**, refusing its `archived`/`deleted`
 transition while a binding names it — the lifecycle hard-deletes after a retention period (lines
-609–610); (3) pin an in-flight invocation to the version it started under and report that version
-to the called operation, which the platform already states for pinning (line 614, BR-029); and
-(4) **audit every publish** with actor, version and validation result — the platform's audit of
-definition changes is unaddressed (NEXT_ADR_SCOPE.md line 26, BR-034) and so is publishing
-governance (line 48, BR-122).
+609–610); (3) pin an in-flight invocation to the version it started under, which the platform
+already states (line 614, BR-029) and reports as `function_version` on the invocation record that
+`start-instance` reads ([DESIGN_GTS_SCHEMAS.md](../../../serverless-runtime/docs/DESIGN_GTS_SCHEMAS.md)
+*InvocationRecord*); (4) **audit every publish** with actor, version and validation result, and
+report the publisher of each version on the registry's read of it, which `start-instance` copies
+into `owf_definition_binding.published_by` — the platform's audit of definition changes is
+unaddressed (NEXT_ADR_SCOPE.md line 26, BR-034), a registered callable carries no publisher
+(`owner`, `created_at`, `updated_at` only, DESIGN_GTS_SCHEMAS.md line 23), and publishing
+governance is unaddressed too (line 48, BR-122); and (5) until (1) lands, **restrict publishing**
+of `order_process` versions, and their `deprecate`, `disable`, `archive` and `delete`
+transitions, to the identity of this gear's definition publish job, so a version the job did not
+validate cannot be published (decision D-137).
 
 - **What the design cannot do until it lands**: the fence at publish time is only the CI
-  conformance test plus the platform-operator publish role (`ADR/0012`), so a publish outside the
-  pipeline is unvalidated and caught only by the run-time guards; a bound version the registry
-  deletes leaves instances whose audit cites a definition nobody can read; and who published a
-  version is evidenced only by `owf_definition_binding.published_by` per instance.
-- **Source**: `ADR/0012`; `design/10-process-definition.md` §2.2, §3.2, §4.2, §4.3.
+  conformance test, the behavioural gate and the publish job (`design/10-process-definition.md`
+  §4.2), so a publish outside the job is unvalidated and caught only by the run-time guards —
+  the binding still records the version the platform pinned, never one the document claims; a
+  bound version the registry deletes leaves instances whose audit cites a definition nobody can
+  read; and who published a version is evidenced only by the publish job's run and the registry's
+  version listing, with `owf_definition_binding.published_by` null.
+- **Source**: `ADR/0012`; `design/10-process-definition.md` §2.2, §3.2, §4.2, §4.3;
+  `design/01-foundation.md` §3.3, §3.7; `DECISIONS.md` D-137.
+
+#### Which version an event trigger starts, and a scoped activation
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-upreq-serverless-runtime-trigger-version-selection`
+
+The platform **MUST** state which version of a Workflow an event trigger starts. A trigger binds a
+`function_id` ([DESIGN_GTS_SCHEMAS.md](../../../serverless-runtime/docs/DESIGN_GTS_SCHEMAS.md)
+*Trigger*), whose GTS id names only the major (`…order_process.v1~`), and the platform states only
+that an invocation is pinned to "the exact version at start time"
+([DESIGN.md](../../../serverless-runtime/docs/DESIGN.md) line 614) and that `active` and
+`deprecated` versions are callable (line 924). The ask is (1) that a trigger starts the newest
+`active` version of the major it names, or the version its binding pins, stated as one rule;
+(2) that a binding **MAY** pin an exact version, so a version is switched on by re-pointing the
+binding rather than by deprecating its predecessor; and (3) optionally, a binding scoped to a
+tenant or a share of events, so a candidate version can start the orders of a canary seller
+before all others.
+
+- **What the design cannot do until it lands**: know which version new orders start on after a
+  publish. The publish job therefore deprecates the replaced version in the same run, so that one
+  version per major is `active`, and the readiness check alerts on a new binding to any other
+  version (`design/10-process-definition.md` §3.8, §4.2). No canary exists: the behavioural gate
+  in a non-production environment is the only run of a candidate before production, and a bad
+  version reaches every new order in the environment until the job publishes the last good
+  document as a new version.
+- **Source**: `design/10-process-definition.md` §4.2; `DECISIONS.md` D-138.
 
 #### Named signals and invocation control
 
@@ -1119,7 +1154,7 @@ then have to accept.
 | Priority | Requirements |
 |----------|-------------|
 | `p1` (critical) | `…-upreq-overlap-presence-read`, `…-upreq-compensation-cancel-reason`, `…-upreq-explicit-start-instant`, `…-upreq-in-flight-rejection`, `…-upreq-cancel-accepted-transition`, `…-upreq-nonterminal-status-read`, `…-upreq-provisioning-latency-budget`, `…-upreq-identity-envelope-echo`, `…-upreq-payment-authorization-outcome`, `…-upreq-generic-approval-expectations-contract`, `…-upreq-submitted-ttl-visibility`, `…-upreq-lifecycle-thin-events`, `…-upreq-catalog-dependency-topology-read`, `…-upreq-pii-classification-ruling`, `…-upreq-event-broker-shared-prerequisites`, `…-upreq-pdp-policy-integration` |
-| `p1` (critical), platform path | `…-upreq-serverless-runtime-readiness-gate`, `…-upreq-serverless-runtime-event-triggers-gts`, `…-upreq-serverless-runtime-consumed-event-member-storage`, `…-upreq-serverless-runtime-pdp-guarded-call`, `…-upreq-serverless-runtime-attempt-and-deadline-propagation`, `…-upreq-serverless-runtime-history-residency-retention`, `…-upreq-serverless-runtime-definition-versioning-validation-hook`, `…-upreq-serverless-runtime-signals`, `…-upreq-serverless-runtime-event-retention-between-listens`, `…-upreq-serverless-runtime-history-growth`, `…-upreq-serverless-runtime-invocation-control-restriction`, `…-upreq-serverless-runtime-dead-letter-operator-visibility` |
+| `p1` (critical), platform path | `…-upreq-serverless-runtime-readiness-gate`, `…-upreq-serverless-runtime-event-triggers-gts`, `…-upreq-serverless-runtime-consumed-event-member-storage`, `…-upreq-serverless-runtime-pdp-guarded-call`, `…-upreq-serverless-runtime-attempt-and-deadline-propagation`, `…-upreq-serverless-runtime-history-residency-retention`, `…-upreq-serverless-runtime-definition-versioning-validation-hook`, `…-upreq-serverless-runtime-trigger-version-selection`, `…-upreq-serverless-runtime-signals`, `…-upreq-serverless-runtime-event-retention-between-listens`, `…-upreq-serverless-runtime-history-growth`, `…-upreq-serverless-runtime-invocation-control-restriction`, `…-upreq-serverless-runtime-dead-letter-operator-visibility` |
 | `p2` (important) | `…-upreq-correlation-propagation`, `…-upreq-serverless-runtime-failure-handler-target`, `…-upreq-lifecycle-failure-reason-coverage` |
 
 `cpt-cf-bss-orders-workflow-upreq-pdp-policy-integration` is `p1` because every caller-driven

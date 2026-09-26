@@ -395,9 +395,11 @@ positions as `planned` — deriving each `gateId` from that configuration (§2.2
 `OrderApprovalRequest` per gate at the requested position with idempotency key
 `resource_tenant_id` + `orderId` + `orderVersion` + `gateId`, through the envelope's registry, so a
 replayed submission is absorbed rather than opening a second gate; records each opened gate's
-window (`escalation_window_ms` from configuration, `window_remaining_ms` = the window,
-`window_armed_at` = database time); enqueues `OrderApprovalRequested` per opened gate; and returns
-the gate references and the duration the definition's escalation `wait` arms.
+window (`escalation_window_ms` resolved from the seller's policy and pinned on the gate row,
+`window_remaining_ms` = the window, `window_armed_at` = database time); enqueues
+`OrderApprovalRequested` per opened gate; and returns the gate references and the first escalation
+round — no duration reaches the definition, whose gate loop re-checks the stored deadline on a
+fixed tick (decision D-134).
 
 `escalate-gate` has two modes. In `fire` mode it escalates every `open` gate at the position whose
 recorded window has elapsed against database time — enqueues `OrderApprovalEscalated`, issues the
@@ -609,7 +611,8 @@ calls a downstream, 5 s for a record-only one.
 
 `arm-park-escalation` and `escalate-gate` are `composable`: a definition version may reposition
 them inside the verdict stage, but the constraints of §4.5 still bind any version that contains
-the arms they serve.
+the arms they serve, and `10 §4.1` requires them — with `open-gates` and `park` — on the gate and
+park paths, so no version may drop them there (decision D-135).
 
 #### Approver inbox and decision endpoints
 
@@ -781,7 +784,7 @@ sequenceDiagram
 **Algorithm: `open-gates`**
 
 1. [ ] - `p1` - Resolve the instance and require a cache row with `verdict = required` whose `reflected_at` is set; refuse `version-mismatch` otherwise - `inst-og-resolve`
-2. [ ] - `p1` - **IF** no gate row exists for the version: read the routing configuration, derive every `gateId` as UUIDv5 over (`orderId`, `orderVersion`, `party`), insert every gate — `open` at the lowest position, `planned` elsewhere — with `assigned_principal` and `escalation_window_ms` from configuration - `inst-og-plan`
+2. [ ] - `p1` - **IF** no gate row exists for the version: read the routing configuration, derive every `gateId` as UUIDv5 over (`orderId`, `orderVersion`, `party`), insert every gate — `open` at the lowest position, `planned` elsewhere — with `assigned_principal`, and with `escalation_window_ms` resolved from the seller's policy — the window it names for the gate's party, else the seller's default window (72 h unless the policy says otherwise) — and pinned on the gate row, so a later policy write does not move it (decision D-134) - `inst-og-plan`
 3. [ ] - `p1` - Require every gate at a position below `position` to be `approved` and the gates at `position` to be `planned` or `open`; refuse `version-mismatch` otherwise - `inst-og-position`
 4. [ ] - `p1` - **FOR EACH** gate at `position`: read the resolved total and currency (R4) and the submitting subject; submit the request under the approval-request key; insert the request row; set `state = open`, `opened_at`, `window_remaining_ms = escalation_window_ms`, `window_armed_at = now` - `inst-og-submit`
 5. [ ] - `p1` - Enqueue one `OrderApprovalRequested` per opened gate and **RETURN** the gate references, `position`, and `escalationRound = 0`; the window stays in the record, and the definition learns of its end only from `escalate-gate`'s `due` - `inst-og-return`
@@ -1000,7 +1003,7 @@ the evidence of who exempted a commercial decision from approval.
 | assigned_principal | text, nullable | The `SecurityContext` principal this gate is assigned to; the inbox filters on this column, never on `party_ref` (§3.2). Never crosses to the definition |
 | sequence_index | int | Routing position, default 0. Gates sharing a value open together; a gate opens only once every lower value is `approved` (§4.3) |
 | state | enum | `planned`, `open`, `approved`, `rejected`, `cancelled` — the complete set; `decided` is not a value |
-| escalation_window_ms | bigint | The configured window for this gate, from routing configuration at plan time (default 72 h) |
+| escalation_window_ms | bigint | The window for this gate, resolved by `open-gates` from the seller's policy (the party's window, else the seller default, 72 h) and pinned here; a policy write reaches only gates planned after it (decision D-134) |
 | window_remaining_ms | bigint, nullable | The window remaining as of `window_armed_at` (while armed) or as captured at the first pause (while paused); NULL while `planned` |
 | window_armed_at | timestamptz, nullable | Database time the window was last armed; NULL while paused, `planned` or decided |
 | pause_causes | text[], NOT NULL, DEFAULT `{}` | Open pause causes, members of `hold` · `approval-outage`; the window re-arms only when this becomes empty |
@@ -1422,8 +1425,11 @@ reasons. This slice registers no new reason.
 These are inputs to the validation rules of
 [`10 §2.2` *Validation before publish*](./10-process-definition.md#validation-before-publish) and
 the fence of [`10 §4.1`](./10-process-definition.md#41-the-fence)
-(`cpt-cf-bss-orders-workflow-adr-definition-versioning-and-protected-steps`); a definition version
-that violates any of them **MUST** be refused.
+(`cpt-cf-bss-orders-workflow-adr-definition-versioning-and-protected-steps`).
+[`10 §4.7`](./10-process-definition.md#47-what-a-definition-change-may-and-may-not-do) *Slice constraints* maps each item below: an
+enforced item is refused through the rule or fence row it restates; every other item is
+canonical-definition guidance, which the canonical version carries and the behavioural gate of
+`10 §4.2` asserts for every candidate version (decision D-136).
 
 1. [ ] - `p1` - **Order.** `obtain-verdict` **<** `reflect-verdict` (`stage = requirement`) **<** `open-gates`; `record-decision` **<** `reflect-verdict` (`stage = gate-outcome`) on the decision path; `reflect-verdict` (`gate-outcome`) **<** `terminate-instance` on the rejected path and **<** the fulfillment stage on the approved path - `inst-c3-order`
 2. [ ] - `p1` - **Fail-closed routing.** The verdict class `unobtainable` **MUST** route only to the park arm (`park`, `arm-park-escalation`, the park loop); no branch **MAY** route it to `reflect-verdict`, `open-gates` or the fulfillment stage, and `unpark` on the verdict path **MUST** be reachable only after an `obtain-verdict` that answered `required` or `not-required` - `inst-c3-fail-closed`

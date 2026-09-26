@@ -317,8 +317,8 @@ D-107). `order_process` is started only by its two trigger bindings; no Orders r
 `…-upreq-serverless-runtime-invocation-control-restriction` lands. The bindings — event type,
 the `category = new_sale` filter on `OrderSubmitted`, `callable_type`, `execution_context` — are
 repository artefacts in `definitions/` beside the definition, reviewed, CI-checked and applied by
-the release pipeline under the platform-operator publish role, never created or edited by hand
-(`10 §3.8`). A binding is a tenant-scoped platform object
+the definition publish job under the platform-operator publish role, never created or edited by
+hand (`10 §3.8`, `10 §4.2`). A binding is a tenant-scoped platform object
 ([serverless-runtime `DESIGN.md:1146`](../../../../serverless-runtime/docs/DESIGN.md#logical-tables)),
 so the filter is **not** the guard: `admit-trigger` re-derives it from the Lifecycle read —
 the order's `resource_tenant_id` must equal the body's, and a start admits only a `new_sale`
@@ -923,8 +923,11 @@ terminates an instance, and records that decision.
 
 ### 4.7 Constraints this slice places on the definition
 
-These are inputs to the validation rules of ADR-0012 and `10 §2.2`; a definition version that
-violates one **MUST** be refused.
+These are inputs to the validation rules of ADR-0012 and `10 §2.2`.
+[`10 §4.7`](./10-process-definition.md#47-what-a-definition-change-may-and-may-not-do) *Slice constraints* maps each item below: an
+enforced item is refused through the rule or fence row it restates; every other item is
+canonical-definition guidance, which the canonical version carries and the behavioural gate of
+`10 §4.2` asserts for every candidate version (decision D-136).
 
 1. [ ] - `p1` - **Admission first.** `admit-trigger` **MUST** be the first operation of the start path and of every `listen` arm that consumes one of the nine Lifecycle triggers, with `role: listen` and the running `correlationId` on an arm. Fragments (b) (`listenAcceptance` → `evaluate-payment-auth-eligibility`) and (e) (`awaitHold` → `apply-hold`, `listenResume` → `apply-resume`) of `10 §3.6` currently call the consuming operation directly and must gain the admission call; fragment (f)'s terminal branch must call `admit-trigger` before `terminate-on-terminal-event` - `inst-def02-admit-first`
 2. [ ] - `p1` - **Start-path branching.** After `admit-trigger` on the start role, only `start` may reach `start-instance`; `absorbed-duplicate`, `ignored-superseded`, `ignored-terminated` and `no-active-instance` **MUST** end the invocation with no further call - `inst-def02-start-branch`
@@ -934,7 +937,7 @@ violates one **MUST** be refused.
 6. [ ] - `p1` - **No swallowing.** Neither operation may sit in a `try` whose `catch` continues the forward path. On the start path, retry exhaustion of `admit-trigger` **MUST** fail the invocation. On a listen arm it **MUST** carry a retry-only `catch`, so exhaustion faults the running invocation, which the instance liveness pass raises as the `invocation-dead` task; it **MUST NOT** be routed to a manual task of its own (`10 §4.6`, decision D-114) - `inst-def02-no-swallow`
 7. [ ] - `p1` - **Supersession wait.** The start path's `try` around `admit-trigger` **MUST** retry `prior-instance-active` (409) under a policy whose horizon covers the prior instance's pre-fulfillment unwind and nests below the lifetime ceiling (working value: constant 5 min, `limit.duration` 24 h); the generic `transient` policy's five attempts do not suffice - `inst-def02-supersession-wait`
 8. [ ] - `p1` - **Amendment reachability.** Every competing `fork` before `begin-fulfillment` settles **MUST** contain the amendment `listen` arm (correlated on `orderId` only, since the amended version is newer), and a `begin-fulfillment` refusal caused by a concurrent amendment **MUST** route to that arm rather than to failure compensation that would report `failed` or `cancelled` - `inst-def02-amendment-reachable`
-9. [ ] - `p1` - **Start bindings.** The event-trigger set that starts the order-process workflow is exactly `{OrderSubmitted, OrderAmended}` (§2.2), declared in the repository beside the definition and applied only by the release pipeline; the start path derives `triggerKind` from the exact event type and never defaults an unknown type (D-107) - `inst-def02-start-bindings`
+9. [ ] - `p1` - **Start bindings.** The event-trigger set that starts the order-process workflow is exactly `{OrderSubmitted, OrderAmended}` (§2.2), declared in the repository beside the definition and applied only by the definition publish job (`10 §4.2`); the start path derives `triggerKind` from the exact event type and never defaults an unknown type (D-107) - `inst-def02-start-bindings`
 10. [ ] - `p2` - **Signals.** This slice handles no operator signal; it handles the nine Lifecycle events only. `cancel-requested` and `reauthorize-requested` are slices 08 and 04 - `inst-def02-signals`
 
 ## 5. Traceability

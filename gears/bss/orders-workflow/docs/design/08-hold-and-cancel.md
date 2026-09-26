@@ -936,8 +936,11 @@ and the unwind continues, and one that fires in the verdict park loop does not p
 These are inputs to the validation rules of
 [`10 §2.2` *Validation before publish*](./10-process-definition.md#validation-before-publish) and
 the fence of [`10 §4.1`](./10-process-definition.md#41-the-fence)
-(`cpt-cf-bss-orders-workflow-adr-definition-versioning-and-protected-steps`); a definition version
-that violates any of them **MUST** be refused.
+(`cpt-cf-bss-orders-workflow-adr-definition-versioning-and-protected-steps`).
+[`10 §4.7`](./10-process-definition.md#47-what-a-definition-change-may-and-may-not-do) *Slice constraints* maps each item below: an
+enforced item is refused through the rule or fence row it restates; every other item is
+canonical-definition guidance, which the canonical version carries and the behavioural gate of
+`10 §4.2` asserts for every candidate version (decision D-136).
 
 1. [ ] - `p1` - **Order in the hold arm.** In the arm that owns an escalation `wait`, `apply-hold` **<** `apply-resume`; after a resume the escalation re-check **MUST** take `apply-resume`'s `due` as its first answer and then return to the gate loop's fixed `PT30S` `waitProbe` tick followed by `escalate-gate` `mode: fire` (`03 §4.5` item 4); the definition **MUST NOT** carry a remaining duration or compute the deadline, and `apply-hold`'s answer carries none to consume - `inst-c8-hold-order`
 2. [ ] - `p1` - **Placement.** Every stage fork **MUST** carry a hold arm, except the ceiling wait (`awaitOperatorAfterPark`) and the unwind's forks, which carry none (`06 §4.7` item 7, `10 §3.6` (c), (d)); the park loop's hold arm only records (`holdPauses` false, `03 §4.5` item 6); the hold arm **MUST** be inside the competing fork whose escalation `wait` it pauses; the lifetime `wait` **MUST** be the top-level `lifetimeCeiling` branch outside every stage fork, and the overdue `wait` the top-level `overdueMonitor` branch; the barrier poll and the expected-fulfillment tick **MUST** be in branches a hold arm does not cancel (`10 §4.5`) - `inst-c8-placement`

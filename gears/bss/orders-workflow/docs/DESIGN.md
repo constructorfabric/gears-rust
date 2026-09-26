@@ -73,7 +73,7 @@ Requirements that significantly influence architecture decisions.
 | `cpt-cf-bss-orders-workflow-fr-owf-backpressure` | Admission controls inside the dispatch operations — the per-order parallel-line cap, the aggregate in-flight cap and the per-seller bucket over `owf_dispatch_admission` — defer a line as a **settled success** carrying `deferred[]` and `retryAfterMs`, so a downstream throttle is a delay and never a retry-budget consumption. |
 | `cpt-cf-bss-orders-workflow-fr-owf-dependency-resilience` | Transient-dependency failures (Lifecycle, Subscriptions, Payments) are `retryable-failure` outcomes the definition's task retry policy re-issues within the step's own budget, escalating to a manual task on exhaustion — through the failure stage where the definition catches the exhaustion (the wave calls; `compensate-order` through the unwind's own resolution arm), and through the sweep's `invocation-dead` task where exhaustion faults the invocation (every other step call, `design/10` §4.6; D-105, D-114), so no exhaustion stalls silently; Generic Approval unavailability is excluded and follows the fail-closed park-and-escalate arm. |
 | `cpt-cf-bss-orders-workflow-fr-owf-task-queue` | A read-side projection over manual tasks and incidents, scoped to the operator's seller tenancy and paged on the immutable `(created_at, task_id)` key, backs the Fulfillment Operator Task Queue; its per-action routes record an `owf_task_resolution_request` and signal the running invocation. Dead-letter rows join it only if the platform exposes its dead letters (pending). |
-| `cpt-cf-bss-orders-workflow-fr-owf-overdue-escalation` | A definition `wait` arm, distinct from every task timeout and from the lifetime ceiling, calls `raise-overdue-escalation` when `in_fulfillment` (or a hold taken from it) exceeds the configurable overdue window, without failing any line or auto-terminaling the order. |
+| `cpt-cf-bss-orders-workflow-fr-owf-overdue-escalation` | A definition re-check tick, distinct from every task timeout and from the lifetime ceiling, calls `raise-overdue-escalation`, which escalates when `in_fulfillment` (or a hold taken from it) exceeds the overdue window — the seller's policy value pinned on the plan at freeze (D-134) — without failing any line or auto-terminaling the order. |
 | `cpt-cf-bss-orders-workflow-fr-owf-hold-resume` | `OrderHeld`/`OrderResumed` are `listen` arms that call `apply-hold`/`apply-resume`; dispatch operations refuse new intents while suspended and let accepted intents run to their terminal outcome; only the approval-escalation tick is inside the arm a hold cancels, and after the resume the re-check continues against the deadline Orders re-based, with `apply-resume`'s `due` as its first answer — no remainder is returned or re-armed — while the lifetime ceiling, the barrier and the overdue `wait` keep running. Both events reach the invocation only while a `listen` for them is armed, unless the platform retains an event delivered between listens (`design/10` §4.4, D-124); until then a lost resume is applied from the Lifecycle order read by `apply-resume` `trigger: poll`, which the resume wait and every other wait holding a recorded suspension call about every `PT15M` (D-130, D-133). Whether the DSL expresses this natively is Q-11. |
 | `cpt-cf-bss-orders-workflow-fr-owf-compensation-declaration` | Each operation declares its compensating operation once in its slice §3.3, mirrored into `owf_step_operation.compensation`; both waves compensate (draft-void, activated-cancel) and there is no third leg and no intra-saga pivot. |
 | `cpt-cf-bss-orders-workflow-fr-owf-compensation-execution` | `run-cancellation-fence` (stop dispatch, identify in-flight, reconcile terminal outcomes including late successes) precedes `compensate-order`, which walks every created subscription in reverse forward-execution order under the Orders-owned ordinal and is resumable by pass, before `report-outcome` ever reports a compensated outcome to Lifecycle; the order is a validation rule and each operation guards it at run time. |
@@ -90,7 +90,7 @@ Requirements that significantly influence architecture decisions.
 | `cpt-cf-bss-orders-workflow-nfr-owf-durability` | Zero lost in-flight workflows across restarts; zero loss for committed process state (business RPO zero for committed steps) | Platform invocation durability + gear-owned process record | The platform plugin resumes every invocation from its history and re-issues any call it did not see answered; every step operation commits its record, audit entry and idempotency settlement in one transaction before answering, so a re-issued call is absorbed and recovery of the record never depends on engine retention | Restart-under-load test asserting zero re-triggered completed steps and zero lost in-flight workflows; fault injection between commit and HTTP answer; audit-log completeness check with the engine's history absent |
 | `cpt-cf-bss-orders-workflow-nfr-owf-idempotency` | Zero duplicate durable effects per idempotency key | Step envelope, dispatch operations, approval-request creation, Lifecycle transition calls | Every step operation is keyed server-side by an ADR-0006 family recomposed from its references, and every outbound call carries a composed key persisted before dispatch, with a caller-side duplicate protocol that confirms outcome by lookup instead of inferring success from silence | Concurrency test firing an identical re-issued call and asserting exactly one durable effect at the target service; sweep-based reconciliation test for client-timeout scenarios |
 | `cpt-cf-bss-orders-workflow-nfr-owf-fulfillment-sla` | p95 ≤ 15 minutes from activation-wave eligibility to terminal fulfillment outcome (standard orders, no manual intervention, no future-dated wait) | Wave-2 dispatch operation, admission controls, definition task timeouts | `dispatch-wave2-activate` dispatches every eligible activation intent in one call up to the per-order cap; the wave-2 task timeout (3 min) and the reconciliation sweep's schedule bound worst-case discovery latency for lost confirmations | Load test measuring p95 activation-eligibility-to-terminal-outcome latency for standard orders at production sizing |
-| `cpt-cf-bss-orders-workflow-nfr-owf-escalation-timer` | Configurable per gate; default 72 h; accuracy ± 5 min | Definition re-check tick (plugin durable timer), gate-window record | The gate loop's fixed `PT30S` tick calls `escalate-gate` `mode: fire`, which compares database time with the gate's stored deadline, so the fire is at most one tick plus one call late — 30 s plus the 3-minute `step` timeout, inside ± 5 min (D-123); the remainder is Orders' record, and a resume re-bases the deadline in Orders rather than re-arming a timer | Timer-accuracy test asserting fired-time within ± 5 min of configured window across a platform worker restart, once the plugin exists |
+| `cpt-cf-bss-orders-workflow-nfr-owf-escalation-timer` | Configurable per gate in the seller's policy, pinned on the gate row by `open-gates` (D-134); default 72 h; accuracy ± 5 min | Definition re-check tick (plugin durable timer), gate-window record | The gate loop's fixed `PT30S` tick calls `escalate-gate` `mode: fire`, which compares database time with the gate's stored deadline, so the fire is at most one tick plus one call late — 30 s plus the 3-minute `step` timeout, inside ± 5 min (D-123); the remainder is Orders' record, and a resume re-bases the deadline in Orders rather than re-arming a timer | Timer-accuracy test asserting fired-time within ± 5 min of configured window across a platform worker restart, once the plugin exists |
 | `cpt-cf-bss-orders-workflow-nfr-owf-manual-task-sla` | 100% manual-task creation for permanently failed lines; SLA countdown visible before breach | `create-manual-task` (protected), task-queue read projection | `create-manual-task` is a protected operation on every failure path under the remediation policy, validated before publish and called before any terminal outcome is declared; the task-queue projection surfaces the SLA deadline (4 h resource-affecting, 24 h otherwise) | Validation-rule test that no definition reaches a terminal outcome under `remediate` without it; UI/API test asserting SLA countdown is visible ahead of breach |
 | `cpt-cf-bss-orders-workflow-nfr-owf-event-latency` | p95 < 30 s from internal state change to event delivery | Platform event producer adapter | Process events are enqueued through the platform producer outbox in the same transaction as the step operation's record and published by platform workers independent of the request path; commit success alone is not evidence of the target | Producer-queue lag (platform metric) measuring p95 enqueue-to-broker-acceptance at production event volume, with backlog and retries present |
 | `cpt-cf-bss-orders-workflow-nfr-owf-audit` | 100% coverage in process audit log | Gear-owned process audit log, written by the step envelope | Every step operation's settlement — first call, re-run, sweep settlement, escalation, compensation, termination — writes an audit row in the same unit of work as the record change, independent of engine history | Structural test that every registered operation's `audit_kind` is written on settlement; negative test that a failed audit append aborts the operation |
@@ -356,11 +356,13 @@ engine's history is stored and for how long, which is the residency ask of the c
 
 A definition version is publishable only if it passes the validation rules of ADR-0012 — every
 `protected` operation present in its order constraints, every `call` to a registered operation,
-every `listen` inside the closed set, nesting bounds, reference-only task inputs, and no protected
-operation inside a `catch` that continues the forward path — run by a pre-publish validation hook
-and by a CI test over the canonical definitions of [`design/10-process-definition.md`](./design/10-process-definition.md).
-The pre-publish hook is an upstream ask, not a platform fact; until it lands, the CI test and the
-platform-operator publish role are the fence at publish time. Independently of the fence, every
+every `listen` inside the closed set, nesting bounds, reference-only task inputs, no protected
+operation inside a `catch` that continues the forward path, and the `p1` composables and shared
+arms on their paths (D-135) — run by a pre-publish validation hook and by a CI test over the
+canonical definitions of [`design/10-process-definition.md`](./design/10-process-definition.md).
+The pre-publish hook is an upstream ask, not a platform fact; until it lands, the CI test, the
+behavioural gate and the publish job, the only publisher, are the fence at publish time
+(`design/10` §4.2, D-138). Independently of the fence, every
 `protected` operation re-checks its own precondition in this gear's record and refuses with a
 catalogue reason when it does not hold, so a definition that bypasses the static fence fails
 closed at the first protected operation it misorders. The protected list — 22 operations — is an
@@ -425,7 +427,7 @@ definition.
 | Entity | Description | Backing table | Specified in |
 |--------|-------------|---------------|--------------|
 | `ProcessInstance` | The process aggregate root: `correlationId`, `orderId` + `orderVersion` key, the recorded phase (a projection written by step operations, never derived from engine state), the platform `invocation_id`, the definition version, suspension state | `owf_process_instance` | `01 §3.7` |
-| `DefinitionBinding` | The pin of one instance to the definition version it started under, with its source (`platform` or `code`) and publisher; written once by `start-instance` | `owf_definition_binding` | `01 §3.7` |
+| `DefinitionBinding` | The pin of one instance to the definition version it started under, with its source (`platform` or `code`) and, once the registry reports one, its publisher; written once by `start-instance` from the platform's invocation record (D-137) | `owf_definition_binding` | `01 §3.7` |
 | `StepOperation` | One registered operation: name, protection, reference schemas, key family, declared event, compensation, reasons, audit kind, retry class, deadline; loaded from the compiled registry | `owf_step_operation` | `01 §3.3`, `01 §3.7` |
 | `ProcessDefinition` / `DefinitionVersion` | The registered Workflow callable and its immutable published revisions; held by the platform function registry, not by this gear | — (platform registry) | `10 §3.1` |
 | `ProcessSignal` | An operator-originated instruction delivered to a running invocation (`cancel-requested`, `reauthorize-requested`, `task-resolution-requested`; `unpark-requested` is reserved, with no origin route and no arm, Q-13, D-122), recorded in Orders before delivery | `owf_cancel_request`, `owf_task_resolution_request` (the request rows) | `10 §3.1` |
@@ -942,9 +944,10 @@ Lifecycle's own cancel, whose `OrderCancelled` ends the process on the terminal-
 
 ```mermaid
 sequenceDiagram
-    Pipeline ->> CI: run the ADR-0012 rules over definitions/ (the fence)
+    Pipeline ->> CI: publish job: run the ADR-0012 rules over definitions/ (no gear build or deploy)
     CI -->> Pipeline: pass
-    Pipeline ->> Registry: register draft, validate, publish version n+1
+    Pipeline ->> Registry: non-production: publish n+1, run the path scenario suite (behavioural gate)
+    Pipeline ->> Registry: register draft, validate, publish version n+1, deprecate n
     Registry ->> Hook: pre-publish validation (upstream ask)
     Hook -->> Registry: pass
     Note over Registry: instances bound to n keep running on n
@@ -952,13 +955,17 @@ sequenceDiagram
     Trigger ->> Plugin: start invocation of the active version (n+1)
     Plugin ->> Steps: admit-trigger
     Plugin ->> Steps: start-instance
+    Steps ->> Registry: read the invocation record: function_id, function_version = n+1
     Steps ->> Steps: insert owf_process_instance + owf_definition_binding (n+1) in one transaction
 ```
 
 **Description**: A publish affects only instances started after it; an instance runs to
 termination on the version `start-instance` bound, a version is never archived or deleted while a
-binding names it, and there is no migration (PRD §5.2). The CI conformance run is the fence at
-publish time until the platform offers a consumer-registered pre-publish hook.
+binding names it, and there is no migration (PRD §5.2). The binding records the version from the
+platform's invocation record, never from the document (D-137). The CI conformance run and the
+behavioural gate of the publish job are the fence at publish time until the platform offers a
+consumer-registered pre-publish hook; a rollback is a new version carrying the last good document
+(D-138).
 
 ### 3.7 Database schemas & tables
 
@@ -1066,7 +1073,8 @@ recoverable from the platform invocation and the gear-owned record independent o
 restarts (`cpt-cf-bss-orders-workflow-nfr-owf-durability`). Orders' side of the platform topology
 is the step surface reachable from the plugin's workers, the two event triggers provisioned per
 environment and enabled only after the readiness gate, and the repository `definitions/` directory
-published to the registry by the release pipeline, never by hand (`design/10` §3.8).
+published to the registry by the definition publish job, which builds and deploys nothing, never
+by hand (`design/10` §3.8, §4.2).
 
 **Background workers** coordinate through toolkit-db session advisory locks (`Db::lock`) under
 the named roster of [`design/01-foundation`](./design/01-foundation.md) §3.8 (D-62 as amended by
@@ -1258,7 +1266,7 @@ The gear stores no cardholder data and holds no payment instrument — it consum
 | Approver-inbox over-disclosure | An approver role string matches every gate of that kind across every order and seller | Assignment boundary | Scoping is the PDP `Eq` constraint on `owf_approval_gate.assigned_principal`, not the role; a gate outside it is not returned by the inbox query and not mutable by the decision `UPDATE` | An over-broad assignment written at gate-open from the routing configuration is honoured as written; assignment correctness is Generic Approval's |
 | Self-approval | The submitting identity decides its own gate | Commercial-control boundary | The decision endpoint refuses the submitting identity, and the SoD clause is carried in the §9.2 expectations contract | Two colluding principals inside one seller tenant; out of scope for a technical control |
 | Callback impersonation | A forged decision or provisioning outcome arrives on the event transport and reaches a `listen` arm | Service boundary | The broker's per-topic produce grant and platform-root tenancy; the event carries references only, and the consuming operation reads the decision or the intent status from its owner (`record-decision` by decision reference, `reconcile-intent` by the `SUB-O13` read) and re-reads the order from Lifecycle under the PDP before any effect | A compromised broker, platform plugin or PDP; out of this gear's control. Neither this gear nor the plugin sees a producer principal, so a mis-provisioned produce grant is invisible until the shared prerequisites of `UPSTREAM_REQS.md` §2.7 are verified |
-| Step-surface impersonation or a rogue definition | A caller other than the platform invokes a step route, or a published definition orders the operations to bypass a `p1` guard | Service boundary / publish boundary | Step routes admit only the serverless-runtime service principal with `token_scopes` naming this gear and the PDP's `process_step × execute` for the enumerated operation; the ADR-0012 fence runs before publish and in CI, and every protected operation re-checks its precondition in Orders' record at run time | Every call after `start-instance` must carry the instance's bound invocation (`01 §3.3` step 3), and every protected operation checks a record precondition — `run-cancellation-fence` included, which needs a recorded cause for its trigger (`06 §3.6`, D-106) — so a caller that is not the instance's invocation is refused `not-found`, and a misordered definition fails closed at the first protected operation whose precondition the record does not hold. Residual: a platform operator publishing outside the pipeline while the pre-publish hook is only an ask, and a principal holding the serverless-runtime scope that also learns an instance's invocation id, until the platform asserts the invocation on the call (`UPSTREAM_REQS.md` §2.9) |
+| Step-surface impersonation or a rogue definition | A caller other than the platform invokes a step route, or a published definition orders the operations to bypass a `p1` guard | Service boundary / publish boundary | Step routes admit only the serverless-runtime service principal with `token_scopes` naming this gear and the PDP's `process_step × execute` for the enumerated operation; the ADR-0012 fence runs before publish and in CI, and every protected operation re-checks its precondition in Orders' record at run time | Every call after `start-instance` must carry the instance's bound invocation (`01 §3.3` step 3), and every protected operation checks a record precondition — `run-cancellation-fence` included, which needs a recorded cause for its trigger (`06 §3.6`, D-106) — so a caller that is not the instance's invocation is refused `not-found`, and a misordered definition fails closed at the first protected operation whose precondition the record does not hold. Residual: a platform operator publishing outside the publish job while the pre-publish hook and the publish restriction it asks for are only an ask — the binding still records the version the platform pinned, never one the document claims (D-137), and a principal holding the serverless-runtime scope that also learns an instance's invocation id, until the platform asserts the invocation on the call (`UPSTREAM_REQS.md` §2.9) |
 | Start or control of an order's invocation outside this gear | A mis-bound or hand-edited trigger, a direct `POST …/invocations` on `order_process`, or a generic `:control` `cancel`/`suspend` by another platform-authorized caller | Platform boundary | The bindings are released with the definition and drift-checked (`10 §3.8`); `admit-trigger` refuses an order whose `resource_tenant_id` is not the body's and starts only a `submitted` `new_sale` order (`02 §3.6`, D-107); the liveness pass raises a `canceled` or failed invocation as an `invocation-dead` task (`01 §3.8`, D-105) | A generic `suspend` is indistinguishable from a normal wait and freezes the order, lifetime ceiling included, until the platform's suspension limit fails it; closed only by `…-upreq-serverless-runtime-invocation-control-restriction` |
 | Order state driven directly by a system actor | A service principal calls a state-affecting operation, or a definition calls a seam directly | BSS seam (R1) | No `(resource, action)` pair a service principal holds writes order state — the catalogue has none; the gateway refuses a service `subject_type` on a human-actor arm before the PDP is asked; a definition may `call` only `/steps/{operation}` (ADR-0012 rule 2), so every Lifecycle transition is inside an Orders operation; no code path in this gear writes order state at all | A defect in Lifecycle's own guard; covered by that gear's PDP-authorized seam |
 | Audit tampering | A holder of database privilege edits or deletes trail rows | Data boundary | No UPDATE or DELETE grant to any role, database triggers rejecting both, a per-process predecessor-hash chain under the frozen contract of `01 §4.17`, the declared verifier alerting and never repairing, and per-namespace checkpoints reconciled against instance counters every 24 h (D-59, D-60) | Within Orders Lifecycle D-100's stated limits ([Lifecycle DECISIONS.md](../../orders-lifecycle/docs/DECISIONS.md)): a holder of the migration role can drop grant and trigger and rewrite all local evidence including the latest checkpoint suffix; a chain lost before its first checkpoint, or a suffix removed with its counter before capture, is not independently evidenced. Independent anchoring is optional hardening, not presumed |
@@ -1483,7 +1491,8 @@ owner and one release vehicle:
 
 | Change | Vehicle | Owner |
 |--------|---------|-------|
-| Reorder, insert or drop a `composable` step; change a `wait`, a retry policy, a `switch` predicate over returned enums or an escalation arm, inside the nesting rule | **A new definition version**, published through the platform registry after the ADR-0012 fence passes; no Orders release | Definition author, platform operator publish (seller-scoped fragments: Q-10) |
+| Reorder, insert or drop a `composable` step (except a `p1` composable on its required path); change a re-check tick, a retry policy, a `switch` predicate over returned enums or an escalation arm, inside the nesting rule — the full list is the one table of [`design/10`](./design/10-process-definition.md) §4.7 (D-136) | **A new definition version**, published by the definition publish job after the ADR-0012 fence and the behavioural gate pass; no Orders build or deploy (D-138) | Definition owners (code owners of `definitions/`); the publish job holds the platform-operator publish role (seller-scoped fragments: Q-10) |
+| An approval escalation window, the overdue window, a manual-task SLA class, the partial-failure policy | **A write of the seller's policy**, audited and bounds-checked; it reaches only records pinned after it (D-134) | The seller's policy owner |
 | What a **step** does — a guard, a seam call, a record change, an input or output schema, a new operation, the `protected` list | **An Orders release** of the slice that owns the operation, plus a definition version that uses it | The owning slice |
 | A **task** — one named `call`, `listen`, `wait` or `switch` in the flow | Belongs to a **definition version**; it is never edited in place — a new version is published | `design/10` |
 | A **process event type** or a **Lifecycle trigger** | A **PRD-level** question, because the PRD enumerates both closed sets; the definition's closed `listen` set follows the PRD, never the reverse | PRD owner |
@@ -1503,18 +1512,23 @@ serverless-runtime that the platform path depends on are its §2.9.
 
 ### 4.8 Configuration and secret management
 
-Every tunable this design names falls on one of two sides. **Definition-side values** — the task
-retry attempts, backoff and jitter, the task timeouts, the escalation window default, the overdue
-window, `max_process_lifetime`, the poll intervals of the barrier and reconcile arms — are
-declared in the definition version and change by publishing a new version inside the nesting rule
-(`design/01-foundation.md` §4.2); they are never runtime-edited and never stored in this gear's
-database. **Operation-side values** — the per-operation deadlines, the sweep ladders and floor, the
-producer-queue partition count and profile, the clock-skew tolerance, the circuit-breaker
-thresholds, the admission caps, the idempotency-key lifetime and the manual-task SLAs — are **gear
-configuration promoted through environments with the deployment**. Values that are per-seller
-policy rather than per-environment tuning (the partial-failure policy election, the overdue
-window) are the one exception and live as policy rows in the owning slice's store, where a change
-is an audited write rather than a redeploy.
+Every tunable this design names falls on one of three sides. **Definition-side values** — the
+task retry attempts, backoff and jitter, the task timeouts, `max_process_lifetime`, the ticks of
+the re-check loops (the escalation, overdue and SLA re-checks, the barrier and reconcile polls) —
+are declared in the definition version and change by publishing a new version inside the nesting
+rule (`design/01-foundation.md` §4.2); they are never runtime-edited and never stored in this
+gear's database. **Operation-side values** — the per-operation deadlines, the sweep ladders and
+floor, the producer-queue partition count and profile, the clock-skew tolerance, the
+circuit-breaker thresholds, the admission caps and the idempotency-key lifetime — are **gear
+configuration promoted through environments with the deployment**. **Per-seller policy values** —
+the partial-failure policy election, the approval escalation window, the overdue window and the
+manual-task SLA classes — live as policy rows in the owning slice's store, where a change is an
+audited, bounds-checked write rather than a redeploy or a publish. The operation that needs one
+resolves it from the seller's policy and pins it on the order's record — `open-gates` on the gate
+row, `construct-and-freeze-plan` on the plan, `create-manual-task` in the task's `sla_deadline` —
+so a policy change reaches only records pinned after it, and the definition holds only the tick
+that re-checks the stored deadline (decision D-134; the precedent is the partial-failure policy
+pinned at freeze, `design/04-fulfillment-plan.md` §2.2).
 
 Configuration is **validated at startup and the service refuses to start on a violation**, not on
 first use: the catalogue conformance assertion of `design/09-read-and-authz.md` §3.7 — every

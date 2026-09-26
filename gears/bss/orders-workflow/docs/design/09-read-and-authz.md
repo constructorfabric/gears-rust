@@ -1581,7 +1581,10 @@ These are inputs to the validation rules of
 the fence of [`10 §4.1`](./10-process-definition.md#41-the-fence)
 (`cpt-cf-bss-orders-workflow-adr-definition-versioning-and-protected-steps`). This slice has no
 protected operation of its own, so it adds no ordering constraint; it constrains what a definition
-may call and what its signals may carry.
+may call and what its signals may carry. [`10 §4.7`](./10-process-definition.md#47-what-a-definition-change-may-and-may-not-do) *Slice constraints* maps each item below: an
+enforced item is refused through the rule or fence row it restates; every other item is
+canonical-definition guidance, which the canonical version carries and the behavioural gate of
+`10 §4.2` asserts for every candidate version (decision D-136).
 
 1. [ ] - `p1` - **Call targets are the enumerated values.** Every `call` **MUST** target `POST /bss-orders-workflow/v1/steps/{operation}` with `{operation}` one of the thirty-three granted values of §3.1; `settle-from-lookup` and `retry-step` **MUST NOT** appear; no `call` **MAY** target a control, read, task or approval route of this gear, since the `Gr` principal holds no pair on them and the call would be refused at run time rather than at publish (`10 §2.2` rules 1–2) - `inst-c9-call-targets`
 2. [ ] - `p1` - **Authority never crosses.** No task `input`, `output`, `export` or signal payload **MAY** carry a `subject_id`, `subject_type`, `token_scopes`, a PDP constraint, a justification or any snapshot field; a signal carries the reference tuple and `requestRef` (and `taskRef` for `task-resolution-requested`) only, and the consuming operation reads the request row by `requestRef` (`10 §2.2` rule 5, ADR-0013) - `inst-c9-no-authority`

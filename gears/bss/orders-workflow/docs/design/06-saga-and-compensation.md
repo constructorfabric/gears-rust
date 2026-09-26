@@ -1125,8 +1125,11 @@ open-questions register in [`../DECISIONS.md`](../DECISIONS.md) alongside the `S
 
 ### 4.7 Constraints this slice places on the definition
 
-These are inputs to the validation rules of ADR-0012 and `10 §2.2`; a definition version that
-violates one **MUST** be refused.
+These are inputs to the validation rules of ADR-0012 and `10 §2.2`.
+[`10 §4.7`](./10-process-definition.md#47-what-a-definition-change-may-and-may-not-do) *Slice constraints* maps each item below: an
+enforced item is refused through the rule or fence row it restates; every other item is
+canonical-definition guidance, which the canonical version carries and the behavioural gate of
+`10 §4.2` asserts for every candidate version (decision D-136).
 
 1. [ ] - `p1` - **Unwind order.** On every failure, cancel, supersede and terminal-event path: `run-cancellation-fence` **<** `compensate-order` **<** `report-outcome` **<** `terminate-instance`, with the `trigger` of `run-cancellation-fence` matching the path (`failure`, `cancel`, `supersede`, `terminal-event`) and the `outcome` of `report-outcome` derived from the fence's `effectiveTrigger` (`failed`, `cancelled`, `superseded`, `terminal-event`), never from the path's entry, because an absorbed trigger keeps the claimed run's report (§4.3) - `inst-def06-unwind-order`
 2. [ ] - `p1` - **Loop until complete.** Only `compensationState = complete` may reach `report-outcome`. `in-progress` and `pending-escalation` **MUST** return to `compensate-order` with `pass` incremented, after a `wait` or a manual-task resolution `listen`, and **MUST NOT** reach `report-outcome` or `terminate-instance`. Fragment (c) routes both through `awaitCompensationResolution`, whose 1 h `retryLeg` is inside the sweep floor; a dedicated `in-progress` case re-entering `compensate` on the barrier's poll interval is the recommended refinement for the fragment's owner - `inst-def06-loop`

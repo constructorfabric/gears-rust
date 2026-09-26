@@ -203,6 +203,27 @@ operation's input or output schema; the reason catalogue; the six-event set and 
 set; the seam calls; the idempotency families; audit kinds; the record tables; the PDP catalogue.
 A definition cannot make Orders do anything an operation does not already do.
 
+> **Amended 2026-09-26 by D-134, D-135, D-136 and D-138**: this contract is now the one table of
+> `design/10-process-definition.md` §4.7, which this paragraph no longer restates. Four
+> corrections. (1) The **business windows** — the approval escalation window, the overdue window
+> and the manual-task SLA classes — are not the definition's: they are values of the seller's
+> policy that `open-gates`, `construct-and-freeze-plan` and `create-manual-task` pin on the
+> order's record, changed by an audited policy write, with no release and no new definition
+> version (D-134). The definition owns only the tick that re-checks each stored deadline, so
+> "the duration of any `wait`" above means a tick, and the escalation, overdue and SLA "waits" of
+> *Timers, retry policy, waits and signals* and of the responsibility table are re-check loops
+> over those stored deadlines. The bound on them is checked where the policy is written
+> (`design/07-manual-tasks.md` §4.8 item 8), not by the nesting rule of *Bounds nest*. (2) The
+> **`p1` composables** — `open-gates`, `escalate-gate`, `park`, `arm-park-escalation`,
+> `raise-overdue-escalation` for the park and outage escalations, `resolve-manual-task`,
+> `evaluate-activation-eligibility` — may be re-positioned but not removed from the paths ADR-0012
+> requires them on, and a policy `switch` reads the pinned `policy` (D-135). (3) **No `call`
+> targets a platform Function**, `composable` operation or not: the grammar subset's "a
+> registered Function only for a `composable` operation" is withdrawn, because a Function would
+> act outside Orders' record (D-136). (4) **"Without an Orders release"** means without an Orders
+> build or deploy: a definition is published by a pipeline job of its own, gated on the rules and
+> a behavioural run of the candidate, and rolled back by a new version (D-138).
+
 **Fallback property.** If the platform readiness gate below does not pass, or if the Q-01
 evaluation in PRD §15 fails on the platform asks, the process record and the step operations are
 unchanged: the same tables, the same transactions, the same audit chain, the same idempotency
@@ -364,7 +385,7 @@ its ADR-0003, ADR-0004 and ADR-0005, and its API surface is its DESIGN.md §3.3.
   [`design/10-process-definition.md`](../design/10-process-definition.md);
   [`design/01-foundation.md`](../design/01-foundation.md) §3.7, §3.8
 - **Decisions register**: [`DECISIONS.md`](../DECISIONS.md) — Q-01 (answered in two parts), D-02,
-  D-53, D-62 (amended), D-65, D-69, D-70 (as amended), D-86 (as amended), Q-10, Q-11
+  D-53, D-62 (amended), D-65, D-69, D-70 (as amended), D-86 (as amended), D-134, D-135, D-136, D-138, Q-10, Q-11
 - **Upstream asks**: [`UPSTREAM_REQS.md`](../UPSTREAM_REQS.md) — serverless-runtime section
 - **Platform**: serverless-runtime
   [ADR-0003](../../../../serverless-runtime/docs/ADR/0003-cpt-cf-serverless-runtime-adr-workflow-dsl.md),

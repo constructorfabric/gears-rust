@@ -1240,7 +1240,11 @@ throttle-induced delay never extends the per-operation deadline (`01 §4.12`).
 
 ### 4.5 Constraints this slice places on the definition
 
-These are this slice's inputs to the validation rules of ADR-0012 (`10 §2.2`, `10 §4`). Items marked
+These are this slice's inputs to the validation rules of ADR-0012 (`10 §2.2`, `10 §4`).
+[`10 §4.7`](./10-process-definition.md#47-what-a-definition-change-may-and-may-not-do) *Slice constraints* maps each item below: an
+enforced item is refused through the rule or fence row it restates; every other item is
+canonical-definition guidance, which the canonical version carries and the behavioural gate of
+`10 §4.2` asserts for every candidate version (decision D-136). Items marked
 † were folded into the canonical YAML of `10 §3.6` (b) when the fragments were reconciled with the
 slice operations (D-80, D-81).
 
@@ -1304,8 +1308,9 @@ slice operations (D-80, D-81).
 11. **Signals handled.** This slice handles only the two Subscriptions outcome events, as wake-ups.
     It handles no operator signal.
 12. **Bounds.** The wave-2 task timeout (3 min) **MUST** exceed `dispatch-wave2-activate`'s 10 s
-    deadline plus the cumulative retry backoff (`01 §4.2`); the wave-1 task timeout (10 min) the
-    same for `dispatch-wave1-create`.
+    deadline, and the wave-1 task timeout (10 min) `dispatch-wave1-create`'s, so one attempt fits;
+    the timeout bounds the retries themselves, so no cumulative backoff is computed (`10 §2.2`
+    rule 4, decision D-126).
 
 ### 4.6 Notes and deviations
 

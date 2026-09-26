@@ -293,12 +293,15 @@ the process-lifetime ceiling remain **five** different things, but they now have
 The **operation enforces** exactly one of them: the **per-operation deadline** inside the
 envelope, evaluated against database time. The **definition declares** the other four — the
 task retry policy (budget, backoff, jitter), the task timeout that bounds a whole step, the
-overdue `wait` and the top-level lifetime `wait` — and the platform plugin executes them
-(`10 §2`, `10 §3.6`). The nesting invariant — per-operation deadline **<** the task's cumulative
-retry budget **<** the task timeout **<** the overdue window **<** the lifetime ceiling — is a
-**definition validation rule** enforced before publish
-(`cpt-cf-bss-orders-workflow-adr-definition-versioning-and-protected-steps`), and the operation's
-own deadline is asserted against the published bounds at configuration load (§4.2). Collapsing any
+overdue re-check and the top-level lifetime `wait` — and the platform plugin executes them
+(`10 §2`, `10 §3.6`); the overdue **window's value** is not the definition's but the seller's
+policy value, pinned on the plan at freeze, and the definition owns only the tick that re-checks
+it (decision D-134). The nesting invariant — per-operation deadline **<** the task timeout **<**
+the overdue window **<** the lifetime ceiling — is checked in two places: over the values the
+definition holds by a **definition validation rule** enforced before publish
+(`cpt-cf-bss-orders-workflow-adr-definition-versioning-and-protected-steps`, `10 §2.2` rule 4),
+and for the overdue window at the audited write of the seller's policy (`07 §4.8` item 8); the
+operation's own deadline is asserted against the published bounds at configuration load (§4.2). Collapsing any
 of the five into another either stalls a transient failure indefinitely, provisions against a
 payer who has not been charged, or leaves an order non-terminal forever.
 
@@ -345,9 +348,10 @@ operation is registered `retry_class = retryable-on: transient` and only to a tr
 or the registry answered `still-processing`. An intent already accepted and in flight is never
 retried as a resubmit: the envelope answers a retried key with the stored acceptance or with
 `still-processing`, and a post-accept hang is recovered by lookup through `settle-from-lookup`,
-never by a further attempt. The numeric values — backoff curve, maximum attempts, task timeouts,
-the overdue window and the lifetime ceiling — are declared on the definition (`10 §2`) and
-recorded here only as the working baselines of §4.2.
+never by a further attempt. The numeric values — backoff curve, maximum attempts, task timeouts
+and the lifetime ceiling — are declared on the definition (`10 §2`), the overdue window is a
+seller-policy value pinned on the plan (decision D-134), and all are recorded here only as the
+working baselines of §4.2.
 
 **ADRs**: `cpt-cf-bss-orders-workflow-adr-idempotency-key-composition`
 
@@ -401,7 +405,8 @@ per-operation `deadline`. The set is closed and compiled: an operation exists be
 registered it against the operation registration boundary (§3.2), and the operation registry
 (§3.7 `owf_step_operation`) is loaded from that compiled set at startup and never written at
 runtime. `protected` operations may be ordered by a definition but never omitted or replaced
-(`10 §2`); `composable` operations may be omitted.
+(`10 §2`); `composable` operations may be omitted, except where `10 §4.1` requires one on its
+path (D-135).
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-entity-process-instance`
 
@@ -842,7 +847,7 @@ declaration is mirrored into `owf_step_operation` (§3.7):
 | Field | Meaning | Closed values |
 |-------|---------|---------------|
 | `name` | Kebab-case, stable; the route segment, the PDP resource property and the definition's `call` target | one per registered operation; the canonical names and their protection are fixed by [ADR-0012](../ADR/0012-cpt-cf-bss-orders-workflow-adr-definition-versioning-and-protected-steps.md) (`cpt-cf-bss-orders-workflow-adr-definition-versioning-and-protected-steps`) |
-| `protection` | Whether a definition may omit or replace it | `protected` (must appear on its path, never replaced) · `composable` (may be omitted) |
+| `protection` | Whether a definition may omit or replace it | `protected` (must appear on its path, never replaced) · `composable` (may be omitted, except a `p1` composable on the path `10 §4.1` requires it on, D-135) |
 | `input` | GTS reference schema of the request body; references and small enums only | a `gts.cf.bss.orders_workflow.step.<name>.input.v1~` type |
 | `output` | GTS reference schema of the success body | a `gts.cf.bss.orders_workflow.step.<name>.output.v1~` type |
 | `idempotency_key` | Derivation family per [`../ADR/0006`](../ADR/0006-cpt-cf-bss-orders-workflow-adr-idempotency-key-composition.md), recomposed server-side | intent · approval-request · lifecycle-transition · instance-scoped (`{tenant}:{correlationId}:{name}[:{subject}][:{round}][:{attempt}]`) · trigger (`{tenant}:{eventId}:admit-trigger[:listen]`, event-scoped, [`02 §2.1`](./02-triggers-and-start.md#21-design-principles)). Every **re-invokable** operation's key ends in its round, and a key a manual-task retry re-enters ends in the minted `attempt` after it — the one rule of *Rounds and attempts* below, whose register lists every re-invokable operation and its round member |
@@ -975,11 +980,11 @@ about the instance the definition has established.
 |-------|-------|
 | `protection` | `protected` — the first operation of every path after `admit-trigger` |
 | `input` | `correlationId` (derived by `admit-trigger`, [`02 §2.1`](./02-triggers-and-start.md#21-design-principles)), `orderId`, `orderVersion`, `resourceTenantId`, `definitionId`, `definitionVersion`, `definitionSource`, `invocationId`, `triggerEventId`, `attemptId`. No seller axis: `resource_tenant_id` is the only tenant axis that crosses the engine boundary (`cpt-cf-bss-orders-workflow-adr-references-not-payloads`) |
-| `output` | `correlationId`, `phase = started`, `definitionVersion`, `invocationId` (the invocation **bound** to the instance: the caller's own on the call that inserts the row, the existing binding's on an absorbed duplicate), `rowVersion` |
+| `output` | `correlationId`, `phase = started`, `definitionVersion` (the version recorded from the platform's invocation record, D-137), `invocationId` (the invocation **bound** to the instance: the caller's own on the call that inserts the row, the existing binding's on an absorbed duplicate), `rowVersion` |
 | `idempotency_key` | instance-scoped: `{tenant}:{correlationId}:start-instance`; the fingerprint **excludes** `invocationId` and `attemptId` |
 | `declared_event` | none (`OrderFulfillmentStarted` belongs to `begin-fulfillment`, slice 04) |
 | `compensation` | none (`terminate-instance` is a path step, not a paired undo) |
-| `reasons` | `idempotency-key-conflict`, `definition-not-bound` (the named `definitionVersion` is not one the registry hook of `10 §3.3` has validated), `line-count-exceeded` (delegated check, slice 04) |
+| `reasons` | `idempotency-key-conflict`, `definition-not-bound` (the platform's invocation record for `invocationId` names a callable other than a major of `order_process`, or a `function_version` other than the input `definitionVersion` — the document's own `version`, D-137; once the hook of `10 §4.2` lands, also a version it has not validated), `line-count-exceeded` (delegated check, slice 04) |
 | `audit_kind` | `instance-start` at sequence 1 (or the next sequence of a pre-admission chain, §3.7) |
 | `retry_class` | `retryable-on: transient` |
 | `deadline` | 5 s |
@@ -988,7 +993,12 @@ Effect, in one transaction: resolve `seller_tenant_id` **inside Orders**, from t
 record that the settled `admit-trigger` admission for `triggerEventId` read (`02 §3.6`
 `inst-at-read`), never from the task input (decision D-76: the seller axis
 is resolved inside Orders and `admit-trigger`'s settled result carries it for `start-instance`);
-insert `owf_process_instance` with `invocation_id = invocationId` and `next_liveness_at` = now +
+read the platform's invocation record for `invocationId`
+(`GET /api/serverless-runtime/v1/invocations/{invocation_id}`, the read the instance liveness pass
+makes, §3.8) and take `definition_id` from its `function_id` and `definition_version` from its
+`function_version` — never from the task input, whose `definitionVersion` is only compared with
+it, so a document cannot claim a version the platform did not pin (decision D-137); a transient
+failure of that read settles `retryable-failure` (503) with the key left `open`; insert `owf_process_instance` with `invocation_id = invocationId` and `next_liveness_at` = now +
 15 min (§3.8 *Instance liveness pass*) (the partial unique index
 `UNIQUE (order_id) WHERE terminal_outcome IS NULL` arbitrates a race, not a prior read), insert
 `owf_definition_binding`, write `instance-start` with `definition_version` set, settle the key.
@@ -1215,12 +1225,15 @@ sequenceDiagram
     participant PL as Platform plugin (invocation of definition vN)
     participant AT as admit-trigger (slice 02)
     participant SE as Step envelope
+    participant RT as serverless-runtime invocation API
     participant DB as owf_process_instance / owf_definition_binding / owf_audit_entry
     PL ->> AT: POST /steps/admit-trigger (eventId, orderId, orderVersion)
     AT -->> PL: admitted, correlationId (derived), resourceTenantId
     PL ->> SE: POST /steps/start-instance (correlationId, definitionId, vN, invocationId, key)
+    SE ->> RT: GET /invocations/{invocationId} (platform invocation record)
+    RT -->> SE: function_id, function_version = vN (else definition-not-bound)
     SE ->> DB: INSERT instance (partial unique index arbitrates)
-    SE ->> DB: INSERT binding (definition_id, vN, source = platform, pinned_at, published_by)
+    SE ->> DB: INSERT binding (function_id, vN, source = platform, pinned_at, published_by = null)
     SE ->> DB: audit instance-start (definition_version = vN, phase_to = started)
     SE -->> PL: 200 correlationId, definitionVersion = vN, invocationId (bound)
     PL ->> SE: POST /steps/start-instance (same key) — replay or duplicate trigger
@@ -1230,7 +1243,8 @@ sequenceDiagram
 **Description**: The binding is written in the transaction that creates the instance and is never
 updated; the platform's pin of the invocation to callable version vN
 ([`DESIGN.md:614`](../../../../serverless-runtime/docs/DESIGN.md#versioning-model)) and Orders'
-binding record the same fact on both sides of the boundary. A later definition version affects
+binding record the same fact on both sides of the boundary, and the binding copies it from the
+platform's invocation record rather than from the document (decision D-137). A later definition version affects
 only instances started after it; nothing here migrates an instance.
 
 #### `settle-from-lookup`
@@ -1412,7 +1426,7 @@ partitioning at this phase.
 | definition_version | text, NOT NULL | The published version pinned at start |
 | definition_source | enum, NOT NULL | `platform` — the registered definition executed by the plugin; `code` — the stated fallback in which Orders sequences the same operations in Rust (`10 §1`) |
 | pinned_at | timestamptz, NOT NULL | Database time of `start-instance` |
-| published_by | text, NOT NULL | Opaque subject id of the principal that published the pinned version, copied from the registry's record at start (D-61 minimisation applies) |
+| published_by | text, nullable | Opaque subject id of the principal that published the pinned version, copied at start from the registry once it reports a publisher per version (part of `…-upreq-serverless-runtime-definition-versioning-validation-hook`); null until then, because the registered callable carries no publisher and the definition must not name its own. Until then the evidence of a publish is the publish job's run and the registry's version listing (`10 §4.2`, decision D-137; D-61 minimisation applies) |
 | resource_tenant_id | uuid, NOT NULL | Resource-recipient axis |
 
 **PK**: correlation_id
@@ -1420,8 +1434,8 @@ partitioning at this phase.
 **Constraints**: no UPDATE and no DELETE grant to any application role; the retention purge holds
 no grant on it — a binding lives as long as its instance row, and an instance row lives for the
 life of the order record. A definition version **MUST NOT** be archived or deleted in the platform
-registry while any row here names it (`10 §4`); the CI check of `10 §2` asserts the set of
-versions named here against the registry.
+registry while any row here names it (`10 §4`); the gear's readiness check in each environment
+compares the versions named here with the registry's version listing (`10 §4.2`, decision D-138).
 
 **Additional info**: **Ownership**: written only by `start-instance` through the envelope.
 **Tenant axis**: `resource_tenant_id` only. Not partitioned; sized by instance count.
@@ -1936,7 +1950,8 @@ against database time, which cuts a hanging effect and settles it `retryable-fai
 and applies only to operations registered `retryable-on: transient`; the **task timeout**, which
 bounds a whole step across its attempts; the **overdue window**, the top-level `overdueMonitor` branch, a
 `PT1H` re-check that calls `raise-overdue-escalation` and nothing else and is due only past the
-stored deadline; and the **process-lifetime ceiling**, the top-level literal `P90D` `wait` whose
+stored deadline — `expected_fulfillment_at` plus the seller's overdue window pinned on the plan
+(`04 §3.7`), so the definition owns the tick and never the window (decision D-134); and the **process-lifetime ceiling**, the top-level literal `P90D` `wait` whose
 firing enters the ceiling stage, which calls `raise-overdue-escalation` and `park` — except during
 an unwind, which does not park (no `compensating → parked` edge) and continues under a fresh
 ceiling; after an operator unpark the process resumes its saved stage under a fresh `P90D`
@@ -1952,8 +1967,9 @@ ever reaches fulfillment. Exhausting either **MUST NOT** mark a `FulfillmentTask
 #### Working baselines for the five bounds
 
 These are **working baselines**, proposed into the program-wide non-functional workshop the PRD
-defers to, not settled platform values. The first is configured on the operation; the other four
-are declared on the definition and recorded here so an unset value is a visible choice.
+defers to, not settled platform values. The first is configured on the operation, the overdue
+window is a value of the seller's policy, and the other three are declared on the definition;
+each is recorded here so an unset value is a visible choice.
 
 | Bound | Owner | Working baseline | Derivation |
 |-------|-------|------------------|------------|
@@ -1961,14 +1977,17 @@ are declared on the definition and recorded here so an unset value is a visible 
 | Task timeout, **wave-2 (activation) tasks** | definition | 3 min | The p95 ≤ 15 min clock starts at activation-wave eligibility, so the window bounds wave 2, the barrier release and the acknowledgement |
 | Task timeout, **wave-1 (draft-create) tasks** | definition | 10 min | Wave 1 sits outside the measured window |
 | Retry budget | definition (`use.retries`) | 5 attempts, exponential from 1 s, capped 30 s, full jitter | With the curve of §4.5 this spends ~15-30 s of cumulative backoff; the 3 min wave-2 timeout on the same `try` bounds it whatever curve the plugin applies, so the validation hook checks only that one attempt's deadline fits the timeout (`10 §2.2` rule 4, D-126) |
-| Overdue window | definition (`wait` arm) | 24 h past expected fulfillment time | Fixed by the PRD as commercial policy (`cpt-cf-bss-orders-workflow-fr-owf-overdue-escalation`) |
+| Overdue window | seller policy, pinned on the plan by `construct-and-freeze-plan` (`04 §3.7`); the definition owns only the `PT1H` re-check tick (D-134) | 24 h past expected fulfillment time, the default a seller's policy starts from | The PRD's business default for commercial policy (`cpt-cf-bss-orders-workflow-fr-owf-overdue-escalation`); a seller's value is bounded where the policy is written (`07 §4.8` item 8) |
 | Max process lifetime | definition (top-level `wait` arm) | 90 days from process start, never cancelled by a hold | Accepted (`DECISIONS.md` D-53) |
 
-**The nesting invariant is normative and is enforced in two places.** Per-operation deadline
-**<** cumulative retry backoff **<** task timeout **<** overdue window **<** lifetime ceiling. The
+**The nesting invariant is normative and is enforced in three places.** Per-operation deadline
+**<** task timeout **<** overdue window **<** lifetime ceiling. The
 validation hook of `10 §2` **MUST** refuse to publish a definition version whose declared values
-violate the ordering against the registered `deadline_ms` of every operation it calls
-(`cpt-cf-bss-orders-workflow-adr-definition-versioning-and-protected-steps`), and the gear
+violate the ordering against the registered `deadline_ms` of every operation it calls, over the
+values the definition holds (`10 §2.2` rule 4,
+`cpt-cf-bss-orders-workflow-adr-definition-versioning-and-protected-steps`); the audited write of a
+seller's policy **MUST** refuse an overdue window or SLA class outside the ordering (`07 §4.8`
+item 8, decision D-134); and the gear
 **MUST** refuse to become ready if a change to an operation's `deadline_ms` breaks the ordering
 against the definition versions active bindings name. A mis-ordered set does not fail loudly — it
 silently disables the inner bound — which is precisely the failure this assertion exists to
@@ -2005,10 +2024,13 @@ request; including everything else is what makes an absorbed duplicate a *verifi
 
 ### 4.4 Timers and retry policy are the definition's
 
-There is no durable timer service in this gear (retired by ADR-0011). Every escalation window,
-the expected-fulfillment wait, the barrier's polling interval, the sweep cadence for a live
-invocation, the overdue window and the lifetime ceiling **MUST** be expressed as `wait` tasks or
-task timeouts of the registered definition (`10 §2`, `10 §3.6`), executed by the plugin's
+There is no durable timer service in this gear (retired by ADR-0011). Every re-check of an
+escalation window, the expected-fulfillment wait, the barrier's polling interval, the sweep
+cadence for a live invocation, the re-check of the overdue window and the lifetime ceiling **MUST**
+be expressed as `wait` tasks or task timeouts of the registered definition (`10 §2`, `10 §3.6`);
+the escalation window, the overdue window and the SLA classes themselves are the seller's policy
+values that an operation pins on the record, never definition values (decision D-134). The waits
+are executed by the plugin's
 durable timers, which survive a platform worker restart by the plugin's own history
 ([serverless-runtime ADR-0004](../../../../serverless-runtime/docs/ADR/0004-cpt-cf-serverless-runtime-adr-temporal-workflow-engine.md)
 *Consequences*). Orders **MUST** record, through a step operation, every arm, pause, re-arm and
