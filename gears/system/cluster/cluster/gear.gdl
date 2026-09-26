@@ -1,0 +1,208 @@
+# Gearbox product metadata for the cluster gear.
+#
+# Projected from #[toolkit::gear]: id and runtime_caps. The attribute declares
+# `capabilities = [stateful, system, grpc, rest]`, and all four are read -- not
+# just `stateful`. `system` is why this gear starts before any application
+# consumer; `grpc` and `rest` are the surfaces the deployable model added, and
+# they are the reason a consumer is no longer pinned to this gear's process.
+#
+# `cluster_providers` is projected too -- from the with_*_provider calls in
+# ClusterGear::provider_registry(), and from each plugin crate's own
+# PROVIDER_NAME and backend impl. What that function registers today:
+#
+#   .with_cache_provider(StandaloneCacheProvider)
+#   .with_cache_provider(PostgresCacheProvider)
+#   .with_lock_provider(PostgresLockProvider)
+#   .with_cache_provider(RedisCacheProvider)
+#   .with_lock_provider(RedisLockProvider)
+#
+#   #[cfg(feature = "k8s")]
+#   .with_cache_provider(K8sCacheProvider)
+#   .with_leader_election_provider(K8sLeaderElectionProvider)
+#   .with_lock_provider(K8sLockProvider)
+#
+# Eight registrations across four crates, three of them behind a cargo feature.
+# A registration whose crate has no `cluster_plugin` locator below is GBX0509 --
+# Gearbox can see the name in `provider_registry()` and cannot find the crate to
+# read its capabilities out of, which is exactly what happened when the redis
+# plugin landed here before its locator did, and again when the k8s plugin did.
+#
+# **`K8sLeaderElectionProvider` is the first native leader election in the
+# tree.** Until it arrived, every scope fell through to the SDK's
+# compare-and-swap default over its cache, and this file said so as a standing
+# fact. That is now true only of a build without the `k8s` feature -- which is
+# why the feature is declared below rather than left to the build.
+#
+# `cluster_plugins` below is a locator, not a restatement. The registry names a
+# library identifier (`standalone_cluster_plugin`) and nothing in that
+# expression says which directory the crate is in, so `package` supplies the one
+# hop Rust cannot -- the same role `sdk` plays for a contract. Names and
+# capabilities are then read out of those crates.
+#
+# `process_local` and `needs_credentials` are the two facts with no Rust
+# representation at all: the nearest signal is that one plugin's options carry a
+# connection string and the other's do not, and reading deployment semantics out
+# of that would be an inference rather than a fact. Declared deliberately.
+
+gear(
+    name = "Cluster Coordination",
+    description = "Cache, leader-election and distributed-lock primitives over pluggable backends.",
+    # "serverless" is the platform's own answer, from gears/system/cluster/gear.toml.
+    # It reads oddly for a coordination gear, but taking the team's taxonomy beats
+    # inventing a better-sounding one.
+    category = "serverless",
+    visibility = "internal",
+
+    package = cargo(
+        crate_name = "cf-gears-cluster",
+        lib = "cluster",
+        path = ".",
+    ),
+
+    # Where the contract traits and the plugin-facing types live.
+    #
+    # Declared for the reason every other host with an SDK declares it: the
+    # crate is scanned only when something says where it is, and until now the
+    # GTS type this gear exposes and the four `#[toolkit::contract]`s were
+    # invisible to the catalogue. It projects no extension points -- the cluster
+    # plugin mechanism is `cluster_plugins` below, not `pub trait *Plugin*` --
+    # which is why this was easy to leave out and easy to get wrong.
+    sdk = cargo(
+        crate_name = "cf-gears-cluster-sdk",
+        lib = "cluster_sdk",
+        path = "../cluster-sdk",
+    ),
+
+    cluster_plugins = [
+        # An in-process store: every replica gets its own, coordinating none of
+        # the others. That is what makes it unusable in a multi-process topology
+        # (GBX0503) and perfect for dev and test.
+        cluster_plugin(
+            package = cargo(
+                crate_name = "cf-gears-standalone-cluster-plugin",
+                lib = "standalone_cluster_plugin",
+                path = "../plugins/standalone-cluster-plugin",
+            ),
+            process_local = True,
+            needs_credentials = False,
+            # The struct `build_cache` deserializes its options into. A join key
+            # and nothing more: the struct is already the authority on what an
+            # option may be -- `deny_unknown_fields`, as its own comment says --
+            # and what Rust has no way to state is which type the `&Map` handed
+            # to `build_cache` is read as. Declared for the same reason
+            # `process_local` is.
+            cache_options = "StandaloneOptions",
+        ),
+        cluster_plugin(
+            package = cargo(
+                crate_name = "cf-postgres-cluster-plugin",
+                lib = "postgres_cluster_plugin",
+                path = "../plugins/postgres-cluster-plugin",
+            ),
+            process_local = False,
+            needs_credentials = True,
+            cache_options = "PostgresClusterConfig",
+            lock_options = "PostgresLockConfig",
+            # Which option is the credential. `connection_string` is a plain
+            # `String`, so nothing in Rust marks it -- the projector reads
+            # `secrecy` wrappers and there is none -- and a form that offered a
+            # plaintext box for it would be offering to commit a password.
+            credential_option = "connection_string",
+        ),
+        # A network service like postgres, and declared the same way for the
+        # same reasons: its state is not in any one process, and it is reached
+        # through an operator-supplied connection URL
+        # (`redis_cluster_plugin::connect`), which is where the credential is.
+        cluster_plugin(
+            package = cargo(
+                crate_name = "cf-redis-cluster-plugin",
+                lib = "redis_cluster_plugin",
+                path = "../plugins/redis-cluster-plugin",
+            ),
+            process_local = False,
+            needs_credentials = True,
+            # Two structs, not one: `build_lock` reads `RedisLockConfig` because
+            # the three cache-only keys have no meaning for a lock, which the
+            # provider's own comment says at the call site.
+            cache_options = "RedisClusterConfig",
+            lock_options = "RedisLockConfig",
+            # `url` embeds the password, which the field's own doc comment says
+            # and its type does not. The name heuristic the Studio uses catches
+            # `connection_string` and misses this one, which is the argument for
+            # declaring it rather than guessing.
+            credential_option = "url",
+        ),
+        # Kubernetes leases and ConfigMaps, and the only plugin that answers all
+        # three primitives. Linked only under the `k8s` feature below: kube is a
+        # heavy dependency tree a non-Kubernetes deployment should not pay for,
+        # so a profile binding this provider needs a build that has it.
+        cluster_plugin(
+            package = cargo(
+                crate_name = "cf-k8s-cluster-plugin",
+                lib = "k8s_cluster_plugin",
+                path = "../plugins/k8s-cluster-plugin",
+            ),
+            process_local = False,
+            # **False, and not an oversight.** This flag is about a credential
+            # the *description* has to supply -- it is what makes GBX0506 refuse
+            # a backend that is told nowhere to find one. The k8s providers
+            # authenticate as the pod, through an in-cluster service account the
+            # platform mounts, and no option of theirs carries a secret. Marking
+            # it True would refuse every correct binding.
+            needs_credentials = False,
+            cache_options = "K8sCacheConfig",
+            leader_election_options = "K8sLeaderElectionConfig",
+            lock_options = "K8sLockConfig",
+        ),
+    ],
+
+    # The gear's own configuration, as opposed to any plugin's options.
+    #
+    # Curated rather than projected wholesale: `ClusterConfig` is located on its
+    # own from `ctx.config_or_default()`, and what a description adds is which
+    # keys are worth putting in front of an integrator. There are two, and both
+    # are. `profiles` is the binding table itself -- a map, so it projects as a
+    # shape no form can render, and it is exposed so that it is *named* rather
+    # than silently missing. `fence_retention` is the one an operator types.
+    #
+    # **`fence_retention` here is not the postgres plugin's
+    # `fence_retention_ms`.** This one governs the cache-backed SDK default lock
+    # and leader-election backends; a native backend keeps its own window in its
+    # own options, which that plugin's own field documents at length.
+    config_schema = config(exposes = ["profiles", "fence_retention"]),
+
+    # `integration` gates tests that want a running backend, so it is not offered.
+    # `k8s` links the native Kubernetes providers; without it `provider: k8s` is
+    # an unknown provider that fails at startup, which makes it the most
+    # deployment-relevant feature this crate has.
+    # `k8s-auth` belongs to a Kubernetes deployment and to no other.
+    cargo_features = [
+        feature("k8s", kinds = ["kubernetes"]),
+        feature("k8s-auth", kinds = ["kubernetes"]),
+    ],
+
+    # Not declared, each for a reason:
+    #
+    # `provides` -- `cluster-sdk` carries four `#[toolkit::contract]` traits and
+    # this gear serves all four over gRPC, so a `provide(...)` each would be
+    # writable. It is left out because nothing consumes them that way: the
+    # cluster edge is modelled by `cluster.cache/leader_election/lock(profile =
+    # ...)` on the *consumer* side and resolved by the cluster resolver, and no
+    # gear in the tree writes `consume(contract = "ClusterCacheApi")`. Declaring
+    # four contracts nobody joins to would assert a relationship the resolver
+    # does not use. The day a gear consumes one, this is where it starts.
+    #
+    # `serves` -- the gear binds no socket of its own. Its gRPC services are
+    # mounted on grpc-hub, which `registered_gears.rs` makes mandatory for any
+    # process that links this gear, and `register_rest` adds no routes at all.
+    # The `via` form would be the way to say "hosted elsewhere", but `via` names
+    # the *capability* that hosts it -- `rest_host`, the only one there is -- and
+    # gRPC has no counterpart in that vocabulary. Declaring `via = "grpc_hub"`
+    # would name a gear where every other use names a capability, which is
+    # inventing a second meaning for one field. Recorded as a gap rather than
+    # filled with a guess.
+    #
+    # `roles` -- there is no deployment-mode enum. `src/main.rs` says it
+    # outright: the binary selects the out-of-process profile and the gear does
+    # not know which profile it is in.
+)

@@ -1,0 +1,51 @@
+# Gearbox product metadata for the account-management gear.
+#
+# Projected from #[toolkit::gear]: id, runtime_caps (db, rest, stateful),
+# colocated_deps (authz-resolver, types-registry, resource-group,
+# tenant-resolver) and the lifecycle clause. Four `deps` is the widest
+# co-location closure in the platform, and it is why this gear is part of
+# `platform-host` rather than a pod of its own.
+
+gear(
+    name = "Account Management",
+    description = "Reference multi-tenant account management with user and tenant lifecycle operations.",
+    category = "oss",
+    visibility = "internal",
+
+    package = cargo(
+        crate_name = "cf-gears-account-management",
+        lib = "account_management",
+        path = ".",
+    ),
+
+    # A locator: the SDK declares the identity-provider plugin trait this gear
+    # selects an implementation of at runtime, and nothing in the gear's own
+    # crate says where that SDK is.
+    sdk = cargo(
+        crate_name = "cf-gears-account-management-sdk",
+        lib = "account_management_sdk",
+        path = "../account-management-sdk",
+    ),
+
+    # The point plugins fill, keyed by the GTS spec their instances register
+    # under and this gear selects by. Declared, and checked against the sdk: the
+    # spec must be a `PluginV1` type it declares, the trait a `pub trait` in it.
+    extension_points = [
+        extension_point("cf.core.idp.plugin.v1~", trait = "IdpPluginClient"),
+    ],
+
+    # **Not declared: `fills` for tenant-resolver's point.** This gear can also
+    # register itself as a tenant-resolver plugin, behind `tr_plugin.enabled`,
+    # which defaults to false. Declaring the fill would make every product that
+    # selects this gear without tenant-resolver fail GBX0513, for a role that is
+    # off unless someone turns it on.
+    #
+    # Known gap: the selector reported for the point above is read as
+    # "constructorfabric", which is `tr_plugin.vendor`. The IdP selector is
+    # `idp.vendor`, default "cf". The point cannot yet name its selector field.
+
+    # Deliberately empty rather than absent: the crate's only feature is
+    # `integration`, which spins up Postgres in Docker per test. "Nothing here
+    # for you" is an answer; saying nothing is not.
+    cargo_features = [],
+)

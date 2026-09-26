@@ -90,7 +90,10 @@ async fn main() -> anyhow::Result<()> {
 
     run_oop_with_options(OopRunOptions {
         // Must equal `#[toolkit::gear(name = ...)]`: the bootstrap registers the
-        // instance under this name and reads `gears.<name>.config` by it.
+        // instance under this name, and with `config_gear_name` left unset it
+        // reads `gears.<name>.config` by it too. Those are one string only for a
+        // gear that runs in one shape; a role-split gear registers under its
+        // role's directory name and still reads its own id.
         gear_name: "cluster".to_owned(),
         verbose: cli.verbose,
         config_path: cli.config,

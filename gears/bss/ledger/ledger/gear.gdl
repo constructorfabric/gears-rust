@@ -1,0 +1,40 @@
+# Gearbox product metadata for the Billing Ledger.
+#
+# Projected from #[toolkit::gear]: id, runtime_caps (db, rest, stateful),
+# colocated_deps (types-registry, authz-resolver, account-management), and the
+# lifecycle (entry `serve`, stop timeout 30s).
+
+gear(
+    name = "Billing Ledger",
+    description = "Append-only double-entry subledger for financially material movements and balances.",
+    category = "bss",
+    visibility = "internal",
+
+    package = cargo(
+        crate_name = "cf-gears-bss-ledger",
+        lib = "bss_ledger",
+        path = ".",
+    ),
+
+    sdk = cargo(
+        crate_name = "cf-gears-bss-ledger-sdk",
+        lib = "bss_ledger_sdk",
+        path = "../ledger-sdk",
+    ),
+
+    # The point plugins fill, keyed by the GTS spec their instances register
+    # under and this gear selects by. Declared, and checked against the sdk: the
+    # spec must be a `PluginV1` type it declares, the trait a `pub trait` in it.
+    extension_points = [
+        extension_point("cf.bss.rate_provider.plugin.v1~", trait = "RateProviderV1"),
+    ],
+
+    # The one top-level switch. Everything else in `BssLedgerConfig` is a
+    # nested section -- jobs, recognition, fx, recon, payments -- or a list
+    # (`seller_tenant_types`), and stays in the configuration file.
+    config_schema = config(exposes = ["events_enabled"]),
+
+    # `test-support` exposes a metrics harness for tests and is kept out of the
+    # release artifact on purpose; nothing here is a deployment choice.
+    cargo_features = [],
+)

@@ -1,0 +1,33 @@
+# Gearbox product metadata for GitHub Mirror.
+#
+# Projected from #[toolkit::gear]: id, runtime_caps (rest, db), colocated_deps
+# (authz-resolver).
+#
+# There is no gear.toml for this gear, so the name is the PRD's title and the
+# description is condensed from the PRD's purpose. **The category is a choice
+# made here, not one the repository records**: nothing else files this gear
+# anywhere, and Studio groups every gear by category, so it needs one. It
+# stands between the platform and an external service, which makes
+# `core-platform-integration` the nearest of the groups in use.
+
+gear(
+    name = "GitHub Mirror",
+    description = "Continuously synchronised local replica of GitHub repository metadata, behind a GitHub-compatible API.",
+    category = "core-platform-integration",
+    visibility = "internal",
+
+    package = cargo(
+        crate_name = "cf-gears-github-mirror",
+        lib = "github_mirror",
+        path = ".",
+    ),
+
+    sdk = cargo(
+        crate_name = "cf-gears-github-mirror-sdk",
+        lib = "github_mirror_sdk",
+        path = "../github-mirror-sdk",
+    ),
+
+    # `github_token` is a secret and is never offered as a control.
+    config_schema = config(exposes = ["api_base_url"]),
+)

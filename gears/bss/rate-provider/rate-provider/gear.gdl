@@ -1,0 +1,56 @@
+# Gearbox product metadata for the FX Rate Provider.
+#
+# Projected from #[toolkit::gear]: id, colocated_deps (types-registry).
+#
+# **Both a plugin and a host, over one trait.** It registers a composite as
+# the ledger's rate provider -- the `fills` below -- and composes source plugins
+# of its own, discovered by `source_vendor`. Both sides implement
+# `bss_ledger_sdk::RateProviderV1`; only the GTS specs tell the two points apart,
+# which is why a point is keyed by its spec.
+#
+# No vendor selector is reported for its own point: its config holds two
+# vendors, `vendor` (what it registers under, for the ledger) and
+# `source_vendor` (what it selects its sources by), and the point cannot yet
+# name which field selects.
+
+gear(
+    name = "FX Rate Provider",
+    description = "Stateless adapter supplying live foreign-exchange rates via composable source plugins.",
+    category = "bss",
+    visibility = "internal",
+
+    package = cargo(
+        crate_name = "cf-gears-bss-rate-provider",
+        lib = "bss_rate_provider",
+        path = ".",
+    ),
+
+    # The GTS types the family declares live here, and belong to this gear.
+    sdk = cargo(
+        crate_name = "cf-gears-bss-rate-provider-sdk",
+        lib = "bss_rate_provider_sdk",
+        path = "../rate-provider-sdk",
+    ),
+
+    # The ledger's point, which the composite fills.
+    fills = "cf.bss.rate_provider.plugin.v1~",
+
+    # The sources' point. Its spec is declared in this gear's own sdk; its
+    # trait is the ledger's, so the point names that crate.
+    extension_points = [
+        extension_point(
+            "cf.bss.rate_provider_source.plugin.v1~",
+            trait = "RateProviderV1",
+            sdk = cargo(
+                crate_name = "cf-gears-bss-ledger-sdk",
+                lib = "bss_ledger_sdk",
+                path = "../../ledger/ledger-sdk",
+            ),
+        ),
+    ],
+
+    # `vendor` and `priority` are how the ledger selects this gear among rate
+    # providers; `source_vendor` is how this gear selects its sources. `id` is
+    # the label reported before the first discovery and is left to the file.
+    config_schema = config(exposes = ["vendor", "priority", "source_vendor"]),
+)

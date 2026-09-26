@@ -1,0 +1,35 @@
+# Gearbox product metadata for the Usage Collector.
+#
+# Projected from #[toolkit::gear]: id, runtime_caps (rest, stateful),
+# colocated_deps (types-registry, authz-resolver), and the lifecycle
+# (entry `serve`, stop timeout 30s). Storage is a plugin, chosen by `vendor`.
+
+gear(
+    name = "Usage Collector",
+    description = "Centralized usage metering with pluggable storage, aggregation, and replay-safe feeds.",
+    category = "core-functionality",
+    visibility = "internal",
+
+    package = cargo(
+        crate_name = "cf-gears-usage-collector",
+        lib = "usage_collector",
+        path = ".",
+    ),
+
+    sdk = cargo(
+        crate_name = "cf-gears-usage-collector-sdk",
+        lib = "usage_collector_sdk",
+        path = "../usage-collector-sdk",
+    ),
+
+    # The point plugins fill, keyed by the GTS spec their instances register
+    # under and this gear selects by. Declared, and checked against the sdk: the
+    # spec must be a `PluginV1` type it declares, the trait a `pub trait` in it.
+    extension_points = [
+        extension_point("cf.core.uc.plugin.v1~", trait = "UsageCollectorPluginV1"),
+    ],
+
+    # `vendor` selects the storage plugin. `metrics` is a nested struct and
+    # stays in the configuration file.
+    config_schema = config(exposes = ["vendor"]),
+)

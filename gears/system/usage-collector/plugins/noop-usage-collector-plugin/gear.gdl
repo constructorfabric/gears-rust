@@ -1,0 +1,25 @@
+# Gearbox product metadata for the Noop Usage Collector Plugin.
+#
+# One of two storage backends filling usage-collector's extension point.
+# Which point that is, and this plugin's vendor and priority, are all read
+# from source; only the sdk locator is declared.
+
+gear(
+    name = "Noop Usage Collector Plugin",
+    description = "No-op storage backend plugin for Usage Collector testing and development.",
+    category = "core-functionality",
+    visibility = "internal",
+
+    package = cargo(
+        crate_name = "cf-gears-noop-usage-collector-plugin",
+        lib = "noop_usage_collector_plugin",
+        path = ".",
+    ),
+
+    # The point this plugin fills, by the GTS spec its host declares. The
+    # declaration is the role; the `impl` in this crate is only checked against
+    # it. No `sdk`: the host's SDK is the host's.
+    fills = "cf.core.uc.plugin.v1~",
+
+    config_schema = config(exposes = ["vendor", "priority"]),
+)

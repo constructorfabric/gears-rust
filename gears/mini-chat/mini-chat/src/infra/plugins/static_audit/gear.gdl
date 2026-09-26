@@ -1,0 +1,27 @@
+# Gearbox product metadata for the Static MiniChat Audit Plugin.
+#
+# Lives in cf-gears-mini-chat beside its host; this description sits beside its
+# own #[toolkit::gear], which `attr` pins. Fills mini-chat's audit extension
+# point, declared by `fills`; vendor and priority are read from source.
+#
+# No gear.toml exists for it: name and description are the gear's own doc
+# comment, the category is the host's.
+
+gear(
+    name = "Static MiniChat Audit Plugin",
+    description = "Logs MiniChat audit events through tracing, for development and testing.",
+    category = "gen-ai",
+    visibility = "internal",
+
+    package = cargo(
+        crate_name = "cf-gears-mini-chat",
+        lib = "mini_chat",
+        path = "../../../..",
+        attr = "src/infra/plugins/static_audit/gear.rs",
+    ),
+
+    fills = "cf.core.mini_chat_audit.plugin.v1~",
+
+    # `enabled = false` keeps the plugin registered and silences it.
+    config_schema = config(exposes = ["enabled", "vendor", "priority"]),
+)

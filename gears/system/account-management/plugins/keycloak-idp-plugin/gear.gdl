@@ -1,0 +1,44 @@
+# Gearbox product metadata for the Keycloak IdP Plugin.
+#
+# Fills account-management's identity-provider extension point
+# (`IdpPluginClient`), declared by `fills`. This plugin's vendor and priority
+# are read from source.
+#
+# There is no gear.toml for this plugin, so name and description come from the
+# crate's own Cargo.toml, and the category is the host family's: the platform
+# files account-management under "oss" and has said nothing separate for its
+# plugins.
+
+gear(
+    name = "Keycloak IdP Plugin",
+    description = "Tenant, user and machine-identity lifecycle for Account Management over the Keycloak admin API.",
+    category = "oss",
+    visibility = "internal",
+
+    package = cargo(
+        crate_name = "cf-gears-keycloak-idp-plugin",
+        lib = "keycloak_idp_plugin",
+        path = ".",
+    ),
+
+    # The point this plugin fills, by the GTS spec its host declares. The
+    # declaration is the role; the `impl` in this crate is only checked against
+    # it. No `sdk`: the host's SDK is the host's.
+    fills = "cf.core.idp.plugin.v1~",
+
+    # `rust` is named because init reads two structs: first
+    # `KeycloakIdpPluginEnabledProbe`, for the `enabled` flag alone, and only
+    # then the real configuration.
+    #
+    # The rest of `KeycloakIdpPluginConfig` is nested -- the realm connection,
+    # the facades, the service account -- and the service account carries a
+    # credential. Those stay in the configuration file.
+    config_schema = config(
+        rust = "KeycloakIdpPluginConfig",
+        exposes = ["vendor", "priority"],
+    ),
+
+    # `default = []` is the crate's only feature and enables nothing; offering
+    # it would be offering a switch that switches nothing.
+    cargo_features = [],
+)

@@ -1,0 +1,30 @@
+# Gearbox product metadata for the Tenant-Resolver AuthZ Plugin.
+#
+# Fills authz-resolver's extension point (`AuthZResolverPluginClient`) by
+# walking the tenant hierarchy through tenant-resolver. The point is declared
+# by `fills`; vendor and priority are read from source, and so is the link to
+# tenant-resolver, which the attribute states as
+# `deps = [types_registry, tenant_resolver]`.
+#
+# No gear.toml exists for it: name and description are the crate's own, and the
+# category is the host's.
+
+gear(
+    name = "Tenant-Resolver AuthZ Plugin",
+    description = "Authorization over the tenant hierarchy, resolved through Tenant Resolver.",
+    category = "core-platform-integration",
+    visibility = "internal",
+
+    package = cargo(
+        crate_name = "cf-gears-tr-authz-plugin",
+        lib = "tr_authz_plugin",
+        path = ".",
+    ),
+
+    # The point this plugin fills, by the GTS spec its host declares. The
+    # declaration is the role; the `impl` in this crate is only checked against
+    # it. No `sdk`: the host's SDK is the host's.
+    fills = "cf.core.authz_resolver.plugin.v1~",
+
+    config_schema = config(exposes = ["vendor", "priority"]),
+)

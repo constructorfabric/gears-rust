@@ -1,0 +1,40 @@
+# Gearbox product metadata for the TimescaleDB Usage Collector Plugin.
+#
+# One of two storage backends filling usage-collector's extension point.
+# Which point that is, and this plugin's vendor and priority, are all read
+# from source; only the sdk locator is declared.
+
+gear(
+    name = "TimescaleDB Usage Collector Plugin",
+    description = "TimescaleDB time-series storage backend plugin for production usage collection.",
+    category = "core-functionality",
+    visibility = "internal",
+
+    package = cargo(
+        crate_name = "cf-gears-timescaledb-usage-collector-plugin",
+        lib = "timescaledb_usage_collector_plugin",
+        path = ".",
+    ),
+
+    # The point this plugin fills, by the GTS spec its host declares. The
+    # declaration is the role; the `impl` in this crate is only checked against
+    # it. No `sdk`: the host's SDK is the host's.
+    fills = "cf.core.uc.plugin.v1~",
+
+    # The operator's knobs, and not the connection: `database_url` is a
+    # `SecretFromEnv`, a credential read from the environment, and a form that
+    # offered a box for it would be offering to commit a password.
+    config_schema = config(exposes = [
+        "vendor",
+        "priority",
+        "pool_size_min",
+        "pool_size_max",
+        "connection_timeout_secs",
+        "statement_timeout_secs",
+        "retention_period_secs",
+    ]),
+
+    # `postgres` gates the Docker-backed integration tests and changes nothing
+    # a deployment links, so nothing is offered.
+    cargo_features = [],
+)

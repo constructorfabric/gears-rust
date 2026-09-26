@@ -1563,6 +1563,7 @@ dependencies = [
  "axum",
  "cf-api-contracts",
  "cf-api-contracts-sdk",
+ "cf-gears-cluster-sdk",
  "cf-gears-toolkit",
  "cf-gears-toolkit-canonical-errors",
  "cf-gears-toolkit-contract",

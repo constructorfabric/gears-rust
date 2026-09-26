@@ -1,0 +1,31 @@
+# Gearbox product metadata for the Static Model Policy Plugin.
+#
+# Lives in cf-gears-mini-chat beside its host; this description sits beside its
+# own #[toolkit::gear], which `attr` pins. Fills mini-chat's model-policy
+# extension point, declared by `fills`; vendor and priority are read from
+# source.
+#
+# Name, description and category come from gears/mini-chat/plugins/
+# static-model-policy-plugin/gear.toml. That directory also holds a Cargo.toml
+# for a crate with no source that is not a workspace member, which is why this
+# description points here rather than there.
+
+gear(
+    name = "Static Model Policy Plugin",
+    description = "Static model policy plugin providing fixed model selection for MiniChat deployments.",
+    category = "gen-ai",
+    visibility = "internal",
+
+    package = cargo(
+        crate_name = "cf-gears-mini-chat",
+        lib = "mini_chat",
+        path = "../../../..",
+        attr = "src/infra/plugins/static_model_policy/gear.rs",
+    ),
+
+    fills = "cf.core.mini_chat_model_policy.plugin.v1~",
+
+    # The model catalogue, kill switches and tier limits are nested records and
+    # stay in the configuration file.
+    config_schema = config(exposes = ["vendor", "priority"]),
+)

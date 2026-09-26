@@ -1,0 +1,31 @@
+# Gearbox product metadata for Plan & Price Modeling.
+#
+# Projected from #[toolkit::gear]: id, runtime_caps (db, rest, stateful),
+# colocated_deps (types-registry, authz-resolver, account-management), and the
+# lifecycle (entry `serve`, stop timeout 30s).
+
+gear(
+    name = "Plan & Price Modeling",
+    description = "Authoritative catalog for subscription plans, price structures, and billing descriptors.",
+    category = "bss",
+    visibility = "internal",
+
+    package = cargo(
+        crate_name = "cf-gears-bss-pricing",
+        lib = "bss_pricing",
+        path = ".",
+    ),
+
+    sdk = cargo(
+        crate_name = "cf-gears-bss-pricing-sdk",
+        lib = "bss_pricing_sdk",
+        path = "../pricing-sdk",
+    ),
+
+    # As in the ledger: one top-level switch, and nested sections that stay in
+    # the configuration file.
+    config_schema = config(exposes = ["events_enabled"]),
+
+    # `test-support` is the ledger's arrangement: a test harness, never shipped.
+    cargo_features = [],
+)

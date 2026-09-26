@@ -1,0 +1,27 @@
+# Gearbox product metadata for the Static License Plugin.
+#
+# Fills license-resolver's extension point, declared by `fills`; this plugin's
+# vendor and priority are read from source. There is no gear.toml beside it:
+# the name and description are the crate's own, the category is the host's.
+
+gear(
+    name = "Static License Plugin",
+    description = "License grants from static configuration rules, for development and testing.",
+    category = "core-platform-integration",
+    visibility = "internal",
+
+    package = cargo(
+        crate_name = "cf-gears-static-license-plugin",
+        lib = "static_license_plugin",
+        path = ".",
+    ),
+
+    # The point this plugin fills, by the GTS spec its host declares. The
+    # declaration is the role; the `impl` in this crate is only checked against
+    # it. No `sdk`: the host's SDK is the host's.
+    fills = "cf.core.license_resolver.plugin.v1~",
+
+    # `grants` is a list of rules; no control renders it, so it stays in the
+    # configuration file.
+    config_schema = config(exposes = ["vendor", "priority"]),
+)

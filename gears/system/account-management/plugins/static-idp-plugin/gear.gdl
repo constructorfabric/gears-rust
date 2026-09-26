@@ -1,0 +1,29 @@
+# Gearbox product metadata for the Static IdP Plugin.
+#
+# Fills account-management's identity-provider extension point
+# (`IdpPluginClient`) with a permissive echo, for development and end-to-end
+# stacks. The point is declared by `fills`; vendor and priority are read from
+# source.
+#
+# No gear.toml exists for it: name and description are the crate's own, and the
+# category is the host family's.
+
+gear(
+    name = "Static IdP Plugin",
+    description = "Permissive echo identity provider for Account Management development and end-to-end stacks.",
+    category = "oss",
+    visibility = "internal",
+
+    package = cargo(
+        crate_name = "cf-gears-static-idp-plugin",
+        lib = "static_idp_plugin",
+        path = ".",
+    ),
+
+    # The point this plugin fills, by the GTS spec its host declares. The
+    # declaration is the role; the `impl` in this crate is only checked against
+    # it. No `sdk`: the host's SDK is the host's.
+    fills = "cf.core.idp.plugin.v1~",
+
+    config_schema = config(exposes = ["vendor", "priority"]),
+)
