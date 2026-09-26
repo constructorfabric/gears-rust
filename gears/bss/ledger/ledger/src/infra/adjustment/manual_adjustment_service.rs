@@ -477,23 +477,21 @@ impl ManualAdjustmentHandler {
         // (page) The Critical write-off alarm — fire-and-forget on its own committed
         // connection (the post was rejected with NO books effect, so there is no post
         // txn to ride).
-        self.publisher
-            .emit_invariant_alarm(
-                ctx,
-                LedgerInvariantAlarm {
-                    category: AlarmCategory::AttemptedWriteOff,
-                    severity: AlarmSeverity::Critical,
-                    tenant_id: req.tenant_id,
-                    scope: format!(
-                        "tenant:{}/flow:MANUAL_ADJUSTMENT/business:{}",
-                        req.tenant_id, req.adjustment_id
-                    ),
-                    code: CODE_MANUAL_ADJUSTMENT_NOT_ALLOWED.to_owned(),
-                    detail: detail.to_owned(), // internal diagnostic — no PII
-                    affected: vec![],
-                },
-            )
-            .await;
+        self.publisher.emit_invariant_alarm(
+            ctx,
+            LedgerInvariantAlarm {
+                category: AlarmCategory::AttemptedWriteOff,
+                severity: AlarmSeverity::Critical,
+                tenant_id: req.tenant_id,
+                scope: format!(
+                    "tenant:{}/flow:MANUAL_ADJUSTMENT/business:{}",
+                    req.tenant_id, req.adjustment_id
+                ),
+                code: CODE_MANUAL_ADJUSTMENT_NOT_ALLOWED.to_owned(),
+                detail: detail.to_owned(), // internal diagnostic — no PII
+                affected: vec![],
+            },
+        );
 
         // (capture) The secured-audit record on a SEPARATE committed transaction. The
         // before_after is PII-free: ids + the action / reason codes + the per-leg
@@ -602,7 +600,6 @@ impl PostSidecar for ManualAdjustmentPostSidecar {
                     ..self.event_template.clone()
                 },
             )
-            .await
             .map_err(|e| DomainError::Internal(format!("publish manual_adjustment.posted: {e}")))?;
         Ok(())
     }

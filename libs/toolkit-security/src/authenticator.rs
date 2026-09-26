@@ -196,29 +196,39 @@ mod tests {
     struct FakeBearer;
 
     impl BearerAuthenticator for FakeBearer {
-        async fn authenticate(&self, token: &str) -> Result<SecurityContext, AuthNError> {
-            if token == "bad" {
-                return Err(AuthNError::InvalidToken);
-            }
-            SecurityContext::builder()
-                .subject_id(Uuid::from_u128(1))
-                .subject_tenant_id(Uuid::from_u128(2))
-                .subject_type(token)
-                .build()
-                .map_err(|e| AuthNError::Other(e.to_string()))
+        fn authenticate(
+            &self,
+            token: &str,
+        ) -> impl Future<Output = Result<SecurityContext, AuthNError>> + Send {
+            let result = if token == "bad" {
+                Err(AuthNError::InvalidToken)
+            } else {
+                SecurityContext::builder()
+                    .subject_id(Uuid::from_u128(1))
+                    .subject_tenant_id(Uuid::from_u128(2))
+                    .subject_type(token)
+                    .build()
+                    .map_err(|e| AuthNError::Other(e.to_string()))
+            };
+            std::future::ready(result)
         }
     }
 
     struct FakeInternal;
 
     impl InternalAuthenticator for FakeInternal {
-        async fn authenticate(&self, token: &str) -> Result<PlatformIdentity, InternalAuthNError> {
-            if token == "bad" {
-                return Err(InternalAuthNError::InvalidToken);
-            }
-            Ok(PlatformIdentity::Shared {
-                name: token.to_owned(),
-            })
+        fn authenticate(
+            &self,
+            token: &str,
+        ) -> impl Future<Output = Result<PlatformIdentity, InternalAuthNError>> + Send {
+            let result = if token == "bad" {
+                Err(InternalAuthNError::InvalidToken)
+            } else {
+                Ok(PlatformIdentity::Shared {
+                    name: token.to_owned(),
+                })
+            };
+            std::future::ready(result)
         }
     }
 

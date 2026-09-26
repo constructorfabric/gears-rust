@@ -90,7 +90,6 @@ impl PostSidecar for ReversalEventSidecar {
                     reason: self.reason.clone(),
                 },
             )
-            .await
             .map_err(|e| DomainError::Internal(format!("publish entry_reversed: {e}")))
     }
 }

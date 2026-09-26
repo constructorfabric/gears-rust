@@ -28,6 +28,8 @@
 //! # }
 //! ```
 
+use std::future::Future;
+
 use secrecy::{ExposeSecret, SecretString};
 
 use crate::internal_auth::{InternalAuthNError, InternalAuthenticator, PlatformIdentity};
@@ -93,8 +95,11 @@ impl SharedSecretInternalAuthenticator {
 }
 
 impl InternalAuthenticator for SharedSecretInternalAuthenticator {
-    async fn authenticate(&self, token: &str) -> Result<PlatformIdentity, InternalAuthNError> {
-        if constant_time_eq(token.as_bytes(), self.secret.expose_secret().as_bytes()) {
+    fn authenticate(
+        &self,
+        token: &str,
+    ) -> impl Future<Output = Result<PlatformIdentity, InternalAuthNError>> + Send {
+        let result = if constant_time_eq(token.as_bytes(), self.secret.expose_secret().as_bytes()) {
             Ok(PlatformIdentity::Shared {
                 name: self.peer_name.clone(),
             })
@@ -108,7 +113,8 @@ impl InternalAuthenticator for SharedSecretInternalAuthenticator {
                 "platform-plane authentication rejected: shared secret did not match"
             );
             Err(InternalAuthNError::InvalidToken)
-        }
+        };
+        std::future::ready(result)
     }
 }
 

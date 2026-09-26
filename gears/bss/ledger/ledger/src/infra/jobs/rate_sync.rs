@@ -132,8 +132,7 @@ impl RateSyncJob {
                         error = %e,
                         "bss-ledger: FX rate-sync provider fetch failed; raising FX_SNAPSHOT_MISSING"
                     );
-                    self.emit_snapshot_missing(&ctx, self.provider.provider_id(), &request_id, &e)
-                        .await;
+                    self.emit_snapshot_missing(&ctx, self.provider.provider_id(), &request_id, &e);
                 }
                 return Ok(RateSyncReport::default());
             }
@@ -259,7 +258,7 @@ impl RateSyncJob {
     /// alarm carries the nil tenant + an `fx-rate-sync` system scope — it signals
     /// "no tenant's rates are being refreshed". Severity is taken from the §4.7
     /// catalog (`Critical`), like the posting service's `alarm_for`.
-    async fn emit_snapshot_missing(
+    fn emit_snapshot_missing(
         &self,
         ctx: &SecurityContext,
         provider_id: &str,
@@ -276,7 +275,7 @@ impl RateSyncJob {
             detail: snapshot_missing_detail(provider_id, request_id, err),
             affected: vec![],
         };
-        self.publisher.emit_invariant_alarm(ctx, alarm).await;
+        self.publisher.emit_invariant_alarm(ctx, alarm);
     }
 }
 

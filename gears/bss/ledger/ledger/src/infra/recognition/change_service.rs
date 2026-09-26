@@ -251,7 +251,6 @@ async fn change_in_txn(
                 status: result.status.clone(),
             },
         )
-        .await
         .map_err(|e| {
             domain_to_db(DomainError::Internal(format!(
                 "publish schedule_changed: {e}"

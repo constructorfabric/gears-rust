@@ -226,8 +226,11 @@ async fn drain_guard_catches_handler_panic_without_leaking_in_flight() {
 
 struct AllowAuthN;
 impl BearerAuthenticator for AllowAuthN {
-    async fn authenticate(&self, _token: &str) -> Result<SecurityContext, AuthNError> {
-        Ok(SecurityContext::anonymous())
+    fn authenticate(
+        &self,
+        _token: &str,
+    ) -> impl std::future::Future<Output = Result<SecurityContext, AuthNError>> + Send {
+        std::future::ready(Ok(SecurityContext::anonymous()))
     }
 }
 
@@ -240,12 +243,16 @@ async fn dyn_bearer_adapter_delegates() {
 
 struct AllowInternal;
 impl InternalAuthenticator for AllowInternal {
-    async fn authenticate(&self, _token: &str) -> Result<PlatformIdentity, InternalAuthNError> {
-        Ok(PlatformIdentity::KubernetesServiceAccount {
+    fn authenticate(
+        &self,
+        _token: &str,
+    ) -> impl std::future::Future<Output = Result<PlatformIdentity, InternalAuthNError>> + Send
+    {
+        std::future::ready(Ok(PlatformIdentity::KubernetesServiceAccount {
             namespace: "ns".to_owned(),
             service_account: "sa".to_owned(),
             pod: None,
-        })
+        }))
     }
 }
 

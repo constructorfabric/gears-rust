@@ -16,7 +16,10 @@
 //! reconciliation-completed, and the invariant alarm), and have each `publish_*`
 //! call `producer.publish(ctx, txn, event).await` inside the caller's
 //! transaction (transactional outbox: the outbox row commits atomically with the
-//! entry, or not at all).
+//! entry, or not at all). Until then, the `publish_*` methods are plain
+//! synchronous functions (there is nothing to `.await` with the broker parked);
+//! restoring the broker means making them `async` again and re-adding `.await`
+//! at every call site.
 
 use std::sync::Arc;
 
@@ -94,7 +97,7 @@ impl LedgerEventPublisher {
     /// # Errors
     /// [`EventPublishError::Publish`] when the broker is wired and the outbox
     /// enqueue or schema validation fails; currently never returns `Err`.
-    pub async fn publish_entry_posted(
+    pub fn publish_entry_posted(
         &self,
         ctx: &SecurityContext,
         txn: &toolkit_db::secure::DbTx<'_>,
@@ -108,7 +111,7 @@ impl LedgerEventPublisher {
     ///
     /// # Errors
     /// [`EventPublishError::Publish`] once the broker is wired; currently never.
-    pub async fn publish_entry_reversed(
+    pub fn publish_entry_reversed(
         &self,
         ctx: &SecurityContext,
         txn: &toolkit_db::secure::DbTx<'_>,
@@ -122,7 +125,7 @@ impl LedgerEventPublisher {
     ///
     /// # Errors
     /// [`EventPublishError::Publish`] once the broker is wired; currently never.
-    pub async fn publish_dispute_recorded(
+    pub fn publish_dispute_recorded(
         &self,
         ctx: &SecurityContext,
         txn: &toolkit_db::secure::DbTx<'_>,
@@ -136,7 +139,7 @@ impl LedgerEventPublisher {
     ///
     /// # Errors
     /// [`EventPublishError::Publish`] once the broker is wired; currently never.
-    pub async fn publish_settlement_returned(
+    pub fn publish_settlement_returned(
         &self,
         ctx: &SecurityContext,
         txn: &toolkit_db::secure::DbTx<'_>,
@@ -150,7 +153,7 @@ impl LedgerEventPublisher {
     ///
     /// # Errors
     /// [`EventPublishError::Publish`] once the broker is wired; currently never.
-    pub async fn publish_revenue_recognized(
+    pub fn publish_revenue_recognized(
         &self,
         ctx: &SecurityContext,
         txn: &toolkit_db::secure::DbTx<'_>,
@@ -164,7 +167,7 @@ impl LedgerEventPublisher {
     ///
     /// # Errors
     /// [`EventPublishError::Publish`] once the broker is wired; currently never.
-    pub async fn publish_revenue_recognition_reversed(
+    pub fn publish_revenue_recognition_reversed(
         &self,
         ctx: &SecurityContext,
         txn: &toolkit_db::secure::DbTx<'_>,
@@ -184,7 +187,7 @@ impl LedgerEventPublisher {
     ///
     /// # Errors
     /// [`EventPublishError::Publish`] once the broker is wired; currently never.
-    pub async fn publish_schedule_changed(
+    pub fn publish_schedule_changed(
         &self,
         ctx: &SecurityContext,
         txn: &toolkit_db::secure::DbTx<'_>,
@@ -198,7 +201,7 @@ impl LedgerEventPublisher {
     ///
     /// # Errors
     /// [`EventPublishError::Publish`] once the broker is wired; currently never.
-    pub async fn publish_credit_note_posted(
+    pub fn publish_credit_note_posted(
         &self,
         ctx: &SecurityContext,
         txn: &toolkit_db::secure::DbTx<'_>,
@@ -212,7 +215,7 @@ impl LedgerEventPublisher {
     ///
     /// # Errors
     /// [`EventPublishError::Publish`] once the broker is wired; currently never.
-    pub async fn publish_debit_note_posted(
+    pub fn publish_debit_note_posted(
         &self,
         ctx: &SecurityContext,
         txn: &toolkit_db::secure::DbTx<'_>,
@@ -226,7 +229,7 @@ impl LedgerEventPublisher {
     ///
     /// # Errors
     /// [`EventPublishError::Publish`] once the broker is wired; currently never.
-    pub async fn publish_refund_recorded(
+    pub fn publish_refund_recorded(
         &self,
         ctx: &SecurityContext,
         txn: &toolkit_db::secure::DbTx<'_>,
@@ -240,7 +243,7 @@ impl LedgerEventPublisher {
     ///
     /// # Errors
     /// [`EventPublishError::Publish`] once the broker is wired; currently never.
-    pub async fn publish_manual_adjustment_posted(
+    pub fn publish_manual_adjustment_posted(
         &self,
         ctx: &SecurityContext,
         txn: &toolkit_db::secure::DbTx<'_>,
@@ -260,7 +263,7 @@ impl LedgerEventPublisher {
     ///
     /// # Errors
     /// [`EventPublishError::Publish`] once the broker is wired; currently never.
-    pub async fn publish_fx_revaluation_completed(
+    pub fn publish_fx_revaluation_completed(
         &self,
         ctx: &SecurityContext,
         txn: &toolkit_db::secure::DbTx<'_>,
@@ -280,7 +283,7 @@ impl LedgerEventPublisher {
     ///
     /// # Errors
     /// [`EventPublishError::Publish`] once the broker is wired; currently never.
-    pub async fn publish_fx_revaluation_reversed(
+    pub fn publish_fx_revaluation_reversed(
         &self,
         ctx: &SecurityContext,
         txn: &toolkit_db::secure::DbTx<'_>,
@@ -300,7 +303,7 @@ impl LedgerEventPublisher {
     ///
     /// # Errors
     /// [`EventPublishError::Publish`] once the broker is wired; currently never.
-    pub async fn publish_period_closed(
+    pub fn publish_period_closed(
         &self,
         ctx: &SecurityContext,
         txn: &toolkit_db::secure::DbTx<'_>,
@@ -314,7 +317,7 @@ impl LedgerEventPublisher {
     ///
     /// # Errors
     /// [`EventPublishError::Publish`] once the broker is wired; currently never.
-    pub async fn publish_reconciliation_completed(
+    pub fn publish_reconciliation_completed(
         &self,
         ctx: &SecurityContext,
         txn: &toolkit_db::secure::DbTx<'_>,
@@ -338,7 +341,7 @@ impl LedgerEventPublisher {
     /// transaction (the alarm fires after the post rolled back, so there is no
     /// caller txn to ride) and enqueue the alarm into the transactional outbox so
     /// the relay delivers it at-least-once.
-    pub async fn emit_invariant_alarm(&self, ctx: &SecurityContext, alarm: LedgerInvariantAlarm) {
+    pub fn emit_invariant_alarm(&self, ctx: &SecurityContext, alarm: LedgerInvariantAlarm) {
         // Counter mirror first, independent of the durable outbox: the alarm is
         // observable in Prometheus/Alertmanager even when the broker is absent.
         if let Some(metrics) = self.metrics.as_ref() {

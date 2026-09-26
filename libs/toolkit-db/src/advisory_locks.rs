@@ -1303,46 +1303,42 @@ impl DbLockGuard {
     ///
     /// # Errors
     /// Returns [`DbLockError`] if unlock fails or the lock was not held.
-    // With no native backend the only arm is the synchronous file cleanup, so there is no await.
-    #[cfg_attr(
-        not(any(feature = "pg", feature = "mysql")),
-        allow(clippy::unused_async)
-    )]
+    #[cfg(any(feature = "pg", feature = "mysql"))]
     pub async fn release(mut self) -> Result<(), DbLockError> {
         let Some(inner) = self.inner.take() else {
             return Ok(());
         };
         match inner {
-            // Synchronous: no await after taking ownership, so cancelling `release()` cannot leave a
-            // stale marker the way async `remove_file` could.
             GuardInner::File { path, file } => {
-                drop(file);
-                remove_file_lock_marker_result(&path)?;
+                release_file(&path, file)?;
             }
-            // Native backends run unlock SQL across `.await`s. Hold `inner` in a cleanup token so a
-            // cancellation mid-release still enqueues the same runtime-free unlock `Drop` would —
-            // otherwise the owned `GuardInner` would just be dropped (it has no cleanup of its own),
-            // stranding the server lock and the claim until the next reconnect.
-            #[cfg(any(feature = "pg", feature = "mysql"))]
-            native => {
-                let mut cleanup = ReleaseCleanup {
-                    inner: Some(native),
-                };
-                // `cleanup.inner` is `Some` here by construction; the `None` arm is unreachable but
-                // avoids an `expect`. The borrow is held across the await, so a cancellation drops
-                // `cleanup` with `inner` still present and its `Drop` enqueues the fallback unlock.
-                let result = match cleanup.inner.as_ref() {
-                    Some(inner) => release_native(inner).await,
-                    None => Ok(()),
-                };
-                // Reached only if not cancelled: the unlock resolved, so the claim state is already
-                // decided — disarm the fallback and surface the real result.
-                cleanup.inner = None;
-                result?;
-            }
+            // Native backends run unlock SQL across `.await`s — see `release_native_with_cleanup`.
+            // Named per-variant (rather than a wildcard) so enabling only one of `pg`/`mysql`
+            // doesn't leave a match arm that silently covers whatever backend gets added next.
+            #[cfg(feature = "pg")]
+            native @ GuardInner::Postgres { .. } => release_native_with_cleanup(native).await?,
+            #[cfg(feature = "mysql")]
+            native @ GuardInner::MySql { .. } => release_native_with_cleanup(native).await?,
         }
         tracing::debug!(key = %self.namespaced_key, "advisory lock released");
         Ok(())
+    }
+
+    /// Deterministically release the lock (preferred path).
+    ///
+    /// # Errors
+    /// Returns [`DbLockError`] if unlock fails or the lock was not held.
+    #[cfg(not(any(feature = "pg", feature = "mysql")))]
+    pub fn release(mut self) -> std::future::Ready<Result<(), DbLockError>> {
+        let Some(inner) = self.inner.take() else {
+            return std::future::ready(Ok(()));
+        };
+        let GuardInner::File { path, file } = inner;
+        let result = release_file(&path, file);
+        if result.is_ok() {
+            tracing::debug!(key = %self.namespaced_key, "advisory lock released");
+        }
+        std::future::ready(result)
     }
 }
 
@@ -1364,6 +1360,28 @@ impl Drop for ReleaseCleanup {
             enqueue_native_unlock(inner);
         }
     }
+}
+
+/// Runs the native-backend unlock for `inner` from [`DbLockGuard::release`].
+///
+/// Holds `inner` in a [`ReleaseCleanup`] token so a cancellation mid-release still enqueues the
+/// same runtime-free unlock `Drop` would — otherwise the owned `GuardInner` would just be dropped
+/// (it has no cleanup of its own), stranding the server lock and the claim until the next
+/// reconnect.
+#[cfg(any(feature = "pg", feature = "mysql"))]
+async fn release_native_with_cleanup(inner: GuardInner) -> Result<(), DbLockError> {
+    let mut cleanup = ReleaseCleanup { inner: Some(inner) };
+    // `cleanup.inner` is `Some` here by construction; the `None` arm is unreachable but avoids an
+    // `expect`. The borrow is held across the await, so a cancellation drops `cleanup` with
+    // `inner` still present and its `Drop` enqueues the fallback unlock.
+    let result = match cleanup.inner.as_ref() {
+        Some(inner) => release_native(inner).await,
+        None => Ok(()),
+    };
+    // Reached only if not cancelled: the unlock resolved, so the claim state is already decided —
+    // disarm the fallback and surface the real result.
+    cleanup.inner = None;
+    result
 }
 
 impl Drop for DbLockGuard {
@@ -1426,6 +1444,17 @@ fn remove_file_lock_marker_result(path: &std::path::Path) -> std::io::Result<()>
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     }
+}
+
+/// Synchronous release of the file-backed lock, shared by both `async` and non-`async`
+/// [`DbLockGuard::release`]: drop the held file handle and remove the marker.
+///
+/// No await after taking ownership, so cancelling `release()` cannot leave a stale marker the way
+/// async `remove_file` could.
+fn release_file(path: &std::path::Path, file: File) -> Result<(), DbLockError> {
+    drop(file);
+    remove_file_lock_marker_result(path)?;
+    Ok(())
 }
 
 /// Best-effort synchronous removal used from [`DbLockGuard`] Drop.

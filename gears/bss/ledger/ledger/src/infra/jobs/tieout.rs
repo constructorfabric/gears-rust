@@ -593,8 +593,7 @@ impl TieOutJob {
                     )
                     .take(MAX_AFFECTED)
                     .collect();
-                self.emit(tenant_id, AlarmCategory::TieOutVariance, &summary, affected)
-                    .await;
+                self.emit(tenant_id, AlarmCategory::TieOutVariance, &summary, affected);
             }
             if !report.imbalanced_entries.is_empty() {
                 let affected = report
@@ -608,8 +607,7 @@ impl TieOutJob {
                     })
                     .take(MAX_AFFECTED)
                     .collect();
-                self.emit(tenant_id, AlarmCategory::EntryImbalance, &summary, affected)
-                    .await;
+                self.emit(tenant_id, AlarmCategory::EntryImbalance, &summary, affected);
             }
             if !report.negative_grains.is_empty() {
                 let affected = report
@@ -628,8 +626,7 @@ impl TieOutJob {
                     AlarmCategory::NegativeBalanceViolation,
                     &summary,
                     affected,
-                )
-                .await;
+                );
             }
         }
         if failed > 0 {
@@ -643,7 +640,7 @@ impl TieOutJob {
 
     /// Emit one fire-and-forget invariant alarm for `category` against `tenant`,
     /// carrying the specific `affected` grains/entries that diverged.
-    async fn emit(
+    fn emit(
         &self,
         tenant_id: Uuid,
         category: AlarmCategory,
@@ -661,8 +658,7 @@ impl TieOutJob {
             affected,
         };
         self.publisher
-            .emit_invariant_alarm(&SecurityContext::anonymous(), alarm)
-            .await;
+            .emit_invariant_alarm(&SecurityContext::anonymous(), alarm);
     }
 }
 

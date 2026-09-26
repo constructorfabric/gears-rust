@@ -465,15 +465,19 @@ mod tests {
     struct FakeAuth;
 
     impl InternalAuthenticator for FakeAuth {
-        async fn authenticate(&self, token: &str) -> Result<PlatformIdentity, InternalAuthNError> {
-            match token {
+        fn authenticate(
+            &self,
+            token: &str,
+        ) -> impl Future<Output = Result<PlatformIdentity, InternalAuthNError>> + Send {
+            let result = match token {
                 "good" => Ok(PlatformIdentity::Shared {
                     name: "peer-x".to_owned(),
                 }),
                 "down" => Err(InternalAuthNError::Unavailable),
                 "broken" => Err(InternalAuthNError::Other("boom".to_owned())),
                 _ => Err(InternalAuthNError::InvalidToken),
-            }
+            };
+            std::future::ready(result)
         }
     }
 

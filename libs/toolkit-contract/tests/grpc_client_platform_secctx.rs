@@ -17,11 +17,11 @@
 
 #![cfg(feature = "grpc-client")]
 // The hand-written tonic-stub client mimics tonic-prost-build output shapes
-// (an `async fn` RPC returning `Result<_, Status>`); the stub body neither
-// awaits nor documents errors, which is fine for a compile-only stand-in.
+// (an RPC method returning an awaitable `Result<_, Status>`); the stub body
+// neither documents errors nor unwraps safely for production, which is fine
+// for a compile-only stand-in.
 #![allow(
     clippy::unwrap_used,
-    clippy::unused_async,
     clippy::missing_errors_doc,
     clippy::missing_panics_doc,
     clippy::must_use_candidate
@@ -99,14 +99,25 @@ pub mod stubs {
                 Self { _channel: channel }
             }
 
-            pub async fn register(
+            // The generated client (`grpc_contract.rs`) hard-codes `.await` on this
+            // call, matching real tonic-generated stubs, so this stand-in must stay
+            // awaitable even though it never actually awaits anything itself: return
+            // a concrete `Future` built with `std::future::ready` instead of `async
+            // fn`, so the metadata capture below still runs at call time (this future
+            // is always awaited immediately, so that is not observable).
+            pub fn register(
                 &mut self,
                 request: tonic::Request<super::RegisterRequest>,
-            ) -> Result<tonic::Response<super::RegisterResponse>, tonic::Status> {
+            ) -> impl std::future::Future<
+                Output = Result<tonic::Response<super::RegisterResponse>, tonic::Status>,
+            > + Send {
                 // Capture the metadata the generated client attached, then fail:
-                // the test asserts on the captured metadata, not the response.
-                *super::super::CAPTURED_METADATA.lock().unwrap() = Some(request.metadata().clone());
-                Err(tonic::Status::unimplemented("test stub"))
+                // the test asserts on the captured metadata, not the response. Take
+                // the request apart instead of cloning out of a borrow, so `request`
+                // is actually consumed.
+                let (metadata, _extensions, _message) = request.into_parts();
+                *super::super::CAPTURED_METADATA.lock().unwrap() = Some(metadata);
+                std::future::ready(Err(tonic::Status::unimplemented("test stub")))
             }
         }
     }
