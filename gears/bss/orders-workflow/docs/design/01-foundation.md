@@ -2561,7 +2561,11 @@ offers them:
    compensation leg) is resolved as usual; its `owf_task_resolution_request` is consumed by the
    next pass, which calls `resolve-manual-task` in-process in place of the signal. The pass runs
    only while the platform still reports the invocation not live; once the fence is claimed a
-   re-drive is refused `order-fenced`. The order ends as the cancel path ends it, and re-acquiring
+   re-drive is refused `order-fenced`. For an order whose fulfillment never began the Workflow
+   cancel is not offered while Lifecycle holds the order live (`09 §3.3`, `08 §3.6`, decision
+   D-109): the Seller Operator cancels it through Lifecycle's own `POST /cancel` first, after which
+   the cancel is offered and the unwind runs with `report-outcome` making no Lifecycle call
+   (`06 §3.6` `inst-ro-reauthorize`). The order ends as the cancel path ends it, and re-acquiring
    the customer is a **new order** created and submitted through Lifecycle. This loses the
    in-flight order, which the PRD's recover-and-continue rule does not allow; the amendment is
    registered (`../UPSTREAM_REQS.md` §4 item 11) and the fallback is retired once the re-drive is

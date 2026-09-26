@@ -51,7 +51,8 @@ normative interface until a canonical specification exists. Two further Subscrip
 `SUB-O15` and `SUB-O16`, are raised here for the first time — they are new asks at the next free
 numbers, not renumberings of anything. It further carries asks on **Orders
 Lifecycle** (visibility of the `submitted` TTL, which a normative MUST in this design depends on
-and which this gear cannot see, and thin variants of the events the platform consumes for it), on **Catalog** (the dependency-topology read every fulfillment
+and which this gear cannot see, thin variants of the events the platform consumes for it, and two
+missing values of the `failure_reason` enumeration), on **Catalog** (the dependency-topology read every fulfillment
 plan is constructed from, a dependency this register did not previously name at all), and on the
 **PRD owner** for a privacy and data-classification ruling this design cannot make for itself,
 and on the **platform authorization policy owner** for the PDP catalogue registration, role
@@ -71,7 +72,7 @@ operator visibility of trigger-path dead letters and a failure-handler safety ne
 | Subscriptions (`gears/bss/subscriptions/docs/SEAMS.md`) | `SUB-O1`, `SUB-O5` registered-and-unagreed; `SUB-O10` registered by the sibling Lifecycle design, unagreed; `SUB-O11`..`SUB-O16` UNASKED (never registered) | Provisioning intents, compensation, in-flight status, correlation propagation, the seam's latency budget, and callback attribution all cross this seam; several gaps make parts of the design fail closed or unenforceable until they land. |
 | Payments | No specification or register exists in this repository | Begin-fulfillment gating needs an authorization outcome distinguishing authorized/pending/failed; there is no owner to receive the ask. |
 | Generic Approval service | No canonical specification; PRD §9.2 expectations contract is the normative interface until one exists | Approval-requirement verdict acquisition, routing, multi-party gates, and escalation are executed against this contract via a phase-1 stand-in that returns `approval not required` (audited), pending the real service. |
-| Orders Lifecycle (`gears/bss/orders-lifecycle`) | UNASKED (never registered) | This design's escalation obligation is stated relative to the order's `submitted` TTL, which Orders Lifecycle owns and this gear can neither read nor derive; without it the obligation is a strict inequality between two quantities, only one of which is knowable here. The events the platform consumes for this gear carry Lifecycle's commercial fields into engine history unless a thin variant exists or the platform stores selected members only (ADR-0013). |
+| Orders Lifecycle (`gears/bss/orders-lifecycle`) | UNASKED (never registered) | This design's escalation obligation is stated relative to the order's `submitted` TTL, which Orders Lifecycle owns and this gear can neither read nor derive; without it the obligation is a strict inequality between two quantities, only one of which is knowable here. The events the platform consumes for this gear carry Lifecycle's commercial fields into engine history unless a thin variant exists or the platform stores selected members only (ADR-0013). Two failure causes have no value in Lifecycle's closed `failure_reason` enumeration (§2.4). |
 | Catalog | UNASKED (never registered; not a PRD-registered actor either) | Every fulfillment plan is constructed from Catalog's dependency topology and frozen against it; the plan cannot be built, validated for cycles, or ordered for compensation without a read contract. |
 | Event Broker (`gears/system/event-broker`) | REGISTERED by Orders Lifecycle (`gears/bss/orders-lifecycle/docs/UPSTREAM_REQS.md` §2.7), open; co-signed here | Process events publish through the platform producer outbox (`ADR/0008`, D-58); the runtime, cursor/retry semantics, dead-letter recovery, root tenancy and delivery observability are platform prerequisites this gear cannot report ready without. |
 | Platform authorization policy owner (`authz-resolver` PDP provider and policy provisioning) | UNASKED (never registered); Orders Lifecycle's `…-upreq-pdp-policy-integration` (`gears/bss/orders-lifecycle/docs/UPSTREAM_REQS.md` §2.9) is the precedent and the two should be provisioned together | Every operation is authorized by the platform PDP on a registered `(resource, action)` pair through the shared `PolicyEnforcer` adapter (`ADR/0010`, D-63); until the catalogue is registered and the roles, the `assigned_principal` approver grant and the service-principal grants are provisioned and verified against the deployed provider, no caller-driven operation is authorizable in production, and this design fabricates no default grant. |
@@ -442,6 +443,32 @@ the PDP inside its step operations (ADR-0013), so a thin variant loses it nothin
 - **Agreement status**: **UNASKED**.
 - **Source**: `ADR/0013`; `DECISIONS.md` D-66 (as amended); `DESIGN.md` §4.2. Raised against
   `gears/bss/orders-lifecycle/docs/UPSTREAM_REQS.md`.
+
+- [ ] `p2` - **ID**: `cpt-cf-bss-orders-workflow-upreq-lifecycle-failure-reason-coverage`
+
+Orders Lifecycle **MUST** add two values to the closed `failure_reason` enumeration of
+`acknowledge-failed` ([Lifecycle `06 §4.4`](../../orders-lifecycle/docs/design/06-workflow-seam.md#44-acknowledgement-normative),
+its D-136), or name the existing value this gear should send for each:
+
+| Proposed value | Raised when | This gear's reason |
+|----------------|-------------|--------------------|
+| `payment-authorization-stale` | the pre-activation re-check found the payment authorization older than its validity, so Workflow voided the wave-1 drafts before any activation | `payment-authorization-stale` (`design/04-fulfillment-plan.md` §3.6 `inst-rc-if-stale`) |
+| `dependency-topology-unavailable` | Catalog could not return a complete, revision-stamped dependency topology for the plan, a plan task was exhausted, and Workflow halted before any subscription was created | `catalog-topology-unavailable` (`design/04-fulfillment-plan.md` §4.3) |
+
+- **Owning upstream gear**: Orders Lifecycle (`gears/bss/orders-lifecycle`).
+- **Why this gear cannot satisfy it alone**: Lifecycle owns the enumeration and the
+  `OrderFulfillmentFailed` schema, and refuses any other value `request-invalid` at its boundary;
+  its own text says adding a value is a contract change to the table and the event schema.
+- **Rationale**: the fence maps every failure cause it admits to one Lifecycle value
+  (`design/06-saga-and-compensation.md` §4.8). Seven causes have a faithful value; these two do
+  not.
+- **What the design cannot do until it lands**: acknowledge these two failures with an honest
+  reason. Until then the fence sends `line-execution-failed` for a stale authorization and
+  `dependency-graph-invalid` for an unavailable topology. The exact reason stays in
+  `owf_cancellation_fence.orders_failure_reason` and in `OrderFulfillmentAborted`, so only
+  Lifecycle's audit `caller_reason` and `OrderFulfillmentFailed` carry the approximation.
+- **Agreement status**: **UNASKED**.
+- **Source**: `DECISIONS.md` D-110. Raised against `gears/bss/orders-lifecycle/docs/UPSTREAM_REQS.md`.
 
 ### 2.5 Catalog
 
@@ -1024,11 +1051,15 @@ then have to accept.
 |----------|-------------|
 | `p1` (critical) | `…-upreq-overlap-presence-read`, `…-upreq-compensation-cancel-reason`, `…-upreq-explicit-start-instant`, `…-upreq-in-flight-rejection`, `…-upreq-cancel-accepted-transition`, `…-upreq-nonterminal-status-read`, `…-upreq-provisioning-latency-budget`, `…-upreq-identity-envelope-echo`, `…-upreq-payment-authorization-outcome`, `…-upreq-generic-approval-expectations-contract`, `…-upreq-submitted-ttl-visibility`, `…-upreq-lifecycle-thin-events`, `…-upreq-catalog-dependency-topology-read`, `…-upreq-pii-classification-ruling`, `…-upreq-event-broker-shared-prerequisites`, `…-upreq-pdp-policy-integration` |
 | `p1` (critical), platform path | `…-upreq-serverless-runtime-readiness-gate`, `…-upreq-serverless-runtime-event-triggers-gts`, `…-upreq-serverless-runtime-consumed-event-member-storage`, `…-upreq-serverless-runtime-pdp-guarded-call`, `…-upreq-serverless-runtime-attempt-and-deadline-propagation`, `…-upreq-serverless-runtime-history-residency-retention`, `…-upreq-serverless-runtime-definition-versioning-validation-hook`, `…-upreq-serverless-runtime-signals`, `…-upreq-serverless-runtime-invocation-control-restriction`, `…-upreq-serverless-runtime-dead-letter-operator-visibility` |
-| `p2` (important) | `…-upreq-correlation-propagation`, `…-upreq-serverless-runtime-failure-handler-target` |
+| `p2` (important) | `…-upreq-correlation-propagation`, `…-upreq-serverless-runtime-failure-handler-target`, `…-upreq-lifecycle-failure-reason-coverage` |
 
 `cpt-cf-bss-orders-workflow-upreq-pdp-policy-integration` is `p1` because every caller-driven
 operation fails closed until the catalogue, roles and the `assigned_principal` approver grant are
 provisioned and verified (`ADR/0010`, `DECISIONS.md` D-63).
+
+`cpt-cf-bss-orders-workflow-upreq-lifecycle-failure-reason-coverage` is `p2` because an interim
+mapping exists and the exact reason survives on the Orders side (`design/06-saga-and-compensation.md`
+§4.8); only Lifecycle's copy of it is approximate.
 
 The serverless-runtime asks of §2.9 are `p1` for the **platform path** only: each gates whether
 the canonical definition can run, not whether the process record and the step operations are
@@ -1157,7 +1188,7 @@ it would shorten (D-105).
   `DECISIONS.md` D-16 (Catalog topology), D-46 and Q-02 (relational escalation threshold), D-50 and
   D-38 (audit retention and the privacy ask); `ADR/0010` and `DECISIONS.md` D-63 (platform PDP
   authorization, §2.8); `ADR/0011`, `ADR/0012`, `ADR/0013` and `DECISIONS.md` D-65…D-108, Q-10…Q-13
-  (serverless-runtime, §2.9)
+  (serverless-runtime, §2.9); `DECISIONS.md` D-110 (the `failure_reason` coverage ask, §2.4)
 - **Platform register**: serverless-runtime has no upstream-requirements register; §2.9 cites its
   [DESIGN.md](../../../serverless-runtime/docs/DESIGN.md), [PRD.md](../../../serverless-runtime/docs/PRD.md),
   [NEXT_ADR_SCOPE.md](../../../serverless-runtime/docs/NEXT_ADR_SCOPE.md) and ADR-0004/0005 by line

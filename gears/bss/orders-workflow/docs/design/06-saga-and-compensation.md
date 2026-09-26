@@ -29,6 +29,8 @@
   - [4.5 The unilateral window is fence-visible](#45-the-unilateral-window-is-fence-visible)
   - [4.6 Upstream dependency disclosed, not resolved: `SUB-O1`](#46-upstream-dependency-disclosed-not-resolved-sub-o1)
   - [4.7 Constraints this slice places on the definition](#47-constraints-this-slice-places-on-the-definition)
+  - [4.8 The failure reason is resolved from the record and mapped (normative)](#48-the-failure-reason-is-resolved-from-the-record-and-mapped-normative)
+  - [4.9 Every Lifecycle answer to `report-outcome` (normative)](#49-every-lifecycle-answer-to-report-outcome-normative)
 - [5. Traceability](#5-traceability)
 
 <!-- /toc -->
@@ -497,11 +499,26 @@ report mode follows the fence row's (possibly promoted) trigger:
 
 | Mode (`outcome`) | Precondition in Orders' record | Seam call | Event enqueued |
 |------------------|-------------------------------|-----------|----------------|
-| `completed` | no fence row; slice 04's completion predicate holds (every task `activated` with a non-null `subscription_id`) | `fulfillment-acknowledgement`, trigger `acknowledge-completed`, with the per-line subscription identifiers | `OrderFulfillmentCompleted` |
-| `failed` | fence `no_active_verified_at` set, trigger `failure` | `fulfillment-acknowledgement`, trigger `acknowledge-failed`, with compensation evidence and the fence row's `failure_reason` | `OrderFulfillmentAborted` |
-| `cancelled` | fence `no_active_verified_at` set, trigger `cancel` | `workflow-cancel`, trigger `cancel-workflow-mediated`, with compensation evidence and the cancel reason from slice 08's request record | `OrderFulfillmentAborted` |
+| `completed` | no fence row; slice 04's completion predicate holds (every task `activated` with a non-null `subscription_id`, the identifiers distinct across the plan's tasks) | `fulfillment-acknowledgement`, trigger `acknowledge-completed`, with the per-line subscription identifiers | `OrderFulfillmentCompleted` |
+| `failed` | fence `no_active_verified_at` set, trigger `failure` | `fulfillment-acknowledgement`, trigger `acknowledge-failed`, with compensation evidence and the fence row's `failure_reason`, mapped from the recorded cause (§4.8) | `OrderFulfillmentAborted` |
+| `cancelled` | fence `no_active_verified_at` set, trigger `cancel` | `workflow-cancel`, trigger `cancel-workflow-mediated`, with compensation evidence and the `cancel_reason` of the fence row's cancel request (`09 §3.7`) | `OrderFulfillmentAborted` |
 | `superseded` | fence `no_active_verified_at` set, trigger `supersede` | **none** — the order is live at the new version | none (supersession is admissible only before `in_fulfillment`, so no fulfillment was started) |
 | `terminal-event` | fence `no_active_verified_at` set, trigger `terminal-event` | **none** — the order is already terminal in Lifecycle | `OrderFulfillmentAborted` only where `begin-fulfillment` had settled for the version, else none |
+
+*Only from fulfillment* (decision D-109). `failed` and `cancelled` reach Lifecycle only for a
+version whose `begin-fulfillment` committed (`owf_fulfillment_plan.begin_fulfillment_committed_at`,
+slice 04): Lifecycle admits `acknowledge-failed` and `cancel-workflow-mediated` from
+`in_fulfillment`, or from `on_hold` with pre-hold `in_fulfillment`, and from nothing else
+([Lifecycle `01 §4.3`](../../../orders-lifecycle/docs/design/01-foundation.md#43-the-state-machine-normative)
+rows 14, 16, 26, 27), and its permission matrix gives this gear's principal no other cancel
+([Lifecycle `08 §4.3`](../../../orders-lifecycle/docs/design/08-read-and-authz.md#43-the-permission-model-normative)).
+A cancel of an order not yet in fulfillment is Lifecycle's ordinary cancel: the Workflow cancel
+route refuses it and `authorize-cancel` does not authorize it while the order is live (`09 §3.3`,
+`08 §3.6`); a plan-level failure passes `begin-fulfillment` before its unwind (`04 §4.3`). A run
+that nevertheless reaches the report without a committed begin — a cancel authorized after the
+order ended by another path — makes no Lifecycle call and records `terminal-event` (§3.6
+`inst-ro-reauthorize`). The same holds where Lifecycle answers that the order is already terminal
+(§4.9).
 
 *The reporting gate.* A compensated outcome is reportable only when the fence row has
 `no_active_verified_at` set, which requires **every** `CompensationRecord` of the run to be
@@ -532,12 +549,11 @@ once per reported outcome.
 
 Does not call the billing chain and does not delay reporting for it
 (`cpt-cf-bss-orders-workflow-constraint-no-billing-wait`). Does not decide compensation success or
-failure. Does not publish to the bus directly. Does not re-check cancel authority: that is
-`authorize-cancel`'s apply-time re-check before the fence (slice 08); once every subscription has
-been removed, withholding the report would leave Lifecycle asserting subscriptions that no longer
-exist (decision D-84: the apply-time re-check of an authorized cancel runs
-once, in `authorize-cancel` before `run-cancellation-fence`, and `report-outcome` does not repeat
-it).
+failure. Does not publish to the bus directly. Does not re-check cancel authority: the re-check
+runs in `authorize-cancel` before the fence and in `compensate-order` before the first compensating
+leg (slice 08); once every subscription has been removed, withholding the report would leave
+Lifecycle asserting subscriptions that no longer exist (decision D-84 as amended: the apply-time
+re-check runs at `pre-fence` and `pre-compensation`, and `report-outcome` does not repeat it).
 
 ##### Related components (by ID)
 
@@ -568,17 +584,16 @@ Every operation answers `permanent-failure` with `version-mismatch` on a termina
 
 | `name` | `protection` | `input` | `output` | `idempotency_key` | `declared_event` | `compensation` | `reasons` | `audit_kind` | `retry_class` | `deadline` |
 |--------|--------------|---------|----------|-------------------|------------------|----------------|-----------|--------------|---------------|------------|
-| `run-cancellation-fence` | `protected` | ref + `trigger` ∈ `failure` · `cancel` · `supersede` · `terminal-event`; `failureReason` (Lifecycle's closed `failure_reason` enum, on `failure` only); `cancelRequestRef` (slice 08's request reference, on `cancel` only); `triggerEventId` (on `supersede` and `terminal-event`) | `fenceRef`, `claim` ∈ `claimed` · `absorbed`, `effectiveTrigger` (the row's trigger after any promotion), `inFlightCount` | instance-scoped `{tenant}:{correlationId}:run-cancellation-fence:{trigger}[:{triggerRef}]`, where `triggerRef` is `cancelRequestRef` on `cancel` and `triggerEventId` on `supersede` and `terminal-event`, and is absent on `failure` (§4.3 *One key per trigger request*) | none | none — the fence is a path step, not an undoable effect | `version-mismatch`, `not-found` (the record holds no cause for this trigger, §3.6 `inst-fence-cause`), `idempotency-key-conflict`, `per-attempt-timeout` | `phase-transition` (`started`/`suspended`/`parked` → `compensating`) on a claim; `step-completion` on an absorption | `retryable-on: transient` | 5 s |
+| `run-cancellation-fence` | `protected` | ref + `trigger` ∈ `failure` · `cancel` · `supersede` · `terminal-event`; `cancelRequestRef` (slice 08's request reference, on `cancel` only); `triggerEventId` (on `supersede` and `terminal-event`). No failure reason is an input: on `failure` the fence resolves it from the cause it found and maps it (§4.8) | `fenceRef`, `claim` ∈ `claimed` · `absorbed`, `effectiveTrigger` (the row's trigger after any promotion), `inFlightCount` | instance-scoped `{tenant}:{correlationId}:run-cancellation-fence:{trigger}[:{triggerRef}]`, where `triggerRef` is `cancelRequestRef` on `cancel` and `triggerEventId` on `supersede` and `terminal-event`, and is absent on `failure` (§4.3 *One key per trigger request*) | none | none — the fence is a path step, not an undoable effect | `version-mismatch`, `not-found` (the record holds no cause for this trigger, §3.6 `inst-fence-cause`), `idempotency-key-conflict`, `per-attempt-timeout` | `phase-transition` (`started`/`suspended`/`parked` → `compensating`) on a claim; `step-completion` on an absorption | `retryable-on: transient` | 5 s |
 | `compensate-order` | `protected` | ref + `pass` (1 on first entry, else the previous answer's `nextPass`, or previous `pass` + 1 after an exhausted retry) | `compensationState` ∈ `complete` · `in-progress` · `pending-escalation`; `nextPass`; `taskRefs[]` (manual tasks raised for `failed-pending-escalation` legs, this pass or earlier) | step: instance-scoped `{tenant}:{correlationId}:compensate-order:{pass}`; per leg: intent family `{tenant}:{orderId}+{orderVersion}+{orderLineId}+{wave}+{intentKind}[+{wave_attempt}]` with `intentKind` ∈ `draft_void` · `activated_cancel` (§2.1) | none — `OrderFulfillmentAborted` belongs to `report-outcome` | none — compensation is not itself compensable (§2.1 *No Intra-Saga Pivot*) | `fence-not-claimed`, `draft-void-failed`, `activated-cancel-failed`, `blocked-upstream` (the last three recorded per leg and carried on the manual task, never a synchronous refusal), `authority-withdrawn` (recorded on the task slice 08's cancel-authority port raises at `pre-compensation`), `circuit-breaker-open`, `per-attempt-timeout`, `idempotency-key-conflict`, `version-mismatch` | `compensation`, one entry per leg settled in the pass; `step-completion` for the pass | `retryable-on: transient` | 10 s |
-| `report-outcome` | `protected` | ref + `outcome` ∈ `completed` · `failed` · `cancelled` · `superseded` · `terminal-event`, `round` (0 on first entry, else the previous answer's `nextRound`) | `reportedOutcome` (the mode actually reported — differs from `outcome` only by the §4.3 promotion `failed` → `cancelled`), `lifecycleCall` ∈ `acknowledged` · `none` · `held` (Lifecycle refused `not-admissible` and the order read shows `on_hold` — a completed acknowledgement of a held order, Lifecycle `06 §3.6`; a settled success that records no report), `nextRound` | step: instance-scoped `{tenant}:{correlationId}:report-outcome:{round}`; seam: lifecycle-transition `{tenant}:{orderId}:{orderVersion}:{trigger}:{round}` with `trigger` ∈ `acknowledge-completed` · `acknowledge-failed` · `cancel-workflow-mediated` ([`01 §3.3` *Rounds and attempts*](./01-foundation.md#rounds-and-attempts-the-one-rule-for-re-invokable-operations)) | `OrderFulfillmentCompleted` on `completed`; `OrderFulfillmentAborted` on `failed`, `cancelled`, and on `terminal-event` where fulfillment had begun (§3.2) | none — `report-outcome` is itself the declared compensation of `begin-fulfillment` (§2.1) | `fence-not-claimed`, `outcome-not-reportable`, `authority-withdrawn` (the `pre-submission` re-check on a cancel run), `version-mismatch`, `circuit-breaker-open`, `per-attempt-timeout`, `idempotency-key-conflict` | `step-completion` | `retryable-on: transient` | 10 s |
+| `report-outcome` | `protected` | ref + `outcome` ∈ `completed` · `failed` · `cancelled` · `superseded` · `terminal-event`, `round` (0 on first entry, else the previous answer's `nextRound`) | `reportedOutcome` (the mode actually reported — differs from `outcome` only by the §4.3 promotion `failed` → `cancelled`, or is `terminal-event` where Lifecycle already holds the order terminal, §3.6 `inst-ro-reauthorize` and `inst-ro-call`), `lifecycleCall` ∈ `acknowledged` · `none` · `held` (Lifecycle refused `not-admissible` and the order read shows `on_hold` — a completed acknowledgement of a held order, Lifecycle `06 §3.6`; a settled success that records no report), `nextRound` | step: instance-scoped `{tenant}:{correlationId}:report-outcome:{round}`; seam: lifecycle-transition `{tenant}:{orderId}:{orderVersion}:{trigger}:{round}` with `trigger` ∈ `acknowledge-completed` · `acknowledge-failed` · `cancel-workflow-mediated` ([`01 §3.3` *Rounds and attempts*](./01-foundation.md#rounds-and-attempts-the-one-rule-for-re-invokable-operations)) | `OrderFulfillmentCompleted` on `completed`; `OrderFulfillmentAborted` on `failed`, `cancelled`, and on `terminal-event` where fulfillment had begun (§3.2) | none — `report-outcome` is itself the declared compensation of `begin-fulfillment` (§2.1) | `fence-not-claimed`, `outcome-not-reportable`, `version-mismatch`, `not-authorized`, `not-found`, `circuit-breaker-open`, `per-attempt-timeout`, `idempotency-key-conflict` — the Lifecycle answers they stand for are §4.9's | `step-completion` | `retryable-on: transient` | 10 s |
 
 **Two catalogue reasons** this slice introduced are registered in `01 §4.9`: `fence-not-claimed`
 (`FailedPrecondition`, 400 — `compensate-order` or a compensated `report-outcome` found no fence
 row for the version, which only a definition that bypassed the fence can cause) and
 `outcome-not-reportable` (`FailedPrecondition`, 400 — the fence has not verified that no active
 subscription remains, or slice 04's completion predicate does not hold for `completed`, or
-Lifecycle refused the evidence with `compensation-evidence-incomplete` or
-`acknowledgement-lines-incomplete`). (Decision D-77: register
+Lifecycle refused the evidence, the roster or a request member Orders built, §4.9). (Decision D-77: register
 `fence-not-claimed` and `outcome-not-reportable` under owner `06-saga-and-compensation` in the
 reason catalogue of `01 §4.9`.)
 
@@ -633,7 +648,7 @@ compensating intent underneath these reports is not yet fixed.
 | orders-workflow (slice 03) | Closure port `close_open_approvals(correlationId, reason)` ([`03 §3.2`](./03-approval-execution.md#32-component-model)) | Fence step 1: cancel every `planned` or `open` gate and close an open park with `resolution = order-terminated`, inside `run-cancellation-fence`'s unit of work |
 | orders-workflow (slice 05) | Intent port; `reconcile-intent`; `owf_provisioning_intent` | Submit compensating intents; reconcile in-flight intents in fence step 3; read the forward ordinal and unmatched confirmations |
 | orders-workflow (slice 07) | Manual-task creation port; Incident Recorder; verified-override record | Escalate a failed leg (always a manual task); record fail-fast forward failures as incidents; enumerate override-attached subjects |
-| orders-workflow (slice 08) | Cancel request record written by `authorize-cancel`; suspension closure port `close_suspension(correlationId, closedReason)`; cancel-authority port `recheck_cancel_authority(correlationId, cancelRequestRef, point)` ([`08 §3.2`](./08-hold-and-cancel.md#32-component-model)) | The cancel reason `report-outcome` carries to `workflow-cancel`; fence step 1 closes a suspension on an unwind taken from hold; `compensate-order` re-checks authority at `pre-compensation` and `report-outcome` at `pre-submission` on the cancel trigger |
+| orders-workflow (slice 08) | Cancel request record (`owf_cancel_request`, inserted by slice 09's Control Operation Gateway, read by `authorize-cancel`); suspension closure port `close_suspension(correlationId, closedReason)`; cancel-authority port `recheck_cancel_authority(correlationId, cancelRequestRef, point)` ([`08 §3.2`](./08-hold-and-cancel.md#32-component-model)) | The cancel reason `report-outcome` carries to `workflow-cancel`; fence step 1 closes a suspension on an unwind taken from hold; `compensate-order` re-checks authority at `pre-compensation` on the cancel trigger |
 | Subscriptions | Provisioning-intent SDK client (through slice 05's port) | Submit draft-void and activated-cancel compensating intents; resolve a subject's current phase; never call OSS directly |
 | Orders Lifecycle | Outcome-report contract (§3.3), bound by reference to `06-workflow-seam.md` §4.4 | Report `completed`, `fulfillment_failed` or the workflow-mediated cancel |
 
@@ -690,8 +705,8 @@ sequenceDiagram
     participant MT as Manual-Task Creator (07)
     participant OR as report-outcome
     participant LC as Orders Lifecycle
-    PL ->> CF: trigger failure, failureReason
-    CF ->> CF: claim owf_cancellation_fence; phase → compensating; closure port (03); stamp steps 1, 2
+    PL ->> CF: trigger failure
+    CF ->> CF: resolve the cause, map its failure_reason (§4.8); claim owf_cancellation_fence; phase → compensating; closure port (03); stamp steps 1, 2
     CF -->> PL: fenceRef, claim = claimed
     loop pass = 1, 2, ... until complete
         PL ->> CE: pass n
@@ -722,12 +737,12 @@ later pass answers `complete`.
 
 **Algorithm: Run Cancellation Fence** (inside `run-cancellation-fence`, after key resolution)
 
-Input: ref, `trigger`, `failureReason`, `cancelRequestRef`, `triggerEventId`
+Input: ref, `trigger`, `cancelRequestRef`, `triggerEventId`
 Output: `fenceRef`, `claim`, `effectiveTrigger`, `inFlightCount`
 
 1. [ ] - `p1` - Lock the instance row; **IF** `terminal_outcome` is set: **RETURN** `permanent-failure` with `version-mismatch` - `inst-fence-lock-instance`
-2. [ ] - `p1` - **Cause precondition** (decision D-106). The record **MUST** already hold the cause the trigger names, else **RETURN** `permanent-failure` with `not-found`, claiming nothing: `cancel` — a settled `authorize-cancel` answering `authorized = true` for `cancelRequestRef` on this instance (slice 08); `supersede` — a settled `admit-trigger` listen admission `supersede` for `triggerEventId` on this instance (slice 02); `terminal-event` — a settled `terminate-on-terminal-event` for `triggerEventId` answering `terminate = true` (slice 02); `failure` — a failure the unwind may act on: a manual task of this instance resolved `exhausted` ([`07 §4.2`](./07-manual-tasks.md#42-remediation-exhausted-and-the-consequence-of-a-breach-normative)), or under `fail-fast` a forward line of the frozen plan in `failed` or a plan refused `invalid-dependency-graph`, or a settled `re-check-pre-activation` answer that aborts ([`04 §4.2`](./04-fulfillment-plan.md#42-the-re-check-advisory-at-construction-authoritative-before-wave-2)). This is the pattern `terminate-on-terminal-event` already follows (`not-found` without a settled `terminate` admission, [`02 §3.3`](./02-triggers-and-start.md#33-api-contracts)); with the invocation binding of `01 §3.3` step 3 it is what keeps a caller that is not the instance's own invocation, or a definition that misorders the path, from unwinding a healthy order - `inst-fence-cause`
-3. [ ] - `p1` - **TRY** insert `owf_cancellation_fence` for `(order_id, order_version)` with `trigger`, `correlation_id`, the references for this trigger and `claimed_by_attempt_id = attemptId`; **CATCH** unique violation: apply the absorption table of §4.3 to the existing row, increment `absorbed_trigger_count`, write `step-completion`, **RETURN** `claim = absorbed` with the row's `effectiveTrigger` and `inFlightCount` - `inst-fence-claim`
+2. [ ] - `p1` - **Cause precondition** (decision D-106). The record **MUST** already hold the cause the trigger names, else **RETURN** `permanent-failure` with `not-found`, claiming nothing: `cancel` — a settled `authorize-cancel` answering `authorized = true` for `cancelRequestRef` on this instance (slice 08); `supersede` — a settled `admit-trigger` listen admission `supersede` for `triggerEventId` on this instance (slice 02); `terminal-event` — a settled `terminate-on-terminal-event` for `triggerEventId` answering `terminate = true` (slice 02); `failure` — a failure the unwind may act on: a manual task of this instance resolved `exhausted` ([`07 §4.2`](./07-manual-tasks.md#42-remediation-exhausted-and-the-consequence-of-a-breach-normative)), or under `fail-fast` a forward line of the frozen plan in `failed` or a plan refused `invalid-dependency-graph`, or a settled `re-check-pre-activation` answer that aborts ([`04 §4.2`](./04-fulfillment-plan.md#42-the-re-check-advisory-at-construction-authoritative-before-wave-2)); on `failure` the cause found also names the Orders reason, which §4.8 maps to Lifecycle's `failure_reason`, and the first cause in this list order is the one recorded. This is the pattern `terminate-on-terminal-event` already follows (`not-found` without a settled `terminate` admission, [`02 §3.3`](./02-triggers-and-start.md#33-api-contracts)); with the invocation binding of `01 §3.3` step 3 it is what keeps a caller that is not the instance's own invocation, or a definition that misorders the path, from unwinding a healthy order - `inst-fence-cause`
+3. [ ] - `p1` - **TRY** insert `owf_cancellation_fence` for `(order_id, order_version)` with `trigger`, `correlation_id`, the references for this trigger — on `failure`, `orders_failure_reason` and `failure_reason` from step 2 and §4.8 — and `claimed_by_attempt_id = attemptId`; **CATCH** unique violation: apply the absorption table of §4.3 to the existing row, increment `absorbed_trigger_count`, write `step-completion`, **RETURN** `claim = absorbed` with the row's `effectiveTrigger` and `inFlightCount` - `inst-fence-claim`
 4. [ ] - `p1` - **Step 1.** Move the phase projection `started`/`suspended`/`parked` → `compensating` (`01 §3.7`; a parked instance, including one parked at the lifetime ceiling, is unwound only through this fence, D-82), after which every dispatch operation of slice 05 refuses for the version; call slice 03's closure port `close_open_approvals(correlationId, reason = trigger)` in this unit of work, which sets every `planned` or `open` gate to `cancelled` and closes an open park with `resolution = order-terminated`; call slice 08's suspension closure port `close_suspension(correlationId, closedReason)` in the same unit of work, with `closedReason` = `cancelled-from-hold` (`cancel`), `superseded-from-hold` (`supersede`) or `terminated-from-hold` (`failure`, `terminal-event`), which closes an `open` or `resume_ahead` suspension row and clears `owf_process_instance.suspended` ([`08 §3.7`](./08-hold-and-cancel.md#37-database-schemas--tables)); stamp `dispatch_stopped_at` - `inst-fence-step1`
 5. [ ] - `p1` - **IF** `trigger = failure` **AND** the frozen plan's policy is `fail-fast`: hand each failed forward line to slice 07's Incident Recorder in this unit of work; never for a compensation leg - `inst-fence-failfast-incident`
 6. [ ] - `p1` - **Step 2.** Select every `owf_provisioning_intent` row for the version that is accepted and not terminal, and every slice-05 dispatch registry record for the version that is `in_flight` or `open`; record their count and stamp `in_flight_identified_at` - `inst-fence-step2`
@@ -755,15 +770,15 @@ Output: `compensationState`, `nextPass`, `taskRefs[]`
 
 **Algorithm: Report Outcome** (inside `report-outcome`, after key resolution)
 
-Input: ref, `outcome`
-Output: `reportedOutcome`, `lifecycleCall`
+Input: ref, `outcome`, `round`
+Output: `reportedOutcome`, `lifecycleCall`, `nextRound`
 
 1. [ ] - `p1` - **IF** `outcome = completed`: **IF** a fence row exists for the version, or slice 04's completion predicate does not hold: **RETURN** `permanent-failure` with `outcome-not-reportable`; **ELSE** read the per-line subscription identifiers from Orders' record and go to step 4 with trigger `acknowledge-completed` - `inst-ro-completed`
 2. [ ] - `p1` - Read the fence row; **IF** none: **RETURN** `permanent-failure` with `fence-not-claimed`; **IF** `no_active_verified_at` is null: **RETURN** `permanent-failure` with `outcome-not-reportable` - `inst-ro-gate`
-3. [ ] - `p1` - Take the mode from the fence row's `trigger`; **IF** it differs from `outcome` other than by the §4.3 promotion `failure` → `cancel`: **RETURN** `permanent-failure` with `version-mismatch`; build the evidence from `owf_compensation_record`; **MATCH** the mode: `failure` → trigger `acknowledge-failed` with the row's `failure_reason`; `cancel` → trigger `cancel-workflow-mediated` with the cancel reason from slice 08's request record; `supersede` or `terminal-event` → no Lifecycle call, go to step 6 - `inst-ro-mode`
-4. [ ] - `p1` - **IF** the mode is `cancel`: call slice 08's cancel-authority port `recheck_cancel_authority(correlationId, cancelRequestRef, pre-submission)` before the submission; **IF** it answers `withdrawn`: stamp `reauthorization_required_at` on the fence row, settle, **RETURN** `permanent-failure` with `authority-withdrawn` (the port has raised the task, which the definition's failure arm absorbs rather than duplicates); a PDP outage is `retryable-failure` - `inst-ro-reauthorize`
-5. [ ] - `p1` - Call the Lifecycle endpoint under the lifecycle-transition key `{tenant}:{orderId}:{orderVersion}:{trigger}:{round}` with the fence's effective deadline; **IF** Lifecycle refuses `not-admissible` and the Lifecycle PDP-authorized order read shows the order `on_hold`: settle, **RETURN** `lifecycleCall = held` with `nextRound` and stamp nothing — the definition waits for the resume and reports again under the next round ([`01 §3.3` *Rounds and attempts*](./01-foundation.md#rounds-and-attempts-the-one-rule-for-re-invokable-operations) rule 4); **IF** Lifecycle refuses with `compensation-evidence-incomplete`, `compensation-evidence-missing` or `acknowledgement-lines-incomplete`: **RETURN** `permanent-failure` with `outcome-not-reportable`; **IF** unavailable: **RETURN** `retryable-failure` - `inst-ro-call`
-6. [ ] - `p1` - In one transaction: stamp `reported_at` and `reported_outcome` on the fence row (or, for `completed`, on the step record), enqueue the declared event where §3.2's table names one, write `step-completion`, settle; **RETURN** - `inst-ro-record`
+3. [ ] - `p1` - Take the mode from the fence row's `trigger`; **IF** it differs from `outcome` other than by the §4.3 promotion `failure` → `cancel`: **RETURN** `permanent-failure` with `version-mismatch`; build the evidence from `owf_compensation_record`; **MATCH** the mode: `failure` → trigger `acknowledge-failed` with the row's mapped `failure_reason` (§4.8); `cancel` → trigger `cancel-workflow-mediated` with the `cancel_reason` of the request `cancel_request_ref` names ([`09 §3.7`](./09-read-and-authz.md#37-database-schemas--tables) `owf_cancel_request`); `supersede` or `terminal-event` → no Lifecycle call, go to step 6 - `inst-ro-mode`
+4. [ ] - `p1` - **Only from fulfillment, and no re-check** (decisions D-109, D-84 as amended). This operation runs no cancel-authority re-check: the walk has verified that no active subscription remains, so the submission records a fact rather than performing a destructive act. **IF** the mode is `failure` or `cancel` **AND** the plan row's `begin_fulfillment_committed_at` is null: make no Lifecycle call, because Lifecycle has no Workflow transition out of a state before `in_fulfillment` ([Lifecycle `01 §4.3`](../../../orders-lifecycle/docs/design/01-foundation.md#43-the-state-machine-normative) rows 14, 16, 26, 27); read the order through the Lifecycle PDP-authorized order read; **IF** it is terminal, go to step 6 with `reportedOutcome = terminal-event` and `lifecycleCall = none`; **ELSE RETURN** `permanent-failure` with `outcome-not-reportable` — no rule reaches it, since `authorize-cancel` admits a cancel before fulfillment only for an order Lifecycle already holds terminal ([`08 §3.6`](./08-hold-and-cancel.md#36-interactions--sequences)) and a plan-level failure passes `begin-fulfillment` first ([`04 §4.3`](./04-fulfillment-plan.md#43-plan-level-failures)) - `inst-ro-reauthorize`
+5. [ ] - `p1` - Call the Lifecycle endpoint under the lifecycle-transition key `{tenant}:{orderId}:{orderVersion}:{trigger}:{round}` with the fence's effective deadline, and answer every outcome by the table of §4.9: a committed or replayed outcome goes to step 6; unavailability, `still-processing` and `authorization-context-changed` are `retryable-failure`; `not-admissible` on an order the Lifecycle PDP-authorized order read shows `on_hold` answers `lifecycleCall = held` with `nextRound` for `completed`, settling and stamping nothing — the definition waits for the resume and reports again under the next round ([`01 §3.3` *Rounds and attempts*](./01-foundation.md#rounds-and-attempts-the-one-rule-for-re-invokable-operations) rule 4); `not-admissible` on an order the read shows terminal goes to step 6 with `reportedOutcome = terminal-event` and `lifecycleCall = none`; every other refusal is the `permanent-failure` §4.9 names - `inst-ro-call`
+6. [ ] - `p1` - In one transaction: stamp `reported_at` and `reported_outcome` (the `reportedOutcome`) on the fence row (or, for `completed`, on the step record), enqueue the declared event where §3.2's table names one for the `reportedOutcome`, write `step-completion`, settle; **RETURN** `reportedOutcome`, `lifecycleCall` and `nextRound` - `inst-ro-record`
 
 #### Authorized-Cancellation Compensation
 
@@ -802,7 +817,11 @@ run is walking, absorbs against the existing run (§4.3). The workflow-mediated 
 by Lifecycle from `in_fulfillment` and from `on_hold` with pre-hold `in_fulfillment`, before the
 spawn signal as after it, and always requires evidence (Lifecycle D-134). A cancel request for an
 order not yet in fulfillment is Lifecycle's ordinary cancel, which reaches this process as
-`OrderCancelled` on the terminal-event path of fragment (f), not through this sequence.
+`OrderCancelled` on the terminal-event path of fragment (f), not through this sequence: the
+Workflow cancel route refuses it with `action-not-offered` (`09 §3.3`) and `authorize-cancel`
+answers `preFulfillment` for it (`08 §3.6`, decision D-109). The reason Lifecycle requires on
+`workflow-cancel` is the `cancel_reason` the route recorded on the request (`09 §3.7`); on a
+promoted failure run it is the promoting request's.
 
 #### Supersession and Terminal-Event Unwind
 
@@ -958,8 +977,9 @@ D-104) — purged row-wise through a `created_at` index; the `retention-purge` w
 | `seller_tenant_id` | uuid | Selling-party axis; NOT NULL |
 | `trigger` | enum | `failure` \| `cancel` \| `supersede` \| `terminal-event` — the trigger that claimed the run, after any promotion; decides `report-outcome`'s mode |
 | `promoted_from` | enum, nullable | `failure` where a cancellation promoted the run (§4.3); NULL otherwise |
-| `failure_reason` | enum, nullable | Lifecycle's closed `failure_reason` value, set on `failure`; carried by `report-outcome` to `acknowledge-failed` |
-| `cancel_request_ref` | uuid, nullable | Slice 08's cancel request record, set on `cancel` or promotion; the source of the cancel reason |
+| `orders_failure_reason` | enum, nullable | The Orders catalogue reason (`01 §4.9`) of the cause `inst-fence-cause` found on `failure`; kept on promotion. The exact reason on the Orders side, carried in `OrderFulfillmentAborted`'s `data` |
+| `failure_reason` | enum, nullable | Lifecycle's closed `failure_reason` value, mapped from `orders_failure_reason` by §4.8, set on `failure`; carried by `report-outcome` to `acknowledge-failed` |
+| `cancel_request_ref` | uuid, nullable | Slice 09's cancel request record (`owf_cancel_request`), set on `cancel` or promotion; its `cancel_reason` is the reason `workflow-cancel` carries |
 | `trigger_event_id` | uuid, nullable | The Lifecycle event of a `supersede` or `terminal-event` run |
 | `claimed_by_attempt_id` | text, NOT NULL | Platform attempt identifier of the claiming `run-cancellation-fence` call |
 | `dispatch_stopped_at` | timestamp | Step 1 completion |
@@ -970,19 +990,19 @@ D-104) — purged row-wise through a `created_at` index; the `retention-purge` w
 | `no_active_verified_at` | timestamp, nullable | Step 5 completion — every record `succeeded` |
 | `reported_at` / `reported_outcome` | timestamp / enum, nullable | Set by `report-outcome` when the outcome is recorded |
 | `absorbed_trigger_count` | integer | Later triggers absorbed against this run (§4.3); starts at 0 |
-| `reauthorization_required_at` | timestamp, nullable | Set by `compensate-order` (`pre-compensation`) or `report-outcome` (`pre-submission`) when slice 08's cancel-authority port answers `withdrawn` on a `cancel` run; while set, no further leg is submitted and no Lifecycle submission is made. Cleared when a newly authorized cancel is absorbed against the run and replaces `cancel_request_ref` (§4.3) (decision D-84: the fence carries the awaiting-re-authorization mark that `08 §4.3` assigns to slice 06) |
+| `reauthorization_required_at` | timestamp, nullable | Set by `compensate-order` (`pre-compensation`) when slice 08's cancel-authority port answers `withdrawn` on a `cancel` run; while set, no further leg is submitted. Cleared when a newly authorized cancel is absorbed against the run and replaces `cancel_request_ref` (§4.3) (decision D-84: the fence carries the awaiting-re-authorization mark that `08 §4.3` assigns to slice 06) |
 | `created_at` | timestamp | When the run was claimed |
 
 **PK**: `(order_id, order_version)`
 
 **Constraints**: steps recorded strictly in order — a later step's column is NOT NULL only once
-the preceding one is set; `failure_reason` NOT NULL when `trigger = failure` and not promoted;
+the preceding one is set; `orders_failure_reason` and `failure_reason` NOT NULL when `trigger = failure` or `promoted_from = failure`;
 `cancel_request_ref` NOT NULL when `trigger = cancel`. The PK is the mutual-exclusion token: the
 insert that claims a run wins, and a losing insert absorbs rather than retries.
 
 **Ownership**: `run-cancellation-fence` inserts the row and writes steps 1–2, the trigger and its
-promotion; `compensate-order` writes steps 3–5; `report-outcome` writes `reported_at` and
-`reported_outcome`; either writes `reauthorization_required_at`. No other writer.
+promotion; `compensate-order` writes steps 3–5 and `reauthorization_required_at`;
+`report-outcome` writes `reported_at` and `reported_outcome`. No other writer.
 
 **Mutability**: deliberately mutable (step stamps, promotion, counter, report stamps); a stamp once
 set is never cleared.
@@ -1015,6 +1035,7 @@ Independently of the definition's fence (ADR-0012 *Run-time guards*):
 4. [ ] - `p1` - On `superseded` or `terminal-event`, `report-outcome` **MUST** make no Lifecycle call - `inst-g06-no-call-modes`
 5. [ ] - `p1` - A compensation-leg failure **MUST** create a manual task through slice 07's creation port under either partial-failure policy, and **MUST NOT** create an incident - `inst-g06-leg-task`
 6. [ ] - `p1` - Every compensating intent **MUST** carry the compensating key of §2.1; a settled answer whose fingerprint does not match **MUST** be treated as `idempotency-key-conflict` - `inst-g06-distinct-key`
+7. [ ] - `p1` - `report-outcome` **MUST NOT** call `acknowledge-failed` or `cancel-workflow-mediated` for a version whose `begin-fulfillment` has not committed, and **MUST** answer every Lifecycle outcome by §4.9 - `inst-g06-from-fulfillment`
 
 ### 4.2 The unilateral-cancel window and no Billing wait
 
@@ -1053,7 +1074,8 @@ compensation. With the reference in the key:
   (`planFailFastUnwind`, `preActivationAbort` and `failFastUnwind`, `10 §3.6` fragment (b)) all
   leave the fulfillment stage, and after the fence the phase is `compensating`, so a version gets
   at most one `failure` fence call. A failed compensation leg is `compensate-order`'s, not a new
-  fence call. A replay therefore carries the same `failureReason` and is absorbed.
+  fence call. A replay therefore presents the same body — the failure reason is resolved from the
+  record (§3.6 `inst-fence-cause`, §4.8), never presented — and is absorbed.
 
 The key never includes a platform-supplied value (ADR-0006 as amended). Decision D-74 records the
 component.
@@ -1066,6 +1088,7 @@ table on a losing insert:
 | `cancel` arrives while a `failure` run is walking | Absorbed. The walk, subjects and steps are unchanged. The row's `trigger` is **promoted** to `cancel`, `promoted_from = failure`, `cancel_request_ref` set, and `report-outcome` consequently submits the workflow-mediated cancel instead of `acknowledge-failed`. `absorbed_trigger_count` incremented |
 | A second `cancel` arrives while a `cancel` run is walking | Absorbed, no change beyond `absorbed_trigger_count` — unless `reauthorization_required_at` is set, in which case the newly authorized request replaces `cancel_request_ref` and the mark is cleared, so the walk resumes under the new authority. The second authorization stays in the audit trail with its own actor (slice 08) |
 | `cancel` arrives after `no_active_verified_at` but before `report-outcome` settles | Absorbed and promoted as in row 1 when the run is `failure`; the outstanding report then goes out as `cancelled` under its own lifecycle-transition key |
+| `cancel` arrives while a `supersede` or `terminal-event` run is walking | Absorbed without promotion: the row keeps its trigger and answers it as `effectiveTrigger`, and the definition takes `reportAs` and `terminationKind` from that answer, never from the path it entered by (`10 §3.6` (c)), so the report stays the supersede or terminal-event one. `absorbed_trigger_count` incremented |
 | `supersede` or `terminal-event` arrives while any run is walking | Absorbed without promotion; `terminate-on-terminal-event` already answers `terminate = false` on a `compensating` instance (slice 02), and the claimed run's own path reaches `terminate-instance` |
 | `OrderAmended` races an in-flight run | The amendment creates a **new order version**; the run stays frozen against its `(order_id, order_version)`, completes and reports against it; the new version starts its own instance per slice 02's unwind-then-start rule |
 
@@ -1104,7 +1127,7 @@ open-questions register in [`../DECISIONS.md`](../DECISIONS.md) alongside the `S
 These are inputs to the validation rules of ADR-0012 and `10 §2.2`; a definition version that
 violates one **MUST** be refused.
 
-1. [ ] - `p1` - **Unwind order.** On every failure, cancel, supersede and terminal-event path: `run-cancellation-fence` **<** `compensate-order` **<** `report-outcome` **<** `terminate-instance`, with the `trigger` of `run-cancellation-fence` matching the path (`failure`, `cancel`, `supersede`, `terminal-event`) and the `outcome` of `report-outcome` matching it (`failed`, `cancelled`, `superseded`, `terminal-event`) - `inst-def06-unwind-order`
+1. [ ] - `p1` - **Unwind order.** On every failure, cancel, supersede and terminal-event path: `run-cancellation-fence` **<** `compensate-order` **<** `report-outcome` **<** `terminate-instance`, with the `trigger` of `run-cancellation-fence` matching the path (`failure`, `cancel`, `supersede`, `terminal-event`) and the `outcome` of `report-outcome` derived from the fence's `effectiveTrigger` (`failed`, `cancelled`, `superseded`, `terminal-event`), never from the path's entry, because an absorbed trigger keeps the claimed run's report (§4.3) - `inst-def06-unwind-order`
 2. [ ] - `p1` - **Loop until complete.** Only `compensationState = complete` may reach `report-outcome`. `in-progress` and `pending-escalation` **MUST** return to `compensate-order` with `pass` incremented, after a `wait` or a manual-task resolution `listen`, and **MUST NOT** reach `report-outcome` or `terminate-instance`. Fragment (c) routes both through `awaitCompensationResolution`, whose 1 h `retryLeg` is inside the sweep floor; a dedicated `in-progress` case re-entering `compensate` on the barrier's poll interval is the recommended refinement for the fragment's owner - `inst-def06-loop`
 3. [ ] - `p1` - **Pass numbering.** Every re-invocation of `compensate-order` **MUST** present a `pass` greater than the last one presented for the instance, and a platform retry of one attempt **MUST** present the same `pass`; `pass` is kept in `$context` and is the only walk state the definition holds - `inst-def06-pass`
 4. [ ] - `p1` - **No per-line walk.** No definition **MAY** submit, order or skip an individual compensating leg; there is no operation for one, and the walk order is not expressible from the definition's data (§3.6 *Compensation Walk Order*) - `inst-def06-no-line-walk`
@@ -1112,6 +1135,61 @@ violates one **MUST** be refused.
 6. [ ] - `p1` - **Completion only after the last wave.** `report-outcome` with `outcome: completed` **MUST** follow `dispatch-wave2-activate` and **MUST NOT** follow `run-cancellation-fence` on the same path (`10 §4.1`) - `inst-def06-completion`
 7. [ ] - `p1` - **Signals during the unwind.** The competing `fork` of the unwind's resolution arm **MUST** contain the `cancel-requested` arm, routed through `authorize-cancel` to `run-cancellation-fence` (which absorbs and promotes, §4.3) and back to `compensate`. The unwind **MUST NOT** contain a hold arm — the phase table of `01 §3.7` has no `compensating → suspended` transition, and a hold does not pause compensation - `inst-def06-signals`
 8. [ ] - `p2` - **Listens.** This slice requires no `listen` of its own: compensating-intent confirmations reach Orders' consumer and `reconcile-intent`, and `compensate-order` reads them from the record on its next pass - `inst-def06-no-listen`
+
+### 4.8 The failure reason is resolved from the record and mapped (normative)
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-constraint-failure-reason-mapping`
+
+`run-cancellation-fence` on `failure` **MUST NOT** take a failure reason from the definition. The
+cause step 2 found (`inst-fence-cause`) names the Orders catalogue reason, and the fence records
+it as `orders_failure_reason` together with the one value of Lifecycle's closed `failure_reason`
+enumeration the table below maps it to
+([Lifecycle `06 §4.4`](../../../orders-lifecycle/docs/design/06-workflow-seam.md#44-acknowledgement-normative),
+Lifecycle D-136). Lifecycle refuses any other value `request-invalid` at its boundary, and a
+missing one `failure-reason-missing`. The definition's `$context.failureReason` is fragment (c)'s
+manual-task reason and never reaches the fence (decision D-110).
+
+| Cause the fence found | `orders_failure_reason` | Lifecycle `failure_reason` |
+|-----------------------|-------------------------|----------------------------|
+| A forward line task resolved `exhausted`, or under `fail-fast` a forward line in `failed` | the line's reason — `wave1-create-failed`, `wave2-activation-failed`, `never-dispatched` or `intent-unresolved`; for several lines, the line with the lowest `execution_seq` | `line-execution-failed` |
+| The same, for a wave-2 line whose activation Subscriptions refused as an overlap collision | `wave2-activation-failed` | `overlap-collision` (a collision raised after the re-check, [Lifecycle `06 §4.3`](../../../orders-lifecycle/docs/design/06-workflow-seam.md#43-begin-fulfillment-and-the-spawn-signal-normative)). Inert until `SUB-O11` gives slice 05 a machine-readable refusal kind ([`../UPSTREAM_REQS.md`](../UPSTREAM_REQS.md) §2.1); until then such a line maps to `line-execution-failed` |
+| A plan task resolved `exhausted`, or under `fail-fast` a plan refused, for an invalid graph | `invalid-dependency-graph` | `dependency-graph-invalid` |
+| A plan task resolved `exhausted` for an incomplete topology | `catalog-topology-unavailable` | `dependency-graph-invalid`, interim |
+| A settled `re-check-pre-activation` abort | `overlap-collision` | `overlap-collision` |
+| — | `market-divergence` | `market-divergence` |
+| — the occupancy port's defer ladder exhausted | `overlap-read-unevaluable` | `overlap-presence-unevaluable` |
+| — the identity port's defer ladder exhausted | `identity-party-unavailable` | `identity-party-unavailable` |
+| — the authorization aged past its validity | `payment-authorization-stale` | `line-execution-failed`, interim |
+
+The two interim rows have no Lifecycle value. Until
+`cpt-cf-bss-orders-workflow-upreq-lifecycle-failure-reason-coverage` adds one for each
+([`../UPSTREAM_REQS.md`](../UPSTREAM_REQS.md) §2.4), the fence sends the interim value and keeps
+the exact reason in `orders_failure_reason` and in `OrderFulfillmentAborted`'s `data` (`01 §4.7`).
+Only Lifecycle's audit `caller_reason` and `OrderFulfillmentFailed` are approximate, and this is
+the residual the ask closes.
+
+### 4.9 Every Lifecycle answer to `report-outcome` (normative)
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-constraint-report-outcome-answers`
+
+`report-outcome` **MUST** answer each outcome of `fulfillment-acknowledgement` and `workflow-cancel`
+([Lifecycle `06 §3.3`, `§3.6`](../../../orders-lifecycle/docs/design/06-workflow-seam.md#36-interactions-and-sequences);
+refusal registry [Lifecycle `01 §4.7`](../../../orders-lifecycle/docs/design/01-foundation.md#refusal-reasons-are-derived-gts-error-types))
+as below. A permanent failure is not caught by the definition and faults the invocation
+(`10 §3.6` (c)), which the liveness pass raises as an `invocation-dead` task (`01 §4.16`), so
+no row is left to a builder's choice (decision D-111).
+
+| Lifecycle answer | When it can arise | `report-outcome` answers |
+|------------------|-------------------|--------------------------|
+| A committed `completed`, `fulfillment_failed` or `cancelled`, or the stored outcome replayed under the same key | The report landed | Step 6 |
+| Unavailable (503), a 5xx, a timeout; `still-processing` (409); `authorization-context-changed` (409) | Transient, a concurrent attempt of the same key, or a changed authorization context that a retry with fresh authorization resolves | `retryable-failure`, key left open |
+| `not-admissible`, the order read shows `on_hold` | `acknowledge-completed` has no `on_hold` row (Lifecycle rows 13, 26) | `completed`: `lifecycleCall = held` with `nextRound`. It cannot arise for `failed` or `cancelled`, which rows 26 and 27 admit from a held order |
+| `not-admissible`, the order read shows a terminal state | The order ended by another path first — an ordinary cancel before the spawn signal (row 15) — while the unwind, which has no lifecycle arm, was walking | Step 6 with `reportedOutcome = terminal-event`, `lifecycleCall = none`; the walk has already removed what the version created |
+| `not-admissible` otherwise; `prehold-not-in-fulfillment`; `version-conflict` | The order is not in fulfillment at this version, which step 4 and D-109 exclude | `permanent-failure` `version-mismatch`, the Lifecycle reason in `owf_step_log.result` |
+| `compensation-evidence-missing`, `compensation-evidence-incomplete`, `acknowledgement-lines-incomplete`, `acknowledgement-subscription-missing`, `acknowledgement-subscription-duplicated` | The evidence or the roster Orders built does not satisfy Lifecycle's guard; the completion predicate's distinct-identifier clause (§3.2) is the Orders-side check for the last one | `permanent-failure` `outcome-not-reportable` |
+| `failure-reason-missing`, `cancel-reason-required`, `request-invalid`, `expected-version-required` | A request member Orders built wrongly: §4.8 always records a mapped reason, every cancel request carries one (`09 §3.7`), and every call carries the expected version | `permanent-failure` `outcome-not-reportable` |
+| `idempotency-mismatch` (409) | The key was settled under a different request | `permanent-failure` `idempotency-key-conflict` |
+| An authorization refusal (`operation-not-permitted-for-actor`, `direct-cancel-window-closed`) or `order-not-found` | The Workflow principal's grant or scope is misconfigured, or the order is outside it | `permanent-failure` `not-authorized`, or `not-found` for `order-not-found` |
 
 ## 5. Traceability
 

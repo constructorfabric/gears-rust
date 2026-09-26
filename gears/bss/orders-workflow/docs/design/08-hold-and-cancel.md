@@ -462,11 +462,13 @@ drive destructive calls long after the grant behind them was withdrawn.
 
 Owns `authorize-cancel` (§3.3) and the **cancel-authority port**
 `recheck_cancel_authority(correlationId, cancelRequestRef, point)`, `point` ∈ `pre-fence` ·
-`pre-compensation` · `pre-submission`. `authorize-cancel` runs the port at `pre-fence`; slice 06
-runs it at `pre-compensation` inside `compensate-order` before the first compensating leg on the
-cancel trigger, and at `pre-submission` inside `report-outcome` before the `workflow-cancel`
-submission — the "first irreversible call" and "final state-changing submission" of
+`pre-compensation`. `authorize-cancel` runs the port at `pre-fence`; slice 06 runs it at
+`pre-compensation` inside `compensate-order` before the first compensating leg on the cancel
+trigger — the "first irreversible call" of
 [`09 §4.4`](./09-read-and-authz.md#44-authorized-invocation-resource-ownership-and-apply-time-re-check-normative).
+There is no `pre-submission` point: once the walk has verified that no active subscription
+remains, the `workflow-cancel` submission records that fact, and withholding it would leave
+Lifecycle asserting subscriptions that no longer exist (decision D-84 as amended).
 The port reads the **authorization snapshot** the control gateway recorded with the accepted
 cancel (`09 §4.4`; the request record `cancelRequestRef` names), rebuilds a `SecurityContext` from
 its four subject fields without a bearer token, and re-runs the snapshot's `(resource, action)`
@@ -486,7 +488,7 @@ command with its own snapshot, submitted by a human who resolves the `authority-
 ##### Related components (by ID)
 
 - `cpt-cf-bss-orders-workflow-component-cancellation-fencer` — precedes (slice 06; the fence runs only after `authorized`)
-- `cpt-cf-bss-orders-workflow-component-compensation-executor` — called by (slice 06, `pre-compensation` and `pre-submission` re-checks)
+- `cpt-cf-bss-orders-workflow-component-compensation-executor` — called by (slice 06, the `pre-compensation` re-check)
 - `cpt-cf-bss-orders-workflow-component-manual-task-creator` — calls (slice 07, `authority-withdrawn`)
 
 ### 3.3 API Contracts
@@ -511,7 +513,7 @@ operation resolves `correlationId` to the instance, narrows every read and write
 |--------|--------------|---------|----------|-------------------|------------------|----------------|-----------|--------------|---------------|------------|
 | `apply-hold` | `protected` | ref + `holdEventId`, `gateRefs[]` (the references `open-gates` last returned; empty outside the approval stage) | `holdOutcome` ∈ `suspended` · `reconciled-out-of-order` · `absorbed-duplicate` · `not-applicable`; `suspensionRef` (nullable). No remaining duration is returned: the remainder stays in `owf_approval_gate.window_remaining_ms` and the definition consumes none | instance-scoped `{tenant}:{correlationId}:apply-hold:{holdEventId}` | none (`OrderHeld` is Lifecycle's) | `apply-resume` (the paired close, like `park`/`unpark`; not a saga leg) | `version-mismatch`, `not-found` (a `gateRef` not of this instance), `idempotency-key-conflict` | `phase-transition` | `retryable-on: transient` | 5 s |
 | `apply-resume` | `protected` | ref + `resumeEventId`, `suspensionRef` (nullable — null on the stage-level resume arm) | `resumeOutcome` ∈ `resumed` · `resume-ahead-recorded` · `absorbed-duplicate`; `due: true\|false` — database time against the escalation deadline re-based from the stored `window_remaining_ms` (true when no remainder is left), the answer the resumed escalation re-check loop switches on first (`10 §3.6` (e)), after which the `PT5M` `waitEscalation` tick resumes; `failedTaskRefs[]` (tasks advanced to `failed` from deferred outcomes; opaque `owf_fulfillment_task` references) | instance-scoped `{tenant}:{correlationId}:apply-resume:{resumeEventId}` | none (`OrderResumed` is Lifecycle's) | none | `version-mismatch`, `not-found` (a `suspensionRef` not of this instance), `idempotency-key-conflict` | `phase-transition` | `retryable-on: transient` | 5 s |
-| `authorize-cancel` | `protected` | ref + `cancelRequestRef` | `authorized` (bool); `taskRef` (the `authority-withdrawn` manual task, on `authorized = false`) | instance-scoped `{tenant}:{correlationId}:authorize-cancel:{cancelRequestRef}` | none (`OrderFulfillmentAborted` is `report-outcome`'s, slice 06) | none | `authority-withdrawn` (recorded refusal, rides the task), `not-found` (a request not of this instance), `version-mismatch`, `per-attempt-timeout`, `idempotency-key-conflict` | `step-completion` | `retryable-on: transient` | 10 s (one PDP decision) |
+| `authorize-cancel` | `protected` | ref + `cancelRequestRef` | `authorized` (bool); `preFulfillment` (bool — `true` with `authorized = false` when the order's fulfillment has not begun and Lifecycle does not hold it terminal, §3.6 `inst-ac-fulfillment`); `taskRef` (the `authority-withdrawn` manual task, on a withdrawn `authorized = false`) | instance-scoped `{tenant}:{correlationId}:authorize-cancel:{cancelRequestRef}` | none (`OrderFulfillmentAborted` is `report-outcome`'s, slice 06) | none | `authority-withdrawn` (recorded refusal, rides the task), `not-found` (a request not of this instance), `version-mismatch`, `per-attempt-timeout`, `idempotency-key-conflict` | `step-completion` | `retryable-on: transient` | 10 s (one PDP decision) |
 
 **What each answer means to the definition.** `suspended` enters the resume wait of `10 §3.6` (e);
 `reconciled-out-of-order`, `absorbed-duplicate` and `not-applicable` are settled successes that
@@ -729,7 +731,7 @@ sequenceDiagram
         AC -->> D: authorized = true
         D ->> F: fence (closes an open suspension: cancelled-from-hold)
         D ->> C: reverse walk (re-check at pre-compensation)
-        D ->> O: outcome cancelled (re-check at pre-submission) → Lifecycle workflow-cancel with evidence
+        D ->> O: outcome cancelled → Lifecycle workflow-cancel with evidence and the request's cancel reason
     end
 ```
 
@@ -741,10 +743,11 @@ cancelled uses the `escalate` task resolution, which routes the decision to a Se
 **`authorize-cancel` — inside the operation**:
 
 1. [ ] - `p1` - Resolve `cancelRequestRef` to the accepted cancel's request record for this `correlationId`; **IF** absent or of another instance **RETURN** `permanent-failure` `not-found` - `inst-ac-resolve`
-2. [ ] - `p1` - Run the cancel-authority port at `pre-fence`: rebuild the `SecurityContext` from the snapshot's subject fields (no bearer token) and request the snapshot's `(resource, action)` on the order with its current prefetched properties, constraints required - `inst-ac-decide`
-3. [ ] - `p1` - **IF** the PDP is unavailable **RETURN** `retryable-failure` (canonical 503) and write nothing but the envelope's step record - `inst-ac-outage`
-4. [ ] - `p1` - **IF** the PDP denies or the compiled scope matches zero rows, create one manual task with reason `authority-withdrawn` naming the request and the subject through slice 07's creator, leave `phase` unchanged, and **RETURN** `authorized = false` with its `taskRef` - `inst-ac-withdrawn`
-5. [ ] - `p1` - **ELSE RETURN** `authorized = true`; the envelope settles the key and writes `step-completion` with the snapshot's subject as the recorded actor - `inst-ac-authorized`
+2. [ ] - `p1` - **Fulfillment begun** (decision D-109). **IF** the plan row's `begin_fulfillment_committed_at` is null for the version: read the order through the Lifecycle PDP-authorized order read; **IF** it is not terminal: mark the request `refused`, create no task, **RETURN** `authorized = false` with `preFulfillment = true` — this gear has no seam to cancel an order before `in_fulfillment` ([Lifecycle `08 §4.3`](../../../orders-lifecycle/docs/design/08-read-and-authz.md#43-the-permission-model-normative): "via workflow-cancel only"), so the cancel is Lifecycle's ordinary cancel, whose `OrderCancelled` the definition's lifecycle arm consumes; **IF** the read is unavailable **RETURN** `retryable-failure`. A terminal order continues to step 3, and the run then reports no Lifecycle transition (`06 §3.6` `inst-ro-reauthorize`). Fulfillment never returns to `approved`, so a committed begin needs no read - `inst-ac-fulfillment`
+3. [ ] - `p1` - Run the cancel-authority port at `pre-fence`: rebuild the `SecurityContext` from the snapshot's subject fields (no bearer token) and request the snapshot's `(resource, action)` on the order with its current prefetched properties, constraints required - `inst-ac-decide`
+4. [ ] - `p1` - **IF** the PDP is unavailable **RETURN** `retryable-failure` (canonical 503) and write nothing but the envelope's step record - `inst-ac-outage`
+5. [ ] - `p1` - **IF** the PDP denies or the compiled scope matches zero rows, create one manual task with reason `authority-withdrawn` naming the request and the subject through slice 07's creator, leave `phase` unchanged, and **RETURN** `authorized = false` with its `taskRef` - `inst-ac-withdrawn`
+6. [ ] - `p1` - **ELSE RETURN** `authorized = true`; the envelope settles the key and writes `step-completion` with the snapshot's subject as the recorded actor - `inst-ac-authorized`
 
 ### 3.7 Database schemas & tables
 
@@ -854,13 +857,16 @@ requires the definition to consume that early resume.
 
 ### 4.3 The apply-time re-check
 
-`authorize-cancel` and the cancel-authority port implement the three re-check points of
+`authorize-cancel` and the cancel-authority port implement the two re-check points of
 [`09 §4.4`](./09-read-and-authz.md#44-authorized-invocation-resource-ownership-and-apply-time-re-check-normative):
-before the fence, before the first compensating leg, before the Lifecycle submission. A withdrawn
+before the fence and before the first compensating leg. The Lifecycle submission is not
+re-checked (D-84 as amended): after the walk it records a fact rather than performing a
+destructive act, and a refusal there would fault the invocation with every subscription already
+removed. A withdrawn
 authority raises exactly one `authority-withdrawn` manual task per request and point — the task is
 created under the operation's key, so a replay does not create a second — leaves
 `owf_process_instance.phase` unchanged, and **MUST NOT** enter `parked`. At `pre-compensation`
-and `pre-submission` the caller (slice 06) additionally marks the fence as awaiting
+the caller (slice 06) additionally marks the fence as awaiting
 re-authorization so no further leg dispatches; that column is slice 06's. A PDP outage is a
 retryable failure of the calling operation, never a default allow. The step-4 wording of
 `09 §4.4` ("retry the decision under the retry governor") is superseded by this rule, since the
@@ -909,7 +915,7 @@ that violates any of them **MUST** be refused.
 2. [ ] - `p1` - **Placement.** Every stage fork **MUST** carry a hold arm; the hold arm **MUST** be inside the competing fork whose escalation `wait` it pauses; the lifetime `wait` **MUST** be the top-level `lifetimeCeiling` branch outside every stage fork, and the overdue `wait` the top-level `overdueMonitor` branch; the barrier poll and the expected-fulfillment tick **MUST** be in branches a hold arm does not cancel (`10 §4.5`) - `inst-c8-placement`
 3. [ ] - `p1` - **Early resume.** Every stage fork that carries a hold arm **MUST** also carry a resume arm that calls `apply-resume` with a null `suspensionRef` and returns to the stage, so a resume delivered before its hold is recorded as `resume-ahead-recorded` and not lost; the definition **MUST** enter the resume wait only on `holdOutcome = suspended` - `inst-c8-early-resume`
 4. [ ] - `p1` - **References.** `apply-hold` **MUST** receive `holdEventId` and the `gateRefs` `open-gates` last returned (empty outside the approval stage); `apply-resume` **MUST** receive `resumeEventId` exported from the resume `listen` and the `suspensionRef` `apply-hold` returned; `authorize-cancel` **MUST** receive the `cancelRequestRef` of the `cancel-requested` signal. No other member is admitted (ADR-0013) - `inst-c8-refs`
-5. [ ] - `p1` - **Denied cancel.** On `authorized = false` the definition **MUST** return to the arm the cancel was taken from — the stage loop, or the resume wait when the cancel was taken from hold (the instance is still `suspended`) — and **MUST NOT** call `run-cancellation-fence`; `authorize-cancel` **MUST** precede `run-cancellation-fence` on every cancel path, including the one taken from the resume wait - `inst-c8-denied-cancel`
+5. [ ] - `p1` - **Denied cancel.** On `authorized = false` — a withdrawn authority, or `preFulfillment` — the definition **MUST** return to the arm the cancel was taken from — the stage loop, or the resume wait when the cancel was taken from hold (the instance is still `suspended`) — and **MUST NOT** call `run-cancellation-fence`; `authorize-cancel` **MUST** precede `run-cancellation-fence` on every cancel path, including the one taken from the resume wait - `inst-c8-denied-cancel`
 6. [ ] - `p1` - **No swallowing.** `apply-hold`, `apply-resume` and `authorize-cancel` **MUST NOT** be inside a `catch` that continues the forward path (`10 §4.6`). A retry exhaustion of `authorize-cancel` **MUST** reach `create-manual-task` with reason `authority-withdrawn` and then the arm of item 5; an exhaustion of `apply-hold` or `apply-resume` **MUST** reach `create-manual-task` and **MUST NOT** proceed as though the hold or resume had been recorded - `inst-c8-no-swallow`
 7. [ ] - `p1` - **Two resilience paths.** No arm **MAY** route an `unobtainable` verdict into a retry-then-failure arm, and no arm **MAY** route `retry-budget-exhausted` or a task timeout into the park arm (`cpt-cf-bss-orders-workflow-principle-resilience-distinct-from-park`) - `inst-c8-two-paths`
 8. [ ] - `p1` - **Deferred failures.** After `apply-resume`, a non-empty `failedTaskRefs[]` **MUST** route to the partial-failure arm of `10 §3.6` (c) before any dispatch operation is called - `inst-c8-deferred`
@@ -927,7 +933,7 @@ first, then the `PT5M` tick.
 
 1. [ ] - `p2` - **01 §3.7** (now reflected there): a `suspended → parked` transition for `parkReason = lifetime-ceiling` with its `parked → suspended` unpark, and a `suspended → terminated` transition is not needed because every unwind from hold passes `compensating` (decision D-82) - `inst-x8-phase`
 2. [ ] - `p2` - **05**: the dispatch operations read `owf_process_instance.suspended` (not `owf_process_suspension`) and permit a same-key re-issue while suspended; `reconcile-intent` records a failure observed while suspended as deferred on `owf_provisioning_intent` with its observation instant - `inst-x8-05`
-3. [ ] - `p2` - **06**: `run-cancellation-fence` calls the suspension closure port in fencing step 1; `compensate-order` and `report-outcome` call the cancel-authority port at `pre-compensation` and `pre-submission` on the cancel trigger and mark the fence awaiting re-authorization on `withdrawn` - `inst-x8-06`
+3. [ ] - `p2` - **06**: `run-cancellation-fence` calls the suspension closure port in fencing step 1; `compensate-order` calls the cancel-authority port at `pre-compensation` on the cancel trigger and marks the fence awaiting re-authorization on `withdrawn`; `report-outcome` calls it at no point (D-84 as amended) - `inst-x8-06`
 4. [ ] - `p2` - **09**: the accepted cancel's request record, carrying the authorization snapshot, is declared as a table of 09 and is what `cancelRequestRef` names; `09 §4.4` step 4 is reworded per §4.3 - `inst-x8-09`
 
 **Platform capabilities assumed, as asks.** A `wait` whose duration is a runtime expression

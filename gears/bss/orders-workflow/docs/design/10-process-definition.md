@@ -643,7 +643,7 @@ deadline stays the owning slice's stored value, so no definition version can mov
 |------------------|----------|-------------------|----------------------------|-------------------------|
 | `waitCeiling` — lifetime ceiling | (a) | `P90D`, literal; no re-check | — | — |
 | `waitTtlMargin` — park escalation, also the verdict retry interval | (a) | `PT5M` | `arm-park-escalation` (03) | `due` |
-| `waitHeldReflect` — reflection refused while the order is held | (a) | `PT5M`; the resume arm re-enters at once | `reflect-verdict` (03), under the next round | `reflected` |
+| `waitHeldReflect` — reflection refused while the order is held, or answered `moved` | (a) | `PT5M`; the resume arm re-enters at once | `reflect-verdict` (03), under the next round | `reflected` |
 | `waitEscalation` — approval escalation window | (a) | `PT5M` — worst-case lateness one tick plus one call, at the edge of the ± 5 min of `nfr-owf-escalation-timer`; a version that needs margin shortens it | `escalate-gate` `mode: fire` (03) | `due` |
 | `waitProbe` — approval-service probe, and in `outageArm` the outage threshold | (a) | `PT30S` (`03 §4.5` item 5) | `escalate-gate` `mode: probe` (03) | `serviceState`; `due` on `outage` |
 | resumed escalation window | (e) | none of its own: the first answer is `apply-resume`'s | `apply-resume` (08), then `waitEscalation` | `due` |
@@ -887,13 +887,14 @@ The approval stage, the `do` list of `process.approval`:
     catch:                              # a permanent refusal: approval-reflection-refused needs a human (03 §4.5 item 3)
       errors: { with: { type: https://serverlessworkflow.io/spec/1.0.0/errors/communication, status: 400 } }
       do: [ { refused: { set: { reflected: refused } } } ]
-    export: { as: '${ $context + { reflected: .reflected, reflectRound: (.nextRound // $context.reflectRound), attemptKey: null } }' }   # reflected ∈ pending_approval | approved | rejected | held | refused; a retry's attempt is spent once the call settles
+    export: { as: '${ $context + { reflected: .reflected, reflectRound: (.nextRound // $context.reflectRound), attemptKey: null } }' }   # reflected ∈ pending_approval | approved | rejected | held | moved | refused; a retry's attempt is spent once the call settles
 - afterReflect:
     switch:
       - approved: { when: '${ $context.reflected == "approved" }', then: toFulfillment }
       - rejected: { when: '${ $context.reflected == "rejected" }', then: terminateRejected }
       - refused:  { when: '${ $context.reflected == "refused" }',  then: reflectionTask }
       - held:     { when: '${ $context.reflected == "held" }',     then: enterHeldReflect }   # Lifecycle not-admissible on an on_hold order (03 §4.4): wait for the resume, then the next round
+      - moved:    { when: '${ $context.reflected == "moved" }',    then: enterHeldReflect }   # Lifecycle version-conflict, or not-admissible on a terminal order (03 §4.4): the lifecycle arm consumes OrderAmended or the terminal event
       - pending:  { then: firstPosition }
 - enterHeldReflect: { set: { stageLoop: reflectVerdict, holdPauses: true } }   # re-entry after the resume goes straight to reflectVerdict
 - awaitHeldReflect:
@@ -1059,7 +1060,12 @@ re-reflects, as `03` requires. A permanent refusal of `reflect-verdict`
 re-enters this stage at `reflectVerdict` carrying the `attemptKey` `retry-step` minted, so the
 retry is a new key rather than a replay of the stored refusal. A `held` reflection — Lifecycle
 refused `not-admissible` and the order is `on_hold` — waits in `awaitHeldReflect` for the resume
-(or the `PT5M` tick) and reflects again under the next round ([`01 §3.3` *Rounds and attempts*](./01-foundation.md#rounds-and-attempts-the-one-rule-for-re-invokable-operations)). The approved path ends at `reflect-verdict`; Lifecycle
+(or the `PT5M` tick) and reflects again under the next round ([`01 §3.3` *Rounds and attempts*](./01-foundation.md#rounds-and-attempts-the-one-rule-for-re-invokable-operations)). A `moved` reflection — Lifecycle
+refused `version-conflict`, or `not-admissible` on an order it holds terminal — waits in the same
+fork, whose lifecycle arm consumes the `OrderAmended` or terminal event that moved the order: a
+stale result is not a failure of the reflection it reports
+([Lifecycle `04 §4.4`](../../../orders-lifecycle/docs/design/04-versioning.md#44-stale-results-normative),
+decision D-112). The approved path ends at `reflect-verdict`; Lifecycle
 emits `OrderApproved`, and the fulfillment stage is entered through the dispatcher in the same
 invocation rather than from a second trigger. **Lifetime.** The ceiling is the top-level
 competing arm, a literal `P90D`. When it fires, `ceilingEntry` records the stage and checkpoint
@@ -1088,8 +1094,9 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
       - expected:        { when: '${ $context.stageLoop == "awaitExpected" }',          then: evaluate }
       - barrier:         { when: '${ $context.stageLoop == "barrierLoop" }',            then: evaluate }
       - held:            { when: '${ $context.stageLoop == "heldWait" }',               then: retryHeld }   # after a resume (or a recorded hold): call the held operation again under its next round
+      - planFailFast:    { when: '${ $context.stageLoop == "planFailFast" }',           then: planFailFast }   # from the failure stage: an exhausted plan task passes begin-fulfillment before its unwind (D-109)
       - fresh:           { then: initEligibility }
-- initEligibility: { set: { eligibilityTrigger: initial, requestRef: null, evaluationSeq: 0, barrierSeq: 0, recheckSeq: 0, wave1Round: 0, wave2Round: 0, rebuildRound: 0, sweepRound: 0, spawnRound: 0, reportRound: 0, planAttempt: 0, wave1Failed: [], wave2Failed: [], spawned: false } }
+- initEligibility: { set: { eligibilityTrigger: initial, requestRef: null, evaluationSeq: 0, barrierSeq: 0, recheckSeq: 0, wave1Round: 0, wave2Round: 0, rebuildRound: 0, sweepRound: 0, spawnRound: 0, reportRound: 0, planAttempt: 0, wave1Failed: [], wave2Failed: [], spawned: false, planFailed: false } }
 - eligibility:                          # protected (04)
     timeout: step
     try:
@@ -1098,8 +1105,9 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
     export: { as: '${ $context + { eligibility: .eligibility, eligibilitySeq: (if .eligibility == "eligible" then $context.evaluationSeq else $context.eligibilitySeq end), evaluationSeq: .nextEvaluationSeq } }' }
 - onEligibility:
     switch:
+      - planFailed: { when: '${ $context.eligibility == "eligible" and $context.planFailed }', then: planFailFast }   # a failed plan waiting to pass begin-fulfillment (D-109)
       - eligible: { when: '${ $context.eligibility == "eligible" }', then: enterPlan }
-      - waiting:  { then: enterEligibilityWait }   # pending | withheld: settled successes that select the wait; the order stays approved
+      - waiting:  { then: enterEligibilityWait }   # pending: a settled success that selects the wait; the order stays approved
 - enterEligibilityWait: { set: { stageLoop: awaitEligibilityChange, holdPauses: false } }
 - awaitEligibilityChange:
     fork:
@@ -1170,13 +1178,18 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
 - planTask:                             # fragment (c)
     set: { failureScope: plan, failureSubjects: [ '${ $context.planRef }' ], failureReason: '${ $context.planReason }', sourceStep: construct-and-freeze-plan, forceTask: true, nextStage: failure, stageLoop: null }
     then: exit
-- planFailFast:                         # no Workflow transition leaves approved: begin-fulfillment is passed before the unwind (04 §4.3)
+- planFailFast:                         # no Workflow transition leaves approved: begin-fulfillment is passed before the unwind (04 §4.3); also the failure stage's route for an exhausted plan task (D-109)
     timeout: step
     try:
-      - call: { step: begin-fulfillment }   # body: ref + planRef, eligibilitySeq
+      - call: { step: begin-fulfillment }   # body: ref + planRef, eligibilitySeq; admitted for a plan that did not freeze (04 §3.6 inst-bf-guard-frozen)
     catch: *transient
-    then: planFailFastUnwind
-- planFailFastUnwind: { set: { unwind: failure, reportAs: failed, terminationKind: compensated, nextStage: unwind, stageLoop: null }, then: exit }   # fragment (c): nothing to void; fulfillment_failed with invalid-dependency-graph
+    export: { as: '${ $context + { beginResult: .result } }' }
+- onPlanFailFast:
+    switch:
+      - begun:   { when: '${ $context.beginResult == "in-fulfillment" }', then: planFailFastUnwind }
+      - waiting: { then: enterPlanFailedWait }   # withheld | held | version-conflict: the order is not in fulfillment, so no failure can be acknowledged yet
+- enterPlanFailedWait: { set: { planFailed: true }, then: enterEligibilityWait }   # the next eligible round calls begin-fulfillment under a new eligibilitySeq; the lifecycle arm ends the wait on an amendment or expiry
+- planFailFastUnwind: { set: { unwind: failure, nextStage: unwind, stageLoop: null }, then: exit }   # fragment (c): nothing to void; fulfillment_failed with dependency-graph-invalid (06 §4.8)
 - beginFulfillment:                     # protected (04): the R1 seam call approved → in_fulfillment; enqueues OrderFulfillmentStarted
     timeout: step
     try:
@@ -1312,17 +1325,18 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
       - proceed:         { when: '${ $context.preActivation == "proceed" }', then: spawnSignal }
       - abort:           { when: '${ $context.preActivation == "abort" }', then: preActivationAbort }
       - notDispatchable: { then: enterBarrierLoop }   # the barrier's hold, lifecycle and cancel arms consume what the operation observed
-- preActivationAbort: { set: { unwind: failure, reportAs: failed, terminationKind: compensated, nextStage: unwind, stageLoop: null }, then: exit }   # never the failure stage; void wave-1 drafts, fulfillment_failed with abortReason
+- preActivationAbort: { set: { unwind: failure, nextStage: unwind, stageLoop: null }, then: exit }   # never the failure stage; void wave-1 drafts, fulfillment_failed with the abort reason the fence maps (06 §4.8)
 - spawnSignal:                          # protected (05): the first activation intent is the Lifecycle spawn/fencing signal
     timeout: step
     try:
-      - call: { step: report-spawn-signal }   # body: ref + round: $context.spawnRound; output: spawnSignal ∈ recorded | already-recorded | held, nextRound
+      - call: { step: report-spawn-signal }   # body: ref + round: $context.spawnRound; output: spawnSignal ∈ recorded | already-recorded | held | not-dispatchable, nextRound
     catch: *transient
-    export: { as: '${ $context + { spawned: (.spawnSignal != "held"), spawnRound: .nextRound, heldCall: "spawn" } }' }
+    export: { as: '${ $context + { spawnAnswer: .spawnSignal, spawned: (.spawnSignal == "recorded" or .spawnSignal == "already-recorded"), spawnRound: .nextRound, heldCall: "spawn" } }' }
 - onSpawn:
     switch:
-      - held: { when: '${ $context.spawned | not }', then: enterHeldWait }   # Lifecycle not-admissible on an on_hold order (05 §3.3): wait for the resume, then the next round
-      - sent: { then: wave2 }
+      - held:            { when: '${ $context.spawnAnswer == "held" }', then: enterHeldWait }   # Lifecycle not-admissible on an on_hold order (05 §3.3): wait for the resume, then the next round
+      - notDispatchable: { when: '${ $context.spawnAnswer == "not-dispatchable" }', then: enterBarrierLoop }   # not-admissible on a terminal order: a cancel committed first (Lifecycle 06 §4.3); the barrier's lifecycle arm consumes OrderCancelled
+      - sent:            { then: wave2 }
 - wave2:                                # protected (05): ONE call, eligible lines as references; the draft-liveness re-read is inside
     try:
       - dispatchWave2:
@@ -1472,7 +1486,17 @@ answers `held`, a settled success; the stage waits in `heldWait` for the resume 
 tick) and calls the same operation again under the next round — for the spawn signal after
 `re-check-pre-activation` runs again, as Lifecycle prescribes after a hold — because Lifecycle replays a
 refusal under its key and only a new round reaches it after the resume
-([`01 §3.3` *Rounds and attempts*](./01-foundation.md#rounds-and-attempts-the-one-rule-for-re-invokable-operations)). **Overdue.** The overdue window is the
+([`01 §3.3` *Rounds and attempts*](./01-foundation.md#rounds-and-attempts-the-one-rule-for-re-invokable-operations)). A spawn signal Lifecycle refuses `not-admissible` for an order it holds
+terminal answers `not-dispatchable`: a cancel committed before the signal, which Lifecycle
+declares the normal outcome of the race ("if cancellation commits first, the signal refuses and
+Workflow dispatches nothing", [Lifecycle `06 §4.3`](../../../orders-lifecycle/docs/design/06-workflow-seam.md#43-begin-fulfillment-and-the-spawn-signal-normative)),
+and the stage returns to the barrier loop, whose lifecycle arm consumes `OrderCancelled` and
+unwinds on the terminal-event path (decision D-109). **Plan failure.** An exhausted plan task
+re-enters this stage at `planFailFast`, and a `planFailFast` whose `begin-fulfillment` answers
+`withheld`, `held` or `version-conflict` waits in the eligibility fork with `planFailed` set, so
+the next `eligible` round passes `begin-fulfillment` under a new `eligibilitySeq` before the
+unwind; an amendment or Lifecycle's `approved` expiry ends the wait through the lifecycle arm (`04 §4.3`).
+**Overdue.** The overdue window is the
 top-level `overdueMonitor` branch: every `PT1H` it calls `raise-overdue-escalation` with
 `escalationKind: overdue-fulfillment` under the round the previous tick returned, which answers
 `due: false`, records nothing and settles its round until database time passes `expected_fulfillment_at` + 24 h, answers `raised: false`
@@ -1502,7 +1526,12 @@ for an order-scope task, `taskReturnStage` and `taskReturnLoop`:
     switch:
       - remediate: { when: '${ $context.policy == "remediate" or $context.forceTask }', then: createTasks }
       - failFast:  { then: failFastUnwind }   # fail-fast records a tracked incident inside compensate-order's path; no actionable task
-- failFastUnwind: { set: { unwind: failure, reportAs: failed, terminationKind: compensated, nextStage: unwind, stageLoop: null }, then: exit }
+- failFastUnwind:                       # every route to a failure unwind: a failure is acknowledged only from fulfillment (06 §3.2, D-109)
+    switch:
+      - notBegun: { when: '${ $context.beginResult != "in-fulfillment" }', then: toBeginFirst }   # only a plan-scope failure is reached before begin-fulfillment (07 §4.2)
+      - begun:    { then: toFailureUnwind }
+- toBeginFirst: { set: { nextStage: fulfillment, stageLoop: planFailFast }, then: exit }   # 04 §4.3: pass begin-fulfillment, then the unwind
+- toFailureUnwind: { set: { unwind: failure, nextStage: unwind, stageLoop: null }, then: exit }
 - createTasks:                          # protected (07): exactly one actionable task per failed subject, reopen semantics inside
     timeout: step
     try:
@@ -1586,8 +1615,11 @@ for an order-scope task, `taskReturnStage` and `taskReturnLoop`:
 
 The unwind stage, the `do` list of `process.unwind` — the order of `06 §4.7`: fence **<**
 `compensate-order` **<** `report-outcome` **<** `terminate-instance`, entered with
-`unwind` ∈ `failure` · `cancel` · `supersede` · `terminal-event`, `reportAs` and
-`terminationKind` in `$context`:
+`unwind` ∈ `failure` · `cancel` · `supersede` · `terminal-event` in `$context`, the trigger the
+fence is presented. `reportAs` and `terminationKind` are derived from the fence's
+`effectiveTrigger`, never from the entry, because a trigger absorbed against a running unwind
+keeps that run's report (`06 §4.3`; a cancel taken during a supersede unwind stays a supersede
+report):
 
 ```yaml
 - enter:
@@ -1598,9 +1630,9 @@ The unwind stage, the `do` list of `process.unwind` — the order of `06 §4.7`:
 - fence:                                # protected (06): claims or absorbs, promotes failure → cancel (06 §4.3); a permanent failure faults the invocation
     timeout: step
     try:
-      - call: { step: run-cancellation-fence }   # body: ref + trigger: $context.unwind, failureReason, cancelRequestRef, triggerEventId; key ends in the request ref (06 §4.3), so a second cancel is absorbed, not a key conflict
+      - call: { step: run-cancellation-fence }   # body: ref + trigger: $context.unwind, cancelRequestRef, triggerEventId; no failure reason (06 §4.8); key ends in the request ref (06 §4.3), so a second cancel is absorbed, not a key conflict
     catch: *transient
-    export: { as: '${ $context + { pass: ($context.pass // 1) } }' }
+    export: { as: '${ $context + { pass: ($context.pass // 1), effectiveTrigger: .effectiveTrigger, reportAs: ({ "failure": "failed", "cancel": "cancelled", "supersede": "superseded", "terminal-event": "terminal-event" }[.effectiveTrigger]), terminationKind: ({ "failure": "compensated", "cancel": "compensated", "supersede": "superseded", "terminal-event": "terminal-order-event" }[.effectiveTrigger]) } }' }
 - enterCompensate: { set: { stageLoop: compensate } }
 - compensate:                           # protected (06): the whole reverse walk, ONE operation because the ordinal is Orders'
     try:
@@ -1655,7 +1687,7 @@ The unwind stage, the `do` list of `process.unwind` — the order of `06 §4.7`:
 - reportOutcome:                        # protected (06): the sole Lifecycle outcome caller; outcome-not-reportable or fence-not-claimed fault the invocation
     timeout: step
     try:
-      - call: { step: report-outcome }  # body: ref + outcome: $context.reportAs ∈ failed | cancelled | superseded | terminal-event
+      - call: { step: report-outcome }  # body: ref + outcome: $context.reportAs ∈ failed | cancelled | superseded | terminal-event, from the fence's effectiveTrigger; reportedOutcome is terminal-event where Lifecycle already holds the order terminal (06 §4.9)
     catch: *transient
 - terminateAborted:                     # protected (01); terminationKind: $context.terminationKind, supersededByOrderVersion on supersede
     timeout: step
@@ -1741,8 +1773,8 @@ of the stage the cancel was taken from:
     switch:
       - authorized: { when: '${ $context.cancelAuthorized == true }', then: toCancelUnwind }
       - withdrawn:  { when: '${ $context.cancelAuthorized == null }', then: authorityTask }
-      - denied:     { then: back }      # the stage and loop the cancel was taken from — the resume wait when taken from a hold (08 §4.7 item 5)
-- toCancelUnwind: { set: { unwind: cancel, reportAs: cancelled, terminationKind: compensated, nextStage: unwind, stageLoop: null }, then: exit }   # fragment (c): workflow-mediated cancel with evidence
+      - denied:     { then: back }      # the stage and loop the cancel was taken from — the resume wait when taken from a hold (08 §4.7 item 5); also preFulfillment (08 §3.6, D-109): the order is cancelled through Lifecycle and the lifecycle arm ends the process
+- toCancelUnwind: { set: { unwind: cancel, nextStage: unwind, stageLoop: null }, then: exit }   # fragment (c): the fence claims, or absorbs against a running unwind and promotes only a failure run (06 §4.3); reportAs follows its effectiveTrigger
 - authorityTask:                        # fragment (c): an order-scope task whose retry returns to the stage the cancel was taken from
     set: { failureScope: order, failureSubjects: [ '${ $context.correlationId }' ], failureReason: authority-withdrawn, sourceStep: authorize-cancel, forceTask: true, taskReturnStage: '${ $context.returnStage }', taskReturnLoop: '${ $context.stageLoop }', nextStage: failure, stageLoop: null }
     then: exit
@@ -1822,7 +1854,11 @@ is where the request's authority is re-checked at apply time — fencing can out
 by days — and precedes `run-cancellation-fence` on every cancel path; a denied re-check returns
 through `back` to the stage and loop the cancel was taken from, which is the resume wait
 (`awaitResume`) when the cancel was taken during a hold, because the instance is still
-`suspended`. A spent budget of `authorize-cancel` opens the `authority-withdrawn` task, whose
+`suspended`. A cancel of an order whose fulfillment has not begun has no Workflow seam: the
+cancel route refuses it and `authorize-cancel` answers `preFulfillment` if one reaches it, so it
+also returns through `back`, and the order is cancelled through Lifecycle's own cancel, whose
+`OrderCancelled` the lifecycle arm consumes (decision D-109). The approval and eligibility forks
+keep their cancel arm for a request accepted against an order Lifecycle already holds terminal. A spent budget of `authorize-cancel` opens the `authority-withdrawn` task, whose
 retry returns to that same stage and loop. A parked instance — including one parked at the
 lifetime ceiling — reaches an unwind only through this path and the fence
 (`parked → compensating`, `01 §3.7`). **After the ceiling** the instance waits in
@@ -2029,7 +2065,7 @@ alone decides (`02 §4.7` items 1 and 3):
       - terminate: { when: '${ $context.admission == "terminate" }', then: terminalEvent }
       - back:      { then: back }       # absorbed-duplicate (an OrderAmended at the pinned version) | ignored-superseded | ignored-terminated
 - supersedePath:                        # fragment (c): fence (supersede) cancels open gates, voids un-activated wave-1 drafts, compensates activated; report-outcome makes no seam call
-    set: { unwind: supersede, reportAs: superseded, terminationKind: superseded, triggerEventId: '${ $context.lifecycleEventId }', preAdmitted: false, nextStage: unwind, stageLoop: null }
+    set: { unwind: supersede, triggerEventId: '${ $context.lifecycleEventId }', preAdmitted: false, nextStage: unwind, stageLoop: null }
     then: exit
 - terminalEvent:                        # protected (02): OrderCancelled | OrderExpired | OrderRejected for an active instance
     timeout: step
@@ -2042,7 +2078,7 @@ alone decides (`02 §4.7` items 1 and 3):
       - unwind: { when: '${ $context.terminate }', then: terminalUnwind }
       - back:   { then: back }          # terminate: false returns to the arm's stage and never skips to terminate-instance (02 §4.7 item 4)
 - terminalUnwind:                       # report-outcome makes no Lifecycle transition: the order is already terminal
-    set: { unwind: terminal-event, reportAs: terminal-event, terminationKind: terminal-order-event, triggerEventId: '${ $context.lifecycleEventId }', preAdmitted: false, nextStage: unwind, stageLoop: null }
+    set: { unwind: terminal-event, triggerEventId: '${ $context.lifecycleEventId }', preAdmitted: false, nextStage: unwind, stageLoop: null }
     then: exit
 - back: { set: { nextStage: '${ $context.returnStage }', preAdmitted: false }, then: exit }
 ```

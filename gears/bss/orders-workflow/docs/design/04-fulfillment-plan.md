@@ -84,7 +84,7 @@ validates it and freezes it before `begin-fulfillment`, so every later read of t
 |-------------|------------------|
 | `cpt-cf-bss-orders-workflow-fr-owf-fulfillment-plan` | `construct-and-freeze-plan` (Plan Constructor, Plan Freeze Store) resolves Catalog dependency data per order line, validates the graph and freezes it per `orderId` + `orderVersion` before `begin-fulfillment` and therefore before any provisioning intent (§3.3, §3.6). |
 | `cpt-cf-bss-orders-workflow-fr-owf-line-progress` | The Progress Tracker owns the `FulfillmentTask` transition table (§3.7) and the per-terminal-entry emission guard for `OrderFulfillmentStepCompleted`, invoked in-process by slice 05's operations; `evaluate-activation-eligibility` answers the barrier conjunction and the per-line dependency order (§3.3). |
-| `cpt-cf-bss-orders-workflow-fr-owf-payment-auth` | `evaluate-payment-auth-eligibility` evaluates the authorization outcome and the buyer-acceptance guard, persists the observed outcome and instant on `owf_fulfillment_plan`, and returns `eligible`, `pending` or `withheld`; the definition re-invokes it on `OrderAcceptanceRecorded`, on `reauthorize-requested` and on its poll arm (§3.3, §3.6). |
+| `cpt-cf-bss-orders-workflow-fr-owf-payment-auth` | `evaluate-payment-auth-eligibility` evaluates the authorization outcome, persists the observed outcome and instant on `owf_fulfillment_plan`, and returns `eligible` or `pending`; the buyer-acceptance guard is Lifecycle's, answered by `begin-fulfillment` as `withheld`; the definition re-invokes it on `OrderAcceptanceRecorded`, on `reauthorize-requested` and on its poll arm (§3.3, §3.6). |
 
 #### NFR Allocation
 
@@ -342,10 +342,9 @@ keeps the pending/failed distinction (§2.1) in one place.
 ##### Responsibility scope
 
 Owns `evaluate-payment-auth-eligibility` and `begin-fulfillment` (§3.3). Reads the authorization
-outcome by request (§3.5) and the recorded-buyer-acceptance requirement and instant from the
-Lifecycle order read (R1); persists the observed outcome, the instant it was observed and the
+outcome by request (§3.5) and the order's axes from the Lifecycle order read (R1); persists the observed outcome, the instant it was observed and the
 Payments request identity on `owf_fulfillment_plan`, creating the unfrozen row on first call;
-answers `eligible`, `pending` or `withheld`. Makes the Lifecycle begin-fulfillment call with the
+answers `eligible` or `pending`. Makes the Lifecycle begin-fulfillment call with the
 recorded outcome, maps Lifecycle's guard refusals to `withheld`, and enqueues
 `OrderFulfillmentStarted` on a committed transition. Provides the authorization-freshness input
 the Progress Tracker's re-check reads (§3.7 columns only; no call).
@@ -355,15 +354,16 @@ the Progress Tracker's re-check reads (§3.7 columns only; no call).
 Does not compute the authorization (Payments owns that) and does not score credit. Does not
 evaluate the seller's tolerate-failure election (Lifecycle does). Does not arm a wait: the former
 `payment-auth-wait` timer is retired by ADR-0011; every re-evaluation is a definition arm (§2.1).
-Does not decide whether buyer acceptance is required — it reads whether a required acceptance has
-been recorded. Does not call Subscriptions.
+Does not evaluate buyer acceptance at all: whether it is required and recorded is Lifecycle's
+guard at begin-fulfillment, which this component maps to `withheld` (decision D-113). Does not
+call Subscriptions.
 
 ##### Related components (by ID)
 
 - `cpt-cf-bss-orders-workflow-component-plan-constructor` — shares the `owf_fulfillment_plan` row
   with (column ownership per §3.7).
 - `cpt-cf-bss-orders-workflow-actor-owf-orders-lifecycle` — calls for the begin-fulfillment
-  transition and reads the order for the acceptance guard.
+  transition and reads the order for its axes.
 - `cpt-cf-bss-orders-workflow-actor-owf-payments` — reads the authorization outcome from.
 
 #### Plan Constructor
@@ -522,7 +522,7 @@ compensation, not order state.
 
 | Method | Path | Description | Stability |
 |--------|------|--------------|-----------|
-| `POST` | `/bss-orders-workflow/v1/steps/evaluate-payment-auth-eligibility` | Read the authorization outcome and the acceptance guard; persist the observation; answer `eligible` / `pending` / `withheld`. | unstable — internal, versioned with `10 §2` |
+| `POST` | `/bss-orders-workflow/v1/steps/evaluate-payment-auth-eligibility` | Read the authorization outcome; persist the observation; answer `eligible` / `pending`. | unstable — internal, versioned with `10 §2` |
 | `POST` | `/bss-orders-workflow/v1/steps/construct-and-freeze-plan` | Resolve Catalog dependencies, validate, pin the policy, compute the expected-fulfillment instant, freeze. | unstable — internal |
 | `POST` | `/bss-orders-workflow/v1/steps/begin-fulfillment` | The Lifecycle seam call `approved → in_fulfillment`; enqueues `OrderFulfillmentStarted`. | unstable — internal |
 | `POST` | `/bss-orders-workflow/v1/steps/evaluate-activation-eligibility` | Evaluate the barrier conjunction and the per-line dependency predicate from Orders' record. | unstable — internal |
@@ -545,7 +545,7 @@ gear's authority — the caller supplies references, never authority (ADR-0013, 
 |-------|-------------------------------------|-----------------------------|---------------------|-----------------------------------|---------------------------|
 | `protection` | `protected` | `protected` | `protected` — the R1 seam call | `composable` | `protected` |
 | `input` (beyond the common members) | `trigger` ∈ `initial` · `acceptance-recorded` · `reauthorize-requested` · `poll`; `requestRef` (the signal's request, nullable); `evaluationSeq` | `attempt` (default 0; minted by `retry-step` on a plan-level task's retry) | `planRef`, `eligibilitySeq` (the `evaluationSeq` of the `eligible` answer) | `planRef`, `evaluationSeq` | `planRef`, `evaluationSeq` |
-| `output` | `eligibility` ∈ `eligible` · `pending` · `withheld`; `withheldCause` ∈ `acceptance-not-recorded` · `acceptance-unevaluable` · `null`; `nextEvaluationSeq` | `planRef`, `lineRefs[]`, `expectedFulfillmentAt` (instant), `policy` ∈ `remediate` · `fail-fast`, `planState` ∈ `frozen` · `invalid-graph` · `topology-unavailable`, `reason` (catalogue code, nullable) | `result` ∈ `in-fulfillment` · `withheld` · `held` (Lifecycle `not-admissible` and the order read shows `on_hold`) · `version-conflict` (Lifecycle `version-conflict`: the order moved; the amendment arm resolves it) — every one a settled success, so no answer of this operation is a 409 the definition must interpret; `withheldCause` ∈ `authorization-pending` · `authorization-failed` · `acceptance-required-not-recorded` · `acceptance-requirement-unevaluable` · `null` | `due: true\|false` — database time against the plan's stored `expected_fulfillment_at`, the answer the barrier's re-check loop switches on (`10 §3.6` (b)); `released` (bool), `eligibleLineRefs[]`, `pendingLineRefs[]`, `nextEvaluationSeq` | `verdict` ∈ `proceed` · `abort` · `not-dispatchable`; `abortReason` (catalogue code, nullable); `observed` ∈ `on-hold` · `superseded` · `terminal` · `null`; `nextEvaluationSeq` |
+| `output` | `eligibility` ∈ `eligible` · `pending`; `nextEvaluationSeq` | `planRef`, `lineRefs[]`, `expectedFulfillmentAt` (instant), `policy` ∈ `remediate` · `fail-fast`, `planState` ∈ `frozen` · `invalid-graph` · `topology-unavailable`, `reason` (catalogue code, nullable) | `result` ∈ `in-fulfillment` · `withheld` · `held` (Lifecycle `not-admissible` and the order read shows `on_hold`) · `version-conflict` (Lifecycle `version-conflict`: the order moved; the amendment arm resolves it) — every one a settled success, so no answer of this operation is a 409 the definition must interpret; `withheldCause` ∈ `authorization-pending` · `authorization-failed` · `acceptance-required-not-recorded` · `acceptance-requirement-unevaluable` · `null` | `due: true\|false` — database time against the plan's stored `expected_fulfillment_at`, the answer the barrier's re-check loop switches on (`10 §3.6` (b)); `released` (bool), `eligibleLineRefs[]`, `pendingLineRefs[]`, `nextEvaluationSeq` | `verdict` ∈ `proceed` · `abort` · `not-dispatchable`; `abortReason` (catalogue code, nullable); `observed` ∈ `on-hold` · `superseded` · `terminal` · `null`; `nextEvaluationSeq` |
 | `idempotency_key` | instance-scoped `{tenant}:{correlationId}:evaluate-payment-auth-eligibility:{evaluationSeq}` | instance-scoped `{tenant}:{correlationId}:construct-and-freeze-plan:{attempt}` | lifecycle-transition `{tenant}:{orderId}:{orderVersion}:begin-fulfillment:{eligibilitySeq}` (§4.1) | instance-scoped `{tenant}:{correlationId}:evaluate-activation-eligibility:{planRef}:{evaluationSeq}` | instance-scoped `{tenant}:{correlationId}:re-check-pre-activation:{planRef}:{evaluationSeq}` |
 | `declared_event` | none | none | `OrderFulfillmentStarted` on `result = in-fulfillment` | none | none |
 | `compensation` | none | none — a frozen plan is superseded by a new order version, never undone | none — the unwind of an order in fulfillment is `run-cancellation-fence` → `compensate-order` → `report-outcome` (06), a path, not a paired undo | none (read-only) | none |
@@ -555,7 +555,7 @@ gear's authority — the caller supplies references, never authority (ADR-0013, 
 | `deadline` | 10 s (Payments and Lifecycle reads) | 10 s (Catalog, Lifecycle, Account Management and `SUB-O5` reads) | 10 s (Lifecycle write) | 5 s (local reads only) | 10 s (Account Management and `SUB-O5` reads) |
 
 **What each answer means to the definition.** A settled `eligible`, `frozen`, `in-fulfillment`,
-`released: true` or `proceed` advances the path. `pending`, `withheld` (either operation) and
+`released: true` or `proceed` advances the path. `pending`, `begin-fulfillment`'s `withheld` and
 `released: false` are **settled successes** that select a waiting arm, never failures. A
 `planState` other than `frozen` and a `verdict` of `abort` are settled successes that select the
 failure or unwind branch of §4.8. `not-dispatchable` is a settled success that returns the path to
@@ -651,25 +651,25 @@ sequenceDiagram
     participant P as Payments
     participant R as Orders record
     D->>G: call (trigger, evaluationSeq)
-    G->>L: order read: acceptance required / recorded
+    G->>L: order read: axes only (acceptance is begin-fulfillment's guard)
     G->>P: authorization read-by-request
     G->>R: upsert owf_fulfillment_plan payment_auth_* (observed outcome, instant)
-    G-->>D: eligible | pending | withheld, nextEvaluationSeq
-    Note over D: pending / withheld → awaitEligibilityChange (acceptance listen, reauthorize signal, poll wait)
+    G-->>D: eligible | pending, nextEvaluationSeq
+    Note over D: pending → awaitEligibilityChange (acceptance listen, reauthorize signal, poll wait)
 ```
 
 **Algorithm: Evaluate Payment-Authorization Eligibility**
 
 Input: correlationId, orderId, orderVersion, trigger, requestRef, evaluationSeq, attemptId
-Output: eligibility, withheldCause, nextEvaluationSeq
+Output: eligibility, nextEvaluationSeq
 
 1. [ ] - `p1` - Resolve the instance and its tenant axes; lock or create the `owf_fulfillment_plan` row for (`orderId`, `orderVersion`) unfrozen, copying `resource_tenant_id`, `payer_tenant_id` and `seller_tenant_id` from the instance and the order read - `inst-pa-resolve-row`
 2. [ ] - `p1` - **IF** the plan row is already `frozen_at` set **AND** `begin_fulfillment_committed_at` is set: **RETURN** `eligible` with the recorded observation — a late signal after the order entered fulfillment changes nothing - `inst-pa-if-already-begun`
-3. [ ] - `p1` - Read the order through the Lifecycle PDP-authorized order read: whether buyer acceptance is required and, if so, whether its instant is recorded - `inst-pa-read-acceptance`
-4. [ ] - `p1` - **IF** the Lifecycle read is unavailable: settle `retryable-failure` (503) and leave the key `open` - `inst-pa-if-lifecycle-unavailable`
+3. [ ] - `p1` - Read no acceptance state. Whether buyer acceptance is required, and recorded, is Lifecycle's begin-fulfillment guard, resolved live at each evaluation and never snapshotted ([Lifecycle `05`](../../../orders-lifecycle/docs/design/05-preconditions.md) §3.6), and Lifecycle's composed order read exposes no guard state ([Lifecycle `08 §4.2`](../../../orders-lifecycle/docs/design/08-read-and-authz.md#42-what-a-read-exposes-normative)); `begin-fulfillment` surfaces an unmet or unevaluable acceptance as `withheld` (`inst-bf-if-withheld`) - `inst-pa-read-acceptance`
+4. [ ] - `p1` - **IF** the Lifecycle order read of step 1 is unavailable: settle `retryable-failure` (503) and leave the key `open` - `inst-pa-if-lifecycle-unavailable`
 5. [ ] - `p1` - Read the authorization outcome from Payments by the order's authorization request identity; a transport failure settles `retryable-failure` (503) with the circuit-breaker rule of `01 §4.5` - `inst-pa-read-outcome`
 6. [ ] - `p1` - Persist `payment_auth_outcome`, `payment_auth_observed_at` = database now **only when the outcome changed or was never recorded**, and `payment_auth_request_ref`; an unchanged `pending` does not move the observed instant - `inst-pa-persist-observation`
-7. [ ] - `p1` - **IF** acceptance is required and not recorded: **RETURN** `withheld` with `acceptance-not-recorded`; **IF** the acceptance requirement was unevaluable: **RETURN** `withheld` with `acceptance-unevaluable` - `inst-pa-if-acceptance-missing`
+7. [ ] - `p1` - No acceptance branch: this operation never answers on acceptance, so a Workflow copy of Lifecycle's election precedence cannot disagree with the guard that decides (decision D-113) - `inst-pa-if-acceptance-missing`
 8. [ ] - `p1` - **IF** the outcome is `pending`: **RETURN** `pending` - `inst-pa-if-pending`
 9. [ ] - `p1` - **RETURN** `eligible` for `authorized` **and** for a conclusive `failed`; the failed outcome is carried to `begin-fulfillment`, where Lifecycle alone evaluates the tolerate-failure election (§2.1) - `inst-pa-return-eligible`
 10. [ ] - `p1` - In every branch, write the step record and `step-completion` audit entry with `trigger` and `requestRef`, and return `nextEvaluationSeq = evaluationSeq + 1` - `inst-pa-record`
@@ -756,7 +756,7 @@ Input: correlationId, orderId, orderVersion, planRef, eligibilitySeq, attemptId
 Output: result, withheldCause
 
 1. [ ] - `p1` - **IF** the plan row's `begin_fulfillment_committed_at` is set: **RETURN** `in-fulfillment` without calling Lifecycle — a later eligible round, or a re-entry after an earlier attempt committed in the background, observes the committed transition instead of presenting a new key to Lifecycle for an order already `in_fulfillment` (the check `inst-pa-if-already-begun` makes for the eligibility evaluation) - `inst-bf-if-already-begun`
-2. [ ] - `p1` - **IF** the plan named by `planRef` is not frozen, or the settled `evaluate-payment-auth-eligibility` step record for `eligibilitySeq` did not answer `eligible`: settle `permanent-failure` with `version-mismatch` - `inst-bf-guard-frozen`
+2. [ ] - `p1` - **IF** the plan named by `planRef` is neither frozen nor an unfrozen plan whose `abort_record` holds `invalid-dependency-graph` or `catalog-topology-unavailable` (the plan-failure begin of §4.3, which precedes a failure unwind), or the settled `evaluate-payment-auth-eligibility` step record for `eligibilitySeq` did not answer `eligible`: settle `permanent-failure` with `version-mismatch` - `inst-bf-guard-frozen`
 3. [ ] - `p1` - Call Lifecycle `begin-fulfillment` with the recorded `payment_auth_outcome`, the expected order version, the process `correlationId` and the operation's key as the Lifecycle idempotency key - `inst-bf-call`
 4. [ ] - `p1` - **IF** Lifecycle answers a transient failure or `still-processing`: settle `retryable-failure` (503 or 409 `Aborted`); never infer success. A 409 from this operation is therefore only ever a retryable answer, which the definition's retry policy re-issues under the same key - `inst-bf-if-transient`
 5. [ ] - `p1` - **IF** Lifecycle refuses with a precondition guard (`authorization-pending`, `authorization-failed`, `acceptance-required-not-recorded`, `acceptance-requirement-unevaluable`): record the refusal code; **RETURN** `withheld` with that `withheldCause` - `inst-bf-if-withheld`
@@ -843,7 +843,7 @@ Output: verdict, abortReason, observed, nextEvaluationSeq
 1. [ ] - `p1` - **IF** slice 05's spawn-signal record exists for this plan: **RETURN** `proceed` with basis `already-spawned` — the re-check is authoritative only before the first activation intent (`PRD.md:329`) - `inst-rc-if-spawned`
 2. [ ] - `p1` - Compose Lifecycle's *Re-check Activation Preconditions* integration algorithm ([`03-gate-and-pin.md`](../../../orders-lifecycle/docs/design/03-gate-and-pin.md#re-check-before-first-activation)) unchanged, through the owning upstream SDKs — the order read, the payer's current commercial profile, the overlap occupancy for each line's stored `overlap_scope_key` - `inst-rc-compose-lifecycle`
 3. [ ] - `p1` - **IF** Lifecycle's outcome is `not-dispatchable`: **RETURN** `not-dispatchable` with `observed` ∈ `on-hold` · `superseded` · `terminal` - `inst-rc-if-not-dispatchable`
-4. [ ] - `p1` - **IF** the outcome is `defer`: increment `recheck_defer_count` and set `recheck_first_defer_at` if null; **IF** fewer than 3 defers and less than 60 s since the first (Lifecycle's `activation-recheck-retry-budget` baseline): settle `retryable-failure` (503, `overlap-read-unevaluable`) and leave the key `open`; **ELSE** write `abort_record` with `overlap-read-unevaluable` and **RETURN** `abort` - `inst-rc-if-defer`
+4. [ ] - `p1` - **IF** the outcome is `defer`: increment `recheck_defer_count` and set `recheck_first_defer_at` if null; **IF** fewer than 3 defers and less than 60 s since the first (Lifecycle's `activation-recheck-retry-budget` baseline): settle `retryable-failure` (503, the unavailable port's reason) and leave the key `open`; **ELSE** write `abort_record` with the unavailable port's own reason — `identity-party-unavailable` for the identity port, `overlap-read-unevaluable` for the overlap-occupancy port — and **RETURN** `abort`; Lifecycle carries each port's reason separately on `acknowledge-failed` ([Lifecycle `06 §4.4`](../../../orders-lifecycle/docs/design/06-workflow-seam.md#44-acknowledgement-normative), its D-127), so the two are never reduced to one - `inst-rc-if-defer`
 5. [ ] - `p1` - **IF** the outcome is `reject`: write `abort_record` with `overlap-collision` or `market-divergence` and the per-line reasons; **RETURN** `abort` - `inst-rc-if-reject`
 6. [ ] - `p1` - **IF** `payment_auth_outcome = authorized` and database now minus `payment_auth_observed_at` exceeds `payment_auth_validity` (30 days): write `abort_record` with `payment-authorization-stale`; **RETURN** `abort`. A tolerated `failed` outcome has no validity horizon — its risk was accepted by Lifecycle at begin-fulfillment - `inst-rc-if-stale`
 7. [ ] - `p1` - **RETURN** `proceed`, an early-abort pass and **not** an admission guarantee: an `overlap-collision` raised later by Subscriptions arrives as a wave-2 failure through slice 05 - `inst-rc-return-proceed`
@@ -1106,15 +1106,28 @@ A plan that does not freeze has no `FulfillmentTask` to key a line task on, and 
   exhaustion under `remediate`, the order must reach `fulfillment_failed`; since no Workflow
   transition leaves `approved`, the definition **MUST** pass `begin-fulfillment` before the unwind
   path, whose `compensate-order` has nothing to void and whose `report-outcome` acknowledges
-  `fulfillment_failed` with `invalid-dependency-graph` and publishes `OrderFulfillmentAborted`.
+  `fulfillment_failed` with Lifecycle's `dependency-graph-invalid` (the fence's mapping, `06 §4.8`) and publishes `OrderFulfillmentAborted`.
 - **`topology-unavailable`** is not a defect of the order. It **MUST** route to a plan-level
   manual task with reason `catalog-topology-unavailable` under **either** policy — fail-fast
   applies to permanent line failures, and a Catalog outage is neither — and resolves by `retry`
   (new `attempt`) once Catalog answers completely; exhaustion follows the `invalid-graph` rule.
+- **Every route to the unwind passes `begin-fulfillment` first.** A plan task's exhaustion —
+  three failed attempts, the SLA elapsing, or the Seller Operator cancelling its last task
+  ([`07 §4.2`](./07-manual-tasks.md#42-remediation-exhausted-and-the-consequence-of-a-breach-normative))
+  — reaches fragment (c)'s `failFastUnwind` with no begin committed, and the definition sends it
+  back to `planFailFast` (`10 §3.6` (b), (c)). `begin-fulfillment` admits the unfrozen plan for
+  this purpose only (`inst-bf-guard-frozen`). Its `withheld`, `held` or `version-conflict` answer
+  means the order is not in fulfillment and no failure can be acknowledged yet: the definition
+  waits in the eligibility fork with `planFailed` set and calls `begin-fulfillment` again on the
+  next `eligible` round, and an amendment (supersession) or Lifecycle's `approved` expiry ends the
+  wait through the lifecycle arm. The unwind's `report-outcome` then acknowledges
+  `fulfillment_failed` with `dependency-graph-invalid`, the value the fence maps both plan reasons
+  to (`06 §4.8`; the topology row is interim) (decision D-109).
 
-(decision D-92: plan-level failures never take a Lifecycle transition from
+(decision D-92, as amended: plan-level failures never take a Lifecycle transition from
 `approved`; `topology-unavailable` is a plan-level manual task under either policy; a plan-level
-failure that must report `fulfillment_failed` passes `begin-fulfillment` first.) The plan-scope
+failure that must report `fulfillment_failed` passes `begin-fulfillment` first, on the fail-fast
+route and on every exhaustion route alike.) The plan-scope
 reference on `owf_manual_task` / `owf_incident` is asked of slice 07 (§4.7).
 
 ### 4.4 The remediation hold is a manual-task state
@@ -1204,7 +1217,10 @@ the fragment now carries each rule, and the note is kept as the reason the rule 
    409s is a routing answer (`inst-bf-if-transient`) (**alignment**: the fragment had no `switch` after
    `beginFulfillment`).
 3. **`planState`** — `frozen` → `begin-fulfillment`; `invalid-graph` → fragment (c) per policy,
-   with `begin-fulfillment` passed before the unwind (§4.3); `topology-unavailable` →
+   with `begin-fulfillment` passed before the unwind (§4.3), and every exhaustion of a plan task
+   **MUST** also route through `planFailFast` before the unwind; a `planFailFast` whose
+   `begin-fulfillment` is not `in-fulfillment` **MUST** return to the eligibility wait with
+   `planFailed` set, never to the unwind; `topology-unavailable` →
    `create-manual-task` under either policy (**alignment**: the fragment routed every non-frozen
    state to `partialFailure`).
 4. **`re-check-pre-activation`** — `abort` → the unwind path (`run-cancellation-fence` →

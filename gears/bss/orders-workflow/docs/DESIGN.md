@@ -630,7 +630,7 @@ plan projection, each pointed at the document that specifies it:
 | Query process progress | `GET …/workflows/{orderId}/progress` | `09 §3.3` | **progress read projector** |
 | Resolve manual task (retry / override / escalate / assign / cancel) | Per-action task routes; `retry`, `override` and `cancel` signal `task-resolution-requested`, consumed by `resolve-manual-task` / `verify-override` | `07 §3.3`, `09 §4.1` | **manual-task creator**, **override verifier**, **escalation router** |
 | Retry failed step | `POST …/workflows/{orderId}/steps/{stepId}/retry`, an alias of the open task's `retry` action; `retry-step` runs inside `resolve-manual-task` | `09 §3.3`, `01 §3.3` | **control operation gateway** |
-| Cancel workflow with compensation | `POST …/workflows/{orderId}/cancel` records `owf_cancel_request` and signals `cancel-requested`; `authorize-cancel` then the unwind path apply it | `09 §3.3`, `08 §3.3`, `06 §3.3` | **cancel mediator** |
+| Cancel workflow with compensation | `POST …/workflows/{orderId}/cancel`, with a mandatory `reason` and only for an order in fulfillment (D-109), records `owf_cancel_request` and signals `cancel-requested`; `authorize-cancel` then the unwind path apply it | `09 §3.3`, `08 §3.3`, `06 §3.3` | **cancel mediator** |
 | Approver inbox read | `GET …/approver-inbox/gates` | `03 §3.3`, `09 §4.1` | **approver inbox projection** |
 | Approval decision submit | `POST …/approver-inbox/gates/{gateId}/decision` | `03 §3.3` | **decision reflector** |
 | Fulfillment Operator task-queue read | `GET …/fulfillment-operator/tasks` | `07 §3.3`, `09 §4.1` | **operator task queue** |
@@ -927,7 +927,10 @@ sequenceDiagram
 `cancel`, which would end the invocation without the fence. The unwind path — fence, the
 one-operation reverse walk resumable by pass, outcome report, termination — is the same path every
 failure, supersession and terminal-event arm takes, and Lifecycle is told the order is cancelled
-only after `compensate-order` reports `complete`.
+only after `compensate-order` reports `complete`, with the requester's mandatory reason. An order
+not yet in fulfillment has no Workflow cancel: the route refuses it, and it is cancelled through
+Lifecycle's own cancel, whose `OrderCancelled` ends the process on the terminal-event path
+(D-109).
 
 #### Publish A Definition Version And Pin An Instance
 

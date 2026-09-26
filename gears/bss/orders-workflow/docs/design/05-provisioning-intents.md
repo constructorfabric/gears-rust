@@ -625,11 +625,11 @@ operation's round. Every step key is recomposed server-side from the body
 |-------|-------|
 | `protection` | `protected` — Waves stage: after `re-check-pre-activation`, before `dispatch-wave2-activate` (`10 §4.1`) |
 | `input` | `ref`, `round` (0 on first entry, else the previous answer's `nextRound`) |
-| `output` | `spawnSignal` (`recorded` · `already-recorded` · `held` — Lifecycle refused `not-admissible` and the order read shows `on_hold`, a settled success after which the definition waits in the barrier loop for the resume and calls again under the next round); `nextRound` |
+| `output` | `spawnSignal` (`recorded` · `already-recorded` · `held` — Lifecycle refused `not-admissible` and the order read shows `on_hold`, a settled success after which the definition waits in the barrier loop for the resume and calls again under the next round · `not-dispatchable` — Lifecycle refused `not-admissible` and the order read shows a terminal state: a cancel committed before the signal, the race Lifecycle declares normal ([`06 §4.3`](../../../orders-lifecycle/docs/design/06-workflow-seam.md#43-begin-fulfillment-and-the-spawn-signal-normative)), a settled success after which the definition dispatches nothing and returns to the barrier loop, whose lifecycle arm consumes `OrderCancelled`); `nextRound` |
 | `idempotency_key` | Lifecycle-transition family: `{tenant}:{orderId}:{orderVersion}:report-spawn-signal:{round}`, the same key passed to Lifecycle, so a replay of one round returns Lifecycle's stored outcome and a refusal of one round is never replayed into the next ([`01 §3.3` *Rounds and attempts*](./01-foundation.md#rounds-and-attempts-the-one-rule-for-re-invokable-operations) rule 4) |
 | `declared_event` | none |
 | `compensation` | none — the spawn signal is written once and never cleared (Lifecycle `06 §4.3`) |
-| `reasons` | `version-mismatch` (Lifecycle `version-conflict`, or `not-admissible` of an order the Lifecycle read does not show `on_hold`), `activation-precondition-unmet` (no `proceed` verdict of `re-check-pre-activation` recorded for this order version), `circuit-breaker-open`, `per-attempt-timeout`, `idempotency-key-conflict`, `not-found` |
+| `reasons` | `version-mismatch` (Lifecycle `version-conflict`, or `not-admissible` of an order the Lifecycle read shows neither `on_hold` nor terminal), `activation-precondition-unmet` (no `proceed` verdict of `re-check-pre-activation` recorded for this order version), `circuit-breaker-open`, `per-attempt-timeout`, `idempotency-key-conflict`, `not-found` |
 | `audit_kind` | `step-completion` |
 | `retry_class` | `retryable-on: transient` |
 | `deadline` | 10 s |
@@ -1237,7 +1237,9 @@ slice operations (D-80, D-81).
    `nextRebuildRound`, `nextSweepRound`, `report-spawn-signal`'s `nextRound` — or 0 on first
    entry, and **MUST NOT** pass one operation's round to another (`rebuild-wave1` never receives
    or writes back wave 1's `dispatchRound`). A `held` answer of `report-spawn-signal` **MUST**
-   route to the barrier loop, whose hold and resume arms consume the hold, never to a failure arm.
+   route to the barrier loop, whose hold and resume arms consume the hold, never to a failure arm;
+   a `not-dispatchable` answer **MUST** route to the barrier loop too, whose lifecycle arm consumes
+   the terminal event, and **MUST NOT** reach `dispatch-wave2-activate` (decision D-109).
 9. **Completion.** `report-outcome` with `outcome: completed` **MUST** follow a
    `dispatch-wave2-activate` whose `pending[]` and `failed[]` were both empty (`10 §4.1`).
    `dispatch-wave2-activate` with an empty `lineRefs[]` **MUST** be reached only from the barrier

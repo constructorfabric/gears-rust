@@ -127,6 +127,11 @@
   - [D-106 (H) Every step call is bound to the instance's invocation, and the fence needs a recorded cause](#d-106-h-every-step-call-is-bound-to-the-instances-invocation-and-the-fence-needs-a-recorded-cause)
   - [D-107 (M) The start is checked against the Lifecycle order, and the bindings are released with the definition](#d-107-m-the-start-is-checked-against-the-lifecycle-order-and-the-bindings-are-released-with-the-definition)
   - [D-108 (M) `retry-step` runs only in-process, with the actor from the request row](#d-108-m-retry-step-runs-only-in-process-with-the-actor-from-the-request-row)
+  - [D-109 (H) Orders reports to Lifecycle only from fulfillment; a cancel before it is Lifecycle's own](#d-109-h-orders-reports-to-lifecycle-only-from-fulfillment-a-cancel-before-it-is-lifecycles-own)
+  - [D-110 (H) The fence resolves the failure reason from the record and maps it to Lifecycle's closed enumeration](#d-110-h-the-fence-resolves-the-failure-reason-from-the-record-and-maps-it-to-lifecycles-closed-enumeration)
+  - [D-111 (M) The report follows the fence row, carries the requester's reason, and names an answer for every Lifecycle refusal](#d-111-m-the-report-follows-the-fence-row-carries-the-requesters-reason-and-names-an-answer-for-every-lifecycle-refusal)
+  - [D-112 (M) `reflect-verdict` sends Lifecycle's wire form, and a moved order is waited out, not failed](#d-112-m-reflect-verdict-sends-lifecycles-wire-form-and-a-moved-order-is-waited-out-not-failed)
+  - [D-113 (M) Workflow does not pre-check buyer acceptance](#d-113-m-workflow-does-not-pre-check-buyer-acceptance)
 - [Open Questions](#open-questions)
   - [Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?](#q-01-which-durable-execution-substrate-backs-the-process--the-oss-workflow-engine-or-a-bss-local-mechanism)
   - [Q-02: The Generic Approval escalation threshold — the one PRD-deferred numeric value this design deliberately leaves unset](#q-02-the-generic-approval-escalation-threshold--the-one-prd-deferred-numeric-value-this-design-deliberately-leaves-unset)
@@ -2135,6 +2140,17 @@ half-way; marking the fence rather than failing it keeps the record honest about
 **Propagated**: `design/06-saga-and-compensation.md` §3.2, §3.7; `design/08-hold-and-cancel.md`
 §3.3, §4.3; `design/10-process-definition.md` §3.6 (d).
 
+**Amended (2026-09-26)**: the entry contradicted itself: it said the re-check runs once, then
+named a `pre-submission` re-check in `report-outcome`, and 06, 08 and 09 carried three points
+(OW2-11). It now runs at two points. `authorize-cancel` decides at `pre-fence`, and
+`compensate-order` re-checks at `pre-compensation` and marks the fence on `withdrawn`.
+`report-outcome` does not re-check, and `pre-submission` is removed from the port, from
+`owf_cancel_request.last_recheck_point` and from `09 §4.4`. After the walk has verified that no
+active subscription remains, the submission records a fact and performs no destructive act. A
+refusal there would fault the invocation with every subscription already removed, and would leave
+Lifecycle asserting subscriptions that no longer exist. That is the rationale 06 §3.2 already gave.
+`authorize-cancel` also answers `preFulfillment` (D-109).
+
 ### D-85 (M) The cancel request is a slice-09 table; task requests are slice 07's
 
 **Accepted.**
@@ -2270,6 +2286,14 @@ is a plan-level manual task under either policy; a plan-level failure that must 
 never began cannot fail fulfillment.
 
 **Propagated**: `design/04-fulfillment-plan.md` §4.3; `design/07-manual-tasks.md` §3.7.
+
+**Amended (2026-09-26)**: "passes `begin-fulfillment` first" held only on the fail-fast route. The
+exhaustion routes (`onCreate`, `onResolution`, `afterOverride`) went straight to the unwind, and
+`begin-fulfillment` refused the unfrozen plan `version-mismatch` (OW2-43). Every route now passes
+it: fragment (c)'s `failFastUnwind` sends a failure with no committed begin back to `planFailFast`.
+`begin-fulfillment` admits an unfrozen plan with a plan `abort_record`. A `withheld`, `held` or
+`version-conflict` answer waits in the eligibility fork and retries on the next `eligible` round
+(D-109).
 
 ### D-93 (L) Sizes: SLA population N ≤ 40 lines, a 200-line cap, 30-day authorization validity
 
@@ -2560,6 +2584,12 @@ smallest rule: one read per bound instance per interval, and one task per dead i
 §3.3, §3.8, §4.4; `DESIGN.md` §1.2, §3.3, §3.8, §4.2, §4.4, §4.5, §4.9;
 `UPSTREAM_REQS.md` §2.9, §3, §4; `ADR/0001`, `ADR/0005`, `ADR/0012`; D-71, D-86.
 
+**Amended (2026-09-26)**: the fallback's cancel reported `cancel-workflow-mediated` whatever the
+order's state. Lifecycle admits that trigger only from fulfillment. For an order whose fulfillment
+never began, the task's `cancel` is `action-not-offered` while Lifecycle holds the order live. The
+Seller Operator cancels it through Lifecycle first, and the unwind then makes no Lifecycle call
+(D-109).
+
 ### D-106 (H) Every step call is bound to the instance's invocation, and the fence needs a recorded cause
 
 **Accepted (2026-09-26).** *(amends D-67)*
@@ -2648,6 +2678,152 @@ actor-from-the-request-row rule.
 **Propagated**: `design/01-foundation.md` §3.3; `design/07-manual-tasks.md` §4.6;
 `design/09-read-and-authz.md` §3.1, §4.2, §4.5; `design/10-process-definition.md` §2.2, §4.1;
 `DESIGN.md` §3.3, §3.5, §4.2; `UPSTREAM_REQS.md` §2.8; D-67.
+
+### D-109 (H) Orders reports to Lifecycle only from fulfillment; a cancel before it is Lifecycle's own
+
+**Accepted (2026-09-26).** *(amends D-84, D-92, D-105)*
+
+**Decision**:
+
+- `failed` and `cancelled` reach Lifecycle only for a version whose `begin-fulfillment`
+  committed (`owf_fulfillment_plan.begin_fulfillment_committed_at`).
+- The Workflow cancel route refuses `action-not-offered` while fulfillment has not begun and the
+  Lifecycle order is live. `authorize-cancel` checks the same at apply time and answers
+  `preFulfillment`, and the definition returns through `back`. The order is cancelled through
+  Lifecycle's `POST /cancel`, and its `OrderCancelled` ends the process on the terminal-event path.
+  The dead-invocation task's `cancel` follows the same rule (D-105).
+- Every failure unwind passes `begin-fulfillment` first (D-92 as amended). Only a plan-scope
+  failure is reached before it, because order-scope tasks never exhaust (`07 §4.2`).
+- `report-outcome` makes no Lifecycle call for a run whose begin never committed. It settles
+  `terminal-event` where Lifecycle holds the order terminal. It settles the same where Lifecycle
+  refuses `not-admissible` on an order it holds terminal.
+- `report-spawn-signal` answers `not-dispatchable`, a settled success, when Lifecycle refuses
+  `not-admissible` on a terminal order. The definition returns to the barrier loop, whose
+  lifecycle arm consumes `OrderCancelled`.
+
+**Rationale**: the cancel arm in the approval and eligibility forks always reported
+`cancel-workflow-mediated`, and an exhausted plan task reported `acknowledge-failed`. Lifecycle
+admits both only from `in_fulfillment`, or from `on_hold` with pre-hold `in_fulfillment`, so
+either faulted the invocation (OW2-43). A seller's direct cancel racing a failure unwind met an
+undefined refusal at the report (OW2-10). A direct cancel committing before the spawn signal,
+which Lifecycle declares the normal outcome of that race, went to a retrying catch and faulted
+(OW2-46). B2 left open what the dead-instance cancel reports for such an order. Precedent:
+Lifecycle `01 §4.3` rows 14, 16, 26, 27 and 17; its permission matrix, "via workflow-cancel only"
+(`08 §4.3`); `06 §4.3`, "if cancellation commits first, the signal refuses and Workflow
+dispatches nothing". Within the set, `re-check-pre-activation` already answers `not-dispatchable`
+for a terminal order (`04 §3.6`), `begin-fulfillment`'s `version-conflict` is a settled success
+(D-102), and 06 §3.2 already reports a terminal-event unwind with no call.
+
+**Propagated**: `design/01-foundation.md` §4.16; `design/04-fulfillment-plan.md` §3.6, §4.3,
+§4.8; `design/05-provisioning-intents.md` §3.3, §4.5; `design/06-saga-and-compensation.md` §3.2,
+§3.6, §4.1, §4.9; `design/07-manual-tasks.md` §4.4; `design/08-hold-and-cancel.md` §3.3, §3.6,
+§4.7; `design/09-read-and-authz.md` §3.3, §3.7; `design/10-process-definition.md` §3.6 (b), (c),
+(d); `DESIGN.md` §3.3, §3.6; D-84, D-92, D-105.
+
+### D-110 (H) The fence resolves the failure reason from the record and maps it to Lifecycle's closed enumeration
+
+**Accepted (2026-09-26).**
+
+**Decision**: `run-cancellation-fence` takes no failure reason as input. On `failure`, the cause
+its precondition found (D-106) names the Orders catalogue reason. The fence records it as
+`orders_failure_reason`, together with the Lifecycle `failure_reason` that the table of
+`06 §4.8` maps it to:
+
+- line failures map to `line-execution-failed`;
+- plan failures map to `dependency-graph-invalid`;
+- re-check aborts map to `overlap-collision`, `market-divergence`, `overlap-presence-unevaluable`
+  or `identity-party-unavailable`.
+
+`payment-authorization-stale` and `catalog-topology-unavailable` have no Lifecycle value. They are
+sent as interim values and registered as
+`…-upreq-lifecycle-failure-reason-coverage` (`p2`). `re-check-pre-activation` records the
+exhausted port's own reason, identity or occupancy.
+
+**Rationale**: the fence input and column were typed as Lifecycle's enumeration, but the
+definition passed Orders catalogue codes, or nothing at all on pre-activation abort and on the
+line branches. Lifecycle refuses any value outside its six with `request-invalid`, so every
+failed order would have faulted at the report (OW2-42). Deriving the reason from the recorded
+cause, rather than taking it from the definition, follows ADR-0013. It also follows the D-106
+precondition, which already reads that cause. Precedent: Lifecycle `06 §4.4` (D-136) and its
+refusal of out-of-enumeration values at the boundary (`01 §4.7`, D-142). Lifecycle carries each
+unavailable port's reason separately (its D-127).
+
+**Propagated**: `design/04-fulfillment-plan.md` §3.6, §4.3; `design/06-saga-and-compensation.md`
+§3.3, §3.6, §3.7, §4.3, §4.8; `design/10-process-definition.md` §3.6 (b), (c);
+`UPSTREAM_REQS.md` §1.1, §1.2, §2.4, §3, §5.
+
+### D-111 (M) The report follows the fence row, carries the requester's reason, and names an answer for every Lifecycle refusal
+
+**Accepted (2026-09-26).**
+
+**Decision**:
+
+- The definition takes `reportAs` and `terminationKind` from the fence's `effectiveTrigger`,
+  never from the path it entered by. A cancel absorbed against a supersede or terminal-event run
+  keeps that run's report.
+- The cancel route requires a free-text `reason` of 1–500 characters. A missing one is canonical
+  `InvalidArgument` with a field violation. It is stored as `owf_cancel_request.cancel_reason` and
+  carried as Lifecycle's `cancel_reason`. On a promoted failure run it is the promoting request's.
+- `report-outcome` answers every Lifecycle outcome of its two endpoints by `06 §4.9`.
+- The completion predicate requires the subscription identifiers to be distinct across the plan's
+  tasks.
+
+**Rationale**: `toCancelUnwind` overwrote `reportAs`, so a superseded version's unwind faulted at
+the report with `version-mismatch`, and the amended version never started (OW2-9). Lifecycle's
+`workflow-cancel` requires `cancel_reason`, but neither the route nor the request record captured
+one (OW2-45). Only three refusals had an answer (OW2-47). Precedent: `06 §4.1` item 3, which takes
+the mode from the fence row, never from the input. The task requests' required `justification`
+(`07 §3.7`) and the canonical `InvalidArgumentV1::FieldViolations`
+(`libs/toolkit-canonical-errors/src/context.rs:128`). Lifecycle's distinctness guard
+(`06 §4.4`).
+
+**Propagated**: `design/04-fulfillment-plan.md` §2.1 (via `06 §3.2`); `design/06-saga-and-compensation.md`
+§3.2, §3.3, §3.6, §3.7, §4.3, §4.7, §4.9; `design/09-read-and-authz.md` §3.3, §3.7;
+`design/10-process-definition.md` §3.6 (c), (d), (f); `DESIGN.md` §3.3, §3.6.
+
+### D-112 (M) `reflect-verdict` sends Lifecycle's wire form, and a moved order is waited out, not failed
+
+**Accepted (2026-09-26).**
+
+**Decision**: `reflect-verdict` sends:
+
+- `verdict` ∈ `required` · `not_required` · `granted` · `denied`;
+- one `deciding_authority`: for `granted`, the authority of the last-decided gate, by
+  `sequence_index`, then `decided_at`, then `gate_id`; for `denied`, the rejecting gate's;
+- `denial_reason` on `denied` only.
+
+Lifecycle `version-conflict`, and `not-admissible` on an order Lifecycle holds terminal, answer
+`moved`. It is a settled success, which the definition waits out in `awaitHeldReflect`, where the
+lifecycle arm consumes the event. Every other refusal is `approval-reflection-refused` (400),
+which fragment (a)'s catch routes to the order-scope task. `version-mismatch` is kept for a
+missing or terminal instance.
+
+**Rationale**: the contract named `approval-reflection-refused`, but the algorithm and §4.4
+answered `version-mismatch` (409). The inner catch retried 409 and then faulted, so the task arm
+never fired (OW2-44). The call sent a "trigger" and plural authorities and dropped the denial
+reason, which Lifecycle would refuse `denial-reason-missing` (OW2-48). Precedent: Lifecycle
+`06 §3.6` *Reflect Verdict* and `04 §4.4`, where a stale result "MUST NOT be treated as a failure
+of the operation it reports". Also `begin-fulfillment`'s settled `version-conflict` (D-102).
+
+**Propagated**: `design/03-approval-execution.md` §3.3, §3.6, §4.4;
+`design/10-process-definition.md` §3.6 (a).
+
+### D-113 (M) Workflow does not pre-check buyer acceptance
+
+**Accepted (2026-09-26).**
+
+**Decision**: `evaluate-payment-auth-eligibility` evaluates the payment authorization only and
+answers `eligible` or `pending`. Buyer acceptance is Lifecycle's begin-fulfillment guard.
+`begin-fulfillment` surfaces it as `withheld`, and the eligibility fork's acceptance `listen`
+wakes the next round.
+
+**Rationale**: the operation read "whether acceptance is required" from Lifecycle's order read,
+which exposes no guard state. Lifecycle resolves the requirement live at each guard and never
+snapshots it (OW2-49). Precedent: Lifecycle `05 §3.6`, whose requirement is resolved live and
+never snapshotted, and `08 §4.2`, which says the read "MUST NOT expose guard state". Also
+`begin-fulfillment`'s existing `withheld` mapping (`04 §3.6`).
+
+**Propagated**: `design/04-fulfillment-plan.md` §1.2, §3.2, §3.3, §3.6.
 
 ## Open Questions
 
@@ -2982,6 +3158,11 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-106 | M Invocation binding and the fence's recorded cause | `design/01-foundation.md` §3.3, §3.6, §3.7, `design/02-triggers-and-start.md` §3.6, `design/06-saga-and-compensation.md` §3.3, §3.6, `design/09-read-and-authz.md` §2.2, §4.1, §4.2, `design/10-process-definition.md` §3.6, `DESIGN.md` §3.3, §4.2, `UPSTREAM_REQS.md` §2.9; D-67 |
 | D-107 | M Start checked against the order; bindings released with the definition | `design/02-triggers-and-start.md` §2.1, §2.2, §3.1, §3.3, §3.6, §3.8, §4.7, `design/10-process-definition.md` §3.3, §3.6, §3.8, `DESIGN.md` §3.5, §4.2, `UPSTREAM_REQS.md` §2.9; D-73, D-76 |
 | D-108 | M `retry-step` in-process only | `design/01-foundation.md` §3.3, `design/07-manual-tasks.md` §4.6, `design/09-read-and-authz.md` §3.1, §4.2, §4.5, `design/10-process-definition.md` §2.2, §4.1, `DESIGN.md` §3.3, §3.5, §4.2, `UPSTREAM_REQS.md` §2.8; D-67 |
+| D-109 | M Reporting only from fulfillment; pre-fulfillment cancel is Lifecycle's | `design/01-foundation.md` §4.16, `design/04-fulfillment-plan.md` §3.6, §4.3, §4.8, `design/05-provisioning-intents.md` §3.3, §4.5, `design/06-saga-and-compensation.md` §3.2, §3.6, §4.1, §4.9, `design/07-manual-tasks.md` §4.4, `design/08-hold-and-cancel.md` §3.3, §3.6, §4.7, `design/09-read-and-authz.md` §3.3, §3.7, `design/10-process-definition.md` §3.6, `DESIGN.md` §3.3, §3.6; D-84, D-92, D-105 |
+| D-110 | M Failure reason resolved from the record and mapped | `design/04-fulfillment-plan.md` §3.6, §4.3, `design/06-saga-and-compensation.md` §3.3, §3.6, §3.7, §4.3, §4.8, `design/10-process-definition.md` §3.6, `UPSTREAM_REQS.md` §1.1, §1.2, §2.4, §3, §5; D-106 |
+| D-111 | M Report follows the fence row; cancel reason; every Lifecycle answer | `design/06-saga-and-compensation.md` §3.2, §3.3, §3.6, §3.7, §4.3, §4.7, §4.9, `design/09-read-and-authz.md` §3.3, §3.7, `design/10-process-definition.md` §3.6, `DESIGN.md` §3.3, §3.6 |
+| D-112 | M `reflect-verdict` wire form and refusals | `design/03-approval-execution.md` §3.3, §3.6, §4.4, `design/10-process-definition.md` §3.6 |
+| D-113 | M No Workflow acceptance pre-check | `design/04-fulfillment-plan.md` §1.2, §3.2, §3.3, §3.6 |
 
-Highest decision number used: **D-108**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
+Highest decision number used: **D-113**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
 register; there are no parts.

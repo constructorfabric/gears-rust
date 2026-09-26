@@ -786,7 +786,7 @@ catalogue rows of §3.1 and the `Gr` row of §4.1. There is therefore no operati
 | `POST` | `/bss-orders-workflow/v1/steps/{operation}` | The step surface of `01 §3.3`, authorized here as `process_step × execute` with `operation` as the resource property; serverless-runtime service principal only (`Gr`) | unstable — internal |
 | `GET` | `/bss-orders-workflow/v1/workflows/{orderId}/progress` | Query process progress (§4.1 read projection, §4.5 field projection). Unchanged | unstable |
 | `POST` | `/bss-orders-workflow/v1/workflows/{orderId}/steps/{stepId}/retry` | Retry failed step. `If-Match` with the process instance's `row_version` REQUIRED; `Idempotency-Key` REQUIRED, recomposed as `{tenant}:{orderId}:{stepId}:retry:{row_version}`. A failed step under `remediate` always holds an open manual task (`10 §4.1` *Failure*); the route is an **alias** of that task's `…/fulfillment-operator/tasks/{taskId}/retry` (`07 §3.3`): it writes the same `owf_task_resolution_request` row (action `retry`) and delivers the same `task-resolution-requested` signal, so `retry-step`'s quarantine and new attempt key (`01 §3.3`) run inside `resolve-manual-task`. A step with no open task is `not-found`; the task's own preconditions (`order-fenced`, `action-not-offered`) apply unchanged. Answers `202 Accepted` with `requestRef`. When the platform reports the invocation not live, the step is the instance's `invocation-dead` task ([`07 §4.4`](./07-manual-tasks.md#44-resolution-actions-by-reason-and-the-two-operator-roles-normative)), and the gateway issues `…/invocations/{invocation_id}:control` `retry` instead of a signal — valid only from `failed` today ([`DESIGN.md:888`](../../../../serverless-runtime/docs/DESIGN.md#invocation-api)) — once the platform confirms that `retry` keeps `invocation_id` and resumes at the faulted task (decisions D-86, D-105, `…-upreq-serverless-runtime-signals`). An invocation that fails with no `on_failure` handler moves on to `dead_lettered` ([`DESIGN.md:458`](../../../../serverless-runtime/docs/DESIGN.md#invocation-status-state-machine)), from which `retry` is not valid today; until the platform confirms those properties the re-drive is `action-not-offered`, and the fallback is the task's `cancel`, the dead-instance unwind of `01 §4.16` | unstable |
-| `POST` | `/bss-orders-workflow/v1/workflows/{orderId}/cancel` | Cancel workflow with compensation. `If-Match` REQUIRED; `Idempotency-Key` REQUIRED, recomposed as `{tenant}:{orderId}:{orderVersion}:cancel:{subject_id}`. Records an `owf_cancel_request` with the authorization snapshot (§4.4) and delivers `cancel-requested` carrying only the reference tuple and `requestRef` (`10 §3.3`); authority is re-checked at apply time by `authorize-cancel` and at the two later points of §4.4, because fencing can outlive the request by days. Never the platform's generic `:control` `cancel` (`10 §4.4`). For an instance whose invocation the platform reports not live (an open `invocation-dead` task), the request is recorded the same way and no signal is sent: the `reconciliation-sweep` worker carries it out as the dead-instance unwind, calling `authorize-cancel` and the rest of the cancel path in-process (`01 §4.16`, D-105). Answers `202 Accepted` with `requestRef` | unstable |
+| `POST` | `/bss-orders-workflow/v1/workflows/{orderId}/cancel` | Cancel workflow with compensation. `If-Match` REQUIRED; `Idempotency-Key` REQUIRED, recomposed as `{tenant}:{orderId}:{orderVersion}:cancel:{subject_id}`. The body carries a REQUIRED free-text `reason` (1–500 characters), the cancel reason Lifecycle's `workflow-cancel` requires ([Lifecycle `06 §3.6`](../../../orders-lifecycle/docs/design/06-workflow-seam.md#36-interactions-and-sequences) *Workflow Cancel*, `cancel-reason-required`); a missing, empty or oversized `reason` is refused at boundary validation with the canonical `InvalidArgument` (400) and a field violation on `reason` ([`toolkit-canonical-errors`](../../../../../libs/toolkit-canonical-errors/src/context.rs) `InvalidArgumentV1::FieldViolations`), before authorization and without a record — input validation, not a catalogue reason. The route is offered only for an order in fulfillment: where the version's `begin-fulfillment` has not committed (slice 04's `begin_fulfillment_committed_at`) and the Lifecycle order read is not terminal, it refuses `action-not-offered` (400), because this gear has no seam to cancel an order before `in_fulfillment` and the order is cancelled through Lifecycle's own `POST /cancel` ([Lifecycle `08 §4.3`](../../../orders-lifecycle/docs/design/08-read-and-authz.md#43-the-permission-model-normative); decision D-109). Records an `owf_cancel_request` with the authorization snapshot (§4.4) and the reason, and delivers `cancel-requested` carrying only the reference tuple and `requestRef` (`10 §3.3`); authority is re-checked at apply time by `authorize-cancel` and at the later point of §4.4, because fencing can outlive the request by days. Never the platform's generic `:control` `cancel` (`10 §4.4`). For an instance whose invocation the platform reports not live (an open `invocation-dead` task), the request is recorded the same way and no signal is sent: the `reconciliation-sweep` worker carries it out as the dead-instance unwind, calling `authorize-cancel` and the rest of the cancel path in-process (`01 §4.16`, D-105). Answers `202 Accepted` with `requestRef` | unstable |
 
 **Removed.** `POST /bss-orders-workflow/v1/workflows` (start workflow) is **removed** in favour of
 the platform event trigger: PRD §9.1 *Start workflow* is realised by the serverless-runtime event
@@ -1168,14 +1168,15 @@ growth log.
 | pdp_constraints | jsonb, NOT NULL | The constraints the PDP returned at acceptance |
 | decided_at | timestamptz, NOT NULL | Database time of the acceptance decision |
 | idempotency_key | text, NOT NULL, UNIQUE | The recomposed key of the accepting route |
+| cancel_reason | text, NOT NULL | The requester's free-text reason from the route body (1–500 characters); `report-outcome` carries it as Lifecycle's `cancel_reason` on `workflow-cancel` (`06 §3.6`), and on application it is written to `owf_audit_entry.justification`, never onto an event payload (`01 §4.9`). Same classification and retention as the task requests' `justification` ([`07 §3.7`](./07-manual-tasks.md#37-database-schemas--tables)) |
 | delivery_state | enum, NOT NULL | `recorded`, `delivered`, `delivery-failed`, `consumed`, `refused` |
-| last_recheck_point | enum, nullable | The last re-check point passed — `pre-fence`, `pre-compensation`, `pre-submission` (`08 §3.2`) |
+| last_recheck_point | enum, nullable | The last re-check point passed — `pre-fence`, `pre-compensation` (`08 §3.2`) |
 | updated_at | timestamptz, NOT NULL | Last delivery-state or re-check change |
 
 **PK**: `request_id`
 
-**Constraints**: the snapshot columns (`resource` through `idempotency_key`) and the axes are
-**immutable** — no UPDATE grant on them; only `delivery_state`, `last_recheck_point` and
+**Constraints**: the snapshot columns (`resource` through `idempotency_key`), `cancel_reason` and
+the axes are **immutable** — no UPDATE grant on them; only `delivery_state`, `last_recheck_point` and
 `updated_at` are updated, forward only (`recorded → delivered | delivery-failed → consumed |
 refused`); `(correlation_id, delivery_state)` indexed for the projection and the
 `still-processing` answer.
@@ -1184,7 +1185,7 @@ refused`); `(correlation_id, delivery_state)` indexed for the projection and the
 (`cpt-cf-bss-orders-workflow-component-control-operation-gateway`); `delivery_state` advanced
 only through the gateway's **request-delivery port** — the signal delivery of `10 §3.2` reports
 `delivered` or `delivery-failed` through it and never writes the row itself — and, with
-`last_recheck_point`, by slice 08's cancel-authority port inside `authorize-cancel`, `compensate-order` and `report-outcome` through the envelope.
+`last_recheck_point`, by slice 08's cancel-authority port inside `authorize-cancel` and `compensate-order` through the envelope; `authorize-cancel` also marks the request `refused` when it answers `preFulfillment` (`08 §3.6`).
 **Mutability**: declared mutable in the three columns above, append-only otherwise. **Tenant
 axes**: all three. **Retention**: ≥ 400 days — it is the evidence of who asked for a destructive
 command and under what authority — never ahead of the audit entry that names it. It never crosses
@@ -1515,14 +1516,16 @@ The Control Operation Gateway therefore records an **authorization snapshot** wi
 command in `owf_cancel_request` (§3.7) — `subject_id`, `subject_type`, `subject_tenant_id`,
 `token_scopes`, the `(resource, action)` pair, the target id, the constraints the PDP returned and
 the decision instant; never the `bearer_token` — and the cancel-authority port of slice 08
-**re-runs the same PDP decision** on the same target at three points: inside `authorize-cancel`
-before the fence (`pre-fence`), inside `compensate-order` before the first compensating leg on the
-cancel trigger (`pre-compensation`), and inside `report-outcome` before the `workflow-cancel`
-submission (`pre-submission`) ([`08 §3.2`, `§4.3`](./08-hold-and-cancel.md#43-the-apply-time-re-check)):
+**re-runs the same PDP decision** on the same target at two points: inside `authorize-cancel`
+before the fence (`pre-fence`), and inside `compensate-order` before the first compensating leg on
+the cancel trigger (`pre-compensation`) ([`08 §3.2`, `§4.3`](./08-hold-and-cancel.md#43-the-apply-time-re-check)).
+The `workflow-cancel` submission after the walk is not re-checked: it records that no active
+subscription remains rather than performing a destructive act, and withholding it would leave
+Lifecycle asserting subscriptions that no longer exist (decision D-84 as amended):
 
 1. [ ] - `p1` - Rebuild a `SecurityContext` from the snapshot's four subject fields, without a bearer token, and request the snapshot's `(resource, action)` on the same target with its current prefetched properties, constraints required - `inst-rc-decide`
 2. [ ] - `p1` - **IF** the PDP allows, apply the freshly compiled scope to the leg's own mutating statement and continue - `inst-rc-continue`
-3. [ ] - `p1` - **IF** the PDP denies, or the fresh scope matches zero rows, raise **one** manual task with reason `authority-withdrawn` (`01 §4.9`, owned by this slice) naming the request and the subject, leave `owf_process_instance.phase` **unchanged**, mark the request `refused` and — at `pre-compensation` and `pre-submission` — let slice 06 mark the fence as awaiting re-authorization so no further leg dispatches, and write the audit entry - `inst-rc-withdrawn`
+3. [ ] - `p1` - **IF** the PDP denies, or the fresh scope matches zero rows, raise **one** manual task with reason `authority-withdrawn` (`01 §4.9`, owned by this slice) naming the request and the subject, leave `owf_process_instance.phase` **unchanged**, mark the request `refused` and — at `pre-compensation` — let slice 06 mark the fence as awaiting re-authorization so no further leg dispatches, and write the audit entry - `inst-rc-withdrawn`
 4. [ ] - `p1` - **IF** the PDP is unavailable, the operation running the re-check answers `retryable-failure` (canonical 503) and changes nothing; the definition's retry policy re-issues the same key, and on exhaustion the failure arm reaches `create-manual-task` with reason `authority-withdrawn` (`08 §4.3`, `08 §4.7` item 6) — never a default allow - `inst-rc-outage`
 
 The re-check is deliberately narrow: it asks the PDP the same question that authorized the
