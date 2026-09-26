@@ -33,12 +33,25 @@ impl Default for InMemoryRouteRepo {
 #[async_trait]
 impl RouteRepository for InMemoryRouteRepo {
     async fn create(&self, route: Route) -> Result<Route, RepositoryError> {
+        use dashmap::mapref::entry::Entry;
         let route_id = route.id;
         let upstream_id = route.upstream_id;
 
-        self.store.insert(route_id, route.clone());
+        // Conflict-safe insert: an externally-supplied id (GTS provisioning) must
+        // not overwrite an existing route or push a duplicate into the index.
+        match self.store.entry(route_id) {
+            Entry::Occupied(_) => {
+                return Err(RepositoryError::Conflict {
+                    entity: "route",
+                    resource: route_id.to_string(),
+                    detail: "route id already exists".into(),
+                });
+            }
+            Entry::Vacant(v) => {
+                v.insert(route.clone());
+            }
+        }
 
-        // Update upstream index.
         self.upstream_index
             .entry(upstream_id)
             .or_default()
@@ -471,6 +484,31 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(matched.id, route_b.id);
+    }
+
+    #[tokio::test]
+    async fn create_duplicate_id_conflicts_without_overwrite_or_index_dup() {
+        let repo = InMemoryRouteRepo::new();
+        let tenant = Uuid::new_v4();
+        let upstream = Uuid::new_v4();
+        let mut r = make_route(tenant, upstream, vec![HttpMethod::Post], "/a", 0);
+        let id = r.id;
+        repo.create(r.clone()).await.unwrap();
+
+        r.priority = 99; // same id, different payload (re-provisioning)
+        assert!(matches!(
+            repo.create(r).await,
+            Err(RepositoryError::Conflict { .. })
+        ));
+
+        // Original route is untouched.
+        assert_eq!(repo.get_by_id(tenant, id).await.unwrap().priority, 0);
+        // No duplicate entry in the upstream index.
+        let routes = repo
+            .list(tenant, Some(upstream), &ListQuery { top: 50, skip: 0 })
+            .await
+            .unwrap();
+        assert_eq!(routes.len(), 1);
     }
 
     #[tokio::test]

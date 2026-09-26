@@ -377,6 +377,24 @@ impl RateLimiter {
         self.buckets.retain(|k, _| !k.starts_with(&prefix));
     }
 
+    /// Remove all rate-limit buckets for an upstream and a set of its routes in
+    /// a single pass over the map.
+    ///
+    /// Equivalent to calling [`Self::remove_keys_for_upstream`] once and
+    /// [`Self::remove_keys_for_route`] per id, but scans `buckets` only once
+    /// rather than once per route (cascade delete of an upstream with many
+    /// routes is otherwise O(routes × total_buckets)).
+    pub fn remove_keys_for_upstream_and_routes(&self, upstream_id: Uuid, route_ids: &[Uuid]) {
+        let upstream_prefix = format!("oagw:ratelimit:upstream:{upstream_id}:");
+        let route_prefixes: Vec<String> = route_ids
+            .iter()
+            .map(|id| format!("oagw:ratelimit:route:{id}:"))
+            .collect();
+        self.buckets.retain(|k, _| {
+            !k.starts_with(&upstream_prefix) && !route_prefixes.iter().any(|p| k.starts_with(p))
+        });
+    }
+
     /// Try to consume tokens for the given key.
     ///
     /// Dispatches to the appropriate algorithm (`TokenBucket` or `SlidingWindow`)
@@ -1003,6 +1021,41 @@ mod tests {
 
         assert!(!limiter.buckets.contains_key(route_key.as_str()));
         assert!(limiter.buckets.contains_key(upstream_key));
+    }
+
+    #[test]
+    fn remove_keys_for_upstream_and_routes_cleans_upstream_and_listed_routes() {
+        let limiter = RateLimiter::new();
+        let config = make_config(10, Window::Second, None);
+        let uid = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let r1 = Uuid::parse_str("00000000-0000-0000-0000-000000000011").unwrap();
+        let r2 = Uuid::parse_str("00000000-0000-0000-0000-000000000012").unwrap();
+
+        let upstream_key = format!("oagw:ratelimit:upstream:{uid}:global:second");
+        let r1_key = format!("oagw:ratelimit:route:{r1}:tenant:aaa:second");
+        let r2_key = format!("oagw:ratelimit:route:{r2}:user:bbb:minute");
+        // A route not in the delete set, and an unrelated upstream — both survive.
+        let other_route =
+            "oagw:ratelimit:route:00000000-0000-0000-0000-000000000099:tenant:ccc:second";
+        let other_upstream =
+            "oagw:ratelimit:upstream:00000000-0000-0000-0000-000000000098:global:second";
+        for k in [
+            &upstream_key,
+            &r1_key,
+            &r2_key,
+            &other_route.to_string(),
+            &other_upstream.to_string(),
+        ] {
+            limiter.try_consume(k, &config, "/test").unwrap();
+        }
+
+        limiter.remove_keys_for_upstream_and_routes(uid, &[r1, r2]);
+
+        assert!(!limiter.buckets.contains_key(upstream_key.as_str()));
+        assert!(!limiter.buckets.contains_key(r1_key.as_str()));
+        assert!(!limiter.buckets.contains_key(r2_key.as_str()));
+        assert!(limiter.buckets.contains_key(other_route));
+        assert!(limiter.buckets.contains_key(other_upstream));
     }
 
     // --- Sliding Window tests ---

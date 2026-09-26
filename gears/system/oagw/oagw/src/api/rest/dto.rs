@@ -43,12 +43,9 @@ pub struct Endpoint {
     #[serde(default)]
     pub scheme: Scheme,
     pub host: String,
-    #[serde(default = "default_port")]
-    pub port: u16,
-}
-
-fn default_port() -> u16 {
-    443
+    /// Absent means "resolve from the scheme" (see `domain::Scheme::default_port`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
@@ -469,10 +466,11 @@ impl From<Scheme> for domain::Scheme {
 
 impl From<Endpoint> for domain::Endpoint {
     fn from(v: Endpoint) -> Self {
+        let scheme: domain::Scheme = v.scheme.into();
         Self {
-            scheme: v.scheme.into(),
+            scheme,
             host: v.host,
-            port: v.port,
+            port: v.port.unwrap_or_else(|| scheme.default_port()),
         }
     }
 }
@@ -758,7 +756,7 @@ impl From<domain::Endpoint> for Endpoint {
         Self {
             scheme: v.scheme.into(),
             host: v.host,
-            port: v.port,
+            port: Some(v.port),
         }
     }
 }
@@ -1099,4 +1097,42 @@ impl toolkit::api::api_dto::ResponseApiDto for RouteResponse {}
 
 fn default_true() -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn portless_endpoint_defaults_by_scheme() {
+        // http without a port must resolve to 80, not 443.
+        let http_ep: Endpoint =
+            serde_json::from_value(serde_json::json!({"scheme": "http", "host": "svc.internal"}))
+                .unwrap();
+        assert_eq!(domain::Endpoint::from(http_ep).port, 80);
+
+        // https without a port stays 443.
+        let https_ep: Endpoint =
+            serde_json::from_value(serde_json::json!({"scheme": "https", "host": "svc.internal"}))
+                .unwrap();
+        assert_eq!(domain::Endpoint::from(https_ep).port, 443);
+
+        // An explicit port round-trips unchanged.
+        let explicit: Endpoint = serde_json::from_value(
+            serde_json::json!({"scheme": "http", "host": "svc.internal", "port": 8080}),
+        )
+        .unwrap();
+        assert_eq!(domain::Endpoint::from(explicit).port, 8080);
+    }
+
+    #[test]
+    fn domain_endpoint_serializes_resolved_port() {
+        // The response direction always surfaces the resolved port.
+        let dto = Endpoint::from(domain::Endpoint {
+            scheme: domain::Scheme::Http,
+            host: "svc.internal".into(),
+            port: 80,
+        });
+        assert_eq!(dto.port, Some(80));
+    }
 }

@@ -5200,9 +5200,13 @@
             "type": "string"
           },
           "port": {
+            "description": "Absent means \"resolve from the scheme\" (see `default_port_for_scheme`).",
             "format": "int32",
             "minimum": 0,
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "scheme": {
             "$ref": "#/components/schemas/Scheme"

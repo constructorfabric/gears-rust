@@ -55,23 +55,39 @@ pub fn apply_passthrough(
     out
 }
 
+/// Header names nominated across *all* `Connection` header lines (RFC 7230 §6.1).
+///
+/// A sender may split the nominated hop-by-hop headers across multiple
+/// `Connection` fields; `HeaderMap::get` only returns the first, so we must
+/// iterate every value. When `keep_upgrade` is set, the `upgrade` token is not
+/// collected (WebSocket upgrade path preserves it).
+fn connection_named_headers(headers: &HeaderMap, keep_upgrade: bool) -> Vec<HeaderName> {
+    let mut out = Vec::new();
+    for value in headers.get_all(http::header::CONNECTION).iter() {
+        let Ok(s) = value.to_str() else { continue };
+        for token in s.split(',') {
+            let token = token.trim();
+            if token.is_empty() || (keep_upgrade && token.eq_ignore_ascii_case("upgrade")) {
+                continue;
+            }
+            // `HeaderName::from_bytes` normalizes case itself, so there's no need
+            // to allocate a lowercased copy of each token.
+            if let Ok(name) = HeaderName::from_bytes(token.as_bytes()) {
+                out.push(name);
+            }
+        }
+    }
+    out
+}
+
 /// Remove hop-by-hop headers that must not be forwarded.
 ///
 /// Per RFC 7230 Section 6.1, intermediaries MUST remove headers listed in the
-/// `Connection` header value in addition to the static hop-by-hop list.
+/// `Connection` header value(s) in addition to the static hop-by-hop list.
 pub fn strip_hop_by_hop(headers: &mut HeaderMap) {
-    // First, parse Connection header and remove any headers it names.
-    if let Some(conn_value) = headers.get("connection").and_then(|v| v.to_str().ok()) {
-        let named: Vec<String> = conn_value
-            .split(',')
-            .map(|token| token.trim().to_lowercase())
-            .filter(|token| !token.is_empty())
-            .collect();
-        for name in &named {
-            if let Ok(header_name) = HeaderName::from_bytes(name.as_bytes()) {
-                headers.remove(header_name);
-            }
-        }
+    // First, remove any headers named across every Connection line.
+    for name in connection_named_headers(headers, false) {
+        headers.remove(&name);
     }
 
     // Then remove the static hop-by-hop list.
@@ -145,18 +161,9 @@ pub fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
 /// Like [`strip_hop_by_hop`] but preserves `Upgrade` and `Connection` headers,
 /// which are required for WebSocket upgrade negotiation (RFC 6455 §4.1).
 pub fn strip_hop_by_hop_for_upgrade(headers: &mut HeaderMap) {
-    // Parse Connection-nominated headers but skip "upgrade" itself.
-    if let Some(conn_value) = headers.get("connection").and_then(|v| v.to_str().ok()) {
-        let named: Vec<String> = conn_value
-            .split(',')
-            .map(|token| token.trim().to_lowercase())
-            .filter(|token| !token.is_empty() && token != "upgrade")
-            .collect();
-        for name in &named {
-            if let Ok(header_name) = HeaderName::from_bytes(name.as_bytes()) {
-                headers.remove(header_name);
-            }
-        }
+    // Remove Connection-nominated headers across every line, but skip "upgrade".
+    for name in connection_named_headers(headers, true) {
+        headers.remove(&name);
     }
 
     // Remove static hop-by-hop headers EXCEPT "connection" and "upgrade".
@@ -528,6 +535,30 @@ mod tests {
     }
 
     #[test]
+    fn hop_by_hop_strips_headers_named_across_multiple_connection_lines() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            http::header::CONNECTION,
+            HeaderValue::from_static("keep-alive"),
+        );
+        headers.append(
+            http::header::CONNECTION,
+            HeaderValue::from_static("authorization"),
+        );
+        headers.insert(
+            http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer secret"),
+        );
+
+        strip_hop_by_hop(&mut headers);
+
+        assert!(
+            !headers.contains_key(http::header::AUTHORIZATION),
+            "a header named in a second Connection line must be stripped"
+        );
+    }
+
+    #[test]
     fn host_replaced() {
         let mut headers = HeaderMap::new();
         headers.insert(http::header::HOST, "original.com".parse().unwrap());
@@ -868,6 +899,32 @@ mod tests {
         strip_hop_by_hop_for_upgrade(&mut headers);
 
         assert!(headers.get("x-custom-hop").is_none());
+        assert_eq!(headers.get("upgrade").unwrap(), "websocket");
+        assert!(headers.get("connection").is_some());
+        assert_eq!(headers.get("x-safe").unwrap(), "keep");
+    }
+
+    #[test]
+    fn upgrade_strip_across_multiple_connection_lines_keeps_upgrade_drops_hop() {
+        let mut headers = HeaderMap::new();
+        // `upgrade` and a hop-by-hop name arrive on separate Connection lines.
+        headers.append(
+            http::header::CONNECTION,
+            HeaderValue::from_static("upgrade"),
+        );
+        headers.append(
+            http::header::CONNECTION,
+            HeaderValue::from_static("x-custom-hop"),
+        );
+        headers.insert("upgrade", "websocket".parse().unwrap());
+        headers.insert("x-custom-hop", "secret".parse().unwrap());
+        headers.insert("x-safe", "keep".parse().unwrap());
+
+        strip_hop_by_hop_for_upgrade(&mut headers);
+
+        // The header named on the second Connection line is stripped...
+        assert!(headers.get("x-custom-hop").is_none());
+        // ...while the upgrade negotiation headers survive.
         assert_eq!(headers.get("upgrade").unwrap(), "websocket");
         assert!(headers.get("connection").is_some());
         assert_eq!(headers.get("x-safe").unwrap(), "keep");
