@@ -13,10 +13,18 @@ where
     SimpleUserSettings: DomainModel,
     SimpleUserSettingsPatch: DomainModel,
 {
+    /// The settings row keyed `(tenant_id, user_id)`, within `scope`.
+    ///
+    /// The scope is what the PDP allows; it need not name the user or a single
+    /// tenant. A grant of "settings in this tenant" (or in a tenant subtree) is
+    /// a legitimate answer, so the row is always narrowed to the caller's own
+    /// full key here rather than left to the PDP.
     async fn find_by_user<C: DBRunner>(
         &self,
         conn: &C,
         scope: &AccessScope,
+        tenant_id: Uuid,
+        user_id: Uuid,
     ) -> Result<Option<SimpleUserSettings>, DomainError>;
 
     async fn upsert_full<C: DBRunner>(

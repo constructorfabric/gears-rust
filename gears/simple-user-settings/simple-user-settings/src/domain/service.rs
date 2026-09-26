@@ -93,7 +93,11 @@ impl<R: SettingsRepository> Service<R> {
 
         let conn = self.db.conn().map_err(DomainError::from)?;
 
-        if let Some(settings) = self.repo.find_by_user(&conn, &scope).await? {
+        if let Some(settings) = self
+            .repo
+            .find_by_user(&conn, &scope, tenant_id, user_id)
+            .await?
+        {
             Ok(settings)
         } else {
             Ok(SimpleUserSettings {
