@@ -38,6 +38,17 @@ decision-makers: Graph Storage design review
 > "vectorizable" into `full_text_search` and `vector_search`, which the single
 > annotation had conflated.
 
+> **Amendment 2026-09-10 ([ADR-0006](./0006-cpt-cf-graph-storage-adr-type-evolution.md)).**
+> One consequence below says "changing annotations is a type-version change".
+> A trait change that no instance can fail — declaring one more `index` path, for
+> example — is now admitted under the same identifier, because the two schemas
+> prove it cannot invalidate anything. What is unchanged is everything about the
+> index *work*: the activation lifecycle in that consequence, and the capacity
+> admission of `fr-index-admission`, still govern it and still do not exist
+> (both deferred). An in-place update opens a second door to that gap
+> rather than creating it, and when the lifecycle lands it has to gate this path
+> too.
+
 ## Context and Problem Statement
 
 A shared graph accumulates payloads from many producers. If every attribute is indexed and embedded, indexes bloat and ingest slows; if none are, filters and vector search stop working; if payloads carry article bodies or raw logs, the graph becomes a slow blob store. The gear needs a defined partitioning of node metadata — what lives in dedicated columns, what is indexed inside JSONB, what feeds embeddings, and what must leave the graph entirely — and a defined authority for those choices per type.
@@ -142,9 +153,11 @@ Annotations in the GTS schema drive indexing and embedding; size ceiling forces 
 
 **What it would change.** This is the narrower of the two and is useful beyond payload filtering — any field whose storage shape is a computed expression rather than a stored column needs it.
 
+**Built meanwhile.** The projection serves declared payload paths without waiting for the asks: the gear resolves each `index` pointer to a scalar kind at registration and renders admitted identifiers to extraction expressions itself, inside the platform's parser, accepted options and `CursorV1`. The asks below are unchanged — when they land, that rendering shrinks to the one mapping ask 2 describes — and a third joins them: a statement surface through which a gear may run `CREATE INDEX` for a declared path, without which equality is indexed (one GIN, containment form) and range and order are not.
+
 **Status of these asks.** Not yet raised with the platform. The index-activation lifecycle this ADR specifies is unimplemented, so there is no consumer to measure a proposed signature against; these are recorded at the precision a reading of the binding supports, and are to be raised with a working prototype behind them — as ADR-0005's asks were — when the lifecycle lands.
 
-**The alternative is refused.** A gear can parse `$filter` itself and emit its own `Condition` carrying a custom expression; that compiles today. It is the second query dialect the architecture lints exist to prevent (DE0802/DE0803), and it would forfeit the ordering and cursor integration that make the projection a contract rather than a query endpoint — solving a quarter of the problem at the cost of the rule that keeps every gear's `$filter` meaning the same thing.
+**The alternative, as refused and as built.** A gear that *parses* `$filter` itself and invents its own dialect is the thing the architecture lints exist to prevent (DE0802/DE0803), and that stays refused. What is built is narrower: the platform parses, the platform's five options are the only ones accepted, the platform's `CursorV1` is the token; the gear owns only the mapping from an admitted identifier to an expression and mirrors the pager's keyset and ordering rules — the seam ask 2 would formalize. Every gear's `$filter` keeps meaning the same thing.
 
 ## More Information
 

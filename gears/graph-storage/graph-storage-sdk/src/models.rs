@@ -1,0 +1,1658 @@
+//! Transport-agnostic models of the graph-storage contract.
+//!
+//! These types cross three boundaries — the `ClientHub` trait, the REST DTO
+//! layer (which owns all serde), and the plugin contracts — so they carry no
+//! serde derives, no HTTP types and no database types. Payloads are arbitrary
+//! GTS-validated JSON and travel as [`serde_json::Value`].
+
+use std::collections::BTreeSet;
+use std::time::{Duration, Instant};
+
+use time::OffsetDateTime;
+use uuid::Uuid;
+
+/// Tenant identity, as carried by the platform security context.
+pub type TenantId = Uuid;
+
+/// Internal node identity. Surrogate and per-tenant: two tenants may both own
+/// a node `17`, so it is never meaningful outside a tenant-scoped call.
+pub type NodeId = i64;
+
+/// Internal edge identity, with the same per-tenant caveat as [`NodeId`].
+pub type EdgeId = i64;
+
+/// Producer-supplied stable node key, unique within a tenant.
+///
+/// Stable is a commitment, not a hint: there is no re-key operation, so
+/// ingesting under a new key creates a different node. Edge keys are derived
+/// from their endpoints' keys, so re-keying a node re-keys every edge incident
+/// to it, and a tombstoned key cannot be reused before purge. The encoding a
+/// producer chooses for its keys is part of the same commitment. PRD
+/// `fr-stable-identity` states the consequences in full.
+pub type NodeKey = String;
+
+/// Deterministic edge key derived from (type, src, dst, discriminator).
+pub type EdgeKey = String;
+
+/// Canonical GTS type identifier (`gts.vendor.package._.type.v1~` form).
+pub type GtsTypeId = String;
+
+/// Interned label identity.
+pub type LabelId = i32;
+
+// ---------------------------------------------------------------------------
+// Closed enums
+// ---------------------------------------------------------------------------
+
+/// A wire or storage string that names no variant of a closed enum.
+///
+/// The Closed Enum Contract's third rule forbids mapping such a value onto a
+/// known variant, so every decoder in this crate refuses by name and hands
+/// the offending spelling back for the caller to report. An `Unknown(String)`
+/// variant would be the other permitted answer; a refusal is chosen because
+/// these values reach authorization and outcome reporting, where carrying an
+/// uninterpretable value forward is worse than stopping.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnknownVariant {
+    /// The enum the value was being decoded into.
+    pub expected: &'static str,
+    /// The value as it arrived, so the report names it.
+    pub found: String,
+}
+
+impl std::fmt::Display for UnknownVariant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "`{}` is not a known {} in this version",
+            self.found, self.expected
+        )
+    }
+}
+
+impl std::error::Error for UnknownVariant {}
+
+/// Both directions of one closed enum's single spelling, from one list.
+///
+/// The encoder and the decoder are generated from the same table, so they
+/// cannot drift apart, and the decoder has no default arm to acquire: there
+/// is nowhere in the generated code for a `_ =>` to be added. Rule 3 is then
+/// a property of this macro rather than a convention each call site keeps.
+macro_rules! closed_enum {
+    ($name:ident, $label:literal { $($variant:ident => $spelling:literal),+ $(,)? }) => {
+        impl $name {
+            /// The one spelling this variant has, in storage and on the wire.
+            #[must_use]
+            pub fn as_str(&self) -> &'static str {
+                match self {
+                    $(Self::$variant => $spelling,)+
+                }
+            }
+        }
+
+        impl std::str::FromStr for $name {
+            type Err = UnknownVariant;
+
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                match value {
+                    $($spelling => Ok(Self::$variant),)+
+                    other => Err(UnknownVariant {
+                        expected: $label,
+                        found: other.to_owned(),
+                    }),
+                }
+            }
+        }
+
+        impl TryFrom<&str> for $name {
+            type Error = UnknownVariant;
+
+            fn try_from(value: &str) -> Result<Self, Self::Error> {
+                value.parse()
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.as_str())
+            }
+        }
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Ontology
+// ---------------------------------------------------------------------------
+
+/// Kind of a registrable GTS type.
+///
+/// One of this crate's **closed enums**: a fixed set that is stored as `TEXT`
+/// under a `CHECK` constraint and carried over REST as a plain string, so the
+/// storage form and the wire form are the same string. DESIGN
+/// § Closed Enum Contract is normative for all of them, and states the three
+/// rules a client depends on: a spelling never changes meaning and is never
+/// reused; adding a variant is compatible while removing or renaming one is
+/// breaking; and an unrecognized value must be carried through or refused by
+/// name, never mapped onto a known variant or defaulted -- an unknown outcome
+/// decoded as `ok` turns a value the server chose into one it denied. The set
+/// is not an extension point: a deployment cannot add to it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TypeKind {
+    Node,
+    Edge,
+    Attribute,
+}
+
+closed_enum!(TypeKind, "type kind" {
+    Node => "node",
+    Edge => "edge",
+    Attribute => "attribute",
+});
+
+/// One type submitted for registration.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TypeRegistration {
+    /// Canonical GTS identifier; must derive from one of the gear's family
+    /// types (base -> family -> producer type, two derivations max).
+    pub type_id: GtsTypeId,
+    /// The type's draft-07 JSON Schema.
+    pub schema: serde_json::Value,
+}
+
+/// Trait values resolved across the whole derivation chain, stored with the
+/// registered type so batch validation never repeats the walk.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EffectiveTraits {
+    /// `owned` / `reference` / `phantom` for nodes, `static` / `analysis` for
+    /// edges. `None` only on abstract types, which are uninstantiable.
+    pub family: Option<String>,
+    pub scope_managed: bool,
+    pub emit_events: bool,
+    /// JSON-pointer payload paths admitted to `$filter` / `$orderby`.
+    pub index: Vec<String>,
+    /// JSON-pointer payload paths folded into the lexical search text.
+    pub full_text_search: Vec<String>,
+    /// JSON-pointer payload paths folded into the embedding input.
+    pub vector_search: Vec<String>,
+    /// Edge endpoint constraints, GTS patterns (edges only).
+    pub src_types: Vec<String>,
+    pub dst_types: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Readiness
+// ---------------------------------------------------------------------------
+
+/// The state of one capability (DESIGN § Readiness Matrix).
+///
+/// `NotImplemented` is this gear's addition to the matrix's three, and it is
+/// the honest answer for a row the matrix specifies and this iteration does
+/// not ship: reporting such a component `Healthy` would be a lie an operator
+/// acts on, and omitting it would hide a capability they are entitled to ask
+/// about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadinessState {
+    Healthy,
+    Degraded,
+    Unhealthy,
+    NotImplemented,
+}
+
+closed_enum!(ReadinessState, "readiness state" {
+    Healthy => "healthy",
+    Degraded => "degraded",
+    Unhealthy => "unhealthy",
+    NotImplemented => "not_implemented",
+});
+
+/// One row of the readiness matrix, as the endpoint reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ComponentReadiness {
+    /// The matrix's own name for the component.
+    pub component: String,
+    pub state: ReadinessState,
+    /// What is wrong, named rather than implied. `None` when healthy.
+    pub problem: Option<String>,
+    /// What this state rejects, in the words of the matrix's third column.
+    pub blocked: Option<String>,
+    /// The condition being waited on, so an operator knows whether to act.
+    pub recovery: Option<String>,
+}
+
+impl ComponentReadiness {
+    #[must_use]
+    pub fn healthy(component: &str) -> Self {
+        Self {
+            component: component.to_owned(),
+            state: ReadinessState::Healthy,
+            problem: None,
+            blocked: None,
+            recovery: None,
+        }
+    }
+
+    #[must_use]
+    pub fn new(
+        component: &str,
+        state: ReadinessState,
+        problem: &str,
+        blocked: &str,
+        recovery: &str,
+    ) -> Self {
+        Self {
+            component: component.to_owned(),
+            state,
+            problem: Some(problem.to_owned()),
+            blocked: Some(blocked.to_owned()),
+            recovery: Some(recovery.to_owned()),
+        }
+    }
+
+    /// Whether this component's state takes the whole gear out of service.
+    ///
+    /// Not simply "is it unhealthy": the matrix is explicit that an
+    /// embedding-space mismatch leaves the gear ready and blocks only the
+    /// vector arms, while an unreachable database admits no traffic at all.
+    /// The aggregate therefore asks the component, not the state.
+    #[must_use]
+    pub fn fatal(&self) -> bool {
+        self.state == ReadinessState::Unhealthy && self.component != EMBEDDING_SPACE
+    }
+}
+
+/// Matrix row names, spelled once so the endpoint and the documentation cannot
+/// drift apart.
+pub const DATABASE: &str = "database_and_migrations";
+pub const SQLPGQ: &str = "server_major_and_sqlpgq";
+pub const EMBEDDING_PROVIDER: &str = "embedding_provider";
+pub const EMBEDDING_SPACE: &str = "embedding_space_identity";
+pub const GRAPH_ENGINE: &str = "graph_engine_plugin";
+pub const AUTHZ: &str = "authz_resolver";
+pub const TYPES_REGISTRY: &str = "types_registry";
+pub const DYNAMIC_INDEXES: &str = "dynamic_indexes";
+pub const TENANT_RECONCILIATION: &str = "tenant_reconciliation";
+pub const METRIC_ANNOTATION: &str = "metric_annotation_source";
+
+/// What `GET /health/ready` answers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Readiness {
+    /// Ready when no component whose failure blocks everything is unhealthy.
+    pub ready: bool,
+    pub components: Vec<ComponentReadiness>,
+}
+
+impl Readiness {
+    #[must_use]
+    pub fn of(components: Vec<ComponentReadiness>) -> Self {
+        Self {
+            ready: !components.iter().any(ComponentReadiness::fatal),
+            components,
+        }
+    }
+}
+
+/// One source namespace and the producer principal bound to it.
+///
+/// The authority the ingest path consults: a reference node's payload names a
+/// `source.system`, and this row decides who may speak for it. `node.
+/// owner_principal` records who *created* a row and never changes; this row
+/// records who may write it now, so an ownership transfer is a change here and
+/// not a rewrite of history.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceNamespaceOwner {
+    /// The `source.system` value of a reference node's identity triple.
+    pub namespace: String,
+    pub owner_principal: String,
+    /// When the namespace was first claimed.
+    pub claimed_at: OffsetDateTime,
+    /// The principal the namespace was taken from, if it was ever transferred.
+    pub previous_owner: Option<String>,
+    pub transferred_at: Option<OffsetDateTime>,
+    /// The subject that performed the transfer — the audit trail of the one
+    /// administrative flow that can move a namespace.
+    pub transferred_by: Option<Subject>,
+}
+
+/// A registered type as the gear reports it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TypeRecord {
+    pub type_id: GtsTypeId,
+    /// Deterministic `UUIDv5` of the GTS identifier (the platform derivation).
+    pub type_uuid: Uuid,
+    pub kind: TypeKind,
+    /// Abstract types (the bases and families) cannot be instantiated.
+    pub is_abstract: bool,
+    pub schema: serde_json::Value,
+    pub effective_traits: EffectiveTraits,
+    pub created_at: OffsetDateTime,
+    /// Which retained definition of this identifier is in force: `1` until the
+    /// type is first updated in place, then one more per accepted update
+    /// (types-registry ADR-0005 calls each of them a retained revision).
+    pub revision: i32,
+}
+
+/// Filter for listing registered types.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TypeQuery {
+    pub kind: Option<TypeKind>,
+    /// GTS identifier pattern, resolved by the shared GTS implementation —
+    /// never compiled to SQL text.
+    pub pattern: Option<String>,
+    pub top: Option<u32>,
+    pub cursor: Option<String>,
+}
+
+/// A resolved set of registered types, the single representation on which a
+/// caller's type filter and an authorizing permission's pattern intersect.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TypeIdSet(pub BTreeSet<GtsTypeId>);
+
+impl TypeIdSet {
+    #[must_use]
+    pub fn intersect(&self, other: &Self) -> Self {
+        Self(self.0.intersection(&other.0).cloned().collect())
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    #[must_use]
+    pub fn contains(&self, type_id: &str) -> bool {
+        self.0.contains(type_id)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Type evolution (registering a changed schema under a known identifier)
+// ---------------------------------------------------------------------------
+
+/// What a registration batch may do to an identifier that is already
+/// registered with a *different* schema.
+///
+/// The platform decided the policy before the gear did: types-registry
+/// ADR-0004 says a major-only GTS id names a mutable logical entity whose
+/// backward-compatible updates keep that id, and ADR-0003 fixes the direction
+/// (`BACKWARD`), the baseline (the current revision) and the posture (an
+/// undecidable check is a refusal). This enum is only the per-request switch
+/// between the gear's historical behaviour and that policy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OnExisting {
+    /// A changed schema is a conflict — the gear's behaviour before type
+    /// updates existed, and still the default so no existing caller changes.
+    #[default]
+    Reject,
+    /// Admit the change when it is admissible; refuse it, with the offending
+    /// schema locations, when it is not.
+    Update,
+}
+
+/// One step of a payload migration.
+///
+/// A closed set, not an expression language. Three steps covered every
+/// incompatible edit the Studio domain model produced in three days, and a
+/// closed set is what lets every path be a checked literal and every value a
+/// bound parameter.
+#[derive(Clone, Debug, PartialEq)]
+pub enum MigrationStep {
+    /// Move a value to another path, if the source is present. An absent
+    /// source is a no-op: a migration fills gaps, it does not invent values.
+    Rename { from: String, to: String },
+    /// Set `path` when nothing is there. A present value is left alone —
+    /// otherwise a "default" would be an overwrite.
+    Default {
+        path: String,
+        value: serde_json::Value,
+    },
+    /// Remove `path` if present.
+    Drop { path: String },
+}
+
+impl MigrationStep {
+    /// The paths this step touches, for the overlap check.
+    #[must_use]
+    pub fn paths(&self) -> Vec<&str> {
+        match self {
+            Self::Rename { from, to } => vec![from.as_str(), to.as_str()],
+            Self::Default { path, .. } | Self::Drop { path } => vec![path.as_str()],
+        }
+    }
+}
+
+/// What to do with one type's stored payloads so they satisfy the candidate.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MigrationSpec {
+    pub type_id: GtsTypeId,
+    pub steps: Vec<MigrationStep>,
+}
+
+/// Per-batch registration options.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TypeRegistrationOptions {
+    pub on_existing: OnExisting,
+    /// Admit a change the schemas cannot prove compatible when every stored
+    /// row of the type still validates against the candidate.
+    ///
+    /// This is deliberately a second, explicit ground for admission rather
+    /// than a relaxation of the first: it is a statement about *this tenant's
+    /// current rows*, not about the accepted instance sets, and it costs a
+    /// scan of the type bounded by `type_update_max_rows`.
+    pub revalidate: bool,
+    /// Compute and report every verdict, write nothing.
+    pub dry_run: bool,
+    /// Payload migrations, at most one per type in the batch.
+    ///
+    /// A migration is the third ground for admitting a change, and the only one
+    /// that *changes* data: the steps are applied to every live row of the
+    /// type, the result is validated against the candidate, and nothing is
+    /// written unless every row passes. It requires a schema change to migrate
+    /// towards — a migration on an unchanged type would be a data-editing API
+    /// wearing a type endpoint's clothes.
+    pub migrations: Vec<MigrationSpec>,
+}
+
+impl TypeRegistrationOptions {
+    /// The migration declared for `type_id`, if any.
+    #[must_use]
+    pub fn migration_for(&self, type_id: &str) -> Option<&MigrationSpec> {
+        self.migrations.iter().find(|m| m.type_id == type_id)
+    }
+}
+
+/// How the candidate stands against the registered definition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TypeChangeState {
+    /// Nothing is registered under this identifier yet.
+    New,
+    /// Byte-identical to what is registered.
+    Unchanged,
+    /// `Valid(old) ⊆ Valid(new)` proved from the schemas.
+    Compatible,
+    /// Proved *not* to hold.
+    Incompatible,
+    /// Could be neither proved nor disproved (`gts` reports `Unknown`).
+    /// ADR-0003 fails closed on this, so it is a refusal — but a distinct one,
+    /// because the fix is a different one.
+    Undecidable,
+}
+
+closed_enum!(TypeChangeState, "type change state" {
+    New => "new",
+    Unchanged => "unchanged",
+    Compatible => "compatible",
+    Incompatible => "incompatible",
+    Undecidable => "undecidable",
+});
+
+/// One reason a directional verdict does not hold, with the schema location
+/// that carries it — so a refusal points at `$.payload` rather than saying
+/// "incompatible".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SchemaDiagnostic {
+    /// Location in the resolved schema, `$` for the document root.
+    pub location: String,
+    /// Machine-readable finding kind, as `gts` names it.
+    pub finding: String,
+    pub message: String,
+}
+
+/// How one trait's declared paths changed between the two definitions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TraitChange {
+    /// `index`, `full_text_search`, `vector_search`, `src_types`, `dst_types`.
+    pub trait_name: String,
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+}
+
+/// The full verdict on one candidate: what the dry run reports and what a
+/// refusal explains itself with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TypeChange {
+    pub type_id: GtsTypeId,
+    pub state: TypeChangeState,
+    /// `compatible` / `incompatible` / `unknown`; the direction ADR-0003
+    /// enforces.
+    pub backward: String,
+    /// Computed and reported, never enforced — the same posture as the
+    /// registry. It tells a producer whether an old reader still accepts new
+    /// payloads.
+    pub forward: String,
+    /// Evidence for the backward verdict.
+    pub diagnostics: Vec<SchemaDiagnostic>,
+    pub traits_changed: Vec<TraitChange>,
+    /// Live rows of this type, when the operation needed to know.
+    pub rows: Option<u64>,
+    /// Rows a migration changed (or would change, in a dry run).
+    pub rows_rewritten: Option<u64>,
+    /// Object levels of the candidate where a *later* definition will not be
+    /// able to add an optional property (`ContentModel::is_evolvable_in_place`).
+    /// Reported so "your next edit will be a major" is a warning today rather
+    /// than a surprise later.
+    pub levels_not_evolvable_in_place: Vec<String>,
+    /// Whether this change needs more than the schemas to be admitted.
+    pub migration_required: bool,
+    /// Whether the gear would admit it under the options of this request.
+    pub admissible: bool,
+}
+
+/// Why an update was admitted. Two grounds, never conflated in a report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdmissionBasis {
+    /// The schemas prove `Valid(old) ⊆ Valid(new)`. No row was read.
+    SchemaProved,
+    /// The schemas do not prove it; every live row of the type was validated
+    /// against the candidate instead. True of *these rows*, not of the type.
+    DataBacked { rows_validated: u64 },
+    /// The rows did not satisfy the candidate, so they were *changed* to: the
+    /// declared steps were applied to every live row and the result validated
+    /// against the candidate before anything was written.
+    Migrated {
+        rows_scanned: u64,
+        rows_rewritten: u64,
+    },
+}
+
+/// What one registration did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TypeOutcome {
+    Created,
+    /// Already registered, byte-identical, nothing written.
+    Unchanged,
+    /// The stored definition was replaced under the same identifier.
+    Updated,
+}
+
+closed_enum!(TypeOutcome, "type outcome" {
+    Created => "created",
+    Unchanged => "unchanged",
+    Updated => "updated",
+});
+
+/// A registered type plus what this call did to it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RegisteredType {
+    pub record: TypeRecord,
+    pub outcome: TypeOutcome,
+    /// Present when `outcome` is `Updated`.
+    pub basis: Option<AdmissionBasis>,
+    /// Present when the identifier was already registered, and always in a
+    /// dry run.
+    pub change: Option<TypeChange>,
+}
+
+// ---------------------------------------------------------------------------
+// Revision-bound identity (Read Consistency Contract)
+// ---------------------------------------------------------------------------
+
+/// The snapshot identity every compound read observes and reports: the
+/// deployment-wide, non-reusable source epoch paired with the per-tenant
+/// monotonic revision.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct GraphRevision {
+    pub source_epoch: i64,
+    pub revision: i64,
+}
+
+/// Handle to one open compound-read snapshot. Opaque to callers; the store
+/// that issued it resolves it back to a live snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadSnapshot {
+    pub id: Uuid,
+    pub revision: GraphRevision,
+}
+
+// ---------------------------------------------------------------------------
+// Element envelope (fr-audit-envelope)
+// ---------------------------------------------------------------------------
+
+/// The party behind a write, in the platform's own vocabulary rather than in
+/// a vocabulary of this gear's own: `SecurityContext`'s `subject_id` and
+/// optional `subject_type`.
+///
+/// A subject and not a user because most writes into this gear arrive from an
+/// automation or a service integration, so a `user_id` member would be empty
+/// on the majority of rows and would need a second member beside it for the
+/// rest (DESIGN § API element envelope).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Subject {
+    pub subject_id: Uuid,
+    /// GTS type of the acting subject, e.g.
+    /// `gts.cf.core.security.subject_user.v1~`. Optional, matching
+    /// `SecurityContext`, which does not always carry one.
+    pub subject_type: Option<GtsTypeId>,
+}
+
+impl Subject {
+    /// The producer principal this subject writes as.
+    ///
+    /// One string, derived from the subject id rather than invented beside it,
+    /// so "who wrote this row" (the audit envelope) and "who owns this
+    /// namespace" (the ownership boundary) cannot disagree. The subject *type*
+    /// is deliberately not part of it: the id is already unique, and folding
+    /// the type in would make one principal look like two the day a producer
+    /// is re-typed.
+    #[must_use]
+    pub fn principal(&self) -> String {
+        self.subject_id.to_string()
+    }
+
+    /// The subject a `SecurityContext` names.
+    #[must_use]
+    pub fn from_security_context(ctx: &toolkit_security::SecurityContext) -> Self {
+        Self {
+            subject_id: ctx.subject_id(),
+            subject_type: ctx.subject_type().map(ToOwned::to_owned),
+        }
+    }
+}
+
+/// The gear-assigned half of an element, identical for every node and every
+/// edge and described by the API schema rather than by the element's GTS type
+/// -- a producer can neither supply nor extend it, and a type registered
+/// statically in the types-registry has nothing to put in it.
+///
+/// It is read-only on every write surface: an envelope member a producer
+/// sends is ignored rather than rejected, so a document read from the API can
+/// be sent back unchanged.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ElementEnvelope {
+    pub tenant_id: Uuid,
+    /// The element's key: a node's producer-supplied `node_key`, an edge's
+    /// gear-derived `edge_key`.
+    pub key: String,
+    pub created_at: OffsetDateTime,
+    pub created_by: Subject,
+    pub updated_at: OffsetDateTime,
+    pub updated_by: Subject,
+    /// Soft-delete tombstone; absent on a live element.
+    pub deleted_at: Option<OffsetDateTime>,
+    pub deleted_by: Option<Subject>,
+    /// The revision the read that produced this element observed.
+    ///
+    /// Per element rather than per response because the tabular projection
+    /// answers inside `toolkit_odata::Page`, which carries items and cursors
+    /// and nothing else -- so this is the only place that read path can
+    /// report the snapshot it observed (PRD § fr-tabular-projection).
+    pub graph_revision: GraphRevision,
+}
+
+// ---------------------------------------------------------------------------
+// Ingest
+// ---------------------------------------------------------------------------
+
+/// A node submitted for ingest. An upsert replaces the row's mutable state
+/// wholesale: a field the request omits is cleared, never preserved.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct NodeSpec {
+    pub node_key: NodeKey,
+    pub type_id: GtsTypeId,
+    pub name: Option<String>,
+    /// GTS-validated attributes. `None` = no opinion on an existing row's
+    /// payload is *not* offered — ingest is replace, so `None` clears.
+    pub payload: Option<serde_json::Value>,
+    /// Optional compare-and-set on the node's stored version.
+    pub expected_version: Option<i64>,
+}
+
+/// An edge submitted for ingest, addressed by its endpoint node keys.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EdgeSpec {
+    pub type_id: GtsTypeId,
+    pub src_node_key: NodeKey,
+    pub dst_node_key: NodeKey,
+    /// Distinguishes parallel edges of one type between one endpoint pair.
+    pub discriminator: Option<String>,
+    pub payload: Option<serde_json::Value>,
+}
+
+/// Declarative scope replacement carried by an ingest batch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplaceScope {
+    /// Scope attribute of the canonical identity
+    /// `(tenant, owning producer, scope attribute, scope value)`.
+    pub attribute: String,
+    pub value: String,
+    /// Monotonic source generation. Older than the recorded one is rejected as
+    /// stale; equal with identical content is a replay; equal with different
+    /// content conflicts.
+    pub generation: i64,
+}
+
+/// Per-request ingest options.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IngestOptions {
+    /// Create phantom endpoint nodes for edges whose endpoints are not in the
+    /// batch and not stored. `None` = the deployment default (on).
+    pub create_phantoms: Option<bool>,
+    /// Return per-item outcomes on success (errors are always per item).
+    pub report_per_item: bool,
+    /// Whether this batch's nodes are embedded. `None` = the deployment
+    /// default (on). `false` keeps existing vectors rather than clearing
+    /// them: a metadata-only re-sync should not cost a re-embedding pass, and
+    /// should not silently empty the vector arm either.
+    pub embed: Option<bool>,
+}
+
+/// One atomic ingest batch.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct IngestRequest {
+    pub nodes: Vec<NodeSpec>,
+    pub edges: Vec<EdgeSpec>,
+    pub options: IngestOptions,
+    pub replace_scope: Option<ReplaceScope>,
+    /// Producer-chosen idempotency key (the REST layer reads the same value
+    /// from the `Idempotency-Key` header).
+    pub idempotency_key: Option<String>,
+}
+
+/// Aggregate counters of one committed batch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IngestCounts {
+    pub nodes_inserted: u64,
+    pub nodes_updated: u64,
+    pub nodes_unchanged: u64,
+    pub edges_inserted: u64,
+    pub edges_updated: u64,
+    pub edges_unchanged: u64,
+    pub phantoms_created: u64,
+    pub phantoms_materialized: u64,
+    /// Rows tombstoned by scope replacement.
+    pub scope_removed_nodes: u64,
+    pub scope_removed_edges: u64,
+}
+
+/// Which collection an ingest item belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ItemFamily {
+    Node,
+    Edge,
+}
+
+/// Per-item outcome, reported when `options.report_per_item` is set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ItemOutcome {
+    Inserted,
+    Updated,
+    Unchanged,
+    Materialized,
+}
+
+closed_enum!(ItemOutcome, "item outcome" {
+    Inserted => "inserted",
+    Updated => "updated",
+    Unchanged => "unchanged",
+    Materialized => "materialized",
+});
+
+/// One per-item validation failure. A batch with any of these commits nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ItemError {
+    pub index: usize,
+    pub family: ItemFamily,
+    pub gts_type: Option<GtsTypeId>,
+    /// JSON pointer to the offending value, when the failure is positional.
+    pub pointer: Option<String>,
+    pub message: String,
+}
+
+/// Outcome of one ingest call.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IngestOutcome {
+    /// Revision the graph reached once the batch committed (unchanged when
+    /// the batch converged without modifying anything).
+    pub revision: GraphRevision,
+    /// True when an idempotency receipt answered the call without touching
+    /// state.
+    ///
+    /// A replayed outcome is the record of the first attempt's commit, not a
+    /// view of the graph now: `revision` and `counts` are what that commit
+    /// reached and did, and a later write — a scope replacement included —
+    /// may since have changed or removed what it wrote. It carries no
+    /// per-item lists, because the receipt keeps counts only. A producer that
+    /// needs current state reads it, and compares `revision` with the
+    /// tenant's current one to know whether anything has committed since.
+    pub replayed: bool,
+    pub counts: IngestCounts,
+    pub per_item_nodes: Option<Vec<ItemOutcome>>,
+    pub per_item_edges: Option<Vec<ItemOutcome>>,
+}
+
+/// Soft-delete target.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeleteRequest {
+    /// Tombstone a node together with its incident edges.
+    Node(NodeKey),
+    /// Tombstone one edge.
+    Edge(EdgeKey),
+}
+
+/// Outcome of a soft delete.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeleteOutcome {
+    pub revision: GraphRevision,
+    pub tombstoned_nodes: u64,
+    pub tombstoned_edges: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Node read / projection
+// ---------------------------------------------------------------------------
+
+/// Edge incidence direction relative to a node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdjacencySide {
+    Outgoing,
+    Incoming,
+}
+
+closed_enum!(AdjacencySide, "adjacency side" {
+    Outgoing => "outgoing",
+    Incoming => "incoming",
+});
+
+/// One incident edge in a node read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdjacencyEntry {
+    pub edge_key: EdgeKey,
+    pub edge_type_id: GtsTypeId,
+    pub side: AdjacencySide,
+    pub neighbor_key: NodeKey,
+    pub neighbor_type_id: GtsTypeId,
+}
+
+/// A node as read paths return it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NodeView {
+    pub node_key: NodeKey,
+    pub type_id: GtsTypeId,
+    pub name: Option<String>,
+    pub payload: Option<serde_json::Value>,
+    pub has_embedding: bool,
+    pub labels: Vec<String>,
+    pub adjacency: Vec<AdjacencyEntry>,
+    pub adjacency_truncated: bool,
+    /// Gear-assigned audit envelope (`fr-audit-envelope`).
+    pub envelope: ElementEnvelope,
+}
+
+/// An edge as the edge read returns it.
+///
+/// The topology references (`EdgeRef`, `AdjacencyEntry`) stay what they are --
+/// a key, a type and two endpoints. This is the element form: payload and the
+/// audit envelope `fr-audit-envelope` asks every returned edge to carry.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EdgeView {
+    pub edge_key: EdgeKey,
+    pub edge_type_id: GtsTypeId,
+    pub src: NodeKey,
+    pub dst: NodeKey,
+    /// Distinguishes parallel edges of one type between one endpoint pair.
+    pub discriminator: Option<String>,
+    pub payload: Option<serde_json::Value>,
+    /// Gear-assigned audit envelope (`fr-audit-envelope`).
+    pub envelope: ElementEnvelope,
+}
+
+/// One row of the tabular projection.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NodeRow {
+    pub node_key: NodeKey,
+    pub type_id: GtsTypeId,
+    pub name: Option<String>,
+    pub payload: Option<serde_json::Value>,
+    /// Gear-assigned audit envelope (`fr-audit-envelope`). On this path it is
+    /// also the only carrier of the observed revision: the page wrapper is
+    /// the platform's and has no member for one.
+    pub envelope: ElementEnvelope,
+}
+
+/// A page of results with an opaque continuation token bound to the observed
+/// revision (Read Consistency Contract).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Page<T> {
+    pub items: Vec<T>,
+    pub next_cursor: Option<String>,
+    pub revision: GraphRevision,
+}
+
+/// Filterable-field schema of the node projection.
+///
+/// Never constructed: it exists to feed `#[derive(ODataFilterable)]`, which
+/// generates [`NodeQueryFilterField`] and its `FilterField` impl. Declaring it
+/// here rather than on the REST DTO keeps one authority for what `$filter` and
+/// `$orderby` may name — the store's column mapping is written against this
+/// type, so a field nobody mapped cannot reach a query.
+///
+/// Payload paths are deliberately absent: they are admissible only where a
+/// type's `index` trait declares them *and* an index backs them, which this
+/// iteration does not yet build.
+#[derive(toolkit_odata_macros::ODataFilterable)]
+pub struct NodeQuery {
+    /// The producer-supplied node key.
+    #[odata(filter(kind = "String"))]
+    pub node_key: String,
+    /// The node's display name.
+    #[odata(filter(kind = "String"))]
+    pub name: String,
+    #[odata(filter(kind = "DateTimeUtc"))]
+    pub created_at: time::OffsetDateTime,
+    #[odata(filter(kind = "DateTimeUtc"))]
+    pub updated_at: time::OffsetDateTime,
+}
+
+pub use NodeQueryFilterField as NodeFilterField;
+
+/// Tabular projection query.
+///
+/// Filtering, ordering and pagination are the **platform** `OData` binding —
+/// the parsed [`toolkit_odata::ODataQuery`], carrying the `CursorV1`
+/// continuation token and its filter hash — not a second dialect of our own.
+#[derive(Clone, Debug, Default)]
+pub struct ProjectionRequest {
+    /// Restrict to these types (already intersected with the authorizing
+    /// permission's pattern by the domain layer).
+    pub type_set: Option<TypeIdSet>,
+    /// The accepted system query options, already parsed and validated.
+    pub query: toolkit_odata::ODataQuery,
+}
+
+// ---------------------------------------------------------------------------
+// Search
+// ---------------------------------------------------------------------------
+
+/// Which arm produced a hit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchArm {
+    Lexical,
+    Vector,
+}
+
+closed_enum!(SearchArm, "search arm" {
+    Lexical => "lexical",
+    Vector => "vector",
+});
+
+/// Search mode. Hybrid runs both arms independently and fuses them with RRF.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchMode {
+    Lexical,
+    Vector,
+    Hybrid,
+}
+
+closed_enum!(SearchMode, "search mode" {
+    Lexical => "lexical",
+    Vector => "vector",
+    Hybrid => "hybrid",
+});
+
+/// One search request.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SearchRequest {
+    pub mode: SearchMode,
+    /// Query text for the lexical arm.
+    pub query: Option<String>,
+    /// Per-arm candidate limit before fusion.
+    pub arm_limit: u32,
+    /// Result limit after fusion.
+    pub limit: u32,
+    /// GTS type patterns narrowing the searched set.
+    pub type_patterns: Vec<String>,
+}
+
+/// A hit's per-arm provenance: which arm matched, at what rank and raw score.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ArmHit {
+    pub arm: SearchArm,
+    pub rank: u32,
+    pub score: f64,
+}
+
+/// One fused search hit.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SearchHit {
+    pub node_key: NodeKey,
+    pub type_id: GtsTypeId,
+    pub name: Option<String>,
+    /// Fused (RRF) score.
+    pub score: f64,
+    pub arms: Vec<ArmHit>,
+    /// Highlighted snippet from the lexical arm, when it matched.
+    pub snippet: Option<String>,
+}
+
+/// Search response, revision-stamped like every compound read.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SearchResponse {
+    pub hits: Vec<SearchHit>,
+    pub revision: GraphRevision,
+    /// Set when the hit list was cut short by `response_max_bytes` rather
+    /// than by the caller's `limit`.
+    ///
+    /// A short list is otherwise indistinguishable from a small graph, and
+    /// the two call for opposite reactions: one is a reason to narrow the
+    /// query, the other a reason to stop looking.
+    pub truncated: Option<TruncationReason>,
+}
+
+// ---------------------------------------------------------------------------
+// Traversal
+// ---------------------------------------------------------------------------
+
+/// Expansion direction. `Either` is the union of the two directed scans in
+/// one semi-join — never the undirected pattern shorthand, which plans as an
+/// all-vertex probe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Direction {
+    Outgoing,
+    Incoming,
+    Either,
+}
+
+closed_enum!(Direction, "direction" {
+    Outgoing => "outgoing",
+    Incoming => "incoming",
+    Either => "either",
+});
+
+/// Per-hop budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HopBudget {
+    pub max_frontier: u32,
+    pub max_edges_scanned: u64,
+}
+
+/// Why an expansion or traversal stopped early. Never silent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TruncationReason {
+    FrontierCap,
+    EdgeScanCap,
+    NodeBudget,
+    /// The hydrated answer reached `response_max_bytes`.
+    ///
+    /// Distinct from `NodeBudget`, and the difference is actionable: a node
+    /// budget is a number the caller asked for and can raise, while this one
+    /// says the elements were large. Asking for fewer, or for a narrower type
+    /// set, is what helps.
+    ResponseBytes,
+}
+
+closed_enum!(TruncationReason, "truncation reason" {
+    FrontierCap => "frontier_cap",
+    EdgeScanCap => "edge_scan_cap",
+    NodeBudget => "node_budget",
+    ResponseBytes => "response_bytes",
+});
+
+/// A traversed edge reference.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EdgeRef {
+    pub edge_key: EdgeKey,
+    pub edge_type_id: GtsTypeId,
+    pub src: NodeKey,
+    pub dst: NodeKey,
+}
+
+/// Label filter placeholder (labels are not shipped in this iteration; the
+/// field exists so the plugin contract does not change when they are).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LabelFilter {
+    pub any_of: Vec<String>,
+}
+
+/// Seeded, depth-bounded traversal request.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TraverseRequest {
+    pub seeds: Vec<NodeKey>,
+    pub depth: u8,
+    /// Per-hop edge-type restriction (GTS patterns).
+    pub edge_type_patterns: Vec<String>,
+    /// Node-type filter applied to the output set (seeds always survive).
+    pub node_type_patterns: Vec<String>,
+    pub max_nodes: Option<u32>,
+}
+
+/// Bounded neighborhood projection request.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NeighborhoodRequest {
+    pub root: NodeKey,
+    pub depth: u8,
+    pub node_budget: Option<u32>,
+    pub include_phantoms: bool,
+}
+
+/// Traversal / neighborhood response.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TraversalResponse {
+    pub nodes: Vec<NodeView>,
+    pub edges: Vec<EdgeRef>,
+    /// The seeds the walk actually started from: the requested keys, deduped,
+    /// and with the ones the caller may not see removed.
+    ///
+    /// A caller cannot derive this from the request. Denied and unknown seeds
+    /// are indistinguishable by contract, and both are simply absent, so a
+    /// traversal from five keys that answers about three is otherwise silent
+    /// about which three — and "seeds always survive truncation" is a promise
+    /// with nothing to check it against.
+    pub seeds: Vec<NodeKey>,
+    pub truncated: Option<TruncationReason>,
+    pub revision: GraphRevision,
+    /// Whether every arm of this read observed one graph state.
+    ///
+    /// The contract asks for a repeatable-read snapshot across seed
+    /// resolution, every hop and hydration. A store that cannot hold one
+    /// declares `StoreCapabilities::snapshots = false`, and the service then
+    /// brackets the walk with a revision read: unchanged means nothing
+    /// committed while it ran and the answer is as good as a snapshot, while
+    /// a moved revision means the arms may not agree with each other.
+    ///
+    /// Said out loud because the alternative is a `revision` field that names
+    /// a state the response never existed at, which no consumer can detect
+    /// and every revision-keyed cache would trust.
+    pub consistent_snapshot: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Labels (contract present, implementation deferred)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct LabelSpec {
+    pub name: String,
+    pub description: Option<String>,
+    pub style: Option<serde_json::Value>,
+    pub applies_to: LabelAppliesTo,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LabelAppliesTo {
+    Node,
+    Edge,
+    Both,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct LabelRecord {
+    pub id: LabelId,
+    pub spec: LabelSpec,
+    pub created_at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LabelAssignment {
+    pub target: LabelTarget,
+    pub attach: Vec<LabelId>,
+    pub detach: Vec<LabelId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LabelTarget {
+    Node(NodeKey),
+    Edge(EdgeKey),
+}
+
+/// Revision-only outcome for label mutations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RevisionOutcome {
+    pub revision: GraphRevision,
+}
+
+// ---------------------------------------------------------------------------
+// Topology (analytics boundary; capability optional)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TopologyRequest {
+    pub cursor: Option<String>,
+    pub page_size: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TopologyPage {
+    pub nodes: Vec<(NodeKey, GtsTypeId)>,
+    pub edges: Vec<EdgeRef>,
+    pub next_cursor: Option<String>,
+    pub schema_version: u32,
+}
+
+// ---------------------------------------------------------------------------
+// Capabilities
+// ---------------------------------------------------------------------------
+
+/// What a store implementation provides. Anything absent is answered
+/// `Unsupported`, never approximated.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "a capability set is independent yes/no facts read by name, not a \
+              parameter list; collapsing them into flags would hide which \
+              capability a store lacks at the call site"
+)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StoreCapabilities {
+    pub scope_replace: bool,
+    pub snapshots: bool,
+    pub vector_search: bool,
+    pub labels: bool,
+    pub chunks: bool,
+    pub topology: bool,
+}
+
+/// What an engine implementation provides beyond one-hop expansion.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EngineCapabilities {
+    pub shortest_path: bool,
+    pub match_pattern: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Budget
+// ---------------------------------------------------------------------------
+
+/// What is left of an operation's absolute deadline — never a fresh timeout,
+/// so a slow earlier step shortens the next one rather than extending the
+/// total.
+#[derive(Clone, Copy, Debug)]
+pub struct RemainingBudget {
+    deadline: Instant,
+}
+
+impl RemainingBudget {
+    /// Open a budget expiring `total` from now.
+    #[must_use]
+    pub fn starting_now(total: Duration) -> Self {
+        Self {
+            deadline: Instant::now() + total,
+        }
+    }
+
+    #[must_use]
+    pub fn remaining(&self) -> Duration {
+        self.deadline.saturating_duration_since(Instant::now())
+    }
+
+    #[must_use]
+    pub fn is_exhausted(&self) -> bool {
+        self.remaining().is_zero()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Embedding space
+// ---------------------------------------------------------------------------
+
+/// Full embedding-space identity. Two providers with the same dimension and
+/// different identities produce incomparable vectors, so the identity is more
+/// than a width.
+///
+/// The fields below are exactly the ones the `embedding_space` table records
+/// (DESIGN § Table `embedding_space`), so a provider's declaration and the
+/// durable row cannot describe different things.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EmbeddingSpaceId {
+    /// Canonical hash over the artifact/preprocessing identity below. Derived
+    /// by [`EmbeddingSpaceId::new`] — never assembled by hand, or two
+    /// providers describing one space would disagree about its name.
+    pub identity_hash: String,
+    /// Exact model artifact: name plus version or content hash.
+    pub model_artifact: String,
+    /// Exact tokenizer artifact, on the same terms.
+    pub tokenizer_artifact: String,
+    /// Declared preprocessing, pooling and normalization configuration. A
+    /// different pooling rule over identical weights still yields vectors
+    /// that must not be compared, so these are part of the identity rather
+    /// than documentation of it.
+    pub preprocessing: serde_json::Value,
+    pub pooling: serde_json::Value,
+    pub normalization: serde_json::Value,
+    pub dimension: u32,
+}
+
+impl EmbeddingSpaceId {
+    /// Build an identity and derive its canonical hash.
+    ///
+    /// The hash lives here rather than in each provider because it is the name
+    /// readiness compares against: the ONNX plugin, a remote plugin and the
+    /// deterministic fake must all arrive at the same string for the same
+    /// space, and at different strings for different ones.
+    ///
+    /// A provider's `preprocessing`, `pooling` and `normalization` blobs are
+    /// frozen once it is released. Their shape is written in the provider's
+    /// code, and the hash is over the blob as built (after key order and
+    /// integral numbers are normalized), not over what it means: adding a
+    /// key, renaming one or changing how a value is spelled gives every
+    /// deployment of the new version a different identity, and the gear
+    /// blocks vector search over what the old version stored until it is
+    /// re-embedded. Values taken from configuration belong in a blob, since a
+    /// different setting there is a different space; a change of shape needs
+    /// the same deliberation as a change of model.
+    #[must_use]
+    pub fn new(
+        model_artifact: impl Into<String>,
+        tokenizer_artifact: impl Into<String>,
+        preprocessing: serde_json::Value,
+        pooling: serde_json::Value,
+        normalization: serde_json::Value,
+        dimension: u32,
+    ) -> Self {
+        let model_artifact = model_artifact.into();
+        let tokenizer_artifact = tokenizer_artifact.into();
+        let identity_hash = identity_hash(
+            &model_artifact,
+            &tokenizer_artifact,
+            &preprocessing,
+            &pooling,
+            &normalization,
+            dimension,
+        );
+        Self {
+            identity_hash,
+            model_artifact,
+            tokenizer_artifact,
+            preprocessing,
+            pooling,
+            normalization,
+            dimension,
+        }
+    }
+}
+
+/// One rendering per JSON value, for everything in this contract that
+/// identifies something by hashing it.
+///
+/// Object keys are sorted, and a whole number is folded onto one spelling.
+/// Both exist because the hash is taken over rendered text: `serde_json` keeps
+/// the variant it parsed, so `1`, `1.0` and `1e0` arrive as `PosInt` and
+/// `Float` and `Display` renders the variant rather than the value. Two
+/// producers of the same logical configuration -- or two versions of one
+/// producer's serializer -- would otherwise hash differently.
+///
+/// Shared rather than copied: the embedding-space identity and the ingest
+/// request hash both do this, and the first version of this function lived in
+/// two places and was fixed in one.
+#[must_use]
+pub fn canonical_json(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.iter()
+                .map(|(key, inner)| (key.clone(), canonical_json(inner)))
+                .collect::<std::collections::BTreeMap<_, _>>()
+                .into_iter()
+                .collect(),
+        ),
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(canonical_json).collect())
+        }
+        serde_json::Value::Number(number) => serde_json::Value::Number(canonical_number(number)),
+        other => other.clone(),
+    }
+}
+
+/// The largest magnitude an `f64` represents without gaps between consecutive
+/// integers. Above it, a float's integral look says nothing about the integer
+/// a producer meant, so the number is left exactly as it was parsed.
+const EXACT_INTEGER_LIMIT: f64 = 9_007_199_254_740_992.0; // 2^53
+
+fn canonical_number(number: &serde_json::Number) -> serde_json::Number {
+    if number.is_f64()
+        && let Some(float) = number.as_f64()
+        && float.fract() == 0.0
+        && float.abs() < EXACT_INTEGER_LIMIT
+    {
+        // `fract() == 0.0` already excludes NaN and both infinities.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the magnitude bound above is exactly the range this cast is lossless over"
+        )]
+        return serde_json::Number::from(float as i64);
+    }
+    number.clone()
+}
+
+fn identity_hash(
+    model_artifact: &str,
+    tokenizer_artifact: &str,
+    preprocessing: &serde_json::Value,
+    pooling: &serde_json::Value,
+    normalization: &serde_json::Value,
+    dimension: u32,
+) -> String {
+    // `aws-lc-rs` is the workspace's FIPS-capable backend; a pure-Rust hasher
+    // is refused by the DE0708 lint. Field boundaries are length-prefixed so
+    // no concatenation of distinct identities can collide.
+    let mut hasher = aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256);
+    let preprocessing = canonical_json(preprocessing).to_string();
+    let pooling = canonical_json(pooling).to_string();
+    let normalization = canonical_json(normalization).to_string();
+    for part in [
+        model_artifact.as_bytes(),
+        tokenizer_artifact.as_bytes(),
+        preprocessing.as_bytes(),
+        pooling.as_bytes(),
+        normalization.as_bytes(),
+        &dimension.to_be_bytes(),
+    ] {
+        hasher.update(&(part.len() as u64).to_be_bytes());
+        hasher.update(part);
+    }
+    hex::encode(hasher.finish())
+}
+
+#[cfg(test)]
+mod embedding_space_tests {
+    use super::EmbeddingSpaceId;
+
+    fn space(pooling: &str, dimension: u32) -> EmbeddingSpaceId {
+        EmbeddingSpaceId::new(
+            "all-MiniLM-L6-v2@sha256:abc",
+            "bert-wordpiece@sha256:def",
+            serde_json::json!({ "lowercase": true }),
+            serde_json::json!({ "strategy": pooling }),
+            serde_json::json!({ "l2": true }),
+            dimension,
+        )
+    }
+
+    /// The other half of "the same configuration". Two providers describing
+    /// one preprocessing step can write its numbers differently -- a config
+    /// round-tripped through a float-based representation renders `1` as
+    /// `1.0` -- and the identity is what readiness compares against the
+    /// identity the stored vectors were produced under. A spelling difference
+    /// there reports the embedding space `Unhealthy`, takes vector and hybrid
+    /// search out of service, and sends the operator to a re-embedding
+    /// lifecycle that would not have fixed anything.
+    #[test]
+    fn the_same_identity_hashes_the_same_however_its_numbers_are_written() {
+        let configured = |preprocessing: &str| {
+            EmbeddingSpaceId::new(
+                "all-MiniLM-L6-v2@sha256:abc",
+                "bert-wordpiece@sha256:def",
+                serde_json::from_str(preprocessing).expect("the fixture is JSON"),
+                serde_json::json!({ "strategy": "mean" }),
+                serde_json::json!({ "l2": true }),
+                384,
+            )
+        };
+        assert_eq!(
+            configured(r#"{"max_length": 512}"#).identity_hash,
+            configured(r#"{"max_length": 512.0}"#).identity_hash
+        );
+        assert_ne!(
+            configured(r#"{"max_length": 512}"#).identity_hash,
+            configured(r#"{"max_length": 256}"#).identity_hash,
+            "folding spellings together must not fold values together"
+        );
+    }
+
+    #[test]
+    fn the_same_identity_hashes_the_same_however_the_json_is_ordered() {
+        let one = EmbeddingSpaceId::new(
+            "m",
+            "t",
+            serde_json::json!({ "a": 1, "b": 2 }),
+            serde_json::json!({}),
+            serde_json::json!({}),
+            384,
+        );
+        let other = EmbeddingSpaceId::new(
+            "m",
+            "t",
+            serde_json::json!({ "b": 2, "a": 1 }),
+            serde_json::json!({}),
+            serde_json::json!({}),
+            384,
+        );
+        assert_eq!(one.identity_hash, other.identity_hash);
+    }
+
+    /// The case ADR-0005 exists for: same weights, same width, different
+    /// pooling — incomparable vectors that a dimension check cannot see.
+    #[test]
+    fn pooling_alone_changes_the_identity() {
+        assert_ne!(
+            space("mean", 384).identity_hash,
+            space("cls", 384).identity_hash
+        );
+    }
+
+    #[test]
+    fn dimension_alone_changes_the_identity() {
+        assert_ne!(
+            space("mean", 384).identity_hash,
+            space("mean", 768).identity_hash
+        );
+    }
+}
+
+#[cfg(test)]
+mod closed_enum_tests {
+    use super::*;
+
+    /// Rule 3 of the Closed Enum Contract, held by a test rather than by each
+    /// call site remembering it.
+    ///
+    /// Every family round-trips through its one spelling, and an
+    /// unrecognized value is refused by name rather than mapped onto a
+    /// variant. The danger the rule exists for is a decoder acquiring a
+    /// `_ =>` arm: an unknown outcome read as `unchanged`, or an unknown
+    /// readiness state read as `healthy`, turns a value the server chose
+    /// into one it did not.
+    macro_rules! contract_case {
+        ($case:ident, $name:ident, $label:literal, [$($variant:expr),+ $(,)?]) => {
+            #[test]
+            fn $case() {
+                let mut seen: Vec<&'static str> = Vec::new();
+                $(
+                    let spelling = $variant.as_str();
+                    assert!(
+                        !seen.contains(&spelling),
+                        "two {} variants share the spelling `{spelling}`",
+                        $label
+                    );
+                    seen.push(spelling);
+                    assert_eq!(
+                        spelling.parse::<$name>().expect("its own spelling decodes"),
+                        $variant,
+                        "{} does not round-trip through `{spelling}`",
+                        $label
+                    );
+                )+
+                for unknown in ["", "UNKNOWN", "healthy_", " node", "something_new"] {
+                    assert!(!seen.contains(&unknown), "the fixture must be unknown");
+                    let refused = unknown
+                        .parse::<$name>()
+                        .expect_err("an unknown value is never a known variant");
+                    assert_eq!(refused.found, unknown);
+                    assert_eq!(refused.expected, $label);
+                }
+            }
+        };
+    }
+
+    contract_case!(
+        a_type_kind,
+        TypeKind,
+        "type kind",
+        [TypeKind::Node, TypeKind::Edge, TypeKind::Attribute]
+    );
+    contract_case!(
+        a_readiness_state,
+        ReadinessState,
+        "readiness state",
+        [
+            ReadinessState::Healthy,
+            ReadinessState::Degraded,
+            ReadinessState::Unhealthy,
+            ReadinessState::NotImplemented,
+        ]
+    );
+    contract_case!(
+        a_type_change_state,
+        TypeChangeState,
+        "type change state",
+        [
+            TypeChangeState::New,
+            TypeChangeState::Unchanged,
+            TypeChangeState::Compatible,
+            TypeChangeState::Incompatible,
+            TypeChangeState::Undecidable,
+        ]
+    );
+    contract_case!(
+        a_type_outcome,
+        TypeOutcome,
+        "type outcome",
+        [
+            TypeOutcome::Created,
+            TypeOutcome::Unchanged,
+            TypeOutcome::Updated
+        ]
+    );
+    contract_case!(
+        an_item_outcome,
+        ItemOutcome,
+        "item outcome",
+        [
+            ItemOutcome::Inserted,
+            ItemOutcome::Updated,
+            ItemOutcome::Unchanged,
+            ItemOutcome::Materialized,
+        ]
+    );
+    contract_case!(
+        an_adjacency_side,
+        AdjacencySide,
+        "adjacency side",
+        [AdjacencySide::Outgoing, AdjacencySide::Incoming]
+    );
+    contract_case!(
+        a_search_arm,
+        SearchArm,
+        "search arm",
+        [SearchArm::Lexical, SearchArm::Vector]
+    );
+    contract_case!(
+        a_search_mode,
+        SearchMode,
+        "search mode",
+        [SearchMode::Lexical, SearchMode::Vector, SearchMode::Hybrid]
+    );
+    contract_case!(
+        a_direction,
+        Direction,
+        "direction",
+        [Direction::Outgoing, Direction::Incoming, Direction::Either]
+    );
+    contract_case!(
+        a_truncation_reason,
+        TruncationReason,
+        "truncation reason",
+        [
+            TruncationReason::FrontierCap,
+            TruncationReason::EdgeScanCap,
+            TruncationReason::NodeBudget,
+            TruncationReason::ResponseBytes,
+        ]
+    );
+}

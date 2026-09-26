@@ -1,0 +1,300 @@
+//! Scope replacement: removing the static content a re-import no longer names
+//! (`cpt-cf-graph-storage-fr-scope-replace`).
+//!
+//! A scope is `(attribute, value)` over a payload field — `repository =
+//! acme/infra` — and a replacement says "this batch is the whole of that
+//! scope now". What it removes is bounded three ways, and every one of them
+//! is the reason the feature exists rather than a detail of it:
+//!
+//! - **Only scope-managed types.** The `scope_managed` trait is declared per
+//!   type and defaults to true; a type that sets it false (the phantom
+//!   family, anything a producer marks) is never removed by another
+//!   producer's re-sync.
+//! - **Only what the batch did not re-supply.** Membership is the payload
+//!   attribute, so a node the batch wrote is by definition still in the
+//!   scope.
+//! - **Never analysis-originated content.** Static edges go first, then only
+//!   those nodes that have no incident edge left. A node still referenced by
+//!   an analysis edge stays, because the conclusion drawn about it must
+//!   survive the re-import of the thing it was drawn about — that is
+//!   `principle-provenance-survives-resync`, and the foreign key would refuse
+//!   the delete anyway.
+//!
+//! Removal is a **hard delete**, not a tombstone, and that is deliberate: a
+//! tombstoned node key is not reusable before purge (Soft Delete Contract), so
+//! tombstoning here would make the next import of the same object a conflict —
+//! the opposite of what a replacement is for.
+
+use graph_storage_sdk::plugin_api::GraphStoreError;
+use sea_orm::sea_query::{Expr, ExprTrait};
+use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter};
+use std::collections::BTreeSet;
+use toolkit_db::secure::{DBRunner, SecureDeleteExt, SecureEntityExt};
+
+use crate::infra::projections::{
+    EndpointPair, NodeIdent, TypeMeta, endpoint_pair_columns, node_ident_columns, type_meta_columns,
+};
+use crate::infra::storage::entity::{edge, gts_type, node};
+use crate::infra::store::map_scope_err;
+use crate::infra::store::types::traits_from_json;
+
+/// The characters a scope attribute may use.
+///
+/// It is rendered into the extraction expression as a literal, exactly like a
+/// declared `index` path, so the alphabet is closed here rather than escaped
+/// there.
+fn plain(attribute: &str) -> bool {
+    !attribute.is_empty()
+        && attribute.len() <= 128
+        && attribute
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+}
+
+/// Which interned type ids are scope-managed nodes, and which are static
+/// edges.
+struct ScopedTypes {
+    managed_nodes: Vec<i32>,
+    static_edges: Vec<i32>,
+}
+
+async fn scoped_types(
+    scope: &toolkit_security::AccessScope,
+    tx: &impl DBRunner,
+) -> Result<ScopedTypes, GraphStoreError> {
+    let rows = gts_type::Entity::find()
+        .secure()
+        .scope_with(scope)
+        .project_all(tx, |query| {
+            type_meta_columns(query).into_model::<TypeMeta>()
+        })
+        .await
+        .map_err(map_scope_err)?;
+
+    let mut managed_nodes = Vec::new();
+    let mut static_edges = Vec::new();
+    for row in rows {
+        let traits = traits_from_json(&row.effective_traits);
+        match row.kind.as_str() {
+            "node" if traits.scope_managed => managed_nodes.push(row.id),
+            // The edge families: `static` content is re-derived by a re-sync,
+            // `analysis` is a conclusion and survives it.
+            "edge" if traits.family.as_deref() == Some("static") => static_edges.push(row.id),
+            _ => {}
+        }
+    }
+    Ok(ScopedTypes {
+        managed_nodes,
+        static_edges,
+    })
+}
+
+/// Remove the scope's static content that this batch did not re-supply.
+///
+/// Runs *after* the batch's own writes, inside the same transaction and under
+/// the fence row's lock: "absent from the submitted batch" can only be decided
+/// once the batch is in.
+pub(crate) async fn remove_stale(
+    scope: &toolkit_security::AccessScope,
+    tx: &impl DBRunner,
+    attribute: &str,
+    value: &str,
+    written: &BTreeSet<String>,
+    declared_edges: &BTreeSet<String>,
+) -> Result<(u64, u64), GraphStoreError> {
+    if !plain(attribute) {
+        return Err(GraphStoreError::InvalidQuery {
+            what: format!(
+                "scope attribute `{attribute}` is not a plain payload field name \
+                 (`[A-Za-z0-9_.-]`, at most 128 characters)"
+            ),
+        });
+    }
+    let types = scoped_types(scope, tx).await?;
+
+    // No managed node type means no node of this scope can be stale -- but
+    // it does not mean nothing is. Edge ownership is recorded on the edge
+    // row itself, by scope attribute and value, not derived from any node
+    // type being managed, so the edge half below must run either way. This
+    // used to return `(0, 0)` here, before the edge block.
+    //
+    // As it stands that branch is not reachable: the abstract base node
+    // types are themselves scope-managed and are registered in any tenant
+    // an edge can exist in, since an edge needs endpoints and every endpoint
+    // type derives from them. So the return encoded an assumption that
+    // happens to hold rather than one that must -- and the day a tenant can
+    // hold edges without a managed node type, it would silently stop
+    // removing them. The node half is skipped; the edge half never is.
+    // Membership is the payload attribute. The field name is a checked
+    // literal and the value is a bound parameter, the same shape the
+    // projection renders.
+    let member =
+        || Expr::cust(format!("(payload #>> '{{{attribute}}}')")).eq(Expr::val(value.to_owned()));
+    let stale_ids: Vec<i64> = if types.managed_nodes.is_empty() {
+        Vec::new()
+    } else {
+        let candidates: Vec<NodeIdent> = node::Entity::find()
+            .secure()
+            .scope_with(scope)
+            .filter(
+                Condition::all()
+                    .add(node::Column::GtsNodeTypeId.is_in(types.managed_nodes))
+                    .add(node::Column::DeletedAt.is_null())
+                    .add(member()),
+            )
+            .project_all(tx, |query| {
+                node_ident_columns(query).into_model::<NodeIdent>()
+            })
+            .await
+            .map_err(map_scope_err)?;
+
+        let stale: Vec<&NodeIdent> = candidates
+            .iter()
+            .filter(|row| !written.contains(&row.node_key))
+            .collect();
+        stale.iter().map(|row| row.id).collect()
+    };
+
+    // Edges first, and only the static ones: an analysis edge is a conclusion
+    // about the content, not a copy of it.
+    //
+    // Two ways a static edge leaves, and the first of them is why this
+    // function no longer returns early when no node is stale. An edge the
+    // producer stopped declaring is gone even when both of its endpoints were
+    // re-supplied -- that is what a declarative snapshot means, and reckoning
+    // only through endpoints could never see it: nothing was stale, so
+    // nothing was removed, and the edge stayed visible for good with no
+    // replay able to repair it.
+    //
+    // Ownership rather than endpoint membership decides the first case. Two
+    // scopes may share endpoint nodes -- different payload attributes, one
+    // node satisfying both -- so "every edge between nodes of this scope"
+    // would take edges another producer declared. An edge no scope has
+    // claimed is left alone here and leaves only by the second route.
+    let removed_edges = if types.static_edges.is_empty() {
+        0
+    } else {
+        let abandoned = Condition::all()
+            .add(edge::Column::ScopeAttribute.eq(attribute.to_owned()))
+            .add(edge::Column::ScopeValue.eq(value.to_owned()))
+            .add(edge::Column::EdgeKey.is_not_in(declared_edges.iter().cloned()));
+        let mut leaves = Condition::any().add(abandoned);
+        if !stale_ids.is_empty() {
+            // Incident to a node that is itself departing, whoever declared
+            // it: the endpoint is going, so the edge cannot stay.
+            leaves = leaves.add(
+                Condition::any()
+                    .add(edge::Column::SrcNodeId.is_in(stale_ids.clone()))
+                    .add(edge::Column::DstNodeId.is_in(stale_ids.clone())),
+            );
+        }
+        edge::Entity::delete_many()
+            .filter(
+                Condition::all()
+                    .add(edge::Column::GtsEdgeTypeId.is_in(types.static_edges))
+                    .add(leaves),
+            )
+            .secure()
+            .scope_with(scope)
+            .exec(tx)
+            .await
+            .map_err(map_scope_err)?
+            .rows_affected
+    };
+
+    if stale_ids.is_empty() {
+        return Ok((0, removed_edges));
+    }
+
+    // A tombstoned edge is a deleted conclusion, and it must not keep a node
+    // alive on behalf of one. Left in place it does exactly that: the row is
+    // still there, so the endpoint foreign key still refuses to let the node
+    // go, and no later replacement can ever clean it up — the scope stops
+    // converging, quietly and permanently.
+    //
+    // So the tombstoned edges of a departing node are purged with it. That is
+    // narrower than it sounds: only edges incident to a node this replacement
+    // has already decided to remove, and only ones somebody deleted earlier.
+    // A *live* analysis edge still keeps its endpoint, which is the rule this
+    // whole predicate exists to enforce. (Adding `deleted_at IS NULL` to the
+    // reference query instead — the obvious reading — would leave the row
+    // behind and have the foreign key refuse the delete, turning a silent
+    // leak into a failed transaction.)
+    edge::Entity::delete_many()
+        .filter(
+            Condition::all()
+                .add(edge::Column::DeletedAt.is_not_null())
+                .add(
+                    Condition::any()
+                        .add(edge::Column::SrcNodeId.is_in(stale_ids.clone()))
+                        .add(edge::Column::DstNodeId.is_in(stale_ids.clone())),
+                ),
+        )
+        .secure()
+        .scope_with(scope)
+        .exec(tx)
+        .await
+        .map_err(map_scope_err)?;
+
+    // Then the nodes that nothing references any more. A node still carrying
+    // an analysis edge stays: removing it would destroy the provenance the
+    // edge holds, and the `ON DELETE RESTRICT` foreign key would refuse it in
+    // any case — this predicate is what turns that refusal into a decision.
+    let still_referenced: BTreeSet<i64> = edge::Entity::find()
+        .secure()
+        .scope_with(scope)
+        .filter(
+            Condition::any()
+                .add(edge::Column::SrcNodeId.is_in(stale_ids.clone()))
+                .add(edge::Column::DstNodeId.is_in(stale_ids.clone())),
+        )
+        .project_all(tx, |query| {
+            endpoint_pair_columns(query).into_model::<EndpointPair>()
+        })
+        .await
+        .map_err(map_scope_err)?
+        .into_iter()
+        .flat_map(|row| [row.src_node_id, row.dst_node_id])
+        .collect();
+
+    let removable: Vec<i64> = stale_ids
+        .into_iter()
+        .filter(|id| !still_referenced.contains(id))
+        .collect();
+    let removed_nodes = if removable.is_empty() {
+        0
+    } else {
+        // Membership is checked again here, in the statement, and not only in
+        // the read that chose these rows. An ordinary ingest can move a node
+        // out of the scope between that read and this delete -- ordinary
+        // ingests do not take the scope's lock, and the secure ORM offers no
+        // row lock to take -- and deleting by id alone then removed a node the
+        // ingest had just reported writing, an outcome neither serial order
+        // produces: ingest-then-replace never sees it as a member, and
+        // replace-then-ingest deletes it and the ingest writes it back. With
+        // the predicate in the statement, PostgreSQL re-evaluates it on the
+        // row as the ingest left it, after waiting for its lock, and a node
+        // that has left the scope stays.
+        //
+        // Its static edges were removed above, before this, because the
+        // foreign key needs them gone first. A node that survives here without
+        // them is the replace-then-ingest outcome exactly -- the replacement
+        // takes the node and its edges, the ingest writes back the node alone
+        // -- so the pair still lands in a state a serial order reaches.
+        node::Entity::delete_many()
+            .filter(
+                Condition::all()
+                    .add(node::Column::Id.is_in(removable))
+                    .add(node::Column::DeletedAt.is_null())
+                    .add(member()),
+            )
+            .secure()
+            .scope_with(scope)
+            .exec(tx)
+            .await
+            .map_err(map_scope_err)?
+            .rows_affected
+    };
+
+    Ok((removed_nodes, removed_edges))
+}

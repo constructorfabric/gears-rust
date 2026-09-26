@@ -1,0 +1,1251 @@
+//! Ontology storage: registration, update, lookup and pattern resolution.
+//!
+//! Registration is idempotent for a byte-identical schema. A *different*
+//! schema under a registered identifier is a conflict by default and, when the
+//! caller asks for `on_existing: update`, an evolution question instead —
+//! decided by `domain::evolution` (the `BACKWARD` direction of types-registry
+//! ADR-0003, computed by `gts` OP#8) and, only where the schemas cannot decide
+//! it, by re-validating the type's own rows.
+//!
+//! `ON CONFLICT DO NOTHING` skipping every row is **convergence, not
+//! failure** — reporting it as an error is the trap a re-registration hit in
+//! the prototype (ADR-0005 § Confirmation).
+
+use graph_storage_sdk::models::{
+    AdmissionBasis, EffectiveTraits, GtsTypeId, OnExisting, Page, RegisteredType, TraitChange,
+    TypeChange, TypeChangeState, TypeIdSet, TypeKind, TypeOutcome, TypeQuery, TypeRecord,
+    TypeRegistration, TypeRegistrationOptions,
+};
+use graph_storage_sdk::plugin_api::{GraphStoreError, StoreCtx};
+use sea_orm::sea_query::Expr;
+use sea_orm::{ActiveValue, ColumnTrait, Condition, EntityTrait, ExprTrait, QueryFilter};
+use toolkit_db::secure::{SecureEntityExt, SecureInsertExt, SecureUpdateExt};
+
+use crate::domain::{evolution, ontology};
+use crate::infra::projections::{TypeMeta, TypeName, type_meta_columns, type_name_columns};
+use crate::infra::storage::entity::gts_type;
+use crate::infra::store::{PgGraphStore, TxStoreError, map_db_error, map_scope_err};
+
+fn kind_to_str(kind: TypeKind) -> &'static str {
+    kind.as_str()
+}
+
+/// The column is `TEXT` under a `CHECK`, so a value outside the set is drift
+/// or corruption. The SDK owns the spelling in both directions and refuses an
+/// unknown one by name; all this adds is what the offending value was found
+/// in.
+fn kind_from_str(value: &str) -> Result<TypeKind, GraphStoreError> {
+    value.parse().map_err(|_| GraphStoreError::Corrupt {
+        reason: format!("gts_type.kind holds `{value}`"),
+    })
+}
+
+/// Read the stored trait resolution back. Hand-written, like the write side:
+/// the SDK models carry no serde by contract, so the JSON shape is owned here,
+/// beside the column that holds it.
+pub(crate) fn traits_from_json(value: &serde_json::Value) -> EffectiveTraits {
+    let strings = |key: &str| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    EffectiveTraits {
+        family: value
+            .get("family")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        scope_managed: value
+            .get("scope_managed")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true),
+        emit_events: value
+            .get("emit_events")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        index: strings("index"),
+        full_text_search: strings("full_text_search"),
+        vector_search: strings("vector_search"),
+        src_types: strings("src_types"),
+        dst_types: strings("dst_types"),
+    }
+}
+
+/// The resolved `index` kinds stored beside the traits (`index_kinds`), as the
+/// projection needs them: pointer -> scalar kind.
+pub(crate) fn index_kinds_from_json(
+    value: &serde_json::Value,
+) -> std::collections::BTreeMap<String, ontology::ScalarKind> {
+    value
+        .get("index_kinds")
+        .and_then(serde_json::Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter_map(|(pointer, kind)| {
+            kind.as_str()
+                .and_then(ontology::ScalarKind::parse)
+                .map(|kind| (pointer.clone(), kind))
+        })
+        .collect()
+}
+
+fn to_record(model: gts_type::Model) -> Result<TypeRecord, GraphStoreError> {
+    let effective_traits = traits_from_json(&model.effective_traits);
+    let is_abstract = model
+        .type_schema
+        .get("x-gts-abstract")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    Ok(TypeRecord {
+        type_id: model.gts_type_id,
+        type_uuid: model.gts_type_uuid,
+        kind: kind_from_str(&model.kind)?,
+        is_abstract,
+        schema: model.type_schema,
+        effective_traits,
+        created_at: model.created_at,
+        revision: model.revision,
+    })
+}
+
+/// Traits are stored as their resolved JSON so the shape the SDK reads and
+/// the shape the column holds cannot drift.
+fn traits_to_json(descriptor: &ontology::TypeDescriptor) -> serde_json::Value {
+    let traits = &descriptor.effective_traits;
+    let index_kinds: serde_json::Map<String, serde_json::Value> = descriptor
+        .index_paths
+        .iter()
+        .map(|p| {
+            (
+                p.pointer.clone(),
+                serde_json::Value::String(p.kind.as_str().to_owned()),
+            )
+        })
+        .collect();
+    serde_json::json!({
+        "index_kinds": index_kinds,
+        "family": traits.family,
+        "scope_managed": traits.scope_managed,
+        "emit_events": traits.emit_events,
+        "index": traits.index,
+        "full_text_search": traits.full_text_search,
+        "vector_search": traits.vector_search,
+        "src_types": traits.src_types,
+        "dst_types": traits.dst_types,
+    })
+}
+
+/// The bounds a re-validating update runs inside, read from configuration
+/// once per call so the batch loop cannot see a changed value halfway.
+#[derive(Clone, Copy)]
+struct UpdateLimits {
+    max_rows: u64,
+    max_migration_rows: u64,
+    batch: u64,
+    max_reported: usize,
+    /// The call's absolute deadline, so a re-validating scan stops waiting
+    /// rather than outliving the request that asked for it.
+    budget: graph_storage_sdk::models::RemainingBudget,
+}
+
+/// Who is registering, and under what authority.
+///
+/// One struct rather than three threaded parameters because a migration writes
+/// element rows, and `fr-audit-envelope` requires the acting subject to be
+/// stamped on every one of them: the subject has to travel with the tenant and
+/// the scope from here to the row.
+struct Actor<'a> {
+    tenant: uuid::Uuid,
+    scope: &'a toolkit_security::AccessScope,
+    subject: graph_storage_sdk::models::Subject,
+}
+
+pub async fn register_types(
+    store: &PgGraphStore,
+    ctx: &StoreCtx<'_>,
+    batch: Vec<TypeRegistration>,
+    options: TypeRegistrationOptions,
+) -> Result<Vec<RegisteredType>, GraphStoreError> {
+    // The batch commits atomically: a partway failure leaves nothing.
+    let tenant = ctx.tenant;
+    let scope = ctx.scope.clone();
+    let subject = ctx.subject.clone();
+    let config = store.config();
+    let max_chain_depth = usize::from(config.ontology_max_chain_depth);
+    let limits = UpdateLimits {
+        max_rows: u64::from(config.type_update_max_rows),
+        max_migration_rows: u64::from(config.type_migration_max_rows),
+        batch: u64::from(config.type_update_batch),
+        max_reported: config.type_update_max_reported_rows as usize,
+        budget: ctx.budget,
+    };
+    store
+        .db()
+        .transaction_ref_mapped::<_, Vec<RegisteredType>, TxStoreError>(move |tx| {
+            let batch = batch.clone();
+            let scope = scope.clone();
+            let options = options.clone();
+            let subject = subject.clone();
+            Box::pin(async move {
+                register_in_tx(
+                    Actor {
+                        tenant,
+                        scope: &scope,
+                        subject,
+                    },
+                    tx,
+                    batch,
+                    max_chain_depth,
+                    &options,
+                    limits,
+                )
+                .await
+                .map_err(TxStoreError::from)
+            })
+        })
+        .await
+        .map_err(|error| error.0)
+}
+
+/// One type's ancestors, resolved from what is registered in this
+/// transaction, outermost base first.
+/// `in_batch` carries what this batch already analyzed, consulted before the
+/// table: a batch may register a family and its producer type together, and a
+/// dry run writes nothing at all, so the ancestor of the second entry has to
+/// be findable without a row.
+async fn ancestor_definitions(
+    scope: &toolkit_security::AccessScope,
+    tx: &impl toolkit_db::secure::DBRunner,
+    type_id: &str,
+    in_batch: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> Result<Vec<(String, serde_json::Value)>, GraphStoreError> {
+    let chain = ontology::ancestors(type_id);
+    let mut out = Vec::new();
+    for ancestor in &chain[..chain.len().saturating_sub(1)] {
+        if let Some(schema) = in_batch.get(ancestor) {
+            out.push((ancestor.clone(), schema.clone()));
+            continue;
+        }
+        let existing = gts_type::Entity::find()
+            .secure()
+            .scope_with(scope)
+            .filter(Condition::all().add(gts_type::Column::GtsTypeId.eq(ancestor.clone())))
+            .one(tx)
+            .await
+            .map_err(map_scope_err)?;
+        match existing {
+            Some(model) => out.push((model.gts_type_id, model.type_schema)),
+            None => {
+                return Err(GraphStoreError::Validation {
+                    items: vec![graph_storage_sdk::models::ItemError {
+                        index: 0,
+                        family: graph_storage_sdk::models::ItemFamily::Node,
+                        gts_type: Some(type_id.to_owned()),
+                        pointer: None,
+                        message: format!("ancestor `{ancestor}` is not registered"),
+                    }],
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn invalid_candidate(type_id: &str, message: String) -> GraphStoreError {
+    GraphStoreError::Validation {
+        items: vec![graph_storage_sdk::models::ItemError {
+            index: 0,
+            family: graph_storage_sdk::models::ItemFamily::Node,
+            gts_type: Some(type_id.to_owned()),
+            pointer: None,
+            message,
+        }],
+    }
+}
+
+/// The conflict a `reject`-mode caller gets — the gear's historical answer,
+/// word for word, plus where to look for the reason.
+fn rejected(type_id: &str) -> GraphStoreError {
+    GraphStoreError::Conflict {
+        reason: format!(
+            "type `{type_id}` is already registered with a different schema; \
+             POST /types/compatibility reports what the change would cost, and \
+             `options.on_existing: \"update\"` admits it when it is admissible"
+        ),
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one type's admission is one sequence — resolve, compare, decide, \
+              re-validate, write — and splitting it across helpers would hide \
+              the order the decision depends on"
+)]
+async fn register_in_tx(
+    actor: Actor<'_>,
+    tx: &impl toolkit_db::secure::DBRunner,
+    batch: Vec<TypeRegistration>,
+    max_chain_depth: usize,
+    options: &TypeRegistrationOptions,
+    limits: UpdateLimits,
+) -> Result<Vec<RegisteredType>, GraphStoreError> {
+    let Actor {
+        tenant,
+        scope,
+        ref subject,
+    } = actor;
+    if let Some(duplicate) = ontology::duplicate_type_id(batch.iter().map(|r| r.type_id.as_str())) {
+        return Err(GraphStoreError::InvalidQuery {
+            what: format!(
+                "`{duplicate}` is registered twice in one batch; a batch is one act and cannot \
+                 name a type twice"
+            ),
+        });
+    }
+    let update = options.on_existing == OnExisting::Update;
+    // A migration naming a type this batch does not carry would silently do
+    // nothing, which is the worst possible answer to a typo.
+    for spec in &options.migrations {
+        if !batch.iter().any(|r| r.type_id == spec.type_id) {
+            return Err(GraphStoreError::InvalidQuery {
+                what: format!(
+                    "a migration names `{}`, which this batch does not register",
+                    spec.type_id
+                ),
+            });
+        }
+    }
+    let mut out = Vec::with_capacity(batch.len());
+    let mut in_batch: std::collections::BTreeMap<String, serde_json::Value> =
+        std::collections::BTreeMap::new();
+    for registration in batch {
+        // Resolve the chain from what is already registered plus what this
+        // batch carries.
+        let ancestors = ancestor_definitions(scope, tx, &registration.type_id, &in_batch).await?;
+        let ancestor_refs: Vec<&serde_json::Value> =
+            ancestors.iter().map(|(_, schema)| schema).collect();
+        let descriptor = ontology::analyze(
+            &registration.type_id,
+            &registration.schema,
+            &ancestor_refs,
+            max_chain_depth,
+        )
+        .map_err(|error| invalid_candidate(&registration.type_id, error.to_string()))?;
+        // The schema must compile against its resolved chain *here*, not at
+        // the first ingest. A `$ref` to something nobody registered passes
+        // every identifier-based check -- the chain comes from the type id,
+        // not from the body -- and then fails every write of that type with
+        // "schema does not compile". Refusing it at registration puts the
+        // error where the producer can act on it.
+        let _ = chain_validator(&ancestors, &descriptor)?;
+        let traits_json = traits_to_json(&descriptor);
+        in_batch.insert(descriptor.type_id.clone(), descriptor.schema.clone());
+        let migration = options.migration_for(&descriptor.type_id);
+
+        let existing = gts_type::Entity::find()
+            .secure()
+            .scope_with(scope)
+            .filter(
+                Condition::all().add(gts_type::Column::GtsTypeId.eq(descriptor.type_id.clone())),
+            )
+            .one(tx)
+            .await
+            .map_err(map_scope_err)?;
+
+        let Some(model) = existing else {
+            if migration.is_some() {
+                return Err(GraphStoreError::InvalidQuery {
+                    what: format!(
+                        "the migration for `{}` has nothing to migrate: the type is not \
+                         registered yet, so it holds no rows",
+                        descriptor.type_id
+                    ),
+                });
+            }
+            if options.dry_run {
+                out.push(RegisteredType {
+                    record: dry_record(&descriptor, &traits_json),
+                    outcome: TypeOutcome::Created,
+                    basis: None,
+                    change: Some(new_type_change(&descriptor.type_id)),
+                });
+                continue;
+            }
+            let active = gts_type::ActiveModel {
+                tenant_id: ActiveValue::Set(tenant),
+                id: ActiveValue::NotSet,
+                gts_type_uuid: ActiveValue::Set(descriptor.type_uuid),
+                gts_type_id: ActiveValue::Set(descriptor.type_id.clone()),
+                kind: ActiveValue::Set(kind_to_str(descriptor.kind).to_owned()),
+                type_schema: ActiveValue::Set(descriptor.schema.clone()),
+                effective_traits: ActiveValue::Set(traits_json),
+                created_at: ActiveValue::Set(time::OffsetDateTime::now_utc()),
+                revision: ActiveValue::Set(1),
+                updated_at: ActiveValue::Set(time::OffsetDateTime::now_utc()),
+            };
+            // scope_unchecked: an INSERT cannot subtree-clamp a row
+            // that does not exist yet.
+            let model = gts_type::Entity::insert(active)
+                .secure()
+                .scope_unchecked(scope)
+                .map_err(map_scope_err)?
+                .exec_with_returning(tx)
+                .await
+                .map_err(map_scope_err)?;
+            out.push(RegisteredType {
+                record: to_record(model)?,
+                outcome: TypeOutcome::Created,
+                basis: None,
+                change: Some(new_type_change(&descriptor.type_id)),
+            });
+            continue;
+        };
+
+        let stored_traits = traits_from_json(&model.effective_traits);
+        let trait_changes = evolution::traits_diff(&stored_traits, &descriptor.effective_traits);
+        let schema_changed = model.type_schema != descriptor.schema;
+        let stored_resolution_is_stale = model.effective_traits != traits_json;
+
+        if !schema_changed && migration.is_some() {
+            // A migration rewrites payloads, and it is admitted as part of
+            // moving a type to a new definition. Offered against an unchanged
+            // schema it would be a data-editing endpoint wearing a type
+            // registration's clothes, which is a different feature with a
+            // different authorization story.
+            return Err(GraphStoreError::InvalidQuery {
+                what: format!(
+                    "the migration for `{}` has nothing to migrate towards: the candidate \
+                     schema is byte-identical to the registered one",
+                    descriptor.type_id
+                ),
+            });
+        }
+
+        if !schema_changed {
+            // Byte-identical re-registration converges. It is *not* nothing
+            // when the stored trait resolution differs from what this gear
+            // resolves: a type registered by an older build carries a stale
+            // `effective_traits` (no `index_kinds`, for one), and the
+            // prototype's workaround was to recreate the database. An
+            // updating caller refreshes it; a rejecting one keeps converging,
+            // so the default path is unchanged.
+            if stored_resolution_is_stale && update && !options.dry_run {
+                let revision = model.revision.saturating_add(1);
+                let written = gts_type::Entity::update_many()
+                    .col_expr(
+                        gts_type::Column::EffectiveTraits,
+                        Expr::value(traits_json.clone()),
+                    )
+                    .col_expr(
+                        gts_type::Column::Revision,
+                        Expr::col(gts_type::Column::Revision).add(1),
+                    )
+                    .col_expr(
+                        gts_type::Column::UpdatedAt,
+                        Expr::value(time::OffsetDateTime::now_utc()),
+                    )
+                    .filter(
+                        Condition::all()
+                            .add(gts_type::Column::Id.eq(model.id))
+                            .add(gts_type::Column::Revision.eq(model.revision)),
+                    )
+                    .secure()
+                    .scope_with(scope)
+                    .exec(tx)
+                    .await
+                    .map_err(map_scope_err)?;
+                revision_moved(written.rows_affected, &descriptor.type_id)?;
+                super::ingest::bump_revision(tenant, scope, tx).await?;
+                out.push(RegisteredType {
+                    record: written_record(&model, &descriptor, revision),
+                    outcome: TypeOutcome::Updated,
+                    basis: Some(AdmissionBasis::SchemaProved),
+                    change: Some(unchanged_type_change(&descriptor.type_id, trait_changes)),
+                });
+                continue;
+            }
+            out.push(RegisteredType {
+                record: to_record(model)?,
+                outcome: TypeOutcome::Unchanged,
+                basis: None,
+                change: Some(unchanged_type_change(&descriptor.type_id, trait_changes)),
+            });
+            continue;
+        }
+
+        // The schema moved. Which of the two definitions accepts more is a
+        // question about their accepted instance sets, and `gts` OP#8 answers
+        // it — over documents whose `$ref`s are resolved, both sides against
+        // the same ancestor set (see `domain::evolution::compare`).
+        let comparison = evolution::compare(
+            &model.type_schema,
+            &descriptor.schema,
+            ancestors.iter().cloned(),
+        )
+        .map_err(|error| invalid_candidate(&descriptor.type_id, error.to_string()))?;
+        let state = comparison.state();
+        let mut change = TypeChange {
+            type_id: descriptor.type_id.clone(),
+            state,
+            backward: comparison.backward.as_str().to_owned(),
+            forward: comparison.forward.as_str().to_owned(),
+            diagnostics: comparison.diagnostics.clone(),
+            traits_changed: trait_changes,
+            rows: None,
+            rows_rewritten: None,
+            levels_not_evolvable_in_place: comparison.levels_not_evolvable_in_place.clone(),
+            migration_required: !matches!(state, TypeChangeState::Compatible),
+            admissible: false,
+        };
+
+        let decision = evolution::decide(
+            state,
+            evolution::Asked {
+                update,
+                offered: evolution::offered(migration.is_some(), options.revalidate),
+            },
+        );
+        if decision == evolution::Decision::Refuse {
+            if options.dry_run {
+                out.push(RegisteredType {
+                    record: to_record(model)?,
+                    outcome: TypeOutcome::Unchanged,
+                    basis: None,
+                    change: Some(change),
+                });
+                continue;
+            }
+            if !update {
+                return Err(rejected(&descriptor.type_id));
+            }
+            return Err(GraphStoreError::Conflict {
+                reason: evolution::refusal_reason(
+                    &descriptor.type_id,
+                    state,
+                    &change.diagnostics,
+                    limits.max_reported.min(5),
+                ),
+            });
+        }
+
+        let candidate = Candidate {
+            descriptor: &descriptor,
+            ancestors: &ancestors,
+            interned: model.id,
+            migration,
+        };
+        let admitted = admit(
+            super::evolution::Migrator {
+                scope,
+                subject,
+                dry_run: options.dry_run,
+            },
+            tx,
+            &candidate,
+            decision,
+            limits,
+            &mut change,
+        )
+        .await?;
+        let Some(basis) = admitted else {
+            // A dry run reports a refusal instead of raising it; the change
+            // now carries why.
+            out.push(RegisteredType {
+                record: to_record(model)?,
+                outcome: TypeOutcome::Unchanged,
+                basis: None,
+                change: Some(change),
+            });
+            continue;
+        };
+
+        if options.dry_run {
+            out.push(RegisteredType {
+                record: to_record(model)?,
+                outcome: TypeOutcome::Updated,
+                basis: Some(basis),
+                change: Some(change),
+            });
+            continue;
+        }
+
+        let revision = model.revision.saturating_add(1);
+        let written = gts_type::Entity::update_many()
+            .col_expr(
+                gts_type::Column::TypeSchema,
+                Expr::value(descriptor.schema.clone()),
+            )
+            .col_expr(
+                gts_type::Column::EffectiveTraits,
+                Expr::value(traits_json.clone()),
+            )
+            .col_expr(
+                gts_type::Column::Revision,
+                Expr::col(gts_type::Column::Revision).add(1),
+            )
+            .col_expr(
+                gts_type::Column::UpdatedAt,
+                Expr::value(time::OffsetDateTime::now_utc()),
+            )
+            .filter(
+                Condition::all()
+                    .add(gts_type::Column::Id.eq(model.id))
+                    .add(gts_type::Column::Revision.eq(model.revision)),
+            )
+            .secure()
+            .scope_with(scope)
+            .exec(tx)
+            .await
+            .map_err(map_scope_err)?;
+        revision_moved(written.rows_affected, &descriptor.type_id)?;
+        // A read at the previous revision could refuse a filter this definition
+        // admits, or accept a payload it now rejects. That is exactly what the
+        // revision exists to fence, so an accepted update advances it — once
+        // per updated type, inside the same transaction. A `created` type
+        // changes no existing read and leaves the counter alone, as
+        // registration always has.
+        super::ingest::bump_revision(tenant, scope, tx).await?;
+        out.push(RegisteredType {
+            record: written_record(&model, &descriptor, revision),
+            outcome: TypeOutcome::Updated,
+            basis: Some(basis),
+            change: Some(change),
+        });
+    }
+    Ok(out)
+}
+
+/// The candidate being admitted, and what the caller offered with it.
+struct Candidate<'a> {
+    descriptor: &'a ontology::TypeDescriptor,
+    ancestors: &'a [(String, serde_json::Value)],
+    /// The interned id of the registered type this candidate replaces.
+    interned: i32,
+    migration: Option<&'a graph_storage_sdk::models::MigrationSpec>,
+}
+
+/// Carry out the decision, and say on what ground the change is admitted.
+///
+/// `Ok(None)` is a dry run's refusal: `change` carries the reason and the
+/// caller reports it. A write refuses by returning `Err`, which rolls the
+/// transaction back — the two row-reading grounds both validate before they
+/// write, and neither leaves a half-applied type behind.
+async fn admit(
+    who: super::evolution::Migrator<'_>,
+    tx: &impl toolkit_db::secure::DBRunner,
+    candidate: &Candidate<'_>,
+    decision: evolution::Decision,
+    limits: UpdateLimits,
+    change: &mut TypeChange,
+) -> Result<Option<AdmissionBasis>, GraphStoreError> {
+    let descriptor = candidate.descriptor;
+    match decision {
+        evolution::Decision::Refuse => Ok(None),
+        evolution::Decision::Accept => {
+            change.admissible = true;
+            Ok(Some(AdmissionBasis::SchemaProved))
+        }
+        evolution::Decision::Revalidate | evolution::Decision::Migrate => {
+            let rows =
+                super::evolution::count_live(who.scope, tx, descriptor.kind, candidate.interned)
+                    .await?;
+            change.rows = Some(rows);
+            if let Some(refusal) = row_ceiling(&descriptor.type_id, rows, limits.bound(decision)) {
+                if who.dry_run {
+                    change.diagnostics.push(refusal.diagnostic);
+                    return Ok(None);
+                }
+                return Err(refusal.error);
+            }
+            let validator = chain_validator(candidate.ancestors, descriptor)?;
+            let bounds = super::evolution::ScanBounds {
+                batch: limits.batch,
+                max_reported: limits.max_reported,
+                budget: limits.budget,
+            };
+
+            if decision == evolution::Decision::Revalidate {
+                // What the schemas could not prove, the rows may still
+                // satisfy. A claim about *these* rows, reported as its own
+                // basis and never cached as a verdict about the type.
+                let failures = super::evolution::revalidate(
+                    who.scope,
+                    tx,
+                    &descriptor.type_id,
+                    descriptor.kind,
+                    candidate.interned,
+                    &validator,
+                    bounds,
+                )
+                .await?;
+                if failures.is_empty() {
+                    change.admissible = true;
+                    return Ok(Some(AdmissionBasis::DataBacked {
+                        rows_validated: rows,
+                    }));
+                }
+                if !who.dry_run {
+                    return Err(GraphStoreError::Validation { items: failures });
+                }
+                report_rows(change, &failures, "stored_row_invalid");
+                return Ok(None);
+            }
+
+            // A migration: the caller stated what to do with the data, so the
+            // question becomes whether the rows fit *once the steps have run*
+            // — answered the only honest way, by running them and validating
+            // the result before writing.
+            let Some(spec) = candidate.migration else {
+                return Err(GraphStoreError::Internal(
+                    "the rule asked for a migration where none was declared".to_owned(),
+                ));
+            };
+            let plan = crate::domain::migration::compile(spec).map_err(|error| {
+                GraphStoreError::InvalidQuery {
+                    what: error.to_string(),
+                }
+            })?;
+            let outcome = super::evolution::migrate(
+                who,
+                tx,
+                super::evolution::Migrating {
+                    type_id: &descriptor.type_id,
+                    kind: descriptor.kind,
+                    interned: candidate.interned,
+                    plan: &plan,
+                    validator: &validator,
+                    full_text_search: &descriptor.effective_traits.full_text_search,
+                    vectorized: !descriptor.effective_traits.vector_search.is_empty(),
+                },
+                bounds,
+            )
+            .await?;
+            change.rows_rewritten = Some(outcome.rows_rewritten);
+            if outcome.failures.is_empty() {
+                change.admissible = true;
+                return Ok(Some(AdmissionBasis::Migrated {
+                    rows_scanned: outcome.rows_scanned,
+                    rows_rewritten: outcome.rows_rewritten,
+                }));
+            }
+            if !who.dry_run {
+                return Err(GraphStoreError::Validation {
+                    items: outcome.failures,
+                });
+            }
+            report_rows(change, &outcome.failures, "row_invalid_after_migration");
+            Ok(None)
+        }
+    }
+}
+
+/// Fold offending rows into the dry run's diagnostics.
+fn report_rows(
+    change: &mut TypeChange,
+    failures: &[graph_storage_sdk::models::ItemError],
+    finding: &str,
+) {
+    for failure in failures {
+        change
+            .diagnostics
+            .push(graph_storage_sdk::models::SchemaDiagnostic {
+                location: failure.pointer.clone().unwrap_or_default(),
+                finding: finding.to_owned(),
+                message: failure.message.clone(),
+            });
+    }
+}
+
+/// A refusal that a write raises and a dry run reports.
+struct Ceiling {
+    error: GraphStoreError,
+    diagnostic: graph_storage_sdk::models::SchemaDiagnostic,
+}
+
+impl UpdateLimits {
+    /// The bound this pass runs under, and the key that sets it.
+    ///
+    /// Two bounds rather than one because the passes run at different rates
+    /// and only one of them writes: re-validation reads ~19 000 rows/s, a
+    /// migration rewrites ~1 900 (one statement per changed row, measured on
+    /// a stand). Under a gateway that kills a synchronous request at 30 s, a
+    /// shared ceiling sized for the first admits a migration that does all of
+    /// its work and is then killed — the work rolls back, and the caller hears
+    /// about a timeout rather than about a bound.
+    fn bound(self, decision: evolution::Decision) -> (u64, &'static str) {
+        if decision == evolution::Decision::Migrate {
+            (self.max_migration_rows, "type_migration_max_rows")
+        } else {
+            (self.max_rows, "type_update_max_rows")
+        }
+    }
+}
+
+/// `None` while the type fits inside the synchronous bound for this pass.
+///
+/// The bound is not the gear's own deadline: `api-gateway` kills a synchronous
+/// request at 30 s whatever this gear is configured with, so the ceiling is
+/// what keeps a row-reading update inside a request that can actually answer.
+fn row_ceiling(type_id: &str, rows: u64, bound: (u64, &str)) -> Option<Ceiling> {
+    let (max_rows, key) = bound;
+    if rows <= max_rows {
+        return None;
+    }
+    let what = format!(
+        "type `{type_id}` has {rows} live rows; one synchronous pass handles at most \
+         {max_rows} (`{key}`)"
+    );
+    Some(Ceiling {
+        error: GraphStoreError::LimitExceeded { what: what.clone() },
+        diagnostic: graph_storage_sdk::models::SchemaDiagnostic {
+            location: "$".to_owned(),
+            finding: "row_ceiling_exceeded".to_owned(),
+            message: what,
+        },
+    })
+}
+
+/// A validator for the candidate, with its ancestors resolvable.
+///
+/// The same validator ingest would compile for this type once the candidate is
+/// registered — which is the point: a row admitted here must be a row the next
+/// ingest of the same content would also admit.
+fn chain_validator(
+    ancestors: &[(String, serde_json::Value)],
+    descriptor: &ontology::TypeDescriptor,
+) -> Result<ontology::ChainValidator, GraphStoreError> {
+    let mut chain: Vec<(String, serde_json::Value)> = ancestors.to_vec();
+    chain.push((descriptor.type_id.clone(), descriptor.schema.clone()));
+    ontology::ChainValidator::compile(&descriptor.schema, chain)
+        .map_err(|error| invalid_candidate(&descriptor.type_id, error.to_string()))
+}
+
+/// The record a dry run reports for a type it did not write.
+fn dry_record(
+    descriptor: &ontology::TypeDescriptor,
+    traits_json: &serde_json::Value,
+) -> TypeRecord {
+    TypeRecord {
+        type_id: descriptor.type_id.clone(),
+        type_uuid: descriptor.type_uuid,
+        kind: descriptor.kind,
+        is_abstract: descriptor.is_abstract,
+        schema: descriptor.schema.clone(),
+        effective_traits: traits_from_json(traits_json),
+        created_at: time::OffsetDateTime::now_utc(),
+        revision: 0,
+    }
+}
+
+fn new_type_change(type_id: &str) -> TypeChange {
+    TypeChange {
+        type_id: type_id.to_owned(),
+        state: TypeChangeState::New,
+        backward: "compatible".to_owned(),
+        forward: "compatible".to_owned(),
+        diagnostics: Vec::new(),
+        traits_changed: Vec::new(),
+        rows: None,
+        rows_rewritten: None,
+        levels_not_evolvable_in_place: Vec::new(),
+        migration_required: false,
+        admissible: true,
+    }
+}
+
+/// The row as it stands after an accepted update.
+///
+/// Built from what was just written rather than read back: the values are in
+/// hand, and a second SELECT inside the transaction would report the same row
+/// at the cost of a round trip per updated type in a 415-type batch.
+fn written_record(
+    stored: &gts_type::Model,
+    descriptor: &ontology::TypeDescriptor,
+    revision: i32,
+) -> TypeRecord {
+    TypeRecord {
+        type_id: descriptor.type_id.clone(),
+        type_uuid: stored.gts_type_uuid,
+        kind: descriptor.kind,
+        is_abstract: descriptor.is_abstract,
+        schema: descriptor.schema.clone(),
+        effective_traits: descriptor.effective_traits.clone(),
+        created_at: stored.created_at,
+        revision,
+    }
+}
+
+fn unchanged_type_change(type_id: &str, traits_changed: Vec<TraitChange>) -> TypeChange {
+    TypeChange {
+        type_id: type_id.to_owned(),
+        state: TypeChangeState::Unchanged,
+        backward: "compatible".to_owned(),
+        forward: "compatible".to_owned(),
+        diagnostics: Vec::new(),
+        traits_changed,
+        rows: None,
+        rows_rewritten: None,
+        levels_not_evolvable_in_place: Vec::new(),
+        migration_required: false,
+        admissible: true,
+    }
+}
+
+pub async fn get_type(
+    store: &PgGraphStore,
+    ctx: &StoreCtx<'_>,
+    id: &GtsTypeId,
+) -> Result<TypeRecord, GraphStoreError> {
+    let conn = store.db().conn().map_err(|error| map_db_error(&error))?;
+    let model = gts_type::Entity::find()
+        .secure()
+        .scope_with(ctx.scope)
+        .filter(Condition::all().add(gts_type::Column::GtsTypeId.eq(id.clone())))
+        .one(&conn)
+        .await
+        .map_err(map_scope_err)?
+        .ok_or(GraphStoreError::NotFound)?;
+    to_record(model)
+}
+
+pub async fn list_types(
+    store: &PgGraphStore,
+    ctx: &StoreCtx<'_>,
+    query: TypeQuery,
+) -> Result<Page<TypeRecord>, GraphStoreError> {
+    let conn = store.db().conn().map_err(|error| map_db_error(&error))?;
+    let limit = query.top.unwrap_or(store.config().projection_max_page) as usize;
+
+    // Keyset paging on the ordering column. The catalogue is deliberately not
+    // an `OData` collection (§ 3.3), so the token is not `CursorV1`: it is the
+    // last identifier the page reached, which the caller has already been
+    // shown.
+    //
+    // The page is *filled* rather than merely cut. The GTS pattern is matched
+    // in Rust — an identifier must never reach a `LIKE` — so a slice of rows
+    // can lose all of them to the filter, and returning that as an empty page
+    // with a continuation token would be a page nobody reads: the convention
+    // every client follows is to stop when `items` is empty, and it would
+    // then miss every match after the gap. So the scan continues until the
+    // page is full or the rows run out.
+    let mut items = Vec::new();
+    let mut after = query.cursor.clone();
+    // Where the scan got to, whether or not anything matched. This is what a
+    // continuation has to be built from: a cursor taken from the last
+    // *matching* row would be right for a page that filled and wrong for one
+    // that ran out of passes, and the second case is the one that loses
+    // types.
+    let mut reached_overall = None;
+    let mut exhausted_catalogue = false;
+    // Bounded: each pass reads at least one row or ends the loop, and the
+    // pass count is capped so a pathological pattern cannot walk a huge
+    // catalogue inside one request.
+    for _ in 0..MAX_CATALOGUE_PASSES {
+        if items.len() >= limit {
+            break;
+        }
+        // Each pass is a fresh statement, so this loop has the same shape as
+        // a traversal's hops and the same rule applies: a pass not started is
+        // work not done.
+        //
+        // Unlike a traversal it *breaks* rather than failing, and the
+        // difference is the cursor. A catalogue page is already allowed to be
+        // short and to carry a continuation, so stopping early is an answer
+        // the caller can act on rather than a degraded one -- which a partial
+        // traversal is not, having nothing to resume from. Returning an error
+        // here instead would throw away the passes already paid for.
+        //
+        // Unless there are none. A break before the first pass answers with
+        // an empty page and no cursor, which reads as "the catalogue ends
+        // here" -- the same silent loss in a different shape. With nothing to
+        // hand back there is nothing to resume from either, so that is the
+        // refusal case.
+        if ctx.budget.is_exhausted() {
+            if reached_overall.is_none() {
+                return Err(GraphStoreError::Deadline);
+            }
+            break;
+        }
+        let mut select = gts_type::Entity::find()
+            .secure()
+            .scope_with(ctx.scope)
+            .order_by(gts_type::Column::GtsTypeId, sea_orm::Order::Asc);
+        if let Some(kind) = query.kind {
+            select =
+                select.filter(Condition::all().add(gts_type::Column::Kind.eq(kind_to_str(kind))));
+        }
+        if let Some(cursor) = &after {
+            select =
+                select.filter(Condition::all().add(gts_type::Column::GtsTypeId.gt(cursor.clone())));
+        }
+        // A slice the size of what is still wanted, plus one row of
+        // lookahead so the loop can tell "the catalogue ends here" from
+        // "there is more after this".
+        let wanted = limit - items.len();
+        let slice = select
+            .limit(u64::try_from(wanted).unwrap_or(u64::MAX) + 1)
+            .all(&conn)
+            .await
+            .map_err(map_scope_err)?;
+        if slice.is_empty() {
+            exhausted_catalogue = true;
+            break;
+        }
+        let exhausted = slice.len() <= wanted;
+
+        // Only the wanted rows are *examined*; the lookahead row is read and
+        // put back. Advancing past a row the filter never saw would skip
+        // every match it carried — which is how the first version of this
+        // loop lost types silently.
+        let mut examined = slice;
+        examined.truncate(wanted);
+        let reached = examined
+            .last()
+            .map(|model| model.gts_type_id.clone())
+            .unwrap_or_default();
+
+        for model in examined {
+            if let Some(pattern) = &query.pattern {
+                let patterns = vec![pattern.clone()];
+                let matches = ontology::matches_any_pattern(&model.gts_type_id, &patterns)
+                    .map_err(|error| GraphStoreError::LimitExceeded {
+                        what: error.to_string(),
+                    })?;
+                if !matches {
+                    continue;
+                }
+            }
+            items.push(to_record(model)?);
+        }
+        reached_overall = Some(reached.clone());
+
+        if exhausted {
+            // Nothing beyond this slice, so nothing to continue to.
+            exhausted_catalogue = true;
+            break;
+        }
+        after = Some(reached);
+    }
+
+    // A continuation is offered whenever rows remain — including the case the
+    // cap creates, where sixteen passes examined nothing the pattern admits
+    // and the page is empty. Reporting no cursor there would tell a client
+    // walking a large catalogue that it had reached the end, and every match
+    // beyond that point would be invisible for good. An empty page with a
+    // cursor is the lesser answer: the client continues, and the next request
+    // resumes exactly where this one stopped looking.
+    let next_cursor = if exhausted_catalogue {
+        None
+    } else {
+        reached_overall
+    };
+
+    let revision = crate::infra::store::reads::revision(store, ctx).await?;
+    Ok(Page {
+        items,
+        next_cursor,
+        revision,
+    })
+}
+
+/// How many slices one catalogue page may read before it answers with what it
+/// has. A pattern that matches nothing would otherwise walk the whole
+/// catalogue inside one request; the caller gets a short page and a cursor,
+/// which is the same contract as any other short page.
+pub const MAX_CATALOGUE_PASSES: usize = 16;
+
+/// Report a type-revision compare-and-set that matched nothing.
+///
+/// The revision is written as `revision + 1` computed by `PostgreSQL` from the
+/// row's own value, and filtered on the revision this transaction read.
+/// Computing `N + 1` here and writing it as a literal is the read-compute-write
+/// that was fixed for the graph revision and for `node.version` earlier in this
+/// work: two registrations both read `N`, both write `N + 1`, and two committed
+/// definitions share one revision. A consumer that caches by revision then
+/// holds one number for two different schemas, which is the fencing the column
+/// exists to provide, gone.
+///
+/// The filter is what makes the loser visible. Without it the database-side
+/// increment alone would still advance twice, but the value this call reports
+/// back would be a guess, since the row's value at write time is not the one
+/// that was read.
+fn revision_moved(rows_affected: u64, type_id: &str) -> Result<(), GraphStoreError> {
+    if rows_affected == 0 {
+        return Err(GraphStoreError::Conflict {
+            reason: format!(
+                "type `{type_id}` was registered again while this registration was being \
+                 decided; re-read it and retry against the revision it has now"
+            ),
+        });
+    }
+    Ok(())
+}
+
+pub async fn resolve_type_set(
+    store: &PgGraphStore,
+    ctx: &StoreCtx<'_>,
+    patterns: &[String],
+) -> Result<TypeIdSet, GraphStoreError> {
+    let conn = store.db().conn().map_err(|error| map_db_error(&error))?;
+    let models = gts_type::Entity::find()
+        .secure()
+        .scope_with(ctx.scope)
+        .project_all(&conn, |query| {
+            type_name_columns(query).into_model::<TypeName>()
+        })
+        .await
+        .map_err(map_scope_err)?;
+
+    let mut set = std::collections::BTreeSet::new();
+    for model in models {
+        let matches =
+            ontology::matches_any_pattern(&model.gts_type_id, patterns).map_err(|error| {
+                GraphStoreError::LimitExceeded {
+                    what: error.to_string(),
+                }
+            })?;
+        if matches {
+            set.insert(model.gts_type_id);
+        }
+    }
+    Ok(TypeIdSet(set))
+}
+
+/// Interned ids for the given GTS identifiers, for the write path.
+pub async fn interned_ids(
+    scope: &toolkit_security::AccessScope,
+    runner: &impl toolkit_db::secure::DBRunner,
+    type_ids: &[String],
+) -> Result<std::collections::BTreeMap<String, (i32, uuid::Uuid, serde_json::Value)>, GraphStoreError>
+{
+    let models = gts_type::Entity::find()
+        .secure()
+        .scope_with(scope)
+        .filter(Condition::all().add(gts_type::Column::GtsTypeId.is_in(type_ids.to_vec())))
+        .project_all(runner, |query| {
+            type_meta_columns(query).into_model::<TypeMeta>()
+        })
+        .await
+        .map_err(map_scope_err)?;
+    Ok(models
+        .into_iter()
+        .map(|m| (m.gts_type_id, (m.id, m.gts_type_uuid, m.effective_traits)))
+        .collect())
+}
+
+/// Count of registered types, used by the readiness surface.
+pub async fn count(store: &PgGraphStore, ctx: &StoreCtx<'_>) -> Result<u64, GraphStoreError> {
+    let conn = store.db().conn().map_err(|error| map_db_error(&error))?;
+    gts_type::Entity::find()
+        .secure()
+        .scope_with(ctx.scope)
+        .count(&conn)
+        .await
+        .map_err(map_scope_err)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn limits() -> UpdateLimits {
+        UpdateLimits {
+            max_rows: 100_000,
+            max_migration_rows: 25_000,
+            batch: 2_000,
+            max_reported: 50,
+            budget: graph_storage_sdk::models::RemainingBudget::starting_now(
+                std::time::Duration::from_secs(10),
+            ),
+        }
+    }
+
+    /// The two passes run at different rates under one 30 s gateway cap, so
+    /// they cannot share a ceiling: at the measured ~1 900 rows/s a migration
+    /// of 100 000 rows would do 52 s of work and be killed. The refusal has to
+    /// name the key that actually applies, or an operator raises the wrong one.
+    #[test]
+    fn each_pass_is_bounded_by_its_own_ceiling_and_names_it() {
+        let migration = row_ceiling(
+            "gts.acme.gs._.thing.v1~",
+            40_000,
+            limits().bound(evolution::Decision::Migrate),
+        )
+        .expect("40 000 rows is past the migration ceiling");
+        assert!(
+            migration
+                .diagnostic
+                .message
+                .contains("type_migration_max_rows"),
+            "{}",
+            migration.diagnostic.message
+        );
+        assert!(migration.diagnostic.message.contains("25000"));
+
+        // The same size is well inside the read-only pass.
+        assert!(
+            row_ceiling(
+                "gts.acme.gs._.thing.v1~",
+                40_000,
+                limits().bound(evolution::Decision::Revalidate),
+            )
+            .is_none(),
+            "40 000 rows is ~2 s of re-validation"
+        );
+
+        let revalidation = row_ceiling(
+            "gts.acme.gs._.thing.v1~",
+            250_000,
+            limits().bound(evolution::Decision::Revalidate),
+        )
+        .expect("250 000 rows is past the read ceiling too");
+        assert!(
+            revalidation
+                .diagnostic
+                .message
+                .contains("type_update_max_rows"),
+            "{}",
+            revalidation.diagnostic.message
+        );
+    }
+
+    /// The one place a closed enum is decoded back out of storage, and the
+    /// arm that refuses an unknown spelling.
+    ///
+    /// `gts_type.kind` is `TEXT` under a `CHECK`, so a value outside the set
+    /// arrives only from schema drift or a corrupted row -- and the one
+    /// answer that is never right is to pick a variant anyway. A default arm
+    /// here would read an unknown kind as a node and quietly file a row under
+    /// the wrong half of the ontology; the Closed Enum Contract's third rule
+    /// exists to forbid exactly that, and until now nothing held it.
+    #[test]
+    fn an_unknown_persisted_kind_is_corruption_rather_than_a_guess() {
+        for (value, expected) in [
+            ("node", TypeKind::Node),
+            ("edge", TypeKind::Edge),
+            ("attribute", TypeKind::Attribute),
+        ] {
+            assert_eq!(
+                kind_from_str(value).expect("a spelling in the set decodes"),
+                expected
+            );
+        }
+
+        for unknown in ["", "Node", "node ", "relation", "attributes"] {
+            match kind_from_str(unknown) {
+                Err(GraphStoreError::Corrupt { reason }) => assert!(
+                    reason.contains(unknown),
+                    "the refusal names the offending value: {reason}"
+                ),
+                other => panic!("`{unknown}` must not decode to a known kind: {other:?}"),
+            }
+        }
+    }
+}

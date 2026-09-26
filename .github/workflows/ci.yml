@@ -58,6 +58,8 @@ jobs:
       rust:   ${{ steps.filter.outputs.rust }}
       fips:   ${{ steps.filter.outputs.fips }}
       magika: ${{ steps.filter.outputs.magika }}
+      onnx_embedding: ${{ steps.filter.outputs.onnx_embedding }}
+      graph_storage: ${{ steps.filter.outputs.graph_storage }}
       dylint: ${{ steps.filter.outputs.dylint }}
       deps:   ${{ steps.filter.outputs.deps }}
       ci:     ${{ steps.filter.outputs.ci }}
@@ -91,6 +93,16 @@ jobs:
               - 'libs/rustls-*/**'
             magika:
               - 'gears/file-parser/**'
+            onnx_embedding:
+              - 'gears/graph-storage/onnx-embedding-plugin/**'
+              - 'gears/graph-storage/graph-storage-sdk/**'
+              # This lane also runs `cargo check -p cf-gears-graph-storage
+              # --features onnx`, which compiles the core gear's own
+              # `#[cfg(feature = "onnx")]` wiring. A change there that breaks
+              # it would otherwise reach main unbuilt.
+              - 'gears/graph-storage/graph-storage/**'
+            graph_storage:
+              - 'gears/graph-storage/**'
             dylint:
               - 'tools/dylint_lints/**'
             deps:
@@ -540,6 +552,231 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: cargo check --target x86_64-pc-windows-msvc -p cf-gears-toolkit-http --features fips
+
+  # The gear's whole suite against a real PostgreSQL 19 with pgvector, and its
+  # own coverage floor, in one pass.
+  #
+  # Two things make this job exist. The lane needs a server that has both
+  # SQL/PGQ and pgvector, and no published image carries both, so the image is
+  # built here from the gear's own Dockerfile (`test-containers` should publish
+  # one; until it does, this is a `docker build`, not a blocked lane). And
+  # `nfr-code-coverage` asks for 85% line coverage "enforced in CI": the
+  # workspace coverage job reports to Codecov and gates on nothing per crate,
+  # while the shared script's project-wide threshold is 80. Without the
+  # PostgreSQL lane the figure is ~55%, because the built-in store is the half
+  # of the gear only a real server exercises — so measuring and running are the
+  # same job or neither is honest.
+  test-graph-storage:
+    name: graph-storage (PostgreSQL 19 + pgvector, coverage floor)
+    needs: changes
+    if: >-
+      !cancelled()
+      && (needs.changes.result != 'success'
+      || needs.changes.outputs.graph_storage == 'true'
+      || needs.changes.outputs.deps == 'true'
+      || needs.changes.outputs.ci == 'true'
+      || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    # The Codecov upload below asks for OIDC off pull requests, and an OIDC
+    # token needs `id-token: write` — the workflow default is `contents: read`
+    # alone, so without this the token request is denied. That upload also sets
+    # `fail_ci_if_error` on the same events, so the denial would fail the job
+    # after the tests and the coverage floor had both passed. The `coverage`
+    # job carries the same pair for the same reason.
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust toolchain (with llvm-tools)
+        uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
+        with:
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}
+          components: llvm-tools-preview
+
+      - name: Pin nightly for all cargo commands
+        run: echo "RUSTUP_TOOLCHAIN=${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}" >> "$GITHUB_ENV"
+
+      - name: Cache Cargo/target
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-bin: false
+          cache-targets: false
+          shared-key: pr-${{ runner.os }}-nightly-${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}-llvm-cov
+
+      - name: Install cargo-llvm-cov and nextest
+        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        with:
+          tool: cargo-llvm-cov,cargo-nextest
+
+      # PostgreSQL 19 plus a pinned pgvector, on the official base so the
+      # stock entrypoint and server arguments testcontainers drives are intact.
+      - name: Build the PostgreSQL 19 + pgvector image
+        run: |
+          docker build \
+            -f gears/graph-storage/docker/pg19-pgvector.Dockerfile \
+            -t pg19-pgvector:ci \
+            gears/graph-storage/docker
+
+      # REQUIRED turns a skip into a failure: this lane exists to run against
+      # a real server, and a green run that quietly skipped it proves nothing.
+      # The thread bound is the lane's own — every case gets its own server,
+      # and more than a couple at once is more than the runner will take.
+      #
+      # The remote embedding plugin is here rather than left to the workspace
+      # coverage job, which gates on nothing: it is shipped as a first-class
+      # deliverable of this gear and it holds the credential handling, the URL
+      # validation and the retry classification, which is exactly the code a
+      # floor is worth having on. Its contract suite answers a mock endpoint
+      # and needs nothing this lane does not already have.
+      #
+      # The ONNX plugin is not, and cannot be from here: its tests need a real
+      # ONNX Runtime and a real model, which only its own lane downloads, so a
+      # figure measured here would be the coverage of a suite that skipped.
+      #
+      # And the gear is built with `remote` here, so the boot path that turns
+      # its configuration into a remote provider is executed, not only
+      # compiled. The plugins' own suites construct their providers directly,
+      # which left `select_embedding_provider` and the gear's feature arms
+      # linted by the all-features clippy pass and run by nothing.
+      - name: Test and enforce the coverage floor
+        timeout-minutes: 30
+        env:
+          RUSTFLAGS: "-C debuginfo=0 --cfg coverage_nightly"
+          GEARS_TEST_PG_GRAPH_IMAGE: "pg19-pgvector:ci"
+          GEARS_TEST_PG_GRAPH_REQUIRED: "1"
+        run: |
+          cargo llvm-cov nextest \
+            -p cf-gears-graph-storage -p cf-gears-graph-storage-sdk \
+            -p cf-gears-graph-storage-remote-embedding-plugin \
+            --features cf-gears-graph-storage/remote \
+            --test-threads=2 \
+            --lcov --output-path lcov.info --fail-under-lines 85
+
+      # The workspace coverage job cannot run this gear's PostgreSQL lane — it
+      # has no pgvector image — so in its report the built-in store reads as
+      # untested and the patch coverage of any change to it is wrong by a wide
+      # margin. Codecov merges uploads per commit, so sending this job's report
+      # as well is what makes the repository's own number true for this gear
+      # rather than an artefact of which lane happened to run.
+      # `if: always()` because the step above both writes the report and
+      # enforces the floor: a run that falls below 85% exits non-zero, and
+      # without this the report it just wrote — the one that shows *where* the
+      # coverage went — would never be uploaded. The job still fails; the
+      # evidence arrives anyway.
+      - name: Upload to Codecov
+        if: always()
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        with:
+          use_oidc: ${{ github.event_name != 'pull_request' }}
+          files: lcov.info
+          flags: graph-storage
+          disable_search: true
+          fail_ci_if_error: ${{ github.event_name != 'pull_request' }}
+
+  # Runs the graph-storage ONNX embedding provider against a real model, which
+  # is the only way this crate is checked at all: without artifacts its tests
+  # skip, and a skipped test proves nothing about pooling, tokenization or the
+  # vectors that come out. Both downloads are pinned by SHA-256; the runtime is
+  # fetched the same way `test-magika` fetches it, and for the same reason
+  # (`ort`'s `download-binaries` conflicts with the workspace's `load-dynamic`
+  # and deadlocks the rc we pin).
+  test-onnx-embedding:
+    name: ONNX embedding provider
+    needs: changes
+    if: >-
+      !cancelled()
+      && (needs.changes.result != 'success'
+      || needs.changes.outputs.onnx_embedding == 'true'
+      || needs.changes.outputs.deps == 'true'
+      || needs.changes.outputs.ci == 'true'
+      || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    env:
+      ONNXRUNTIME_VERSION: "1.29.0"
+      ONNXRUNTIME_SHA256: "c3fddc4f139a045b0c4902c57410f0694f1c2fdf9b6939fbe38b1aeae7cd14ba"
+      # sentence-transformers/all-MiniLM-L6-v2: the MiniLM-class model
+      # ADR-0005 names, 384 dimensions, mean-pooled and L2-normalized.
+      MODEL_URL: "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model.onnx"
+      MODEL_SHA256: "6fd5d72fe4589f189f8ebc006442dbb529bb7ce38f8082112682524616046452"
+      TOKENIZER_URL: "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/tokenizer.json"
+      TOKENIZER_SHA256: "be50c3628f2bf5bb5e3a7f17b1f74611b2561a3a27eeab05e5aa30f411572037"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust toolchain from rust-toolchain.toml
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup show
+
+      - name: Cache Cargo/target
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        with:
+          cache-bin: false
+          cache-targets: false
+          shared-key: pr-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-onnx
+
+      - name: Fetch ONNX Runtime shared library
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -sL --fail -o /tmp/onnxruntime.tgz \
+            "https://github.com/microsoft/onnxruntime/releases/download/v${ONNXRUNTIME_VERSION}/onnxruntime-linux-x64-${ONNXRUNTIME_VERSION}.tgz"
+          echo "${ONNXRUNTIME_SHA256}  /tmp/onnxruntime.tgz" | sha256sum --check
+          tar xzf /tmp/onnxruntime.tgz -C /tmp
+          echo "ORT_DYLIB_PATH=/tmp/onnxruntime-linux-x64-${ONNXRUNTIME_VERSION}/lib/libonnxruntime.so" >> "$GITHUB_ENV"
+
+      - name: Fetch the model and tokenizer
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/minilm
+          curl -sL --fail -o /tmp/minilm/model.onnx "${MODEL_URL}"
+          curl -sL --fail -o /tmp/minilm/tokenizer.json "${TOKENIZER_URL}"
+          echo "${MODEL_SHA256}  /tmp/minilm/model.onnx" | sha256sum --check
+          echo "${TOKENIZER_SHA256}  /tmp/minilm/tokenizer.json" | sha256sum --check
+          echo "GRAPH_STORAGE_ONNX_MODEL=/tmp/minilm/model.onnx" >> "$GITHUB_ENV"
+          echo "GRAPH_STORAGE_ONNX_TOKENIZER=/tmp/minilm/tokenizer.json" >> "$GITHUB_ENV"
+
+      # REQUIRED turns a skip into a failure: this lane exists to run the
+      # model, and a green run that quietly skipped it is worse than no lane.
+      - name: cargo test (ONNX embedding provider)
+        shell: bash
+        timeout-minutes: 15
+        env:
+          GRAPH_STORAGE_ONNX_REQUIRED: "1"
+        run: cargo test -p cf-gears-graph-storage-onnx-embedding-plugin
+
+      # The gear's own ONNX wiring, against the artifacts this lane downloaded:
+      # the plugin suite above loads the provider directly, so without this
+      # nothing ran the configuration-to-provider path an operator boots
+      # through. REQUIRED for the same reason as the step above.
+      - name: cargo test (graph-storage ONNX provider wiring)
+        shell: bash
+        timeout-minutes: 15
+        env:
+          GRAPH_STORAGE_ONNX_REQUIRED: "1"
+        run: "cargo test -p cf-gears-graph-storage --lib --features onnx gear::"
+
+      - name: cargo check (graph-storage with the onnx feature)
+        run: cargo check -p cf-gears-graph-storage --features onnx
 
   # Builds and tests file-parser's optional `magika` feature so it doesn't
   # silently rot. `ort`'s own `download-binaries` feature is NOT used here —
