@@ -45,7 +45,7 @@ impl GithubMirrorClientV1 for LocalClient {
         name: &str,
     ) -> Result<SyncSummary, CanonicalError> {
         self.service
-            .sync_repository(ctx, owner, name)
+            .sync_now(ctx, owner, name)
             .await
             .map_err(CanonicalError::from)
     }

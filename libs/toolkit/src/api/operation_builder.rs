@@ -165,6 +165,9 @@ pub struct ParamSpec {
     pub format: Option<String>,
     /// Optional JSON Schema `minimum`.
     pub minimum: Option<f64>,
+    /// The only values this parameter accepts, rendered as the schema's
+    /// `enum`. Empty means any value of `param_type` will do.
+    pub enum_values: Vec<String>,
 }
 
 impl ParamSpec {
@@ -203,6 +206,7 @@ impl ParamSpec {
             array: false,
             format: None,
             minimum: None,
+            enum_values: Vec::new(),
         }
     }
 
@@ -210,6 +214,25 @@ impl ParamSpec {
     #[must_use]
     pub fn required(mut self, required: bool) -> Self {
         self.required = required;
+        self
+    }
+
+    /// The closed set of values this parameter accepts.
+    ///
+    /// They reach the document as the schema's `enum`, so a client generated
+    /// from the spec gets the set rather than a bare string, and a caller
+    /// reading the document can see what the endpoint takes without trying a
+    /// value to find out.
+    #[must_use]
+    pub fn enum_values<V, I>(mut self, values: I) -> Self
+    where
+        I: IntoIterator<Item = V>,
+        V: AsRef<str>,
+    {
+        self.enum_values = values
+            .into_iter()
+            .map(|value| value.as_ref().to_owned())
+            .collect();
         self
     }
 
@@ -850,6 +873,35 @@ where
                 .required(required)
                 .description(description)
                 .param_type(param_type),
+        );
+        self
+    }
+
+    /// Add a string query parameter that only accepts `values`.
+    ///
+    /// The values reach the document as the parameter's `enum`, so a client
+    /// generated from the spec gets a closed set rather than a bare string,
+    /// and a caller reading the document can see what the endpoint takes
+    /// without trying one.
+    ///
+    /// The parameter stays a string; [`ParamSpec::enum_values`] is what
+    /// narrows it.
+    pub fn query_param_enum<V, I>(
+        mut self,
+        name: impl Into<String>,
+        required: bool,
+        description: impl Into<String>,
+        values: I,
+    ) -> Self
+    where
+        I: IntoIterator<Item = V>,
+        V: AsRef<str>,
+    {
+        self.spec.params.push(
+            ParamSpec::query(name)
+                .required(required)
+                .description(description)
+                .enum_values(values),
         );
         self
     }

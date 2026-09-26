@@ -37,7 +37,12 @@ pub fn register_routes(mut router: Router, openapi: &dyn OpenApiRegistry) -> Rou
         .tag(API_TAG)
         .authenticated()
         .require_license_features::<License>([])
-        .query_param("limit", false, "Maximum number of repositories to return")
+        .query_param_typed(
+            "limit",
+            false,
+            "Maximum number of repositories to return",
+            "integer",
+        )
         .query_param("cursor", false, "Cursor for pagination")
         .handler(handlers::list_repos)
         .json_response_with_schema::<toolkit_odata::Page<dto::RepoDto>>(
@@ -56,18 +61,172 @@ pub fn register_routes(mut router: Router, openapi: &dyn OpenApiRegistry) -> Rou
         .operation_id("github_mirror.v1.sync_repository")
         .summary("Sync a repository from GitHub into the mirror")
         .description(
-            "Fetches the repository plus the first page of its entities from GitHub and              upserts them into the caller's tenant mirror. First slice of the sync engine:              no pagination, conditional requests, or rate-limit budgeting yet.",
+            "Queues a sync of the repository and answers immediately with a session id. \
+             The background worker pages through the repository and every object type in \
+             scope, replays the `ETag` it stored last time so GitHub can answer `304` \
+             instead of resending a page, and waits out a rate limit before carrying \
+             on. What it fetches is upserted into the caller's tenant mirror; poll the \
+             session for the outcome. While a sync of the repository is queued or \
+             running, a request on the same terms joins it and one with a different \
+             scope or `since` is refused with `409`.",
         )
         .tag(API_TAG)
         .authenticated()
         .require_license_features::<License>([])
         .path_param("owner", "Repo owner login")
         .path_param("name", "Repo name")
+        .query_param_typed("force", false, "Bypass the HTTP cache and re-fetch everything", "boolean")
+        .query_param(
+            "include",
+            false,
+            "Comma-separated object types to collect, e.g. `issues,pull_requests`",
+        )
+        .query_param("actions_scope", false, "`all`, `open` or `none` for CI results")
+        .query_param("reactions_scope", false, "`all`, `open` or `none` for reactions")
+        .query_param("timeline_scope", false, "`all`, `open` or `none` for timeline events")
+        .query_param(
+            "since",
+            false,
+            "RFC3339 instant; closed issues and pull requests older than this are not collected",
+        )
         .handler(handlers::sync_repository)
-        .json_response_with_schema::<dto::SyncSummaryDto>(
+        .json_response_with_schema::<dto::SyncAcceptedDto>(
+            openapi,
+            StatusCode::ACCEPTED,
+            "Sync queued; the body carries the session id to poll. A repeat call on the \
+             same terms for a repository whose sync is still queued or running answers \
+             with that existing session instead of starting another",
+        )
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_404(openapi)
+        .error_409(openapi)
+        .error_500(openapi)
+        .register(router, openapi);
+
+    router = OperationBuilder::delete("/github-mirror/v1/cache")
+        .operation_id("github_mirror.v1.clear_cache")
+        .summary("Drop cached GitHub responses for an owner or a repository")
+        .description(
+            "DESIGN 4's `clear_cache`. Removes raw cached responses so the next sync              re-fetches instead of revalidating; the mirrored rows themselves are left              untouched. Give `repo=owner/name` for one repository or `owner=X` for              everything mirrored under that owner.",
+        )
+        .tag(API_TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .query_param("owner", false, "Clear every repository of this owner")
+        .query_param("repo", false, "Clear only this `owner/name` repository")
+        .handler(handlers::clear_cache)
+        .json_response_with_schema::<dto::CacheClearedDto>(
             openapi,
             StatusCode::OK,
-            "Repo synced into the mirror",
+            "How many cached responses were removed",
+        )
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_500(openapi)
+        .register(router, openapi);
+
+    router = OperationBuilder::post("/github-mirror/v1/sync/resume")
+        .operation_id("github_mirror.v1.resume_syncs")
+        .summary("Re-run repositories still marked in_progress")
+        .description(
+            "PRD 5.2's resume operation. Resume is a re-run, not a restore: each              repository still marked `in_progress` is queued for a fresh sync, and the              cache plus change-detection state are what make that cheap. Answers              immediately with one session id per repository. Pass `repo=owner/name`              to resume a single repository; a repository that is not `in_progress`              has nothing to resume and comes back with `resumed: 0`.",
+        )
+        .tag(API_TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .query_param("repo", false, "Resume only this `owner/name` repository")
+        .query_param_typed("force", false, "Bypass the HTTP cache and re-fetch everything", "boolean")
+        .handler(handlers::resume_syncs)
+        .json_response_with_schema::<dto::ResumeAcceptedDto>(
+            openapi,
+            StatusCode::ACCEPTED,
+            "Resume queued; the body carries one session id per repository",
+        )
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_500(openapi)
+        .register(router, openapi);
+
+    router = OperationBuilder::get("/github-mirror/v1/sync-status")
+        .operation_id("github_mirror.v1.list_repo_sync_status")
+        .summary("Per-repository run status and last-sync time")
+        .tag(API_TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .query_param_enum(
+            "status",
+            false,
+            "Only `in_progress` or only `complete`",
+            ["in_progress", "complete"],
+        )
+        .query_param_typed(
+            "limit",
+            false,
+            "Maximum number of repositories to return",
+            "integer",
+        )
+        .query_param("cursor", false, "`next_cursor` of the previous page")
+        .handler(handlers::list_repo_sync_status)
+        .json_response_with_schema::<toolkit_odata::Page<dto::RepoSyncStatusDto>>(
+            openapi,
+            StatusCode::OK,
+            "Paginated per-repository run statuses",
+        )
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_500(openapi)
+        .register(router, openapi);
+
+    register_session_routes(router, openapi)
+}
+
+/// Session, run-status and per-entity read routes.
+///
+/// Split from [`register_routes`] only to stay under the 200-line cap; the two
+/// halves are one registration pass.
+fn register_session_routes(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
+    router = OperationBuilder::get("/github-mirror/v1/sessions")
+        .operation_id("github_mirror.v1.list_sync_sessions")
+        .summary("List sync sessions, newest first")
+        .tag(API_TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .query_param_typed(
+            "limit",
+            false,
+            "Maximum number of sessions to return",
+            "integer",
+        )
+        .query_param("cursor", false, "`next_cursor` of the previous page")
+        .handler(handlers::list_sync_sessions)
+        .json_response_with_schema::<toolkit_odata::Page<dto::SyncSessionDto>>(
+            openapi,
+            StatusCode::OK,
+            "Paginated list of sync sessions",
+        )
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_500(openapi)
+        .register(router, openapi);
+
+    router = OperationBuilder::get("/github-mirror/v1/sessions/{id}")
+        .operation_id("github_mirror.v1.get_sync_session")
+        .summary("One sync session by id")
+        .tag(API_TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .path_param("id", "Session id, as returned by the sync endpoint")
+        .handler(handlers::get_sync_session)
+        .json_response_with_schema::<dto::SyncSessionDto>(
+            openapi,
+            StatusCode::OK,
+            "The session's current status, progress and duration",
         )
         .error_400(openapi)
         .error_401(openapi)
@@ -89,7 +248,12 @@ pub fn register_routes(mut router: Router, openapi: &dyn OpenApiRegistry) -> Rou
         .path_param("owner", "Repo owner login")
         .path_param("name", "Repo name")
         .path_param("sha", "Commit SHA")
-        .query_param("limit", false, "Maximum number of files to return")
+        .query_param_typed(
+            "limit",
+            false,
+            "Maximum number of files to return",
+            "integer",
+        )
         .handler(handlers::list_commit_files)
         .json_response_with_schema::<toolkit_odata::Page<dto::CommitFileDto>>(
             openapi,
@@ -116,7 +280,7 @@ pub fn register_routes(mut router: Router, openapi: &dyn OpenApiRegistry) -> Rou
         .path_param("owner", "Repo owner login")
         .path_param("name", "Repo name")
         .path_param("number", "Pull request number")
-        .query_param("limit", false, "Maximum number of threads to return")
+        .query_param_typed("limit", false, "Maximum number of threads to return", "integer")
         .handler(handlers::list_review_threads)
         .json_response_with_schema::<toolkit_odata::Page<dto::ReviewThreadDto>>(
             openapi,

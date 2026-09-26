@@ -13,10 +13,6 @@ pub struct Migration;
 /// Wide types on purpose: a single file's patch runs to tens of kilobytes, and
 /// `MySQL`'s plain `TEXT` caps at 64 KB. GitHub itself omits the field for very
 /// large diffs, so the column stays nullable.
-///
-/// Named with a `z_` prefix because the migration runner applies migrations in
-/// **name** order and this one alters a table created by
-/// `pull_request_files_014`.
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {

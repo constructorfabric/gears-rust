@@ -1,10 +1,13 @@
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use async_trait::async_trait;
 use axum::Router;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use toolkit::api::OpenApiRegistry;
+use toolkit::contracts::RunnableCapability;
 use toolkit::{Gear, GearCtx, Healthcheck, HealthcheckResult, RestApiCapability};
-use tracing::info;
+use tracing::{info, warn};
 
 use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
 use github_mirror_sdk::GithubMirrorClientV1;
@@ -14,18 +17,20 @@ use crate::config::GithubMirrorConfig;
 use crate::domain::local_client::LocalClient;
 use crate::domain::ports::github::GithubPort;
 use crate::domain::service::{Service, ServiceConfig};
+use crate::domain::sync::SyncPoolRunner;
 use crate::infra::github::client::GithubClient;
 use crate::infra::storage::sea_orm_repo::{
     SeaOrmBranchRepository, SeaOrmCheckRunRepository, SeaOrmCommentRepository,
     SeaOrmCommitCommentRepository, SeaOrmCommitFileRepository, SeaOrmCommitRepository,
     SeaOrmCommitStatusRepository, SeaOrmContributorRepository, SeaOrmDeploymentRepository,
-    SeaOrmIssueEventRepository, SeaOrmIssueReactionRepository, SeaOrmIssueRepository,
-    SeaOrmIssueTimelineRepository, SeaOrmLabelRepository, SeaOrmMilestoneRepository,
-    SeaOrmPullRequestCommitRepository, SeaOrmPullRequestFileRepository,
-    SeaOrmPullRequestRepository, SeaOrmReleaseRepository, SeaOrmRepoRepository,
-    SeaOrmReviewCommentRepository, SeaOrmReviewRepository, SeaOrmReviewThreadRepository,
-    SeaOrmSyncWriter, SeaOrmTagRepository, SeaOrmWorkflowJobRepository,
-    SeaOrmWorkflowRunRepository,
+    SeaOrmEntityFingerprintRepository, SeaOrmHttpCache, SeaOrmIssueEventRepository,
+    SeaOrmIssueReactionRepository, SeaOrmIssueRepository, SeaOrmIssueTimelineRepository,
+    SeaOrmLabelRepository, SeaOrmMilestoneRepository, SeaOrmPullRequestCommitRepository,
+    SeaOrmPullRequestFileRepository, SeaOrmPullRequestRepository, SeaOrmReleaseRepository,
+    SeaOrmRepoRepository, SeaOrmRepoSyncStatusRepository, SeaOrmReviewCommentRepository,
+    SeaOrmReviewRepository, SeaOrmReviewThreadRepository, SeaOrmSyncSessionRepository,
+    SeaOrmSyncWatermarkRepository, SeaOrmSyncWriter, SeaOrmTagRepository,
+    SeaOrmWorkflowJobRepository, SeaOrmWorkflowRunRepository,
 };
 
 type ConcreteService = Service;
@@ -35,11 +40,13 @@ type ConcreteService = Service;
 #[toolkit::gear(
     name = "github-mirror",
     deps = [authz_resolver],
-    capabilities = [rest, db]
+    capabilities = [rest, db, stateful]
 )]
 #[derive(Default)]
 pub struct GithubMirrorGear {
     service: OnceLock<Arc<ConcreteService>>,
+    sync_cancel_token: Mutex<Option<CancellationToken>>,
+    sync_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl toolkit::contracts::DatabaseCapability for GithubMirrorGear {
@@ -56,6 +63,11 @@ impl Gear for GithubMirrorGear {
         // Fails startup on a malformed or non-HTTP base URL rather than
         // letting every later fetch build garbage requests from it.
         cfg.resolved_api_base_url()
+            .map_err(|e| anyhow::anyhow!("invalid github-mirror config: {e}"))?;
+        // Same reason for the default scope: a deployment that collects nothing
+        // should fail to start, not fail the first sync someone asks for.
+        cfg.scope
+            .validate()
             .map_err(|e| anyhow::anyhow!("invalid github-mirror config: {e}"))?;
         info!(gear = Self::MODULE_NAME, api_base_url = %cfg.api_base_url, "Initializing gear");
 
@@ -87,10 +99,16 @@ impl Gear for GithubMirrorGear {
         let issue_reactions = Arc::new(SeaOrmIssueReactionRepository::new(Arc::clone(&db)));
         let check_runs = Arc::new(SeaOrmCheckRunRepository::new(Arc::clone(&db)));
         let issue_timeline = Arc::new(SeaOrmIssueTimelineRepository::new(Arc::clone(&db)));
-        let github: Arc<dyn GithubPort> = Arc::new(GithubClient::new(
-            cfg.api_base_url.clone(),
-            cfg.resolved_token()?,
-        )?);
+        let sync_sessions = Arc::new(SeaOrmSyncSessionRepository::new(Arc::clone(&db)));
+        let repo_sync_status = Arc::new(SeaOrmRepoSyncStatusRepository::new(Arc::clone(&db)));
+        // Conditional requests: a stored ETag replayed as If-None-Match turns a
+        // repeat sync into 304s, which GitHub does not charge against the rate
+        // limit (#4630).
+        let http_cache = Arc::new(SeaOrmHttpCache::new(Arc::clone(&db), cfg.cache_compression));
+        let github: Arc<dyn GithubPort> = Arc::new(
+            GithubClient::with_cache(cfg.api_base_url.clone(), cfg.resolved_token()?, http_cache)?
+                .with_max_concurrent_requests(cfg.max_concurrent_requests),
+        );
 
         let authz = ctx
             .client_hub()
@@ -126,11 +144,21 @@ impl Gear for GithubMirrorGear {
             issue_reactions,
             check_runs,
             issue_timeline,
+            sync_sessions,
+            repo_sync_status,
             Arc::new(SeaOrmSyncWriter::new(Arc::clone(&db))),
+            Arc::new(SeaOrmEntityFingerprintRepository::new(Arc::clone(&db))),
+            Arc::new(SeaOrmSyncWatermarkRepository::new(Arc::clone(&db))),
             github,
             policy_enforcer,
             ServiceConfig {
                 api_base_url: cfg.api_base_url,
+                scope: cfg.scope,
+                max_concurrent_syncs: cfg.max_concurrent_syncs,
+                max_concurrent_tasks: cfg.max_concurrent_tasks,
+                sync_deadline: std::time::Duration::from_secs(
+                    cfg.sync_deadline_minutes.get().saturating_mul(60),
+                ),
             },
         ));
 
@@ -142,6 +170,108 @@ impl Gear for GithubMirrorGear {
         ctx.client_hub()
             .register::<dyn GithubMirrorClientV1>(client);
 
+        Ok(())
+    }
+}
+
+/// Take a lock, keeping the data even if a previous holder panicked.
+///
+/// Both mutexes guard a single `Option` that only `start` and `stop` touch,
+/// so a poisoned one holds nothing half-written and refusing to start over it
+/// would be worse than carrying on.
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+#[async_trait]
+impl RunnableCapability for GithubMirrorGear {
+    /// Start the sync worker pool: up to `max_concurrent_syncs` repositories
+    /// sync at once, drawn from the service's job queue a tenant at a time.
+    ///
+    /// Before it starts, sessions left `queued` or `running` by a previous
+    /// process are closed out as `interrupted` — the queue lives in memory, so
+    /// nothing will ever pick them up again. The sweep happens here rather
+    /// than in [`Self::stop`] because a killed process never reaches `stop`,
+    /// and only after this call has claimed the job receiver: that proves no
+    /// pool is running, so a duplicate `start` fails without touching live
+    /// sessions or their locks.
+    async fn start(&self, cancel: CancellationToken) -> anyhow::Result<()> {
+        let service = self
+            .service
+            .get()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{} service not initialized - init() must run before start()",
+                    Self::MODULE_NAME
+                )
+            })?
+            .clone();
+
+        let Some(jobs) = service.take_sync_receiver().await else {
+            anyhow::bail!("{} sync worker already started", Self::MODULE_NAME);
+        };
+
+        match service
+            .sweep_interrupted_sessions(&toolkit_security::AccessScope::allow_all())
+            .await
+        {
+            Ok(0) => {}
+            Ok(swept) => info!(sessions = swept, "closed out interrupted sync sessions"),
+            Err(e) => warn!(error = %e, "could not sweep interrupted sync sessions"),
+        }
+
+        let new_cancel_token = cancel.child_token();
+        service.bind_shutdown(new_cancel_token.clone());
+        let max_concurrent = service.max_concurrent_syncs();
+        let runner = SyncPoolRunner::new(service, jobs, max_concurrent, new_cancel_token.clone());
+        let handle = tokio::spawn(runner.run());
+
+        // Claiming the token and rejecting a second `start` happen under one
+        // lock, so two callers cannot both believe they are first.
+        let mut cancel_token = lock(&self.sync_cancel_token);
+        if cancel_token.is_some() {
+            handle.abort();
+            anyhow::bail!("{} sync worker already started", Self::MODULE_NAME);
+        }
+        *cancel_token = Some(new_cancel_token);
+
+        let mut sync_handle = lock(&self.sync_handle);
+        *sync_handle = Some(handle);
+
+        info!("github-mirror sync worker started");
+        Ok(())
+    }
+
+    /// Stop the pool. It takes no more jobs and finishes the syncs already
+    /// running; jobs still waiting are dropped.
+    ///
+    /// When the framework's hard-stop deadline fires first the pool is
+    /// aborted rather than left running, as `RunnableCapability` requires. A
+    /// sync cut short that way leaves its session row `in_progress` until the
+    /// next start-up sweep marks it `interrupted`, and the repository stays
+    /// the `in_progress` that `POST /sync/resume` looks for, so the work
+    /// carries on from the watermarks and fingerprints already stored.
+    async fn stop(&self, deadline_token: CancellationToken) -> anyhow::Result<()> {
+        if let Some(token) = lock(&self.sync_cancel_token).take() {
+            token.cancel();
+        }
+
+        let handle = lock(&self.sync_handle).take();
+        if let Some(mut handle) = handle {
+            tokio::select! {
+                result = &mut handle => {
+                    if let Err(e) = result
+                        && !e.is_cancelled()
+                    {
+                        warn!(error = ?e, "github-mirror sync worker task failed");
+                    }
+                }
+                () = deadline_token.cancelled() => {
+                    handle.abort();
+                    info!("github-mirror sync worker aborted by the framework's stop deadline");
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -209,6 +339,6 @@ mod tests {
     fn gear_provides_all_migrations() {
         use toolkit::contracts::DatabaseCapability;
         let gear = GithubMirrorGear::default();
-        assert_eq!(gear.migrations().len(), 38);
+        assert_eq!(gear.migrations().len(), 43);
     }
 }

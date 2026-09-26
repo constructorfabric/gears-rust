@@ -40,11 +40,6 @@ const TABLES: [&str; 26] = [
 /// Adds `extracted_at` — when a sync last wrote the row — to every mirrored
 /// table. Doubles as the deletion-reconciliation watermark: a row whose
 /// stamp predates the current sync was not seen by it.
-///
-/// The file is named with a `z_` prefix on purpose: the migration runner
-/// applies migrations in **name** order, and this one alters tables created
-/// by migrations up to `workflow_runs_013`, so its name must sort after all
-/// of them.
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {

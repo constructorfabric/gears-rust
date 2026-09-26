@@ -243,13 +243,20 @@ so the unchecked boxes below read as "not yet", not "abandoned".
 - Multi-tenant isolation via SecureORM scoping on every query
 - `github-mirror-sdk` client crate
 
+**Delivered by the sync engine increment**
+([gears-rust#4632](https://github.com/constructorfabric/gears-rust/issues/4632) and
+[gears-rust#4630](https://github.com/constructorfabric/gears-rust/issues/4630)):
+
+- Sync sessions, resume, background execution, scope configuration and per-repo run
+  status, with a per-run deadline
+- `ETag`/`Last-Modified` conditional requests, upstream pagination cache, cache
+  clearing and compression
+- Two concurrency settings beside the request semaphore: `max_concurrent_syncs`
+  (repositories the pool runs at once) and `max_concurrent_tasks` (tasks inside one
+  repository's run)
+
 **Deferred to tracked follow-ups**:
 
-- Sync sessions, resume, background execution, scope configuration, per-repo run
-  status: [gears-rust#4632](https://github.com/constructorfabric/gears-rust/issues/4632)
-- ETag/Last-Modified conditional requests, upstream pagination cache, cache eviction
-  and compression:
-  [gears-rust#4630](https://github.com/constructorfabric/gears-rust/issues/4630)
 - Credstore-backed per-tenant credentials and token pools:
   [gears-rust#4534](https://github.com/constructorfabric/gears-rust/issues/4534)
 - Write-back operations, Python bindings, CLI tool, state-change events: later
@@ -311,11 +318,11 @@ so the unchecked boxes below read as "not yet", not "abandoned".
 
 - [ ] `p1` - **ID**: `cpt-cf-github-mirror-fr-session-init`
 
-The system **MUST** accept a session configuration struct (provided by the caller) containing: GitHub token (or token pool reference), database connection credentials, telemetry log file path, cache configuration, and synchronization scope. The system **MUST** validate the GitHub token(s) and their scopes where possible, open the selected storage backend, create a synchronization session record, and load previous cursors and failed tasks from prior sessions. The library **MUST NOT** read environment variables or configuration files — all inputs come from the caller (see §5.20).
+The system **MUST** accept a session configuration struct (provided by the caller) containing: GitHub token (or token pool reference), database connection credentials, telemetry log file path, cache configuration, and synchronization scope. The system **MUST** validate the GitHub token(s) and their scopes where possible, open the selected storage backend, and create a synchronization session record. The library **MUST NOT** read environment variables or configuration files — all inputs come from the caller (see §5.20).
 
-Multiple synchronization sessions **MUST** be able to run in parallel, each with its own configuration. Sessions that share the same GitHub token **MUST** share rate-limit budgets. The global request semaphore and per-token rate-limit controllers are managed by the engine singleton.
+Multiple synchronization sessions **MUST** be able to run in parallel, each with its own configuration. Sessions that share the same GitHub token **MUST** share rate-limit budgets. The global request semaphore and per-token rate-limit controllers are managed by the engine singleton, and two configured limits sit beside it: how many repositories the pool runs at once, and how many tasks one repository's run keeps in flight.
 
-Synchronization **MUST** always run at the repository level: `sync_repo(session, repo, options)` is the sole entry point. Each call independently drives one repository through the synchronization phases. Multiple calls run concurrently with no cross-repo phase barrier. Global concurrency is controlled solely by the engine's request semaphore.
+Synchronization **MUST** always run at the repository level: `sync_repo(session, repo, options)` is the sole entry point. Each call **MUST** load that repository's watermarks and entity fingerprints from prior runs before it starts (see `cpt-cf-github-mirror-fr-session-resume`), then independently drive the repository through the synchronization phases. Multiple calls run concurrently with no cross-repo phase barrier. Global concurrency is bounded by the engine's request semaphore together with the configured repository and task limits.
 
 - **Rationale**: Every synchronization operation depends on a correctly initialized session; invalid tokens or misconfigured backends must be caught before any API calls are made.
 - **Actors**: `cpt-cf-github-mirror-actor-lib-consumer`, `cpt-cf-github-mirror-actor-cli-operator`, `cpt-cf-github-mirror-actor-python-consumer`
@@ -325,6 +332,8 @@ Synchronization **MUST** always run at the repository level: `sync_repo(session,
 - [ ] `p1` - **ID**: `cpt-cf-github-mirror-fr-session-resume`
 
 Synchronization **MUST** be re-enterable: the whole job is orchestrated in memory and individual tasks are NOT persisted. Re-running **MUST** rescan the full repository and rely on (a) the HTTP ETag/Last-Modified cache to avoid re-fetching unchanged data and (b) durable change-detection state (watermarks + entity fingerprints) to skip unchanged entities. The system **MUST** record a per-repo run status (`in_progress`/`complete`) and provide a resume operation that re-runs every repository still marked `in_progress`. A force mode **MUST** bypass the cache entirely.
+
+The session statuses (`queued`, `in_progress`, `complete`, `failed`, `interrupted`) and the per-repo run statuses (`in_progress`, `complete`) are stored and returned under the same names. A published name **MUST NOT** be renamed or given another meaning, and new statuses are only ever added. A stored status the running build does not know **MUST** fail the read as an internal error rather than be read as some other status.
 
 - **Rationale**: Large-repo synchronization can take hours; re-entrancy via caching is simpler than persisting per-task state.
 - **Actors**: `cpt-cf-github-mirror-actor-lib-consumer`, `cpt-cf-github-mirror-actor-cli-operator`, `cpt-cf-github-mirror-actor-python-consumer`
@@ -408,6 +417,17 @@ The system **MUST NOT** trigger GitHub secondary rate limits under normal operat
 
 - **Rationale**: Rate-limit violations cause temporary bans that halt synchronization for extended periods.
 - **Actors**: `cpt-cf-github-mirror-actor-github-rest`, `cpt-cf-github-mirror-actor-github-graphql`
+
+#### Synchronization Deadline
+
+- [ ] `p1` - **ID**: `cpt-cf-github-mirror-fr-sync-deadline`
+
+One repository's synchronization **MUST** run under a deadline, configurable per deployment, after which the system **MUST** stop that run rather than let it continue without bound. Stopping **MUST** be orderly: work in flight finishes its writes, the repository's synchronization lock is released, and the session records that the deadline was the reason. The deadline **MUST** apply to one repository's run, so stopping one leaves every other running repository alone.
+
+A stopped run **MUST NOT** lose what it achieved: its watermarks, cached responses and entity fingerprints stay, the repository stays marked as in progress, and the next synchronization or resume continues from there (`cpt-cf-github-mirror-fr-session-resume`).
+
+- **Rationale**: Per-request timeouts and retry limits bound a single call, not a run. Without a run-level deadline a synchronization that cannot make progress — an endless pagination cursor, a repository whose rate-limit budget never recovers — holds its repository's lock and its worker for as long as the process lives, and every later request for that repository collapses into it.
+- **Actors**: `cpt-cf-github-mirror-actor-lib-consumer`, `cpt-cf-github-mirror-actor-cli-operator`
 
 #### Idempotent and Resumable Operations
 
@@ -931,6 +951,7 @@ The mirror is a replica of personal data: every contributor row is a person, and
 
 - **Lawful basis and scope**: the mirror holds only what its configured repositories expose to the credential it syncs with. It **MUST NOT** fetch user-profile or organization-membership endpoints (§5.2), so it never widens the personal data beyond what the mirrored entities already carry.
 - **Retention**: mirrored data **MUST** be deletable per repository and per tenant. Removing a repository from a tenant's scope **MUST** remove its mirrored rows and its raw responses; the raw-response store **MUST** honor a configurable maximum age independent of the normalized rows.
+- **Schema changes**: the mirror's tables change only through versioned migrations shipped with the gear and applied in name order when it starts; every migration **MUST** carry a `down()` that restores the previous schema, and a change to a table that already holds mirrored rows **MUST** be additive (a new table, or a new nullable column) so that rolling back never discards those rows. Rolling a deployment back **MUST** run the matching `down()` steps before the older binary starts.
 - **Erasure**: a deployment **MUST** be able to delete a person's mirrored footprint — contributor row, and the author identity on their entities — without deleting the entities themselves, so an erasure request can be answered without discarding the repository's history.
 - **Access control**: personal data **MUST** be reachable only through the tenant-scoped surfaces (§5.11); no endpoint may return rows outside the caller's tenant, which is enforced in storage rather than per handler.
 - **Audit**: reads and deletions of mirrored data **MUST** be attributable to a caller through the platform's `SecurityContext`, and sync runs **MUST** be attributable through their session records (§5.1).

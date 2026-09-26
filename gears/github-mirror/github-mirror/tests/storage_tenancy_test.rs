@@ -2,8 +2,19 @@
 
 mod common;
 
-use github_mirror::domain::repo::{ListingFilter, PageWindow, RepoRecord};
+use github_mirror::domain::ports::github::FetchOptions;
+use github_mirror::domain::repo::{
+    EntityFingerprintRecord, EntityFingerprintRepository, ListingFilter, PageWindow, RepoRecord,
+    SyncWatermarkRecord, SyncWatermarkRepository,
+};
+use github_mirror::domain::scope::{CollectionMode, ScopeConfig};
+use github_mirror::domain::service::SyncProgress;
+use github_mirror::infra::storage::sea_orm_repo::{
+    SeaOrmEntityFingerprintRepository, SeaOrmSyncWatermarkRepository,
+};
+use toolkit_db::{DBProvider, DbError};
 use toolkit_odata::ODataQuery;
+use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 const OWNER: &str = "rust-lang";
@@ -11,7 +22,19 @@ const NAME: &str = "rust";
 const ISSUE_NUMBER: i64 = 11;
 const PULL_NUMBER: i64 = 12;
 const COMMIT_SHA: &str = "c1";
-const RUN_ID: i64 = 7;
+const RUN_ID: i64 = 81;
+const REPO_ID: i64 = 42;
+/// A value only tenant A ever writes, so finding it under tenant B's scope is
+/// proof the two tenants share a row.
+const A_ONLY: &str = "written-by-tenant-a";
+
+fn collect_everything() -> ScopeConfig {
+    let mut scope = ScopeConfig::default();
+    scope.collection.actions = CollectionMode::All;
+    scope.collection.reactions = CollectionMode::All;
+    scope.collection.timeline = CollectionMode::All;
+    scope
+}
 
 fn repo(id: i64, name: &str) -> RepoRecord {
     RepoRecord {
@@ -161,8 +184,9 @@ async fn every_child_listing_of_a_shared_repository_stays_with_its_tenant() {
     use std::sync::Arc;
 
     let fixture = common::fetched_repository();
+    let db = common::inmem_db().await;
     let service = common::service_with_github(
-        common::inmem_db().await,
+        db.clone(),
         "https://api.github.com",
         Arc::new(common::FakeGithub {
             result: Some(fixture.clone()),
@@ -173,7 +197,21 @@ async fn every_child_listing_of_a_shared_repository_stays_with_its_tenant() {
 
     for (tenant, who) in [(&tenant_a, "tenant A"), (&tenant_b, "tenant B")] {
         service
-            .sync_repository(tenant, OWNER, NAME)
+            .sync_repository(
+                tenant,
+                OWNER,
+                NAME,
+                &FetchOptions {
+                    tenant_id: tenant.subject_tenant_id(),
+                    access_scope: AccessScope::default(),
+                    scope: collect_everything(),
+                    force: false,
+                    since: None,
+                    cancel: tokio_util::sync::CancellationToken::new(),
+                },
+                &SyncProgress::new(),
+                &tokio_util::sync::CancellationToken::new(),
+            )
             .await
             .unwrap_or_else(|e| panic!("{who} must be able to sync the shared repository: {e}"));
     }
@@ -459,4 +497,92 @@ async fn every_child_listing_of_a_shared_repository_stays_with_its_tenant() {
             );
         }
     }
+
+    // The sweep state both tenants built for the same GitHub repository id.
+    // Its tables are keyed on `(tenant_id, repo_id, …)`, so a row written by
+    // one tenant's run must never be the row the other tenant's run reads,
+    // or a sweep would resume from a repository it never walked.
+    let provider = Arc::new(DBProvider::<DbError>::new(db));
+    let watermarks = SeaOrmSyncWatermarkRepository::new(Arc::clone(&provider));
+    let fingerprints = SeaOrmEntityFingerprintRepository::new(Arc::clone(&provider));
+
+    let scope_a = AccessScope::for_tenant(tenant_a.subject_tenant_id());
+    let scope_b = AccessScope::for_tenant(tenant_b.subject_tenant_id());
+    let entity_id = fixture.issues[0].number.to_string();
+
+    for (scope, who) in [(&scope_a, "tenant A"), (&scope_b, "tenant B")] {
+        assert!(
+            watermarks
+                .find(scope, REPO_ID, "issues")
+                .await
+                .expect("the watermark must read")
+                .is_some(),
+            "{who} must have a watermark of its own for the shared repository"
+        );
+        assert!(
+            !fingerprints
+                .find_many(scope, REPO_ID, "issue", std::slice::from_ref(&entity_id))
+                .await
+                .expect("the fingerprints must read")
+                .is_empty(),
+            "{who} must have a fingerprint of its own for the shared issue"
+        );
+    }
+
+    watermarks
+        .upsert(
+            &scope_a,
+            tenant_a.subject_tenant_id(),
+            SyncWatermarkRecord {
+                repo_id: REPO_ID,
+                family: "issues".to_owned(),
+                last_seen_updated_at: Some(A_ONLY.to_owned()),
+                page1_etag: Some(A_ONLY.to_owned()),
+                sweep_in_progress: true,
+                candidate_high_water: Some(A_ONLY.to_owned()),
+            },
+        )
+        .await
+        .expect("tenant A must be able to write its own watermark");
+
+    let b_watermark = watermarks
+        .find(&scope_b, REPO_ID, "issues")
+        .await
+        .expect("the watermark must read")
+        .expect("tenant B still has its own");
+    assert_ne!(
+        b_watermark.last_seen_updated_at.as_deref(),
+        Some(A_ONLY),
+        "tenant A's sweep must not move tenant B's watermark for the same repository id"
+    );
+    assert!(
+        !b_watermark.sweep_in_progress,
+        "tenant B's sweep finished; tenant A starting another must not reopen it"
+    );
+
+    let stored_a = fingerprints
+        .find_many(&scope_a, REPO_ID, "issue", std::slice::from_ref(&entity_id))
+        .await
+        .expect("the fingerprints must read");
+    fingerprints
+        .upsert(
+            &scope_a,
+            tenant_a.subject_tenant_id(),
+            EntityFingerprintRecord {
+                fingerprint: A_ONLY.to_owned(),
+                ..stored_a[0].clone()
+            },
+        )
+        .await
+        .expect("tenant A must be able to write its own fingerprint");
+
+    let b_fingerprints = fingerprints
+        .find_many(&scope_b, REPO_ID, "issue", std::slice::from_ref(&entity_id))
+        .await
+        .expect("the fingerprints must read");
+    assert_ne!(
+        b_fingerprints[0].fingerprint, A_ONLY,
+        "tenant A's refinement must not overwrite tenant B's fingerprint for the \
+         same repository id and entity"
+    );
 }

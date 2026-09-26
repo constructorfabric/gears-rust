@@ -9,14 +9,10 @@ pub struct Migration;
 /// Adds `author_json` to `gm_issues` and `gm_pull_requests`: GitHub's `user`
 /// object as it arrived, not just the login.
 ///
-/// The `author_login` column added by `z_issue_pull_people_037` stays — it is
+/// The `author_login` column added by `m0039_issue_pull_people` stays — it is
 /// the indexable identity a `creator` filter would need, while this column is
 /// what the GitHub-compatible surface hands back, so a client sees the same
 /// avatar, profile URL and account type GitHub sends.
-///
-/// Named with a `z_` prefix because the migration runner applies migrations in
-/// **name** order and this one alters tables created by `issues_002` and
-/// `pull_requests_003`.
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
