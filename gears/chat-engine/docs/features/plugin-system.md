@@ -274,7 +274,7 @@ Plugin authors **MUST NOT** add their own `Debug`/`Display` impls (or `tracing` 
 3. [ ] - `p1` - Build call context: {session_type_id, plugin_config, tenant_id, user_id, client_id, session_id (if applicable), method-specific payload, timestamp} - `inst-invoke-build-ctx`
 4. [ ] - `p1` - **TRY** - `inst-invoke-try`
    1. [ ] - `p1` - Dispatch to plugin trait method (on_session_type_configured / on_session_created / on_session_updated / on_message / on_message_recreate / on_session_summary / health_check) - `inst-invoke-dispatch`
-   2. [ ] - `p1` - **RETURN** method result to caller (Vec<Capability>, ResponseStream, HealthStatus, or void) - `inst-invoke-return`
+   2. [ ] - `p1` - **RETURN** the method result to the caller (a list of capabilities, a response stream, a health status, or nothing) - `inst-invoke-return`
 5. [ ] - `p1` - **CATCH** plugin error - `inst-invoke-catch`
    1. [ ] - `p1` - Log error with trace_id, plugin_instance_id, session_type_id, method_name, error details - `inst-invoke-log-error`
    2. [ ] - `p1` - **RETURN** error to caller for upstream handling (caller decides HTTP status: 502, 503, or fire-and-forget) - `inst-invoke-return-error`
@@ -294,14 +294,14 @@ Plugin authors **MUST NOT** add their own `Debug`/`Display` impls (or `tracing` 
 **Steps**:
 1. [ ] - `p1` - Receive trait method call with call context (includes `plugin_config` containing endpoint address, authentication config, timeout, retry config) - `inst-wc-input`
 2. [ ] - `p1` - Extract transport configuration from `plugin_config.config` JSONB: endpoint address, auth_type, auth_credentials, timeout_ms, retry_count, retry_backoff_ms - `inst-wc-extract-config`
-3. [ ] - `p1` - Map trait method to webhook event type (on_session_created -> session.created, on_message -> message.new, etc.) - `inst-wc-map-event`
+3. [ ] - `p1` - Map trait method to webhook event type (on_session_created maps to session.created, on_message maps to message.new, and so on) - `inst-wc-map-event`
 4. [ ] - `p1` - Build outbound request with event payload conforming to Chat Engine webhook schemas - `inst-wc-build-request`
 5. [ ] - `p1` - **IF** auth_type is configured: apply authentication credentials to the outbound request - `inst-wc-apply-auth`
 6. [ ] - `p1` - **TRY** - `inst-wc-try`
    1. [ ] - `p1` - Send request to the configured endpoint with configured timeout; for streaming methods (on_message, on_message_recreate, on_session_summary), read chunked response and pipe chunks to ResponseStream - `inst-wc-send`
    2. [ ] - `p1` - **IF** endpoint returns error response: **IF** retry_count > 0, retry with backoff; else return error - `inst-wc-retry`
    3. [ ] - `p1` - Parse response body according to expected schema for the event type - `inst-wc-parse`
-   4. [ ] - `p1` - **RETURN** parsed result (Vec<Capability>, ResponseStream, HealthStatus) - `inst-wc-return`
+   4. [ ] - `p1` - **RETURN** the parsed result (a list of capabilities, a response stream, or a health status) - `inst-wc-return`
 7. [ ] - `p1` - **CATCH** transport error (connection refused, timeout, security handshake failure) - `inst-wc-catch`
    1. [ ] - `p1` - **RETURN** error with detail (endpoint unreachable, timeout exceeded, transport failure) - `inst-wc-return-error`
 

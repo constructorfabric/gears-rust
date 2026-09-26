@@ -182,7 +182,7 @@ Groups are the core nodes of the resource group hierarchy. This feature implemen
 1. [x] - `p1` - Actor sends PUT /api/resource-group/v1/groups/{group_id} with new hierarchy.parent_id - `inst-move-group-1`
 2. [x] - `p1` - DB: BEGIN transaction (SERIALIZABLE isolation) - `inst-move-group-2`
 3. [x] - `p1` - Load group and new parent in transaction - `inst-move-group-3`
-4. [x] - `p1` - **IF** new_parent_id == group_id → **RETURN** CycleDetected (self-parent) - `inst-move-group-4`
+4. [x] - `p1` - **IF** the new parent ID equals the group ID **RETURN** CycleDetected (self-parent) - `inst-move-group-4`
 5. [x] - `p1` - Invoke cycle detection: check new parent is NOT in subtree of group - `inst-move-group-5`
 6. [x] - `p1` - **IF** cycle detected → **RETURN** CycleDetected with involved node IDs - `inst-move-group-6`
 7. [x] - `p1` - Validate parent type compatibility for group's type against new parent's type - `inst-move-group-7`
@@ -236,7 +236,7 @@ Groups are the core nodes of the resource group hierarchy. This feature implemen
 **Output**: Pass or CycleDetected with involved node IDs
 
 **Steps**:
-1. [x] - `p1` - **IF** new_parent_id == group_id → **RETURN** CycleDetected (self-parent) - `inst-cycle-1`
+1. [x] - `p1` - **IF** the new parent ID equals the group ID **RETURN** CycleDetected (self-parent) - `inst-cycle-1`
 2. [x] - `p1` - DB: SELECT descendant_id FROM resource_group_closure WHERE ancestor_id = {group_id} — get all descendants of the moving group - `inst-cycle-2`
 3. [x] - `p1` - **IF** new_parent_id IN descendants → **RETURN** CycleDetected: new parent is a descendant of the moving group - `inst-cycle-3`
 4. [x] - `p1` - **RETURN** pass - `inst-cycle-4`

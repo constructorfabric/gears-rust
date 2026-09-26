@@ -175,7 +175,7 @@ Types define the structural rules for the resource group hierarchy — which par
 1. [x] - `p1` - Validate `schema_id` via GtsTypePath value object (format, length, non-empty) - `inst-val-input-1`
 2. [x] - `p1` - **IF** `schema_id` does not have RG type prefix `gts.cf.core.rg.type.v1~` - `inst-val-input-2`
    1. [x] - `p1` - **RETURN** Validation error: "Type schema_id must have RG type prefix" - `inst-val-input-2a`
-3. [x] - `p1` - Validate placement invariant: `can_be_root == true OR len(allowed_parent_types) >= 1` - `inst-val-input-3`
+3. [x] - `p1` - Validate placement invariant: `can_be_root` is true OR `allowed_parent_types` has at least one entry - `inst-val-input-3`
 4. [x] - `p1` - **IF** invariant violated - `inst-val-input-4`
    1. [x] - `p1` - **RETURN** Validation error: "Type must allow root placement or have at least one allowed parent" - `inst-val-input-4a`
 5. [x] - `p1` - **FOR EACH** parent_path in allowed_parent_types - `inst-val-input-5`

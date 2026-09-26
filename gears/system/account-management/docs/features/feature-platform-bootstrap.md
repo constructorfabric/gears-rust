@@ -129,11 +129,11 @@ Bootstrap is triggered by the `AccountManagementGear` lifecycle rather than an e
 **Steps**:
 
 1. [ ] - `p1` - Parse the query result into `{ row_count, first_status }` - `inst-algo-idem-parse`
-2. [ ] - `p1` - **IF** `row_count == 0` - `inst-algo-idem-no-row`
+2. [ ] - `p1` - **IF** the row count is 0 - `inst-algo-idem-no-row`
    1. [ ] - `p1` - **RETURN** `no-root` - `inst-algo-idem-return-no-root`
-3. [ ] - `p1` - **IF** `first_status == 1` (active) - `inst-algo-idem-row-active`
+3. [ ] - `p1` - **IF** the first status is 1 (active) - `inst-algo-idem-row-active`
    1. [ ] - `p1` - **RETURN** `active-root-exists` - `inst-algo-idem-return-active`
-4. [ ] - `p1` - **IF** `first_status == 0` (provisioning) - `inst-algo-idem-row-provisioning`
+4. [ ] - `p1` - **IF** the first status is 0 (provisioning) - `inst-algo-idem-row-provisioning`
    1. [ ] - `p1` - **RETURN** `provisioning-root-stuck` - `inst-algo-idem-return-stuck`
 5. [ ] - `p1` - **ELSE** unexpected status (suspended or deleted on a root row) - `inst-algo-idem-invariant-violation`
    1. [ ] - `p1` - **RETURN** `invariant-violation` (fail-fast — root cannot be suspended or deleted) - `inst-algo-idem-return-invariant`

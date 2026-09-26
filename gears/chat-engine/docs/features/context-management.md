@@ -117,9 +117,9 @@ Success criteria: Context payloads are constructed correctly for each strategy; 
 
 **Steps**:
 1. [ ] - `p2` - **IF** `type` NOT IN ('full', 'sliding_window', 'summarized') **RETURN** 400 Bad Request (unknown strategy type) - `inst-vs-check-type`
-2. [ ] - `p2` - **IF** `type` == 'sliding_window' AND top-level `window_size` is absent or < 1 **RETURN** 400 Bad Request (window_size required and must be >= 1) - `inst-vs-check-window`
-3. [ ] - `p2` - **IF** `type` == 'summarized' AND top-level `recent_messages_to_keep` is absent or < 2 **RETURN** 400 Bad Request (recent_messages_to_keep required and must be >= 2) - `inst-vs-check-summarized`
-4. [ ] - `p2` - **IF** `type` == 'full': no additional fields required - `inst-vs-full-noop`
+2. [ ] - `p2` - **IF** `type` is sliding_window AND top-level `window_size` is absent or less than 1 **RETURN** 400 Bad Request (window_size is required and must be at least 1) - `inst-vs-check-window`
+3. [ ] - `p2` - **IF** `type` is summarized AND top-level `recent_messages_to_keep` is absent or less than 2 **RETURN** 400 Bad Request (recent_messages_to_keep is required and must be at least 2) - `inst-vs-check-summarized`
+4. [ ] - `p2` - **IF** `type` is full: no additional fields are required - `inst-vs-full-noop`
 5. [ ] - `p2` - **RETURN** validated strategy - `inst-vs-return`
 
 ### Extract Active Path
@@ -144,9 +144,9 @@ Success criteria: Context payloads are constructed correctly for each strategy; 
 
 **Steps**:
 1. [ ] - `p2` - Load memory_strategy from session metadata; default to 'full' if not set - `inst-as-load`
-2. [ ] - `p2` - **IF** strategy.type == 'full': context = all active-path messages + current user message - `inst-as-full`
-3. [ ] - `p2` - **IF** strategy.type == 'sliding_window': context = last N messages from active path (where N = strategy.window_size, read from the flat top-level field) + current user message - `inst-as-window`
-4. [ ] - `p2` - **IF** strategy.type == 'summarized': context = messages with is_hidden_from_backend=false from active path + current user message (summary messages included, summarized originals excluded by visibility flag); retain the last `strategy.recent_messages_to_keep` messages from the active path regardless of visibility flags to ensure recent context is always available - `inst-as-summarized`
+2. [ ] - `p2` - **IF** the strategy type is full: the context is all active-path messages plus the current user message - `inst-as-full`
+3. [ ] - `p2` - **IF** the strategy type is sliding_window: the context is the last N messages from the active path (where N is the strategy window_size, read from the flat top-level field) plus the current user message - `inst-as-window`
+4. [ ] - `p2` - **IF** the strategy type is summarized: the context is the active-path messages that are not hidden from the backend (is_hidden_from_backend is false) plus the current user message (summary messages included, summarized originals excluded by visibility flag); retain the last `recent_messages_to_keep` messages from the active path regardless of visibility flags to ensure recent context is always available - `inst-as-summarized`
 5. [ ] - `p2` - **RETURN** context payload as ordered messages array - `inst-as-return`
 
 ### Handle Context Overflow
@@ -157,13 +157,13 @@ Success criteria: Context payloads are constructed correctly for each strategy; 
 **Output**: Retry result (streaming response handle) or error propagated to client
 
 **Steps**:
-1. [ ] - `p2` - **IF** strategy.type == 'summarized': invoke `on_session_summary` via backend plugin with full visible history (as defined in ADR-0023) - `inst-ho-summarize`
+1. [ ] - `p2` - **IF** the strategy type is summarized: invoke `on_session_summary` via backend plugin with full visible history (as defined in ADR-0023) - `inst-ho-summarize`
    1. [ ] - `p2` - **IF** plugin returns SummaryResult: persist summary message (role=system, is_hidden_from_user=true), mark summarized_message_ids with is_hidden_from_backend=true - `inst-ho-persist-summary`
    2. [ ] - `p2` - Rebuild context using `cpt-cf-chat-engine-algo-context-management-apply-strategy` with updated visibility - `inst-ho-rebuild`
    3. [ ] - `p2` - Retry plugin invocation using `cpt-cf-chat-engine-algo-message-processing-invoke-plugin` with rebuilt context - `inst-ho-retry`
    4. [ ] - `p2` - **IF** retry returns context_overflow again **RETURN** error to client (context still exceeds limit after summarization) - `inst-ho-retry-fail`
-2. [ ] - `p2` - **IF** strategy.type == 'sliding_window': **RETURN** error to client (sliding window does not support automatic recovery; client should reduce window_size) - `inst-ho-window-fail`
-3. [ ] - `p2` - **IF** strategy.type == 'full': **RETURN** error to client (full history overflow; client should switch to sliding_window or summarized strategy) - `inst-ho-full-fail`
+2. [ ] - `p2` - **IF** the strategy type is sliding_window: **RETURN** error to client (sliding window does not support automatic recovery; client should reduce window_size) - `inst-ho-window-fail`
+3. [ ] - `p2` - **IF** the strategy type is full: **RETURN** error to client (full history overflow; client should switch to sliding_window or summarized strategy) - `inst-ho-full-fail`
 4. [ ] - `p2` - **RETURN** result (streaming response handle on success, or error propagated to client) - `inst-ho-return`
 
 ## 4. States (CDSL)

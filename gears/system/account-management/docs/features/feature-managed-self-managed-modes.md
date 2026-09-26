@@ -130,7 +130,7 @@ Delivers the post-creation dual-consent conversion workflow described in PRD §5
 2. [ ] - `p1` - Load the target `ConversionRequest` by `request_id` via ConversionRepository - `inst-flow-appr-load-request`
 3. [ ] - `p1` - **IF** request `status ≠ pending` - `inst-flow-appr-already-resolved`
    1. [ ] - `p1` - **RETURN** `(reject, code=already_resolved)` via the `errors-observability` envelope - `inst-flow-appr-already-resolved-return`
-4. [ ] - `p1` - **IF** `caller_side == initiator_side` (initiator cannot approve their own request per PRD §5.4) - `inst-flow-appr-actor-guard`
+4. [ ] - `p1` - **IF** the caller side is the initiator side (initiator cannot approve their own request per PRD §5.4) - `inst-flow-appr-actor-guard`
    1. [ ] - `p1` - **RETURN** `(reject, code=invalid_actor_for_transition, attempted_status=approved, caller_side)` - `inst-flow-appr-actor-return`
 5. [ ] - `p1` - Counterparty MAY supply an optional `comment` (≤1000 chars) explaining the approval rationale; ConversionService threads it into `algo-dual-consent-apply`, which persists it to `dbtable-conversion-requests.approved_comment` inside the same TX as the state transition (never rewriteable) per `dod-managed-self-managed-modes-audit-comments` - `inst-flow-appr-comment`
 6. [ ] - `p1` - Invoke `algo-dual-consent-apply` with `(request_id, actor, caller_side, comment)` — runs the whole approval transaction - `inst-flow-appr-apply`
@@ -159,7 +159,7 @@ Delivers the post-creation dual-consent conversion workflow described in PRD §5
 2. [ ] - `p1` - Load the target `ConversionRequest` by `request_id` via ConversionRepository - `inst-flow-rej-load-request`
 3. [ ] - `p1` - **IF** request `status ≠ pending` - `inst-flow-rej-already-resolved`
    1. [ ] - `p1` - **RETURN** `(reject, code=already_resolved)` - `inst-flow-rej-already-resolved-return`
-4. [ ] - `p1` - **IF** `caller_side == initiator_side` - `inst-flow-rej-actor-guard`
+4. [ ] - `p1` - **IF** the caller side is the initiator side - `inst-flow-rej-actor-guard`
    1. [ ] - `p1` - **RETURN** `(reject, code=invalid_actor_for_transition, attempted_status=rejected, caller_side)` - `inst-flow-rej-actor-return`
 5. [ ] - `p1` - Counterparty MAY supply an optional `comment` (≤1000 chars) explaining the rejection rationale; ConversionService persists it to `dbtable-conversion-requests.rejected_comment` inside the same TX as the state transition per `dod-managed-self-managed-modes-audit-comments` - `inst-flow-rej-comment`
 6. [ ] - `p1` - Invoke ConversionService `reject(caller_side, request_id, actor, comment)` — single transaction setting `status=rejected`, `rejected_by=actor`, `rejected_comment?`; `tenants.self_managed` untouched; emit audit entry via `errors-observability` - `inst-flow-rej-service-reject`
@@ -303,10 +303,10 @@ Delivers the post-creation dual-consent conversion workflow described in PRD §5
 
 > Per `fr-conversion-creation-time-self-managed`, the parent's explicit create call IS the dual-consent signal at creation time — no `ConversionRequest` row is written. Barrier materialization at activation is owned by `tenant-hierarchy-management`; this feature only asserts the bypass decision. Root-tenant creation does not flow through this algorithm — `feature-platform-bootstrap` inserts the root row directly via `TenantService` with `self_managed=false` by deployment convention, bypassing the hierarchy-management create saga that invokes this admission check.
 
-1. [ ] - `p1` - **IF** request `self_managed == true` - `inst-algo-ctsma-selfmanaged-branch`
+1. [ ] - `p1` - **IF** the request sets `self_managed` to true - `inst-algo-ctsma-selfmanaged-branch`
    1. [ ] - `p1` - Mark the create path as "bypass dual-consent" and record that the create saga itself counts as consent per `fr-conversion-creation-time-self-managed` - `inst-algo-ctsma-bypass-mark`
    2. [ ] - `p1` - **RETURN** admit; saga step 3 will materialize the barrier via `algo-closure-maintenance` activation branch (ancestor-walk carries `barrier=1` for the strict `(ancestor, self]` entries because `tenants.self_managed=true` is already persisted by saga step 1) - `inst-algo-ctsma-selfmanaged-return`
-2. [ ] - `p1` - **ELSE** request `self_managed == false` (managed creation) - `inst-algo-ctsma-managed-branch`
+2. [ ] - `p1` - **ELSE** the request sets `self_managed` to false (managed creation) - `inst-algo-ctsma-managed-branch`
    1. [ ] - `p1` - **RETURN** admit; saga step 3 materializes closure rows with `barrier=0` on every self-row and with strict-ancestor barriers derived from any self-managed ancestor that already exists per the canonical rule - `inst-algo-ctsma-managed-return`
 
 ### Root-Tenant Conversion Refusal
@@ -348,7 +348,7 @@ Delivers the post-creation dual-consent conversion workflow described in PRD §5
 **Transitions**:
 
 1. [ ] - `p1` - **FROM** `pending` **TO** `approved` **WHEN** `algo-dual-consent-apply` commits its single transaction (pre-approval barrier guard via `algo-allowed-parent-types-evaluation` passed; `tenants.self_managed` flipped; `tenant_closure.barrier` re-materialized via `algo-closure-maintenance`; request row transitioned; audit entry emitted) - `inst-state-conversion-pending-to-approved`
-2. [ ] - `p1` - **FROM** `pending` **TO** `cancelled` **WHEN** the initiator PATCHes their own row on the initiator-side collection (`caller_side == initiator_side`) per `flow-conversion-cancellation` - `inst-state-conversion-pending-to-cancelled`
+2. [ ] - `p1` - **FROM** `pending` **TO** `cancelled` **WHEN** the initiator PATCHes their own row on the initiator-side collection (the caller side is the initiator side) per `flow-conversion-cancellation` - `inst-state-conversion-pending-to-cancelled`
 3. [ ] - `p1` - **FROM** `pending` **TO** `rejected` **WHEN** the counterparty PATCHes the row on the counterparty-side collection (`caller_side != initiator_side`) per `flow-conversion-rejection` - `inst-state-conversion-pending-to-rejected`
 4. [ ] - `p1` - **FROM** `pending` **TO** `expired` **WHEN** `algo-conversion-expiry-reaper` observes `now() >= expires_at` on a `pending` row; `tenants.self_managed` MUST NOT change on this transition per `fr-mode-conversion-expiry` - `inst-state-conversion-pending-to-expired`
 

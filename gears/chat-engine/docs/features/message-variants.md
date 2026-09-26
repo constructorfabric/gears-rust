@@ -230,8 +230,8 @@ Success criteria: Variant creation latency equivalent to normal message send; br
 2. [ ] - `p2` - Resolve plugin: `hub.get_scoped::<dyn ChatEngineBackendPlugin>(ClientScope::gts_id(&plugin_instance_id))` - `inst-vpc-resolve`
 3. [ ] - `p2` - **IF** plugin not found **RETURN** 502 Bad Gateway (target plugin not registered) - `inst-vpc-not-found`
 4. [ ] - `p2` - **TRY** - `inst-vpc-try`
-   1. [ ] - `p2` - Call `plugin.on_session_updated(ctx)` with session context — plugin queries Model Registry for capabilities, returns `Vec<Capability>` - `inst-vpc-call`
-   2. [ ] - `p2` - **RETURN** `Vec<Capability>` as refreshed enabled_capabilities - `inst-vpc-return-caps`
+   1. [ ] - `p2` - Call the plugin's `on_session_updated` hook with the session context — the plugin queries Model Registry for capabilities and returns a list of capabilities - `inst-vpc-call`
+   2. [ ] - `p2` - **RETURN** the list of capabilities as the refreshed enabled_capabilities - `inst-vpc-return-caps`
 5. [ ] - `p2` - **CATCH** plugin error - `inst-vpc-catch`
    1. [ ] - `p2` - **RETURN** 502 Bad Gateway with error detail - `inst-vpc-error`
 

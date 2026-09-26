@@ -136,7 +136,7 @@ Success criteria: Export renders the active message path in the requested format
 1. [ ] - `p3` - API: invoke access-shared-session endpoint (see `cpt-cf-chat-engine-seq-share-session`) - `inst-as-api`
 2. [ ] - `p3` - Algorithm: validate share token using `cpt-cf-chat-engine-algo-session-export-validate-token` - `inst-as-validate`
 3. [ ] - `p3` - DB: load session record by share_token.session_id - `inst-as-get-session`
-4. [ ] - `p3` - **IF** session.lifecycle_state == 'hard_deleted' **RETURN** 404 Not Found - `inst-as-check-deleted`
+4. [ ] - `p3` - **IF** the session lifecycle state is hard_deleted **RETURN** 404 Not Found - `inst-as-check-deleted`
 5. [ ] - `p3` - DB: load active-path messages for session, ordered chronologically - `inst-as-get-messages`
 6. [ ] - `p3` - **RETURN** 200 (session metadata, messages on active path, read_only=true) - `inst-as-return`
 
@@ -175,8 +175,8 @@ Success criteria: Export renders the active message path in the requested format
 **Steps**:
 1. [ ] - `p3` - DB: load active-path messages for session, ordered chronologically - `inst-be-select`
 2. [ ] - `p3` - Filter to active path only: traverse from root following is_active=true nodes - `inst-be-active-path`
-3. [ ] - `p3` - **IF** format == json: serialize messages as JSON array with session metadata envelope - `inst-be-json`
-4. [ ] - `p3` - **IF** format == markdown: render messages as Markdown with role headers and timestamps - `inst-be-markdown`
+3. [ ] - `p3` - **IF** the format is json: serialize messages as JSON array with session metadata envelope - `inst-be-json`
+4. [ ] - `p3` - **IF** the format is markdown: render messages as Markdown with role headers and timestamps - `inst-be-markdown`
 5. [ ] - `p3` - **RETURN** (rendered_content, message_count) - `inst-be-return`
 
 ### Upload Export
