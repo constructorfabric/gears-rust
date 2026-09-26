@@ -604,7 +604,12 @@ async fn pg_spec_009_expired_backlog_swept_in_bounded_batches() {
     .await;
     let connection_string = config.connection_string.clone();
     let schema = config.schema.clone();
+    // No background reaper: it sweeps at startup and again whenever `try_lock`
+    // below signals its deadline hint, and its `SKIP LOCKED` batches would take
+    // part of the backlog this test counts. `__test_sweep_once` must be the only
+    // sweeper for the exact counts below to mean anything.
     let handle = PostgresLockPlugin::builder(config)
+        .__without_reaper()
         .build_and_start()
         .await
         .unwrap();
