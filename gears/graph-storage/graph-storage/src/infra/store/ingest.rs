@@ -1361,9 +1361,17 @@ async fn upsert_edge(
         current.scope_attribute.as_deref() != Some(*attribute)
             || current.scope_value.as_deref() != Some(*value)
     });
+    // The guard above reads the ownership; the write has to hold it. Two
+    // scopes can both read the edge unowned before either commits, and then
+    // neither is refused: whichever UPDATE ran second overwrote the first's
+    // mark, and nobody was told. So a scoped write is a compare-and-set on
+    // the ownership it read, and a write that matched nothing was beaten to
+    // the claim -- it answers the conflict a known owner answers, found by
+    // reading who got there first.
+    let ownership_as_read = ownership_as_read(&current);
     if current.payload == payload && current.deleted_at.is_none() {
         if let Some((attribute, value)) = claim {
-            edge::Entity::update_many()
+            let claimed = edge::Entity::update_many()
                 .col_expr(
                     edge::Column::ScopeAttribute,
                     Expr::value(Some(attribute.to_owned())),
@@ -1373,11 +1381,15 @@ async fn upsert_edge(
                     Expr::value(Some(value.to_owned())),
                 )
                 .filter(Condition::all().add(edge::Column::Id.eq(current.id)))
+                .filter(ownership_as_read)
                 .secure()
                 .scope_with(scope)
                 .exec(tx)
                 .await
                 .map_err(map_scope_err)?;
+            if claimed.rows_affected == 0 {
+                return Err(lost_write(scope, tx, current.id, &edge_key, declaring).await);
+            }
         }
         return Ok(ItemOutcome::Unchanged);
     }
@@ -1394,6 +1406,9 @@ async fn upsert_edge(
                 edge::Column::ScopeValue,
                 Expr::value(Some(value.to_owned())),
             );
+    }
+    if declaring.is_some() {
+        update = update.filter(ownership_as_read);
     }
     let written = update
         .col_expr(edge::Column::Payload, Expr::value(payload))
@@ -1425,38 +1440,93 @@ async fn upsert_edge(
         .await
         .map_err(map_scope_err)?;
 
-    // Zero rows means the row this write was prepared against is gone, and
-    // answering `Updated` would tell the caller its payload landed when
-    // nothing holds it. A scope replacement removes an edge it no longer
+    // Zero rows means the row this write was prepared against is not the row
+    // that is there now, and answering `Updated` would tell the caller its
+    // payload landed when nothing holds it. Two things can have happened.
+    // The row is gone: a scope replacement removes an edge it no longer
     // declares with a hard delete, not a tombstone, and these transactions
-    // begin without setting an isolation level: at the server default the row
-    // can disappear between the read above and this statement rather than
-    // raising a serialization failure.
+    // begin without setting an isolation level, so at the server default the
+    // row can disappear between the read above and this statement rather
+    // than raising a serialization failure. Or, for a scoped write, another
+    // scope's claim landed first and the ownership filter matched nothing.
+    // `lost_write` re-reads the row to say which.
     //
     // Unlike a node, an edge has no tombstone conflict to report here: a
     // tombstoned edge is deliberately revived by this very statement, which
-    // clears `deleted_at`. What is left is the one case, and it is retryable
-    // -- the key is free, so a re-ingest inserts rather than updates.
+    // clears `deleted_at`. The removed case is retryable -- the key is free,
+    // so a re-ingest inserts rather than updates -- and the claimed case is
+    // the conflict a known owner answers.
     //
-    // Not covered by a case, and said so rather than left to be assumed.
-    // Reaching it needs a hard delete to commit between the read above and
-    // this write, and the two are inside one transaction with no seam to
-    // hold it open at; a test that raced for it would assert nothing on the
-    // runs where the timing did not happen -- the same reasoning the
-    // migration compare-and-set records. What *is* covered is the decision
-    // this branch rests on, that a deleted edge is revived rather than
-    // refused, which `a_deleted_edge_is_revived_by_the_next_upsert` holds
-    // against both stores.
+    // The removed case is not covered by a case, and said so rather than
+    // left to be assumed: reaching it needs a hard delete to commit between
+    // the read above and this write, inside one transaction with no seam to
+    // hold it open at. What *is* covered is that a deleted edge is revived
+    // rather than refused (`a_deleted_edge_is_revived_by_the_next_upsert`),
+    // and the claim race, which
+    // `two_scopes_racing_to_claim_an_unowned_edge_leave_it_with_one` opens
+    // against the built-in store with a barrier.
     if written.rows_affected == 0 {
-        return Err(GraphStoreError::Conflict {
+        return Err(lost_write(scope, tx, id, &edge_key, declaring).await);
+    }
+
+    Ok(ItemOutcome::Updated)
+}
+
+/// The ownership an edge was read with, as the predicate its write must
+/// still match: the pair the row carried, or its absence.
+fn ownership_as_read(current: &edge::Model) -> Condition {
+    Condition::all()
+        .add(match &current.scope_attribute {
+            Some(attribute) => edge::Column::ScopeAttribute.eq(attribute.clone()),
+            None => edge::Column::ScopeAttribute.is_null(),
+        })
+        .add(match &current.scope_value {
+            Some(value) => edge::Column::ScopeValue.eq(value.clone()),
+            None => edge::Column::ScopeValue.is_null(),
+        })
+}
+
+/// What an edge write that matched nothing found in the row's place: another
+/// scope's claim, or no row at all. Read rather than guessed, because the
+/// two ask different things of the caller.
+async fn lost_write(
+    scope: &AccessScope,
+    tx: &impl DBRunner,
+    id: i64,
+    edge_key: &str,
+    declaring: Option<(&str, &str)>,
+) -> GraphStoreError {
+    let row = match edge::Entity::find()
+        .secure()
+        .scope_with(scope)
+        .filter(Condition::all().add(edge::Column::Id.eq(id)))
+        .one(tx)
+        .await
+    {
+        Ok(row) => row,
+        Err(error) => return map_scope_err(error),
+    };
+    let owner = row.and_then(|row| row.scope_attribute.zip(row.scope_value));
+    match (owner, declaring) {
+        (Some((attribute, value)), Some((declaring_attribute, declaring_value)))
+            if (attribute.as_str(), value.as_str()) != (declaring_attribute, declaring_value) =>
+        {
+            GraphStoreError::Conflict {
+                reason: format!(
+                    "edge `{edge_key}` was claimed by scope `{attribute}={value}` while this \
+                     write under `{declaring_attribute}={declaring_value}` was being \
+                     prepared; a move between scopes is a deletion and a re-declaration, \
+                     not a write"
+                ),
+            }
+        }
+        _ => GraphStoreError::Conflict {
             reason: format!(
                 "edge `{edge_key}` was removed while this write was being prepared; \
                  re-ingest it"
             ),
-        });
+        },
     }
-
-    Ok(ItemOutcome::Updated)
 }
 
 pub async fn soft_delete(

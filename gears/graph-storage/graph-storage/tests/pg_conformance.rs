@@ -1935,3 +1935,17 @@ async fn an_elided_insert_that_asks_for_its_row_reports_record_not_found() {
         "an elided insert with RETURNING must report RecordNotFound, got {elided:?}"
     );
 }
+
+/// The window this needs is open here: the two claims run in two
+/// transactions, and both read the edge unowned before either commits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_scopes_racing_to_claim_an_unowned_edge_leave_it_with_one() {
+    let Some(stand) = stand(HopStrategy::Pgq).await else {
+        return;
+    };
+    conformance::two_scopes_racing_to_claim_an_unowned_edge_leave_it_with_one(
+        std::sync::Arc::clone(&stand.store) as std::sync::Arc<dyn GraphStoreV1>,
+        Uuid::now_v7(),
+    )
+    .await;
+}

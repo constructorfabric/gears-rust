@@ -2449,6 +2449,15 @@ fn apply_edge(
     }
     let outcome = match edges.iter_mut().find(|e| e.key == edge_key) {
         Some(existing) if existing.payload == spec.payload && !existing.deleted => {
+            // A convergent replay still claims an edge nobody owns: ownership
+            // is bookkeeping about who declared the edge, not content, so the
+            // batch stays unchanged and the revision stays put -- the same
+            // answer the built-in store gives. Without this, two scopes
+            // re-declaring one unowned edge were both told they claimed it,
+            // and neither replacement ever removed it.
+            if existing.scope.is_none() && scope.is_some() {
+                existing.scope.clone_from(&scope);
+            }
             ItemOutcome::Unchanged
         }
         Some(existing) => {

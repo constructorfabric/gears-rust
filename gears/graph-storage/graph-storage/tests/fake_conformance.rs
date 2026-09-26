@@ -617,3 +617,16 @@ async fn a_deleted_conclusion_stops_pinning_its_endpoint() {
 async fn a_batch_that_names_one_type_twice_is_refused() {
     conformance::a_batch_that_names_one_type_twice_is_refused(&store(), Uuid::now_v7()).await;
 }
+
+/// Run here too. This store serializes `ingest` under one lock, so the second
+/// claim reads the first's ownership rather than racing its write -- what it
+/// proves here is that both routes answer with one owner and one conflict.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_scopes_racing_to_claim_an_unowned_edge_leave_it_with_one() {
+    conformance::two_scopes_racing_to_claim_an_unowned_edge_leave_it_with_one(
+        std::sync::Arc::new(store())
+            as std::sync::Arc<dyn graph_storage_sdk::plugin_api::GraphStoreV1>,
+        Uuid::now_v7(),
+    )
+    .await;
+}

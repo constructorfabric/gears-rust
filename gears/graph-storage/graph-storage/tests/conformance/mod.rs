@@ -6555,3 +6555,127 @@ pub async fn a_node_delete_racing_its_edge_delete_counts_every_edge_once(
         }
     }
 }
+
+/// Two scopes racing to claim one unowned edge leave it with exactly one of
+/// them, and tell the other.
+///
+/// An edge first written by an unscoped ingest is unowned, and the first
+/// scoped batch to name it claims it. The guard against taking an owned edge
+/// reads ownership before it writes, so two scopes that both read the edge
+/// unowned before either commits were both admitted, and whichever wrote
+/// second overwrote the first's mark: the loser's later replacement no longer
+/// removed the edge, the winner's did, and neither was told. The claim is a
+/// compare-and-set on the ownership that was read now, so the write that
+/// matched nothing answers the conflict a known owner answers.
+///
+/// Sixteen rounds behind a barrier, on a fresh pair of scopes each. On a
+/// store that serializes `ingest` under one lock the window cannot open, and
+/// the case proves that both routes -- read the owner, or lose the write --
+/// answer with one owner and one conflict.
+pub async fn two_scopes_racing_to_claim_an_unowned_edge_leave_it_with_one(
+    store: std::sync::Arc<dyn GraphStoreV1>,
+    tenant: Uuid,
+) {
+    let scope = AccessScope::for_tenant(tenant);
+    let reader = ctx(tenant, &scope, None);
+    store
+        .register_types(&reader, ontology_batch())
+        .await
+        .expect("the ontology registers");
+
+    for round in 0..16 {
+        let repository = format!("acme/infra-{round}");
+        let component = format!("auth-{round}");
+        // Both nodes satisfy both scope attributes, so either scope may
+        // declare the edge between them.
+        let shared = |key: &str| NodeSpec {
+            node_key: key.to_owned(),
+            type_id: OWNED.to_owned(),
+            name: Some(key.to_owned()),
+            payload: Some(serde_json::json!({
+                "repository": repository,
+                "component": component,
+            })),
+            ..NodeSpec::default()
+        };
+        let (first, second) = (format!("first-{round}"), format!("second-{round}"));
+        // An unscoped ingest: the edge exists and nobody owns it.
+        ingest_batch(
+            store.as_ref(),
+            &reader,
+            batch(
+                vec![shared(&first), shared(&second)],
+                vec![edge(&first, &second)],
+            ),
+        )
+        .await
+        .expect("the unowned edge is created");
+
+        let gate = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let claim = |attribute: &'static str, value: String| {
+            let store = std::sync::Arc::clone(&store);
+            let gate = std::sync::Arc::clone(&gate);
+            let batch = IngestRequest {
+                replace_scope: Some(ReplaceScope {
+                    attribute: attribute.to_owned(),
+                    value,
+                    generation: 1,
+                }),
+                ..batch(
+                    vec![shared(&first), shared(&second)],
+                    vec![edge(&first, &second)],
+                )
+            };
+            tokio::spawn(async move {
+                let scope = AccessScope::for_tenant(tenant);
+                let ctx = ctx(tenant, &scope, None);
+                gate.wait().await;
+                ingest_batch(store.as_ref(), &ctx, batch).await
+            })
+        };
+        let by_repository = claim("repository", repository.clone());
+        let by_component = claim("component", component.clone());
+        let by_repository = by_repository.await.expect("the task does not panic");
+        let by_component = by_component.await.expect("the task does not panic");
+
+        let (winner, loser) = match (&by_repository, &by_component) {
+            (Ok(_), Err(loser)) => (("repository", repository.clone()), loser),
+            (Err(loser), Ok(_)) => (("component", component.clone()), loser),
+            (Ok(_), Ok(_)) => panic!(
+                "round {round}: both scopes were told they claimed the edge; the \
+                 second claim overwrote the first and nobody was told"
+            ),
+            (Err(repository), Err(component)) => panic!(
+                "round {round}: neither scope claimed the edge: {repository:?} / \
+                 {component:?}"
+            ),
+        };
+        assert!(
+            matches!(loser, GraphStoreError::Conflict { .. }),
+            "round {round}: the scope that lost the claim is told a conflict it can act \
+             on: {loser:?}"
+        );
+
+        // The winner owns it: its next replacement without the edge removes
+        // it, which is the observable half of ownership.
+        let outcome = ingest_batch(
+            store.as_ref(),
+            &reader,
+            IngestRequest {
+                replace_scope: Some(ReplaceScope {
+                    attribute: winner.0.to_owned(),
+                    value: winner.1,
+                    generation: 2,
+                }),
+                ..batch(vec![shared(&first), shared(&second)], Vec::new())
+            },
+        )
+        .await
+        .expect("the owner re-declares itself without the edge");
+        assert_eq!(
+            outcome.counts.scope_removed_edges, 1,
+            "round {round}: the edge left with the scope that won the claim: {:?}",
+            outcome.counts
+        );
+    }
+}
