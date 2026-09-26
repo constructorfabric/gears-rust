@@ -197,3 +197,17 @@ type-revision history.
   external embedding egress path, and #4877 neither applies to it nor blocks
   it. Shipping `onnx`-only is the supported way to run this gear before #4877
   lands.
+- *A migration cannot rebuild the vector index without blocking the `node`
+  table.* The platform's migration runner wraps every migration in a
+  transaction and ignores `use_transaction()`, and `PostgreSQL` refuses
+  `CREATE INDEX CONCURRENTLY` inside one, so an index change can only be
+  written the way m0003 writes it: `DROP INDEX` and `CREATE INDEX` in one
+  transaction. That holds an `ACCESS EXCLUSIVE` lock on `node` from the drop
+  until the commit, so reads and writes both wait for the whole HNSW build (a
+  `CREATE INDEX` alone would hold a `SHARE` lock, which still blocks writes).
+  m0003 itself costs nothing: every migration of this gear ships in the same
+  release, so it runs on an empty table at first install. A later migration
+  that changes the index on a populated table needs a maintenance window, or
+  has to be run as an operator step outside the runner, until the runner can
+  run a migration outside a transaction
+  ([#5011](https://github.com/constructorfabric/gears-rust/issues/5011)).
