@@ -68,7 +68,7 @@ Shipped ([ADR-0001](0001-cpt-cf-credstore-adr-stateful-gear.md)–[0003](0003-cp
 | Failure | State after | Who cleans up |
 |---|---|---|
 | Steps 1–2 fail | Nothing written or changed | Nothing to clean up |
-| Step 3 fails | gc row `pending`; row unchanged | Best-effort `DELETE gc`; caller gets 503 |
+| Step 3 fails | gc row `pending`; row unchanged | Best-effort mark `aborted` (never delete — the plugin's error may be ambiguous: the bytes can have persisted despite it); job's gc drain issues `plugin.delete` + drops the row; caller gets 503 |
 | Step 4 fails — DB unavailable | Backend holds orphan bytes; gc row `pending` | Job's pending-reclaim pass once older than `gc.pending_max_age_secs` |
 | Step 4 fails — CAS lost | Orphan bytes, unreferenced; winner's row already updated | Best-effort mark `aborted` + delete; job's gc drain as backstop |
 | Step 5 fails | Row points at `new_id`; old bytes remain, gc row `superseded` | Job's gc drain, next run |
