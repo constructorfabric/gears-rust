@@ -139,29 +139,37 @@ curl -s -X PUT "http://127.0.0.1:8087/cf/credstore/v1/credentials/partner-openai
 curl -s -X PATCH "http://127.0.0.1:8087/cf/credstore/v1/credentials/partner-openai-key" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/merge-patch+json" \
-  -H 'If-Match: "<etag-of-the-record>"' \
+  -H 'If-Match: "7f3a…-…-…c1.1"' \
+  -i \
   -d '{"secret": "sk-def456"}'
+
+# 204 No Content
+# ETag: "7f3a…-…-…c1.2"     <- version bumped; the validator the NEXT write needs
 ```
 
-**Edit metadata without touching the secret** — a partial update with no `secret` key, usable with `write` but not `write_secret`. Requires `write`.
+**Edit metadata without touching the secret** — a partial update with no `secret` key, usable with `write` but not `write_secret`. Requires `write`. Its `If-Match` is the ETag the rotate above just returned, not the one the record was created with — every write, including this metadata-only one, bumps `version` and invalidates the validator that preceded it.
 
 ```text
 # NOT IMPLEMENTED — planned, ADR-0007
 curl -s -X PATCH "http://127.0.0.1:8087/cf/credstore/v1/credentials/partner-openai-key" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/merge-patch+json" \
-  -H 'If-Match: "<etag-of-the-record>"' \
+  -H 'If-Match: "7f3a…-…-…c1.2"' \
+  -i \
   -d '{"sharing": "tenant"}'
+
+# 204 No Content
+# ETag: "7f3a…-…-…c1.3"
 ```
 
-**Remove the secret, keep the record** — a partial update with `secret: null`, the only way to reach the secret-less `declared` state. Metadata and `fallback` stay untouched; `fallback` then decides resolution. Requires `write_secret`.
+**Remove the secret, keep the record** — a partial update with `secret: null` against an existing record, one way to reach the secret-less `declared` state (a create-only `PUT` with `secret: null` reaches it too on a reference with no record yet — see "Suppress an inherited credential you do not own" below). Metadata and `fallback` stay untouched; `fallback` then decides resolution. Requires `write_secret`. `If-Match` is again the ETag the previous write returned.
 
 ```text
 # NOT IMPLEMENTED — planned, ADR-0007
 curl -s -X PATCH "http://127.0.0.1:8087/cf/credstore/v1/credentials/partner-openai-key" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/merge-patch+json" \
-  -H 'If-Match: "<etag-of-the-record>"' \
+  -H 'If-Match: "7f3a…-…-…c1.3"' \
   -d '{"secret": null}'
 ```
 
