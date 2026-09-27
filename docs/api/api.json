@@ -6000,13 +6000,6 @@
         ],
         "type": "object"
       },
-      "FileDtoList": {
-        "description": "List of files (`GET /files`).",
-        "items": {
-          "$ref": "#/components/schemas/FileDto"
-        },
-        "type": "array"
-      },
       "FileParserInfoDto": {
         "description": "REST DTO for file parser info response",
         "properties": {
@@ -16034,13 +16027,6 @@
         ],
         "type": "object"
       },
-      "RetentionRuleDtoList": {
-        "description": "List of retention rules (`GET /retention-rules`).",
-        "items": {
-          "$ref": "#/components/schemas/RetentionRuleDto"
-        },
-        "type": "array"
-      },
       "RetireBody": {
         "description": "The body of a retirement request.",
         "properties": {
@@ -19861,13 +19847,6 @@
           "created_at"
         ],
         "type": "object"
-      },
-      "VersionDtoList": {
-        "description": "List of file versions (`GET /files/{id}/versions`).",
-        "items": {
-          "$ref": "#/components/schemas/VersionDto"
-        },
-        "type": "array"
       },
       "WebSearchConfig": {
         "description": "Web search toggle.",
