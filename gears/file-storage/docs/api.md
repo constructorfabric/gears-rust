@@ -151,7 +151,8 @@ Notes:
   `conflict`, which would contradict what the original call already returned. With
   `bind: "manual"` (or `POST /files/{id}/versions`, which never auto-binds), the client follows up
   with an explicit `POST /files/{id}/bind` (see "Upload, bind, and the conflict retry" below).
-- `GET /files/{id}/versions` returns a JSON array of version objects, ordered `created_at DESC` with `version_id
+- `GET /files/{id}/versions` returns a cursor-paginated page (`{items, page_info}`, see "Cursor pagination" below) of
+  version objects, ordered `created_at DESC` with `version_id
   DESC` as a deterministic tie-breaker — same reasoning as `GET /files` above. Each carries
   `{ version_id, mime_type, size, hash_algorithm, hash, hash_mode, part_count?, manifest?, status, is_current, created_at }`
   (ADR-0006). `hash` is lowercase-hex; `hash_algorithm` is always `"SHA-256"`. `hash_mode` is `"whole-sha256"` (then
