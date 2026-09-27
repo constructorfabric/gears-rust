@@ -237,14 +237,15 @@ impl StoredCompleteResult {
         }
         // `bind_state` vs. `etag`/`current_etag`, matching what
         // `resolve_bind_state` actually writes for each state: `Bound` always
-        // carries the new content `etag`, `Conflict` always carries the
-        // current-content `current_etag`. `Manual` writes neither, but
-        // nothing else ever populates them for a manual snapshot either, so
-        // there is nothing to check there.
-        if bind_state == BindState::Bound && self.etag.is_none() {
-            return None;
-        }
-        if bind_state == BindState::Conflict && self.current_etag.is_none() {
+        // carries the new content `etag` and no `current_etag`, `Conflict`
+        // carries `current_etag` and no `etag`, `Manual` carries neither.
+        // Any other combination is a corrupt snapshot.
+        let consistent = match bind_state {
+            BindState::Bound => self.etag.is_some() && self.current_etag.is_none(),
+            BindState::Conflict => self.etag.is_none() && self.current_etag.is_some(),
+            BindState::Manual => self.etag.is_none() && self.current_etag.is_none(),
+        };
+        if !consistent {
             return None;
         }
         // Both hash modes are SHA-256 (`hash::ALGORITHM`), so a hex string
@@ -903,6 +904,53 @@ mod tests {
             stored.into_completed(Some("v1,0:aa".to_owned())).is_none(),
             "bind_state=conflict without a current_etag must fall back"
         );
+    }
+
+    #[test]
+    fn into_completed_rejects_bound_with_current_etag() {
+        let stored = StoredCompleteResult {
+            current_etag: Some("\"other\"".to_owned()),
+            ..stored_bound()
+        };
+        assert!(
+            stored.into_completed(None).is_none(),
+            "bind_state=bound must not also carry a current_etag"
+        );
+    }
+
+    #[test]
+    fn into_completed_rejects_conflict_with_etag() {
+        let stored = StoredCompleteResult {
+            hash_mode: HashMode::MultipartCompositeSha256.as_str().to_owned(),
+            part_count: 2,
+            bind_state: BindState::Conflict.as_str().to_owned(),
+            etag: Some("\"new\"".to_owned()),
+            current_etag: Some("\"current\"".to_owned()),
+            ..stored_bound()
+        };
+        assert!(
+            stored.into_completed(Some("v1,0:aa".to_owned())).is_none(),
+            "bind_state=conflict must not also carry an etag"
+        );
+    }
+
+    #[test]
+    fn into_completed_rejects_manual_with_etags() {
+        for (etag, current_etag) in [
+            (Some("\"new\"".to_owned()), None),
+            (None, Some("\"current\"".to_owned())),
+        ] {
+            let stored = StoredCompleteResult {
+                bind_state: BindState::Manual.as_str().to_owned(),
+                etag,
+                current_etag,
+                ..stored_bound()
+            };
+            assert!(
+                stored.into_completed(None).is_none(),
+                "bind_state=manual must carry neither etag nor current_etag"
+            );
+        }
     }
 
     #[test]
