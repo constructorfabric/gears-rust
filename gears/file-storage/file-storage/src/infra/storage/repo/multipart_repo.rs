@@ -526,38 +526,49 @@ impl MultipartRepo {
     /// whose `expires_at` is before `now`. Used by the orphan-reconciliation
     /// sweep to clean up stale sessions.
     ///
-    /// Ordered `(expires_at, upload_id)` ascending, up to `limit` rows -- one
-    /// batch per sweep pass, mirroring `VersionRepo::list_pending_older_than`.
-    /// No cursor is needed: the caller's own CAS moves every returned row's
-    /// `state` away from `in_progress`/`completing` before the next sweep
-    /// tick, so it falls out of this same query's next result set on its
-    /// own, and whatever this pass's `limit` left behind is simply picked up
-    /// then.
+    /// Ordered `(expires_at, upload_id)` ascending, up to `limit` rows.
+    /// `after`, when `Some((expires_at, upload_id))`, restricts the result to
+    /// rows strictly greater than that key in the same ordering (keyset
+    /// pagination via `expires_at > a OR (expires_at = a AND upload_id >
+    /// b)`, portable across `PostgreSQL` and `SQLite`) -- `None` starts from
+    /// the longest-expired row. The cleanup engine's sweep tick uses this to
+    /// page past a batch's candidates regardless of whether each one was
+    /// actually reaped, so a session this query keeps returning does not
+    /// block the rest of the backlog for the remainder of one tick -- see
+    /// [`crate::domain::cleanup::CleanupEngine::run_sweep`]'s doc.
     pub async fn list_expired<C: DBRunner>(
         &self,
         conn: &C,
         now: OffsetDateTime,
         limit: u64,
+        after: Option<(OffsetDateTime, Uuid)>,
     ) -> Result<Vec<MultipartUploadSession>, DomainError> {
-        let rows = UploadEntity::find()
-            .filter(
-                sea_orm::Condition::all()
-                    .add(UploadColumn::ExpiresAt.lt(now))
+        let mut filter = sea_orm::Condition::all()
+            .add(UploadColumn::ExpiresAt.lt(now))
+            .add(
+                sea_orm::Condition::any()
+                    .add(UploadColumn::State.eq("in_progress"))
+                    // A `completing` session whose completer died
+                    // AND whose session lifetime
+                    // has passed is also abandoned — but only once
+                    // its lease has expired too, so a live completer
+                    // racing `expires_at` is never reaped mid-flight.
                     .add(
-                        sea_orm::Condition::any()
-                            .add(UploadColumn::State.eq("in_progress"))
-                            // A `completing` session whose completer died
-                            // AND whose session lifetime
-                            // has passed is also abandoned — but only once
-                            // its lease has expired too, so a live completer
-                            // racing `expires_at` is never reaped mid-flight.
-                            .add(
-                                sea_orm::Condition::all()
-                                    .add(UploadColumn::State.eq("completing"))
-                                    .add(UploadColumn::LeaseUntil.lt(now)),
-                            ),
+                        sea_orm::Condition::all()
+                            .add(UploadColumn::State.eq("completing"))
+                            .add(UploadColumn::LeaseUntil.lt(now)),
                     ),
-            )
+            );
+        if let Some((after_expires_at, after_upload_id)) = after {
+            filter = filter.add(super::tuple_gt(
+                (UploadEntity, UploadColumn::ExpiresAt),
+                (UploadEntity, UploadColumn::UploadId),
+                after_expires_at,
+                after_upload_id,
+            ));
+        }
+        let rows = UploadEntity::find()
+            .filter(filter)
             .order_by_asc(UploadColumn::ExpiresAt)
             .order_by_asc(UploadColumn::UploadId)
             .limit(limit)

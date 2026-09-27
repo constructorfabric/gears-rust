@@ -395,10 +395,11 @@ async fn create_file_bind_invalid_value_returns_400_before_touching_multipart() 
                 owner_id,
             },
             None,
-            0,
+            None,
         )
         .await
-        .expect("list_files");
+        .expect("list_files")
+        .items;
     assert!(
         files.is_empty(),
         "a rejected create must not have created a file row"
@@ -445,10 +446,11 @@ async fn create_file_multipart_with_idempotency_key_returns_400() {
                 owner_id,
             },
             None,
-            0,
+            None,
         )
         .await
-        .expect("list_files");
+        .expect("list_files")
+        .items;
     assert!(
         files.is_empty(),
         "the idempotency+multipart conflict must be rejected before create_file_bare runs"
@@ -563,10 +565,11 @@ async fn create_file_multipart_intent_initiate_failure_compensates_bare_file() {
                 owner_id,
             },
             None,
-            0,
+            None,
         )
         .await
-        .expect("list_files");
+        .expect("list_files")
+        .items;
     assert!(
         files.is_empty(),
         "compensate_failed_multipart_initiate must remove the orphan bare file"

@@ -3,6 +3,7 @@ use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use super::*;
+use crate::Page;
 use crate::models::{
     CreateFileOutcome, EffectivePolicy, FileFetch, MetadataLimits, MultipartCompleteOutcome,
     MultipartPlan, MultipartStatus, Policy, RetentionRule, Storage, UploadTicket, VersionRecord,
@@ -45,12 +46,9 @@ impl FileStorageClientV1 for StubClient {
         _ctx: &SecurityContext,
         _owner: OwnerFilter,
         _limit: Option<u64>,
-        _offset: u64,
+        _cursor: Option<&str>,
     ) -> Result<Page<FileRecord>, FileStorageError> {
-        Ok(Page {
-            items: vec![],
-            next_offset: None,
-        })
+        Ok(Page::empty(0))
     }
 
     async fn update_metadata(
@@ -86,12 +84,9 @@ impl FileStorageClientV1 for StubClient {
         _ctx: &SecurityContext,
         _file_id: FileId,
         _limit: Option<u64>,
-        _offset: u64,
+        _cursor: Option<&str>,
     ) -> Result<Page<VersionRecord>, FileStorageError> {
-        Ok(Page {
-            items: vec![],
-            next_offset: None,
-        })
+        Ok(Page::empty(0))
     }
 
     async fn presign_version(
@@ -229,8 +224,10 @@ impl FileStorageClientV1 for StubClient {
     async fn list_retention_rules(
         &self,
         _ctx: &SecurityContext,
-    ) -> Result<Vec<RetentionRule>, FileStorageError> {
-        Ok(vec![])
+        _limit: Option<u64>,
+        _cursor: Option<&str>,
+    ) -> Result<Page<RetentionRule>, FileStorageError> {
+        Ok(Page::empty(0))
     }
 
     async fn create_retention_rule(

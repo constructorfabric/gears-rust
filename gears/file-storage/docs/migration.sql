@@ -111,12 +111,12 @@ COMMENT ON COLUMN file_storage.files.meta_version   IS 'Monotonic counter; bumpe
 -- Indexes on files -----------------------------------------------------------
 
 -- Covers the primary `GET /files` listing query: tenant + owner_kind + owner_id
--- with created_at descending, file_id descending as a tie-breaker for stable
--- OFFSET pagination when two rows share a created_at instant (FileRepo::list
--- sorts ORDER BY created_at DESC, file_id DESC). Supersedes
--- files_owner_listing_idx (created_at DESC only, m20260624_000001_p1_initial),
--- dropped in the same migration that adds this one (shipped,
--- m20260924_000001_upload_flow_redesign).
+-- with created_at descending, file_id descending as the keyset tie-breaker
+-- for stable forward-only cursor pagination when two rows share a created_at
+-- instant (FileRepo::list_page sorts ORDER BY created_at DESC, file_id DESC).
+-- Supersedes files_owner_listing_idx (created_at DESC only,
+-- m20260624_000001_p1_initial), dropped in the same migration that adds this
+-- one (shipped, m20260924_000001_upload_flow_redesign).
 CREATE INDEX files_owner_listing_v2_idx
     ON file_storage.files (tenant_id, owner_kind, owner_id, created_at DESC, file_id DESC);
 
@@ -215,17 +215,18 @@ CREATE INDEX file_versions_pending_idx
     ON file_storage.file_versions (created_at)
     WHERE status = 'pending';
 
--- Recovery / debugging index on backend pointer ("which versions live on backend X?").
-CREATE INDEX file_versions_backend_idx
-    ON file_storage.file_versions (backend_id);
+-- `file_versions_backend_idx` (backend_id) was DROPPED in
+-- m20260924_000001_upload_flow_redesign: no query filters file_versions by
+-- backend_id (backend migration reads/writes a version by (file_id,
+-- version_id), never scans by backend), so it only paid insert/update cost.
 
--- Covers VersionRepo::list_by_file (GET /files/{id}/versions, and the
--- unbounded Store::list_versions used by delete/expiry blob accounting,
--- backend migration and the sweep engine): filters file_id = ?, sorts
--- created_at DESC. The composite PK (file_id, version_id) serves the filter
--- but not the sort, and versions are never pruned in P1/P2, so this was a
--- full per-file scan + sort with no supporting index (shipped,
--- m20260924_000001_upload_flow_redesign).
+-- Covers VersionRepo::list_by_file_page (GET /files/{id}/versions, cursor
+-- pagination) and VersionRepo::list_by_file (the unbounded read used by
+-- delete/expiry blob accounting, backend migration and the sweep engine):
+-- both filter file_id = ?, sort created_at DESC. The composite PK (file_id,
+-- version_id) serves the filter but not the sort, and versions are never
+-- pruned in P1/P2, so this was a full per-file scan + sort with no
+-- supporting index (shipped, m20260924_000001_upload_flow_redesign).
 CREATE INDEX file_versions_file_created_idx
     ON file_storage.file_versions (file_id, created_at, version_id);
 
@@ -596,6 +597,13 @@ CREATE INDEX retention_rules_scope_idx
 CREATE INDEX retention_rules_file_scope_idx
     ON file_storage.retention_rules (scope_target_id)
     WHERE scope = 'file';
+
+-- Covers `GET /retention-rules`' canonical order and non-admin visibility
+-- filter (RetentionRuleRepo::list_page: tenant_id = ?, ORDER BY created_at
+-- DESC, rule_id DESC) -- cursor pagination, tie-breaker reasoning mirrors
+-- files_owner_listing_v2_idx above (shipped, m20260924_000001_upload_flow_redesign).
+CREATE INDEX retention_rules_tenant_listing_idx
+    ON file_storage.retention_rules (tenant_id, created_at DESC, rule_id DESC);
 
 
 -- =============================================================================

@@ -105,6 +105,55 @@ fn validate_ignores_zero_sweep_interval_when_sweep_disabled() {
 }
 
 #[test]
+fn default_sweep_time_budget_is_fifteen_minutes() {
+    let cfg = FileStorageConfig::default();
+    assert_eq!(cfg.sweep_time_budget_secs, 900);
+}
+
+#[test]
+fn validate_rejects_zero_sweep_time_budget_when_sweep_enabled() {
+    // A zero budget with the sweep on would silently cap every tick at one
+    // batch per phase (see `CleanupEngine::run_sweep`'s doc) -- the same trap
+    // `sweep_interval_secs == 0` guards against above.
+    let cfg = FileStorageConfig {
+        require_signing_key_seed: false,
+        sweep_time_budget_secs: 0,
+        enable_background_sweep: true,
+        ..FileStorageConfig::default()
+    };
+    assert!(
+        cfg.validate().is_err(),
+        "sweep_time_budget_secs == 0 must be rejected when the sweep is enabled"
+    );
+}
+
+#[test]
+fn validate_accepts_positive_sweep_time_budget_when_sweep_enabled() {
+    let cfg = FileStorageConfig {
+        require_signing_key_seed: false,
+        sweep_time_budget_secs: 60,
+        enable_background_sweep: true,
+        ..FileStorageConfig::default()
+    };
+    assert!(
+        cfg.validate().is_ok(),
+        "a positive sweep time budget must pass validation"
+    );
+}
+
+#[test]
+fn validate_ignores_zero_sweep_time_budget_when_sweep_disabled() {
+    // With the sweep off the budget is unused, so it need not be constrained.
+    let cfg = FileStorageConfig {
+        require_signing_key_seed: false,
+        sweep_time_budget_secs: 0,
+        enable_background_sweep: false,
+        ..FileStorageConfig::default()
+    };
+    assert!(cfg.validate().is_ok());
+}
+
+#[test]
 fn validate_rejects_missing_signing_key_seed_when_required_flag_set() {
     let cfg = FileStorageConfig {
         signing_key_seed: None,
@@ -532,8 +581,8 @@ fn validate_accepts_default_url_ttl_of_one() {
 #[test]
 fn validate_rejects_default_page_size_exceeding_max_page_size() {
     let cfg = FileStorageConfig {
-        default_page_size: 2000,
-        max_page_size: 1000,
+        default_page_size: 150,
+        max_page_size: 100,
         require_signing_key_seed: false,
         ..FileStorageConfig::default()
     };
@@ -547,8 +596,8 @@ fn validate_rejects_default_page_size_exceeding_max_page_size() {
 #[test]
 fn validate_accepts_default_page_size_equal_to_max_page_size() {
     let cfg = FileStorageConfig {
-        default_page_size: 500,
-        max_page_size: 500,
+        default_page_size: 100,
+        max_page_size: 100,
         require_signing_key_seed: false,
         ..FileStorageConfig::default()
     };
@@ -1099,4 +1148,50 @@ fn validate_rejects_previous_signing_public_keys_above_max() {
         err.to_string().contains("MAX_PREVIOUS_SIGNING_PUBLIC_KEYS"),
         "error should name the exceeded ceiling: {err}"
     );
+}
+
+// ── sweep_time_budget_secs absolute ceiling ─────────────────────────────────
+//
+// `domain::cleanup::CleanupEngine::run_sweep` uses it as a `Duration` added
+// to `Instant::now()` via `checked_add` (an oversized value is simply treated
+// as "unbounded", not an overflow hazard) -- but it otherwise has no ceiling
+// of its own, and an unbounded budget would let one sweep tick run forever.
+
+#[test]
+fn validate_accepts_sweep_time_budget_at_ceiling() {
+    let cfg = FileStorageConfig {
+        require_signing_key_seed: false,
+        sweep_time_budget_secs: MAX_SWEEP_TIME_BUDGET_SECS,
+        ..FileStorageConfig::default()
+    };
+    assert!(
+        cfg.validate().is_ok(),
+        "sweep_time_budget_secs == MAX_SWEEP_TIME_BUDGET_SECS must be accepted"
+    );
+}
+
+#[test]
+fn validate_rejects_sweep_time_budget_above_ceiling() {
+    let cfg = FileStorageConfig {
+        require_signing_key_seed: false,
+        sweep_time_budget_secs: MAX_SWEEP_TIME_BUDGET_SECS + 1,
+        ..FileStorageConfig::default()
+    };
+    assert!(
+        cfg.validate().is_err(),
+        "sweep_time_budget_secs exceeding MAX_SWEEP_TIME_BUDGET_SECS must be rejected"
+    );
+}
+
+#[test]
+fn validate_accepts_default_config_sweep_time_budget_ceiling() {
+    let cfg = FileStorageConfig {
+        require_signing_key_seed: false,
+        ..FileStorageConfig::default()
+    };
+    assert!(
+        cfg.sweep_time_budget_secs <= MAX_SWEEP_TIME_BUDGET_SECS,
+        "sanity: the shipped default_sweep_time_budget_secs must not itself exceed the ceiling"
+    );
+    assert!(cfg.validate().is_ok());
 }

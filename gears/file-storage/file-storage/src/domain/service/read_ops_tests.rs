@@ -147,9 +147,10 @@ async fn list_files_returns_each_files_custom_metadata() {
         owner_id: owner,
     };
     let files = svc
-        .list_files(&ctx, owner_filter, Some(10), 0)
+        .list_files(&ctx, owner_filter, Some(10), None)
         .await
-        .unwrap();
+        .unwrap()
+        .items;
     assert_eq!(files.len(), 3, "sanity: all three files listed");
 
     let file_ids: Vec<Uuid> = files.iter().map(|f| f.file_id).collect();

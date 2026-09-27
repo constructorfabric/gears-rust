@@ -14,7 +14,8 @@
 #![allow(unknown_lints, de0309_must_have_domain_model)]
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -31,43 +32,44 @@ use crate::infra::external_clients::{UsageDelta, UsageReporter};
 /// `File` rows the sweep holds in memory at once, independent of total count.
 const RETENTION_SWEEP_BATCH: u64 = 500;
 
-/// Page size for [`CleanupEngine::sweep_abandoned_pending`] (sweep step 1,
-/// first phase): abandoned pending version rows reclaimed per sweep pass.
-/// One batch per pass, same as every other step-1/step-2 query -- none of
-/// them loop to exhaustion -- so a backlog built up during an outage or a
-/// run of repeated client failures cannot force a single sweep tick to
-/// materialize and process an unbounded candidate list; any remainder is
-/// left for the next scheduled sweep (see
-/// [`crate::domain::ports::CleanupStore::list_abandoned_pending_versions`]
-/// for why no cursor is needed to pick it up).
+/// Page size for [`CleanupEngine::sweep_abandoned_pending_page`] (sweep step
+/// 1, first phase): abandoned pending version rows reclaimed per batch. A
+/// tick keeps calling this phase, keyset-paginated by `(created_at,
+/// version_id)`, batch after batch (interleaved with the other sweep phases)
+/// until it comes up short or [`CleanupEngine`]'s per-tick time budget runs
+/// out; whatever is left is picked up either later in the same tick or, once
+/// the budget is spent, by the next scheduled tick.
 const ABANDONED_PENDING_SWEEP_BATCH: u64 = 500;
 
 /// Page size for the second phase of sweep step 1
-/// ([`CleanupEngine::sweep_versionless_files`]): permanently versionless
-/// `files` rows reclaimed per sweep pass. One batch per pass, same as its
-/// step-1 sibling [`CleanupEngine::sweep_abandoned_pending`] and step 2's
-/// `sweep_expired_multipart` -- neither loops to exhaustion, so this phase
-/// doesn't either; a bound is still applied here (rather than an unbounded
-/// scan) purely as a defensive cap against a pathological backlog, with any
-/// remainder left for the next scheduled sweep.
+/// ([`CleanupEngine::sweep_versionless_files_page`]): permanently versionless
+/// `files` rows reclaimed per batch. Same keyset-pagination and time-budget
+/// reasoning as [`ABANDONED_PENDING_SWEEP_BATCH`] above, paginated by
+/// `(created_at, file_id)`.
 const VERSIONLESS_SWEEP_BATCH: u64 = 500;
 
-/// Page size for [`CleanupEngine::sweep_expired_multipart`] (sweep step 2):
-/// expired multipart sessions aborted per sweep pass. Same reasoning as
-/// [`ABANDONED_PENDING_SWEEP_BATCH`] above -- a backlog of unreconciled
-/// sessions (e.g. from a client that stopped uploading parts en masse)
-/// cannot force one sweep tick to abort an unbounded number of sessions in a
-/// single pass; the remainder is picked up by the next tick (see
-/// [`crate::domain::ports::CleanupStore::list_expired_multipart_uploads`]
-/// for why no cursor is needed).
+/// Page size for [`CleanupEngine::sweep_expired_multipart_page`] (sweep step
+/// 2): expired multipart sessions aborted per batch. Same keyset-pagination
+/// and time-budget reasoning as [`ABANDONED_PENDING_SWEEP_BATCH`] above,
+/// paginated by `(expires_at, upload_id)`.
 const EXPIRED_MULTIPART_SWEEP_BATCH: u64 = 500;
 
-/// Page size for sweep step 4 (expired `idempotency_keys` rows). Same
-/// reasoning as the other sweep phases above: a stalled sweep letting a
-/// large backlog accumulate must not turn the next tick into one unbounded
-/// `DELETE` (a long-held lock on `PostgreSQL`, one large single-writer
-/// transaction on `SQLite`); the remainder is picked up by the next tick.
+/// Page size for sweep step 4 (expired `idempotency_keys` rows) per batch.
+/// No cursor is needed here: each batch deletes the rows it selects, so the
+/// next call (later in the same tick, or the next tick) naturally sees the
+/// next-oldest backlog rather than the same rows again. A stalled sweep
+/// letting a large backlog accumulate must not turn one tick into a single
+/// unbounded `DELETE` (a long-held lock on `PostgreSQL`, one large
+/// single-writer transaction on `SQLite`).
 const EXPIRED_IDEMPOTENCY_SWEEP_BATCH: u64 = 500;
+
+/// Default per-tick time budget for [`CleanupEngine::run_sweep`] -- used
+/// whenever [`CleanupEngine::with_tick_budget`] is never called (e.g. every
+/// test in this crate that builds a `CleanupEngine` directly, and the
+/// `CleanupEngine::new(...)` call in `gear.rs` before `.with_tick_budget(..)`
+/// is applied). Mirrors `FileStorageConfig::sweep_time_budget_secs`'s own
+/// default (900s / 15 minutes) -- see that field's doc comment for why.
+const DEFAULT_SWEEP_TICK_BUDGET: Duration = Duration::from_mins(15);
 
 /// Configuration knobs for the cleanup engine.
 #[derive(Debug, Clone)]
@@ -87,7 +89,7 @@ pub struct SweepResult {
     /// abandoned-pending-version phase or step 2's expired-multipart-session
     /// phase (a `file_versions` row existed and was aged out, leaving the
     /// parent with zero versions), or by step 1's dedicated
-    /// versionless-files phase ([`CleanupEngine::sweep_versionless_files`])
+    /// versionless-files phase ([`CleanupEngine::sweep_versionless_files_page`])
     /// for a `files` row that never received a version at all.
     pub abandoned_files_deleted: usize,
     /// Number of expired in-progress multipart sessions aborted.
@@ -96,6 +98,16 @@ pub struct SweepResult {
     pub retention_expired_deleted: usize,
     /// Number of expired `idempotency_keys` rows deleted.
     pub idempotency_keys_deleted: u64,
+    /// `true` when this tick stopped because its time budget
+    /// ([`CleanupEngine::with_tick_budget`] / `sweep_time_budget_secs`) ran
+    /// out while at least one sweep phase still had more candidates to
+    /// process, `false` when every phase ran to exhaustion on its own. A
+    /// budget-exhausted tick is not an error -- the unfinished phases simply
+    /// resume (pending/versionless/multipart from the start of their keyset
+    /// order again; retention from its saved cursor) on a later tick.
+    pub budget_exhausted: bool,
+    /// Wall-clock duration of this sweep tick, in milliseconds.
+    pub elapsed_ms: u64,
 }
 
 /// The cleanup engine -- orchestrates the background sweep.
@@ -116,6 +128,17 @@ pub struct CleanupEngine {
     /// no-op); `gear.rs` opts in via [`Self::with_usage_reporter`] once a
     /// Usage Collector client is wired.
     usage_reporter: Option<Arc<dyn UsageReporter>>,
+    /// Per-tick time budget for [`Self::run_sweep`]. Defaults to
+    /// [`DEFAULT_SWEEP_TICK_BUDGET`]; `gear.rs` overrides it via
+    /// [`Self::with_tick_budget`] from `FileStorageConfig::sweep_time_budget_secs`.
+    tick_budget: Duration,
+    /// Retention-sweep keyset cursor (`files.file_id`), carried **across**
+    /// ticks -- unlike the other sweep phases' cursors, which
+    /// [`Self::run_sweep`] keeps as tick-local variables and always restarts
+    /// at `None`. `None` means "start from the beginning" (either nothing
+    /// was in progress, or the last tick finished the whole table). See
+    /// [`Self::sweep_retention_expiry_page`] for how it advances.
+    retention_cursor: Mutex<Option<Uuid>>,
 }
 
 impl CleanupEngine {
@@ -131,6 +154,8 @@ impl CleanupEngine {
             backends,
             config,
             usage_reporter: None,
+            tick_budget: DEFAULT_SWEEP_TICK_BUDGET,
+            retention_cursor: Mutex::new(None),
         }
     }
 
@@ -140,6 +165,15 @@ impl CleanupEngine {
     #[must_use]
     pub fn with_usage_reporter(mut self, usage_reporter: Option<Arc<dyn UsageReporter>>) -> Self {
         self.usage_reporter = usage_reporter;
+        self
+    }
+
+    /// Override the per-tick time budget (default: [`DEFAULT_SWEEP_TICK_BUDGET`]).
+    /// Builder step, same shape as [`Self::with_usage_reporter`]; `gear.rs`
+    /// calls this once at init with `FileStorageConfig::sweep_time_budget_secs`.
+    #[must_use]
+    pub fn with_tick_budget(mut self, tick_budget: Duration) -> Self {
+        self.tick_budget = tick_budget;
         self
     }
 
@@ -162,8 +196,8 @@ impl CleanupEngine {
     ///    active multipart session: a live `in_progress` one (`expires_at >
     ///    now`), or any `completing` one (regardless of lease), neither of
     ///    which is ever selected regardless of age. Followed by a second phase,
-    ///    [`Self::sweep_versionless_files`], for `files` rows that never got a
-    ///    version row in the first place (so the first phase's own
+    ///    [`Self::sweep_versionless_files_page`], for `files` rows that never
+    ///    got a version row in the first place (so the first phase's own
     ///    version-age query can never see them) -- e.g. a process crash
     ///    between `FileService::create_file_bare`'s commit and
     ///    `MultipartService::initiate_multipart_upload`'s
@@ -180,63 +214,204 @@ impl CleanupEngine {
     /// idempotent: concurrent sweeps on the same data produce at most one
     /// successful deletion per row (the first writer wins; the rest get
     /// `Ok(false)` from the version/file delete methods).
+    ///
+    /// # Time budget and multi-pass batching
+    ///
+    /// A single call to any one phase only ever processes one bounded batch
+    /// (`ABANDONED_PENDING_SWEEP_BATCH` and siblings, `500` rows). Rather than
+    /// stopping there, this method repeats the four steps above as further
+    /// **passes**, in the same order, each pass fetching one more batch per
+    /// not-yet-exhausted phase, until either every phase is exhausted (its
+    /// last batch came back short, or its query/delete errored) or the
+    /// per-tick time budget ([`Self::with_tick_budget`], default
+    /// [`DEFAULT_SWEEP_TICK_BUDGET`]) runs out. The very first pass always
+    /// runs in full regardless of the budget -- even a zero budget still
+    /// processes one batch per phase -- so a misconfigured budget can never
+    /// make a tick do *less* than the old single-batch-per-call behaviour.
+    /// The deadline is checked before every batch from the second pass
+    /// onward; `now`/`grace_cutoff` are sampled once at the top and reused
+    /// for every pass and every phase, so a guard that depends on "now" (see
+    /// `sweep_abandoned_pending_page`'s doc) sees one consistent instant for
+    /// the whole tick.
+    ///
+    /// Phases 1/1b/2 each keep a keyset cursor **local to this call**,
+    /// starting at `None` (oldest first) every tick regardless of how far a
+    /// previous tick got -- a stuck head-of-line candidate (an active
+    /// multipart session, a transient per-candidate error) is retried from
+    /// scratch next tick, and free candidates further back in keyset order
+    /// are no longer starved behind it within *this* tick. Phase 3
+    /// (retention) is the exception: its cursor survives across ticks (see
+    /// [`Self::sweep_retention_expiry_page`]) because a full table scan can
+    /// legitimately span many ticks, and restarting it from scratch every
+    /// tick would starve files later in `file_id` order on a large enough
+    /// deployment. Phase 4 (idempotency) needs no cursor at all: each batch
+    /// deletes the rows it selects, so the next call -- later this tick, or
+    /// next tick -- naturally sees the next-oldest backlog.
     #[tracing::instrument(skip_all)]
     pub async fn run_sweep(&self) -> SweepResult {
+        let tick_start = Instant::now();
+        // `None` here means "budget large enough that `Instant + Duration`
+        // would overflow" -- treated as unbounded (never times out) rather
+        // than panicking or silently truncating.
+        let deadline = tick_start.checked_add(self.tick_budget);
+
         let mut result = SweepResult::default();
         let now = OffsetDateTime::now_utc();
         let grace =
             time::Duration::seconds(i64::try_from(self.config.orphan_grace_secs).unwrap_or(3600));
         let grace_cutoff = now - grace;
 
-        // Step 1 -- abandoned pending versions (+ the parent `files` row, if
-        // reclaiming the version leaves it a permanent zero-version orphan).
-        let (pending_deleted, files_deleted) =
-            self.sweep_abandoned_pending(grace_cutoff, now).await;
-        result.abandoned_pending_deleted += pending_deleted;
-        result.abandoned_files_deleted += files_deleted;
+        // Per-phase tick-local state: a keyset cursor (reset to `None` every
+        // tick -- see doc comment above) and an "exhausted" latch that, once
+        // set, skips that phase for the rest of this tick.
+        let mut pending_after: Option<(OffsetDateTime, Uuid)> = None;
+        let mut pending_done = false;
+        let mut versionless_after: Option<(OffsetDateTime, Uuid)> = None;
+        let mut versionless_done = false;
+        let mut multipart_after: Option<(OffsetDateTime, Uuid)> = None;
+        let mut multipart_done = false;
+        let mut idempotency_done = false;
 
-        // Step 1, second phase -- `files` rows that never received a version
-        // at all (so the query above, keyed on a *version's* age, could never
-        // have selected them). Same `grace_cutoff`: a live `POST /files`
-        // request between `create_file_bare`'s commit and the multipart
-        // plan's `insert_pending_version` spans milliseconds, while
-        // `orphan_grace_secs` is configured in hours, so there is no race
-        // between this phase and an in-flight create.
-        result.abandoned_files_deleted += self.sweep_versionless_files(grace_cutoff).await;
+        // Retention rules are loaded once for the whole tick (unchanged from
+        // the old single-pass behaviour) -- see `sweep_retention_expiry_page`.
+        // An empty rule set means no scan is needed at all this tick, and the
+        // persisted cursor is reset (there is nothing left to resume). A
+        // failure to load the rules is deliberately NOT treated the same way:
+        // it also skips the scan for this tick, but the persisted cursor from
+        // a previous tick's in-progress scan must survive a transient load
+        // error untouched, so that scan resumes where it left off once rule
+        // loading recovers.
+        let (all_rules, rules_load_failed) = match self.store.list_all_retention_rules().await {
+            Ok(rules) => (rules, false),
+            Err(e) => {
+                tracing::warn!(error = ?e, "cleanup: failed to list retention rules");
+                (Vec::new(), true)
+            }
+        };
+        let mut retention_after = *self
+            .retention_cursor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !rules_load_failed && all_rules.is_empty() {
+            retention_after = None;
+            *self
+                .retention_cursor
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        }
+        let mut retention_done = all_rules.is_empty();
 
-        // Step 2 -- expired multipart sessions. This can also reclaim a
-        // zero-version orphan file left behind by step 1 above: step 1's own
-        // orphan check runs while this session still looks in_progress, so it
-        // declines then and leaves the reclaim to whichever step finishes
-        // last for a given file (see `cleanup_expired_session_version`'s doc).
-        let (expired_aborted, files_deleted_by_step2) = self.sweep_expired_multipart(now).await;
-        result.expired_multipart_aborted += expired_aborted;
-        result.abandoned_files_deleted += files_deleted_by_step2;
+        // Checked before each not-yet-exhausted phase's batch, but only from
+        // the second pass onward -- see `run_sweep`'s doc for why the first
+        // pass is unconditional.
+        let deadline_hit = |first_pass: bool| -> bool {
+            !first_pass
+                && match deadline {
+                    Some(d) => Instant::now() >= d,
+                    None => false,
+                }
+        };
 
-        // Step 3 -- retention-policy expiry.
-        result.retention_expired_deleted += self.sweep_retention_expiry(now).await;
+        let mut budget_exhausted = false;
+        let mut first_pass = true;
+        loop {
+            if !pending_done {
+                if deadline_hit(first_pass) {
+                    budget_exhausted = true;
+                    break;
+                }
+                let (pending_deleted, files_deleted, exhausted, next_after) = self
+                    .sweep_abandoned_pending_page(grace_cutoff, now, pending_after)
+                    .await;
+                result.abandoned_pending_deleted += pending_deleted;
+                result.abandoned_files_deleted += files_deleted;
+                pending_after = next_after;
+                pending_done = exhausted;
+            }
 
-        // Step 4 -- expired idempotency-key rows. The
-        // `audit_outbox`/`events_outbox` tables are deliberately NOT swept
-        // here: `published_at` stays `NULL` until the Tier 4 EventBroker
-        // relay exists, so a row-age-based purge would silently drop rows
-        // that were never delivered.
-        result.idempotency_keys_deleted += self
-            .store
-            .delete_expired_idempotency_keys(now, EXPIRED_IDEMPOTENCY_SWEEP_BATCH)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(error = ?e, "cleanup: failed to delete expired idempotency keys");
-                0
-            });
+            if !versionless_done {
+                if deadline_hit(first_pass) {
+                    budget_exhausted = true;
+                    break;
+                }
+                let (files_deleted, exhausted, next_after) = self
+                    .sweep_versionless_files_page(grace_cutoff, versionless_after)
+                    .await;
+                result.abandoned_files_deleted += files_deleted;
+                versionless_after = next_after;
+                versionless_done = exhausted;
+            }
 
+            if !multipart_done {
+                if deadline_hit(first_pass) {
+                    budget_exhausted = true;
+                    break;
+                }
+                let (aborted, files_deleted, exhausted, next_after) = self
+                    .sweep_expired_multipart_page(now, multipart_after)
+                    .await;
+                result.expired_multipart_aborted += aborted;
+                result.abandoned_files_deleted += files_deleted;
+                multipart_after = next_after;
+                multipart_done = exhausted;
+            }
+
+            if !retention_done {
+                if deadline_hit(first_pass) {
+                    budget_exhausted = true;
+                    break;
+                }
+                let (deleted, exhausted, next_after) = self
+                    .sweep_retention_expiry_page(now, &all_rules, retention_after)
+                    .await;
+                result.retention_expired_deleted += deleted;
+                retention_after = next_after;
+                retention_done = exhausted;
+            }
+
+            if !idempotency_done {
+                if deadline_hit(first_pass) {
+                    budget_exhausted = true;
+                    break;
+                }
+                // Step 4 -- expired idempotency-key rows. The
+                // `audit_outbox`/`events_outbox` tables are deliberately NOT
+                // swept here: `published_at` stays `NULL` until the Tier 4
+                // EventBroker relay exists, so a row-age-based purge would
+                // silently drop rows that were never delivered.
+                let (deleted, exhausted) = self.sweep_idempotency_page(now).await;
+                result.idempotency_keys_deleted += deleted;
+                idempotency_done = exhausted;
+            }
+
+            if pending_done
+                && versionless_done
+                && multipart_done
+                && retention_done
+                && idempotency_done
+            {
+                break;
+            }
+            first_pass = false;
+        }
+
+        // Persist the retention cursor for the next tick -- see
+        // `sweep_retention_expiry_page`'s doc for what each outcome means.
+        *self
+            .retention_cursor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = retention_after;
+
+        result.budget_exhausted = budget_exhausted;
+        result.elapsed_ms = u64::try_from(tick_start.elapsed().as_millis()).unwrap_or(u64::MAX);
         result
     }
 
     // ── private sweep methods ──────────────────────────────────────────────────
 
-    /// Delete pending version rows that were never finalised and are older than
-    /// `grace_cutoff`. Blob bytes are cleaned up on a best-effort basis.
+    /// Delete one batch of pending version rows that were never finalised and
+    /// are older than `grace_cutoff`. Blob bytes are cleaned up on a
+    /// best-effort basis.
     ///
     /// Invariant: a pending version referenced by a live `in_progress`
     /// multipart session (`expires_at > now`) is never selected here,
@@ -246,15 +421,34 @@ impl CleanupEngine {
     /// guard must use the *same* "now" the caller used to decide the session
     /// is still live, not a value re-sampled inside the query layer.
     ///
-    /// Returns `(pending_versions_deleted, orphan_files_deleted)`.
-    async fn sweep_abandoned_pending(
+    /// `after` is this phase's keyset cursor (`(created_at, version_id)`),
+    /// `None` to start from the oldest candidate -- see [`Self::run_sweep`]'s
+    /// doc for why it is tick-local rather than persisted. It exists so a
+    /// candidate this batch could not reclaim (a still-blocking multipart
+    /// session, a transient per-row error) does not keep re-appearing at the
+    /// head of every subsequent batch **within this tick** and starve
+    /// everything behind it; the cursor always advances to the last
+    /// candidate this batch saw, regardless of whether that candidate was
+    /// actually reclaimed.
+    ///
+    /// Returns `(pending_versions_deleted, orphan_files_deleted, exhausted,
+    /// next_after)`. `exhausted` is `true` once this phase has nothing left
+    /// to do this tick: the batch came back shorter than the page size, or
+    /// the list query itself errored (logged here).
+    async fn sweep_abandoned_pending_page(
         &self,
         grace_cutoff: OffsetDateTime,
         now: OffsetDateTime,
-    ) -> (usize, usize) {
+        after: Option<(OffsetDateTime, Uuid)>,
+    ) -> (usize, usize, bool, Option<(OffsetDateTime, Uuid)>) {
         let versions = match self
             .store
-            .list_abandoned_pending_versions(grace_cutoff, now, ABANDONED_PENDING_SWEEP_BATCH)
+            .list_abandoned_pending_versions(
+                grace_cutoff,
+                now,
+                ABANDONED_PENDING_SWEEP_BATCH,
+                after,
+            )
             .await
         {
             Ok(v) => v,
@@ -263,9 +457,14 @@ impl CleanupEngine {
                     error = ?e,
                     "cleanup: failed to list abandoned pending versions"
                 );
-                return (0, 0);
+                return (0, 0, true, after);
             }
         };
+        let exhausted = (versions.len() as u64) < ABANDONED_PENDING_SWEEP_BATCH;
+        let next_after = versions
+            .last()
+            .map(|v| (v.created_at, v.version_id))
+            .or(after);
 
         // Resolve every candidate's parent file in ONE batch call, up front,
         // instead of one `get_file` per candidate inside the loop below (up
@@ -298,7 +497,7 @@ impl CleanupEngine {
             pending_count += pending;
             files_count += files;
         }
-        (pending_count, files_count)
+        (pending_count, files_count, exhausted, next_after)
     }
 
     /// Best-effort load of a file row for audit tenant attribution. A failed
@@ -321,8 +520,8 @@ impl CleanupEngine {
     /// Batched counterpart of [`Self::load_file_for_audit`]: resolves every
     /// distinct file in `ids` in ONE round trip (`CleanupStore::list_files_by_ids`)
     /// instead of one `get_file` per candidate, keyed by `file_id` for the
-    /// caller's loop to look up. Used by [`Self::sweep_abandoned_pending`] and
-    /// [`Self::sweep_expired_multipart`] to resolve a whole sweep batch's
+    /// caller's loop to look up. Used by [`Self::sweep_abandoned_pending_page`] and
+    /// [`Self::sweep_expired_multipart_page`] to resolve a whole sweep batch's
     /// (up to 500) candidates' audit `tenant_id`s up front.
     ///
     /// A failed batch read is logged once for the whole batch and treated as
@@ -363,7 +562,7 @@ impl CleanupEngine {
     ///
     /// The delete itself is status-guarded (`delete_pending_version`, only
     /// removes the row while it is still `status = pending`) -- the same CAS
-    /// pattern `sweep_expired_multipart`'s step already uses. Between
+    /// pattern `sweep_expired_multipart_page`'s step already uses. Between
     /// `list_abandoned_pending_versions` returning this row and this call
     /// running, a client's `finalize_upload` can race in and flip the version
     /// `pending -> available`; an unconditional delete would then remove a
@@ -376,7 +575,7 @@ impl CleanupEngine {
     /// or `1`.
     ///
     /// `prefetched_file` is this candidate's parent `File`, if the caller
-    /// already resolved it (`sweep_abandoned_pending` batch-loads every
+    /// already resolved it (`sweep_abandoned_pending_page` batch-loads every
     /// candidate's file in one round trip before its loop, instead of one
     /// `get_file` per candidate here); `None` when the batch load did not
     /// cover this `file_id` (e.g. it failed, or a direct unit-test call has
@@ -390,7 +589,7 @@ impl CleanupEngine {
     /// deterministically, without real concurrency -- mirroring
     /// [`Self::cleanup_expired_session_version`]'s reason for being `pub`
     /// on step 2's sibling race. Otherwise only called from
-    /// `sweep_abandoned_pending`, one snapshot at a time.
+    /// `sweep_abandoned_pending_page`, one snapshot at a time.
     pub async fn delete_abandoned_pending_version(
         &self,
         file_id: Uuid,
@@ -471,12 +670,12 @@ impl CleanupEngine {
         }
     }
 
-    /// Second phase of sweep step 1: reclaim `files` rows that never
-    /// received **any** version at all -- not even a `pending` one -- and are
-    /// therefore invisible to [`Self::sweep_abandoned_pending`]'s own
-    /// zero-version-orphan reclaim just above, which only ever runs as a side
-    /// effect of aging out a `file_versions` row that existed in the first
-    /// place.
+    /// Second phase of sweep step 1: reclaim one batch of `files` rows that
+    /// never received **any** version at all -- not even a `pending` one --
+    /// and are therefore invisible to
+    /// [`Self::sweep_abandoned_pending_page`]'s own zero-version-orphan
+    /// reclaim just above, which only ever runs as a side effect of aging out
+    /// a `file_versions` row that existed in the first place.
     ///
     /// Such a row is born when the merged `POST /files` create+plan path
     /// commits [`crate::domain::service::FileService::create_file_bare`]'s
@@ -486,21 +685,27 @@ impl CleanupEngine {
     /// `insert_pending_version`, or a `FileService::
     /// compensate_failed_multipart_initiate` that itself failed to delete the
     /// row (see that method's doc comment). Neither of those ever produces a
-    /// `file_versions` row, so `sweep_abandoned_pending`'s
+    /// `file_versions` row, so `sweep_abandoned_pending_page`'s
     /// `list_abandoned_pending_versions` query (keyed on a *version's* age)
-    /// and `sweep_expired_multipart`'s `list_expired_multipart_uploads`
+    /// and `sweep_expired_multipart_page`'s `list_expired_multipart_uploads`
     /// (keyed on a *session's* expiry) can never select the file.
     ///
-    /// One batch per sweep pass, same as every other step-1/step-2 query
-    /// (none of them loop to exhaustion either) -- bounded by
-    /// `VERSIONLESS_SWEEP_BATCH` purely as a defensive cap; any remainder is
-    /// picked up by the next scheduled sweep.
+    /// `after` is this phase's tick-local keyset cursor (`(created_at,
+    /// file_id)`) -- see [`Self::sweep_abandoned_pending_page`]'s doc for why
+    /// it exists and how it advances (same rule here: always to the last
+    /// candidate seen, regardless of outcome).
     ///
-    /// Returns the number of `files` rows deleted.
-    async fn sweep_versionless_files(&self, grace_cutoff: OffsetDateTime) -> usize {
+    /// Returns `(orphan_files_deleted, exhausted, next_after)` -- `exhausted`
+    /// under the same rule as `sweep_abandoned_pending_page`'s (short batch,
+    /// or the list query errored).
+    async fn sweep_versionless_files_page(
+        &self,
+        grace_cutoff: OffsetDateTime,
+        after: Option<(OffsetDateTime, Uuid)>,
+    ) -> (usize, bool, Option<(OffsetDateTime, Uuid)>) {
         let candidates = match self
             .store
-            .list_versionless_orphan_files(grace_cutoff, VERSIONLESS_SWEEP_BATCH)
+            .list_versionless_orphan_files(grace_cutoff, VERSIONLESS_SWEEP_BATCH, after)
             .await
         {
             Ok(files) => files,
@@ -509,9 +714,14 @@ impl CleanupEngine {
                     error = ?e,
                     "cleanup: failed to list versionless orphan files"
                 );
-                return 0;
+                return (0, true, after);
             }
         };
+        let exhausted = (candidates.len() as u64) < VERSIONLESS_SWEEP_BATCH;
+        let next_after = candidates
+            .last()
+            .map(|f| (f.created_at, f.file_id))
+            .or(after);
 
         let mut count = 0_usize;
         for file in candidates {
@@ -519,15 +729,15 @@ impl CleanupEngine {
             // `maybe_delete_orphaned_file` re-verifies zero-versions fresh
             // (via `orphan_candidate_file`'s own `list_versions` call) and
             // still checks `has_blocking_multipart_session` before deleting
-            // -- the same guard `sweep_abandoned_pending`'s reclaim above
-            // relies on -- so a version or an in-progress multipart session
-            // that appears for this file after the list query above cannot
-            // be destroyed out from under it.
+            // -- the same guard `sweep_abandoned_pending_page`'s reclaim
+            // above relies on -- so a version or an in-progress multipart
+            // session that appears for this file after the list query above
+            // cannot be destroyed out from under it.
             count += self
                 .maybe_delete_orphaned_file(file_id, Some(file), "versionless_orphan_file")
                 .await;
         }
-        count
+        (count, exhausted, next_after)
     }
 
     /// After deleting a file's last abandoned pending version, check whether
@@ -707,7 +917,7 @@ impl CleanupEngine {
     /// Whether `file_id` has an active (`in_progress` or `completing`)
     /// multipart session that should block orphan-file deletion.
     ///
-    /// `sweep_abandoned_pending` keys only on a pending version's age, so a
+    /// `sweep_abandoned_pending_page` keys only on a pending version's age, so a
     /// multipart session that is legitimately still active can still have
     /// its backing version aged past the orphan grace window and reclaimed
     /// earlier in the same sweep pass. If [`Self::orphan_candidate_file`]'s
@@ -718,10 +928,10 @@ impl CleanupEngine {
     /// `in_progress` here, and regardless of lease status: a session
     /// mid-assembly under a live lease must not be destroyed out from under
     /// its completer, and even a `completing` session whose lease has
-    /// expired is left alone -- reaping it is `sweep_expired_multipart`'s
+    /// expired is left alone -- reaping it is `sweep_expired_multipart_page`'s
     /// job, not this guard's. Returning `true` leaves the file for a
     /// later sweep instead -- once the session is aborted/completed (by
-    /// `sweep_expired_multipart` or the user), a subsequent pass will find
+    /// `sweep_expired_multipart_page` or the user), a subsequent pass will find
     /// zero versions and no active session, and finish reclaiming it
     /// then. A lookup failure is treated as blocking (logged), erring toward
     /// not deleting.
@@ -740,14 +950,25 @@ impl CleanupEngine {
         }
     }
 
-    /// Abort in-progress multipart sessions whose `expires_at` has passed.
-    /// Returns `(sessions_aborted, orphan_files_reclaimed)` -- the second
-    /// tally counts files reclaimed here, not only by step 1 (see
-    /// `run_sweep`'s step 2 comment and `cleanup_expired_session_version`'s doc).
-    async fn sweep_expired_multipart(&self, now: OffsetDateTime) -> (usize, usize) {
+    /// Abort one batch of in-progress multipart sessions whose `expires_at`
+    /// has passed. `after` is this phase's tick-local keyset cursor
+    /// (`(expires_at, upload_id)`) -- see
+    /// [`Self::sweep_abandoned_pending_page`]'s doc for why it exists and how
+    /// it advances.
+    ///
+    /// Returns `(sessions_aborted, orphan_files_reclaimed, exhausted,
+    /// next_after)` -- the second tally counts files reclaimed here, not only
+    /// by step 1 (see `run_sweep`'s step 2 comment and
+    /// `cleanup_expired_session_version`'s doc); `exhausted` under the same
+    /// rule as `sweep_abandoned_pending_page`'s.
+    async fn sweep_expired_multipart_page(
+        &self,
+        now: OffsetDateTime,
+        after: Option<(OffsetDateTime, Uuid)>,
+    ) -> (usize, usize, bool, Option<(OffsetDateTime, Uuid)>) {
         let sessions = match self
             .store
-            .list_expired_multipart_uploads(now, EXPIRED_MULTIPART_SWEEP_BATCH)
+            .list_expired_multipart_uploads(now, EXPIRED_MULTIPART_SWEEP_BATCH, after)
             .await
         {
             Ok(s) => s,
@@ -756,11 +977,16 @@ impl CleanupEngine {
                     error = ?e,
                     "cleanup: failed to list expired multipart uploads"
                 );
-                return (0, 0);
+                return (0, 0, true, after);
             }
         };
+        let exhausted = (sessions.len() as u64) < EXPIRED_MULTIPART_SWEEP_BATCH;
+        let next_after = sessions
+            .last()
+            .map(|s| (s.expires_at, s.upload_id))
+            .or(after);
 
-        // Same batch-first pattern as `sweep_abandoned_pending`: resolve
+        // Same batch-first pattern as `sweep_abandoned_pending_page`: resolve
         // every candidate session's parent file in ONE round trip instead of
         // one `get_file` per session inside the loop below.
         let file_ids: Vec<Uuid> = {
@@ -783,7 +1009,7 @@ impl CleanupEngine {
             aborted_count += aborted;
             files_count += files;
         }
-        (aborted_count, files_count)
+        (aborted_count, files_count, exhausted, next_after)
     }
 
     /// Abort one expired multipart session: win the session's own
@@ -804,7 +1030,7 @@ impl CleanupEngine {
         prefetched_file: Option<file_storage_sdk::File>,
     ) -> (usize, usize) {
         // `prefetched_file` is this session's parent `File`, already
-        // resolved by `sweep_expired_multipart`'s batch load before its loop
+        // resolved by `sweep_expired_multipart_page`'s batch load before its loop
         // (`load_files_by_ids_for_audit`) -- thread it all the way down
         // through `cleanup_expired_session_version_with_file` to
         // `orphan_candidate_file`, instead of letting each of those three
@@ -876,7 +1102,7 @@ impl CleanupEngine {
     /// after that method has already won the session CAS.
     ///
     /// The version row backing this session may already be gone by the time
-    /// this runs: step 1 of the same sweep (`sweep_abandoned_pending`) only
+    /// this runs: step 1 of the same sweep (`sweep_abandoned_pending_page`) only
     /// excludes an `in_progress` session with `expires_at > now` (still live)
     /// -- a `completing` session is excluded unconditionally instead, so this
     /// race is specific to `in_progress`. An *expired-but-still-`in_progress`*
@@ -1065,62 +1291,63 @@ impl CleanupEngine {
         }
     }
 
-    /// Delete files that have been expired by a retention rule.
+    /// Delete files expired by a retention rule, one keyset page (by
+    /// `file_id`) at a time -- so the sweep never materializes every file
+    /// across every tenant at once, memory stays bounded regardless of
+    /// deployment size, and a full-table scan can span as many ticks as it
+    /// needs to.
     ///
-    /// Files are scanned in keyset-paginated batches (by `file_id`) so the sweep
-    /// never materializes every file across every tenant at once — memory stays
-    /// bounded regardless of deployment size. Retention rules are fetched once
-    /// and reused across batches (the rule set is small relative to the files).
-    async fn sweep_retention_expiry(&self, now: OffsetDateTime) -> usize {
-        let all_rules = match self.store.list_all_retention_rules().await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(error = ?e, "cleanup: failed to list retention rules");
-                return 0;
-            }
-        };
-        // No rules configured → nothing to expire; skip the file scan entirely.
-        if all_rules.is_empty() {
-            return 0;
-        }
-
-        let mut count = 0_usize;
-        let mut after: Option<Uuid> = None;
-        // Keyset cursor loop: each page advances `after` past its last file_id.
-        // Safe even though `expire_batch` deletes rows — the next query filters
-        // `file_id > after`, so deletions never shift the window. A short page
-        // (or `None` from a query error) ends the sweep.
-        while let Some(batch) = self.next_retention_page(after).await {
-            if batch.is_empty() {
-                break;
-            }
-            after = batch.last().map(|f| f.file_id);
-            let last_page = (batch.len() as u64) < RETENTION_SWEEP_BATCH;
-            count += self.expire_batch(&batch, &all_rules, now).await;
-            if last_page {
-                break;
-            }
-        }
-        count
-    }
-
-    /// Fetch the next keyset page of files for the retention sweep. Returns
-    /// `None` (ending the sweep) on a query error, logging it best-effort.
-    async fn next_retention_page(
+    /// `all_rules` is loaded once per tick by [`Self::run_sweep`] (the rule
+    /// set is small relative to the files) and handed down unchanged to every
+    /// page. `after` is the persisted cross-tick cursor (see
+    /// [`CleanupEngine::retention_cursor`]) -- unlike the other three sweep
+    /// phases' cursors, this one is NOT reset every tick: a full scan can
+    /// legitimately span many ticks on a large deployment, and restarting
+    /// from `file_id` zero every tick would starve files later in keyset
+    /// order.
+    ///
+    /// Returns `(files_deleted, exhausted, next_after)`:
+    /// - a short page (fewer than [`RETENTION_SWEEP_BATCH`] rows) means the
+    ///   whole table has now been scanned -- `exhausted = true`,
+    ///   `next_after = None` (the next tick, or the next call once more rules
+    ///   exist, starts over from the beginning);
+    /// - a full page means more files remain -- `exhausted = false`,
+    ///   `next_after = Some(..)` pointing past this page, so either a later
+    ///   pass this same tick or (once the budget runs out) the next tick
+    ///   resumes from there; deleting rows in this page does not shift that
+    ///   window, since the next query filters `file_id > next_after`;
+    /// - a query error leaves the cursor untouched (`next_after = after`) and
+    ///   marks the phase `exhausted` for this tick -- retrying the exact same
+    ///   page next tick rather than either losing the caller's place or
+    ///   spinning on a persistent error within this tick.
+    async fn sweep_retention_expiry_page(
         &self,
+        now: OffsetDateTime,
+        all_rules: &[crate::domain::policy::StoredRetentionRule],
         after: Option<Uuid>,
-    ) -> Option<Vec<file_storage_sdk::File>> {
-        match self
+    ) -> (usize, bool, Option<Uuid>) {
+        let batch = match self
             .store
             .list_all_files_for_sweep(after, RETENTION_SWEEP_BATCH)
             .await
         {
-            Ok(files) => Some(files),
+            Ok(batch) => batch,
             Err(e) => {
                 tracing::warn!(error = ?e, "cleanup: failed to list files for retention sweep");
-                None
+                return (0, true, after);
             }
+        };
+        if batch.is_empty() {
+            return (0, true, None);
         }
+        let exhausted = (batch.len() as u64) < RETENTION_SWEEP_BATCH;
+        let next_after = batch.last().map(|f| f.file_id);
+        let deleted = self.expire_batch(&batch, all_rules, now).await;
+        (
+            deleted,
+            exhausted,
+            if exhausted { None } else { next_after },
+        )
     }
 
     /// Apply retention rules to one page of files. Returns the number deleted.
@@ -1338,6 +1565,28 @@ impl CleanupEngine {
                     "cleanup: failed to delete retention-expired file"
                 );
                 0
+            }
+        }
+    }
+
+    /// Delete one batch of expired `idempotency_keys` rows (`expires_at <=
+    /// now`). No cursor is threaded through: each call deletes the rows it
+    /// selects, so a later call this same tick (or the next tick) naturally
+    /// sees the next-oldest backlog rather than the rows just removed.
+    ///
+    /// Returns `(rows_deleted, exhausted)`: `exhausted` once the batch came
+    /// back shorter than [`EXPIRED_IDEMPOTENCY_SWEEP_BATCH`] or the delete
+    /// itself errored (logged here).
+    async fn sweep_idempotency_page(&self, now: OffsetDateTime) -> (u64, bool) {
+        match self
+            .store
+            .delete_expired_idempotency_keys(now, EXPIRED_IDEMPOTENCY_SWEEP_BATCH)
+            .await
+        {
+            Ok(deleted) => (deleted, deleted < EXPIRED_IDEMPOTENCY_SWEEP_BATCH),
+            Err(e) => {
+                tracing::warn!(error = ?e, "cleanup: failed to delete expired idempotency keys");
+                (0, true)
             }
         }
     }

@@ -22,7 +22,7 @@ use uuid::Uuid;
 /// belt-and-suspenders check alongside the exhaustive match in
 /// `expected_status`: bumping this without adding both a match arm there and
 /// an instance in `all_variant_instances` fails the test below.
-const EXPECTED_VARIANT_COUNT: usize = 25;
+const EXPECTED_VARIANT_COUNT: usize = 26;
 
 /// The expected HTTP status for every `DomainError` variant, per the
 /// canonical-error taxonomy in `libs/toolkit-canonical-errors/src/error.rs`
@@ -45,7 +45,14 @@ fn expected_status(err: &DomainError) -> u16 {
         | DomainError::PolicyMimeNotAllowed { .. }
         | DomainError::PolicySizeExceeded { .. }
         | DomainError::PolicyMetadataExceeded { .. }
-        | DomainError::MultipartNotSupported { .. } => 400,
+        | DomainError::MultipartNotSupported { .. }
+        // Delegates to `toolkit_odata`'s own `Error -> CanonicalError` mapping
+        // (`libs/toolkit-odata/src/problem_mapping.rs`): every cursor-pagination
+        // failure (`INVALID_CURSOR`/`ORDER_MISMATCH`/`FILTER_MISMATCH`/
+        // `INVALID_LIMIT`/etc.) is `InvalidArgument` -> 400, except `Db`/
+        // `ParsingUnavailable` -> `Internal` -> 500 (not reachable through
+        // `domain::pagination`, which never constructs those two).
+        | DomainError::Cursor(_) => 400,
         DomainError::TokenInvalid { .. } | DomainError::Forbidden => 403,
         DomainError::FileNotFound { .. }
         | DomainError::VersionNotFound { .. }
@@ -146,6 +153,7 @@ fn all_variant_instances() -> Vec<DomainError> {
         DomainError::VersionedFileMigrationNotSupported {
             file_id: Uuid::nil(),
         },
+        DomainError::Cursor(toolkit_odata::Error::InvalidCursor),
     ]
 }
 

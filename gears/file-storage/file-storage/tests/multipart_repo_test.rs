@@ -629,7 +629,7 @@ async fn list_expired_caps_at_limit_and_orders_deterministically() {
     }
 
     let rows = multipart
-        .list_expired(&conn, now, 3)
+        .list_expired(&conn, now, 3, None)
         .await
         .expect("list_expired must not error");
 
@@ -644,5 +644,75 @@ async fn list_expired_caps_at_limit_and_orders_deterministically() {
         "rows must be ordered (expires_at, upload_id) ascending -- a first \
          (longest-expired), then b before c (same expires_at, b's upload_id \
          is smaller), and d (most recently expired) excluded by the limit"
+    );
+}
+
+/// `MultipartRepo::list_expired`'s `after` keyset cursor must return only
+/// rows strictly past `(expires_at, upload_id)`, including the
+/// same-`expires_at` tiebreak case (the sweep's cursor lands on `b`, sharing
+/// `c`'s `expires_at`; `c` must still be returned, `b` must not be repeated).
+#[tokio::test]
+async fn list_expired_after_cursor_excludes_seen_rows_including_expires_at_tie() {
+    let db = db().await;
+    let conn = db.conn().expect("conn");
+    let files = FileRepo::new();
+    let multipart = MultipartRepo::new();
+    let scope = AccessScope::allow_all();
+
+    let file_id = Uuid::now_v7();
+    let tenant_id = Uuid::now_v7();
+    files
+        .create(&conn, &scope, &new_file(file_id, tenant_id))
+        .await
+        .expect("create parent file");
+
+    let now = OffsetDateTime::now_utc();
+    let id_a = Uuid::from_u128(1);
+    let id_b = Uuid::from_u128(11);
+    let id_c = Uuid::from_u128(12);
+    let id_d = Uuid::from_u128(99);
+
+    for (upload_id, expires_at) in [
+        (id_a, now - time::Duration::hours(3)),
+        (id_b, now - time::Duration::hours(2)),
+        (id_c, now - time::Duration::hours(2)),
+        (id_d, now - time::Duration::hours(1)),
+    ] {
+        multipart
+            .create(
+                &conn,
+                upload_id,
+                file_id,
+                Uuid::now_v7(),
+                "backend-handle",
+                Some("mem"),
+                Some("/x"),
+                "application/octet-stream",
+                100,
+                50,
+                false,
+                expires_at,
+                now,
+            )
+            .await
+            .expect("create expired session");
+    }
+
+    // Cursor lands exactly on `b`: same `expires_at` as `c`, smaller
+    // `upload_id`. Only `c` and `d` must come back -- `a` and `b` (at or
+    // before the cursor) must not, and `b` must not reappear despite sharing
+    // `c`'s `expires_at`.
+    let after = (now - time::Duration::hours(2), id_b);
+    let rows = multipart
+        .list_expired(&conn, now, 10, Some(after))
+        .await
+        .expect("list_expired with after must not error");
+
+    assert_eq!(
+        rows.iter().map(|s| s.upload_id).collect::<Vec<_>>(),
+        vec![id_c, id_d],
+        "after = (b's expires_at, b's upload_id) must return only rows \
+         strictly past that key: c (same expires_at, larger upload_id) and \
+         d (strictly less expired), never a, never b itself"
     );
 }

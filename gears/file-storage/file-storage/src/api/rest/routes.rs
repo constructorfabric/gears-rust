@@ -204,18 +204,36 @@ pub(crate) fn register_routes(
         .error_500(openapi)
         .register(router, openapi);
 
-    // GET /files/{id}/versions — list versions
+    // GET /files/{id}/versions — list versions (cursor pagination)
     router = OperationBuilder::get(format!("{BASE}/files/{{id}}/versions"))
         .operation_id("file_storage.list_versions")
         .authenticated()
         .require_license_features::<License>([])
-        .summary("List all versions of a file")
+        .summary("List a file's versions, newest first (cursor pagination)")
+        .description(
+            "Forward-only keyset pagination: `limit` (default 25, max 200) and the \
+             opaque `cursor` from the previous page's `page_info.next_cursor`. Canonical \
+             order is `created_at desc, version_id desc`; a page may return fewer than \
+             `limit` items (with `next_cursor` still set) when the ADR-0006 manifest-byte \
+             budget truncates it -- see docs/api.md.",
+        )
         .tag(API_TAG)
         .path_param("id", "File UUID")
-        .query_param_typed("limit", false, "Page size", "integer")
-        .query_param_typed("offset", false, "Offset", "integer")
+        .query_param_typed("limit", false, "Page size (default 25, max 200)", "integer")
+        .query_param(
+            "cursor",
+            false,
+            "Opaque continuation token from the previous page",
+        )
         .handler(handlers::list_versions)
-        .json_response_with_schema::<dto::VersionDtoList>(openapi, StatusCode::OK, "Versions")
+        .json_response_with_schema::<toolkit_odata::Page<dto::VersionDto>>(
+            openapi,
+            StatusCode::OK,
+            "Versions",
+        )
+        // 400: malformed/mismatched cursor, an unsupported query parameter
+        // (e.g. the old `offset`), or `limit=0`.
+        .error_400(openapi)
         .error_401(openapi)
         .error_403(openapi)
         .error_404(openapi)
@@ -299,19 +317,34 @@ pub(crate) fn register_routes(
         .error_500(openapi)
         .register(router, openapi);
 
-    // GET /files — list (mandatory owner filter, offset pagination)
+    // GET /files — list (mandatory owner filter, cursor pagination)
     router = OperationBuilder::get(format!("{BASE}/files"))
         .operation_id("file_storage.list_files")
         .authenticated()
         .require_license_features::<License>([])
-        .summary("List files for an owner (owner_kind + owner_id required)")
+        .summary("List files for an owner (owner_kind + owner_id required, cursor pagination)")
+        .description(
+            "Forward-only keyset pagination: `limit` (default 25, max 200) and the \
+             opaque `cursor` from the previous page's `page_info.next_cursor`. Canonical \
+             order is `created_at desc, file_id desc` -- see docs/api.md.",
+        )
         .tag(API_TAG)
         .query_param("owner_kind", true, "'user' or 'app'")
         .query_param("owner_id", true, "Owner UUID")
-        .query_param_typed("limit", false, "Page size", "integer")
-        .query_param_typed("offset", false, "Offset", "integer")
+        .query_param_typed("limit", false, "Page size (default 25, max 200)", "integer")
+        .query_param(
+            "cursor",
+            false,
+            "Opaque continuation token from the previous page",
+        )
         .handler(handlers::list_files)
-        .json_response_with_schema::<dto::FileDtoList>(openapi, StatusCode::OK, "Files")
+        .json_response_with_schema::<toolkit_odata::Page<dto::FileDto>>(
+            openapi,
+            StatusCode::OK,
+            "Files",
+        )
+        // 400: malformed/mismatched cursor, an unsupported query parameter
+        // (e.g. the old `offset`), `limit=0`, or an invalid `owner_kind`.
         .error_400(openapi)
         .error_401(openapi)
         .error_403(openapi)
@@ -414,19 +447,36 @@ pub(crate) fn register_routes(
         .error_500(openapi)
         .register(router, openapi);
 
-    // GET /retention-rules — list retention rules
+    // GET /retention-rules — list retention rules (cursor pagination)
     router = OperationBuilder::get(format!("{BASE}/retention-rules"))
         .operation_id("file_storage.list_retention_rules")
         .authenticated()
         .require_license_features::<License>([])
-        .summary("List all retention rules for the caller's tenant")
+        .summary("List retention rules visible to the caller for their tenant")
+        .description(
+            "Forward-only keyset pagination: `limit` (default 25, max 200) and the \
+             opaque `cursor` from the previous page's `page_info.next_cursor`. Canonical \
+             order is `created_at desc, rule_id desc`. An admin caller sees every rule in \
+             the tenant; a non-admin caller sees only tenant-scope rules, their own \
+             user-scope rules, and file-scope rules on files they own -- filtered in SQL, \
+             so every page but the last is full -- see docs/api.md.",
+        )
         .tag(API_TAG)
+        .query_param_typed("limit", false, "Page size (default 25, max 200)", "integer")
+        .query_param(
+            "cursor",
+            false,
+            "Opaque continuation token from the previous page",
+        )
         .handler(handlers::list_retention_rules)
-        .json_response_with_schema::<dto::RetentionRuleDtoList>(
+        .json_response_with_schema::<toolkit_odata::Page<dto::RetentionRuleDto>>(
             openapi,
             StatusCode::OK,
             "Retention rules",
         )
+        // 400: malformed/mismatched cursor, an unsupported query parameter,
+        // or `limit=0`.
+        .error_400(openapi)
         .error_401(openapi)
         .error_403(openapi)
         .error_500(openapi)

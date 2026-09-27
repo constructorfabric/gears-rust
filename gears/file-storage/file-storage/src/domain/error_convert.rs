@@ -19,6 +19,17 @@ impl From<DbError> for DomainError {
     }
 }
 
+/// `domain::pagination`'s cursor codec returns `toolkit_odata::Error`
+/// directly rather than a gear-local wrapper, so callers can `?` it straight
+/// into `Result<_, DomainError>` and let `api/rest/error.rs` map it via
+/// `toolkit_odata`'s own `Error -> CanonicalError` (see `DomainError::Cursor`'s
+/// doc comment).
+impl From<toolkit_odata::Error> for DomainError {
+    fn from(e: toolkit_odata::Error) -> Self {
+        Self::Cursor(e)
+    }
+}
+
 #[allow(unknown_lints, de1302_error_from_to_string)]
 impl From<ScopeError> for DomainError {
     fn from(e: ScopeError) -> Self {

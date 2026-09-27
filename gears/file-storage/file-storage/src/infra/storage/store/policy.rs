@@ -88,7 +88,9 @@ impl Store {
             .await
     }
 
-    /// List all retention rules for a tenant (all scopes).
+    /// List all retention rules for a tenant (all scopes), unpaginated --
+    /// see `PolicyStore::list_retention_rules`'s doc comment for who this is
+    /// for.
     pub async fn list_retention_rules(
         &self,
         scope: &AccessScope,
@@ -99,6 +101,79 @@ impl Store {
             .retention_rules
             .list_for_tenant(&conn, scope, tenant_id)
             .await
+    }
+
+    /// List retention rules for a tenant, forward-only cursor-paginated,
+    /// with the non-admin visibility filter applied in SQL -- backs
+    /// `GET /retention-rules`. See `PolicyStore::list_retention_rules_page`'s
+    /// doc comment for the exact semantics.
+    ///
+    /// Fetches `limit + 1` rows to learn whether a next page exists without
+    /// a separate `COUNT` query, trims back to `limit`, and encodes
+    /// `next_cursor` from the last row actually returned. No client filter
+    /// applies to this listing, so its cursor carries no binding fingerprint
+    /// (`f: None`) -- unlike `/files`/`/files/{id}/versions`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn list_retention_rules_page(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        admin: bool,
+        subject_kind: &str,
+        subject_id: Uuid,
+        limit: u64,
+        cursor: Option<&str>,
+    ) -> Result<toolkit_odata::Page<StoredRetentionRule>, DomainError> {
+        use crate::domain::pagination;
+
+        let after = cursor
+            .map(|token| pagination::decode(token, pagination::RETENTION_RULES_ID_FIELD, None))
+            .transpose()?;
+
+        let conn = self.db.conn().map_err(db_err)?;
+        let mut rows = self
+            .repos
+            .retention_rules
+            .list_page(
+                &conn,
+                scope,
+                crate::infra::storage::repo::RetentionRuleListParams {
+                    tenant_id,
+                    admin,
+                    subject_kind,
+                    subject_id,
+                    limit: limit.saturating_add(1),
+                    after,
+                },
+            )
+            .await?;
+
+        let has_more = rows.len() as u64 > limit;
+        if has_more {
+            rows.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+        }
+        let next_cursor = if has_more {
+            rows.last()
+                .map(|r| {
+                    pagination::encode(
+                        r.created_at,
+                        r.rule_id,
+                        pagination::RETENTION_RULES_ID_FIELD,
+                        None,
+                    )
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        Ok(toolkit_odata::Page::new(
+            rows,
+            toolkit_odata::PageInfo {
+                next_cursor,
+                prev_cursor: None,
+                limit,
+            },
+        ))
     }
 
     /// Fetch a single retention rule by `rule_id`.

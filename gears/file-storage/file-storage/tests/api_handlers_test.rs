@@ -1136,17 +1136,17 @@ async fn list_files_batches_metadata_without_cross_wiring_between_files() {
     let resp = handlers::list_files(
         axum::Extension(subject.clone()),
         axum::Extension(Arc::clone(&svc)),
-        axum::extract::Query(handlers::ListQuery {
+        toolkit::api::rest::extract::Query(handlers::ListQuery {
             owner_kind: "user".to_owned(),
             owner_id: owner,
             limit: None,
-            offset: None,
+            cursor: None,
         }),
     )
     .await
     .expect("list_files");
 
-    let items = resp.0.0;
+    let items = resp.0.items;
     assert_eq!(items.len(), 2, "expected both files in the page");
 
     let dto_a = items

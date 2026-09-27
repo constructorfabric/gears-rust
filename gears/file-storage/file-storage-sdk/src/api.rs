@@ -5,11 +5,12 @@ use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use crate::FileStorageError;
+use crate::Page;
 use crate::models::{
     CreateFileOutcome, CustomMetadataPatch, EffectivePolicy, FileFetch, FileId, FileRecord,
     MultipartCompleteOutcome, MultipartIntent, MultipartPlan, MultipartStatus, NewFile,
-    OwnerFilter, OwnerKind, Page, Policy, PolicyBody, PolicyScope, RetentionRule,
-    RetentionRuleBody, RetentionScope, Storage, UploadTicket, VersionId, VersionRecord,
+    OwnerFilter, OwnerKind, Policy, PolicyBody, PolicyScope, RetentionRule, RetentionRuleBody,
+    RetentionScope, Storage, UploadTicket, VersionId, VersionRecord,
 };
 
 /// Public client trait other gears resolve from `ClientHub`.
@@ -72,13 +73,15 @@ pub trait FileStorageClientV1: Send + Sync {
     ) -> Result<FileFetch, FileStorageError>;
 
     /// List files (each with its custom metadata) for a mandatory owner
-    /// filter, offset-paginated.
+    /// filter, forward-only cursor-paginated.
+    /// `cursor` resumes after the position encoded in a previous
+    /// `page.page_info.next_cursor` (`None` starts from the first page).
     async fn list_files(
         &self,
         ctx: &SecurityContext,
         owner: OwnerFilter,
         limit: Option<u64>,
-        offset: u64,
+        cursor: Option<&str>,
     ) -> Result<Page<FileRecord>, FileStorageError>;
 
     /// `JSON`-merge-patch a file's custom metadata, optionally guarded by
@@ -112,13 +115,18 @@ pub trait FileStorageClientV1: Send + Sync {
 
     // ── versions ─────────────────────────────────────────────────────────────
 
-    /// List a file's content versions, newest first, offset-paginated.
+    /// List a file's content versions, newest first, forward-only
+    /// cursor-paginated. `cursor` resumes
+    /// after the position encoded in a previous `page.page_info.next_cursor`
+    /// (`None` starts from the first page). A page may carry fewer than
+    /// `limit` items (with `next_cursor` still set) when the ADR-0006
+    /// manifest-byte budget truncates it -- see `docs/api.md`.
     async fn list_versions(
         &self,
         ctx: &SecurityContext,
         file_id: FileId,
         limit: Option<u64>,
-        offset: u64,
+        cursor: Option<&str>,
     ) -> Result<Page<VersionRecord>, FileStorageError>;
 
     /// Presign a new content version on an existing file (bind it afterwards
@@ -249,11 +257,17 @@ pub trait FileStorageClientV1: Send + Sync {
 
     // ── retention rules ──────────────────────────────────────────────────────
 
-    /// List all retention rules visible to the caller.
+    /// List retention rules visible to the caller for their tenant,
+    /// forward-only cursor-paginated. An
+    /// admin caller sees every rule in the tenant; a non-admin caller sees
+    /// only tenant-scope rules, their own user-scope rules, and file-scope
+    /// rules on files they own.
     async fn list_retention_rules(
         &self,
         ctx: &SecurityContext,
-    ) -> Result<Vec<RetentionRule>, FileStorageError>;
+        limit: Option<u64>,
+        cursor: Option<&str>,
+    ) -> Result<Page<RetentionRule>, FileStorageError>;
 
     /// Create a new retention rule.
     async fn create_retention_rule(

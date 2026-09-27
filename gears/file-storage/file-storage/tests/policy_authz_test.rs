@@ -147,6 +147,8 @@ async fn build_harness() -> Harness {
         max_page_size: 1000,
         idempotency_ttl_secs: 86400,
     };
+    let default_page_size = cfg.default_page_size;
+    let max_page_size = cfg.max_page_size;
     let store = Store::new(Arc::clone(&db));
     let policy_store: Arc<dyn PolicyStore> = Arc::new(store.clone());
     let file_svc = Arc::new(FileService::new(
@@ -161,6 +163,8 @@ async fn build_harness() -> Harness {
     let policy_svc = Arc::new(PolicyService::new(
         Arc::clone(&policy_store),
         Arc::clone(&authorizer),
+        default_page_size,
+        max_page_size,
     ));
     Harness {
         file_svc,
@@ -1364,9 +1368,10 @@ async fn list_retention_rules_filters_by_scope_for_non_admin() {
 
     let visible = h
         .policy_svc
-        .list_retention_rules(&ctx_subject)
+        .list_retention_rules(&ctx_subject, None, None)
         .await
-        .expect("list_retention_rules should succeed for a non-admin");
+        .expect("list_retention_rules should succeed for a non-admin")
+        .items;
     let visible_ids: std::collections::HashSet<Uuid> = visible.iter().map(|r| r.rule_id).collect();
     let expected_visible: std::collections::HashSet<Uuid> =
         [tenant_rule.rule_id, subject_rule.rule_id]
@@ -1384,9 +1389,10 @@ async fn list_retention_rules_filters_by_scope_for_non_admin() {
     h.authz.set_admin(true);
     let all = h
         .policy_svc
-        .list_retention_rules(&ctx_admin)
+        .list_retention_rules(&ctx_admin, None, None)
         .await
-        .expect("list_retention_rules should succeed for admin");
+        .expect("list_retention_rules should succeed for admin")
+        .items;
     let all_ids: std::collections::HashSet<Uuid> = all.iter().map(|r| r.rule_id).collect();
     let expected_all: std::collections::HashSet<Uuid> = [
         tenant_rule.rule_id,
@@ -1438,12 +1444,12 @@ async fn create_file_foreign_owner_without_admin_is_denied() {
                 owner_id: user_b,
             },
             None,
-            0,
+            None,
         )
         .await
         .expect("list_files as admin-scope check");
     assert!(
-        listed.is_empty(),
+        listed.items.is_empty(),
         "denied create_file must not have written a file row for user_b"
     );
 }

@@ -30,9 +30,10 @@ pub const MAX_FINALIZE_TOKEN_GRACE_SECS: u64 = 7 * 24 * 3600;
 /// single request's row count, chunk count, response size, and latency with
 /// no cap of its own. `validate()` rejects anything above this regardless of
 /// what an operator sets, the same way `MAX_FINALIZE_TOKEN_GRACE_SECS`
-/// bounds `finalize_token_grace_secs`. `default_max_page_size` (1000) sits
+/// bounds `finalize_token_grace_secs`. `default_max_page_size` (200) sits
 /// exactly at this ceiling, so the shipped default is never itself rejected.
-pub const MAX_PAGE_SIZE_CEILING: u64 = 1000;
+/// Matches the platform-wide cursor-pagination cap (`guidelines/DNA/REST/QUERYING.md`).
+pub const MAX_PAGE_SIZE_CEILING: u64 = 200;
 
 /// Upper bound (seconds) accepted for `max_url_ttl_secs`: 30 days.
 ///
@@ -92,6 +93,18 @@ pub const MAX_ORPHAN_GRACE_SECS: u64 = 30 * 24 * 3600;
 /// own; 30 days is well past any realistic retry window while the shipped
 /// default (24 hours) sits far below it.
 pub const MAX_IDEMPOTENCY_TTL_SECS: u64 = 30 * 24 * 3600;
+
+/// Upper bound (seconds) accepted for `sweep_time_budget_secs`: 24 hours.
+///
+/// `domain::cleanup::CleanupEngine::run_sweep` uses it directly as a
+/// `std::time::Duration` added to `Instant::now()` (via `checked_add`, so an
+/// oversized value cannot overflow -- it is simply treated as "unbounded"),
+/// so this isn't an overflow hazard the way the `i64`-conversion ceilings
+/// above are -- but a budget this large would let one sweep tick run
+/// essentially forever, defeating the point of having a budget at all. 24
+/// hours is already far longer than any realistic sweep tick should take
+/// while the shipped default (900s / 15 minutes) sits far below it.
+pub const MAX_SWEEP_TIME_BUDGET_SECS: u64 = 24 * 3600;
 
 /// Configuration for the `file-storage` gear.
 ///
@@ -214,6 +227,13 @@ pub struct FileStorageConfig {
     /// Default: 3600 (1 hour).
     #[serde(default = "default_sweep_interval_secs")]
     pub sweep_interval_secs: u64,
+
+    /// Overall time budget (seconds) for one background cleanup sweep tick.
+    /// Once a tick has run this long, any sweep phase still short of
+    /// exhaustion carries its remaining work over to the next tick instead of
+    /// blocking it further. Default: 900 (15 minutes).
+    #[serde(default = "default_sweep_time_budget_secs")]
+    pub sweep_time_budget_secs: u64,
 
     /// When `true`, the background cleanup sweep is started at gear init.
     /// **Defaults to `true`** — any deployment that doesn't say otherwise
@@ -404,6 +424,18 @@ impl FileStorageConfig {
         if self.enable_background_sweep && self.sweep_interval_secs == 0 {
             anyhow::bail!(
                 "invalid file-storage config: sweep_interval_secs must be > 0 when \
+                 enable_background_sweep is true"
+            );
+        }
+        // A zero time budget with the sweep enabled would still let a tick's
+        // unconditional first pass run (see `CleanupEngine::run_sweep`'s
+        // doc), but every subsequent pass would immediately see the budget
+        // already exhausted -- silently capping every tick at one batch per
+        // phase, the same trap `sweep_interval_secs == 0` guards against
+        // above. Reject it up front instead.
+        if self.enable_background_sweep && self.sweep_time_budget_secs == 0 {
+            anyhow::bail!(
+                "invalid file-storage config: sweep_time_budget_secs must be > 0 when \
                  enable_background_sweep is true"
             );
         }
@@ -605,6 +637,17 @@ impl FileStorageConfig {
                 MAX_MULTIPART_COMPLETE_LEASE_SECS
             );
         }
+        // `sweep_time_budget_secs` otherwise has no ceiling of its own --
+        // reject it up front, the same way MAX_ORPHAN_GRACE_SECS bounds
+        // orphan_grace_secs above.
+        if self.sweep_time_budget_secs > MAX_SWEEP_TIME_BUDGET_SECS {
+            anyhow::bail!(
+                "invalid file-storage config: sweep_time_budget_secs ({}) must not exceed \
+                 MAX_SWEEP_TIME_BUDGET_SECS ({})",
+                self.sweep_time_budget_secs,
+                MAX_SWEEP_TIME_BUDGET_SECS
+            );
+        }
         // `idempotency_ttl_secs` otherwise has no ceiling of its own --
         // `FileService::create_file` adds it directly to `now` to compute the
         // stored idempotency record's `expires_at`.
@@ -701,6 +744,7 @@ impl fmt::Debug for FileStorageConfig {
             .field("idempotency_ttl_secs", &self.idempotency_ttl_secs)
             .field("orphan_grace_secs", &self.orphan_grace_secs)
             .field("sweep_interval_secs", &self.sweep_interval_secs)
+            .field("sweep_time_budget_secs", &self.sweep_time_budget_secs)
             .field("enable_background_sweep", &self.enable_background_sweep)
             .field("enable_in_memory_backend", &self.enable_in_memory_backend)
             // Never print the signing key — only whether one is configured.
@@ -752,6 +796,7 @@ impl Default for FileStorageConfig {
             idempotency_ttl_secs: default_idempotency_ttl_secs(),
             orphan_grace_secs: default_orphan_grace_secs(),
             sweep_interval_secs: default_sweep_interval_secs(),
+            sweep_time_budget_secs: default_sweep_time_budget_secs(),
             enable_background_sweep: default_enable_background_sweep(),
             enable_in_memory_backend: false,
             s3_backends: Vec::new(),
@@ -792,11 +837,11 @@ fn default_sidecar_base_url() -> String {
 }
 
 fn default_page_size() -> u64 {
-    50
+    25 // platform-wide cursor-pagination default (guidelines/DNA/REST/QUERYING.md)
 }
 
 fn default_max_page_size() -> u64 {
-    1000
+    200 // platform-wide cursor-pagination cap; see MAX_PAGE_SIZE_CEILING
 }
 
 fn default_storage_root() -> String {
@@ -813,6 +858,10 @@ fn default_orphan_grace_secs() -> u64 {
 
 fn default_sweep_interval_secs() -> u64 {
     3600 // 1 hour
+}
+
+fn default_sweep_time_budget_secs() -> u64 {
+    900 // 15 minutes
 }
 
 fn default_enable_background_sweep() -> bool {

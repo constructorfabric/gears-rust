@@ -16,7 +16,6 @@
 // Domain terms (ETag, If-Match, FileStorage, GET/PUT) recur throughout the docs.
 #![allow(clippy::doc_markdown)]
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use time::OffsetDateTime;
@@ -41,11 +40,28 @@ use crate::domain::ports::PolicyStore;
 pub struct PolicyService {
     store: Arc<dyn PolicyStore>,
     authorizer: Arc<dyn Authorizer>,
+    /// Page-size defaults for `list_retention_rules` -- the same `FileStorageConfig::default_page_size`/
+    /// `max_page_size` values `FileService::list_files`/`list_versions` are
+    /// clamped against, threaded through separately since `PolicyService`
+    /// deliberately does not hold a `FileService`/`ServiceConfig` reference
+    /// (see this struct's own doc comment on keeping the fan-in graph clean).
+    default_page_size: u64,
+    max_page_size: u64,
 }
 
 impl PolicyService {
-    pub fn new(store: Arc<dyn PolicyStore>, authorizer: Arc<dyn Authorizer>) -> Self {
-        Self { store, authorizer }
+    pub fn new(
+        store: Arc<dyn PolicyStore>,
+        authorizer: Arc<dyn Authorizer>,
+        default_page_size: u64,
+        max_page_size: u64,
+    ) -> Self {
+        Self {
+            store,
+            authorizer,
+            default_page_size,
+            max_page_size,
+        }
     }
 
     // ── policy management ──────────────────────────────────────────────────────
@@ -182,168 +198,91 @@ impl PolicyService {
         ))
     }
 
-    /// List retention rules for the caller's tenant.
+    /// List retention rules for the caller's tenant, forward-only
+    /// cursor-paginated.
+    ///
+    /// Plain `READ` only clears "may list retention rules at all" — a
+    /// non-admin caller must not see every rule in the tenant (`User`-scope
+    /// rules targeting another subject, `File`-scope rules on another
+    /// owner's file would otherwise leak another member's retention
+    /// configuration). Visibility is gated on `ADMIN_POLICY` — the same
+    /// administrative escape hatch `set_policy`/`get_effective_policy` use
+    /// above — and, for a non-admin caller, filtered **in SQL** (`PolicyStore::
+    /// list_retention_rules_page`) rather than in the application:
+    /// - `Tenant`-scope rules are visible to everyone (nothing
+    ///   owner-specific to hide);
+    /// - `User`-scope rules only when `scope_target_id` is the caller's own
+    ///   subject id;
+    /// - `File`-scope rules are visible when their `scope_target_id`
+    ///   resolves to a file this caller owns. A `File`-scope rule is
+    ///   reachable by any caller holding per-file `WRITE` on their own file
+    ///   (`authorize_retention_scope`'s `File` arm, and
+    ///   `create_retention_rule` runs it before insert) and removable by
+    ///   `rule_id` alone (`delete_retention_rule`) — dropping the scope
+    ///   entirely from this listing would leave a caller who created such a
+    ///   rule and then lost track of its `rule_id` with no way to find it
+    ///   again. `WRITE`-but-not-owned targets stay invisible here (comparing
+    ///   the owner pair is an under-approximation of "reachable by this
+    ///   caller", the same one `create.rs`'s cross-owner guards and
+    ///   `read_ops::list_files` already make elsewhere in this gear, cheaper
+    ///   than re-running a full per-file `WRITE` authorization decision for
+    ///   every rule on the page).
+    ///
+    /// Filtering in SQL means the page this returns is always full (up to
+    /// `limit`) except on the true last page — unlike the old
+    /// filter-after-fetch version, where a non-admin listing containing many
+    /// invisible rules could return a short (even empty) "page" despite more
+    /// visible rows existing further in the tenant's rule set.
+    ///
+    /// This whole non-admin branch still costs one extra `ADMIN_POLICY`
+    /// probe on every listing before it even knows the caller is not an
+    /// admin — `Authorizer::authorize` gives no cheaper "is this subject an
+    /// admin" query, so there is no way to skip straight to the non-admin
+    /// path without first trying (and failing) the admin one.
     pub async fn list_retention_rules(
         &self,
         ctx: &SecurityContext,
-    ) -> Result<Vec<StoredRetentionRule>, DomainError> {
+        limit: Option<u64>,
+        cursor: Option<&str>,
+    ) -> Result<toolkit_odata::Page<StoredRetentionRule>, DomainError> {
         let scope = self
             .authorizer
             .authorize(ctx, actions::READ, "", None)
             .await?;
-        let rules = self
-            .store
-            .list_retention_rules(&scope, ctx.subject_tenant_id())
-            .await?;
+        let limit = crate::domain::pagination::clamp_limit(
+            limit,
+            self.default_page_size,
+            self.max_page_size,
+        )?;
 
-        // Plain `READ` above only clears "may list retention rules at all" —
-        // the store call itself has no owner/target filter and returns
-        // EVERY rule in the tenant, including `User`-scope rules that target
-        // another subject and `File`-scope rules that target another
-        // owner's file. Left unfiltered, any tenant member could enumerate
-        // every other member's retention configuration. Gate the extra
-        // visibility on `ADMIN_POLICY` — the same administrative escape
-        // hatch `set_policy`/`get_effective_policy` use above — and filter
-        // down to what a non-admin caller may actually see:
-        // - `Tenant`-scope rules are visible to everyone (nothing
-        //   owner-specific to hide);
-        // - `User`-scope rules only when `scope_target_id` is the caller's
-        //   own subject id;
-        // - `File`-scope rules are visible when their `scope_target_id`
-        //   resolves to a file this caller owns (see the per-rule handling
-        //   below for the two ways that resolution costs less than
-        //   dropping the whole scope, and for what still cannot be
-        //   expressed). A `File`-scope rule is reachable by any caller
-        //   holding per-file `WRITE` on their own file
-        //   (`authorize_retention_scope`'s `File` arm, and
-        //   `create_retention_rule` runs it before insert) and removable by
-        //   `rule_id` alone (`delete_retention_rule`) — dropping the scope
-        //   entirely from this listing would leave a caller who created such
-        //   a rule and then lost track of its `rule_id` with no way to find
-        //   it again.
-        //
-        // Note this whole non-admin branch, `File`-scope or not, still costs
-        // one extra `ADMIN_POLICY` probe on every listing before it even
-        // knows the caller is not an admin — `Authorizer::authorize` gives
-        // no cheaper "is this subject an admin" query, so there is no way to
-        // skip straight to the non-admin path without first trying (and
-        // failing) the admin one.
-        match self
+        let admin = match self
             .authorizer
             .authorize(ctx, actions::ADMIN_POLICY, "", None)
             .await
         {
-            Ok(_) => Ok(rules),
-            Err(DomainError::Forbidden) => {
-                let subject_id = ctx.subject_id();
-                // Same normalization `FileService::actor_kind` applies for
-                // audit rows: anything that is not explicitly an app subject
-                // is a user. Duplicated rather than shared because that helper
-                // is private to `FileService`.
-                let subject_kind = match ctx.subject_type() {
-                    Some("app") => "app",
-                    _ => "user",
-                };
-                let tenant_scope = Self::tenant_scope(ctx);
-                // Resolve every distinct `File`-scope target on this page in
-                // ONE batched query (`PolicyStore::list_files_by_ids`,
-                // chunked against the bind-parameter budget like every other
-                // batch read in this gear) instead of one `require_file`
-                // round trip per rule -- several rules commonly target the
-                // same file (e.g. an age rule and a metadata rule on one
-                // upload), so `scope_target_id`s are deduped before the
-                // fetch too.
-                let file_ids: Vec<Uuid> = {
-                    let mut ids: Vec<Uuid> = rules
-                        .iter()
-                        .filter(|r| r.scope == RetentionScope::File)
-                        .filter_map(|r| r.scope_target_id)
-                        .collect();
-                    ids.sort_unstable();
-                    ids.dedup();
-                    ids
-                };
-                // A `file_id` absent from the result should no longer happen
-                // in practice: a `File`-scope rule is now removed in the SAME
-                // transaction as its target file (`Store::
-                // delete_file_collecting_versions`/`delete_orphan_file_with_event`/
-                // `delete_version_or_whole_file`, plus a one-time cleanup in
-                // `m20260924_000001_upload_flow_redesign` for rows already
-                // dangling before that fix), so a rule surviving its file is
-                // no longer an expected steady state -- only a defensive
-                // fallback for the race between this listing's rule read and
-                // its batched file read a few lines below (the target file
-                // could be deleted, by any of those same paths, in between).
-                // On that race, the rule simply has no entry here, exactly
-                // like a `FileNotFound` from `require_file` used to; an admin
-                // can still reach it via the `Ok` arm above, or remove it via
-                // `delete_retention_rule`'s own dangling-target fallback.
-                let owner_by_file: HashMap<Uuid, (String, Uuid)> = self
-                    .store
-                    .list_files_by_ids(&tenant_scope, &file_ids)
-                    .await?
-                    .into_iter()
-                    .map(|file| {
-                        (
-                            file.file_id,
-                            (file.owner_kind.as_str().to_owned(), file.owner_id),
-                        )
-                    })
-                    .collect();
-                let mut visible = Vec::with_capacity(rules.len());
-                for rule in rules {
-                    let keep = match rule.scope {
-                        RetentionScope::Tenant => true,
-                        RetentionScope::User => rule.scope_target_id == Some(subject_id),
-                        // A row without a target should not occur --
-                        // `validate_retention_rule` rejects it on write --
-                        // but the column is nullable, so the `None` case is
-                        // matched here rather than asserted away: it resolves
-                        // to nothing and is simply invisible.
-                        RetentionScope::File => {
-                            let Some(file_id) = rule.scope_target_id else {
-                                continue;
-                            };
-                            // A `File`-scope rule can be created by anyone
-                            // holding per-file `WRITE`, not only the file's
-                            // owner (`authorize_retention_scope`'s `File` arm
-                            // checks `WRITE`, not ownership) -- so comparing
-                            // `owner_id` here is an under-approximation of
-                            // "created by / reachable by this caller". It is
-                            // the same approximation `create.rs`'s
-                            // cross-owner guards and `read_ops::list_files`
-                            // already make elsewhere in this gear (comparing
-                            // `owner_id` directly rather than re-running a
-                            // full per-file `WRITE` authorization decision
-                            // for every rule on the page, which would turn
-                            // this into up to N *authorizer* round-trips on
-                            // top of the batch fetch above). A rule whose
-                            // target file this caller can `WRITE` but does
-                            // not own stays invisible here -- an
-                            // under-approximation, but cheaper than the
-                            // exact check.
-                            //
-                            // Compare the owner PAIR, not just the id: `user`
-                            // and `app` are disjoint owner spaces that can
-                            // legitimately carry the same UUID, so matching on
-                            // `owner_id` alone would show an app subject the
-                            // retention rules of a user's file with the same
-                            // id (and vice versa). Same reasoning as
-                            // `create.rs`'s cross-owner guard, which already
-                            // compares kind and id together.
-                            owner_by_file
-                                .get(&file_id)
-                                .is_some_and(|(kind, id)| *id == subject_id && kind == subject_kind)
-                        }
-                    };
-                    if keep {
-                        visible.push(rule);
-                    }
-                }
-                Ok(visible)
-            }
-            Err(err) => Err(err),
-        }
+            Ok(_) => true,
+            Err(DomainError::Forbidden) => false,
+            Err(err) => return Err(err),
+        };
+        // Same normalization `FileService::actor_kind` applies for audit
+        // rows: anything that is not explicitly an app subject is a user.
+        // Duplicated rather than shared because that helper is private to
+        // `FileService`.
+        let subject_kind = match ctx.subject_type() {
+            Some("app") => "app",
+            _ => "user",
+        };
+        self.store
+            .list_retention_rules_page(
+                &scope,
+                ctx.subject_tenant_id(),
+                admin,
+                subject_kind,
+                ctx.subject_id(),
+                limit,
+                cursor,
+            )
+            .await
     }
 
     /// Create a new retention rule.

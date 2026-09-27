@@ -58,6 +58,8 @@ async fn build_client() -> FileStorageLocalClient {
         max_page_size: 1000,
         idempotency_ttl_secs: 86400,
     };
+    let default_page_size = cfg.default_page_size;
+    let max_page_size = cfg.max_page_size;
     let store = Store::new(Arc::clone(&db));
     let multipart_store: Arc<dyn MultipartStore> = Arc::new(store.clone());
     let policy_store: Arc<dyn PolicyStore> = Arc::new(store.clone());
@@ -79,7 +81,12 @@ async fn build_client() -> FileStorageLocalClient {
         "http://sidecar.test".to_owned(),
         3600,
     ));
-    let policy_service = Arc::new(PolicyService::new(policy_store, authorizer));
+    let policy_service = Arc::new(PolicyService::new(
+        policy_store,
+        authorizer,
+        default_page_size,
+        max_page_size,
+    ));
     FileStorageLocalClient::new(service, multipart_service, policy_service)
 }
 

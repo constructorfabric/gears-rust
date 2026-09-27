@@ -104,7 +104,12 @@ impl VersionRepo {
         found.map(file_version_from_model).transpose()
     }
 
-    /// List a page of a file's versions, newest first.
+    /// List a page of a file's versions, newest first -- unbounded
+    /// (`limit`/`offset` from the caller, no keyset) reads for internal
+    /// callers that need a plain, complete-or-capped slice ([`UNBOUNDED_VERSIONS`]'s
+    /// doc lists them: cascade delete, backend migration, ownership-transfer
+    /// usage accounting, and the retention/orphan-reconciliation sweeps).
+    /// The REST-facing, cursor-paginated listing is [`Self::list_by_file_page`].
     ///
     /// Ordered `(created_at, version_id)` descending, not `created_at` alone:
     /// several versions of the same file can share a `created_at` instant
@@ -127,6 +132,45 @@ impl VersionRepo {
             .order_by_desc(Column::VersionId)
             .limit(limit)
             .offset(offset)
+            .secure()
+            .scope_with(scope)
+            .all(conn)
+            .await
+            .map_err(db_err)?;
+        rows.into_iter().map(file_version_from_model).collect()
+    }
+
+    /// List a page of a file's versions, newest first, forward-only
+    /// keyset-paginated -- backs
+    /// `GET /files/{id}/versions`. Same `(created_at, version_id)`
+    /// descending order as [`Self::list_by_file`] (see its doc comment for
+    /// why the tie-breaker is needed); `after`, when `Some`, restricts the
+    /// result to rows strictly past that position in this same descending
+    /// order. Callers fetch `limit + 1` rows to learn whether a next page
+    /// exists (`domain::pagination`'s `Page` contract); this method itself
+    /// just runs whatever `limit` it is given.
+    pub async fn list_by_file_page<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        file_id: Uuid,
+        limit: u64,
+        after: Option<crate::domain::pagination::Seek>,
+    ) -> Result<Vec<FileVersion>, DomainError> {
+        let mut filter = Condition::all().add(Column::FileId.eq(file_id));
+        if let Some(seek) = after {
+            filter = filter.add(super::tuple_lt(
+                (Entity, Column::CreatedAt),
+                (Entity, Column::VersionId),
+                seek.created_at,
+                seek.id,
+            ));
+        }
+        let rows = Entity::find()
+            .filter(filter)
+            .order_by_desc(Column::CreatedAt)
+            .order_by_desc(Column::VersionId)
+            .limit(limit)
             .secure()
             .scope_with(scope)
             .all(conn)
@@ -495,12 +539,18 @@ impl VersionRepo {
     /// does the version stop being backed by an active session and become
     /// reclaimable on a later sweep.
     ///
-    /// Ordered `(created_at, version_id)` ascending, up to `limit` rows -- one
-    /// batch per sweep pass, mirroring `FileRepo::list_versionless_orphan_files`.
-    /// No cursor is needed: every row returned here is either deleted or
-    /// flipped off `pending` by the caller before the next sweep tick, so it
-    /// falls out of this same query's next result set on its own, and
-    /// whatever this pass's `limit` left behind is simply picked up then.
+    /// Ordered `(created_at, version_id)` ascending, up to `limit` rows.
+    /// `after`, when `Some((created_at, version_id))`, restricts the result
+    /// to rows strictly greater than that key in the same ordering (keyset
+    /// pagination via `created_at > a OR (created_at = a AND version_id >
+    /// b)`, portable across `PostgreSQL` and `SQLite`) -- `None` starts from
+    /// the oldest row. The cleanup engine's sweep tick uses this to page past
+    /// a batch's candidates regardless of whether each one was actually
+    /// reclaimed (see
+    /// [`crate::domain::cleanup::CleanupEngine::run_sweep`]'s doc), so a
+    /// candidate this query keeps returning (e.g. one still excluded by the
+    /// active-session subquery below) does not block the rest of the backlog
+    /// for the remainder of one tick.
     pub async fn list_pending_older_than<C: DBRunner>(
         &self,
         conn: &C,
@@ -508,30 +558,38 @@ impl VersionRepo {
         older_than: OffsetDateTime,
         now: OffsetDateTime,
         limit: u64,
+        after: Option<(OffsetDateTime, Uuid)>,
     ) -> Result<Vec<FileVersion>, DomainError> {
-        let rows = Entity::find()
-            .filter(
-                Condition::all()
-                    .add(Column::Status.eq(VersionStatus::Pending.as_str()))
-                    .add(Column::CreatedAt.lt(older_than))
-                    .add(
-                        Column::VersionId.not_in_subquery(
-                            Query::select()
-                                .column(MultipartUploadColumn::VersionId)
-                                .from(MultipartUploadEntity)
-                                .cond_where(
-                                    Condition::any()
-                                        .add(
-                                            Condition::all()
-                                                .add(MultipartUploadColumn::State.eq("in_progress"))
-                                                .add(MultipartUploadColumn::ExpiresAt.gt(now)),
-                                        )
-                                        .add(MultipartUploadColumn::State.eq("completing")),
+        let mut filter = Condition::all()
+            .add(Column::Status.eq(VersionStatus::Pending.as_str()))
+            .add(Column::CreatedAt.lt(older_than))
+            .add(
+                Column::VersionId.not_in_subquery(
+                    Query::select()
+                        .column(MultipartUploadColumn::VersionId)
+                        .from(MultipartUploadEntity)
+                        .cond_where(
+                            Condition::any()
+                                .add(
+                                    Condition::all()
+                                        .add(MultipartUploadColumn::State.eq("in_progress"))
+                                        .add(MultipartUploadColumn::ExpiresAt.gt(now)),
                                 )
-                                .to_owned(),
-                        ),
-                    ),
-            )
+                                .add(MultipartUploadColumn::State.eq("completing")),
+                        )
+                        .to_owned(),
+                ),
+            );
+        if let Some((after_created_at, after_version_id)) = after {
+            filter = filter.add(super::tuple_gt(
+                (Entity, Column::CreatedAt),
+                (Entity, Column::VersionId),
+                after_created_at,
+                after_version_id,
+            ));
+        }
+        let rows = Entity::find()
+            .filter(filter)
             .order_by_asc(Column::CreatedAt)
             .order_by_asc(Column::VersionId)
             .limit(limit)

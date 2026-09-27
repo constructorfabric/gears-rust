@@ -141,21 +141,18 @@ impl FileStorageClientV1 for FileStorageLocalClient {
         ctx: &SecurityContext,
         owner: OwnerFilter,
         limit: Option<u64>,
-        offset: u64,
+        cursor: Option<&str>,
     ) -> Result<Page<FileRecord>, FileStorageError> {
         // Shared with `api::rest::handlers::list_files` — same batched
         // custom-metadata attachment, see `FileService::list_files_with_metadata`.
-        let items = self
+        let page = self
             .service
-            .list_files_with_metadata(ctx, owner, limit, offset)
-            .await?
-            .into_iter()
-            .map(|(file, custom_metadata)| FileRecord {
-                file,
-                custom_metadata,
-            })
-            .collect::<Vec<_>>();
-        Ok(Page::new(items, limit, offset))
+            .list_files_with_metadata(ctx, owner, limit, cursor)
+            .await?;
+        Ok(page.map_items(|(file, custom_metadata)| FileRecord {
+            file,
+            custom_metadata,
+        }))
     }
 
     async fn update_metadata(
@@ -202,19 +199,15 @@ impl FileStorageClientV1 for FileStorageLocalClient {
         ctx: &SecurityContext,
         file_id: FileId,
         limit: Option<u64>,
-        offset: u64,
+        cursor: Option<&str>,
     ) -> Result<Page<VersionRecord>, FileStorageError> {
         // Shared with `api::rest::handlers::list_versions` — same
         // manifest-byte budget and truncation.
-        let versions = self
+        let page = self
             .service
-            .list_versions_with_manifests(ctx, file_id, limit, offset)
+            .list_versions_with_manifests(ctx, file_id, limit, cursor)
             .await?;
-        let items = versions
-            .into_iter()
-            .map(|(version, manifest)| VersionRecord { version, manifest })
-            .collect();
-        Ok(Page::new(items, limit, offset))
+        Ok(page.map_items(|(version, manifest)| VersionRecord { version, manifest }))
     }
 
     async fn presign_version(
@@ -423,12 +416,14 @@ impl FileStorageClientV1 for FileStorageLocalClient {
     async fn list_retention_rules(
         &self,
         ctx: &SecurityContext,
-    ) -> Result<Vec<RetentionRule>, FileStorageError> {
-        let rules = self.policy_service.list_retention_rules(ctx).await?;
-        Ok(rules
-            .into_iter()
-            .map(sdk_convert::stored_retention_rule)
-            .collect())
+        limit: Option<u64>,
+        cursor: Option<&str>,
+    ) -> Result<Page<RetentionRule>, FileStorageError> {
+        let page = self
+            .policy_service
+            .list_retention_rules(ctx, limit, cursor)
+            .await?;
+        Ok(page.map_items(sdk_convert::stored_retention_rule))
     }
 
     async fn create_retention_rule(

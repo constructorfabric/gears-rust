@@ -338,6 +338,9 @@ gear's code. It remains a planned P2 requirement (see PRD.md/DESIGN.md).
   - The background cleanup sweep: abandoned-pending-version reclamation (skips versions still
     backing a live in-progress or any completing multipart session), expired-multipart-session abort,
     retention-policy expiry (keyset-paginated file scan), expired idempotency-key purge
+  - Per-tick time budget (`sweep_time_budget_secs`): each tick keeps taking further bounded batches per step,
+    interleaved across steps, until every step is exhausted or the budget runs out; unfinished work carries over
+    to a later pass in the same tick or the next tick rather than being dropped
   - Per-instance sweep scheduling; cross-instance coordination is not implemented
 
 - **Out of scope**:

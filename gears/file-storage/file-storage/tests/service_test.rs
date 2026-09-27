@@ -259,9 +259,10 @@ async fn full_upload_bind_download_lifecycle() {
 
     // Versions: exactly one, current, available.
     let versions = svc
-        .list_versions(&ctx, ticket.file_id, None, 0)
+        .list_versions(&ctx, ticket.file_id, None, None)
         .await
-        .unwrap();
+        .unwrap()
+        .items;
     assert_eq!(versions.len(), 1);
     assert!(versions[0].is_current);
     assert_eq!(versions[0].size, 11);
@@ -613,11 +614,11 @@ async fn list_files_filters_by_owner() {
                 owner_id: owner,
             },
             Some(10),
-            0,
+            None,
         )
         .await
         .unwrap();
-    assert!(found.iter().any(|f| f.file_id == t.file_id));
+    assert!(found.items.iter().any(|f| f.file_id == t.file_id));
 
     let empty = svc
         .list_files(
@@ -627,11 +628,11 @@ async fn list_files_filters_by_owner() {
                 owner_id: Uuid::now_v7(),
             },
             Some(10),
-            0,
+            None,
         )
         .await
         .unwrap();
-    assert!(empty.is_empty());
+    assert!(empty.items.is_empty());
 }
 
 // NOTE: `list_files_returns_each_files_custom_metadata` (exercising
@@ -695,8 +696,15 @@ async fn list_versions_caps_at_max_page_size() {
     );
 
     // No explicit limit → clamps to max_page_size (primary outcome).
-    let page = svc.list_versions(&ctx, t0.file_id, None, 0).await.unwrap();
-    assert_eq!(page.len() as u64, max_page_size);
+    let page = svc
+        .list_versions(&ctx, t0.file_id, None, None)
+        .await
+        .unwrap();
+    assert_eq!(page.items.len() as u64, max_page_size);
+    assert!(
+        page.page_info.next_cursor.is_some(),
+        "more versions remain beyond the clamped page"
+    );
 
     // Secondary artifact: the page is exactly the newest `max_page_size`
     // versions, newest-first — the last `max_page_size` created ids, in
@@ -707,15 +715,15 @@ async fn list_versions_caps_at_max_page_size() {
         .take(usize::try_from(max_page_size).expect("max_page_size fits usize"))
         .copied()
         .collect();
-    let actual: Vec<Uuid> = page.iter().map(|v| v.version_id).collect();
+    let actual: Vec<Uuid> = page.items.iter().map(|v| v.version_id).collect();
     assert_eq!(actual, expected, "must be the newest-first page");
 
     // A caller-supplied limit above max_page_size is still clamped.
     let clamped = svc
-        .list_versions(&ctx, t0.file_id, Some(max_page_size + 100), 0)
+        .list_versions(&ctx, t0.file_id, Some(max_page_size + 100), None)
         .await
         .unwrap();
-    assert_eq!(clamped.len() as u64, max_page_size);
+    assert_eq!(clamped.items.len() as u64, max_page_size);
 }
 
 // ── P2 2.7: delete_version vs bind race cannot dangle `files.content_id` ────
@@ -771,7 +779,11 @@ async fn delete_current_version_is_rejected() {
     );
 
     // The row must survive and content_id must still resolve.
-    let versions = svc.list_versions(&ctx, t1.file_id, None, 0).await.unwrap();
+    let versions = svc
+        .list_versions(&ctx, t1.file_id, None, None)
+        .await
+        .unwrap()
+        .items;
     assert!(
         versions.iter().any(|v| v.version_id == t1.version_id),
         "current version must survive the rejected delete"

@@ -86,10 +86,21 @@
 //!   created_at DESC, file_id DESC)`, replacing `files_owner_listing_idx
 //!   (tenant_id, owner_kind, owner_id, created_at DESC)` from the already-
 //!   released `m20260624_000001_p1_initial` (left untouched, dropped here
-//!   instead): `FileRepo::list` sorts `ORDER BY created_at DESC, file_id
+//!   instead): `FileRepo::list_page` sorts `ORDER BY created_at DESC, file_id
 //!   DESC`, and the old index's missing `file_id` tie-break left that half of
 //!   the sort to an extra in-memory pass over every row sharing a
 //!   `created_at` instant.
+//! - `retention_rules_tenant_listing_idx` on `retention_rules (tenant_id,
+//!   created_at DESC, rule_id DESC)` (cursor pagination): `RetentionRuleRepo::list_page`'s canonical order for
+//!   `GET /retention-rules`, same tie-breaker reasoning as
+//!   `files_owner_listing_v2_idx` above -- `retention_rules` had no index of
+//!   its own to serve either the filter or the sort before this.
+//! - `file_versions_backend_idx` (`m20260624_000001_p1_initial`, on
+//!   `file_versions (backend_id)`) is DROPPED, not added: no query in this
+//!   gear filters `file_versions` by `backend_id` -- backend migration reads
+//!   and writes a version by `(file_id, version_id)`, never scans by
+//!   backend -- so it only paid insert/update cost with no read ever using
+//!   it.
 //!
 //! # 3. `file_versions.bound_on_finalize`
 //!
@@ -116,8 +127,9 @@
 //!
 //! # `down()`
 //!
-//! Rolls both parts back, in reverse order: first the five new indexes
-//! (dropped) with `files_owner_listing_idx` recreated, then the
+//! Rolls both parts back, in reverse order: first the new indexes (dropped,
+//! including `retention_rules_tenant_listing_idx`) with `files_owner_listing_idx`
+//! and `file_versions_backend_idx` recreated, then the
 //! `multipart_uploads` columns/CHECK (and, on `SQLite`, the table itself)
 //! restored to their pre-migration shape. A `completing` row cannot satisfy
 //! the narrowed CHECK (that lease state did not exist before this migration),
@@ -190,6 +202,17 @@ CREATE INDEX IF NOT EXISTS file_versions_file_created_idx
 CREATE INDEX IF NOT EXISTS files_owner_listing_v2_idx
     ON files (tenant_id, owner_kind, owner_id, created_at DESC, file_id DESC);
 DROP INDEX IF EXISTS files_owner_listing_idx;
+-- Cursor pagination: `GET /retention-rules`'
+-- canonical order is `created_at DESC, rule_id DESC`, same tie-breaker
+-- reasoning as `files_owner_listing_v2_idx` above -- retention_rules has no
+-- index of its own to serve it otherwise.
+CREATE INDEX IF NOT EXISTS retention_rules_tenant_listing_idx
+    ON retention_rules (tenant_id, created_at DESC, rule_id DESC);
+-- `file_versions_backend_idx` (m20260624_000001_p1_initial): no query in this
+-- gear filters `file_versions` by `backend_id` -- `migrate_backend`/backend
+-- migration reads/writes by `(file_id, version_id)`, never scans by backend --
+-- so this index only pays insert/update cost with no read ever using it.
+DROP INDEX IF EXISTS file_versions_backend_idx;
 
 -- Part 3: persisted finalize-time bind decision (see the module doc).
 ALTER TABLE file_versions
@@ -298,6 +321,12 @@ CREATE INDEX IF NOT EXISTS file_versions_file_created_idx
 CREATE INDEX IF NOT EXISTS files_owner_listing_v2_idx
     ON files (tenant_id, owner_kind, owner_id, created_at DESC, file_id DESC);
 DROP INDEX IF EXISTS files_owner_listing_idx;
+-- Cursor pagination -- see POSTGRES_UP's
+-- matching statement for the full comment.
+CREATE INDEX IF NOT EXISTS retention_rules_tenant_listing_idx
+    ON retention_rules (tenant_id, created_at DESC, rule_id DESC);
+-- Unused index removal -- see POSTGRES_UP's matching statement.
+DROP INDEX IF EXISTS file_versions_backend_idx;
 
 -- Part 3: persisted finalize-time bind decision (see the module doc).
 -- SQLite's `ADD COLUMN` has no `IF NOT EXISTS` clause, unlike Postgres above.
@@ -331,6 +360,10 @@ DROP INDEX IF EXISTS file_versions_file_created_idx;
 DROP INDEX IF EXISTS files_versionless_sweep_idx;
 DROP INDEX IF EXISTS multipart_uploads_sweep_idx;
 DROP INDEX IF EXISTS idempotency_keys_file_idx;
+-- Reverse of the cursor-pagination/unused-index changes above.
+DROP INDEX IF EXISTS retention_rules_tenant_listing_idx;
+CREATE INDEX IF NOT EXISTS file_versions_backend_idx
+    ON file_versions (backend_id);
 
 -- Part 3 (see the module doc): plain, symmetric drop -- nothing else in
 -- this migration depends on the column existing.
@@ -363,6 +396,11 @@ DROP INDEX IF EXISTS file_versions_file_created_idx;
 DROP INDEX IF EXISTS files_versionless_sweep_idx;
 DROP INDEX IF EXISTS multipart_uploads_sweep_idx;
 DROP INDEX IF EXISTS idempotency_keys_file_idx;
+-- Reverse of the cursor-pagination/unused-index changes above -- see
+-- POSTGRES_DOWN's matching statement.
+DROP INDEX IF EXISTS retention_rules_tenant_listing_idx;
+CREATE INDEX IF NOT EXISTS file_versions_backend_idx
+    ON file_versions (backend_id);
 
 -- Part 3 (see the module doc): plain, symmetric drop. SQLite's `DROP COLUMN`
 -- has no `IF EXISTS` clause, unlike Postgres's equivalent statement.

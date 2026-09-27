@@ -367,6 +367,89 @@ async fn list_by_file_orders_by_created_at_then_version_id_so_paged_offsets_do_n
     );
 }
 
+/// `VersionRepo::list_by_file_page` (the cursor-paginated listing backing
+/// `GET /files/{id}/versions`) must walk the
+/// same `(created_at, version_id)` descending keyset -- including the
+/// same-`created_at` tie case -- with every row covered exactly once and no
+/// duplicates, one page at a time via `after`.
+#[tokio::test]
+async fn list_by_file_page_keyset_orders_by_created_at_then_version_id_with_no_skip_or_repeat() {
+    let db = db().await;
+    let conn = db.conn().expect("conn");
+    let scope = AccessScope::allow_all();
+    let files = FileRepo::new();
+    let versions = VersionRepo::new();
+
+    let file_id = Uuid::now_v7();
+    let tenant = Uuid::now_v7();
+    files
+        .create(&conn, &scope, &new_file(file_id, tenant))
+        .await
+        .expect("create file");
+
+    let same_instant = OffsetDateTime::now_utc();
+    let ids = [
+        Uuid::from_u128(1),
+        Uuid::from_u128(2),
+        Uuid::from_u128(3),
+        Uuid::from_u128(4),
+    ];
+    for &version_id in &ids {
+        versions
+            .insert(
+                &conn,
+                &scope,
+                &new_pending_version(file_id, version_id, same_instant),
+            )
+            .await
+            .expect("insert version");
+    }
+
+    let page1 = versions
+        .list_by_file_page(&conn, &scope, file_id, 2, None)
+        .await
+        .expect("page 1");
+    assert_eq!(page1.len(), 2);
+    let last = page1.last().expect("page 1 non-empty");
+    let after_pos = file_storage::domain::pagination::Seek {
+        created_at: last.created_at,
+        id: last.version_id,
+    };
+    let page2 = versions
+        .list_by_file_page(&conn, &scope, file_id, 2, Some(after_pos))
+        .await
+        .expect("page 2");
+    let page3 = versions
+        .list_by_file_page(&conn, &scope, file_id, 2, {
+            let last = page2.last().expect("page 2 non-empty");
+            Some(file_storage::domain::pagination::Seek {
+                created_at: last.created_at,
+                id: last.version_id,
+            })
+        })
+        .await
+        .expect("page 3 (past the end)");
+
+    let mut seen: Vec<Uuid> = page1
+        .iter()
+        .chain(page2.iter())
+        .map(|v| v.version_id)
+        .collect();
+    let mut expected = ids.to_vec();
+    expected.sort_unstable_by(|a, b| b.cmp(a)); // version_id descending
+    assert_eq!(
+        seen, expected,
+        "two keyset pages over four equal-created_at rows must together cover \
+         every version_id exactly once, in version_id-descending order"
+    );
+    seen.dedup();
+    assert_eq!(seen.len(), 4, "no version_id may be repeated across pages");
+    assert!(
+        page3.is_empty(),
+        "a keyset page starting past the last row must be empty, got {page3:?}"
+    );
+}
+
 /// `VersionRepo::list_pending_older_than` must cap its result at `limit` rows
 /// -- the cleanup sweep's abandoned-pending-version phase used to run this
 /// query with no bound at all, materializing an entire backlog in one sweep
@@ -431,7 +514,7 @@ async fn list_pending_older_than_caps_at_limit_and_orders_deterministically() {
     let now = OffsetDateTime::now_utc();
     let older_than = now;
     let rows = versions
-        .list_pending_older_than(&conn, &scope, older_than, now, 3)
+        .list_pending_older_than(&conn, &scope, older_than, now, 3, None)
         .await
         .expect("list_pending_older_than must not error");
 
@@ -446,6 +529,82 @@ async fn list_pending_older_than_caps_at_limit_and_orders_deterministically() {
         "rows must be ordered (created_at, version_id) ascending -- a first \
          (oldest), then b before c (same created_at, b's version_id is \
          smaller), and d (strictly newest) excluded by the limit"
+    );
+}
+
+/// `VersionRepo::list_pending_older_than`'s `after` keyset cursor must
+/// return only rows strictly past `(created_at, version_id)`, including the
+/// same-`created_at` tiebreak case (the sweep's cursor lands on `b`, sharing
+/// `c`'s `created_at`; `c` must still be returned, `b` must not be repeated).
+#[tokio::test]
+async fn list_pending_older_than_after_cursor_excludes_seen_rows_including_created_at_tie() {
+    let db = db().await;
+    let conn = db.conn().expect("conn");
+    let scope = AccessScope::allow_all();
+    let files = FileRepo::new();
+    let versions = VersionRepo::new();
+
+    let file_id = Uuid::now_v7();
+    let tenant = Uuid::now_v7();
+    files
+        .create(&conn, &scope, &new_file(file_id, tenant))
+        .await
+        .expect("create file");
+
+    let base = OffsetDateTime::now_utc() - time::Duration::hours(10);
+    let id_a = Uuid::from_u128(1);
+    let id_b = Uuid::from_u128(11);
+    let id_c = Uuid::from_u128(12);
+    let id_d = Uuid::from_u128(99);
+
+    versions
+        .insert(&conn, &scope, &new_pending_version(file_id, id_a, base))
+        .await
+        .expect("insert a");
+    versions
+        .insert(
+            &conn,
+            &scope,
+            &new_pending_version(file_id, id_b, base + time::Duration::seconds(1)),
+        )
+        .await
+        .expect("insert b");
+    versions
+        .insert(
+            &conn,
+            &scope,
+            &new_pending_version(file_id, id_c, base + time::Duration::seconds(1)),
+        )
+        .await
+        .expect("insert c (same created_at as b, larger version_id)");
+    versions
+        .insert(
+            &conn,
+            &scope,
+            &new_pending_version(file_id, id_d, base + time::Duration::seconds(2)),
+        )
+        .await
+        .expect("insert d (strictly newest)");
+
+    let now = OffsetDateTime::now_utc();
+    let older_than = now;
+
+    // Cursor lands exactly on `b`: same `created_at` as `c`, smaller
+    // `version_id`. Only `c` and `d` must come back -- `a` and `b` (at or
+    // before the cursor) must not, and `b` must not reappear despite sharing
+    // `c`'s `created_at`.
+    let after = (base + time::Duration::seconds(1), id_b);
+    let rows = versions
+        .list_pending_older_than(&conn, &scope, older_than, now, 10, Some(after))
+        .await
+        .expect("list_pending_older_than with after must not error");
+
+    assert_eq!(
+        rows.iter().map(|r| r.version_id).collect::<Vec<_>>(),
+        vec![id_c, id_d],
+        "after = (b's created_at, b's version_id) must return only rows \
+         strictly past that key: c (same created_at, larger version_id) and \
+         d (strictly newer), never a, never b itself"
     );
 }
 

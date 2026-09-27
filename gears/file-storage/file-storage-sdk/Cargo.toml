@@ -32,3 +32,8 @@ toolkit-security = { workspace = true }
 # Canonical error envelope (re-exported as `FileStorageError`)
 toolkit-canonical-errors = { workspace = true }
 toolkit-gts = { workspace = true }
+
+# `list_files`/`list_versions`/`list_retention_rules` return
+# `toolkit_odata::Page<T>` — the platform's cursor-pagination envelope
+#. Mirrors account-management-sdk's use.
+toolkit-odata = { workspace = true }

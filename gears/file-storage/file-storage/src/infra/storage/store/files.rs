@@ -86,19 +86,65 @@ impl Store {
             .ok_or_else(|| DomainError::file_not_found(file_id))
     }
 
-    /// List files for an owner filter, newest-first, offset-paginated.
+    /// List files for an owner filter, newest-first, forward-only
+    /// keyset-paginated. `limit` is the
+    /// caller's already-clamped page size (see `FileService::list_files`);
+    /// `cursor`, when `Some`, resumes after the position it encodes --
+    /// decoded and validated here against [`crate::domain::pagination::files_binding`]
+    /// so a cursor issued for a different owner pair is rejected as a `400`
+    /// rather than silently reused.
+    ///
+    /// Fetches `limit + 1` rows to learn whether a next page exists without
+    /// a separate `COUNT` query (the platform's cursor-pagination contract,
+    /// `guidelines/DNA/REST/QUERYING.md`), trims back to `limit`, and encodes
+    /// `next_cursor` from the last row actually returned.
     pub async fn list_files(
         &self,
         scope: &AccessScope,
         owner: OwnerFilter,
         limit: u64,
-        offset: u64,
-    ) -> Result<Vec<File>, DomainError> {
+        cursor: Option<&str>,
+    ) -> Result<toolkit_odata::Page<File>, DomainError> {
+        use crate::domain::pagination;
+
+        let binding = pagination::files_binding(&owner);
+        let after = cursor
+            .map(|token| pagination::decode(token, pagination::FILES_ID_FIELD, binding.as_deref()))
+            .transpose()?;
+
         let conn = self.db.conn().map_err(db_err)?;
-        self.repos
+        let mut rows = self
+            .repos
             .files
-            .list(&conn, scope, owner, limit, offset)
-            .await
+            .list_page(&conn, scope, owner, limit.saturating_add(1), after)
+            .await?;
+
+        let has_more = rows.len() as u64 > limit;
+        if has_more {
+            rows.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+        }
+        let next_cursor = if has_more {
+            rows.last()
+                .map(|f| {
+                    pagination::encode(
+                        f.created_at,
+                        f.file_id,
+                        pagination::FILES_ID_FIELD,
+                        binding.clone(),
+                    )
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        Ok(toolkit_odata::Page::new(
+            rows,
+            toolkit_odata::PageInfo {
+                next_cursor,
+                prev_cursor: None,
+                limit,
+            },
+        ))
     }
 
     // ── create ───────────────────────────────────────────────────────────────

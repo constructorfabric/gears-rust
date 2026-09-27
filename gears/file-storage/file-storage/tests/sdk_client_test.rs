@@ -194,7 +194,7 @@ async fn build_harness() -> Harness {
         "http://sidecar.test".to_owned(),
         3600,
     ));
-    let policy_svc = Arc::new(PolicyService::new(policy_store, authorizer));
+    let policy_svc = Arc::new(PolicyService::new(policy_store, authorizer, 50, 1000));
 
     let client = FileStorageLocalClient::new(
         Arc::clone(&file_svc),
@@ -418,7 +418,7 @@ async fn list_files_success_and_cross_owner_forbidden() {
                 owner_id: owner_a,
             },
             Some(10),
-            0,
+            None,
         )
         .await
         .expect("self-owner list succeeds");
@@ -433,7 +433,7 @@ async fn list_files_success_and_cross_owner_forbidden() {
                 owner_id: owner_a,
             },
             Some(10),
-            0,
+            None,
         )
         .await
         .unwrap_err();
@@ -485,7 +485,7 @@ async fn list_files_includes_custom_metadata() {
                 owner_id: owner,
             },
             Some(10),
-            0,
+            None,
         )
         .await
         .expect("list_files");
@@ -602,7 +602,7 @@ async fn list_versions_success_and_unknown_file() {
 
     let page = h
         .client
-        .list_versions(&ctx, file_id, Some(10), 0)
+        .list_versions(&ctx, file_id, Some(10), None)
         .await
         .expect("list_versions");
     assert_eq!(page.items.len(), 1);
@@ -611,7 +611,7 @@ async fn list_versions_success_and_unknown_file() {
 
     let err = h
         .client
-        .list_versions(&ctx, Uuid::now_v7(), Some(10), 0)
+        .list_versions(&ctx, Uuid::now_v7(), Some(10), None)
         .await
         .unwrap_err();
     assert!(matches!(err, FileStorageError::NotFound { .. }));
@@ -1076,13 +1076,17 @@ async fn list_retention_rules_success_and_read_denied() {
 
     let rules = h
         .client
-        .list_retention_rules(&ctx)
+        .list_retention_rules(&ctx, None, None)
         .await
         .expect("list_retention_rules");
-    assert!(rules.is_empty());
+    assert!(rules.items.is_empty());
 
     h.authz.set_deny_read(true);
-    let err = h.client.list_retention_rules(&ctx).await.unwrap_err();
+    let err = h
+        .client
+        .list_retention_rules(&ctx, None, None)
+        .await
+        .unwrap_err();
     assert!(matches!(err, FileStorageError::PermissionDenied { .. }));
 }
 
@@ -1323,7 +1327,7 @@ async fn equivalence_list_files_with_metadata() {
 
     let sdk_page = h
         .client
-        .list_files(&ctx, owner_filter, Some(10), 0)
+        .list_files(&ctx, owner_filter, Some(10), None)
         .await
         .expect("sdk list_files");
     let sdk_record = sdk_page
@@ -1380,7 +1384,7 @@ async fn equivalence_list_files_with_metadata() {
         .expect("dispatch list");
     assert_eq!(list_resp.status(), StatusCode::OK);
     let list_body = body_json(list_resp).await;
-    let rest_items = list_body.as_array().expect("array body");
+    let rest_items = list_body["items"].as_array().expect("array body");
 
     // Both the sdk-created and rest-created file are owned by the same
     // subject, so both appear in this single owner-scoped REST listing —
@@ -1629,7 +1633,7 @@ async fn service_owner_self_service_create_upload_and_read() {
     }
     let versions = h
         .client
-        .list_versions(&ctx_app, ticket.file_id, Some(10), 0)
+        .list_versions(&ctx_app, ticket.file_id, Some(10), None)
         .await
         .expect("list_versions");
     assert_eq!(versions.items.len(), 1);

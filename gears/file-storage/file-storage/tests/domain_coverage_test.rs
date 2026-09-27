@@ -8,7 +8,7 @@
 //! exercises `manifests_for_versions`/`VersionDto`.
 //!
 //! Each `tests/*.rs` file is its own integration-test crate, so the small
-//! test doubles below (`TestAuthorizer`, `FaultyListFilesByIdsStore`,
+//! test doubles below (`TestAuthorizer`, `CountingPolicyStore`,
 //! `FaultyCleanupStore`) are self-contained copies of the patterns already
 //! established in `tests/policy_authz_test.rs` / `tests/cleanup_test.rs`
 //! rather than shared code.
@@ -237,110 +237,6 @@ impl Authorizer for TestAuthorizer {
     }
 }
 
-// ── FaultyListFilesByIdsStore (PolicyStore test double) ─────────────────────
-
-/// A [`PolicyStore`] wrapper that makes `list_files_by_ids` fail with an
-/// error OTHER than a partial/absent result whenever the requested id list
-/// contains one specific `file_id`, delegating every other method (and every
-/// call not naming that id) to a real [`Store`]. Used to prove
-/// `PolicyService::list_retention_rules`'s batched `File`-scope resolution
-/// propagates an unexpected store error instead of silently treating it like
-/// a dangling target.
-struct FaultyListFilesByIdsStore {
-    inner: Store,
-    fault_file_id: Uuid,
-}
-
-#[async_trait]
-impl PolicyStore for FaultyListFilesByIdsStore {
-    async fn require_file(&self, scope: &AccessScope, file_id: Uuid) -> Result<File, DomainError> {
-        self.inner.require_file(scope, file_id).await
-    }
-
-    async fn list_files_by_ids(
-        &self,
-        scope: &AccessScope,
-        ids: &[Uuid],
-    ) -> Result<Vec<File>, DomainError> {
-        if ids.contains(&self.fault_file_id) {
-            Err(DomainError::InternalError)
-        } else {
-            self.inner.list_files_by_ids(scope, ids).await
-        }
-    }
-
-    async fn get_policy(
-        &self,
-        scope: &AccessScope,
-        tenant_id: Uuid,
-        policy_scope: &PolicyScope,
-        scope_owner_id: Option<Uuid>,
-    ) -> Result<Option<StoredPolicy>, DomainError> {
-        self.inner
-            .get_policy(scope, tenant_id, policy_scope, scope_owner_id)
-            .await
-    }
-
-    async fn upsert_policy(
-        &self,
-        scope: &AccessScope,
-        tenant_id: Uuid,
-        policy_scope: &PolicyScope,
-        scope_owner_id: Option<Uuid>,
-        body: &PolicyBody,
-        now: OffsetDateTime,
-    ) -> Result<Uuid, DomainError> {
-        self.inner
-            .upsert_policy(scope, tenant_id, policy_scope, scope_owner_id, body, now)
-            .await
-    }
-
-    async fn list_retention_rules(
-        &self,
-        scope: &AccessScope,
-        tenant_id: Uuid,
-    ) -> Result<Vec<StoredRetentionRule>, DomainError> {
-        self.inner.list_retention_rules(scope, tenant_id).await
-    }
-
-    async fn insert_retention_rule(
-        &self,
-        scope: &AccessScope,
-        tenant_id: Uuid,
-        retention_scope: &RetentionScope,
-        scope_target_id: Option<Uuid>,
-        body: &RetentionRuleBody,
-        now: OffsetDateTime,
-    ) -> Result<Uuid, DomainError> {
-        self.inner
-            .insert_retention_rule(
-                scope,
-                tenant_id,
-                retention_scope,
-                scope_target_id,
-                body,
-                now,
-            )
-            .await
-    }
-
-    async fn delete_retention_rule(
-        &self,
-        scope: &AccessScope,
-        rule_id: Uuid,
-    ) -> Result<bool, DomainError> {
-        self.inner.delete_retention_rule(scope, rule_id).await
-    }
-
-    async fn get_retention_rule(
-        &self,
-        scope: &AccessScope,
-        rule_id: Uuid,
-    ) -> Result<Option<StoredRetentionRule>, DomainError> {
-        self.inner.get_retention_rule(scope, rule_id).await
-    }
-}
-
 // ── CountingPolicyStore (PolicyStore test double) ───────────────────────────
 
 /// A [`PolicyStore`] wrapper that counts calls to `require_file` and
@@ -415,6 +311,30 @@ impl PolicyStore for CountingPolicyStore {
         self.inner.list_retention_rules(scope, tenant_id).await
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn list_retention_rules_page(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        admin: bool,
+        subject_kind: &str,
+        subject_id: Uuid,
+        limit: u64,
+        cursor: Option<&str>,
+    ) -> Result<toolkit_odata::Page<StoredRetentionRule>, DomainError> {
+        self.inner
+            .list_retention_rules_page(
+                scope,
+                tenant_id,
+                admin,
+                subject_kind,
+                subject_id,
+                limit,
+                cursor,
+            )
+            .await
+    }
+
     async fn insert_retention_rule(
         &self,
         scope: &AccessScope,
@@ -456,9 +376,13 @@ impl PolicyStore for CountingPolicyStore {
 /// Regression (t26): several `File`-scope retention rules spread across
 /// several distinct files -- some owned by the listing caller, some owned by
 /// someone else -- a non-admin caller must see only the rules on files they
-/// own themselves, and resolving all of those distinct targets must cost
-/// exactly one batched `list_files_by_ids` call, never one `require_file`
-/// round trip per target.
+/// own themselves. This visibility resolution
+/// now happens entirely in SQL (`RetentionRuleRepo::list_page`'s `File`-scope
+/// subquery), so it costs neither a `require_file` round trip per target nor
+/// a batched `list_files_by_ids` call at all -- both counters must stay at
+/// `0` (this test used to assert `list_files_by_ids_calls == 1`, back when
+/// the application resolved File-scope targets itself; that mechanism no
+/// longer exists).
 #[tokio::test]
 async fn list_retention_rules_file_scope_many_targets_regression() {
     let db = build_db().await;
@@ -481,7 +405,8 @@ async fn list_retention_rules_file_scope_many_targets_regression() {
         None,
         None,
     );
-    let policy_svc = PolicyService::new(Arc::clone(&policy_store), Arc::clone(&authorizer));
+    let policy_svc =
+        PolicyService::new(Arc::clone(&policy_store), Arc::clone(&authorizer), 50, 1000);
 
     let tenant = Uuid::now_v7();
     let self_id = Uuid::now_v7();
@@ -530,9 +455,10 @@ async fn list_retention_rules_file_scope_many_targets_regression() {
     authz.set_admin(false);
 
     let visible = policy_svc
-        .list_retention_rules(&ctx_self)
+        .list_retention_rules(&ctx_self, None, None)
         .await
-        .expect("list_retention_rules");
+        .expect("list_retention_rules")
+        .items;
 
     assert_eq!(
         visible.len(),
@@ -553,8 +479,8 @@ async fn list_retention_rules_file_scope_many_targets_regression() {
     );
     assert_eq!(
         list_files_by_ids_calls.load(Ordering::SeqCst),
-        1,
-        "resolving 5 distinct File-scope targets must cost exactly one batched call, not N"
+        0,
+        "File-scope visibility is now resolved in SQL -- it must never call list_files_by_ids"
     );
 }
 
@@ -593,9 +519,10 @@ impl CleanupStore for FaultyCleanupStore {
         older_than: OffsetDateTime,
         now: OffsetDateTime,
         limit: u64,
+        after: Option<(OffsetDateTime, Uuid)>,
     ) -> Result<Vec<FileVersion>, DomainError> {
         self.inner
-            .list_abandoned_pending_versions(older_than, now, limit)
+            .list_abandoned_pending_versions(older_than, now, limit, after)
             .await
     }
 
@@ -603,9 +530,10 @@ impl CleanupStore for FaultyCleanupStore {
         &self,
         created_before: OffsetDateTime,
         limit: u64,
+        after: Option<(OffsetDateTime, Uuid)>,
     ) -> Result<Vec<File>, DomainError> {
         self.inner
-            .list_versionless_orphan_files(created_before, limit)
+            .list_versionless_orphan_files(created_before, limit, after)
             .await
     }
 
@@ -633,11 +561,14 @@ impl CleanupStore for FaultyCleanupStore {
         &self,
         now: OffsetDateTime,
         limit: u64,
+        after: Option<(OffsetDateTime, Uuid)>,
     ) -> Result<Vec<MultipartUploadSession>, DomainError> {
         if self.faults.fault_list_expired_multipart {
             return Err(DomainError::InternalError);
         }
-        self.inner.list_expired_multipart_uploads(now, limit).await
+        self.inner
+            .list_expired_multipart_uploads(now, limit, after)
+            .await
     }
 
     async fn abort_multipart_upload(
@@ -775,7 +706,8 @@ async fn list_retention_rules_file_scope_visible_only_when_owner_kind_and_id_bot
         None,
         None,
     );
-    let policy_svc = PolicyService::new(Arc::clone(&policy_store), Arc::clone(&authorizer));
+    let policy_svc =
+        PolicyService::new(Arc::clone(&policy_store), Arc::clone(&authorizer), 50, 1000);
 
     let tenant = Uuid::now_v7();
     let admin_id = Uuid::now_v7();
@@ -825,9 +757,10 @@ async fn list_retention_rules_file_scope_visible_only_when_owner_kind_and_id_bot
 
     authz.set_admin(false);
     let visible = policy_svc
-        .list_retention_rules(&ctx_app)
+        .list_retention_rules(&ctx_app, None, None)
         .await
-        .expect("list_retention_rules for the app subject");
+        .expect("list_retention_rules for the app subject")
+        .items;
     let visible_ids: std::collections::HashSet<Uuid> = visible.iter().map(|r| r.rule_id).collect();
 
     assert!(
@@ -836,7 +769,7 @@ async fn list_retention_rules_file_scope_visible_only_when_owner_kind_and_id_bot
     );
     assert!(
         visible_ids.contains(&rule_app_2.rule_id),
-        "a second rule on the same file must also be visible via the owner cache"
+        "a second rule on the same file must also be visible"
     );
     assert!(
         !visible_ids.contains(&rule_user.rule_id),
@@ -871,7 +804,7 @@ async fn list_retention_rules_file_scope_deleted_target_is_invisible_for_nonadmi
         None,
         None,
     );
-    let policy_svc = PolicyService::new(policy_store, authorizer);
+    let policy_svc = PolicyService::new(policy_store, authorizer, 50, 1000);
 
     let tenant = Uuid::now_v7();
     let user = Uuid::now_v7();
@@ -896,54 +829,13 @@ async fn list_retention_rules_file_scope_deleted_target_is_invisible_for_nonadmi
         .expect("delete the target file");
 
     let visible = policy_svc
-        .list_retention_rules(&ctx_user)
+        .list_retention_rules(&ctx_user, None, None)
         .await
-        .expect("list_retention_rules after target deleted");
+        .expect("list_retention_rules after target deleted")
+        .items;
     assert!(
         !visible.iter().any(|r| r.rule_id == rule.rule_id),
         "a rule whose target file is gone must not be visible to a non-admin caller"
-    );
-}
-
-/// A `list_files_by_ids` failure OTHER than a partial/absent result (e.g. a
-/// transient store error) must propagate as-is, not be swallowed the same
-/// way a dangling target is.
-#[tokio::test]
-async fn list_retention_rules_require_file_error_other_than_not_found_propagates() {
-    let db = build_db().await;
-    let store = Store::new(Arc::clone(&db));
-
-    let tenant = Uuid::now_v7();
-    let subject = Uuid::now_v7();
-    // Never actually created as a file -- `FaultyListFilesByIdsStore` always
-    // errors for it regardless, so its non-existence is irrelevant.
-    let fault_file_id = Uuid::now_v7();
-
-    let real_policy_store: Arc<dyn PolicyStore> = Arc::new(store.clone());
-    real_policy_store
-        .insert_retention_rule(
-            &AccessScope::allow_all(),
-            tenant,
-            &RetentionScope::File,
-            Some(fault_file_id),
-            &valid_rule_body(),
-            OffsetDateTime::now_utc(),
-        )
-        .await
-        .expect("insert rule directly, bypassing PolicyService");
-
-    let faulty_store: Arc<dyn PolicyStore> = Arc::new(FaultyListFilesByIdsStore {
-        inner: store,
-        fault_file_id,
-    });
-    let authorizer: Arc<dyn Authorizer> = Arc::new(TestAuthorizer::new()); // non-admin by default
-    let policy_svc = PolicyService::new(faulty_store, authorizer);
-
-    let ctx_user = ctx(tenant, subject);
-    let result = policy_svc.list_retention_rules(&ctx_user).await;
-    assert!(
-        matches!(result, Err(DomainError::InternalError)),
-        "a require_file failure other than FileNotFound must propagate, got {result:?}"
     );
 }
 
@@ -957,13 +849,13 @@ async fn list_retention_rules_admin_probe_unexpected_error_propagates() {
     let authz = Arc::new(TestAuthorizer::new());
     authz.set_admin_probe_error(true);
     let authorizer: Arc<dyn Authorizer> = authz;
-    let policy_svc = PolicyService::new(policy_store, authorizer);
+    let policy_svc = PolicyService::new(policy_store, authorizer, 50, 1000);
 
     let tenant = Uuid::now_v7();
     let subject = Uuid::now_v7();
     let ctx_user = ctx(tenant, subject);
 
-    let result = policy_svc.list_retention_rules(&ctx_user).await;
+    let result = policy_svc.list_retention_rules(&ctx_user, None, None).await;
     assert!(
         matches!(result, Err(DomainError::InternalError)),
         "an ADMIN_POLICY probe error other than Forbidden must propagate as-is, got {result:?}"
@@ -1974,7 +1866,7 @@ async fn list_versions_endpoint_batches_manifest_lookup_and_serializes_versions(
         .await
         .expect("read body");
     let body: serde_json::Value = serde_json::from_slice(&bytes).expect("valid JSON body");
-    let items = body.as_array().expect("array body");
+    let items = body["items"].as_array().expect("array body");
     assert_eq!(items.len(), 1, "expected exactly the one bound version");
     let version_id_str = ticket.version_id.to_string();
     assert_eq!(items[0]["version_id"], version_id_str.as_str());
@@ -2068,7 +1960,7 @@ async fn list_versions_endpoint_returns_full_page_for_whole_sha256_versions() {
         .await
         .expect("read body");
     let body: serde_json::Value = serde_json::from_slice(&bytes).expect("valid JSON body");
-    let items = body.as_array().expect("array body");
+    let items = body["items"].as_array().expect("array body");
     assert_eq!(
         items.len(),
         8,
@@ -2218,7 +2110,7 @@ async fn list_versions_endpoint_returns_composite_version_with_manifest() {
         .await
         .expect("read body");
     let body: serde_json::Value = serde_json::from_slice(&bytes).expect("valid JSON body");
-    let items = body.as_array().expect("array body");
+    let items = body["items"].as_array().expect("array body");
     assert_eq!(items.len(), 1, "expected exactly the one composite version");
     assert_eq!(items[0]["hash_mode"], "multipart-composite-sha256");
     let manifest = items[0]["manifest"]

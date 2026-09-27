@@ -65,14 +65,15 @@ impl FileService {
         self.store.list_metadata_for_files(file_ids).await
     }
 
-    /// List files for a mandatory owner filter, offset-paginated.
+    /// List files for a mandatory owner filter, forward-only
+    /// cursor-paginated.
     pub async fn list_files(
         &self,
         ctx: &SecurityContext,
         owner: OwnerFilter,
         limit: Option<u64>,
-        offset: u64,
-    ) -> Result<Vec<File>, DomainError> {
+        cursor: Option<&str>,
+    ) -> Result<toolkit_odata::Page<File>, DomainError> {
         // Authorize (access gate), then always tenant-scope the query so the
         // tenant boundary holds regardless of the PDP's returned constraints.
         self.authorizer
@@ -103,11 +104,13 @@ impl FileService {
                 .authorize(ctx, actions::ADMIN_POLICY, "", None)
                 .await?;
         }
-        let limit = limit
-            .unwrap_or(self.cfg.default_page_size)
-            .min(self.cfg.max_page_size);
+        let limit = crate::domain::pagination::clamp_limit(
+            limit,
+            self.cfg.default_page_size,
+            self.cfg.max_page_size,
+        )?;
         self.store
-            .list_files(&Self::tenant_scope(ctx), owner, limit, offset)
+            .list_files(&Self::tenant_scope(ctx), owner, limit, cursor)
             .await
     }
 
@@ -123,18 +126,15 @@ impl FileService {
         ctx: &SecurityContext,
         owner: OwnerFilter,
         limit: Option<u64>,
-        offset: u64,
-    ) -> Result<Vec<(File, Vec<CustomMetadataEntry>)>, DomainError> {
-        let files = self.list_files(ctx, owner, limit, offset).await?;
-        let file_ids: Vec<Uuid> = files.iter().map(|f| f.file_id).collect();
+        cursor: Option<&str>,
+    ) -> Result<toolkit_odata::Page<(File, Vec<CustomMetadataEntry>)>, DomainError> {
+        let page = self.list_files(ctx, owner, limit, cursor).await?;
+        let file_ids: Vec<Uuid> = page.items.iter().map(|f| f.file_id).collect();
         let mut metadata_by_file = self.list_metadata_for_files(&file_ids).await?;
-        Ok(files
-            .into_iter()
-            .map(|f| {
-                let meta = metadata_by_file.remove(&f.file_id).unwrap_or_default();
-                (f, meta)
-            })
-            .collect())
+        Ok(page.map_items(|f| {
+            let meta = metadata_by_file.remove(&f.file_id).unwrap_or_default();
+            (f, meta)
+        }))
     }
 
     /// Authorize `GET /storages` and `GET /storages/{id}` (backend
@@ -212,25 +212,28 @@ impl FileService {
     }
 
     /// `GET /files/{id}/versions`: list a page of a file's versions, newest
-    /// first, offset-paginated and capped at `ServiceConfig::max_page_size`
-    /// (P2 2.2 — closes the unbounded-listing amplification surface).
+    /// first, forward-only cursor-paginated
+    /// and capped at `ServiceConfig::max_page_size` (P2 2.2 — closes the
+    /// unbounded-listing amplification surface).
     pub async fn list_versions(
         &self,
         ctx: &SecurityContext,
         file_id: Uuid,
         limit: Option<u64>,
-        offset: u64,
-    ) -> Result<Vec<FileVersion>, DomainError> {
+        cursor: Option<&str>,
+    ) -> Result<toolkit_odata::Page<FileVersion>, DomainError> {
         let prefetch = Self::tenant_scope(ctx);
         let file = self.store.require_file(&prefetch, file_id).await?;
         let _scope = self
             .authorizer
             .authorize(ctx, actions::READ, &file.gts_file_type, Some(file_id))
             .await?;
-        let limit = limit
-            .unwrap_or(self.cfg.default_page_size)
-            .min(self.cfg.max_page_size);
-        self.store.list_versions_page(file_id, limit, offset).await
+        let limit = crate::domain::pagination::clamp_limit(
+            limit,
+            self.cfg.default_page_size,
+            self.cfg.max_page_size,
+        )?;
+        self.store.list_versions_page(file_id, limit, cursor).await
     }
 
     /// Batched manifest lookup for `list_versions`'s page of results: one
@@ -260,24 +263,64 @@ impl FileService {
     /// Extracted here (rather than left inline in the REST handler) so both
     /// callers apply the exact same manifest-byte budget and truncation —
     /// see [`fetch_manifests_within_budget`]'s doc for the full contract.
+    ///
+    /// # Cursor vs. manifest-budget truncation
+    ///
+    /// [`Self::list_versions`] already decides `next_cursor` from a plain
+    /// `limit + 1` fetch (`Store::list_versions_page`), before any manifest
+    /// is even read. When [`fetch_manifests_within_budget`] truncates the
+    /// page further (dropping some already-fetched versions to stay within
+    /// [`LIST_VERSIONS_MANIFEST_BUDGET_BYTES`]), that earlier decision is
+    /// stale: the client must still be able to resume from the last version
+    /// this response actually carries, even on what the query itself saw as
+    /// its very last page. `next_cursor` is therefore rebuilt from the new
+    /// last item whenever the budget cut the page short, and left as
+    /// `list_versions` computed it otherwise (the common case, where the two
+    /// agree because nothing was dropped).
     pub async fn list_versions_with_manifests(
         &self,
         ctx: &SecurityContext,
         file_id: Uuid,
         limit: Option<u64>,
-        offset: u64,
-    ) -> Result<Vec<(FileVersion, Option<String>)>, DomainError> {
-        let mut versions = self.list_versions(ctx, file_id, limit, offset).await?;
+        cursor: Option<&str>,
+    ) -> Result<toolkit_odata::Page<(FileVersion, Option<String>)>, DomainError> {
+        let mut page = self.list_versions(ctx, file_id, limit, cursor).await?;
+        let fetched_len = page.items.len();
         let mut manifests = self
-            .fetch_manifests_within_budget(&mut versions, LIST_VERSIONS_MANIFEST_BUDGET_BYTES)
+            .fetch_manifests_within_budget(&mut page.items, LIST_VERSIONS_MANIFEST_BUDGET_BYTES)
             .await?;
-        Ok(versions
+        let budget_truncated = page.items.len() < fetched_len;
+        let next_cursor = if budget_truncated {
+            page.items
+                .last()
+                .map(|v| {
+                    crate::domain::pagination::encode(
+                        v.created_at,
+                        v.version_id,
+                        crate::domain::pagination::VERSIONS_ID_FIELD,
+                        crate::domain::pagination::versions_binding(file_id),
+                    )
+                })
+                .transpose()?
+        } else {
+            page.page_info.next_cursor.clone()
+        };
+        let items = page
+            .items
             .into_iter()
             .map(|v| {
                 let manifest = manifests.remove(&v.version_id);
                 (v, manifest)
             })
-            .collect())
+            .collect();
+        Ok(toolkit_odata::Page::new(
+            items,
+            toolkit_odata::PageInfo {
+                next_cursor,
+                prev_cursor: None,
+                limit: page.page_info.limit,
+            },
+        ))
     }
 
     /// Fetch every multipart-composite version's manifest for one
@@ -593,7 +636,7 @@ const LIST_VERSIONS_MANIFEST_BUDGET_BYTES: u64 = 4 * 1024 * 1024;
 /// not one per version.
 const MANIFEST_FETCH_BATCH_SIZE: usize = 8;
 
-/// How many of `versions` (already offset/limit-paginated in the service's
+/// How many of `versions` (already cursor/limit-paginated in the service's
 /// return order, newest first) to keep so the summed byte length of their
 /// `manifests` entries never exceeds `budget_bytes`.
 ///
@@ -605,17 +648,12 @@ const MANIFEST_FETCH_BATCH_SIZE: usize = 8;
 /// after this version can never have its whole next page truncated to
 /// nothing by the same oversized manifest.
 ///
-/// `VersionDtoList` serializes as a bare JSON array (see `docs/api.md`), so
-/// there is no `has_more`/`next_offset`/cursor field available to signal an
-/// early truncation without changing the wire format. Continuing correctly
-/// after a truncated page therefore relies on the client resuming at
-/// `offset + <number of versions actually received>` rather than
-/// `offset + limit` -- already the correct, general offset-pagination
-/// client contract (it is exactly how a short *final* page had to be
-/// handled even before this budget existed), so an early-truncated page
-/// composes with it with no special case. A client that instead always
-/// advances by `limit` risks skipping the remainder after a
-/// budget-truncated page.
+/// An early truncation here always forces `page_info.next_cursor` to be
+/// rebuilt from the new last item (see
+/// [`FileService::list_versions_with_manifests`]'s doc comment) rather than
+/// left as whatever the plain `limit + 1` fetch decided -- a client that
+/// simply follows `next_cursor` therefore resumes correctly after a
+/// budget-truncated page with no special case of its own.
 fn manifest_budget_cutoff(
     versions: &[FileVersion],
     manifests: &std::collections::HashMap<Uuid, String>,

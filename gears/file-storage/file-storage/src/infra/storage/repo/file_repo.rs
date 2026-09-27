@@ -158,34 +158,48 @@ impl FileRepo {
         Ok(files)
     }
 
-    /// List files for a mandatory owner filter, newest first, offset-paginated.
+    /// List files for a mandatory owner filter, newest first, forward-only
+    /// keyset-paginated (replaces the
+    /// previous `OFFSET` pagination).
     ///
     /// Ordered `(created_at, file_id)` descending, not `created_at` alone:
     /// `created_at` is not unique (several files created in the same
-    /// millisecond-resolution instant sort equal on it), and an `OFFSET`
-    /// page boundary drawn through a run of equal `created_at` values has no
-    /// defined relative order across two separate queries -- a row can be
-    /// skipped or repeated across pages. `file_id` is the primary key, so
-    /// adding it as a tie-breaker makes the order -- and therefore the page
-    /// boundary -- fully deterministic.
-    pub async fn list<C: DBRunner>(
+    /// millisecond-resolution instant sort equal on it), and a page boundary
+    /// drawn through a run of equal `created_at` values has no defined
+    /// relative order across two separate queries without a tie-breaker --
+    /// a row can be skipped or repeated across pages. `file_id` is the
+    /// primary key, so adding it as a tie-breaker makes the order -- and
+    /// therefore the page boundary -- fully deterministic. `after`, when
+    /// `Some`, restricts the result to rows strictly PAST that position in
+    /// this same descending order (`created_at < a.created_at OR
+    /// (created_at = a.created_at AND file_id < a.id)`) -- `None` starts
+    /// from the newest row. Callers fetch `limit + 1` rows to learn whether
+    /// a next page exists (`domain::pagination`'s `Page` contract); this
+    /// method itself just runs whatever `limit` it is given.
+    pub async fn list_page<C: DBRunner>(
         &self,
         conn: &C,
         scope: &AccessScope,
         owner: OwnerFilter,
         limit: u64,
-        offset: u64,
+        after: Option<crate::domain::pagination::Seek>,
     ) -> Result<Vec<File>, DomainError> {
+        let mut filter = Condition::all()
+            .add(Column::OwnerKind.eq(owner.owner_kind.as_str()))
+            .add(Column::OwnerId.eq(owner.owner_id));
+        if let Some(seek) = after {
+            filter = filter.add(super::tuple_lt(
+                (Entity, Column::CreatedAt),
+                (Entity, Column::FileId),
+                seek.created_at,
+                seek.id,
+            ));
+        }
         let rows = Entity::find()
-            .filter(
-                Condition::all()
-                    .add(Column::OwnerKind.eq(owner.owner_kind.as_str()))
-                    .add(Column::OwnerId.eq(owner.owner_id)),
-            )
+            .filter(filter)
             .order_by_desc(Column::CreatedAt)
             .order_by_desc(Column::FileId)
             .limit(limit)
-            .offset(offset)
             .secure()
             .scope_with(scope)
             .all(conn)
@@ -389,7 +403,7 @@ impl FileRepo {
     /// before `created_before`, ordered by `(created_at, file_id)`
     /// ascending, up to `limit` rows. Feeds the cleanup sweep's dedicated
     /// versionless-orphan-file phase
-    /// ([`crate::domain::cleanup::CleanupEngine::sweep_versionless_files`]).
+    /// ([`crate::domain::cleanup::CleanupEngine::sweep_versionless_files_page`]).
     ///
     /// Same correlated-subquery shape as [`Self::delete_if_orphan`]'s
     /// `NOT EXISTS` guard, generalized from a single literal `file_id` to a
@@ -406,12 +420,21 @@ impl FileRepo {
     /// gap between this list and that delete therefore cannot cause data
     /// loss, only a safely-declined delete attempt (same reasoning as
     /// `CleanupEngine::orphan_candidate_file`'s doc comment).
+    /// `after`, when `Some((created_at, file_id))`, restricts the result to
+    /// rows strictly greater than that key in the same `(created_at,
+    /// file_id)` ordering (keyset pagination via `created_at > a OR
+    /// (created_at = a AND file_id > b)`, portable across `PostgreSQL` and
+    /// `SQLite`) -- `None` starts from the oldest row. Same tick-local cursor
+    /// usage as [`Self::list_all_for_sweep`]'s persisted one, but reset every
+    /// tick by the caller -- see
+    /// [`crate::domain::cleanup::CleanupEngine::run_sweep`]'s doc.
     pub async fn list_versionless_orphan_files<C: DBRunner>(
         &self,
         conn: &C,
         scope: &AccessScope,
         created_before: OffsetDateTime,
         limit: u64,
+        after: Option<(OffsetDateTime, Uuid)>,
     ) -> Result<Vec<File>, DomainError> {
         let mut has_any_version = Query::select();
         has_any_version
@@ -420,13 +443,21 @@ impl FileRepo {
             .and_where(Expr::col(VersionColumn::FileId).equals((Entity, Column::FileId)));
         let no_versions_exist = Condition::all().add(Expr::exists(has_any_version)).not();
 
+        let mut filter = Condition::all()
+            .add(Column::ContentId.is_null())
+            .add(Column::CreatedAt.lt(created_before))
+            .add(no_versions_exist);
+        if let Some((after_created_at, after_file_id)) = after {
+            filter = filter.add(super::tuple_gt(
+                (Entity, Column::CreatedAt),
+                (Entity, Column::FileId),
+                after_created_at,
+                after_file_id,
+            ));
+        }
+
         let rows = Entity::find()
-            .filter(
-                Condition::all()
-                    .add(Column::ContentId.is_null())
-                    .add(Column::CreatedAt.lt(created_before))
-                    .add(no_versions_exist),
-            )
+            .filter(filter)
             .order_by_asc(Column::CreatedAt)
             .order_by_asc(Column::FileId)
             .limit(limit)

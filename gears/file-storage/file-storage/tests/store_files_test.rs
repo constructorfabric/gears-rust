@@ -27,6 +27,7 @@ use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 use file_storage::domain::audit::{AuditEntry, AuditOperation, FileEvent};
+use file_storage::domain::pagination;
 use file_storage::domain::policy::{AgeRetention, RetentionRuleBody, RetentionScope};
 use file_storage::infra::content::hash_mode::HashMode;
 use file_storage::infra::storage::Store;
@@ -628,7 +629,7 @@ async fn files_delete_with_event_cascades_file_scope_retention_rule() {
 /// exactly the four `file_id`s, each exactly once, in `file_id` descending
 /// order.
 #[tokio::test]
-async fn list_orders_by_created_at_then_file_id_so_paged_offsets_do_not_skip_or_repeat() {
+async fn list_page_orders_by_created_at_then_file_id_so_keyset_pages_do_not_skip_or_repeat() {
     let (_store, db) = build_store().await;
     let conn = db.conn().expect("conn");
     let scope = AccessScope::allow_all();
@@ -664,11 +665,15 @@ async fn list_orders_by_created_at_then_file_id_so_paged_offsets_do_not_skip_or_
         owner_id,
     };
     let page1 = files
-        .list(&conn, &scope, owner, 2, 0)
+        .list_page(&conn, &scope, owner, 2, None)
         .await
         .expect("page 1");
+    let after_pos = pagination::Seek {
+        created_at: page1.last().expect("page 1 non-empty").created_at,
+        id: page1.last().expect("page 1 non-empty").file_id,
+    };
     let page2 = files
-        .list(&conn, &scope, owner, 2, 2)
+        .list_page(&conn, &scope, owner, 2, Some(after_pos))
         .await
         .expect("page 2");
 
@@ -681,7 +686,7 @@ async fn list_orders_by_created_at_then_file_id_so_paged_offsets_do_not_skip_or_
     expected.sort_unstable_by(|a, b| b.cmp(a)); // file_id descending
     assert_eq!(
         seen, expected,
-        "two OFFSET pages over four equal-created_at rows must together cover \
+        "two keyset pages over four equal-created_at rows must together cover \
          every file_id exactly once, in file_id-descending order -- a bare \
          `ORDER BY created_at` tie-breaks nondeterministically and can skip \
          or repeat a row across pages"
@@ -691,5 +696,65 @@ async fn list_orders_by_created_at_then_file_id_so_paged_offsets_do_not_skip_or_
         seen.len(),
         4,
         "no file_id may be repeated across the two pages"
+    );
+}
+
+/// `FileRepo::list_versionless_orphan_files`'s `after` keyset cursor must
+/// return only rows strictly past `(created_at, file_id)`, including the
+/// same-`created_at` tiebreak case (the sweep's cursor lands on `b`, sharing
+/// `c`'s `created_at`; `c` must still be returned, `b` must not be repeated).
+#[tokio::test]
+async fn list_versionless_orphan_files_after_cursor_excludes_seen_rows_including_created_at_tie() {
+    let (_store, db) = build_store().await;
+    let conn = db.conn().expect("conn");
+    let scope = AccessScope::allow_all();
+    let files = FileRepo::new();
+
+    let tenant_id = Uuid::now_v7();
+    let base = OffsetDateTime::now_utc() - time::Duration::hours(10);
+    let id_a = Uuid::from_u128(1);
+    let id_b = Uuid::from_u128(11);
+    let id_c = Uuid::from_u128(12);
+    let id_d = Uuid::from_u128(99);
+
+    for (file_id, created_at) in [
+        (id_a, base),
+        (id_b, base + time::Duration::seconds(1)),
+        (id_c, base + time::Duration::seconds(1)),
+        (id_d, base + time::Duration::seconds(2)),
+    ] {
+        let file = File {
+            file_id,
+            tenant_id,
+            owner_kind: OwnerKind::User,
+            owner_id: Uuid::now_v7(),
+            name: "doc.bin".to_owned(),
+            gts_file_type: GTS.to_owned(),
+            content_id: None,
+            meta_version: 0,
+            created_at,
+            last_modified_at: created_at,
+        };
+        files.create(&conn, &scope, &file).await.expect("create");
+    }
+
+    let created_before = OffsetDateTime::now_utc();
+
+    // Cursor lands exactly on `b`: same `created_at` as `c`, smaller
+    // `file_id`. Only `c` and `d` must come back -- `a` and `b` (at or
+    // before the cursor) must not, and `b` must not reappear despite sharing
+    // `c`'s `created_at`.
+    let after = (base + time::Duration::seconds(1), id_b);
+    let rows = files
+        .list_versionless_orphan_files(&conn, &scope, created_before, 10, Some(after))
+        .await
+        .expect("list_versionless_orphan_files with after must not error");
+
+    assert_eq!(
+        rows.iter().map(|f| f.file_id).collect::<Vec<_>>(),
+        vec![id_c, id_d],
+        "after = (b's created_at, b's file_id) must return only rows \
+         strictly past that key: c (same created_at, larger file_id) and d \
+         (strictly newer), never a, never b itself"
     );
 }

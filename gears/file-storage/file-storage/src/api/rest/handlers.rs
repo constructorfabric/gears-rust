@@ -13,17 +13,22 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use toolkit::api::canonical_prelude::*;
+// Aliased so the three cursor-paginated listings' query structs (which must
+// reject an unknown query key, e.g. the old `offset`, as a canonical `400`
+// rather than axum's plain-text rejection body) can opt into
+// `toolkit::api::rest::extract::Query` without shadowing the plain
+// `axum::extract::Query` every other handler in this file still uses.
+use toolkit::api::rest::extract::Query as CanonicalQuery;
 use toolkit_security::SecurityContext;
 
 use file_storage_sdk::{CustomMetadataPatch, NewFile, OwnerFilter, OwnerKind};
 
 use super::dto::{
     BindReq, CreateFileReq, CreateRetentionRuleReq, DownloadTicketDto, EffectivePolicyDto, FileDto,
-    FileDtoList, InitiateMultipartReq, MigrateBackendReq, MissingPartDto, MultipartCompleteDto,
+    InitiateMultipartReq, MigrateBackendReq, MissingPartDto, MultipartCompleteDto,
     MultipartCompletingDto, MultipartPartPlanDto, MultipartPlanDto, MultipartStatusDto, PolicyDto,
-    ReceivedPartDto, RetentionRuleDto, RetentionRuleDtoList, SetPolicyReq, StorageDto,
-    StorageDtoList, TransferOwnershipReq, UpdateMetadataReq, UploadTicketDto, VersionDto,
-    VersionDtoList,
+    ReceivedPartDto, RetentionRuleDto, SetPolicyReq, StorageDto, StorageDtoList,
+    TransferOwnershipReq, UpdateMetadataReq, UploadTicketDto, VersionDto,
 };
 use crate::domain::error::DomainError;
 use crate::domain::etag;
@@ -39,13 +44,16 @@ type MultiSvc = Extension<Arc<MultipartService>>;
 type PolicySvc = Extension<Arc<PolicyService>>;
 type Ctx = Extension<SecurityContext>;
 
-/// Query params for `GET /files`.
+/// Query params for `GET /files` (cursor pagination). `deny_unknown_fields` rejects an unrecognized key -- notably the
+/// old `offset` -- as a canonical `400` via `CanonicalQuery`'s rejection
+/// mapping, instead of silently ignoring it.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ListQuery {
     pub owner_kind: String,
     pub owner_id: Uuid,
     pub limit: Option<u64>,
-    pub offset: Option<u64>,
+    pub cursor: Option<String>,
 }
 
 /// Query params for `GET /files/{id}/download-url`.
@@ -54,11 +62,22 @@ pub struct DownloadQuery {
     pub version_id: Option<Uuid>,
 }
 
-/// Query params for `GET /files/{id}/versions`.
+/// Query params for `GET /files/{id}/versions` (cursor pagination -- see
+/// [`ListQuery`]'s doc comment).
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ListVersionsQuery {
     pub limit: Option<u64>,
-    pub offset: Option<u64>,
+    pub cursor: Option<String>,
+}
+
+/// Query params for `GET /retention-rules` (cursor pagination -- see
+/// [`ListQuery`]'s doc comment).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListRetentionRulesQuery {
+    pub limit: Option<u64>,
+    pub cursor: Option<String>,
 }
 
 fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -314,8 +333,8 @@ pub async fn get_file(
 pub async fn list_files(
     Extension(ctx): Ctx,
     Extension(svc): Svc,
-    Query(q): Query<ListQuery>,
-) -> ApiResult<JsonBody<FileDtoList>> {
+    CanonicalQuery(q): CanonicalQuery<ListQuery>,
+) -> ApiResult<JsonPage<FileDto>> {
     let owner_kind = OwnerKind::parse(&q.owner_kind)
         .ok_or_else(|| DomainError::validation("owner_kind", "must be 'user' or 'app'"))?;
     let owner = OwnerFilter {
@@ -325,33 +344,28 @@ pub async fn list_files(
     // Shared with the SDK local client — see `FileService::list_files_with_metadata`
     // (batched: one `IN (...)` query for the whole page rather than one
     // `list_metadata` call per file).
-    let files_with_metadata = svc
-        .list_files_with_metadata(&ctx, owner, q.limit, q.offset.unwrap_or(0))
+    let page = svc
+        .list_files_with_metadata(&ctx, owner, q.limit, q.cursor.as_deref())
         .await?;
-    let items = files_with_metadata
-        .into_iter()
-        .map(|(f, meta)| FileDto::from_parts(f, meta))
-        .collect();
-    Ok(Json(FileDtoList(items)))
+    Ok(Json(
+        page.map_items(|(f, meta)| FileDto::from_parts(f, meta)),
+    ))
 }
 
 pub async fn list_versions(
     Extension(ctx): Ctx,
     Extension(svc): Svc,
     Path(file_id): Path<Uuid>,
-    Query(q): Query<ListVersionsQuery>,
-) -> ApiResult<JsonBody<VersionDtoList>> {
+    CanonicalQuery(q): CanonicalQuery<ListVersionsQuery>,
+) -> ApiResult<JsonPage<VersionDto>> {
     // The manifest-byte budget (and its batched-fetch/truncation) is shared
     // with the SDK local client -- see `FileService::list_versions_with_manifests`.
-    let versions = svc
-        .list_versions_with_manifests(&ctx, file_id, q.limit, q.offset.unwrap_or(0))
+    let page = svc
+        .list_versions_with_manifests(&ctx, file_id, q.limit, q.cursor.as_deref())
         .await?;
-    Ok(Json(VersionDtoList(
-        versions
-            .into_iter()
-            .map(|(v, manifest)| VersionDto::from_parts(v, manifest))
-            .collect(),
-    )))
+    Ok(Json(page.map_items(|(v, manifest)| {
+        VersionDto::from_parts(v, manifest)
+    })))
 }
 
 pub async fn download_url(
@@ -506,15 +520,17 @@ pub async fn get_effective_policy(
 
 // ── retention rules (P2-M1) ────────────────────────────────────────────────────
 
-/// `GET /retention-rules` — list all retention rules for the caller's tenant.
+/// `GET /retention-rules` — list retention rules visible to the caller for
+/// their tenant, cursor-paginated.
 pub async fn list_retention_rules(
     Extension(ctx): Ctx,
     Extension(svc): PolicySvc,
-) -> ApiResult<JsonBody<RetentionRuleDtoList>> {
-    let rules = svc.list_retention_rules(&ctx).await?;
-    Ok(Json(RetentionRuleDtoList(
-        rules.into_iter().map(RetentionRuleDto::from).collect(),
-    )))
+    CanonicalQuery(q): CanonicalQuery<ListRetentionRulesQuery>,
+) -> ApiResult<JsonPage<RetentionRuleDto>> {
+    let page = svc
+        .list_retention_rules(&ctx, q.limit, q.cursor.as_deref())
+        .await?;
+    Ok(Json(page.map_items(RetentionRuleDto::from)))
 }
 
 /// `POST /retention-rules` — create a new retention rule.

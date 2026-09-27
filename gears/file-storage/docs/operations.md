@@ -27,16 +27,18 @@ gear started with no `file-storage` config section at all gets every default bel
 actually boot**: `require_signing_key_seed` defaults to `true` with `signing_key_seed` unset, and
 `FileStorageConfig::validate()` fails gear init on exactly that combination (see `require_signing_key_seed` below).
 A genuinely zero-config deployment is dev/test-only (set `require_signing_key_seed: false` there).
-`FileStorageConfig::validate()` (called at gear init, before anything is wired up) rejects **nineteen**
-invalid configurations — six missing-secret/zero-value guards (`sweep_interval_secs == 0` with the sweep enabled;
+`FileStorageConfig::validate()` (called at gear init, before anything is wired up) rejects **twenty-one**
+invalid configurations — seven missing-secret/zero-value guards (`sweep_interval_secs == 0` or
+`sweep_time_budget_secs == 0` with the sweep enabled;
 `default_url_ttl_secs`, `multipart_session_ttl_secs` or `multipart_complete_lease_secs` equal to `0`, instead of
 silently using one second; `signing_key_seed` absent while required; `finalize_internal_secret` absent while
-required); eight absolute
+required); nine absolute
 ceilings (`finalize_token_grace_secs` above `MAX_FINALIZE_TOKEN_GRACE_SECS`, 7 days; `max_page_size` above
-`MAX_PAGE_SIZE_CEILING`, 1000; `max_url_ttl_secs` above `MAX_URL_TTL_CEILING`, 30 days; `multipart_session_ttl_secs`
+`MAX_PAGE_SIZE_CEILING`, 200; `max_url_ttl_secs` above `MAX_URL_TTL_CEILING`, 30 days; `multipart_session_ttl_secs`
 above `MAX_MULTIPART_SESSION_TTL_SECS`, 30 days; `multipart_complete_lease_secs` above
 `MAX_MULTIPART_COMPLETE_LEASE_SECS`, 1 day; `orphan_grace_secs` above `MAX_ORPHAN_GRACE_SECS`, 30 days;
-`idempotency_ttl_secs` above `MAX_IDEMPOTENCY_TTL_SECS`, 30 days; `previous_signing_public_keys` having more than
+`idempotency_ttl_secs` above `MAX_IDEMPOTENCY_TTL_SECS`, 30 days; `sweep_time_budget_secs` above
+`MAX_SWEEP_TIME_BUDGET_SECS`, 24 hours; `previous_signing_public_keys` having more than
 `infra::signed_url::MAX_PREVIOUS_SIGNING_PUBLIC_KEYS`, 8, entries — see those fields below); four cross-field ordering invariants (`default_url_ttl_secs`
 vs. `max_url_ttl_secs`; `default_page_size` vs. `max_page_size`; `default_url_ttl_secs` vs. `orphan_grace_secs`;
 `multipart_session_ttl_secs` vs. `default_url_ttl_secs`); and one per-entry format check (each
@@ -57,14 +59,15 @@ there is no standalone TOML/JSON file of its own.
 | `multipart_session_ttl_secs` | `86400` (24h) | `default_multipart_session_ttl_secs()` |
 | `multipart_complete_lease_secs` | `120` (2 min) | `default_multipart_complete_lease_secs()` |
 | `sidecar_base_url` | `"http://localhost:8087"` | `default_sidecar_base_url()` |
-| `default_page_size` | `50` | `default_page_size()` |
-| `max_page_size` | `1000` | `default_max_page_size()` |
+| `default_page_size` | `25` | `default_page_size()` |
+| `max_page_size` | `200` | `default_max_page_size()` |
 | `storage_root` | `"./.file-storage-data"` | `default_storage_root()` |
 | `signing_key_seed` | `None` (no `#[serde(default = …)]`, just `Option::default()`) | struct field default |
 | `require_signing_key_seed` | `true` | `default_require_signing_key_seed()` |
 | `idempotency_ttl_secs` | `86400` (24h) | `default_idempotency_ttl_secs()` |
 | `orphan_grace_secs` | `3600` (1h) | `default_orphan_grace_secs()` |
 | `sweep_interval_secs` | `3600` (1h) | `default_sweep_interval_secs()` |
+| `sweep_time_budget_secs` | `900` (15 min) | `default_sweep_time_budget_secs()` |
 | `enable_background_sweep` | `true` | `default_enable_background_sweep()` |
 | `enable_in_memory_backend` | `false` (bare `#[serde(default)]`) | struct field default |
 | `s3_backends` | `[]` (empty, bare `#[serde(default)]`) | struct field default |
@@ -150,14 +153,17 @@ unreachable from the client, every content operation fails even though the contr
 easy to overlook because control-plane health checks and metadata CRUD (`GET /files`, etc.) will look fine.
 
 ### `default_page_size` / `max_page_size`
-Pagination defaults/ceiling for `GET /files` (and similar list endpoints) — `50` / `1000` respectively.
+Pagination defaults/ceiling for `GET /files`, `GET /files/{id}/versions` and `GET /retention-rules` — `25` / `200`
+respectively, matching the platform-wide cursor-pagination convention (`guidelines/DNA/REST/QUERYING.md`).
 **Production recommendation**: the defaults are reasonable starting points; raise `max_page_size` only if clients
 have a proven need for larger pages and the DB/latency budget supports it. **Misconfiguration risk**: a very large
 `max_page_size` lets a caller force an expensive, unbounded-feeling listing query; a `default_page_size` larger than
 `max_page_size` would be self-contradictory — `FileStorageConfig::validate()` rejects this combination at startup.
-`max_page_size` also has its own absolute ceiling, `MAX_PAGE_SIZE_CEILING` (`1000`, the same value as the shipped
+`max_page_size` also has its own absolute ceiling, `MAX_PAGE_SIZE_CEILING` (`200`, the same value as the shipped
 default): `validate()` rejects any configured `max_page_size` above it, independent of the `default_page_size`
-check, since it is otherwise the only bound on a single listing request's row count and response size.
+check, since it is otherwise the only bound on a single listing request's row count and response size. A caller-supplied
+`limit` above `max_page_size` is not rejected — it is silently clamped down to `max_page_size` (`limit.min(max)`); only
+`limit == 0` is a `400`.
 
 ### `storage_root`
 Local filesystem root for the default `local-fs` backend (default `./.file-storage-data`, i.e. **relative to the
@@ -286,6 +292,24 @@ tighten it if orphan reconciliation / retention-driven deletion needs to be clos
 risk**: too long → orphaned pending versions, expired multipart sessions, retention-expired files, and expired
 idempotency keys all accumulate for longer between passes (storage growth, and retention-policy compliance windows
 run wider than the policy nominally states).
+
+### `sweep_time_budget_secs`
+Overall wall-clock time budget (seconds, default `900` = 15 min) for one background cleanup sweep tick. Within that
+budget, each of the four sweep steps keeps taking another bounded batch — interleaved in the same fixed step order,
+one batch per not-yet-exhausted step per pass — until every step is exhausted (its last batch came back short, or
+its query/delete errored) or the budget runs out; whatever is left carries over to the next tick rather than being
+dropped. The very first pass of a tick always completes in full regardless of the budget, so even a very small
+budget still processes one batch per step every tick — the historical single-batch-per-call behaviour is the floor,
+never less. `FileStorageConfig::validate()` **rejects** `sweep_time_budget_secs == 0` combined with
+`enable_background_sweep == true` at startup, the same way it rejects `sweep_interval_secs == 0` above (a zero
+budget would silently cap every tick at exactly that one unconditional first pass). **Production recommendation**:
+the 15-minute default comfortably covers a normal-sized backlog well inside a `sweep_interval_secs` cycle; raise it
+if a deployment's backlog routinely needs more than one tick to clear (see [The background cleanup
+sweep](#the-background-cleanup-sweep) below for how the four steps' cursors behave across ticks). **Misconfiguration
+risk**: too short → most ticks report `budget_exhausted = true` and only make partial progress per tick (not
+incorrect, just slower to converge); too long → one tick can run for most of a `sweep_interval_secs` cycle, though
+still bounded by this budget rather than able to run forever. Capped at `MAX_SWEEP_TIME_BUDGET_SECS` (`86400` s = 24
+hours); `validate()` fails gear init above it.
 
 ### `enable_background_sweep`
 When `true` (**the default**), the cleanup sweep loop starts at gear init. **Production recommendation**: leave at
@@ -472,6 +496,27 @@ job the gear schedules on a `sweep_interval_secs` timer when `enable_background_
 Each step is **best-effort**: a failure in one step is logged at `warn` and does not abort the rest of the sweep, and
 every operation is written to be safely idempotent under concurrent sweeps (no cross-instance leader election exists
 today — every replica runs its own sweep independently; cross-instance coordination is expected in a future release).
+
+Each tick has an overall time budget (`sweep_time_budget_secs`, default 15 minutes — see that field above). Rather
+than taking exactly one batch per step and stopping, one tick repeats the four steps below as further passes, in
+the same order, each pass taking one more batch per step that has not yet run out of candidates — until either
+every step is exhausted (its last batch came back shorter than its page size, or its query/delete errored) or the
+budget runs out. The very first pass always completes in full regardless of the budget, so even
+`sweep_time_budget_secs` set very low still processes one batch per step every tick. `run_sweep`'s returned
+`SweepResult` carries `budget_exhausted` (`true` when the tick stopped on the time budget rather than because
+every step was exhausted) and `elapsed_ms` (the tick's wall-clock duration), both logged alongside the existing
+tallies.
+
+Three of the four steps (abandoned-pending, versionless-files, expired-multipart) keep a keyset cursor for this
+purpose that is **local to one tick**: a candidate a batch could not actually reclaim this pass (a still-active
+multipart session, a transient per-row error) does not block the rest of that step's backlog for the remainder of
+the tick, and every new tick starts each of these three steps over from its oldest candidate again — so a
+candidate that was blocked in one tick is retried once whatever was blocking it has cleared, rather than being
+skipped forever. The retention-expiry step is the exception: its `file_id` cursor is **persisted on the
+`CleanupEngine`** and survives across ticks, because a full table scan can legitimately take longer than one
+tick's budget on a large deployment, and restarting it from the beginning every tick would starve files later in
+`file_id` order. The idempotency-key step needs no cursor at all — each batch deletes the rows it selects, so the
+next call (later in the same tick, or the next tick) naturally sees the next-oldest backlog.
 
 The sweep runs **four** steps, in this order:
 

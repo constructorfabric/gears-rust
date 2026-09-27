@@ -68,11 +68,19 @@ impl Store {
         older_than: OffsetDateTime,
         now: OffsetDateTime,
         limit: u64,
+        after: Option<(OffsetDateTime, Uuid)>,
     ) -> Result<Vec<FileVersion>, DomainError> {
         let conn = self.db.conn().map_err(db_err)?;
         self.repos
             .versions
-            .list_pending_older_than(&conn, &AccessScope::allow_all(), older_than, now, limit)
+            .list_pending_older_than(
+                &conn,
+                &AccessScope::allow_all(),
+                older_than,
+                now,
+                limit,
+                after,
+            )
             .await
     }
 
@@ -86,11 +94,18 @@ impl Store {
         &self,
         created_before: OffsetDateTime,
         limit: u64,
+        after: Option<(OffsetDateTime, Uuid)>,
     ) -> Result<Vec<File>, DomainError> {
         let conn = self.db.conn().map_err(db_err)?;
         self.repos
             .files
-            .list_versionless_orphan_files(&conn, &AccessScope::allow_all(), created_before, limit)
+            .list_versionless_orphan_files(
+                &conn,
+                &AccessScope::allow_all(),
+                created_before,
+                limit,
+                after,
+            )
             .await
     }
 
@@ -102,9 +117,13 @@ impl Store {
         &self,
         now: OffsetDateTime,
         limit: u64,
+        after: Option<(OffsetDateTime, Uuid)>,
     ) -> Result<Vec<MultipartUploadSession>, DomainError> {
         let conn = self.db.conn().map_err(db_err)?;
-        self.repos.multipart.list_expired(&conn, now, limit).await
+        self.repos
+            .multipart
+            .list_expired(&conn, now, limit, after)
+            .await
     }
 
     /// List files across all tenants for the retention sweep, keyset-paginated

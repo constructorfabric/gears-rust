@@ -171,6 +171,12 @@ impl From<DomainError> for CanonicalError {
                 .with_reason("VERSIONED_FILE_MIGRATION_NOT_SUPPORTED")
                 .create()
             }
+            // Delegates to `toolkit_odata`'s own `Error -> CanonicalError`
+            // mapping (`libs/toolkit-odata/src/problem_mapping.rs`) rather
+            // than re-deriving `INVALID_CURSOR`/`ORDER_MISMATCH`/
+            // `FILTER_MISMATCH` field violations here -- see
+            // `DomainError::Cursor`'s doc comment.
+            DomainError::Cursor(err) => CanonicalError::from(err.clone()),
         }
     }
 }

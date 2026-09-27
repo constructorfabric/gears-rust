@@ -297,7 +297,12 @@ impl Gear for FileStorageGear {
                 )
             })?;
 
-        let policy_svc = Arc::new(PolicyService::new(policy_store, authorizer));
+        let policy_svc = Arc::new(PolicyService::new(
+            policy_store,
+            authorizer,
+            cfg.default_page_size,
+            cfg.max_page_size,
+        ));
         self.policy_service
             .set(Arc::clone(&policy_svc))
             .map_err(|_| {
@@ -314,7 +319,8 @@ impl Gear for FileStorageGear {
                             orphan_grace_secs: cfg.orphan_grace_secs,
                         },
                     )
-                    .with_usage_reporter(None), // see TODO above `service`
+                    .with_usage_reporter(None) // see TODO above `service`
+                    .with_tick_budget(std::time::Duration::from_secs(cfg.sweep_time_budget_secs)),
                 ),
                 metrics: Arc::clone(&metrics),
                 sweep_interval_secs: cfg.sweep_interval_secs,

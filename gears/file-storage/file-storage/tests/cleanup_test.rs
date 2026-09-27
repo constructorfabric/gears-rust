@@ -233,7 +233,7 @@ async fn build_all_full(
         "http://sidecar.test".to_owned(),
         3600,
     ));
-    let psvc = Arc::new(PolicyService::new(policy_store, authorizer));
+    let psvc = Arc::new(PolicyService::new(policy_store, authorizer, 50, 1000));
     let dp = TestDataPlane::new(Arc::clone(&svc), store.clone(), backends);
     let engine = CleanupEngine::new(
         sweep_store,
@@ -338,7 +338,7 @@ async fn build_all_with_dsn(
         "http://sidecar.test".to_owned(),
         3600,
     ));
-    let psvc = Arc::new(PolicyService::new(policy_store, authorizer));
+    let psvc = Arc::new(PolicyService::new(policy_store, authorizer, 50, 1000));
     let dp = TestDataPlane::new(Arc::clone(&svc), store.clone(), backends);
     let engine = CleanupEngine::new(
         sweep_store,
@@ -515,6 +515,57 @@ fn new_file_owned_by(owner_id: Uuid) -> NewFile {
     }
 }
 
+/// Build a bare [`File`] row with an explicit `file_id`/`content_id`/
+/// `created_at`, for the sweep time-budget-batching tests below that seed
+/// hundreds of rows directly through `FileRepo`/`VersionRepo` -- bypassing
+/// `FileService`'s per-call overhead (auth, quota, signed-URL issuance) --
+/// rather than through the service API `new_file()`/`create_file` use.
+fn raw_file(
+    file_id: Uuid,
+    tenant_id: Uuid,
+    content_id: Option<Uuid>,
+    created_at: time::OffsetDateTime,
+) -> File {
+    File {
+        file_id,
+        tenant_id,
+        owner_kind: OwnerKind::User,
+        owner_id: Uuid::now_v7(),
+        name: "batch.bin".to_owned(),
+        gts_file_type: GTS.to_owned(),
+        content_id,
+        meta_version: 0,
+        created_at,
+        last_modified_at: created_at,
+    }
+}
+
+/// Build a `pending` [`FileVersion`] row with an explicit `file_id`/
+/// `version_id`/`created_at`, for direct insertion via `VersionRepo` --
+/// see [`raw_file`]'s doc comment for why.
+fn raw_pending_version(
+    file_id: Uuid,
+    version_id: Uuid,
+    created_at: time::OffsetDateTime,
+) -> FileVersion {
+    FileVersion {
+        file_id,
+        version_id,
+        mime_type: "text/plain".to_owned(),
+        size: 0,
+        hash_algorithm: "SHA-256".to_owned(),
+        hash_value: vec![0u8; 32],
+        hash_mode: "whole-sha256".to_owned(),
+        part_count: None,
+        status: VersionStatus::Pending,
+        is_current: false,
+        backend_id: "mem".to_owned(),
+        backend_path: format!("/{file_id}/{version_id}"),
+        created_at,
+        bound_on_finalize: false,
+    }
+}
+
 /// A [`CleanupStore`] wrapper that makes the version-collecting file delete
 /// fail for one specific `file_id` while delegating every other method to a
 /// real [`Store`]. `CleanupStore` is a narrow trait, so this is a small
@@ -541,9 +592,10 @@ impl CleanupStore for FaultyListVersionsStore {
         older_than: time::OffsetDateTime,
         now: time::OffsetDateTime,
         limit: u64,
+        after: Option<(time::OffsetDateTime, Uuid)>,
     ) -> Result<Vec<FileVersion>, DomainError> {
         self.inner
-            .list_abandoned_pending_versions(older_than, now, limit)
+            .list_abandoned_pending_versions(older_than, now, limit, after)
             .await
     }
 
@@ -551,9 +603,10 @@ impl CleanupStore for FaultyListVersionsStore {
         &self,
         created_before: time::OffsetDateTime,
         limit: u64,
+        after: Option<(time::OffsetDateTime, Uuid)>,
     ) -> Result<Vec<File>, DomainError> {
         self.inner
-            .list_versionless_orphan_files(created_before, limit)
+            .list_versionless_orphan_files(created_before, limit, after)
             .await
     }
 
@@ -581,8 +634,11 @@ impl CleanupStore for FaultyListVersionsStore {
         &self,
         now: time::OffsetDateTime,
         limit: u64,
+        after: Option<(time::OffsetDateTime, Uuid)>,
     ) -> Result<Vec<MultipartUploadSession>, DomainError> {
-        self.inner.list_expired_multipart_uploads(now, limit).await
+        self.inner
+            .list_expired_multipart_uploads(now, limit, after)
+            .await
     }
 
     async fn abort_multipart_upload(
@@ -709,9 +765,10 @@ impl CleanupStore for FaultyListFilesByIdsStore {
         older_than: time::OffsetDateTime,
         now: time::OffsetDateTime,
         limit: u64,
+        after: Option<(time::OffsetDateTime, Uuid)>,
     ) -> Result<Vec<FileVersion>, DomainError> {
         self.inner
-            .list_abandoned_pending_versions(older_than, now, limit)
+            .list_abandoned_pending_versions(older_than, now, limit, after)
             .await
     }
 
@@ -719,9 +776,10 @@ impl CleanupStore for FaultyListFilesByIdsStore {
         &self,
         created_before: time::OffsetDateTime,
         limit: u64,
+        after: Option<(time::OffsetDateTime, Uuid)>,
     ) -> Result<Vec<File>, DomainError> {
         self.inner
-            .list_versionless_orphan_files(created_before, limit)
+            .list_versionless_orphan_files(created_before, limit, after)
             .await
     }
 
@@ -749,8 +807,11 @@ impl CleanupStore for FaultyListFilesByIdsStore {
         &self,
         now: time::OffsetDateTime,
         limit: u64,
+        after: Option<(time::OffsetDateTime, Uuid)>,
     ) -> Result<Vec<MultipartUploadSession>, DomainError> {
-        self.inner.list_expired_multipart_uploads(now, limit).await
+        self.inner
+            .list_expired_multipart_uploads(now, limit, after)
+            .await
     }
 
     async fn abort_multipart_upload(
@@ -873,9 +934,10 @@ impl CleanupStore for CountingCleanupStoreWrapper {
         older_than: time::OffsetDateTime,
         now: time::OffsetDateTime,
         limit: u64,
+        after: Option<(time::OffsetDateTime, Uuid)>,
     ) -> Result<Vec<FileVersion>, DomainError> {
         self.inner
-            .list_abandoned_pending_versions(older_than, now, limit)
+            .list_abandoned_pending_versions(older_than, now, limit, after)
             .await
     }
 
@@ -883,9 +945,10 @@ impl CleanupStore for CountingCleanupStoreWrapper {
         &self,
         created_before: time::OffsetDateTime,
         limit: u64,
+        after: Option<(time::OffsetDateTime, Uuid)>,
     ) -> Result<Vec<File>, DomainError> {
         self.inner
-            .list_versionless_orphan_files(created_before, limit)
+            .list_versionless_orphan_files(created_before, limit, after)
             .await
     }
 
@@ -913,8 +976,11 @@ impl CleanupStore for CountingCleanupStoreWrapper {
         &self,
         now: time::OffsetDateTime,
         limit: u64,
+        after: Option<(time::OffsetDateTime, Uuid)>,
     ) -> Result<Vec<MultipartUploadSession>, DomainError> {
-        self.inner.list_expired_multipart_uploads(now, limit).await
+        self.inner
+            .list_expired_multipart_uploads(now, limit, after)
+            .await
     }
 
     async fn abort_multipart_upload(
@@ -1580,7 +1646,7 @@ async fn expired_multipart_session_is_aborted_by_sweep() {
     // Confirm the session is not yet expired from the sweep's perspective
     // (expires_at is 7 days in the future).
     let not_expired = store
-        .list_expired_multipart_uploads(time::OffsetDateTime::now_utc(), 100)
+        .list_expired_multipart_uploads(time::OffsetDateTime::now_utc(), 100, None)
         .await
         .unwrap();
     assert!(
@@ -1629,7 +1695,7 @@ async fn expired_multipart_session_is_aborted_by_sweep() {
 
     // Confirm this session shows up as expired.
     let expired = store
-        .list_expired_multipart_uploads(time::OffsetDateTime::now_utc(), 100)
+        .list_expired_multipart_uploads(time::OffsetDateTime::now_utc(), 100, None)
         .await
         .unwrap();
     assert!(
@@ -1748,7 +1814,7 @@ async fn sweep_aborts_expired_completing_session() {
     // Confirm it is actually picked up by the sweep's own listing query --
     // this is the index-hardening migration's `completing`-branch predicate.
     let expired = store
-        .list_expired_multipart_uploads(time::OffsetDateTime::now_utc(), 100)
+        .list_expired_multipart_uploads(time::OffsetDateTime::now_utc(), 100, None)
         .await
         .unwrap();
     assert!(
@@ -4045,6 +4111,444 @@ async fn run_sweep_deletes_expired_idempotency_rows() {
     assert_eq!(remaining.response_status, 201);
     assert_eq!(remaining.response_body, "{\"ok\":true}");
     assert_eq!(remaining.response_etag, "etag-live");
+}
+
+// ── sweep time-budget batching (P2 1.x) ─────────────────────────────────────
+
+/// A single `run_sweep()` tick must process MORE than one bounded batch per
+/// phase when candidates exceed a `..._SWEEP_BATCH` (500) and the default
+/// time budget (900s) has plenty of room to spare. Seeds 1200 abandoned
+/// pending versions (2.4x `ABANDONED_PENDING_SWEEP_BATCH`) and, independently,
+/// 1200 expired idempotency-key rows (2.4x `EXPIRED_IDEMPOTENCY_SWEEP_BATCH`);
+/// a single `run_sweep()` call must clear all of both, and `budget_exhausted`
+/// must be `false` since the default budget is nowhere near exhausted by this
+/// size of backlog.
+#[tokio::test]
+async fn run_sweep_processes_multiple_batches_within_one_ticks_time_budget() {
+    use file_storage::infra::storage::repo::{FileRepo, IdempotencyRepo, VersionRepo};
+    use file_storage::infra::storage::store::IdempotencyInsert;
+
+    const PENDING_COUNT: usize = 1200;
+    const IDEMPOTENCY_COUNT: usize = 1200;
+
+    let (_svc, _psvc, _msvc, _dp, store, engine, _backend, db) = build_all_full(0).await;
+    let conn = db.conn().expect("conn");
+    let scope = toolkit_security::AccessScope::allow_all();
+    let files_repo = FileRepo::new();
+    let versions_repo = VersionRepo::new();
+
+    let tenant = Uuid::now_v7();
+    let now = time::OffsetDateTime::now_utc();
+    let old = now - time::Duration::hours(2);
+
+    // 1200 distinct files, each with exactly one long-abandoned pending
+    // version -- more than 2x `ABANDONED_PENDING_SWEEP_BATCH` (500), so a
+    // single sweep tick must take multiple passes over this phase to clear
+    // them all.
+    for i in 0..PENDING_COUNT {
+        let file_id = Uuid::from_u128(1_000_000 + i as u128);
+        let version_id = Uuid::from_u128(2_000_000 + i as u128);
+        files_repo
+            .create(&conn, &scope, &raw_file(file_id, tenant, None, old))
+            .await
+            .expect("create pending-candidate file");
+        versions_repo
+            .insert(
+                &conn,
+                &scope,
+                &raw_pending_version(file_id, version_id, old),
+            )
+            .await
+            .expect("insert pending version");
+    }
+
+    // One anchor file, kept alive throughout the sweep (a fake bound
+    // `content_id` keeps the versionless-orphan phase from touching it)
+    // purely to satisfy `idempotency_keys.file_id`'s FK -- 1200 expired
+    // idempotency rows all point at it, more than 2x
+    // `EXPIRED_IDEMPOTENCY_SWEEP_BATCH` (500).
+    let anchor_file_id = Uuid::from_u128(3_000_000);
+    files_repo
+        .create(
+            &conn,
+            &scope,
+            &raw_file(anchor_file_id, tenant, Some(Uuid::now_v7()), now),
+        )
+        .await
+        .expect("create anchor file");
+
+    let idempotency_repo = IdempotencyRepo::new();
+    for i in 0..IDEMPOTENCY_COUNT {
+        idempotency_repo
+            .insert(
+                &conn,
+                &IdempotencyInsert {
+                    tenant_id: tenant,
+                    owner_kind: "user".to_owned(),
+                    owner_id: Uuid::now_v7(),
+                    key: format!("batch-key-{i}"),
+                    subject_id: Uuid::now_v7(),
+                    response_status: 201,
+                    response_body: "{}".to_owned(),
+                    response_etag: format!("etag-{i}"),
+                    request_hash: format!("hash-{i}").into_bytes(),
+                    expires_at: now - time::Duration::hours(1),
+                },
+                anchor_file_id,
+                now - time::Duration::hours(2),
+            )
+            .await
+            .expect("insert expired idempotency row");
+    }
+
+    let result = engine.run_sweep().await;
+
+    assert_eq!(
+        result.abandoned_pending_deleted, PENDING_COUNT,
+        "one tick must clear the whole {PENDING_COUNT}-row pending backlog, not just one \
+         ABANDONED_PENDING_SWEEP_BATCH (500) batch"
+    );
+    assert_eq!(
+        result.idempotency_keys_deleted, IDEMPOTENCY_COUNT as u64,
+        "one tick must clear the whole {IDEMPOTENCY_COUNT}-row idempotency backlog, not \
+         just one EXPIRED_IDEMPOTENCY_SWEEP_BATCH (500) batch"
+    );
+    assert!(
+        !result.budget_exhausted,
+        "the default 900s tick budget must not be exhausted by this size of backlog"
+    );
+
+    // Sanity: the anchor file must still exist -- its bound (fake)
+    // content_id keeps it out of the versionless-orphan phase.
+    let anchor = store
+        .get_file(&toolkit_security::AccessScope::allow_all(), anchor_file_id)
+        .await
+        .unwrap();
+    assert!(anchor.is_some(), "anchor file must survive the sweep");
+}
+
+/// `with_tick_budget(Duration::ZERO)` must still complete exactly the first,
+/// unconditional pass over each phase (one batch, up to 500 rows) and then
+/// stop -- `budget_exhausted` must be `true` -- leaving the remainder for a
+/// later call. The historical single-batch-per-call behaviour is the floor a
+/// minimal (or misconfigured) budget can never go below.
+#[tokio::test]
+async fn run_sweep_with_zero_budget_processes_exactly_one_pass_then_stops() {
+    use file_storage::infra::storage::repo::{FileRepo, VersionRepo};
+
+    const TOTAL: usize = 700; // > ABANDONED_PENDING_SWEEP_BATCH (500)
+    const FIRST_BATCH: usize = 500;
+
+    let db = build_db().await;
+    let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let backends = BackendRegistry::new(vec![Arc::clone(&backend)], "mem").expect("registry");
+    let store = Store::new(Arc::clone(&db));
+    let sweep_store: Arc<dyn CleanupStore> = Arc::new(store.clone());
+    let engine = CleanupEngine::new(
+        sweep_store,
+        backends,
+        CleanupConfig {
+            orphan_grace_secs: 0,
+        },
+    )
+    .with_tick_budget(std::time::Duration::ZERO);
+
+    let conn = db.conn().expect("conn");
+    let scope = toolkit_security::AccessScope::allow_all();
+    let files_repo = FileRepo::new();
+    let versions_repo = VersionRepo::new();
+    let tenant = Uuid::now_v7();
+    let old = time::OffsetDateTime::now_utc() - time::Duration::hours(2);
+
+    for i in 0..TOTAL {
+        let file_id = Uuid::from_u128(10_000_000 + i as u128);
+        let version_id = Uuid::from_u128(20_000_000 + i as u128);
+        files_repo
+            .create(&conn, &scope, &raw_file(file_id, tenant, None, old))
+            .await
+            .expect("create file");
+        versions_repo
+            .insert(
+                &conn,
+                &scope,
+                &raw_pending_version(file_id, version_id, old),
+            )
+            .await
+            .expect("insert pending version");
+    }
+
+    let first = engine.run_sweep().await;
+    assert_eq!(
+        first.abandoned_pending_deleted, FIRST_BATCH,
+        "a zero-budget tick must process exactly one ABANDONED_PENDING_SWEEP_BATCH (500) \
+         batch on its unconditional first pass, no more"
+    );
+    assert!(
+        first.budget_exhausted,
+        "a zero-budget tick must report budget_exhausted once its first pass leaves work \
+         unfinished"
+    );
+
+    let second = engine.run_sweep().await;
+    assert_eq!(
+        second.abandoned_pending_deleted,
+        TOTAL - FIRST_BATCH,
+        "a second call must clear the remainder left behind by the first"
+    );
+    assert!(
+        !second.budget_exhausted,
+        "the second call's remaining {} candidates fit in one more batch, so it must run \
+         to exhaustion",
+        TOTAL - FIRST_BATCH
+    );
+}
+
+/// A batch of blocked head-of-line candidates must not starve free candidates
+/// further back in keyset order, within the same tick -- the P2 1.x
+/// keyset-cursor fix for the head-of-line-blocking bug this task also fixes.
+/// Seeds exactly `VERSIONLESS_SWEEP_BATCH` (500) versionless files at the
+/// head of `(created_at, file_id)` order, each blocked by a live
+/// `in_progress` multipart session referencing it (so
+/// `has_blocking_multipart_session` declines every one of them), plus 3 more
+/// versionless files further along in `created_at` order with no blocking
+/// session. All 3 free files must be reclaimed within the SAME `run_sweep()`
+/// call -- before this fix, a fixed head-of-line batch with no cursor could
+/// never advance past 500 permanently-blocked candidates.
+#[tokio::test]
+async fn sweep_versionless_files_head_of_line_block_does_not_starve_free_candidates() {
+    use file_storage::infra::storage::repo::{FileRepo, MultipartRepo};
+
+    const BLOCKED: usize = 500; // == VERSIONLESS_SWEEP_BATCH
+    const FREE: usize = 3;
+
+    let db = build_db().await;
+    let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let backends = BackendRegistry::new(vec![Arc::clone(&backend)], "mem").expect("registry");
+    let store = Store::new(Arc::clone(&db));
+    let sweep_store: Arc<dyn CleanupStore> = Arc::new(store.clone());
+    let engine = CleanupEngine::new(
+        sweep_store,
+        backends,
+        CleanupConfig {
+            orphan_grace_secs: 0,
+        },
+    );
+
+    let conn = db.conn().expect("conn");
+    let scope = toolkit_security::AccessScope::allow_all();
+    let files_repo = FileRepo::new();
+    let multipart_repo = MultipartRepo::new();
+    let tenant = Uuid::now_v7();
+    let now = time::OffsetDateTime::now_utc();
+    let head_created_at = now - time::Duration::hours(10);
+    let tail_created_at = now - time::Duration::hours(9);
+
+    let mut blocked_ids = Vec::with_capacity(BLOCKED);
+    for i in 0..BLOCKED {
+        let file_id = Uuid::from_u128(40_000_000 + i as u128);
+        files_repo
+            .create(
+                &conn,
+                &scope,
+                &raw_file(file_id, tenant, None, head_created_at),
+            )
+            .await
+            .expect("create blocked versionless file");
+        multipart_repo
+            .create(
+                &conn,
+                Uuid::now_v7(),
+                file_id,
+                Uuid::now_v7(),
+                "backend-handle",
+                Some("mem"),
+                Some("/blocked"),
+                "application/octet-stream",
+                100,
+                50,
+                false,
+                now + time::Duration::hours(1), // still in the future: live session
+                now,
+            )
+            .await
+            .expect("create blocking in_progress multipart session");
+        blocked_ids.push(file_id);
+    }
+
+    let mut free_ids = Vec::with_capacity(FREE);
+    for i in 0..FREE {
+        let file_id = Uuid::from_u128(50_000_000 + i as u128);
+        files_repo
+            .create(
+                &conn,
+                &scope,
+                &raw_file(file_id, tenant, None, tail_created_at),
+            )
+            .await
+            .expect("create free versionless file");
+        free_ids.push(file_id);
+    }
+
+    let result = engine.run_sweep().await;
+    assert_eq!(
+        result.abandoned_files_deleted, FREE,
+        "the {FREE} free versionless files further along in created_at order must be \
+         reclaimed in the same tick, despite {BLOCKED} permanently-blocked candidates \
+         filling the whole first VERSIONLESS_SWEEP_BATCH page ahead of them"
+    );
+
+    for file_id in free_ids {
+        let file = store
+            .get_file(&toolkit_security::AccessScope::allow_all(), file_id)
+            .await
+            .unwrap();
+        assert!(
+            file.is_none(),
+            "free versionless file {file_id} must be deleted"
+        );
+    }
+    for file_id in blocked_ids {
+        let file = store
+            .get_file(&toolkit_security::AccessScope::allow_all(), file_id)
+            .await
+            .unwrap();
+        assert!(
+            file.is_some(),
+            "blocked versionless file {file_id} must survive (active multipart session)"
+        );
+    }
+}
+
+/// Retention-policy expiry must continue from where it left off across
+/// ticks, not restart from the beginning -- the P2 1.x cross-tick retention
+/// cursor. With a zero-budget engine (so each `run_sweep()` call takes
+/// exactly one `RETENTION_SWEEP_BATCH` (500) page) and 600 files -- all
+/// matching a tenant-wide `max_age_days = 0` rule -- the first call must
+/// delete exactly the first 500 (by `file_id` ascending) and leave the last
+/// 100; the second call must then delete exactly those remaining 100, not
+/// re-scan (and re-decide) the same first page.
+#[tokio::test]
+async fn retention_sweep_continues_from_persisted_cursor_across_ticks() {
+    use file_storage::infra::storage::repo::FileRepo;
+
+    const TOTAL: usize = 600;
+    const PAGE: usize = 500; // == RETENTION_SWEEP_BATCH
+
+    let db = build_db().await;
+    let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let backends = BackendRegistry::new(vec![Arc::clone(&backend)], "mem").expect("registry");
+    let store = Store::new(Arc::clone(&db));
+    let sweep_store: Arc<dyn CleanupStore> = Arc::new(store.clone());
+    let engine = CleanupEngine::new(
+        sweep_store,
+        backends,
+        CleanupConfig {
+            orphan_grace_secs: 86400,
+        },
+    )
+    .with_tick_budget(std::time::Duration::ZERO);
+
+    let conn = db.conn().expect("conn");
+    let scope = toolkit_security::AccessScope::allow_all();
+    let files_repo = FileRepo::new();
+    let tenant = Uuid::now_v7();
+    let now = time::OffsetDateTime::now_utc();
+    let old = now - time::Duration::days(40);
+
+    // Deterministic, strictly increasing file_ids so `file_id` ascending
+    // order matches creation order exactly -- lets the test assert WHICH
+    // half survives after the first call, not just how many.
+    let mut ids = Vec::with_capacity(TOTAL);
+    for i in 0..TOTAL {
+        let file_id = Uuid::from_u128(60_000_000 + i as u128);
+        // A fake but non-null content_id keeps this file out of the
+        // versionless-orphan phase entirely -- this test is retention-only.
+        files_repo
+            .create(
+                &conn,
+                &scope,
+                &raw_file(file_id, tenant, Some(Uuid::now_v7()), old),
+            )
+            .await
+            .expect("create retention candidate file");
+        ids.push(file_id);
+    }
+
+    store
+        .insert_retention_rule(
+            &toolkit_security::AccessScope::allow_all(),
+            tenant,
+            &RetentionScope::Tenant,
+            None,
+            &RetentionRuleBody {
+                age: Some(AgeRetention { max_age_days: 0 }),
+                inactivity: None,
+                metadata: None,
+            },
+            now,
+        )
+        .await
+        .expect("insert tenant retention rule");
+
+    let first = engine.run_sweep().await;
+    assert_eq!(
+        first.retention_expired_deleted, PAGE,
+        "a zero-budget tick must delete exactly one RETENTION_SWEEP_BATCH (500) page, not \
+         the whole {TOTAL}-file backlog in one call"
+    );
+    assert!(
+        first.budget_exhausted,
+        "the retention step alone had more pages left when the zero budget ran out"
+    );
+
+    // The first 500 (by file_id ascending) must be gone; the last 100 must
+    // still be there, untouched.
+    for &file_id in &ids[..PAGE] {
+        let file = store
+            .get_file(&toolkit_security::AccessScope::allow_all(), file_id)
+            .await
+            .unwrap();
+        assert!(
+            file.is_none(),
+            "file {file_id} in the first page must be deleted"
+        );
+    }
+    for &file_id in &ids[PAGE..] {
+        let file = store
+            .get_file(&toolkit_security::AccessScope::allow_all(), file_id)
+            .await
+            .unwrap();
+        assert!(
+            file.is_some(),
+            "file {file_id} past the first page must survive the first tick"
+        );
+    }
+
+    let second = engine.run_sweep().await;
+    assert_eq!(
+        second.retention_expired_deleted,
+        TOTAL - PAGE,
+        "the second tick must continue from the persisted cursor and clear exactly the \
+         remaining {} files, proving it did not restart from the beginning",
+        TOTAL - PAGE
+    );
+    assert!(
+        !second.budget_exhausted,
+        "the remaining {} files fit in one more page, so the second tick must run to \
+         exhaustion",
+        TOTAL - PAGE
+    );
+
+    for &file_id in &ids {
+        let file = store
+            .get_file(&toolkit_security::AccessScope::allow_all(), file_id)
+            .await
+            .unwrap();
+        assert!(
+            file.is_none(),
+            "file {file_id} must be gone after the second tick"
+        );
+    }
 }
 
 /// Defense-in-depth lock-in (P2 remediation 1.9): `run_sweep()` must NOT touch

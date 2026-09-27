@@ -1,6 +1,7 @@
 //! Repository for the `retention_rules` table.
 
-use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter, Set};
+use sea_orm::sea_query::Query;
+use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set};
 use toolkit_db::secure::{DBRunner, SecureDeleteExt, SecureEntityExt, secure_insert};
 use toolkit_security::AccessScope;
 use uuid::Uuid;
@@ -8,9 +9,10 @@ use uuid::Uuid;
 use crate::domain::error::DomainError;
 use crate::domain::policy::{RetentionRuleBody, RetentionScope, StoredRetentionRule};
 use crate::infra::storage::db::db_err;
+use crate::infra::storage::entity::file::{Column as FileColumn, Entity as FileEntity};
 use crate::infra::storage::entity::retention_rule::{ActiveModel, Column, Entity, Model};
 
-use super::InsertRetentionRule;
+use super::{InsertRetentionRule, RetentionRuleListParams};
 
 /// Repository over the `retention_rules` table.
 #[derive(Clone, Default)]
@@ -31,6 +33,73 @@ impl RetentionRuleRepo {
     ) -> Result<Vec<StoredRetentionRule>, DomainError> {
         let rows = Entity::find()
             .filter(Column::TenantId.eq(tenant_id))
+            .secure()
+            .scope_with(scope)
+            .all(conn)
+            .await
+            .map_err(db_err)?;
+
+        rows.into_iter().map(map_model).collect()
+    }
+
+    /// List retention rules for a tenant, forward-only keyset-paginated
+    ///, with the non-admin visibility filter
+    /// applied in SQL -- see [`RetentionRuleListParams`]'s field docs and
+    /// `PolicyStore::list_retention_rules_page`'s doc comment for the exact
+    /// semantics this reproduces (1:1) from the old filter-after-fetch
+    /// application logic.
+    ///
+    /// Ordered `(created_at, rule_id)` descending -- same tie-breaker
+    /// reasoning as `FileRepo::list_page`/`VersionRepo::list_by_file_page`.
+    /// `after`, when `Some`, restricts the result to rows strictly past that
+    /// position in this same descending order.
+    pub async fn list_page<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        params: RetentionRuleListParams<'_>,
+    ) -> Result<Vec<StoredRetentionRule>, DomainError> {
+        let mut filter = Condition::all().add(Column::TenantId.eq(params.tenant_id));
+        if !params.admin {
+            // `EXISTS`-free `IN` subquery over the caller's own files --
+            // mirrors `FileRepo::delete_if_orphan`/`list_versionless_orphan_files`'s
+            // correlated-subquery style, here uncorrelated (own files are a
+            // small, tenant+owner-scoped set independent of the outer row).
+            let own_files = Query::select()
+                .column(FileColumn::FileId)
+                .from(FileEntity)
+                .and_where(FileColumn::TenantId.eq(params.tenant_id))
+                .and_where(FileColumn::OwnerKind.eq(params.subject_kind))
+                .and_where(FileColumn::OwnerId.eq(params.subject_id))
+                .to_owned();
+            let visible = Condition::any()
+                .add(Column::Scope.eq(RetentionScope::Tenant.as_str()))
+                .add(
+                    Condition::all()
+                        .add(Column::Scope.eq(RetentionScope::User.as_str()))
+                        .add(Column::ScopeTargetId.eq(params.subject_id)),
+                )
+                .add(
+                    Condition::all()
+                        .add(Column::Scope.eq(RetentionScope::File.as_str()))
+                        .add(Column::ScopeTargetId.in_subquery(own_files)),
+                );
+            filter = filter.add(visible);
+        }
+        if let Some(seek) = params.after {
+            filter = filter.add(super::tuple_lt(
+                (Entity, Column::CreatedAt),
+                (Entity, Column::RuleId),
+                seek.created_at,
+                seek.id,
+            ));
+        }
+
+        let rows = Entity::find()
+            .filter(filter)
+            .order_by_desc(Column::CreatedAt)
+            .order_by_desc(Column::RuleId)
+            .limit(params.limit)
             .secure()
             .scope_with(scope)
             .all(conn)

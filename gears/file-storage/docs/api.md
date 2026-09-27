@@ -66,8 +66,8 @@ Encoding conventions:
 5.  PATCH  /files/{id}                      update custom metadata (JSON Merge Patch)        — If-Match-Metadata?
 6.  GET    /files/{id}                      file metadata (JSON)                                          — If-None-Match
 7.  DELETE /files/{id}                      delete file + all versions                                    — If-Match
-8.  GET    /files                           list files (owner_kind + owner_id required; paginated; JSON array of metadata incl. custom_metadata)
-9.  GET    /files/{id}/versions             list versions (version_id, size, hash, hash_mode, part_count?, manifest?, created_at, is_current)
+8.  GET    /files                           list files (owner_kind + owner_id required; cursor-paginated; `{items, page_info}` incl. custom_metadata)
+9.  GET    /files/{id}/versions             list versions (version_id, size, hash, hash_mode, part_count?, manifest?, created_at, is_current; cursor-paginated)
 10. DELETE /files/{id}/versions/{version_id} delete a single, non-current version                          — 409 if current
 11. GET    /storages                        list storages + capabilities inline
 12. GET    /storages/{storage_id}           one storage + capabilities
@@ -119,16 +119,16 @@ Notes:
   check pass while actually listing the other owner space's files. Each returned item's `custom_metadata` is real,
   batch-fetched per page (one `IN (...)` query), not an always-empty placeholder. Results are ordered
   `created_at DESC` with `file_id DESC` as a deterministic tie-breaker — `created_at` has only millisecond
-  resolution, so rows can share an instant, and without the tie-breaker an offset-paginated page could skip or
-  repeat a row at that boundary.
-- Both listing endpoints (`GET /files`, `GET /files/{id}/versions`) page via `?limit`/`?offset`. The effective
-  limit on every request is `min(requested-or-default, configured max_page_size)`: `default_page_size` (50 by
-  default) is used when `?limit` is omitted, and `max_page_size` (1000 by default) is a **hard ceiling** —
-  `MAX_PAGE_SIZE_CEILING` = 1000 — that a configured `max_page_size` can never exceed regardless of what an
-  operator sets, enforced at config-validation time (gear init fails if `max_page_size` is configured above it),
-  independent of and in addition to the ordinary `default_page_size ≤ max_page_size` sanity check. A caller can
-  therefore never receive more than the configured `max_page_size` items in one page, and that configured value
-  itself can never exceed 1000.
+  resolution, so rows can share an instant, and without the tie-breaker a page boundary could skip or repeat a row
+  at that boundary. See [Cursor pagination](#cursor-pagination) below for the full model.
+- All three listing endpoints (`GET /files`, `GET /files/{id}/versions`, `GET /retention-rules`) page via
+  `?limit`/`?cursor` — see [Cursor pagination](#cursor-pagination). The effective limit on every request is
+  `min(requested-or-default, configured max_page_size)`: `default_page_size` (25 by default) is used when `?limit`
+  is omitted, and `max_page_size` (200 by default) is a **hard ceiling** — `MAX_PAGE_SIZE_CEILING` = 200 — that a
+  configured `max_page_size` can never exceed regardless of what an operator sets, enforced at config-validation
+  time (gear init fails if `max_page_size` is configured above it), independent of and in addition to the ordinary
+  `default_page_size ≤ max_page_size` sanity check. A caller can therefore never receive more than the configured
+  `max_page_size` items in one page, and that configured value itself can never exceed 200.
 - `POST /files` and `POST /files/{id}/versions` return `{ file_id, version_id, upload_url }` (the control plane
   creates a `pending` `file_versions` row for `version_id` before returning the URL). The client `PUT`s the bytes to
   `upload_url` on the sidecar; the sidecar streams them to the backend, measuring size + SHA-256, then calls the
@@ -167,13 +167,50 @@ Notes:
   if attaching the next `multipart-composite-sha256` version's manifest, in page order, would push the running
   total over budget, the page is cut short right before that version (the version already-included even if its own
   single manifest exceeds the budget alone, so the listing always makes forward progress). Such a page can
-  therefore come back shorter than `?limit` with more versions still to list. There is no `has_more`/`next_offset`
-  field for this — as with any other short page, the client resumes at `offset + <versions actually received>`.
+  therefore come back shorter than `?limit` with more versions still to list — but `page_info.next_cursor` is
+  **always** set on a budget-truncated page (rebuilt from the last version actually returned, even when the
+  underlying keyset query itself had reached the true end), so a client that simply follows `next_cursor` resumes
+  correctly with no special case of its own.
 - `GET /files/{id}/download-url` returns `{ download_url, etag, version_id }`. By default it pins the current
   `content_id`; `?version_id=<v>` pins a specific version.
 - Restoring a prior version is `POST /files/{id}/bind` with that `version_id` (a pointer swap, no re-upload).
 - `DELETE /files/{id}/versions/{version_id}` cannot delete the file's current version (`409`, "bind another version
   first"); deleting the file's only version instead deletes the whole file.
+
+## Cursor pagination
+
+Every list endpoint in this gear — `GET /files`, `GET /files/{id}/versions`, `GET /retention-rules` — shares one
+pagination model (platform-wide convention, `guidelines/DNA/REST/QUERYING.md` /
+PLID-52.06):
+
+- **Request**: `limit` (integer, default 25, min 1, max 200 — `limit=0` is a `400`; a `limit` above 200 is silently
+  clamped down to 200, `limit.min(max_page_size)`) and `cursor` (an opaque string, the previous page's
+  `page_info.next_cursor`). No other query parameter is accepted — an unrecognized key (including the pre-redesign
+  `offset`) is rejected as a `400`, not silently ignored.
+- **Response**: `{"items": [...], "page_info": {"next_cursor": <string|null>, "prev_cursor": null, "limit": N}}`.
+  There is no `total`/count field — pagination never runs a `COUNT` query. `prev_cursor` is always `null`: this
+  platform's listings are **forward-only**, there is no backward paging.
+- **Canonical order and tie-break**: fixed per endpoint, not client-selectable (no `$orderby`) — `created_at desc,
+  file_id desc` for `/files`, `created_at desc, version_id desc` for `/files/{id}/versions`, `created_at desc,
+  rule_id desc` for `/retention-rules`. The id-column tie-break exists because `created_at` has only
+  millisecond resolution: two rows created in the same instant would otherwise have no defined relative order
+  across two page requests, and a page boundary drawn through such a run could skip or repeat a row.
+- **Keyset semantics under concurrent writes**: `next_cursor` encodes the exact `(created_at, id)` position of the
+  last row a page returned; the next page's query is `WHERE (created_at, id) < (cursor's position)` in that same
+  order (never an `OFFSET`). A row deleted between two page requests is simply absent from the next page (no
+  skip/duplicate of any *other* row); a row inserted with a position **before** the cursor (i.e. newer than
+  everything already walked) is invisible to a walk already past it — it will not retroactively appear in a page
+  already served, and will not be skipped either, since it wasn't part of the walk's remaining range to begin
+  with. This is the standard keyset-pagination guarantee: no duplicates, no skips, at the cost of never showing a
+  client a "total" or letting it jump to an arbitrary page.
+- **Cursor errors**: a cursor is opaque (`toolkit_odata::CursorV1`, base64url-encoded) and bound to the query it was
+  issued for. Decoding/validating it maps to canonical `400 InvalidArgument` reasons: `INVALID_CURSOR` (unreadable
+  token, wrong version, malformed fields, or a `"bwd"` direction — this platform never issues one and rejects a
+  client-supplied one outright), `ORDER_MISMATCH` (the cursor's encoded sort order doesn't match this endpoint's
+  canonical order — effectively "a cursor from a different listing"), `FILTER_MISMATCH` (the cursor is bound to a
+  different owner pair for `/files`, or a different `file_id` for `/files/{id}/versions`; `/retention-rules` has no
+  such binding). `GET /files/{id}/versions` additionally rejects a cursor issued for a different file, and
+  `GET /files` a cursor issued for a different `(owner_kind, owner_id)` pair.
 
 ## P1 — Sidecar (signed-URL authorized)
 
@@ -506,7 +543,7 @@ Tenant/user/file-scoped rules (age-based, inactivity-based, or custom-metadata-v
 background cleanup sweep (see `docs/operations.md`), which deletes files matching an active rule's criteria.
 
 ```text
-GET    /retention-rules             list all retention rules for the caller's tenant
+GET    /retention-rules             list retention rules for the caller's tenant (cursor-paginated)
 POST   /retention-rules             create a retention rule
 DELETE /retention-rules/{rule_id}   delete a retention rule
 ```
@@ -517,16 +554,18 @@ DELETE /retention-rules/{rule_id}   delete a retention rule
   `400`: a body with **all three** of `age`/`inactivity`/`metadata` absent (a rule that could never match any file);
   `age.max_age_days` or `inactivity.inactivity_days` **less than 1** (either would match every file in the tenant on
   the very next sweep tick); and `scope` ∈ `{user, file}` with `scope_target_id` omitted.
-- `GET /retention-rules` (no scope filter query param) returns every rule in the caller's tenant, across every
-  scope, only when the caller holds `ADMIN_POLICY`. A non-admin caller instead gets a filtered view: all
-  `tenant`-scope rules, `user`-scope rules that target themselves, and `file`-scope rules whose target file they
-  own (compared as the `(owner_kind, owner_id)` pair, not `owner_id` alone) — the underlying store query has no
-  owner/target filter, so without this filtering step any tenant member could otherwise enumerate every other
-  member's retention configuration. A `file`-scope rule is deleted together with its target file (there is no
-  FK/cascade at the DB level, so the delete path removes it explicitly), so it can no longer outlive the file and go
-  invisible that way. One remaining caveat on the `file`-scope case: a rule created via delegated `WRITE` on a file
-  the creator does not own stays invisible to that creator, since visibility is gated on file *ownership*, not on
-  having created the rule.
+- `GET /retention-rules` (no scope filter query param; `?limit`/`?cursor` — see
+  [Cursor pagination](#cursor-pagination)) returns every rule in the caller's tenant, across every scope, only when
+  the caller holds `ADMIN_POLICY`. A non-admin caller instead gets a filtered view: all `tenant`-scope rules,
+  `user`-scope rules that target themselves, and `file`-scope rules whose target file they own (compared as the
+  `(owner_kind, owner_id)` pair, not `owner_id` alone) — this visibility filter is applied **in SQL** (a `WHERE`
+  clause with a `File`-scope subquery over the caller's own files), so without it any tenant member could otherwise
+  enumerate every other member's retention configuration, and — unlike an application-level filter applied after
+  an unconditional fetch — every page but the last is guaranteed full. A `file`-scope rule is deleted together with
+  its target file (there is no FK/cascade at the DB level, so the delete path removes it explicitly), so it can no
+  longer outlive the file and go invisible that way. One remaining caveat on the `file`-scope case: a rule created
+  via delegated `WRITE` on a file the creator does not own stays invisible to that creator, since visibility is
+  gated on file *ownership*, not on having created the rule.
 - `POST /retention-rules` with `scope="tenant"` requires the caller's `ADMIN_POLICY` authorization scope, with no
   fallback to `WRITE` — a tenant-scope rule is a standing instruction for the background sweep to permanently
   delete every matching file for every subject in the tenant, so ordinary file-`WRITE` is not enough.

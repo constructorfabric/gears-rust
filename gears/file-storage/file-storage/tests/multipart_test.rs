@@ -402,7 +402,7 @@ async fn build_service_with_policy() -> (
         "http://sidecar.test".to_owned(),
         3600,
     ));
-    let psvc = Arc::new(PolicyService::new(policy_store, authorizer));
+    let psvc = Arc::new(PolicyService::new(policy_store, authorizer, 50, 1000));
     (svc, msvc, psvc, dp)
 }
 
@@ -1164,9 +1164,10 @@ async fn multipart_full_lifecycle_create_to_delete() {
         .await
         .expect("file must exist before delete");
     assert!(
-        svc.list_versions(&ctx, ticket.file_id, None, 0)
+        svc.list_versions(&ctx, ticket.file_id, None, None)
             .await
             .unwrap()
+            .items
             .iter()
             .any(|v| v.version_id == plan.version_id),
         "the completed multipart version must be present before delete",
@@ -1443,7 +1444,7 @@ async fn idempotency_replay_reflects_tightened_size_policy() {
         None,
         None,
     ));
-    let psvc = PolicyService::new(policy_store, authorizer);
+    let psvc = PolicyService::new(policy_store, authorizer, 50, 1000);
 
     let ctx = ctx(Uuid::now_v7());
 

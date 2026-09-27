@@ -108,6 +108,11 @@ opentelemetry = { workspace = true }
 
 # Local dependencies
 toolkit = { workspace = true }
+# Cursor pagination envelope (`Page<T>`/`CursorV1`) for the three SQL-backed
+# listings (`GET /files`, `GET /files/{id}/versions`, `GET /retention-rules`)
+# -- "with-utoipa" registers `Page<T>`'s OpenAPI schema (mirrors event-broker
+# and pricing's own dependency declaration).
+toolkit-odata = { workspace = true, features = ["with-utoipa"] }
 toolkit-db = { workspace = true, features = ["sqlite", "pg"] }
 toolkit-db-macros = { workspace = true }
 toolkit-security = { workspace = true }

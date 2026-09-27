@@ -693,13 +693,14 @@ and `meta_version`. (The pointer-swap CAS itself is driven by `bind-service`; th
 - Persist the bind: set `File.content_id := version_id` and flip that version to `is_current`/`available`. Content
   writes do **not** bump `meta_version`; metadata-only updates bump `meta_version` and `last_modified_at`
 - Enforce tenant boundary via SecureConn — every query/mutation passes through the request's `SecurityContext`
-- Tenant + mandatory owner filter on `GET /files`; offset pagination (`limit`/`offset` query params, capped by
-  `FileStorageConfig::max_page_size`); ordered `created_at DESC, file_id DESC` (the `file_id` tie-breaker keeps
-  offset pagination stable across rows sharing a `created_at` instant), index-backed by
-  `(tenant_id, owner_kind, owner_id, created_at DESC, file_id DESC)`. `GET /files`
-  and `GET /files/{id}/versions` both return a bare JSON array, not an `{items, next_cursor}` envelope. OData
-  `$filter`/`$orderby` is not implemented. List a file's versions ordered by `created_at DESC, version_id DESC`
-  (same tie-breaker reasoning), same offset model
+- Tenant + mandatory owner filter on `GET /files`; forward-only keyset cursor pagination (`limit`/`cursor` query
+  params, default 25, max 200, capped by `FileStorageConfig::max_page_size`);
+  ordered `created_at DESC, file_id DESC` (the `file_id` tie-breaker keeps the keyset page boundary stable across
+  rows sharing a `created_at` instant), index-backed by `(tenant_id, owner_kind, owner_id, created_at DESC, file_id
+  DESC)`. `GET /files`, `GET /files/{id}/versions`, and `GET /retention-rules` all return
+  `{items, page_info: {next_cursor, prev_cursor: null, limit}}` (`toolkit_odata::Page<T>`), never a bare JSON array
+  — `prev_cursor` is always `null` (no backward paging). OData `$filter`/`$orderby` is not implemented. List a
+  file's versions ordered by `created_at DESC, version_id DESC` (same tie-breaker reasoning), same keyset model
 - Reject PRD-defined constraints at this layer when they are not enforceable as DB constraints (e.g., GTS format
   validation regex, tenant policy delta in P2)
 
@@ -1261,14 +1262,14 @@ sequenceDiagram
     participant MS as metadata-service
     participant DB as Postgres
 
-    C->>CTL: GET /files?owner_kind=user&owner_id=<u>&limit=<l>&offset=<o>
+    C->>CTL: GET /files?owner_kind=user&owner_id=<u>&limit=<l>&cursor=<c>
     CTL->>AZ: check(action=read, resource=gts~*~) — list scope
     AZ-->>CTL: Allow
-    CTL->>MS: list(tenant=ctx.tenant, owner_kind=user, owner_id=<u>, limit, offset)
-    MS->>DB: SELECT ... WHERE tenant_id=$1 AND owner_kind=$2 AND owner_id=$3 ORDER BY created_at LIMIT $4 OFFSET $5
-    DB-->>MS: rows
+    CTL->>MS: list(tenant=ctx.tenant, owner_kind=user, owner_id=<u>, limit, cursor)
+    MS->>DB: SELECT ... WHERE tenant_id=$1 AND owner_kind=$2 AND owner_id=$3 AND (created_at, file_id) < (decoded cursor) ORDER BY created_at DESC, file_id DESC LIMIT $4+1
+    DB-->>MS: rows (limit + 1, to detect a next page)
     MS-->>CTL: rows
-    CTL-->>C: 200 + JSON array of files
+    CTL-->>C: 200 + {items, page_info: {next_cursor, prev_cursor: null, limit}}
 ```
 
 #### Configure policy (P2-M1)
@@ -1356,7 +1357,7 @@ The file row holds **no bytes and no per-content fields** (mime, size, hash, bac
 - `PRIMARY KEY (file_id)`
 - `(tenant_id, owner_kind, owner_id, created_at DESC, file_id DESC)` — covers `GET /files` listing
   (sorted `ORDER BY created_at DESC, file_id DESC`; the `file_id` tie-breaker keeps two
-  `OFFSET`-paginated pages from skipping or repeating a row when they share a `created_at` instant).
+  keyset-paginated pages from skipping or repeating a row when they share a `created_at` instant).
   `files_owner_listing_v2_idx` in `docs/migration.sql`, shipped in `m20260924_000001_upload_flow_redesign`,
   superseding the released `files_owner_listing_idx (tenant_id, owner_kind, owner_id, created_at DESC)`
   (`m20260624_000001_p1_initial`), dropped in the same migration

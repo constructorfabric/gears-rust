@@ -174,21 +174,25 @@ pub trait CleanupStore: Send + Sync {
     /// of age, so the sweep cannot reclaim it out from under an in-progress
     /// upload. A session whose `expires_at` has already passed is not
     /// excluded: it is aborted by the next sweep step
-    /// (`sweep_expired_multipart`) and its version becomes reclaimable on a
+    /// (`sweep_expired_multipart_page`) and its version becomes reclaimable on a
     /// later sweep.
     ///
-    /// Ordered `(created_at, version_id)` ascending, up to `limit` rows --
-    /// one batch per sweep pass, same as
-    /// [`Self::list_versionless_orphan_files`]. No cursor is threaded through:
-    /// every row this query returns is either deleted or moved off `pending`
-    /// by the caller, so it drops out of the next pass's result set on its
-    /// own: a plain re-run of the same query, not a resumed scan, picks up
-    /// whatever this pass's batch cap left behind.
+    /// Ordered `(created_at, version_id)` ascending, up to `limit` rows.
+    /// `after`, when `Some((created_at, version_id))`, restricts the result
+    /// to rows strictly greater than that key in the same ordering (keyset
+    /// pagination) -- `None` starts from the oldest row. The sweep engine
+    /// uses this within one tick to page past a batch's candidates
+    /// regardless of whether each one was actually reclaimed (a still-active
+    /// multipart session, a transient per-row error), so a stuck
+    /// head-of-line candidate cannot starve the rest of the backlog for the
+    /// whole tick -- see [`crate::domain::cleanup::CleanupEngine::run_sweep`]'s
+    /// doc for why this cursor is tick-local rather than persisted.
     async fn list_abandoned_pending_versions(
         &self,
         older_than: OffsetDateTime,
         now: OffsetDateTime,
         limit: u64,
+        after: Option<(OffsetDateTime, Uuid)>,
     ) -> Result<Vec<FileVersion>, DomainError>;
 
     /// List `files` rows that never received **any** version at all --
@@ -197,7 +201,7 @@ pub trait CleanupStore: Send + Sync {
     /// file_id)` ascending, up to `limit` rows.
     ///
     /// Feeds the second phase of sweep step 1
-    /// ([`crate::domain::cleanup::CleanupEngine::sweep_versionless_files`]).
+    /// ([`crate::domain::cleanup::CleanupEngine::sweep_versionless_files_page`]).
     /// Unlike [`Self::list_abandoned_pending_versions`] above (keyed on the
     /// age of a `file_versions` row that exists), this method finds `files`
     /// rows that never got a version row in the first place -- e.g. a
@@ -208,10 +212,16 @@ pub trait CleanupStore: Send + Sync {
     /// `list_abandoned_pending_versions` nor `list_expired_multipart_uploads`
     /// can ever select such a row, since both key off a `file_versions` (or
     /// `multipart_uploads`) row that was never created.
+    /// `after`, when `Some((created_at, file_id))`, restricts the result to
+    /// rows strictly greater than that key in the same `(created_at,
+    /// file_id)` ordering (keyset pagination) -- `None` starts from the
+    /// oldest row. Same tick-local cursor usage as
+    /// [`Self::list_abandoned_pending_versions`]'s `after`.
     async fn list_versionless_orphan_files(
         &self,
         created_before: OffsetDateTime,
         limit: u64,
+        after: Option<(OffsetDateTime, Uuid)>,
     ) -> Result<Vec<File>, DomainError>;
 
     /// Delete a version row + audit in one transaction. Returns `true` if removed.
@@ -238,16 +248,16 @@ pub trait CleanupStore: Send + Sync {
 
     /// List `in_progress` (or lease-lapsed `completing`) multipart sessions
     /// whose `expires_at` is before `now`, ordered `(expires_at, upload_id)`
-    /// ascending, up to `limit` rows -- one batch per sweep pass, same as
-    /// [`Self::list_abandoned_pending_versions`]. No cursor is threaded
-    /// through here either: the caller CASes each returned session's `state`
-    /// away from `in_progress`/`completing`, so it drops out of the next
-    /// pass's result set on its own, and a plain re-run of the same query
-    /// picks up whatever this pass's batch cap left behind.
+    /// ascending, up to `limit` rows. `after`, when `Some((expires_at,
+    /// upload_id))`, restricts the result to rows strictly greater than that
+    /// key in the same ordering (keyset pagination) -- `None` starts from the
+    /// longest-expired row. Same tick-local cursor usage as
+    /// [`Self::list_abandoned_pending_versions`]'s `after`.
     async fn list_expired_multipart_uploads(
         &self,
         now: OffsetDateTime,
         limit: u64,
+        after: Option<(OffsetDateTime, Uuid)>,
     ) -> Result<Vec<MultipartUploadSession>, DomainError>;
 
     /// Mark a multipart session as `aborted` + audit in one transaction.
@@ -309,12 +319,12 @@ pub trait CleanupStore: Send + Sync {
     /// or `completing`) multipart upload session, regardless of
     /// `expires_at`/`lease_until`. Guards the P2 2.8 orphan-file delete
     /// against racing a not-yet-reaped multipart session whose pending
-    /// version was just reclaimed by `sweep_abandoned_pending` (keyed only on
+    /// version was just reclaimed by `sweep_abandoned_pending_page` (keyed only on
     /// version age, not multipart session state) -- without this check,
     /// deleting the file would `ON DELETE CASCADE` the still-active session
     /// out from under the upload. `completing` blocks unconditionally
     /// (lease status is not consulted): a completer may be assembling the
-    /// final object right now, and only `sweep_expired_multipart`'s own CAS
+    /// final object right now, and only `sweep_expired_multipart_page`'s own CAS
     /// gets to decide a stuck lease is actually abandoned.
     async fn has_active_multipart_for_file(&self, file_id: Uuid) -> Result<bool, DomainError>;
 
@@ -615,12 +625,44 @@ pub trait PolicyStore: Send + Sync {
         now: OffsetDateTime,
     ) -> Result<Uuid, DomainError>;
 
-    /// List all retention rules for a tenant (all scopes).
+    /// List all retention rules for a tenant (all scopes), unpaginated. Used
+    /// by the sweep engine's data-plane views (`CleanupStore::
+    /// list_all_retention_rules`/`list_by_file_scope` are the sweep's own,
+    /// separate methods) and directly by tests as a ground-truth read of the
+    /// whole tenant's rule set; `PolicyService::list_retention_rules`'s REST-
+    /// facing listing uses [`Self::list_retention_rules_page`] instead.
     async fn list_retention_rules(
         &self,
         scope: &AccessScope,
         tenant_id: Uuid,
     ) -> Result<Vec<StoredRetentionRule>, DomainError>;
+
+    /// List retention rules for a tenant, forward-only cursor-paginated
+    ///, with the non-admin visibility filter
+    /// applied **in SQL** rather than in the application:
+    /// `scope = 'tenant' OR (scope = 'user' AND scope_target_id = subject_id)
+    /// OR (scope = 'file' AND scope_target_id IN (files this
+    /// (subject_kind, subject_id) owns))`. `admin` (resolved by the caller
+    /// probing `ADMIN_POLICY`) skips the visibility filter entirely -- an
+    /// admin sees every rule in the tenant. Canonical order `created_at DESC,
+    /// rule_id DESC`; `cursor`, when `Some`, resumes after the position it
+    /// encodes (rejected as a `400` if it names a listing this call wasn't
+    /// made for -- see `domain::pagination`).
+    ///
+    /// # Errors
+    /// A cursor error (`domain::pagination`) for an unreadable/mismatched
+    /// `cursor`, or the underlying store error.
+    #[allow(clippy::too_many_arguments)]
+    async fn list_retention_rules_page(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        admin: bool,
+        subject_kind: &str,
+        subject_id: Uuid,
+        limit: u64,
+        cursor: Option<&str>,
+    ) -> Result<toolkit_odata::Page<StoredRetentionRule>, DomainError>;
 
     /// Insert a new retention rule. Returns the assigned `rule_id`.
     async fn insert_retention_rule(

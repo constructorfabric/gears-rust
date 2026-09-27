@@ -161,6 +161,8 @@ async fn upload_flow_redesign_down_actually_drops_the_new_columns_and_indexes() 
     );
     assert!(index_exists(&db, "files_owner_listing_v2_idx").await);
     assert!(!index_exists(&db, "files_owner_listing_idx").await);
+    assert!(index_exists(&db, "retention_rules_tenant_listing_idx").await);
+    assert!(!index_exists(&db, "file_versions_backend_idx").await);
 
     // Roll back only the last-registered migration, rather than the whole
     // history, so this test is independent of how many migrations precede
@@ -199,6 +201,14 @@ async fn upload_flow_redesign_down_actually_drops_the_new_columns_and_indexes() 
     assert!(!index_exists(&db, "multipart_uploads_sweep_idx").await);
     assert!(!index_exists(&db, "files_versionless_sweep_idx").await);
     assert!(!index_exists(&db, "file_versions_file_created_idx").await);
+    assert!(
+        !index_exists(&db, "retention_rules_tenant_listing_idx").await,
+        "retention_rules_tenant_listing_idx must be dropped by down()"
+    );
+    assert!(
+        index_exists(&db, "file_versions_backend_idx").await,
+        "file_versions_backend_idx must be recreated by down()"
+    );
 
     Migrator::up(&db, Some(1))
         .await
@@ -222,6 +232,8 @@ async fn upload_flow_redesign_down_actually_drops_the_new_columns_and_indexes() 
     );
     assert!(index_exists(&db, "files_owner_listing_v2_idx").await);
     assert!(!index_exists(&db, "files_owner_listing_idx").await);
+    assert!(index_exists(&db, "retention_rules_tenant_listing_idx").await);
+    assert!(!index_exists(&db, "file_versions_backend_idx").await);
 }
 
 // ── upload_flow_redesign: backend_id/backend_path backfill ──────────────────
@@ -468,6 +480,15 @@ async fn upload_flow_redesign_indexes_exist_after_up() {
         !index_exists(&db, "files_owner_listing_idx").await,
         "files_owner_listing_idx must be dropped after up() -- superseded by \
          files_owner_listing_v2_idx"
+    );
+    assert!(
+        index_exists(&db, "retention_rules_tenant_listing_idx").await,
+        "retention_rules_tenant_listing_idx must exist after up()"
+    );
+    assert!(
+        !index_exists(&db, "file_versions_backend_idx").await,
+        "file_versions_backend_idx must be dropped after up() -- unused (no query \
+         filters file_versions by backend_id)"
     );
 }
 

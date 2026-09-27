@@ -192,7 +192,7 @@ async fn build_service(
         None,
     ));
     let dp = TestDataPlane::new(Arc::clone(&svc), store, backends);
-    let psvc = Arc::new(PolicyService::new(policy_store, authorizer));
+    let psvc = Arc::new(PolicyService::new(policy_store, authorizer, 50, 1000));
     (svc, psvc, dp, store_handle)
 }
 

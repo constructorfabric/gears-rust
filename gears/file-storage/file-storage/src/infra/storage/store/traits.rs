@@ -21,16 +21,18 @@ impl CleanupStore for Store {
         older_than: OffsetDateTime,
         now: OffsetDateTime,
         limit: u64,
+        after: Option<(OffsetDateTime, Uuid)>,
     ) -> Result<Vec<FileVersion>, DomainError> {
-        Store::list_abandoned_pending_versions(self, older_than, now, limit).await
+        Store::list_abandoned_pending_versions(self, older_than, now, limit, after).await
     }
 
     async fn list_versionless_orphan_files(
         &self,
         created_before: OffsetDateTime,
         limit: u64,
+        after: Option<(OffsetDateTime, Uuid)>,
     ) -> Result<Vec<File>, DomainError> {
-        Store::list_versionless_orphan_files(self, created_before, limit).await
+        Store::list_versionless_orphan_files(self, created_before, limit, after).await
     }
 
     async fn delete_version(
@@ -55,8 +57,9 @@ impl CleanupStore for Store {
         &self,
         now: OffsetDateTime,
         limit: u64,
+        after: Option<(OffsetDateTime, Uuid)>,
     ) -> Result<Vec<crate::domain::multipart::MultipartUploadSession>, DomainError> {
-        Store::list_expired_multipart_uploads(self, now, limit).await
+        Store::list_expired_multipart_uploads(self, now, limit, after).await
     }
 
     async fn abort_multipart_upload(
@@ -422,6 +425,30 @@ impl crate::domain::ports::PolicyStore for Store {
         tenant_id: Uuid,
     ) -> Result<Vec<crate::domain::policy::StoredRetentionRule>, DomainError> {
         Store::list_retention_rules(self, scope, tenant_id).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn list_retention_rules_page(
+        &self,
+        scope: &toolkit_security::AccessScope,
+        tenant_id: Uuid,
+        admin: bool,
+        subject_kind: &str,
+        subject_id: Uuid,
+        limit: u64,
+        cursor: Option<&str>,
+    ) -> Result<toolkit_odata::Page<crate::domain::policy::StoredRetentionRule>, DomainError> {
+        Store::list_retention_rules_page(
+            self,
+            scope,
+            tenant_id,
+            admin,
+            subject_kind,
+            subject_id,
+            limit,
+            cursor,
+        )
+        .await
     }
 
     async fn insert_retention_rule(

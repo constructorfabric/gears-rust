@@ -109,6 +109,17 @@ pub enum DomainError {
     /// 409 — backend migration was requested for a versioned file (>1 version).
     #[error("File {file_id} has multiple versions and cannot be migrated between backends")]
     VersionedFileMigrationNotSupported { file_id: Uuid },
+
+    /// A cursor-pagination failure from `domain::pagination` (unreadable
+    /// token, order/filter mismatch against the current request, or a
+    /// `"bwd"` direction — this platform's listings are forward-only).
+    /// Mapped straight through `toolkit_odata`'s own `Error -> CanonicalError`
+    /// (`libs/toolkit-odata/src/problem_mapping.rs`) at the REST boundary
+    /// (`api/rest/error.rs`), so the `INVALID_CURSOR`/`ORDER_MISMATCH`/
+    /// `FILTER_MISMATCH` reason codes stay identical to every other cursor
+    /// consumer on the platform instead of a gear-local re-derivation.
+    #[error("{0}")]
+    Cursor(toolkit_odata::Error),
 }
 
 impl DomainError {

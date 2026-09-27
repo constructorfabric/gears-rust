@@ -812,7 +812,7 @@ async fn negative_control_read_paths_produce_no_write_statements() {
     svc.get_file(&ctx, ticket.file_id)
         .await
         .expect("get_file should succeed");
-    svc.list_versions(&ctx, ticket.file_id, None, 0)
+    svc.list_versions(&ctx, ticket.file_id, None, None)
         .await
         .expect("list_versions should succeed");
     let _ = msvc; // silence unused in case future reads move here

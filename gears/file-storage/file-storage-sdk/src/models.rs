@@ -238,38 +238,6 @@ pub struct VersionRecord {
     pub manifest: Option<String>,
 }
 
-/// A page of an offset-paginated listing.
-///
-/// Not `toolkit_odata::Page` (cursor-based `OData` paging): every listing
-/// operation on this trait mirrors a control-plane endpoint that already
-/// uses plain `limit`/`offset` (no cursor, no total count — see
-/// `docs/api.md`), so this stays a simple offset-continuation marker instead
-/// of introducing a cursor format nothing else in this gear speaks.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Page<T> {
-    pub items: Vec<T>,
-    /// Offset to resume at for the next page. `Some` only when this page was
-    /// full against the caller's own requested `limit` — a hint that more
-    /// results may exist, not a guarantee (no `COUNT` query backs it). `None`
-    /// on a short page (the common "last page" signal) or when the caller
-    /// left `limit` unspecified (the server's own default page size is not
-    /// visible to the client, so no continuation offset can be computed).
-    pub next_offset: Option<u64>,
-}
-
-impl<T> Page<T> {
-    /// Build a page from `items` plus the `(limit, offset)` the caller
-    /// requested, applying the [`Self::next_offset`] heuristic described on
-    /// the field doc.
-    #[must_use]
-    pub fn new(items: Vec<T>, requested_limit: Option<u64>, offset: u64) -> Self {
-        let next_offset = requested_limit.and_then(|limit| {
-            (items.len() as u64 >= limit).then(|| offset.saturating_add(items.len() as u64))
-        });
-        Self { items, next_offset }
-    }
-}
-
 // ── Upload / download tickets ───────────────────────────────────────────────
 
 /// Identity plus the signed URL a caller `PUT`s a single part's bytes to

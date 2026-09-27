@@ -30,7 +30,45 @@ pub use policy_repo::PolicyRepo;
 pub use retention_rule_repo::RetentionRuleRepo;
 pub use version_repo::VersionRepo;
 
+use sea_orm::ExprTrait;
+use sea_orm::sea_query::{Expr, IntoColumnRef};
+
 use crate::domain::policy::{RetentionRuleBody, RetentionScope};
+
+// Keyset predicates are written as row-value comparisons because Postgres
+// uses `(a, b) < (x, y)` as an index range bound, while the equivalent
+// `a < x OR (a = x AND b < y)` expansion only filters after the scan.
+fn keyset_pair(
+    a: impl IntoColumnRef,
+    b: impl IntoColumnRef,
+    va: impl Into<sea_orm::Value>,
+    vb: impl Into<sea_orm::Value>,
+) -> (Expr, Expr) {
+    (
+        Expr::tuple([Expr::col(a), Expr::col(b)]),
+        Expr::tuple([Expr::val(va), Expr::val(vb)]),
+    )
+}
+
+fn tuple_lt(
+    a: impl IntoColumnRef,
+    b: impl IntoColumnRef,
+    va: impl Into<sea_orm::Value>,
+    vb: impl Into<sea_orm::Value>,
+) -> Expr {
+    let (cols, vals) = keyset_pair(a, b, va, vb);
+    cols.lt(vals)
+}
+
+fn tuple_gt(
+    a: impl IntoColumnRef,
+    b: impl IntoColumnRef,
+    va: impl Into<sea_orm::Value>,
+    vb: impl Into<sea_orm::Value>,
+) -> Expr {
+    let (cols, vals) = keyset_pair(a, b, va, vb);
+    cols.gt(vals)
+}
 
 /// Row types returned by the audit / file-event outbox repositories.
 ///
@@ -54,6 +92,25 @@ pub struct InsertRetentionRule<'a> {
     pub scope_target_id: Option<uuid::Uuid>,
     pub body: &'a RetentionRuleBody,
     pub now: time::OffsetDateTime,
+}
+
+/// Parameters for [`RetentionRuleRepo::list_page`](retention_rule_repo::RetentionRuleRepo::list_page)
+///. Defined here for the same reason as
+/// [`InsertRetentionRule`] above.
+pub struct RetentionRuleListParams<'a> {
+    pub tenant_id: uuid::Uuid,
+    /// Skips the non-admin visibility filter entirely -- an admin sees
+    /// every rule in the tenant.
+    pub admin: bool,
+    /// The caller's own `(owner_kind, owner_id)` pair -- `"user"`/`"app"` --
+    /// used to resolve which `File`-scope rules are visible to a non-admin
+    /// caller (ignored when `admin` is `true`).
+    pub subject_kind: &'a str,
+    pub subject_id: uuid::Uuid,
+    /// Already `limit + 1` (or whatever the caller wants fetched); this
+    /// method does not itself know about the `Page` `has_more` convention.
+    pub limit: u64,
+    pub after: Option<crate::domain::pagination::Seek>,
 }
 
 /// The full set of tenant-scoped repositories, owned by the persistence

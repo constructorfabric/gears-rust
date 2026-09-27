@@ -34,11 +34,18 @@ pub use models::{
     CustomMetadataEntry, CustomMetadataPatch, DownloadTicket, EffectivePolicy, File, FileFetch,
     FileId, FileRecord, FileVersion, InactivityRetention, MetadataLimits, MetadataRetention,
     MimeSizeOverride, MissingPart, MultipartCompleteOutcome, MultipartIntent, MultipartPartPlan,
-    MultipartPlan, MultipartStatus, MultipartUploadState, NewFile, OwnerFilter, OwnerKind, Page,
-    Policy, PolicyBody, PolicyScope, ReceivedPart, RetentionRule, RetentionRuleBody,
-    RetentionScope, SizeLimits, Storage, StorageCapabilities, UploadTicket, VersionId,
-    VersionRecord, VersionStatus,
+    MultipartPlan, MultipartStatus, MultipartUploadState, NewFile, OwnerFilter, OwnerKind, Policy,
+    PolicyBody, PolicyScope, ReceivedPart, RetentionRule, RetentionRuleBody, RetentionScope,
+    SizeLimits, Storage, StorageCapabilities, UploadTicket, VersionId, VersionRecord,
+    VersionStatus,
 };
+
+// Cursor-pagination envelope for `list_files`/`list_versions`/
+// `list_retention_rules` -- the platform's
+// shared `Page<T>`/`PageInfo` (`libs/toolkit-odata/src/page.rs`), not a
+// gear-local offset marker. Re-exported so callers of this SDK need not add
+// their own `toolkit-odata` dependency just to name the return type.
+pub use toolkit_odata::Page;
 
 pub use toolkit_canonical_errors::CanonicalError as FileStorageError;
 pub use toolkit_canonical_errors::{self, CanonicalError, Problem};

@@ -96,24 +96,3 @@ fn retention_scope_str_round_trips() {
     }
     assert_eq!(RetentionScope::parse("bogus"), None);
 }
-
-#[test]
-fn page_next_offset_is_none_on_a_short_page() {
-    let page = Page::new(vec![1, 2, 3], Some(10), 0);
-    assert_eq!(page.next_offset, None);
-}
-
-#[test]
-fn page_next_offset_is_none_when_limit_is_unspecified() {
-    // No `limit` was requested, so the server's own default page size is
-    // invisible to the client — no continuation offset can be computed even
-    // for a full-looking page.
-    let page = Page::new(vec![1, 2, 3], None, 0);
-    assert_eq!(page.next_offset, None);
-}
-
-#[test]
-fn page_next_offset_advances_past_a_full_page() {
-    let page = Page::new(vec![1, 2, 3], Some(3), 7);
-    assert_eq!(page.next_offset, Some(10));
-}

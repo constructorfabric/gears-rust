@@ -101,21 +101,74 @@ impl Store {
             .await
     }
 
-    /// List a page of a file's versions, newest first — backs
-    /// `GET /files/{id}/versions`. `limit`/`offset` are expected to
-    /// already be clamped by the caller (see
-    /// `FileService::list_versions`/`ServiceConfig::max_page_size`).
+    /// List a page of a file's versions, newest first, forward-only
+    /// cursor-paginated — backs
+    /// `GET /files/{id}/versions`. `limit` is expected to already be
+    /// clamped by the caller (see
+    /// `FileService::list_versions`/`ServiceConfig::max_page_size`);
+    /// `cursor`, when `Some`, resumes after the position it encodes --
+    /// decoded and validated here against
+    /// [`crate::domain::pagination::versions_binding`] so a cursor issued
+    /// for a different file is rejected as a `400` rather than silently
+    /// reused.
+    ///
+    /// Fetches `limit + 1` rows to learn whether a next page exists without
+    /// a separate `COUNT` query, trims back to `limit`, and encodes
+    /// `next_cursor` from the last row actually returned.
     pub async fn list_versions_page(
         &self,
         file_id: Uuid,
         limit: u64,
-        offset: u64,
-    ) -> Result<Vec<FileVersion>, DomainError> {
+        cursor: Option<&str>,
+    ) -> Result<toolkit_odata::Page<FileVersion>, DomainError> {
+        use crate::domain::pagination;
+
+        let binding = pagination::versions_binding(file_id);
+        let after = cursor
+            .map(|token| {
+                pagination::decode(token, pagination::VERSIONS_ID_FIELD, binding.as_deref())
+            })
+            .transpose()?;
+
         let conn = self.db.conn().map_err(db_err)?;
-        self.repos
+        let mut rows = self
+            .repos
             .versions
-            .list_by_file(&conn, &AccessScope::allow_all(), file_id, limit, offset)
-            .await
+            .list_by_file_page(
+                &conn,
+                &AccessScope::allow_all(),
+                file_id,
+                limit.saturating_add(1),
+                after,
+            )
+            .await?;
+
+        let has_more = rows.len() as u64 > limit;
+        if has_more {
+            rows.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+        }
+        let next_cursor = if has_more {
+            rows.last()
+                .map(|v| {
+                    pagination::encode(
+                        v.created_at,
+                        v.version_id,
+                        pagination::VERSIONS_ID_FIELD,
+                        binding.clone(),
+                    )
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        Ok(toolkit_odata::Page::new(
+            rows,
+            toolkit_odata::PageInfo {
+                next_cursor,
+                prev_cursor: None,
+                limit,
+            },
+        ))
     }
 
     /// Return the MIME type of the file's current (bound) version, if any.

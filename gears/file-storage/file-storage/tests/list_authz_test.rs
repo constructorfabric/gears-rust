@@ -191,7 +191,7 @@ async fn list_files_foreign_owner_without_admin_is_denied() {
 
     let result = h
         .file_svc
-        .list_files(&ctx_b, owner_filter(user_a), Some(10), 0)
+        .list_files(&ctx_b, owner_filter(user_a), Some(10), None)
         .await;
     assert!(
         matches!(result, Err(DomainError::Forbidden)),
@@ -215,10 +215,10 @@ async fn list_files_self_owner_is_allowed() {
 
     let found = h
         .file_svc
-        .list_files(&ctx_a, owner_filter(user_a), Some(10), 0)
+        .list_files(&ctx_a, owner_filter(user_a), Some(10), None)
         .await
         .expect("self-owner list should succeed");
-    assert!(found.iter().any(|f| f.file_id == ticket.file_id));
+    assert!(found.items.iter().any(|f| f.file_id == ticket.file_id));
 }
 
 /// `owner_id` alone matching the caller is not enough: `owner_kind` picks
@@ -244,7 +244,7 @@ async fn list_files_owner_kind_mismatch_without_admin_is_denied() {
                 owner_id: user_a,
             },
             Some(10),
-            0,
+            None,
         )
         .await;
     assert!(
@@ -288,11 +288,11 @@ async fn list_files_owner_kind_match_without_admin_is_allowed() {
                 owner_id: app_id,
             },
             Some(10),
-            0,
+            None,
         )
         .await
         .expect("self-service app listing should succeed without ADMIN_POLICY");
-    assert!(found.iter().any(|f| f.file_id == ticket));
+    assert!(found.items.iter().any(|f| f.file_id == ticket));
 }
 
 /// An `ADMIN_POLICY`-authorized caller may list another user's files.
@@ -314,8 +314,8 @@ async fn list_files_foreign_owner_with_admin_scope_is_allowed() {
 
     let found = h
         .file_svc
-        .list_files(&ctx_admin, owner_filter(user_a), Some(10), 0)
+        .list_files(&ctx_admin, owner_filter(user_a), Some(10), None)
         .await
         .expect("admin should be able to list foreign owner's files");
-    assert!(found.iter().any(|f| f.file_id == ticket.file_id));
+    assert!(found.items.iter().any(|f| f.file_id == ticket.file_id));
 }

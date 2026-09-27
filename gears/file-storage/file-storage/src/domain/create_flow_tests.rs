@@ -325,12 +325,12 @@ async fn failed_initiate_compensates_the_orphaned_bare_file() {
                 owner_id: owner,
             },
             Some(10),
-            0,
+            None,
         )
         .await
         .expect("list_files");
     assert!(
-        listed.is_empty(),
+        listed.items.is_empty(),
         "the orphaned bare file must have been compensated away, got {listed:?}"
     );
 }
