@@ -220,6 +220,19 @@ impl StoredCompleteResult {
         match hash_mode {
             HashMode::WholeSha256 if self.part_count != 1 || manifest.is_some() => return None,
             HashMode::MultipartCompositeSha256 if self.part_count < 1 => return None,
+            // A plan of two or more parts always persists its manifest row
+            // in the same transaction that writes this snapshot
+            // (`complete_multipart_upload`'s multi-part branch) -- a missing
+            // manifest here means the snapshot itself is corrupt, not a
+            // legitimate historical state. `part_count == 1` is excluded:
+            // that's the one-part composite predating the ADR-0006
+            // single-part amendment (`DECOMPOSITION.md`, "Schema-level
+            // `part_count >= 2` floor"), and its manifest is looked up the
+            // same way any other composite version's is, not carried by this
+            // struct -- there's nothing here to check it against.
+            HashMode::MultipartCompositeSha256 if self.part_count >= 2 && manifest.is_none() => {
+                return None;
+            }
             _ => {}
         }
         // `bind_state` vs. `etag`/`current_etag`, matching what
@@ -234,11 +247,17 @@ impl StoredCompleteResult {
         if bind_state == BindState::Conflict && self.current_etag.is_none() {
             return None;
         }
+        // Both hash modes are SHA-256 (`hash::ALGORITHM`), so a hex string
+        // that decodes to anything but exactly 32 bytes is a corrupt digest
+        // no matter which mode wrote it.
+        let content_hash = hex::decode(&self.content_hash)
+            .ok()
+            .filter(|d| d.len() == 32)?;
         Some(CompletedMultipartUpload {
             version_id: self.version_id,
             size: self.size,
             hash_algorithm: crate::infra::content::hash::ALGORITHM,
-            content_hash: hex::decode(&self.content_hash).ok()?,
+            content_hash,
             hash_mode,
             part_count: self.part_count,
             manifest,
@@ -883,6 +902,55 @@ mod tests {
         assert!(
             stored.into_completed(Some("v1,0:aa".to_owned())).is_none(),
             "bind_state=conflict without a current_etag must fall back"
+        );
+    }
+
+    #[test]
+    fn into_completed_rejects_undersized_content_hash() {
+        let stored = StoredCompleteResult {
+            content_hash: hex::encode([0u8; 1]),
+            ..stored_bound()
+        };
+        assert!(
+            stored.into_completed(None).is_none(),
+            "a content_hash that isn't exactly a 32-byte SHA-256 digest must fall back"
+        );
+    }
+
+    #[test]
+    fn into_completed_rejects_composite_with_two_parts_and_no_manifest() {
+        let stored = StoredCompleteResult {
+            hash_mode: HashMode::MultipartCompositeSha256.as_str().to_owned(),
+            part_count: 2,
+            bind_state: BindState::Manual.as_str().to_owned(),
+            etag: None,
+            current_etag: None,
+            ..stored_bound()
+        };
+        assert!(
+            stored.into_completed(None).is_none(),
+            "a multi-part composite snapshot with no manifest is corrupt, not legacy"
+        );
+    }
+
+    #[test]
+    fn into_completed_accepts_legacy_one_part_composite_snapshot_without_manifest() {
+        // Unlike a two-or-more-part composite, a one-part composite predates
+        // the ADR-0006 single-part amendment and this struct never carried
+        // its own copy of the manifest either way -- a missing manifest
+        // argument here (e.g. a caller that hasn't looked it up) must not be
+        // treated as corruption.
+        let stored = StoredCompleteResult {
+            hash_mode: HashMode::MultipartCompositeSha256.as_str().to_owned(),
+            part_count: 1,
+            bind_state: BindState::Manual.as_str().to_owned(),
+            etag: None,
+            current_etag: None,
+            ..stored_bound()
+        };
+        assert!(
+            stored.into_completed(None).is_some(),
+            "a legacy one-part composite snapshot without a manifest must still be accepted"
         );
     }
 }

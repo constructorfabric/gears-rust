@@ -559,6 +559,20 @@ mod tests {
         }
     }
 
+    /// Same as [`make`], but with `failed: true` -- for `failed_statements()`
+    /// coverage, which needs a mix of both.
+    fn make_failed(
+        seq: usize,
+        kind: QueryKind,
+        table: Option<&str>,
+        in_tx: bool,
+    ) -> super::RecordedQuery {
+        super::RecordedQuery {
+            failed: true,
+            ..make(seq, kind, table, in_tx)
+        }
+    }
+
     #[test]
     fn total_params_sums_param_count_across_events() {
         let mut a = make(0, QueryKind::Select, Some("gts_type"), false);
@@ -673,5 +687,22 @@ mod tests {
             "one transition into the tx region:\n{dump}"
         );
         assert!(dump.contains("resource_group_closure"));
+    }
+
+    #[test]
+    fn failed_statements_returns_only_failed_events_in_order() {
+        let rec = super::QueryRecorder::from_events_for_testing(vec![
+            make(0, QueryKind::Select, Some("gts_type"), false),
+            make_failed(1, QueryKind::Insert, Some("resource_group"), true),
+            make(2, QueryKind::Update, Some("resource_group"), true),
+            make_failed(3, QueryKind::Delete, Some("resource_group"), false),
+        ]);
+        let failed = rec.failed_statements();
+        assert_eq!(
+            failed.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![1, 3],
+            "expected exactly the two failed events, in their original order"
+        );
+        assert!(failed.iter().all(|e| e.failed));
     }
 }

@@ -410,6 +410,112 @@ async fn upload_flow_redesign_backfills_bound_on_finalize_false_for_existing_ver
     );
 }
 
+// ── upload_flow_redesign: dangling File-scope retention-rule cleanup ────────
+
+/// A second file, distinct from `FILE` above, used only by the retention-rule
+/// cleanup test below -- kept around (never deleted) so its `File`-scope rule
+/// has a live target and must survive the cleanup.
+const FILE2: &str = "00000000-0000-0000-0000-0000000000c2";
+/// A `file_id` that is deliberately never inserted into `files` -- models a
+/// file row deleted before this migration ran, leaving its `File`-scope
+/// retention rule dangling (`retention_rules.scope_target_id` carries no FK,
+/// see `m20260701_000001_p2_initial`).
+const DELETED_FILE: &str = "00000000-0000-0000-0000-0000000000c3";
+const RULE_FILE_LIVE: &str = "00000000-0000-0000-0000-0000000000e1";
+const RULE_FILE_DANGLING: &str = "00000000-0000-0000-0000-0000000000e2";
+const RULE_TENANT: &str = "00000000-0000-0000-0000-0000000000e3";
+const RULE_USER: &str = "00000000-0000-0000-0000-0000000000e4";
+/// Arbitrary owner id for the `user`-scope rule -- `retention_rules` has no FK
+/// from `scope_target_id` to any owner table for that scope either, so any
+/// UUID is a valid target.
+const USER_OWNER: &str = "00000000-0000-0000-0000-0000000000b2";
+
+async fn insert_retention_rule(
+    db: &DatabaseConnection,
+    rule_id: &str,
+    scope: &str,
+    scope_target_id: Option<&str>,
+) {
+    let target_sql = scope_target_id.map_or("NULL".to_owned(), |id| format!("'{id}'"));
+    db.execute_raw(stmt(
+        db,
+        format!(
+            "INSERT INTO retention_rules (rule_id, tenant_id, scope, scope_target_id, body) \
+             VALUES ('{rule_id}', '{TENANT}', '{scope}', {target_sql}, '{{}}')"
+        ),
+    ))
+    .await
+    .expect("insert retention rule");
+}
+
+/// Part 4's one-time `DELETE` must remove exactly the `File`-scope rules left
+/// dangling by a `files` row deleted before this migration ran, and nothing
+/// else: a `File`-scope rule on a file that still exists, a `Tenant`-scope
+/// rule (no target to dangle), and a `User`-scope rule (a different scope
+/// entirely) must all survive unchanged.
+#[tokio::test]
+async fn upload_flow_redesign_deletes_only_dangling_file_scope_retention_rules() {
+    let db = Database::connect("sqlite::memory:")
+        .await
+        .expect("connect in-memory sqlite");
+    db.execute_raw(stmt(&db, "PRAGMA foreign_keys = ON;"))
+        .await
+        .expect("enable foreign keys");
+
+    // Every migration up to (not including) upload_flow_redesign -- retention
+    // rules already exist from m20260701_000001_p2_initial, and part 4's
+    // cleanup only runs once upload_flow_redesign itself is applied below.
+    Migrator::up(&db, Some(7))
+        .await
+        .expect("apply every migration up to (not including) upload_flow_redesign");
+
+    insert_file(&db, FILE2).await;
+
+    insert_retention_rule(&db, RULE_FILE_LIVE, "file", Some(FILE2)).await;
+    insert_retention_rule(&db, RULE_FILE_DANGLING, "file", Some(DELETED_FILE)).await;
+    insert_retention_rule(&db, RULE_TENANT, "tenant", None).await;
+    insert_retention_rule(&db, RULE_USER, "user", Some(USER_OWNER)).await;
+
+    Migrator::up(&db, None)
+        .await
+        .expect("apply the remaining migration (upload_flow_redesign)");
+
+    let remaining_ids: Vec<String> = {
+        let rows = db
+            .query_all_raw(stmt(
+                &db,
+                "SELECT rule_id AS id FROM retention_rules ORDER BY rule_id",
+            ))
+            .await
+            .expect("query remaining rules");
+        rows.iter()
+            .map(|r| r.try_get::<String>("", "id").expect("rule_id"))
+            .collect()
+    };
+
+    assert!(
+        remaining_ids.contains(&RULE_FILE_LIVE.to_owned()),
+        "a File-scope rule on a file that still exists must survive: {remaining_ids:?}"
+    );
+    assert!(
+        !remaining_ids.contains(&RULE_FILE_DANGLING.to_owned()),
+        "a File-scope rule on an already-deleted file must be removed: {remaining_ids:?}"
+    );
+    assert!(
+        remaining_ids.contains(&RULE_TENANT.to_owned()),
+        "a Tenant-scope rule must never be touched by this cleanup: {remaining_ids:?}"
+    );
+    assert!(
+        remaining_ids.contains(&RULE_USER.to_owned()),
+        "a User-scope rule must never be touched by this cleanup: {remaining_ids:?}"
+    );
+    assert_eq!(
+        remaining_ids.len(),
+        3,
+        "exactly the one dangling File-scope rule must have been deleted: {remaining_ids:?}"
+    );
+}
+
 // ── upload_flow_redesign rebuild: child rows and indexes survive ────────────
 
 /// Upload id used only by the `upload_flow_redesign` rebuild-survival test
