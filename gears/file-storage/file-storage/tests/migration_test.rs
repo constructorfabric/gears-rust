@@ -159,6 +159,16 @@ async fn upload_flow_redesign_down_actually_drops_the_new_columns_and_indexes() 
         backend_cols_before.is_ok(),
         "backend_id/backend_path must exist after the full up(): {backend_cols_before:?}"
     );
+    let bound_on_finalize_before = db
+        .execute_raw(stmt(
+            &db,
+            "SELECT bound_on_finalize FROM file_versions LIMIT 0",
+        ))
+        .await;
+    assert!(
+        bound_on_finalize_before.is_ok(),
+        "bound_on_finalize must exist after the full up(): {bound_on_finalize_before:?}"
+    );
     assert!(index_exists(&db, "files_owner_listing_v2_idx").await);
     assert!(!index_exists(&db, "files_owner_listing_idx").await);
     assert!(index_exists(&db, "retention_rules_tenant_listing_idx").await);
@@ -188,6 +198,17 @@ async fn upload_flow_redesign_down_actually_drops_the_new_columns_and_indexes() 
         backend_cols_after_down.is_err(),
         "backend_id/backend_path must be gone after a real (non-no-op) down(): \
          {backend_cols_after_down:?}"
+    );
+    let bound_on_finalize_after_down = db
+        .execute_raw(stmt(
+            &db,
+            "SELECT bound_on_finalize FROM file_versions LIMIT 0",
+        ))
+        .await;
+    assert!(
+        bound_on_finalize_after_down.is_err(),
+        "bound_on_finalize must be gone after a real (non-no-op) down(): \
+         {bound_on_finalize_after_down:?}"
     );
     assert!(
         !index_exists(&db, "files_owner_listing_v2_idx").await,
@@ -229,6 +250,16 @@ async fn upload_flow_redesign_down_actually_drops_the_new_columns_and_indexes() 
     assert!(
         backend_cols_after_up.is_ok(),
         "backend_id/backend_path must exist again after re-up(): {backend_cols_after_up:?}"
+    );
+    let bound_on_finalize_after_up = db
+        .execute_raw(stmt(
+            &db,
+            "SELECT bound_on_finalize FROM file_versions LIMIT 0",
+        ))
+        .await;
+    assert!(
+        bound_on_finalize_after_up.is_ok(),
+        "bound_on_finalize must exist again after re-up(): {bound_on_finalize_after_up:?}"
     );
     assert!(index_exists(&db, "files_owner_listing_v2_idx").await);
     assert!(!index_exists(&db, "files_owner_listing_idx").await);
@@ -335,6 +366,47 @@ async fn upload_flow_redesign_backfills_backend_id_and_path_from_matching_versio
         .await,
         1,
         "a session with no matching version must be left NULL, not backfilled"
+    );
+}
+
+/// A `file_versions` row that existed before this migration must default to
+/// `bound_on_finalize = false` once the migration adds the column -- the
+/// same "pre-existing row survives a new `NOT NULL DEFAULT` column" contract
+/// `multipart_uploads.auto_bind` already gets, pinned here for
+/// `file_versions.bound_on_finalize` specifically.
+#[tokio::test]
+async fn upload_flow_redesign_backfills_bound_on_finalize_false_for_existing_version() {
+    let db = Database::connect("sqlite::memory:")
+        .await
+        .expect("connect in-memory sqlite");
+    db.execute_raw(stmt(&db, "PRAGMA foreign_keys = ON;"))
+        .await
+        .expect("enable foreign keys");
+
+    // Every migration up to (not including) upload_flow_redesign -- the "old"
+    // schema, before bound_on_finalize existed on file_versions.
+    Migrator::up(&db, Some(7))
+        .await
+        .expect("apply every migration up to (not including) upload_flow_redesign");
+
+    insert_file(&db, FILE).await;
+    insert_version(&db, FILE, VERSION, 1).await;
+
+    Migrator::up(&db, None)
+        .await
+        .expect("apply the remaining migration (upload_flow_redesign)");
+
+    assert_eq!(
+        count(
+            &db,
+            &format!(
+                "SELECT COUNT(*) AS c FROM file_versions WHERE version_id = '{VERSION}' \
+                 AND bound_on_finalize = 0"
+            )
+        )
+        .await,
+        1,
+        "a version that existed before this migration must default bound_on_finalize to false"
     );
 }
 

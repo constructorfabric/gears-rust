@@ -16,7 +16,7 @@ use file_storage_sdk::{File, FileVersion, VersionStatus};
 use crate::domain::audit::{AuditEntry, FileEvent};
 use crate::domain::error::DomainError;
 use crate::domain::etag;
-use crate::domain::multipart::{BindState, StoredCompleteResult};
+use crate::domain::multipart::{BindState, MultipartUploadState, StoredCompleteResult};
 use crate::domain::ports::{
     AutoBindOnFinalize, DeleteVersionOutcome, FinalizeMultipartOutcome, FinalizeVersionOutcome,
     MultipartFinishSnapshot,
@@ -345,6 +345,49 @@ impl Store {
     /// never a later racing rebind. So they are derived here, mirroring
     /// `MultipartService::bind_state_for`'s model exactly, instead of being
     /// passed in via [`MultipartFinishSnapshot`].
+    ///
+    /// Before any of that, the session row is locked
+    /// (`MultipartRepo::lock_session_state`) and its `state` re-checked:
+    /// this call's own embedded finalize CAS below is fenced only by
+    /// `file_versions.status = 'pending'`, never by lease ownership (see
+    /// `MultipartRepo::finish_complete`'s doc for why an owner check would
+    /// re-strand the exact race
+    /// `f2_stale_completer_converges_instead_of_stranding_after_owner_fencing_fix`
+    /// exists to prevent) -- so, unguarded, a stale completer whose lease
+    /// the abandoned-session sweep has already reclaimed (`CAS`ing the session
+    /// `completing -> aborted` and deleting its part rows,
+    /// `CleanupEngine::abort_expired_multipart_session`) could still commit
+    /// this transaction and finalize (and bind) a version for a session the
+    /// system has already recorded as `aborted`. The lock makes the two
+    /// transactions serialize on this row instead of racing.
+    ///
+    /// Only a vanished row or `aborted` fail this check with
+    /// [`DomainError::conflict`] (rolling back the whole transaction, the
+    /// version left `pending`) -- every OTHER state this call can actually
+    /// observe here is a legitimate path this method already handles
+    /// correctly further down and must keep doing so:
+    /// - `completing` is the ordinary case, whether this caller is the
+    ///   session's original lease holder or won it via takeover (a takeover
+    ///   changes `lease_owner`/`lease_until`, never `state`).
+    /// - `completed` is reachable too -- a second, redundant completer whose
+    ///   own finalize attempt only reaches this call *after* another
+    ///   completer's finalize (this same method, a different invocation)
+    ///   already committed the version AND the session's own
+    ///   `completing -> completed` CAS in one transaction (exactly
+    ///   `f2_stale_completer_converges_instead_of_stranding_after_owner_fencing_fix`'s
+    ///   interleaving). Rejecting that here would turn a caller this system
+    ///   is specifically designed to converge silently (via the version's
+    ///   own now-lost `status = 'pending'` CAS below, then
+    ///   `converge_or_error_after_lost_finalize_cas`) into a hard error
+    ///   instead -- breaking that exact regression test. Letting it through
+    ///   here is safe: the version CAS a few lines down will correctly find
+    ///   `status` already `available` and report `updated: false`, which is
+    ///   the caller's existing, correct signal to converge.
+    /// - `in_progress` is reachable in principle too (an even-later takeover
+    ///   whose own assembly failed released its lease,
+    ///   `MultipartRepo::release_complete_lease`, before this call's much
+    ///   older attempt finally lands) and is left to the same fallthrough --
+    ///   out of scope for this fix, which is about `aborted` specifically.
     pub async fn finalize_multipart_version(
         &self,
         file_id: Uuid,
@@ -365,7 +408,13 @@ impl Store {
         let db = self.db.db();
         // Retryable for the same cross-transaction lock-order reason
         // `finalize_version` documents (this is the same transaction body,
-        // with the terminal session CAS appended).
+        // with the terminal session CAS appended) -- lock order here is
+        // `multipart_uploads` -> `file_versions` -> `files`.
+        // `Store::abort_multipart_upload` (the cleanup sweep's path onto the
+        // same `multipart_uploads` row) never touches `file_versions`/`files`
+        // in its own transaction, so it cannot race this one in the reverse
+        // order; the bounded retry here is purely for the pre-existing
+        // `file_versions` -> `files` half this comment already documented.
         transaction_with_bounded_retry(&db, move |tx| {
             let files = files.clone();
             let versions = versions.clone();
@@ -379,6 +428,23 @@ impl Store {
             let finish = finish.clone();
             Box::pin(async move {
                 let scope = AccessScope::allow_all();
+                // FIRST statement of the transaction (see
+                // `MultipartRepo::lock_session_state`'s doc for why order
+                // matters): reject a session the abandoned-session sweep has
+                // already reclaimed before this call can finalize (and
+                // potentially bind) a version underneath it. See this
+                // method's own doc comment for exactly which states pass
+                // through here unchanged and why.
+                let session_state = multipart.lock_session_state(tx, finish.upload_id).await?;
+                let reclaimed_by_cleanup = match session_state.as_deref() {
+                    Some(state) => state == MultipartUploadState::Aborted.as_str(),
+                    None => true,
+                };
+                if reclaimed_by_cleanup {
+                    return Err(DomainError::conflict(
+                        "multipart session is no longer completing (aborted by cleanup)",
+                    ));
+                }
                 let updated = versions
                     .finalize(
                         tx,

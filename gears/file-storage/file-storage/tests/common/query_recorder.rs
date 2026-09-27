@@ -14,8 +14,10 @@
 //! Attaches a `SeaORM` metric callback to a raw connection *before* it is
 //! wrapped into a toolkit-db `DBProvider` (see
 //! [`super::test_db_with_recorder`]), so every statement the service layer
-//! issues is captured: normalized SQL text (literals redacted, variadic
-//! placeholder lists collapsed so batch size doesn't change the "shape"),
+//! issues is captured: normalized SQL text (literals redacted, an `IN (...)`
+//! list's placeholders collapsed so its length doesn't change the "shape" --
+//! scoped to `IN (...)` specifically so a multi-row `VALUES (...)` tuple's
+//! placeholder count, which IS its column count, stays distinguishable),
 //! statement kind, a best-effort target table, and whether it executed while
 //! the toolkit-db transaction-bypass guard was armed (i.e. inside a
 //! `Db::transaction*` closure).
@@ -121,13 +123,22 @@ static RE_STRING_LIT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"'(?:[^']|'')*'").expect("valid regex"));
 static RE_NUMBER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b\d+\b").expect("valid regex"));
 static RE_WHITESPACE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").expect("valid regex"));
-// Collapse a run of 2+ `?` placeholders (SQLite/MySQL style) or `$1, $2, ...`
-// (Postgres style) into a single canonical marker, so an `IN (...)` list or a
-// multi-row `INSERT ... VALUES` batch normalizes the same way regardless of N.
-static RE_PLACEHOLDER_LIST: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\?(?:\s*,\s*\?)+").expect("valid regex"));
-static RE_PG_PLACEHOLDER_LIST: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\$\d+(?:\s*,\s*\$\d+)+").expect("valid regex"));
+// Collapse an `IN (...)` list of `$1, $2, ...` (Postgres style) placeholders
+// into a single canonical marker, so the predicate normalizes the same way
+// regardless of how many values it was given (scale-invariant grouping).
+// Deliberately scoped to `IN (...)` rather than any comma-joined run of
+// placeholders: a multi-row `INSERT ... VALUES (...)` tuple's placeholder
+// count IS its column count, which must stay distinguishable between
+// differently-shaped statements, unlike an `IN` list's length. Must run
+// BEFORE `RE_NUMBER`, which would otherwise strip the digits out of
+// `$1`/`$2` first and permanently defeat this pattern's `\$\d+` requirement.
+static RE_PG_IN_LIST: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\bIN\s*\(\s*\$\d+(?:\s*,\s*\$\d+)*\s*\)").expect("valid regex")
+});
+// Same collapse, for SQLite/MySQL-style `?` placeholders -- same
+// VALUES-arity carve-out applies.
+static RE_QM_IN_LIST: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bIN\s*\(\s*\?(?:\s*,\s*\?)*\s*\)").expect("valid regex"));
 
 static RE_INSERT_TABLE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)^insert\s+into\s+"?([a-zA-Z_][a-zA-Z0-9_]*)"?"#).expect("valid regex")
@@ -151,9 +162,16 @@ static RE_FROM_TABLE: LazyLock<Regex> = LazyLock::new(|| {
 #[must_use]
 pub fn normalize_sql(sql: &str) -> String {
     let s = RE_STRING_LIT.replace_all(sql, "'?'");
+    // Collapse `IN (...)` lists FIRST, while the Postgres form's digits are
+    // still there for `RE_PG_IN_LIST` to match -- `RE_NUMBER` below would
+    // otherwise blank them out first and permanently defeat it (see that
+    // static's doc comment). `$$` (not `$`): the `regex` crate's replacement
+    // syntax treats a bare `$name` as a capture-group reference -- since this
+    // pattern has no such group, an unescaped `$N` here would silently
+    // expand to "" instead of the literal marker text.
+    let s = RE_PG_IN_LIST.replace_all(&s, "IN ($$N)");
+    let s = RE_QM_IN_LIST.replace_all(&s, "IN (?)");
     let s = RE_NUMBER.replace_all(&s, "?");
-    let s = RE_PLACEHOLDER_LIST.replace_all(&s, "?");
-    let s = RE_PG_PLACEHOLDER_LIST.replace_all(&s, "$1");
     let s = RE_WHITESPACE.replace_all(&s, " ");
     s.trim().to_owned()
 }
@@ -474,6 +492,39 @@ mod tests {
             (
                 r#"SELECT * FROM "gts_type" WHERE "id" IN (?, ?, ?)"#,
                 r#"SELECT * FROM "gts_type" WHERE "id" IN (?)"#,
+            ),
+            // SQLite-style `IN (...)` collapses the same regardless of list
+            // length (mirrors `normalize_sql_placeholder_list_length_does_not_change_shape`
+            // below, spelled out here as an explicit input/expected pair).
+            (
+                r#"SELECT * FROM "t" WHERE "id" IN (?, ?)"#,
+                r#"SELECT * FROM "t" WHERE "id" IN (?)"#,
+            ),
+            // Postgres-style `IN ($1, $2, ...)` must collapse the same way --
+            // this is `RE_PG_IN_LIST`, which used to be permanently dead
+            // because `RE_NUMBER` ran first and blanked out the digits
+            // `\$\d+` needs to match.
+            (
+                r#"SELECT * FROM "t" WHERE "id" IN ($1, $2)"#,
+                r#"SELECT * FROM "t" WHERE "id" IN ($N)"#,
+            ),
+            (
+                r#"SELECT * FROM "t" WHERE "id" IN ($1, $2, $3)"#,
+                r#"SELECT * FROM "t" WHERE "id" IN ($N)"#,
+            ),
+            // A multi-row `VALUES` tuple's placeholder count IS its column
+            // count -- unlike an `IN (...)` list's length, that must stay
+            // distinguishable between differently-shaped statements, so
+            // neither of these is touched at all (both normalize to
+            // themselves, unlike the old unscoped collapse which turned both
+            // into "VALUES (?)").
+            (
+                "INSERT INTO t (a, b) VALUES (?, ?)",
+                "INSERT INTO t (a, b) VALUES (?, ?)",
+            ),
+            (
+                "INSERT INTO t (a, b, c) VALUES (?, ?, ?)",
+                "INSERT INTO t (a, b, c) VALUES (?, ?, ?)",
             ),
         ];
         for (input, expected) in cases {

@@ -44,7 +44,10 @@ mod m20260924_000001_upload_flow_redesign;
 /// sweep's `content_id IS NULL AND created_at < cutoff` scan),
 /// `file_versions_file_created_idx` (covers `VersionRepo::list_by_file`), and
 /// `files_owner_listing_v2_idx` (supersedes `files_owner_listing_idx` with a
-/// `file_id` tie-breaker).
+/// `file_id` tie-breaker). It also adds `file_versions.bound_on_finalize`
+/// (persists a version's own bind-on-finalize CAS outcome) and runs a
+/// one-time cleanup of `retention_rules` rows left dangling by a `files` row
+/// deleted before this migration ran.
 pub struct Migrator;
 
 #[async_trait::async_trait]

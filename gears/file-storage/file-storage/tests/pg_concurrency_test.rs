@@ -113,6 +113,20 @@
 //!   (backdated timestamps, no barrier needed), included here for parity and
 //!   to confirm the same fix holds against a real PostgreSQL FK/cascade
 //!   dialect.
+//! - `f11_*` -- a stale completer's finalize used to be able to commit after
+//!   the abandoned-session sweep already reclaimed its session: cleanup CASes
+//!   an expired-lease `completing` session straight to `aborted` (deleting
+//!   its part rows) without regard for a completer still mid-assembly on
+//!   that same lease, and `Store::finalize_multipart_version`'s embedded
+//!   version-finalize CAS was fenced only by `file_versions.status =
+//!   'pending'`, never by the session's own state -- so that completer could
+//!   still finalize (and auto-bind) the version afterwards, leaving the
+//!   version `available`/bound underneath a session recorded as `aborted`
+//!   with no parts left to reconstruct it from. Sequential by construction
+//!   (an already-expired lease is handed to `acquire_multipart_complete_lease`
+//!   directly; no real sleep or barrier needed). Fixed by locking the session
+//!   row first, inside the SAME transaction, and rejecting with `Conflict`
+//!   unless it is still (or again) `completing`.
 //! - `invariant_checker_*` -- post-state invariant checker: no version-less
 //!   `files` rows outside a documented window (a window this file's own
 //!   scenarios show is NOT actually bounded -- demonstrated directly against
@@ -141,10 +155,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use file_storage::domain::audit::{AuditEntry, AuditOperation};
 use file_storage::domain::authz::TenantOnlyAuthorizer;
 use file_storage::domain::cleanup::{CleanupConfig, CleanupEngine};
 use file_storage::domain::error::DomainError;
-use file_storage::domain::multipart::{BindState, MultipartPart};
+use file_storage::domain::multipart::{BindState, MultipartPart, MultipartUploadState};
 use file_storage::domain::multipart_service::MultipartService;
 use file_storage::domain::policy::{PolicyScope, StoredPolicy};
 use file_storage::domain::ports::{
@@ -155,6 +170,7 @@ use file_storage::domain::service::{FileService, ServiceConfig};
 use file_storage::infra::backend::{
     BackendRegistry, InMemoryBackend, LocalFsBackend, StorageBackend,
 };
+use file_storage::infra::content::hash_mode::HashMode;
 use file_storage::infra::content::{hash, mime};
 use file_storage::infra::signed_url::Issuer;
 use file_storage::infra::storage::Store;
@@ -744,7 +760,14 @@ async fn f1_backend_initiation_failure_orphan_reclaimed_by_versionless_sweep() {
             file_id,
             "application/octet-stream",
             20,
-            Some(10),
+            // `None` (default part size), not a tiny literal like `10`: since
+            // P2 remediation 2.11 added the `DEFAULT_MIN_PART_SIZE..=MAX_PART_SIZE`
+            // range check on `preferred_part_size`, a sub-boundary value would
+            // be rejected by THAT validation before ever reaching this test's
+            // `FailingInitiateBackend` -- this test's own name and assertions
+            // are about the backend-initiation failure path specifically, not
+            // input validation.
+            None,
             false,
         )
         .await
@@ -1303,6 +1326,210 @@ async fn f2_stale_completer_converges_instead_of_stranding_after_owner_fencing_f
         completed_c.version_id, completed_a.version_id,
         "the replayed result must match the original completion"
     );
+}
+
+// =========================================================================
+// A stale completer's finalize must not be able to commit after cleanup has
+// already reclaimed its session. Sequential by construction (an
+// already-expired lease is handed straight to
+// `acquire_multipart_complete_lease`, no real sleep needed) -- see the
+// module doc's `f11_*` entry.
+// =========================================================================
+
+/// `Store::finalize_multipart_version`'s embedded finalize CAS used to be
+/// fenced only by `file_versions.status = 'pending'`, never by the
+/// multipart session's own state. If the abandoned-session sweep had
+/// already CASed the session `completing -> aborted` (deleting its part
+/// rows) by the time a stale completer's own finalize transaction ran, that
+/// transaction still committed -- the version becoming `available`
+/// underneath a session the system had already recorded as `aborted`. Fixed
+/// by locking the session row first, inside the SAME transaction, and
+/// rejecting with `Conflict` unless it is still `completing`.
+#[tokio::test]
+async fn f11_finalize_multipart_version_rejects_after_cleanup_aborts_completing_session() {
+    let (db, _pg_guard) = pg_db_or_skip!();
+    let store = Store::new(Arc::clone(&db));
+    let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let backends = BackendRegistry::new(vec![Arc::clone(&backend)], "mem").expect("registry");
+    let multipart_store: Arc<dyn MultipartStore> = Arc::new(store.clone());
+    let svc = make_file_service(store.clone(), backends.clone());
+
+    let tenant_id = Uuid::now_v7();
+    let ctx = make_ctx(tenant_id);
+    let file_id = svc
+        .create_file_bare(&ctx, new_file())
+        .await
+        .expect("create_file_bare");
+
+    let msvc = make_multipart_service(Arc::clone(&multipart_store), backends.clone(), 120);
+    let plan = msvc
+        .initiate_multipart_upload(
+            &ctx,
+            file_id,
+            "application/octet-stream",
+            10 * 1024 * 1024,
+            Some(5 * 1024 * 1024),
+            false, // auto_bind -- not exercised here, keep the scenario minimal
+        )
+        .await
+        .expect("initiate_multipart_upload (in-memory backend supports multipart_native)");
+    simulate_all_parts(&multipart_store, &backend, &plan, file_id).await;
+
+    let now = OffsetDateTime::now_utc();
+    // Acquire the completion lease with an ALREADY-expired `lease_until`:
+    // `acquire_complete_lease`'s CAS only looks at the row's CURRENT state
+    // (fresh `in_progress`, in this case) to decide whether to grant the
+    // lease -- it never validates the freshness of the value it is about to
+    // write. This deterministically produces the same "completing, lease
+    // already expired" row shape a real completer whose assembly outran its
+    // own lease would eventually reach, without a real sleep.
+    let acquired = store
+        .acquire_multipart_complete_lease(
+            plan.upload_id,
+            "stale-completer",
+            now - time::Duration::seconds(1),
+            now,
+        )
+        .await
+        .expect("acquire_multipart_complete_lease");
+    assert!(
+        acquired,
+        "a fresh in_progress session must accept the lease"
+    );
+
+    // Also backdate the session's own `expires_at`: the real sweep only ever
+    // *selects* a `completing` session for `abort_expired_completing` once
+    // BOTH its `expires_at` and its `lease_until` have passed
+    // (`MultipartRepo::list_expired`) -- matching that precondition here
+    // (rather than relying solely on the expired lease) keeps this scenario
+    // indistinguishable from the real sweep's, not just from the narrower
+    // write-time CAS `abort_expired_completing` itself checks.
+    backdate_multipart_expires_at(&db, plan.upload_id, now - time::Duration::seconds(1)).await;
+
+    // Cleanup's own abort CAS (`Store::abort_multipart_upload`): the
+    // `in_progress -> aborted` transition misses (state is now `completing`),
+    // so it falls to `abort_expired_completing`, which matches because the
+    // lease set above is already in the past -- exactly
+    // `CleanupEngine::abort_expired_multipart_session`'s real path.
+    let abort_audit = AuditEntry::success(
+        tenant_id,
+        "system",
+        Uuid::nil(),
+        Some(file_id),
+        AuditOperation::MultipartAbort,
+        serde_json::json!({"reason": "expired_multipart_session_cleanup"}),
+    );
+    let aborted = store
+        .abort_multipart_upload(plan.upload_id, abort_audit)
+        .await
+        .expect("abort_multipart_upload");
+    assert!(
+        aborted,
+        "cleanup's abort must win the CAS while the lease is expired"
+    );
+    let session_before = store
+        .get_multipart_upload(plan.upload_id)
+        .await
+        .expect("get_multipart_upload")
+        .expect("session row must still exist");
+    assert_eq!(session_before.state, MultipartUploadState::Aborted);
+
+    // The stale completer's own finalize, arriving AFTER cleanup already
+    // won -- the exact race this fix closes.
+    let finalize_audit = AuditEntry::success(
+        tenant_id,
+        "user",
+        ctx.subject_id(),
+        Some(file_id),
+        AuditOperation::FinalizeVersion,
+        serde_json::json!({"version_id": plan.version_id, "upload_id": plan.upload_id}),
+    );
+    let session_audit = AuditEntry::success(
+        tenant_id,
+        "user",
+        ctx.subject_id(),
+        Some(file_id),
+        AuditOperation::MultipartComplete,
+        serde_json::json!({"upload_id": plan.upload_id}),
+    );
+    let err = store
+        .finalize_multipart_version(
+            file_id,
+            None,
+            Some("application/octet-stream".to_owned()),
+            finalize_audit,
+            None,
+            MultipartFinishSnapshot {
+                upload_id: plan.upload_id,
+                version_id: plan.version_id,
+                size: 10 * 1024 * 1024,
+                content_hash: vec![0u8; 32],
+                hash_mode: HashMode::WholeSha256,
+                part_count: None,
+                session_audit,
+            },
+        )
+        .await
+        .expect_err("finalize must be rejected once cleanup has aborted the session");
+    assert!(
+        matches!(err, DomainError::Conflict { .. }),
+        "expected Conflict once the session is aborted, got {err:?}"
+    );
+
+    let version = store
+        .get_version(file_id, plan.version_id)
+        .await
+        .expect("get_version")
+        .expect("version row must still exist");
+    assert_eq!(
+        version.status,
+        VersionStatus::Pending,
+        "the version must stay pending -- the finalize must have rolled back entirely"
+    );
+
+    let file = store
+        .require_file(&AccessScope::allow_all(), file_id)
+        .await
+        .expect("require_file");
+    assert!(
+        file.content_id.is_none(),
+        "content_id must remain unbound -- the rejected finalize must not have auto-bound"
+    );
+
+    let session_after = store
+        .get_multipart_upload(plan.upload_id)
+        .await
+        .expect("get_multipart_upload")
+        .expect("session row must still exist");
+    assert_eq!(
+        session_after.state,
+        MultipartUploadState::Aborted,
+        "the session must remain aborted -- the rejected finalize must not have resurrected it"
+    );
+
+    // Clean up: every test in this file shares ONE PostgreSQL database (see
+    // the module doc), and several sibling tests sweep with
+    // `orphan_grace_secs: 0` -- an aborted-but-still-`pending` version like
+    // this one, left behind, would be picked up as "abandoned" by THEIR
+    // sweep calls and inflate their own reclaim-count assertions. Deleting
+    // the file cascades to its version and this session (both FK
+    // `ON DELETE CASCADE`), leaving nothing for a later test to trip over.
+    store
+        .delete_file_collecting_versions(
+            &AccessScope::allow_all(),
+            file_id,
+            AuditEntry::success(
+                tenant_id,
+                "system",
+                Uuid::nil(),
+                Some(file_id),
+                AuditOperation::DeleteFile,
+                serde_json::json!({"reason": "test cleanup"}),
+            ),
+            None,
+        )
+        .await
+        .expect("test cleanup: delete_file_collecting_versions");
 }
 
 /// Directly flip `multipart_uploads.expires_at` on a row -- no public API

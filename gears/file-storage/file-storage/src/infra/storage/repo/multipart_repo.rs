@@ -4,6 +4,7 @@
 //! all queries use `AccessScope::allow_all()`. The tenant boundary is
 //! enforced through the parent `files` row before a session is created.
 
+use sea_orm::sea_query::LockType;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set};
 use time::OffsetDateTime;
 use toolkit_db::secure::{
@@ -84,6 +85,40 @@ impl MultipartRepo {
             .await
             .map_err(db_err)?;
         Ok(())
+    }
+
+    /// Lock a `multipart_uploads` row with `SELECT ... FOR UPDATE` and
+    /// return its current `state`, or `None` if no such session exists.
+    ///
+    /// Call only as the transaction's FIRST statement -- the same discipline
+    /// `FileRepo::lock_for_update` documents for `files`
+    /// (parent-before-children ordering, no I/O while held).
+    /// `Store::finalize_multipart_version` takes this lock before touching
+    /// `file_versions`/`files` so it can never commit its embedded version
+    /// finalize/bind against a session the abandoned-session sweep has
+    /// concurrently `CAS`ed out of `completing` (`Self::abort_expired_completing`
+    /// via `Store::abort_multipart_upload`, which locks only this same table)
+    /// -- one of the two transactions blocks on this row until the other
+    /// commits, instead of both proceeding from a `state` read that is
+    /// already stale by the time either one acts on it.
+    ///
+    /// On `SQLite`, `.lock(..)` renders nothing -- correctness there comes
+    /// from `SQLite`'s single-writer model instead, same caveat as
+    /// `FileRepo::lock_for_update`.
+    pub async fn lock_session_state<C: DBRunner>(
+        &self,
+        conn: &C,
+        upload_id: Uuid,
+    ) -> Result<Option<String>, DomainError> {
+        let found = UploadEntity::find()
+            .filter(UploadColumn::UploadId.eq(upload_id))
+            .lock(LockType::Update)
+            .secure()
+            .scope_with(&AccessScope::allow_all())
+            .one(conn)
+            .await
+            .map_err(db_err)?;
+        Ok(found.map(|m| m.state))
     }
 
     /// Fetch a multipart upload session by `upload_id`.

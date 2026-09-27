@@ -844,6 +844,158 @@ async fn abort_multipart_upload_deletes_part_rows_and_pending_version() {
     assert_eq!(session_after.state, MultipartUploadState::Aborted);
 }
 
+/// SQLite counterpart of `pg_concurrency_test.rs`'s
+/// `f11_finalize_multipart_version_rejects_after_cleanup_aborts_completing_session`:
+/// no real concurrency is needed for this scenario, only that the session is
+/// already `aborted` (cleanup's own `abort_expired_completing` CAS) by the
+/// time `finalize_multipart_version` runs, so it is pinned here too, on the
+/// backend these store-level tests otherwise use.
+///
+/// `Store::finalize_multipart_version`'s embedded finalize CAS used to be
+/// fenced only by `file_versions.status = 'pending'`, never by the session's
+/// own state, so a stale completer could still finalize a version for a
+/// session cleanup had already reclaimed. Fixed by locking the session row
+/// first and rejecting with `Conflict` unless it is still `completing`.
+#[tokio::test]
+async fn finalize_multipart_version_rejects_after_cleanup_aborts_completing_session() {
+    use file_storage::domain::audit::{AuditEntry, AuditOperation};
+    use file_storage::domain::ports::MultipartFinishSnapshot;
+    use file_storage::infra::content::hash_mode::HashMode;
+    use file_storage_sdk::VersionStatus;
+    use toolkit_security::AccessScope;
+
+    let (svc, msvc, _dp, store) = build_service_with_store().await;
+    let tenant_id = Uuid::now_v7();
+    let ctx = ctx(tenant_id);
+
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+    let plan = msvc
+        .initiate_multipart_upload(
+            &ctx,
+            ticket.file_id,
+            "application/octet-stream",
+            10 * 1024 * 1024,
+            Some(5 * 1024 * 1024),
+            false,
+        )
+        .await
+        .unwrap();
+
+    let now = time::OffsetDateTime::now_utc();
+    // Already-expired `lease_until`: `acquire_complete_lease`'s CAS only
+    // looks at the row's CURRENT state (fresh `in_progress`) to grant the
+    // lease, never at the freshness of the value it is about to write.
+    let acquired = store
+        .acquire_multipart_complete_lease(
+            plan.upload_id,
+            "stale-completer",
+            now - time::Duration::seconds(1),
+            now,
+        )
+        .await
+        .unwrap();
+    assert!(
+        acquired,
+        "a fresh in_progress session must accept the lease"
+    );
+
+    // Cleanup's own abort CAS: `in_progress -> aborted` misses (state is now
+    // `completing`), so it falls to `abort_expired_completing`, which
+    // matches because the lease set above is already in the past.
+    let abort_audit = AuditEntry::success(
+        tenant_id,
+        "system",
+        Uuid::nil(),
+        Some(ticket.file_id),
+        AuditOperation::MultipartAbort,
+        serde_json::json!({"reason": "expired_multipart_session_cleanup"}),
+    );
+    let aborted = store
+        .abort_multipart_upload(plan.upload_id, abort_audit)
+        .await
+        .unwrap();
+    assert!(
+        aborted,
+        "cleanup's abort must win the CAS while the lease is expired"
+    );
+
+    // The stale completer's own finalize, arriving AFTER cleanup already
+    // won -- the exact race this fix closes.
+    let finalize_audit = AuditEntry::success(
+        tenant_id,
+        "user",
+        ctx.subject_id(),
+        Some(ticket.file_id),
+        AuditOperation::FinalizeVersion,
+        serde_json::json!({"version_id": plan.version_id, "upload_id": plan.upload_id}),
+    );
+    let session_audit = AuditEntry::success(
+        tenant_id,
+        "user",
+        ctx.subject_id(),
+        Some(ticket.file_id),
+        AuditOperation::MultipartComplete,
+        serde_json::json!({"upload_id": plan.upload_id}),
+    );
+    let err = store
+        .finalize_multipart_version(
+            ticket.file_id,
+            None,
+            Some("application/octet-stream".to_owned()),
+            finalize_audit,
+            None,
+            MultipartFinishSnapshot {
+                upload_id: plan.upload_id,
+                version_id: plan.version_id,
+                size: 10 * 1024 * 1024,
+                content_hash: vec![0u8; 32],
+                hash_mode: HashMode::WholeSha256,
+                part_count: None,
+                session_audit,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, DomainError::Conflict { .. }),
+        "expected Conflict once the session is aborted, got {err:?}"
+    );
+
+    let version = store
+        .get_version(ticket.file_id, plan.version_id)
+        .await
+        .unwrap()
+        .expect("version row must still exist");
+    assert_eq!(
+        version.status,
+        VersionStatus::Pending,
+        "the version must stay pending -- the finalize must have rolled back entirely"
+    );
+
+    let file = store
+        .require_file(&AccessScope::allow_all(), ticket.file_id)
+        .await
+        .unwrap();
+    assert!(
+        file.content_id.is_none(),
+        "content_id must remain unbound -- the rejected finalize must not have auto-bound"
+    );
+
+    let session_after = store
+        .get_multipart_upload(plan.upload_id)
+        .await
+        .unwrap()
+        .expect("session row must still exist");
+    assert_eq!(
+        session_after.state,
+        MultipartUploadState::Aborted,
+        "the session must remain aborted -- the rejected finalize must not have resurrected it"
+    );
+}
+
 // -- 1c. multipart-complete MIME validation (P2 remediation item 1.10) -------
 
 /// Minimal JPEG signature (`infer` recognizes `image/jpeg` from these leading
@@ -1842,6 +1994,125 @@ async fn initiate_multipart_rejects_absurd_preferred_part_size() {
     assert!(
         matches!(err, DomainError::Validation { .. }),
         "expected Validation for an absurd preferred_part_size, got {err:?}"
+    );
+}
+
+/// The upper boundary itself: `preferred_part_size == MAX_PART_SIZE` is
+/// inside the inclusive range and must be accepted -- `u64::MAX` above is far
+/// enough from the real boundary that an off-by-one on the `..=` check
+/// (e.g. accidentally narrowing it to `..`) would not be caught by it.
+#[tokio::test]
+async fn initiate_multipart_accepts_preferred_part_size_at_max_boundary() {
+    use file_storage::domain::multipart::MAX_PART_SIZE;
+
+    let (svc, msvc, _dp) = build_service().await;
+    let ctx = ctx(Uuid::now_v7());
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+
+    let plan = msvc
+        .initiate_multipart_upload(
+            &ctx,
+            ticket.file_id,
+            "application/octet-stream",
+            1024,
+            Some(MAX_PART_SIZE),
+            false,
+        )
+        .await
+        .unwrap();
+    assert!(!plan.upload_id.is_nil());
+}
+
+/// One byte past the upper boundary must still be rejected -- pins the
+/// inclusive `..=MAX_PART_SIZE` upper edge precisely (as opposed to
+/// `initiate_multipart_rejects_absurd_preferred_part_size`'s `u64::MAX`,
+/// which stays rejected even if the check were accidentally widened to
+/// admit a few bytes past `MAX_PART_SIZE`).
+#[tokio::test]
+async fn initiate_multipart_rejects_preferred_part_size_above_max_boundary() {
+    use file_storage::domain::multipart::MAX_PART_SIZE;
+
+    let (svc, msvc, _dp) = build_service().await;
+    let ctx = ctx(Uuid::now_v7());
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+
+    let err = msvc
+        .initiate_multipart_upload(
+            &ctx,
+            ticket.file_id,
+            "application/octet-stream",
+            1024,
+            Some(MAX_PART_SIZE + 1),
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, DomainError::Validation { .. }),
+        "expected Validation for preferred_part_size = MAX_PART_SIZE + 1, got {err:?}"
+    );
+}
+
+/// The lower boundary: `preferred_part_size == DEFAULT_MIN_PART_SIZE` is
+/// inside the inclusive range and must be accepted.
+#[tokio::test]
+async fn initiate_multipart_accepts_preferred_part_size_at_min_boundary() {
+    use file_storage::domain::multipart::DEFAULT_MIN_PART_SIZE;
+
+    let (svc, msvc, _dp) = build_service().await;
+    let ctx = ctx(Uuid::now_v7());
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+
+    let plan = msvc
+        .initiate_multipart_upload(
+            &ctx,
+            ticket.file_id,
+            "application/octet-stream",
+            1024,
+            Some(DEFAULT_MIN_PART_SIZE),
+            false,
+        )
+        .await
+        .unwrap();
+    assert!(!plan.upload_id.is_nil());
+}
+
+/// One byte below the lower boundary must still be rejected -- pins the
+/// inclusive `DEFAULT_MIN_PART_SIZE..=` lower edge precisely.
+#[tokio::test]
+async fn initiate_multipart_rejects_preferred_part_size_below_min_boundary() {
+    use file_storage::domain::multipart::DEFAULT_MIN_PART_SIZE;
+
+    let (svc, msvc, _dp) = build_service().await;
+    let ctx = ctx(Uuid::now_v7());
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+
+    let err = msvc
+        .initiate_multipart_upload(
+            &ctx,
+            ticket.file_id,
+            "application/octet-stream",
+            1024,
+            Some(DEFAULT_MIN_PART_SIZE - 1),
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, DomainError::Validation { .. }),
+        "expected Validation for preferred_part_size = DEFAULT_MIN_PART_SIZE - 1, got {err:?}"
     );
 }
 

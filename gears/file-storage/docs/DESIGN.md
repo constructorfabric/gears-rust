@@ -115,7 +115,7 @@ See [PRD.md](./PRD.md) §1 "Overview" and §1.3 "Goals":
 | `cpt-cf-file-storage-fr-upload-file`                   | Control `POST /files` (authz) → signed PUT URL to the sidecar; sidecar streams bytes (incremental SHA-256, no in-stream MIME check) to the backend object `/{file_id}/{version_id}`, then calls the token-authenticated **finalize** callback (`pending → available`, control-plane MIME check on read-back); with `bind: "manual"` the client then separately **binds** the version (`content_id`) under `If-Match` — the default `bind: "auto"` binds inline in finalize (see `cpt-cf-file-storage-fr-auto-bind`) |
 | `cpt-cf-file-storage-fr-download-file`                 | Control presign (authz) → signed GET URL to the sidecar; the sidecar streams the current `content_id` blob from its `backend-abstraction` driver                                                                                 |
 | `cpt-cf-file-storage-fr-delete-file`                   | Control `DELETE /files/{id}` (requires `If-Match`): **metadata-row-first** — the `files` row and **all** its version rows are deleted in a committed transaction and `204` is returned, *then* the sidecar deletes the backend objects best-effort; a failed backend delete leaves only unreferenced objects swept by the P2 cleanup engine (never a row pointing at missing bytes). Idempotent: re-deleting returns `404`. Sequence in §3.6 |
-| `cpt-cf-file-storage-fr-get-metadata`                  | Control `GET /files/{id}` (metadata JSON, supports `If-None-Match` → `304`) reads `files` + `files_custom_metadata` via `metadata-service` — no content on this surface; there is no separate `HEAD` route on either plane (§3.3) |
+| `cpt-cf-file-storage-fr-get-metadata`                  | Control `GET /files/{id}` (metadata JSON, supports `If-None-Match` → `304`) reads `files` + `files_custom_metadata` via `metadata-service` — no content on this surface; the sidecar has its own `HEAD` route on the signed download URL (same auth/`404` contract as `GET`, no body — api.md); there is no separate `HEAD` route on the control plane (§3.3) |
 | `cpt-cf-file-storage-fr-list-files`                    | `GET /files` with mandatory `owner_kind` filter; tenant-scoped DB query through `metadata-service`                                                                       |
 | `cpt-cf-file-storage-fr-content-type-validation`       | Validated on the **control plane, post-write**, not in-stream at the sidecar: `finalize`/`complete_multipart` read back a bounded MIME-sniff prefix (`infra::content::mime`, `MIME_SNIFF_PREFIX_BYTES` ≈ 8 KiB) and reject a declared/actual mismatch with `400`, before the version is ever marked `available` |
 | `cpt-cf-file-storage-fr-file-ownership`                | Columns `tenant_id`, `owner_kind`, `owner_id` on `files`; immutable except via P2 ownership transfer                                                                     |
@@ -956,11 +956,13 @@ schema, status codes — is documented in **[api.md](./api.md)**. The summary:
   /files/{id}/versions/{version_id}`), `GET /files`, `GET /files/{id}/versions`, `GET /storages`,
   `GET /storages/{storage_id}`, plus the P2 multipart (`POST .../multipart`, `.../complete`, `GET .../multipart/{id}`,
   `DELETE .../multipart/{id}`), policy (`GET`/`PUT /policy`, `GET /policy/effective`), retention-rule, backend
-  `migrate`, and ownership `transfer` endpoints. No anonymous surface, and **no `HEAD` route on either plane**
-  (see api.md)
-- **Sidecar content surface**: `PUT`/`GET` (plus multipart-part `PUT`) addressed **only** by a control-issued
-  signed URL on the sidecar's own domain. There is no sidecar `HEAD` route and no `If-Match`/`If-None-Match`/`304`
-  support on this surface (§4.1) — conditional-GET semantics live on the control plane's `GET /files/{id}` instead.
+  `migrate`, and ownership `transfer` endpoints. No anonymous surface, and **no `HEAD` route on the control
+  plane** (see api.md)
+- **Sidecar content surface**: `PUT`/`GET`/`HEAD` (plus multipart-part `PUT`) addressed **only** by a control-issued
+  signed URL on the sidecar's own domain. `HEAD` shares the same signed download URL as `GET` and returns the same
+  `Accept-Ranges`/`Content-Type`/`ETag` headers plus an explicit `Content-Length`, with no body (§4.1, api.md); no
+  `If-Match`/`If-None-Match`/`304` support on this surface — conditional-GET semantics live on the control plane's
+  `GET /files/{id}` instead.
   Raw body — **no `multipart/form-data`**; the declared mime travels in the pre-register context, not a form part
 - **Sidecar contract documentation**: unlike control routes (auto-described via OperationBuilder → generated
   OpenAPI), the sidecar's `PUT`/`GET` surface is **outside** the generated OpenAPI flow. Clients do not call
@@ -1570,9 +1572,10 @@ Any other backend read failure remains `500`.
 **`Accept-Ranges: bytes` advertising.** Every `GET` response from the sidecar (`200`/`206`) includes
 `Accept-Ranges: bytes`. This is independent of whether the request had a `Range` header — it advertises that the
 **endpoint** supports range, so a media player loading the file via a `GET` without `Range` knows it can issue
-follow-up range requests for seeks. The sidecar has **no `HEAD` route** — there is no signed-URL equivalent of a
-range-aware `HEAD`; a caller that needs the size ahead of time reads it from the control plane's `GET /files/{id}`
-metadata response instead (§3.3; there is no `HEAD` route on either plane).
+follow-up range requests for seeks. The sidecar's `HEAD` route (same signed download URL as `GET`) advertises the
+same `Accept-Ranges: bytes`, alongside `Content-Type`/`ETag` and an explicit `Content-Length`, with no body — a
+caller that needs the size ahead of time can issue `HEAD` instead, or read it from the control plane's
+`GET /files/{id}` metadata response (§3.3; there is no separate `HEAD` route on the control plane).
 
 **No conditional headers on the sidecar's content path.** The sidecar's `GET`/`PUT` process only `Range` (this
 section) and the token's own `exp` — neither `If-Match` nor `If-None-Match` is read or enforced there. Conditional

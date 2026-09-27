@@ -187,6 +187,15 @@ CREATE TABLE file_storage.file_versions (
     backend_id       text         NOT NULL,
     backend_path     text         NOT NULL,
 
+    -- Set the moment this version's OWN finalize call wins the bind-on-finalize
+    -- CAS (single-part `bind: "auto"` finalize, or multipart `complete` on an
+    -- `auto_bind` session), in the SAME transaction as that CAS. The
+    -- idempotent-retry fast path reads this back instead of re-deriving the
+    -- bind outcome from a live read of files.content_id, which can have moved
+    -- on to a different version by the time of the retry. Existing rows
+    -- default to false (shipped, m20260924_000001_upload_flow_redesign).
+    bound_on_finalize boolean      NOT NULL  DEFAULT false,
+
     created_at       timestamptz  NOT NULL  DEFAULT now(),
 
     PRIMARY KEY (file_id, version_id)
@@ -604,6 +613,13 @@ CREATE INDEX retention_rules_file_scope_idx
 -- files_owner_listing_v2_idx above (shipped, m20260924_000001_upload_flow_redesign).
 CREATE INDEX retention_rules_tenant_listing_idx
     ON file_storage.retention_rules (tenant_id, created_at DESC, rule_id DESC);
+
+-- One-time cleanup (shipped, m20260924_000001_upload_flow_redesign): DELETE
+-- any scope = 'file' rule whose scope_target_id no longer matches a
+-- files.file_id row. retention_rules has no FK from scope_target_id to
+-- files.file_id (scope = 'file' rows are matched by id alone), so a files
+-- row deleted before this migration ran could leave its rule dangling with
+-- nothing left to reference.
 
 
 -- =============================================================================
