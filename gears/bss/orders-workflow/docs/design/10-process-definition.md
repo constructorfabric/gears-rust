@@ -1031,7 +1031,7 @@ The approval stage, the `do` list of `process.approval`:
 - afterReflect:
     switch:
       - approved: { when: '${ $context.reflected == "approved" }', then: toFulfillment }
-      - rejected: { when: '${ $context.reflected == "rejected" }', then: terminateRejected }
+      - rejected: { when: '${ $context.reflected == "rejected" }', then: beforeReject }
       - refused:  { when: '${ $context.reflected == "refused" }',  then: reflectionTask }
       - held:     { when: '${ $context.reflected == "held" }',     then: enterHeldReflect }   # Lifecycle not-admissible on an on_hold order (03 §4.4): wait for the resume, then the next round
       - moved:    { when: '${ $context.reflected == "moved" }',    then: enterHeldReflect }   # Lifecycle version-conflict, or not-admissible on a terminal order (03 §4.4): the lifecycle arm consumes OrderAmended or the terminal event
@@ -1055,6 +1055,16 @@ The approval stage, the `do` list of `process.approval`:
 - reflectionTask:                       # fragment (c): an order-scope task whose retry re-enters reflectVerdict
     set: { failureScope: order, failureSubjects: '${ [ { subjectRef: $context.correlationId, reason: "approval-reflection-refused", cause: "permanent-refusal" } ] }', sourceStep: reflect-verdict, sourceAttempt: '${ $context.reflectAttempt }', forceTask: true, taskReturnStage: approval, taskReturnLoop: reflectVerdict, nextStage: failure, stageLoop: null }
     then: exit
+- beforeReject:                         # an Orders suspension a Lifecycle resume overtook is closed first, so terminate-instance runs from started (D-175, D-183)
+    switch:
+      - heldPoll: { when: '${ $context.suspensionRef != null }', then: pollBeforeReject }
+      - clear:    { then: terminateRejected }
+- pollBeforeReject:                     # protected (08): pollHeld's call under the next resumePollRound; the order is rejected at its own version (Lifecycle row 10, reached only from pending_approval), so the read shows the hold over and the call closes the suspension, suspended → started (08 inst-ar-poll, D-183); nothing is deferred before begin-fulfillment, so failedTaskRefs is empty
+    timeout: step
+    try:
+      - call: { step: apply-resume }    # body: ref + trigger: poll, suspensionRef, round: $context.resumePollRound; output: resumeOutcome = resumed-by-read, due, failedTaskRefs[] = [], nextRound
+    catch: *transient
+    export: { as: '${ $context + { resumeOutcome: .resumeOutcome, resumePollRound: .nextRound, heldTicks: 0, suspensionRef: (if .resumeOutcome == "resumed-by-read" then null else $context.suspensionRef end) } }' }   # no switch follows: still-held cannot arise on a rejected order, as held cannot at the unwind's reportOutcome; were it answered, terminate-instance would refuse fence-not-claimed and fault the invocation (D-114, D-175)
 - terminateRejected:                    # protected (01); body: ref + terminalOutcome: aborted, terminationKind: rejected — every terminationKind but completed ends the instance aborted (01 §3.3, §3.7, D-166)
     timeout: step
     try:
@@ -1631,7 +1641,17 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
 - onReport:
     switch:
       - held:     { when: '${ $context.lifecycleCall == "held" }', then: enterHeldReport }   # a completed acknowledgement of an on_hold order (06 §3.3): resume first
-      - reported: { then: terminateCompleted }
+      - reported: { then: beforeComplete }
+- beforeComplete:                       # as beforeReject: an overtaken Orders suspension is closed before terminate-instance (D-175, D-183)
+    switch:
+      - heldPoll: { when: '${ $context.suspensionRef != null }', then: pollBeforeComplete }
+      - clear:    { then: terminateCompleted }
+- pollBeforeComplete:                   # protected (08): pollHeld's call under the next resumePollRound; the order is completed at its own version (Lifecycle row 13, reached only from in_fulfillment), so the call closes the suspension, suspended → started (08 inst-ar-poll, D-183); every line is activated, and a deferred failure stays on a task that is not, so failedTaskRefs is empty
+    timeout: step
+    try:
+      - call: { step: apply-resume }    # body: ref + trigger: poll, suspensionRef, round: $context.resumePollRound; output: resumeOutcome = resumed-by-read, due, failedTaskRefs[] = [], nextRound
+    catch: *transient
+    export: { as: '${ $context + { resumeOutcome: .resumeOutcome, resumePollRound: .nextRound, heldTicks: 0, suspensionRef: (if .resumeOutcome == "resumed-by-read" then null else $context.suspensionRef end) } }' }   # no switch follows, as at pollBeforeReject (D-183)
 - terminateCompleted:                   # protected (01); body: ref + terminalOutcome: completed, terminationKind: completed
     timeout: step
     try:
@@ -2476,7 +2496,21 @@ before it acts on an event too. If Lifecycle holds the order `on_hold` again, it
 `still-held`. The resume stage then returns to the resume wait, with `suspensionRef` kept and the
 poll still running, or to the stage the arm interrupted. The suspension stays open for the later
 hold. `apply-hold` applies the same read to a `resume_ahead` row: it consumes the row, and it
-still records the suspension when Lifecycle holds the order. **No failure route before
+still records the suspension when Lifecycle holds the order. **A suspension is closed before
+`terminate-instance`** (decision D-183). A Lifecycle resume can overtake an open Orders
+suspension: the resume stage returned with `suspensionRef` kept (`stillHeldBack`), or the tick of
+a held wait won the race against the resume's `listen`. The next `reflect-verdict` or completion
+report then reaches Lifecycle on an order no longer held and settles `rejected` or `completed`
+while Orders still records `suspended`, and `terminate-instance` refuses from that phase (D-175).
+So whenever `suspensionRef` is set, `beforeReject` and `beforeComplete` route through
+`pollBeforeReject` and `pollBeforeComplete`, which make `pollHeld`'s call, `apply-resume`
+`trigger: poll` under the next `resumePollRound`. The order is then `rejected` or `completed`
+at its own version, states Lifecycle reaches only from `pending_approval` and `in_fulfillment`, so
+the read shows the hold over. The call closes the suspension `resumed-by-read` and moves the phase
+`suspended → started`, the edge `terminate-instance` then takes. `still-held` cannot arise there,
+so no switch follows, as none follows the unwind's `reportOutcome`; were it answered, the refusal
+faults the invocation (D-114). `terminateAborted` needs no poll, because it follows the fence,
+which closes the suspension and moves the phase to `compensating`. **No failure route before
 begin-fulfillment** (decision D-143). The resume wait is entered only from the approval stage,
 where no dispatch has run and nothing is deferred, so its poll has no failure route. The resume
 stage takes its failure route only when the interrupted stage is past the eligibility wait. The
@@ -2657,7 +2691,7 @@ any of them:
 
 | Stage | Protected operations, in order | May be interleaved with (composable) |
 |-------|-------------------------------|--------------------------------------|
-| Admission | `admit-trigger` (`role: start`) **<** `start-instance`; on every arm that consumes a Lifecycle trigger, `admit-trigger` (`role: listen`) **<** the consuming operation (`evaluate-payment-auth-eligibility`, `apply-hold`, `apply-resume`, `terminate-on-terminal-event`, `run-cancellation-fence` on supersede); `apply-resume` with `trigger: poll` consumes no trigger and follows no admission — the Lifecycle order read inside it is its guard (D-130), wherever it is called from (the resume wait, or `pollHeld` in another wait, D-133) | — |
+| Admission | `admit-trigger` (`role: start`) **<** `start-instance`; on every arm that consumes a Lifecycle trigger, `admit-trigger` (`role: listen`) **<** the consuming operation (`evaluate-payment-auth-eligibility`, `apply-hold`, `apply-resume`, `terminate-on-terminal-event`, `run-cancellation-fence` on supersede); `apply-resume` with `trigger: poll` consumes no trigger and follows no admission — the Lifecycle order read inside it is its guard (D-130), wherever it is called from (the resume wait, `pollHeld` in another wait, D-133, or before `terminate-instance`, D-183) | — |
 | Verdict | `obtain-verdict` **<** `reflect-verdict`; `record-decision` **<** `reflect-verdict` on the decision path. The `p1` composables on their paths (decision D-135): on every walk where `verdict = unobtainable`, `park` **<** a park loop whose tick calls `arm-park-escalation`, with a walk from it to `raise-overdue-escalation` (`escalationKind: park`), and no `reflect-verdict`, `open-gates` or `nextStage: fulfillment` until a later `obtain-verdict` answers `required` or `not-required` (ADR-0007, `03 §4.5` items 2 and 6); on every walk where `reflected = pending_approval`, `open-gates` **<** `record-decision`, and the wait between them is a competing `fork` carrying the decision `listen` and a tick branch whose route calls `escalate-gate` `mode: fire` and then `mode: probe`, with a walk from a probe to `raise-overdue-escalation` (`escalationKind: approval-outage`) (`fr-owf-approval-request`, `fr-owf-approval-escalation`, `03 §4.5` items 1, 4 and 5) | `open-gates`, `escalate-gate`, `arm-park-escalation`, `park`, `unpark` (beyond those paths) |
 | Plan | `evaluate-payment-auth-eligibility` **<** `construct-and-freeze-plan` **<** `begin-fulfillment` | `evaluate-activation-eligibility` |
 | Waves | `begin-fulfillment` **<** `dispatch-wave1-create` **<** `re-check-pre-activation` **<** `report-spawn-signal` **<** `dispatch-wave2-activate`, and every walk that reaches either dispatch operation carries the pinned `beginResult = in-fulfillment` (decision D-143): the failure stage's return to the barrier and the resume stage's failure route are decided on it or on the interrupted stage, never on a returned list; every walk to `dispatch-wave2-activate` passes an `evaluate-activation-eligibility` answer whose pinned `released` is `true`, and the pinned `spawned = true` of a sent spawn signal, before it — the ADR-0004 conjunction: `released` is true only once database time has reached `expected_fulfillment_at` and every create is confirmed (`04 §3.6` `inst-ae-if-conjunction-false`), so the `waitExpected` re-check loop is where a walk waits while `due` is false, not a separate order constraint, and the run-time guard is `05 §3.6` `inst-pi-wave2-guard` (`activation-precondition-unmet`) (decision D-144); `evaluate-activation-eligibility` stays `composable` everywhere else | `evaluate-activation-eligibility` (beyond the conjunction), `reconcile-intent`, `reread-draft-liveness`, `rebuild-wave1` |
@@ -2877,7 +2911,8 @@ the re-check loop, (ii) is bounded by the retry budget, (iii) is settled as one 
 carrying `lineRefs[]`, (iv) is the event-retention ask of §4.4 (D-124): until it is answered an
 event delivered between listens can be lost, and only a lost resume is recovered — in the
 approval stage's resume wait by the stopgap poll of D-130, and in every other wait that holds a
-recorded suspension by the same poll on its tick (D-133); (v) is satisfied by the re-check loop,
+recorded suspension by the same poll on its tick (D-133), and the same poll closes a suspension a
+resume overtook before `terminate-instance` after a rejection or a completion (D-183); (v) is satisfied by the re-check loop,
 which needs no Function, and asks only whether a remainder could be armed directly, which is (i);
 and (vi) is assumed: every retry-only `catch` of §3.6 relies on it, and the CI test cannot observe
 it, so the plugin's answer is a readiness item (open question Q-11: Q-11 carries the six

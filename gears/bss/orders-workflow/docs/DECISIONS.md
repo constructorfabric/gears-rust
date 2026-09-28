@@ -3649,6 +3649,11 @@ resume Lifecycle has overtaken closes nothing (D-141). The resume wait's poll ha
 route, because the wait precedes `begin-fulfillment` and nothing is deferred there
 (`pollResumeFailure` is removed, D-143).
 
+**Amended by D-183 (2026-09-28)**: the poll no longer answers `still-held` on every terminal order.
+A `rejected` or `completed` order at the instance's version is not held, and the poll closes its
+open suspension. The definition also calls the poll once before `terminate-instance` after a
+rejection or a completion while it holds a `suspensionRef`.
+
 **Amended by D-150 (2026-09-26)**: entering the resume wait no longer resets `resumePollRound`; only `applyHold` resets it, for a new `suspensionRef`.
 
 ### D-131 (H) The references that cross the engine are a closed six-type vocabulary; cardinality, counters and the resource tenant are the stated residual
@@ -5231,6 +5236,11 @@ Lifecycle does not hold the order. The recorded phase is then `started` unless a
 suspension is still open because the resume that closed it at Lifecycle has not yet been
 consumed. That residual is left to a follow-up review and is not routed here; until then such a call faults the invocation to `invocation-dead`.
 
+**Amended by D-183 (2026-09-28)**: the residual is routed. Before `terminateRejected` and
+`terminateCompleted` the definition closes such a suspension through `apply-resume`
+`trigger: poll`, which now treats a `rejected` or `completed` order as no longer held, so
+`terminate-instance` runs from `started`.
+
 **Propagated**: `design/01-foundation.md` §3.3 (`terminate-instance`), §3.7 (the phase table's
 note). Related: D-82, D-114, D-166.
 
@@ -5397,6 +5407,53 @@ applies it.
 
 **Propagated**: `design/06-saga-and-compensation.md` §3.7; `DESIGN.md` §3.7. Related: D-84,
 D-106.
+
+### D-183 (H) A suspension a Lifecycle resume overtook is closed by the poll before `terminate-instance`
+
+**Accepted (2026-09-28).** *(amends D-130's poll rule in `08` `inst-ar-poll`; closes the residual D-175 left open)*
+
+**Decision**: before `terminateRejected` and before `terminateCompleted`, the definition calls
+`apply-resume` with `trigger: poll` under its next `resumePollRound` whenever it holds a
+`suspensionRef` (`beforeReject` → `pollBeforeReject`, `beforeComplete` → `pollBeforeComplete`,
+`10 §3.6` (a), (b)). The call is `pollHeld`'s, with the same body, key family and export. The poll
+now treats a `rejected` or `completed` order at the instance's version as no longer held. It
+closes the open suspension `resumed-by-read`, clears `owf_process_instance.suspended` and moves
+the phase `suspended → started`. `terminate-instance` then takes its permitted
+`started → terminated` edge. `on_hold`, a newer version and the other terminal states
+(`cancelled`, `expired`, `fulfillment_failed`) still answer `still-held`, which leaves them to the
+lifecycle arm as before. No switch follows the call. `still-held` cannot arise there, and were it
+answered, `terminate-instance` refuses `fence-not-claimed` and the invocation faults
+(D-114, D-175). `failedTaskRefs[]` is empty at both calls: before `begin-fulfillment` nothing is
+deferred (D-143), and a completion implies every line `activated`, while a deferred failure stays
+on a task that is not.
+
+**Rationale**: D-175 recorded the residual. A Lifecycle resume can overtake an open Orders
+suspension. One way is for the resume stage to answer `still-held` on the stage-level arm and
+return with `suspensionRef` kept (`stillHeldBack`, D-141). Another is for a held wait's tick to
+win the race against the resume's `listen`, since `afterHeldReflect` and `afterHeldWait` poll only
+on every third tick. The next tick then calls `reflect-verdict` or the completion report on an
+order Lifecycle no longer holds. Neither operation reads Orders' hold: `03 §3.6`
+`inst-rv3-resolve` refuses only a terminal instance, and `06 §3.6` `inst-ro-completed` checks only
+the fence and the completion predicate. So Lifecycle settles `rejected` or `completed`, and
+`terminate-instance` is called from `suspended`, refuses, and faults to `invocation-dead`. The
+poll could not close such a suspension as written, because it answered `still-held` on every
+terminal order. `rejected` and `completed` differ from the other terminal states. Lifecycle
+reaches them only by this gear's own reflection and completion report, from `pending_approval` and
+`in_fulfillment` (Lifecycle `01 §4.3` rows 10 and 13), so a Lifecycle resume (row 22) came first
+and no hold is in force. **Precedent**: the held-poll pattern itself, `pollHeld` and `pollResume`
+(D-130, D-133), and the poll `onLeftPark` makes once on the way out of the park loop before a
+stage that does not poll. The read is the D-141 rule that a suspension closes only when Lifecycle
+no longer holds the order. For no switch on an answer that cannot arise, the unwind's
+`reportOutcome` follows no switch for `held` (`10 §3.6` (c)). **Rejected**: routing a
+rejection or completion taken while suspended through the fence (`terminal-event`). That
+would move a completed order through compensation. Letting `terminate-instance` close the
+suspension was rejected too, because it would add the `suspended → terminated` edge D-82 and
+D-175 exclude.
+
+**Propagated**: `design/10-process-definition.md` §3.6 (a), (b), (e), §4.5;
+`design/08-hold-and-cancel.md` §3.3, §3.6 `inst-ar-poll`, §4.7 item 10;
+`design/01-foundation.md` §3.3 (`terminate-instance`, the poll's round row). Related: D-82,
+D-114, D-130, D-133, D-141, D-143, D-175.
 
 ### Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?
 
@@ -5841,6 +5898,7 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-180 | H Suspension closure port clears `owf_process_instance.suspended` | `design/01-foundation.md` §3.3, §3.7, `design/08-hold-and-cancel.md` §3.7, `design/05-provisioning-intents.md` §3.4; D-82, D-149, D-153 |
 | D-181 | M Step-retry route records through slice 07's intake port | `design/07-manual-tasks.md` §3.2, §3.7, `design/09-read-and-authz.md` §3.1–§3.4, §3.6, `design/README.md`, `DESIGN.md` §3.7; D-85, D-139, D-153 |
 | D-182 | M Re-authorization mark: the fence's one rewritable stamp | `design/06-saga-and-compensation.md` §3.7, `DESIGN.md` §3.7; D-84, D-106 |
+| D-183 | H Poll closes an overtaken suspension before terminate-instance; `rejected`/`completed` are not held | `design/10-process-definition.md` §3.6 (a), (b), (e), §4.5, `design/08-hold-and-cancel.md` §3.3, §3.6, §4.7, `design/01-foundation.md` §3.3; D-130, D-133, D-141, D-175 |
 
-Highest decision number used: **D-182**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
+Highest decision number used: **D-183**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
 register; there are no parts.

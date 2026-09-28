@@ -1006,7 +1006,7 @@ this table is the index the validation hook of `10 §2.2` and the envelope's cou
 | `report-outcome` (06) | `round` → `nextRound` | step `…:report-outcome:{round}`; Lifecycle `…:{trigger}:{round}` |
 | `resolve-manual-task` `sla-check` (07) | `slaRound` → `slaRound` | `…:resolve-manual-task:sla:{slaRound}` |
 | `resolve-manual-task` `sla-check` scoped to one task (07), the ceiling wait's | `slaRound` → `slaRound`, the definition's `ceilingSlaRound`, 0 for each ceiling task (D-129) | `…:resolve-manual-task:sla:{taskRef}:{slaRound}` |
-| `apply-resume` `trigger: poll` (08), per suspension | `round` → `nextRound`, the definition's `resumePollRound`, 0 for each new `suspensionRef` `apply-hold` answers and shared by the resume wait and every other wait that polls the hold (D-130, D-133) | `…:apply-resume:poll:{suspensionRef}:{round}` |
+| `apply-resume` `trigger: poll` (08), per suspension | `round` → `nextRound`, the definition's `resumePollRound`, 0 for each new `suspensionRef` `apply-hold` answers and shared by the resume wait, every other wait that polls the hold and the poll before `terminate-instance` (D-130, D-133, D-183) | `…:apply-resume:poll:{suspensionRef}:{round}` |
 | `raise-overdue-escalation` `overdue-fulfillment` (07) | `round` → `nextRound` | `…:raise-overdue-escalation:overdue-fulfillment:{orderVersion}:-:{round}` |
 | `raise-overdue-escalation` `lifetime-ceiling` (07) | `round` → `nextRound`, the definition's `ceilingRound`: each ceiling of one instance is a new round (D-121) | `…:raise-overdue-escalation:lifetime-ceiling:{orderVersion}:-:{round}` |
 
@@ -1183,6 +1183,9 @@ a parked instance is unwound only through the fence. The call settles `permanent
 `fence-not-claimed` (`FailedPrecondition`, 400, registered by slice 06 for the same precondition
 on `compensate-order` and `report-outcome`, `06 §3.6` `inst-co-fence-guard`, `inst-ro-gate`),
 writes `step-completion` carrying it (§3.3 *What each receipt records*), and closes no task.
+The definition does not reach it there: before `terminateRejected` and `terminateCompleted` it
+closes, through `apply-resume` `trigger: poll`, a suspension a Lifecycle resume overtook
+(`10 §3.6` (a), (b), decision D-183).
 Not `version-mismatch`: that is `Aborted` (409), which the definition's `*transient` catch
 re-issues under the same key (`10 §2.2`) to the same refusal until the budget is spent; a 400
 matches no `catch` and faults the invocation at once, as `reportOutcome`'s `fence-not-claimed`
