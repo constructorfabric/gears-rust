@@ -124,8 +124,9 @@ D-58, and any relaxation of the number is a Product decision, not a silent widen
 
 ### Consequences
 
-* **Atomic durable notification.** An event-declaring step cannot commit without its toolkit
-  producer message, and an aborted step cannot publish one.
+* **Atomic durable notification.** An event-declaring step cannot commit without the toolkit
+  producer messages its contract requires (zero or more, D-179), and an aborted step cannot
+  publish one.
 * **No custom Workflow outbox.** There is no `owf_event_outbox`, no Workflow drain, lease, retry
   cap, delivered-row purge, `dead_lettered_at` column or Workflow-owned dead-letter schema for
   outbound events. Platform migration families are not counted as Workflow tables; the engine
@@ -273,7 +274,8 @@ This decision directly addresses the following requirements or design elements:
 * `cpt-cf-bss-orders-workflow-nfr-owf-event-latency` — publication is outside the commit path;
   producer-queue lag is the instrument that measures the 30 s target
 * `cpt-cf-bss-orders-workflow-nfr-owf-audit` — enqueue shares the step's transaction, so an
-  event-declaring step cannot silently omit its durable producer message
+  event-declaring step cannot silently omit the durable producer messages its contract requires
+  (zero or more, D-179)
 * `cpt-cf-bss-orders-workflow-component-foundation` (**platform event producer adapter**, the
   component `design/01-foundation.md` §3.2 declares under its unchanged identifier) — constructs
   the typed events and enqueues through the bound producer outbox; owns no table, drain or re-drive

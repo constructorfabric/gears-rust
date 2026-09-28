@@ -740,7 +740,7 @@ Output: planRef, lineRefs[], expectedFulfillmentAt, policy, planState, reason
 8. [ ] - `p1` - **IF** the graph is missing an edge target or is cyclic: write the unfrozen row with the pinned policy and `abort_record` (`invalid-dependency-graph`, the offending edge set); **RETURN** `invalid-graph` - `inst-pc-if-invalid`
 9. [ ] - `p1` - Read the payer's current commercial profile and the `SUB-O5` overlap presence for the lines, and record the observation in `construction_recheck` (`clear` · `collision` · `divergence` · `unevaluable`, with per-line codes); the observation **MUST NOT** block the freeze (§4.2) - `inst-pc-advisory-recheck`
 10. [ ] - `p1` - Compute `expected_fulfillment_at = max(database now, latest service-activation date among lines)` - `inst-pc-expected-time`
-11. [ ] - `p1` - In the settlement transaction: insert the tasks in `pending`, write `dependency_graph`, `catalog_topology_revision`, `partial_failure_policy`, `overdue_window_ms`, `expected_fulfillment_at`, set `frozen_at` and `frozen_by_attempt_id`; **RETURN** `frozen` - `inst-pc-freeze`
+11. [ ] - `p1` - In the settlement transaction: insert the tasks in `pending`, write `dependency_graph`, `catalog_topology_revision`, `partial_failure_policy`, `overdue_window_ms`, `seller_policy_revision`, `expected_fulfillment_at`, set `frozen_at` and `frozen_by_attempt_id`; **RETURN** `frozen` - `inst-pc-freeze`
 
 **Description**: Construction runs while the order is still `approved`. The advisory observation
 satisfies the PRD's "at plan construction … consume the same overlap-presence read" without
@@ -957,6 +957,7 @@ table is lost; no table in this slice holds a timer.
 | begin_fulfillment_committed_at | timestamptz nullable | Database time `begin-fulfillment` recorded a committed `in_fulfillment`. |
 | partial_failure_policy | text nullable | `remediate` \| `fail_fast`, pinned by `construct-and-freeze-plan` (§2.2); NULL only before construction. |
 | overdue_window_ms | bigint nullable | The seller's overdue window, pinned by `construct-and-freeze-plan` with the policy (§2.2, business default 24 h); the overdue deadline is `expected_fulfillment_at` + this value, read by `07`'s `raise-overdue-escalation`; NULL only before construction (decision D-134). |
+| seller_policy_revision | jsonb nullable | The `sellerPolicyRevision` of the pinned `partial_failure_policy` and `overdue_window_ms`: the (`policy_id`, `policy_revision`) of each `owf_seller_policy` row the seller-policy port used (`01 §3.7`); written with them and resolved through `owf_configuration_revision` for the row's whole retention; NULL only before construction (decisions D-140, D-160). |
 | catalog_topology_revision | text nullable | The Catalog topology revision the graph was resolved against. |
 | dependency_graph | jsonb nullable | Validated, acyclic dependency edges among this plan's tasks. |
 | expected_fulfillment_at | timestamptz nullable | `max(construction time, latest service-activation date among lines)`; returned as `expectedFulfillmentAt`. |
@@ -972,15 +973,15 @@ table is lost; no table in this slice holds a timer.
 
 **Constraints**: NOT NULL on order_id, order_version, plan_ref, resource_tenant_id,
 payer_tenant_id, seller_tenant_id, recheck_defer_count, created_at; `plan_ref` UNIQUE;
-`partial_failure_policy`, `overdue_window_ms`, `catalog_topology_revision`, `dependency_graph`,
-`expected_fulfillment_at` and `frozen_by_attempt_id` NOT NULL once `frozen_at` is set, and
+`partial_failure_policy`, `overdue_window_ms`, `seller_policy_revision`, `catalog_topology_revision`,
+`dependency_graph`, `expected_fulfillment_at` and `frozen_by_attempt_id` NOT NULL once `frozen_at` is set, and
 immutable thereafter; `abort_record` NULL whenever any task of the plan is `activated`; at most
 **200** tasks per plan (§4.6).
 
 **Additional info**: **Ownership** — one writer per column group, each inside its operation's
 settlement transaction through the envelope: `evaluate-payment-auth-eligibility` creates the row
 and writes `payment_auth_*`; `begin-fulfillment` writes `begin_fulfillment_committed_at`;
-`construct-and-freeze-plan` writes the policy and overdue window, graph, revision, expected instant, construction
+`construct-and-freeze-plan` writes the policy and overdue window with their `seller_policy_revision`, graph, revision, expected instant, construction
 observation, freeze columns and a construction `abort_record`; `re-check-pre-activation` writes
 `recheck_*` and a pre-activation `abort_record`. **Mutability**: deliberately mutable before
 freeze and in the listed post-freeze columns (`begin_fulfillment_committed_at`, `recheck_*`,

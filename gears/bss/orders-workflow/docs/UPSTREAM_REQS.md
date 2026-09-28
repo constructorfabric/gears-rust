@@ -566,8 +566,8 @@ and this gear **co-signs them by reference rather than restating them**:
 
 Each of those asks **MUST** be satisfied for the `bss-orders-workflow-events` producer queue and
 the `gts.cf.bss.orders_workflow.*` event family on the same terms as for Lifecycle's queue; this
-gear raises no divergent requirement and accepts whatever resolution the sibling register
-records.
+gear raises no divergent requirement other than the grants for its own topic below (D-177), and
+accepts whatever resolution the sibling register records.
 
 **This gear's own topic's grants.** The six events publish on this gear's own topic,
 `gts.cf.core.events.topic.v1~cf.bss._.orders_workflow.v1`, not on Lifecycle's

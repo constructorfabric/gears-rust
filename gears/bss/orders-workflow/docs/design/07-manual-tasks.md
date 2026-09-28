@@ -1045,6 +1045,7 @@ it.
 | source_attempt | text | The failing call's key tail at the entrance, `{round}[:{attempt}]` (or the event reference of an event-keyed operation, §3.3) |
 | severity | enum | `normal` \| `urgent` \| `escalated`. `activated-cancel-failed` is created `urgent` |
 | sla_deadline | timestamptz | Computed by §4.1 at creation and recomputed on `reopened`, from the class window of the seller's policy (D-134) |
+| seller_policy_revision | jsonb | The `sellerPolicyRevision` of the class window `sla_deadline` was computed from: the (`policy_id`, `policy_revision`) of each `owf_seller_policy` row the seller-policy port used (`01 §3.7`); rewritten with `sla_deadline` on `reopened`, and resolved through `owf_configuration_revision` for the row's whole retention (decisions D-140, D-160) |
 | sla_breached_at | timestamptz, nullable | Stamped by `resolve-manual-task` (`sla-check`) when the deadline was found elapsed |
 | assignment_state | enum | `unassigned` \| `assigned` \| `in_progress` \| `resolved` \| `reopened`; transitions in §4.3 |
 | assignee | text, nullable | Principal holding the task; NULL while `unassigned` |
@@ -1070,7 +1071,7 @@ it.
 
 **Constraints**: NOT NULL on `correlation_id`, `order_id`, `order_version`, `task_scope`,
 `scope_ref`, `failure_reason`, `failure_cause`, `source_step`, `source_attempt`, `severity`,
-`sla_deadline`, `resource_tenant_id`, `seller_tenant_id`, `row_version`; `line_ref` NOT NULL exactly
+`sla_deadline`, `seller_policy_revision`, `resource_tenant_id`, `seller_tenant_id`, `row_version`; `line_ref` NOT NULL exactly
 when `task_scope = line`; **UNIQUE (`order_id`, `order_version`, `task_scope`, `scope_ref`,
 `failure_reason`)** — the reason is in the key because a line that failed forward and then failed
 its compensation leg is two failures, and a repeat under the same reason is an absorb or a reopen,

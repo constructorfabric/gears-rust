@@ -169,7 +169,7 @@ Orders record         owf_definition_binding pins the version per instance (01 �
 Every effect of the order process is a step operation of `01`–`09` invoked by a `call` task.
 The definition uses **no `run`** task (containers, scripts, shell, sub-workflows would be effects
 outside Orders' record) and **no `emit`** task (Orders publishes its six process events through
-its own producer inside operations, [`01 §4.7`](./01-foundation.md#47-one-event-per-committed-step-outcome-and-the-six-named-process-events-only)).
+its own producer inside operations, [`01 §4.7`](./01-foundation.md#47-declared-events-per-settlement-and-the-six-named-process-events-only)).
 No `call` targets a registered platform Function, because a Function's effect would be outside
 Orders' record and outside the step surface's authorization (decision D-136). It never calls
 Orders Lifecycle, Subscriptions, Payments or the Generic Approval service
@@ -1065,7 +1065,7 @@ The approval stage, the `do` list of `process.approval`:
       - call: { step: apply-resume }    # body: ref + trigger: poll, suspensionRef, round: $context.resumePollRound; output: resumeOutcome = resumed-by-read, due, failedTaskRefs[] = [], nextRound
     catch: *transient
     export: { as: '${ $context + { resumeOutcome: .resumeOutcome, resumePollRound: .nextRound, heldTicks: 0, suspensionRef: (if .resumeOutcome == "resumed-by-read" then null else $context.suspensionRef end) } }' }   # no switch follows: still-held cannot arise on a rejected order, as held cannot at the unwind's reportOutcome; were it answered, terminate-instance would refuse fence-not-claimed and fault the invocation (D-114, D-175)
-- terminateRejected:                    # protected (01); body: ref + terminalOutcome: aborted, terminationKind: rejected — every terminationKind but completed ends the instance aborted (01 §3.3, §3.7, D-166)
+- terminateRejected:                    # protected (01); body: ref + terminalOutcome: aborted, terminationKind: rejected — every terminationKind but completed ends the instance aborted; the input schema refuses a mismatched pair with a 400 before registry resolution, which faults the invocation (01 §3.3 terminate-instance input, D-166, D-114)
     timeout: step
     try:
       - call: { step: terminate-instance }
@@ -1709,8 +1709,9 @@ The overdue monitor, the `do` list of the top-level `overdueMonitor` branch of f
           try:
             - call: { step: raise-overdue-escalation }   # body: ref + escalationKind: overdue-fulfillment, round: $context.overdueRound; output: due, raised, nextRound
           catch: *transient
-    catch:                              # a failed check is the next tick's to repeat under the same round; nothing routes on it
+    catch:                              # a spent budget or timeout is the next tick's to repeat under the same round; nothing routes on it. No type filter, so the timeout error (…/errors/timeout, 408) reaches `when`, as in the compensate catch; a 500 or any other status is not matched and faults the invocation (D-168, D-114)
       as: overdueError
+      when: '${ $overdueError.status as $s | any((408, 429, 503, 504, 409); . == $s) }'
       do: [ { unanswered: { set: { due: false, raised: false } } } ]
     export: { as: '${ $context + { overdueRound: (.nextRound // $context.overdueRound) } }' }
 - onOverdue:
@@ -1819,7 +1820,10 @@ unwind; an amendment or Lifecycle's `approved` expiry ends the wait through the 
 top-level `overdueMonitor` branch: every `PT1H` it calls `raise-overdue-escalation` with
 `escalationKind: overdue-fulfillment` under the round the previous tick returned, which answers
 `due: false`, records nothing and settles its round until database time passes `expected_fulfillment_at` + the plan's pinned overdue window (default 24 h, D-134), answers `raised: false`
-once `report-outcome` has settled, and otherwise records the escalation once. It raises an
+once `report-outcome` has settled, and otherwise records the escalation once. A spent retry
+budget or a timeout is the next tick's to repeat under the same round; any other status — a
+deterministic `500` among them — is not matched by the monitor's `catch` and faults the invocation,
+as it does for every other step (decision D-168). It raises an
 escalation and nothing else, never cancels fulfillment and is never paused by a hold
 ([`07`](./07-manual-tasks.md), `cpt-cf-bss-orders-workflow-fr-owf-overdue-escalation`); it stops
 with the invocation, so it needs no `listen` for Orders' own terminal events.

@@ -4103,6 +4103,8 @@ and the publish job checks the other direction. The "one audit entry under the d
 could not be written: `owf_audit_entry` is one instance's chain. Each changed row is instead
 appended to `owf_configuration_revision`, which resolves every recorded `sellerPolicyRevision`.
 
+**Amended (2026-09-28, residuals of the re-review)**: the pin's provenance was recorded only in the settled `owf_step_log.result`, which is purged at 90 days while the gate, plan and task rows it provenances are kept ≥ 400 days (V-A-7). Each pinned record now carries it in a `seller_policy_revision` column — `owf_approval_gate` (`design/03` §3.7), `owf_fulfillment_plan` (`design/04` §3.7), `owf_manual_task` (`design/07` §3.7) — written with the pinned value, and the registry's `settled_output` (D-167) carries it for replays; neither log nor registry is the provenance. **Precedent**: Lifecycle's expiry record captures the effective `(policy_id, policy_revision)` beside the value it applies (Lifecycle `07-hold-and-expiry.md:461`). A column realizing this decision's "pinned with its revision", not a behaviour change, so no new decision.
+
 ### D-141 (M) A resume closes only a suspension Lifecycle no longer holds
 
 **Accepted (2026-09-26).** *(amends D-87, D-130)*
@@ -4917,7 +4919,8 @@ answer, which routes them.
 `sourceStep` and one `sourceAttempt` per call (`07 §3.3`, D-116); a wave's failed lines folded
 into a sweep's or a resume's call would be recorded against another operation's attempt, and a
 retry would mint the attempt of the wrong family (D-119). Clearing at the folding entry keeps each
-task's source exact and costs only a later task for the other list.
+task's source step exact; `sourceAttempt` is the attempt of the call that folds the list. It costs
+only a later task for the other list.
 
 **Why deferred stays first.** `05 §4.5` item 4 routes a deferral to its loop, and the loop is the
 deferred lines' only carrier (`enterDeferral1`, `wave2Again`); a failure first would leave them
@@ -4948,6 +4951,8 @@ the task (it copies `nextStage` while writing it), as `lineFailure1` and `lineFa
 **Propagated**: `design/10-process-definition.md` §3.6 (b) `initEligibility`, `onEvaluate`,
 `lineFailure1`, `wave2`, `onWave2`, `rebuildLapsed`, `lineFailure2` and the description, (c)
 `createTasks`. Related: D-54, D-116, D-119.
+
+**Clarified (2026-09-28, residuals of the re-review)**: the rationale said clearing at the folding entry keeps each task's "source exact"; it keeps the source **step** exact, and `sourceAttempt` is the attempt of the call that folds the list (V-E-3).
 
 ### D-166 (M) A completion report never answers terminal-event, and every terminate-instance names its terminal outcome
 
@@ -4983,6 +4988,8 @@ rules out faults the invocation rather than gaining a route.
 **Propagated**: `design/06-saga-and-compensation.md` §3.3 `report-outcome` output, §3.6
 `inst-ro-call`, §4.9; `design/10-process-definition.md` §3.6 (a) `terminateRejected`, (b)
 `reportCompleted`, `terminateCompleted`, (c) `terminateAborted`. Related: D-109, D-111.
+
+**Clarified (2026-09-28, residuals of the re-review)**: the pairing — `terminationKind` `completed` ↔ `terminalOutcome` `completed`, every other kind ↔ `aborted` — is stated in `design/01` §3.3 `terminate-instance` `input` and enforced by the registered input schema: a mismatched pair is a 400 before registry resolution, which faults the invocation (D-114), not `version-mismatch`, whose 409 `*transient` would re-issue (V-E-2). `design/10` §3.6 (a) `terminateRejected` cites it.
 
 ### D-167 (H) A settled key's answer lives on its registry row; the step log is recovery history with its own purge grant
 
@@ -5051,6 +5058,8 @@ termination* mapping of a temporary outage to 503 and other persistence failures
 §3.7 (*A settlement that cannot commit aborts whole*), §4.3, §4.17 *Append rule*; `DESIGN.md` §1.2
 (the audit NFR's verification). Related: D-64, D-103, D-114, D-132.
 
+**Clarified (2026-09-28, residuals of the re-review)**: (1) "No `catch` of the canonical definition matches 500" was not true of `overdueCheck`, whose outer `catch` had no `errors` filter and no `when`, so a deterministic 500 was swallowed every tick (V-A-2). It now carries `when` status ∈ {408, 429, 503, 504, 409} and no type filter, as `compensate`'s outer catch does, so a spent budget or a timeout is still the next tick's and a 500 faults the invocation. Every other outer `catch` of `design/10` already filters by status or `when`. (2) The abort is its own row, `aborted`, in `design/01` §3.3's closed outcome set — 503 when temporary, 500 when deterministic, no catalogue reason — rather than a clause of `retryable-failure`, whose record is left `open`, which a committed-lease abort does not do (V-A-3).
+
 ### D-169 (H) `start-instance` reads the platform before its one transaction
 
 **Accepted (2026-09-28).** *(amends D-103, D-137)*
@@ -5108,6 +5117,8 @@ table consistent with the existing kinds and the phase-shape CHECKs.
 (the replay sequence), §3.7 (`owf_step_log`), §4.6, §4.13; `design/02-triggers-and-start.md` §3.7;
 `DESIGN.md` §1.2. Related: D-103.
 
+**Clarified (2026-09-28, residuals of the re-review)**: `owf_step_operation.audit_kind` reads "its **success** settlement writes (§3.3 *What each receipt records*)" (V-A-4); `owf_step_log.settled_at` is the commit time of the transaction that wrote the row and `deadline_at`, on a row whose receipt ran no effect, the deadline that would have applied, so the non-settling rows of the table have defined values (V-A-9).
+
 ### D-171 (H) An early evaluation settles success with `due: false`
 
 **Accepted (2026-09-28).** *(amends D-102's application in `01 §4.15`)*
@@ -5123,6 +5134,8 @@ It is also not what the definition expects: `waitExpected` routes on `due` (re-r
 **Precedent**: D-102 rule 1 itself and `10 §3.6` (b)'s re-check loop.
 
 **Propagated**: `design/01-foundation.md` §4.15. Related: D-102.
+
+**Clarified (2026-09-28, residuals of the re-review)**: `DESIGN.md` §4.5 still said an early wake-up answers `retryable-failure`; it now states this decision, and its clock-skew sentence states `design/01` §3.3's refusal before registry resolution (the canonical 503, nothing recorded) (V-A-1).
 
 ### D-172 (H) A pre-admission `admit-trigger` audit entry may carry no seller
 
@@ -5153,6 +5166,8 @@ the rows written before the owning record is known.
 **Propagated**: `design/01-foundation.md` §3.7 (tenancy note, `owf_audit_entry` schema,
 constraints and the seller-scoped read), §4.11, §4.17 *Acceptance evidence*;
 `design/02-triggers-and-start.md` §3.6 `inst-at-settle`, §3.7. Related: D-60, D-76.
+
+**Clarified (2026-09-28, residuals of the re-review)**: the CHECK is written as SQL, `step_id = 'admit-trigger' OR step_id LIKE 'admit-trigger:%'`, over the `step_id` form `design/01` §3.7 now states: `{operation}`, or `{operation}:{subject reference}` where one applies (V-A-8).
 
 ### D-173 (H) READ COMMITTED; the pre-admission append allocates and checks in one statement, and `start-instance` collides with it symmetrically
 
@@ -5358,6 +5373,8 @@ smallest rule that fits the contracts already written.
 `design/05-provisioning-intents.md` §3.3; `design/06-saga-and-compensation.md` §3.3;
 `design/07-manual-tasks.md` §3.3; `DESIGN.md` §2.1; `ADR/0008`. Related: D-58.
 
+**Clarified (2026-09-28, residuals of the re-review)**: `design/01` §4.7's heading reads "Declared events per settlement, and the six named process events only" (anchor updated in its TOC entry and in `design/10`), and `ADR/0008`'s consequences say "the producer messages its contract requires (zero or more)" (V-A-5, V-C-1, V-C-2).
+
 ### D-180 (H) The suspension closure port also clears `owf_process_instance.suspended`
 
 **Accepted (2026-09-28).**
@@ -5472,6 +5489,8 @@ D-175 exclude.
 `design/01-foundation.md` §3.3 (`terminate-instance`, the poll's round row); `DESIGN.md` §1.2
 (`fr-owf-hold-resume`). Related: D-82,
 D-114, D-130, D-133, D-141, D-143, D-175.
+
+**Clarified (2026-09-28, residuals of the re-review)**: `design/08` §4.7 item 10 said the pre-termination poll routes `failedTaskRefs[]` as item 8 does once `begin-fulfillment` has committed; it now exempts that call and states why its list is empty, as this decision does (V-E-1).
 
 ## Open Questions
 

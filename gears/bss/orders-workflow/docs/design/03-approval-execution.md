@@ -1005,6 +1005,7 @@ the evidence of who exempted a commercial decision from approval — purged row-
 | sequence_index | int | Routing position, default 0. Gates sharing a value open together; a gate opens only once every lower value is `approved` (§4.3) |
 | state | enum | `planned`, `open`, `approved`, `rejected`, `cancelled` — the complete set; `decided` is not a value |
 | escalation_window_ms | bigint | The window for this gate, resolved by `open-gates` from the seller's policy (the party's window, else the seller default, 72 h) and pinned here; a policy write reaches only gates planned after it (decision D-134) |
+| seller_policy_revision | jsonb | The `sellerPolicyRevision` of the window: the (`policy_id`, `policy_revision`) of each `owf_seller_policy` row the seller-policy port used when `open-gates` resolved it (`01 §3.7`), pinned with `escalation_window_ms` and immutable with it; it resolves through `owf_configuration_revision` for the row's whole retention (decisions D-140, D-160) |
 | window_remaining_ms | bigint, nullable | The window remaining as of `window_armed_at` (while armed) or as captured at the first pause (while paused); NULL while `planned` |
 | window_armed_at | timestamptz, nullable | Database time the window was last armed; NULL while paused, `planned` or decided |
 | pause_causes | text[], NOT NULL, DEFAULT `{}` | Open pause causes, members of `hold` · `approval-outage`; the window re-arms only when this becomes empty |
@@ -1019,7 +1020,7 @@ the evidence of who exempted a commercial decision from approval — purged row-
 **PK**: `gate_id`
 
 **Constraints**: `idempotency_key` UNIQUE; `state` NOT NULL and constrained to the five-value enum;
-`resource_tenant_id` NOT NULL; `decision_reason` and `deciding_authority` NOT NULL whenever `state`
+`resource_tenant_id` and `seller_policy_revision` NOT NULL; `decision_reason` and `deciding_authority` NOT NULL whenever `state`
 is `approved` or `rejected`, enforced as a check constraint rather than by operation discipline;
 `window_remaining_ms` and `opened_at` NOT NULL whenever `state = open`; `window_armed_at` NULL
 whenever `pause_causes` is non-empty; `outage_since` NOT NULL exactly when `pause_causes`

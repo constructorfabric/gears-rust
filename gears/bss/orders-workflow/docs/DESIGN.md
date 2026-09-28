@@ -1488,11 +1488,14 @@ time is the platform's to state.
 **Clocks are not trusted.** Registry lease expiry, the per-operation deadline and every deadline
 comparison an operation makes are evaluated against **database time**, not replica wall-clock,
 with a **30-second skew tolerance**: a replica whose clock drifts beyond it releases its advisory
-locks and answers step calls with `retryable-failure` rather than continuing to act
-(`01 §4.15`). The definition's `wait` instants are the plugin's clock; an operation woken "too
-early" by Orders' clock — the expected-fulfillment instant not yet reached by database time —
-answers `retryable-failure` rather than act, which is what keeps a future-dated line from being
-activated ahead of its contracted date whatever the two clocks disagree on.
+locks and refuses step calls before registry resolution — the canonical `503`, with nothing
+recorded — rather than continuing to act (`01 §4.15`, `01 §3.3`). The definition's `wait` instants
+are the plugin's clock; an operation woken "too early" by Orders' clock — the expected-fulfillment
+instant not yet reached by database time — does not act: it settles `success` with `due: false`
+and the next round, and the definition's re-check loop waits its next tick; it never answers
+`retryable-failure`, which would leave the key `open` and spend the task's retry budget on a clock
+difference (decision D-171). That is what keeps a future-dated line from being activated ahead of
+its contracted date whatever the two clocks disagree on.
 
 ### 4.6 Testability
 

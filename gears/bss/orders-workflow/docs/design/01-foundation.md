@@ -28,7 +28,7 @@
   - [4.4 Timers and retry policy are the definition's](#44-timers-and-retry-policy-are-the-definitions)
   - [4.5 The envelope's bound and the caller-side duplicate protocol](#45-the-envelopes-bound-and-the-caller-side-duplicate-protocol)
   - [4.6 The process audit log is 100% complete with zero silent drops](#46-the-process-audit-log-is-100-complete-with-zero-silent-drops)
-  - [4.7 One event per committed step outcome, and the six named process events only](#47-one-event-per-committed-step-outcome-and-the-six-named-process-events-only)
+  - [4.7 Declared events per settlement, and the six named process events only](#47-declared-events-per-settlement-and-the-six-named-process-events-only)
   - [4.8 Dead letters are the platform's; the manual task is Orders'](#48-dead-letters-are-the-platforms-the-manual-task-is-orders)
   - [4.9 The machine-readable reason catalogue](#49-the-machine-readable-reason-catalogue)
   - [4.10 The operation registration boundary](#410-the-operation-registration-boundary)
@@ -886,7 +886,8 @@ definition's `catch` sees (`$error.status`, `10 §2`):
 
 | Outcome | Meaning | Answer |
 |---------|---------|--------|
-| `retryable-failure` | The attempt failed transiently — downstream not accepting, per-operation deadline cut it before an accept, or an open breaker; the registry record is left `open` and the definition's retry policy may re-issue the same key. A unit of work that could not commit (§3.7 *A settlement that cannot commit aborts whole*) settles nothing and answers the canonical `ServiceUnavailable` 503 without a catalogue reason, leaving the record as the abort rule states per operation shape | 503 or 504 with the catalogue reason; 503 with none on an abort |
+| `retryable-failure` | The attempt failed transiently — downstream not accepting, per-operation deadline cut it before an accept, or an open breaker; the registry record is left `open` and the definition's retry policy may re-issue the same key | 503 or 504 with the catalogue reason |
+| `aborted` | The unit of work could not commit (§3.7 *A settlement that cannot commit aborts whole*): nothing is settled and nothing the attempt wrote in that transaction remains; the registry record is left as that rule's *What remains* states per operation shape — `open` or absent for a single-transaction operation, `in_flight` under a committed lease otherwise. The name is this outcome's, not the canonical 409 `Aborted` that `still-processing` answers with | the canonical `ServiceUnavailable` 503 when the failure is temporary, the canonical `Internal` 500 when it is deterministic (§3.7 *What the caller gets*); no catalogue reason |
 | `permanent-failure` | The attempt failed in a way the operation declared non-retryable, or the caller presented a key conflict; the definition's named failure route applies where `10 §4.6` names one, and otherwise the invocation faults | 400, 403, 404 or 409 (`AlreadyExists`) with the catalogue reason |
 | `still-processing` | The registry found an `in_flight` record under this key with a live lease, or a dead lease inside the key lifetime on a key whose dead lease is settled by lookup (§4.3 *Lease-expired*); the caller must not infer success and must not resubmit under a new key; re-issue the same key after backoff or wait for `settle-from-lookup` | 409 `Aborted`, `still-processing` or `idempotency-lease-expired` |
 | `aged-out` | The key's retention window (§3.7) elapsed with no settled record; the next attempt is a **new operation under a new key** — it appends the key's `attempt` component — never a resume of the old one | 400, `idempotency-key-aged-out` |
@@ -1160,7 +1161,7 @@ ceiling park.
 | Field | Value |
 |-------|-------|
 | `protection` | `protected` — the last operation of every path |
-| `input` | `correlationId`, `terminalOutcome` (`completed` · `aborted`), `terminationKind` (`completed` · `compensated` · `superseded` · `rejected` · `terminal-order-event`), `reason` (catalogue, nullable), `supersededByOrderVersion` (nullable), `attemptId` |
+| `input` | `correlationId`, `terminalOutcome` (`completed` · `aborted`), `terminationKind` (`completed` · `compensated` · `superseded` · `rejected` · `terminal-order-event`), `reason` (catalogue, nullable), `supersededByOrderVersion` (nullable), `attemptId`. The pair is fixed: `terminationKind` `completed` ↔ `terminalOutcome` `completed`, and every other kind ↔ `aborted` (decision D-166). The registered input schema states the pairing, so a mismatched pair is a body the input schema refuses — 400 before registry resolution, nothing recorded (*What each receipt records*) — which matches no `catch` and faults the invocation as the definition defect it is (D-114); not `version-mismatch`, whose 409 `Aborted` the `*transient` catch would re-issue to the same refusal (below) |
 | `output` | `phase = terminated`, `terminalOutcome`, `rowVersion` |
 | `idempotency_key` | instance-scoped: `{tenant}:{correlationId}:terminate-instance` |
 | `declared_event` | none (`OrderFulfillmentCompleted`/`Aborted` belong to `report-outcome`, slice 06) |
@@ -1561,8 +1562,8 @@ compares the versions named here with the registry's version listing (`10 §4.2`
 | attempt_number | integer, NOT NULL | Orders' count of settled attempts under this key at the time of this row, starting at 1; a derived count, **not unique** — a `still-processing` or `aged-out` row carries the count it found |
 | outcome | enum | `success`, `retryable-failure`, `permanent-failure`, `still-processing`, `aged-out`, `absorbed` — the receipt classes of §3.3 *What each receipt records*; `absorbed` is a replay of a settled key answered from the registry, whose effect did not run (decision D-170) |
 | result | jsonb, nullable | **The concluded attempt's machine-readable result**, kept for recovery reads and diagnosis for the table's 90 days. For an operation that accepted a downstream intent it carries the `transition_request_id` the downstream assigned plus the downstream's own status token; for a refusal it carries the catalogue reason and the redacted diagnostic (§4.11); NULL on `still-processing`, `aged-out` and `absorbed`. It is **not** what a replay answers from — that is `owf_idempotency_registry.settled_output`, which lives as long as the key can be replayed (decision D-167) |
-| deadline_at | timestamptz, NOT NULL | The effective per-operation deadline that bounded the attempt (§3.3 step 4) |
-| received_at, settled_at | timestamptz, NOT NULL | Receipt of the call and commit of its settlement, database time |
+| deadline_at | timestamptz, NOT NULL | The effective per-operation deadline that bounded the attempt (§3.3 step 4), or, on a row whose receipt ran no effect — `absorbed`, a key conflict, `still-processing`, `aged-out` — the deadline that would have applied to this receipt had it run (decision D-170) |
+| received_at, settled_at | timestamptz, NOT NULL | Receipt of the call, and the commit time of the transaction that wrote this row — the settlement's for a settling row, the receipt's own for a row that settles nothing (§3.3 *What each receipt records*); both database time |
 
 **PK**: step_log_id
 
@@ -1674,7 +1675,7 @@ and abort on a failed validation, serialization or enqueue
   record `in_flight` under its holder, which stops heartbeating at the abort; once the lease is
   dead, §4.3 *Lease-expired* applies — a re-run under a new holder, or, on an intent-submitting
   key, `still-processing` until `settle-from-lookup` settles it from the downstream's outcome.
-- **What the caller gets.** Lifecycle's *Infrastructure-error termination* mapping
+- **What the caller gets** — the `aborted` outcome of §3.3. Lifecycle's *Infrastructure-error termination* mapping
   (`01-foundation.md:853-862`): a known temporary unavailability — a lost connection, a
   serialization or deadlock failure, a lock or statement timeout, the zero-rows fence, the second
   audit-sequence collision of §3.7 `owf_audit_entry` *Chain allocation* — answers
@@ -1754,7 +1755,7 @@ after the purge finds an instance that answers every operation `version-mismatch
 | key_family | enum, NOT NULL | `intent`, `approval-request`, `lifecycle-transition`, `instance-scoped`, `trigger` |
 | declared_event | text, nullable | One of the six GTS event types of §4.7, or NULL |
 | compensation | text, nullable | The paired operation name, or NULL; FK to this table |
-| audit_kind | enum, NOT NULL | The `owf_audit_entry.event_kind` its settlement writes |
+| audit_kind | enum, NOT NULL | The `owf_audit_entry.event_kind` its success settlement writes (§3.3 *What each receipt records*) |
 | retry_class | enum, NOT NULL | `retryable-on-transient`, `never` |
 | deadline_ms | integer, NOT NULL | Per-operation budget inside the envelope |
 | pdp_action | text, NOT NULL | Always `execute`; the catalogue action of `09 §3.2` the route requests |
@@ -1855,9 +1856,13 @@ the operation's settlement transaction, at the step where the operation resolves
 takes no lock. It returns the effective values together with the `policy_revision` of each row it
 used. The operation pins the value on its record: the gate's `escalation_window_ms` (`03 §3.7`),
 the plan's `partial_failure_policy` and `overdue_window_ms` (`04 §3.7`), or the task's
-`sla_deadline` (`07 §4.1`). It records the revisions it read in its settled `owf_step_log.result`
-as `sellerPolicyRevision`, which gives the pin its provenance. A replay answers from the settled
-record and never reads the policy again, and no later read moves a pinned value. A promotion
+`sla_deadline` (`07 §4.1`). It records the revisions it read as `sellerPolicyRevision` on the
+pinned record itself, in the record's `seller_policy_revision` column (`03 §3.7`, `04 §3.7`,
+`07 §3.7`), which gives the pin its provenance for as long as the pin is retained, and in the
+registry row's `settled_output` (§3.7, decision D-167). Neither the 90-day `owf_step_log.result`
+nor the registry row, purged once its key has expired and the instance has been terminal for 30
+days (§3.8), outlives the pin, so neither
+is the provenance. A replay answers from the settled record and never reads the policy again, and no later read moves a pinned value. A promotion
 therefore reaches only the records pinned after it (decision D-134). This is Lifecycle's snapshot
 of the effective `orders_date_policy` row, stored with the admitted order and never re-read
 ([Lifecycle `03 §4.2`](../../../orders-lifecycle/docs/design/03-gate-and-pin.md#42-the-orders-delta-normative)
@@ -1945,7 +1950,7 @@ and no audit claim rests on resolving a revision to a full row.
 | prev_hash | bytea, NOT NULL | The `entry_hash` of the preceding entry on the same `correlation_id`, or the chain genesis digest of §4.17 for sequence 1. Never NULL: this table has no unchained rows |
 | entry_hash | bytea, NOT NULL | 32-byte SHA-256 digest over every other column of this row under the v1 encoding of §4.17 |
 | event_kind | enum | `instance-start`, `step-start`, `step-completion`, `retry`, `timeout`, `sweep`, `sweep-settlement`, `escalation`, `compensation`, `phase-transition`, `termination`, `dead-letter` — the closed v1 token set; `dead-letter` is retained so the v1 vocabulary is unchanged, and no Orders path writes it while inbound dead letters are the platform's (§4.8) |
-| step_id | text, nullable | The operation the entry records (with its subject reference where one applies); NULL on instance-level kinds |
+| step_id | text, nullable | The operation the entry records, as `{operation}` or, where a subject reference applies, `{operation}:{subject reference}` — an `admit-trigger` entry is `admit-trigger` on the start path and `admit-trigger:{terminal event kind}` on the listen path (`02 §3.7`); NULL on instance-level kinds |
 | attempt_number | integer, nullable | The attempt the entry records, matching `owf_step_log.attempt_number`; NULL where no attempt applies |
 | definition_version | text, nullable | The pinned process-definition version, set on the `instance-start` entry; NULL elsewhere |
 | phase_from, phase_to | enum, nullable | The `owf_process_instance.phase` values a `phase-transition` or `termination` entry moves between; `phase_from` NULL on `instance-start`; both NULL on every other kind |
@@ -1969,8 +1974,8 @@ per-process retrieval in chain order and on `(seller_tenant_id, created_at)` for
 tenancy-scoped audit read. `event_kind`-shape CHECKs: `definition_version` non-null exactly on
 `instance-start`; `phase_to` non-null exactly on `instance-start`, `phase-transition` and
 `termination`; `hash_version = 1`. **Seller axis** (decision D-172): CHECK `seller_tenant_id IS
-NOT NULL OR (event_kind IN ('step-start', 'step-completion', 'retry', 'timeout') AND step_id`
-names `admit-trigger`)`; the half a CHECK cannot express — that no instance row existed for the
+NOT NULL OR (event_kind IN ('step-start', 'step-completion', 'retry', 'timeout') AND (step_id =
+'admit-trigger' OR step_id LIKE 'admit-trigger:%'))`, over the `step_id` form above; the half a CHECK cannot express — that no instance row existed for the
 correlation — is the writer's rule: only the pre-admission append of *Chain allocation* writes a
 NULL, and it inserts nothing once an instance row is visible.
 
@@ -2535,7 +2540,7 @@ receipt that changes nothing — an absorbed replay, a key conflict, `still-proc
 `aged-out`, a call refused before registry resolution, an aborted unit of work — writes none, so
 the completeness check counts settlements and committed leases, not receipts (decision D-170).
 This is the concrete mechanism behind §4.1 (`cpt-cf-bss-orders-workflow-nfr-owf-audit`).
-### 4.7 One event per committed step outcome, and the six named process events only
+### 4.7 Declared events per settlement, and the six named process events only
 
 This gear **MUST** publish exactly the six named process events —
 `OrderFulfillmentStarted`, `OrderFulfillmentStepCompleted`, `OrderFulfillmentCompleted`,
@@ -2954,11 +2959,14 @@ Every process table in §3.7 is **tenant-scoped by a NOT NULL column**, not by c
 carries `resource_tenant_id`, and `owf_process_instance` and `owf_audit_entry` additionally carry
 `seller_tenant_id` because each backs an operator- or seller-scoped surface — NOT NULL except on
 a pre-admission `admit-trigger` audit entry whose seller is not yet known, which no seller-scoped
-predicate matches (§3.7 `owf_audit_entry`, decision D-172). The three exemptions are
-configuration: `owf_step_operation`, which has no tenant column, `owf_seller_policy`, which is
-keyed by `seller_tenant_id` alone and has no row per resource tenant (decision D-140), and
-`owf_configuration_revision`, their append-only history, which has no tenant column (decision
-D-160). The platform `toolkit_db::outbox` tables and the
+predicate matches (§3.7 `owf_audit_entry`, decision D-172). Six tables are exempt; the full list
+is `DESIGN.md` §3.7's. Three are configuration: `owf_step_operation`, which has no tenant column,
+`owf_seller_policy`, which is keyed by `seller_tenant_id` alone and has no row per resource tenant
+(decision D-140), and `owf_configuration_revision`, their append-only history, which has no tenant
+column (decision D-160). Three carry another axis instead: `owf_dispatch_admission`, per-seller
+admission state keyed by `seller_tenant_id` alone, NULL on its gear-level aggregate row
+(`05 §3.7`), and `owf_audit_checkpoint` and `owf_audit_checkpoint_member`, keyed on the immutable
+audit namespace `audit_tenant_id` (§3.7). The platform `toolkit_db::outbox` tables and the
 platform's own invocation index and history are not Workflow tables; the tenant axes ride the
 event `data` (§4.7) and the envelope tenancy is platform-root. Every read this gear exposes
 **MUST** carry the corresponding tenant predicate, and the platform's SecureORM
