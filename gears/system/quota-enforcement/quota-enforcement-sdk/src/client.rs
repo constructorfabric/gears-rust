@@ -74,6 +74,26 @@ pub trait QuotaManagerClientV1: Send + Sync + 'static {
         filter: QuotaFilter,
         page: PageRequest,
     ) -> Result<PageResult<QuotaView>, QuotaEnforcementError>;
+
+    /// Return `amount` to one named Quota. Corrective, never evaluated against
+    /// a policy, and floored at zero.
+    ///
+    /// Credit is a management-plane operation: it is authorized as its own
+    /// action, so a principal allowed to debit is not thereby allowed to credit.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidArgument` for a non-positive amount or a missing key;
+    /// `NotFound` for an unknown Quota or one outside the caller's scope (the
+    /// two are indistinguishable); `PermissionDenied` when the caller may not
+    /// credit, or for a Quota the scope shows but that belongs to another
+    /// tenant; `FailedPrecondition` for a deactivated Quota or a closed period;
+    /// `Aborted` on a payload mismatch.
+    async fn credit(
+        &self,
+        ctx: &SecurityContext,
+        request: CreditRequest,
+    ) -> Result<Decision, QuotaEnforcementError>;
 }
 
 /// Performs guarded consumption operations.
@@ -99,21 +119,6 @@ pub trait QuotaEnforcementClientV1: Send + Sync + 'static {
         &self,
         ctx: &SecurityContext,
         request: DebitRequest,
-    ) -> Result<Decision, QuotaEnforcementError>;
-
-    /// Return `amount` to one named Quota. Corrective, never evaluated against
-    /// a policy, and floored at zero.
-    ///
-    /// # Errors
-    ///
-    /// `InvalidArgument` for a non-positive amount or a missing key;
-    /// `NotFound` for an unknown Quota, `PermissionDenied` for one outside the
-    /// caller's scope; `FailedPrecondition` for a deactivated Quota or a
-    /// closed period; `Aborted` on a payload mismatch.
-    async fn credit(
-        &self,
-        ctx: &SecurityContext,
-        request: CreditRequest,
     ) -> Result<Decision, QuotaEnforcementError>;
 
     /// Reverse a committed debit, restoring the counters to what they would

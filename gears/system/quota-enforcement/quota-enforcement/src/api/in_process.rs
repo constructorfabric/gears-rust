@@ -1,5 +1,6 @@
 //! The in-process `QuotaManagerClientV1`: the SDK client trait over the domain
-//! service, registered in `ClientHub` at `init`.
+//! service, registered in `ClientHub` at `init`. It carries Quota management
+//! and credit, the management-plane counter correction.
 //!
 //! It enters the domain exactly where REST does (`Service::quotas`), so both
 //! transports share one admission boundary. Before bootstrap binds the
@@ -74,6 +75,14 @@ impl QuotaManagerClientV1 for InProcessQuotaManager {
         Ok(quotas
             .list(ctx, ListQuotasRequest::from((filter, page)))
             .await?)
+    }
+
+    async fn credit(
+        &self,
+        ctx: &SecurityContext,
+        request: quota_enforcement_sdk::CreditRequest,
+    ) -> Result<quota_enforcement_sdk::Decision, QuotaEnforcementError> {
+        Ok(self.service.operations()?.credit(ctx, request).await?)
     }
 }
 
@@ -173,14 +182,6 @@ impl quota_enforcement_sdk::QuotaEnforcementClientV1 for InProcessQuotaEnforceme
         request: quota_enforcement_sdk::DebitRequest,
     ) -> Result<quota_enforcement_sdk::Decision, QuotaEnforcementError> {
         Ok(self.service.operations()?.debit(ctx, request).await?)
-    }
-
-    async fn credit(
-        &self,
-        ctx: &SecurityContext,
-        request: quota_enforcement_sdk::CreditRequest,
-    ) -> Result<quota_enforcement_sdk::Decision, QuotaEnforcementError> {
-        Ok(self.service.operations()?.credit(ctx, request).await?)
     }
 
     async fn rollback(

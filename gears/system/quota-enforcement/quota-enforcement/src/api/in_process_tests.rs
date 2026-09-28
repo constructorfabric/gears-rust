@@ -210,3 +210,40 @@ async fn a_caller_supplied_constraint_contract_is_rejected_before_the_lookup() {
     );
     assert_eq!(status(err), 400);
 }
+
+#[tokio::test]
+async fn credit_is_a_manager_operation_through_the_same_domain_path() {
+    let client = InProcessQuotaManager::new(unbound_service());
+    let err = client
+        .credit(
+            &ctx(),
+            quota_enforcement_sdk::CreditRequest {
+                tenant_id: tenant(),
+                quota_id: quota_enforcement_sdk::QuotaId::generate(),
+                amount: 1,
+                idempotency_key: "c1".to_owned(),
+            },
+        )
+        .await
+        .expect_err("not ready");
+    assert_eq!(status(err), 503);
+
+    let client = InProcessQuotaManager::new(bound_service().await);
+    let id = client.create_quota(&ctx(), spec()).await.expect("create");
+    let decision = client
+        .credit(
+            &ctx(),
+            quota_enforcement_sdk::CreditRequest {
+                tenant_id: tenant(),
+                quota_id: id,
+                amount: 1,
+                idempotency_key: "c1".to_owned(),
+            },
+        )
+        .await
+        .expect("credit");
+    assert_eq!(
+        decision.result,
+        quota_enforcement_sdk::DecisionResult::Allowed
+    );
+}
