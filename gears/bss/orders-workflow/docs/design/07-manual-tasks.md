@@ -728,7 +728,7 @@ failed-entrance route is a change to this table.
 | Wave-2 `failed[]`, or retry exhaustion of `dispatch-wave2-activate` | definition | `line` | `wave2-activation-failed` |
 | `reconcile-intent` `failed[]` / `unresolved[]` (05) | definition | `line` | `wave1-create-failed`, `wave2-activation-failed`, `never-dispatched`, `intent-unresolved` |
 | Plan not frozen (04 §4.3) | definition | `plan` | `invalid-dependency-graph` (under `remediate`), `catalog-topology-unavailable` (either policy) |
-| `reflect-verdict` `permanent-failure` (03 §4.5) | definition | `order` | `approval-reflection-refused` |
+| `reflect-verdict` answer `refused` (03 §4.4, §4.5; a settled success routed on the output, D-190) | definition | `order` | `approval-reflection-refused` |
 | Compensation leg `failed-pending-escalation` (06) | `compensate-order`, creation port, **either policy** | `line` | `draft-void-failed`, `activated-cancel-failed` |
 | Deferred failures applied by `apply-resume` (`08 §4.7` item 8) | definition | `line` | the reason slice 05 recorded with the deferred outcome: `wave1-create-failed`, `wave2-activation-failed`, `never-dispatched`, `intent-unresolved` |
 | Apply-time authority re-check fails at `pre-compensation` (`06 §3.6` `inst-co-reauthorize`, `09 §4.4`) | `compensate-order`, through slice 08's cancel-authority port and the creation port | `order` | `authority-withdrawn` |

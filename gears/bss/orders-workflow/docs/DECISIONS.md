@@ -206,6 +206,9 @@
   - [D-185 (M) A key ages while its instance lives only if its operation submits downstream; an aged-out key is re-issued under an operator-minted successor](#d-185-m-a-key-ages-while-its-instance-lives-only-if-its-operation-submits-downstream-an-aged-out-key-is-re-issued-under-an-operator-minted-successor)
   - [D-186 (M) The Seller Operator reads an order's process audit trail through a paged, seller-scoped audit route](#d-186-m-the-seller-operator-reads-an-orders-process-audit-trail-through-a-paged-seller-scoped-audit-route)
   - [D-187 (L) A contended worker lock skips the pass; only a lock or database error is a coordination failure](#d-187-l-a-contended-worker-lock-skips-the-pass-only-a-lock-or-database-error-is-a-coordination-failure)
+  - [D-188 (H) A Lifecycle re-run past Lifecycle's 24-hour key window reads the order back and settles `already-applied`](#d-188-h-a-lifecycle-re-run-past-lifecycles-24-hour-key-window-reads-the-order-back-and-settles-already-applied)
+  - [D-189 (M) `open-gates` looks a gate's request up by its key before it submits, and adopts one it finds](#d-189-m-open-gates-looks-a-gates-request-up-by-its-key-before-it-submits-and-adopts-one-it-finds)
+  - [D-190 (M) `reflect-verdict` answers a Lifecycle refusal as the settled answer `refused`, and the definition catches no 400 of it](#d-190-m-reflect-verdict-answers-a-lifecycle-refusal-as-the-settled-answer-refused-and-the-definition-catches-no-400-of-it)
 - [Open Questions](#open-questions)
   - [Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?](#q-01-which-durable-execution-substrate-backs-the-process--the-oss-workflow-engine-or-a-bss-local-mechanism)
   - [Q-02: The Generic Approval escalation threshold — the one PRD-deferred numeric value this design deliberately leaves unset](#q-02-the-generic-approval-escalation-threshold--the-one-prd-deferred-numeric-value-this-design-deliberately-leaves-unset)
@@ -1703,7 +1706,7 @@ gear to a versioned platform workflow definition (`ADR/0011`, `ADR/0012`, `ADR/0
 each slice was restructured into step operations and a definition fragment. D-65…D-72 carry the
 three ADRs and their cross-cutting consequences; D-73…D-101 are the decisions the slice
 restructurings recorded, D-102…D-163 the decisions taken on the second review of
-2026-09-26, and D-164…D-187 those taken on the re-review of 2026-09-28. Each names the entries it amends; the amended entries carry a dated
+2026-09-26, and D-164…D-190 those taken on the re-review of 2026-09-28. Each names the entries it amends; the amended entries carry a dated
 **Amended by** note. D-65…D-101 were taken on 2026-09-24.
 
 ### D-65 (H) The order process flow is a versioned platform workflow definition executed by serverless-runtime
@@ -2698,6 +2701,8 @@ the line's wave, and the definition keeps one attempt per wave (`wave1AttemptKey
 
 **Amended by D-171 (2026-09-28)**: `01 §4.15` now applies rule 1 to an early wake-up — `due: false` and the next round, a settled success — where it had required `retryable-failure`.
 
+**Amended by D-188 (2026-09-28)**: rule 4's read of the order on a Lifecycle `not-admissible` first recognises the transition already applied — the order at `orderVersion` in the target state of the transition submitted — and settles success `already-applied`, because a key re-issued after Lifecycle's 24-hour window is a new operation there (Lifecycle `01-foundation.md:238-241`).
+
 ### D-103 (M) The registry lease is fenced by a holder token, sized below the retry horizon, and resolved per key family
 
 **Accepted (2026-09-26).** *(amends D-03 and D-71)*
@@ -3084,6 +3089,8 @@ of the operation it reports". Also `begin-fulfillment`'s settled `version-confli
 
 **Propagated**: `design/03-approval-execution.md` §3.3, §3.6, §4.4;
 `design/10-process-definition.md` §3.6 (a).
+
+**Amended by D-190 (2026-09-28)**: every other refusal answers `reflected = refused`, a settled success carrying `refusalReason`, which fragment (a) routes on the output to the order-scope task; the 400 `catch` is removed. D-188 adds that a `rejected` order at this version after `reflect-approval-denied` is the reflection applied, not `moved`.
 
 ### D-113 (M) Workflow does not pre-check buyer acceptance
 
@@ -5007,6 +5014,8 @@ rules out faults the invocation rather than gaining a route.
 
 **Clarified (2026-09-28, residuals of the re-review)**: the pairing — `terminationKind` `completed` ↔ `terminalOutcome` `completed`, every other kind ↔ `aborted` — is stated in `design/01` §3.3 `terminate-instance` `input` and enforced by the registered input schema: a mismatched pair is a 400 before registry resolution, which faults the invocation (D-114), not `version-mismatch`, whose 409 `*transient` would re-issue (V-E-2). `design/10` §3.6 (a) `terminateRejected` cites it.
 
+**Amended by D-188 (2026-09-28)**: the terminal case can arise for a completion after all — the order `completed` by this gear's own report, re-issued after Lifecycle's 24-hour key window. When the read shows `completed` at this version with every line `activated` under the reported subscription identifiers, `report-outcome` answers `lifecycleCall = already-applied`, which `onReport` routes with `acknowledged`; any other terminal state keeps `permanent-failure` `version-mismatch`.
+
 ### D-167 (H) A settled key's answer lives on its registry row; the step log is recovery history with its own purge grant
 
 **Accepted (2026-09-28).** *(amends D-103, D-104)*
@@ -5619,6 +5628,8 @@ this design's own rule 3 (D-102).
 §4.4, §4.6; `design/10-process-definition.md` §4.6; `design/05-provisioning-intents.md` §2.2;
 `DESIGN.md` §3.3, §3.7; D-104, D-105, D-108.
 
+**Amended by D-188, D-189 and D-190 (2026-09-28)**: the "no process instance to outlive it" of the precedent is this gear's problem at Lifecycle's end: a successor key changes the step key only, so a re-issue reaches Lifecycle after its 24-hour window under the same transition key and is answered by D-188's read-back, and reaches Generic Approval under the same request key, which `open-gates` now looks up before it submits (D-189). Rule (4)'s "`reflect-verdict`'s existing 400 catch reaches its own order-scope task" is withdrawn: its refusal is a settled answer, and an aged-out `reflect-verdict` key faults the invocation like every other, whose `invocation-dead` task mints the successor (D-190).
+
 ### D-186 (M) The Seller Operator reads an order's process audit trail through a paged, seller-scoped audit route
 
 **Accepted (2026-09-28).** *(amends D-172; clarifies `02 §3.6` without a behaviour change)*
@@ -5692,6 +5703,125 @@ same section repeats the "bounded non-blocking acquisition through `Db::try_lock
 (`:1946-1947`); that is for its owner to correct.
 
 **Propagated**: `design/01-foundation.md` §3.8; D-62.
+
+### D-188 (H) A Lifecycle re-run past Lifecycle's 24-hour key window reads the order back and settles `already-applied`
+
+**Accepted (2026-09-28).** *(amends D-102, D-166, D-185)*
+
+**Decision**: (1) Rule 4 of `01 §3.3` *Rounds and attempts* (`inst-owf-round-lifecycle`) gains a
+first case. On a Lifecycle `not-admissible`, the operation already reads the order through the
+Lifecycle PDP-authorized order read. Before the `on_hold` and terminal cases, it compares that
+read with the transition it submitted. When the order is at `orderVersion` in that transition's
+target state, the operation settles success with the Lifecycle answer `already-applied`. It
+records the answer in `owf_step_log.result`, runs its committed branch, and returns its ordinary
+success output. (2) The targets are these. `reflect-verdict`: `pending_approval` for `required`,
+`approved` for `not_required` and `granted`, and `rejected` for `denied`. `begin-fulfillment`:
+`in_fulfillment`, which then sets `begin_fulfillment_committed_at` and enqueues
+`OrderFulfillmentStarted`. `report-outcome`: `completed` for `acknowledge-completed`, where the
+per-line read also shows every line `activated` under the subscription identifier the report
+carries, and `fulfillment_failed` for `acknowledge-failed`. Both set
+`lifecycleCall = already-applied`, which `onReport` routes with `acknowledged`. A `cancelled`
+order keeps its terminal row (`reportedOutcome = terminal-event`), because an ordinary cancel
+(row 15) reaches it too and the read does not show which. (3) `report-spawn-signal` needs no
+read-back. Its row is a self-loop, so a past-window re-run is admitted to the guard
+`spawn_signal_at IS NULL`, which refuses it `spawn-signal-already-recorded`. The operation
+already answers that refusal `already-recorded`, a settled success; `05 §3.3` now says so. It
+records no instant, and nothing reads one. (4) `UPSTREAM_REQS.md` §2.4 gains
+`…-upreq-lifecycle-workflow-key-retention`. It asks Lifecycle to retain workflow-trigger-class
+keys for at least 30 days, or to expose a read of a seam operation's stored outcome by its key.
+
+**Rationale**: Lifecycle's registry is a 24-hour request cache. "Past the window a replayed key is
+a new operation, so the window must exceed the longest caller retry horizon" (Lifecycle
+`01-foundation.md:238-241`). This gear re-issues its four transition calls under unchanged keys
+after a lease death or an interruption of days. D-185 keeps those keys aging at 30 days, and a
+successor key changes the step key only: the Lifecycle keys of `begin-fulfillment`,
+`report-spawn-signal` and `report-outcome` carry no attempt. Take a transition that committed
+before its step settled, re-issued more than 24 hours later. It meets the version check, which
+passes because a transition changes no commercial version. It then meets the state table, which
+has no row for the trigger from the state already reached, so Lifecycle refuses it
+`not-admissible` (Lifecycle `06-workflow-seam.md:352-356`). Rule 4 turned any such refusal it
+did not recognise into `permanent-failure` `version-mismatch`. That faulted the invocation, and
+the re-drive faulted the same way. `reflect-verdict` answered `moved` for an order already
+`rejected`, and `report-outcome` answered `completed` on a `completed` order with the fault D-166
+chose. The order read exposes state, version and the per-line projection. It does not expose the
+recorded verdict, the failure reason or the audit, which the Workflow principal has no grant to
+read (Lifecycle `08-read-and-authz.md:300-303`, `:1041-1042`). The target states suffice, because
+only this gear's rows 7–11, 13, 14 and 26 reach them at an order version, and a resume only
+restores a state reached before. **Precedent**: the `held` answer rule 4 already gives on the
+same read, a settled success after a Lifecycle refusal (D-102). `begin-fulfillment`'s
+short-circuit to `in-fulfillment` once the transition is committed (`04 §3.6`
+`inst-bf-if-already-begun`). And the confirm-by-lookup rule for an aged-out intent
+(`UPSTREAM_REQS.md` `SUB-O13`). **Rejected**: reading the audit to match the key, which the
+Workflow principal is not granted; and treating every terminal `not-admissible` as applied, which
+would report an ordinary cancel as this gear's own.
+
+**Propagated**: `design/01-foundation.md` §3.3 (*Rounds and attempts* rule 4), §3.7 (*Which keys
+age while the instance lives*), §4.3 (*Lease-expired*); `design/03-approval-execution.md` §3.3
+`reflect-verdict`, §3.6 `inst-rv3-settle`, §4.4; `design/04-fulfillment-plan.md` §3.3, §3.6
+`inst-bf-if-held`; `design/05-provisioning-intents.md` §3.2, §3.3 `report-spawn-signal`;
+`design/06-saga-and-compensation.md` §3.2, §3.3 `report-outcome`, §3.6 `inst-ro-call`, §4.9;
+`design/10-process-definition.md` §3.6 (a), (b); `UPSTREAM_REQS.md` §1.2, §2.4, §3; D-102,
+D-166, D-185.
+
+### D-189 (M) `open-gates` looks a gate's request up by its key before it submits, and adopts one it finds
+
+**Accepted (2026-09-28).** *(amends D-185)*
+
+**Decision**: (1) `open-gates` step 4 (`03 §3.6` `inst-og-submit`) looks each gate's request up
+at Generic Approval by its approval-request key before it submits. If the service holds a request
+under the key, `open-gates` adopts it and does not submit again. Otherwise it submits as before. A
+look-up the service does not answer is `retryable-failure`, never a blind resubmission. (2) The
+Generic Approval ask of `UPSTREAM_REQS.md` §2.3 gains two clauses. The service de-duplicates by
+request key for the life of the gate, until the request is decided or cancelled. And it answers a
+read of a request by its request key.
+
+**Rationale**: the approval-request key is `resource_tenant_id` + `orderId` + `orderVersion` +
+`gateId` and carries no attempt. A successor re-run after the step key aged out (D-185) presents
+it again, possibly weeks after the first call submitted. The expectations contract says only "be
+idempotent by request key" (`UPSTREAM_REQS.md` §2.3), with no window. The only read it offers is
+the decision by `decisionEventId`. So a service that keeps its keys for a request-cache window, as
+Lifecycle does for 24 hours, would open a second request for the same party, which is the failure
+`open-gates`' derived `gateId` exists to exclude. **Precedent**: the confirm-by-lookup rule this
+gear asks of Subscriptions: "after an idempotency key ages out, confirm outcomes by lookup rather
+than resubmission" (`UPSTREAM_REQS.md` `SUB-O13`, `design/05-provisioning-intents.md` §4.1). In
+phase 1 the stand-in never opens a gate (`03 §3.5`), so nothing changes until the service lands.
+
+**Propagated**: `design/03-approval-execution.md` §3.5, §3.6 (the gate-open sequence,
+`inst-og-submit`, its description); `design/01-foundation.md` §3.7 (*Which keys age while the
+instance lives*), §4.3 (*Lease-expired*); `UPSTREAM_REQS.md` §2.3; D-185.
+
+### D-190 (M) `reflect-verdict` answers a Lifecycle refusal as the settled answer `refused`, and the definition catches no 400 of it
+
+**Accepted (2026-09-28).** *(amends D-112, D-185; ADR-0012 as amended)*
+
+**Decision**: (1) A Lifecycle refusal of the reflection that is none of `held`, `moved` or the
+applied transition of D-188 answers `reflected = refused`. It is a settled success that stamps
+nothing, returns `nextRound`, and carries the Lifecycle reason as `refusalReason` and in
+`owf_step_log.result`. It is no longer a `permanent-failure` `approval-reflection-refused` (400).
+(2) Fragment (a) of `10 §3.6` drops the outer 400 `catch` around `reflect-verdict`. The call sits
+under the plain transient `catch`, as every other protected call does, and `afterReflect`'s
+existing `refused` case routes the output to `reflectionTask`. (3) The task's `retry` re-enters
+under the next round and the `attempt` `retry-step` minted. (4) `approval-reflection-refused`
+stays in the `01 §4.9` catalogue as the order-scope task's `failure_reason` (`07 §3.7`). The
+count of 43 is unchanged. (5) `10 §4.6` no longer lists `reflect-verdict` as a caught route. A
+genuine 400 of `reflect-verdict` — an aged-out key, a validation defect — faults the invocation
+like every other, and the `invocation-dead` task's `retry` mints the successor attempt (D-185).
+
+**Rationale**: the DSL `catch` filters on type and status only. The plugin does not surface
+`error_code` (Q-11). So the 400 `catch` that caught `approval-reflection-refused` also caught
+`idempotency-key-aged-out` and every other 400, and labelled each a reflection refusal. D-185
+relied on that mislabel for the aged-out case. An answer the operation settles itself is routed on
+its value, so no status has to be interpreted. **Precedent**: the design's settled-success
+answers `held`, `due: false`, `deferred` and `unobtainable` (D-102). `record-decision`'s refused
+decision answers success with `applied: false`, "never `permanent-failure`" (`03 §4.4`). And
+`begin-fulfillment` moved its guard refusals to the settled `withheld` for the same reason, so
+that "no `catch` has to tell a version conflict from a still-processing answer by status"
+(`04 §3.6`).
+
+**Propagated**: `design/03-approval-execution.md` §3.3 `reflect-verdict`, §3.6 `inst-rv3-settle`,
+§4.4, §4.5 item 3; `design/10-process-definition.md` §3.6 (a) `reflectVerdict`, `afterReflect`,
+`reflectionTask`, the approval-stage prose, §4.6; `design/01-foundation.md` §4.3 (*Aged-out key*),
+§4.9; `design/07-manual-tasks.md` §3.3; `ADR/0012` (Rule 6); D-112, D-185.
 
 ## Open Questions
 
@@ -6143,6 +6273,9 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-185 | M Only downstream-submitting keys age while the instance lives; aged-out re-issued under an operator-minted successor | `design/01-foundation.md` §3.2, §3.3, §3.7, §4.3, §4.16, `design/09-read-and-authz.md` §3.1, §3.6, `design/07-manual-tasks.md` §4.4, §4.6, `design/10-process-definition.md` §4.6, `design/05-provisioning-intents.md` §2.2, `DESIGN.md` §3.3, §3.7; D-104, D-105, D-108 |
 | D-186 | M Seller-scoped, keyset-paged audit read route; start-instance refusals audited pre-admission | `design/09-read-and-authz.md` §1.2, §2.2, §3.1–§3.3, §4.1, §4.3, `design/01-foundation.md` §3.7, `design/02-triggers-and-start.md` §1.2, §3.6, §3.7, `DESIGN.md` §1.2, §3.2, §3.3, §3.5, `design/README.md`, `ADR/0010`, `UPSTREAM_REQS.md` §2.8; D-172 |
 | D-187 | L Contended worker lock skips the pass; only an error is a coordination failure | `design/01-foundation.md` §3.8; D-62 |
+| D-188 | H Past-window Lifecycle re-run reads the order back; `already-applied`; Lifecycle key-retention ask | `design/01-foundation.md` §3.3, §3.7, §4.3, `design/03-approval-execution.md` §3.3, §3.6, §4.4, `design/04-fulfillment-plan.md` §3.3, §3.6, `design/05-provisioning-intents.md` §3.2, §3.3, `design/06-saga-and-compensation.md` §3.2, §3.3, §3.6, §4.9, `design/10-process-definition.md` §3.6 (a), (b), `UPSTREAM_REQS.md` §1.2, §2.4, §3; D-102, D-166, D-185 |
+| D-189 | M `open-gates` looks a gate's request up by key and adopts it; Generic Approval ask extended | `design/03-approval-execution.md` §3.5, §3.6, `design/01-foundation.md` §3.7, §4.3, `UPSTREAM_REQS.md` §2.3; D-185 |
+| D-190 | M `reflect-verdict` answers its refusal `refused`; no 400 catch | `design/03-approval-execution.md` §3.3, §3.6, §4.4, §4.5, `design/10-process-definition.md` §3.6 (a), §4.6, `design/01-foundation.md` §4.3, §4.9, `design/07-manual-tasks.md` §3.3, `ADR/0012`; D-112, D-185 |
 
-Highest decision number used: **D-187**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
+Highest decision number used: **D-190**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
 register; there are no parts.

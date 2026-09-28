@@ -495,7 +495,9 @@ seam call rather than a side effect of the wave-2 call.
 
 Owns `report-spawn-signal` (§3.3): calls `POST /bss-orders-lifecycle/v1/orders/{orderId}/spawn-signal`
 under the Lifecycle-transition key family with `expected_version`, and records the returned
-instant on the step record. A replay under the same key returns Lifecycle's stored outcome.
+instant on the step record. A replay under the same key returns Lifecycle's stored outcome; past
+Lifecycle's 24-hour window it answers `spawn-signal-already-recorded`, which this operation
+settles `already-recorded` (§3.3, decision D-188).
 
 ##### Responsibility boundaries
 
@@ -652,7 +654,7 @@ operation's round. Every step key is recomposed server-side from the body
 |-------|-------|
 | `protection` | `protected` — Waves stage: after `re-check-pre-activation`, before `dispatch-wave2-activate` (`10 §4.1`) |
 | `input` | `ref`, `round` (0 on first entry, else the previous answer's `nextRound`) |
-| `output` | `spawnSignal` (`recorded` · `already-recorded` · `held` — Lifecycle refused `not-admissible` and the order read shows `on_hold`, a settled success after which the definition waits in `heldWait` — the fork of the resume arm and a `PT5M` tick, `10 §3.6` (b) — re-runs `re-check-pre-activation` after the resume, as Lifecycle prescribes, and calls again under the next round · `not-dispatchable` — Lifecycle refused `not-admissible` and the order read shows a terminal state: a cancel committed before the signal, the race Lifecycle declares normal ([`06 §4.3`](../../../orders-lifecycle/docs/design/06-workflow-seam.md#43-begin-fulfillment-and-the-spawn-signal-normative)), a settled success after which the definition dispatches nothing and returns to the barrier loop, whose lifecycle arm consumes `OrderCancelled`); `nextRound` |
+| `output` | `spawnSignal` (`recorded` · `already-recorded` — Lifecycle refused `spawn-signal-already-recorded`: the fence is committed, by a report under another key or by this key's own earlier report once Lifecycle's 24-hour window has forgotten it — a self-loop row admits such a re-run to that guard, which refuses it with no second signal and no event (Lifecycle `06-workflow-seam.md:451`, `:456-459`, `:761`); a settled success that records no instant, which nothing reads, since `dispatch-wave2-activate`'s guard reads the settlement (`inst-pi-wave2-guard`, decision D-188) · `held` — Lifecycle refused `not-admissible` and the order read shows `on_hold`, a settled success after which the definition waits in `heldWait` — the fork of the resume arm and a `PT5M` tick, `10 §3.6` (b) — re-runs `re-check-pre-activation` after the resume, as Lifecycle prescribes, and calls again under the next round · `not-dispatchable` — Lifecycle refused `not-admissible` and the order read shows a terminal state: a cancel committed before the signal, the race Lifecycle declares normal ([`06 §4.3`](../../../orders-lifecycle/docs/design/06-workflow-seam.md#43-begin-fulfillment-and-the-spawn-signal-normative)), a settled success after which the definition dispatches nothing and returns to the barrier loop, whose lifecycle arm consumes `OrderCancelled`); `nextRound` |
 | `idempotency_key` | Lifecycle-transition family: `{tenant}:{orderId}:{orderVersion}:report-spawn-signal:{round}`, the same key passed to Lifecycle, so a replay of one round returns Lifecycle's stored outcome and a refusal of one round is never replayed into the next ([`01 §3.3` *Rounds and attempts*](./01-foundation.md#rounds-and-attempts-the-one-rule-for-re-invokable-operations) rule 4) |
 | `declared_event` | none |
 | `compensation` | none — the spawn signal is written once and never cleared (Lifecycle `06 §4.3`) |

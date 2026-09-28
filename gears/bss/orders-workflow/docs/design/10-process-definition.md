@@ -1019,22 +1019,17 @@ The approval stage, the `do` list of `process.approval`:
     switch:
       - heldPoll: { when: '${ $context.suspensionRef != null }', then: pollHeld }
       - reflect:  { then: reflectVerdict }
-- reflectVerdict:                       # protected (03): requirement stage submitted → pending_approval | approved; gate-outcome stage pending_approval → approved | rejected (R1)
+- reflectVerdict:                       # protected (03): requirement stage submitted → pending_approval | approved; gate-outcome stage pending_approval → approved | rejected (R1); no 400 is caught: a Lifecycle refusal is the settled answer refused, and a genuine 400 (aged-out, validation) faults the invocation (§4.6, D-190)
+    timeout: step
     try:
-      - reflect:
-          timeout: step
-          try:
-            - call: { step: reflect-verdict }   # body: ref + stage: $context.reflectStage, round: $context.reflectRound, attemptKey: $context.attemptKey; output: reflected, nextRound
-          catch: *transient
-    catch:                              # a permanent refusal: approval-reflection-refused needs a human (03 §4.5 item 3)
-      errors: { with: { type: https://serverlessworkflow.io/spec/1.0.0/errors/communication, status: 400 } }
-      do: [ { refused: { set: { reflected: refused } } } ]
-    export: { as: '${ $context + { reflected: .reflected, reflectRound: (.nextRound // $context.reflectRound), reflectAttempt: (($context.reflectRound | tostring) + (if $context.attemptKey then ":" + ($context.attemptKey | tostring) else "" end)), attemptKey: null } }' }   # reflectAttempt: the call's key tail {round}[:{attempt}], the task's sourceAttempt; reflected ∈ pending_approval | approved | rejected | held | moved | refused; a retry's attempt is spent once the call settles
+      - call: { step: reflect-verdict }   # body: ref + stage: $context.reflectStage, round: $context.reflectRound, attemptKey: $context.attemptKey; output: reflected, refusalReason (on refused), nextRound
+    catch: *transient
+    export: { as: '${ $context + { reflected: .reflected, reflectRound: .nextRound, reflectAttempt: (($context.reflectRound | tostring) + (if $context.attemptKey then ":" + ($context.attemptKey | tostring) else "" end)), attemptKey: null } }' }   # reflectAttempt: the call's key tail {round}[:{attempt}], the task's sourceAttempt; reflected ∈ pending_approval | approved | rejected | held | moved | refused, every one a settled success returning nextRound — an already-applied reflection (Lifecycle not-admissible, the order read shows the stage's target state, D-188) answers its target state like a committed one; a retry's attempt is spent once the call settles
 - afterReflect:
     switch:
       - approved: { when: '${ $context.reflected == "approved" }', then: toFulfillment }
       - rejected: { when: '${ $context.reflected == "rejected" }', then: beforeReject }
-      - refused:  { when: '${ $context.reflected == "refused" }',  then: reflectionTask }
+      - refused:  { when: '${ $context.reflected == "refused" }',  then: reflectionTask }   # every other Lifecycle refusal of the reflection, a settled answer carrying refusalReason (03 §4.4, D-190)
       - held:     { when: '${ $context.reflected == "held" }',     then: enterHeldReflect }   # Lifecycle not-admissible on an on_hold order (03 §4.4): wait for the resume, then the next round
       - moved:    { when: '${ $context.reflected == "moved" }',    then: enterHeldReflect }   # Lifecycle version-conflict, or not-admissible on a terminal order (03 §4.4): the lifecycle arm consumes OrderAmended or the terminal event
       - pending:  { then: firstPosition }
@@ -1054,7 +1049,7 @@ The approval stage, the `do` list of `process.approval`:
       - tick:  { when: '${ .arm == "tick" }', then: reflectVerdict }
       - other: { then: leave }          # hold | resume | lifecycle | cancel
 - toFulfillment: { set: { nextStage: fulfillment, stageLoop: null }, then: exit }   # Lifecycle emits OrderApproved; fragment (b) follows in the same invocation
-- reflectionTask:                       # fragment (c): an order-scope task whose retry re-enters reflectVerdict
+- reflectionTask:                       # fragment (c): an order-scope task whose retry re-enters reflectVerdict under the next round and the minted attempt
     set: { failureScope: order, failureSubjects: '${ [ { subjectRef: $context.correlationId, reason: "approval-reflection-refused", cause: "permanent-refusal" } ] }', sourceStep: reflect-verdict, sourceAttempt: '${ $context.reflectAttempt }', forceTask: true, taskReturnStage: approval, taskReturnLoop: reflectVerdict, nextStage: failure, stageLoop: null }
     then: exit
 - beforeReject:                         # an Orders suspension a Lifecycle resume overtook is closed first, so terminate-instance runs from started (D-175, D-183)
@@ -1246,10 +1241,13 @@ tick retries `obtain-verdict` under the next round and, while the verdict is sti
 `escalation_due_at` through `arm-park-escalation`, whose `due` is `false` once the park escalation
 is recorded, so the park clock is never re-armed. A repeat `obtain-verdict` for a version whose
 verdict is already reflected returns the cached answer inside the operation and never
-re-reflects, as `03` requires. A permanent refusal of `reflect-verdict`
-(`approval-reflection-refused`) goes to an order-scope manual task (fragment (c)), whose retry
-re-enters this stage at `reflectVerdict` carrying the `attemptKey` `retry-step` minted, so the
-retry is a new key rather than a replay of the stored refusal. A `held` reflection — Lifecycle
+re-reflects, as `03` requires. A Lifecycle refusal of the reflection
+answers `refused`, a settled success routed on the output — never by a `catch`, so a genuine 400
+of `reflect-verdict` faults the invocation as §4.6 requires (decision D-190) — to an order-scope
+manual task (`approval-reflection-refused`, fragment (c)), whose retry re-enters this stage at
+`reflectVerdict` under the next round and the `attemptKey` `retry-step` minted. A Lifecycle
+`not-admissible` whose order read shows the stage's target state is the reflection already
+applied, past Lifecycle's 24-hour key window, and answers that state (decision D-188). A `held` reflection — Lifecycle
 refused `not-admissible` and the order is `on_hold` — waits in `awaitHeldReflect` for the resume
 (or the `PT5M` tick) and reflects again under the next round ([`01 §3.3` *Rounds and attempts*](./01-foundation.md#rounds-and-attempts-the-one-rule-for-re-invokable-operations)). A `moved` reflection — Lifecycle
 refused `version-conflict`, or `not-admissible` on an order it holds terminal — waits in the same
@@ -1642,13 +1640,13 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
 - reportCompleted:                      # protected (06): in_fulfillment → completed with per-line subscription ids; enqueues OrderFulfillmentCompleted
     timeout: step
     try:
-      - call: { step: report-outcome }  # body: ref + outcome: completed, round: $context.reportRound; output: reportedOutcome = completed, lifecycleCall ∈ acknowledged | held, nextRound — never terminal-event or none: the spawn signal is recorded before any completion report, after which Lifecycle leaves in_fulfillment, and a hold taken from it, only by this gear's own reports (06 §4.9, D-166)
+      - call: { step: report-outcome }  # body: ref + outcome: completed, round: $context.reportRound; output: reportedOutcome = completed, lifecycleCall ∈ acknowledged | already-applied | held, nextRound (already-applied: Lifecycle refused not-admissible and the read shows this report applied, 06 §4.9, D-188; routed with acknowledged) — never terminal-event or none: the spawn signal is recorded before any completion report, after which Lifecycle leaves in_fulfillment, and a hold taken from it, only by this gear's own reports (06 §4.9, D-166)
     catch: *transient
     export: { as: '${ $context + { lifecycleCall: .lifecycleCall, reportRound: .nextRound } }' }
 - onReport:
     switch:
       - held:     { when: '${ $context.lifecycleCall == "held" }', then: enterHeldReport }   # a completed acknowledgement of an on_hold order (06 §3.3): resume first
-      - reported: { then: beforeComplete }
+      - reported: { then: beforeComplete }   # acknowledged | already-applied
 - beforeComplete:                       # as beforeReject: an overtaken Orders suspension is closed before terminate-instance (D-175, D-183)
     switch:
       - heldPoll: { when: '${ $context.suspensionRef != null }', then: pollBeforeComplete }
@@ -2964,11 +2962,12 @@ subject an operator can act on, and only on these routes:
 |-------|--------|----------|
 | `dispatch-wave1-create`, `dispatch-wave2-activate` | budget or timeout spent (408, 429, 503, 504); 409 is the re-read | a line task per wave line (fragment (c), `07 §3.3`) |
 | `compensate-order` | budget or timeout spent, 409 | `awaitCompensationResolution`, then the next pass (`06 §4.7` item 5) |
-| `reflect-verdict` | `approval-reflection-refused` (400) | an order-scope task whose retry re-enters `reflectVerdict` (`03 §4.5` item 3) |
 | `admit-trigger` on the start path | `prior-instance-active` (409) | the `supersession` retry, then a fault (`02 §4.7` item 7) |
 
-Everything else faults: every listen-arm admission, `apply-hold`, `apply-resume`,
-`authorize-cancel`, the evaluations and `begin-fulfillment` of slice 04,
+`reflect-verdict`'s Lifecycle refusal is not on this table: it is the settled answer `refused`,
+routed on the output to its order-scope task (`03 §4.5` item 3), so no `catch` names a 400 of it
+(decision D-190). Everything else faults: every listen-arm admission, `apply-hold`, `apply-resume`,
+`authorize-cancel`, every failure of `reflect-verdict`, the evaluations and `begin-fulfillment` of slice 04,
 `report-spawn-signal`, `run-cancellation-fence`, `report-outcome`, `create-manual-task` and
 `terminate-instance`. A fault on one of them is a failure of Orders or of a dependency the order
 cannot proceed without, not of a subject. A task that the failure stage raised for it would have
@@ -2984,11 +2983,9 @@ failed while the definition proceeds as if it had not.
 **An aged-out key is one of these faults, with its own way back** (decision D-185). Only the nine
 operations that submit downstream (`01 §3.7` `owf_step_operation.submits_downstream`) age while
 the instance lives, so only their re-issue after a long interruption — a ceiling park, a hold, an
-`invocation-dead` task awaiting its re-drive — can answer `aged-out` (400). No route above names it
-except `reflect-verdict`'s, whose 400 catch raises the order-scope task whose `retry` re-enters
-under a minted `attempt` (the plugin does not surface `error_code`, Q-11, so that task carries
-`approval-reflection-refused` whichever 400 it was; its step-log receipt names `aged-out`). Every
-other one faults the invocation, and the `invocation-dead` task's `retry` mints the family's next
+`invocation-dead` task awaiting its re-drive — can answer `aged-out` (400). No route above names
+it, `reflect-verdict`'s included, since its refusal is an answer rather than a 400 (decision
+D-190), so every one faults the invocation, and the `invocation-dead` task's `retry` mints the family's next
 `attempt` before the re-drive, so the re-issued call — the same key, the same task — is resolved
 under its successor key rather than answering `aged-out` again (`01 §4.3` *Aged-out key*); a cancel
 takes the dead-instance unwind, which does the same. No `catch` is added: a 400 filter cannot tell

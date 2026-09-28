@@ -984,8 +984,36 @@ next round out, a per-instance counter, an attempt only from an operator retry):
    That is the handling Lifecycle prescribes for its own `not-dispatchable` answer: re-read the
    order, wait for the resume, re-run
    ([Lifecycle `06 §4.3`](../../../orders-lifecycle/docs/design/06-workflow-seam.md#43-begin-fulfillment-and-the-spawn-signal-normative),
-   `06-workflow-seam.md:743`). Any other `not-admissible` stays `permanent-failure` with
-   `version-mismatch` - `inst-owf-round-lifecycle`
+   `06-workflow-seam.md:743`). **The same read also recognises a transition already applied**
+   (decision D-188). Lifecycle keeps a key for 24 hours only, and "past the window a replayed key
+   is a new operation" ([Lifecycle `01 §2.2`](../../../orders-lifecycle/docs/design/01-foundation.md#the-idempotency-window-is-24-hours-and-is-not-a-commercial-bound),
+   `01-foundation.md:238-241`), while this gear re-issues an unchanged key after a lease death or
+   an interruption of days (§3.7 *Key lifetime*). A re-run of a transition that committed before
+   the window closed then meets the version check, which passes because a transition changes no
+   commercial version, and then the state table, which has no row for the trigger from the
+   state it already reached, so it is refused `not-admissible` (Lifecycle
+   `06-workflow-seam.md:352-356`). So **before** the `on_hold` and terminal cases, the operation
+   compares the read with the transition it submitted: when the order is at `orderVersion` in
+   **that transition's target state**, it settles **success** with the Lifecycle answer
+   `already-applied`, recorded in `owf_step_log.result`, and continues as its committed branch
+   does, returning its ordinary success output. The targets are: `reflect-verdict` —
+   `pending_approval` for `required`, `approved` for `not_required` (stage `requirement`),
+   `approved` for `granted`, `rejected` for `denied` (stage `gate-outcome`); `begin-fulfillment` —
+   `in_fulfillment`; `report-outcome` — `completed` for `acknowledge-completed`, where the per-line
+   read (`GET …/orders/{orderId}/lines`) also shows every line `activated` with the subscription
+   identifier the report carries, and `fulfillment_failed` for `acknowledge-failed`. Only this
+   gear's triggers reach those states at an order version (Lifecycle `01 §4.3` rows 7–11, 13, 14,
+   26) — a resume only restores one reached before — so the state is the evidence; the Lifecycle read exposes state, version and the per-line
+   projection, not the recorded verdict, failure reason or audit (Lifecycle
+   `08-read-and-authz.md:300-303`, `:1041-1042`), and no downstream step reads what it withholds.
+   `cancelled` is not such evidence, since an ordinary cancel (row 15) also reaches it, and keeps
+   the terminal answer `06 §4.9` gives it. `report-spawn-signal` needs no read-back: its row is a
+   self-loop, so a past-window re-run is admitted to the slice guard `spawn_signal_at IS NULL`,
+   which refuses it `spawn-signal-already-recorded` — one refused audit entry at Lifecycle, no
+   second signal and no event (Lifecycle `06-workflow-seam.md:451`, `:456-459`, `:761`) — and the
+   operation already answers that refusal `already-recorded`, a settled success (`05 §3.3`). Any
+   other `not-admissible` stays `permanent-failure` with `version-mismatch` -
+   `inst-owf-round-lifecycle`
 
 **The register of re-invokable operations.** Each operation's §3.3 declaration is authoritative;
 this table is the index the validation hook of `10 §2.2` and the envelope's counter read from.
@@ -1668,7 +1696,13 @@ split changes only when it is evaluated, and re-basing a downstream-submitting k
 the resubmission under a forgotten key the lifetime exists to prevent. There is no exact
 precedent: Lifecycle's registry is a request cache with a 24-hour window and no process instance
 to outlive it ([Lifecycle `01 §2.2`](../../../orders-lifecycle/docs/design/01-foundation.md),
-`01-foundation.md:234-243`).
+`01-foundation.md:234-243`). That window is shorter than this gear's re-issue of a key, and a
+successor key changes the step key only: the Lifecycle-transition key of `begin-fulfillment`,
+`report-spawn-signal` and `report-outcome`, and the approval-request key of `open-gates`, carry no
+attempt. So a re-issue that reaches Lifecycle after its window is answered by the read-back of
+§3.3 *Rounds and attempts* rule 4 (decision D-188), and `open-gates` looks a gate's request up by
+its key before it submits (`03 §3.6`, decision D-189); both downstreams are asked to hold the key
+longer (`../UPSTREAM_REQS.md` §2.3, §2.4).
 
 **The heartbeat rule is normative.** While an effect runs under an `in_flight` record, the holder
 **MUST** refresh `lease_heartbeat_at` and extend `lease_expires_at` every 5 s. A lease whose
@@ -2472,8 +2506,8 @@ exactly one of them:
 | **Absorbed duplicate** | `settled`, `request_fingerprint` matches | Return the stored outcome unchanged, from `settled_output` (§3.7); the effect is **never** re-run. |
 | **Key conflict** | Any state, `request_fingerprint` does **not** match | Refuse the call (`idempotency-key-conflict`, `permanent-failure`). The same key was presented for a materially different request, which is a caller defect — a wrongly authored definition input — not a duplicate. |
 | **Still-processing** | `in_flight`, lease **live** | **MUST NOT** be inferred as success and **MUST NOT** be resubmitted under a new key; the definition re-issues the same key after backoff (`still-processing`, 409 `Aborted`). |
-| **Lease-expired** | `in_flight`, `lease_expires_at` passed, the key **not** aged out (§3.7 *Key lifetime*) | Resolved by the key's family (D-103). **The intent-submitting operations** — `dispatch-wave1-create`, `dispatch-wave2-activate` and `compensate-order` — treat it as **still-processing** (`idempotency-lease-expired`, 409 `Aborted`): the real outcome is confirmed by lookup and settled only by `settle-from-lookup` (§3.3); the effect is **never** re-run blind, because the holder may have crashed *after* Subscriptions accepted an intent. **Every other operation** re-runs it as a re-run under a new `lease_holder`: its outbound call is either a read or a submission the downstream de-duplicates under the key the step derives — Lifecycle answers a committed transition with its stored outcome ([Lifecycle `01 §4.2`](../../../orders-lifecycle/docs/design/01-foundation.md#42-idempotency-semantics-normative), first row), and the approval-request key does the same at Generic Approval (`../ADR/0006`) — so a crash after the downstream accepted is absorbed downstream, and the old holder's late settlement fails the fence. A record-only operation never leaves this state behind (§3.7). |
-| **Aged-out key** | `expires_at` passed with no settled record, on an operation that submits downstream; on any other operation, only once the instance is terminal (§3.7 *Key lifetime*, D-185) | Evaluated on the retained row — the tombstone rule of §3.7 keeps it until no replay can arrive, so expiry is logical and never inferred from a missing row. `settle-from-lookup` is read-only past this point. The next attempt is a **new operation under a new key** — it appends the key's `attempt` component (minted by `retry-step`; for an intent key, the per-line `wave_attempt` minted by the rebuild path or by an operator's retry of a `failed` intent, slice 05) — never a resume of the old one and never a replay of the identical key string. **The successor key** (D-185): when the family holds an `attempt` minted after the aged key's `created_at`, the envelope resolves the re-issued aged key under its successor — the same key with the latest such `attempt` in its attempt component — through this table: a first call the first time, and thereafter whatever the successor's own record resolves to, so a definition that keeps presenting the key it holds reaches the same successor every time; the first arrival is recorded in the family's `presented` history with the key it arrived under (§3.3 *Rounds and attempts*, rule 3, D-174). Without such an attempt it answers `aged-out`. The attempt is minted only by an operator's decision: the `retry` of the order-scope task the answer reaches — the `invocation-dead` task, because no `catch` of the canonical definition routes a 400 of these operations except `reflect-verdict`'s, whose own task mints it (`10 §4.6`) — in the transaction that records the request (`09 §3.6` `inst-cs-record`), and the dead-instance unwind after a recorded cancel (§4.16 item 2). |
+| **Lease-expired** | `in_flight`, `lease_expires_at` passed, the key **not** aged out (§3.7 *Key lifetime*) | Resolved by the key's family (D-103). **The intent-submitting operations** — `dispatch-wave1-create`, `dispatch-wave2-activate` and `compensate-order` — treat it as **still-processing** (`idempotency-lease-expired`, 409 `Aborted`): the real outcome is confirmed by lookup and settled only by `settle-from-lookup` (§3.3); the effect is **never** re-run blind, because the holder may have crashed *after* Subscriptions accepted an intent. **Every other operation** re-runs it as a re-run under a new `lease_holder`: its outbound call is either a read or a submission the downstream de-duplicates under the key the step derives — Lifecycle answers a committed transition with its stored outcome ([Lifecycle `01 §4.2`](../../../orders-lifecycle/docs/design/01-foundation.md#42-idempotency-semantics-normative), first row), and the approval-request key does the same at Generic Approval (`../ADR/0006`) — so a crash after the downstream accepted is absorbed downstream (past Lifecycle's 24-hour window, by the read-back of §3.3 *Rounds and attempts* rule 4, and at Generic Approval by `open-gates`' look-up of the gate's request before it submits, decisions D-188, D-189), and the old holder's late settlement fails the fence. A record-only operation never leaves this state behind (§3.7). |
+| **Aged-out key** | `expires_at` passed with no settled record, on an operation that submits downstream; on any other operation, only once the instance is terminal (§3.7 *Key lifetime*, D-185) | Evaluated on the retained row — the tombstone rule of §3.7 keeps it until no replay can arrive, so expiry is logical and never inferred from a missing row. `settle-from-lookup` is read-only past this point. The next attempt is a **new operation under a new key** — it appends the key's `attempt` component (minted by `retry-step`; for an intent key, the per-line `wave_attempt` minted by the rebuild path or by an operator's retry of a `failed` intent, slice 05) — never a resume of the old one and never a replay of the identical key string. **The successor key** (D-185): when the family holds an `attempt` minted after the aged key's `created_at`, the envelope resolves the re-issued aged key under its successor — the same key with the latest such `attempt` in its attempt component — through this table: a first call the first time, and thereafter whatever the successor's own record resolves to, so a definition that keeps presenting the key it holds reaches the same successor every time; the first arrival is recorded in the family's `presented` history with the key it arrived under (§3.3 *Rounds and attempts*, rule 3, D-174). Without such an attempt it answers `aged-out`. The attempt is minted only by an operator's decision: the `retry` of the order-scope task the answer reaches — the `invocation-dead` task, because no `catch` of the canonical definition routes a 400 of these operations (`10 §4.6`; `reflect-verdict`'s refusal is an answer, not a 400, decision D-190) — in the transaction that records the request (`09 §3.6` `inst-cs-record`), and the dead-instance unwind after a recorded cancel (§4.16 item 2). |
 
 No seventh outcome exists. **These six are registry outcomes, not additional step outcomes.**
 They are what resolving a key yields *inside* the envelope; the definition still sees only the
@@ -2955,7 +2989,10 @@ the order-scope task reason of the instance liveness pass, added by D-105; decis
 `activation-precondition-unmet`, `intent-unresolved`, `fence-not-claimed`,
 `outcome-not-reportable`, `order-fenced`, `action-not-offered`, `override-unverified`,
 `lifetime-ceiling-reached`, `approval-reflection-refused` — are registered here with the categories
-their owning slices chose).
+their owning slices chose). `approval-reflection-refused` is no longer returned as an error:
+`reflect-verdict` carries it as the reason of its settled `refused` answer, and it stays in the
+table as the order-scope task's `failure_reason` (`07 §3.7`), which is drawn from this catalogue
+(decision D-190).
 
 **Why these categories, stated once.** The canonical SDK fixes `FailedPrecondition` to HTTP 400,
 not 409 or 422, so a conflict that must answer 409 is `Aborted` (a retry may succeed:

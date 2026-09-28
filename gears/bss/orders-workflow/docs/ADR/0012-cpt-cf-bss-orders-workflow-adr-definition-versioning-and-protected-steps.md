@@ -180,6 +180,12 @@ rather than one task, fails closed before a definition can be executed, and stil
   > maximum) < the `gate` timeout — 55 s < 60 s in the canonical
   > (`design/10-process-definition.md` §2.2 rule 4).
 
+  > **Amended 2026-09-28 by D-190**: **Rule 6**'s named failure routes no longer include
+  > `reflect-verdict`'s order task, which the D-126 block above lists. A Lifecycle refusal of the
+  > reflection is the settled answer `refused`, and the definition routes it on the output to that
+  > task, so no `catch` around `reflect-verdict` names a 400 and a genuine 400 of it faults the
+  > invocation (`design/10-process-definition.md` §3.6 (a), §4.6).
+
   The `protected` list is closed and fixed here; adding to it or removing from it is an Orders
   release and an amendment of this ADR: `start-instance`, `settle-from-lookup` (sweep-only),
   `terminate-instance`, `admit-trigger`, `terminate-on-terminal-event`, `obtain-verdict`,

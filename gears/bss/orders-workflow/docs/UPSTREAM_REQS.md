@@ -72,7 +72,7 @@ operator visibility of trigger-path dead letters and a failure-handler safety ne
 | Subscriptions (`gears/bss/subscriptions/docs/SEAMS.md`) | `SUB-O1`, `SUB-O5` registered-and-unagreed; `SUB-O10` registered by the sibling Lifecycle design, unagreed; `SUB-O11`..`SUB-O16` UNASKED (never registered) | Provisioning intents, compensation, in-flight status, correlation propagation, the seam's latency budget, and callback attribution all cross this seam; several gaps make parts of the design fail closed or unenforceable until they land. |
 | Payments | No specification or register exists in this repository | Begin-fulfillment gating needs an authorization outcome distinguishing authorized/pending/failed; there is no owner to receive the ask. |
 | Generic Approval service | No canonical specification; PRD §9.2 expectations contract is the normative interface until one exists | Approval-requirement verdict acquisition, routing, multi-party gates, and escalation are executed against this contract via a phase-1 stand-in that returns `approval not required` (audited), pending the real service. |
-| Orders Lifecycle (`gears/bss/orders-lifecycle`) | UNASKED (never registered) | This design's escalation obligation is stated relative to the order's `submitted` TTL, which Orders Lifecycle owns and this gear can neither read nor derive; without it the obligation is a strict inequality between two quantities, only one of which is knowable here. The events the platform consumes for this gear carry Lifecycle's commercial fields into engine history unless a thin variant exists or the platform stores selected members only (ADR-0013). Two failure causes have no value in Lifecycle's closed `failure_reason` enumeration (§2.4). |
+| Orders Lifecycle (`gears/bss/orders-lifecycle`) | UNASKED (never registered) | This design's escalation obligation is stated relative to the order's `submitted` TTL, which Orders Lifecycle owns and this gear can neither read nor derive; without it the obligation is a strict inequality between two quantities, only one of which is knowable here. The events the platform consumes for this gear carry Lifecycle's commercial fields into engine history unless a thin variant exists or the platform stores selected members only (ADR-0013). Two failure causes have no value in Lifecycle's closed `failure_reason` enumeration (§2.4). Lifecycle's 24-hour idempotency window is shorter than this gear's re-issue of a transition key (§2.4, D-188). |
 | Catalog | UNASKED (never registered; not a PRD-registered actor either) | Every fulfillment plan is constructed from Catalog's dependency topology and frozen against it; the plan cannot be built, validated for cycles, or ordered for compensation without a read contract. |
 | Event Broker (`gears/system/event-broker`) | REGISTERED by Orders Lifecycle (`gears/bss/orders-lifecycle/docs/UPSTREAM_REQS.md` §2.7), open; co-signed here | Process events publish through the platform producer outbox (`ADR/0008`, D-58); the runtime, cursor/retry semantics, dead-letter recovery, root tenancy and delivery observability are platform prerequisites this gear cannot report ready without. |
 | Platform authorization policy owner (`authz-resolver` PDP provider and policy provisioning) | UNASKED (never registered); Orders Lifecycle's `…-upreq-pdp-policy-integration` (`gears/bss/orders-lifecycle/docs/UPSTREAM_REQS.md` §2.9) is the precedent and the two should be provisioned together | Every operation is authorized by the platform PDP on a registered `(resource, action)` pair through the shared `PolicyEnforcer` adapter (`ADR/0010`, D-63); until the catalogue is registered and the roles, the `assigned_principal` approver grant and the service-principal grants are provisioned and verified against the deployed provider, no caller-driven operation is authorizable in production, and this design fabricates no default grant. |
@@ -350,7 +350,15 @@ clause is asked: the decision **event** carries references only — `orderId`, `
 gate identifier and a `decisionEventId` — and the decision itself (outcome, reason, deciding
 authority, deciding subject) is **read** by `record-decision` from the service by
 `decisionEventId`, so no approver identity or reason text crosses into engine history
-(`design/03-approval-execution.md` §3.3).
+(`design/03-approval-execution.md` §3.3). Since D-189 two more are asked. "Idempotent by request
+key" holds **for the life of the gate** — until the request is decided or cancelled — not for a
+request-cache window, because the approval-request key
+(`resource_tenant_id` + `orderId` + `orderVersion` + `gateId`) carries no attempt and is presented
+again by a re-run after this gear's own step key aged out (30 days, D-185). And the service answers
+a **read of a request by its request key**, which `open-gates` makes before it submits and so
+adopts a request an unsettled earlier call made (`design/03-approval-execution.md` §3.6
+`inst-og-submit`) — the confirm-by-lookup rule this gear already asks of Subscriptions after a key
+ages out (§2.1 `SUB-O13`).
 
 - **Owning upstream gear**: Generic Approval service. **No canonical specification exists today**
   (the `gears/approval-service` gear PRD remains a stub); PRD §9.2 is the normative interface until
@@ -366,7 +374,8 @@ authority, deciding subject) is **read** by `record-decision` from the service b
 - **Agreement status**: UNASKED — no canonical specification exists to register this contract
   against; PRD §9.2 is a self-declared expectations contract, not an upstream-agreed one.
 - **Source**: PRD §9.2 (External Integration Contracts), §6.2 (approval execution), §13
-  Dependencies (Generic Approval service, `p1`).
+  Dependencies (Generic Approval service, `p1`); `DECISIONS.md` D-189 (request-key lifetime and
+  read by request key).
 
 ### 2.4 Orders Lifecycle
 
@@ -471,6 +480,40 @@ its D-136), or name the existing value this gear should send for each:
   Lifecycle's audit `caller_reason` and `OrderFulfillmentFailed` carry the approximation.
 - **Agreement status**: **UNASKED**.
 - **Source**: `DECISIONS.md` D-110. Raised against `gears/bss/orders-lifecycle/docs/UPSTREAM_REQS.md`.
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-upreq-lifecycle-workflow-key-retention`
+
+Orders Lifecycle **MUST** either **retain the idempotency records of the workflow-trigger class**
+(the triggers of the five seam operations, [Lifecycle `01 §4.1`](../../orders-lifecycle/docs/design/01-foundation.md#41-the-transition-contract-normative)),
+scoped to the Workflow service principal, for **at least 30 days** from the record's creation —
+this gear's key lifetime (`design/01-foundation.md` §3.7 *Key lifetime*, D-185), after which it
+never re-issues the same key — **or expose a read of a seam operation's stored outcome by its
+idempotency key**, returning the outcome the key settled (committed, or the refusal) or "no
+record".
+
+- **Owning upstream gear**: Orders Lifecycle (`gears/bss/orders-lifecycle`).
+- **Why this gear cannot satisfy it alone**: Lifecycle owns the registry and its 24-hour window
+  ([Lifecycle `01 §2.2`](../../orders-lifecycle/docs/design/01-foundation.md#the-idempotency-window-is-24-hours-and-is-not-a-commercial-bound)).
+  This gear re-issues an unchanged Lifecycle key after a lease death or an interruption that can
+  last days — a hold, a ceiling park, an `invocation-dead` task awaiting its re-drive — and the
+  keys of `begin-fulfillment`, `report-spawn-signal` and `report-outcome` carry no attempt, so
+  even an operator-minted successor presents the same Lifecycle key.
+- **Rationale**: Lifecycle's own constraint already states the requirement: "Past the window a
+  replayed key is a new operation, so the window must exceed the longest caller retry horizon"
+  (Lifecycle `01-foundation.md:238-241`). For this caller that horizon is 30 days. Past the window,
+  a re-run of a transition that committed is refused `not-admissible` — the version check passes
+  and the state table has no row from the state already reached (Lifecycle
+  `06-workflow-seam.md:352-356`) — instead of replaying the stored success.
+- **Interim in place — this ask is open but not blocking**: D-188 reads the order back on a
+  `not-admissible` and, where it is at the call's version in the transition's target state,
+  settles `already-applied` (`design/01-foundation.md` §3.3 *Rounds and attempts* rule 4). The
+  residuals are what the read cannot show: the recorded verdict, failure reason and cancelling
+  path are not in Lifecycle's order read, so a `cancelled` order is reported `terminal-event`
+  rather than as this gear's cancel, and each such re-run appends one refused attempt to
+  Lifecycle's audit trail.
+- **Agreement status**: **UNASKED**.
+- **Source**: `DECISIONS.md` D-188, D-185. Raised against
+  `gears/bss/orders-lifecycle/docs/UPSTREAM_REQS.md`.
 
 ### 2.5 Catalog
 
@@ -1176,7 +1219,7 @@ then have to accept.
 
 | Priority | Requirements |
 |----------|-------------|
-| `p1` (critical) | `…-upreq-overlap-presence-read`, `…-upreq-compensation-cancel-reason`, `…-upreq-explicit-start-instant`, `…-upreq-in-flight-rejection`, `…-upreq-cancel-accepted-transition`, `…-upreq-nonterminal-status-read`, `…-upreq-provisioning-latency-budget`, `…-upreq-identity-envelope-echo`, `…-upreq-payment-authorization-outcome`, `…-upreq-generic-approval-expectations-contract`, `…-upreq-submitted-ttl-visibility`, `…-upreq-lifecycle-thin-events`, `…-upreq-catalog-dependency-topology-read`, `…-upreq-pii-classification-ruling`, `…-upreq-event-broker-shared-prerequisites`, `…-upreq-pdp-policy-integration` |
+| `p1` (critical) | `…-upreq-overlap-presence-read`, `…-upreq-compensation-cancel-reason`, `…-upreq-explicit-start-instant`, `…-upreq-in-flight-rejection`, `…-upreq-cancel-accepted-transition`, `…-upreq-nonterminal-status-read`, `…-upreq-provisioning-latency-budget`, `…-upreq-identity-envelope-echo`, `…-upreq-payment-authorization-outcome`, `…-upreq-generic-approval-expectations-contract`, `…-upreq-submitted-ttl-visibility`, `…-upreq-lifecycle-thin-events`, `…-upreq-lifecycle-workflow-key-retention`, `…-upreq-catalog-dependency-topology-read`, `…-upreq-pii-classification-ruling`, `…-upreq-event-broker-shared-prerequisites`, `…-upreq-pdp-policy-integration` |
 | `p1` (critical), platform path | `…-upreq-serverless-runtime-readiness-gate`, `…-upreq-serverless-runtime-event-triggers-gts`, `…-upreq-serverless-runtime-consumed-event-member-storage`, `…-upreq-serverless-runtime-pdp-guarded-call`, `…-upreq-serverless-runtime-attempt-and-deadline-propagation`, `…-upreq-serverless-runtime-history-residency-retention`, `…-upreq-serverless-runtime-definition-versioning-validation-hook`, `…-upreq-serverless-runtime-trigger-version-selection`, `…-upreq-serverless-runtime-signals`, `…-upreq-serverless-runtime-event-retention-between-listens`, `…-upreq-serverless-runtime-history-growth`, `…-upreq-serverless-runtime-invocation-control-restriction`, `…-upreq-serverless-runtime-dead-letter-operator-visibility` |
 | `p2` (important) | `…-upreq-correlation-propagation`, `…-upreq-serverless-runtime-failure-handler-target`, `…-upreq-lifecycle-failure-reason-coverage` |
 
