@@ -274,8 +274,8 @@ The system **MUST** provide the `CoordinationAdapter` (`cpt-cf-quota-enforcement
 the platform `cluster` gear's leader election per `cpt-cf-quota-enforcement-adr-coordination-plugin`. The adapter
 **MUST** define the typed cluster profile `QuotaEnforcementProfile` (name `quota-enforcement`), resolve the
 leader-election facade in the gear's lifecycle `start` with the `Linearizable` requirement, scope every election name
-under the `qe` prefix, and map the closed `SingletonScope` enum (`LeaseSweeper`, `RetentionSweeper`) to the election
-names `lease-sweeper` and `retention-sweeper`. It **MUST** implement the domain port `SingletonCoordinator` with
+under the `qe` prefix, and map the closed `SingletonScope` enum (`LeaseSweeper`, `RetentionSweeper`, and `LifecycleGauges`, which the
+quota-lifecycle feature adds) to the election names `lease-sweeper`, `retention-sweeper`, and `lifecycle-gauges`. It **MUST** implement the domain port `SingletonCoordinator` with
 run-while-leader semantics: the work starts on election with a child `CancellationToken`, is cancelled on leadership
 loss, is aborted after the configured stop timeout, and restarts on re-election; the resolved cluster backend renews
 the claim.

@@ -57,7 +57,7 @@ not here.
 
 - **Scope**:
   - `quota-enforcement` and `quota-enforcement-sdk` crate skeletons registered in the workspace
-  - `QuotaEnforcementStoragePluginV1` trait, closed `StorageError` enum, invariants I1–I13, `toolkit-db` plugin
+  - `QuotaEnforcementStoragePluginV1` trait, closed `StorageError` enum, invariants I1–I14, `toolkit-db` plugin
   - `cluster-sdk` dependency (no `deps = [cluster]` edge), typed `quota-enforcement` cluster profile, and the
     coordination adapter (one leader election per sweeper scope, linearizable requirement validated at startup)
   - Gateway REST registration into the platform `api-gateway`, DTO validation shell, phase-1 PDP admission via
