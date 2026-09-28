@@ -121,14 +121,18 @@ impl PolicyManagement<'_> {
             .await?;
         // @cpt-end:cpt-cf-quota-enforcement-flow-policy-write:p1:inst-pw-snapshot
         // @cpt-begin:cpt-cf-quota-enforcement-flow-policy-write:p1:inst-pw-validate
-        let compiled = self.compile(&admitted, &spec.engine_id, &spec.engine_config, &full)?;
+        let compiled = self
+            .compile(&admitted, &spec.engine_id, &spec.engine_config, &full)
+            .await?;
         // Persist only the contracts the artifact reads: a change to an input
         // it never touches must not invalidate a later activation.
         let snapshot = self
             .schemas
             .snapshot(&spec.scope, &spec.engine_id, compiled.inputs())
             .await?;
-        let artifact = self.rebuild(&admitted, &spec.engine_id, &spec.engine_config, &snapshot)?;
+        let artifact = self
+            .rebuild(&admitted, &spec.engine_id, &spec.engine_config, &snapshot)
+            .await?;
         // @cpt-end:cpt-cf-quota-enforcement-flow-policy-write:p1:inst-pw-validate
         let events = [event(None, "created")];
         let draft = PolicyDraft {
@@ -193,12 +197,14 @@ impl PolicyManagement<'_> {
             .schemas
             .snapshot(&current.scope, &engine_id, EnvironmentInputs::ALL)
             .await?;
-        let compiled = self.compile(&admitted, &engine_id, &config, &full)?;
+        let compiled = self.compile(&admitted, &engine_id, &config, &full).await?;
         let snapshot = self
             .schemas
             .snapshot(&current.scope, &engine_id, compiled.inputs())
             .await?;
-        let artifact = self.rebuild(&admitted, &engine_id, &config, &snapshot)?;
+        let artifact = self
+            .rebuild(&admitted, &engine_id, &config, &snapshot)
+            .await?;
         let update = PolicyUpdate {
             if_match_version: patch.if_match_version,
             engine_id: Some(engine_id),
@@ -247,12 +253,14 @@ impl PolicyManagement<'_> {
                 })
             })?;
         self.schemas.check_activation(&version)?;
-        let artifact = self.compile(
-            &admitted,
-            &version.engine_id,
-            &version.engine_config,
-            &version.schema_snapshot,
-        )?;
+        let artifact = self
+            .compile(
+                &admitted,
+                &version.engine_id,
+                &version.engine_config,
+                &version.schema_snapshot,
+            )
+            .await?;
         // Rollback is a latest-pointer move, so the notification says `updated`;
         // `rolled_back` is the state the displaced version lands in, not a
         // change kind (feature flow `inst-prd-rollback-apply`).
@@ -395,27 +403,39 @@ impl PolicyManagement<'_> {
 
     // @cpt-begin:cpt-cf-quota-enforcement-flow-policy-write:p1:inst-pw-invalid
     // @cpt-begin:cpt-cf-quota-enforcement-flow-policy-write:p1:inst-pw-invalid-if
-    fn compile(
+    async fn compile(
         &self,
         _admitted: &OperatorAdmission,
         engine_id: &str,
         config: &serde_json::Value,
         snapshot: &PolicySchemaSnapshot,
     ) -> Result<Arc<dyn ValidatedConfig>, DomainError> {
-        let engine = self
-            .engines
-            .get(engine_id)
-            .ok_or_else(|| self.unknown_engine(engine_id))?;
-        engine
-            .validate_config(EngineValidationInput {
-                raw: config,
-                schemas: snapshot,
-            })
-            .map_err(|e| DomainError::InvalidPolicy {
-                field: "engine_config",
-                reason: "INVALID_ENGINE_CONFIG",
-                detail: e.to_string(),
-            })
+        let engine = Arc::clone(
+            self.engines
+                .get(engine_id)
+                .ok_or_else(|| self.unknown_engine(engine_id))?,
+        );
+        // Validation is CPU work bounded only by the engine's own limits, so it
+        // shares the compilation permits with cache-miss rebuilds and stays off
+        // the runtime's workers. The clones are the price of a 'static task.
+        let permit = self.cache.compile_permit().await?;
+        let raw = config.clone();
+        let schemas = snapshot.clone();
+        let validated = tokio::task::spawn_blocking(move || {
+            let outcome = engine.validate_config(EngineValidationInput {
+                raw: &raw,
+                schemas: &schemas,
+            });
+            drop(permit);
+            outcome
+        })
+        .await
+        .map_err(|e| DomainError::Internal(format!("policy validation did not run: {e}")))?;
+        validated.map_err(|e| DomainError::InvalidPolicy {
+            field: "engine_config",
+            reason: "INVALID_ENGINE_CONFIG",
+            detail: e.to_string(),
+        })
     }
     // @cpt-end:cpt-cf-quota-enforcement-flow-policy-write:p1:inst-pw-invalid-if
     // @cpt-end:cpt-cf-quota-enforcement-flow-policy-write:p1:inst-pw-invalid
@@ -424,7 +444,7 @@ impl PolicyManagement<'_> {
     /// A version storage accepts must be one a restart can rebuild, so an
     /// engine that under-reports the inputs it reads fails here, at the write,
     /// instead of stranding the policy at its next activation.
-    fn rebuild(
+    async fn rebuild(
         &self,
         admitted: &OperatorAdmission,
         engine_id: &str,
@@ -432,6 +452,7 @@ impl PolicyManagement<'_> {
         snapshot: &PolicySchemaSnapshot,
     ) -> Result<Arc<dyn ValidatedConfig>, DomainError> {
         self.compile(admitted, engine_id, config, snapshot)
+            .await
             .map_err(|error| {
                 DomainError::Internal(format!(
                     "engine `{engine_id}` reads inputs its persisted schemas cannot rebuild: {error}"

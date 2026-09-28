@@ -331,6 +331,10 @@ async fn update_is_conditional_and_a_stale_version_counts_a_conflict_not_a_trans
     ));
     assert_eq!(*h.metrics.policy_conflicts.lock(), 1);
     assert_eq!(transitions(&h), vec![PolicyTransition::Create]);
+    assert!(
+        h.artifacts.get(&id, 2).is_none(),
+        "a refused write publishes nothing to the artifact cache"
+    );
 
     let updated = policies
         .update(&ctx(), id.clone(), patch(1))
@@ -482,11 +486,49 @@ async fn a_denied_operator_never_reaches_storage() {
             .expect("read")
             .is_none()
     );
-    assert!(matches!(
-        policies.read(&ctx(), &PolicyId::global(), None).await,
-        Err(DomainError::PdpDenied { .. })
-    ));
+    let id = PolicyId::global();
+    let denials = [
+        policies.read(&ctx(), &id, None).await.err(),
+        policies
+            .list(&ctx(), &id, PageRequest::first(10))
+            .await
+            .err(),
+        policies.update(&ctx(), id.clone(), patch(1)).await.err(),
+        policies.rollback(&ctx(), id.clone(), 1, None).await.err(),
+        policies.delete(&ctx(), id.clone(), None).await.err(),
+    ];
+    for denial in denials {
+        assert!(
+            matches!(denial, Some(DomainError::PdpDenied { .. })),
+            "every policy operation is refused at admission: {denial:?}"
+        );
+    }
     assert!(transitions(&h).is_empty());
+}
+
+#[tokio::test]
+async fn a_policy_write_waits_for_a_compilation_permit() {
+    let h = harness(permitted()).await;
+    let policies = h.service.policies().expect("bound");
+    // The harness allows two concurrent compilations; take both.
+    let held = [
+        h.artifacts.compile_permit().await.expect("permit"),
+        h.artifacts.compile_permit().await.expect("permit"),
+    ];
+
+    let operator = ctx();
+    let write = policies.create(&operator, mrw(PolicyScope::Global));
+    tokio::pin!(write);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut write)
+            .await
+            .is_err(),
+        "validation does not run while every compilation permit is taken"
+    );
+
+    drop(held);
+    let created = write.await.expect("create once a permit is free");
+    assert_eq!(created.version, 1);
 }
 
 #[tokio::test]

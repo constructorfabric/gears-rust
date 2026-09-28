@@ -158,6 +158,19 @@ impl PolicyArtifactCache {
         }
     }
 
+    /// Take one of the compilation permits that bound concurrent engine
+    /// validation, whether it is a cache-miss rebuild or a policy write.
+    ///
+    /// # Errors
+    ///
+    /// Internal when the permits are closed, which only happens at shutdown.
+    pub async fn compile_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, DomainError> {
+        Arc::clone(&self.permits)
+            .acquire_owned()
+            .await
+            .map_err(|_| DomainError::Internal("preparation permits closed".to_owned()))
+    }
+
     /// Claim the gate that serialises preparation of one version. Claimants
     /// take the lock, re-check the cache, and compile only if they are still
     /// the first. The claim is counted here, under the map lock.
@@ -423,10 +436,7 @@ impl<'a> PreparedEvaluation<'a> {
                 persisted.engine_id
             ))
         })?);
-        let permit = Arc::clone(&self.artifacts.permits)
-            .acquire_owned()
-            .await
-            .map_err(|_| DomainError::Internal("preparation permits closed".to_owned()))?;
+        let permit = self.artifacts.compile_permit().await?;
         let engine_id = persisted.engine_id.clone();
         let cache = Arc::clone(&self.artifacts);
         // Compilation is unbounded CPU work: parsing alone runs on a thread of

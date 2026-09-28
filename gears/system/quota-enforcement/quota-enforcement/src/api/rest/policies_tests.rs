@@ -13,7 +13,7 @@ use tower::ServiceExt as _;
 
 use super::super::routes::{PATH_PREFIX, register_routes};
 use crate::domain::Service;
-use crate::test_support::{METRIC_TOKENS, PermitUnconstrainedPdp, bound_service, ctx};
+use crate::test_support::{DenyAllPdp, METRIC_TOKENS, PermitUnconstrainedPdp, bound_service, ctx};
 
 fn app(service: Arc<Service>) -> Router {
     register_routes(Router::new(), &OpenApiRegistryImpl::new(), service).layer(Extension(ctx()))
@@ -251,4 +251,14 @@ async fn delete_is_idempotent_protects_global_and_404s_only_for_a_never_created_
         StatusCode::OK,
         "the global policy stays active: {body}"
     );
+}
+
+#[tokio::test]
+async fn a_caller_the_pdp_denies_gets_403_on_the_policy_endpoints() {
+    let app = app(bound_service(Arc::new(DenyAllPdp)).await);
+
+    let (status, body) = send(&app, Method::POST, "/policies", Some(metric_policy())).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, body) = send(&app, Method::GET, "/policies/global", None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
 }

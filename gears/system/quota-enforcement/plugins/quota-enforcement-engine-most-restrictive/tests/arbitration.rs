@@ -195,3 +195,20 @@ fn empty_and_expired_sets_deny() -> TestResult {
     }
     Ok(())
 }
+
+#[test]
+fn repeated_evaluation_of_one_context_is_byte_identical() -> TestResult {
+    let user = quota(Some(100), 80)?;
+    let tenant = quota(Some(10_000), 300)?;
+    let inputs = [
+        (&user, QuotaScopeTier::User),
+        (&tenant, QuotaScopeTier::Tenant),
+    ];
+    // An allowed and a denied verdict, each evaluated twice from one context.
+    for amount in [50, 50_000] {
+        let first = serde_json::to_vec(&evaluate(&inputs, amount)?)?;
+        let second = serde_json::to_vec(&evaluate(&inputs, amount)?)?;
+        assert_eq!(first, second, "amount {amount}");
+    }
+    Ok(())
+}
