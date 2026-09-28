@@ -704,13 +704,7 @@ where
         }
     }
 
-    // Validate cursor consistency (filter hash only)
-    if let Some(cur) = &query.cursor
-        && let (Some(h), Some(cf)) = (query.filter_hash.as_deref(), cur.f.as_deref())
-        && h != cf
-    {
-        return Err(ODataError::FilterMismatch);
-    }
+    crate::odata::core::check_cursor_filter(query)?;
 
     let mut s = select.inner;
 

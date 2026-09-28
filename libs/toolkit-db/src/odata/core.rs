@@ -766,6 +766,38 @@ where
 /* ---------- pagination combiner ---------- */
 
 // Use unified pagination types from toolkit-odata
+/// A cursor continues the listing whose `$filter` it recorded.
+///
+/// The cursor carries the hash of the filter its first page ran under (`f`).
+/// The check used to compare only two present hashes, so a cursor minted
+/// under a filter and replayed *without* one skipped it and resumed an
+/// unfiltered walk at a filtered position -- a page from a different listing,
+/// or an empty one read as its end. When the cursor recorded a hash, the
+/// query must carry the same one: its own `filter_hash`, or, for a query built
+/// in-process without one, the hash of its `$filter` computed the way the REST
+/// extractor computes it. A cursor that recorded none (minted in-process
+/// without a hash) cannot say which listing it belongs to and is not checked,
+/// which is what it always was.
+///
+/// # Errors
+///
+/// [`ODataError::FilterMismatch`] when the query's filter is not the one the
+/// cursor recorded.
+pub fn check_cursor_filter(q: &ODataQuery) -> Result<(), ODataError> {
+    let Some(recorded) = q.cursor.as_ref().and_then(|cur| cur.f.as_deref()) else {
+        return Ok(());
+    };
+    let effective = q
+        .filter_hash
+        .clone()
+        .or_else(|| toolkit_odata::short_filter_hash(q.filter.as_deref()));
+    if effective.as_deref() == Some(recorded) {
+        Ok(())
+    } else {
+        Err(ODataError::FilterMismatch)
+    }
+}
+
 pub use toolkit_odata::{Page, PageInfo};
 
 // Note: LimitCfg is imported at the top and re-exported from odata/mod.rs
@@ -815,13 +847,7 @@ where
             .ensure_tiebreaker(tiebreaker.0, tiebreaker.1)
     };
 
-    // Validate cursor consistency (filter hash only) if cursor present
-    if let Some(cur) = &q.cursor
-        && let (Some(h), Some(cf)) = (q.filter_hash.as_deref(), cur.f.as_deref())
-        && h != cf
-    {
-        return Err(ODataError::FilterMismatch);
-    }
+    check_cursor_filter(q)?;
 
     // Compose: filter → cursor predicate → order; apply limit+1 at the end
     let mut s = select;
@@ -962,6 +988,49 @@ fn build_cursor<E: EntityTrait>(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// A cursor that recorded a filter hash continues only under that filter.
+    /// Replaying it without the filter used to pass the check (it compared
+    /// only two present hashes) and resume an unfiltered walk.
+    #[test]
+    fn a_cursor_is_checked_against_the_filter_it_recorded() {
+        let filter = || {
+            toolkit_odata::parse_filter_string("name eq 'x'")
+                .expect("filter parses")
+                .into_expr()
+        };
+        let minted = toolkit_odata::short_filter_hash(Some(&filter()));
+        let cursor = |f: Option<String>| CursorV1 {
+            k: vec!["v:x".to_owned()],
+            o: SortDir::Asc,
+            s: "+id".to_owned(),
+            f,
+            d: "fwd".to_owned(),
+        };
+        let with = |f: Option<String>| ODataQuery::new().with_cursor(cursor(f));
+
+        // The same filter, stamped (REST) or computed (in-process): continues.
+        let mut stamped = with(minted.clone()).with_filter(filter());
+        stamped.filter_hash.clone_from(&minted);
+        assert!(check_cursor_filter(&stamped).is_ok());
+        assert!(check_cursor_filter(&with(minted.clone()).with_filter(filter())).is_ok());
+
+        // Omitted or different: refused.
+        assert!(matches!(
+            check_cursor_filter(&with(minted.clone())),
+            Err(ODataError::FilterMismatch)
+        ));
+        let other = toolkit_odata::parse_filter_string("name eq 'y'")
+            .expect("filter parses")
+            .into_expr();
+        assert!(matches!(
+            check_cursor_filter(&with(minted).with_filter(other)),
+            Err(ODataError::FilterMismatch)
+        ));
+
+        // A cursor that recorded no hash says nothing to check against.
+        assert!(check_cursor_filter(&with(None).with_filter(filter())).is_ok());
+    }
     // `super` aliases `toolkit_odata::ast` as `core`, which shadows the `core`
     // crate inside this module; spell the path out to disambiguate.
     use self::core::Value as V;
