@@ -118,3 +118,30 @@ async fn registry_failures_and_a_missing_registry_are_unavailability() {
         "{err:?}"
     );
 }
+
+#[tokio::test]
+async fn a_registry_call_that_never_answers_is_an_unavailable_registry() {
+    let hanging = std::future::pending::<Result<(), CanonicalError>>();
+    let err = super::bounded(std::time::Duration::from_millis(20), hanging)
+        .await
+        .expect_err("the deadline elapses");
+    assert!(
+        matches!(&err, DomainError::TypesRegistryUnavailable(detail) if detail.contains("no answer")),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_selection_deadline_defaults_to_ten_seconds_and_can_be_tightened() {
+    let hub = hub_with(&[]);
+    assert_eq!(
+        binding(hub.clone()).deadline,
+        super::DEFAULT_SELECTION_DEADLINE
+    );
+    assert_eq!(
+        super::DEFAULT_SELECTION_DEADLINE,
+        std::time::Duration::from_secs(10)
+    );
+    let tightened = binding(hub).with_deadline(std::time::Duration::from_millis(5));
+    assert_eq!(tightened.deadline, std::time::Duration::from_millis(5));
+}

@@ -111,6 +111,68 @@ async fn drive_starts_the_body_on_election_stops_it_on_loss_and_resigns_on_shutd
     assert_eq!(body.stops(), 2, "the body stopped before the resign");
 }
 
+/// Raises its flag when dropped, which is what an abort does to a body.
+struct DropFlag(Arc<AtomicBool>);
+
+impl Drop for DropFlag {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// A body that never returns, whatever its token says.
+fn stubborn_work(started: Arc<AtomicBool>, dropped: Arc<AtomicBool>) -> LeaderWork {
+    Arc::new(move |_token: CancellationToken| {
+        let started = started.clone();
+        let dropped = dropped.clone();
+        Box::pin(async move {
+            let _guard = DropFlag(dropped);
+            started.store(true, Ordering::SeqCst);
+            std::future::pending::<()>().await;
+        })
+    })
+}
+
+#[tokio::test]
+async fn a_body_that_ignores_cancellation_is_aborted_after_the_stop_timeout() {
+    let stop_timeout = Duration::from_millis(100);
+    let (sender, mut resigns, watch) = LeaderWatch::channel(8, LeaderStatus::Follower);
+    let started = Arc::new(AtomicBool::new(false));
+    let dropped = Arc::new(AtomicBool::new(false));
+    let shutdown = CancellationToken::new();
+    let task = tokio::spawn(drive(
+        SingletonScope::LeaseSweeper,
+        watch,
+        shutdown.clone(),
+        stubborn_work(started.clone(), dropped.clone()),
+        stop_timeout,
+    ));
+
+    sender
+        .send_status(LeaderStatus::Leader)
+        .await
+        .expect("watch alive");
+    wait_until("body started", || started.load(Ordering::SeqCst)).await;
+
+    let lost_at = tokio::time::Instant::now();
+    sender
+        .send_status(LeaderStatus::Lost)
+        .await
+        .expect("watch alive");
+    wait_until("body aborted", || dropped.load(Ordering::SeqCst)).await;
+    assert!(
+        lost_at.elapsed() >= stop_timeout,
+        "the body is given the whole stop timeout before the abort"
+    );
+
+    shutdown.cancel();
+    let responder = resigns.recv().await.expect("shutdown resigns the election");
+    responder.respond(Ok(()));
+    task.await
+        .expect("drive joins")
+        .expect("drive returns Ok after the resign");
+}
+
 #[tokio::test]
 async fn drive_restarts_the_body_after_a_gap_when_the_snapshot_still_reads_leader() {
     let (sender, mut resigns, watch) = LeaderWatch::channel(8, LeaderStatus::Follower);
