@@ -3330,6 +3330,11 @@ or cancel stage the ceiling interrupted returns where it would have, not to the 
 **Amended by D-163 (2026-09-28)**: a ceiling that fires while a lifecycle or cancel stage taken
 from the ceiling wait is running re-arms without parking and without running `ceilingEntry`.
 
+**Amended by D-164 (2026-09-28)**: `ceilingEntry` also saves the interrupted stage's payload
+(`lifecycleEventId`, `triggerKind`, `cancelRequestRef`, `requestRef`, `taskRef`) and
+`backToProcess` restores it with `preAdmitted: false`; the ceiling wait's resolution arm writes
+its own `ceilingRequestRef`.
+
 ### D-122 (H) The ceiling wait consumes only its own task, and no unrecorded signal unparks
 
 **Accepted (2026-09-26).**
@@ -4289,6 +4294,11 @@ event id they stored. **Precedent**: `enterParkLoop` before `park` and `leftPark
 
 **Propagated**: `design/10-process-definition.md` §3.6 intro, (a), (c), (d); D-121.
 
+**Amended by D-164 (2026-09-28)**: the re-issue is under the interrupted stage's own payload — the
+ceiling wait's resolution arm writes `ceilingRequestRef`, not `requestRef`, and `backToProcess`
+restores the event and request members `ceilingEntry` saved — so a ceiling arm no longer changes
+the key a checkpoint call re-issues under.
+
 ### D-148 (M) The escalation bound counts every call between two fires
 
 **Accepted (2026-09-26).** *(amends D-123)*
@@ -4715,6 +4725,10 @@ requires where a pinned member is consumed (D-144), and `ceilingReturnLoop`, the
 **Propagated**: `design/10-process-definition.md` §2.2 rule 1, §3.6 (a), (d), (e), (f) and their
 descriptions; `ADR/0012` (amendment block after the D-144 block); D-121, D-144.
 
+**Amended by D-164 (2026-09-28)**: the re-walk's `backToProcess` case no longer relies on the new
+event's admission matching the earlier one: `backToProcess` restores `lifecycleEventId` and
+`triggerKind` with `preAdmitted: false`, so the interrupted lifecycle stage re-admits its own event.
+
 ### D-162 (M) The gate-loop calls retry under a policy whose worst case fits their timeout
 
 **Accepted (2026-09-26).** *(amends D-148)*
@@ -4768,6 +4782,76 @@ already covers. Closes the edge case left open by D-161.
 
 **Propagated**: `design/10-process-definition.md` §3.6 (a) `afterLifetime` and the lifetime
 paragraph of fragment (d); D-121, D-161.
+
+### D-164 (H) The ceiling wait writes its own request reference, and a ceiling restores the payload of the stage it interrupted
+
+**Accepted (2026-09-28).** *(amends D-121, D-147, D-161)*
+
+**Decision**: (1) the ceiling wait's resolution arm writes a new member `ceilingRequestRef`, and
+`resolveCeilingTask` sends `requestRef: $context.ceilingRequestRef`; `requestRef` stays with the
+stage the ceiling interrupted. (2) `ceilingEntry` also saves the interrupted stage's payload —
+`lifecycleEventId`, `triggerKind`, `cancelRequestRef`, `requestRef` and `taskRef` — as
+`ceilingReturnEventId`, `ceilingReturnTriggerKind`, `ceilingReturnCancelRef`,
+`ceilingReturnRequestRef` and `ceilingReturnTaskRef`, each under the same "keep the first ceiling's
+value while `nextStage = ceiling`" `if` as `ceilingReturnStage` (D-163), and `backToProcess`
+restores them. (3) `backToProcess` writes `preAdmitted: false`, a literal, instead of saving
+`preAdmitted`: an interrupted lifecycle stage re-admits the restored event, and `admit-trigger`'s
+event-scoped key `{tenant}:{eventId}:admit-trigger:listen`, whose fingerprint covers
+`triggerKind` (`02 §2.1`, §3.3), answers it with the admission already settled for it. The saved
+members are payload, not routing members, so rule 1's member lists are unchanged except that
+`backToProcess` joins the writes where `preAdmitted` is `false`.
+
+**Which members, and the sweep.** A member needs saving when a checkpoint call that a re-entered
+stage re-issues reads it from `$context`, and something between `ceilingEntry` and
+`backToProcess` can write it: the ceiling stage itself, the ceiling wait's four arms
+(resolution, SLA, lifecycle, cancel), and the lifecycle and cancel stages taken from them, whose
+`back` returns to the ceiling. Checked:
+- *Written there and read by a re-issued call* — saved: `lifecycleEventId` and `triggerKind`
+  (lifecycle arm; read by `admitAcceptance`, `admitHold`, `applyHold`, `admitLifecycle`,
+  `terminalEvent`); `cancelRequestRef` (cancel arm; read by `authorize`); `requestRef` (the
+  ceiling resolution arm before (1); read by `resolveTask`, `verifyOverride` and the eligibility
+  call). `taskRef` is saved with `requestRef` though no ceiling writer is left, so the restore is
+  the whole payload of the failure stage's `resolveTask`.
+- *Written there, but every reader recomputes it on re-entry* — not saved: `admission` and
+  `supersededByOrderVersion` (the interrupted stage re-runs its admission; `preAdmitted: false`
+  sends a lifecycle stage through `admitLifecycle`), `terminate` (`terminalEvent` re-runs),
+  `cancelAuthorized` (`authorize` re-runs), `resolution` (`resolveTask` re-runs; no `enter`
+  reaches `onResolution` directly).
+- *Ceiling-only members*: `ceilingTaskRef`, `ceilingSlaRound`, `ceilingSubject`, `ceilingRound`,
+  and now `ceilingRequestRef`, which no other stage reads.
+- *Read by a re-issued call, but nothing there writes it*: `resumeEventId` and `suspensionRef`
+  (the ceiling wait has no hold or resume arm, `06 §4.7` item 7), `heldStage`, `heldLoop`,
+  `eligibilityTrigger`, `slaRound`, `wave1LineRefs`, `eligibleLineRefs`, the rounds and attempt
+  keys.
+- *Outside the ceiling*: a shared arm of a stage fork (hold, resume, lifecycle, cancel) writes only
+  `lifecycleEventId`, `resumeEventId`, `triggerKind`, `preAdmitted`, `cancelRequestRef` and
+  `heldTicks`, and the stage it interrupted re-enters at its `stageLoop`. No checkpoint call a
+  stage re-enters at reads one of them: `recordDecision`, `resolveTask`, `resolveCompensationTask`,
+  `compensate`, `wave1`, `reflectVerdict`, `preActivation` and `reportCompleted` read their own
+  stage's members, and the calls that do read them (`admitHold`, `applyHold`, `admitResume`,
+  `admitLifecycle`, `terminalEvent`, `authorize`, `admitAcceptance`) run only on a fresh entry
+  right after their own arm, or re-enter at a wait whose next arm writes them afresh. The unwind's
+  cancel arm can overwrite `cancelRequestRef` with a denied request, but the unwind re-enters at
+  `compensate` or its resolution wait and never re-runs the fence with it; a ceiling never
+  interrupts the unwind (`afterLifetime`'s `unwinding` case). No other pair found.
+
+**Rationale**: the ceiling interrupts a stage wherever it is, and its wait consumes signals and
+events of its own. When those were written into the members the interrupted stage's checkpoint
+call reads, the call re-issued after the unpark carried the ceiling's payload: `resolveTask` for
+task A under the ceiling task's request (wrong key; A's consumed request lost, breaking D-147),
+an `admitHold` presenting an `OrderAmended` event id as `OrderHeld` under a key that event's own
+admission settled with another fingerprint (`idempotency-key-conflict`, `01 §4.3`), or an
+`authorize` for the ceiling wait's cancel request instead of the stage's own (re-review E-1,
+E-2). **Precedent**: `ceilingTaskRef` and `ceilingSlaRound` (D-121, D-129), the ceiling task's
+own members kept apart from the failure stage's `taskRef` and `slaRound` for exactly this reason;
+and `ceilingReturnStage`, `ceilingReturnLoop` and `ceilingReturnBack` with their nested-ceiling
+guard (D-161, D-163), which the payload members copy. The literal `preAdmitted: false` follows
+D-161's rule that every write that goes with `lifecycleEventId` clears it, and the replay follows
+D-147: the call is re-issued under its unchanged key.
+
+**Propagated**: `design/10-process-definition.md` §2.2 rule 1, §3.6 (a) `ceilingEntry`, (c) the
+task-resolution arm's comment, (d) the ceiling wait, `resolveCeilingTask`, `backToProcess` and the
+description, (f) the description; D-121, D-147, D-161.
 
 ### Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?
 
@@ -5193,6 +5277,7 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-161 | H Admission answers only its own event; ceiling restores the return stage | `design/10-process-definition.md` §2.2, §3.6, `ADR/0012`; D-121, D-144 |
 | D-162 | M Gate-loop calls retry under a policy that fits their timeout | `design/10-process-definition.md` §1.2, §2.2, §3.6, `design/01-foundation.md` §4.2, §4.5, `design/03-approval-execution.md` §1.2, §4.5, `ADR/0012`; D-148 |
 | D-163 | M A ceiling while parked at a ceiling re-arms and keeps the first ceiling's return state | `design/10-process-definition.md` §3.6 (a), (d) |
+| D-164 | H Ceiling wait's own request ref; a ceiling restores the interrupted stage's payload | `design/10-process-definition.md` §2.2, §3.6 (a), (c), (d), (f); D-121, D-147, D-161 |
 
-Highest decision number used: **D-163**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
+Highest decision number used: **D-164**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
 register; there are no parts.

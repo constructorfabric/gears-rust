@@ -302,7 +302,7 @@ consumer-supplied hook before publish — a pending ask
 (`cpt-cf-bss-orders-workflow-upreq-serverless-runtime-definition-versioning-validation-hook`,
 [`../UPSTREAM_REQS.md`](../UPSTREAM_REQS.md) §2.9) — in that hook (§3.2):
 
-1. [ ] - `p1` - Every `protected` operation of each path appears exactly where §4 *The fence* orders it; `settle-from-lookup` and `retry-step`, which run only in-process (`01 §3.3`, D-108), never appear. A path is a walk of the **routing graph**, whose states are a task position plus the values of the routing members `nextStage`, `stageLoop`, `returnStage`, `taskReturnStage`, `taskReturnLoop`, `ceilingReturnStage`, `ceilingReturnLoop`, `ceilingReturnBack`, `heldStage`, `heldLoop` and `arm`. Every write of a routing member **MUST** be a string literal, a copy of another routing member, or an `if … then … else` over routing members that yields one of those — never an operation's output or another `$context` member — so each member ranges over a finite set of literals the check enumerates. Ten **pinned members** are tracked the same way (decisions D-135, D-144): `verdict`, written only as a copy of `obtain-verdict`'s `verdict`; `reflected`, only as a copy of `reflect-verdict`'s `reflected` or the literal `refused` its `catch` sets; `policy`, only as a copy of `construct-and-freeze-plan`'s `policy`, the seller's partial-failure policy pinned at freeze (`04 §2.2`); `forceTask`, only as a boolean literal; `beginResult`, only as a copy of `begin-fulfillment`'s `result`, null until the first call (decision D-143); `released`, only as a copy of `evaluate-activation-eligibility`'s `released`; `spawned`, `planFailed` and `preAdmitted`, only as boolean literals, each `false` where it is initialised or consumed (`preAdmitted` also in every arm that writes `lifecycleEventId`, decision D-161) and `true` only in the task one case of a `switch` over an operation's closed enum routes to (`spawnSent` after a sent spawn signal, `enterPlanFailedWait` after a `planFailFast` that did not begin, a `toLifecycle` after a hold, resume or acceptance admission answered `supersede` or `terminate`); and `failureScope`, only as one of the literals `line`, `plan` and `order` in the task that enters the failure stage. At each write of a pinned member copied from an output the walk forks once per value of its closed enum; a literal write is decided. The canonical version routes every `switch` that leads towards a protected operation, a stage exit or a `p1` composable of §4.1 on routing and pinned members only, or on a member both of whose ways satisfy §4.1 (decision D-144). A `switch` case over routing and pinned members is decided by the state; a case over any other member is taken both ways, and a §4.1 condition written *on some walk* is checked as reachability from the task it names. The check explores every state reachable from `admitTrigger` and refuses the version if any walk to `end` breaks §4.1 or leaves a stage by a `nextStage` no `dispatch` case names; a walk it cannot decide is refused, never assumed (decision D-126) - `inst-def-protected-present`
+1. [ ] - `p1` - Every `protected` operation of each path appears exactly where §4 *The fence* orders it; `settle-from-lookup` and `retry-step`, which run only in-process (`01 §3.3`, D-108), never appear. A path is a walk of the **routing graph**, whose states are a task position plus the values of the routing members `nextStage`, `stageLoop`, `returnStage`, `taskReturnStage`, `taskReturnLoop`, `ceilingReturnStage`, `ceilingReturnLoop`, `ceilingReturnBack`, `heldStage`, `heldLoop` and `arm`. Every write of a routing member **MUST** be a string literal, a copy of another routing member, or an `if … then … else` over routing members that yields one of those — never an operation's output or another `$context` member — so each member ranges over a finite set of literals the check enumerates. Ten **pinned members** are tracked the same way (decisions D-135, D-144): `verdict`, written only as a copy of `obtain-verdict`'s `verdict`; `reflected`, only as a copy of `reflect-verdict`'s `reflected` or the literal `refused` its `catch` sets; `policy`, only as a copy of `construct-and-freeze-plan`'s `policy`, the seller's partial-failure policy pinned at freeze (`04 §2.2`); `forceTask`, only as a boolean literal; `beginResult`, only as a copy of `begin-fulfillment`'s `result`, null until the first call (decision D-143); `released`, only as a copy of `evaluate-activation-eligibility`'s `released`; `spawned`, `planFailed` and `preAdmitted`, only as boolean literals, each `false` where it is initialised or consumed (`preAdmitted` also in every arm that writes `lifecycleEventId`, decision D-161, and in `backToProcess`, which restores it, decision D-164) and `true` only in the task one case of a `switch` over an operation's closed enum routes to (`spawnSent` after a sent spawn signal, `enterPlanFailedWait` after a `planFailFast` that did not begin, a `toLifecycle` after a hold, resume or acceptance admission answered `supersede` or `terminate`); and `failureScope`, only as one of the literals `line`, `plan` and `order` in the task that enters the failure stage. At each write of a pinned member copied from an output the walk forks once per value of its closed enum; a literal write is decided. The canonical version routes every `switch` that leads towards a protected operation, a stage exit or a `p1` composable of §4.1 on routing and pinned members only, or on a member both of whose ways satisfy §4.1 (decision D-144). A `switch` case over routing and pinned members is decided by the state; a case over any other member is taken both ways, and a §4.1 condition written *on some walk* is checked as reachability from the task it names. The check explores every state reachable from `admitTrigger` and refuses the version if any walk to `end` breaks §4.1 or leaves a stage by a `nextStage` no `dispatch` case names; a walk it cannot decide is refused, never assumed (decision D-126) - `inst-def-protected-present`
 2. [ ] - `p1` - Every `call: http` targets `POST /bss-orders-workflow/v1/steps/{operation}` with `{operation}` a row of `owf_step_operation`, and its `endpoint` is exactly `${ $context.stepsBase + "/<operation>" }` with the operation name a literal. `stepsBase` is written only by `input.from`; no `set`, `output` or `export` **MAY** name it, so no version can send its calls, or the credential the plugin attaches to them, to another host, and the CI test and the hook compare the `input.from` value with the environment's step-surface base (§3.7). No `call` **MAY** target a registered Function, `composable` operation or not (decision D-136) - `inst-def-call-targets`
 3. [ ] - `p1` - Every `listen` filter type is in the closed set above and carries the two correlations, except the `OrderAmended` filter, which correlates on `orderId` only (the closed set above, `02 §4.7` item 8); a filter **MAY** add a correlation, as the ceiling wait's `taskRef` does - `inst-def-listen-targets`
 4. [ ] - `p1` - Bounds nest, over values the definition holds: every task that calls an operation declares a `timeout` from `use.timeouts`; the operation's `deadline_ms` **<** that timeout, so one attempt fits; every task timeout and every literal `wait` **<** the literal `P90D` lifetime `wait`. The check computes no cumulative backoff, because the DSL gives `backoff.exponential` no multiplier (dsl-reference.md *Retry*) and the timeout bounds the retries whatever their curve. The one exception is a task under the `gate` timeout, whose timeout is a term of the escalation bound and so must never be what ends its retries: it **MUST** carry the `gate` retry policy, whose backoff is `constant`, and the check computes attempts × the largest `deadline_ms` called + (attempts − 1) × (delay + the jitter maximum) **<** the `gate` timeout — 4 × 10 s + 3 × 5 s = 55 s < 60 s in the canonical (decision D-162). The escalation window, the overdue window and the SLA classes are not definition values — each is a per-seller policy value that an operation pins on the order's record (decision D-134) — so their bounds are checked where the seller's policy is written (`07 §4.8` item 8) and, for the overdue window against the `wave1` timeout, also by the publish job (§4.2 step 1, decision D-159), not here (decision D-126) - `inst-def-bounds-nest`
@@ -929,6 +929,12 @@ do:
         ceilingReturnStage: '${ if $context.nextStage == "ceiling" then $context.ceilingReturnStage else $context.nextStage end }'
         ceilingReturnLoop:  '${ if $context.nextStage == "ceiling" then $context.ceilingReturnLoop else $context.stageLoop end }'
         ceilingReturnBack:  '${ if $context.nextStage == "ceiling" then $context.ceilingReturnBack else $context.returnStage end }'   # the interrupted stage's own return: the ceiling stage's leave overwrites returnStage, and backToProcess restores it (D-161)
+        # the interrupted stage's payload: every member a re-entered checkpoint call reads that the ceiling wait's lifecycle and cancel arms, or a stage taken from them, can overwrite; backToProcess restores it (D-164)
+        ceilingReturnEventId:     '${ if $context.nextStage == "ceiling" then $context.ceilingReturnEventId else $context.lifecycleEventId end }'
+        ceilingReturnTriggerKind: '${ if $context.nextStage == "ceiling" then $context.ceilingReturnTriggerKind else $context.triggerKind end }'
+        ceilingReturnCancelRef:   '${ if $context.nextStage == "ceiling" then $context.ceilingReturnCancelRef else $context.cancelRequestRef end }'
+        ceilingReturnRequestRef:  '${ if $context.nextStage == "ceiling" then $context.ceilingReturnRequestRef else $context.requestRef end }'   # no ceiling arm writes requestRef or taskRef since D-164 (ceilingRequestRef); saved so the restore is the whole payload of every re-issued call
+        ceilingReturnTaskRef:     '${ if $context.nextStage == "ceiling" then $context.ceilingReturnTaskRef else $context.taskRef end }'
         nextStage: ceiling
       then: lifetime
 ```
@@ -1242,7 +1248,7 @@ decision D-112). The approved path ends at `reflect-verdict`; Lifecycle
 emits `OrderApproved`, and the fulfillment stage is entered through the dispatcher in the same
 invocation rather than from a second trigger. **Lifetime.** The ceiling is the top-level
 competing arm, a literal `P90D`. When it fires, `ceilingEntry` records the stage and checkpoint
-the process was in and re-enters the `lifetime` fork at the ceiling stage of fragment (d), which
+the process was in, with the payload its checkpoint call reads (decision D-164), and re-enters the `lifetime` fork at the ceiling stage of fragment (d), which
 raises the escalation and parks; the re-entered fork arms a fresh ceiling, so an instance the
 operator unparks continues under a new 90-day bound, and each ceiling is its own round
 (`ceilingRound`): its escalation, its task and its park subject `ceiling:{round}` are new, so a
@@ -1849,7 +1855,7 @@ exhaustion on it, never on the answer's `resumeAt` or a returned list (decision 
     fork:
       compete: true
       branches:
-        - resolution:                   # the task-resolution arm, also used by (c) awaitCompensationResolution and (d) awaitOperatorAfterPark
+        - resolution:                   # the task-resolution arm, also used by (c) awaitCompensationResolution; (d) awaitOperatorAfterPark has its own, scoped to ceilingTaskRef and writing ceilingRequestRef (D-164)
             do:
               - listenResolution:
                   listen:
@@ -2143,7 +2149,7 @@ The ceiling stage, the `do` list of `process.ceiling`, entered from `ceilingEntr
                           taskRef:      { from: '${ .data.taskRef }',      expect: '${ $context.ceilingTaskRef }' }
                     read: envelope
                   output: { as: '${ .[0] | { requestRef: .data.requestRef } }' }
-              - arm: { set: { arm: resolution, requestRef: '${ .requestRef }' } }
+              - arm: { set: { arm: resolution, ceilingRequestRef: '${ .requestRef }' } }   # its own member, as ceilingTaskRef: requestRef stays the interrupted stage's, whose resolveTask re-issues under it after the unpark (D-147, D-164)
         - sla:       { do: [ { waitSla: { wait: PT5M } }, { arm: { set: { arm: sla } } } ] }   # 07 §4.8 item 3: the ceiling task has a waiter and an SLA tick like every task (D-129)
         - lifecycle: { do: [ ‹lifecycle arm of (f)› ] }
         - cancel:    { do: [ ‹cancel arm of (d)› ] }   # the Seller Operator's way to end a ceiling park: the order cancel, not the task's cancel (07 §4.4, D-129)
@@ -2163,7 +2169,7 @@ The ceiling stage, the `do` list of `process.ceiling`, entered from `ceilingEntr
 - resolveCeilingTask:                   # composable (07)
     timeout: step
     try:
-      - call: { step: resolve-manual-task }   # body: ref + trigger: request, taskRef: $context.ceilingTaskRef, requestRef
+      - call: { step: resolve-manual-task }   # body: ref + trigger: request, taskRef: $context.ceilingTaskRef, requestRef: $context.ceilingRequestRef
     catch: *transient
     export: { as: '${ $context + { resolution: .resolution } }' }
 - onCeilingResolution:
@@ -2175,7 +2181,18 @@ The ceiling stage, the `do` list of `process.ceiling`, entered from `ceilingEntr
     try:
       - call: { step: unpark }          # body: ref + subjectRef: $context.ceilingSubject; refused not-found unless this ceiling's task is resolved retry (01 §3.3); output: phase = the pre-park phase
     catch: *transient
-- backToProcess: { set: { nextStage: '${ $context.ceilingReturnStage }', stageLoop: '${ $context.ceilingReturnLoop }', returnStage: '${ $context.ceilingReturnBack }' }, then: exit }   # the routing state the ceiling interrupted, returnStage included, so a lifecycle, hold, resume or cancel stage it interrupted goes back where it would have (D-161)
+- backToProcess:                        # the routing state the ceiling interrupted, returnStage included, so a lifecycle, hold, resume or cancel stage it interrupted goes back where it would have (D-161)
+    set:
+      nextStage:   '${ $context.ceilingReturnStage }'
+      stageLoop:   '${ $context.ceilingReturnLoop }'
+      returnStage: '${ $context.ceilingReturnBack }'
+      lifecycleEventId: '${ $context.ceilingReturnEventId }'   # and its payload, so a re-entered admitHold, applyHold, admitAcceptance, admitLifecycle, terminalEvent, authorize or resolveTask re-issues under its own event or request, never one the ceiling wait consumed (D-164)
+      triggerKind:      '${ $context.ceilingReturnTriggerKind }'
+      cancelRequestRef: '${ $context.ceilingReturnCancelRef }'
+      requestRef:       '${ $context.ceilingReturnRequestRef }'
+      taskRef:          '${ $context.ceilingReturnTaskRef }'
+      preAdmitted: false                # a literal (rule 1), as in every arm that writes lifecycleEventId: an interrupted lifecycle stage re-admits the restored event, which the event-scoped admit-trigger key answers with its settled admission (02 §2.1, D-164)
+    then: exit
 - leave: { set: { nextStage: '${ .arm }', returnStage: ceiling }, then: exit }
 ```
 
@@ -2236,7 +2253,23 @@ ceiling that fires while a lifecycle or cancel stage taken **from** the ceiling 
 (`returnStage = ceiling`, which only the ceiling stage's `leave` writes and `backToProcess`
 restores) re-arms without parking, like the verdict park: the instance is already parked at the
 open ceiling, whose task keeps its own SLA tick, and `ceilingEntry` is not run, so the first
-ceiling's saved stage, checkpoint and return are kept (decision D-163). The
+ceiling's saved stage, checkpoint and return are kept (decision D-163). **The ceiling keeps the
+interrupted stage's payload too** (decision D-164). The ceiling wait's resolution arm writes its
+own `ceilingRequestRef`, as the escalation writes its own `ceilingTaskRef`, so `requestRef` and
+`taskRef` stay those of a failure stage the ceiling interrupted at `resolveTask`, which re-issues
+that call under its unchanged key after the unpark (D-147). The wait's lifecycle and cancel arms,
+and the lifecycle and cancel stages taken from them, do write members an interrupted stage's
+checkpoint call reads — `lifecycleEventId` and `triggerKind` (`admitAcceptance`, `admitHold`,
+`applyHold`, `admitLifecycle`, `terminalEvent`) and `cancelRequestRef` (`authorize`) — so
+`ceilingEntry` saves those, with `requestRef` and `taskRef`, under the same nested-ceiling `if` as
+the routing members, and `backToProcess` restores them. Without the restore a hold stage
+re-entered after the unpark would present the ceiling wait's `OrderAmended` event id to
+`admit-trigger` as an `OrderHeld`, whose event-scoped key that event's own admission already
+settled under another fingerprint (`idempotency-key-conflict`, `01 §4.3`), and a cancel stage
+would authorize the ceiling wait's request instead of its own. `backToProcess` writes
+`preAdmitted: false`, a literal like every other write that goes with `lifecycleEventId`: a
+lifecycle stage the ceiling interrupted re-admits the restored event, and the event-scoped
+`admit-trigger` key (`02 §2.1`) answers it with the admission already settled for it. The
 canonical version has **no `unpark-requested` arm**: `:plugin-control` is authorized
 platform-side (`../ADR/0010`), so a signal with no Orders origin route is not a signal no one can
 send, and the arm is removed until Q-13 gives it an origin route and a request row
@@ -2544,12 +2577,12 @@ operation, and the returned `admission`, never event data, selects the path; a h
 acceptance admission that answers `supersede` or `terminate` enters this stage with
 `preAdmitted` and is routed without a second admission. Every arm that writes `lifecycleEventId`
 — acceptance, hold, resume and lifecycle — sets `preAdmitted: false`, so `preAdmitted` is true
-only while `lifecycleEventId` is the event whose admission set it: a ceiling that interrupts this
-stage, followed by a lifecycle arm in the ceiling wait, sends the new event through
-`admitLifecycle` rather than routing it on the earlier event's answer. Nothing is lost by the
-overwrite, because `supersede` and `terminate` are read from Lifecycle's order state, which never
-leaves superseded or terminal, so the new event's admission answers `supersede` or `terminate`
-whenever the earlier one did (`02 §3.3` *Trigger-to-outcome table*, decision D-161). Termination is symmetric with start: a
+only while `lifecycleEventId` is the event whose admission set it: a lifecycle arm taken in the
+ceiling wait sends its new event through `admitLifecycle` rather than routing it on the earlier
+event's answer (decision D-161). A ceiling that interrupts this stage saves `lifecycleEventId` and
+`triggerKind` and `backToProcess` restores them with `preAdmitted: false`, so the interrupted stage
+re-admits its own event — a replay under that event's unchanged key — and never the one the
+ceiling wait consumed (decision D-164). Termination is symmetric with start: a
 terminal order event and a superseding version both run the cancellation fence and the
 compensation walk before `terminate-instance`, and neither leaves a wave-1 draft for a platform
 TTL this gear does not own. The admission decision — is this event for a superseded, current or
