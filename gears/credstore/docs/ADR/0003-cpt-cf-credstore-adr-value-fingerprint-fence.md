@@ -83,9 +83,9 @@ value and its metadata came from one writer. The fence key is auto-generated and
 
 ### Confirmation
 
-* Unit test: the poisoned crosswise end-state (backend value ≠ row fingerprint) reads as a 404, and a subsequent PUT heals it.
+* Unit test: the poisoned crosswise end-state (backend value ≠ row fingerprint) reads as a 404, and a subsequent PUT heals it. **[Superseded by ADR-0006]**: recovery is a fresh version under a new `value_id`, not an in-place healing PUT — see the top-of-file amendment.
 * Unit + e2e: a recreated secret rejects the previous generation's `"<id>.<version>"` validator (409) even though the version counters coincide.
-* Unit: an out-of-band `value_fp = NULL` row serves on trust, backfills exactly once via a CAS that does not bump the version, then verifies `ok`.
+* Unit: an out-of-band `value_fp = NULL` row serves on trust, backfills exactly once via a CAS that does not bump the version, then verifies `ok`. **[Withdrawn by ADR-0006]**: there is no NULL-seeded, trust-on-first-read row left to backfill — see the top-of-file amendment.
 * Unit: fence-key bootstrap persists the key under the reserved nil-tenant entry; a tenant PUT to the same reference never clobbers it and cannot resolve it.
 * Unit: a stale cached key self-heals via the one-shot refresh on mismatch.
 * Metrics: `fence_verify{ok|legacy|mismatch}` and `fence_backfill{...}` are emitted with the documented labels.
