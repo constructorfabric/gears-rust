@@ -1981,7 +1981,7 @@ and no audit claim rests on resolving a revision to a full row.
 | correlation_id | uuid, NOT NULL | Owning process instance and chain key. An entry recorded before the instance row exists — an `admit-trigger` attempt on a not-yet-admitted correlation — is audited under the derived `correlationId` of [`02 §2.1`](./02-triggers-and-start.md#21-design-principles) (UUIDv5 over `resource_tenant_id`, `orderId`, `orderVersion`), so every entry belongs to exactly one chain |
 | order_id, order_version | text, integer | Denormalized for query without a join |
 | resource_tenant_id | uuid, NOT NULL | Resource-recipient axis |
-| seller_tenant_id | uuid, nullable **only** on a pre-admission `admit-trigger` entry | Selling-party axis; the audit read surface is seller-scoped. NULL where the seller is not yet known: on a pre-admission `admit-trigger` entry — written by the pre-admission append of *Chain allocation* below, while no instance row exists for the correlation — whose Lifecycle read has not yet returned the order (`step-start`), failed (`inst-at-read`) or returned an order of another resource tenant (`inst-at-tenant`), since the seller is resolved from that read (decision D-76). Every other entry carries it: an entry on the instance path copies `owf_process_instance.seller_tenant_id`, and a pre-admission entry after a successful read carries the read order's (decision D-172) |
+| seller_tenant_id | uuid, nullable **only** on a pre-admission `admit-trigger` entry | Selling-party axis, copied from the instance on the instance path; the audit read of `09 §3.3` is seller-scoped on it, and on a NULL through the chain's instance (D-186). NULL where the seller is not yet known: on a pre-admission `admit-trigger` entry — written by the pre-admission append of *Chain allocation* below, while no instance row exists for the correlation — whose Lifecycle read has not yet returned the order (`step-start`), failed (`inst-at-read`) or returned an order of another resource tenant (`inst-at-tenant`), since the seller is resolved from that read (decision D-76). Every other entry carries it: an entry on the instance path copies `owf_process_instance.seller_tenant_id`, and a pre-admission entry after a successful read carries the read order's (decision D-172), as does a pre-admission `start-instance` refusal, whose seller is the one its settled `start` admission read (D-76; `02 §3.6` *Start on trigger*) |
 | sequence | bigint, NOT NULL | Per-chain audit counter, allocated from `owf_process_instance.audit_sequence` under the instance row lock, or, before the instance row exists, as the chain's head + 1 by the pre-admission append (*Chain allocation* below); starts at 1 and is gapless within a chain |
 | prev_hash | bytea, NOT NULL | The `entry_hash` of the preceding entry on the same `correlation_id`, or the chain genesis digest of §4.17 for sequence 1. Never NULL: this table has no unchained rows |
 | entry_hash | bytea, NOT NULL | 32-byte SHA-256 digest over every other column of this row under the v1 encoding of §4.17 |
@@ -2006,8 +2006,8 @@ substitutes for the other). `(correlation_id, sequence)` UNIQUE, which serves th
 rejects a competing append: two transactions allocating the same sequence cannot both commit, and
 the loser rolls back without consuming a sequence and re-executes as *Chain allocation* below
 states. Indexed on `(correlation_id, sequence)` for
-per-process retrieval in chain order and on `(seller_tenant_id, created_at)` for the
-tenancy-scoped audit read. `event_kind`-shape CHECKs: `definition_version` non-null exactly on
+per-process retrieval in chain order and on `(order_id, created_at, audit_id)` for the
+keyset-paged audit read of `09 §3.3` (decision D-186). `event_kind`-shape CHECKs: `definition_version` non-null exactly on
 `instance-start`; `phase_to` non-null exactly on `instance-start`, `phase-transition` and
 `termination`; `hash_version = 1`. **Seller axis** (decision D-172): CHECK `seller_tenant_id IS
 NOT NULL OR (event_kind IN ('step-start', 'step-completion', 'retry', 'timeout') AND (step_id =
@@ -2015,16 +2015,15 @@ NOT NULL OR (event_kind IN ('step-start', 'step-completion', 'retry', 'timeout')
 correlation — is the writer's rule: only the pre-admission append of *Chain allocation* writes a
 NULL, and it inserts nothing once an instance row is visible.
 
-**A NULL seller and the seller-scoped read.** The seller-scoped audit read resolves its predicate
-on `seller_tenant_id` — an `Eq`, `In` or `InTenantSubtree` constraint compiled to the
-`AccessScope` (`09 §2.2` *Tenant scoping and payment-card exclusion on every read*) — and NULL
-satisfies none of them, so a pre-admission entry with no
-seller is never listed by a seller's scope, and no read **MAY** treat NULL as a wildcard. It is
-read as part of its chain: by `correlation_id`, under the axes of the instance `start-instance`
-later bound to that correlation (`owf_process_instance.seller_tenant_id`), and before any
-instance exists only by the SELECT-only verifier and checkpoint worker of §3.8. `09` exposes no
-audit route today (its §3.3 lists none); a route added later scopes these rows through the
-chain's instance. The hash contract is unchanged: §4.17's v1 framing already encodes a NULL
+**A NULL seller and the seller-scoped read.** The audit read of `09 §3.3`
+(`GET …/workflows/{orderId}/audit`, decision D-186) applies its seller scope — an `Eq`, `In` or
+`InTenantSubtree` constraint on `seller_tenant_id` compiled to the `AccessScope` (`09 §2.2`
+*Tenant scoping and payment-card exclusion on every read*) — to an entry's own
+`seller_tenant_id`, and NULL satisfies none of them, so no read **MAY** treat NULL as a wildcard. A
+pre-admission entry with no seller is read as part of its chain: by `correlation_id`, under the
+axes of the instance `start-instance` later bound to that correlation
+(`owf_process_instance.seller_tenant_id`), and before any instance exists only by the SELECT-only
+verifier and checkpoint worker of §3.8. The hash contract is unchanged: §4.17's v1 framing already encodes a NULL
 field as the single byte `0x00`, distinct from any UUID's `0x01 || u32_be(16) || bytes`, so the
 digest of a NULL-seller entry is defined and D-60 needs no new version. The shape is
 Lifecycle's, whose audit leaves its tenancy axes NULL "for unresolved refusals"
@@ -2320,16 +2319,34 @@ call (§4.3 *Lease-expired*), and a record-only operation leaves none (§3.7). T
 idempotency-window sweep: registry retention is the tombstone purge above, and an aged-out key
 needs no worker because §4.3 makes the *next* attempt a new key.
 
-**Selected primitive: `toolkit_db::Db::lock(gear, key)`**, or bounded non-blocking acquisition
-through `Db::try_lock` with `LockConfig`, holding the `DbLockGuard` for one bounded pass and
-awaiting `release()` on normal completion
-([`toolkit-db/advisory_locks.rs`](../../../../../libs/toolkit-db/src/advisory_locks.rs)). These
-are PostgreSQL session advisory locks, **not TTL leases**: no renewal, deadline or fencing token.
-The deployment constraint and the **session loss is not fencing** rule are Lifecycle `01 §3.8`'s,
-adopted by reference: correctness rests on the table-level transactional recheck named per worker
-above even when two passes overlap, and a worker with no such recheck is not admitted to this
-roster. Stop scheduling further work on observed coordination or database failure, abandon the
-pass and reacquire before retrying. `cluster-sdk` is not selected, for the reason Lifecycle gives;
+**Selected primitive: `toolkit_db::Db::lock(gear, key)`**, or `Db::try_lock(gear, key,
+LockConfig)`, holding the `DbLockGuard` for one bounded pass and awaiting `release()` on normal
+completion ([`toolkit-db/advisory_locks.rs`](../../../../../libs/toolkit-db/src/advisory_locks.rs)).
+The two differ, and a worker handles each answer as the SDK states it (decision D-187). The
+handling is Lifecycle's: "contended passes skip/reschedule", and "release errors are reported, not
+treated as proof of ownership" ([Lifecycle `01 §3.8`](../../../orders-lifecycle/docs/design/01-foundation.md),
+`01-foundation.md:1948-1949`):
+
+- **`Db::lock`** is "a single non-blocking attempt" that "returns `DbLockError::AlreadyHeld` on
+  contention" (`advisory_locks.rs:1617-1621`). `AlreadyHeld` means a peer replica holds this
+  worker's key and is running this pass: the worker **skips the pass** and tries again at its
+  next scheduled tick. It is not a coordination failure, and it is neither retried at once nor
+  alerted on.
+- **`Db::try_lock` with `LockConfig`** retries "with configurable retry/backoff policy" and
+  returns `Result<Option<DbLockGuard>>` (`lib.rs:573-582`): `Ok(None)` means the lock was not
+  acquired within the configured bound ("timed out or attempts exceeded",
+  `advisory_locks.rs:1636-1641`), which the worker also treats as **skip the pass**.
+- Only an `Err` from either call — `DbLockError::Database` or another lock error than
+  `AlreadyHeld` — is a coordination failure, and so is a database error during the pass. A failed
+  `release()` is reported, and is never read as proof that the pass held the lock.
+
+These are PostgreSQL session advisory locks, **not TTL leases**: no renewal, deadline or fencing
+token. The deployment constraint and the **session loss is not fencing** rule are Lifecycle
+`01 §3.8`'s, adopted by reference: correctness rests on the table-level transactional recheck
+named per worker above even when two passes overlap, and a worker with no such recheck is not
+admitted to this roster. On a coordination or database failure the worker stops scheduling
+further work, abandons the pass and reacquires before retrying; contention (`AlreadyHeld`, or
+`Ok(None)` from `try_lock`) is never such a failure. `cluster-sdk` is not selected, for the reason Lifecycle gives;
 `gears/bss/libs/coord` remains the Q-09 candidate, and the recheck column is what makes the answer
 swappable.
 

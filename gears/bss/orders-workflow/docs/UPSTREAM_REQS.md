@@ -632,19 +632,20 @@ no REST, SDK or event-handler caller.
 **The concrete ask:**
 
 1. **Catalogue registration.** Register the resource labels
-   `gts.cf.bss.orders_workflow.{process_instance,process_step,fulfillment_task,manual_task,approval_gate,progress}.v1~`
+   `gts.cf.bss.orders_workflow.{process_instance,process_step,fulfillment_task,manual_task,approval_gate,progress,audit}.v1~`
    and their permission instances `…cf.bss.orders_workflow.<resource>_<action>.v1` for the
    actions of `09 §3.1` — `process_instance × {cancel, retry_step}` (`start` is retired with the
    REST start route, D-73), `process_step × execute` with its thirty-five `operation` values as
    the property domain, `fulfillment_task × read`, `manual_task × {read, resolve, override,
-   assign, escalate, cancel}`, `approval_gate × {read_inbox, approve}`, `progress × read` — with the
+   assign, escalate, cancel}`, `approval_gate × {read_inbox, approve}`, `progress × read`, `audit × read` (D-186) — with the
    `supported_properties` each `ResourceType` advertises. The `dead_letter` label and its `read`,
    `redrive` and `discard` actions are **not registered** until the platform answers
    `…-upreq-serverless-runtime-dead-letter-operator-visibility` (§2.9).
 2. **Roles.** Provision Approver, Fulfillment Operator and Seller Operator roles producing the
    expected decisions of `09 §4.1`, with seller scope as a constraint on `seller_tenant_id` and
    tenant isolation as a constraint on `resource_tenant_id`; Fulfillment Operator holds no
-   `process_instance × cancel`, `manual_task × cancel` or `dead_letter × discard`.
+   `process_instance × cancel`, `manual_task × cancel`, `dead_letter × discard` or `audit × read`,
+   and only the Seller Operator holds `audit × read` (D-186).
 3. **The approver grant keyed on `assigned_principal`.** `approval_gate × read_inbox` and
    `approval_gate × approve` granted as an "own resource" constraint
    `assigned_principal = subject_id` (an `Eq` on a custom property this gear supplies), and

@@ -101,6 +101,7 @@ enforceable rather than aspirational.
 |-------------|------------------|
 | `cpt-cf-bss-orders-workflow-fr-owf-authorization` | One shared authorization adapter over the platform PDP (`PolicyEnforcer`) invoked on every registered route, the step routes included; registered resource/action catalogue in §3.1, endpoint mapping in §3.2, expected-decision matrix in §4.1 |
 | `cpt-cf-bss-orders-workflow-interface-owf-ops` (query process progress) | Read-only progress projection in §4.1's read rows, sourced from this gear's own record only |
+| `cpt-cf-bss-orders-workflow-actor-owf-seller-operator` ("view workflow status across orders in seller scope with audit", `PRD.md:149`), `cpt-cf-bss-orders-workflow-nfr-owf-audit` | The audit read `GET …/workflows/{orderId}/audit` (§3.3 *Audit read*): the order's process audit trail from `owf_audit_entry`, `audit × read` in seller scope, keyset-paged on `(created_at, audit_id)` (decision D-186) |
 | `cpt-cf-bss-orders-workflow-interface-owf-ops` (start, resolve, retry, cancel) | Start is the platform event trigger (§3.3, no Orders route); resolve is slice 07's per-action task routes (`07 §3.3`); retry and cancel are control operations of this slice that record the request and signal the invocation (§3.6 *Control operation to signal*) |
 
 #### NFR Allocation
@@ -291,7 +292,7 @@ authorized cancellation" as an input precondition and neither of them owns autho
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-constraint-bounded-page-size`
 
 Every list this gear exposes — the approver inbox, the operator task queue, the fulfillment-plan
-line projection, and the manual-task list — takes a page size and returns a **keyset cursor**.
+line projection, the manual-task list and the audit read — takes a page size and returns a **keyset cursor**.
 Default 50, maximum 200, as working baselines: the p95 < 200 ms budget is stated per page, and an
 unpaged read behind a ≥ 400-day retention floor with no archival makes the budget meaningless the
 first time an order accumulates a long remediation history. A requested page size above the
@@ -299,7 +300,8 @@ maximum is **clamped server-side to 200** rather than honoured.
 
 The cursor is keyset, not offset, and its sort key is immutable: `(created_at, task_id)` for the
 task queue and the manual-task list, `(created_at, gate_id)` for the approver inbox,
-`(order_line_id)` within a frozen plan for the line projection. A mutable column — assignment
+`(order_line_id)` within a frozen plan for the line projection, `(created_at, audit_id)` for the
+audit read, as Lifecycle's audit read (Lifecycle `08 §2.2`). A mutable column — assignment
 state, SLA countdown, task state — is never a sort key: the sweep and every operator action
 rewrite it, so a row could move between pages and be returned twice or skipped entirely, silently,
 behind a 200 and a valid-looking cursor.
@@ -410,6 +412,7 @@ through `pep_prop`.
 | `gts.cf.bss.orders_workflow.manual_task.v1~` | `owf_manual_task` and the incident rows the queue projects | `read`, `resolve`, `override`, `assign`, `escalate`, `cancel` | `resource_tenant_id`, `seller_tenant_id`; resource id = `task_id`; `assignee` |
 | `gts.cf.bss.orders_workflow.dead_letter.v1~` | **Pending.** `owf_dead_letter_record` is retired (`01 §3.7` *Retired tables*); the label survives only for `owf_dead_letter_triage`, which slice 07 keeps *pending* the platform's answer on operator visibility of trigger-path dead letters (`01 §4.8`, `UPSTREAM_REQS.md` §2.9) | `read`, `redrive`, `discard` — **not registered** until that ask is answered | `resource_tenant_id`, `seller_tenant_id`; resource id = the triage row's id |
 | `gts.cf.bss.orders_workflow.approval_gate.v1~` | `owf_approval_gate` | `read_inbox`, `approve` (approve or reject; the submitting identity is barred server-side, D-56) | `resource_tenant_id`, `seller_tenant_id`; resource id = `gate_id`; `assigned_principal`; `order_id` |
+| `gts.cf.bss.orders_workflow.audit.v1~` | `owf_audit_entry` — the process audit trail of an order's instances (`01 §3.7`); read-only, appended only by the audit writer | `read` | `resource_tenant_id`, `seller_tenant_id` of the entry, or, on a pre-admission entry with a NULL seller (D-172), of the instance later bound to its chain; resource id = `order_id` |
 | `gts.cf.bss.orders_workflow.progress.v1~` | `owf_process_progress_view` — the read projection | `read` | `resource_tenant_id`, `seller_tenant_id`, `payer_tenant_id`; resource id = `order_id`; the set of `order_id` values carrying a gate whose `assigned_principal` is the caller, for the approver's `A*` path |
 
 **`process_step × execute` property values (normative).** One value per registered operation,
@@ -505,6 +508,8 @@ graph LR
     G --> H[Authorization adapter over PolicyEnforcer]
     H -->|decision| P[(authz-resolver PDP)]
     H -->|allow| I[Progress Read Projector]
+    H -->|allow, audit read| U[Audit Trail Reader]
+    U --> V[(owf_audit_entry via owf_process_instance)]
     H -->|allow, execute| J[Step operations - slices 01-08]
     H -->|allow, control op| Q[(owf_cancel_request / 07 request row)]
     Q --> S[Signal delivery - 10 §3.2]
@@ -638,7 +643,7 @@ made by the consuming step operation, not by the gateway.
 - `cpt-cf-bss-orders-workflow-component-signal-delivery` — depends on; delivers the signal the gateway recorded.
 
 **Endpoint → `(resource × action)` mapping (normative).** Every REST route any slice registers,
-mapped once: fifteen caller-facing routes (three of them *pending*) and the step routes as one
+mapped once: sixteen caller-facing routes (three of them *pending*) and the step routes as one
 row. This table is what the startup assertion and the CI conformance test of §3.7 check the
 routing table against; the step row is expanded per `operation` value by §3.1.
 
@@ -646,6 +651,7 @@ routing table against; the step row is expanded per `operation` value by §3.1.
 |------------------|-------------------|---------------------------|
 | `POST /bss-orders-workflow/v1/steps/{operation}` (one route per `owf_step_operation` row, `01 §3.3`) | `process_step × execute` | `correlationId`; `operation`; `resource_tenant_id` from the body, checked against the bound instance |
 | `GET /bss-orders-workflow/v1/workflows/{orderId}/progress` | `progress × read` | `order_id`; prefetched axes; the caller's gate orders (`A*`) |
+| `GET /bss-orders-workflow/v1/workflows/{orderId}/audit` | `audit × read` | `order_id`; prefetched axes of the order's instances; paged (§3.3 *Audit read*) |
 | `POST /bss-orders-workflow/v1/workflows/{orderId}/steps/{stepId}/retry` | `process_instance × retry_step` | `order_id`; prefetched axes; 07 request row recorded and signalled |
 | `POST /bss-orders-workflow/v1/workflows/{orderId}/cancel` | `process_instance × cancel` | `order_id`; prefetched axes; snapshot recorded (§4.4), request signalled |
 | `GET /bss-orders-workflow/v1/fulfillment-operator/tasks` | `manual_task × read` | list; constraints required |
@@ -767,6 +773,37 @@ rather than committing a record the read would misreport.
 - `cpt-cf-bss-orders-workflow-component-progress-read-projector` — writes the row that component serves.
 - `cpt-cf-bss-orders-workflow-component-step-executor` — runs inside its settlement unit of work.
 
+#### Audit Trail Reader
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-component-audit-trail-reader`
+
+##### Why this component exists
+
+The process audit log is complete by rule (`01 §4.6`) and retained at audit grade (§4.3), and the
+Seller Operator needs to read it for the orders in their seller scope (`PRD.md:149`). A complete
+audit nobody can read is not an audit, which is Lifecycle's reason for its own audit read
+(Lifecycle `08 §1.2`, `08-read-and-authz.md:75-82`); here the need is a stated actor need, not only a rationale (decision
+D-186).
+
+##### Responsibility scope
+
+Serves `GET …/workflows/{orderId}/audit` (§3.3 *Audit read*): reads the order's `owf_audit_entry`
+rows under the compiled `audit × read` scope in keyset order `(created_at, audit_id)`, one bounded
+page per request, and returns the fields §3.3 lists.
+
+##### Responsibility boundaries
+
+Never writes: the audit writer of `01 §3.2` is the table's only appender, and the chain verifier
+and checkpoint worker of `01 §3.8` are its only other readers. Never verifies the chain, never
+returns a hash field, and never reads `owf_step_log.result`. Never lists a NULL-seller entry of a
+chain no instance was bound to, and never treats a NULL `seller_tenant_id` as a wildcard
+(`01 §3.7`, D-172). Not an export: a page is one read of the currently authorized rows, not a snapshot.
+
+##### Related components (by ID)
+
+- `cpt-cf-bss-orders-workflow-component-permission-evaluator` — depends on for read authorization.
+- `cpt-cf-bss-orders-workflow-component-audit-writer` — reads the rows that component appends (`01 §3.2`).
+
 ### 3.3 API Contracts
 
 - [ ] `p2` - **ID**: `cpt-cf-bss-orders-workflow-interface-owf-read-authz-ops`
@@ -786,8 +823,65 @@ catalogue rows of §3.1 and the `Gr` row of §4.1. There is therefore no operati
 |--------|------|--------------|-----------|
 | `POST` | `/bss-orders-workflow/v1/steps/{operation}` | The step surface of `01 §3.3`, authorized here as `process_step × execute` with `operation` as the resource property; serverless-runtime service principal only (`Gr`) | unstable — internal |
 | `GET` | `/bss-orders-workflow/v1/workflows/{orderId}/progress` | Query process progress (§4.1 read projection, §4.5 field projection). Unchanged | unstable |
+| `GET` | `/bss-orders-workflow/v1/workflows/{orderId}/audit` | The order's process audit trail, `audit × read`, Seller Operator in seller scope; **paged** on `(created_at, audit_id)` (*Audit read* below, decision D-186) | unstable |
 | `POST` | `/bss-orders-workflow/v1/workflows/{orderId}/steps/{stepId}/retry` | Retry failed step. `If-Match` with the process instance's `row_version` REQUIRED; `Idempotency-Key` REQUIRED, recomposed as `{tenant}:{orderId}:{stepId}:retry:{row_version}`. A failed step under `remediate` always holds an open manual task (`10 §4.1` *Failure*); the route is an **alias** of that task's `…/fulfillment-operator/tasks/{taskId}/retry` (`07 §3.3`): it records the same `owf_task_resolution_request` row (action `retry`) through slice 07's intake port `record_resolution_request` (`07 §3.2`, D-181) and delivers the same `task-resolution-requested` signal, so `retry-step`'s quarantine and new attempt key (`01 §3.3`) run inside `resolve-manual-task`. A step with no open task is `not-found`; the task's own preconditions (`order-fenced`, `action-not-offered`) apply unchanged. Answers `202 Accepted` with `requestRef`. When the platform reports the invocation not live, the step is the instance's `invocation-dead` task ([`07 §4.4`](./07-manual-tasks.md#44-resolution-actions-by-reason-and-the-two-operator-roles-normative)), and the gateway issues `…/invocations/{invocation_id}:control` `retry` instead of a signal — valid only from `failed` today ([`DESIGN.md:888`](../../../../serverless-runtime/docs/DESIGN.md#invocation-api)) — once the platform confirms that `retry` keeps `invocation_id` and resumes at the faulted task (decisions D-86, D-105, `…-upreq-serverless-runtime-signals`). An invocation that fails with no `on_failure` handler moves on to `dead_lettered` ([`DESIGN.md:458`](../../../../serverless-runtime/docs/DESIGN.md#invocation-status-state-machine)), from which `retry` is not valid today; until the platform confirms those properties the re-drive is `action-not-offered`, and the fallback is the task's `cancel`, the dead-instance unwind of `01 §4.16` | unstable |
 | `POST` | `/bss-orders-workflow/v1/workflows/{orderId}/cancel` | Cancel workflow with compensation. `If-Match` REQUIRED; `Idempotency-Key` REQUIRED, recomposed as `{tenant}:{orderId}:{orderVersion}:cancel:{subject_id}`. The body carries a REQUIRED free-text `reason` (1–500 characters), the cancel reason Lifecycle's `workflow-cancel` requires ([Lifecycle `06 §3.6`](../../../orders-lifecycle/docs/design/06-workflow-seam.md#36-interactions-and-sequences) *Workflow Cancel*, `cancel-reason-required`); a missing, empty or oversized `reason` is refused at boundary validation with the canonical `InvalidArgument` (400) and a field violation on `reason` ([`toolkit-canonical-errors`](../../../../../libs/toolkit-canonical-errors/src/context.rs) `InvalidArgumentV1::FieldViolations`), before authorization and without a record — input validation, not a catalogue reason. The route is offered only for an order in fulfillment: where the version's `begin-fulfillment` has not committed (slice 04's `begin_fulfillment_committed_at`) and the Lifecycle order read is not terminal, it refuses `action-not-offered` (400), because this gear has no seam to cancel an order before `in_fulfillment` and the order is cancelled through Lifecycle's own `POST /cancel` ([Lifecycle `08 §4.3`](../../../orders-lifecycle/docs/design/08-read-and-authz.md#43-the-permission-model-normative); decision D-109). Records an `owf_cancel_request` with the authorization snapshot (§4.4) and the reason, and delivers `cancel-requested` carrying only the reference tuple and `requestRef` (`10 §3.3`); authority is re-checked at apply time by `authorize-cancel` and at the later point of §4.4, because fencing can outlive the request by days. Never the platform's generic `:control` `cancel` (`10 §4.4`). For an instance whose invocation the platform reports not live (an open `invocation-dead` task), the request is recorded the same way and no signal is sent: the `reconciliation-sweep` worker carries it out as the dead-instance unwind, calling `authorize-cancel` and the rest of the cancel path in-process (`01 §4.16`, D-105). Answers `202 Accepted` with `requestRef` | unstable |
+
+**Audit read** (decision D-186). `GET /bss-orders-workflow/v1/workflows/{orderId}/audit`
+returns the order's process audit trail. The shape is Lifecycle's audit read
+(`GET /bss-orders-lifecycle/v1/orders/{orderId}/audit`, Lifecycle `08 §2.2`, §3.3, §3.6
+`cpt-cf-bss-orders-lifecycle-seq-audit-read`), restated for this gear's chains:
+
+- **Authorization.** `audit × read` on `gts.cf.bss.orders_workflow.audit.v1~`, a separate pair
+  from `progress × read`, as Lifecycle asks `audit × read` "not merely `order × read`" (Lifecycle
+  `08 §3.6` common read wrapper step 2). Only the Seller Operator is granted it, in seller scope
+  (`S`, §4.1), following Lifecycle's matrix, whose audit read grants the Seller Operator in seller
+  scope and no operational or service principal (Lifecycle `08 §4.3`, `08-read-and-authz.md:1042`). The Fulfillment Operator,
+  whose needs are the task queue (`PRD.md:142`), reads each task's `failure_reason` and
+  `failure_cause` there (`07 §4.5`). The targeted-denial rule of §2.2 applies: an order outside
+  the caller's scope is `not-found` (404).
+- **Scope.** One ordered set of the order's entries (`order_id = $1`), from two disjoint
+  branches, with the compiled `AccessScope` applied before sorting and limiting — Lifecycle's
+  shape, which merges its resolved rows with its unresolved rows by the same ordering rather than
+  concatenating two paged sets (Lifecycle `08 §2.2` *Audit concurrency contract*). **(i)** An entry
+  that carries a seller is scoped on its own `seller_tenant_id` and `resource_tenant_id` (`S`):
+  every instance-path entry, whose seller is copied from the instance, and every pre-admission
+  entry that carries one — an `admit-trigger` entry after a successful Lifecycle read, and a
+  refusal `start-instance` settled before inserting an instance (`definition-not-bound`,
+  `line-count-exceeded`; `02 §3.6`), whether or not an instance was ever bound. **(ii)** An entry
+  with a NULL seller — a pre-admission `admit-trigger` entry written before or without a
+  successful read (D-172) — is scoped on the instance `start-instance` later bound to its
+  `correlation_id`, under that instance's axes. A NULL-seller entry of a chain no instance was
+  bound to is not listed, because it has no seller to scope it by; the SELECT-only verifier and
+  checkpoint worker read it (`01 §3.7`). NULL is never a wildcard.
+- **Paging.** Keyset on `(created_at ASC, audit_id ASC)`, both immutable, `audit_id` in binary
+  UUID order, microseconds preserved. The next page reads rows strictly after the last returned
+  tuple, at most `limit + 1` of them, and emits `next_cursor` only when the extra row exists.
+  Default 50, maximum 200, clamped server-side (§2.2). The cursor is an opaque, versioned token
+  bound to this route, the `orderId` and the caller's principal and tenant context, and it
+  carries no authority: every page is re-authorized. A token that fails its structure or binding
+  is refused at boundary validation with the canonical `InvalidArgument` (400) and a field
+  violation on `cursor`, before authorization. The read uses the index
+  `(order_id, created_at, audit_id)` of `01 §3.7`.
+- **Why the page bound is load-bearing.** The trail grows with process traffic, not with commercial
+  events: every settled round of a re-check loop, every retry and every timeout writes one entry
+  (`01 §3.3` *What each receipt records*), and a gate's `PT30S` loop alone writes thousands over a
+  72-hour window. An unpaged read would be a memory-amplification vector for any caller holding
+  the grant, which is Lifecycle's reason for paging its own (Lifecycle `08 §2.2`). One page reads at
+  most 201 rows through the index, whatever the chain's length.
+- **Live view, not export.** A page is one read of the currently authorized rows. An entry whose
+  transaction commits after a page was read with an earlier `created_at` can fall behind the
+  cursor, so the walk is not a snapshot and this route **MUST NOT** be offered as an incremental
+  export. This is Lifecycle's audit concurrency contract (D-101 there). Chain verification stays
+  sequence-based and independent of this route (`01 §4.17`).
+- **Response.** `items[]`, `next_cursor`, `limit`. Each item carries `auditId`, `correlationId`,
+  `orderId`, `orderVersion`, `sequence`, `eventKind`, `stepId`, `attemptNumber`,
+  `definitionVersion`, `phaseFrom`, `phaseTo`, `actor`, `actorClass`, `idempotencyKey`, `reason`
+  (catalogue value), `justification` (the human-supplied text, never machine-keyed) and
+  `createdAt`. Nothing else is returned: not `prev_hash`, `entry_hash`, `hash_version` or
+  `audit_tenant_id`, which are chain internals that Lifecycle's read does not expose either
+  ("actor, reason, idempotency and correlation references, never internal diagnostics", Lifecycle
+  `08 §3.6`), and no `owf_step_log.result`. Stability `unstable`, as the other reads.
 
 **Removed.** `POST /bss-orders-workflow/v1/workflows` (start workflow) is **removed** in favour of
 the platform event trigger: PRD §9.1 *Start workflow* is realised by the serverless-runtime event
@@ -1239,7 +1333,7 @@ The gear is not ready until the catalogue check of §3.7 passes (`01 §3.8` read
 ### 4.1 The per-actor permission matrix (normative)
 
 The matrix is the **expected-decision table** for every route in the gear's routing table —
-fifteen caller-facing routes (three *pending*) and the step routes as one row — against **all
+sixteen caller-facing routes (three *pending*) and the step routes as one row — against **all
 nine** principal classes. It is not itself enforced by this gear: the platform PDP decides, on
 the `(resource, action)` pair §3.2 maps each row to, and the platform policy owner provisions the
 roles that produce these answers. What this gear enforces is that the question asked is the one
@@ -1281,6 +1375,7 @@ signal*); `+pg` = paged (`cpt-cf-bss-orders-workflow-constraint-bounded-page-siz
 |-----------|----------|-----------------------|------------------|-------------------|-------------------|----------------|----------|----------|----------|
 | `POST /bss-orders-workflow/v1/steps/{operation}` (every step route) | — | — | — | — | — | — | — | — | ✓ `Gr` `+key`; `settle-from-lookup`, `retry-step` — |
 | `GET /bss-orders-workflow/v1/workflows/{orderId}/progress` | ✓ `A*`, §4.5 projection | ✓ `S` | ✓ `S` | ✓ `Gc` | — | — | — | — | — |
+| `GET /bss-orders-workflow/v1/workflows/{orderId}/audit` | — | — | ✓ `S` `+pg`, scoped through each chain's instance | — | — | — | — | — | — |
 | `POST /bss-orders-workflow/v1/workflows/{orderId}/steps/{stepId}/retry` | — | ✓ `S` `+own+aud+ver+key+sig` | ✓ `S` `+own+aud+ver+key+sig` | — | — | — | — | — | — |
 | `POST /bss-orders-workflow/v1/workflows/{orderId}/cancel` | — | — | ✓ `S` `+own+aud+ver+key+sig+re` | — | — | — | — | — | — |
 | `GET /bss-orders-workflow/v1/fulfillment-operator/tasks` | — | ✓ `S` `+pg` | ✓ `S` `+pg` | — | — | — | — | — | — |
@@ -1430,7 +1525,7 @@ and latency thresholds are stated as working baselines per PRD §7, pending the 
 NFR workshop, not as settled numbers.
 
 - **API latency (working baseline)**: progress reads (`query process progress`, approver inbox,
-  operator task queue) return at p95 < 200 ms. Synchronous control operations (the per-action
+  operator task queue, the audit read, per page) return at p95 < 200 ms. Synchronous control operations (the per-action
   task routes of slice 07, retry failed step, cancel workflow with compensation) accept the
   command — authorized, recorded in its request row and handed to signal delivery — at
   p95 < 1 s. Start is the

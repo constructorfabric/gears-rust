@@ -83,7 +83,7 @@ neither leaves a wave-1 draft for a platform TTL this gear does not own.
 
 | NFR ID | NFR Summary | Allocated To | Design Response | Verification Approach |
 |--------|-------------|--------------|------------------|------------------------|
-| `cpt-cf-bss-orders-workflow-nfr-owf-audit` | 100% audit coverage of process state transitions, zero silent drops | `admit-trigger`, `terminate-on-terminal-event`; audit writer of [`01`](./01-foundation.md) | Every admission attempt writes `step-start` and a settlement entry, including attempts before any instance exists (the pre-admission chain of `01 §3.7`); every termination decision is audited before the definition sees it | Audit-log coverage check over the admission and termination classes, per the shared engine gate; a platform-dead-lettered start leaves N audited attempts and no `instance-start` |
+| `cpt-cf-bss-orders-workflow-nfr-owf-audit` | 100% audit coverage of process state transitions, zero silent drops | `admit-trigger`, `terminate-on-terminal-event`; audit writer of [`01`](./01-foundation.md) | Every admission attempt writes `step-start` and a settlement entry, including attempts before any instance exists (the pre-admission chain of `01 §3.7`), and so does a refusal `start-instance` settles before inserting the instance (below); every termination decision is audited before the definition sees it | Audit-log coverage check over the admission and termination classes, per the shared engine gate; a platform-dead-lettered start leaves N audited attempts and no `instance-start` |
 | `cpt-cf-bss-orders-workflow-nfr-owf-idempotency` | Exactly one active workflow per order id at a time | `admit-trigger` (routing), `start-instance` (01, insert); `owf_process_instance` partial unique index | The invariant is carried by `UNIQUE (order_id) WHERE terminal_outcome IS NULL`, not by a read-then-insert. `admit-trigger` refuses to settle `start` for a new version while the prior version's instance is non-terminal (§4.3), and `start-instance` lets the index arbitrate any race that remains | Concurrent-start test: two invocations for one `OrderSubmitted` yield one `owf_process_instance` row and one binding; supersession test: the new version's `start-instance` never commits before the prior instance's `terminate-instance` |
 
 #### Key ADRs
@@ -663,7 +663,17 @@ its first task calls `admit-trigger` with the event's references only. The opera
 platform's invocation record for its `invocationId` and binds the `function_id` and
 `function_version` it names, never a version the task input declares; a record that names another
 callable or version refuses `definition-not-bound` (decision D-137, [`01 §3.6`](./01-foundation.md#start-instance-binds-the-definition-version)).
-It inserts the instance and the binding, and the partial unique index — not the read — decides single occupancy. Its answer
+**A refusal of `start-instance` is audited through the same pre-admission path.** When
+`start-instance` settles `permanent-failure` — `definition-not-bound`, or `line-count-exceeded`
+from slice 04's delegated check — no instance row exists for the correlation, so its one
+settlement entry (`step-completion` carrying the reason, `step_id` `start-instance`, because its
+`instance-start` kind requires a phase, `01 §3.3` *What each receipt records*) is appended to the
+derived correlation's chain by the guarded pre-admission append of `01 §3.7` *Chain allocation*
+(path 2), exactly as `admit-trigger`'s entries are. Unlike an early `admit-trigger` entry it
+always carries `seller_tenant_id`: the seller comes from the settled `start` admission the call
+follows (decision D-76), so the audit read of `09 §3.3` lists it under its own seller, instance
+or not (D-186). A transient failure of the platform read writes no entry, and a key conflict
+writes none (`01 §3.3`). It inserts the instance and the binding, and the partial unique index — not the read — decides single occupancy. Its answer
 carries the invocation the instance is bound to; an invocation that reads back another
 invocation's id is a duplicate and ends itself (`01 §3.3` `start-instance`). The approval
 stage of fragment (a) follows.
@@ -805,7 +815,7 @@ engine-owned tables per [`01 §3.7`](./01-foundation.md#37-database-schemas--tab
 | `owf_process_instance`, partial index `UNIQUE (order_id) WHERE terminal_outcome IS NULL` | `start-instance` / `terminate-instance` through the envelope (01) | Single active instance per order (§2.1); the supersession guard reads it under row lock (§4.3) |
 | `owf_idempotency_registry`, `operation = 'admit-trigger'`, key per §2.1 | Idempotency registry (01) | Duplicate absorption; the `open` state that lets a non-admitted attempt re-run; tenant-namespaced by the key prefix (`01 §3.7`) |
 | `owf_step_log` | Step envelope (01) | One row per admission attempt, carrying the platform `attempt_id`, the outcome and the read version in `result`; **not** a dedup store |
-| `owf_audit_entry` | Audit writer (01) | `step-start` and a settlement entry per attempt — `step-completion`, or `retry` or `timeout` on a retryable failure (`01 §3.3` *What each receipt records*) — under the derived correlation before the instance exists, with `seller_tenant_id` NULL until the Lifecycle read yields the seller (`01 §3.7`, D-172) |
+| `owf_audit_entry` | Audit writer (01) | `step-start` and a settlement entry per attempt — `step-completion`, or `retry` or `timeout` on a retryable failure (`01 §3.3` *What each receipt records*) — under the derived correlation before the instance exists, with `seller_tenant_id` NULL until the Lifecycle read yields the seller (`01 §3.7`, D-172); on the same chain, the `step-completion` entry of a `start-instance` refusal settled before the instance exists (`definition-not-bound`, `line-count-exceeded`), always with the seller (§3.6 *Start on trigger*) |
 | `owf_step_operation` | Operation registry (01) | The two rows of §3.3 |
 
 **Columns that moved.** The platform attempt identifier is recorded as `owf_step_log.attempt_id`

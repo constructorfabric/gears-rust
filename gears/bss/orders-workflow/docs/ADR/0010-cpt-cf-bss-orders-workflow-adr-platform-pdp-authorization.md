@@ -188,6 +188,9 @@ raises one `authority-withdrawn` manual task and leaves `owf_process_instance.ph
 > the step route once per registered operation (thirty-five, `09 §3.1`); there is no event
 > handler, because the triggers are the platform's.
 
+> **Amended 2026-09-28 by D-186**: the caller-facing routes are sixteen — the audit read
+> `GET …/workflows/{orderId}/audit` (`audit × read`, Seller Operator in seller scope) joins them.
+
 ## Pros and Cons of the Options
 
 ### Platform PDP through the shared PolicyEnforcer adapter (chosen)

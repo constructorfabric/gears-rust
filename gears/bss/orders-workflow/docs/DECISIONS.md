@@ -204,6 +204,8 @@
   - [D-183 (H) A suspension a Lifecycle resume overtook is closed by the poll before `terminate-instance`](#d-183-h-a-suspension-a-lifecycle-resume-overtook-is-closed-by-the-poll-before-terminate-instance)
   - [D-184 (M) A consumed acceptance event and a consumed re-authorization signal are their own checkpoints](#d-184-m-a-consumed-acceptance-event-and-a-consumed-re-authorization-signal-are-their-own-checkpoints)
   - [D-185 (M) A key ages while its instance lives only if its operation submits downstream; an aged-out key is re-issued under an operator-minted successor](#d-185-m-a-key-ages-while-its-instance-lives-only-if-its-operation-submits-downstream-an-aged-out-key-is-re-issued-under-an-operator-minted-successor)
+  - [D-186 (M) The Seller Operator reads an order's process audit trail through a paged, seller-scoped audit route](#d-186-m-the-seller-operator-reads-an-orders-process-audit-trail-through-a-paged-seller-scoped-audit-route)
+  - [D-187 (L) A contended worker lock skips the pass; only a lock or database error is a coordination failure](#d-187-l-a-contended-worker-lock-skips-the-pass-only-a-lock-or-database-error-is-a-coordination-failure)
 - [Open Questions](#open-questions)
   - [Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?](#q-01-which-durable-execution-substrate-backs-the-process--the-oss-workflow-engine-or-a-bss-local-mechanism)
   - [Q-02: The Generic Approval escalation threshold — the one PRD-deferred numeric value this design deliberately leaves unset](#q-02-the-generic-approval-escalation-threshold--the-one-prd-deferred-numeric-value-this-design-deliberately-leaves-unset)
@@ -1595,6 +1597,8 @@ Q-09 lands on the fenced lease.
 **Propagated**: `design/01-foundation.md` §1.3, §3.4, §3.8, §4.15; `DESIGN.md` §1.3, §2.2,
 §3.4, §3.8, §4.1, §4.2 *Supply chain*, §4.5; Q-09.
 
+**Amended by D-187 (2026-09-28)**: a contended acquisition — `AlreadyHeld` from `Db::lock`, `Ok(None)` from `Db::try_lock` — skips the pass and is not a coordination failure; only an error from either call, or a database error during the pass, is.
+
 ### D-63 (H) Authorization is delegated to the platform PDP through the shared PolicyEnforcer adapter
 
 **Accepted.** *(carries [`ADR/0010`](./ADR/0010-cpt-cf-bss-orders-workflow-adr-platform-pdp-authorization.md); mirrors Lifecycle D-34 as amended, D-111, D-114, D-141 and D-115; amends D-37)*
@@ -1699,7 +1703,7 @@ gear to a versioned platform workflow definition (`ADR/0011`, `ADR/0012`, `ADR/0
 each slice was restructured into step operations and a definition fragment. D-65…D-72 carry the
 three ADRs and their cross-cutting consequences; D-73…D-101 are the decisions the slice
 restructurings recorded, D-102…D-163 the decisions taken on the second review of
-2026-09-26, and D-164…D-185 those taken on the re-review of 2026-09-28. Each names the entries it amends; the amended entries carry a dated
+2026-09-26, and D-164…D-187 those taken on the re-review of 2026-09-28. Each names the entries it amends; the amended entries carry a dated
 **Amended by** note. D-65…D-101 were taken on 2026-09-24.
 
 ### D-65 (H) The order process flow is a versioned platform workflow definition executed by serverless-runtime
@@ -5181,6 +5185,8 @@ constraints and the seller-scoped read), §4.11, §4.17 *Acceptance evidence*;
 
 **Clarified (2026-09-28, residuals of the re-review)**: the CHECK is written as SQL, `step_id = 'admit-trigger' OR step_id LIKE 'admit-trigger:%'`, over the `step_id` form `design/01` §3.7 now states: `{operation}`, or `{operation}:{subject reference}` where one applies (V-A-8).
 
+**Amended by D-186 (2026-09-28)**: "`09` exposes no audit route today" no longer holds: `GET …/workflows/{orderId}/audit` lists a NULL-seller pre-admission entry through the instance later bound to its correlation, and never one whose chain no instance was bound to.
+
 ### D-173 (H) READ COMMITTED; the pre-admission append allocates and checks in one statement, and `start-instance` collides with it symmetrically
 
 **Accepted (2026-09-28).**
@@ -5612,6 +5618,80 @@ this design's own rule 3 (D-102).
 §4.16; `design/09-read-and-authz.md` §3.1, §3.6 `inst-cs-record`; `design/07-manual-tasks.md`
 §4.4, §4.6; `design/10-process-definition.md` §4.6; `design/05-provisioning-intents.md` §2.2;
 `DESIGN.md` §3.3, §3.7; D-104, D-105, D-108.
+
+### D-186 (M) The Seller Operator reads an order's process audit trail through a paged, seller-scoped audit route
+
+**Accepted (2026-09-28).** *(amends D-172; clarifies `02 §3.6` without a behaviour change)*
+
+**Decision**: slice 09 registers `GET /bss-orders-workflow/v1/workflows/{orderId}/audit` as
+`audit × read` on a new label, `gts.cf.bss.orders_workflow.audit.v1~`, served by a new Audit
+Trail Reader. Only the Seller Operator is granted it, in seller scope (`S` `+pg`); every other
+principal class is `—`. The read is one ordered set of the order's `owf_audit_entry` rows, built
+from two disjoint branches with the scope applied before sorting and limiting. (i) An entry that
+carries a seller is scoped on its own `seller_tenant_id` and `resource_tenant_id`. (ii) A
+pre-admission entry with a NULL seller is scoped through the instance later bound to its
+correlation. A NULL-seller entry of a chain no instance was bound to is not listed, and NULL is
+never a wildcard. Paging is keyset on `(created_at, audit_id)`, default 50 and maximum 200,
+clamped. The read fetches at most `limit + 1` rows through a new index
+`(order_id, created_at, audit_id)`, which replaces `(seller_tenant_id, created_at)`. The cursor
+is opaque, bound to the route, the order and the principal, and a bad cursor is refused with the
+canonical `InvalidArgument` (400). A page is a live view, not an export. Each item returns the
+entry's references, kind, phases, actor, idempotency key, catalogue reason, justification and
+`createdAt`, and no hash field, no `audit_tenant_id` and no step-log `result`. The caller-facing
+route count becomes sixteen (three pending). `02 §3.6` now states that a `start-instance`
+refusal settled before the instance exists (`definition-not-bound`, `line-count-exceeded`) is
+audited through the same pre-admission append as `admit-trigger`. That entry always carries the
+seller, so branch (i) lists it.
+
+**Rationale**: the PRD gives the Seller Operator the need to "view workflow status across orders
+in seller scope with audit" (`PRD.md:149`). `01 §3.7` described a seller-scoped audit read and
+indexed for it, but `09` exposed no route or resource type, so the complete audit log had no read.
+The trail grows with process traffic: every settled re-check round, retry and timeout writes an
+entry, and a `PT30S` gate loop writes thousands. An unpaged read would therefore be a
+memory-amplification vector. **Precedent**: Lifecycle's audit read,
+`GET /bss-orders-lifecycle/v1/orders/{orderId}/audit` (Lifecycle
+`08-read-and-authz.md:75-82`, `:200-285`, `:390`, `:762-835`). It asks for a separate
+`audit × read`, "not merely `order × read`" (`:622-623`), and grants the Seller Operator in
+seller scope and no operational or service principal (`:1042`). It pages on
+`(created_at ASC, audit_id ASC)` for exactly this amplification reason. It merges resolved and
+unresolved rows as one ordered set (its D-98 and D-101) and returns actor, reason, idempotency and
+correlation references, "never internal diagnostics". Two points are not followed. This gear
+clamps an oversized page (`09 §2.2`) where Lifecycle refuses it. This gear keeps no read access
+log, which Lifecycle writes for delegated and cross-tenant reads, because no read of this gear has
+one and adding the store is outside this fix.
+
+**Propagated**: `design/09-read-and-authz.md` §1.2, §2.2, §3.1, §3.2 (diagram, Audit Trail
+Reader, endpoint mapping), §3.3, §4.1, §4.3; `design/01-foundation.md` §3.7 (`owf_audit_entry`:
+`seller_tenant_id`, the index, *A NULL seller and the seller-scoped read*);
+`design/02-triggers-and-start.md` §1.2, §3.6, §3.7; `DESIGN.md` §1.2, §3.2, §3.3, §3.5;
+`design/README.md`; `ADR/0010`; `UPSTREAM_REQS.md` §2.8; D-172.
+
+### D-187 (L) A contended worker lock skips the pass; only a lock or database error is a coordination failure
+
+**Accepted (2026-09-28).** *(amends D-62)*
+
+**Decision**: `01 §3.8` states the two toolkit-db calls as the SDK does. `Db::lock` is a single
+non-blocking attempt. Its `DbLockError::AlreadyHeld` means a peer holds the pass, and the worker
+skips the pass until its next tick. `Db::try_lock` with `LockConfig` retries under the configured
+bound. Its `Ok(None)` means the lock was not acquired within that bound, and the worker again
+skips the pass. Only an `Err` from either call, or a database error during the pass, is a
+coordination failure. On such a failure the worker stops scheduling, abandons the pass and
+reacquires. A failed `release()` is reported and never read as proof of ownership.
+
+**Rationale**: `01 §3.8` called `Db::try_lock` the "bounded non-blocking acquisition" and did not
+say what a contended acquisition was. Its only rule, "stop scheduling further work on observed
+coordination or database failure", could read `AlreadyHeld` — the normal answer whenever another
+replica runs the pass — as a failure to act on. The SDK says otherwise. `Db::lock` is "a single
+non-blocking attempt" that "returns `DbLockError::AlreadyHeld` on contention"
+(`libs/toolkit-db/src/advisory_locks.rs:1617-1621`). `try_lock` is "with configurable
+retry/backoff policy" and answers `Ok(None)` "if timed out or attempts exceeded"
+(`libs/toolkit-db/src/lib.rs:573-582`, `advisory_locks.rs:1636-1641`). **Precedent**: Lifecycle
+`01 §3.8`, "Contended passes skip/reschedule" and "release errors are reported, not treated as
+proof of ownership" (`gears/bss/orders-lifecycle/docs/design/01-foundation.md:1948-1949`). The
+same section repeats the "bounded non-blocking acquisition through `Db::try_lock`" wording
+(`:1946-1947`); that is for its owner to correct.
+
+**Propagated**: `design/01-foundation.md` §3.8; D-62.
 
 ## Open Questions
 
@@ -6061,6 +6141,8 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-183 | H Poll closes an overtaken suspension before terminate-instance; `rejected`/`completed` are not held | `design/10-process-definition.md` §3.6 (a), (b), (e), §4.1, §4.5, `design/08-hold-and-cancel.md` §3.3, §3.6, §4.7, `design/01-foundation.md` §3.3, `DESIGN.md` §1.2; D-130, D-133, D-141, D-175 |
 | D-184 | M Consumed acceptance event and re-authorization signal are their own checkpoints | `design/10-process-definition.md` §3.6 intro, (b); D-147, D-164 |
 | D-185 | M Only downstream-submitting keys age while the instance lives; aged-out re-issued under an operator-minted successor | `design/01-foundation.md` §3.2, §3.3, §3.7, §4.3, §4.16, `design/09-read-and-authz.md` §3.1, §3.6, `design/07-manual-tasks.md` §4.4, §4.6, `design/10-process-definition.md` §4.6, `design/05-provisioning-intents.md` §2.2, `DESIGN.md` §3.3, §3.7; D-104, D-105, D-108 |
+| D-186 | M Seller-scoped, keyset-paged audit read route; start-instance refusals audited pre-admission | `design/09-read-and-authz.md` §1.2, §2.2, §3.1–§3.3, §4.1, §4.3, `design/01-foundation.md` §3.7, `design/02-triggers-and-start.md` §1.2, §3.6, §3.7, `DESIGN.md` §1.2, §3.2, §3.3, §3.5, `design/README.md`, `ADR/0010`, `UPSTREAM_REQS.md` §2.8; D-172 |
+| D-187 | L Contended worker lock skips the pass; only an error is a coordination failure | `design/01-foundation.md` §3.8; D-62 |
 
-Highest decision number used: **D-185**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
+Highest decision number used: **D-187**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
 register; there are no parts.

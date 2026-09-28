@@ -93,7 +93,7 @@ Requirements that significantly influence architecture decisions.
 | `cpt-cf-bss-orders-workflow-nfr-owf-escalation-timer` | Configurable per gate in the seller's policy, pinned on the gate row by `open-gates` (D-134); default 72 h; accuracy ± 5 min | Definition re-check tick (plugin durable timer), gate-window record | The gate loop's fixed `PT30S` tick calls `escalate-gate` `mode: fire`, which compares database time with the gate's stored deadline, so the fire is at most 4 min 30 s late — one 30 s tick plus the calls that can run between two fires (the rest of a fire, the probe or `record-decision`, the next fire), each under the definition's 60-second `gate` timeout, with every return into the gate loop firing first — inside ± 5 min (D-123, D-148); the remainder is Orders' record, and a resume re-bases the deadline in Orders rather than re-arming a timer | Timer-accuracy test asserting fired-time within ± 5 min of configured window across a platform worker restart, once the plugin exists |
 | `cpt-cf-bss-orders-workflow-nfr-owf-manual-task-sla` | 100% manual-task creation for permanently failed lines; SLA countdown visible before breach | `create-manual-task` (protected), task-queue read projection | `create-manual-task` is a protected operation on every failure path under the remediation policy, validated before publish and called before any terminal outcome is declared; the task-queue projection surfaces the SLA deadline (4 h resource-affecting, 24 h otherwise) | Validation-rule test that no definition reaches a terminal outcome under `remediate` without it; UI/API test asserting SLA countdown is visible ahead of breach |
 | `cpt-cf-bss-orders-workflow-nfr-owf-event-latency` | p95 < 30 s from internal state change to event delivery | Platform event producer adapter | Process events are enqueued through the platform producer outbox in the same transaction as the step operation's record and published by platform workers independent of the request path; commit success alone is not evidence of the target | Producer-queue lag (platform metric) measuring p95 enqueue-to-broker-acceptance at production event volume, with backlog and retries present |
-| `cpt-cf-bss-orders-workflow-nfr-owf-audit` | 100% coverage in process audit log | Gear-owned process audit log, written by the step envelope | Every step operation's settlement — first call, re-run, sweep settlement, escalation, compensation, termination — writes an audit row in the same unit of work as the record change, independent of engine history | Structural test that every registered operation's `audit_kind` is written on its success settlement and every other receipt writes what `design/01-foundation.md` §3.3 *What each receipt records* names (D-170); negative test that a failed audit append aborts the operation whole (D-168) |
+| `cpt-cf-bss-orders-workflow-nfr-owf-audit` | 100% coverage in process audit log | Gear-owned process audit log, written by the step envelope | Every step operation's settlement — first call, re-run, sweep settlement, escalation, compensation, termination — writes an audit row in the same unit of work as the record change, independent of engine history; the Seller Operator reads an order's trail in seller scope through the paged audit read (`design/09-read-and-authz.md` §3.3, D-186) | Structural test that every registered operation's `audit_kind` is written on its success settlement and every other receipt writes what `design/01-foundation.md` §3.3 *What each receipt records* names (D-170); negative test that a failed audit append aborts the operation whole (D-168) |
 | `cpt-cf-bss-orders-workflow-nfr-owf-api-latency` | Command acceptance p95 < 1 s; progress reads p95 < 200 ms | Control operations, progress-read projection | Control commands (cancel, resolve task, retry step) record a request row and deliver a signal to the invocation (one platform hop), answering `202 Accepted` without waiting on the consuming operation; progress reads are served from the denormalized `owf_process_progress_view` projection | Latency benchmark for command acceptance, including the signal hop, and for progress-read endpoints at production request rates |
 | `cpt-cf-bss-orders-workflow-nfr-owf-availability` | 99.9% control-plane availability (working baseline) | Control-plane deployment topology, step surface | The control plane and the step surface are deployed with redundancy per the platform BSS availability baseline; in-flight processes are recoverable from the platform invocation and the gear-owned record independent of control-plane restarts; readiness includes the platform readiness gate | Availability monitoring against the 99.9% baseline; chaos test restarting the control plane while workflows are in flight |
 | `cpt-cf-bss-orders-workflow-nfr-owf-retention` | Business-level retention aligned with platform audit policy; default ≥ 400 days, configurable | Gear-owned process audit / saga log / manual-task stores; bound definition versions | Retention is enforced on the gear-owned stores independently of the platform engine's history retention, so an engine purge cannot erase the gear's record; a definition version stays resolvable while any binding names it (upstream ask) | Retention test asserting gear-owned audit records survive past an engine-side history purge cycle |
@@ -558,7 +558,7 @@ graph TB
 | Saga and compensation | `06 §3.2` | **compensation-execution component**, **cancellation-fencing component**, **outcome-report component** |
 | Manual tasks | `07 §3.2` | **manual-task creator**, **incident recorder**, **override verifier**, **escalation router**, **operator task queue**, **overdue escalation monitor** |
 | Hold and cancel | `08 §3.2` | **suspension controller**, **resume coordinator**, **cancel mediator**; retired: **dependency retry governor** |
-| Read and authorization | `09 §3.2` | **authorization adapter (permission evaluator)**, **control operation gateway**, **progress read projector**, **progress projection writer** |
+| Read and authorization | `09 §3.2` | **authorization adapter (permission evaluator)**, **control operation gateway**, **progress read projector**, **progress projection writer**, **audit trail reader** (D-186) |
 
 Component names in the right-hand column are **names, not identifiers**: the identifier is minted
 and owned by the document named in *Specified in*, and repeating it here would make this index a
@@ -609,9 +609,9 @@ definition's arm — never the gateway — calls the operation that applies it.
    `retry_class`, `deadline`).
 2. **Control operations and reads** — the caller-facing routes: progress read, retry failed step,
    cancel with compensation, the operator task queue and its per-action task routes, the
-   approver inbox and decision, the per-line plan projection, and three dead-letter routes that
-   are **pending** the platform's answer on dead-letter visibility. `09 §4.1` states fifteen
-   caller-facing routes (three pending) plus the step routes as one row, against nine principal
+   approver inbox and decision, the per-line plan projection, the audit read, and three
+   dead-letter routes that are **pending** the platform's answer on dead-letter visibility.
+   `09 §4.1` states sixteen caller-facing routes (three pending) plus the step routes as one row, against nine principal
    classes. A mutating control operation records a request row and delivers a signal to the
    running invocation; it never calls a step operation itself.
 3. **The platform surface, by reference** — the serverless-runtime Function Registry
@@ -625,8 +625,8 @@ lives under **`/bss-orders-workflow/v1/…`**, matching the sibling Orders Lifec
 `/bss-orders-lifecycle/v1/…`. There is exactly **one** namespace. **This section states no
 individual path beyond the step route** — paths are declared once, by the owning slice.
 
-**Operations** — the PRD §9.1 business operations, the two read-side projections and the per-line
-plan projection, each pointed at the document that specifies it:
+**Operations** — the PRD §9.1 business operations, the two read-side projections, the per-line
+plan projection and the audit read, each pointed at the document that specifies it:
 
 | Operation | Realised by | Specified in | Owning component |
 |-----------|-------------|--------------|------------------|
@@ -639,6 +639,7 @@ plan projection, each pointed at the document that specifies it:
 | Approval decision submit | `POST …/approver-inbox/gates/{gateId}/decision` | `03 §3.3` | **decision reflector** |
 | Fulfillment Operator task-queue read | `GET …/fulfillment-operator/tasks` | `07 §3.3`, `09 §4.1` | **operator task queue** |
 | Per-line fulfillment-plan projection | `GET …/fulfillment-plan/{orderId}/{orderVersion}` | `04 §3.3` | **progress tracker** |
+| Audit read (the order's process audit trail, Seller Operator in seller scope) | `GET …/workflows/{orderId}/audit`, keyset-paged on `(created_at, audit_id)` | `09 §3.3` | **audit trail reader** |
 
 PRD §9.1 lists *Start workflow* with an order-ID-plus-version idempotency key; that key is now the
 trigger family `{tenant}:{eventId}:admit-trigger` recomposed by `admit-trigger` together with the
@@ -757,7 +758,7 @@ tables for the producer queue, which are library-migrated and not Workflow table
 
 - **Dependency**: `authz-resolver` through `AuthZResolverApi` resolved from `ClientHub`; **mandatory** — startup fails without wiring
 
-Decides every authorization request this gear makes: the fifteen caller-facing routes (three
+Decides every authorization request this gear makes: the sixteen caller-facing routes (three
 pending) and the step routes on their registered `(resource, action)` pairs. There are no
 event handlers: this gear subscribes to no topic, and every event reaches it as a step call from
 the platform principal under the `process_step × execute` grant (`design/09-read-and-authz.md`
@@ -1648,6 +1649,6 @@ alone.
 - **PRD**: [`PRD.md`](./PRD.md)
 - **ADRs**: [`ADR/`](./ADR/) — thirteen decisions: `cpt-cf-bss-orders-workflow-adr-durable-execution-substrate`, `cpt-cf-bss-orders-workflow-adr-slice-decomposition`, `cpt-cf-bss-orders-workflow-adr-process-state-non-authoritative`, `cpt-cf-bss-orders-workflow-adr-two-wave-activation-barrier`, `cpt-cf-bss-orders-workflow-adr-saga-compensable-no-pivot`, `cpt-cf-bss-orders-workflow-adr-idempotency-key-composition`, `cpt-cf-bss-orders-workflow-adr-fail-closed-verdict-park`, `cpt-cf-bss-orders-workflow-adr-outbox-process-events`, `cpt-cf-bss-orders-workflow-adr-manual-task-dead-letter-separation`, `cpt-cf-bss-orders-workflow-adr-platform-pdp-authorization`, `cpt-cf-bss-orders-workflow-adr-flow-as-platform-definition`, `cpt-cf-bss-orders-workflow-adr-definition-versioning-and-protected-steps`, `cpt-cf-bss-orders-workflow-adr-references-not-payloads`
 - **Design set**: [`design/`](./design/) — the foundation, the process definition ([`design/10-process-definition.md`](./design/10-process-definition.md), first in build order after the foundation) and the capability slices; the phased build order is authored in [`design/README.md`](./design/README.md)
-- **Decisions register**: [`DECISIONS.md`](./DECISIONS.md) — D-65…D-101 carry the platform-definition decision and the slice decisions it produced, D-102…D-163 the second-review decisions, D-164…D-185 the decisions of the re-review of 2026-09-28; Q-01 answered in two parts, Q-10…Q-13 open
+- **Decisions register**: [`DECISIONS.md`](./DECISIONS.md) — D-65…D-101 carry the platform-definition decision and the slice decisions it produced, D-102…D-163 the second-review decisions, D-164…D-187 the decisions of the re-review of 2026-09-28; Q-01 answered in two parts, Q-10…Q-13 open
 - **Upstream requirements**: [`UPSTREAM_REQS.md`](./UPSTREAM_REQS.md) — the asks this gear raises on gears it does not own, serverless-runtime in §2.9
 - **Platform**: serverless-runtime [DESIGN.md](../../../serverless-runtime/docs/DESIGN.md) §1.1, §1.4, §3.1, §3.3; [ADR-0003](../../../serverless-runtime/docs/ADR/0003-cpt-cf-serverless-runtime-adr-workflow-dsl.md), [ADR-0004](../../../serverless-runtime/docs/ADR/0004-cpt-cf-serverless-runtime-adr-temporal-workflow-engine.md), [ADR-0005](../../../serverless-runtime/docs/ADR/0005-cpt-cf-serverless-runtime-adr-thin-host.md)

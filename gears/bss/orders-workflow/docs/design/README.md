@@ -76,8 +76,8 @@ documents below and nowhere else, so there is exactly one normative statement of
   gate-window port, and the apply-time cancel re-check.
 - [`09-read-and-authz.md`](./09-read-and-authz.md) — no step operations of its own: the
   authorization of the step surface (`process_step × execute`), the control operations that
-  record a request and signal the invocation, the progress projection, and the per-actor
-  authorization matrix.
+  record a request and signal the invocation, the progress projection, the seller-scoped audit
+  read over `01`'s `owf_audit_entry` (D-186), and the per-actor authorization matrix.
 
 ## Slice map (PRD ↔ implementation phase)
 
