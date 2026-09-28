@@ -183,7 +183,7 @@ consumption-operations feature)
 3. [ ] - `p1` - `tenant_id`, `subject_id`, `quota_id`, `policy_id`, `idempotency_key`, `lease_token`, projection type,
    caller attribution, and raw/unregistered metric input never appear as label values; a declared `metric` label is
    populated only after registry/catalogue validation with the canonical registered identity; conformance is enforced
-   by tests and code review at each emission site - `inst-tel-highcard`
+   by the typed label parameters of the metrics port and by the label-catalogue tests - `inst-tel-highcard`
 4. [ ] - `p1` - **RETURN** the observation to the platform OTLP export when the `otel` feature is enabled - `inst-tel-export`
 
 ## 4. States (CDSL)
@@ -315,8 +315,10 @@ coordination contract, plugin crate, or bootstrap probe ships.
 - [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-telemetry-conventions`
 
 The system **MUST** emit gear-specific instruments via `tracing` with OTLP export under the `otel` feature, enforcing
-the bounded-cardinality label discipline as a compile-time/code-review convention with no high-cardinality identifier
-ever used as a label value.
+the bounded-cardinality label discipline through the type system: every label value is a static token of a closed
+enum or an admitted-metric label that only the catalogue frozen at bootstrap can construct, so no high-cardinality
+identifier can reach a label value. Export queueing, batching, and drop behaviour under backend saturation belong to
+the platform OTLP pipeline, not to this gear.
 
 **Implements**:
 - `cpt-cf-quota-enforcement-algo-telemetry-emission`
@@ -343,6 +345,8 @@ ever used as a label value.
   (idempotent seeding; the `global` Policy is seeded by the resolution-policy-engine bootstrap extension)
 - [ ] Killing the elected sweeper replica makes a survivor leader within one election TTL plus observation lag; a
   graceful stop resigns and hands over within one round trip; both hold on the standalone and the Postgres cluster
+- [ ] A sweep body that ignores cancellation is aborted once the configured stop timeout elapses after leadership
+  loss, and a body stopped by leadership loss starts again when the replica is re-elected
   backends (recovery input consumed by the lease-operations feature, which owns the end-to-end RTO drill)
 - [ ] A committed write to the foundation-owned tables (config rows, schema metadata) survives a storage-backend
   restart with zero data loss — the durable-commit contract input consumed by the consumption-operations end-to-end

@@ -147,13 +147,19 @@ consumption-operations feature), `cpt-cf-quota-enforcement-usecase-region-gated-
    `PROJECTION_NOT_RESOLVABLE` - `inst-pw-snapshot`
 6. [ ] - `p1` - Call the named Engine's `validate_config(raw)` with the snapshotted schemas: the `cel` validator
    parses, type-checks, and statically verifies property/projection references and pair compatibility per
-   `cpt-cf-quota-enforcement-algo-cel-engine`; the `most-restrictive-wins` validator rejects any non-empty config - `inst-pw-validate`
+   `cpt-cf-quota-enforcement-algo-cel-engine`; the `most-restrictive-wins` validator rejects any non-empty config;
+   validation work is bounded before it starts: the serialized `engine_config` by the operator-configured
+   `config_max_bytes` (default 16 KiB, `POLICY_CONFIG_TOO_LARGE`), the schema snapshot by byte, schema-count, and
+   depth limits (`POLICY_SCHEMA_TOO_LARGE`), and a `cel` expression by 8 KiB of source, 32 levels of bracket nesting,
+   and 1024 AST nodes at depth 48 after macro expansion; cache-miss rebuilds run under the
+   `preparation_max_concurrency` cap (default 4) - `inst-pw-validate`
 7. [ ] - `p1` - **IF** validation fails - `inst-pw-invalid-if`
    1. [ ] - `p1` - **RETURN** the Engine's structured error before persistence; persisted Policies always carry an
       Engine-validated config - `inst-pw-invalid`
 8. [ ] - `p1` - DB: in one storage transaction (`cpt-cf-quota-enforcement-seq-policy-version-update`): insert the new
    `quota_resolution_policy_version` row with `version_state = active` (create: `policy_version = 1`; update:
-   `N + 1`), transition the prior active version to `superseded` (update only), move the latest-pointer atomically,
+   `N + 1`) carrying the step-5 schema snapshot narrowed to the inputs the config reads, transition the prior active
+   version to `superseded` (update only), move the latest-pointer atomically,
    enqueue the `policy-changed` event (`change_kind = created` or `updated`) in the same transaction (invariant
    I11; dispatch is owned by the notifications feature). The compiled artifact from step 6 is retained and published
    into the `ValidatedConfig` cache keyed by `(policy_id, policy_version)` only after the transaction commits, per the
@@ -185,10 +191,11 @@ consumption-operations feature), `cpt-cf-quota-enforcement-usecase-region-gated-
    1. [ ] - `p1` - **RETURN** `UNKNOWN_POLICY_VERSION` - `inst-prd-unknown`
 3. [ ] - `p1` - **IF** `target_version` is in `rolled_back` state - `inst-prd-rb-if`
    1. [ ] - `p1` - **RETURN** `VERSION_ROLLED_BACK`; terminal versions are never re-activated - `inst-prd-rb`
-4. [ ] - `p1` - DB: atomically make `target_version` active again, transition the previously-active version to
-   `rolled_back` (terminal), move the latest-pointer, and enqueue `policy-changed` with `change_kind = updated`
-   (rollback is a latest-pointer move; `rolled_back` is a `version_state` value, not a notification discriminator);
-   the operation is naturally idempotent on retry against the same target - `inst-prd-rollback-apply`
+4. [ ] - `p1` - DB: when `target_version` is already the active version (a retry), return it unchanged with no state
+   transition, audit row, event, or `policy_version_transitions_total` increment; otherwise atomically make
+   `target_version` active again, transition the previously-active version to `rolled_back` (terminal), move the
+   latest-pointer, and enqueue `policy-changed` with `change_kind = updated` (rollback is a latest-pointer move;
+   `rolled_back` is a `version_state` value, not a notification discriminator) - `inst-prd-rollback-apply`
 5. [ ] - `p1` - **RETURN** `200 OK` with the new active `PolicyVersion`; increment
    `policy_version_transitions_total` - `inst-prd-rollback-return`
 
@@ -241,9 +248,13 @@ plugin `bootstrap()` seeding step
 3. [ ] - `p1` - DB: after Engine registration succeeds, seed the `global` Policy idempotently when missing, inside the
    storage plugin `bootstrap()` seeding step:
    `policy_id = global, policy_version = 1, version_state = active, engine_id = most-restrictive-wins, engine_config = {}` - `inst-ebs-seed`
-4. [ ] - `p1` - The registration-before-seeding order guarantees that no active Policy ever references an unregistered
-   Engine; the seeded global Policy is not deletable and remains the ultimate fallback, so evaluation never enters a
-   "no Policy applies" state - `inst-ebs-order`
+4. [ ] - `p1` - The registration-before-seeding order guarantees that the seeded global Policy never references an
+   unregistered Engine; before readiness every persisted active Policy version is rebuilt from its stored config and
+   schema snapshot, and one that names an Engine the current binary does not register (for example after a rollout
+   that removed it), whose snapshot no longer matches the active catalogue, or whose config no longer compiles fails
+   readiness (`UNKNOWN_ENGINE`, `POLICY_CATALOG_INCOMPATIBLE`) with no fallback to another Engine; the seeded global
+   Policy is not deletable and remains the ultimate fallback, so evaluation never enters a "no Policy applies"
+   state - `inst-ebs-order`
 5. [ ] - `p1` - **RETURN** ready; a Policy referencing an `engine_id` not registered in the current deployment is
    rejected at create/update time per `cpt-cf-quota-enforcement-flow-policy-write` - `inst-ebs-return`
 
@@ -607,7 +618,7 @@ attribution **MUST NOT** appear as label values; Policy attribution belongs on t
 - [ ] An Engine evaluation exceeding the per-Policy timeout surfaces `DeadlineExceeded`, discards any partial
   Decision, and mutates no counter; a `cel` cost-cap exhaustion surfaces `ResourceExhausted`
 - [ ] Both built-in Engines return byte-identical Decisions for repeated evaluation of the same `EvaluationContext`
-  (determinism property test, the input to idempotent replay)
+  (determinism test over the canonical key-ordered serialization, the input to idempotent replay)
 - [ ] Decision diagnostics carry `engine_id`, `policy_id`, and `policy_version`, plus the per-Quota detail (quota ID,
   type, `enforcement_mode`, current amount, cap, contribution)
 - [ ] Metrics scrape shows no `policy_id`, `quota_id`, `tenant_id`, metric, projection-type, or caller label on any
