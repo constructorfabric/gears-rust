@@ -227,30 +227,38 @@ Realises `cpt-cf-quota-enforcement-seq-rollback`.
 - A rollback replay is a no-op returning the stored Decision
 
 **Error Scenarios**:
-- Original-debit key not found: `UNKNOWN_OPERATION` (canonical `NotFound`)
+- Original-debit key not found, or found under a different authorized attribution: `UNKNOWN_OPERATION` (canonical
+  `NotFound`); the two are indistinguishable, so a key alone neither probes nor reverses a debit
+- Attribution not admitted by the PDP: `PermissionDenied`, before any storage access
 - Attribution period already settled (`period-rollover` emitted): `PERIOD_CLOSED`; no mutation and no event
 - Rollback targeting a credit: rejected; credits are not reversible via rollback
 
 **Steps**:
 1. [ ] - `p1` - Caller sends `POST /v1/quota-enforcement/operations/rollback` with a `RollbackRequest` carrying the
-   original debit's idempotency key and the rollback's own idempotency key - `inst-rlb-request`
+   reversed debit's attribution, which kind of operation the original key names (direct debit or lease commit), the
+   original idempotency key and the rollback's own idempotency key; the attribution passes the same PDP admission and
+   catalogue mapping as a debit's (action `rollback`), and its authorized subject set fingerprints both the rollback's
+   own `IdempotencySubjectKey` and the original debit's scope, however many Quotas that
+   debit's plan spanned - `inst-rlb-request`
 2. [ ] - `p1` - DB: `lookup_idempotency` on the rollback's own key; on an exact replay **RETURN** the stored Decision
    per `cpt-cf-quota-enforcement-algo-idempotency-replay` - `inst-rlb-idem`
 3. [ ] - `p1` - DB: look up the original committed debit by the original idempotency key; lease-commit-derived debits
    are addressable through the commit call's idempotency key exactly like direct debits
    (`cpt-cf-quota-enforcement-fr-rollback`) - `inst-rlb-lookup`
-4. [ ] - `p1` - **IF** no committed debit exists under the original key - `inst-rlb-unknown-if`
-   1. [ ] - `p1` - **RETURN** `UNKNOWN_OPERATION` (canonical `NotFound`); a rollback against a credit is likewise
-      rejected, since credits are corrective and not reversible via rollback - `inst-rlb-unknown`
+4. [ ] - `p1` - **IF** no committed debit exists under the original scope, or the attribution digest recorded on it
+   differs from the one just authorized - `inst-rlb-unknown-if`
+   1. [ ] - `p1` - **RETURN** `UNKNOWN_OPERATION` (canonical `NotFound`), the same answer for both cases; a rollback
+      against a credit is likewise rejected, since credits are corrective and not reversible via
+      rollback - `inst-rlb-unknown`
 5. [ ] - `p1` - **IF** the debit's attribution period has been fully settled, meaning its `period-rollover` event has
    been emitted - `inst-rlb-settled-if`
    1. [ ] - `p1` - **RETURN** `PERIOD_CLOSED` before any mutation, with no event; rollback closure is
       settlement-keyed, intentionally asymmetric with credit's calendar-keyed closure, so cross-period lease commits
       stay reversible during the settlement window - `inst-rlb-settled`
-6. [ ] - `p1` - DB: `apply_rollback(original_idem_key, idem_key, events)` in one transaction: lock the affected counter
+6. [ ] - `p1` - DB: `apply_rollback(target, idem_write, events)` in one transaction: lock the affected counter
    rows, reverse the original mutation against the debit's `acquisition_period_id` (I5), never the wall-clock current
-   period, persist the rollback's idempotency record using the `IdempotencySubjectKey` fingerprint of the owning
-   Quota's `(projection_type, subject_id)`, append the operation-log entry, and enqueue the `quota-rollback-applied` event
+   period, persist the rollback's idempotency record under the scope fingerprinted from the re-authorized attribution
+   (step 1), append the operation-log entry, and enqueue the `quota-rollback-applied` event
    carrying the original idempotency key, the rolled-back amount, the target Quota, and the consumer identity from
    `SecurityContext` (I11); commit - `inst-rlb-apply`
 7. [ ] - `p1` - **RETURN** the Decision; the SDK path is `QuotaEnforcementClientV1::rollback(req)`; replay of the same
@@ -360,7 +368,8 @@ full evaluation
 
 **Steps**:
 1. [ ] - `p1` - Construct `IdempotencySubjectKey` as the SHA-256 fingerprint of the canonical sorted, deduplicated
-   subject set: debit uses the complete authorized, catalogue-mapped applicable set; credit and rollback use the owning Quota's
+   subject set: debit and rollback use the complete authorized, catalogue-mapped applicable set (rollback re-authorizes
+   the reversed debit's attribution, so its set is the debit's); credit uses the owning Quota's
    persisted `(projection_type, subject_id)` pair read under the mutation row lock. The caller never supplies or
    narrows the subject key, and `quota_id` is not part of it (`cpt-cf-quota-enforcement-fr-idempotency`) - `inst-idem-scope`
 2. [ ] - `p1` - Different tenants, subject keys, or operation types using the same key string create independent records;
@@ -555,8 +564,9 @@ instances is delegated to the storage plugin (I9).
 
 The system **MUST** enforce typed `IdempotencyScope { tenant_id, subject_key, operation_type, idem_key }` on every write
 operation. `subject_key: IdempotencySubjectKey` is the fixed-width SHA-256 fingerprint of the canonical complete
-PDP-authorized, catalogue-mapped subject set for debit, or of the owning Quota's persisted subject pair for credit and
-rollback; it is never derived from a caller-selected projection or from `quota_id`.
+PDP-authorized, catalogue-mapped subject set for debit and rollback (rollback re-authorizes the reversed debit's
+attribution), or of the owning Quota's persisted subject pair for credit; it is never derived from a caller-selected
+projection or from `quota_id`.
 Exact replays **MUST** return the stored `decision_blob` verbatim without re-invoking the Engine or re-binding `time`;
 divergent payloads **MUST** return `IDEMPOTENCY_PAYLOAD_MISMATCH` (409) leaving the original record untouched. The
 `payload_hash` is the canonical SHA-256 of the sorted-JSON payload stored as fixed-width binary; the evaluation
