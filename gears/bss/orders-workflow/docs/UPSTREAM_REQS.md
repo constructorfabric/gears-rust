@@ -358,7 +358,12 @@ again by a re-run after this gear's own step key aged out (30 days, D-185). And 
 a **read of a request by its request key**, which `open-gates` makes before it submits and so
 adopts a request an unsettled earlier call made (`design/03-approval-execution.md` §3.6
 `inst-og-submit`) — the confirm-by-lookup rule this gear already asks of Subscriptions after a key
-ages out (§2.1 `SUB-O13`).
+ages out (§2.1 `SUB-O13`). The read **answers for every state of the request** — `open`,
+decided or `cancelled` — never "not found" for a request it holds, and carries the request's state
+and the instant it opened, from which `open-gates` dates an adopted gate's escalation window. For
+a request decided before it is adopted, the service re-publishes its decision event under the same
+`decisionEventId` until `record-decision` reads that decision by `decisionEventId`, so the
+decision reaches this gear's `listen` like any other (D-189 as clarified).
 
 - **Owning upstream gear**: Generic Approval service. **No canonical specification exists today**
   (the `gears/approval-service` gear PRD remains a stub); PRD §9.2 is the normative interface until

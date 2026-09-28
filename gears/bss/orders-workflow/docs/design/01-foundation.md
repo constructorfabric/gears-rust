@@ -1011,8 +1011,15 @@ next round out, a per-instance counter, an attempt only from an operator retry):
    self-loop, so a past-window re-run is admitted to the slice guard `spawn_signal_at IS NULL`,
    which refuses it `spawn-signal-already-recorded` — one refused audit entry at Lifecycle, no
    second signal and no event (Lifecycle `06-workflow-seam.md:451`, `:456-459`, `:761`) — and the
-   operation already answers that refusal `already-recorded`, a settled success (`05 §3.3`). Any
-   other `not-admissible` stays `permanent-failure` with `version-mismatch` -
+   operation already answers that refusal `already-recorded`, a settled success (`05 §3.3`).
+   After `already-applied` and `held`, the terminal case and the remaining refusals are each
+   operation's own: `reflect-verdict` answers a terminal order `moved` and every other Lifecycle
+   refusal `refused`, both settled successes (`03 §4.4`, `03 §3.6` `inst-rv3-settle`, decision
+   D-190); `report-spawn-signal` answers a terminal order `not-dispatchable`, a settled success
+   (`05 §3.3`); `report-outcome` answers a terminal order `terminal-event` for `failed` or
+   `cancelled` ([`06 §4.9`](./06-saga-and-compensation.md#49-every-lifecycle-answer-to-report-outcome-normative));
+   `begin-fulfillment` has no terminal answer (`04 §3.6` `inst-bf-if-held`). Any other
+   `not-admissible` stays `permanent-failure` with `version-mismatch` -
    `inst-owf-round-lifecycle`
 
 **The register of re-invokable operations.** Each operation's §3.3 declaration is authoritative;
@@ -3062,15 +3069,17 @@ Every process table in §3.7 is **tenant-scoped by a NOT NULL column**, not by c
 carries `resource_tenant_id`, and `owf_process_instance` and `owf_audit_entry` additionally carry
 `seller_tenant_id` because each backs an operator- or seller-scoped surface — NOT NULL except on
 a pre-admission `admit-trigger` audit entry whose seller is not yet known, which no seller-scoped
-predicate matches (§3.7 `owf_audit_entry`, decision D-172). Six tables are exempt; the full list
+predicate matches (§3.7 `owf_audit_entry`, decision D-172). Seven tables are exempt; the full list
 is `DESIGN.md` §3.7's. Three are configuration: `owf_step_operation`, which has no tenant column,
 `owf_seller_policy`, which is keyed by `seller_tenant_id` alone and has no row per resource tenant
 (decision D-140), and `owf_configuration_revision`, their append-only history, which has no tenant
 column (decision D-160). Three carry another axis instead: `owf_dispatch_admission`, per-seller
 admission state keyed by `seller_tenant_id` alone, NULL on its gear-level aggregate row
 (`05 §3.7`), and `owf_audit_checkpoint` and `owf_audit_checkpoint_member`, keyed on the immutable
-audit namespace `audit_tenant_id` (§3.7). The platform `toolkit_db::outbox` tables and the
-platform's own invocation index and history are not Workflow tables; the tenant axes ride the
+audit namespace `audit_tenant_id` (§3.7). One is an access record: `owf_read_access_log`, keyed on
+the caller's `subject_tenant_id` NOT NULL, with the order's resource and seller axes nullable
+because a refused read of an order with no instance has none (`09 §3.7`, decision D-191). The
+platform `toolkit_db::outbox` tables and the platform's own invocation index and history are not Workflow tables; the tenant axes ride the
 event `data` (§4.7) and the envelope tenancy is platform-root. Every read this gear exposes
 **MUST** carry the corresponding tenant predicate, and the platform's SecureORM
 `#[secure(tenant_col = ...)]` isolation attaches to that column. Retention is **per store**

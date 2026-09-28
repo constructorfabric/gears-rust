@@ -2104,8 +2104,9 @@ family's round, which a held completion report may already have advanced; it nee
 case. **One failure rule.** A retry budget spent, a timeout, or a permanent refusal faults the
 invocation, except where this fragment catches it because the failure is a subject an
 operator can act on: a wave call's exhaustion and a wave's `failed[]` (line tasks),
-`compensate-order`'s exhaustion (the next pass, after `awaitCompensationResolution`) and
-`reflect-verdict`'s refusal (an order-scope task). **The remediation hold holds**: a `retry`
+and `compensate-order`'s exhaustion (the next pass, after `awaitCompensationResolution`).
+`reflect-verdict`'s Lifecycle refusal is not caught: it is the settled answer `refused`, routed
+on its output to an order-scope task (decision D-190). **The remediation hold holds**: a `retry`
 or a verified override of one line while the order still has open tasks
 (`openTaskCount > 0`) returns to `awaitResolution`, where every open task keeps its waiter, and
 the last resolution — a retry, a verified override or a Seller Operator's `closed` — takes every
@@ -2953,9 +2954,11 @@ is spent is Q-11 (vi); a route that catches a spent timeout names 408 and carrie
 **One failure rule** (decision D-114). A step call's spent retry budget, its spent timeout, and
 a permanent refusal the definition does not route **MUST** fault the invocation. The platform
 records it `failed`, then `dead_lettered`, and the instance liveness pass raises the
-`invocation-dead` task within one pass interval (`01 §3.8`, `01 §4.16`). The task's platform
-re-drive resumes at the faulted task under its still-open key: `retryable-failure` leaves the
-key `open` (`01 §3.3`). The definition **MUST** catch a failure only where it is the failure of a
+`invocation-dead` task within one pass interval (`01 §3.8`, `01 §4.16`). Once the platform
+confirms it (decision D-192), the task's platform re-drive resumes at the faulted task under its
+still-open key: `retryable-failure` leaves the key `open` (`01 §3.3`). Until then the task's
+`retry` is `action-not-offered` and the fault is resolved by the dead-instance unwind
+(`01 §4.16` item 2). The definition **MUST** catch a failure only where it is the failure of a
 subject an operator can act on, and only on these routes:
 
 | Route | Caught | Leads to |
@@ -2985,10 +2988,12 @@ operations that submit downstream (`01 §3.7` `owf_step_operation.submits_downst
 the instance lives, so only their re-issue after a long interruption — a ceiling park, a hold, an
 `invocation-dead` task awaiting its re-drive — can answer `aged-out` (400). No route above names
 it, `reflect-verdict`'s included, since its refusal is an answer rather than a 400 (decision
-D-190), so every one faults the invocation, and the `invocation-dead` task's `retry` mints the family's next
+D-190), so every one faults the invocation. Once the platform confirms the re-drive (decision
+D-192), the `invocation-dead` task's `retry` mints the family's next
 `attempt` before the re-drive, so the re-issued call — the same key, the same task — is resolved
-under its successor key rather than answering `aged-out` again (`01 §4.3` *Aged-out key*); a cancel
-takes the dead-instance unwind, which does the same. No `catch` is added: a 400 filter cannot tell
+under its successor key rather than answering `aged-out` again (`01 §4.3` *Aged-out key*); until
+then, and on a cancel, the order takes the dead-instance unwind (`01 §4.16` item 2), which does
+the same. No `catch` is added: a 400 filter cannot tell
 the aged-out answer from a caller defect before Q-11 is answered, and the failure rule above
 already sends both to the one task an operator acts on.
 

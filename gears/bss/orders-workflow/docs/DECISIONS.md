@@ -5777,6 +5777,8 @@ age while the instance lives*), §4.3 (*Lease-expired*); `design/03-approval-exe
 `design/10-process-definition.md` §3.6 (a), (b); `UPSTREAM_REQS.md` §1.2, §2.4, §3; D-102,
 D-166, D-185.
 
+**Clarified (2026-09-28, verification V2)**: rule 4's tail in `design/01-foundation.md` §3.3 (*Rounds and attempts*, `inst-owf-round-lifecycle`) spoke of "the `on_hold` and terminal cases" and stated no terminal case. After `already-applied` and `held` it now names each operation's own: `reflect-verdict`'s `moved` and `refused` (`03 §4.4`, D-190), `report-spawn-signal`'s `not-dispatchable` (`05 §3.3`), and `report-outcome`'s `terminal-event` (`06 §4.9`). `begin-fulfillment` has no terminal answer and keeps `permanent-failure` `version-mismatch` (`04 §3.6` `inst-bf-if-held`). No behaviour changes (V2-3).
+
 ### D-189 (M) `open-gates` looks a gate's request up by its key before it submits, and adopts one it finds
 
 **Accepted (2026-09-28).** *(amends D-185)*
@@ -5803,6 +5805,8 @@ phase 1 the stand-in never opens a gate (`03 §3.5`), so nothing changes until t
 **Propagated**: `design/03-approval-execution.md` §3.5, §3.6 (the gate-open sequence,
 `inst-og-submit`, its description); `design/01-foundation.md` §3.7 (*Which keys age while the
 instance lives*), §4.3 (*Lease-expired*); `UPSTREAM_REQS.md` §2.3; D-185.
+
+**Clarified (2026-09-28, verification V2)**: the finding was about what an adopted request is when it is not open, and when its window starts. `open-gates` step 4 (`design/03-approval-execution.md` §3.6 `inst-og-submit`) now covers each state. An adopted `open` request dates its gate's window from the request's opened instant as the service reports it. It sets `window_remaining_ms` = the pinned `escalation_window_ms` less the time elapsed since then, and never counts from the adoption. No `owf_approval_request` row can date it, because the earlier call never reached its settlement. An adopted decided request is opened like an open one. The service re-publishes its decision event until `record-decision` reads it by `decisionEventId`, so only `record-decision` decides a gate, as the gate state machine requires, and it applies the separation-of-duties guard. A `cancelled` request is not adopted. The operation settles `permanent-failure` `version-mismatch`, since the key carries no attempt and the gate has no other key, and the invocation fault leaves through the `invocation-dead` task (D-192). `UPSTREAM_REQS.md` §2.3 asks for a read that answers every state with the opened instant, and for that re-publication. This fills in D-189's "adopts one it finds" and needs no new decision (V2-7).
 
 ### D-190 (M) `reflect-verdict` answers a Lifecycle refusal as the settled answer `refused`, and the definition catches no 400 of it
 
@@ -5836,6 +5840,10 @@ that "no `catch` has to tell a version conflict from a still-processing answer b
 §4.4, §4.5 item 3; `design/10-process-definition.md` §3.6 (a) `reflectVerdict`, `afterReflect`,
 `reflectionTask`, the approval-stage prose, §4.6; `design/01-foundation.md` §4.3 (*Aged-out key*),
 §4.9; `design/07-manual-tasks.md` §3.3; `ADR/0012` (Rule 6); D-112, D-185.
+
+**Amended by D-192 (2026-09-28)**: item (5)'s "the `invocation-dead` task's `retry` mints the successor attempt" holds once the platform confirms the re-drive. Until then that `retry` is `action-not-offered`, and the fault is resolved by the dead-instance unwind (`design/01-foundation.md` §4.16 item 2). `design/10-process-definition.md` §4.6 says the same.
+
+**Clarified (2026-09-28, verification V2)**: the `reflect-verdict` row of `design/03-approval-execution.md` §3.3 had lost the separator between `compensation` and `reasons`, so `none` and the first reason ran into one cell. The row again has the header's eleven cells (V2-1). Fragment (c)'s failure-rule prose in `design/10-process-definition.md` §3.6 listed "`reflect-verdict`'s refusal (an order-scope task)" among the caught failures. It now says that refusal is the settled answer `refused`, routed on its output and not caught (V2-5).
 
 ### D-191 (M) The audit read is access-logged like Lifecycle's: one `owf_read_access_log` row per request, served or refused
 
@@ -5890,6 +5898,8 @@ read*, *Access log*), §3.7 (`owf_read_access_log`, *Which reads are access-logg
 roster); `DESIGN.md` §3.3, §3.7 (inventory,
 counts, D-48 exemptions, retention register), §4.4 (*Audit integrity*); D-48, D-104, D-186.
 
+**Clarified (2026-09-28, verification V2)**: `design/01-foundation.md` §4.11 still said "Six tables are exempt". It now says seven, and names `owf_read_access_log` as §3.7 and `DESIGN.md` §3.7 do (V2-2).
+
 ### D-192 (M) The operator re-drive of a dead invocation is an explicit readiness item that gates the action, not readiness
 
 **Accepted (2026-09-28).** *(amends D-86, D-105)*
@@ -5922,6 +5932,8 @@ gear unready: the pending dead-letter routes of `09 §4.1` stay unregistered unt
 **Propagated**: `design/01-foundation.md` §3.8 (*Readiness*); `design/07-manual-tasks.md` §4.4;
 `design/10-process-definition.md` §3.3 (*Generic control*); `UPSTREAM_REQS.md` §2.9 (preamble,
 `…-upreq-serverless-runtime-signals`); D-86, D-105.
+
+**Clarified (2026-09-28, verification V2)**: `ADR/0011`'s *Runtime gate* held readiness on "the platform asks below", and its signals ask covers the re-drive. It gains an amendment block that carves the re-drive out of readiness (V2-4). `design/10-process-definition.md` §4.6 described the re-drive as available, in the one failure rule and in the aged-out-key paragraph. It now adds "once the platform confirms it", and names the dead-instance unwind (`01 §4.16` item 2) as the remedy until then (V2-6).
 
 ## Open Questions
 

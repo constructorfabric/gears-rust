@@ -258,6 +258,15 @@ are documentation until the platform host, its Temporal plugin and the platform 
 and the readiness gate passes. This gear cannot be ready for order traffic on the platform path
 before then; the fallback property is what holds in the meantime.
 
+> **Amended 2026-09-28 by D-192**: one platform ask below does not gate readiness. The operator
+> re-drive that the named-signals ask covers (D-86 as amended) is an explicit item of the
+> readiness gate that gates the action, not readiness: for the `platform` source the gear reports
+> ready without it, and the `invocation-dead` task's `retry` stays `action-not-offered` until the
+> platform confirms that `:control` `retry` keeps `invocation_id`, resumes at the faulted task and
+> is valid from `dead_lettered`. Until then the remedy for a dead invocation is the order cancel,
+> carried out as the dead-instance unwind (`design/01-foundation.md` §3.8 *Readiness*, §4.16
+> item 2; `design/07-manual-tasks.md` §4.4).
+
 **Q-01 is answered in two parts.**
 
 1. *The substrate choice is made.* The durable-execution substrate is the serverless-runtime
