@@ -298,12 +298,16 @@ overdue re-check and the top-level lifetime `wait` — and the platform plugin e
 policy value, pinned on the plan at freeze, and the definition owns only the tick that re-checks
 it (decision D-134). The nesting invariant — per-operation deadline **<** the task timeout **<** the
 lifetime ceiling, and the longest fulfillment-stage task timeout **<** the overdue window **<** the
-lifetime ceiling (§4.2) — is checked in two places: over the values the
-definition holds by a **definition validation rule** enforced before publish
-(`cpt-cf-bss-orders-workflow-adr-definition-versioning-and-protected-steps`, `10 §2.2` rule 4),
-and for the overdue window at the audited write of the seller's policy, the policy load of
-`owf_seller_policy` (§3.7, `07 §4.8` item 8, decision D-140); the
-operation's own deadline is asserted against the published bounds at configuration load (§4.2). Collapsing any
+lifetime ceiling (§4.2) — is enforced in four places, one wherever either side changes (§4.2):
+(1) over the values the definition holds, by a **definition validation rule** enforced before
+publish (`cpt-cf-bss-orders-workflow-adr-definition-versioning-and-protected-steps`, `10 §2.2`
+rule 4); (2) by the publish job, which refuses a candidate whose `wave1` timeout is not below
+every effective overdue window of the environment (`10 §4.2` step 1, decision D-159); (3) for the
+overdue window, at the audited write of the seller's policy, the policy load of
+`owf_seller_policy` (§3.7, `07 §4.8` item 8, decisions D-134 and D-140); and (4) for the
+operation's own deadline, at readiness, which refuses a `deadline_ms` change that breaks the
+ordering against the live version set and alerts on a publish and a promotion that raced
+(§4.2, decision D-176). Collapsing any
 of the five into another either stalls a transient failure indefinitely, provisions against a
 payer who has not been charged, or leaves an order non-terminal forever.
 
@@ -954,7 +958,9 @@ next round out, a per-instance counter, an attempt only from an operator retry):
    omitted from the key. For a line task the family is the dispatch operation of the line's wave,
    whatever step raised the task, and the definition keeps one attempt per wave; the line's own
    re-send is keyed by the per-line `wave_attempt` on its task row, which the retry increments
-   only for an intent recorded `failed` (`05 §4.4`, decision D-119). A round is the definition's loop; an attempt is an operator's decision
+   only for an intent recorded `failed` (`05 §4.4`, decision D-119). The first call that presents
+   an attempt records it, with the key it arrived under, in the family's `presented` history
+   (§3.7 `key_rounds`), which is what the quarantine of §4.13 counts (decision D-174). A round is the definition's loop; an attempt is an operator's decision
    that a failed step runs again, and it is the only way past a settled refusal of the same round.
    An attempt above the family's minted counter is `idempotency-key-mismatch` - `inst-owf-attempt`
 4. [ ] - `p1` - **A Lifecycle-transition key carries the round.** The key Orders passes to
@@ -1022,7 +1028,7 @@ about the instance the definition has established.
 | `declared_event` | none (`OrderFulfillmentStarted` belongs to `begin-fulfillment`, slice 04) |
 | `compensation` | none (`terminate-instance` is a path step, not a paired undo) |
 | `reasons` | `idempotency-key-conflict`, `definition-not-bound` (the platform's invocation record for `invocationId` names a callable other than a major of `order_process`, or a `function_version` other than the input `definitionVersion` — the document's own `version`, D-137; once the hook of `10 §4.2` lands, also a version it has not validated), `line-count-exceeded` (delegated check, slice 04) |
-| `audit_kind` | `instance-start` at sequence 1 (or the next sequence of a pre-admission chain, §3.7) |
+| `audit_kind` | `instance-start` at the chain's head + 1, read in the inserting transaction — the next sequence after the pre-admission entries of `admit-trigger`, or 1 on a chain with none (§3.7 *Chain allocation*, path 3, decision D-173) |
 | `retry_class` | `retryable-on: transient` |
 | `deadline` | 5 s |
 
@@ -1108,8 +1114,10 @@ nothing. This is the only path that may settle a key whose closure it did not ru
 | `deadline` | 5 s |
 
 Effect: verify the instance `row_version` the caller presents, apply the Orders-side quarantine
-of §4.13 (three consecutive **presented** attempts of one `stepRef` that terminated without a settled
-outcome trip `poison-step`; an attempt no call ever presented is skipped), mint the next `attempt` of the step's family in
+of §4.13 over the family's `presented` history in `key_rounds` (three consecutive **presented**
+attempts of one `stepRef`, each of whose registry record is still `in_flight` with a dead lease,
+trip `poison-step`; an attempt no call ever presented is absent from the history and skipped,
+decision D-174), mint the next `attempt` of the step's family in
 `owf_process_instance.key_rounds` (§3.3 *Rounds and attempts*, rule 3), and record the operator's retry as a `retry` audit entry whose actor is the request row's `requested_by`, never the `SecurityContext` of the call that carries it, which is the serverless-runtime principal's ([`07 §4.6`](./07-manual-tasks.md#46-operation-rules-normative) rule 3).
 The re-dispatch itself is the definition's resume arm (`10 §3.6` (c)).
 
@@ -1151,18 +1159,28 @@ ceiling park.
 | `idempotency_key` | instance-scoped: `{tenant}:{correlationId}:terminate-instance` |
 | `declared_event` | none (`OrderFulfillmentCompleted`/`Aborted` belong to `report-outcome`, slice 06) |
 | `compensation` | none |
-| `reasons` | `version-mismatch` |
+| `reasons` | `version-mismatch`, `fence-not-claimed` (the instance is `suspended` or `parked`, whose only way to `terminated` is through the cancellation fence, below) |
 | `audit_kind` | `termination` |
 | `retry_class` | `retryable-on: transient` |
 | `deadline` | 5 s |
 
-Effect: set `terminal_outcome`, move the phase projection to `terminated` from any non-terminal
-phase per §3.7, call slice 07's in-process closure port `close_open_tasks(correlationId, outcome)`
+Effect: set `terminal_outcome`, move the phase projection to `terminated` along one of the two
+edges §3.7 permits — `compensating → terminated` (an unwind that passed the fence) or
+`started → terminated` (a completion or a rejection) — call slice 07's in-process closure port `close_open_tasks(correlationId, outcome)`
 in the same unit of work — so every open manual task, `requested` resolution request and open
 escalation of the instance is closed with the termination
 ([`07 §2.2`](./07-manual-tasks.md#22-constraints)) — write `termination` with
 `phase_from`/`phase_to`, release the partial unique index so a new version's instance may start.
-A terminated instance accepts no further operation:
+**From `suspended` or `parked` it moves nothing** (decision D-175): §3.7 has no
+`suspended → terminated` edge, because every unwind from a hold passes `compensating` (D-82), and
+a parked instance is unwound only through the fence. The call settles `permanent-failure` with
+`fence-not-claimed` (`FailedPrecondition`, 400, registered by slice 06 for the same precondition
+on `compensate-order` and `report-outcome`, `06 §3.6` `inst-co-fence-guard`, `inst-ro-gate`),
+writes `step-completion` carrying it (§3.3 *What each receipt records*), and closes no task.
+Not `version-mismatch`: that is `Aborted` (409), which the definition's `*transient` catch
+re-issues under the same key (`10 §2.2`) to the same refusal until the budget is spent; a 400
+matches no `catch` and faults the invocation at once, as `reportOutcome`'s `fence-not-claimed`
+does (`10 §3.6` (c), D-114). A terminated instance accepts no further operation:
 every other operation answers `permanent-failure` with `version-mismatch` once the row is
 terminal.
 
@@ -1393,7 +1411,9 @@ through the foundation's `record_configuration` port (decision D-160).
 **Tenancy is a column on every process table here, not a convention.** Every table except the
 three configuration tables carries `resource_tenant_id uuid NOT NULL` — the
 resource-recipient axis — and the tables backing an operator- or seller-scoped surface
-additionally carry `seller_tenant_id uuid NOT NULL`, the selling-party axis. The three
+additionally carry `seller_tenant_id uuid NOT NULL`, the selling-party axis, with one exception:
+`owf_audit_entry.seller_tenant_id` is NULL on a pre-admission `admit-trigger` entry written
+before the Lifecycle read that yields the seller (decision D-172). The three
 configuration tables are `owf_step_operation`, which has no tenant column, `owf_seller_policy`,
 which is keyed by `seller_tenant_id` alone (NULL on its platform row), and
 `owf_configuration_revision`, the append-only history of both and of the authorization catalogue,
@@ -1424,8 +1444,8 @@ has no enforcing predicate.
 | suspended | boolean | Set by `apply-hold`, cleared by `apply-resume`; redundant with `phase = suspended` and kept as the hold predicate the dispatch operations read |
 | last_settled_step | text, nullable | The last settled **protected** operation and its subject; a read-side marker, not a resume pointer — the platform resumes from its own history |
 | row_version | bigint, NOT NULL, DEFAULT 0 | Optimistic-concurrency version, incremented on **every** write to this row; surfaced to operator callers as an ETag and required as `If-Match` on the mutating operations of `09 §3.3` |
-| audit_sequence | bigint, NOT NULL, DEFAULT 0 | The instance's committed audit-chain head: incremented under this row's lock in the same transaction as every `owf_audit_entry` append for this `correlation_id` (§4.17). The `start-instance` transaction that inserts this row also writes the `instance-start` entry |
-| key_rounds | jsonb, NOT NULL, DEFAULT `{}` | The per-family round and attempt counters of §3.3 *Rounds and attempts*: one entry `{round, attempt}` per family (operation name plus the subject its key names). Written only by the envelope, under this row's lock, in the transaction that settles a round with success (`round`, including a `settle-from-lookup` settlement with `success`, §3.3) or that `retry-step` commits (`attempt`); never decremented, never purged while the row exists |
+| audit_sequence | bigint, NOT NULL, DEFAULT 0 | The instance's committed audit-chain head: incremented under this row's lock in the same transaction as every `owf_audit_entry` append for this `correlation_id` (§4.17). The `start-instance` transaction that inserts this row initialises it to the chain's head + 1, read in that transaction, and writes the `instance-start` entry at that sequence (§3.7 `owf_audit_entry` *Chain allocation*, decision D-173) |
+| key_rounds | jsonb, NOT NULL, DEFAULT `{}` | The per-family round and attempt counters of §3.3 *Rounds and attempts*: one entry `{round, attempt, presented}` per family (operation name plus the subject its key names). `presented` is the bounded history the quarantine of §4.13 counts from: `[{attempt, key}]`, one element per minted attempt (≥ 1) a call has presented, holding the full registry key it was first presented under, ordered by `attempt` and trimmed to the last three (decision D-174). Written only by the envelope, under this row's lock: `round` in the transaction that settles a round with success (including a `settle-from-lookup` settlement with `success`, §3.3); `attempt` in the transaction `retry-step` commits; a `presented` element in the transaction that first inserts a registry record for a key ending in that attempt — a committed-lease operation's lease transaction, or a single-transaction operation's one transaction. Never decremented, never purged while the row exists |
 | terminal_outcome | enum, nullable | `completed`, `aborted`, or NULL while non-terminal |
 | created_at, updated_at | timestamptz | Bookkeeping |
 
@@ -1459,7 +1479,8 @@ Lifecycle is by reference only.
 and resumable by an operator, a park is the fail-closed consequence of an unobtainable verdict or
 an exhausted lifetime ceiling and clears only when an operation records that it may. There is no
 `suspended → terminated` edge: every unwind from a hold passes `compensating` (decision D-82: the lifetime-ceiling park is permitted from `suspended` and leaves the suspension
-open; a parked instance is unwound only through the fence). There is no `compensating → parked`
+open; a parked instance is unwound only through the fence), and `terminate-instance` called from
+`suspended` or `parked` refuses `fence-not-claimed` (§3.3, decision D-175). There is no `compensating → parked`
 edge: a lifetime ceiling that fires anywhere inside an unwind does not park, and the unwind
 continues under the fresh ceiling of the re-entered `lifetime` fork (`10 §3.6` (a)). There is no
 `parked → parked` edge either: a ceiling that fires during the verdict park loop does not park
@@ -1641,7 +1662,8 @@ and abort on a failed validation, serialization or enqueue
   key, `still-processing` until `settle-from-lookup` settles it from the downstream's outcome.
 - **What the caller gets.** Lifecycle's *Infrastructure-error termination* mapping
   (`01-foundation.md:853-862`): a known temporary unavailability — a lost connection, a
-  serialization or deadlock failure, a lock or statement timeout, the zero-rows fence — answers
+  serialization or deadlock failure, a lock or statement timeout, the zero-rows fence, the second
+  audit-sequence collision of §3.7 `owf_audit_entry` *Chain allocation* — answers
   the canonical `ServiceUnavailable` (503), which the definition's `*transient` catch re-issues
   under the same key (`10 §2.2`: 429, 503, 504, 409). Every other failure — an audit encoding failure, an enqueue the SDK refuses for schema,
   serialization or size, any unexpected persistence error — answers the canonical `Internal`
@@ -1904,8 +1926,8 @@ and no audit claim rests on resolving a revision to a full row.
 | correlation_id | uuid, NOT NULL | Owning process instance and chain key. An entry recorded before the instance row exists — an `admit-trigger` attempt on a not-yet-admitted correlation — is audited under the derived `correlationId` of [`02 §2.1`](./02-triggers-and-start.md#21-design-principles) (UUIDv5 over `resource_tenant_id`, `orderId`, `orderVersion`), so every entry belongs to exactly one chain |
 | order_id, order_version | text, integer | Denormalized for query without a join |
 | resource_tenant_id | uuid, NOT NULL | Resource-recipient axis |
-| seller_tenant_id | uuid, NOT NULL | Selling-party axis; the audit read surface is seller-scoped |
-| sequence | bigint, NOT NULL | Per-instance audit counter, allocated from `owf_process_instance.audit_sequence` under the instance row lock; starts at 1 and is gapless within a chain |
+| seller_tenant_id | uuid, nullable **only** on a pre-admission `admit-trigger` entry | Selling-party axis; the audit read surface is seller-scoped. NULL where the seller is not yet known: on a pre-admission `admit-trigger` entry — written by the pre-admission append of *Chain allocation* below, while no instance row exists for the correlation — whose Lifecycle read has not yet returned the order (`step-start`), failed (`inst-at-read`) or returned an order of another resource tenant (`inst-at-tenant`), since the seller is resolved from that read (decision D-76). Every other entry carries it: an entry on the instance path copies `owf_process_instance.seller_tenant_id`, and a pre-admission entry after a successful read carries the read order's (decision D-172) |
+| sequence | bigint, NOT NULL | Per-chain audit counter, allocated from `owf_process_instance.audit_sequence` under the instance row lock, or, before the instance row exists, as the chain's head + 1 by the pre-admission append (*Chain allocation* below); starts at 1 and is gapless within a chain |
 | prev_hash | bytea, NOT NULL | The `entry_hash` of the preceding entry on the same `correlation_id`, or the chain genesis digest of §4.17 for sequence 1. Never NULL: this table has no unchained rows |
 | entry_hash | bytea, NOT NULL | 32-byte SHA-256 digest over every other column of this row under the v1 encoding of §4.17 |
 | event_kind | enum | `instance-start`, `step-start`, `step-completion`, `retry`, `timeout`, `sweep`, `sweep-settlement`, `escalation`, `compensation`, `phase-transition`, `termination`, `dead-letter` — the closed v1 token set; `dead-letter` is retained so the v1 vocabulary is unchanged, and no Orders path writes it while inbound dead letters are the platform's (§4.8) |
@@ -1927,21 +1949,83 @@ identity-erasure operators and the retention worker, **and** database triggers t
 UPDATE and DELETE regardless of grant (the Pricing pattern D-59 adopts; both are required, neither
 substitutes for the other). `(correlation_id, sequence)` UNIQUE, which serves the chain and
 rejects a competing append: two transactions allocating the same sequence cannot both commit, and
-the loser rolls back without consuming a sequence. Indexed on `(correlation_id, sequence)` for
+the loser rolls back without consuming a sequence and re-executes as *Chain allocation* below
+states. Indexed on `(correlation_id, sequence)` for
 per-process retrieval in chain order and on `(seller_tenant_id, created_at)` for the
 tenancy-scoped audit read. `event_kind`-shape CHECKs: `definition_version` non-null exactly on
 `instance-start`; `phase_to` non-null exactly on `instance-start`, `phase-transition` and
-`termination`; `hash_version = 1`.
+`termination`; `hash_version = 1`. **Seller axis** (decision D-172): CHECK `seller_tenant_id IS
+NOT NULL OR (event_kind IN ('step-start', 'step-completion', 'retry', 'timeout') AND step_id`
+names `admit-trigger`)`; the half a CHECK cannot express — that no instance row existed for the
+correlation — is the writer's rule: only the pre-admission append of *Chain allocation* writes a
+NULL, and it inserts nothing once an instance row is visible.
 
-**Chain allocation.** Every append runs in the transaction of the transition it records
-(§4.17 *Append rule*): the writer locks the instance row, increments `audit_sequence`, computes
-`entry_hash` over the fully constructed row and inserts it. Where no instance row exists yet — a
-pre-admission `admit-trigger` attempt — the envelope allocates the next sequence for the derived
-`correlation_id` from the chain's current head inside its own transaction, and the uniqueness
-constraint arbitrates a race. When such a correlation is later admitted, the `start-instance`
-transaction initialises `audit_sequence` from the existing head and writes `instance-start` at
-the next sequence rather than at 1; genesis covers the first entry of a correlation whichever
-kind it is. Sequence 1 is otherwise always `instance-start`.
+**A NULL seller and the seller-scoped read.** The seller-scoped audit read resolves its predicate
+on `seller_tenant_id` — an `Eq`, `In` or `InTenantSubtree` constraint compiled to the
+`AccessScope` (`09 §2.2` *Tenant scoping and payment-card exclusion on every read*) — and NULL
+satisfies none of them, so a pre-admission entry with no
+seller is never listed by a seller's scope, and no read **MAY** treat NULL as a wildcard. It is
+read as part of its chain: by `correlation_id`, under the axes of the instance `start-instance`
+later bound to that correlation (`owf_process_instance.seller_tenant_id`), and before any
+instance exists only by the SELECT-only verifier and checkpoint worker of §3.8. `09` exposes no
+audit route today (its §3.3 lists none); a route added later scopes these rows through the
+chain's instance. The hash contract is unchanged: §4.17's v1 framing already encodes a NULL
+field as the single byte `0x00`, distinct from any UUID's `0x01 || u32_be(16) || bytes`, so the
+digest of a NULL-seller entry is defined and D-60 needs no new version. The shape is
+Lifecycle's, whose audit leaves its tenancy axes NULL "for unresolved refusals"
+([Lifecycle `01 §3.7` `orders_transition_audit`](../../../orders-lifecycle/docs/design/01-foundation.md#37-database-schemas-and-tables),
+`01-foundation.md:1606-1613`).
+
+**Chain allocation** (decision D-173). Every append runs in the transaction of the transition it
+records (§4.17 *Append rule*), and every Workflow transaction runs at **READ COMMITTED**, so each
+statement sees every transaction committed before it began — Lifecycle's stated isolation, which
+its concurrency argument relies on in the same way
+([Lifecycle `01 §3.6`](../../../orders-lifecycle/docs/design/01-foundation.md#36-interactions-and-sequences),
+`01-foundation.md:1017-1022`: under snapshot isolation its insert would raise a serialisation
+failure instead of reporting the conflict). Three paths allocate a sequence:
+
+1. [ ] - `p1` - **The instance path**, whenever the instance row exists: the writer locks the
+   instance row, increments `audit_sequence`, computes `entry_hash` over the fully constructed
+   row, copying the instance's `seller_tenant_id`, and inserts it. The row lock serialises every
+   append of the chain - `inst-owf-chain-instance`
+2. [ ] - `p1` - **The pre-admission append**, for a correlation with no instance row — an
+   `admit-trigger` attempt on the start role, and a refusal `start-instance` settles before it
+   inserts one (§3.3 *What each receipt records*). The writer reads the chain's head (the highest
+   `sequence` and its `entry_hash`, or genesis when the chain has no entry, §4.17), builds and hashes the row at head + 1,
+   and inserts it in **one** statement that also checks that no instance exists:
+   `INSERT INTO owf_audit_entry … SELECT <the row> WHERE NOT EXISTS (SELECT 1 FROM
+   owf_process_instance WHERE correlation_id = <c>)`. Zero rows inserted means an instance
+   committed after the head read: the writer appends through the instance path instead, in the
+   same transaction. A unique violation on `(correlation_id, sequence)` means another append
+   took head + 1 first: the transaction rolls back whole and the envelope re-executes it once —
+   the transaction, never the effect, whose result it holds — reading the head afresh; a second
+   collision is an abort under §3.7 *A settlement that cannot commit aborts whole* (503) -
+   `inst-owf-chain-preadmission`
+3. [ ] - `p1` - **`start-instance`**, in the transaction that inserts the instance row: it reads
+   the chain's head in that transaction, inserts the instance with `audit_sequence` = head + 1
+   and writes `instance-start` at head + 1 — 1 when the chain has no entry yet. A collision on
+   `(correlation_id, sequence)` is handled as in path 2: the transaction, instance insert
+   included, rolls back and is re-executed once - `inst-owf-chain-start`
+
+**Why no entry can land behind the counter.** The failure to exclude is a pre-admission entry
+committed at a sequence the instance's `audit_sequence` does not cover, after which every
+instance-path append would collide or the verifier's contiguity check would fail forever. Paths 2
+and 3 both write at head + 1 of a head they read, so the two orders a race can take both end in a
+defined state. If `start-instance` commits before the pre-admission statement begins, READ
+COMMITTED makes its instance visible to the `NOT EXISTS`, which inserts nothing, and the entry
+goes through the instance path under the row lock. Otherwise both transactions computed the
+same head + 1, or one computed it from a head the other moved. Either way they insert the same
+`(correlation_id, sequence)`, the second inserter waits on the first's uncommitted index entry,
+and one of them fails on the unique constraint and re-executes against the new head. A
+pre-admission entry above the instance's head would need a head that includes `instance-start`,
+which is visible only after `start-instance` committed — and then the `NOT EXISTS` of the same
+transaction's later statement sees the instance. Toolkit-db offers no transaction-scoped advisory
+lock (its `Db::lock` is a session lock, one non-blocking attempt,
+[`advisory_locks.rs`](../../../../../libs/toolkit-db/src/advisory_locks.rs)), so the unique
+constraint, not a lock, is the arbiter, as it is for Lifecycle's claims. Genesis covers the first
+entry of a correlation whichever kind it is, and sequence 1 is `instance-start` exactly when no
+pre-admission entry precedes it — which on the platform start path, where `admit-trigger` always
+writes first, is never.
 
 **The chaining rule** is the v1 byte contract of §4.17 (D-60), stated once there: SHA-256 over
 a Workflow-specific row tag and the framed, ordered fields of the row, linking the preceding
@@ -2770,7 +2854,9 @@ definition (`10`); the engine contains no operation logic and no commercial poli
 
 Every process table in §3.7 is **tenant-scoped by a NOT NULL column**, not by convention: each
 carries `resource_tenant_id`, and `owf_process_instance` and `owf_audit_entry` additionally carry
-`seller_tenant_id` because each backs an operator- or seller-scoped surface. The three exemptions are
+`seller_tenant_id` because each backs an operator- or seller-scoped surface — NOT NULL except on
+a pre-admission `admit-trigger` audit entry whose seller is not yet known, which no seller-scoped
+predicate matches (§3.7 `owf_audit_entry`, decision D-172). The three exemptions are
 configuration: `owf_step_operation`, which has no tenant column, `owf_seller_policy`, which is
 keyed by `seller_tenant_id` alone and has no row per resource tenant (decision D-140), and
 `owf_configuration_revision`, their append-only history, which has no tenant column (decision
@@ -2844,21 +2930,40 @@ plugin's poison handling and ends in the invocation's `failed` or `dead_lettered
 (`DESIGN.md:449`, `DESIGN.md:458`); the sweep of §3.8 keeps reading that instance's due intents,
 and its instance liveness pass raises the instance as an `invocation-dead` task. This slice keeps
 exactly one crash-loop guard of its own: **`retry-step` MUST quarantine** a step whose operator
-retries keep terminating without a settled outcome — working baseline **3** consecutive retries of
-one `stepRef` whose attempts were **presented** — a call of the family arrived under the attempt's
-key, so the registry holds a record for it — and left that key `in_flight` with a dead lease or
-produced no step record — by refusing the fourth with `poison-step`, writing the `retry` audit entry with that reason and
-leaving the manual task open for escalation. The guard is deliberately separate from the
+retries keep terminating without a settled outcome — working baseline **3** — by refusing the
+next retry with `poison-step`, writing the `retry` audit entry with that reason and leaving the
+manual task open for escalation. The counting rule (decision D-174, amending D-152):
+
+1. [ ] - `p1` - **Only presented attempts are counted.** An attempt is presented when a call of
+   the family first arrived under a key ending in it; the envelope then records `{attempt, key}`
+   in the family's `presented` history in `owf_process_instance.key_rounds` (§3.7), in the
+   transaction that first inserts the key's registry record. An attempt `retry-step` minted that
+   no call presented has no element: it neither counts nor breaks the run - `inst-owf-q-presented`
+2. [ ] - `p1` - **Each presented attempt is judged by its key's registry record now**, read by
+   the recorded `key` — the tombstone rule keeps the row while the instance lives (§3.7). It
+   **counts** when that record is `in_flight` with a dead lease: the attempt ended with no settled
+   outcome and nothing has settled it since. It **resets** the run when the record is `settled`
+   — success, a permanent failure, or a `settle-from-lookup` settlement of the dead lease — or
+   `open`, whose attempt settled a retryable failure and ended by exhausting the definition's
+   budget, an ordinary failure the operator can read. A record `in_flight` with a live lease is
+   still running and neither counts nor resets - `inst-owf-q-judge`
+3. [ ] - `p1` - **The run is the tail of the history, by `attempt`.** `retry-step` refuses when
+   the history holds three presented attempts and all three count; any reset among them ends
+   the run. A single-transaction operation never leaves a counting record — its crash rolls its
+   one transaction back, the `presented` element with it, and its re-issue runs as a first call
+   (§3.7) — so the guard trips only on operations that commit a lease - `inst-owf-q-run`
+
+No outcome is stored in the history, because a dead lease can still be settled by lookup after
+the fact and must then reset the run. The guard is deliberately separate from the
 definition's retry budget: sharing one counter would let an ordinary retry train exhaust the
-quarantine allowance. For the same reason an attempt that no call presented is **skipped** — it
-neither counts nor breaks the consecutive run. Under D-119 every line task of a wave mints into
+quarantine allowance. Under D-119 every line task of a wave mints into
 the wave's one dispatch family, and the definition carries only the wave's latest attempt, so the
 attempts minted by several line retries before the next dispatch are overwritten unused, and a
 retry of a `submitted` or `unresolved` line mints one that causes no dispatch
-([`05 §4.4`](./05-provisioning-intents.md#44-operation-rules-normative)). None of those is a crash,
-so an operator retrying four lines of one wave under the remediation hold is never refused
-`poison-step` for them; the one attempt the next dispatch presents settles and resets the run
-(decision D-152).
+([`05 §4.4`](./05-provisioning-intents.md#44-operation-rules-normative)). None of those is
+presented, so an operator retrying four lines of one wave under the remediation hold is never
+refused `poison-step` for them; the one attempt the next dispatch presents settles and resets the
+run (decision D-152).
 
 ### 4.14 Determinism discipline: what is computed on which side of the boundary
 
@@ -2967,7 +3072,8 @@ of work, the sweep settlement, the compensation step, the pre-admission `admit-t
 a failed append or encoding failure **MUST** abort that unit of work, with the registry state and
 the answer §3.7 *A settlement that cannot commit aborts whole* states (decision D-168). An
 unaudited transition is not a permitted outcome. The append takes the `owf_process_instance` row
-lock, increments `audit_sequence`, and inserts the entry; counter, entry and business mutation
+lock, increments `audit_sequence`, and inserts the entry — or, while no instance row exists,
+allocates head + 1 in the one guarded statement of §3.7 *Chain allocation* (decision D-173); counter, entry and business mutation
 commit or roll back together, and no non-transactional database sequence is used. No read
 **MAY** derive process or order state from this table, and nothing recovers from it.
 
@@ -3035,7 +3141,9 @@ conditions and is not presumed available.
 
 **Acceptance evidence (implementation requirements, not claims).** Frozen preimage and digest
 vectors for genesis, `instance-start`, a later step entry, a pre-admission `admit-trigger` entry
-and a roll-up; every-field mutation tests over every covered column, including NULL/empty and
+with a NULL `seller_tenant_id` and one with a seller, and a roll-up; a pre-admission append racing
+`start-instance` in both commit orders, ending with a contiguous chain whose head equals the
+instance's `audit_sequence`; every-field mutation tests over every covered column, including NULL/empty and
 adjacent-field boundaries; malformed length and version rejection; database timestamp round
 trips; concurrent same-instance appends that never fork and a rollback that never consumes a
 sequence; different instances sharing no lock; database rejection of every UPDATE and DELETE by

@@ -688,7 +688,7 @@ Output: `admission`, `correlationId`, `currentOrderVersion`, or a retryable fail
 11. [ ] - `p1` - **IF** `role = start` **AND** the read state is terminal: **RETURN** `ignored-terminated` - `inst-at-start-terminal`
 12. [ ] - `p1` - **IF** `role = start` **AND** an active instance exists at an older version: **RETURN** `retryable-failure` with `prior-instance-active`; the key stays `open` (§4.3) - `inst-at-prior-active`
 13. [ ] - `p1` - **IF** `role = start` **AND** the read state is `submitted` **AND** the read order's `category` is `new_sale`: **RETURN** `start`; otherwise **RETURN** `no-active-instance` - `inst-at-start`
-14. [ ] - `p1` - The envelope writes the step record (`result` carrying `admission`, the read version and state), the audit entry under the chain of `correlationId` (the derived one on a start attempt with no instance yet) and settles the key, in one transaction - `inst-at-settle`
+14. [ ] - `p1` - The envelope writes the step record (`result` carrying `admission`, the read version and state), the audit entry under the chain of `correlationId` (the derived one on a start attempt with no instance yet, appended by the guarded pre-admission append of `01 §3.7` *Chain allocation*, carrying the read order's `seller_tenant_id`, or NULL where the read failed or named another tenant, D-172, D-173) and settles the key, in one transaction - `inst-at-settle`
 
 #### Duplicate absorption
 
@@ -805,7 +805,7 @@ engine-owned tables per [`01 §3.7`](./01-foundation.md#37-database-schemas--tab
 | `owf_process_instance`, partial index `UNIQUE (order_id) WHERE terminal_outcome IS NULL` | `start-instance` / `terminate-instance` through the envelope (01) | Single active instance per order (§2.1); the supersession guard reads it under row lock (§4.3) |
 | `owf_idempotency_registry`, `operation = 'admit-trigger'`, key per §2.1 | Idempotency registry (01) | Duplicate absorption; the `open` state that lets a non-admitted attempt re-run; tenant-namespaced by the key prefix (`01 §3.7`) |
 | `owf_step_log` | Step envelope (01) | One row per admission attempt, carrying the platform `attempt_id`, the outcome and the read version in `result`; **not** a dedup store |
-| `owf_audit_entry` | Audit writer (01) | `step-start` and a settlement entry per attempt — `step-completion`, or `retry` or `timeout` on a retryable failure (`01 §3.3` *What each receipt records*) — under the derived correlation before the instance exists |
+| `owf_audit_entry` | Audit writer (01) | `step-start` and a settlement entry per attempt — `step-completion`, or `retry` or `timeout` on a retryable failure (`01 §3.3` *What each receipt records*) — under the derived correlation before the instance exists, with `seller_tenant_id` NULL until the Lifecycle read yields the seller (`01 §3.7`, D-172) |
 | `owf_step_operation` | Operation registry (01) | The two rows of §3.3 |
 
 **Columns that moved.** The platform attempt identifier is recorded as `owf_step_log.attempt_id`

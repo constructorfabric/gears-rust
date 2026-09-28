@@ -2074,6 +2074,8 @@ and `start-instance` needs the seller axis for every seller-scoped row it writes
 
 **Propagated**: `design/01-foundation.md` §3.3 *start-instance*; `design/02-triggers-and-start.md` §3.3.
 
+**Amended by D-172 (2026-09-28)**: the seller is resolved from `admit-trigger`'s Lifecycle read, so a pre-admission audit entry written before that read returns an order — its `step-start`, and the settlement of a failed or foreign-tenant read — carries `seller_tenant_id` NULL; `owf_audit_entry` admits NULL only there.
+
 ### D-77 (M) Twelve reasons are registered for the step operations; the catalogue holds forty-two
 
 **Accepted.** *(amends D-64's counts)*
@@ -2238,6 +2240,8 @@ without closing the suspension keeps the two facts separate.
 nothing, because the table has neither a `compensating → parked` nor a `parked → parked` edge.
 Each ceiling parks under its own subject `ceiling:{round}`, and its `unpark` requires that
 ceiling's task resolved `retry` (D-122).
+
+**Amended by D-175 (2026-09-28)**: `terminate-instance` called from `suspended` or `parked` refuses `fence-not-claimed` rather than moving the phase, so the missing `suspended → terminated` edge is enforced at the operation.
 
 ### D-83 (H) `compensate-order` is one operation over the Orders-owned ordinal, resumable by pass
 
@@ -4439,6 +4443,8 @@ retry train must not exhaust the quarantine allowance.
 
 **Propagated**: `design/01-foundation.md` §3.3 (`retry-step`), §4.13; D-119.
 
+**Amended by D-174 (2026-09-28)**: "presented" is recorded, not inferred: each family keeps a `presented` history of `{attempt, key}` in `key_rounds`, and an attempt counts when its key's registry record is `in_flight` with a dead lease; a settled or `open` record resets the run.
+
 ### D-153 (M) Slice 05 re-arms an unresolved intent through its own port
 
 **Accepted (2026-09-26).** *(amends D-119, D-125)*
@@ -5086,6 +5092,152 @@ It is also not what the definition expects: `waitExpected` routes on `due` (re-r
 
 **Propagated**: `design/01-foundation.md` §4.15. Related: D-102.
 
+### D-172 (H) A pre-admission `admit-trigger` audit entry may carry no seller
+
+**Accepted (2026-09-28).** *(amends D-76; D-60 unchanged)*
+
+**Decision**: `owf_audit_entry.seller_tenant_id` is nullable only on a pre-admission
+`admit-trigger` entry whose seller is not yet known: the `step-start`, and the settlement entry
+of an attempt whose Lifecycle read failed or returned another resource tenant's order. A CHECK
+admits NULL only with `event_kind` ∈ `step-start` · `step-completion` · `retry` · `timeout` and a
+`step_id` naming `admit-trigger`. The writer rule carries the half a CHECK cannot: only the
+guarded pre-admission append of D-173 writes NULL, and every instance-path entry copies the
+instance's seller. A NULL satisfies no seller-scoped predicate (`Eq`, `In`, `InTenantSubtree`),
+and no read may treat it as a wildcard. Such an entry is read as part of its chain, by
+`correlation_id` under the instance later bound to it, and before that only by the SELECT-only
+verifier and checkpoint worker. `09` exposes no audit route today.
+
+**Rationale**: the column was NOT NULL, but D-76 resolves the seller from the Lifecycle read that
+`admit-trigger` makes after its `step-start`, and a failed read yields none, so the first
+pre-admission entry could not be written (re-review B-1). The frozen v1 encoding already frames
+NULL as `0x00`, distinct from a framed UUID (`01 §4.17`), so the digest is defined and D-60 needs
+no new `hash_version`. **Precedent**: Lifecycle's own audit table leaves its tenancy axes NULL
+where the aggregate was not resolved — `audit_tenant_id`, `resource_tenant_id` and `order_id` of
+`orders_transition_audit` are "NULL for unresolved refusals" (Lifecycle `01 §3.7`,
+`01-foundation.md:1606-1613`, Lifecycle D-98, D-104) — and its idempotency record keeps
+`order_id` NULL while no order exists (`01-foundation.md:1827`). Both are nullable axes scoped to
+the rows written before the owning record is known.
+
+**Propagated**: `design/01-foundation.md` §3.7 (tenancy note, `owf_audit_entry` schema,
+constraints and the seller-scoped read), §4.11, §4.17 *Acceptance evidence*;
+`design/02-triggers-and-start.md` §3.6 `inst-at-settle`, §3.7. Related: D-60, D-76.
+
+### D-173 (H) READ COMMITTED; the pre-admission append allocates and checks in one statement, and `start-instance` collides with it symmetrically
+
+**Accepted (2026-09-28).**
+
+**Decision**: every Workflow transaction runs at READ COMMITTED. An audit append takes one of three
+paths:
+- **Instance path**, when the instance row exists: lock the row and increment `audit_sequence`.
+- **Pre-admission append**, for a correlation with no instance row: read the chain's head, build
+  and hash the row at head + 1, and insert it with `INSERT … SELECT … WHERE NOT EXISTS (instance
+  for the correlation)`. Zero rows means an instance committed in between, so the writer appends
+  through the instance path in the same transaction. A unique violation on `(correlation_id,
+  sequence)` re-executes the transaction once, never the effect, and a second one aborts with the
+  canonical 503 of D-168.
+- **`start-instance`**, in its inserting transaction: read the head, initialise `audit_sequence` =
+  head + 1 and write `instance-start` there. It collides and re-executes in the same way.
+
+**Why the argument holds.** Paths 2 and 3 both write at head + 1 of a head they read, and the race
+ends in one of two ways:
+- `start-instance` committed before the pre-admission statement began. READ COMMITTED shows the
+  `NOT EXISTS` the instance, so the append goes through the row lock.
+- Otherwise both transactions insert the same `(correlation_id, sequence)`. The second waits on
+  the first's uncommitted index entry, one fails, and it re-reads the head.
+
+An entry above the instance's head would need a head that includes `instance-start`. That head is
+visible only after `start-instance` committed, and the later `NOT EXISTS` then sees the instance.
+So no pre-admission entry can land behind the counter.
+
+**Rationale**: the pre-admission allocation "from the chain's current head … and the uniqueness
+constraint arbitrates a race" left a window under READ COMMITTED. An entry committed after
+`start-instance` read the head, at a sequence above it, would never conflict, and the instance's
+counter would fall behind the chain for good. No isolation level was stated (re-review B-2).
+**Precedent**: Lifecycle states READ COMMITTED and relies on unique constraints rather than
+locks for its claims (Lifecycle `01 §3.6`, `01-foundation.md:1017-1022`). Toolkit-db offers only
+session-level, non-blocking advisory locks (`libs/toolkit-db/src/advisory_locks.rs`: `Db::lock` is
+one attempt, `try_lock` retries), with no transaction-scoped lock to serialise a chain that has
+no row yet.
+
+**Propagated**: `design/01-foundation.md` §3.3 (`start-instance` `audit_kind`), §3.7
+(`owf_process_instance.audit_sequence`, `owf_audit_entry` `sequence`, constraints, *Chain
+allocation*, the abort rule's 503 list), §4.17 *Append rule*, *Acceptance evidence*;
+`design/02-triggers-and-start.md` §3.6 `inst-at-settle`. Related: D-59, D-60, D-168.
+
+### D-174 (H) The quarantine counts from a per-family history of presented attempts
+
+**Accepted (2026-09-28).** *(amends D-152)*
+
+**Decision**: each `owf_process_instance.key_rounds` family entry gains `presented:
+[{attempt, key}]`. The envelope records a minted attempt (≥ 1), with the full registry key, in the
+transaction that first inserts a registry record for a key ending in that attempt. The history is
+ordered by `attempt` and trimmed to the last three. `retry-step` judges each element by its key's
+registry record at the time it runs:
+- `in_flight` with a dead lease **counts**;
+- `settled` (success, a permanent failure, or a lookup settlement) or `open` (a retryable failure
+  that exhausted the budget) **resets** the run;
+- a live lease does neither.
+
+It refuses `poison-step` when the three most recent presented attempts all count. An unpresented
+attempt has no element and is skipped, as D-152 required. No outcome is stored, because a dead
+lease can still be settled by lookup and must then reset the run. A single-transaction operation
+never leaves a counting record, so the guard trips only on operations that commit a lease.
+
+**Rationale**: the attempt key is `…:{round}:{attempt}` and `key_rounds` held only the latest
+`{round, attempt}`, so the round an attempt was presented under, and hence its registry record,
+was recorded nowhere, and "presented" could not be evaluated (re-review B-7). **Precedent**: none
+in the platform or the BSS gears for an operator-retry quarantine (D-152). The history reuses the
+instance row's existing per-family counters and the registry's tombstone retention (D-104), which
+keeps every presented key's record while the instance lives.
+
+**Propagated**: `design/01-foundation.md` §3.3 (*Rounds and attempts* rule 3, `retry-step`),
+§3.7 (`key_rounds`), §4.13. Related: D-102, D-104, D-119, D-152.
+
+### D-175 (M) `terminate-instance` takes only the two permitted edges; from `suspended` or `parked` it refuses `fence-not-claimed`
+
+**Accepted (2026-09-28).** *(amends D-82's application in `01 §3.3`)*
+
+**Decision**: `terminate-instance` moves the phase only along `compensating → terminated` and
+`started → terminated`. From `suspended` or `parked` it settles `permanent-failure` with
+`fence-not-claimed` (400), writes `step-completion` carrying the reason, and closes nothing.
+
+**Why this reason.** `version-mismatch` is `Aborted` (409). The definition's `*transient` catch
+would re-issue it under the same key to the same refusal until the budget is spent.
+`fence-not-claimed` is `FailedPrecondition` and names the precondition exactly: the only way from
+these phases to `terminated` is through the cancellation fence. A 400 matches no `catch`, so the
+invocation faults and the liveness pass raises `invocation-dead`, as `reportOutcome`'s
+`fence-not-claimed` already does.
+
+**Rationale**: the effect said "from any non-terminal phase per §3.7", but §3.7 permits only the
+two edges: there is no `suspended → terminated` edge (D-82), and a parked instance is unwound
+only through the fence (re-review A-2). **Precedent**: slice 06's own use of `fence-not-claimed`
+for `compensate-order` and `report-outcome` without a fence (`06 §3.6` `inst-co-fence-guard`,
+`inst-ro-gate`), and D-166, which answers a state the design excludes with a refusal that faults
+rather than a route.
+
+**Checked in `10 §3.6`**: `terminateAborted` follows the fence, so the phase is `compensating`.
+`terminateRejected` and `terminateCompleted` follow a Lifecycle transition that succeeded, so
+Lifecycle does not hold the order. The recorded phase is then `started` unless an Orders
+suspension is still open because the resume that closed it at Lifecycle has not yet been
+consumed. That residual is left to a follow-up review and is not routed here; until then such a call faults the invocation to `invocation-dead`.
+
+**Propagated**: `design/01-foundation.md` §3.3 (`terminate-instance`), §3.7 (the phase table's
+note). Related: D-82, D-114, D-166.
+
+### D-176 (L) The nesting invariant is enforced in four places, and §2.1 says so
+
+**Accepted (2026-09-28).**
+
+**Decision**: `01 §2.1` *Five bounds, two owners* names the four enforcement points that `01 §4.2`
+states. They are the definition validation rule at publish (`10 §2.2` rule 4), the publish job's
+`wave1`-versus-overdue check (`10 §4.2` step 1, D-159), the audited seller-policy write
+(`07 §4.8` item 8, D-134, D-140), and readiness for a `deadline_ms` change.
+
+**Rationale**: `01 §2.1` said "checked in two places" while `01 §4.2` says four (re-review A-8).
+**Precedent**: `01 §4.2` itself; no behaviour changes.
+
+**Propagated**: `design/01-foundation.md` §2.1. Related: D-126, D-134, D-159.
+
 ### Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?
 
 **Owner**: Architecture.
@@ -5518,6 +5670,11 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-169 | H `start-instance` reads the platform before its one transaction | `design/01-foundation.md` §3.3, §3.6, §3.7, §4.3; D-76, D-137 |
 | D-170 | M What each receipt records; `audit_kind` is the success kind | `design/01-foundation.md` §3.3, §3.6, §3.7, §4.6, §4.13, `design/02-triggers-and-start.md` §3.7, `DESIGN.md` §1.2; D-103 |
 | D-171 | H An early evaluation settles success with `due: false` | `design/01-foundation.md` §4.15; D-102 |
+| D-172 | H Pre-admission audit entries may carry no seller | `design/01-foundation.md` §3.7, §4.11, §4.17, `design/02-triggers-and-start.md` §3.6, §3.7; D-60, D-76 |
+| D-173 | H READ COMMITTED; guarded pre-admission append; symmetric start-instance collision | `design/01-foundation.md` §3.3, §3.7, §4.17, `design/02-triggers-and-start.md` §3.6; D-59, D-60, D-168 |
+| D-174 | H Quarantine counts from a per-family presented-attempt history | `design/01-foundation.md` §3.3, §3.7, §4.13; D-102, D-104, D-119, D-152 |
+| D-175 | M terminate-instance on the two permitted edges; `fence-not-claimed` from suspended or parked | `design/01-foundation.md` §3.3, §3.7; D-82, D-114, D-166 |
+| D-176 | L Nesting invariant: four enforcement points in §2.1 | `design/01-foundation.md` §2.1; D-126, D-134, D-159 |
 
-Highest decision number used: **D-171**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
+Highest decision number used: **D-176**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
 register; there are no parts.
