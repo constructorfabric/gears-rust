@@ -406,7 +406,8 @@ not here.
   - POST /v1/quota-enforcement/operations/credit
   - POST /v1/quota-enforcement/operations/rollback
   - POST /v1/quota-enforcement/operations/preview
-  - `QuotaEnforcementClientV1` (`debit`, `credit`, `rollback`, `evaluate_preview`)
+  - `QuotaEnforcementClientV1` (`debit`, `rollback`, `evaluate_preview`)
+  - `QuotaManagerClientV1` (`credit`)
 
 - **Sequences**:
 

@@ -588,8 +588,9 @@ through `EvaluationOrchestrator` into the storage plugin (phase-2). Does not own
 
 ##### Why this component exists
 
-Public S2S surface for nine consumer operations: `debit`, `credit`, `rollback`, `reserve`, `commit`, `release`,
-`batch_debit`, `evaluate_preview`, and `snapshot`.
+Public S2S surface for eight consumer operations: `debit`, `rollback`, `reserve`, `commit`, `release`, `batch_debit`,
+`evaluate_preview`, and `snapshot`, plus the management-plane `credit`, which is served on the same surface but
+authorized as its own action and exposed in the SDK on `QuotaManagerClientV1` only.
 
 ##### Responsibility scope
 
@@ -1089,7 +1090,6 @@ engine, notification sink) is bound `Send + Sync + 'static` so it registers in T
 | Method                                    | Returns                     | Realises                                                                                                                                                                                                                                                      |
 | ----------------------------------------- | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `debit(req: DebitRequest)`                | `Decision`                  | `cpt-cf-quota-enforcement-fr-debit`                                                                                                                                                                                                                           |
-| `credit(req: CreditRequest)`              | `Decision`                  | `cpt-cf-quota-enforcement-fr-credit`                                                                                                                                                                                                                          |
 | `rollback(req: RollbackRequest)`          | `Decision`                  | `cpt-cf-quota-enforcement-fr-rollback`                                                                                                                                                                                                                        |
 | `evaluate_preview(req: PreviewRequest)`   | `DecisionPreview`           | `cpt-cf-quota-enforcement-fr-evaluate-preview`                                                                                                                                                                                                                |
 | `batch_debit(req: BatchDebitRequest)`     | `BatchDecision`             | `cpt-cf-quota-enforcement-fr-batch-debit`                                                                                                                                                                                                                     |
@@ -1110,6 +1110,7 @@ requires to surface as a Decision verdict at HTTP 200, never as an error.
 | `update_quota(id, patch)`                   | `()`                            | `cpt-cf-quota-enforcement-fr-quota-lifecycle`                                                                                                     |
 | `deactivate_quota(id)`                      | `DeactivateOutcome`             | `cpt-cf-quota-enforcement-fr-quota-lifecycle` (cascade resolved leases)                                                                           |
 | `read_quotas(filter, page)`                 | `PageResult<QuotaView>`         | `cpt-cf-quota-enforcement-fr-quota-lifecycle`; the public read shape is the stored `Quota` plus the server-computed `currently_within_window` (one clock reading per response) and the current `metric_kind` (`null` when the registry no longer knows the metric); storage `read_quotas` keeps returning `PageResult<Quota>` |
+| `credit(req: CreditRequest)`                | `Decision`                      | `cpt-cf-quota-enforcement-fr-credit` (management-plane counter correction, authorized as its own action) |
 | `evaluate_preview(req: ManagementPreviewRequest)` | `DecisionPreview`          | Explicit target under manager PDP scope; `cpt-cf-quota-enforcement-fr-evaluate-preview`                                                           |
 | `snapshot(req: ManagementSnapshotRequest)`  | `PageResult<QuotaSnapshot>`      | Explicit target under manager PDP scope; snapshot read requirements                                                                                |
 
@@ -1546,6 +1547,7 @@ sequenceDiagram
     else fresh
         EO ->> SP: apply_debit_plan(ctx, EvaluatedMutation { applicable, amount, request, resource, idem_key, evaluate }, events)
         Note over SP: BEGIN tx: Quota rows locked,<br/>Policy selected (metric ⇒ global)
+        Note over SP: scope's idempotency stripe locked and record re-read,<br/>a concurrent winner's stored outcome is replayed
         SP ->> EO: evaluate(EvaluationContext) (synchronous callback, no I/O)
         EO ->> EO: pin version-keyed ValidatedConfig<br/>(absent: PreparationRequired, tx rolls back,<br/>compile outside it and retry)
         EO ->> ER: evaluate(ctx, EvaluationContext, ValidatedConfig)
@@ -1740,6 +1742,7 @@ sequenceDiagram
             EO -->> Caller: stored AcquireLeaseOutcome
         else fresh
             EO ->> SP: BEGIN tx + read_quota_snapshot with row lock
+            Note over SP: scope's idempotency stripe locked and record re-read,<br/>a concurrent winner's stored outcome is replayed
             SP -->> EO: Vec<QuotaSnapshot>
             EO ->> ER: evaluate (admission)
             ER -->> EO: Decision
@@ -1901,7 +1904,7 @@ sequenceDiagram
         EO -->> Caller: stored BatchDecision
     else fresh
         EO ->> SP: BEGIN tx + apply_batch_debit(envelope, items, events)
-        Note over SP: 1. Sort all applicable Quotas across items<br/>2. Single locked read on union (lex by quota_id, ADR-0002)<br/>3. Per-item evaluate sequentially (sees intermediate state per PRD §5.7)<br/>4. Validate invariants per item<br/>5. Apply mutations or roll back the entire envelope
+        Note over SP: 0. Lock the envelope's idempotency stripe and re-read its record<br/>(a concurrent winner's outcome is replayed)<br/>1. Sort all applicable Quotas across items<br/>2. Single locked read on union (lex by quota_id, ADR-0002)<br/>3. Per-item evaluate sequentially (sees intermediate state per PRD §5.7)<br/>4. Validate invariants per item<br/>5. Apply mutations or roll back the entire envelope
         alt any item fails OR batch-timeout (250 ms)
             SP -->> EO: BatchDecision with all-or-nothing rollback
             EO -->> Caller: BatchDecision with all-or-nothing rollback
