@@ -202,7 +202,7 @@ principle regardless of how convenient the shortcut looks locally.
 Every process-execution state change — step start, step completion, a re-issued attempt, a
 per-operation deadline, escalation, compensation, termination — is recorded by one step
 operation through the same envelope: idempotency resolution before the effect, and the record,
-the audit entry, the declared event and the settlement in one transaction after it. No capability
+the audit entry, the declared events and the settlement in one transaction after it. No capability
 slice mutates the saga log, a gate, `FulfillmentTask` status or the recorded phase by a side door,
 and the definition cannot record anything at all — it can only call a registered operation. The
 sequencing moved to the platform definition (ADR-0011); the single writer did not. This is what
@@ -1449,7 +1449,10 @@ and rate-limit failures without a Workflow attempt cap; `toolkit_db::outbox` ret
 queue-partition cursor while such a retry is pending. The SDK permanently rejects invalid data,
 unrecoverable producer identity and persistent chain divergence; toolkit-db parks an inspectable
 dead letter and advances the partition cursor, so later notifications may proceed and a permanent
-reject may create a gap (Lifecycle D-87). A platform producer dead letter is broker evidence,
+reject may create a gap (Lifecycle D-87). An unknown producer identity is the bulk case: the SDK
+registers a replacement for future enqueues and rejects every message still queued under the old
+id, so one rotation dead-letters every unpublished process event at once (`design/01-foundation`
+§3.7, D-178). A platform producer dead letter is broker evidence,
 never a process outcome and never an order state. Operations use the shared operator interface and
 SDK republication that Lifecycle requests as
 `cpt-cf-bss-orders-lifecycle-upreq-event-broker-dead-letter-recovery` and this gear co-signs in
@@ -1458,8 +1461,10 @@ release prerequisites. Inbound dead letters — a trigger or outcome event the p
 deliver to an invocation — are the platform event-trigger path's, and their operator visibility
 is asked of the platform (`UPSTREAM_REQS.md` §2.9). There is no Workflow re-drive endpoint served
 today. Process events publish under explicit platform-root tenancy per the Lifecycle D-95
-precedent, with `orderId` as the partition key
-(`cpt-cf-bss-orders-workflow-adr-outbox-process-events`).
+precedent, on this gear's own topic `gts.cf.core.events.topic.v1~cf.bss._.orders_workflow.v1`
+with `orderId` as the partition key, so per-order ordering holds within that topic and never
+against Lifecycle's (`design/01-foundation` §4.7, D-177;
+`cpt-cf-bss-orders-workflow-adr-outbox-process-events`).
 
 **Cold start is throttled, and recovery has a target.** After a platform or gear restart the
 plugin re-issues every unanswered call at once; the admission controls inside the dispatch

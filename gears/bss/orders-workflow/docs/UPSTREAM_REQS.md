@@ -569,6 +569,20 @@ the `gts.cf.bss.orders_workflow.*` event family on the same terms as for Lifecyc
 gear raises no divergent requirement and accepts whatever resolution the sibling register
 records.
 
+**This gear's own topic's grants.** The six events publish on this gear's own topic,
+`gts.cf.core.events.topic.v1~cf.bss._.orders_workflow.v1`, not on Lifecycle's
+(`design/01-foundation.md` §4.7, `DECISIONS.md` D-177), so the grants the root-tenancy ask names
+for Lifecycle's topic do not cover it and **MUST** be provisioned for it separately, on the terms
+Lifecycle `design/08-read-and-authz.md` *Internal lifecycle stream authorization* states for its
+own stream: the Workflow producer service principal **MUST** have explicit broker authorization
+to publish the `gts.cf.bss.orders_workflow.*` family on this topic under platform-root tenancy,
+and no other principal may produce on it; each consumer service principal **MUST** have explicit
+authorization for the event types it requires, this topic and its consumer group, with
+root-scoped event access; membership of the root tenant grants neither. The deployed broker
+partition count for this topic **MUST** be published as the runtime ask requires for Lifecycle's.
+Registering the topic instance itself is this gear's, at init before readiness, and is not asked
+of the platform.
+
 - **Owning upstream gear**: `event-broker` (`gears/system/event-broker`) and the platform SDK/GTS
   guideline maintainers, as named in the Lifecycle register.
 - **Why this gear cannot satisfy it alone**: the runtime, the SDK recovery path, the operator
@@ -578,14 +592,17 @@ records.
   ready for event-producing traffic (`DESIGN.md` §3.5) and can test only against an
   `EventBrokerApi` double. Until dead-letter recovery lands, a platform dead letter on the
   Workflow queue has no supported republication path and the gap it leaves is permanent for that
-  event. Until root tenancy is confirmed, the envelope `tenant_id` contract of
+  event; a producer-registration rotation is its expected bulk case, rejecting every event
+still queued under the old producer id at once (`design/01-foundation.md` §3.7, D-178). Until
+the grants on this gear's topic are provisioned, no event it enqueues can be published or
+consumed. Until root tenancy is confirmed, the envelope `tenant_id` contract of
   `design/01-foundation.md` §4.7 is stated but unverified. Until delivery observability lands,
   the p95 < 30 s target (`cpt-cf-bss-orders-workflow-nfr-owf-event-latency`) has no producer-queue
   lag metric to be measured by and Q-07's resolution is unevidenced.
-- **Agreement status**: **REGISTERED by Lifecycle, open**; this gear adds a co-signature, not a
-  new ask.
+- **Agreement status**: **REGISTERED by Lifecycle, open**; this gear adds a co-signature and the
+  grant line for its own topic above (D-177), not a new capability.
 - **Source**: `ADR/0008` (`cpt-cf-bss-orders-workflow-adr-outbox-process-events`); `DECISIONS.md`
-  D-58, Q-07; `design/01-foundation.md` §3.6, §3.7, §4.7; `DESIGN.md` §3.5, §4.4, §4.5.
+  D-58, D-177, D-178, Q-07; `design/01-foundation.md` §3.6, §3.7, §4.7; `DESIGN.md` §3.5, §4.4, §4.5.
 
 ### 2.8 Platform authorization policy
 

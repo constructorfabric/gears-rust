@@ -1431,6 +1431,8 @@ producer persistence* and the retention/immutability register, §3.8, §4.7, §4
 
 **ADR**: `cpt-cf-bss-orders-workflow-adr-outbox-process-events`.
 
+**Amended by D-177, D-178 and D-179 (2026-09-28)**: the six events publish to this gear's own topic `gts.cf.core.events.topic.v1~cf.bss._.orders_workflow.v1`, declared in the abstract type's `x-gts-traits` with `/subject`, and share no partition with Lifecycle's events (D-177). A producer-registration rotation dead-letters every message queued under the old id (D-178). A settlement enqueues zero or more events of its declared type, at most one per subject (D-179).
+
 ### D-59 (H) Retain gear-owned transactional audit following Pricing and Orders Lifecycle
 
 **Accepted.** *(mirrors Lifecycle D-97 and D-103; hardens D-50, which remains in force)*
@@ -5238,6 +5240,89 @@ states. They are the definition validation rule at publish (`10 §2.2` rule 4), 
 
 **Propagated**: `design/01-foundation.md` §2.1. Related: D-126, D-134, D-159.
 
+### D-177 (H) The six events publish to this gear's own topic, named in the abstract type's `x-gts-traits`
+
+**Accepted (2026-09-28).** *(amends D-58; mirrors Lifecycle `01 §4.7` *Traits, and versioning*)*
+
+**Decision**: the abstract `cf.bss.orders_workflow.event.v1~` declares
+`x-gts-traits` `{ topic: gts.cf.core.events.topic.v1~cf.bss._.orders_workflow.v1,
+allowed_subject_types: [gts.cf.bss.orders.order.v1~], partition_key: /subject }`, and every
+concrete type's resolved schema keeps these values. The topic is a `TopicV1` instance this gear
+owns, named in the package's default namespace `_` as Lifecycle names `…~cf.bss._.orders.v1`,
+with no `retention` (the broker default). The gear registers it in `types-registry` at init with
+the seven event types, before readiness. The `DbProducer` declares the topic and the
+`gts.cf.core.events.event.v1~cf.bss.orders_workflow.*` pattern, and `prepare_all()` refusing
+either leaves the instance not ready. `/subject` is set explicitly, overriding the SDK helper's
+`/tenant_id`. Per-order ordering holds within this topic. The claim that Lifecycle's state events
+for an order share its partition is withdrawn: they are on another topic, and the broker scopes
+ordering to one (topic, partition). A consumer correlates the two streams by `orderId` and
+`orderVersion`, never by partition. The produce grant on this topic and each consumer's grant
+are provisioned for it separately (`UPSTREAM_REQS.md` §2.7).
+
+**Rationale**: the six types declared no `x-gts-traits`. The SDK's `EventTraits` has
+`deny_unknown_fields` and no default for `topic` (`event-broker-sdk/src/gts.rs`), so the derived
+types could not be registered. `01 §4.7` also claimed co-partitioning with Lifecycle's events,
+which would hold only on a shared topic (re-review P-2). The user decided on a gear-owned topic:
+sharing Lifecycle's topic would put two gears' producers on one stream that Lifecycle's grant
+names as its own. **Precedent**: Lifecycle `01 §4.7`'s traits block (topic, subject type,
+`/subject`), its `prepare_all()` readiness gate (Lifecycle `01 §3.8`), and the SDK's rule that
+the owning gear registers its topic and types at init (`gts.rs` module header).
+
+**Propagated**: `design/01-foundation.md` §3.2 *Platform event producer adapter*, §3.4, §3.8,
+§4.7; `DESIGN.md` §4.4; `ADR/0008`; `UPSTREAM_REQS.md` §2.7. Related: D-58.
+
+### D-178 (H) A producer-registration rotation rejects every message queued under the old id
+
+**Accepted (2026-09-28).** *(amends D-58; mirrors Lifecycle `01 §3.7` *Platform-managed producer persistence*)*
+
+**Decision**: the design states the bulk case of `UnknownProducerRegistration::RegisterNew`.
+When the broker answers `UnknownProducer`, the SDK registers a replacement for future enqueues
+and returns `Reject` for the message (`Rotated`) and for every later message still carrying the
+old id (`AlreadyRotated`). Every committed, unpublished process event in any of the 16 queue
+partitions then becomes a toolkit dead letter. The operator sees a burst of pending dead letters
+on `bss-orders-workflow-events` with the SDK's "producer_id … is unknown" reason, under the
+pending-dead-letter alert. Process state is unchanged. This is named as the expected bulk case of
+the shared dead-letter recovery ask. Re-drive republishes each event under the current producer
+with its original id and payload, possibly after later events for the same orders. Consumers
+absorb duplicates by event id and late events by `orderVersion` plus an authoritative read.
+Until the ask lands, a rotation leaves those events permanently missing.
+
+**Rationale**: the design registered with `RegisterNew` and treated identity loss as one
+permanent fault per message, but the SDK (`producer/outbox.rs` `handle_unknown_producer`) rejects
+the whole queued backlog (re-review P-1). **Precedent**: Lifecycle's sentence "Registration
+rotation affects future enqueues and permanently rejects a message carrying the unknown old
+producer identity, which is why consumers cannot treat the stream as a ledger", mirrored
+verbatim; the bulk consequence is read from the SDK source, since Lifecycle states only the
+single-message form.
+
+**Propagated**: `design/01-foundation.md` §3.6 *Platform producer-outbox publication* step 5,
+§3.7 *Platform-managed producer persistence*, §4.7; `DESIGN.md` §4.4; `ADR/0008`;
+`UPSTREAM_REQS.md` §2.7. Related: D-58.
+
+### D-179 (M) A settlement enqueues zero or more events of its declared type, at most one per subject
+
+**Accepted (2026-09-28).** *(amends D-58's "one typed event per event-declaring step")*
+
+**Decision**: `01 §4.7` and the §3.3 `declared_event` contract field read "zero or more events
+of the declared type per settlement, exactly as the operation's contract states, at most one per
+subject it names, enqueued in the settlement transaction". The 64 KiB bound applies to each
+event. Each registering slice's row states its count. `open-gates` and `escalate-gate` emit one
+per gate. `dispatch-wave1-create`, `dispatch-wave2-activate` and `reconcile-intent` emit one per
+line. `begin-fulfillment` and `report-outcome` emit one for the order. `verify-override` emits
+one for its line. `owf_step_operation.declared_event` keeps naming the type only.
+
+**Rationale**: §4.7 required exactly one event per event-declaring step, while slice 05's dispatch
+operations and slice 03's gate operations declare one per line or per gate (re-review B-3).
+**Precedent**: Lifecycle's "construct exactly one typed event" per transition (`01 §3.6`
+*Attempt Transition* step 24, `inst-enqueue-outbox`) is the base case. No platform or BSS gear
+emits several events per settlement, so the per-subject rule has no precedent and is the
+smallest rule that fits the contracts already written.
+
+**Propagated**: `design/01-foundation.md` §3.1 *Outbox entry*, §3.1 relationships, §3.3, §3.6,
+§4.7; `design/03-approval-execution.md` §3.3; `design/04-fulfillment-plan.md` §3.3;
+`design/05-provisioning-intents.md` §3.3; `design/06-saga-and-compensation.md` §3.3;
+`design/07-manual-tasks.md` §3.3; `DESIGN.md` §2.1; `ADR/0008`. Related: D-58.
+
 ### Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?
 
 **Owner**: Architecture.
@@ -5675,6 +5760,9 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-174 | H Quarantine counts from a per-family presented-attempt history | `design/01-foundation.md` §3.3, §3.7, §4.13; D-102, D-104, D-119, D-152 |
 | D-175 | M terminate-instance on the two permitted edges; `fence-not-claimed` from suspended or parked | `design/01-foundation.md` §3.3, §3.7; D-82, D-114, D-166 |
 | D-176 | L Nesting invariant: four enforcement points in §2.1 | `design/01-foundation.md` §2.1; D-126, D-134, D-159 |
+| D-177 | H Own topic `…~cf.bss._.orders_workflow.v1` in the abstract type's `x-gts-traits`; no co-partitioning with Lifecycle | `design/01-foundation.md` §3.2, §3.4, §3.8, §4.7, `DESIGN.md` §4.4, `ADR/0008`, `UPSTREAM_REQS.md` §2.7; D-58 |
+| D-178 | H Producer rotation rejects every message queued under the old id | `design/01-foundation.md` §3.6, §3.7, §4.7, `DESIGN.md` §4.4, `ADR/0008`, `UPSTREAM_REQS.md` §2.7; D-58 |
+| D-179 | M Zero or more events of the declared type per settlement, at most one per subject | `design/01-foundation.md` §3.1, §3.3, §3.6, §4.7, `design/03`–`07` §3.3, `DESIGN.md` §2.1, `ADR/0008`; D-58 |
 
-Highest decision number used: **D-176**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
+Highest decision number used: **D-179**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
 register; there are no parts.

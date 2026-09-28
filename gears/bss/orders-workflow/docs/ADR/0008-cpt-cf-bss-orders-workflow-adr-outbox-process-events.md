@@ -47,14 +47,15 @@ target honestly.
 
 ## Decision Drivers
 
-* An event-declaring committed step and its durable producer message must commit atomically, in
-  the same unit of work as the audit entry and the idempotency settlement.
+* An event-declaring committed step and its durable producer messages — zero or more of the
+  declared type, at most one per subject its contract names (`DECISIONS.md` D-179) — must commit
+  atomically, in the same unit of work as the audit entry and the idempotency settlement.
 * No Event Broker call may occur inside a durable-execution step transaction.
 * Existing platform producer/outbox capabilities should be reused rather than forked; the sibling
   gear has already made this move, so deviating from it needs its own rationale.
 * Delivery is at-least-once, so event identity and consumer de-duplication are mandatory.
 * Every payload carries the process `correlationId` for consumer-side correlation; `orderId` must
-  route one order's process events to one broker partition.
+  route one order's process events to one broker partition of this gear's topic.
 * The six process events must remain strictly disjoint from Lifecycle's state-event set; no
   consumer may see dual publication of one semantic change.
 * The PRD sets a p95 < 30 s delivery target for the six events
@@ -84,9 +85,14 @@ registration, the opaque producer envelope, local sequence, partition mapping, l
 retry classification, dead-letter lifecycle and vacuum.
 
 The producer queue is `bss-orders-workflow-events`, configured with `Partitions::of(16)` and the
-toolkit high-throughput profile. `orderId` is the GTS event partition key, so every version of one
-order — and Lifecycle's state events for it, which use the same key — share per-order ordering
-semantics. Event Broker topic partition count is explicit configuration and must match the
+toolkit high-throughput profile. The six events publish to this gear's own topic,
+`gts.cf.core.events.topic.v1~cf.bss._.orders_workflow.v1`, which the gear registers in
+`types-registry` before readiness and names in the abstract event type's `x-gts-traits` with
+`partition_key` `/subject` (`design/01-foundation.md` §4.7, `DECISIONS.md` D-177), as Lifecycle
+does for its own topic. `orderId` is therefore the partition key within that topic, and every
+event for one order keeps per-order ordering there; Lifecycle's state events are on Lifecycle's
+topic, and nothing orders the two streams against each other, so a consumer correlates them by
+`orderId` and `orderVersion`, never by partition. Event Broker topic partition count is explicit configuration and must match the
 deployed broker. Envelope tenancy is platform-root per Lifecycle D-95; `resourceTenantId` and
 `sellerTenantId` remain payload fields. Eager schema preparation, managed producer registration,
 queue registration and worker startup are readiness requirements.
@@ -133,21 +139,24 @@ D-58, and any relaxation of the number is a Product decision, not a silent widen
   topic/broker partition, not `event.id`. The SDK takes the sequence from `OutboxMessage.seq` and
   manages the predecessor cursor; Workflow supplies neither a custom sequence nor an event-ID
   broker token, and the former per-correlation `sequence` ordinal is withdrawn.
-* **Availability-oriented ordering.** Events for one order route to one broker partition and
-  remain FIFO during normal processing and transient retry. The SDK maps `(topic, broker
+* **Availability-oriented ordering.** Events for one order route to one broker partition of this
+  gear's topic and remain FIFO during normal processing and transient retry. The SDK maps `(topic, broker
   partition)` to one toolkit queue partition, so a transient retry blocks that whole toolkit
   partition. Transport and rate-limit faults return `Retry` without a Workflow attempt cap.
 * **Permanent rejection may create a gap** (Lifecycle D-87). Invalid envelopes/schema,
   unrecoverable producer identity and persistent chained-sequence divergence return `Reject`;
   toolkit-db writes an inspectable dead letter and advances the queue-partition cursor. Later
-  events may proceed. A strict per-correlation barrier is not rebuilt beside the platform.
+  events may proceed. A strict per-correlation barrier is not rebuilt beside the platform. An
+  unknown producer identity is the bulk case: the SDK registers a replacement for future enqueues
+  and rejects every message still queued under the old id, so one rotation dead-letters every
+  unpublished event, whose recovery is the shared dead-letter ask (`DECISIONS.md` D-178).
 * **Consumers reconcile with authority.** Consumers of the six events must de-duplicate by event
   ID and verify `orderVersion` plus resulting state against an authoritative Lifecycle read before
   acting; a timeout or authorization failure on that read is not evidence of staleness. The same
   obligation binds this gear as a consumer of Lifecycle's stream
   ([`02 §2.1`](../design/02-triggers-and-start.md#21-design-principles)) and of Subscriptions
   confirmations ([`05 §2`](../design/05-provisioning-intents.md#2-principles--constraints)).
-* **Payload bound.** The serialized producer envelope must fit toolkit-db's 64 KiB payload limit.
+* **Payload bound.** Each serialized producer envelope must fit toolkit-db's 64 KiB payload limit.
   The largest payload is `OrderFulfillmentCompleted.lineOutcomes[]` at the 200-line cap; it is a
   capacity test, not an assumption.
 * **No operator re-drive surface in this gear.** Dead-letter recovery uses the shared platform
@@ -185,8 +194,10 @@ dead letter then advances it on `Reject`. Toolkit outbox rejects payloads above 
 6. permanent-rejection tests proving a dead letter is visible, process state is unchanged, no
    Orders dead-letter row is written (that table is retired, D-72), and later events may proceed;
 7. largest-envelope tests for `OrderFulfillmentCompleted` at the 200-line cap;
-8. readiness tests for absent Event Broker runtime, schema preparation failure, producer
-   registration failure and broker-partition mismatch; and
+8. readiness tests for absent Event Broker runtime, an unregistered or undeclared topic, schema
+   preparation failure, producer registration failure and broker-partition mismatch; a
+   producer-rotation test proving every message queued under the old id is dead-lettered and
+   process state is unchanged; and
 9. producer-queue lag measured against the 30 s p95 target at expected load, with backlog and
    retries present and the delayed-delivery/dead-letter alerts of `DESIGN.md §4.4` exercised.
 

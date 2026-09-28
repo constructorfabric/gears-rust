@@ -475,7 +475,8 @@ of whatever the platform keeps of its own run, and never read as the recovery re
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-entity-outbox-entry`
 
-One typed event per process event a settled step declares, enqueued through the bound platform
+One typed event per process event a settled step's contract names — zero or more of its
+declared type, at most one per subject (§3.3 `declared_event`) — enqueued through the bound platform
 producer outbox in the settlement transaction: the event identity, its GTS type, `orderId` (the
 partition key), the tenant axes, the process `correlationId` and the `data` payload of §4.7.
 Local sequence, delivery bookkeeping and retry state are platform-owned (`toolkit_db::outbox`);
@@ -495,7 +496,7 @@ trigger path's dead letter, see §4.8 and `10 §3.3`.
 - `Process instance` → `Idempotency record`: one-to-many; one record per logical step call, re-runnable only while `open`.
 - `Step operation` → `Step log entry`: one-to-many by operation name; the registry row is the contract every entry was produced under.
 - `Process instance` → `Audit entry`: one-to-many, append-only; the `instance-start` entry carries the pinned definition version.
-- `Process instance` → `Outbox entry`: one-to-many; one enqueued typed event per settled step that declares a process event.
+- `Process instance` → `Outbox entry`: one-to-many; zero or more enqueued typed events per settled step that declares a process event, at most one per subject its contract names (§3.3 `declared_event`).
 
 ### 3.2 Component Model
 
@@ -689,14 +690,17 @@ gateway-issued service `SecurityContext`; binding one `ProducerOutboxQueue`
 (`bss-orders-workflow-events`, 16 toolkit partitions, high-throughput profile) to
 `toolkit_db::outbox`; and enqueuing through that bound handle using the settlement transaction
 runner, so the enqueue commits with the audit entry and the idempotency settlement. Every event
-carries the process `correlationId`; `orderId` is the event type's broker partition key.
+carries the process `correlationId`; `orderId` is the event type's broker partition key on the
+gear's own topic `gts.cf.core.events.topic.v1~cf.bss._.orders_workflow.v1`, which this gear
+registers before readiness (§4.7, decision D-177).
 
 ##### Responsibility boundaries
 
 Workflow owns event meaning and payload construction, but does not own an outbox table, lease
 acquisition, sequence assignment, retry classification, dead-letter lifecycle, vacuuming or a
 re-drive API. Publication failure never alters process state. It does not guarantee event ordering
-across orders, only per broker partition (§4.7). Which operation declares which event is the
+across orders, only per broker partition of its own topic, and none against Lifecycle's stream,
+which is another topic (§4.7). Which operation declares which event is the
 registering slice's contract (§3.3 `declared_event`).
 
 ##### Related components (by ID)
@@ -814,7 +818,8 @@ the platform's timeline without depending on the timeline surviving.
 
 **What the envelope guarantees around a call**: the idempotency key is resolved before the
 operation's effect runs; the outcome is durably recorded — step record, audit entry and, where the
-operation declares one, a typed event enqueued through the bound platform producer outbox with
+operation declares one, the typed events its contract names (zero or more, at most one per
+subject, §3.3 `declared_event`) enqueued through the bound platform producer outbox with
 the same transaction runner — in the same unit of work that settles the idempotency record; an
 effect that raises is caught and mapped to a retryable or permanent outcome per the operation's
 `retry_class`, never left unrecorded — the one exception being a unit of work that cannot itself
@@ -861,7 +866,7 @@ declaration is mirrored into `owf_step_operation` (§3.7):
 | `input` | GTS reference schema of the request body; references and small enums only | a `gts.cf.bss.orders_workflow.step.<name>.input.v1~` type |
 | `output` | GTS reference schema of the success body | a `gts.cf.bss.orders_workflow.step.<name>.output.v1~` type |
 | `idempotency_key` | Derivation family per [`../ADR/0006`](../ADR/0006-cpt-cf-bss-orders-workflow-adr-idempotency-key-composition.md), recomposed server-side | intent · approval-request · lifecycle-transition · instance-scoped (`{tenant}:{correlationId}:{name}[:{subject}][:{round}][:{attempt}]`) · trigger (`{tenant}:{eventId}:admit-trigger[:listen]`, event-scoped, [`02 §2.1`](./02-triggers-and-start.md#21-design-principles)). Every **re-invokable** operation's key ends in its round, and a key a manual-task retry re-enters ends in the minted `attempt` after it — the one rule of *Rounds and attempts* below, whose register lists every re-invokable operation and its round member |
-| `declared_event` | The process event enqueued in the settlement transaction on success | one of the six of §4.7, or none |
+| `declared_event` | The process-event type a success settlement enqueues: zero or more events of that type, exactly as the operation's contract states (at most one per subject it names — the order, a gate or a line), in the settlement transaction; the 64 KiB bound of §4.7 applies to each event (decision D-179) | one of the six of §4.7, or none |
 | `compensation` | The operation that undoes this one's effect | a registered operation name, or none |
 | `reasons` | The catalogue subset it may raise | names from §4.9 |
 | `audit_kind` | The `owf_audit_entry.event_kind` its **success** settlement writes; every other receipt writes what *What each receipt records* below names, whatever this field says (decision D-170) | one of the closed kinds of §3.7 |
@@ -1192,7 +1197,7 @@ terminal.
 | `orders-lifecycle` | Versioned contract / SDK client | Read of current order state and version inside an operation before it acts; this gear never writes the order aggregate directly |
 | `toolkit-db` | Runtime-scoped database access plus `outbox` | The process instance, step log, idempotency registry, audit chain, definition binding, operation registry and seller policy; toolkit outbox migrations and the managed producer queue |
 | `event-broker-sdk` | `EventBrokerApi`, `DbProducer`, `ProducerOutboxQueue` (`outbox` feature) | Typed validation, managed chained producer registration, broker partitioning and asynchronous publication of the six process events |
-| `types-registry` | SDK client | Resolving and registering the GTS event types of §4.7, the error types of §4.9 and the step input/output reference schemas of §3.3 before readiness; a type that fails to register fails the boot |
+| `types-registry` | SDK client | Resolving and registering the gear's topic instance and GTS event types of §4.7, the error types of §4.9 and the step input/output reference schemas of §3.3 before readiness; a type that fails to register fails the boot |
 | `authz-resolver` | `PolicyEnforcer` adapter (`dyn AuthZResolverApi`) | The `execute` decision on every step call (§3.3) |
 | `toolkit-db` advisory locks | `Db::lock` / `Db::try_lock`, `DbLockGuard` | Session-bound coordination for the three-worker roster of §3.8 |
 
@@ -1267,7 +1272,7 @@ sequenceDiagram
     SE ->> OP: run effect under deadline
     OP -->> SE: accepted (transition_request_id)
     SE ->> AW: append step-completion (actor, key K, correlationId, attempt 2)
-    SE ->> OB: enqueue typed event where declared (same transaction runner)
+    SE ->> OB: enqueue the typed events the contract names, where declared (same transaction runner)
     SE ->> IR: settle K = success, settled_output = the answer, outcome_ref → step record (a2) (txn 4)
     SE -->> PL: 200 settled success
     PL ->> SE: POST /steps/dispatch-wave1-create (key K, attemptId a2) — worker replay
@@ -1379,7 +1384,7 @@ Output: acknowledged, retained for retry, or platform dead-lettered
 2. [ ] - `p1` - Let the Event Broker SDK decode the producer envelope and publish through `EventBrokerApi` under its registered producer in managed `ProducerMode::Chained`: `meta.sequence` comes from `OutboxMessage.seq`, and `meta.previous` comes from the SDK-managed cursor for that producer/topic/broker partition. Event ID is not a broker de-duplication token - `inst-owf-try-publish`
 3. [ ] - `p1` - **IF** Event Broker returns accepted, persisted or duplicate: return `MessageResult::Ok`, allowing toolkit-db to advance the queue cursor - `inst-owf-mark-delivered`
 4. [ ] - `p1` - **IF** the SDK classifies the fault as transport or rate limiting: return `MessageResult::Retry`; toolkit-db retains the cursor and applies its retry cadence, so the entire toolkit queue partition remains FIFO-blocked until the message succeeds; Workflow imposes no attempt cap - `inst-owf-backoff-reschedule`
-5. [ ] - `p1` - **IF** the SDK classifies the fault as permanent — including invalid envelope/schema, unrecoverable producer identity or persistent chained-sequence divergence: return `MessageResult::Reject`; toolkit-db writes its dead-letter record and advances the queue-partition cursor; Workflow writes nothing (§4.8) - `inst-owf-park-dead-letter`
+5. [ ] - `p1` - **IF** the SDK classifies the fault as permanent — including invalid envelope/schema, unrecoverable producer identity or persistent chained-sequence divergence: return `MessageResult::Reject`; toolkit-db writes its dead-letter record and advances the queue-partition cursor; Workflow writes nothing (§4.8). An unknown producer identity is rejected even when the SDK rotates the registration: the replacement serves future enqueues only, so every message still queued under the old id is rejected in turn — a bulk case, not a single message (§3.7 *Platform-managed producer persistence*, decision D-178) - `inst-owf-park-dead-letter`
 
 **Description**: This algorithm documents the behaviour Workflow relies on; its implementation is
 the platform `ProducerOutboxProcessor` and toolkit leased worker, exactly as
@@ -2109,7 +2114,31 @@ counted among the engine's ten tables. This mirrors
 The producer queue name is `bss-orders-workflow-events`, with `Partitions::of(16)` and
 `OutboxProfile::high_throughput()`. Managed producer registration uses the stable key
 `bss-orders-workflow-events-v1`, `MissingProducerRegistration::RegisterNew` and
-`UnknownProducerRegistration::RegisterNew`; the producer source is `bss-orders-workflow`. The
+`UnknownProducerRegistration::RegisterNew`; the producer source is `bss-orders-workflow`.
+Registration rotation affects future enqueues and permanently rejects a message carrying the
+unknown old producer identity, which is why consumers cannot treat the stream as a ledger — the
+sentence Lifecycle `01 §3.7` *Platform-managed producer persistence* states for its own producer.
+**Rotation is a bulk rejection, not a single one** (decision D-178). Each queued envelope carries
+the producer id current at its enqueue. When the broker answers `UnknownProducer` for that id,
+the SDK processor ([`producer/outbox.rs`](../../../../system/event-broker/event-broker-sdk/src/producer/outbox.rs)
+`handle_unknown_producer`) registers a replacement under `RegisterNew` and returns
+`MessageResult::Reject` for that message (`UnknownProducerAction::Rotated`), and again for every
+later message still carrying the old id (`AlreadyRotated`); only events enqueued after the
+rotation carry the new id. Every process event committed but not yet published at that moment,
+in any of the 16 queue partitions, therefore becomes a toolkit dead letter as its partition's
+cursor reaches it. What an operator sees is a burst of pending dead letters on
+`bss-orders-workflow-events`, each rejected with the SDK's "producer_id … is unknown" reason,
+raising the pending-dead-letter alert of `DESIGN.md` §4.4; process state, the audit trail and
+Lifecycle's order state are unaffected (§4.8). This is the expected bulk case of the shared
+dead-letter recovery ask co-signed in `UPSTREAM_REQS.md` §2.7
+(`cpt-cf-bss-orders-lifecycle-upreq-event-broker-dead-letter-recovery`), whose SDK half must
+republish "when the original producer sequence can no longer be reused": re-drive republishes
+each rejected event under the current producer with its original event id and business payload,
+after later events for the same orders may already have been delivered. Consumers of the six
+events absorb a re-driven duplicate by event id and a late one by `orderVersion` plus an
+authoritative Lifecycle read (§4.7 *Consumer obligation*); nothing in this gear re-enqueues or
+re-drives. Until that ask lands, a rotation leaves every event it rejected permanently missing
+from the stream. The
 enqueue is the only Workflow write into these tables and it always rides the settlement
 transaction runner (§3.6); no Workflow code reads, updates, purges or re-drives them. Delivery is
 at-least-once; consumers de-duplicate by the event envelope `id` (§4.7).
@@ -2197,7 +2226,7 @@ until the registered definition version it expects to bind new instances to reso
 platform function registry and the platform invocation API answers; while the platform has no
 code (`10 §1`), that check is the readiness gate ADR-0011 names, and the gear is not ready for the
 `platform` definition source. The operation registry load (§3.7 `owf_step_operation`), GTS type
-registration (§3.4) and the producer registration remain readiness preconditions, and so does the
+registration (§3.4), the topic instance of §4.7 and the producer registration remain readiness preconditions, and so does the
 platform row of `owf_seller_policy`: a missing one is a deployment failure (§3.7, decision D-140).
 
 This is the authoritative roster and coordination contract for the **three Workflow-owned
@@ -2532,7 +2561,11 @@ documentation correction is tracked by Lifecycle in its `UPSTREAM_REQS.md §2.7`
 package: `gts.cf.bss.orders_workflow.*`. Vendor `cf`, package `bss` and the version suffix follow
 the platform format; the `orders_workflow` namespace and every name under it are this gear's to
 allocate, and no other gear may define an identifier in it. Lifecycle's `orders` namespace is
-disjoint, which is what keeps the two event families structurally separate.
+disjoint, which is what keeps the two event families structurally separate. The gear also owns
+one topic instance, `gts.cf.core.events.topic.v1~cf.bss._.orders_workflow.v1`, named in the
+package's default namespace `_` exactly as Lifecycle names its own
+`gts.cf.core.events.topic.v1~cf.bss._.orders.v1` (*Traits, topic and partitioning* below,
+decision D-177).
 
 The six events derive from the platform event base type through one abstract process-event base,
 mirroring
@@ -2564,9 +2597,53 @@ the open Lifecycle ask `cpt-cf-bss-orders-lifecycle-upreq-event-broker-root-tena
 in `UPSTREAM_REQS.md §2.7`. `source` is `bss-orders-workflow`. `subject` is the canonical order
 UUID string and `subject_type` is Lifecycle's registered `gts.cf.bss.orders.order.v1~`; this gear
 registers no subject type of its own, because the subject of a process event is the order.
-`partition_key` resolves to `orderId` (`/subject`), so every version of one order — and
-Lifecycle's state events for it — routes to one broker partition. `resourceTenantId` and
-`sellerTenantId` are payload fields, not envelope tenancy.
+`partition_key` resolves to `orderId` (`/subject`) on this gear's own topic (below).
+`resourceTenantId` and `sellerTenantId` are payload fields, not envelope tenancy.
+
+**Traits, topic and partitioning.** The SDK's `EventTraits`
+([`gts.rs`](../../../../system/event-broker/event-broker-sdk/src/gts.rs)) rejects unknown keys and
+gives `topic` no default, so a derived type that declares none cannot be registered. The abstract
+`cf.bss.orders_workflow.event.v1~` declares the following traits, exactly as
+[Lifecycle `01 §4.7` *Traits, and versioning*](../../../orders-lifecycle/docs/design/01-foundation.md#47-gts-types-for-the-cross-gear-contract-surface-normative)
+does for its abstract event, and each of the six concrete types' resolved schema **MUST** retain
+these values:
+
+```json
+{
+  "x-gts-traits": {
+    "topic": "gts.cf.core.events.topic.v1~cf.bss._.orders_workflow.v1",
+    "allowed_subject_types": ["gts.cf.bss.orders.order.v1~"],
+    "partition_key": "/subject"
+  }
+}
+```
+
+- **The topic is this gear's own.** `gts.cf.core.events.topic.v1~cf.bss._.orders_workflow.v1` is a
+  `TopicV1` instance owned by this gear; it is not Lifecycle's topic, and only this gear's
+  producer is granted produce on it (`UPSTREAM_REQS.md` §2.7). Its `description` names the six
+  process events; it declares no `retention`, so the broker-configured default applies, as for
+  Lifecycle's topic. Retention is a topic property, not an event trait and not the local audit
+  retention of §3.7.
+- **Who registers it, and when.** The gear registers the topic instance in `types-registry` at
+  init, together with the abstract and six concrete event types, before readiness (§3.4, §3.8):
+  the SDK states that topics and event types are "registered in `types-registry` by whichever
+  gear owns them, at that gear's init - never by the broker" (`gts.rs` module header). The `DbProducer` then declares
+  this topic and the `gts.cf.core.events.event.v1~cf.bss.orders_workflow.*` event-type pattern,
+  and its eager `prepare_all()` fails with `TopicNotFound` if the broker does not list the topic
+  and with `TypeNotInDeclaredTopic` if a type resolves to another topic; either failure leaves
+  the instance not ready.
+- **`/subject` is set explicitly.** It selects the order UUID independently of envelope tenancy;
+  omitting it would select the SDK's `/tenant_id` default, which is the platform root on every
+  event and would put the whole stream on one partition. The SDK's `derived_event_type_schema`
+  helper emits `/tenant_id`; implementation **MUST** set `/subject` in the registered schema,
+  as Lifecycle states for its own.
+- **Ordering holds within this topic only.** Every event for one order routes to one partition
+  of this gear's topic, so the six process events for one order keep per-order FIFO in ordinary
+  operation (the limits of *Broker idempotency* below apply). Nothing orders a process event
+  against a Lifecycle state event: they are on different topics, and the broker scopes
+  sequencing, offsets and ordering to a single (topic, partition) (`TopicV1`). A consumer that
+  correlates the two streams does so by `orderId` and `orderVersion`, never by partition or
+  sequence.
 
 **`data` is the extension field.** The abstract process-event schema narrows the platform
 envelope's `properties.data` to the order-summary block; each concrete schema further narrows the
@@ -2599,14 +2676,18 @@ The **per-event delta** carries only what that event adds:
 `reason` on any payload is always the **catalogue** value, never the free-text `justification`
 (§3.7 `owf_audit_entry`, §4.9), and no payload carries raw downstream error text (§4.11).
 
-**Payload bound.** The serialized producer envelope **MUST** fit toolkit-db's 64 KiB payload
+**Payload bound.** Each serialized producer envelope **MUST** fit toolkit-db's 64 KiB payload
 limit. The largest payload is `OrderFulfillmentCompleted.lineOutcomes[]` at the 200-line cap; a
 capacity test at that cap is required evidence, not an assumption, and `OrderFulfillmentAborted`
 at the same cap is the second case.
 
 **Typed publication.** Each concrete Rust event implements `TypedEvent`; its GTS identifier and
-subject type are compile-time constants. Type/schema preparation and registration in
-`types-registry` occur before readiness (§3.4). At enqueue the SDK validates the serialized
+subject type are compile-time constants. Topic, type and schema registration in
+`types-registry` and the producer's eager preparation occur before readiness (§3.4). Required
+verification: register the topic, the abstract and the six concrete types against the deployed
+registry and broker; verify that every concrete type's resolved traits carry this topic and
+`/subject`, that an unknown trait is rejected, and that two events for one order resolve to one
+partition of this topic by `/subject`, not `/tenant_id`. At enqueue the SDK validates the serialized
 business data against the prepared schema, resolves the prepared partition-key pointer and
 serializes the standard producer envelope into toolkit-db's opaque payload. Workflow does not
 index or query event payloads in its database; Event Broker is the event query and replay
@@ -2619,8 +2700,14 @@ identifier**, not a bump, because no additive-compatibility contract survives it
 
 #### Broker idempotency is not event-ID de-duplication
 
-Exactly one typed event **MUST** be enqueued through the bound `event_broker_sdk::ProducerOutbox`
-per committed step **that declares an event**, using the step's transaction runner (§3.3, §3.6).
+A settlement enqueues **zero or more events of its operation's declared type**, exactly as that
+operation's contract states — at most one per subject the contract names (the order, a gate, a
+line) — through the bound `event_broker_sdk::ProducerOutbox`, using the step's transaction runner,
+in the settlement transaction (§3.3, §3.6, decision D-179). An operation declaring none enqueues
+nothing; a settlement that does not commit enqueues nothing. The 64 KiB bound of *Payload bound*
+applies to each event, not to their sum. Lifecycle's rule is exactly one typed event per
+transition (Lifecycle `01 §3.6` *Attempt Transition* step 24, `inst-enqueue-outbox`), which is this design's base case; the per-subject case, where one
+settlement names several gates or lines, has no platform or BSS precedent and is this gear's.
 `DbProducer` uses managed `ProducerMode::Chained`; producer identity is broker-issued and persisted
 by the SDK, and toolkit `OutboxMessage.seq` is the local durable sequence. Workflow **MUST NOT**
 mint producer IDs, persist a last-sent cursor, allocate a per-correlation ordinal or implement
@@ -2639,7 +2726,9 @@ as Lifecycle `01 §4.4` states for the sibling gear.
 
 Delivery is at-least-once. FIFO holds per broker partition during normal processing and transient
 retries; a permanently rejected event may be absent while later events proceed (§3.6, Lifecycle
-D-87). Recovery of a platform dead letter uses the shared operator interface and SDK
+D-87). A producer-registration rotation rejects every event still queued under the old producer
+id at once, so such a gap can span many orders (§3.7 *Platform-managed producer persistence*,
+decision D-178). Recovery of a platform dead letter uses the shared operator interface and SDK
 republication requested in `UPSTREAM_REQS.md §2.7`; Workflow exposes no REST re-drive wrapper,
 and recovery preserves the original event ID and business payload. A dead letter **MUST NOT**
 alter process state.
