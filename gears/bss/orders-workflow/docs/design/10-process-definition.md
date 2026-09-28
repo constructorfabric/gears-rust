@@ -1055,7 +1055,7 @@ The approval stage, the `do` list of `process.approval`:
 - reflectionTask:                       # fragment (c): an order-scope task whose retry re-enters reflectVerdict
     set: { failureScope: order, failureSubjects: '${ [ { subjectRef: $context.correlationId, reason: "approval-reflection-refused", cause: "permanent-refusal" } ] }', sourceStep: reflect-verdict, sourceAttempt: '${ $context.reflectAttempt }', forceTask: true, taskReturnStage: approval, taskReturnLoop: reflectVerdict, nextStage: failure, stageLoop: null }
     then: exit
-- terminateRejected:                    # protected (01); terminationKind: rejected
+- terminateRejected:                    # protected (01); body: ref + terminalOutcome: aborted, terminationKind: rejected — every terminationKind but completed ends the instance aborted (01 §3.3, §3.7, D-166)
     timeout: step
     try:
       - call: { step: terminate-instance }
@@ -1284,7 +1284,7 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
       - heldReport:      { when: '${ $context.stageLoop == "heldReport" }',             then: reportCompleted }   # the completion report under its next round
       - planFailFast:    { when: '${ $context.stageLoop == "planFailFast" }',           then: planFailFast }   # from the failure stage: an exhausted plan task passes begin-fulfillment before its unwind (D-109)
       - fresh:           { then: initEligibility }
-- initEligibility: { set: { eligibilityTrigger: initial, requestRef: null, evaluationSeq: 0, barrierSeq: 0, recheckSeq: 0, wave1Round: 0, wave2Round: 0, rebuildRound: 0, sweepRound: 0, spawnRound: 0, reportRound: 0, planAttempt: 0, wave1Failed: [], wave2Failed: [], spawned: false, planFailed: false, wave1AttemptKey: null, wave2AttemptKey: null } }
+- initEligibility: { set: { eligibilityTrigger: initial, requestRef: null, evaluationSeq: 0, barrierSeq: 0, recheckSeq: 0, wave1Round: 0, wave2Round: 0, rebuildRound: 0, sweepRound: 0, spawnRound: 0, reportRound: 0, planAttempt: 0, wave1Failed: [], wave2Failed: [], pendingLapsed: [], spawned: false, planFailed: false, wave1AttemptKey: null, wave2AttemptKey: null } }
 - eligibility:                          # protected (04)
     timeout: step
     try:
@@ -1452,7 +1452,7 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
       - other:    { then: leave }       # re-entered at wave1 (stageLoop)
 - wave1Again: { set: { wave1LineRefs: '${ $context.wave1Deferred }' }, then: wave1 }
 - lineFailure1:                         # fragment (c)
-    set: { failureScope: line, failureSubjects: '${ [ $context.wave1Failed[] | { subjectRef: .lineRef, reason: .reason, cause: "explicit-failure-confirmation" } ] }', sourceStep: dispatch-wave1-create, sourceAttempt: '${ $context.wave1Attempt }', nextStage: failure, stageLoop: null }
+    set: { failureScope: line, failureSubjects: '${ [ $context.wave1Failed[] | { subjectRef: .lineRef, reason: .reason, cause: "explicit-failure-confirmation" } ] }', sourceStep: dispatch-wave1-create, sourceAttempt: '${ $context.wave1Attempt }', wave1Failed: [], nextStage: failure, stageLoop: null }   # the entry that folds a wave's failed list into the task clears it, and no other entry does: failed[] lists a line once (05 §4.5 item 6, D-165)
     then: exit
 - enterAwaitExpected: { set: { stageLoop: awaitExpected, holdPauses: false } }
 - evaluate:                             # composable (04): both halves from Orders' record — due (database time against expected_fulfillment_at) and every create confirmed
@@ -1464,6 +1464,7 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
 - onEvaluate:
     switch:
       - undispatched:  { when: '${ ($context.undispatched | length) > 0 }', then: redispatchUndispatched }   # a pending line with no live wave-1 intent: a retried or rowless line (05 §4.5 item 6, D-119)
+      - lapsed:        { when: '${ ($context.pendingLapsed | length) > 0 }', then: rebuildLapsed }   # lapsed lines a wave-2 answer carried past its failed lines: rebuilt on the return to the barrier (05 §4.5 item 5, D-165)
       - releasedFirst: { when: '${ $context.released and ($context.spawned | not) }', then: preActivation }
       - releasedAgain: { when: '${ $context.released }', then: wave2 }   # the spawn signal is recorded once
       - notDue:        { when: '${ $context.expectedDue | not }', then: awaitExpected }
@@ -1573,16 +1574,16 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
       as: waveError
       when: '${ $waveError.status as $s | any((409, 408, 429, 503, 504); . == $s) }'
       do: [ { classify: { set: { waveOutcome: '${ if $waveError.status == 409 then "reread" else "exhausted" end }', waveCause: '${ if $waveError.status == 408 then "step-deadline-exceeded" else "retry-budget-exhausted" end }' } } } ]
-    export: { as: '${ $context + { waveOutcome: (.waveOutcome // "answered"), waveCause: (.waveCause // null), wave2Attempt: (($context.wave2Round | tostring) + (if $context.wave2AttemptKey then ":" + ($context.wave2AttemptKey | tostring) else "" end)), wave2AttemptKey: (if (.waveOutcome // "answered") == "answered" then null else $context.wave2AttemptKey end), wave2Failed: ($context.wave2Failed + (.failed // [])), wave2Pending: (.pending // []), lapsed: (.lapsed // []), wave2Deferred: (.deferred // []), wave2DeferReason: (.deferReason // null), wave2Round: (.nextDispatchRound // $context.wave2Round) } }' }
-- onWave2:                              # 05 §4.5 items 4–6 and 9
+    export: { as: '${ $context + { waveOutcome: (.waveOutcome // "answered"), waveCause: (.waveCause // null), wave2Attempt: (($context.wave2Round | tostring) + (if $context.wave2AttemptKey then ":" + ($context.wave2AttemptKey | tostring) else "" end)), wave2AttemptKey: (if (.waveOutcome // "answered") == "answered" then null else $context.wave2AttemptKey end), wave2Failed: ($context.wave2Failed + (.failed // [])), wave2Pending: (.pending // []), pendingLapsed: ((($context.pendingLapsed // []) + (.lapsed // [])) | unique), wave2Deferred: (.deferred // []), wave2DeferReason: (.deferReason // null), wave2Round: (.nextDispatchRound // $context.wave2Round) } }' }
+- onWave2:                              # 05 §4.5 items 4–6 and 9; as onWave1: deferred, then failed, then lapsed (D-165)
     switch:
       - reread:     { when: '${ $context.waveOutcome == "reread" }',    then: wave2Reread }
       - exhausted:  { when: '${ $context.waveOutcome == "exhausted" }', then: wave2Exhausted }
-      - lapsed:     { when: '${ ($context.lapsed | length) > 0 }', then: rebuildLapsed }
-      - deferred:   { when: '${ ($context.wave2Deferred | length) > 0 }', then: awaitDeferral2 }
-      - anyFailed:  { when: '${ ($context.wave2Failed | length) > 0 }', then: lineFailure2 }   # D-54
+      - deferred:   { when: '${ ($context.wave2Deferred | length) > 0 }', then: awaitDeferral2 }   # the deferral loop is the deferred lines' only carrier (item 4); wave2Failed and pendingLapsed accumulate across answers, so neither is dropped by the wait
+      - anyFailed:  { when: '${ ($context.wave2Failed | length) > 0 }', then: lineFailure2 }   # D-54; before lapsed, so a line failed in the same answer as a lapsed one gets its task (item 6)
+      - lapsed:     { when: '${ ($context.pendingLapsed | length) > 0 }', then: rebuildLapsed }   # after a failure, onEvaluate rebuilds them on the return to the barrier
       - anyPending: { when: '${ ($context.wave2Pending | length) > 0 }', then: enterBarrierLoop }  # dependents wait for their dependencies; the same conjunction
-      - complete:   { then: reportCompleted }                                                     # pending[] and failed[] both empty
+      - complete:   { then: reportCompleted }                                                     # pending[], failed[] and lapsed[] all empty
 - wave2Reread:                         # 05 §4.5 item 3: read, route what it found, then wait in the barrier loop, whose poll re-issues nothing blind (D-120)
     timeout: step
     try:
@@ -1599,9 +1600,9 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
 - rebuildLapsed:                        # composable (05): a lapsed draft is rebuilt and goes back through wave 1 and the barrier, never straight to wave 2
     timeout: step
     try:
-      - call: { step: rebuild-wave1 }   # body: ref + planRef, lineRefs: $context.lapsed, rebuildRound: $context.rebuildRound (its own round, never wave 1's)
+      - call: { step: rebuild-wave1 }   # body: ref + planRef, lineRefs: $context.pendingLapsed, rebuildRound: $context.rebuildRound (its own round, never wave 1's)
     catch: *transient
-    export: { as: '${ $context + { wave1LineRefs: .rebuilt, rebuildRound: .nextRebuildRound } }' }   # wave1Round is written only from dispatch-wave1-create answers
+    export: { as: '${ $context + { wave1LineRefs: .rebuilt, rebuildRound: .nextRebuildRound, pendingLapsed: [] } }' }   # wave1Round is written only from dispatch-wave1-create answers; the lapsed lines are spent once rebuilt
     then: enterWave1
 - awaitDeferral2:                       # a stage wait is a competing fork with the shared arms (rule 8, D-142)
     fork:
@@ -1619,19 +1620,19 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
       - other:    { then: leave }       # re-entered by stageLoop (awaitExpected or barrierLoop, never the held-spawn loop, which spawnSent left), which re-evaluates before any dispatch
 - wave2Again: { set: { eligibleLineRefs: '${ $context.wave2Deferred }' }, then: wave2 }
 - lineFailure2:
-    set: { failureScope: line, failureSubjects: '${ [ $context.wave2Failed[] | { subjectRef: .lineRef, reason: .reason, cause: "explicit-failure-confirmation" } ] }', sourceStep: dispatch-wave2-activate, sourceAttempt: '${ $context.wave2Attempt }', nextStage: failure, stageLoop: null }
+    set: { failureScope: line, failureSubjects: '${ [ $context.wave2Failed[] | { subjectRef: .lineRef, reason: .reason, cause: "explicit-failure-confirmation" } ] }', sourceStep: dispatch-wave2-activate, sourceAttempt: '${ $context.wave2Attempt }', wave2Failed: [], nextStage: failure, stageLoop: null }   # D-165: as lineFailure1
     then: exit
 - reportCompleted:                      # protected (06): in_fulfillment → completed with per-line subscription ids; enqueues OrderFulfillmentCompleted
     timeout: step
     try:
-      - call: { step: report-outcome }  # body: ref + outcome: completed, round: $context.reportRound; output: lifecycleCall ∈ acknowledged | held, nextRound
+      - call: { step: report-outcome }  # body: ref + outcome: completed, round: $context.reportRound; output: reportedOutcome = completed, lifecycleCall ∈ acknowledged | held, nextRound — never terminal-event or none: the spawn signal is recorded before any completion report, after which Lifecycle leaves in_fulfillment, and a hold taken from it, only by this gear's own reports (06 §4.9, D-166)
     catch: *transient
     export: { as: '${ $context + { lifecycleCall: .lifecycleCall, reportRound: .nextRound } }' }
 - onReport:
     switch:
       - held:     { when: '${ $context.lifecycleCall == "held" }', then: enterHeldReport }   # a completed acknowledgement of an on_hold order (06 §3.3): resume first
       - reported: { then: terminateCompleted }
-- terminateCompleted:                   # protected (01); terminationKind: completed
+- terminateCompleted:                   # protected (01); body: ref + terminalOutcome: completed, terminationKind: completed
     timeout: step
     try:
       - call: { step: terminate-instance }
@@ -1728,7 +1729,13 @@ re-evaluates before any dispatch and the operation answers `due: false` and re-d
 it recorded; `retryAfterMs` is the operation's, never a `wait` value. A `lapsed[]` line goes to
 `rebuild-wave1` — under its own `rebuildRound`, never wave 1's round — and back through wave 1 and
 the barrier; a `failed[]` line, an exhausted budget
-and a spent wave timeout go to fragment (c); a 409 is followed by a `reconcile-intent` read
+and a spent wave timeout go to fragment (c). Both waves route an answer in one order —
+`deferred[]`, then `failed[]`, then `lapsed[]` — and nothing an earlier case leaves behind is
+dropped (decision D-165): `wave1Failed` and `wave2Failed` accumulate across answers and are
+cleared only by `lineFailure1` and `lineFailure2`, the entries that fold them into the task, so a
+failure entered from another operation (a sweep, a held poll, a resume) leaves them for the wave's
+next answer; `pendingLapsed` accumulates the lapsed lines until `rebuildLapsed` sends them, from
+`onWave2` or, once the failure stage returns to the barrier, from `onEvaluate`. A 409 is followed by a `reconcile-intent` read
 before the call is re-issued, and that read is routed like the poll arm's: its `failed[]` and
 `unresolved[]` go to fragment (c), its round is passed back, and wave 1 is re-issued under the
 unchanged key only after the `PT30S` `waitReread1`, while wave 2 waits in the barrier loop
@@ -1845,7 +1852,7 @@ exhaustion on it, never on the answer's `resumeAt` or a returned list (decision 
     try:
       - call: { step: create-manual-task }   # body: ref + scope: $context.failureScope, subjects: $context.failureSubjects, sourceStep: $context.sourceStep, sourceAttempt: $context.sourceAttempt
     catch: *transient
-    export: { as: '${ $context + { taskRefs: .taskRefs, exhaustedTaskRefs: .exhaustedTaskRefs, slaRound: .slaRound, wave1Failed: [], wave2Failed: [], forceTask: false } }' }
+    export: { as: '${ $context + { taskRefs: .taskRefs, exhaustedTaskRefs: .exhaustedTaskRefs, slaRound: .slaRound, forceTask: false } }' }   # wave1Failed and wave2Failed are cleared by lineFailure1 and lineFailure2, the entries that fold them into failureSubjects; any other entry leaves them for the wave's next answer (D-165)
 - onCreate:
     switch:
       - exhausted: { when: '${ ($context.exhaustedTaskRefs | length) > 0 }', then: failFastUnwind }   # the third failed attempt (07 §4.2)
@@ -2010,7 +2017,7 @@ report):
       - call: { step: report-outcome }  # body: ref + outcome: $context.reportAs ∈ failed | cancelled | superseded | terminal-event, from the fence's effectiveTrigger, round: ($context.reportRound // 0); reportedOutcome is terminal-event where Lifecycle already holds the order terminal (06 §4.9)
     catch: *transient
     export: { as: '${ $context + { reportRound: .nextRound } }' }   # the family's round carries over from a held completion report; held cannot arise here (06 §4.9: rows 26 and 27 admit failed and cancelled from a held order), so no switch follows
-- terminateAborted:                     # protected (01); body: ref + terminationKind: $context.terminationKind, supersededByOrderVersion: $context.supersededByOrderVersion (admit-trigger's currentOrderVersion on a supersede admission, null otherwise, D-155)
+- terminateAborted:                     # protected (01); body: ref + terminalOutcome: aborted, terminationKind: $context.terminationKind, supersededByOrderVersion: $context.supersededByOrderVersion (admit-trigger's currentOrderVersion on a supersede admission, null otherwise, D-155)
     timeout: step
     try:
       - call: { step: terminate-instance }

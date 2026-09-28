@@ -4853,6 +4853,93 @@ D-147: the call is re-issued under its unchanged key.
 task-resolution arm's comment, (d) the ceiling wait, `resolveCeilingTask`, `backToProcess` and the
 description, (f) the description; D-121, D-147, D-161.
 
+### D-165 (H) A wave answer routes deferred, then failed, then lapsed, and no entry drops what another has not folded
+
+**Accepted (2026-09-28).**
+
+**Decision**: (1) `onWave2` routes `deferred[]`, then `failed[]`, then `lapsed[]` — the order
+`onWave1` already uses for deferred and failed — so a line failed in the same answer as a lapsed
+one reaches fragment (c) before the rebuild. (2) The lapsed lines are carried in a new member
+`pendingLapsed`, which every wave-2 answer extends (`unique`), `rebuildLapsed` sends and clears,
+and `initEligibility` initialises; `onEvaluate` gains a `lapsed` case after `undispatched`, so the
+rebuild runs when the failure stage's retry, last close or verified override returns to the
+barrier. (3) `createTasks` no longer clears `wave1Failed` and `wave2Failed`; `lineFailure1` and
+`lineFailure2`, the only entries that fold those lists into `failureSubjects`, clear their own
+list in the same `set`. Any other line-scope entry — `sweepFailure`, `heldPollFailure`,
+`resumeFailure`, `wave1Exhausted`, `wave2Exhausted` — leaves both lists for the wave's next
+answer, which routes them.
+
+**Why not fold both lists into every line-scope entry.** `create-manual-task` takes one
+`sourceStep` and one `sourceAttempt` per call (`07 §3.3`, D-116); a wave's failed lines folded
+into a sweep's or a resume's call would be recorded against another operation's attempt, and a
+retry would mint the attempt of the wrong family (D-119). Clearing at the folding entry keeps each
+task's source exact and costs only a later task for the other list.
+
+**Why deferred stays first.** `05 §4.5` item 4 routes a deferral to its loop, and the loop is the
+deferred lines' only carrier (`enterDeferral1`, `wave2Again`); a failure first would leave them
+behind, since `evaluate-activation-eligibility` names a line whose intent is live and deferred in
+neither `undispatchedLineRefs` nor a failure. The failed and lapsed lists accumulate across
+answers, so the deferral delays them and drops neither.
+
+**The sweep.** Every switch that tests a failed list against another: `onWave1` (deferred before
+failed; unchanged, and now safe because only `lineFailure1` clears `wave1Failed`), `onWave2`
+(fixed), `onWave1Reread`, `onWave2Reread` and `onSweep` (failed first already), `afterHeldPoll`
+and `onResume` (deferred failures before any dispatch, and their lists are the operation's own
+answer, consumed by the entry that reads them). `complete` in `onWave2` is now reached only with
+`wave2Deferred`, `wave2Failed`, `pendingLapsed` and `wave2Pending` all empty. Every `then:` of the
+changed lists names a sibling, and the stage's `enter` switch needs no new case: the return to the
+barrier re-enters at `barrierLoop`, whose `evaluate` routes `pendingLapsed`.
+
+**Rationale**: `05 §4.5` item 6 lists a line in `failed[]` exactly once, so a list the definition
+drops is never listed again. `onWave2` sent a lapsed-and-failed answer to the rebuild, and
+`createTasks` cleared both wave lists on every entry, including a sweep, held-poll or resume
+failure that had not folded them; a line failed alongside a lapsed one was then never given a
+task and the order could report `completed` (re-review E-3). **Precedent**: the accumulating
+`wave1Failed` and `wave2Failed` exports themselves, which already carry a failed line across a
+deferral; `resumeFailure`, which clears `suspensionRef` in the entering `set` that consumes it;
+and `onEvaluate`'s `undispatched` case (D-119), where the barrier routes lines it owes wave 1
+before releasing. `ceilingEntry` already relies on a `set` reading `$context` as it was before
+the task (it copies `nextStage` while writing it), as `lineFailure1` and `lineFailure2` now do.
+
+**Propagated**: `design/10-process-definition.md` §3.6 (b) `initEligibility`, `onEvaluate`,
+`lineFailure1`, `wave2`, `onWave2`, `rebuildLapsed`, `lineFailure2` and the description, (c)
+`createTasks`. Related: D-54, D-116, D-119.
+
+### D-166 (M) A completion report never answers terminal-event, and every terminate-instance names its terminal outcome
+
+**Accepted (2026-09-28).**
+
+**Decision**: (1) `report-outcome` with `outcome: completed` answers `permanent-failure`
+`version-mismatch`, not `reportedOutcome = terminal-event`, when Lifecycle refuses
+`not-admissible` for a terminal order (`06 §3.6` `inst-ro-call`, `06 §4.9`); its output comment in
+`10 §3.6` (b) states `reportedOutcome = completed` and `lifecycleCall` ∈ `acknowledged` · `held`,
+and the definition keeps `onReport` as it is. (2) Each `terminate-instance` body names
+`terminalOutcome`: `completed` for `terminateCompleted`; `aborted` for `terminateRejected` and for
+`terminateAborted` on every `terminationKind` of the unwind (`compensated`, `superseded`,
+`terminal-order-event`).
+
+**Rationale**: (1) The terminal case cannot arise for a completion. `reportCompleted` is reached
+only after `spawnSent`, so Lifecycle has recorded `spawn_signal_at`; from then on it leaves
+`in_fulfillment`, and an `on_hold` whose pre-hold state is `in_fulfillment`, only by this gear's
+reports (Lifecycle `01 §4.3` rows 13, 14, 16, 26, 27): the ordinary cancel of row 15 needs no
+spawn signal, row 23 applies the pre-hold state's own guard, and row 24 and the missing
+`in_fulfillment → expired` row exclude expiry. The unwind's reports, the only others, never
+return to `reportCompleted`. Routing the answer would have needed a terminal event the definition
+does not hold — the fence's `terminal-event` trigger requires a settled
+`terminate-on-terminal-event` for a `triggerEventId` (`06 §3.6` `inst-fence-cause`) — and every
+re-report would enqueue `OrderFulfillmentAborted` again under a new round. So the answer the design
+excludes is a refusal, not a route (re-review E-5). (2) `01 §3.3` lists `terminalOutcome`
+(`completed` · `aborted`) as a required input and the three calls sent none (re-review E-6);
+`02 §2.1` and §4.3 already set `aborted` for superseded and terminal-event terminations, and the
+sweep's cancel path of `01 §4.16` presents `aborted` with `compensated`. **Precedent**: `06 §4.9`'s
+`not-admissible otherwise` row, which answers `version-mismatch` for a Lifecycle state the design
+excludes (D-109, D-111), and `orderTaskExhausted` in `10 §3.6` (c), where an answer the design
+rules out faults the invocation rather than gaining a route.
+
+**Propagated**: `design/06-saga-and-compensation.md` §3.3 `report-outcome` output, §3.6
+`inst-ro-call`, §4.9; `design/10-process-definition.md` §3.6 (a) `terminateRejected`, (b)
+`reportCompleted`, `terminateCompleted`, (c) `terminateAborted`. Related: D-109, D-111.
+
 ### Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?
 
 **Owner**: Architecture.
@@ -5278,6 +5365,8 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-162 | M Gate-loop calls retry under a policy that fits their timeout | `design/10-process-definition.md` §1.2, §2.2, §3.6, `design/01-foundation.md` §4.2, §4.5, `design/03-approval-execution.md` §1.2, §4.5, `ADR/0012`; D-148 |
 | D-163 | M A ceiling while parked at a ceiling re-arms and keeps the first ceiling's return state | `design/10-process-definition.md` §3.6 (a), (d) |
 | D-164 | H Ceiling wait's own request ref; a ceiling restores the interrupted stage's payload | `design/10-process-definition.md` §2.2, §3.6 (a), (c), (d), (f); D-121, D-147, D-161 |
+| D-165 | H Wave answers route deferred, failed, lapsed; only the folding entry clears a failed list | `design/10-process-definition.md` §3.6 (b), (c); D-54, D-116 |
+| D-166 | M Completion never answers terminal-event; terminate-instance names terminalOutcome | `design/06-saga-and-compensation.md` §3.3, §3.6, §4.9, `design/10-process-definition.md` §3.6 (a), (b), (c); D-109, D-111 |
 
-Highest decision number used: **D-164**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
+Highest decision number used: **D-166**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
 register; there are no parts.
