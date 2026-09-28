@@ -12,6 +12,7 @@ fn defaults_select_the_platform_vendor_and_the_cluster_election_defaults() {
     assert_eq!(cfg.election.ttl(), Duration::from_secs(30));
     assert_eq!(cfg.election.max_missed_renewals, 2);
     assert_eq!(cfg.sweeper_stop_timeout(), Duration::from_secs(10));
+    assert_eq!(cfg.pdp_deadline(), Duration::from_millis(250));
     assert_eq!(cfg.metrics.instrument_name("denial_total"), "denial_total");
     cfg.validate().expect("defaults are valid");
 }
@@ -52,6 +53,13 @@ fn a_blank_vendor_and_zero_timings_are_rejected_with_the_field_name() {
                 ..QuotaEnforcementConfig::default()
             },
             "sweeper_stop_timeout_secs",
+        ),
+        (
+            QuotaEnforcementConfig {
+                pdp_deadline_ms: 0,
+                ..QuotaEnforcementConfig::default()
+            },
+            "pdp_deadline_ms",
         ),
     ];
     for (cfg, field) in cases {
