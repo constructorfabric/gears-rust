@@ -921,6 +921,7 @@ do:
       switch:
         - unwinding: { when: '${ .arm == "lifetime" and $context.unwind != null }', then: lifetime }   # set on every entry to the unwind and never cleared, so it covers a cancel or a task taken from inside it: no compensating → parked edge (01 §3.7); the unwind continues under a fresh ceiling (D-121)
         - verdictPark: { when: '${ .arm == "lifetime" and $context.stageLoop == "parkLoop" }', then: lifetime }   # the verdict park, or a hold, resume, lifecycle or cancel stage taken from it: already parked and escalated by its own clock; no parked → parked edge, and the park ends only by its three routes (03 §4.1, D-121)
+        - ceilingParked: { when: '${ .arm == "lifetime" and $context.returnStage == "ceiling" }', then: lifetime }   # a lifecycle or cancel stage taken from the ceiling wait: the instance is already parked at a ceiling whose task is open and has its own SLA tick; no parked → parked edge, and ceilingEntry must not overwrite that ceiling's saved return state (D-163)
         - ceiling:   { when: '${ .arm == "lifetime" }', then: ceilingEntry }
         - other:     { then: end }
   - ceilingEntry:                       # records where the process was, then re-enters the fork at the ceiling stage of fragment (d)
@@ -2230,7 +2231,12 @@ and checkpoint `ceilingEntry` recorded, under the fresh ceiling of the re-entere
 `backToProcess` restores it: the ceiling stage's own `leave` sets `returnStage` to `ceiling` so
 that a cancel or lifecycle arm taken from its wait comes back to it, and without the restore a
 lifecycle, hold, resume or cancel stage the ceiling interrupted would go back to the ceiling stage
-and escalate a new ceiling round instead of returning where it came from (decision D-161). The
+and escalate a new ceiling round instead of returning where it came from (decision D-161). A
+ceiling that fires while a lifecycle or cancel stage taken **from** the ceiling wait is running
+(`returnStage = ceiling`, which only the ceiling stage's `leave` writes and `backToProcess`
+restores) re-arms without parking, like the verdict park: the instance is already parked at the
+open ceiling, whose task keeps its own SLA tick, and `ceilingEntry` is not run, so the first
+ceiling's saved stage, checkpoint and return are kept (decision D-163). The
 canonical version has **no `unpark-requested` arm**: `:plugin-control` is authorized
 platform-side (`../ADR/0010`), so a signal with no Orders origin route is not a signal no one can
 send, and the arm is removed until Q-13 gives it an origin route and a request row

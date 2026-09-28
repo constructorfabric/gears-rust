@@ -182,6 +182,7 @@
   - [D-161 (H) An admission answers only for its own event, and a ceiling restores the return stage it interrupted](#d-161-h-an-admission-answers-only-for-its-own-event-and-a-ceiling-restores-the-return-stage-it-interrupted)
   - [D-162 (M) The gate-loop calls retry under a policy whose worst case fits their timeout](#d-162-m-the-gate-loop-calls-retry-under-a-policy-whose-worst-case-fits-their-timeout)
 - [Open Questions](#open-questions)
+  - [D-163 (M) A ceiling that fires while parked at a ceiling re-arms, and keeps the first ceiling's return state](#d-163-m-a-ceiling-that-fires-while-parked-at-a-ceiling-re-arms-and-keeps-the-first-ceilings-return-state)
   - [Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?](#q-01-which-durable-execution-substrate-backs-the-process--the-oss-workflow-engine-or-a-bss-local-mechanism)
   - [Q-02: The Generic Approval escalation threshold — the one PRD-deferred numeric value this design deliberately leaves unset](#q-02-the-generic-approval-escalation-threshold--the-one-prd-deferred-numeric-value-this-design-deliberately-leaves-unset)
   - [Q-03: Does a bounded hold/resume cycle count or bound the total elapsed non-terminal lifetime of an order, beyond the single-cycle remaining-window guarantee this design already keeps?](#q-03-does-a-bounded-holdresume-cycle-count-or-bound-the-total-elapsed-non-terminal-lifetime-of-an-order-beyond-the-single-cycle-remaining-window-guarantee-this-design-already-keeps)
@@ -1671,7 +1672,7 @@ The decisions in this section were taken when the order process flow moved from 
 gear to a versioned platform workflow definition (`ADR/0011`, `ADR/0012`, `ADR/0013`), and when
 each slice was restructured into step operations and a definition fragment. D-65…D-72 carry the
 three ADRs and their cross-cutting consequences; D-73…D-101 are the decisions the slice
-restructurings recorded, and D-102…D-162 the decisions taken on the second review of
+restructurings recorded, and D-102…D-163 the decisions taken on the second review of
 2026-09-26. Each names the entries it amends; the amended entries carry a dated
 **Amended by** note. D-65…D-101 were taken on 2026-09-24.
 
@@ -3326,6 +3327,9 @@ round is the same shape); `01 §3.7`'s transition table as the authority for whi
 `returnStage` as `ceilingReturnBack`, and `backToProcess` restores it, so a lifecycle, hold, resume
 or cancel stage the ceiling interrupted returns where it would have, not to the ceiling stage.
 
+**Amended by D-163 (2026-09-28)**: a ceiling that fires while a lifecycle or cancel stage taken
+from the ceiling wait is running re-arms without parking and without running `ceilingEntry`.
+
 ### D-122 (H) The ceiling wait consumes only its own task, and no unrecorded signal unparks
 
 **Accepted (2026-09-26).**
@@ -4742,6 +4746,29 @@ timeout*, *Fixed waits*; `design/01-foundation.md` §4.2, §4.5; `design/03-appr
 
 ## Open Questions
 
+
+### D-163 (M) A ceiling that fires while parked at a ceiling re-arms, and keeps the first ceiling's return state
+
+**Accepted.**
+
+**Decision**: `afterLifetime` (`design/10-process-definition.md` §3.6 (a)) gains a case before
+`ceiling`: when the lifetime arm completes while `returnStage = ceiling`, the process re-arms the
+lifetime fork at its current stage without running `ceilingEntry` or `park`. `returnStage` is
+`ceiling` exactly while a lifecycle or cancel stage taken from the ceiling wait is running: only the
+ceiling stage's `leave` writes that value, and `backToProcess` restores the saved one on unpark.
+
+**Rationale**: in that state the instance is already parked at the open ceiling (`01 §3.7` has no
+`parked → parked` edge), and that ceiling's task already has its waiter and its SLA tick (D-129).
+Running `ceilingEntry` would overwrite the first ceiling's `ceilingReturnStage`,
+`ceilingReturnLoop` and `ceilingReturnBack`, so a later unpark would resume at the cancel or
+lifecycle stage instead of the stage the first ceiling interrupted. This follows the verdict-park
+case of the same switch (D-121): an instance already parked by its own clock re-arms and is not
+parked again. A cancel authorized from that stage enters the unwind, which the `unwinding` case
+already covers. Closes the edge case left open by D-161.
+
+**Propagated**: `design/10-process-definition.md` §3.6 (a) `afterLifetime` and the lifetime
+paragraph of fragment (d); D-121, D-161.
+
 ### Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?
 
 **Owner**: Architecture.
@@ -5165,6 +5192,7 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-160 | M Configuration revisions in an append-only table | `design/01-foundation.md` §3.2, §3.7, §3.8, §4.11, `design/09-read-and-authz.md` §3.7, `DESIGN.md` §3.7, §4.7, §4.8; D-48, D-63, D-69, D-104, D-140 |
 | D-161 | H Admission answers only its own event; ceiling restores the return stage | `design/10-process-definition.md` §2.2, §3.6, `ADR/0012`; D-121, D-144 |
 | D-162 | M Gate-loop calls retry under a policy that fits their timeout | `design/10-process-definition.md` §1.2, §2.2, §3.6, `design/01-foundation.md` §4.2, §4.5, `design/03-approval-execution.md` §1.2, §4.5, `ADR/0012`; D-148 |
+| D-163 | M A ceiling while parked at a ceiling re-arms and keeps the first ceiling's return state | `design/10-process-definition.md` §3.6 (a), (d) |
 
-Highest decision number used: **D-162**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
+Highest decision number used: **D-163**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
 register; there are no parts.
