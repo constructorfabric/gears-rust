@@ -570,7 +570,7 @@ attribution **MUST NOT** appear as label values; Policy attribution belongs on t
 **Constraints**: `cpt-cf-quota-enforcement-constraint-in-process-engine-registration`
 
 **Touches**:
-- API: platform observability stack (`tracing` + `toolkit` `otel` feature, per the foundation telemetry conventions)
+- API: platform observability stack (`QeMetrics` port with its `OpenTelemetry` adapter for metrics, `tracing` for logs and spans, `toolkit` `otel` feature, per the foundation telemetry conventions)
 - Entities: gear-specific counters and histograms per PRD §5.16, the PRD §5.9 versioning telemetry requirement, and
   DESIGN §4.1
 
