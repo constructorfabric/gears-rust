@@ -8,21 +8,28 @@
 //! Singleton coordination is not a plugin of this gear. The platform `cluster`
 //! gear provides it, and `infra::cluster_coordination` resolves it (ADR-0006).
 
+use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use quota_enforcement_sdk::{QuotaEnforcementStoragePluginSpecV1, QuotaEnforcementStoragePluginV1};
 use toolkit::client_hub::{ClientHub, ClientScope};
 use toolkit::plugins::choose_plugin_instance;
+use toolkit_canonical_errors::CanonicalError;
 use toolkit_macros::domain_model;
 use types_registry_sdk::{InstanceQuery, TypesRegistryClient};
 
 use super::error::{DomainError, PluginKind};
+
+/// Default budget for the registry listing that selects a plugin instance.
+pub const DEFAULT_SELECTION_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Vendor-driven plugin resolution.
 #[domain_model]
 pub struct PluginBinding {
     hub: Arc<ClientHub>,
     storage_vendor: String,
+    deadline: Duration,
 }
 
 impl PluginBinding {
@@ -32,7 +39,15 @@ impl PluginBinding {
         Self {
             hub,
             storage_vendor,
+            deadline: DEFAULT_SELECTION_DEADLINE,
         }
+    }
+
+    /// Override the budget the selecting registry listing may take.
+    #[must_use]
+    pub const fn with_deadline(mut self, deadline: Duration) -> Self {
+        self.deadline = deadline;
+        self
     }
 
     /// Resolve the active storage plugin.
@@ -65,10 +80,12 @@ impl PluginBinding {
             .get::<dyn TypesRegistryClient>()
             .map_err(|e| DomainError::TypesRegistryUnavailable(e.to_string()))?;
         let type_id = <P as gts::GtsSchema>::TYPE_ID;
-        let instances = registry
-            .list_instances(InstanceQuery::new().with_pattern(format!("{type_id}*")))
-            .await
-            .map_err(|e| DomainError::TypesRegistryUnavailable(e.to_string()))?;
+        // A registry that never answers must fail bootstrap, not hang it.
+        let instances = bounded(
+            self.deadline,
+            registry.list_instances(InstanceQuery::new().with_pattern(format!("{type_id}*"))),
+        )
+        .await?;
         // A registry answers the pattern query with instances of this spec. The
         // prefix filter keeps the selection correct against a registry that
         // ignores the pattern, so a foreign instance never fails deserialization.
@@ -86,6 +103,21 @@ impl PluginBinding {
             "selected plugin instance"
         );
         Ok(gts_id)
+    }
+}
+
+/// Runs one registry call under `deadline`; a failure and an overrun are both
+/// an unavailable registry.
+async fn bounded<T>(
+    deadline: Duration,
+    call: impl Future<Output = Result<T, CanonicalError>>,
+) -> Result<T, DomainError> {
+    match tokio::time::timeout(deadline, call).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(err)) => Err(DomainError::TypesRegistryUnavailable(err.to_string())),
+        Err(_elapsed) => Err(DomainError::TypesRegistryUnavailable(format!(
+            "no answer within {deadline:?}"
+        ))),
     }
 }
 
