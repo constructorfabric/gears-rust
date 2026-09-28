@@ -207,9 +207,9 @@ The resource base retains `type`, optional `id`, and `metadata`.
 
 ### Attribution and authorization
 
-* **The whole consumer surface is service-to-service only.** Debit, credit, rollback, lease
+* **The whole consumer surface is service-to-service only.** Debit, rollback, lease
   operations, batch debit, consumer snapshot reads, and consumer `evaluate_preview` calls all
-  require an authenticated service principal. End users do not call QE directly; a consuming
+  require an authenticated service principal, and so does the management-plane credit. End users do not call QE directly; a consuming
   product serves self-service views through its backend.
 * **PDP authorizes the explicit attribution tuple.** Consumer `tenant_id`, subject refs,
   metric, and optional resource are caller-supplied and untrusted until PDP grants the

@@ -213,7 +213,7 @@ Realises `cpt-cf-quota-enforcement-seq-credit`.
    `(projection_type, subject_id)` read under the same row lock, per `cpt-cf-quota-enforcement-fr-idempotency`, and
    the operation-log entry are persisted, and the `quota-counter-adjusted` event carrying the credited amount, the
    target `quota_id`, and the authenticated service principal from `SecurityContext` is enqueued (I11); commit - `inst-cre-apply`
-7. [ ] - `p1` - **RETURN** the outcome; the SDK path is `QuotaEnforcementClientV1::credit(req)` returning `Decision` - `inst-cre-return`
+7. [ ] - `p1` - **RETURN** the outcome; the SDK path is `QuotaManagerClientV1::credit(req)` returning `Decision` - `inst-cre-return`
 
 ### Rollback
 
