@@ -689,7 +689,7 @@ sequenceDiagram
     GW->>P: best-effort delete(old_id)
     GW->>DB: DELETE gc(old_id)
     GW-->>C: 201 create / 204 replace
-    Note over GW,P: plugin.put fails → best-effort DELETE gc(new_id); 503; nothing served changes
+    Note over GW,P: plugin.put fails → best-effort mark gc(new_id) aborted (never deleted — the failure may be ambiguous); 503; nothing served changes
     Note over GW,DB: CAS lost (row changed under us) → 409; best-effort UPDATE gc(new_id) reason=aborted + best-effort plugin.delete(new_id) + DELETE gc(new_id)
     Note over GW,DB: DB unreachable at the CAS → 503; new bytes are an orphan already recorded pending → the maintenance job reconciles
 ```
@@ -1250,6 +1250,14 @@ Closing it needs a signal this gear does not have: a hierarchy version or change
 
 **Likelihood**: Low | **Impact**: Medium | **Priority**: P2
 
+#### Risk: Override-type-consistency check races a concurrent ancestor delete-and-recreate
+
+**Impact**: `cpt-cf-credstore-fr-override-type-consistency` reads the type of "the credential the reference currently resolves to" and rejects a create whose type differs — but that read and the child's own create-only insert are not one transaction. If, between the two, the ancestor's `shared` row is deleted and a new one created under a different type, the child's create can commit against a type that no longer matches what the reference now resolves to.
+
+**Mitigation**: none at the row-generation level today — the check is read-then-insert, not a CAS against the ancestor row's id or version. The window needs a concurrent write on a *different tenant's* row (the ancestor's) landing between one tenant's read and its own create-only insert; ordinary same-tenant traffic never hits it, and hitting it produces a locally-inconsistent type pairing, never a disclosure or an authorization bypass — the child record itself is still exactly what its own creator asked for.
+
+**Likelihood**: Low | **Impact**: Low | **Priority**: P3
+
 #### Risk: Reference wedged by stuck saga rows
 
 **Shipped today, superseded by ADR-0006 (planned):**
@@ -1270,7 +1278,7 @@ Schema is managed by SeaORM migrations (raw per-backend SQL, PostgreSQL + SQLite
 
 Future schema changes are additive migrations on top. **Backward compatibility** for clients: untyped writes behave exactly as before (`generic` type, all sharing modes, no expiry). Rollback = revert the gear and run the migration `down`.
 
-**Planned: `m0002`** (ADR-0005, ADR-0006, ADR-0008 — landing together, §4.7): the `fallback` column and collection-read indexes, plus `value_id`, the partial unique index on it, the `credstore_value_gc` table, the narrowed `status` and fingerprint `CHECK`s, and the drop of `idx_credstore_pending`. `m0002` itself is schema-only and leaves every pre-existing `active` row `declared` (§4.7) — it mints no `value_id` and moves no backend bytes. A deployment with no pre-existing rows under the old key shape (nothing written before ADR-0006 shipped) needs nothing further: `m0002` runs over an empty table and there is nothing to move. A deployment that already holds rows under the old shape additionally needs the one-off, out-of-gear data migration ADR-0006 requires (moving the fence key and copying each fingerprint-checked value to a fresh `value_id`) **before** `m0002`'s narrowed `CHECK`s are applied to that data; this gear ships no such job — it is an external, one-off script and runbook, not a resident or on-demand gear capability (ADR-0006, "Consequences"). That migration is stop-the-world by design, not a rolling/mixed-version rollout: the old and new backend key shapes cannot both serve the same reference, so the runbook's own order — snapshot, stop the old version, apply `m0002`, move the values, start the new version — is the only supported sequence, and its rollback is restoring the pre-migration database dump (and, if the backend cleanup step already ran, a backend snapshot too), not a schema `down` migration against live data.
+**Planned: `m0002`** (ADR-0005, ADR-0006, ADR-0008 — landing together, §4.7): the `fallback` column and collection-read indexes, plus `value_id`, the partial unique index on it, the `credstore_value_gc` table, the narrowed `status` and fingerprint `CHECK`s, and the drop of `idx_credstore_pending`. `m0002` itself is schema-only and leaves every pre-existing `active` row `declared` (§4.7) — it mints no `value_id` and moves no backend bytes. A deployment with no pre-existing rows under the old key shape (nothing written before ADR-0006 shipped) needs nothing further: `m0002` runs over an empty table and there is nothing to move. A deployment that already holds rows under the old shape additionally needs the one-off, out-of-gear data migration ADR-0006 requires (moving the fence key and copying each fingerprint-checked value to a fresh `value_id`) **before** `m0002`'s narrowed `CHECK`s are applied to that data; this gear ships no such job — it is an external, one-off script and runbook, not a resident or on-demand gear capability (ADR-0006, "Consequences"). That migration is stop-the-world by design, not a rolling/mixed-version rollout: the old and new backend key shapes cannot both serve the same reference, so the runbook's own order — snapshot, stop the old version, apply `m0002`, move the values, start the new version — is the only supported sequence, and its rollback is restoring the pre-migration database dump (and, if the backend cleanup step already ran, a backend snapshot too), not a schema `down` migration against live data. The same stop-the-world window also carries PDP grant reissuance for [ADR-0010](./ADR/0010-cpt-cf-credstore-adr-type-scoped-authorization.md)'s renamed resource type and six-action split — see that ADR's Consequences for who reissues what and why there is no dual-grant coexistence period.
 
 ## 9. Open Questions
 

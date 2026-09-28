@@ -54,6 +54,7 @@ A permission is a GTS instance `gts.cf.toolkit.authz.permission.v1~cf.core.creds
 
 - A permission's resource type accepts GTS wildcards (e.g. `gts.cf.core.credstore.credential.*`). A wildcard on the base type is an operator's tool, not an application's: every subtype registered later is granted the moment it exists, so grants on secret types name concrete types or an explicit set in practice.
 - A bare shape type (`api_key`, `generic`) cannot be scoped per purpose; a purpose needs its own subtype. Registering one needs no credstore release.
+- **Grant reissuance is a pre-deployment step, not a rolling one.** Because no shipped grant matches any new action, every existing policy against `gts.cf.core.credstore.secret.v1~` (`read`/`write`/`delete`) must be re-issued against `credential.v1~`'s six actions (`read` → `read` + `list`; `write` → `write`; `delete` → `delete`; a grant that also needs the secret adds `read_secret`/`write_secret` explicitly, never inferred) before this ADR's code deploys — the same PDP policy owner (platform or tenant admin, per the grant's own scope) who issued the old grant reissues it. There is no dual-grant window: since the actions genuinely differ (three vs. six, with the secret split out), a policy engine cannot honor both simultaneously without over- or under-granting, so this ships in the same stop-the-world window as the `m0002` data migration (DESIGN §8), not as an independent rollout.
 
 ### Confirmation
 

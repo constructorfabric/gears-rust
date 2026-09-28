@@ -115,6 +115,7 @@ The reaper is removed, not reshaped. A saga has intermediate states that are wro
 - A plugin wants its backend's native versioning directly (O3); today that stays an implementation choice behind the three-method SPI.
 - One job period of garbage or expired-row lifetime hurts a high-rotation reference: shorten the cadence or add an eager in-request drain.
 - Out-of-band seeding is wanted back for bootstrap; `ck_credstore_fp_with_value` is now load-bearing, so it needs a narrower story than ADR-0003's.
+- **A residual window in pending-reclaim, narrower than the one step 4's `rows_affected` check closes.** That check stops a writer from completing step 4 *after* the job has already deleted `gc(new_id)` — but the job's own two actions, `plugin.delete(new_id)` then `DELETE gc(new_id)`, are not one atomic step (D5: the plugin has no transactions). If a stalled writer's step 4 lands in the gap between those two — the gc row still exists, so the writer's check passes — the row commits pointing at `new_id` after its backend bytes are already gone. This still needs the same precondition as the case step 4 already guards against (a writer stalled past `gc.pending_max_age_secs`, 3600 s by default, without crashing), narrowed further to the job's own single-digit-millisecond gap between two calls; revisit with a claim/lease on the gc row before the backend delete if a narrower guarantee is ever needed.
 
 ## Pros and Cons of the Options
 
