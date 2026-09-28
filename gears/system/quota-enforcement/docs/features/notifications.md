@@ -288,7 +288,7 @@ upstream prerequisite of this feature, and QE does not query the framework's tab
 **Constraints**: `cpt-cf-quota-enforcement-constraint-bounded-cardinality`
 
 **Touches**:
-- API: platform observability stack (`tracing` + `toolkit` `otel` feature)
+- API: platform observability stack (`QeMetrics` port with its `OpenTelemetry` adapter for metrics, `tracing` for logs and spans, `toolkit` `otel` feature)
 - Entities: dispatch instruments per PRD §5.16 / DESIGN §4.1
 
 ## 6. Acceptance Criteria

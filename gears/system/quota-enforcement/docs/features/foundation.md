@@ -298,7 +298,7 @@ coordination contract, plugin crate, or bootstrap probe ships.
 
 - [x] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-telemetry-conventions`
 
-The system **MUST** emit gear-specific instruments via `tracing` with OTLP export under the `otel` feature, enforcing
+The system **MUST** emit gear-specific instruments through the `QeMetrics` port and its `OpenTelemetry` adapter, exported over OTLP by the platform under the `otel` feature, enforcing
 the bounded-cardinality label discipline through the type system: every label value is a static token of a closed
 enum or an admitted-metric label that only the catalogue frozen at bootstrap can construct, so no high-cardinality
 identifier can reach a label value. Export queueing, batching, and drop behaviour under backend saturation belong to
@@ -310,7 +310,7 @@ the platform OTLP pipeline, not to this gear.
 **Constraints**: `cpt-cf-quota-enforcement-constraint-bounded-cardinality`
 
 **Touches**:
-- API: platform observability stack (`tracing` + `toolkit` `otel` feature)
+- API: platform observability stack (`QeMetrics` port with its `OpenTelemetry` adapter for metrics, `tracing` for logs and spans, `toolkit` `otel` feature)
 - Entities: gear-specific counters, histograms, gauges per PRD §5.16
 
 ## 6. Acceptance Criteria
