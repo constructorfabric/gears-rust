@@ -1593,11 +1593,11 @@ sequenceDiagram
         SP -->> QES: stored Decision (verbatim)
         QES -->> QM: stored Decision (verbatim)
     else fresh
-        SP ->> SP: read quota row WHERE quota_id = $1 with row lock
-        alt row not found
+        SP ->> SP: read quota row WHERE quota_id = $1 AND the AccessScope predicate, with row lock
+        alt row absent or outside AccessScope (indistinguishable)
             SP -->> QES: StorageError::QuotaNotFound
             QES -->> QM: 404 UNKNOWN_QUOTA (DomainError::NotFound)
-        else cross-tenant (quota.tenant_id != authorized tenant_id, defense-in-depth)
+        else row visible in scope but quota.tenant_id != request tenant_id (defense-in-depth)
             SP -->> QES: StorageError::SubjectOutOfScope
             QES -->> QM: 403 PdpDenied
         else status = 'deactivated'
@@ -1623,9 +1623,11 @@ sequenceDiagram
 Engine invocation (per `cpt-cf-quota-enforcement-fr-credit`). Four rejection arms fire **before any mutation**, all
 inside the transaction with a row-locked read so the check and the mutation share atomic semantics:
 
-1. **Unknown quota.** `quota_id` does not exist → `StorageError::QuotaNotFound` →
-   `DomainError::NotFound { kind: "quota", id }` → 404.
-1. **Cross-tenant quota.** Row exists but `quota.tenant_id ≠ authorized tenant_id` (the PDP layer should already have caught
+1. **Unknown or out-of-scope quota.** No row with this `quota_id` is visible under the caller's `AccessScope`, which the
+   row-locked read applies in its predicate → `StorageError::QuotaNotFound` → `DomainError::NotFound { kind: "quota", id }`
+   → 404. An absent row and a row outside the scope are one answer, so a guessed identifier reveals nothing.
+1. **Another tenant's quota in scope.** The row is visible under the scope (for example a sibling tenant under a subtree
+   grant) but `quota.tenant_id ≠` the request's authorized `tenant_id` (the PDP layer should already have caught
    this; storage check is defense-in-depth per `cpt-cf-quota-enforcement-nfr-tenant-isolation-integrity`) →
    `StorageError::SubjectOutOfScope` → `DomainError::PdpDenied` → 403.
 1. **Deactivated quota.** Row exists, tenant scope matches, but `status = 'deactivated'` →

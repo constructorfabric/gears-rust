@@ -169,8 +169,10 @@ Realises `cpt-cf-quota-enforcement-seq-credit`.
 
 **Error Scenarios**:
 - `amount <= 0`: `INVALID_AMOUNT` before idempotency lookup or the row-locked read
-- Unknown `quota_id`: canonical `NotFound` (404, `UNKNOWN_QUOTA`)
-- Quota outside the caller's tenant: `PdpDenied` (403, storage defense-in-depth)
+- Unknown `quota_id`, or a Quota outside the caller's `AccessScope`: canonical `NotFound` (404, `UNKNOWN_QUOTA`); the two
+  are indistinguishable
+- Quota visible in the caller's scope but owned by a tenant other than the request's: `PdpDenied` (403, storage
+  defense-in-depth)
 - Deactivated Quota: `QUOTA_DEACTIVATED` (400)
 - Consumption Quota whose calendar window has elapsed: `PERIOD_CLOSED` (400)
 
@@ -179,8 +181,8 @@ Realises `cpt-cf-quota-enforcement-seq-credit`.
 2. [x] - `p1` - **IF** `amount <= 0` - `inst-cre-amount-if`
    1. [x] - `p1` - **RETURN** `INVALID_AMOUNT` before idempotency lookup, the row-locked Quota read, or any other pipeline step; nothing is persisted - `inst-cre-amount`
 3. [x] - `p1` - DB: `lookup_idempotency` inside the transaction; on an exact replay **RETURN** the stored outcome verbatim per `cpt-cf-quota-enforcement-algo-idempotency-replay` - `inst-cre-idem`
-4. [x] - `p1` - DB: read the Quota row under a row lock, so the four rejection arms and the mutation share atomic semantics - `inst-cre-lock`
-5. [x] - `p1` - **IF** the row is absent, cross-tenant, deactivated, or a consumption Quota whose calendar window has elapsed (`time >= period_end` at the moment the transaction is evaluated) - `inst-cre-guard-if`
+4. [x] - `p1` - DB: read the Quota row by `quota_id` and the caller's `AccessScope` in one predicate, under a row lock, so the four rejection arms and the mutation share atomic semantics - `inst-cre-lock`
+5. [x] - `p1` - **IF** the row is absent or outside the scope, in scope but another tenant's, deactivated, or a consumption Quota whose calendar window has elapsed (`time >= period_end` at the moment the transaction is evaluated) - `inst-cre-guard-if`
    1. [x] - `p1` - **RETURN** the matching rejection before any mutation: `StorageError::QuotaNotFound` lifts to `NotFound { kind: "quota" }` (404), `StorageError::SubjectOutOfScope` lifts to `PdpDenied` (403), `StorageError::QuotaDeactivated` lifts to `QUOTA_DEACTIVATED` (400), and `StorageError::PeriodClosed` lifts to `PERIOD_CLOSED` (400); credit closure is calendar-keyed, so the rejection fires immediately at the boundary even while the settlement window is still draining cross-period lease commits - `inst-cre-guard`
 6. [x] - `p1` - DB: `apply_credit(quota_id, amount, idem_key, events)` in the same transaction: an allocation Quota decrements its in-flight counter and a consumption Quota decreases the current-period consumed amount, both with a floor of zero; the idempotency record uses an `IdempotencySubjectKey` fingerprint of the owning Quota's `(projection_type, subject_id)` read under the same row lock, per `cpt-cf-quota-enforcement-fr-idempotency`, and the operation-log entry are persisted, and the `quota-counter-adjusted` event carrying the credited amount, the target `quota_id`, and the authenticated service principal from `SecurityContext` is enqueued (I11); commit - `inst-cre-apply`
 7. [x] - `p1` - **RETURN** the outcome; the SDK path is `QuotaEnforcementClientV1::credit(req)` returning `Decision` - `inst-cre-return`
@@ -545,7 +547,7 @@ retry storm at 10x normal RPS with a 5% retry rate showing zero double-count eve
 - [x] A replay after the retention window (default 24 h, honoring a per-`(tenant, metric)` override) is re-evaluated
   as a new operation
 - [x] Credit rejection arms fire before any mutation, in-tx with the row lock: unknown `quota_id` gives 404
-  `UNKNOWN_QUOTA`, a cross-tenant Quota gives 403, a deactivated Quota gives 400 `QUOTA_DEACTIVATED`, and a
+  `UNKNOWN_QUOTA`, a Quota outside the caller's scope gives the same 404, a Quota in scope but of another tenant gives 403, a deactivated Quota gives 400 `QUOTA_DEACTIVATED`, and a
   consumption Quota at `time >= period_end` gives 400 `PERIOD_CLOSED` even while the settlement window is still
   draining; a successful credit floors the counter at zero and enqueues `quota-counter-adjusted` with the credited
   amount, `quota_id`, and authenticated service principal in the same transaction
