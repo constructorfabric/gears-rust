@@ -805,7 +805,7 @@ engine-owned tables per [`01 §3.7`](./01-foundation.md#37-database-schemas--tab
 | `owf_process_instance`, partial index `UNIQUE (order_id) WHERE terminal_outcome IS NULL` | `start-instance` / `terminate-instance` through the envelope (01) | Single active instance per order (§2.1); the supersession guard reads it under row lock (§4.3) |
 | `owf_idempotency_registry`, `operation = 'admit-trigger'`, key per §2.1 | Idempotency registry (01) | Duplicate absorption; the `open` state that lets a non-admitted attempt re-run; tenant-namespaced by the key prefix (`01 §3.7`) |
 | `owf_step_log` | Step envelope (01) | One row per admission attempt, carrying the platform `attempt_id`, the outcome and the read version in `result`; **not** a dedup store |
-| `owf_audit_entry` | Audit writer (01) | `step-start` and `step-completion` per attempt, under the derived correlation before the instance exists |
+| `owf_audit_entry` | Audit writer (01) | `step-start` and a settlement entry per attempt — `step-completion`, or `retry` or `timeout` on a retryable failure (`01 §3.3` *What each receipt records*) — under the derived correlation before the instance exists |
 | `owf_step_operation` | Operation registry (01) | The two rows of §3.3 |
 
 **Columns that moved.** The platform attempt identifier is recorded as `owf_step_log.attempt_id`

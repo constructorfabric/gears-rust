@@ -2658,6 +2658,8 @@ the line's wave, and the definition keeps one attempt per wave (`wave1AttemptKey
 `wave2AttemptKey`). The dispatch step keys end `{dispatchRound}[:{attempt}]`. The intent key's
 `wave_attempt` is a separate, per-line counter on the task row.
 
+**Amended by D-171 (2026-09-28)**: `01 §4.15` now applies rule 1 to an early wake-up — `due: false` and the next round, a settled success — where it had required `retryable-failure`.
+
 ### D-103 (M) The registry lease is fenced by a holder token, sized below the retry horizon, and resolved per key family
 
 **Accepted (2026-09-26).** *(amends D-03 and D-71)*
@@ -2696,6 +2698,8 @@ lease exhausts and faults the invocation; that fault is the stated fallback (`in
 the re-drive, D-105), and a longer lease would make every train meet it. `01 §3.7` states the
 lease rationale as probabilistic (re-review R-3, D-39 as amended).
 
+**Amended by D-167, D-168, D-169 and D-170 (2026-09-28)**: a replay answers from the registry's `settled_output`, not the step-log `result`; the zero-rows fence is one case of a general abort rule, which also states the answer (503 or 500) and what each operation shape leaves; `start-instance` joins the exceptions to the one-transaction shape, reading the platform before its transaction; and "every receipt writes a row" is "every receipt that reached registry resolution", with `absorbed` added to the outcome enum.
+
 ### D-104 (M) No Workflow-owned table is partitioned; registry rows are kept as tombstones until no replay can arrive
 
 **Accepted (2026-09-26).** *(mirrors Lifecycle D-91)*
@@ -2731,6 +2735,8 @@ view) are listed as such. `design/09-read-and-authz.md` §4.3 cites the register
 keeping a partial copy. The worker never deletes a row of a non-terminal instance, which can
 outlive a 400-day window only behind a ceiling park (D-129). Second review OW2-87: the register
 said every window had a worker, while the roster named six stores.
+
+**Amended by D-167 (2026-09-28)**: the tombstone rule keeps a replayable answer too — each settled row carries its immutable `settled_output` — and the step log's 90-day window runs whatever the instance's state, under a DELETE grant only the retention purge holds.
 
 ### D-105 (H) A dead invocation is raised as one order-scope task; the platform re-drive is the recovery, an Orders-driven cancel the fallback
 
@@ -4940,6 +4946,146 @@ rules out faults the invocation rather than gaining a route.
 `inst-ro-call`, §4.9; `design/10-process-definition.md` §3.6 (a) `terminateRejected`, (b)
 `reportCompleted`, `terminateCompleted`, (c) `terminateAborted`. Related: D-109, D-111.
 
+### D-167 (H) A settled key's answer lives on its registry row; the step log is recovery history with its own purge grant
+
+**Accepted (2026-09-28).** *(amends D-103, D-104)*
+
+**Decision**: (1) `owf_idempotency_registry` gains `settled_output` (`{formatVersion: 1, status,
+body}`: the success body, or the HTTP status and `error_code` of a settled failure), written in
+the settlement transaction by the envelope or by `settle-from-lookup`, immutable once `status =
+settled`, and CHECKed non-null exactly on a settled row. An absorbed replay answers from it.
+`outcome_ref` stays as a join link to the step-log row, with no FK and never dereferenced by a
+replay. (2) `owf_step_log.result` is the concluded attempt's diagnostic record for 90 days; nothing
+that outlives the window reads it. The sweep and compensation name an intent by the
+`transition_request_id` on its `owf_provisioning_intent` row. (3) `owf_step_log` has no UPDATE
+grant and a DELETE grant held by the `retention-purge` role alone. Its 90-day window runs from
+`received_at` whatever the instance's state. The purge roster's "never a row whose instance is not
+terminal" is scoped to the ≥ 400-day group.
+
+**Rationale**: a replay recovered its output through `outcome_ref` from a step-log row purged at
+90 days, while registry rows are kept as long as a replay can arrive and an instance can outlive
+90 days under fresh `P90D` ceilings. A replay after the purge would have found a settled key with
+no answer (re-review A-1). `01 §3.7` also listed `owf_step_log` among tables with no DELETE grant
+while the purge deletes it. **Precedent**: Lifecycle settles its idempotency record with an
+"immutable settled_response" and replays that snapshot rather than a rebuilt response (Lifecycle
+`01 §3.6` *Transition commit* `inst-settle-success`, `01-foundation.md:768`; `orders_idempotency`,
+`01-foundation.md:1834-1851`).
+
+**Propagated**: `design/01-foundation.md` §3.6 (the replay sequence and its description), §3.7
+(`owf_step_log`, `owf_idempotency_registry`, *Partitioning, retention and immutability*), §3.8
+(retention purge), §4.3; `DESIGN.md` §3.7 (inventory and retention register). Related: D-103,
+D-104.
+
+### D-168 (H) A settlement that cannot commit aborts whole and answers the canonical infrastructure Problem
+
+**Accepted (2026-09-28).** *(amends D-103)*
+
+**Decision**: a unit of work rolls back entirely, and no later step runs, when the audit append
+or its encoding fails, when the producer enqueue fails (schema validation, serialization, the 64
+KiB bound, the enqueue itself), when any other statement fails, or when the holder fence matches
+zero rows. It records nothing about the failure. A single-transaction operation leaves the
+registry as it found it (none, or `open`). A committed-lease operation leaves its record
+`in_flight` until the lease dies, and then §4.3 *Lease-expired* applies. The caller gets the
+canonical `ServiceUnavailable` (503) for a known temporary unavailability (a lost connection, a
+serialization or deadlock failure, a lock or statement timeout, the zero-rows fence). Anything
+else gets the canonical `Internal` (500): an audit encoding failure, an enqueue the SDK refuses,
+any other unexpected persistence error. Neither carries a Workflow reason, so the catalogue counts
+are unchanged. A deterministic failure is not settled as a permanent failure. No `catch` of the
+canonical definition matches 500, so the invocation faults and the liveness pass raises
+`invocation-dead`.
+
+**Why not 503 for everything.** `*transient` retries 429, 503, 504 and 409 (`10 §2.2`). A 503 for
+a deterministic failure would burn five attempts on the same failure before the same fault.
+**Why not settle it permanent.** The transaction that would record it is the one that failed, and
+a settlement without its declared event breaks `01 §4.7`.
+
+**Rationale**: only the zero-rows fence had a defined abort (re-review B-4); a failed append, a
+failed enqueue and a database error left the registry state and the answer unstated.
+**Precedent**: Lifecycle `01 §3.6` *Transition commit* `inst-if-audit-fails` ("roll back the
+entire transaction, including … idempotency changes, then RETURN the sanitized canonical
+infrastructure Problem") and `inst-enqueue-outbox` ("IF validation, serialization or enqueue
+fails, abort the transaction"), `01-foundation.md:765-767`; and its *Infrastructure-error
+termination* mapping of a temporary outage to 503 and other persistence failures to 500
+(`01-foundation.md:853-862`). The 500 fault follows the definition's own `unknownStage` and
+`orderTaskExhausted` (`10 §3.6`).
+
+**Propagated**: `design/01-foundation.md` §3.3 (the envelope guarantee, the outcome table), §3.6,
+§3.7 (*A settlement that cannot commit aborts whole*), §4.3, §4.17 *Append rule*; `DESIGN.md` §1.2
+(the audit NFR's verification). Related: D-64, D-103, D-114, D-132.
+
+### D-169 (H) `start-instance` reads the platform before its one transaction
+
+**Accepted (2026-09-28).** *(amends D-103, D-137)*
+
+**Decision**: `start-instance` is an exception to the record-only one-transaction shape, as
+`admit-trigger`, `apply-hold` and `apply-resume` are. Once its key resolves to a first call or a
+re-run, it reads the platform invocation record outside any transaction. A transient failure of
+that read answers the canonical `ServiceUnavailable` (503) and writes nothing: no instance, no
+binding, no step record, no audit entry, and the registry record as it was. Then one transaction
+re-resolves the key under the registry row lock and does the rest: it compares the version,
+inserts the instance and the binding, writes `instance-start` and settles. It commits no lease and
+writes no `step-start`.
+
+**Rationale**: the effect was described as "in one transaction" while it contained an outside
+read, and the one-transaction list named only three 5 s operations with outside reads (re-review
+B-5, A-6). Holding a transaction open across a platform call would pin a connection and the
+registry row lock on the platform's latency. **Precedent**: the control gateway reads the same
+invocation record "before any row is written" and then records in one transaction (`09 §3.6`
+`inst-cs-live`, `inst-cs-record`), and the PDP outage at `inst-owf-step-pdp` answers the same
+canonical 503 with nothing recorded. `admit-trigger`'s committed lease before its Lifecycle read is
+not followed: here it would add one more pre-admission audit append for a read that changes
+nothing.
+
+**Propagated**: `design/01-foundation.md` §3.3 (`start-instance`, *What each receipt records*),
+§3.6 (*`start-instance` binds the definition version*), §3.7 (*A record-only operation holds its
+lease*), §4.3. Related: D-76, D-137.
+
+### D-170 (M) One table says what each receipt records; `audit_kind` is the success kind
+
+**Accepted (2026-09-28).** *(amends D-103)*
+
+**Decision**: `01 §3.3` *What each receipt records* maps every receipt class to its step-log row
+and its audit entry, and `audit_kind` names the success settlement's kind only. The rules:
+- A call refused before registry resolution writes neither a row nor an entry: it has no registry
+  record for the NOT NULL `receipt_ordinal`, and its key may be invalid.
+- The start of an attempt writes `step-start` only where a lease commits on its own (the
+  committed-lease operations).
+- A retryable failure writes `retry`, and a deadline cut `timeout`.
+- A permanent failure writes the `audit_kind` carrying the reason, or `step-completion` where that
+  kind needs a `phase_to`.
+- An absorbed replay writes an `absorbed` row (a new `owf_step_log.outcome` member) and no entry.
+- A key conflict writes a `permanent-failure` row and no entry.
+- `still-processing` and `aged-out` write their row and no entry.
+- An aborted unit of work writes nothing.
+§4.6's completeness check counts settlements and committed leases, not receipts.
+
+**Rationale**: the envelope wrote kinds other than `audit_kind` (the replay sequence's retry entry),
+`timeout` was never assigned, and nothing said what the non-settling receipts write (re-review
+B-6). **Precedent**: `02 §3.6`'s duplicate absorption already writes a step-log row for an absorbed
+attempt and no audit entry, and Lifecycle's registry writes nothing on a refusal before
+resolution; no platform precedent fixes an audit kind per receipt class, so this is the smallest
+table consistent with the existing kinds and the phase-shape CHECKs.
+
+**Propagated**: `design/01-foundation.md` §3.3 (contract table, *What each receipt records*), §3.6
+(the replay sequence), §3.7 (`owf_step_log`), §4.6, §4.13; `design/02-triggers-and-start.md` §3.7;
+`DESIGN.md` §1.2. Related: D-103.
+
+### D-171 (H) An early evaluation settles success with `due: false`
+
+**Accepted (2026-09-28).** *(amends D-102's application in `01 §4.15`)*
+
+**Decision**: an operation that finds a stored deadline not yet reached by database time settles
+**success** with `due: false` and the next round. It does not act and never answers
+`retryable-failure`.
+
+**Rationale**: `01 §4.15` required `retryable-failure` for an early wake-up. That answer contradicts
+D-102's rule that a re-check answer recording nothing is a settled success returning the next
+round, would leave the key `open`, and would spend the task's retry budget on a clock difference.
+It is also not what the definition expects: `waitExpected` routes on `due` (re-review A-3).
+**Precedent**: D-102 rule 1 itself and `10 §3.6` (b)'s re-check loop.
+
+**Propagated**: `design/01-foundation.md` §4.15. Related: D-102.
+
 ### Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?
 
 **Owner**: Architecture.
@@ -5367,6 +5513,11 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-164 | H Ceiling wait's own request ref; a ceiling restores the interrupted stage's payload | `design/10-process-definition.md` §2.2, §3.6 (a), (c), (d), (f); D-121, D-147, D-161 |
 | D-165 | H Wave answers route deferred, failed, lapsed; only the folding entry clears a failed list | `design/10-process-definition.md` §3.6 (b), (c); D-54, D-116 |
 | D-166 | M Completion never answers terminal-event; terminate-instance names terminalOutcome | `design/06-saga-and-compensation.md` §3.3, §3.6, §4.9, `design/10-process-definition.md` §3.6 (a), (b), (c); D-109, D-111 |
+| D-167 | H Settled answer on the registry row; step-log purge grant | `design/01-foundation.md` §3.6, §3.7, §3.8, §4.3, `DESIGN.md` §3.7; D-103, D-104 |
+| D-168 | H A settlement that cannot commit aborts whole; 503 or 500 | `design/01-foundation.md` §3.3, §3.6, §3.7, §4.3, §4.17, `DESIGN.md` §1.2; D-64, D-103, D-114, D-132 |
+| D-169 | H `start-instance` reads the platform before its one transaction | `design/01-foundation.md` §3.3, §3.6, §3.7, §4.3; D-76, D-137 |
+| D-170 | M What each receipt records; `audit_kind` is the success kind | `design/01-foundation.md` §3.3, §3.6, §3.7, §4.6, §4.13, `design/02-triggers-and-start.md` §3.7, `DESIGN.md` §1.2; D-103 |
+| D-171 | H An early evaluation settles success with `due: false` | `design/01-foundation.md` §4.15; D-102 |
 
-Highest decision number used: **D-166**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
+Highest decision number used: **D-171**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
 register; there are no parts.
