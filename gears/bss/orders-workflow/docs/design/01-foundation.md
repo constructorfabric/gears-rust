@@ -383,8 +383,9 @@ to bound; a throttle-induced delay inside an operation never counts as a failed 
 Process artifacts owned by this engine — step log entries, idempotency records, definition
 bindings and the process audit log — carry commercial order context and are tenant-scoped by a
 **column, not by convention**: every engine table except the three configuration tables
-`owf_step_operation`, `owf_seller_policy` and `owf_configuration_revision` (the D-48 exemptions of
-§3.7) carries `resource_tenant_id` NOT NULL, and the tables backing an operator- or
+`owf_step_operation`, `owf_seller_policy` and `owf_configuration_revision` and the two audit
+checkpoint tables, keyed on `audit_tenant_id` (the D-48 exemptions of §3.7), carries
+`resource_tenant_id` NOT NULL, and the tables backing an operator- or
 seller-scoped surface carry `seller_tenant_id` as well (§3.7, §4.11). They are retained at audit
 grade by this gear independently of platform history, and must never carry payment-card data.
 Classification is aligned with the underlying order record owned by Orders Lifecycle. The same
@@ -1145,7 +1146,7 @@ Effect: the `started → parked` and `parked → started` transitions of §3.7 �
 `parkReason = lifetime-ceiling` only, `suspended → parked`, whose `unpark` is `parked → suspended`
 because the hold flag is still set — recorded as the phase projection. `unpark` restores the
 pre-park phase from the `suspended` flag and never clears the flag, which only `apply-resume`
-does (slice 08). Whether a verdict is obtainable, and when to try again, is the definition's park arm
+and, on an unwind, slice 08's suspension closure port do (slice 08, decision D-180). Whether a verdict is obtainable, and when to try again, is the definition's park arm
 (`10 §3.6` (a)); Orders records the park and its reason. **An unpark of a lifetime-ceiling park
 needs a recorded cause** (decision D-122, following `run-cancellation-fence`'s
 `inst-fence-cause`, D-106): `unpark` with a `ceiling:{round}` subject **MUST** refuse `not-found`
@@ -1414,7 +1415,7 @@ envelope, and slice 09's startup catalogue check appends to `owf_configuration_r
 through the foundation's `record_configuration` port (decision D-160).
 
 **Tenancy is a column on every process table here, not a convention.** Every table except the
-three configuration tables carries `resource_tenant_id uuid NOT NULL` — the
+three configuration tables and the two audit checkpoint tables carries `resource_tenant_id uuid NOT NULL` — the
 resource-recipient axis — and the tables backing an operator- or seller-scoped surface
 additionally carry `seller_tenant_id uuid NOT NULL`, the selling-party axis, with one exception:
 `owf_audit_entry.seller_tenant_id` is NULL on a pre-admission `admit-trigger` entry written
@@ -1422,7 +1423,12 @@ before the Lifecycle read that yields the seller (decision D-172). The three
 configuration tables are `owf_step_operation`, which has no tenant column, `owf_seller_policy`,
 which is keyed by `seller_tenant_id` alone (NULL on its platform row), and
 `owf_configuration_revision`, the append-only history of both and of the authorization catalogue,
-which has no tenant column (decision D-160). `payer_tenant_id` is
+which has no tenant column (decision D-160). `owf_audit_checkpoint` and
+`owf_audit_checkpoint_member` carry no `resource_tenant_id` either: they are keyed on the
+immutable audit namespace `audit_tenant_id`, a `resource_tenant_id` value captured at process
+start, because a checkpoint summarises many processes' chains within one namespace (§4.17). The
+slice exemption is `owf_dispatch_admission`, keyed by `seller_tenant_id` alone (`05 §3.7`);
+`DESIGN.md` §3.7 lists all six. `payer_tenant_id` is
 the billing axis and is carried only where a payment decision is recorded against the row; the
 engine tables record none. The axis names are the sibling gear's
 ([`orders-lifecycle` §3.7](../../../orders-lifecycle/docs/design/01-foundation.md)). Each table
@@ -1446,7 +1452,7 @@ has no enforcing predicate.
 | invocation_id | text, nullable | The platform invocation driving this instance (`DESIGN.md:865`); the handle the sweep's status read and the signal delivery of `10 §3.3` use, and the value every step route call is bound to (§3.3 step 3, *Invocation binding*); never re-bound (D-86); NULL only under `definition_source = code` |
 | next_liveness_at | timestamptz, NOT NULL | When the instance liveness pass of §3.8 next reads the invocation's platform status; set by `start-instance` to now + 15 min and advanced by each pass — 15 min while the invocation is live, 5 min while it is not, so the pass observes the SLA of the tasks no definition waits on (D-105, D-151) |
 | phase | enum | `started`, `suspended`, `parked`, `compensating`, `terminated` — a **recorded projection** written by step operations, see the transition table below |
-| suspended | boolean | Set by `apply-hold`, cleared by `apply-resume`; redundant with `phase = suspended` and kept as the hold predicate the dispatch operations read |
+| suspended | boolean | Set by `apply-hold`; cleared by `apply-resume`, and by slice 08's suspension closure port `close_suspension` in the unit of work of `run-cancellation-fence`'s step 1, because an unwind is not paused by a hold and no compensating leg may read a hold predicate (`06 §3.6` `inst-fence-step1`, `08 §3.7`, decision D-180); redundant with `phase = suspended` outside an unwind and a park, and kept as the hold predicate the dispatch operations read |
 | last_settled_step | text, nullable | The last settled **protected** operation and its subject; a read-side marker, not a resume pointer — the platform resumes from its own history |
 | row_version | bigint, NOT NULL, DEFAULT 0 | Optimistic-concurrency version, incremented on **every** write to this row; surfaced to operator callers as an ETag and required as `If-Match` on the mutating operations of `09 §3.3` |
 | audit_sequence | bigint, NOT NULL, DEFAULT 0 | The instance's committed audit-chain head: incremented under this row's lock in the same transaction as every `owf_audit_entry` append for this `correlation_id` (§4.17). The `start-instance` transaction that inserts this row initialises it to the chain's head + 1, read in that transaction, and writes the `instance-start` entry at that sequence (§3.7 `owf_audit_entry` *Chain allocation*, decision D-173) |

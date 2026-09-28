@@ -994,7 +994,7 @@ D-104) — purged row-wise through a `created_at` index; the `retention-purge` w
 | `no_active_verified_at` | timestamp, nullable | Step 5 completion — every record `succeeded` |
 | `reported_at` / `reported_outcome` | timestamp / enum, nullable | Set by `report-outcome` when the outcome is recorded |
 | `absorbed_trigger_count` | integer | Later triggers absorbed against this run (§4.3); starts at 0 |
-| `reauthorization_required_at` | timestamp, nullable | Set by `compensate-order` (`pre-compensation`) when slice 08's cancel-authority port answers `withdrawn` on a `cancel` run; while set, no further leg is submitted. Cleared when a newly authorized cancel is absorbed against the run and replaces `cancel_request_ref` (§4.3) (decision D-84: the fence carries the awaiting-re-authorization mark that `08 §4.3` assigns to slice 06) |
+| `reauthorization_required_at` | timestamp, nullable | Set by `compensate-order` (`pre-compensation`) when slice 08's cancel-authority port answers `withdrawn` on a `cancel` run; while set, no further leg is submitted. Cleared only by `run-cancellation-fence` when a newly authorized cancel is absorbed against the run and replaces `cancel_request_ref` (§4.3, `inst-fence-claim`) — the fence's one rewritable stamp (D-182) (decision D-84: the fence carries the awaiting-re-authorization mark that `08 §4.3` assigns to slice 06) |
 | `created_at` | timestamp | When the run was claimed |
 
 **PK**: `(order_id, order_version)`
@@ -1005,11 +1005,18 @@ the preceding one is set; `orders_failure_reason` and `failure_reason` NOT NULL 
 insert that claims a run wins, and a losing insert absorbs rather than retries.
 
 **Ownership**: `run-cancellation-fence` inserts the row and writes steps 1–2, the trigger and its
-promotion; `compensate-order` writes steps 3–5 and `reauthorization_required_at`;
-`report-outcome` writes `reported_at` and `reported_outcome`. No other writer.
+promotion, and, when it absorbs a newly authorized cancel against a `cancel` run whose
+`reauthorization_required_at` is set, replaces `cancel_request_ref` with the new request and
+clears the mark in that absorption's transaction (§4.3, decision D-182); `compensate-order`
+writes steps 3–5 and sets `reauthorization_required_at`; `report-outcome` writes `reported_at`
+and `reported_outcome`. No other writer.
 
 **Mutability**: deliberately mutable (step stamps, promotion, counter, report stamps); a stamp once
-set is never cleared.
+set is never cleared, with one stated exception: the re-authorization mark
+`reauthorization_required_at` is the fence's one rewritable stamp. `compensate-order` sets it on a
+`withdrawn` re-check, and only `run-cancellation-fence`'s absorption of a newly authorized cancel
+clears it, replacing `cancel_request_ref` in the same write; a later `withdrawn` re-check may set
+it again. `cancel_request_ref` changes only in that absorption, once set (D-182).
 
 **Additional info**: Tenant axes `resource_tenant_id` and `seller_tenant_id` (operator
 visibility). Read by `report-outcome` as the gate; a missing row is itself a refusal. **Retention

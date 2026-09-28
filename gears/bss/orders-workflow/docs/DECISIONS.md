@@ -1153,6 +1153,8 @@ composition, including this family set.
 
 **Amended by D-140 (2026-09-26).** There are now two stated exemptions, both configuration: `owf_step_operation`, and `owf_seller_policy`, which is keyed by `seller_tenant_id` alone, NULL on its platform row (`design/01-foundation.md` §3.7). **Amended by D-160 (2026-09-26)**: a third, `owf_configuration_revision`, the append-only history of the configuration loads, which has no tenant column.
 
+**Note (2026-09-28, re-review C-6)**: the register of exemptions was incomplete. Three non-configuration tables also carry no `resource_tenant_id`, each with another axis: `owf_dispatch_admission`, keyed by `seller_tenant_id` alone, NULL on its aggregate row (`design/05-provisioning-intents.md` §3.7), and `owf_audit_checkpoint` and `owf_audit_checkpoint_member`, keyed on the immutable audit namespace `audit_tenant_id` (`design/01-foundation.md` §3.7). `DESIGN.md` §3.7 now lists all six. No table changes.
+
 **Decision**: this gear adopts the sibling Orders Lifecycle set's three tenant axes by name —
 `resource_tenant_id` (resource recipient), `payer_tenant_id` (billing party), `seller_tenant_id`
 (selling party). Every one of the gear's `owf_*` tables carries **at least** `resource_tenant_id`,
@@ -2272,6 +2274,8 @@ the next pass as a duplicate.
 
 **Accepted.**
 
+**Amended by D-182 (2026-09-28)**: `reauthorization_required_at` is the fence's one rewritable stamp; `run-cancellation-fence`'s absorption of a newly authorized cancel clears it and replaces `cancel_request_ref`, and `06 §3.7` names that writer.
+
 **Decision**: the apply-time re-check of an authorized cancel runs once, in `authorize-cancel`,
 before `run-cancellation-fence`; `report-outcome` does not repeat it. `compensate-order`
 (`pre-compensation`) and `report-outcome` (`pre-submission`) call slice 08's cancel-authority port
@@ -2305,6 +2309,8 @@ task's re-drive resumes at `authorize-cancel` (D-114).
 ### D-85 (M) The cancel request is a slice-09 table; task requests are slice 07's
 
 **Accepted.**
+
+**Amended by D-181 (2026-09-28)**: the step-retry route no longer inserts `owf_task_resolution_request` itself; slice 09's gateway records it through slice 07's intake port `record_resolution_request`, in the gateway's unit of work, so slice 07 stays the table's sole writer.
 
 **Decision**: an accepted Seller Operator cancel is recorded in `owf_cancel_request` (slice 09),
 carrying the authorization snapshot, before its `cancel-requested` signal is delivered; the
@@ -3963,6 +3969,8 @@ overdue window.
 
 **Accepted (2026-09-26).** *(carries `ADR/0002` as amended)*
 
+**Amended by D-181 (2026-09-28)**: slice 09's step-retry route calls slice 07's resolution-request intake port; 09 is built after 07, so this is a forward edge and the back-edges are unchanged.
+
 **Decision**: the build order is **01, 10, 02, 03, 04, 05, 07, 08, 06, 09**. A slice depends on
 another when it calls that slice's operation or port in-process, or reads or writes its table; the
 definition's `call` to an operation is not an edge. Slice 06 is built after 07 and 08, because it
@@ -5323,6 +5331,73 @@ smallest rule that fits the contracts already written.
 `design/05-provisioning-intents.md` §3.3; `design/06-saga-and-compensation.md` §3.3;
 `design/07-manual-tasks.md` §3.3; `DESIGN.md` §2.1; `ADR/0008`. Related: D-58.
 
+### D-180 (H) The suspension closure port also clears `owf_process_instance.suspended`
+
+**Accepted (2026-09-28).**
+
+**Decision**: slice 08's suspension closure port `close_suspension(correlationId, closedReason)`,
+called by `run-cancellation-fence` in fence step 1, closes the `open` or `resume_ahead`
+suspension row and clears `owf_process_instance.suspended` in the fence's unit of work. On an
+instance with no such row it changes nothing. The flag's writers are now: `apply-hold` sets it;
+`apply-resume` and the closure port clear it. `unpark` still never clears it.
+
+**Rationale**: `06 §3.6` `inst-fence-step1` already said the port clears the flag. `08 §3.7`
+declared the port without saying so, and `01 §3.7` named only `apply-hold` and `apply-resume` as
+the flag's writers (re-review C-1). The user decided that the port clears it. An unwind is not
+paused by a hold (`06 §4.7` item 7). The unwind path has no `apply-resume`. A flag left set
+would give the compensating legs a hold predicate they must not see. **Precedent**: the fence's
+other step-1 closure port, slice 03's `close_open_approvals`, which settles the gate and park
+state that slice owns in the same unit of work (D-149). The port pattern is D-153's: the owning
+slice writes its own record through a port the caller invokes inside its transaction.
+
+**Propagated**: `design/01-foundation.md` §3.3 (`park`/`unpark`), §3.7
+(`owf_process_instance.suspended`); `design/08-hold-and-cancel.md` §3.7;
+`design/05-provisioning-intents.md` §3.4. `design/06-saga-and-compensation.md` §3.6 is
+unchanged. Related: D-82, D-149, D-153.
+
+### D-181 (M) The step-retry route records its task resolution request through slice 07's intake port
+
+**Accepted (2026-09-28).** *(amends D-85)*
+
+**Decision**: slice 07's Operator Task Queue exposes the in-process port
+`record_resolution_request(taskRef, action = retry, requestedBy, justification?,
+idempotencyKey)`. Slice 09's Control Operation Gateway calls it inside its own unit of work for
+`POST …/steps/{stepId}/retry`, naming the step's own task or the `invocation-dead` task. The port
+inserts the `requested` row with the task's `row_version` read under its lock and answers the
+`requestRef`. The one-pending-request index refuses a second request `version-mismatch`. The
+audit entry, the projection and the delivery stay the gateway's. The port and the queue's own
+routes are the only insert paths into `owf_task_resolution_request`. Slice 09 is built after 07,
+so the call is a forward edge and adds no back-edge.
+
+**Rationale**: `07 §3.7` said the table is "inserted only by" the Operator Task Queue, while
+`09 §3.2`, `09 §3.6` `inst-cs-record` and D-85 had slice 09's gateway insert it for a step retry.
+That breaks the sole-writer rule of `DESIGN.md` §3.7 (re-review C-3). **Precedent**: the
+design's port pattern, where the owner writes its table through a port called in the caller's
+unit of work (D-139's build-order edges; slice 05's re-arm port, D-153).
+
+**Propagated**: `design/07-manual-tasks.md` §3.2, §3.7; `design/09-read-and-authz.md` §3.1,
+§3.2, §3.3, §3.4, §3.6; `design/README.md`; `DESIGN.md` §3.7. Related: D-85, D-139, D-153.
+
+### D-182 (M) The re-authorization mark is the cancellation fence's one rewritable stamp
+
+**Accepted (2026-09-28).** *(amends D-84's application in `06 §3.7`)*
+
+**Decision**: `owf_cancellation_fence.reauthorization_required_at` is the stated exception to the
+fence's write-once stamps. `compensate-order` sets it on a `withdrawn` re-check at
+`pre-compensation`. Only `run-cancellation-fence`, absorbing a newly authorized cancel against
+the run (`06 §4.3`, applied in `inst-fence-claim`), clears it and replaces `cancel_request_ref`
+in the same write. A later `withdrawn` re-check may set it again. `cancel_request_ref` changes
+only in that absorption once set. `06 §3.7` names `run-cancellation-fence` as that writer.
+
+**Rationale**: `DESIGN.md` §3.7 and `06 §3.7` said a stamp once set never changes, and `06 §3.7`
+named only `compensate-order` as the mark's writer, while `06 §4.3` clears it on absorption
+(re-review C-4). **Precedent**: none in the platform or the BSS gears for a clearable mark on a
+fence row. The smallest rule states the one exception where the absorption table already
+applies it.
+
+**Propagated**: `design/06-saga-and-compensation.md` §3.7; `DESIGN.md` §3.7. Related: D-84,
+D-106.
+
 ### Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?
 
 **Owner**: Architecture.
@@ -5763,6 +5838,9 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-177 | H Own topic `…~cf.bss._.orders_workflow.v1` in the abstract type's `x-gts-traits`; no co-partitioning with Lifecycle | `design/01-foundation.md` §3.2, §3.4, §3.8, §4.7, `DESIGN.md` §4.4, `ADR/0008`, `UPSTREAM_REQS.md` §2.7; D-58 |
 | D-178 | H Producer rotation rejects every message queued under the old id | `design/01-foundation.md` §3.6, §3.7, §4.7, `DESIGN.md` §4.4, `ADR/0008`, `UPSTREAM_REQS.md` §2.7; D-58 |
 | D-179 | M Zero or more events of the declared type per settlement, at most one per subject | `design/01-foundation.md` §3.1, §3.3, §3.6, §4.7, `design/03`–`07` §3.3, `DESIGN.md` §2.1, `ADR/0008`; D-58 |
+| D-180 | H Suspension closure port clears `owf_process_instance.suspended` | `design/01-foundation.md` §3.3, §3.7, `design/08-hold-and-cancel.md` §3.7, `design/05-provisioning-intents.md` §3.4; D-82, D-149, D-153 |
+| D-181 | M Step-retry route records through slice 07's intake port | `design/07-manual-tasks.md` §3.2, §3.7, `design/09-read-and-authz.md` §3.1–§3.4, §3.6, `design/README.md`, `DESIGN.md` §3.7; D-85, D-139, D-153 |
+| D-182 | M Re-authorization mark: the fence's one rewritable stamp | `design/06-saga-and-compensation.md` §3.7, `DESIGN.md` §3.7; D-84, D-106 |
 
-Highest decision number used: **D-179**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
+Highest decision number used: **D-182**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
 register; there are no parts.

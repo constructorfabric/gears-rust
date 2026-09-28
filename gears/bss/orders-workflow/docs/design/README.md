@@ -147,7 +147,8 @@ slice 07's manual-task creator in the same unit of work. `06` comes after both: 
 creation port and Incident Recorder, and slice 08's suspension-closure and cancel-authority ports
 (`06 §5`). The cancel path reaching `06`'s fence is a
 path of the definition, not an edge. `09` depends on `01` through `08` and `10` because it
-authorizes every route and every step operation the others declare; nothing here is separable from
+authorizes every route and every step operation the others declare, and its step-retry route
+calls slice 07's resolution-request intake port (`07 §3.2`, D-181); nothing here is separable from
 the whole set.
 
 **The cycles, stated.** Eleven pairs depend on each other, and the back-edges above are where each is

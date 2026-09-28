@@ -61,7 +61,7 @@ Requirements that significantly influence architecture decisions.
 | `cpt-cf-bss-orders-workflow-fr-owf-approval-request` | `obtain-verdict` queries the approval-requirement verdict (or the §9.2 stand-in) keyed on `orderId` + `orderVersion` and caches it against that version; `reflect-verdict` reflects it into Lifecycle; `open-gates` opens `OrderApprovalRequest` gates, never computing the verdict itself. |
 | `cpt-cf-bss-orders-workflow-fr-owf-approval-idempotency` | Every `OrderApprovalRequest` is created under a composed idempotency key (`orderId` + `orderVersion` + gate id) enforced by a uniqueness constraint in the approval-request store, so a re-invoked `open-gates` resolves to the one already-durable request. |
 | `cpt-cf-bss-orders-workflow-fr-owf-approval-escalation` | The escalation window is Orders' stored deadline, re-checked by the gate loop's fixed `PT30S` tick — a plugin durable timer — through `escalate-gate` `mode: fire`, then probed in `probe` mode (`design/10` §3.6, D-123); `escalate-gate` records the escalation and issues the command, Generic Approval only supplying configuration and receiving it. The remaining window is Orders' record (`owf_approval_gate.window_remaining_ms`) and never leaves it: `apply-hold` pauses it and `apply-resume` re-bases the deadline through slice 03's gate-window port, and neither returns a remainder — `apply-resume` answers the first `due`, after which the tick resumes (D-70, D-80 as amended); a gate-open outage is the probe's `outage` answer. |
-| `cpt-cf-bss-orders-workflow-fr-owf-approval-decision` | The decision event is a `listen` arm of the gate loop; `record-decision` reads the decision by its reference, applies the guards and reflects `approved`/`rejected` into Lifecycle idempotently, and the definition branches on the returned enum to the fulfillment stage or to the unwind path. |
+| `cpt-cf-bss-orders-workflow-fr-owf-approval-decision` | The decision event is a `listen` arm of the gate loop; `record-decision` reads the decision by its reference and applies the guards; the definition branches on its returned enum and, once the gates are decided, calls `reflect-verdict` with `stage = gate-outcome`, which reflects `approved`/`rejected` into Lifecycle idempotently, then enters the fulfillment stage or terminates on the rejected path. |
 | `cpt-cf-bss-orders-workflow-fr-owf-approver-inbox` | A read-side projection over the approval-request store, scoped by the gate's `assigned_principal`, backs the Approver Inbox UI surface; the decision route records the decision through the same idempotent `record-decision` path as the system callback. |
 | `cpt-cf-bss-orders-workflow-fr-owf-fulfillment-plan` | `evaluate-payment-auth-eligibility` then `construct-and-freeze-plan` resolve per-line Catalog dependencies, validate the graph acyclic and complete, and freeze one `FulfillmentTask` per line under `orderId` + `orderVersion` before any intent is dispatched; `re-check-pre-activation` is authoritative before wave 2 and aborts via draft-void without entering the remediation path. |
 | `cpt-cf-bss-orders-workflow-fr-owf-line-progress` | Each `FulfillmentTask` is a small state machine (`pending → draft_created → activated/failed`, plus the `draft_created → pending` rebuild edge) whose terminal transitions alone emit `OrderFulfillmentStepCompleted`; `report-outcome` defers the Lifecycle `completed` acknowledgement until every task is `activated`, and the definition routes a `failed` task through the configured remediate/fail-fast policy. |
@@ -829,14 +829,20 @@ sequenceDiagram
     GenericApproval -->> Definition: decision event (reference only)
     Definition ->> Steps: record-decision
     Steps ->> GenericApproval: read decision by reference
+    Steps -->> Definition: gateState approved
+    Definition ->> Steps: reflect-verdict (gate-outcome)
     Steps ->> Lifecycle: reflect pending_approval -> approved
     Definition ->> Definition: switch to fulfillment stage
 ```
 
 **Description**: The definition owns the order — verdict, gates, the escalation `wait`, the
 decision `listen` — and every effect is an Orders operation; the escalation window is a platform
-timer and its remainder is Orders' record. The approval stage hands off to fulfillment by
-branching on `record-decision`'s returned enum, never by an Orders call to another slice.
+timer and its remainder is Orders' record. `record-decision` records the decision and changes no
+Lifecycle state; the definition branches on its returned enum, calls `reflect-verdict` with
+`stage = gate-outcome` to reflect the outcome into Lifecycle (`pending_approval → approved` here,
+`→ rejected` on a rejection), and on `approved` enters the fulfillment stage — never by an Orders
+call to another slice (`design/03-approval-execution.md` §3.2, `design/10-process-definition.md`
+§4.1 *The fence*: `record-decision` **<** `reflect-verdict`).
 
 #### Multi-Line Fulfillment, Two-Wave Barrier
 
@@ -987,10 +993,14 @@ the twenty-eight are deliberately mutable (one of them, `owf_dead_letter_triage`
 inventory (`design/01-foundation.md` §3.7 *Platform-managed producer persistence*), and neither is
 anything the platform engine stores — definition versions live in the platform function registry.
 
-Every table except the three configuration tables carries `resource_tenant_id` NOT NULL. Those
-three are the stated exemptions to D-48: the load-only `owf_step_operation` (D-69),
+Every table except the six named here carries `resource_tenant_id` NOT NULL. The six are the
+stated exemptions to D-48. Three are configuration: the load-only `owf_step_operation` (D-69),
 `owf_seller_policy`, which is keyed by `seller_tenant_id` alone (D-140), and the append-only
-`owf_configuration_revision`, their history (D-160); tables backing an operator- or seller-scoped surface
+`owf_configuration_revision`, their history (D-160). Three carry another axis instead:
+`owf_dispatch_admission`, per-seller admission state keyed by `seller_tenant_id` alone, NULL on
+its gear-level aggregate row (`05 §3.7`), and `owf_audit_checkpoint` and
+`owf_audit_checkpoint_member`, keyed on the immutable audit namespace `audit_tenant_id` — a
+`resource_tenant_id` value captured at process start (`01 §3.7`). Tables backing an operator- or seller-scoped surface
 additionally carry `seller_tenant_id`, and per-tenant fairness and back-pressure key on
 `seller_tenant_id`. The axis choice is stated per table in the owning document.
 
@@ -1015,9 +1025,9 @@ additionally carry `seller_tenant_id`, and per-tenant fairness and back-pressure
 | `owf_provisioning_intent` | `05 §3.7` | provisioning-intents — intent dispatcher | **mutable** — `status`, acceptance columns, `subscription_id` and sweep columns settle in place; the composed key and `intent_kind` never change |
 | `owf_dispatch_admission` | `05 §3.7` | provisioning-intents — dispatch admission control | **mutable** — per-seller admission state serialized by row locks; no history |
 | `owf_compensation_record` | `06 §3.7` | saga-and-compensation — compensation-execution component | **mutable** — resolution, outcome, counters and `attempt_id` settle in place; no DELETE grant but the retention purge's |
-| `owf_cancellation_fence` | `06 §3.7` | saga-and-compensation — cancellation-fencing component | **mutable** — fencing-step stamps, promotion, pass counter, report stamps, `reauthorization_required_at`; a stamp once set never changes |
+| `owf_cancellation_fence` | `06 §3.7` | saga-and-compensation — cancellation-fencing component | **mutable** — fencing-step stamps, promotion, pass counter, report stamps, `reauthorization_required_at`; a stamp once set never changes, except the re-authorization mark: `reauthorization_required_at`, set by `compensate-order`, is cleared, and `cancel_request_ref` replaced, only when `run-cancellation-fence` absorbs a newly authorized cancel against the run (`06 §4.3`, D-182) |
 | `owf_manual_task` | `07 §3.7` | manual-tasks — manual-task creator | **mutable** — assignment and resolution advance; `sla_deadline` is reset on reopen; carries `row_version` |
-| `owf_task_resolution_request` | `07 §3.7` | manual-tasks — control request of `retry` / `override` / `cancel` | **mutable** in the settlement columns only |
+| `owf_task_resolution_request` | `07 §3.7` | manual-tasks — control request of `retry` / `override` / `cancel`, inserted by the operator task queue's routes and by its intake port `record_resolution_request`, which slice 09's step-retry route calls in its own unit of work (D-181) | **mutable** in the settlement columns only |
 | `owf_incident` | `07 §3.7` | manual-tasks — incident recorder | append-only — non-actionable record, read-only in the operator queue |
 | `owf_overdue_escalation` | `07 §3.7` | manual-tasks — overdue-escalation monitor | **mutable** — only to settle `outcome` |
 | `owf_dead_letter_triage` | `07 §3.7` | manual-tasks — operator task queue | **pending** — created only if the platform exposes its trigger-path dead letters to operators (`UPSTREAM_REQS.md` §2.9); **mutable** if created, retired if the ask is declined |

@@ -577,6 +577,20 @@ instance's invocation. The answer is `202 Accepted` with the `requestRef`; the r
 (`requested` → `applied` · `refused`) is visible on the task read. `assign` and `escalate` are
 applied in-process (Escalation Router) and answer `200`.
 
+*Resolution-request intake port.* The same insert is exposed as the in-process port
+`record_resolution_request(taskRef, action = retry, requestedBy, justification?, idempotencyKey)`,
+which slice 09's Control Operation Gateway calls inside **its** unit of work for the step-retry
+route `POST …/steps/{stepId}/retry` (`09 §3.6` *Control operation to signal*, `inst-cs-record`),
+naming the step's own task or the instance's `invocation-dead` task. It inserts one `requested`
+row with `action = retry` and `task_row_version` = the named task's `row_version`, read under
+that task's row lock in the caller's transaction (the route's `If-Match` is the instance's
+`row_version`, not the task's). It answers the `requestRef`. A second pending request for the
+task violates the one-pending-request index and is refused `version-mismatch`, exactly as on this
+component's own routes (§4.6 `inst-r7-one-request`). The caller has already authorized the route, recomposed
+its key and checked its `+ver` predicate; the port writes no audit entry, projection or signal,
+which stay the caller's. This port and this component's own routes are the only insert paths
+into `owf_task_resolution_request` (decision D-181).
+
 *Authorization is checked per row, on reads and mutations alike.* Every list result is filtered on
 `seller_tenant_id` against the caller's seller scope. Every mutating endpoint carries the caller's
 PDP-compiled `AccessScope` as a predicate **inside its mutating statement** (`09 §4.4`): `UPDATE …
@@ -1113,7 +1127,10 @@ check. **Retention ≥ 400 days.** Growth table, **not partitioned** (`01 §3.7`
 `refusal_reason`, `settled_at`; UNIQUE (`idempotency_key`); UNIQUE (`task_id`) WHERE `state =
 'requested'` — one pending request per task, so two operators cannot queue competing resolutions.
 
-**Ownership**: inserted only by `cpt-cf-bss-orders-workflow-component-operator-task-queue`;
+**Ownership**: inserted only by `cpt-cf-bss-orders-workflow-component-operator-task-queue`, through
+its own routes or through its resolution-request intake port `record_resolution_request` (§3.2),
+the only other insert path, which slice 09's Control Operation Gateway calls for the step-retry
+route inside its own unit of work (decision D-181);
 `state`, `refusal_reason` and `settled_at` written only by `resolve-manual-task`,
 `verify-override` and the closure port. **Mutability**: mutable in the settlement columns only.
 

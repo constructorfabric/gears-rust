@@ -721,7 +721,7 @@ operation's round. Every step key is recomposed server-side from the body
 | orders-workflow (slice 04, Fulfillment Plan) | `cpt-cf-bss-orders-workflow-component-progress-tracker` — transition rule, in-process | The only writer of `owf_fulfillment_task.state`; this slice applies it on every outcome |
 | orders-workflow (slice 04, Fulfillment Plan) | `re-check-pre-activation` settlement, read | `report-spawn-signal`'s precondition |
 | orders-workflow (slice 06, Saga) | `compensate-order` → Intent Dispatcher, in-process | Compensating intents are built and submitted here, recorded in `owf_provisioning_intent` |
-| orders-workflow (slice 08, Hold/Cancel) | `owf_process_instance.suspended` (the hold predicate `apply-hold` sets and `apply-resume` clears, `01 §3.7`), read; deferred-outcome columns on `owf_provisioning_intent`, applied by `apply-resume` | A suspended instance defers every dispatch (`deferReason = held`); a failure observed while suspended is recorded as deferred, not applied ([`08 §2.2`](./08-hold-and-cancel.md#22-constraints)) |
+| orders-workflow (slice 08, Hold/Cancel) | `owf_process_instance.suspended` (the hold predicate `apply-hold` sets and `apply-resume` or, on an unwind, slice 08's suspension closure port clears, `01 §3.7`), read; deferred-outcome columns on `owf_provisioning_intent`, applied by `apply-resume` | A suspended instance defers every dispatch (`deferReason = held`); a failure observed while suspended is recorded as deferred, not applied ([`08 §2.2`](./08-hold-and-cancel.md#22-constraints)) |
 | orders-workflow (slice 10, Process Definition) | Fragment (b) of `10 §3.6` | Sequences the operations; holds only their references |
 
 **Dependency Rules** (per project conventions):

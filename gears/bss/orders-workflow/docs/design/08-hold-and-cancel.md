@@ -843,15 +843,21 @@ CHECK `(closed_reason IN ('resumed', 'resumed-by-read')) = (resumed_at IS NOT NU
 `resume_ahead`), `apply-resume` (close with `resumed` or `resumed-by-read`, insert of `resume_ahead`, attaching a late event to a `resumed-by-read` row) and the
 **suspension closure port** `close_suspension(correlationId, closedReason)` that
 `run-cancellation-fence` (slice 06) calls in fencing step 1 on an unwind entered while a row is
-`open` or `resume_ahead`. **Mutability**: deliberately mutable (state and close columns).
+`open` or `resume_ahead`. The port closes that row with `closedReason` and, in the same unit of
+work, clears `owf_process_instance.suspended`; on an instance with no such row it changes
+nothing. It clears the flag because an unwind is not paused by a hold (`06 §4.7` item 7): no
+compensating leg may see a hold predicate, and no `apply-resume` follows on the unwind path
+(decision D-180). **Mutability**: deliberately mutable (state and close columns).
 **Tenant axes**: `resource_tenant_id` (always) and `seller_tenant_id`. **Retention** ≥ 400 days —
 a suspension is audit evidence of who froze an order and for how long. Not partitioned
 (`01 §3.7`, D-104), so the one-open-suspension partial index and the event-id uniqueness hold across the
 whole table; purged row-wise through a `created_at` index. The event-id uniqueness constraints deduplicate redelivery below the idempotency
 key; they are deliberately **not** the at-most-one rule, which the partial index alone carries.
 The hold predicate the dispatch operations read is `owf_process_instance.suspended`
-([`01 §3.7`](./01-foundation.md#table-owf_process_instance)), written by the same two operations
-in the same transaction; this table is the record, the column is the predicate.
+([`01 §3.7`](./01-foundation.md#table-owf_process_instance)), set by `apply-hold` and cleared by
+`apply-resume`, each in the transaction that writes this table, and cleared by the suspension
+closure port in the fence's unit of work that closes the row; this table is the record, the
+column is the predicate.
 
 **Example**:
 
