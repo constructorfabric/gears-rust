@@ -139,7 +139,8 @@ consumption-operations feature)
 3. [ ] - `p1` - Deserialize the request and run the operation's documented public target-shape checks; reject malformed
    shape with canonical `InvalidArgument` before any PDP call - `inst-adm-shape`
 4. [ ] - `p1` - API: call `PolicyEnforcer::access_scope(...)` with the requested operation and explicit target — the in-process PEP evaluates against `authz-resolver`
-   and compiles the response itself, returning `AccessScope` or `EnforcerError`; QE never sees the raw decision and
+   and compiles the response itself within the configured `pdp_deadline_ms` (default 250 ms; an overrun is a PDP-unreachable
+   `EnforcerError`), returning `AccessScope` or `EnforcerError`; QE never sees the raw decision and
    keeps no PDP decision cache of its own - `inst-adm-pdp`
 5. [ ] - `p1` - **IF** the call returns `EnforcerError` (denied, compile-failed, or PDP unreachable) - `inst-adm-deny-if`
    1. [ ] - `p1` - **RETURN** the canonical error (`PermissionDenied` / `ServiceUnavailable`); no handler runs - `inst-adm-deny`

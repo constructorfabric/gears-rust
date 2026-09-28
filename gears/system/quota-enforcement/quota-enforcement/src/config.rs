@@ -20,6 +20,9 @@ pub struct QuotaEnforcementConfig {
     /// Budget, in seconds, for a sweep body to stop after leadership loss or
     /// shutdown. A body that overruns the budget is aborted.
     pub sweeper_stop_timeout_secs: u64,
+    /// Budget, in milliseconds, for one PDP evaluation on the admission path.
+    /// An evaluation that overruns it fails closed as `ServiceUnavailable`.
+    pub pdp_deadline_ms: u64,
     /// Operational metrics.
     pub metrics: MetricsConfig,
     /// The owner projections configured for evaluation.
@@ -36,6 +39,7 @@ impl Default for QuotaEnforcementConfig {
             storage_vendor: "constructorfabric".to_owned(),
             election: ElectionTimingConfig::default(),
             sweeper_stop_timeout_secs: 10,
+            pdp_deadline_ms: 250,
             metrics: MetricsConfig::default(),
             catalog: CatalogSection::default(),
             quotas: QuotasSection::default(),
@@ -61,6 +65,9 @@ impl QuotaEnforcementConfig {
         if self.sweeper_stop_timeout_secs == 0 {
             anyhow::bail!("[quota-enforcement].sweeper_stop_timeout_secs must be at least 1");
         }
+        if self.pdp_deadline_ms == 0 {
+            anyhow::bail!("[quota-enforcement].pdp_deadline_ms must be at least 1");
+        }
         self.metrics.validate()?;
         self.catalog.validate()?;
         self.quotas.validate()?;
@@ -71,6 +78,12 @@ impl QuotaEnforcementConfig {
     #[must_use]
     pub const fn sweeper_stop_timeout(&self) -> Duration {
         Duration::from_secs(self.sweeper_stop_timeout_secs)
+    }
+
+    /// Budget for one PDP evaluation on the admission path.
+    #[must_use]
+    pub const fn pdp_deadline(&self) -> Duration {
+        Duration::from_millis(self.pdp_deadline_ms)
     }
 }
 

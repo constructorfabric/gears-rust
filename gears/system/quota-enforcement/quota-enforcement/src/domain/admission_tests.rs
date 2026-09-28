@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use authz_resolver_sdk::PolicyEnforcer;
 use quota_enforcement_sdk::TenantId;
@@ -12,7 +13,7 @@ use crate::domain::error::DomainError;
 use crate::domain::pep::{actions, resources};
 use crate::domain::ports::metrics::DenialReason;
 use crate::test_support::{
-    DenyAllPdp, FailingPdp, PermitSubtreePdp, PermitTenantsPdp, PermitUnconstrainedPdp,
+    DenyAllPdp, FailingPdp, HangingPdp, PermitSubtreePdp, PermitTenantsPdp, PermitUnconstrainedPdp,
     RecordingMetrics, ctx, tenant,
 };
 
@@ -136,6 +137,25 @@ async fn an_unreachable_pdp_is_unavailable_never_a_permit() {
         )
         .await
         .expect_err("fail closed");
+    assert!(matches!(err, DomainError::PdpUnavailable(_)), "{err:?}");
+    assert_eq!(metrics.denials(), vec![DenialReason::PdpUnavailable]);
+}
+
+#[tokio::test]
+async fn a_pdp_that_overruns_the_deadline_is_unavailable_never_a_permit() {
+    let metrics = Arc::new(RecordingMetrics::default());
+    let enforcer =
+        PolicyEnforcer::new(Arc::new(HangingPdp)).with_deadline(Duration::from_millis(20));
+    let admission = Admission::new(enforcer, metrics.clone());
+    let err = admission
+        .admit(
+            &ctx(),
+            &resources::QUOTA,
+            actions::GET,
+            AdmissionTarget::tenant(tenant()),
+        )
+        .await
+        .expect_err("fail closed on the deadline");
     assert!(matches!(err, DomainError::PdpUnavailable(_)), "{err:?}");
     assert_eq!(metrics.denials(), vec![DenialReason::PdpUnavailable]);
 }

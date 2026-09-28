@@ -43,6 +43,7 @@ gears:
         ttl_secs: 30                        # leadership claim TTL (cluster default)
         max_missed_renewals: 2              # renewal failures before loss (cluster default)
       sweeper_stop_timeout_secs: 10         # budget for a sweep body to stop
+      pdp_deadline_ms: 250                  # budget for one PDP evaluation; overrun is 503
       metrics:
         prefix: ""                          # empty: catalogue names verbatim
 

@@ -218,7 +218,8 @@ impl Gear for QuotaEnforcementGear {
             .get::<dyn AuthZResolverApi>()
             .with_context(|| format!("{} requires an authz-resolver client", Self::MODULE_NAME))?;
         let pdp_probe = Arc::new(PdpReachability::new(authz.clone()));
-        let enforcer = PolicyEnforcer::new(authz);
+        // The SDK default is a hang guard, far above the admission latency budget.
+        let enforcer = PolicyEnforcer::new(authz).with_deadline(cfg.pdp_deadline());
 
         // The projection contract catalogue is built from the types registry at
         // bootstrap; without the client there is no catalogue to publish. The
