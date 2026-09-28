@@ -209,6 +209,8 @@
   - [D-188 (H) A Lifecycle re-run past Lifecycle's 24-hour key window reads the order back and settles `already-applied`](#d-188-h-a-lifecycle-re-run-past-lifecycles-24-hour-key-window-reads-the-order-back-and-settles-already-applied)
   - [D-189 (M) `open-gates` looks a gate's request up by its key before it submits, and adopts one it finds](#d-189-m-open-gates-looks-a-gates-request-up-by-its-key-before-it-submits-and-adopts-one-it-finds)
   - [D-190 (M) `reflect-verdict` answers a Lifecycle refusal as the settled answer `refused`, and the definition catches no 400 of it](#d-190-m-reflect-verdict-answers-a-lifecycle-refusal-as-the-settled-answer-refused-and-the-definition-catches-no-400-of-it)
+  - [D-191 (M) The audit read is access-logged like Lifecycle's: one `owf_read_access_log` row per request, served or refused](#d-191-m-the-audit-read-is-access-logged-like-lifecycles-one-owf_read_access_log-row-per-request-served-or-refused)
+  - [D-192 (M) The operator re-drive of a dead invocation is an explicit readiness item that gates the action, not readiness](#d-192-m-the-operator-re-drive-of-a-dead-invocation-is-an-explicit-readiness-item-that-gates-the-action-not-readiness)
 - [Open Questions](#open-questions)
   - [Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?](#q-01-which-durable-execution-substrate-backs-the-process--the-oss-workflow-engine-or-a-bss-local-mechanism)
   - [Q-02: The Generic Approval escalation threshold — the one PRD-deferred numeric value this design deliberately leaves unset](#q-02-the-generic-approval-escalation-threshold--the-one-prd-deferred-numeric-value-this-design-deliberately-leaves-unset)
@@ -1182,6 +1184,8 @@ composition, including this family set.
 
 **Note (2026-09-28, re-review C-6)**: the register of exemptions was incomplete. Three non-configuration tables also carry no `resource_tenant_id`, each with another axis: `owf_dispatch_admission`, keyed by `seller_tenant_id` alone, NULL on its aggregate row (`design/05-provisioning-intents.md` §3.7), and `owf_audit_checkpoint` and `owf_audit_checkpoint_member`, keyed on the immutable audit namespace `audit_tenant_id` (`design/01-foundation.md` §3.7). `DESIGN.md` §3.7 now lists all six. No table changes.
 
+**Amended by D-191 (2026-09-28)**: a seventh exemption, `owf_read_access_log`, the audit read's access log, keyed on the caller's `subject_tenant_id` NOT NULL, with the order's `resource_tenant_id` and `seller_tenant_id` nullable because a refused read of an order with no instance has none (`design/09-read-and-authz.md` §3.7).
+
 **Decision**: this gear adopts the sibling Orders Lifecycle set's three tenant axes by name —
 `resource_tenant_id` (resource recipient), `payer_tenant_id` (billing party), `seller_tenant_id`
 (selling party). Every one of the gear's `owf_*` tables carries **at least** `resource_tenant_id`,
@@ -1706,7 +1710,7 @@ gear to a versioned platform workflow definition (`ADR/0011`, `ADR/0012`, `ADR/0
 each slice was restructured into step operations and a definition fragment. D-65…D-72 carry the
 three ADRs and their cross-cutting consequences; D-73…D-101 are the decisions the slice
 restructurings recorded, D-102…D-163 the decisions taken on the second review of
-2026-09-26, and D-164…D-190 those taken on the re-review of 2026-09-28. Each names the entries it amends; the amended entries carry a dated
+2026-09-26, and D-164…D-192 those taken on the re-review of 2026-09-28. Each names the entries it amends; the amended entries carry a dated
 **Amended by** note. D-65…D-101 were taken on 2026-09-24.
 
 ### D-65 (H) The order process flow is a versioned platform workflow definition executed by serverless-runtime
@@ -2385,6 +2389,8 @@ the recovery, and it must also resume at the faulted task. The fallback is a Sel
 cancel, carried out in-process by the sweep. Re-acquiring the customer takes a new order, and the
 PRD amendment for that loss is registered.
 
+**Amended by D-192 (2026-09-28)**: the confirmation this entry waits for is now an explicit item of the readiness gate of `design/01-foundation.md` §3.8 that gates the `invocation-dead` task's `retry`, not readiness: the gear reports ready without it, and until the platform confirms `retry` keeps `invocation_id`, resumes at the faulted task and is valid from `dead_lettered`, the unwind is the only remedy.
+
 ### D-87 (M) One outage threshold governs the park clock, and the gate-open outage pause is a probe arm
 
 **Accepted.** *(amends D-11, D-46)*
@@ -2783,6 +2789,8 @@ said every window had a worker, while the roster named six stores.
 
 **Amended by D-185 (2026-09-28)**: "aged-out is evaluated from it" holds for a key whose operation submits downstream; any other key is evaluated for aging only once its instance is terminal, so a live instance's record-only or read-only key is never answered `aged-out`.
 
+**Amended by D-191 (2026-09-28)**: the roster gains `owf_read_access_log`, purged at 90 days from `accessed_at` whatever the instance's state (`design/09-read-and-authz.md` §3.7); the register now covers twenty-nine tables.
+
 ### D-105 (H) A dead invocation is raised as one order-scope task; the platform re-drive is the recovery, an Orders-driven cancel the fallback
 
 **Accepted (2026-09-26).** *(amends D-71 and D-86)*
@@ -2860,6 +2868,8 @@ unless D-86's condition holds, and a cancel is that task's `cancel`, recorded fo
 unwind; the request row names the task it resolves.
 
 **Amended by D-185 (2026-09-28)**: the `invocation-dead` task's `retry` also mints, in the transaction that records it, the next `attempt` of each downstream-submitting family whose key resolves `aged-out`, and the dead-instance unwind does the same after a recorded cancel, so the re-driven or in-process call runs under its successor key instead of faulting again.
+
+**Amended by D-192 (2026-09-28)**: "`retry` is offered only once the platform confirms" is stated as an explicit item of the readiness gate (`design/01-foundation.md` §3.8) that gates the action, not readiness; `design/07-manual-tasks.md` §4.4 names the unwind as the only remedy until then, and aged-out downstream keys (D-185) and deterministic 500s (D-168) as faults that land there.
 
 ### D-106 (H) Every step call is bound to the instance's invocation, and the fence needs a recorded cause
 
@@ -5677,6 +5687,10 @@ Reader, endpoint mapping), §3.3, §4.1, §4.3; `design/01-foundation.md` §3.7 
 `design/02-triggers-and-start.md` §1.2, §3.6, §3.7; `DESIGN.md` §1.2, §3.2, §3.3, §3.5;
 `design/README.md`; `ADR/0010`; `UPSTREAM_REQS.md` §2.8; D-172.
 
+**Amended by D-191 (2026-09-28)**: "This gear keeps no read access log … adding the store is outside this fix" no longer holds: the audit read appends one `owf_read_access_log` row per request, served or refused, following Lifecycle's served-and-refused pattern (`design/09-read-and-authz.md` §3.3, §3.7).
+
+**Clarified (2026-09-28)**: `design/07-manual-tasks.md` §4.5 said a failing attempt's `owf_step_log.result` "is readable only through the audit-logged support read of `09`", and `09` has no such read. It now says that no route exposes `result`, that the failing attempt's catalogue `reason` reaches the Seller Operator on this entry's audit read, whose items carry `reason` and `justification` and no `owf_step_log.result`, and that the raw `result` is readable only through database access under a role outside the gear's routes, since `design/01-foundation.md` §3.7 names no SELECT role on the step log. No behaviour changes.
+
 ### D-187 (L) A contended worker lock skips the pass; only a lock or database error is a coordination failure
 
 **Accepted (2026-09-28).** *(amends D-62)*
@@ -5822,6 +5836,92 @@ that "no `catch` has to tell a version conflict from a still-processing answer b
 §4.4, §4.5 item 3; `design/10-process-definition.md` §3.6 (a) `reflectVerdict`, `afterReflect`,
 `reflectionTask`, the approval-stage prose, §4.6; `design/01-foundation.md` §4.3 (*Aged-out key*),
 §4.9; `design/07-manual-tasks.md` §3.3; `ADR/0012` (Rule 6); D-112, D-185.
+
+### D-191 (M) The audit read is access-logged like Lifecycle's: one `owf_read_access_log` row per request, served or refused
+
+**Accepted (2026-09-28).** *(amends D-48, D-104, D-186)*
+
+**Decision**: (1) Slice 09 owns a new table, `owf_read_access_log` (`09 §3.7`). The Audit Trail
+Reader is its sole writer and no route reads it. (2) Every request to
+`GET …/workflows/{orderId}/audit` that reaches an access decision appends one row, one per page
+and never one per item. The row carries `operation` = `audit-read`, the requested `orderId`
+(`requested_order_ref`, no FK), the trusted `actor` and `actor_class`, the caller's
+`subject_tenant_id`, the order's resource and seller axes when the prefetch resolved them, the
+supplied delegation proof reference if any, `outcome` (`served` or `refused`), the
+`refusal_reason` and `accessed_at`. It stores no page contents. (3) A served page commits its row
+before the page is returned. If the append fails, the read answers the canonical
+`ServiceUnavailable` (503) with no page. A refusal (`not-found`, `not-authorized`) is returned
+unchanged when its append fails, and the failure is raised on the audit-integrity alert of
+`DESIGN.md` §4.4. A cursor refused at boundary validation and a PDP outage append nothing. (4)
+The table is append-only. No role holds an UPDATE grant, and the `retention-purge` role alone holds
+DELETE. It is not trigger-protected or chained. Its retention is 90 days from `accessed_at`,
+purged through that index whatever the instance's state. (5) Its axis is `subject_tenant_id` NOT
+NULL. The order's axes are nullable, which makes it the seventh stated exemption from D-48. (6)
+The progress read, the approver inbox, the operator task queue and the plan projection are not
+access-logged. **Counts**: tables 28 → 29, ten engine and nineteen slice tables (was eighteen).
+Mutable tables stay 19. D-48 exemptions 6 → 7.
+
+**Rationale**: D-186 gave the gear its widest disclosure — every actor, idempotency key and
+justification of an order's process — and kept no record of who read it. So a review could not
+establish who had read a trail, which is the question an audit read raises first. **Precedent**:
+Lifecycle's read surface writes `orders_read_access_log` "one entry per request, not per row …
+Persist a required served log before returning data. Refused-log failure emits the required
+infrastructure/security signal without turning refusal into access" (Lifecycle
+`08-read-and-authz.md:660-666`). Its audit read writes it "on the same served-and-refused pattern
+as the other read paths" (`:829-838`). A failed append "blocks a served response and never blocks a
+refusal" (`:840-850`). The table has the same columns, adapted here: this gear has no order table,
+so there is one no-FK `requested_order_ref` and no `order_id`. It is append-only with 90-day
+retention (`:865-927`, `08 §4.5`), and its purge is in the retention sweep (Lifecycle `DESIGN.md`
+§3.8). The tenant axis follows Lifecycle's scoping of an unresolved refusal by the caller's stored
+`subject_tenant_id` (Lifecycle D-104, `08-read-and-authz.md:818-820`). **Where this differs from
+Lifecycle.** Lifecycle logs a served read only on a supplied delegation proof or a resource tenant
+that differs from the subject's (`08 §4.4`, `:1367-1384`). This gear's audit read logs every
+request instead. It is the widest disclosure here too, as Lifecycle says of its own
+(`:834-836`), and a Seller Operator's read of a customer's order meets the cross-tenant trigger
+in the ordinary case anyway. The other reads are not logged. No grant of `09 §4.1` is a delegated
+path, so the first trigger cannot arise on them. The second does arise whenever the caller's
+tenant is not the order's resource tenant, and they are not logged for it. They disclose process
+state, not the audit trail, and the order's content is read and logged through Lifecycle. That
+divergence is stated in `09 §3.7`, not hidden.
+
+**Propagated**: `design/09-read-and-authz.md` §3.2 (diagram, Audit Trail Reader), §3.3 (*Audit
+read*, *Access log*), §3.7 (`owf_read_access_log`, *Which reads are access-logged*), §4.3;
+`design/01-foundation.md` §3.7 (*Tenancy*, the D-48 exemptions), §3.8 (the `retention-purge`
+roster); `DESIGN.md` §3.3, §3.7 (inventory,
+counts, D-48 exemptions, retention register), §4.4 (*Audit integrity*); D-48, D-104, D-186.
+
+### D-192 (M) The operator re-drive of a dead invocation is an explicit readiness item that gates the action, not readiness
+
+**Accepted (2026-09-28).** *(amends D-86, D-105)*
+
+**Decision**: (1) `01 §3.8` *Readiness* names the re-drive as an explicit item of the platform
+readiness gate. For the `platform` source the gear reports ready without it. The
+`invocation-dead` task's `retry` stays `action-not-offered` until the platform confirms three
+things: `:control` `retry` keeps `invocation_id`, it resumes at the faulted task, and it is valid
+from `dead_lettered`. (2) `07 §4.4` states that until then the only remedy is the order cancel,
+carried out as the dead-instance unwind (`01 §4.16` item 2), with Lifecycle's own cancel first
+before fulfillment has begun (D-109). Every invocation fault lands there, including an aged-out
+downstream key (D-185) and a deterministic `Internal` (500) (D-168). (3) The signals ask of
+`UPSTREAM_REQS.md` §2.9 names those dependants and says why the clause gates the action and not
+readiness. It stays `p1` (critical). `10 §3.3` *Generic control* says the same.
+
+**Rationale**: D-86 and D-105 already made `retry` depend on the platform's confirmation. The
+readiness gate of `01 §3.8` did not say so, and `UPSTREAM_REQS.md` §2.9 called its whole section
+"the content of the readiness gate". So a reader could take the gate either to block readiness on
+the re-drive or to ignore it. Since D-185 and D-168 route aged-out keys and deterministic 500s
+through the invocation fault on purpose, the answer covers more than rare deaths. Readiness is
+not held on it because the unwind is a complete remedy, if a lossy one: the order ends through
+the cancel path, and the loss is the PRD amendment of `UPSTREAM_REQS.md` §4 item 11. Blocking
+readiness would stop every order to protect the one whose invocation dies. **Precedent**: this is
+how `09 §3.3` already reads D-86 ("until the platform confirms those properties the re-drive is
+`action-not-offered`, and the fallback is the task's `cancel`"). It is also how the gear handles
+its other unconfirmed platform asks, which leave the dependent action unoffered rather than the
+gear unready: the pending dead-letter routes of `09 §4.1` stay unregistered until
+`…-upreq-serverless-runtime-dead-letter-operator-visibility` is answered.
+
+**Propagated**: `design/01-foundation.md` §3.8 (*Readiness*); `design/07-manual-tasks.md` §4.4;
+`design/10-process-definition.md` §3.3 (*Generic control*); `UPSTREAM_REQS.md` §2.9 (preamble,
+`…-upreq-serverless-runtime-signals`); D-86, D-105.
 
 ## Open Questions
 
@@ -6276,6 +6376,8 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-188 | H Past-window Lifecycle re-run reads the order back; `already-applied`; Lifecycle key-retention ask | `design/01-foundation.md` §3.3, §3.7, §4.3, `design/03-approval-execution.md` §3.3, §3.6, §4.4, `design/04-fulfillment-plan.md` §3.3, §3.6, `design/05-provisioning-intents.md` §3.2, §3.3, `design/06-saga-and-compensation.md` §3.2, §3.3, §3.6, §4.9, `design/10-process-definition.md` §3.6 (a), (b), `UPSTREAM_REQS.md` §1.2, §2.4, §3; D-102, D-166, D-185 |
 | D-189 | M `open-gates` looks a gate's request up by key and adopts it; Generic Approval ask extended | `design/03-approval-execution.md` §3.5, §3.6, `design/01-foundation.md` §3.7, §4.3, `UPSTREAM_REQS.md` §2.3; D-185 |
 | D-190 | M `reflect-verdict` answers its refusal `refused`; no 400 catch | `design/03-approval-execution.md` §3.3, §3.6, §4.4, §4.5, `design/10-process-definition.md` §3.6 (a), §4.6, `design/01-foundation.md` §4.3, §4.9, `design/07-manual-tasks.md` §3.3, `ADR/0012`; D-112, D-185 |
+| D-191 | M Audit read access-logged: `owf_read_access_log`, one row per request, served or refused | `design/09-read-and-authz.md` §3.2, §3.3, §3.7, §4.3, `design/01-foundation.md` §3.7, §3.8, `DESIGN.md` §3.3, §3.7, §4.4; D-48, D-104, D-186 |
+| D-192 | M Dead-invocation re-drive: explicit readiness item gating the action, not readiness | `design/01-foundation.md` §3.8, `design/07-manual-tasks.md` §4.4, `design/10-process-definition.md` §3.3, `UPSTREAM_REQS.md` §2.9; D-86, D-105 |
 
-Highest decision number used: **D-190**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
+Highest decision number used: **D-192**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
 register; there are no parts.

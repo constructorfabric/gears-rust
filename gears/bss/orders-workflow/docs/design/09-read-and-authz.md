@@ -510,6 +510,7 @@ graph LR
     H -->|allow| I[Progress Read Projector]
     H -->|allow, audit read| U[Audit Trail Reader]
     U --> V[(owf_audit_entry via owf_process_instance)]
+    U -->|sole writer, one row per request| AL[(owf_read_access_log)]
     H -->|allow, execute| J[Step operations - slices 01-08]
     H -->|allow, control op| Q[(owf_cancel_request / 07 request row)]
     Q --> S[Signal delivery - 10 §3.2]
@@ -789,12 +790,15 @@ D-186).
 
 Serves `GET …/workflows/{orderId}/audit` (§3.3 *Audit read*): reads the order's `owf_audit_entry`
 rows under the compiled `audit × read` scope in keyset order `(created_at, audit_id)`, one bounded
-page per request, and returns the fields §3.3 lists.
+page per request, and returns the fields §3.3 lists. Appends one `owf_read_access_log` row per
+request, served or refused, and commits a served row before the page is returned (§3.3 *Audit
+read*, *Access log*; §3.7; decision D-191).
 
 ##### Responsibility boundaries
 
-Never writes: the audit writer of `01 §3.2` is the table's only appender, and the chain verifier
-and checkpoint worker of `01 §3.8` are its only other readers. Never verifies the chain, never
+Never writes `owf_audit_entry`: the audit writer of `01 §3.2` is the table's only appender, and
+the chain verifier and checkpoint worker of `01 §3.8` are its only other readers. The one table it
+writes is `owf_read_access_log`, of which it is the sole writer (§3.7). Never verifies the chain, never
 returns a hash field, and never reads `owf_step_log.result`. Never lists a NULL-seller entry of a
 chain no instance was bound to, and never treats a NULL `seller_tenant_id` as a wildcard
 (`01 §3.7`, D-172). Not an export: a page is one read of the currently authorized rows, not a snapshot.
@@ -882,6 +886,22 @@ returns the order's process audit trail. The shape is Lifecycle's audit read
   `audit_tenant_id`, which are chain internals that Lifecycle's read does not expose either
   ("actor, reason, idempotency and correlation references, never internal diagnostics", Lifecycle
   `08 §3.6`), and no `owf_step_log.result`. Stability `unstable`, as the other reads.
+- **Access log** (decision D-191). Every request that reaches an access decision appends **one**
+  `owf_read_access_log` row (§3.7), one per page and never one per item. This is Lifecycle's
+  served-and-refused pattern: "one entry per request, not per row … Persist a required served log
+  before returning data. Refused-log failure emits the required infrastructure/security signal
+  without turning refusal into access" (Lifecycle `08 §3.6` common read wrapper step 5,
+  `08-read-and-authz.md:660-666`). Lifecycle applies it to its audit read "on the same
+  served-and-refused pattern as the other read paths" (`08-read-and-authz.md:829-838`). A
+  **served** page commits its row, with `outcome` = `served`, before the page is returned. If
+  that append fails, the read answers the canonical `ServiceUnavailable` (503) with no page,
+  because an unlogged served read is the outcome the log exists to exclude (Lifecycle
+  `08-read-and-authz.md:840-850`). A **refused** request (`not-found`, `not-authorized`) appends
+  its row with `outcome` = `refused` and the refusal returned. If that append fails, the refusal
+  is still returned unchanged, and the failure is raised on the audit-integrity signal of
+  `../DESIGN.md` §4.4, never turned into a different answer. A cursor refused at boundary
+  validation, and a PDP timeout or outage (503), reach no access decision and append nothing,
+  as in Lifecycle (`08 §4.4`, `08-read-and-authz.md:1384`; the audit-read sequence, `:778-779`).
 
 **Removed.** `POST /bss-orders-workflow/v1/workflows` (start workflow) is **removed** in favour of
 the platform event trigger: PRD §9.1 *Start workflow* is realised by the serverless-runtime event
@@ -1178,7 +1198,8 @@ per-action task routes of slice 07 deliver by the same sequence (`07 §3.6`).
 **Kept**: `owf_process_progress_view` (dead-letter columns out; `phase` and `invocation_id` in).
 **Added**: `owf_cancel_request`, the request record `10 §4.4` and `08 §3.3`'s `cancelRequestRef`
 require for a cancel (decision D-85: the cancel request record is a table
-of slice 09; retry, override and task-cancel requests are slice 07's `owf_task_resolution_request`). **Lost**: none of this slice's own; the event-handler topic declarations of the conformance
+of slice 09; retry, override and task-cancel requests are slice 07's `owf_task_resolution_request`);
+and `owf_read_access_log`, the audit read's access log (decision D-191). **Lost**: none of this slice's own; the event-handler topic declarations of the conformance
 check are retired with the handlers.
 
 #### Table: owf_process_progress_view
@@ -1294,6 +1315,80 @@ the engine boundary: the definition sees `requestRef` only (ADR-0013). The reque
 override and task cancel is slice 07's
 [`owf_task_resolution_request`](./07-manual-tasks.md#37-database-schemas--tables), whose actor and
 justification the same rule keeps out of the definition.
+
+#### Table: owf_read_access_log
+
+**ID**: `cpt-cf-bss-orders-workflow-dbtable-owf-read-access-log`
+
+The access log of the audit read (decision D-191). Its shape is Lifecycle's
+`orders_read_access_log` ([Lifecycle `08 §3.7`](../../../orders-lifecycle/docs/design/08-read-and-authz.md#37-database-schemas-and-tables),
+`08-read-and-authz.md:865-927`), adapted to a gear that has no order table and one logged route.
+
+**Schema**:
+
+| Column | Type | Description |
+|--------|------|--------------|
+| access_id | uuid, NOT NULL | One row per request |
+| operation | text, NOT NULL | The operation name of the logged route, `audit-read` (`GET …/workflows/{orderId}/audit`, §3.3) |
+| requested_order_ref | uuid, NOT NULL | The `orderId` the caller asked for, as the path carries it; **no foreign key**, so a request for an order that does not exist, or that has no instance, keeps its row. This is Lifecycle's `requested_order_ref`. This gear has no order table to hold Lifecycle's FK `order_id` against, and the route is always order-scoped, so one column serves |
+| actor | text, NOT NULL | The immutable `SecurityContext.subject_id()` as lowercase hyphenated UUID text, as `owf_audit_entry.actor` (`01 §3.7`, D-61); never a name, email or caller-supplied label |
+| actor_class | enum, NOT NULL | `system`, `service` or `user`, derived from the authenticated context only, as `owf_audit_entry.actor_class` |
+| subject_tenant_id | uuid, NOT NULL | The caller's home tenant; the axis this row is scoped by |
+| resource_tenant_id, seller_tenant_id | uuid, nullable | The axes of the order's instances as the prefetch resolved them (§3.2 endpoint mapping), set only when known. NULL when the order has no instance. Recorded for review, never returned to the caller |
+| delegation_proof_ref | text, nullable | The delegation proof reference the caller supplied, which the adapter forwards to the PDP (§3.1, Lifecycle D-111); recorded as supplied, never verified here. NULL when none was supplied |
+| outcome | enum, NOT NULL | `served` or `refused` |
+| refusal_reason | text, nullable | The registered reason returned on a refusal — `not-found` or `not-authorized` (`01 §4.9`); NULL on `served` |
+| accessed_at | timestamptz, NOT NULL | Database time of the append |
+
+No page contents are stored: no item, cursor, page size or row count.
+
+**PK**: `access_id`
+
+**Indexes**: `(accessed_at)` for the 90-day purge; `(requested_order_ref, accessed_at)` for the
+per-order access history a review asks for. Rows with no instance axes on that index are also
+how probing for orders that do not exist is counted per `actor`. Both are Lifecycle's.
+
+**Constraints**: append-only — **no UPDATE grant** to any role, and a DELETE grant held by the
+`retention-purge` role alone, for its window. This is Lifecycle's "append-only" with its 90-day
+purge, and the same grant shape as `owf_step_log` (`01 §3.7`, D-167). The table is not
+trigger-protected or hash-chained, because Lifecycle's table is not either: it is an access
+record, not the process audit. CHECK `outcome IN ('served', 'refused')`; CHECK
+`(outcome = 'served') = (refusal_reason IS NULL)`; CHECK `operation = 'audit-read'`.
+
+**Additional info**: **Ownership**: written only by the Audit Trail Reader
+(`cpt-cf-bss-orders-workflow-component-audit-trail-reader`), on the served-and-refused terms of
+§3.3 *Audit read*, *Access log*. **No route reads it**. It is read through direct database access
+for review and security investigation, as Lifecycle's is, with no read surface. **Tenant axes**:
+`subject_tenant_id` NOT NULL. The order's `resource_tenant_id` and `seller_tenant_id` are
+nullable because a refused request for an order with no instance has none. That makes this a
+stated exemption from D-48's resource-axis rule (`../DESIGN.md` §3.7). The precedent is
+Lifecycle's scoping of an unresolved refusal by the stored `subject_tenant_id` of the caller
+(Lifecycle D-104, `08-read-and-authz.md:818-820`). **Retention**: **90 days** from
+`accessed_at`, Lifecycle's value, bounded separately from the audit-grade stores because it grows
+with read traffic rather than with process events (Lifecycle `08 §4.5`). It is purged row-wise
+through the `(accessed_at)` index by `retention-purge` whatever the instance's state, and it is not
+partitioned (`01 §3.7`, D-104). **Mutability**: append-only.
+
+**Which reads are access-logged.** Only the audit read writes this table. Lifecycle logs every
+refused read. It logs a served read on two triggers: the caller supplied a delegation proof, or
+the order's current resource tenant differs from the subject tenant (Lifecycle `08 §4.4`
+*Served-read logging policy*, `08-read-and-authz.md:1367-1384`). It says its audit read is the
+surface "where the omission mattered most: the audit trail is the widest disclosure the gear
+makes" (`08-read-and-authz.md:834-836`). This gear's audit read is its widest disclosure too:
+every actor, idempotency key and justification of the order's process. So it logs **every**
+request, served or refused, without classifying the two triggers. A Seller Operator's read of a
+customer's order meets the cross-tenant trigger in the ordinary case, so classifying would log
+nearly every call anyway and add one more rule to test.
+
+The progress read, the approver inbox, the operator task queue and the plan projection are **not**
+access-logged. Lifecycle's first trigger cannot arise on them: no cell of §4.1 is a delegated
+grant, and every grant is seller scope (`S`), assignment (`A`, `A*`) or a service principal
+(`Gc`). The second trigger *does* arise on them, whenever the caller's tenant is not the order's
+resource tenant. This design does not log them for it. They disclose process state (phase, task
+and gate status, catalogue reasons), not the audit trail's actors, keys and justifications, and
+the order's commercial content is read, and access-logged, through Lifecycle's own routes. That
+is a stated divergence from Lifecycle's cross-tenant rule, recorded in D-191, not a claim that
+these reads are never cross-tenant.
 
 #### No permission table: the catalogue conformance check
 
@@ -1548,9 +1643,11 @@ NFR workshop, not as settled numbers.
   global rule, and each store states its own so an operator can tell evidence from bookkeeping.
   The one register of every store's window, and of which stores the `retention-purge` worker
   never touches, is [`../DESIGN.md`](../DESIGN.md) §3.7 *Retention*, executed by the roster of
-  [`01 §3.8`](./01-foundation.md#38-deployment-topology); this slice's two stores are
-  `owf_cancel_request` (≥ 400 days) and `owf_process_progress_view` (the life of the process
-  record it projects, never purged ahead of it).
+  [`01 §3.8`](./01-foundation.md#38-deployment-topology); this slice's three stores are
+  `owf_cancel_request` (≥ 400 days), `owf_process_progress_view` (the life of the process
+  record it projects, never purged ahead of it) and `owf_read_access_log` (90 days, Lifecycle's
+  read-access-log value, decision D-191) — the one store of this slice below the 400-day floor,
+  because it is an access record that grows with read traffic, not audit-grade process evidence.
 
   `owf_dead_letter_record` and `owf_retry_state` are retired (`01 §3.7` *Retired tables*); their
   former rows in this register are removed.

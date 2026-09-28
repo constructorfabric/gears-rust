@@ -1397,6 +1397,17 @@ forward task under `remediate`, projected as a flag, not an assignment state).
 | `order` | yes — for `approval-reflection-refused`, re-enter `reflect-verdict` under the minted `attempt`; for `authority-withdrawn` (raised only at `pre-compensation`), a new `compensate-order` pass, which submits no leg while the fence awaits re-authorization — the resolution is a newly authorized cancel, absorbed against the run through the unwind's cancel arm (`06 §4.3`); for `lifetime-ceiling-reached`, `unpark` through the ceiling wait's task-resolution arm in `10 §3.6` (d), the one route out of a ceiling park besides the order cancel | no | yes | Seller Operator — except on `lifetime-ceiling-reached`, where it is not offered: closing that task would leave the order parked with nothing to wait on, so the Seller Operator ends the park with the order cancel of `09 §3.3`, which the ceiling wait's cancel arm consumes and the fence unwinds (`parked → compensating`), or, before fulfillment has begun, where that route refuses, with Lifecycle's own cancel (D-109, D-129); and except on `approval-reflection-refused`, where it is not offered either: the failure stage waiting on it would be left with no open task and nothing to wait on, and the order, not yet in fulfillment, is ended by Lifecycle's own cancel, whose `OrderCancelled` that stage's lifecycle arm consumes (D-109, D-146) |
 | `order`, `invocation-dead` | the platform re-drive — the control gateway issues `…:control` `retry` of the bound invocation instead of a signal ([`01 §4.16`](./01-foundation.md#416-recovery-is-the-platforms-invocation-and-orders-record) item 1); offered only from a platform state the platform confirms `retry` from, keeping `invocation_id` and resuming at the faulted task, and never once the fence is claimed (`order-fenced`); where the fault was an aged-out key of an operation that submits downstream, the recording of the `retry` also mints that family's next `attempt`, so the re-driven call runs under its successor key (`01 §4.3` *Aged-out key*, D-185) | no | yes | Seller Operator — the order cancel of `09 §3.3`, which, with no invocation to signal, the liveness pass carries out as the dead-instance unwind (`01 §4.16` item 2); `action-not-offered` while the order's fulfillment has not begun and Lifecycle holds it live, because only Lifecycle's own cancel can end such an order (D-109) |
 
+**Until the platform confirms the re-drive, the `invocation-dead` task has one remedy** (decision
+D-192). `retry` stays `action-not-offered` until the platform confirms that `:control` `retry`
+keeps `invocation_id`, resumes at the faulted task and is valid from `dead_lettered`, where an
+invocation with no `on_failure` handler ends up (`…-upreq-serverless-runtime-signals`; D-86,
+D-105). The gear is ready without it (`01 §3.8` *Readiness*). Until then the only way out is the
+order cancel, carried out as the dead-instance unwind (`01 §4.16` item 2). Before fulfillment has
+begun, Lifecycle's own cancel comes first (D-109). The order ends as the cancel path ends it, and
+the customer is re-acquired by a new order. Every invocation fault lands here. That includes an
+aged-out key of an operation that submits downstream, whose successor `attempt` the unwind mints
+(D-185), and a deterministic `Internal` (500) that no `catch` matches (D-168).
+
 **While a `lifetime-ceiling-reached` task is open, it is the only task of the instance that offers
 `retry`, `override` or `cancel`** — it stays open only while the instance is parked at that
 ceiling, because the fence closes it on every way into an unwind (§3.2 closure port, D-149): every other task of the instance offers `escalate` only, and a
@@ -1418,9 +1429,14 @@ compensation (`09 §3.3`). `escalate` exists to connect the two roles.
 ### 4.5 What reaches the operator surface (normative redaction rule)
 
 No downstream error text is projected. A task, incident or escalation exposes its catalogue
-`failure_reason`, its `failure_cause` and the step context; the `owf_step_log.result` of the
-failing attempt is readable only through the audit-logged support read of `09`, and it is itself
-redacted at write per `01 §4.11`. A platform dead letter (pending) is projected with the platform's
+`failure_reason`, its `failure_cause` and the step context. The `owf_step_log.result` of the
+failing attempt is exposed by **no route**. What the failing attempt records reaches the Seller
+Operator as the catalogue `reason` of its entry on the audit read of
+[`09 §3.3`](./09-read-and-authz.md#33-api-contracts) *Audit read* (decision D-186), whose items
+carry `reason` and `justification` and "no `owf_step_log.result`". The raw `result` is readable,
+within its 90-day window, only by platform operators with direct database access, under a
+database role outside the gear's routes: `01 §3.7` declares the step log's UPDATE and DELETE
+grants and names no SELECT role. It is itself redacted at write per `01 §4.11`. A platform dead letter (pending) is projected with the platform's
 surfaced reason only; this slice adds no diagnostics. The synchronous RFC-9457 envelope already
 forbids downstream error text, and a queue that shows what the envelope refuses to show would
 reopen that leak with a longer retention.

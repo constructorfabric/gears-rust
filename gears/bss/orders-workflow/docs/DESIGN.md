@@ -639,7 +639,7 @@ plan projection and the audit read, each pointed at the document that specifies 
 | Approval decision submit | `POST …/approver-inbox/gates/{gateId}/decision` | `03 §3.3` | **decision reflector** |
 | Fulfillment Operator task-queue read | `GET …/fulfillment-operator/tasks` | `07 §3.3`, `09 §4.1` | **operator task queue** |
 | Per-line fulfillment-plan projection | `GET …/fulfillment-plan/{orderId}/{orderVersion}` | `04 §3.3` | **progress tracker** |
-| Audit read (the order's process audit trail, Seller Operator in seller scope) | `GET …/workflows/{orderId}/audit`, keyset-paged on `(created_at, audit_id)` | `09 §3.3` | **audit trail reader** |
+| Audit read (the order's process audit trail, Seller Operator in seller scope) | `GET …/workflows/{orderId}/audit`, keyset-paged on `(created_at, audit_id)`; every request, served or refused, appends one `owf_read_access_log` row (D-191) | `09 §3.3` | **audit trail reader** |
 
 PRD §9.1 lists *Start workflow* with an order-ID-plus-version idempotency key; that key is now the
 trigger family `{tenant}:{eventId}:admit-trigger` recomposed by `admit-trigger` together with the
@@ -990,18 +990,21 @@ inside another operation's unit of work; no other component writes to a table it
 on a compensating or remediation path. **Column-level definitions, keys, constraints, indexes and
 state enums are specified normatively in the document named in the "Specified in" column, and are
 not restated here.** Mutability is declared **per table** rather than globally, because nineteen of
-the twenty-eight are deliberately mutable (one of them, `owf_dead_letter_triage`, pending); the platform producer-outbox tables are not in this
+the twenty-nine are deliberately mutable (one of them, `owf_dead_letter_triage`, pending); the platform producer-outbox tables are not in this
 inventory (`design/01-foundation.md` §3.7 *Platform-managed producer persistence*), and neither is
 anything the platform engine stores — definition versions live in the platform function registry.
 
-Every table except the six named here carries `resource_tenant_id` NOT NULL. The six are the
+Every table except the seven named here carries `resource_tenant_id` NOT NULL. The seven are the
 stated exemptions to D-48. Three are configuration: the load-only `owf_step_operation` (D-69),
 `owf_seller_policy`, which is keyed by `seller_tenant_id` alone (D-140), and the append-only
 `owf_configuration_revision`, their history (D-160). Three carry another axis instead:
 `owf_dispatch_admission`, per-seller admission state keyed by `seller_tenant_id` alone, NULL on
 its gear-level aggregate row (`05 §3.7`), and `owf_audit_checkpoint` and
 `owf_audit_checkpoint_member`, keyed on the immutable audit namespace `audit_tenant_id` — a
-`resource_tenant_id` value captured at process start (`01 §3.7`). Tables backing an operator- or seller-scoped surface
+`resource_tenant_id` value captured at process start (`01 §3.7`). One is an access record:
+`owf_read_access_log`, keyed on the caller's `subject_tenant_id` NOT NULL, with the order's
+resource and seller axes nullable because a refused read of an order with no instance has none
+(`09 §3.7`, D-191). Tables backing an operator- or seller-scoped surface
 additionally carry `seller_tenant_id`, and per-tenant fairness and back-pressure key on
 `seller_tenant_id`. The axis choice is stated per table in the owning document.
 
@@ -1035,17 +1038,18 @@ additionally carry `seller_tenant_id`, and per-tenant fairness and back-pressure
 | `owf_process_suspension` | `08 §3.7` | hold-and-cancel — suspension controller | **mutable** — `state` settles through `open / resume_ahead / closed`; a partial unique index enforces at most one unsettled row per order |
 | `owf_process_progress_view` | `09 §3.7` | read-and-authz — progress projection writer (sole writer; the read projector only reads) | **mutable** — materialised projection, one row per order, refreshed in the same transaction as the change it reflects |
 | `owf_cancel_request` | `09 §3.7` | read-and-authz — control operation gateway | **mutable** in `delivery_state`, `last_recheck_point` and `updated_at` only, forward only; append-only otherwise |
+| `owf_read_access_log` | `09 §3.7` | read-and-authz — audit trail reader (sole writer) | append-only — one row per audit-read request, served or refused; no UPDATE grant, DELETE to the retention purge only (D-191) |
 
 **Retired tables** (each named with its retiring decision; a one-line note stays where each was
 defined): `owf_durable_timer` and `owf_retry_state` — timers and retry policy are the platform's
 (ADR-0011, D-70), and `owf_step_log.attempt_id` records the platform attempt; `owf_timer_pause`
 — the pause is `owf_approval_gate.pause_causes` and the remainder `window_remaining_ms` (D-70,
 D-87); `owf_dead_letter_record` — an inbound delivery past its cap is the platform trigger path's
-dead letter (ADR-0009 as amended, D-72). Twenty-eight tables remain: ten engine tables and
-eighteen slice tables, one of them pending (`owf_seller_policy` is the ninth engine table, D-140,
+dead letter (ADR-0009 as amended, D-72). Twenty-nine tables remain: ten engine tables and
+nineteen slice tables, one of them pending (`owf_seller_policy` is the ninth engine table, D-140,
 and `owf_configuration_revision` the tenth, D-160).
 
-**Retention, per store rather than as one global floor.** Every one of the twenty-eight tables has
+**Retention, per store rather than as one global floor.** Every one of the twenty-nine tables has
 a row here, taken from the window its specifying slice's §3.7 declares; the *Purge* column is
 what the `retention-purge` worker of §3.8 does with it:
 
@@ -1068,6 +1072,7 @@ what the `retention-purge` worker of §3.8 does with it:
 | `owf_manual_task`, `owf_task_resolution_request`, `owf_incident`, `owf_overdue_escalation`, `owf_dead_letter_triage` (pending) (`07 §3.7`) | ≥ 400 days | purged through the index each names |
 | `owf_process_suspension` (`08 §3.7`) | ≥ 400 days | purged through its `created_at` index |
 | `owf_cancel_request` (`09 §3.7`) | ≥ 400 days, never ahead of the audit entry that names it | purged through a `decided_at` index |
+| `owf_read_access_log` (`09 §3.7`) | 90 days from `accessed_at`, whatever the instance's state — Lifecycle's read-access-log value (Lifecycle `08 §4.5`, D-191) | purged through its `accessed_at` index |
 
 A ≥ 400-day window is a configurable floor, not a fixed age. The worker **MUST NOT** delete a row
 whose instance is not terminal: an instance older than the window exists only behind a
@@ -1411,7 +1416,7 @@ arrival nobody pages on:
 | **Overdue-window breach while held** | any breach on a process whose order is on hold, reported separately — the overdue timer does not pause, so this distinguishes a stalled process from an intentionally suspended one |
 | Manual-task arrival rate | above the § 4.1 baseline of 1 % of lines; escalates at 5 % over 15 minutes |
 | Manual-task SLA | any task within 25 % of its deadline; any breach |
-| Audit integrity | any audit-append failure, any hash-chain verification mismatch, any non-zero unaudited-transition count |
+| Audit integrity | any audit-append failure, any hash-chain verification mismatch, any non-zero unaudited-transition count; any `owf_read_access_log` append failure on the audit read, served or refused (`09 §3.3`, D-191) |
 | Reconciliation sweep | any intent still non-terminal at the sweep floor; any sweep run that does not complete inside its transaction budget |
 | Command and read latency | SLO burn-rate alerts derived from the `p95 < 1 s` and `p95 < 200 ms` budgets |
 

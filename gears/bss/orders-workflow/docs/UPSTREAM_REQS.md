@@ -742,7 +742,9 @@ capability the design depends on that **no serverless-runtime document states as
 each cites the platform text it builds on, by file and line, and none invents an API beyond the
 platform's own [DESIGN.md §3.3](../../../serverless-runtime/docs/DESIGN.md#33-api-contracts).
 `gears/serverless-runtime/` holds documentation and a `gear.toml` and no crate, so the whole
-section is also the content of the readiness gate.
+section is also the content of the readiness gate, except the re-drive clause of
+`…-upreq-serverless-runtime-signals`, which gates the `invocation-dead` task's `retry` and not
+readiness (`design/01-foundation.md` §3.8, D-192).
 
 - **Owning upstream gear (all asks in this section)**: `serverless-runtime`
   (`gears/serverless-runtime/docs/`), its host, SDK and Temporal plugin owners.
@@ -1079,7 +1081,20 @@ plugin, which owns the verb set (line 893).
   task offers no re-drive, and the only way out for a dead invocation's order is the fallback of
   D-105: a Seller Operator's cancel, carried out in-process by the sweep, and a new order to
   re-acquire the customer (§4 item 11).
-- **Source**: `design/10-process-definition.md` §3.2 *Signal delivery*, §3.3, §4.4; `design/09-read-and-authz.md` §3.3, §3.6; `design/07-manual-tasks.md` §3.3; `design/08-hold-and-cancel.md` §3.3.
+- **Who depends on the re-drive clause** (decision D-192): every invocation fault reaches the
+  operator through the `invocation-dead` task, so every fault waits on this clause. That covers a
+  step whose retries run out and a suspension that outlives the platform's limit. It also covers the two faults the design routes to it on purpose. One is an aged-out key of an
+  operation that submits downstream, whose re-drive mints the successor `attempt`
+  (`design/01-foundation.md` §4.3 *Aged-out key*, D-185). The other is a deterministic canonical
+  `Internal` (500), which no `catch` matches (`design/01-foundation.md` §3.7 *A settlement that cannot commit
+  aborts whole*, D-168). Each of these ends in the unwind and a lost in-flight order until the clause is
+  confirmed.
+- **Readiness**: the clause is an explicit item of the readiness gate of
+  `design/01-foundation.md` §3.8. It is the one `p1` clause of this section that gates an operator
+  action, not readiness: the gear reports ready without it, and the `invocation-dead` `retry` stays
+  `action-not-offered` until the platform confirms it. The ask keeps `p1` (critical) because the
+  PRD's recover-and-continue rule (§4 item 11) is met only once it lands.
+- **Source**: `design/10-process-definition.md` §3.2 *Signal delivery*, §3.3, §4.4; `design/09-read-and-authz.md` §3.3, §3.6; `design/07-manual-tasks.md` §3.3, §4.4; `design/08-hold-and-cancel.md` §3.3; `design/01-foundation.md` §3.8, §4.16.
 
 #### Retention of an event delivered between listens
 
