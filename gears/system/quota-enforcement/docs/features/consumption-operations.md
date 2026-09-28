@@ -343,8 +343,7 @@ counter mutation
    transaction (I1, I2, I11); a `Denied` Decision changes no counter and persists its idempotency record with an empty
    plan so an exact replay returns the original verdict (PRD §5.8), while the operation log records only successful
    mutating operations per the DESIGN `OperationLog` definition; a `NO_APPLICABLE_QUOTA` denial persists no idempotency
-   record and no operation-log entry per the PRD acceptance criteria (the tension with §5.8 replay durability is a
-   tracked upstream PRD item, section 7); concurrent multi-Quota mutations follow the deterministic lexicographic
+   record and no operation-log entry per the PRD §5.8 exception for that denial; concurrent multi-Quota mutations follow the deterministic lexicographic
    `quota_id` acquisition ordering of ADR-0002 - `inst-pipe-apply`
 8. [ ] - `p1` - Forward the `AccessScope` unmodified into every storage read and write, where `SecureConn` compiles it
    into query filters (phase-2 defense-in-depth per
@@ -741,10 +740,7 @@ retry storm at 10x normal RPS with a 5% retry rate showing zero double-count eve
   §5.9 assigns that sweep to storage retention; the gap is already tracked by the resolution-policy-engine feature
   and no such primitive is promised here. The hot-path source of the `Direct`/`QuotaGated` classification is not
   spelled out in DESIGN beyond the closed `StorageError::MetricNotQuotaGated` variant; this document anchors the
-  rejection on that variant and leaves the realisation plugin-internal. PRD §5.8 replay durability requires a `Denied`
-  verdict to replay verbatim, while the PRD acceptance criteria state that a `NO_APPLICABLE_QUOTA` denial creates no
-  idempotency record; the two pull in opposite directions for that denial. This document follows the explicit
-  acceptance criterion, and the reconciliation is a tracked upstream PRD item.
+  rejection on that variant and leaves the realisation plugin-internal.
 - **Known P1 limitation**: silent Quotas emit their closing `period-rollover` only on the next operation; the P2
   active rollover scheduler (DESIGN §4.3) covers them without changing this feature's contract.
 - **Rust contract notes**: the pipeline is async over the Tokio-based storage plugin while the Engine call is sync
