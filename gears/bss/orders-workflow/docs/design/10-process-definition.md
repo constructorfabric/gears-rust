@@ -2981,6 +2981,20 @@ and the liveness pass that observes it (D-105). **Rationale**: a swallowed failu
 order state the dual-authority principle exists to prevent; Orders' record would show the step
 failed while the definition proceeds as if it had not.
 
+**An aged-out key is one of these faults, with its own way back** (decision D-185). Only the nine
+operations that submit downstream (`01 §3.7` `owf_step_operation.submits_downstream`) age while
+the instance lives, so only their re-issue after a long interruption — a ceiling park, a hold, an
+`invocation-dead` task awaiting its re-drive — can answer `aged-out` (400). No route above names it
+except `reflect-verdict`'s, whose 400 catch raises the order-scope task whose `retry` re-enters
+under a minted `attempt` (the plugin does not surface `error_code`, Q-11, so that task carries
+`approval-reflection-refused` whichever 400 it was; its step-log receipt names `aged-out`). Every
+other one faults the invocation, and the `invocation-dead` task's `retry` mints the family's next
+`attempt` before the re-drive, so the re-issued call — the same key, the same task — is resolved
+under its successor key rather than answering `aged-out` again (`01 §4.3` *Aged-out key*); a cancel
+takes the dead-instance unwind, which does the same. No `catch` is added: a 400 filter cannot tell
+the aged-out answer from a caller defect before Q-11 is answered, and the failure rule above
+already sends both to the one task an operator acts on.
+
 ### 4.7 What a definition change may and may not do
 
 - [ ] `p2` - **ID**: `cpt-cf-bss-orders-workflow-constraint-definition-change-scope`

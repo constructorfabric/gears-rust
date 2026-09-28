@@ -619,7 +619,8 @@ Recording the required idempotency key ahead of every step operation's effect; s
 settled outcome; absorbing a duplicate without a second durable effect; holding a settled
 `retryable-failure` as `open` so the same key may run once more per settled failure; refusing a
 key replayed against a different fingerprint; and tracking the key-lifetime window after which
-`settle-from-lookup` is read-only and a next attempt is a new key.
+`settle-from-lookup` is read-only and a next attempt is a new key — on an operation that submits
+downstream, and on any other key only once its instance is terminal (§3.7 *Key lifetime*, D-185).
 
 ##### Responsibility boundaries
 
@@ -890,7 +891,7 @@ definition's `catch` sees (`$error.status`, `10 §2`):
 | `aborted` | The unit of work could not commit (§3.7 *A settlement that cannot commit aborts whole*): nothing is settled and nothing the attempt wrote in that transaction remains; the registry record is left as that rule's *What remains* states per operation shape — `open` or absent for a single-transaction operation, `in_flight` under a committed lease otherwise. The name is this outcome's, not the canonical 409 `Aborted` that `still-processing` answers with | the canonical `ServiceUnavailable` 503 when the failure is temporary, the canonical `Internal` 500 when it is deterministic (§3.7 *What the caller gets*); no catalogue reason |
 | `permanent-failure` | The attempt failed in a way the operation declared non-retryable, or the caller presented a key conflict; the definition's named failure route applies where `10 §4.6` names one, and otherwise the invocation faults | 400, 403, 404 or 409 (`AlreadyExists`) with the catalogue reason |
 | `still-processing` | The registry found an `in_flight` record under this key with a live lease, or a dead lease inside the key lifetime on a key whose dead lease is settled by lookup (§4.3 *Lease-expired*); the caller must not infer success and must not resubmit under a new key; re-issue the same key after backoff or wait for `settle-from-lookup` | 409 `Aborted`, `still-processing` or `idempotency-lease-expired` |
-| `aged-out` | The key's retention window (§3.7) elapsed with no settled record; the next attempt is a **new operation under a new key** — it appends the key's `attempt` component — never a resume of the old one | 400, `idempotency-key-aged-out` |
+| `aged-out` | The key's lifetime (§3.7 *Key lifetime*) elapsed with no settled record — on an operation that submits downstream (`owf_step_operation.submits_downstream`) whatever the instance's state, and on every other operation only once its instance is terminal (decision D-185); the next attempt is a **new operation under a new key** — it appends the key's `attempt` component, minted by an operator's retry (§4.3 *Aged-out key*) — never a resume of the old one | 400, `idempotency-key-aged-out` |
 
 `dead-lettered` is **not** an outcome of this surface: a delivery that exhausts its cap is the
 platform trigger path's (§4.8), and a step-level failure has the manual task. A definition
@@ -1109,7 +1110,7 @@ nothing. This is the only path that may settle a key whose closure it did not ru
 
 | Field | Value |
 |-------|-------|
-| `protection` | `composable` (operator), **in-process only**: it is never a definition `call` target (the validation hook rejects one, `10 §2.2` rule 1) and no principal holds its `process_step × execute` value ([`09 §3.1`](./09-read-and-authz.md#31-domain-model)); it runs only inside `resolve-manual-task`'s `retry` resolution (slice 07), exactly as `settle-from-lookup` runs only in-process inside its three named callers — `reconcile-intent`, `compensate-order` (`inst-co-settle-prior`) and the `reconciliation-sweep` worker — and never as a definition `call` (decision D-108) |
+| `protection` | `composable` (operator), **in-process only**: it is never a definition `call` target (the validation hook rejects one, `10 §2.2` rule 1) and no principal holds its `process_step × execute` value ([`09 §3.1`](./09-read-and-authz.md#31-domain-model)); it runs only inside `resolve-manual-task`'s `retry` resolution (slice 07) — and, for the aged-out successor of §4.3, its minting effect runs inside the control gateway's recording of the `invocation-dead` task's `retry` (`09 §3.6` `inst-cs-record`) and inside the dead-instance unwind (§4.16 item 2), both on an operator's recorded request (decision D-185) — exactly as `settle-from-lookup` runs only in-process inside its three named callers — `reconcile-intent`, `compensate-order` (`inst-co-settle-prior`) and the `reconciliation-sweep` worker — and never as a definition `call` (decision D-108) |
 | `input` | `correlationId`, `stepRef` (operation name plus subject reference), `taskRef` (the manual task whose `retry` resolution invokes it), `requestRef` (the applied `owf_task_resolution_request` row, [`07 §3.7`](./07-manual-tasks.md#37-database-schemas--tables)), `attemptId` |
 | `output` | `attemptKey` (the minted `attempt` the definition passes to the re-entered operation, which appends it to its key after the round, §3.3 *Rounds and attempts*), `quarantined` |
 | `idempotency_key` | instance-scoped: `{tenant}:{correlationId}:retry-step:{taskRef}:{resolutionSeq}` |
@@ -1617,7 +1618,7 @@ these rows to validate a round (§3.3 *Rounds and attempts*, rule 2).
 | outcome | enum, nullable | `success` or `failure` once `settled`; `failure` also on an `open` record, describing its last attempt |
 | settled_output | jsonb, nullable | **The answer a replay returns** (decision D-167): `{formatVersion: 1, status, body}` — the success body the operation's `output` schema declares, or, on a settled failure, the HTTP status and `error_code` from which the fixed step-route Problem of §4.9 is rebuilt. Written in the settlement transaction — by the envelope or by `settle-from-lookup`, which writes the output it builds from Orders' record — and immutable once `status = settled`: no statement writes it afterwards, and `receipt_count` is the only column a settled row still changes. NULL while `in_flight` or `open` |
 | outcome_ref | uuid, nullable | Join link to the `owf_step_log` entry the last settlement produced, for reads and diagnosis while that row exists; no FK, because the step log is purged at 90 days and this row may outlive it, and no replay dereferences it |
-| created_at, expires_at | timestamptz | The key's lifetime; `expires_at = created_at + 30 days`, written at creation from database time and never extended by a re-run, a heartbeat or a settlement |
+| created_at, expires_at | timestamptz | The key's lifetime; `expires_at = created_at + 30 days`, written at creation from database time and never extended by a re-run, a heartbeat or a settlement. Which keys it ages while the instance lives is *Key lifetime* below (decision D-185) |
 
 **PK**: (operation, idempotency_key) — the table is **not partitioned** (D-104), so the key is
 unique across the whole table and not only within a month
@@ -1631,9 +1632,43 @@ for `reconcile-intent`'s check of a dispatching step key (§3.8).
 
 | Value | Working baseline | Derivation |
 |-------|------------------|------------|
-| Key lifetime (`expires_at`) | **30 days** from creation | At or above the maximum retry horizon, which includes manual-task resolution and one or more hold/resume cycles and is therefore measured in days, not hours |
+| Key lifetime (`expires_at`) | **30 days** from creation | Above the ordinary retry horizon of a downstream submission — the task retry trains, a manual-task resolution, a hold/resume cycle with Lifecycle's TTLs set — and therefore measured in days, not hours. It is **not** a bound on how long a key may wait for its re-issue: a lifetime-ceiling park awaits an operator, a hold lasts as long as Lifecycle holds the order, and an `invocation-dead` task awaits its re-drive, none of them bounded. What the lifetime governs is therefore split by operation shape below (decision D-185) |
 | In-flight lease (`lease_expires_at`) | **15 s** | Above the longest per-operation deadline (10 s, §4.2), so a live holder never loses its lease before its own deadline cuts it; short enough that the later same-key retries of a crashed holder **usually** land on a dead lease, which §4.3 resolves: the lease dies 10-15 s after the crash (the last heartbeat plus the lease), and the declared retry policy (§4.5) spaces the attempts by an exponential delay from 1 s plus a 0-30 s jitter draw, so most retry trains outlast it. The claim is probabilistic, not a bound: the draw is the plugin's, and a train whose every attempt meets the live lease settles `still-processing` each time, exhausts and faults the invocation. That fault is the stated fallback — the liveness pass raises the `invocation-dead` task and the operator re-drives (§4.16, [`07 §4.4`](./07-manual-tasks.md#44-resolution-actions-by-reason-and-the-two-operator-roles-normative)) — and no longer lease, which would make every retry meet a live one (D-103), avoids it |
 | Lease heartbeat | **5 s** | One third of the lease, so two consecutive missed heartbeats are needed before a lease is considered dead |
+
+**Which keys age while the instance lives** (decision D-185). A key ages so that no call is ever
+resubmitted downstream under a key the downstream may no longer de-duplicate (D-25). That reason
+exists only where the effect submits something downstream, so the lifetime is evaluated by
+operation shape, from `owf_step_operation.submits_downstream`:
+
+- **An operation that submits nothing downstream** (`submits_downstream = false`) — every
+  record-only operation, and every operation whose only outside call is a read: `admit-trigger`,
+  `apply-hold` and `apply-resume` (a Lifecycle order read), `start-instance` (the platform's
+  invocation read), `obtain-verdict` and `record-decision` (Generic Approval reads), the
+  evaluations and `construct-and-freeze-plan` of slice 04, `reread-draft-liveness`,
+  `reconcile-intent` and `verify-override` (Subscriptions status reads), `authorize-cancel` (a PDP
+  decision) — **does not age while its instance is non-terminal**: its `expires_at` is evaluated
+  only once `owf_process_instance.terminal_outcome` is set (a `trigger`-family key whose admission
+  started no instance ages at `expires_at`, as before). Nothing downstream can be duplicated by its
+  late re-run: its effect is Orders' own writes, which the key's fingerprint, the instance
+  `row_version` and the operation's own guards bound exactly as they bound a re-run inside the
+  lifetime, and a read re-reads current state. Twenty-six of the thirty-five operations are of
+  this shape.
+- **An operation that submits downstream** (`submits_downstream = true`) — the intent-submitting
+  `dispatch-wave1-create`, `dispatch-wave2-activate` and `compensate-order` (Subscriptions); the
+  Lifecycle transitions of `reflect-verdict`, `begin-fulfillment`, `report-spawn-signal` and
+  `report-outcome`; `open-gates` (the Generic Approval gate submission) and `escalate-gate` (the
+  escalation command, delivered under the step key) — **ages at `expires_at` whatever the
+  instance's state**, and an aged-out key is never re-run. Its re-issue after the lifetime is a
+  handled route (§4.3 *Aged-out key*): the call is resolved under a successor key once an
+  operator's retry has minted one, and until then answers `aged-out`.
+
+No expiry is re-based: `expires_at` is written once and never extended (the column above), so the
+split changes only when it is evaluated, and re-basing a downstream-submitting key would be exactly
+the resubmission under a forgotten key the lifetime exists to prevent. There is no exact
+precedent: Lifecycle's registry is a request cache with a 24-hour window and no process instance
+to outlive it ([Lifecycle `01 §2.2`](../../../orders-lifecycle/docs/design/01-foundation.md),
+`01-foundation.md:234-243`).
 
 **The heartbeat rule is normative.** While an effect runs under an `in_flight` record, the holder
 **MUST** refresh `lease_heartbeat_at` and extend `lease_expires_at` every 5 s. A lease whose
@@ -1753,6 +1788,7 @@ after the purge finds an instance that answers every operation `version-mismatch
 | sweep_only | boolean, NOT NULL, DEFAULT false | True only for `settle-from-lookup`: never a definition `call` target |
 | input_type, output_type | text, NOT NULL | The GTS reference schemas of §3.3 |
 | key_family | enum, NOT NULL | `intent`, `approval-request`, `lifecycle-transition`, `instance-scoped`, `trigger` |
+| submits_downstream | boolean, NOT NULL | True for the nine operations whose effect submits to a downstream — Subscriptions intents, Lifecycle transitions, the Generic Approval gate submission and escalation command; false for the twenty-six whose effect is record-only or whose only outside call is a read. Decides whether the key lifetime is evaluated while the instance is non-terminal (§3.7 `owf_idempotency_registry` *Key lifetime*, decision D-185) |
 | declared_event | text, nullable | One of the six GTS event types of §4.7, or NULL |
 | compensation | text, nullable | The paired operation name, or NULL; FK to this table |
 | audit_kind | enum, NOT NULL | The `owf_audit_entry.event_kind` its success settlement writes (§3.3 *What each receipt records*) |
@@ -2419,15 +2455,16 @@ exactly one of them:
 | **Absorbed duplicate** | `settled`, `request_fingerprint` matches | Return the stored outcome unchanged, from `settled_output` (§3.7); the effect is **never** re-run. |
 | **Key conflict** | Any state, `request_fingerprint` does **not** match | Refuse the call (`idempotency-key-conflict`, `permanent-failure`). The same key was presented for a materially different request, which is a caller defect — a wrongly authored definition input — not a duplicate. |
 | **Still-processing** | `in_flight`, lease **live** | **MUST NOT** be inferred as success and **MUST NOT** be resubmitted under a new key; the definition re-issues the same key after backoff (`still-processing`, 409 `Aborted`). |
-| **Lease-expired** | `in_flight`, `lease_expires_at` passed, `expires_at` **not** passed | Resolved by the key's family (D-103). **The intent-submitting operations** — `dispatch-wave1-create`, `dispatch-wave2-activate` and `compensate-order` — treat it as **still-processing** (`idempotency-lease-expired`, 409 `Aborted`): the real outcome is confirmed by lookup and settled only by `settle-from-lookup` (§3.3); the effect is **never** re-run blind, because the holder may have crashed *after* Subscriptions accepted an intent. **Every other operation** re-runs it as a re-run under a new `lease_holder`: its outbound call is either a read or a submission the downstream de-duplicates under the key the step derives — Lifecycle answers a committed transition with its stored outcome ([Lifecycle `01 §4.2`](../../../orders-lifecycle/docs/design/01-foundation.md#42-idempotency-semantics-normative), first row), and the approval-request key does the same at Generic Approval (`../ADR/0006`) — so a crash after the downstream accepted is absorbed downstream, and the old holder's late settlement fails the fence. A record-only operation never leaves this state behind (§3.7). |
-| **Aged-out key** | `expires_at` passed with no settled record | Evaluated on the retained row — the tombstone rule of §3.7 keeps it until no replay can arrive, so expiry is logical and never inferred from a missing row. `settle-from-lookup` is read-only past this point. The next attempt is a **new operation under a new key** — it appends the key's `attempt` component (minted by `retry-step`; for an intent key, the per-line `wave_attempt` minted by the rebuild path or by an operator's retry of a `failed` intent, slice 05) — never a resume of the old one and never a replay of the identical key string. |
+| **Lease-expired** | `in_flight`, `lease_expires_at` passed, the key **not** aged out (§3.7 *Key lifetime*) | Resolved by the key's family (D-103). **The intent-submitting operations** — `dispatch-wave1-create`, `dispatch-wave2-activate` and `compensate-order` — treat it as **still-processing** (`idempotency-lease-expired`, 409 `Aborted`): the real outcome is confirmed by lookup and settled only by `settle-from-lookup` (§3.3); the effect is **never** re-run blind, because the holder may have crashed *after* Subscriptions accepted an intent. **Every other operation** re-runs it as a re-run under a new `lease_holder`: its outbound call is either a read or a submission the downstream de-duplicates under the key the step derives — Lifecycle answers a committed transition with its stored outcome ([Lifecycle `01 §4.2`](../../../orders-lifecycle/docs/design/01-foundation.md#42-idempotency-semantics-normative), first row), and the approval-request key does the same at Generic Approval (`../ADR/0006`) — so a crash after the downstream accepted is absorbed downstream, and the old holder's late settlement fails the fence. A record-only operation never leaves this state behind (§3.7). |
+| **Aged-out key** | `expires_at` passed with no settled record, on an operation that submits downstream; on any other operation, only once the instance is terminal (§3.7 *Key lifetime*, D-185) | Evaluated on the retained row — the tombstone rule of §3.7 keeps it until no replay can arrive, so expiry is logical and never inferred from a missing row. `settle-from-lookup` is read-only past this point. The next attempt is a **new operation under a new key** — it appends the key's `attempt` component (minted by `retry-step`; for an intent key, the per-line `wave_attempt` minted by the rebuild path or by an operator's retry of a `failed` intent, slice 05) — never a resume of the old one and never a replay of the identical key string. **The successor key** (D-185): when the family holds an `attempt` minted after the aged key's `created_at`, the envelope resolves the re-issued aged key under its successor — the same key with the latest such `attempt` in its attempt component — through this table: a first call the first time, and thereafter whatever the successor's own record resolves to, so a definition that keeps presenting the key it holds reaches the same successor every time; the first arrival is recorded in the family's `presented` history with the key it arrived under (§3.3 *Rounds and attempts*, rule 3, D-174). Without such an attempt it answers `aged-out`. The attempt is minted only by an operator's decision: the `retry` of the order-scope task the answer reaches — the `invocation-dead` task, because no `catch` of the canonical definition routes a 400 of these operations except `reflect-verdict`'s, whose own task mints it (`10 §4.6`) — in the transaction that records the request (`09 §3.6` `inst-cs-record`), and the dead-instance unwind after a recorded cancel (§4.16 item 2). |
 
 No seventh outcome exists. **These six are registry outcomes, not additional step outcomes.**
 They are what resolving a key yields *inside* the envelope; the definition still sees only the
 closed set of §3.3. The mapping is fixed: first call, re-run and absorbed duplicate resolve to the
 settled outcome; still-processing surfaces as `still-processing`, and so does lease-expired on
 an intent-submitting key, while on every other key lease-expired resolves as a re-run; aged-out
-surfaces as `aged-out`; a key conflict surfaces as `permanent-failure` carrying
+surfaces as `aged-out` until an operator's retry mints the successor, under which the re-issued key
+resolves thereafter (D-185); a key conflict surfaces as `permanent-failure` carrying
 `idempotency-key-conflict`.
 
 **`fingerprint` defined.** The fingerprint of a request is a **SHA-256 over its canonical request
@@ -3142,7 +3179,12 @@ offers them:
    for an event that is not delivered again, and every fixed wait would restart. Which one the
    platform does is part of `…-upreq-serverless-runtime-signals`; until the platform confirms both
    properties — the invocation is kept and execution resumes at the faulted task — and `retry` is
-   valid from the state the invocation is in, `retry` is `action-not-offered` - `inst-owf-dead-redrive`
+   valid from the state the invocation is in, `retry` is `action-not-offered`. A fault on an
+   aged-out key of an operation that submits downstream is re-driven the same way: the
+   transaction that records the `retry` also mints, through `retry-step`'s effect, the next
+   `attempt` of each such family of the instance whose key resolves `aged-out`, so the re-issued
+   call runs under its successor key (§4.3 *Aged-out key*, decision D-185) rather than faulting
+   again on the same answer - `inst-owf-dead-redrive`
 2. [ ] - `p1` - **Fallback: the dead-instance unwind.** `cancel` (Seller Operator) records the
    order cancel of [`09 §3.3`](./09-read-and-authz.md#33-api-contracts) as an `owf_cancel_request`
    and, because no invocation can receive `cancel-requested`, the sweep's liveness pass drives the
@@ -3150,7 +3192,9 @@ offers them:
    `authorize-cancel`, `run-cancellation-fence` (`cancel`), `compensate-order` until it answers
    `complete`, `report-outcome` (`cancelled`), `terminate-instance` (`aborted`, `compensated`) —
    each under the key, round and pass the definition would present, taken from the previous
-   settled answer in Orders' record. A task one of them raises (a withdrawn authority, a
+   settled answer in Orders' record; a key that resolves `aged-out` is presented once more after
+   the pass mints its successor `attempt` through `retry-step`'s effect, the recorded cancel being
+   the operator's decision (§4.3 *Aged-out key*, D-185). A task one of them raises (a withdrawn authority, a
    compensation leg) is resolved as usual; its `owf_task_resolution_request` is consumed by the
    next pass, which calls `resolve-manual-task` in-process in place of the signal. The pass runs
    only while the platform still reports the invocation not live; once the fence is claimed a

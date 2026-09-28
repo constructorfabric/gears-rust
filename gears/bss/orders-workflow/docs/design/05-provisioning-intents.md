@@ -221,8 +221,10 @@ wave + `intentKind`, plus `wave_attempt` after a rebuild or a retry of a failed 
 operation call that dispatched it (instance-scoped, §3.3), the process `correlationId` and the
 platform's `invocationId`/`attemptId` are structurally distinct and must never be interchanged
 (`01 §2.2`). The intent key governs submission de-duplication at Subscriptions and has a bounded
-lifetime — **30 days**, at or above the maximum retry horizon including manual-task resolution and
-hold/resume — after which the sweep may no longer use it to resubmit; the step key governs
+lifetime — **30 days**, above the ordinary retry horizon including manual-task resolution and a
+hold/resume cycle, but not a bound on how long a line may wait (a ceiling park or an unbounded hold
+may outlast it) — after which the sweep may no longer use it to resubmit, and the line's next
+submission is a new key (§4.4); the step key governs
 replay of one definition task; the `correlationId` is a whole-process trace identifier with no
 expiry. No component of any key is derived from `attemptId`, `invocationId` or any other
 platform-supplied value (ADR-0006 as amended).

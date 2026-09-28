@@ -203,6 +203,7 @@
   - [D-182 (M) The re-authorization mark is the cancellation fence's one rewritable stamp](#d-182-m-the-re-authorization-mark-is-the-cancellation-fences-one-rewritable-stamp)
   - [D-183 (H) A suspension a Lifecycle resume overtook is closed by the poll before `terminate-instance`](#d-183-h-a-suspension-a-lifecycle-resume-overtook-is-closed-by-the-poll-before-terminate-instance)
   - [D-184 (M) A consumed acceptance event and a consumed re-authorization signal are their own checkpoints](#d-184-m-a-consumed-acceptance-event-and-a-consumed-re-authorization-signal-are-their-own-checkpoints)
+  - [D-185 (M) A key ages while its instance lives only if its operation submits downstream; an aged-out key is re-issued under an operator-minted successor](#d-185-m-a-key-ages-while-its-instance-lives-only-if-its-operation-submits-downstream-an-aged-out-key-is-re-issued-under-an-operator-minted-successor)
 - [Open Questions](#open-questions)
   - [Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?](#q-01-which-durable-execution-substrate-backs-the-process--the-oss-workflow-engine-or-a-bss-local-mechanism)
   - [Q-02: The Generic Approval escalation threshold — the one PRD-deferred numeric value this design deliberately leaves unset](#q-02-the-generic-approval-escalation-threshold--the-one-prd-deferred-numeric-value-this-design-deliberately-leaves-unset)
@@ -1698,7 +1699,7 @@ gear to a versioned platform workflow definition (`ADR/0011`, `ADR/0012`, `ADR/0
 each slice was restructured into step operations and a definition fragment. D-65…D-72 carry the
 three ADRs and their cross-cutting consequences; D-73…D-101 are the decisions the slice
 restructurings recorded, D-102…D-163 the decisions taken on the second review of
-2026-09-26, and D-164…D-184 those taken on the re-review of 2026-09-28. Each names the entries it amends; the amended entries carry a dated
+2026-09-26, and D-164…D-185 those taken on the re-review of 2026-09-28. Each names the entries it amends; the amended entries carry a dated
 **Amended by** note. D-65…D-101 were taken on 2026-09-24.
 
 ### D-65 (H) The order process flow is a versioned platform workflow definition executed by serverless-runtime
@@ -2771,6 +2772,8 @@ said every window had a worker, while the roster named six stores.
 
 **Amended by D-167 (2026-09-28)**: the tombstone rule keeps a replayable answer too — each settled row carries its immutable `settled_output` — and the step log's 90-day window runs whatever the instance's state, under a DELETE grant only the retention purge holds.
 
+**Amended by D-185 (2026-09-28)**: "aged-out is evaluated from it" holds for a key whose operation submits downstream; any other key is evaluated for aging only once its instance is terminal, so a live instance's record-only or read-only key is never answered `aged-out`.
+
 ### D-105 (H) A dead invocation is raised as one order-scope task; the platform re-drive is the recovery, an Orders-driven cancel the fallback
 
 **Accepted (2026-09-26).** *(amends D-71 and D-86)*
@@ -2846,6 +2849,8 @@ before it records anything (`09 §3.6` new step `inst-cs-live`): on a not-live i
 retry is the `invocation-dead` task's `retry`, refused `action-not-offered` with no row written
 unless D-86's condition holds, and a cancel is that task's `cancel`, recorded for the dead-instance
 unwind; the request row names the task it resolves.
+
+**Amended by D-185 (2026-09-28)**: the `invocation-dead` task's `retry` also mints, in the transaction that records it, the next `attempt` of each downstream-submitting family whose key resolves `aged-out`, and the dead-instance unwind does the same after a recorded cancel, so the re-driven or in-process call runs under its successor key instead of faulting again.
 
 ### D-106 (H) Every step call is bound to the instance's invocation, and the fence needs a recorded cause
 
@@ -2944,6 +2949,8 @@ wrong since `compensate-order` settles its own previous pass through it (`06 §3
 `inst-co-settle-prior`). The comparison is with `settle-from-lookup` running only in-process inside
 its three named callers — `reconcile-intent`, `compensate-order`, the sweep worker (re-review
 R-24).
+
+**Amended by D-185 (2026-09-28)**: `retry-step`'s minting effect also runs in-process inside the control gateway's recording of an `invocation-dead` `retry` and inside the dead-instance unwind, for an aged-out successor, with the actor from the recorded request; it is still never a definition `call` and no principal is granted it.
 
 ### D-109 (H) Orders reports to Lifecycle only from fulfillment; a cancel before it is Lifecycle's own
 
@@ -5545,6 +5552,67 @@ loses nothing. The tick, probe, poll, SLA, retry-leg and lifetime arms carry no 
 `afterEligibilityChange`, `enterEligibility`, `enterAdmitAcceptance`, `onAcceptanceAdmission`,
 `toLifecycle`, `onEligibility`, `enterPlanFailFast`) and its description; D-147.
 
+### D-185 (M) A key ages while its instance lives only if its operation submits downstream; an aged-out key is re-issued under an operator-minted successor
+
+**Accepted (2026-09-28).** *(amends D-104, D-105, D-108)*
+
+**Decision**: (1) `owf_step_operation` gains `submits_downstream`. It is true for the nine
+operations whose effect submits to a downstream: `dispatch-wave1-create`,
+`dispatch-wave2-activate` and `compensate-order` (Subscriptions intents); `reflect-verdict`,
+`begin-fulfillment`, `report-spawn-signal` and `report-outcome` (Lifecycle transitions); and
+`open-gates` and `escalate-gate` (the Generic Approval gate submission and escalation command). It
+is false for the other twenty-six. Those are record-only, or their only outside call is a read
+(`admit-trigger`, `apply-hold`, `apply-resume`, `start-instance`, `obtain-verdict`,
+`record-decision`, the slice-04 evaluations and `construct-and-freeze-plan`,
+`reread-draft-liveness`, `reconcile-intent`, `verify-override`, `authorize-cancel`).
+(2) A key of a `false` operation does not age while its instance is non-terminal. Its `expires_at`
+is evaluated only once `terminal_outcome` is set. A `trigger`-family key whose admission started
+no instance ages at `expires_at` as before. (3) A key of a `true` operation ages at `expires_at`
+whatever the instance's state, and an aged-out key is never re-run. When its family holds an
+`attempt` minted after the aged key's `created_at`, the envelope resolves the re-issued aged key
+under the successor key, which carries the latest such attempt. It is a first call the first
+time, and resolves as the successor's own record says thereafter. Without such an attempt the
+answer stays `aged-out` (400). (4) The attempt is minted only on an operator's recorded decision,
+through `retry-step`'s effect. Two new places run that effect. The control gateway's recording of
+the `invocation-dead` task's `retry` (`09 §3.6` `inst-cs-record`) mints the next attempt of each
+such family whose key resolves `aged-out`. The dead-instance unwind (`01 §4.16` item 2) does the
+same after a recorded cancel. `reflect-verdict`'s existing 400 catch reaches its own order-scope
+task, whose `retry` already mints the attempt. No `catch` is added to `10`. (5) The key lifetime
+stays 30 days, is written once and is never extended. Its derivation no longer claims to be at or
+above the maximum retry horizon.
+
+**Rationale**: `01 §3.7` justified 30 days as "at or above the maximum retry horizon, which
+includes manual-task resolution and one or more hold/resume cycles". That horizon is not bounded.
+A lifetime-ceiling park waits for an operator. A hold lasts while Lifecycle holds the order, which
+nothing bounds when its TTLs are unset. An `invocation-dead` task waits for its re-drive. Take a
+checkpoint call interrupted before it settled: its key is `open`, or `in_flight` with a dead
+lease. After more than 30 days it was re-issued under the unchanged key and answered `aged-out`.
+No `catch` in `10` routes that 400, so the invocation faulted. The re-drive then re-issued the same
+key and faulted the same way, and the order could only be cancelled. Keys age for one reason: so
+that nothing is resubmitted downstream under a key the downstream may have forgotten (D-25). For
+an operation that submits nothing downstream the reason does not apply. Its late re-run writes
+only Orders' own rows, under the key's fingerprint, the instance `row_version` and the
+operation's guards, exactly as a re-run inside the lifetime does, and a read re-reads. For an
+operation that submits downstream the reason applies, so its key keeps aging. The new key its
+re-issue needs comes from an operator, as rule 3 of `01 §3.3` *Rounds and attempts* already
+requires of every attempt. The re-drive cannot carry that attempt: the platform re-runs the
+faulted task with the same parameters. So the envelope resolves the key the definition still
+holds under the minted successor, and records the arrival in the family's `presented` history
+(D-174). A 400 `catch` was rejected. The plugin does not surface `error_code` (Q-11), so such a
+catch cannot tell `aged-out` from a caller defect, and the failure rule (D-114) already sends both
+to the `invocation-dead` task. Re-basing `expires_at` was rejected too, because re-basing a
+downstream-submitting key is the resubmission the lifetime forbids. **Precedent**: none exact.
+Lifecycle's registry is a 24-hour request cache with no process instance to outlive it (Lifecycle
+`01-foundation.md:234-243`). Lifecycle's rule that expiry is logical and evaluated against
+database time (`01 §4.2`, `01-foundation.md:2259`) is kept. The attempt that re-keys a step is
+this design's own rule 3 (D-102).
+
+**Propagated**: `design/01-foundation.md` §3.2 (idempotency registry), §3.3 (the outcome table,
+`retry-step`), §3.7 (`owf_idempotency_registry` *Key lifetime*, `owf_step_operation`), §4.3,
+§4.16; `design/09-read-and-authz.md` §3.1, §3.6 `inst-cs-record`; `design/07-manual-tasks.md`
+§4.4, §4.6; `design/10-process-definition.md` §4.6; `design/05-provisioning-intents.md` §2.2;
+`DESIGN.md` §3.3, §3.7; D-104, D-105, D-108.
+
 ## Open Questions
 
 ### Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?
@@ -5992,6 +6060,7 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-182 | M Re-authorization mark: the fence's one rewritable stamp | `design/06-saga-and-compensation.md` §3.7, `DESIGN.md` §3.7; D-84, D-106 |
 | D-183 | H Poll closes an overtaken suspension before terminate-instance; `rejected`/`completed` are not held | `design/10-process-definition.md` §3.6 (a), (b), (e), §4.1, §4.5, `design/08-hold-and-cancel.md` §3.3, §3.6, §4.7, `design/01-foundation.md` §3.3, `DESIGN.md` §1.2; D-130, D-133, D-141, D-175 |
 | D-184 | M Consumed acceptance event and re-authorization signal are their own checkpoints | `design/10-process-definition.md` §3.6 intro, (b); D-147, D-164 |
+| D-185 | M Only downstream-submitting keys age while the instance lives; aged-out re-issued under an operator-minted successor | `design/01-foundation.md` §3.2, §3.3, §3.7, §4.3, §4.16, `design/09-read-and-authz.md` §3.1, §3.6, `design/07-manual-tasks.md` §4.4, §4.6, `design/10-process-definition.md` §4.6, `design/05-provisioning-intents.md` §2.2, `DESIGN.md` §3.3, §3.7; D-104, D-105, D-108 |
 
-Highest decision number used: **D-184**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
+Highest decision number used: **D-185**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
 register; there are no parts.
