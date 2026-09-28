@@ -12,8 +12,10 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::sync::Arc;
+use types_registry::domain::selection::FieldSelection;
 
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
+use serde_json::value::RawValue;
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 use time::macros::datetime;
@@ -33,7 +35,7 @@ use types_registry::infra::storage::entity::{
 };
 
 mod common;
-use common::{TestDir, allow_all, stores, test_db, test_db_file};
+use common::{TestDir, allow_all, doc, stores, test_db, test_db_file};
 
 const BOOT: OffsetDateTime = datetime!(2026-08-18 09:15:30 UTC);
 const CF_TYPE: &str = gts_id!("cf.core.example.type.v1~");
@@ -255,52 +257,62 @@ async fn a_schema_and_instance_survive_database_reopen() {
     // current-state branch and two separate tables.
     let svc = service(&db);
     let schema_by_id = svc
-        .entity(&EntityKey::parse(CF_TYPE))
+        .entity(&EntityKey::parse(CF_TYPE), FieldSelection::full())
         .await
         .expect("read by identifier")
         .expect("the schema survived");
     let schema_by_uuid = svc
-        .entity(&EntityKey::parse(&schema_uuid.to_string()))
+        .entity(
+            &EntityKey::parse(&schema_uuid.to_string()),
+            FieldSelection::full(),
+        )
         .await
         .expect("read by Registry Reference")
         .expect("the schema survived");
     let instance_by_id = svc
-        .entity(&EntityKey::parse(CF_INSTANCE))
+        .entity(&EntityKey::parse(CF_INSTANCE), FieldSelection::full())
         .await
         .expect("read Instance by identifier")
         .expect("the Instance survived");
 
     assert_eq!(schema_by_id.gts_id, CF_TYPE);
     assert_eq!(schema_by_id.gts_uuid, schema_uuid);
-    assert_eq!(schema_by_id.resource_version, 1);
+    assert_eq!(schema_by_id.origin.map(|o| o.resource_version), Some(1));
     assert_eq!(schema_by_uuid.gts_uuid, schema_by_id.gts_uuid);
     assert_eq!(schema_by_uuid.gts_id, schema_by_id.gts_id);
 
-    assert_eq!(schema_by_id.content.as_ref(), Some(&authored_schema));
+    assert_eq!(
+        doc(schema_by_id.content.as_deref()).as_ref(),
+        Some(&authored_schema)
+    );
     let stored_raw: Value =
         serde_json::from_str(&after.schema_revisions[0].raw_schema).expect("raw_schema is JSON");
     assert_eq!(stored_raw, authored_schema);
 
+    // The artifacts are served verbatim: the stored canonical text, byte for byte.
     let persisted_schema = &after.schemas[0];
     assert_eq!(
-        schema_by_id.resolved_schema,
-        Some(serde_json::from_str(&persisted_schema.resolved_schema).expect("resolved schema")),
+        schema_by_id.resolved_schema.as_deref().map(RawValue::get),
+        Some(persisted_schema.resolved_schema.as_str()),
     );
     assert_eq!(
-        schema_by_id.effective_traits,
-        Some(serde_json::from_str(&persisted_schema.effective_traits).expect("effective traits")),
+        schema_by_id.effective_traits.as_deref().map(RawValue::get),
+        Some(persisted_schema.effective_traits.as_str()),
     );
     assert_eq!(
-        schema_by_id.effective_traits_schema,
-        Some(
-            serde_json::from_str(&persisted_schema.effective_traits_schema)
-                .expect("effective traits schema"),
-        ),
+        schema_by_id
+            .effective_traits_schema
+            .as_deref()
+            .map(RawValue::get),
+        Some(persisted_schema.effective_traits_schema.as_str()),
     );
 
     assert_eq!(instance_by_id.gts_id, CF_INSTANCE);
-    assert_eq!(instance_by_id.resource_version, 1);
-    assert_eq!(instance_by_id.content.as_ref(), Some(&authored_instance));
+    assert_eq!(instance_by_id.origin.map(|o| o.resource_version), Some(1));
+    assert_eq!(
+        doc(instance_by_id.content.as_deref()).as_ref(),
+        Some(&authored_instance)
+    );
     assert!(instance_by_id.resolved_schema.is_none());
     assert!(instance_by_id.effective_traits.is_none());
     assert!(instance_by_id.effective_traits_schema.is_none());
@@ -405,11 +417,11 @@ async fn a_nonterminal_operation_survives_reopen_and_completes_when_admitted() {
     assert_eq!(op.items[0].resource_version, Some(1));
 
     let entity = svc
-        .entity(&EntityKey::parse(CF_TYPE))
+        .entity(&EntityKey::parse(CF_TYPE), FieldSelection::full())
         .await
         .expect("read")
         .expect("admission registered the entity");
-    assert_eq!(entity.resource_version, 1);
+    assert_eq!(entity.origin.map(|o| o.resource_version), Some(1));
 
     drop(svc);
     drop(db);
@@ -472,15 +484,19 @@ async fn an_entity_without_its_current_state_is_reported_as_corrupt() {
             .expect("remove current instance state");
     }
 
-    for (gts_id, expected) in [
-        (CF_TYPE, "no current Type Schema state"),
-        (CF_INSTANCE, "no current Instance state"),
-    ] {
-        match svc.entity(&EntityKey::parse(gts_id)).await {
-            Err(ServiceError::CorruptDocument(detail)) => {
-                assert!(detail.contains(expected), "unexpected detail: {detail}");
+    // Selection must not change the answer: a document-free read still reads the
+    // current-state pointer and reports its absence.
+    for selection in [FieldSelection::default(), FieldSelection::full()] {
+        for (gts_id, expected) in [
+            (CF_TYPE, "no current Type Schema state"),
+            (CF_INSTANCE, "no current Instance state"),
+        ] {
+            match svc.entity(&EntityKey::parse(gts_id), selection).await {
+                Err(ServiceError::CorruptDocument(detail)) => {
+                    assert!(detail.contains(expected), "unexpected detail: {detail}");
+                }
+                other => panic!("expected corrupt current state, got {other:?}"),
             }
-            other => panic!("expected corrupt current state, got {other:?}"),
         }
     }
 }

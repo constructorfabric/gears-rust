@@ -33,8 +33,8 @@ enum PublishWrite {
 }
 
 impl PublishWrite {
-    fn of(prediction: &Predicted) -> Self {
-        match prediction {
+    fn of(prediction: &Predicted) -> Result<Self, WorkerError> {
+        Ok(match prediction {
             Predicted::Terminal {
                 write: ItemOutcomeWrite::Succeeded(outcome),
                 ..
@@ -46,9 +46,11 @@ impl PublishWrite {
                 resource_version: *resource_version,
             },
             Predicted::Refused(failure) => Self::Failed {
-                error_payload: failure.to_payload(),
+                error_payload: failure
+                    .to_payload()
+                    .map_err(WorkerError::FailureUnencodable)?,
             },
-        }
+        })
     }
 }
 
@@ -77,8 +79,8 @@ pub(super) async fn publish(
     let writes: Vec<(i64, PublishWrite)> = items
         .iter()
         .zip(predictions)
-        .map(|(item, prediction)| (item.id, PublishWrite::of(prediction)))
-        .collect();
+        .map(|(item, prediction)| Ok((item.id, PublishWrite::of(prediction)?)))
+        .collect::<Result<_, WorkerError>>()?;
     let tx_stores = Arc::clone(stores);
     let tx_scope = scope.clone();
     let recorded = db

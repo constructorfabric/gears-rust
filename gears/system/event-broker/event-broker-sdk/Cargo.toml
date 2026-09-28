@@ -25,7 +25,22 @@ db = ["dep:sea-orm", "dep:toolkit-db", "toolkit-db/sqlite"]
 # `toolkit-db`'s outbox pipeline is unconditional, so `db` is all this needs.
 outbox = ["db"]
 integration = []
-test-util = ["dep:async-stream"]
+# REST transport implementation of `EventBrokerApi` (src/rest/) and the
+# `cf-evctl` binary. Off by default so a plain SDK build pulls in no HTTP or
+# wire dependencies (base-trait purity, docs/arch/toolkit-contract-binding).
+rest-client = [
+    "dep:reqwest",
+    "dep:toolkit-http",
+    "dep:bytes",
+    "dep:serde_html_form",
+    "dep:async-stream",
+    "dep:clap",
+    "dep:secrecy",
+    "dep:http-body-util",
+    "dep:http-body",
+    "dep:tracing-subscriber",
+    "dep:rusqlite",
+]
 
 [dependencies]
 async-trait = { workspace = true }
@@ -59,6 +74,30 @@ schemars = { workspace = true }
 toolkit-db = { workspace = true, optional = true }
 sea-orm = { workspace = true, optional = true }
 
+# --- REST transport (feature = "rest-client") -------------------------------
+reqwest = { workspace = true, optional = true }
+toolkit-http = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+serde_html_form = { workspace = true, optional = true }
+clap = { workspace = true, optional = true }
+secrecy = { workspace = true, optional = true }
+http-body-util = { workspace = true, optional = true }
+rusqlite = { workspace = true, optional = true }
+http-body = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+
+[[bin]]
+name = "cf-evctl"
+path = "src/bin/evctl.rs"
+required-features = ["rest-client"]
+
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt", "sync"] }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "net"] }
+# Serve the gear's axum router in-process for the REST transport round-trip test.
+axum = { workspace = true }
+# The gear, with its in-process test harness, so the SDK's integration tests
+# resolve a real `EventBrokerApi` (`LocalBroker`) from the harness's `ClientHub`
+# instead of a mock. gear -> SDK is a normal dep; this SDK -> gear edge is
+# dev-only, so Cargo permits the cycle.
+cf-gears-event-broker = { path = "../event-broker", features = ["test-utils"] }
 trybuild = { workspace = true }

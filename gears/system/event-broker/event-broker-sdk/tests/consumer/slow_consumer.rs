@@ -1,23 +1,24 @@
+use event_broker_sdk::Sequence;
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use event_broker_sdk::mock::stubs::test_ctx_for_tenant;
-use event_broker_sdk::mock::{MockBroker, MockBrokerHandle};
+use event_broker::test_support::StaticTypesRegistry;
+use event_broker_sdk::gts_id;
 use event_broker_sdk::{
     BatchHandlerOutcome, CommitOffset, ConnectionDropReason, ConsumerBuffering, ConsumerBuilder,
     ConsumerError, ConsumerGroupId, ConsumerGroupRef, ConsumerHandler, ConsumerRuntimeEvent,
-    ConsumerRuntimeListener, EventBatch, EventBrokerApi, Fallback, InMemoryOffsetManager,
-    OffsetManagerError, OffsetStore, ResolvedPosition, TopicId,
+    ConsumerRuntimeListener, EventBatch, Fallback, InMemoryOffsetManager, OffsetManagerError,
+    OffsetStore, Position, TopicId,
 };
-use uuid::Uuid;
+use serde_json::json;
 
-use super::common::{TENANT, publish_json, wait_until};
+use super::common::{SHOWCASE_SUBJECT_TYPE, TopicFixture, publish_json, topic, wait_until};
 
-const SLOW_TOPIC: &str = "gts.cf.core.events.topic.v1~example.mock.showcase.slow.v1";
-const SLOW_EVENT_TYPE: &str = "gts.cf.core.events.event.v1~example.mock.showcase.slow.v1~";
-const FAST_TOPIC: &str = "gts.cf.core.events.topic.v1~example.mock.showcase.fast.v1";
-const FAST_EVENT_TYPE: &str = "gts.cf.core.events.event.v1~example.mock.showcase.fast.v1~";
+const SLOW_TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.showcase.slow.v1");
+const SLOW_EVENT_TYPE: &str = gts_id!("cf.core.events.event.v1~example.mock.showcase.slow.v1~");
+const FAST_TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.showcase.fast.v1");
+const FAST_EVENT_TYPE: &str = gts_id!("cf.core.events.event.v1~example.mock.showcase.fast.v1~");
 
 #[derive(Clone, Default)]
 struct RecordingRuntimeListener {
@@ -44,9 +45,9 @@ impl OffsetStore for SequencedOffsetManager {
         _group: &ConsumerGroupId,
         _topic: &TopicId,
         _partition: u32,
-    ) -> Result<ResolvedPosition, OffsetManagerError> {
+    ) -> Result<Position, OffsetManagerError> {
         self.timeline.lock().unwrap().push("load");
-        Ok(ResolvedPosition::Earliest)
+        Ok(Position::Earliest)
     }
 }
 
@@ -57,7 +58,7 @@ impl CommitOffset for SequencedOffsetManager {
         _group: &ConsumerGroupId,
         _topic: &TopicId,
         _partition: u32,
-        _offset: i64,
+        _offset: Sequence,
     ) -> Result<(), OffsetManagerError> {
         Ok(())
     }
@@ -104,52 +105,28 @@ impl ConsumerHandler for RecordingBatchHandler {
     }
 }
 
-async fn broker_with_slow_and_fast_topics() -> (
-    Arc<dyn EventBrokerApi>,
-    MockBrokerHandle,
-    toolkit_security::SecurityContext,
-) {
-    let mock = MockBroker::new();
-    let control = MockBrokerHandle::from_broker(&mock);
-    control.register_topic(SLOW_TOPIC, 2).await;
-    control
-        .register_event_type(
-            SLOW_TOPIC,
-            SLOW_EVENT_TYPE,
-            serde_json::json!({ "type": "object" }),
-            &[],
-        )
-        .await;
-    control.register_topic(FAST_TOPIC, 1).await;
-    control
-        .register_event_type(
-            FAST_TOPIC,
-            FAST_EVENT_TYPE,
-            serde_json::json!({ "type": "object" }),
-            &[],
-        )
-        .await;
-    control
-        .set_heartbeat_interval(std::time::Duration::from_millis(10))
-        .await;
-
-    (
-        Arc::new(mock),
-        control,
-        test_ctx_for_tenant(Uuid::parse_str(TENANT).expect("tenant uuid")),
-    )
+async fn broker_with_slow_and_fast_topics() -> TopicFixture {
+    super::common::fixture_from_catalog(StaticTypesRegistry::of(json!([
+        { "id": SLOW_TOPIC, "partitions": 2 },
+        { "id": SLOW_EVENT_TYPE, "topic": SLOW_TOPIC, "data_schema": { "type": "object" }, "allowed_subject_types": [SHOWCASE_SUBJECT_TYPE], "partition_key": "/source" },
+        { "id": FAST_TOPIC, "partitions": 1 },
+        { "id": FAST_EVENT_TYPE, "topic": FAST_TOPIC, "data_schema": { "type": "object" }, "allowed_subject_types": [SHOWCASE_SUBJECT_TYPE], "partition_key": "/source" },
+    ])))
+    .await
 }
 
 #[tokio::test]
 async fn if_a_partition_is_slow_the_sdk_drops_drains_and_rejoins_from_offsets() {
-    let (broker, _control, ctx) = broker_with_slow_and_fast_topics().await;
+    let fixture = broker_with_slow_and_fast_topics().await;
+    let broker = fixture.broker.clone();
+    let ctx = fixture.ctx.clone();
     let listener = RecordingRuntimeListener::default();
     let events = listener.events.clone();
     let timeline = Arc::new(Mutex::new(Vec::new()));
 
     let handle = ConsumerBuilder::new(broker.clone())
         .group(ConsumerGroupRef::auto_anonymous("showcase-slow-drop"))
-        .topics([SLOW_TOPIC])
+        .topics([topic(SLOW_TOPIC)])
         .buffering(ConsumerBuffering {
             partition_capacity: 8,
             high_watermark: 1,
@@ -221,7 +198,7 @@ async fn if_a_partition_is_slow_the_sdk_drops_drains_and_rejoins_from_offsets() 
                 (topic == SLOW_TOPIC).then(|| {
                     affected
                         .iter()
-                        .map(|slot| (slot.topic.clone(), slot.partition))
+                        .map(|slot| (slot.topic.as_ref().to_owned(), slot.partition))
                         .collect::<BTreeSet<_>>()
                 })
             } else {
@@ -237,7 +214,9 @@ async fn if_a_partition_is_slow_the_sdk_drops_drains_and_rejoins_from_offsets() 
 
 #[tokio::test]
 async fn if_a_topic_is_noisy_i_can_isolate_it_in_a_separate_consumer_handle() {
-    let (broker, _control, ctx) = broker_with_slow_and_fast_topics().await;
+    let fixture = broker_with_slow_and_fast_topics().await;
+    let broker = fixture.broker.clone();
+    let ctx = fixture.ctx.clone();
     let slow_listener = RecordingRuntimeListener::default();
     let slow_events = slow_listener.events.clone();
     let slow_timeline = Arc::new(Mutex::new(Vec::new()));
@@ -245,7 +224,7 @@ async fn if_a_topic_is_noisy_i_can_isolate_it_in_a_separate_consumer_handle() {
 
     let slow_handle = ConsumerBuilder::new(broker.clone())
         .group(ConsumerGroupRef::auto_anonymous("showcase-noisy-slow"))
-        .topics([SLOW_TOPIC])
+        .topics([topic(SLOW_TOPIC)])
         .buffering(ConsumerBuffering {
             partition_capacity: 8,
             high_watermark: 1,
@@ -264,7 +243,7 @@ async fn if_a_topic_is_noisy_i_can_isolate_it_in_a_separate_consumer_handle() {
 
     let fast_handle = ConsumerBuilder::new(broker.clone())
         .group(ConsumerGroupRef::auto_anonymous("showcase-noisy-fast"))
-        .topics([FAST_TOPIC])
+        .topics([topic(FAST_TOPIC)])
         .offset_manager(InMemoryOffsetManager::new(Fallback::Earliest))
         .batch_handler(RecordingBatchHandler {
             subjects: fast_subjects.clone(),

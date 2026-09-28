@@ -6,16 +6,18 @@ use axum::{Extension, Router};
 use toolkit::api::OpenApiRegistry;
 use toolkit::api::canonical_prelude::StatusCode;
 use toolkit::api::operation_builder::{
-    CORE_GLOBAL_BASE_LICENSE_FEATURE, LicenseFeature, OperationBuilder, ParamSpec,
-    ResponseHeaderSpec, ResponseHeaderType,
+    CORE_GLOBAL_BASE_LICENSE_FEATURE, LicenseFeature, OperationBuilder, OperationBuilderODataExt,
+    ParamSpec, ResponseHeaderSpec, ResponseHeaderType,
 };
 
 use super::dto::{
-    DeleteEntitiesRequest, EntityDto, GtsEntityDto, ListEntitiesResponse, OperationAcceptedDto,
-    OperationDto, RegisterEntitiesRequest, RegisterEntitiesResponse, SubmitEntitiesRequest,
+    BatchGetRequest, DeleteEntitiesRequest, EntityDto, EntityLookupsDto, EntityPageDto,
+    GtsEntityDto, ListEntitiesResponse, OperationAcceptedDto, OperationDto,
+    RegisterEntitiesRequest, RegisterEntitiesResponse, SubmitEntitiesRequest,
 };
 use super::handlers;
 pub use super::paths::{V1, V2};
+use crate::config::Limits;
 use crate::domain::registry_service::RegistryService;
 use crate::domain::service::TypesRegistryService;
 
@@ -61,6 +63,11 @@ pub fn register_routes(
     router = register_v1(router, openapi);
     router = register_submit(router, openapi);
     router = register_reads(router, openapi);
+    router = register_batch_get(router, openapi);
+    let limits = registry
+        .as_deref()
+        .map_or_else(Limits::default, |registry| *registry.limits());
+    router = register_discovery(router, openapi, &limits);
     router = register_batch_delete(router, openapi);
     router = register_delete_entity(router, openapi);
 
@@ -273,10 +280,17 @@ fn register_reads(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         .operation_id("types_registry.get_entity")
         .summary("Get a GTS entity by identifier or Registry Reference")
         .description(
-            "Return one entity with its authored document and the effective artifacts \
-             materialized at admission. The key is either a canonical GTS identifier or the \
-             Registry Reference UUID derived from it. A deleted entity is still readable and \
-             reports its lifecycle status.",
+            "Return one entity, projected by `$select`. The key is either a canonical GTS \
+             identifier or the Registry Reference UUID derived from it; a key over 1024 \
+             bytes is a 400, and any other key naming no entity is a 404. Absent `$select` is \
+             the document-free default `gts_id,gts_uuid,kind,origin,lifecycle_status`; \
+             documents are selected individually from `content`, \
+             `resolved_schema`, `effective_traits` and `effective_traits_schema` (the last \
+             three Type Schemas only), plus the `provenance` group. Names are \
+             case-insensitive; an empty, duplicate, unknown or nested name is a 400. \
+             `gts_id`, `gts_uuid`, `kind` and `lifecycle_status` are always returned, \
+             whether or not `$select` names them, so a deleted entity is still readable and \
+             reports it. No other query parameter is accepted.",
         )
         .tag(API_TAG)
         .authenticated()
@@ -286,9 +300,151 @@ fn register_reads(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
             "A GTS identifier (e.g. gts.acme.core.events.user_created.v1~) or a Registry \
              Reference UUID",
         )
+        .with_odata_select()
         .handler(handlers::get_entity_by_key)
         .json_response_with_schema::<EntityDto>(openapi, StatusCode::OK, "The requested entity")
         .problem_response(openapi, StatusCode::NOT_FOUND, "Entity not found")
+        .standard_errors(openapi)
+        .error_503(openapi)
+        .register(router, openapi);
+    router
+}
+
+/// `POST {V2}/entities:batchGet` (T22a).
+fn register_batch_get(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
+    // A read-only custom action, and a `POST` for two reasons that are about the
+    // transport rather than the semantics: an identifier runs to 1024 characters,
+    // which a query string cannot carry safely, and portable `GET` has no body
+    // (DESIGN §3.3). It is still a read — no `Idempotency-Key`, nothing to replay.
+    router = OperationBuilder::post(format!("{V2}/entities:batchGet"))
+        .operation_id("types_registry.batch_get_entities")
+        .summary("Read a set of GTS entities by key")
+        .description(
+            "Read up to 100 entities in one round trip. Each item names one entity in `key` \
+             (a canonical GTS identifier or the Registry Reference UUID derived from it), \
+             resolved exactly as GET /types-registry/v2/entities/{entity_key} resolves it. \
+             A top-level `$select` string applies to every key and follows that route's \
+             `$select` rules; absent, the document-free default. Tombstones are `found`. Returns 200 with one result \
+             per requested key, in request order and echoing the key it was asked by: `found` \
+             with the selected fields, exactly as the exact read returns them and always \
+             including `gts_id`, `gts_uuid`, `kind` and `lifecycle_status`, or `not_found`. Query parameters are refused, `$select` included. A key \
+             named twice collapses onto its first mention; the two spellings of one entity are \
+             two keys and get two results. An absent key is not a 404: one missing key must \
+             not lose the answers for the others. The If-None-Match header is refused rather \
+             than ignored: validators are per key and belong in each item's `if_none_match`.",
+        )
+        .tag(API_TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .json_request::<BatchGetRequest>(openapi, "Keys to read")
+        .handler(handlers::batch_get_entities)
+        .json_response_with_schema::<EntityLookupsDto>(
+            openapi,
+            StatusCode::OK,
+            "One result per requested key",
+        )
+        .standard_errors(openapi)
+        .error_413(openapi)
+        .error_415(openapi)
+        .error_422(openapi)
+        .error_503(openapi)
+        .register(router, openapi);
+    router
+}
+
+/// `GET {V2}/entities` — the bounded, projected discovery page (D12, T22a, T22b).
+fn register_discovery(
+    mut router: Router,
+    openapi: &dyn OpenApiRegistry,
+    limits: &Limits,
+) -> Router {
+    let (default, max) = (limits.page_size_default, limits.page_size_max);
+    router = OperationBuilder::get(format!("{V2}/entities"))
+        .operation_id("types_registry.list_entities")
+        .summary("Discover GTS entities")
+        .description(format!(
+            "Return one bounded page of entities, ordered by canonical identifier, with a \
+             cursor only when another match remains; a page with a cursor is full. \
+             `lifecycle_status` is `active` (default), `deleted` \
+             (tombstones only) or `all`. Each item is projected by `$select` \
+             exactly as GET /types-registry/v2/entities/{{entity_key}} projects it; absent, the \
+             document-free default; `gts_id`, `gts_uuid`, `kind` and `lifecycle_status` are \
+             always returned. A page never carries a validator. `depth` bounds the number of \
+             identifier segments and `kind` narrows to Type Schemas or Instances; \
+             `lifecycle_status`, `depth` and `kind` intersect with `pattern` before the page \
+             limit. `limit` (alias `$top`) \
+             defaults to {default} and may not exceed {max}; a caller selecting documents should \
+             page smaller. `cursor` (alias `$skiptoken`) is opaque, versioned and bound to \
+             the pattern, `depth`, `kind`, `lifecycle_status` and the normalized `$select` \
+             it was issued for: resuming under any of them changed, or with a token of \
+             another version, is a 400, while an absent and an explicit default value of \
+             `$select` or `lifecycle_status` are interchangeable. Any other query parameter \
+             is refused.",
+        ))
+        .tag(API_TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .query_param(
+            "pattern",
+            false,
+            "A GTS identifier pattern (GTS spec section 10), with or without a wildcard. With one \
+             trailing `*`, starting at a segment token or the version, it matches every \
+             identifier under that prefix, derived types and Instances included (e.g. \
+             gts.acme.core.*, gts.acme.core.events.user_created.v1~*). Without `*` it must \
+             be a valid GTS identifier: a Type Schema identifier matches itself, every type \
+             derived from it and every Instance of them (e.g. \
+             gts.acme.core.events.user_created.v1~); an Instance identifier matches that \
+             Instance. In either form a segment that gives only a major version (`v1`) \
+             matches every minor of that major (`v1`, `v1.0`, `v1.3`), while a given minor \
+             matches only itself. A pattern that does not parse is a 400",
+        )
+        // `ParamSpec` has no `maximum`, so the upper bound is stated in the description.
+        .param(
+            ParamSpec::query("depth")
+                .param_type("integer")
+                .minimum(1.0)
+                .description(
+                    "Inclusive maximum number of GTS identifier segments, 1 to 255: a \
+                     one-segment root has depth 1 and each derived type or Instance tail \
+                     adds one. Applies with or without `pattern`",
+                ),
+        )
+        // `ParamSpec` has no `enum`, so the vocabulary is stated in the description.
+        .param(ParamSpec::query("kind").param_type("string").description(
+            "Only entities of this kind: `type_schema` or `instance`. Absent means both; \
+             any other value is a 400",
+        ))
+        .param(
+            ParamSpec::query("lifecycle_status")
+                .param_type("string")
+                .description(
+                    "`active` (default), `deleted` (tombstones only) or `all` (both). Any other \
+                     value, empty or repeated, is a 400",
+                ),
+        )
+        // `ParamSpec` has no `maximum`, and this one is configured, so the description states it.
+        .param(
+            ParamSpec::query("limit")
+                .param_type("integer")
+                .minimum(1.0)
+                .description(format!(
+                    "Page size, 1 to {max}. Defaults to {default}. Alias: $top"
+                )),
+        )
+        .query_param(
+            "cursor",
+            false,
+            "The previous page's page_info.next_cursor, under the same pattern, depth, kind, \
+             lifecycle_status and $select. \
+             Absent starts at the beginning. Alias: $skiptoken",
+        )
+        .with_odata_select()
+        .handler(handlers::discover_entities)
+        .json_response_with_schema::<EntityPageDto>(
+            openapi,
+            StatusCode::OK,
+            "One page and, while more remains, its cursor",
+        )
         .standard_errors(openapi)
         .error_503(openapi)
         .register(router, openapi);

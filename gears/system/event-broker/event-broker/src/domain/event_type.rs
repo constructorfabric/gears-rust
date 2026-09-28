@@ -11,7 +11,7 @@
 use gts::GtsInstanceId;
 use types_registry_sdk::GtsTypeSchema;
 
-use crate::domain::error::DomainError;
+use crate::domain::error::{DomainError, ErrorCode};
 
 /// The topic that events of this type are published to.
 ///
@@ -86,11 +86,15 @@ pub fn partition_key(event_type: &GtsTypeSchema) -> Result<String, DomainError> 
 /// unreadable.
 pub fn validate_partition_key(event_type: &GtsTypeSchema) -> Result<(), DomainError> {
     let pointer = partition_key(event_type)?;
-    let rejected = |detail: &str| {
-        DomainError::Validation(format!(
+    // `InvalidSpec` is the code every rejected specification carries
+    // (`infra::specification::bulk_load`); there is no narrower documented
+    // code for a partition-key pointer.
+    let rejected = |detail: &str| DomainError::Validation {
+        code: ErrorCode::InvalidSpec,
+        message: format!(
             "{} declares partition key `{pointer}`, which {detail}",
             event_type.type_id.as_ref()
-        ))
+        ),
     };
 
     let Some(path) = pointer.strip_prefix('/') else {

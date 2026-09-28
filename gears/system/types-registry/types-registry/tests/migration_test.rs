@@ -4,8 +4,9 @@
 //! ties an `operation_item` to its parent's `kind` / `dry_run`, and the
 //! up/down/up roundtrip — without needing a running server.
 //!
-//! `docs/database.sql` is normative. P0 adds nine initial tables and then
-//! `coordination_state`; federation's `source_claim` remains absent.
+//! `docs/database.sql` is normative. P0 adds nine initial tables, then
+//! `coordination_state` and `entity_gts_segment`; federation's `source_claim`
+//! remains absent.
 //!
 //! Postgres- and `MySQL`-dialect *behaviour* (identity columns, `bytea`,
 //! `ascii_bin` collation, FK `RESTRICT`) is not reachable from `SQLite`. The
@@ -32,6 +33,7 @@ const P0_TABLES: &[&str] = &[
     "types_registry__type_schema",
     "types_registry__instance",
     "types_registry__dependency",
+    "types_registry__entity_gts_segment",
 ];
 
 /// Tables that P0 must not create.
@@ -46,6 +48,10 @@ const P0_INDEXES: &[&str] = &[
     "idx_tr_entity_family",
     "idx_tr_entity_visibility",
     "idx_tr_dependency_to",
+    "idx_tr_entity_depth",
+    "idx_tr_entity_kind_lifecycle",
+    "idx_tr_entity_lifecycle",
+    "idx_tr_entity_gts_segment_lookup",
 ];
 
 // The uuid columns hold 16 raw bytes, not the 36-character text form: `sqlx`
@@ -227,6 +233,165 @@ async fn an_existing_operation_item_gains_compat_forced_reading_false() {
     );
 }
 
+/// An existing installation must lose the legacy column from both revision
+/// tables when the next migration is applied.
+#[tokio::test]
+async fn an_existing_installation_loses_the_revision_content_hash() {
+    let db = Database::connect("sqlite::memory:")
+        .await
+        .expect("connect in-memory sqlite");
+    let tables = [
+        "types_registry__type_schema_revision",
+        "types_registry__instance_revision",
+    ];
+
+    Migrator::up(&db, Some(3))
+        .await
+        .expect("apply migrations before the drop");
+    for table in tables {
+        exec(&db, format!("SELECT content_hash FROM {table}"))
+            .await
+            .unwrap_or_else(|e| panic!("{table} carries the column before upgrade: {e}"));
+    }
+
+    Migrator::up(&db, None).await.expect("apply the rest");
+    for table in tables {
+        assert!(
+            exec(&db, format!("SELECT content_hash FROM {table}"))
+                .await
+                .is_err(),
+            "{table} must no longer carry content_hash",
+        );
+    }
+}
+
+/// A rollback cannot restore valid hashes for existing revisions, so it
+/// refuses before changing either table or the migration ledger.
+#[tokio::test]
+async fn rolling_back_the_content_hash_drop_refuses_while_revisions_exist() {
+    let revisions = [
+        (
+            "types_registry__type_schema_revision",
+            format!(
+                "INSERT INTO types_registry__type_schema_revision \
+                 (entity_id, revision_no, raw_schema, gts_spec_version, gts_impl_version, \
+                  compat_forced, operation_item_id, created_at, updated_at) \
+                 VALUES (1, 1, '{{}}', '0.13', '0.12.0', 0, 1, '{TS}', '{TS}')"
+            ),
+        ),
+        (
+            "types_registry__instance_revision",
+            format!(
+                "INSERT INTO types_registry__instance_revision \
+                 (entity_id, revision_no, canonical_value, type_schema_entity_id, \
+                  type_schema_revision_no, gts_spec_version, gts_impl_version, \
+                  operation_item_id, created_at, updated_at) \
+                 VALUES (2, 1, '{{}}', 1, 1, '0.13', '0.12.0', 2, '{TS}', '{TS}')"
+            ),
+        ),
+    ];
+    for (table, insert) in revisions {
+        // Foreign keys off so one revision row stands in for a full admission
+        // graph; down only asks whether a row exists.
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        db.execute_raw(stmt(&db, "PRAGMA foreign_keys = OFF;"))
+            .await
+            .expect("disable foreign keys");
+        Migrator::up(&db, Some(4))
+            .await
+            .expect("apply migrations through the drop");
+        exec(&db, insert)
+            .await
+            .unwrap_or_else(|e| panic!("insert a revision into {table}: {e}"));
+
+        let mut schemas_before = Vec::new();
+        for revision_table in [
+            "types_registry__type_schema_revision",
+            "types_registry__instance_revision",
+        ] {
+            let row = db
+                .query_one_raw(stmt(
+                    &db,
+                    format!(
+                        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = '{revision_table}'"
+                    ),
+                ))
+                .await
+                .expect("read table schema")
+                .expect("revision table exists");
+            schemas_before.push((
+                revision_table,
+                row.try_get::<String>("", "sql").expect("table DDL"),
+            ));
+        }
+        let applied_before = db
+            .query_one_raw(stmt(&db, "SELECT COUNT(*) AS n FROM seaql_migrations"))
+            .await
+            .expect("count applied migrations")
+            .expect("one row")
+            .try_get::<i64>("", "n")
+            .expect("migration count");
+
+        let err = Migrator::down(&db, Some(1))
+            .await
+            .expect_err("down must refuse while a revision exists");
+        assert!(
+            matches!(&err, sea_orm::DbErr::Migration(message)
+                if message.contains(table) && message.contains("content_hash")),
+            "{table}: {err:?}",
+        );
+
+        for revision_table in [
+            "types_registry__type_schema_revision",
+            "types_registry__instance_revision",
+        ] {
+            assert!(
+                exec(&db, format!("SELECT content_hash FROM {revision_table}"))
+                    .await
+                    .is_err(),
+                "a refused rollback must not restore content_hash to {revision_table}",
+            );
+        }
+
+        for (revision_table, before) in schemas_before {
+            let row = db
+                .query_one_raw(stmt(
+                    &db,
+                    format!(
+                        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = '{revision_table}'"
+                    ),
+                ))
+                .await
+                .expect("read table schema")
+                .expect("revision table exists");
+            assert_eq!(
+                row.try_get::<String>("", "sql").expect("table DDL"),
+                before,
+                "refused rollback changed {revision_table}"
+            );
+        }
+        let row = db
+            .query_one_raw(stmt(&db, format!("SELECT COUNT(*) AS n FROM {table}")))
+            .await
+            .expect("count revisions")
+            .expect("one row");
+        assert_eq!(row.try_get::<i64>("", "n").expect("n"), 1, "{table}");
+        let applied_after = db
+            .query_one_raw(stmt(&db, "SELECT COUNT(*) AS n FROM seaql_migrations"))
+            .await
+            .expect("read migration state")
+            .expect("one row")
+            .try_get::<i64>("", "n")
+            .expect("migration count");
+        assert_eq!(
+            applied_after, applied_before,
+            "refused rollback changed migration state"
+        );
+    }
+}
+
 /// `SQLite`'s INTEGER boolean needs an explicit 0/1 check.
 #[tokio::test]
 async fn the_lowered_compat_forced_boolean_refuses_a_value_outside_zero_and_one() {
@@ -299,7 +464,7 @@ async fn the_coordination_state_migration_absorbs_a_table_that_already_exists() 
 }
 
 #[tokio::test]
-async fn migration_creates_the_nine_p0_tables() {
+async fn migration_creates_the_p0_tables() {
     let db = migrated_db().await;
     for table in P0_TABLES {
         exec(&db, format!("SELECT COUNT(*) FROM {table}"))
@@ -382,6 +547,128 @@ async fn migration_creates_every_index_declared_in_the_p0_subset() {
 }
 
 // ---------------------------------------------------------------------------
+// chain_depth and entity_gts_segment
+// ---------------------------------------------------------------------------
+
+async fn insert_entity(db: &DatabaseConnection, chain_depth: &str) -> Result<(), sea_orm::DbErr> {
+    exec(
+        db,
+        format!(
+            "INSERT INTO types_registry__entity \
+             (gts_uuid, gts_id, entity_kind, chain_depth, family_id, ownership_scope, \
+              owner_tenant_id, owning_gear, lifecycle_status, resource_version, created_at, \
+              updated_at) \
+             VALUES ({ENTITY_UUID}, '{GTS_TYPE}', 1, {chain_depth}, 1, 1, NULL, \
+                     'types-registry', 1, 1, '{TS}', '{TS}')"
+        ),
+    )
+    .await
+}
+
+async fn insert_segment(
+    db: &DatabaseConnection,
+    segment_no: i64,
+    is_type: i64,
+) -> Result<(), sea_orm::DbErr> {
+    exec(
+        db,
+        format!(
+            "INSERT INTO types_registry__entity_gts_segment \
+             (entity_id, segment_no, segment_name, major, minor, is_type) \
+             VALUES (1, {segment_no}, 'acme.crm.customer.type', 1, NULL, {is_type})"
+        ),
+    )
+    .await
+}
+
+/// `SQLite` cannot add a `NOT NULL` column, so its CHECK refuses NULL.
+#[tokio::test]
+async fn entity_chain_depth_check_rejects_null_and_zero() {
+    let db = migrated_db().await;
+    insert_family(&db).await;
+    for bad in ["NULL", "0"] {
+        insert_entity(&db, bad)
+            .await
+            .expect_err("ck_tr_entity_chain_depth must reject it");
+    }
+    insert_entity(&db, "1")
+        .await
+        .expect("depth 1 is admissible");
+}
+
+#[tokio::test]
+async fn segment_rows_are_checked_and_cascade_with_their_entity() {
+    let db = migrated_db().await;
+    insert_family(&db).await;
+    insert_entity(&db, "1").await.expect("entity");
+    insert_segment(&db, -1, 1)
+        .await
+        .expect_err("ck_tr_entity_gts_segment_no must reject a negative position");
+    insert_segment(&db, 0, 2)
+        .await
+        .expect_err("is_type must stay in the boolean domain");
+    insert_segment(&db, 0, 1).await.expect("segment 0");
+    insert_segment(&db, 0, 1)
+        .await
+        .expect_err("the primary key allows one row per position");
+
+    exec(&db, "DELETE FROM types_registry__entity")
+        .await
+        .expect("delete the entity");
+    let row = db
+        .query_one_raw(stmt(
+            &db,
+            "SELECT COUNT(*) AS n FROM types_registry__entity_gts_segment",
+        ))
+        .await
+        .expect("count segments")
+        .expect("one row");
+    assert_eq!(row.try_get::<i64>("", "n").expect("n"), 0, "rows cascade");
+}
+
+/// No backfill: an installation that already holds entities refuses the
+/// migration and keeps its schema.
+#[tokio::test]
+async fn segment_materialization_refuses_an_existing_entity() {
+    let db = Database::connect("sqlite::memory:")
+        .await
+        .expect("connect in-memory sqlite");
+    Migrator::up(&db, Some(4))
+        .await
+        .expect("apply migrations before the materialization");
+    insert_family(&db).await;
+    exec(
+        &db,
+        format!(
+            "INSERT INTO types_registry__entity \
+             (gts_uuid, gts_id, entity_kind, family_id, ownership_scope, owner_tenant_id, \
+              owning_gear, lifecycle_status, resource_version, created_at, updated_at) \
+             VALUES ({ENTITY_UUID}, '{GTS_TYPE}', 1, 1, 1, NULL, 'types-registry', 1, 1, \
+                     '{TS}', '{TS}')"
+        ),
+    )
+    .await
+    .expect("an entity from before the migration");
+
+    let err = Migrator::up(&db, None)
+        .await
+        .expect_err("up must refuse a non-empty entity table");
+    assert!(
+        matches!(&err, sea_orm::DbErr::Migration(message) if message.contains("no backfill")),
+        "{err:?}"
+    );
+    exec(&db, "SELECT chain_depth FROM types_registry__entity")
+        .await
+        .expect_err("the refused migration added no column");
+    exec(
+        &db,
+        "SELECT COUNT(*) FROM types_registry__entity_gts_segment",
+    )
+    .await
+    .expect_err("and no table");
+}
+
+// ---------------------------------------------------------------------------
 // version_family
 // ---------------------------------------------------------------------------
 
@@ -446,9 +733,9 @@ async fn entity_owner_check_rejects_a_global_row_without_owning_gear() {
         &db,
         format!(
             "INSERT INTO types_registry__entity \
-             (gts_uuid, gts_id, entity_kind, family_id, ownership_scope, owner_tenant_id, \
+             (gts_uuid, gts_id, entity_kind, chain_depth, family_id, ownership_scope, owner_tenant_id, \
               owning_gear, lifecycle_status, resource_version, created_at, updated_at) \
-             VALUES ({ENTITY_UUID}, '{GTS_TYPE}', 1, 1, 1, NULL, NULL, 1, 1, '{TS}', '{TS}')"
+             VALUES ({ENTITY_UUID}, '{GTS_TYPE}', 1, 1, 1, 1, NULL, NULL, 1, 1, '{TS}', '{TS}')"
         ),
     )
     .await
@@ -463,9 +750,9 @@ async fn entity_owner_check_accepts_a_global_row_with_owning_gear() {
         &db,
         format!(
             "INSERT INTO types_registry__entity \
-             (gts_uuid, gts_id, entity_kind, family_id, ownership_scope, owner_tenant_id, \
+             (gts_uuid, gts_id, entity_kind, chain_depth, family_id, ownership_scope, owner_tenant_id, \
               owning_gear, lifecycle_status, resource_version, created_at, updated_at) \
-             VALUES ({ENTITY_UUID}, '{GTS_TYPE}', 1, 1, 1, NULL, 'types-registry', 1, 1, \
+             VALUES ({ENTITY_UUID}, '{GTS_TYPE}', 1, 1, 1, 1, NULL, 'types-registry', 1, 1, \
                      '{TS}', '{TS}')"
         ),
     )
@@ -481,9 +768,9 @@ async fn entity_lifecycle_check_rejects_a_deleted_row_without_deleted_at() {
         &db,
         format!(
             "INSERT INTO types_registry__entity \
-             (gts_uuid, gts_id, entity_kind, family_id, ownership_scope, owner_tenant_id, \
+             (gts_uuid, gts_id, entity_kind, chain_depth, family_id, ownership_scope, owner_tenant_id, \
               owning_gear, lifecycle_status, resource_version, deleted_at, created_at, updated_at) \
-             VALUES ({ENTITY_UUID}, '{GTS_TYPE}', 1, 1, 1, NULL, 'types-registry', 2, 1, \
+             VALUES ({ENTITY_UUID}, '{GTS_TYPE}', 1, 1, 1, 1, NULL, 'types-registry', 2, 1, \
                      NULL, '{TS}', '{TS}')"
         ),
     )
@@ -499,9 +786,9 @@ async fn entity_resource_version_check_rejects_zero() {
         &db,
         format!(
             "INSERT INTO types_registry__entity \
-             (gts_uuid, gts_id, entity_kind, family_id, ownership_scope, owner_tenant_id, \
+             (gts_uuid, gts_id, entity_kind, chain_depth, family_id, ownership_scope, owner_tenant_id, \
               owning_gear, lifecycle_status, resource_version, created_at, updated_at) \
-             VALUES ({ENTITY_UUID}, '{GTS_TYPE}', 1, 1, 1, NULL, 'types-registry', 1, 0, \
+             VALUES ({ENTITY_UUID}, '{GTS_TYPE}', 1, 1, 1, 1, NULL, 'types-registry', 1, 0, \
                      '{TS}', '{TS}')"
         ),
     )
@@ -516,9 +803,9 @@ async fn entity_family_foreign_key_rejects_an_unknown_family() {
         &db,
         format!(
             "INSERT INTO types_registry__entity \
-             (gts_uuid, gts_id, entity_kind, family_id, ownership_scope, owner_tenant_id, \
+             (gts_uuid, gts_id, entity_kind, chain_depth, family_id, ownership_scope, owner_tenant_id, \
               owning_gear, lifecycle_status, resource_version, created_at, updated_at) \
-             VALUES ({ENTITY_UUID}, '{GTS_TYPE}', 1, 999, 1, NULL, 'types-registry', 1, 1, \
+             VALUES ({ENTITY_UUID}, '{GTS_TYPE}', 1, 1, 999, 1, NULL, 'types-registry', 1, 1, \
                      '{TS}', '{TS}')"
         ),
     )
@@ -731,9 +1018,9 @@ async fn dependency_kind_check_rejects_an_unknown_kind() {
         &db,
         format!(
             "INSERT INTO types_registry__entity \
-             (gts_uuid, gts_id, entity_kind, family_id, ownership_scope, owner_tenant_id, \
+             (gts_uuid, gts_id, entity_kind, chain_depth, family_id, ownership_scope, owner_tenant_id, \
               owning_gear, lifecycle_status, resource_version, created_at, updated_at) \
-             VALUES ({ENTITY_UUID}, '{GTS_TYPE}', 1, 1, 1, NULL, 'types-registry', 1, 1, \
+             VALUES ({ENTITY_UUID}, '{GTS_TYPE}', 1, 1, 1, 1, NULL, 'types-registry', 1, 1, \
                      '{TS}', '{TS}')"
         ),
     )
@@ -896,9 +1183,9 @@ async fn entity_kind_check_rejects_a_third_kind() {
         &db,
         format!(
             "INSERT INTO types_registry__entity \
-             (gts_uuid, gts_id, entity_kind, family_id, ownership_scope, owner_tenant_id, \
+             (gts_uuid, gts_id, entity_kind, chain_depth, family_id, ownership_scope, owner_tenant_id, \
               owning_gear, lifecycle_status, resource_version, created_at, updated_at) \
-             VALUES ({ENTITY_UUID}, '{GTS_TYPE}', 3, 1, 1, NULL, 'types-registry', 1, 1, \
+             VALUES ({ENTITY_UUID}, '{GTS_TYPE}', 3, 1, 1, 1, NULL, 'types-registry', 1, 1, \
                      '{TS}', '{TS}')"
         ),
     )
@@ -914,9 +1201,9 @@ async fn entity_ownership_scope_check_rejects_a_third_scope() {
         &db,
         format!(
             "INSERT INTO types_registry__entity \
-             (gts_uuid, gts_id, entity_kind, family_id, ownership_scope, owner_tenant_id, \
+             (gts_uuid, gts_id, entity_kind, chain_depth, family_id, ownership_scope, owner_tenant_id, \
               owning_gear, lifecycle_status, resource_version, created_at, updated_at) \
-             VALUES ({ENTITY_UUID}, '{GTS_TYPE}', 1, 1, 3, NULL, 'types-registry', 1, 1, \
+             VALUES ({ENTITY_UUID}, '{GTS_TYPE}', 1, 1, 1, 3, NULL, 'types-registry', 1, 1, \
                      '{TS}', '{TS}')"
         ),
     )
@@ -932,9 +1219,9 @@ async fn entity_lifecycle_check_rejects_a_third_status() {
         &db,
         format!(
             "INSERT INTO types_registry__entity \
-             (gts_uuid, gts_id, entity_kind, family_id, ownership_scope, owner_tenant_id, \
+             (gts_uuid, gts_id, entity_kind, chain_depth, family_id, ownership_scope, owner_tenant_id, \
               owning_gear, lifecycle_status, resource_version, created_at, updated_at) \
-             VALUES ({ENTITY_UUID}, '{GTS_TYPE}', 1, 1, 1, NULL, 'types-registry', 3, 1, \
+             VALUES ({ENTITY_UUID}, '{GTS_TYPE}', 1, 1, 1, 1, NULL, 'types-registry', 3, 1, \
                      '{TS}', '{TS}')"
         ),
     )
@@ -1086,14 +1373,17 @@ async fn every_table_accepts_a_complete_admission_graph() {
             .await
             .expect("succeeded registration item");
     }
-    for (uuid, gts_id, kind) in [(ENTITY_UUID, GTS_TYPE, 1), (INSTANCE_UUID, GTS_INSTANCE, 2)] {
+    for (uuid, gts_id, kind, depth) in [
+        (ENTITY_UUID, GTS_TYPE, 1, 1),
+        (INSTANCE_UUID, GTS_INSTANCE, 2, 2),
+    ] {
         exec(
             &db,
             format!(
                 "INSERT INTO types_registry__entity \
-                 (gts_uuid, gts_id, entity_kind, family_id, ownership_scope, owner_tenant_id, \
+                 (gts_uuid, gts_id, entity_kind, chain_depth, family_id, ownership_scope, owner_tenant_id, \
                   owning_gear, lifecycle_status, resource_version, created_at, updated_at) \
-                 VALUES ({uuid}, '{gts_id}', {kind}, 1, 1, NULL, 'types-registry', 1, 1, \
+                 VALUES ({uuid}, '{gts_id}', {kind}, {depth}, 1, 1, NULL, 'types-registry', 1, 1, \
                          '{TS}', '{TS}')"
             ),
         )
@@ -1105,9 +1395,9 @@ async fn every_table_accepts_a_complete_admission_graph() {
         &db,
         format!(
             "INSERT INTO types_registry__type_schema_revision \
-             (entity_id, revision_no, raw_schema, content_hash, gts_spec_version, \
+             (entity_id, revision_no, raw_schema, gts_spec_version, \
               gts_impl_version, compat_forced, operation_item_id, created_at, updated_at) \
-             VALUES (1, 1, '{{}}', X'00', '0.13', '0.12.0', 0, 1, '{TS}', '{TS}')"
+             VALUES (1, 1, '{{}}', '0.13', '0.12.0', 0, 1, '{TS}', '{TS}')"
         ),
     )
     .await
@@ -1129,10 +1419,10 @@ async fn every_table_accepts_a_complete_admission_graph() {
         &db,
         format!(
             "INSERT INTO types_registry__instance_revision \
-             (entity_id, revision_no, canonical_value, content_hash, type_schema_entity_id, \
+             (entity_id, revision_no, canonical_value, type_schema_entity_id, \
               type_schema_revision_no, gts_spec_version, gts_impl_version, operation_item_id, \
               created_at, updated_at) \
-             VALUES (2, 1, '{{}}', X'00', 1, 1, '0.13', '0.12.0', 2, '{TS}', '{TS}')"
+             VALUES (2, 1, '{{}}', 1, 1, '0.13', '0.12.0', 2, '{TS}', '{TS}')"
         ),
     )
     .await
@@ -1198,9 +1488,9 @@ async fn type_schema_revision_numbers_start_at_one() {
         &db,
         format!(
             "INSERT INTO types_registry__entity \
-             (gts_uuid, gts_id, entity_kind, family_id, ownership_scope, owner_tenant_id, \
+             (gts_uuid, gts_id, entity_kind, chain_depth, family_id, ownership_scope, owner_tenant_id, \
               owning_gear, lifecycle_status, resource_version, created_at, updated_at) \
-             VALUES ({ENTITY_UUID}, '{GTS_TYPE}', 1, 1, 1, NULL, 'types-registry', 1, 1, \
+             VALUES ({ENTITY_UUID}, '{GTS_TYPE}', 1, 1, 1, 1, NULL, 'types-registry', 1, 1, \
                      '{TS}', '{TS}')"
         ),
     )
@@ -1210,9 +1500,9 @@ async fn type_schema_revision_numbers_start_at_one() {
         &db,
         format!(
             "INSERT INTO types_registry__type_schema_revision \
-             (entity_id, revision_no, raw_schema, content_hash, gts_spec_version, \
+             (entity_id, revision_no, raw_schema, gts_spec_version, \
               gts_impl_version, compat_forced, operation_item_id, created_at, updated_at) \
-             VALUES (1, 0, '{{}}', X'00', '0.13', '0.12.0', 0, 1, '{TS}', '{TS}')"
+             VALUES (1, 0, '{{}}', '0.13', '0.12.0', 0, 1, '{TS}', '{TS}')"
         ),
     )
     .await
@@ -1222,9 +1512,9 @@ async fn type_schema_revision_numbers_start_at_one() {
         &db,
         format!(
             "INSERT INTO types_registry__type_schema_revision \
-             (entity_id, revision_no, raw_schema, content_hash, gts_spec_version, \
+             (entity_id, revision_no, raw_schema, gts_spec_version, \
               gts_impl_version, compat_forced, operation_item_id, created_at, updated_at) \
-             VALUES (1, 1, '{{}}', X'00', '0.13', '0.12.0', 7, 1, '{TS}', '{TS}')"
+             VALUES (1, 1, '{{}}', '0.13', '0.12.0', 7, 1, '{TS}', '{TS}')"
         ),
     )
     .await
@@ -1272,14 +1562,17 @@ async fn instance_revision_numbers_start_at_one() {
             .await
             .expect("succeeded item");
     }
-    for (uuid, gts_id, kind) in [(ENTITY_UUID, GTS_TYPE, 1), (INSTANCE_UUID, GTS_INSTANCE, 2)] {
+    for (uuid, gts_id, kind, depth) in [
+        (ENTITY_UUID, GTS_TYPE, 1, 1),
+        (INSTANCE_UUID, GTS_INSTANCE, 2, 2),
+    ] {
         exec(
             &db,
             format!(
                 "INSERT INTO types_registry__entity \
-                 (gts_uuid, gts_id, entity_kind, family_id, ownership_scope, owner_tenant_id, \
+                 (gts_uuid, gts_id, entity_kind, chain_depth, family_id, ownership_scope, owner_tenant_id, \
                   owning_gear, lifecycle_status, resource_version, created_at, updated_at) \
-                 VALUES ({uuid}, '{gts_id}', {kind}, 1, 1, NULL, 'types-registry', 1, 1, \
+                 VALUES ({uuid}, '{gts_id}', {kind}, {depth}, 1, 1, NULL, 'types-registry', 1, 1, \
                          '{TS}', '{TS}')"
             ),
         )
@@ -1290,9 +1583,9 @@ async fn instance_revision_numbers_start_at_one() {
         &db,
         format!(
             "INSERT INTO types_registry__type_schema_revision \
-             (entity_id, revision_no, raw_schema, content_hash, gts_spec_version, \
+             (entity_id, revision_no, raw_schema, gts_spec_version, \
               gts_impl_version, compat_forced, operation_item_id, created_at, updated_at) \
-             VALUES (1, 1, '{{}}', X'00', '0.13', '0.12.0', 0, 1, '{TS}', '{TS}')"
+             VALUES (1, 1, '{{}}', '0.13', '0.12.0', 0, 1, '{TS}', '{TS}')"
         ),
     )
     .await
@@ -1302,10 +1595,10 @@ async fn instance_revision_numbers_start_at_one() {
         &db,
         format!(
             "INSERT INTO types_registry__instance_revision \
-             (entity_id, revision_no, canonical_value, content_hash, type_schema_entity_id, \
+             (entity_id, revision_no, canonical_value, type_schema_entity_id, \
               type_schema_revision_no, gts_spec_version, gts_impl_version, operation_item_id, \
               created_at, updated_at) \
-             VALUES (2, 0, '{{}}', X'00', 1, 1, '0.13', '0.12.0', 2, '{TS}', '{TS}')"
+             VALUES (2, 0, '{{}}', 1, 1, '0.13', '0.12.0', 2, '{TS}', '{TS}')"
         ),
     )
     .await
@@ -1316,10 +1609,10 @@ async fn instance_revision_numbers_start_at_one() {
         &db,
         format!(
             "INSERT INTO types_registry__instance_revision \
-             (entity_id, revision_no, canonical_value, content_hash, type_schema_entity_id, \
+             (entity_id, revision_no, canonical_value, type_schema_entity_id, \
               type_schema_revision_no, gts_spec_version, gts_impl_version, operation_item_id, \
               created_at, updated_at) \
-             VALUES (2, 1, '{{}}', X'00', 1, 9, '0.13', '0.12.0', 2, '{TS}', '{TS}')"
+             VALUES (2, 1, '{{}}', 1, 9, '0.13', '0.12.0', 2, '{TS}', '{TS}')"
         ),
     )
     .await

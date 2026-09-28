@@ -24,10 +24,11 @@ use uuid::Uuid;
 use crate::domain::admission::Precondition;
 use crate::domain::admission::fingerprint::{RequestFingerprint, ScopeHash};
 use crate::domain::enums::{
-    DependencyKind, EntityKind, LifecycleStatus, OperationItemStatus, OperationKind,
-    OperationStatus, OwnershipScope, Plane,
+    DependencyKind, EntityKind, LifecycleFilter, LifecycleStatus, OperationItemStatus,
+    OperationKind, OperationStatus, OwnershipScope, Plane,
 };
 use crate::domain::family::FamilyKey;
+use crate::domain::selection::FieldSelection;
 
 // The output port the admission path's instruments cross (T16).
 pub mod metrics;
@@ -251,13 +252,31 @@ pub struct CurrentDocument {
     /// caller's job: this port moves bytes, and the layer that knows what a
     /// malformed document means is the one that names the entity in the error.
     pub raw_schema: String,
-    /// The digest of [`Self::raw_schema`], so the `unchanged` decision can reject an
-    /// inequality without comparing whole documents. A **prefilter only**
-    /// (ADR-0012): equality proposes redundancy, the bytes confirm it — which is why
-    /// the text travels beside the digest rather than instead of it.
-    pub content_hash: Vec<u8>,
     /// The projection state to use when writing artifacts derived from this document.
     pub projection: CurrentSchemaCas,
+}
+
+/// The revision row is always read, so the pointer is checked whatever the
+/// selection. Documents and `provenance` are `Some` only when selected.
+#[domain_model]
+#[derive(Clone, Debug)]
+pub struct CurrentReadRow {
+    pub entity_id: i64,
+    /// The authored document or value, canonical UTF-8 text, unparsed.
+    pub content: Option<String>,
+    pub resolved_schema: Option<String>,
+    pub effective_traits: Option<String>,
+    pub effective_traits_schema: Option<String>,
+    pub provenance: Option<RevisionProvenance>,
+}
+
+#[domain_model]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RevisionProvenance {
+    pub gts_spec_version: String,
+    pub gts_impl_version: String,
+    /// `None` for an Instance, which has no compatibility check to waive.
+    pub compat_forced: Option<bool>,
 }
 
 /// The result of a reverse-impact read.
@@ -419,7 +438,6 @@ pub struct NewRevision {
     pub entity_id: i64,
     pub revision_no: i32,
     pub raw_schema: String,
-    pub content_hash: Vec<u8>,
     pub gts_spec_version: String,
     pub gts_impl_version: String,
     pub compat_forced: bool,
@@ -475,9 +493,6 @@ pub struct CurrentInstanceValue {
     /// The authored value as submitted, canonical UTF-8 text. Parsing it is the
     /// caller's job, as on [`CurrentDocument`].
     pub canonical_value: String,
-    /// The digest of [`Self::canonical_value`] — a prefilter, as on
-    /// [`CurrentDocument::content_hash`].
-    pub content_hash: Vec<u8>,
     pub type_schema_entity_id: i64,
     pub type_schema_revision_no: i32,
 }
@@ -492,7 +507,6 @@ pub struct NewInstanceRevision {
     pub entity_id: i64,
     pub revision_no: i32,
     pub canonical_value: String,
-    pub content_hash: Vec<u8>,
     /// The revision that validated this value; `ON DELETE RESTRICT` pins it.
     pub type_schema_entity_id: i64,
     pub type_schema_revision_no: i32,
@@ -592,6 +606,67 @@ pub trait VersionFamilyStore: Send + Sync {
     ) -> Result<(VersionFamilyRow, bool), ScopeError>;
 }
 
+/// One keyset page request: resume after a stored `gts_id`, not at an offset.
+#[domain_model]
+#[derive(Clone, Debug)]
+pub struct PageRequest {
+    /// Exclusive lower bound. `None` starts at the beginning.
+    pub after: Option<String>,
+    pub limit: u32,
+}
+
+impl PageRequest {
+    #[must_use]
+    pub fn first(limit: u32) -> Self {
+        Self { after: None, limit }
+    }
+
+    #[must_use]
+    pub fn after(after: String, limit: u32) -> Self {
+        Self {
+            after: Some(after),
+            limit,
+        }
+    }
+}
+
+/// What a discovery page is restricted to; every absent field and the default
+/// `lifecycle` mean no restriction beyond active entities. Every field is
+/// decided in SQL before the page limit.
+#[domain_model]
+#[derive(Clone, Debug, Default)]
+pub struct ListFilter {
+    /// Parsed by `gts-rust`, compiled to stored-segment predicates.
+    pub pattern: Option<gts::GtsIdPattern>,
+    /// The stored `entity.kind`.
+    pub kind: Option<EntityKind>,
+    /// The stored `entity.lifecycle_status`.
+    pub lifecycle: LifecycleFilter,
+    /// Inclusive maximum of the stored `entity.chain_depth`
+    /// (`GtsId::segments().len()`).
+    pub max_chain_depth: Option<std::num::NonZeroU8>,
+}
+
+/// One page of a keyset traversal.
+#[domain_model]
+#[derive(Clone, Debug)]
+pub struct EntityPage {
+    pub items: Vec<EntityRow>,
+    /// The last returned `gts_id` when another row matches, else `None`. A page
+    /// with a continuation is always full.
+    pub next_after: Option<String>,
+}
+
+impl EntityPage {
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            items: Vec::new(),
+            next_after: None,
+        }
+    }
+}
+
 /// Entity identity and lifecycle.
 #[async_trait]
 pub trait EntityStore: Send + Sync {
@@ -639,6 +714,17 @@ pub trait EntityStore: Send + Sync {
         scope: &AccessScope,
         gts_uuids: &[Uuid],
     ) -> Result<Vec<EntityRow>, ScopeError>;
+
+    /// One keyset page of entities matching `filter`, active only unless
+    /// `filter.lifecycle` asks for tombstones (ADR-0008). Every filter applies
+    /// before a row counts toward the limit, so only the last page is short.
+    async fn list_page(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        filter: &ListFilter,
+        request: PageRequest,
+    ) -> Result<EntityPage, ScopeError>;
 
     /// The kind of one member of a family, or `None` when the family is empty.
     /// The input to T10's one-kind-per-family rule.
@@ -715,6 +801,16 @@ pub trait TypeSchemaStore: Send + Sync {
         entity_id: i64,
     ) -> Result<Option<CurrentTypeSchemaRow>, ScopeError>;
 
+    /// Fetches only the documents `selection` names, in bounded chunks;
+    /// `entity_id`-sorted, entities without a current row absent.
+    async fn read_current_schemas(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        entity_ids: &[i64],
+        selection: FieldSelection,
+    ) -> Result<Vec<CurrentReadRow>, ScopeError>;
+
     /// Current revision numbers and fingerprints, `entity_id`-sorted, without artifacts.
     /// Entities with no current row are simply absent.
     async fn current_schema_projections(
@@ -777,6 +873,15 @@ pub trait InstanceStore: Send + Sync {
         scope: &AccessScope,
         entity_id: i64,
     ) -> Result<Option<CurrentInstanceRow>, ScopeError>;
+
+    /// As [`TypeSchemaStore::read_current_schemas`]; Instances have no artifacts.
+    async fn read_current_values(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        entity_ids: &[i64],
+        selection: FieldSelection,
+    ) -> Result<Vec<CurrentReadRow>, ScopeError>;
 
     async fn insert_instance_revision(
         &self,

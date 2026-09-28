@@ -17,14 +17,15 @@ use crate::domain::admission::fingerprint::ScopeHash;
 use crate::domain::enums::{DependencyKind, EntityKind, OwnershipScope};
 use crate::domain::family::FamilyKey;
 use crate::domain::ports::{
-    CurrentDocument, CurrentInstanceRow, CurrentInstanceValue, CurrentSchemaCas,
+    CurrentDocument, CurrentInstanceRow, CurrentInstanceValue, CurrentReadRow, CurrentSchemaCas,
     CurrentSchemaProjection, CurrentTypeSchemaRow, DependencyClosure, DependencyEdgeRow,
-    DependencyStore, EdgeSide, EntityEdge, EntityRow, EntityStore, EntityWriteOrderStore,
-    InstanceStore, ItemSuccess, NewCurrentInstance, NewCurrentTypeSchema, NewEntity,
-    NewInstanceRevision, NewOperation, NewOperationItem, NewRevision, OperationItemRow,
-    OperationRow, OperationStore, ReverseImpact, TypeSchemaStore, VersionFamilyRow,
-    VersionFamilyStore,
+    DependencyStore, EdgeSide, EntityEdge, EntityPage, EntityRow, EntityStore,
+    EntityWriteOrderStore, InstanceStore, ItemSuccess, ListFilter, NewCurrentInstance,
+    NewCurrentTypeSchema, NewEntity, NewInstanceRevision, NewOperation, NewOperationItem,
+    NewRevision, OperationItemRow, OperationRow, OperationStore, PageRequest, ReverseImpact,
+    TypeSchemaStore, VersionFamilyRow, VersionFamilyStore,
 };
+use crate::domain::selection::FieldSelection;
 
 use super::repo::{
     CoordinationStateRepo, DependencyRepo, EntityRepo, InstanceRepo, OperationRepo, TypeSchemaRepo,
@@ -127,6 +128,16 @@ impl EntityStore for Repos {
         EntityRepo::find_by_gts_uuids(tx, scope, gts_uuids).await
     }
 
+    async fn list_page(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        filter: &ListFilter,
+        request: PageRequest,
+    ) -> Result<EntityPage, ScopeError> {
+        EntityRepo::list_page(tx, scope, filter, request).await
+    }
+
     async fn kind_in_family(
         &self,
         tx: &DbTx<'_>,
@@ -189,6 +200,16 @@ impl TypeSchemaStore for Repos {
         TypeSchemaRepo::find_current(tx, scope, entity_id).await
     }
 
+    async fn read_current_schemas(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        entity_ids: &[i64],
+        selection: FieldSelection,
+    ) -> Result<Vec<CurrentReadRow>, ScopeError> {
+        TypeSchemaRepo::read_current(tx, scope, entity_ids, selection).await
+    }
+
     async fn current_schema_projections(
         &self,
         tx: &DbTx<'_>,
@@ -245,6 +266,16 @@ impl InstanceStore for Repos {
         entity_id: i64,
     ) -> Result<Option<CurrentInstanceRow>, ScopeError> {
         InstanceRepo::find_current(tx, scope, entity_id).await
+    }
+
+    async fn read_current_values(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        entity_ids: &[i64],
+        selection: FieldSelection,
+    ) -> Result<Vec<CurrentReadRow>, ScopeError> {
+        InstanceRepo::read_current(tx, scope, entity_ids, selection).await
     }
 
     async fn insert_instance_revision(

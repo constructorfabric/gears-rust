@@ -79,7 +79,7 @@ async def test_delete_one_entity_leaves_a_readable_tombstone(
     await given_registered(schema)
     before = await read_entity(registry_http, registry_api_path, schema["gts_id"])
     assert before["lifecycle_status"] == "active", before
-    assert before["resource_version"] == 1, before
+    assert before["origin"]["resource_version"] == 1, before
 
     operation = await delete_one_and_poll(
         registry_http, registry_api_path, schema["gts_id"], 1, RECEIPT
@@ -163,7 +163,7 @@ async def test_a_stale_expected_version_is_a_terminal_item_not_a_412(
 
     after = await read_entity(registry_http, registry_api_path, schema["gts_id"])
     assert after["lifecycle_status"] == "active", after
-    assert after["resource_version"] == 1, after
+    assert after["origin"]["resource_version"] == 1, after
 
 
 @pytest.mark.scenario("TR-DEL-005")
@@ -186,4 +186,4 @@ async def test_a_live_dependant_outside_the_batch_blocks_the_deletion(
 
     after = await read_entity(registry_http, registry_api_path, schema["gts_id"])
     assert after["lifecycle_status"] == "active", after
-    assert after["resource_version"] == 1, after
+    assert after["origin"]["resource_version"] == 1, after

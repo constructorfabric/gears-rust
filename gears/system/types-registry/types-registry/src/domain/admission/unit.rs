@@ -37,7 +37,7 @@ use super::unchanged::{self, UnchangedCandidate};
 use super::vector::{self, RevisionVector, VectorDrift};
 use crate::config::Limits;
 use crate::domain::admission::{AdmissionFailureReason, Precondition};
-use crate::domain::artifacts::{MaterializedArtifacts, content_hash};
+use crate::domain::artifacts::MaterializedArtifacts;
 use crate::domain::compat::{self, Baseline};
 use crate::domain::dependency::{DependencyEdge, extract_edges};
 use crate::domain::enums::{DependencyKind, EntityKind, LifecycleStatus, OwnershipScope};
@@ -100,7 +100,6 @@ pub struct EvaluatedUnit {
     pub gts_uuid: Uuid,
     pub family_key: FamilyKey,
     pub canonical_body: String,
-    pub content_hash: Vec<u8>,
     pub outcome: EvaluatedOutcome,
     pub operation_item_id: i64,
     /// The effective ADR-0004 waiver, persisted as `compat_forced`.
@@ -701,7 +700,6 @@ fn evaluate_loaded(
     // Validate the candidate before judging its compatibility with another document.
     check_compatibility(&mut store, id, content, baseline, reporting)?;
 
-    let content_hash = content_hash(&canonical_body);
     Ok(EvaluatedUnit {
         gts_id: id.id().to_owned(),
         // Derived by `gts-rust`, never locally: the Registry Reference is a
@@ -711,7 +709,6 @@ fn evaluate_loaded(
         gts_uuid: id.to_uuid(),
         family_key: family_key(id),
         canonical_body,
-        content_hash,
         outcome,
         operation_item_id,
         compat_forced: reporting.forced,
@@ -1090,7 +1087,6 @@ pub async fn commit_creation(
                         entity_id: entity.id,
                         revision_no,
                         raw_schema: unit.canonical_body.clone(),
-                        content_hash: unit.content_hash.clone(),
                         // Recorded for *every* revision, including one with no
                         // compatibility comparison at all: it identifies the engine,
                         // and that cannot be reconstructed later (ADR-0003).
@@ -1131,7 +1127,6 @@ pub async fn commit_creation(
                         entity_id: entity.id,
                         revision_no,
                         canonical_value: unit.canonical_body.clone(),
-                        content_hash: unit.content_hash.clone(),
                         // From evaluation's snapshot, not a fresh lookup: re-reading
                         // could pin a revision that landed after validation.
                         type_schema_entity_id: *type_schema_entity_id,
@@ -1255,11 +1250,10 @@ pub async fn commit_revision(
     )
     .await?;
 
-    // The hash is a prefilter and the bytes are the decision (ADR-0012): a digest
-    // collision would otherwise silently swallow a real edit. Equality against an
+    // The canonical bytes are the decision (ADR-0012). Equality against an
     // *older* revision is deliberately not asked — that is an ordinary update which
     // allocates a new number rather than moving the pointer backwards (ADR-0005).
-    if current.matches_authored(&unit.content_hash, &unit.canonical_body) {
+    if current.matches_authored(&unit.canonical_body) {
         return commit_unchanged(
             stores,
             tx,
@@ -1355,7 +1349,6 @@ pub async fn commit_revision(
                         entity_id: entity.id,
                         revision_no,
                         raw_schema: unit.canonical_body.clone(),
-                        content_hash: unit.content_hash.clone(),
                         gts_spec_version: GTS_SPECIFICATION_VERSION.to_owned(),
                         gts_impl_version: GTS_IMPLEMENTATION_VERSION.to_owned(),
                         compat_forced: unit.compat_forced,
@@ -1401,7 +1394,6 @@ pub async fn commit_revision(
                         entity_id: entity.id,
                         revision_no,
                         canonical_value: unit.canonical_body.clone(),
-                        content_hash: unit.content_hash.clone(),
                         // Re-recorded per revision, not inherited: this value was
                         // validated against whatever the schema's current revision
                         // was at *this* evaluation.

@@ -1,15 +1,19 @@
 //! REST DTOs for the Types Registry gear.
 
+use serde_json::value::RawValue;
 use uuid::Uuid;
 
 use gts::GtsIdSegment;
 use types_registry_sdk::RegisterSummary;
 
+use crate::domain::admission::{AdmissionFailureReason, StoredFailure};
 use crate::domain::enums::{
     EntityKind, LifecycleStatus, OperationItemStatus, OperationKind, OperationStatus,
 };
 use crate::domain::model::{GtsEntity, ListQuery, SegmentMatchScope};
-use crate::domain::registry_service::{EntityRecord, OperationItemRecord, OperationRecord};
+use crate::domain::registry_service::{
+    EntityLookup, EntityRecord, MAX_BATCH_GET_KEYS, OperationItemRecord, OperationRecord,
+};
 
 /// DTO for a GTS ID segment.
 #[derive(Debug, Clone)]
@@ -220,20 +224,261 @@ mod tests {
     use gts::GtsIdSegment;
     use toolkit_gts::{GTS_ID_PREFIX, gts_id};
 
+    fn schema_json<T: utoipa::PartialSchema>() -> serde_json::Value {
+        serde_json::to_value(T::schema()).expect("a schema serializes")
+    }
+
+    /// `OpenAPI` must say what `$select` does: identity, kind and lifecycle are
+    /// always present, metadata is never `null`, and a selected document may be `null`.
+    #[test]
+    fn the_entity_schema_declares_projection_accurately() {
+        let schema = schema_json::<EntityDto>();
+        assert_eq!(
+            schema["required"],
+            serde_json::json!(["gts_id", "gts_uuid", "kind", "lifecycle_status"])
+        );
+        let properties = &schema["properties"];
+        for field in ["gts_id", "gts_uuid"] {
+            assert_eq!(properties[field]["type"], "string", "{field}: {properties}");
+        }
+        assert_eq!(properties["gts_uuid"]["format"], "uuid");
+        for field in [
+            "content",
+            "resolved_schema",
+            "effective_traits",
+            "effective_traits_schema",
+        ] {
+            // Any JSON value, `null` included: nothing but the description, as
+            // `serde_json::Value` declared it before the `RawValue` switch.
+            let keys: Vec<&String> = properties[field]
+                .as_object()
+                .expect("a property schema")
+                .keys()
+                .collect();
+            assert_eq!(keys, ["description"], "{field}: {}", properties[field]);
+        }
+    }
+
+    #[test]
+    fn the_batch_request_schema_keeps_items_a_plain_array() {
+        let schema = schema_json::<BatchGetRequest>();
+        assert_eq!(schema["required"], serde_json::json!(["items"]), "{schema}");
+        let mut items = schema["properties"]["items"].clone();
+        items
+            .as_object_mut()
+            .expect("a property schema")
+            .remove("description");
+        assert_eq!(
+            items,
+            serde_json::json!({
+                "type": "array",
+                "items": { "$ref": "#/components/schemas/BatchGetItemDto" },
+                "minItems": 1,
+            }),
+        );
+    }
+
+    fn batch_request(items: &[serde_json::Value]) -> serde_json::Result<BatchGetRequest> {
+        serde_json::from_str(&serde_json::json!({ "items": items }).to_string())
+    }
+
+    #[test]
+    fn a_batch_keeps_the_first_items_up_to_the_ceiling_and_counts_all() {
+        for total in [0, 1, MAX_BATCH_GET_KEYS, MAX_BATCH_GET_KEYS + 1, 10_000] {
+            let items: Vec<serde_json::Value> = (0..total)
+                .map(|i| serde_json::json!({ "key": format!("k{i}") }))
+                .collect();
+            let request = batch_request(&items).expect("a well-formed batch parses");
+            assert_eq!(request.items.count(), total);
+            let kept = request.items.into_items();
+            assert_eq!(kept.len(), total.min(MAX_BATCH_GET_KEYS), "{total}");
+            for (i, item) in kept.iter().enumerate() {
+                assert_eq!(item.key, format!("k{i}"));
+            }
+        }
+    }
+
+    #[test]
+    fn only_items_within_the_ceiling_are_validated() {
+        let mut items: Vec<serde_json::Value> = (0..MAX_BATCH_GET_KEYS)
+            .map(|i| serde_json::json!({ "key": format!("k{i}") }))
+            .collect();
+        items.push(serde_json::json!({ "unknown": true }));
+        let past = batch_request(&items).expect("an item past the ceiling is not read");
+        assert_eq!(past.items.count(), MAX_BATCH_GET_KEYS + 1);
+
+        items.swap(0, MAX_BATCH_GET_KEYS);
+        assert!(batch_request(&items).is_err(), "an item within it still is");
+    }
+
+    #[test]
+    fn unselected_fields_are_omitted_and_a_selected_null_is_kept() {
+        let dto = EntityDto {
+            gts_id: "gts.cf.core.example.type.v1~".to_owned(),
+            gts_uuid: Uuid::nil(),
+            kind: EntityKindDto::TypeSchema,
+            origin: None,
+            lifecycle_status: LifecycleStatusDto::Deleted,
+            content: Some(RawValue::from_string("null".to_owned()).expect("JSON")),
+            resolved_schema: None,
+            effective_traits: None,
+            effective_traits_schema: None,
+            provenance: None,
+        };
+        assert_eq!(
+            serde_json::to_value(dto).expect("serialize"),
+            serde_json::json!({
+                "gts_id": "gts.cf.core.example.type.v1~",
+                "gts_uuid": Uuid::nil(),
+                "kind": "type_schema",
+                "lifecycle_status": "deleted",
+                "content": null,
+            }),
+        );
+    }
+
+    #[test]
+    fn origin_is_internally_tagged_with_rfc3339_timestamps() {
+        let at = time::macros::datetime!(2026-09-23 10:00:00 UTC);
+        let origin = OriginDto::Managed {
+            resource_version: 3,
+            created_at: at,
+            updated_at: at,
+        };
+        assert_eq!(
+            serde_json::to_value(origin).expect("serialize"),
+            serde_json::json!({
+                "type": "managed",
+                "resource_version": 3,
+                "created_at": "2026-09-23T10:00:00Z",
+                "updated_at": "2026-09-23T10:00:00Z",
+            }),
+        );
+    }
+
     #[test]
     fn operation_item_error_preserves_reason_and_message() -> Result<(), serde_json::Error> {
         let payload = serde_json::json!({
             "reason": "incompatible_with_baseline",
             "message": "PropertyAdded at $.payload",
         });
-        let dto = OperationItemDto::from(OperationItemRecord {
-            gts_id: gts_id!("cf.core.compat.thing.v1~").to_owned(),
-            status: OperationItemStatus::Failed,
-            resource_version: None,
-            error: Some(payload.to_string()),
-        });
+        let dto = OperationItemDto::from_record(
+            OperationItemRecord {
+                gts_id: gts_id!("cf.core.compat.thing.v1~").to_owned(),
+                status: OperationItemStatus::Failed,
+                resource_version: None,
+                error: Some(StoredFailure::parse(&payload.to_string())),
+            },
+            Uuid::nil(),
+        );
         assert_eq!(serde_json::to_value(dto)?["error"], payload);
         Ok(())
+    }
+
+    fn item_error(stored: Option<&str>) -> serde_json::Value {
+        let dto = OperationItemDto::from_record(
+            OperationItemRecord {
+                gts_id: gts_id!("cf.core.compat.thing.v1~").to_owned(),
+                status: OperationItemStatus::Failed,
+                resource_version: None,
+                error: stored.map(StoredFailure::parse),
+            },
+            Uuid::nil(),
+        );
+        serde_json::to_value(dto).expect("serialize")["error"].clone()
+    }
+
+    #[test]
+    fn operation_item_error_keeps_dependency_and_system_failure_details() {
+        for payload in [
+            serde_json::json!({
+                "reason": "dependency_not_found",
+                "message": "$ref target 'cf.core.absent.type.v1~' is not registered",
+                "dependency_id": "cf.core.absent.type.v1~",
+                "dependency_kind": "ref",
+            }),
+            serde_json::json!({
+                "reason": "system_failure",
+                "message": "admission could not complete because of a system failure",
+                "error_code": "delivery_exhausted",
+                "operation_id": "7f0c3a52-3f58-4c61-9f1e-2d4c2f6c1a10",
+            }),
+            // An unknown future reason passes through verbatim.
+            serde_json::json!({ "reason": "future_refusal", "message": "future details" }),
+        ] {
+            assert_eq!(item_error(Some(&payload.to_string())), payload);
+        }
+    }
+
+    #[test]
+    fn a_corrupt_stored_error_stays_an_object_without_the_raw_payload() {
+        for (stored, reason) in [
+            ("secret not JSON", "unparsable_payload"),
+            (r#""secret string""#, "unrecognized_payload"),
+            (
+                r#"{"reason":42,"message":"secret"}"#,
+                "unrecognized_payload",
+            ),
+            (r#"{"reason":"invalid_schema"}"#, "unrecognized_payload"),
+            (
+                r#"{"reason":"system_failure","message":"secret","operation_id":"secret"}"#,
+                "unrecognized_payload",
+            ),
+            (
+                r#"{"reason":"system_failure","message":"secret","error_code":7}"#,
+                "unrecognized_payload",
+            ),
+            (
+                r#"{"reason":"dependency_not_found","message":"secret","dependency_id":"secret"}"#,
+                "unrecognized_payload",
+            ),
+        ] {
+            let error = item_error(Some(stored));
+            assert_eq!(error["reason"], reason, "{stored}");
+            let message = error["message"].as_str().expect("message is a string");
+            assert!(!message.contains("secret"), "{stored} leaked: {message}");
+            assert!(
+                !message.contains("invalid_schema"),
+                "{stored} leaked: {message}"
+            );
+            assert_eq!(
+                error.as_object().map(serde_json::Map::len),
+                Some(2),
+                "{stored}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_item_without_a_stored_error_has_none() {
+        assert_eq!(item_error(None), serde_json::Value::Null);
+    }
+
+    #[test]
+    fn the_operation_item_error_schema_is_a_typed_object() {
+        let schema = schema_json::<OperationItemErrorDto>();
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["required"], serde_json::json!(["reason", "message"]));
+        let properties = &schema["properties"];
+        for field in [
+            "reason",
+            "message",
+            "dependency_id",
+            "dependency_kind",
+            "error_code",
+        ] {
+            assert_eq!(properties[field]["type"], "string", "{field}: {properties}");
+        }
+        assert_eq!(properties["operation_id"]["format"], "uuid");
+
+        let item = schema_json::<OperationItemDto>();
+        let variants = &item["properties"]["error"]["oneOf"];
+        assert_eq!(variants.as_array().map(Vec::len), Some(2), "{variants}");
+        assert_eq!(variants[0], serde_json::json!({"type": "null"}));
+        assert_eq!(
+            variants[1]["$ref"],
+            "#/components/schemas/OperationItemErrorDto"
+        );
     }
 
     fn seg(full_id: &str, idx: usize) -> GtsIdSegment {
@@ -569,12 +814,33 @@ pub struct OperationItemDto {
     pub gts_id: String,
     pub status: OperationItemStatusDto,
     pub resource_version: Option<i64>,
-    /// The refusal as `{reason, message}`, when this candidate failed.
-    /// `reason` is a stable machine-readable code; `message` is an explanation for humans.
-    /// Structured candidate or system-failure details.
-    /// Compatibility messages include causes and schema locations where available.
-    /// Clients must not parse `message` or depend on its wording.
-    pub error: Option<serde_json::Value>,
+    /// Present when this candidate failed.
+    pub error: Option<OperationItemErrorDto>,
+}
+
+/// Why a candidate failed. `reason` is a stable code and may be one the client
+/// does not know; `message` is for humans and must not be parsed.
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(response)]
+pub struct OperationItemErrorDto {
+    pub reason: String,
+    pub message: String,
+    /// The missing dependency, for `dependency_not_found`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub dependency_id: Option<String>,
+    /// `base`, `conforming_type` or `ref`; newer writers may add kinds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub dependency_kind: Option<String>,
+    /// Stable diagnostic code of a `system_failure`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub error_code: Option<String>,
+    /// The operation a `system_failure` terminalized.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub operation_id: Option<Uuid>,
 }
 
 /// An operation as a caller polls it.
@@ -596,28 +862,73 @@ pub struct OperationDto {
     pub items: Vec<OperationItemDto>,
 }
 
-/// One entity with its authored content and the artifacts materialized at
-/// admission (D3). No consumer recomputes an effective form.
+/// One entity, projected by `$select` (SPEC §10.2).
+///
+/// `gts_id`, `gts_uuid`, `kind` and `lifecycle_status` are always present, so a
+/// projected item is identifiable, its kind needs no second read, and a tombstone is
+/// never mistaken for an absence. An
+/// unselected field is omitted; a selected document that is JSON `null` stays
+/// present as `null`. The three artifacts are absent on an Instance. Documents
+/// are written as stored, canonical text: keys sorted, no insignificant whitespace.
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(response)]
 pub struct EntityDto {
+    /// Always present.
     pub gts_id: String,
-    /// The Registry Reference: a deterministic `UUIDv5` of the identifier.
+    /// Always present. The Registry Reference: a deterministic `UUIDv5` of the
+    /// identifier.
     pub gts_uuid: Uuid,
+    /// Always present.
     pub kind: EntityKindDto,
-    /// A tombstone stays exact-readable and only leaves discovery.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub origin: Option<OriginDto>,
+    /// Always present. A tombstone stays exact-readable and is listed only on request.
     pub lifecycle_status: LifecycleStatusDto,
-    pub resource_version: i64,
-    /// Caller-declared attribution. It MUST NOT be used to authorize.
-    pub owning_gear: Option<String>,
-    #[serde(with = "time::serde::rfc3339")]
-    pub created_at: time::OffsetDateTime,
-    #[serde(with = "time::serde::rfc3339")]
-    pub updated_at: time::OffsetDateTime,
-    pub content: Option<serde_json::Value>,
-    pub resolved_schema: Option<serde_json::Value>,
-    pub effective_traits: Option<serde_json::Value>,
-    pub effective_traits_schema: Option<serde_json::Value>,
+    /// The whole authored document, either kind.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<serde_json::Value>)]
+    pub content: Option<Box<RawValue>>,
+    /// Type Schemas only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<serde_json::Value>)]
+    pub resolved_schema: Option<Box<RawValue>>,
+    /// Type Schemas only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<serde_json::Value>)]
+    pub effective_traits: Option<Box<RawValue>>,
+    /// Type Schemas only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<serde_json::Value>)]
+    pub effective_traits_schema: Option<Box<RawValue>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub provenance: Option<ProvenanceDto>,
+}
+
+/// Where an entity comes from. P0 has only the managed variant; federation adds
+/// `external` without changing this one.
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(response)]
+#[serde(tag = "type")]
+pub enum OriginDto {
+    Managed {
+        resource_version: i64,
+        #[serde(with = "time::serde::rfc3339")]
+        created_at: time::OffsetDateTime,
+        #[serde(with = "time::serde::rfc3339")]
+        updated_at: time::OffsetDateTime,
+    },
+}
+
+/// Who admitted the current revision and how. Selected as one group.
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(response)]
+pub struct ProvenanceDto {
+    pub gts_spec_version: String,
+    pub gts_impl_version: String,
+    /// Whether ADR-0004 `force` waived a cross-minor check; `null` for Instances.
+    pub compat_forced: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -731,22 +1042,55 @@ impl From<LifecycleStatus> for LifecycleStatusDto {
     }
 }
 
-impl From<OperationItemRecord> for OperationItemDto {
-    fn from(item: OperationItemRecord) -> Self {
+impl OperationItemDto {
+    fn from_record(item: OperationItemRecord, operation_id: Uuid) -> Self {
+        let error = item.error.map(|stored| {
+            stored.map_or_else(
+                |unreadable| {
+                    tracing::error!(
+                        %operation_id,
+                        gts_id = %item.gts_id,
+                        reason = unreadable.reason.as_str(),
+                        cause = %unreadable.cause,
+                        "types_registry cannot read a stored item failure"
+                    );
+                    OperationItemErrorDto::unreadable(&unreadable.reason)
+                },
+                Into::into,
+            )
+        });
         Self {
             gts_id: item.gts_id,
             status: item.status.into(),
             resource_version: item.resource_version,
-            // The stored payload is already a JSON object; re-parsing it keeps the
-            // response a document rather than a string containing one. A payload
-            // that does not parse is surfaced as a string field rather than
-            // dropped, so a corrupt row is visible instead of invisible.
-            error: item.error.map(|payload| {
-                match serde_json::from_str::<serde_json::Value>(&payload) {
-                    Ok(value) => value,
-                    Err(_) => serde_json::Value::String(payload),
-                }
-            }),
+            error,
+        }
+    }
+}
+
+impl OperationItemErrorDto {
+    /// Reported by reason; the stored text is never echoed.
+    fn unreadable(reason: &AdmissionFailureReason) -> Self {
+        Self {
+            reason: reason.as_str().to_owned(),
+            message: "the recorded failure could not be read".to_owned(),
+            dependency_id: None,
+            dependency_kind: None,
+            error_code: None,
+            operation_id: None,
+        }
+    }
+}
+
+impl From<StoredFailure> for OperationItemErrorDto {
+    fn from(failure: StoredFailure) -> Self {
+        Self {
+            reason: failure.reason,
+            message: failure.message,
+            dependency_id: failure.dependency_id,
+            dependency_kind: failure.dependency_kind,
+            error_code: failure.error_code,
+            operation_id: failure.operation_id,
         }
     }
 }
@@ -761,7 +1105,11 @@ impl From<OperationRecord> for OperationDto {
             created_at: record.created_at,
             started_at: record.started_at,
             completed_at: record.completed_at,
-            items: record.items.into_iter().map(Into::into).collect(),
+            items: record
+                .items
+                .into_iter()
+                .map(|item| OperationItemDto::from_record(item, record.operation_id))
+                .collect(),
         }
     }
 }
@@ -772,15 +1120,198 @@ impl From<EntityRecord> for EntityDto {
             gts_id: record.gts_id,
             gts_uuid: record.gts_uuid,
             kind: record.kind.into(),
+            origin: record.origin.map(|origin| OriginDto::Managed {
+                resource_version: origin.resource_version,
+                created_at: origin.created_at,
+                updated_at: origin.updated_at,
+            }),
             lifecycle_status: record.lifecycle_status.into(),
-            resource_version: record.resource_version,
-            owning_gear: record.owning_gear,
-            created_at: record.created_at,
-            updated_at: record.updated_at,
             content: record.content,
             resolved_schema: record.resolved_schema,
             effective_traits: record.effective_traits,
             effective_traits_schema: record.effective_traits_schema,
+            provenance: record.provenance.map(|p| ProvenanceDto {
+                gts_spec_version: p.gts_spec_version,
+                gts_impl_version: p.gts_impl_version,
+                compat_forced: p.compat_forced,
+            }),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// The two read surfaces: `:batchGet` and discovery (T22a, T22b)
+// ---------------------------------------------------------------------------
+//
+// Exact read and `batchGet` share [`EntityDto`] and one `$select` normalization, so
+// one key answers identically on both (SPEC §10.2).
+
+/// One key in a batch read.
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(request)]
+#[serde(deny_unknown_fields)]
+pub struct BatchGetItemDto {
+    /// A canonical GTS identifier or a Registry Reference UUID, classified exactly
+    /// as `GET /entities/{entity_key}` classifies its path segment.
+    #[schema(max_length = 1024)]
+    pub key: String,
+    /// This key's validator from an earlier read, which makes just this key
+    /// conditional. The field the two header names lowercase to — `if_none_match`
+    /// going out, `etag` coming back — because one `If-None-Match` header cannot
+    /// represent a batch of them (DESIGN §3.3).
+    ///
+    /// **No read emits a validator yet:** T29 adds `etag` to a result and the
+    /// comparison behind it. Until then no value a caller could hold can match, so
+    /// every present key is read unconditionally and answers `found` — which is
+    /// what a stale validator does after T29 too. The field is declared now so the
+    /// wire shape does not change under the callers T23 migrates.
+    #[serde(default)]
+    #[schema(max_length = 1024)]
+    pub if_none_match: Option<String>,
+}
+
+/// A batch read. Unknown fields are refused, so a misspelled `$select` is not
+/// answered with the default set.
+// `$select` is the OData wire name, not a snake_case choice.
+#[allow(unknown_lints, de0803_api_snake_case)]
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(request)]
+#[serde(deny_unknown_fields)]
+pub struct BatchGetRequest {
+    /// No `max_items`: the ceiling is `MAX_BATCH_GET_KEYS`, applied while the body
+    /// is parsed. Items past it are counted, not kept.
+    #[schema(value_type = Vec<BatchGetItemDto>, min_items = 1)]
+    pub items: BatchGetItems,
+    /// Fields to return for every key, spelled as the GET routes' `$select`.
+    /// Absent is the document-free default.
+    #[serde(default, rename = "$select")]
+    #[schema(max_length = 2048)]
+    pub select: Option<String>,
+}
+
+/// The first [`MAX_BATCH_GET_KEYS`] items and the count of all of them: an
+/// over-long batch is refused by count without one DTO per element.
+#[derive(Debug, Clone)]
+pub struct BatchGetItems {
+    items: Vec<BatchGetItemDto>,
+    count: usize,
+}
+
+impl BatchGetItems {
+    #[must_use]
+    pub fn count(&self) -> usize {
+        self.count
+    }
+
+    #[must_use]
+    pub fn into_items(self) -> Vec<BatchGetItemDto> {
+        self.items
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for BatchGetItems {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Items;
+
+        impl<'de> serde::de::Visitor<'de> for Items {
+            type Value = BatchGetItems;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an array of batch read items")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut items = Vec::new();
+                while items.len() < MAX_BATCH_GET_KEYS {
+                    let Some(item) = seq.next_element::<BatchGetItemDto>()? else {
+                        let count = items.len();
+                        return Ok(BatchGetItems { items, count });
+                    };
+                    items.push(item);
+                }
+                // Ignore excess item payloads; only their count matters.
+                let mut count = items.len();
+                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                    count += 1;
+                }
+                Ok(BatchGetItems { items, count })
+            }
+        }
+
+        deserializer.deserialize_seq(Items)
+    }
+}
+
+/// `found` or `not_found`.
+///
+/// DESIGN's `unchanged` arrives with T29's validators and its `failed` needs
+/// federation, which is out of P0 (SPEC §2). Declaring either now would publish a
+/// vocabulary value this gear never emits, which a generated client would
+/// type-check against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[toolkit_macros::api_dto(response)]
+pub enum EntityLookupStatusDto {
+    Found,
+    NotFound,
+}
+
+impl From<&EntityLookup> for EntityLookupStatusDto {
+    fn from(lookup: &EntityLookup) -> Self {
+        match lookup {
+            EntityLookup::Found(_) => Self::Found,
+            EntityLookup::NotFound => Self::NotFound,
+        }
+    }
+}
+
+/// One key's answer, echoing the key it was asked by.
+///
+/// The echo is not redundant: a caller that mixed identifiers and Registry
+/// References matches answers to questions without re-deriving either, and an
+/// absence has no entity to carry the key for it.
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(response)]
+pub struct EntityLookupDto {
+    pub key: String,
+    pub status: EntityLookupStatusDto,
+    /// The selected fields, exactly as the exact read returns them for the same
+    /// `$select`. Absent on `not_found`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entity: Option<EntityDto>,
+}
+
+/// The results of one batch read, in request order.
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(response)]
+pub struct EntityLookupsDto {
+    pub items: Vec<EntityLookupDto>,
+}
+
+/// Where the next page starts.
+///
+/// `next_cursor` and the page size only. No `prev_cursor`, because discovery pages
+/// forward only, and no total, because counting a set this page did not read would
+/// be a second unbounded query.
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(response)]
+pub struct PageInfoDto {
+    /// Present exactly when another match exists, and then the page is full.
+    /// Absent means this page is the last one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    /// The page size actually applied, which is the default when the caller named none.
+    #[schema(minimum = 1)]
+    pub limit: u32,
+}
+
+/// One bounded page of discovery results (SPEC §10.1's `EntityPage`).
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(response)]
+pub struct EntityPageDto {
+    /// Each item projected exactly as the exact read projects it.
+    pub items: Vec<EntityDto>,
+    pub page_info: PageInfoDto,
 }

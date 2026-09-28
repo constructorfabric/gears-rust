@@ -1,24 +1,34 @@
 //! REST handlers for the Types Registry gear.
 
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::{Extension, OriginalUri};
 use axum::http::{HeaderMap, HeaderValue, header};
+use axum::response::{IntoResponse, Response};
 use toolkit::api::canonical_prelude::*;
 use toolkit::api::rest::extract;
 use uuid::Uuid;
 
+use super::cursor::Binding;
 use super::dto::{
-    DeleteEntitiesRequest, DeleteEntityQuery, EntityDto, GtsEntityDto, ListEntitiesQuery,
-    ListEntitiesResponse, OperationAcceptedDto, OperationDto, RegisterEntitiesRequest,
+    BatchGetRequest, DeleteEntitiesRequest, DeleteEntityQuery, EntityDto, EntityLookupDto,
+    EntityLookupsDto, EntityPageDto, GtsEntityDto, ListEntitiesQuery, ListEntitiesResponse,
+    OperationAcceptedDto, OperationDto, PageInfoDto, RegisterEntitiesRequest,
     RegisterEntitiesResponse, RegisterResultDto, RegisterSummaryDto, SubmitEntitiesRequest,
 };
+use super::params::{DiscoveryParams, ExactReadSelection, NoQuery};
 use super::paths::V2;
 use crate::domain::admission::{Accepted, Candidate, SubmitRequest};
 use crate::domain::enums::OperationKind;
 use crate::domain::error::DomainError;
-use crate::domain::registry_service::{DeleteRequest, DeleteTarget, EntityKey, RegistryService};
+use crate::domain::registry_service::{
+    DeleteRequest, DeleteTarget, DiscoveryQuery, EntityKey, EntityLookup, MAX_BATCH_GET_KEYS,
+    MAX_KEY_LEN, RegistryService, ServiceError,
+};
+use crate::domain::selection::FieldSelection;
 use crate::domain::service::TypesRegistryService;
 
 /// POST /api/v1/types-registry/entities
@@ -112,9 +122,11 @@ pub async fn get_entity(
 // ---------------------------------------------------------------------------
 //
 // Mapping steps only. Every one of these reads a request, calls exactly one domain
-// method, and maps the result — no policy, no limit, no existence check and no
-// vocabulary decision lives here, which is what lets a future `api/grpc` adapter
-// reuse the same domain surface (SPEC §8.4).
+// method, and maps the result — no policy, no existence check and no vocabulary
+// decision lives here, which is what lets a future `api/grpc` adapter reuse the
+// same domain surface (SPEC §8.4). Size bounds checked here only fail early; the
+// domain enforces the same ones for every adapter. The one exception is a batch
+// item's `if_none_match`, which no domain method receives until T29 compares it.
 //
 // The handlers above this line are the pre-database path T27 deletes.
 
@@ -335,15 +347,158 @@ fn no_store() -> HeaderMap {
 pub async fn get_entity_by_key(
     Extension(service): Extension<Option<Arc<RegistryService>>>,
     extract::Path(key): extract::Path<String>,
-) -> ApiResult<Json<EntityDto>> {
+    ExactReadSelection(selection): ExactReadSelection,
+) -> ApiResult<Response> {
     let service = require_registry(service)?;
     let parsed = EntityKey::parse(&key);
     let record = service
-        .entity(&parsed)
+        .entity(&parsed, selection)
         .await
         .map_err(CanonicalError::from)?
         .ok_or_else(|| CanonicalError::from(DomainError::not_found_by_id(key)))?;
-    Ok(Json(record.into()))
+    json_body(EntityDto::from(record), selection).await
+}
+
+/// Serialized off the executor when the body carries documents.
+async fn json_body<T: serde::Serialize + Send + 'static>(
+    value: T,
+    selection: FieldSelection,
+) -> Result<Response, CanonicalError> {
+    if !selection.selects_any_document() {
+        return Ok(Json(value).into_response());
+    }
+    let bytes = tokio::task::spawn_blocking(move || serde_json::to_vec(&value))
+        .await
+        .map_err(ServiceError::Blocking)?
+        .map_err(|e| super::error::response_not_serialized(&e))?;
+    let content_type = HeaderValue::from_static("application/json");
+    Ok(([(header::CONTENT_TYPE, content_type)], bytes).into_response())
+}
+
+/// `POST /types-registry/v2/entities:batchGet`
+///
+/// An exact read of a bounded key set, with one explicit result per key. A `POST`
+/// rather than a `GET`: identifiers run to 1024 characters, which a query string
+/// cannot carry safely, and portable `GET` has no body (DESIGN §3.3).
+///
+/// Absence is a `200` with `not_found` on that key, not a `404`: one missing key
+/// must not lose the answers for the others.
+pub async fn batch_get_entities(
+    Extension(service): Extension<Option<Arc<RegistryService>>>,
+    headers: HeaderMap,
+    _: NoQuery,
+    extract::Json(req): extract::Json<BatchGetRequest>,
+) -> ApiResult<Response> {
+    let service = require_registry(service)?;
+    let selection = super::select::parse(req.select.as_deref())?;
+    // Refused before the read, not ignored: a caller that sent one believes its
+    // request is conditional, and answering `200` with full snapshots would be
+    // answering a different question.
+    if headers.contains_key(header::IF_NONE_MATCH) {
+        return Err(super::error::if_none_match_not_supported());
+    }
+
+    // Bounded before any per-item work, and on the raw count: duplicates still cost
+    // parsing and must not stretch the ceiling.
+    let count = req.items.count();
+    if count == 0 || count > MAX_BATCH_GET_KEYS {
+        return Err(ServiceError::BatchReadOutOfRange { count }.into());
+    }
+    let items = req.items.into_items();
+    // `if_none_match` is length-checked but not compared: no read emits a
+    // validator until T29.
+    let mut spelling_map: HashMap<EntityKey, String> = HashMap::with_capacity(items.len());
+    let mut keys: Vec<EntityKey> = Vec::with_capacity(items.len());
+    for item in items {
+        // Before `EntityKey::parse` copies the key; the domain repeats the check.
+        if item.key.len() > MAX_KEY_LEN {
+            return Err(super::error::key_too_long(item.key.len()));
+        }
+        if let Some(validator) = &item.if_none_match
+            && validator.len() > MAX_KEY_LEN
+        {
+            return Err(super::error::validator_too_long(validator.len()));
+        }
+        let key = EntityKey::parse(&item.key);
+        // The service dedups; the echo keeps the first spelling.
+        if let Entry::Vacant(e) = spelling_map.entry(key.clone()) {
+            e.insert(item.key);
+        }
+        keys.push(key);
+    }
+
+    let results = service
+        .batch_get(&keys, selection)
+        .await
+        .map_err(CanonicalError::from)?;
+
+    let body = EntityLookupsDto {
+        items: results
+            .into_iter()
+            .map(|(key, lookup)| {
+                let key = spelling_map.remove(&key).ok_or_else(|| {
+                    tracing::error!(
+                        unexpected_key = ?key,
+                        batch_size = keys.len(),
+                        "types_registry batch read answered a key it was not asked"
+                    );
+                    CanonicalError::internal("the registry could not match a batch read result")
+                        .create()
+                })?;
+                Ok(EntityLookupDto {
+                    key,
+                    status: (&lookup).into(),
+                    entity: match lookup {
+                        EntityLookup::Found(record) => Some(EntityDto::from(record)),
+                        EntityLookup::NotFound => None,
+                    },
+                })
+            })
+            .collect::<Result<_, CanonicalError>>()?,
+    };
+    json_body(body, selection).await
+}
+
+/// `GET /types-registry/v2/entities`
+///
+/// One bounded page ordered by canonical identifier, projected by `$select`, plus
+/// the cursor for the next one (D12).
+pub async fn discover_entities(
+    Extension(service): Extension<Option<Arc<RegistryService>>>,
+    params: DiscoveryParams,
+) -> ApiResult<Response> {
+    let service = require_registry(service)?;
+    let mut query = DiscoveryQuery {
+        pattern: params.pattern,
+        after: None,
+        limit: params.limit,
+        kind: params.kind,
+        lifecycle: params.lifecycle,
+        max_chain_depth: params.max_chain_depth,
+        selection: params.selection,
+    };
+    if let Some(cursor) = &params.cursor {
+        query.after = Some(super::cursor::resume(cursor, &Binding::from(&query))?);
+    }
+
+    let page = service
+        .discover(&query)
+        .await
+        .map_err(CanonicalError::from)?;
+
+    let next_cursor = page
+        .next_after
+        .as_deref()
+        .map(|after| super::cursor::encode(after, &Binding::from(&query)))
+        .transpose()?;
+    let body = EntityPageDto {
+        items: page.items.into_iter().map(Into::into).collect(),
+        page_info: PageInfoDto {
+            next_cursor,
+            limit: page.limit,
+        },
+    };
+    json_body(body, query.selection).await
 }
 
 /// The database-backed path is only wired where a database is bound to this gear
@@ -382,6 +537,31 @@ mod tests {
             repo,
             crate::config::TypesRegistryConfig::default(),
         ))
+    }
+
+    /// A body `serde_json` refuses, as an out-of-range timestamp would be.
+    struct Unserializable;
+
+    impl serde::Serialize for Unserializable {
+        fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+            Err(serde::ser::Error::custom("injected serialization failure"))
+        }
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn a_body_that_does_not_serialize_is_not_reported_as_a_blocking_task() {
+        let selection = FieldSelection::parse(&["content"]).expect("valid");
+        let Err(refused) = json_body(Unserializable, selection).await else {
+            panic!("the body cannot be serialized");
+        };
+        assert_eq!(
+            toolkit_canonical_errors::Problem::from(refused).status,
+            Some(500)
+        );
+        assert!(logs_contain("injected serialization failure"));
+        assert!(logs_contain(r#"at="response serialization""#));
+        assert!(!logs_contain("blocking task"));
     }
 
     #[tokio::test]

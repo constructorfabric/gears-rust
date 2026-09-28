@@ -1,6 +1,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::sync::Arc;
+use types_registry::domain::selection::FieldSelection;
 
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use serde_json::{Value, json};
@@ -156,7 +157,10 @@ async fn assert_missing_dependency(
     );
     assert!(
         registry
-            .entity(&EntityKey::GtsId(candidate_id.to_owned()))
+            .entity(
+                &EntityKey::GtsId(candidate_id.to_owned()),
+                FieldSelection::full()
+            )
             .await
             .expect("read refused candidate")
             .is_none(),
@@ -241,7 +245,10 @@ async fn a_missing_dependency_does_not_prevent_an_independent_candidate_from_com
     assert!(independent.error.is_none());
     assert!(
         registry
-            .entity(&EntityKey::GtsId(INDEPENDENT.to_owned()))
+            .entity(
+                &EntityKey::GtsId(INDEPENDENT.to_owned()),
+                FieldSelection::full()
+            )
             .await
             .expect("read admitted entity")
             .is_some()
@@ -295,7 +302,10 @@ async fn dry_run_missing_dependencies_keep_the_same_diagnostics_without_entity_w
         assert_eq!(independent.resource_version, None);
         assert!(
             registry
-                .entity(&EntityKey::GtsId(INDEPENDENT.to_owned()))
+                .entity(
+                    &EntityKey::GtsId(INDEPENDENT.to_owned()),
+                    FieldSelection::full()
+                )
                 .await
                 .expect("read independently validated entity")
                 .is_none(),
@@ -339,7 +349,7 @@ async fn an_instance_before_its_conforming_type_in_the_same_batch_succeeds() {
         assert!(item.error.is_none());
         assert!(
             registry
-                .entity(&EntityKey::GtsId(id.to_owned()))
+                .entity(&EntityKey::GtsId(id.to_owned()), FieldSelection::full())
                 .await
                 .expect("read registered entity")
                 .is_some(),

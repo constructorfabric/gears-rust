@@ -699,7 +699,7 @@ jobs:
         uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
         with:
           toolchain: ${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}
-          components: llvm-tools-preview
+          components: llvm-tools-preview, rust-src
 
       # Override rust-toolchain.toml (which pins stable) for all cargo
       # commands in this job.

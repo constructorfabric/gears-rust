@@ -18,7 +18,10 @@ fn missing_dependency_details_survive_outcome_redelivery() {
             kind,
             target: "cf.core.absent.type.v1~".into(),
         });
-        assert_eq!(ItemFailure::from_payload(&failure.to_payload()), failure);
+        assert_eq!(
+            ItemFailure::from_payload(&failure.to_payload().expect("encode")),
+            failure
+        );
     }
 }
 
@@ -40,7 +43,7 @@ fn an_unknown_dependency_kind_survives_with_its_target() {
         "an unknown kind says nothing about the reason",
     );
     assert_eq!(
-        ItemFailure::from_payload(&failure.to_payload()),
+        ItemFailure::from_payload(&failure.to_payload().expect("encode")),
         failure,
         "and re-recording it writes the token back unchanged",
     );
@@ -124,7 +127,7 @@ fn known_reasons_keep_their_wire_codes_and_metric_labels_after_storage() {
         ),
     ] {
         let failure = ItemFailure::new(reason.clone(), "failure details".to_owned());
-        let payload = failure.to_payload();
+        let payload = failure.to_payload().expect("encode");
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&payload).expect("JSON"),
             serde_json::json!({"reason": code, "message": "failure details"}),
@@ -147,7 +150,8 @@ fn an_unknown_stored_reason_is_preserved_but_counts_under_other() {
     assert_eq!(reason_label(&failure.reason), "other");
     assert_eq!(failure.reason.as_str(), "future_refusal");
     assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&failure.to_payload()).expect("JSON"),
+        serde_json::from_str::<serde_json::Value>(&failure.to_payload().expect("encode"))
+            .expect("JSON"),
         serde_json::from_str::<serde_json::Value>(payload).expect("JSON"),
     );
 }
@@ -168,6 +172,9 @@ fn malformed_payloads_keep_the_original_content_and_diagnostic_reason() {
         let failure = ItemFailure::from_payload(payload);
         assert_eq!(failure.reason, reason);
         assert_eq!(failure.message, payload);
-        assert_eq!(ItemFailure::from_payload(&failure.to_payload()), failure);
+        assert_eq!(
+            ItemFailure::from_payload(&failure.to_payload().expect("encode")),
+            failure
+        );
     }
 }

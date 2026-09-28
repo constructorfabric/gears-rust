@@ -10,7 +10,6 @@ use super::revision::{
     RevisionCommit, read_current_content, revision_entity, terminalize_unchanged,
 };
 use crate::domain::admission::{AdmissionFailureReason, Precondition};
-use crate::domain::artifacts::content_hash;
 use crate::domain::enums::LifecycleStatus;
 use crate::domain::ports::{OperationItemRow, Stores};
 
@@ -52,9 +51,8 @@ pub(super) async fn probe(
         entity.id,
     )
     .await?;
-    // A digest is only a prefilter: collisions must not swallow edits.
     Ok(current
-        .matches_authored(&content_hash(payload), payload)
+        .matches_authored(payload)
         .then_some(UnchangedCandidate {
             gts_id: item.gts_id.clone(),
             entity_id: entity.id,

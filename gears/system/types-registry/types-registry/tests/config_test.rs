@@ -18,7 +18,7 @@ use std::time::Duration;
 use serde_json::json;
 use toolkit_gts::gts_id;
 
-use types_registry::config::{ByteSize, ConfigError, TypesRegistryConfig};
+use types_registry::config::{ByteSize, ConfigError, PAGE_SIZE_CEILING, TypesRegistryConfig};
 use types_registry::domain::enums::OwnershipScope;
 
 fn parse(value: serde_json::Value) -> TypesRegistryConfig {
@@ -59,8 +59,8 @@ fn the_defaults_are_the_ones_the_spec_documents() {
     assert_eq!(cfg.limits.resolution_closure, 64);
     assert_eq!(cfg.limits.batch_candidates, 100);
     assert_eq!(cfg.limits.activation_write_set, 512);
-    assert_eq!(cfg.limits.page_size_default, 100);
-    assert_eq!(cfg.limits.page_size_max, 1000);
+    assert_eq!(cfg.limits.page_size_default, 50);
+    assert_eq!(cfg.limits.page_size_max, 100);
     assert_eq!(cfg.worker.operation_timeout, Duration::from_mins(5));
     assert_eq!(cfg.worker.max_revalidation_attempts, 8);
     assert_eq!(cfg.worker.max_delivery_attempts, 8);
@@ -119,8 +119,8 @@ fn the_documented_configuration_block_parses_and_validates() {
             "resolution_closure": 64,
             "batch_candidates": 100,
             "activation_write_set": 512,
-            "page_size_default": 100,
-            "page_size_max": 1000,
+            "page_size_default": 50,
+            "page_size_max": 100,
         },
         "registration_policy": {
             (gts_id!("acme.*")): { "allowed_vendors": ["acme"], "tenant_ownable": true },
@@ -303,59 +303,18 @@ fn a_zero_page_size_fails_startup() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Keys P0 accepts and does not enforce
-// ---------------------------------------------------------------------------
-
-/// The shipped defaults name nothing: a deployment that configures nothing is not
-/// told about limits it never asked for.
+/// Configured limits parse, validate and are kept as written.
 #[test]
-fn the_defaults_report_no_inert_keys() {
-    assert!(TypesRegistryConfig::default().inert_limit_keys().is_empty());
-    assert!(parse(json!({})).inert_limit_keys().is_empty());
-}
-
-/// Every key P0 parses without acting on, one at a time, each reported under the
-/// name an operator wrote. The list is exhaustive on purpose: when a task binds one
-/// of these, its line here fails, which is the reminder to move the key out of the
-/// list and out of the "accepted, not enforced" docstring.
-#[test]
-fn each_unenforced_key_is_named_when_it_is_moved_off_its_default() {
-    for (limits, expected) in [
-        (
-            json!({ "page_size_default": 50 }),
-            "limits.page_size_default",
-        ),
-        (json!({ "page_size_max": 500 }), "limits.page_size_max"),
-    ] {
-        let cfg = parse(json!({ "limits": limits.clone() }));
-        assert_eq!(
-            cfg.inert_limit_keys(),
-            vec![expected],
-            "setting {limits} must be reported as inert",
-        );
-    }
-
-    let worker = json!({ "operation_timeout": "30s" });
-    let cfg = parse(json!({ "worker": worker }));
-    assert!(
-        cfg.inert_limit_keys().is_empty(),
-        "operation_timeout is enforced by the admission outbox lease",
-    );
-}
-
-/// The keys that *are* enforced are never reported, whatever they are set to —
-/// otherwise the warning would train an operator to ignore it.
-#[test]
-fn the_enforced_limits_are_never_reported_as_inert() {
+fn configured_limits_are_kept() {
     let cfg = parse(json!({
         "limits": {
             "authored_document": "1MB", "batch_candidates": 7, "activation_write_set": 8,
-            "resolved_document": "2MB", "resolution_closure": 128
+            "resolved_document": "2MB", "resolution_closure": 128,
+            "page_size_default": 20, "page_size_max": 40
         },
         "worker": { "max_revalidation_attempts": 3 }
     }));
-    assert!(cfg.inert_limit_keys().is_empty());
+    cfg.validate().expect("valid limits");
     assert_eq!(cfg.limits.authored_document.bytes(), 1024 * 1024);
     assert_eq!(cfg.limits.batch_candidates, 7);
     assert_eq!(cfg.limits.resolved_document.bytes(), 2 * 1024 * 1024);
@@ -368,6 +327,15 @@ fn the_enforced_limits_are_never_reported_as_inert() {
         cfg.worker.max_revalidation_attempts, 3,
         "T15 enforces this one: the bound on the revalidation loop"
     );
+}
+
+#[test]
+fn a_page_size_max_above_the_ceiling_fails_startup() {
+    let at = parse(json!({ "limits": { "page_size_max": PAGE_SIZE_CEILING } }));
+    at.validate().expect("the ceiling itself is valid");
+    let over = parse(json!({ "limits": { "page_size_max": PAGE_SIZE_CEILING + 1 } }));
+    let err = over.validate().expect_err("above the ceiling must fail");
+    assert!(matches!(err, ConfigError::Limits(_)), "got {err}");
 }
 
 #[test]
@@ -424,18 +392,6 @@ fn zero_operation_timeout_is_rejected() {
 }
 
 #[test]
-fn several_inert_keys_are_reported_together() {
-    let cfg = parse(json!({
-        "limits": { "page_size_default": 50, "page_size_max": 500 },
-        "worker": { "operation_timeout": "10m" }
-    }));
-    assert_eq!(
-        cfg.inert_limit_keys(),
-        vec!["limits.page_size_default", "limits.page_size_max"],
-    );
-}
-
-#[test]
 fn a_zero_enforced_limit_fails_startup() {
     for limits in [
         json!({ "batch_candidates": 0 }),
@@ -457,7 +413,6 @@ fn a_zero_enforced_limit_fails_startup() {
 fn the_minimum_positive_resolution_budgets_are_valid_configuration() {
     let cfg = parse(json!({ "limits": { "resolved_document": 1, "resolution_closure": 1 } }));
     cfg.validate().expect("positive budgets are valid");
-    assert!(cfg.inert_limit_keys().is_empty());
 }
 
 #[test]

@@ -2,14 +2,14 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use event_broker_sdk::{
-    ConsumerBuilder, ConsumerError, ConsumerGroupRef, EventTypeRef, Fallback, HandlerOutcome,
-    InMemoryOffsetManager, RawEvent, SingleEventHandler, SubscriptionInterest, TopicRef,
+    ConsumerBuilder, ConsumerError, ConsumerGroupRef, Fallback, HandlerOutcome,
+    InMemoryOffsetManager, RawEvent, SingleEventHandler, SubscriptionInterest, gts_id,
 };
 
-use super::common::{publish_json, topic_fixture, wait_until};
+use super::common::{event_pattern, publish_json, topic, topic_fixture, wait_until};
 
-const TOPIC: &str = "gts.cf.core.events.topic.v1~example.mock.showcase.inmemory.v1";
-const EVENT_TYPE: &str = "gts.cf.core.events.event.v1~example.mock.showcase.inmemory.v1~";
+const TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.showcase.inmemory.v1");
+const EVENT_TYPE: &str = gts_id!("cf.core.events.event.v1~example.mock.showcase.inmemory.v1~");
 
 struct RecordingHandler {
     subjects: Arc<Mutex<Vec<String>>>,
@@ -35,8 +35,8 @@ async fn if_i_want_at_least_once_consumption_with_in_memory_offsets() {
     let handle = ConsumerBuilder::new(fixture.broker.clone())
         .group(ConsumerGroupRef::auto_anonymous("showcase-in-memory"))
         .subscription_interests([SubscriptionInterest::builder()
-            .topic(TopicRef::gts(TOPIC))
-            .types([EventTypeRef::gts(EVENT_TYPE)])
+            .topic(topic(TOPIC))
+            .types([event_pattern(EVENT_TYPE)])
             .build()
             .expect("topic-scoped interest")])
         .offset_manager(InMemoryOffsetManager::new(Fallback::Earliest))

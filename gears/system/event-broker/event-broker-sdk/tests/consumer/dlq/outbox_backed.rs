@@ -1,3 +1,4 @@
+use event_broker_sdk::Sequence;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -6,9 +7,10 @@ use async_trait::async_trait;
 use chrono::Utc;
 use event_broker_sdk::consumer::LOCAL_DB_OFFSET_STORE_MIGRATION_SQL;
 use event_broker_sdk::dlq::{ConsumerDlqOutbox, DeadLetterEnvelope, DeadLetterRecord};
+use event_broker_sdk::gts_id;
 use event_broker_sdk::{
-    CommitOffsetInTx, ConsumerGroupId, Fallback, LocalDbOffsetManager, OffsetStore, RawEvent,
-    ResolvedPosition, TopicId,
+    CommitOffsetInTx, ConsumerGroupId, Fallback, LocalDbOffsetManager, OffsetStore, Position,
+    RawEvent, TopicId,
 };
 use sea_orm::{ConnectionTrait, Database, Statement};
 use toolkit_db::outbox::{
@@ -20,9 +22,9 @@ use crate::consumer::common::wait_until;
 
 const DLQ_QUEUE: &str = "showcase-consumer-dlq";
 const DLQ_PARTITIONS: u32 = 4;
-const TOPIC_GTS: &str = "gts.cf.core.events.topic.v1~example.showcase.outbox.dlq.v1";
-const EVENT_TYPE_GTS: &str = "gts.cf.core.events.event.v1~example.showcase.outbox.dlq.v1~";
-const GROUP_GTS: &str = "gts.cf.core.events.consumer_group.v1~example.showcase.outbox.dlq.v1";
+const TOPIC_GTS: &str = gts_id!("cf.core.events.topic.v1~example.showcase.outbox.dlq.v1");
+const EVENT_TYPE_GTS: &str = gts_id!("cf.core.events.event.v1~example.showcase.outbox.dlq.v1~");
+const GROUP_GTS: &str = gts_id!("cf.core.events.consumer_group.v1~example.showcase.outbox.dlq.v1");
 
 static DB_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -114,14 +116,14 @@ async fn fixture() -> DlqOutboxFixture {
 fn rejected_event(offset: i64) -> RawEvent {
     RawEvent {
         id: Uuid::new_v4(),
-        type_id: EVENT_TYPE_GTS.to_owned(),
-        topic: TOPIC_GTS.to_owned(),
+        type_id: event_broker_sdk::GtsTypeId::new(EVENT_TYPE_GTS),
+        topic: event_broker_sdk::GtsInstanceId::try_new(TOPIC_GTS).unwrap(),
         tenant_id: Uuid::nil(),
         subject: format!("dlq-order-{offset}"),
-        subject_type: "order".to_owned(),
+        subject_type: event_broker_sdk::GtsTypeId::new("gts.x.eb.test.subject.v1~"),
         partition: 0,
-        sequence: offset,
-        offset,
+        sequence: Sequence::assigned(offset),
+        offset: Sequence::assigned(offset),
         occurred_at: Utc::now(),
         sequence_time: Utc::now(),
         trace_parent: None,
@@ -149,7 +151,7 @@ async fn load_position(
     group: &ConsumerGroupId,
     topic: &TopicId,
     partition: u32,
-) -> ResolvedPosition {
+) -> Position {
     manager
         .load_position(group, topic, partition)
         .await
@@ -224,7 +226,7 @@ async fn if_i_want_transactional_dlq_i_enqueue_and_commit_offset_in_the_same_tx(
     assert_eq!(envelope.offset, event.offset);
     assert_eq!(
         load_position(&manager, &group, &topic, event.partition).await,
-        ResolvedPosition::Exact(event.offset)
+        Position::Exact(event.offset)
     );
 
     fixture.stop().await;
@@ -277,7 +279,7 @@ async fn if_the_dlq_transaction_rolls_back_neither_handoff_nor_offset_is_durable
     assert!(fixture.envelopes.lock().unwrap().is_empty());
     assert_eq!(
         load_position(&manager, &group, &topic, event.partition).await,
-        ResolvedPosition::Earliest
+        Position::Earliest
     );
 
     fixture.stop().await;
@@ -331,7 +333,7 @@ async fn if_the_main_transaction_rolled_back_i_open_a_new_tx_for_dlq_and_offset_
     assert_eq!(envelope.offset, event.offset);
     assert_eq!(
         load_position(&manager, &group, &topic, event.partition).await,
-        ResolvedPosition::Exact(event.offset)
+        Position::Exact(event.offset)
     );
 
     fixture.stop().await;
@@ -374,7 +376,7 @@ async fn if_dlq_handoff_fails_i_do_not_commit_the_source_offset() {
     assert!(fixture.envelopes.lock().unwrap().is_empty());
     assert_eq!(
         load_position(&manager, &group, &topic, event.partition).await,
-        ResolvedPosition::Earliest
+        Position::Earliest
     );
 
     fixture.stop().await;

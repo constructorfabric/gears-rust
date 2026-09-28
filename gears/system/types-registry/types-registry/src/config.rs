@@ -13,6 +13,10 @@ pub use crate::policy_config::PolicyEntry;
 /// Lease time reserved after admission.
 pub const LEASE_HEADROOM: Duration = Duration::from_secs(2);
 
+/// A discovery page carries the same documents a batch read does, so it shares
+/// that ceiling (C10).
+pub const PAGE_SIZE_CEILING: u32 = 100;
+
 /// Largest attempt budget that fits the outbox's signed counter.
 const MAX_DELIVERY_ATTEMPTS: u32 = i16::MAX as u32 - 1;
 
@@ -101,9 +105,9 @@ pub struct Limits {
     pub batch_candidates: usize,
     /// Maximum dependents reached by one revision; also caps CTE depth (SPEC §4).
     pub activation_write_set: usize,
-    /// Default `GET /entities` page size; not consumed in P0.
+    /// Default `GET /entities` page size.
     pub page_size_default: u32,
-    /// Maximum `GET /entities` page size; not consumed in P0.
+    /// Maximum `GET /entities` page size, at most [`PAGE_SIZE_CEILING`].
     pub page_size_max: u32,
 }
 
@@ -115,8 +119,8 @@ impl Default for Limits {
             resolution_closure: 64,
             batch_candidates: 100,
             activation_write_set: 512,
-            page_size_default: 100,
-            page_size_max: 1000,
+            page_size_default: 50,
+            page_size_max: 100,
         }
     }
 }
@@ -307,6 +311,12 @@ impl TypesRegistryConfig {
     /// [`ConfigError::Limits`] for an invalid limit, or [`ConfigError::Worker`]
     /// for an invalid worker setting.
     pub fn validate(&self) -> Result<RegistrationPolicy, ConfigError> {
+        if self.limits.page_size_max > PAGE_SIZE_CEILING {
+            return Err(ConfigError::Limits(format!(
+                "limits.page_size_max ({}) exceeds {PAGE_SIZE_CEILING}",
+                self.limits.page_size_max
+            )));
+        }
         if self.limits.page_size_default > self.limits.page_size_max {
             return Err(ConfigError::Limits(format!(
                 "limits.page_size_default ({}) exceeds limits.page_size_max ({})",
@@ -378,20 +388,6 @@ impl TypesRegistryConfig {
             )));
         }
         Ok(RegistrationPolicy::compile(&self.registration_policy)?)
-    }
-
-    /// Non-default settings accepted but not enforced in P0.
-    #[must_use]
-    pub fn inert_limit_keys(&self) -> Vec<&'static str> {
-        let limits = Limits::default();
-        let mut keys = Vec::new();
-        if self.limits.page_size_default != limits.page_size_default {
-            keys.push("limits.page_size_default");
-        }
-        if self.limits.page_size_max != limits.page_size_max {
-            keys.push("limits.page_size_max");
-        }
-        keys
     }
 
     /// Converts this config to a `gts::GtsConfig`.

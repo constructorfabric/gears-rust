@@ -62,7 +62,7 @@ fn worker(db: &Provider) -> DBProvider<WorkerError> {
     DBProvider::new(db.db())
 }
 
-/// Vary `title` to move the content hash, revision, and dependent artifacts
+/// Vary `title` to move the authored content, revision, and dependent artifacts
 /// without changing the accepted-instance set.
 fn base_schema(marker: &str) -> Value {
     json!({

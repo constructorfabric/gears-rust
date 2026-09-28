@@ -2,8 +2,7 @@ use std::num::NonZeroU32;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use gts::GtsInstanceId;
-use serde::{Deserialize, Serialize};
+use gts::{GtsIdPattern, GtsInstanceId, GtsTypeId};
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
@@ -14,12 +13,12 @@ use crate::models::{
     ConsumerGroup, ConsumerGroupQuery, CreateConsumerGroupRequest, EventType, Page,
     PartitionLeader, PartitionRange, ResetScope, Subscription, Topic, TopicSegment,
 };
+use crate::sequence::Sequence;
 
 // --- Supporting types ---------------------------------------------------------
 
 /// Producer deduplication mode declared at broker registration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ProducerMode {
     /// No producer id and no broker-side idempotency metadata.
     Stateless,
@@ -51,7 +50,7 @@ pub struct PartitionCursor {
 /// Broker cursors for one topic - the `last_sequence` of each of its partitions.
 #[derive(Debug, Clone)]
 pub struct TopicCursors {
-    pub topic: String,
+    pub topic: GtsInstanceId,
     pub partitions: Vec<PartitionCursor>,
 }
 
@@ -73,45 +72,47 @@ impl ProducerCursors {
     }
 
     /// The broker's known `last_sequence` for a `(topic, partition)`, if any.
-    pub fn last_sequence(&self, topic: &str, partition: u32) -> Option<i64> {
+    pub fn last_sequence(&self, topic: &GtsInstanceId, partition: u32) -> Option<i64> {
         self.topics
             .iter()
-            .find(|t| t.topic == topic)
+            .find(|t| &t.topic == topic)
             .and_then(|t| t.partitions.iter().find(|p| p.partition == partition))
             .map(|p| p.last_sequence)
     }
 }
 
 /// Where the consumer wants the broker to begin emitting for an assigned
-/// `(topic, partition)`. The integer in [`ResolvedPosition::Exact`] is the
+/// `(topic, partition)`. The integer in [`Position::Exact`] is the
 /// last offset the consumer has already processed. The broker computes
 /// "emit from offset + 1" server-side.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ResolvedPosition {
+pub enum Position {
     /// Last offset the consumer has processed; broker emits from offset + 1.
-    Exact(i64),
+    Exact(Sequence),
     /// Broker-resolved: emit from the partition's retention floor onwards.
     Earliest,
     /// Broker-resolved: emit only events admitted after this SEEK.
     Latest,
-    /// Broker-resolved: seek to the first offset whose `occurred_at` is at or
-    /// after the given ISO-8601 timestamp.
-    AtTimestamp(String),
+    /// Broker-resolved: seek so delivery begins at the first event whose
+    /// `occurred_at` is at or after this instant. Parsed at the API boundary,
+    /// so no backend re-parses a string or has to invent behaviour for one it
+    /// cannot read.
+    At(chrono::DateTime<chrono::Utc>),
 }
 
 /// One per-partition seed for the pre-stream SEEK call.
 #[derive(Debug, Clone)]
 pub struct SeekPosition {
-    pub topic: String,
+    pub topic: GtsInstanceId,
     pub partition: u32,
-    pub value: ResolvedPosition,
+    pub value: Position,
 }
 
 /// Partition assignment returned from a JOIN.
 /// The starting cursor is established separately via SEEK.
 #[derive(Debug, Clone)]
 pub struct AssignedPartition {
-    pub topic: String,
+    pub topic: GtsInstanceId,
     pub partition: u32,
 }
 
@@ -120,7 +121,6 @@ pub struct AssignedPartition {
 pub struct SubscriptionAssignment {
     pub subscription_id: SubscriptionId,
     pub topology_version: i64,
-    pub expires_at: chrono::DateTime<chrono::Utc>,
     pub assigned: Vec<AssignedPartition>,
 }
 
@@ -143,13 +143,12 @@ pub struct JoinRequest {
 #[derive(Debug, Clone)]
 pub struct WireEvent {
     pub id: Uuid,
-    pub type_id: String,
+    pub type_id: GtsTypeId,
     pub tenant_id: Uuid,
     pub subject: String,
-    pub subject_type: String,
+    pub subject_type: GtsTypeId,
     pub partition: u32,
-    pub sequence: i64,
-    pub offset: i64,
+    pub sequence: Sequence,
     pub occurred_at: chrono::DateTime<chrono::Utc>,
     pub sequence_time: chrono::DateTime<chrono::Utc>,
     pub trace_parent: Option<String>,
@@ -166,9 +165,9 @@ pub struct PartitionPosition {
     pub topic: GtsInstanceId,
     pub partition: u32,
     /// Session cursor - last processed offset.
-    pub offset: i64,
+    pub offset: Sequence,
     /// Highest offset the broker has scanned for this group/partition.
-    pub last_examined: i64,
+    pub last_examined: Sequence,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,8 +201,7 @@ pub type FrameStream =
     std::pin::Pin<Box<dyn futures_core::Stream<Item = Result<WireFrame, EventBrokerError>> + Send>>;
 
 /// Whether to stop traversal at self-managed tenant boundaries.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum BarrierMode {
     #[default]
     Respect,
@@ -236,36 +234,28 @@ impl TenantTraversalDepth {
 /// Paired filter engine + expression for a subscription interest.
 #[derive(Debug, Clone)]
 pub struct Filter {
-    pub(crate) engine: String,
+    pub(crate) engine: GtsInstanceId,
     pub(crate) expression: String,
 }
 
 impl Filter {
     pub fn new(
-        engine: impl Into<String>,
+        engine: GtsInstanceId,
         expression: impl Into<String>,
     ) -> Result<Self, EventBrokerError> {
-        let engine = engine.into();
         let expression = expression.into();
-        if engine.trim().is_empty() {
-            return Err(EventBrokerError::InvalidConsumerOptions {
-                detail: "subscription filter engine must not be empty".to_owned(),
-                instance: String::new(),
-            });
-        }
         if expression.is_empty() || expression.len() > 4096 {
             return Err(EventBrokerError::InvalidConsumerOptions {
                 detail: format!(
                     "subscription filter expression must be 1..=4096 bytes (got {})",
                     expression.len()
                 ),
-                instance: String::new(),
             });
         }
         Ok(Self { engine, expression })
     }
 
-    pub fn engine(&self) -> &str {
+    pub fn engine(&self) -> &GtsInstanceId {
         &self.engine
     }
 
@@ -277,21 +267,21 @@ impl Filter {
 /// One interest entry for a subscription JOIN.
 #[derive(Debug, Clone)]
 pub struct SubscriptionInterest {
-    pub(crate) topic: String,
+    pub(crate) topic: GtsInstanceId,
     pub(crate) tenant_id: Uuid,
     pub(crate) tenant_depth: TenantTraversalDepth,
     pub(crate) barrier_mode: BarrierMode,
-    pub(crate) types: Vec<String>,
+    pub(crate) types: Vec<GtsIdPattern>,
     pub(crate) filter: Option<Filter>,
 }
 
 #[derive(Debug, Default)]
 pub struct SubscriptionInterestBuilder {
-    topic: Option<String>,
+    topic: Option<GtsInstanceId>,
     tenant_id: Option<Uuid>,
     tenant_depth: TenantTraversalDepth,
     barrier_mode: BarrierMode,
-    types: Vec<String>,
+    types: Vec<GtsIdPattern>,
     filter: Option<Filter>,
 }
 
@@ -300,7 +290,7 @@ impl SubscriptionInterest {
         SubscriptionInterestBuilder::default()
     }
 
-    pub fn topic(&self) -> &str {
+    pub fn topic(&self) -> &GtsInstanceId {
         &self.topic
     }
 
@@ -316,7 +306,7 @@ impl SubscriptionInterest {
         self.barrier_mode
     }
 
-    pub fn types(&self) -> &[String] {
+    pub fn types(&self) -> &[GtsIdPattern] {
         &self.types
     }
 
@@ -326,8 +316,8 @@ impl SubscriptionInterest {
 }
 
 impl SubscriptionInterestBuilder {
-    pub fn topic(mut self, topic: impl Into<String>) -> Self {
-        self.topic = Some(topic.into());
+    pub fn topic(mut self, topic: GtsInstanceId) -> Self {
+        self.topic = Some(topic);
         self
     }
 
@@ -346,12 +336,11 @@ impl SubscriptionInterestBuilder {
         self
     }
 
-    pub fn types<I, S>(mut self, types: I) -> Self
+    pub fn types<I>(mut self, types: I) -> Self
     where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
+        I: IntoIterator<Item = GtsIdPattern>,
     {
-        self.types = types.into_iter().map(Into::into).collect();
+        self.types = types.into_iter().collect();
         self
     }
 
@@ -365,34 +354,18 @@ impl SubscriptionInterestBuilder {
             .topic
             .ok_or_else(|| EventBrokerError::InvalidConsumerOptions {
                 detail: "subscription interest topic is required".to_owned(),
-                instance: String::new(),
             })?;
         let tenant_id = self
             .tenant_id
             .ok_or_else(|| EventBrokerError::InvalidConsumerOptions {
                 detail: "subscription interest tenant_id is required".to_owned(),
-                instance: String::new(),
             })?;
-        if topic.trim().is_empty() {
-            return Err(EventBrokerError::InvalidConsumerOptions {
-                detail: "subscription interest topic must not be empty".to_owned(),
-                instance: String::new(),
-            });
-        }
         if self.types.is_empty() || self.types.len() > 32 {
             return Err(EventBrokerError::InvalidConsumerOptions {
                 detail: format!(
                     "subscription interest event types must be 1..=32 entries (got {})",
                     self.types.len()
                 ),
-                instance: String::new(),
-            });
-        }
-        if self.types.iter().any(|ty| ty.trim().is_empty()) {
-            return Err(EventBrokerError::InvalidConsumerOptions {
-                detail: "subscription interest event types must not contain empty entries"
-                    .to_owned(),
-                instance: String::new(),
             });
         }
 
@@ -410,18 +383,18 @@ impl SubscriptionInterestBuilder {
 /// Opaque backend configuration envelope.
 /// `gts_type_id` is a full GTS identifier registered with `types-registry-sdk`.
 /// `config` is JSON validated against the GTS type's schema.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct StorageBackendConfig {
-    pub gts_type_id: String,
+    pub gts_type_id: GtsTypeId,
     pub config: serde_json::Value,
 }
 
 /// Resolved position returned from a SEEK call, one entry per requested partition.
 #[derive(Debug, Clone)]
 pub struct SeekResult {
-    pub topic: String,
+    pub topic: GtsInstanceId,
     pub partition: u32,
-    pub offset: i64,
+    pub offset: Sequence,
 }
 
 // --- EventBrokerApi - client-facing interface ------------------------------------
@@ -433,8 +406,8 @@ pub struct SeekResult {
 /// let broker = hub.get::<dyn EventBrokerApi>()?;
 /// ```
 ///
-/// Implemented by: the in-process direct backend, the remote HTTP backend,
-/// and the mock (`--features test-util`). This boundary is **transport-agnostic** - no
+/// Implemented by: the in-process direct backend (the gear's `LocalBroker`) and
+/// the remote HTTP backend. This boundary is **transport-agnostic** - no
 /// HTTP types leak through it, and method docs describe operations, not wire paths.
 /// HTTP verbs/paths (and their renames) live solely in `openapi.yaml` and the HTTP
 /// backend, the single source of truth.
@@ -470,11 +443,14 @@ pub trait EventBrokerApi: Send + Sync {
         self.publish(ctx, event).await
     }
 
+    /// Publish a batch atomically. A batch is all-or-nothing (a single
+    /// mode-shape or chain violation rejects the whole batch, per DESIGN), so
+    /// the outcome is one value for the batch, not one per event.
     async fn publish_batch(
         &self,
         ctx: &SecurityContext,
         events: &[Event],
-    ) -> Result<Vec<IngestOutcome>, EventBrokerError>;
+    ) -> Result<IngestOutcome, EventBrokerError>;
 
     async fn get_producer_cursors(
         &self,
@@ -544,23 +520,37 @@ pub trait EventBrokerApi: Send + Sync {
         id: SubscriptionId,
     ) -> Result<FrameStream, EventBrokerError>;
 
+    /// Seed cursor positions for a subscription's assigned partitions before a
+    /// stream is opened.
+    ///
+    /// `topology_version` is the `topology_version` the caller last
+    /// observed for the subscription (from the JOIN response or a subscription
+    /// read). It fences the seek against a concurrent rebalance: if the group's
+    /// topology has moved since, the whole seek is rejected with
+    /// [`EventBrokerError::TopologyVersionMismatch`] and the caller re-reads the
+    /// subscription and re-seeks. This is the only way a partition reassigned by
+    /// a rebalance in the pre-stream window is told apart from a partition the
+    /// caller never owned.
     async fn seek(
         &self,
         ctx: &SecurityContext,
         id: SubscriptionId,
+        topology_version: i64,
         positions: &[SeekPosition],
     ) -> Result<Vec<SeekResult>, EventBrokerError>;
 
     // -- Topic / event-type introspection -------------------------------------
     async fn list_topics(&self, ctx: &SecurityContext) -> Result<Vec<Topic>, EventBrokerError>;
 
+    /// The backend's segment manifest for one `(topic, partition)`. The wire
+    /// response is a single manifest object (`docs/openapi.yaml`), not a page.
     async fn list_topic_segments(
         &self,
         ctx: &SecurityContext,
         topic: &str,
         partition: u32,
         range: PartitionRange,
-    ) -> Result<Vec<TopicSegment>, EventBrokerError>;
+    ) -> Result<TopicSegment, EventBrokerError>;
 
     async fn list_event_types(
         &self,
@@ -593,14 +583,51 @@ pub trait EventBrokerBackend: Send + Sync {
         events: &[Event],
     ) -> Result<(), StorageBackendError>;
 
+    /// Stored events strictly after `after`, in sequence order, at most
+    /// `max_count` of them.
+    ///
+    /// **Every read of the log is exclusive of the position it names.** Fetching
+    /// with sequence 43 returns sequences greater than 43 - never 43 itself, and
+    /// not necessarily 44, because the next populated sequence is unknowable in a
+    /// space retention and filtering leave sparse. A caller therefore never
+    /// computes the position it wants next; it names the one it has consumed.
+    /// `Sequence::NONE` reads from the start of the space.
     async fn read(
         &self,
         ctx: &SecurityContext,
         topic: &str,
         partition: u32,
-        start_offset: i64,
+        after: Sequence,
         max_count: usize,
     ) -> Result<Vec<Event>, StorageBackendError>;
+
+    /// Resolves a requested position to the cursor to read after.
+    ///
+    /// The backend owns this because it is the only thing that knows what it
+    /// holds: where retention has reached, what it has assigned, and when each
+    /// event occurred.
+    ///
+    /// - `Exact(n)` returns `n`, or [`StorageBackendError::OffsetOutOfRange`]
+    ///   when `n` is not a position a cursor may hold here.
+    /// - `Earliest` returns the position just below the oldest event still
+    ///   stored, so delivery begins at that event.
+    /// - `Latest` returns the highest sequence ever assigned - the highest
+    ///   *assigned* rather than the highest still stored, so erasing the newest
+    ///   event never moves it backwards.
+    /// - `At(t)` returns the position just below the first event whose
+    ///   `occurred_at` is at or after `t`, falling back to `Latest` when no
+    ///   stored event is that recent.
+    ///
+    /// A returned position is one a cursor may hold. It is not a claim that an
+    /// event occupies it, and frequently none does - the position below the
+    /// retention floor is precisely the event retention removed.
+    async fn resolve(
+        &self,
+        ctx: &SecurityContext,
+        topic: &str,
+        partition: u32,
+        position: Position,
+    ) -> Result<Sequence, StorageBackendError>;
 
     async fn query(
         &self,
@@ -615,4 +642,170 @@ pub trait EventBrokerBackend: Send + Sync {
         ctx: &SecurityContext,
         topic: &str,
     ) -> Result<Vec<PartitionLeader>, StorageBackendError>;
+
+    /// Performs one retention pass over a single partition and reports what it
+    /// removed.
+    ///
+    /// The backend that owns the rows owns keeping them bounded, so this is a
+    /// trait method rather than anything the broker does to a backend from
+    /// outside - a second backend brings its own enforcement instead of
+    /// inheriting the first one's.
+    ///
+    /// Driven, never self-scheduling: the caller decides the cadence and this
+    /// performs exactly one pass. A backend owns no timer and spawns no task,
+    /// which is the difference between a test that forces three passes
+    /// deterministically and one that sleeps hoping a background thread ran.
+    /// It is also why retention still fires for a topic that has stopped
+    /// receiving events, which enforcement on the append path would not.
+    ///
+    /// # Errors
+    /// [`StorageBackendError::RetentionFailed`] if the pass could not be
+    /// applied. A failed pass removes nothing: whatever it would have removed
+    /// is still there for the next one.
+    async fn maintain(
+        &self,
+        ctx: &SecurityContext,
+        request: &RetentionRequest,
+    ) -> Result<RetentionReport, StorageBackendError>;
+}
+
+/// One partition's retention pass: which partition, and the bounds it must end
+/// within.
+///
+/// The duration bound arrives as an absolute instant rather than a duration
+/// because the caller owns the clock - it is the thing already ticking. A
+/// backend with no clock of its own cannot drift from the broker's, and a test
+/// moves the cutoff instead of having to age the events.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetentionRequest {
+    topic: GtsInstanceId,
+    partition: u32,
+    oldest_permitted: chrono::DateTime<chrono::Utc>,
+    max_stored_bytes: Option<u64>,
+}
+
+impl RetentionRequest {
+    /// Three arguments of mutually distinguishable types, so none can be passed
+    /// in another's place; the optional byte bound is chained.
+    #[must_use]
+    pub fn for_partition(
+        topic: GtsInstanceId,
+        partition: u32,
+        oldest_permitted: chrono::DateTime<chrono::Utc>,
+    ) -> RetentionRequestBuilder {
+        RetentionRequestBuilder {
+            request: RetentionRequest {
+                topic,
+                partition,
+                oldest_permitted,
+                max_stored_bytes: None,
+            },
+        }
+    }
+
+    #[must_use]
+    pub fn topic(&self) -> &GtsInstanceId {
+        &self.topic
+    }
+
+    #[must_use]
+    pub fn partition(&self) -> u32 {
+        self.partition
+    }
+
+    /// Events stamped before this instant are past the duration bound.
+    #[must_use]
+    pub fn oldest_permitted(&self) -> chrono::DateTime<chrono::Utc> {
+        self.oldest_permitted
+    }
+
+    /// Bytes the partition may hold. `None` leaves it bounded by
+    /// [`oldest_permitted`](Self::oldest_permitted) alone, free to grow past
+    /// any byte figure.
+    #[must_use]
+    pub fn max_stored_bytes(&self) -> Option<u64> {
+        self.max_stored_bytes
+    }
+}
+
+pub struct RetentionRequestBuilder {
+    request: RetentionRequest,
+}
+
+impl RetentionRequestBuilder {
+    /// Bounds the partition by stored bytes as well as by age. Whichever bound
+    /// is reached first triggers removal.
+    #[must_use]
+    pub fn max_stored_bytes(mut self, bytes: u64) -> Self {
+        self.request.max_stored_bytes = Some(bytes);
+        self
+    }
+
+    #[must_use]
+    pub fn build(self) -> RetentionRequest {
+        self.request
+    }
+}
+
+/// What one retention pass did, and where the partition stands after it.
+///
+/// Every figure is counted rather than derived: `removed_events` is the rows
+/// the pass actually removed and `remaining_events` the rows still stored.
+/// Neither is the distance between two sequence numbers - sequences are
+/// ordinals, and after a prefix removal that distance is not a count of
+/// anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RetentionReport {
+    /// Events this pass removed.
+    pub removed_events: u64,
+    /// Stored bytes this pass removed, summed over the rows it removed.
+    pub removed_bytes: u64,
+    /// Events still stored in the partition.
+    pub remaining_events: u64,
+    /// Stored bytes those events occupy.
+    pub remaining_bytes: u64,
+    /// The partition's new floor: the lowest sequence still stored, or `None`
+    /// when the pass left the partition empty.
+    ///
+    /// A reader positioned below this has been overtaken by retention. It is
+    /// owed the oldest surviving event and no explanation, so nothing here is
+    /// ever reported to a consumer.
+    pub oldest_surviving_sequence: Option<Sequence>,
+}
+
+/// Builds one backend from an operator's `backend` block.
+///
+/// The wiring-side counterpart to [`EventBrokerBackend`]: a plugin implements
+/// this so the gear can bind a topic to the backend its settings name, without
+/// the gear knowing how that backend stores a row. Not a `RunnableCapability`
+/// and not a `Gear` - a host builds the provider and injects it, the way the
+/// cluster gear injects its cache providers.
+#[async_trait]
+pub trait EventBrokerBackendProvider: Send + Sync {
+    /// The GTS backend type this provider serves, as a topic's `backend.type`
+    /// names it - a type derived from `gts.cf.core.events.backend.v1~`.
+    ///
+    /// A type identifier rather than a short alias because a backend *is* a GTS
+    /// type: the plugin registers it, and a running deployment of it is an
+    /// instance of that type (`docs/DESIGN.md`, "Backend Type vs. Backend
+    /// Instance"). The plugin owns the identifier, so adding a backend adds no
+    /// name to the gear.
+    fn backend_type(&self) -> &'static str;
+
+    /// Builds the backend from the settings written beside `type` in that
+    /// topic's `backend` block.
+    ///
+    /// The gear passes them through without inspecting them: each backend
+    /// publishes its own schema, so the type that can reject an unknown key is
+    /// this plugin's, not the gear's. Anything the backend needs that is not
+    /// operator configuration - a database handle the host already owns, say -
+    /// is captured when the provider itself is constructed, not passed here.
+    ///
+    /// # Errors
+    /// [`StorageBackendError::InvalidConfig`] if `settings` are not the ones
+    /// this backend understands.
+    async fn build_backend(
+        &self,
+        settings: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<std::sync::Arc<dyn EventBrokerBackend>, StorageBackendError>;
 }

@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use crate::consumer::RawEvent;
 use crate::ids::ConsumerGroupId;
+use crate::sequence::Sequence;
 
 use super::{ConsumerDlqOutbox, DeadLetterEnvelope, DeadLetterRecord};
 
@@ -54,14 +55,14 @@ impl toolkit_db::outbox::LeasedMessageHandler for CapturingProcessor {
 fn raw_event(offset: i64) -> RawEvent {
     RawEvent {
         id: Uuid::new_v4(),
-        type_id: EVENT_TYPE.to_owned(),
-        topic: TOPIC.to_owned(),
+        type_id: gts::GtsTypeId::new(EVENT_TYPE),
+        topic: gts::GtsInstanceId::try_new(TOPIC).unwrap(),
         tenant_id: Uuid::new_v4(),
         subject: format!("order-{offset}"),
-        subject_type: "order".to_owned(),
+        subject_type: gts::GtsTypeId::new("gts.x.eb.test.subject.v1~"),
         partition: 6,
-        sequence: offset,
-        offset,
+        sequence: Sequence::assigned(offset),
+        offset: Sequence::assigned(offset),
         occurred_at: Utc::now(),
         sequence_time: Utc::now(),
         trace_parent: None,
