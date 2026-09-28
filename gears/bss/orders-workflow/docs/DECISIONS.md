@@ -202,6 +202,7 @@
   - [D-181 (M) The step-retry route records its task resolution request through slice 07's intake port](#d-181-m-the-step-retry-route-records-its-task-resolution-request-through-slice-07s-intake-port)
   - [D-182 (M) The re-authorization mark is the cancellation fence's one rewritable stamp](#d-182-m-the-re-authorization-mark-is-the-cancellation-fences-one-rewritable-stamp)
   - [D-183 (H) A suspension a Lifecycle resume overtook is closed by the poll before `terminate-instance`](#d-183-h-a-suspension-a-lifecycle-resume-overtook-is-closed-by-the-poll-before-terminate-instance)
+  - [D-184 (M) A consumed acceptance event and a consumed re-authorization signal are their own checkpoints](#d-184-m-a-consumed-acceptance-event-and-a-consumed-re-authorization-signal-are-their-own-checkpoints)
 - [Open Questions](#open-questions)
   - [Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?](#q-01-which-durable-execution-substrate-backs-the-process--the-oss-workflow-engine-or-a-bss-local-mechanism)
   - [Q-02: The Generic Approval escalation threshold — the one PRD-deferred numeric value this design deliberately leaves unset](#q-02-the-generic-approval-escalation-threshold--the-one-prd-deferred-numeric-value-this-design-deliberately-leaves-unset)
@@ -1697,7 +1698,7 @@ gear to a versioned platform workflow definition (`ADR/0011`, `ADR/0012`, `ADR/0
 each slice was restructured into step operations and a definition fragment. D-65…D-72 carry the
 three ADRs and their cross-cutting consequences; D-73…D-101 are the decisions the slice
 restructurings recorded, D-102…D-163 the decisions taken on the second review of
-2026-09-26, and D-164…D-183 those taken on the re-review of 2026-09-28. Each names the entries it amends; the amended entries carry a dated
+2026-09-26, and D-164…D-184 those taken on the re-review of 2026-09-28. Each names the entries it amends; the amended entries carry a dated
 **Amended by** note. D-65…D-101 were taken on 2026-09-24.
 
 ### D-65 (H) The order process flow is a versioned platform workflow definition executed by serverless-runtime
@@ -4346,6 +4347,10 @@ ceiling wait's resolution arm writes `ceilingRequestRef`, not `requestRef`, and 
 restores the event and request members `ceilingEntry` saved — so a ceiling arm no longer changes
 the key a checkpoint call re-issues under.
 
+**Amended by D-184 (2026-09-28)**: the fulfillment stage's two payload-consuming calls follow the
+same rule — the acceptance `admit-trigger` (`admitAcceptance`) and the evaluation a
+`reauthorize-requested` signal asks for (`eligibility`) are recorded in `stageLoop` before they run.
+
 ### D-148 (M) The escalation bound counts every call between two fires
 
 **Accepted (2026-09-26).** *(amends D-123)*
@@ -5492,6 +5497,54 @@ D-114, D-130, D-133, D-141, D-143, D-175.
 
 **Clarified (2026-09-28, residuals of the re-review)**: `design/08` §4.7 item 10 said the pre-termination poll routes `failedTaskRefs[]` as item 8 does once `begin-fulfillment` has committed; it now exempts that call and states why its list is empty, as this decision does (V-E-1).
 
+### D-184 (M) A consumed acceptance event and a consumed re-authorization signal are their own checkpoints
+
+**Accepted (2026-09-28).** *(amends D-147)*
+
+**Decision**: in the fulfillment stage (`10 §3.6` (b)), `afterEligibilityChange` routes the
+acceptance arm to `enterAdmitAcceptance` (`stageLoop: admitAcceptance`) before `admitAcceptance`,
+and the re-evaluation arm to `enterEligibility` (`stageLoop: eligibility`) before
+`evaluate-payment-auth-eligibility`; the stage's `enter` switch gains the cases `acceptance`
+(→ `admitAcceptance`) and `reevaluation` (→ `eligibility`). The acceptance checkpoint also covers
+the evaluation `acceptanceRecorded` leads to: a re-issued admission answers its settled `advance`
+and the evaluation re-runs under the same `evaluationSeq`. Every route on replaces the checkpoint:
+`enterPlan` and `enterEligibilityWait` as before; `onAcceptanceAdmission`'s `back` now goes
+through `enterEligibilityWait`; `onEligibility`'s `planFailed` case goes through a new
+`enterPlanFailFast` (`stageLoop: planFailFast`, whose `enter` case already exists for the
+failure stage's route, D-109); and `toLifecycle` writes `stageLoop: awaitEligibilityChange`, so a
+`back` from fragment (f) waits again rather than re-admitting an acceptance whose `terminate`
+answer `terminalEvent` then declined. The PT5M poll shares the re-evaluation route; its payload is
+empty and its re-issue is absorbed.
+
+**Rationale**: both calls consume an arm's payload after the fork, as `record-decision` and
+`resolve-manual-task` did before D-147. The stage's checkpoint was `awaitEligibilityChange`, so a
+lifetime ceiling that cancelled `process` during `admitAcceptance`, the evaluation after it, or the
+evaluation a `reauthorize-requested` signal asked for re-entered the wait: the consumed
+`OrderAcceptanceRecorded` event and the operator's re-authorization request were neither
+re-issued nor delivered again, and only the PT5M poll re-read the payment status, under
+`trigger: poll` with no `requestRef`. The re-issue keeps its key: `admit-trigger`'s event-scoped
+key comes from `lifecycleEventId` and `triggerKind`, and the evaluation's
+`{…}:evaluate-payment-auth-eligibility:{evaluationSeq}` from `evaluationSeq`, which only that
+evaluation's own export advances. The body members `lifecycleEventId`, `triggerKind` and
+`requestRef` are already saved by `ceilingEntry` and restored by `backToProcess` (D-164);
+`eligibilityTrigger` needs no save, because no ceiling arm, and neither the lifecycle nor the
+cancel stage taken from one, writes it (D-164's sweep). **Precedent**: D-147's
+`enterRecordDecision`, `enterResolveTask`, `enterResolveCompensationTask` and
+`enterResolveCeilingTask`, with D-147's rule that the routes back to the waiting fork go through
+the stage's `enter…` task; and D-121's `enterParkLoop` before `park`.
+
+**Sweep**: every other arm that sets a payload was checked. The decision arm (`recordDecision`) and
+the failure stage's, the unwind's and the ceiling wait's task-resolution arms (`resolveTask`,
+`resolveCompensationTask`, `resolveCeilingTask`) are already checkpoints (D-147). The hold,
+resume, lifecycle and cancel arms enter a shared stage whose first call is its re-entry point, with
+the payload restored after a ceiling (D-164). The confirmation arm's `reconcileHint` is a
+`composable` wake-up, which the barrier's PT30S poll repeats over every due intent, so dropping it
+loses nothing. The tick, probe, poll, SLA, retry-leg and lifetime arms carry no payload.
+
+**Propagated**: `design/10-process-definition.md` §3.6 intro, (b) (`enter`,
+`afterEligibilityChange`, `enterEligibility`, `enterAdmitAcceptance`, `onAcceptanceAdmission`,
+`toLifecycle`, `onEligibility`, `enterPlanFailFast`) and its description; D-147.
+
 ## Open Questions
 
 ### Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?
@@ -5938,6 +5991,7 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-181 | M Step-retry route records through slice 07's intake port | `design/07-manual-tasks.md` §3.2, §3.7, `design/09-read-and-authz.md` §3.1–§3.4, §3.6, `design/README.md`, `DESIGN.md` §3.7; D-85, D-139, D-153 |
 | D-182 | M Re-authorization mark: the fence's one rewritable stamp | `design/06-saga-and-compensation.md` §3.7, `DESIGN.md` §3.7; D-84, D-106 |
 | D-183 | H Poll closes an overtaken suspension before terminate-instance; `rejected`/`completed` are not held | `design/10-process-definition.md` §3.6 (a), (b), (e), §4.1, §4.5, `design/08-hold-and-cancel.md` §3.3, §3.6, §4.7, `design/01-foundation.md` §3.3, `DESIGN.md` §1.2; D-130, D-133, D-141, D-175 |
+| D-184 | M Consumed acceptance event and re-authorization signal are their own checkpoints | `design/10-process-definition.md` §3.6 intro, (b); D-147, D-164 |
 
-Highest decision number used: **D-183**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
+Highest decision number used: **D-184**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
 register; there are no parts.

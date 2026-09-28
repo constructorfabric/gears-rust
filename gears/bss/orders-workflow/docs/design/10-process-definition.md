@@ -712,10 +712,12 @@ then: exit }`, and the `enter` switch of the returning stage re-enters `$context
 Re-entry at a checkpoint re-issues the checkpoint's calls under their unchanged idempotency keys,
 which the envelope answers with the stored outcome (`01 §3.3`). A call that consumes an arm's
 payload after the fork — `record-decision` after the decision arm, `resolve-manual-task` after a
-task-resolution arm — is a checkpoint of its own: the stage records it in `stageLoop` before the
-call and its `enter` switch re-issues it, so a lifetime ceiling that cancels `process` during the
-call neither drops the consumed decision or resolution nor waits for a signal that will not come
-again (decision D-147).
+task-resolution arm, the acceptance `admit-trigger` after the acceptance arm and
+`evaluate-payment-auth-eligibility` after the `reauthorize-requested` arm — is a checkpoint of its
+own: the stage records it in `stageLoop` before the call and its `enter` switch re-issues it, so a
+lifetime ceiling that cancels `process` during the call neither drops the consumed decision,
+resolution, acceptance or re-authorization nor waits for a signal that will not come again
+(decisions D-147, D-184).
 
 #### Fixed waits and re-check loops
 
@@ -1286,6 +1288,8 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
 - enter:
     switch:
       - eligibilityWait: { when: '${ $context.stageLoop == "awaitEligibilityChange" }', then: awaitEligibilityChange }
+      - acceptance:      { when: '${ $context.stageLoop == "admitAcceptance" }',        then: admitAcceptance }   # a consumed acceptance is re-admitted under its unchanged event-scoped key, then evaluated under the unchanged evaluationSeq, never dropped (D-147, D-184)
+      - reevaluation:    { when: '${ $context.stageLoop == "eligibility" }',            then: eligibility }       # a consumed re-authorization is re-evaluated under the unchanged evaluationSeq and requestRef, never dropped (D-147, D-184)
       - plan:            { when: '${ $context.stageLoop == "freezePlan" }',             then: freezePlan }
       - wave1:           { when: '${ $context.stageLoop == "wave1" }',                  then: wave1 }
       - expected:        { when: '${ $context.stageLoop == "awaitExpected" }',          then: evaluate }
@@ -1303,7 +1307,7 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
     export: { as: '${ $context + { eligibility: .eligibility, eligibilitySeq: (if .eligibility == "eligible" then $context.evaluationSeq else $context.eligibilitySeq end), evaluationSeq: .nextEvaluationSeq } }' }
 - onEligibility:
     switch:
-      - planFailed: { when: '${ $context.eligibility == "eligible" and $context.planFailed }', then: planFailFast }   # a failed plan waiting to pass begin-fulfillment (D-109)
+      - planFailed: { when: '${ $context.eligibility == "eligible" and $context.planFailed }', then: enterPlanFailFast }   # a failed plan waiting to pass begin-fulfillment (D-109)
       - eligible: { when: '${ $context.eligibility == "eligible" }', then: enterPlan }
       - waiting:  { then: enterEligibilityWait }   # pending: a settled success that selects the wait; the order stays approved
 - enterEligibilityWait: { set: { stageLoop: awaitEligibilityChange, holdPauses: false } }
@@ -1344,10 +1348,12 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
         - cancel:    { do: [ ‹cancel arm of (d)› ] }
 - afterEligibilityChange:
     switch:
-      - acceptance: { when: '${ .arm == "acceptance" }', then: admitAcceptance }
+      - acceptance: { when: '${ .arm == "acceptance" }', then: enterAdmitAcceptance }
       - heldPoll:   { when: '${ .arm == "reevaluate" and $context.eligibilityTrigger == "poll" and $context.heldTicks >= 3 }', then: pollHeld }   # D-133
-      - again:      { when: '${ .arm == "reevaluate" }', then: eligibility }
+      - again:      { when: '${ .arm == "reevaluate" }', then: enterEligibility }
       - other:      { then: leave }
+- enterEligibility: { set: { stageLoop: eligibility }, then: eligibility }   # the reauthorize arm consumed its signal: a checkpoint before the call (D-147, D-184); the poll takes it too, harmlessly
+- enterAdmitAcceptance: { set: { stageLoop: admitAcceptance } }   # the acceptance arm consumed its event: a checkpoint before the admission and the evaluation it leads to (D-147, D-184)
 - admitAcceptance:                      # protected (02): admission before consumption (02 §4.7 item 1)
     timeout: step
     try:
@@ -1358,8 +1364,8 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
     switch:
       - advance:  { when: '${ $context.admission == "advance" }', then: acceptanceRecorded }
       - onward:   { when: '${ $context.admission == "supersede" or $context.admission == "terminate" }', then: toLifecycle }
-      - back:     { then: awaitEligibilityChange }
-- toLifecycle: { set: { nextStage: lifecycle, preAdmitted: true, returnStage: fulfillment }, then: exit }   # fragment (f) routes the admitted answer
+      - back:     { then: enterEligibilityWait }   # the checkpoint is replaced before the stage waits again (D-147)
+- toLifecycle: { set: { nextStage: lifecycle, preAdmitted: true, returnStage: fulfillment, stageLoop: awaitEligibilityChange }, then: exit }   # fragment (f) routes the admitted answer; a back from it re-enters the wait, never the admission (D-184)
 - acceptanceRecorded: { set: { eligibilityTrigger: acceptance-recorded, requestRef: null }, then: eligibility }
 - enterPlan: { set: { stageLoop: freezePlan } }
 - freezePlan:                           # protected (04)
@@ -1377,6 +1383,7 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
 - planTask:                             # fragment (c)
     set: { failureScope: plan, failureSubjects: '${ [ { subjectRef: $context.planRef, reason: $context.planReason, cause: "plan-not-frozen" } ] }', sourceStep: construct-and-freeze-plan, sourceAttempt: '${ $context.planAttempt | tostring }', forceTask: true, nextStage: failure, stageLoop: null }
     then: exit
+- enterPlanFailFast: { set: { stageLoop: planFailFast } }   # replaces the eligibility checkpoint, so a ceiling during the call re-issues begin-fulfillment under its unchanged eligibilitySeq (D-184)
 - planFailFast:                         # no Workflow transition leaves approved: begin-fulfillment is passed before the unwind (04 §4.3); also the failure stage's route for an exhausted plan task (D-109)
     timeout: step
     try:
@@ -1734,7 +1741,17 @@ settled `eligible` and a settled `frozen`, receives the `eligible` round as `eli
 `withheld`, `held` or `version-conflict` answer — all settled successes, so no 409 has to be read
 as a routing answer — returns to the eligibility wait; once the transition has committed, every
 later call answers `in-fulfillment` from Orders' record (`04 §3.6`). Each of the three evaluation operations returns `nextEvaluationSeq` and the
-definition passes it back unchanged. **Plan.** A `frozen` plan proceeds; `topology-unavailable`
+definition passes it back unchanged. The two arms that consume a payload are checkpoints of their
+own (decision D-184, after D-147): `enterAdmitAcceptance` records `admitAcceptance` before the
+admission, and the evaluation `acceptanceRecorded` leads to runs under it; `enterEligibility`
+records `eligibility` before the evaluation a `reauthorize-requested` signal (or the poll) asks
+for. A ceiling during either call re-enters at that call, which re-issues under its unchanged key
+— the event-scoped `admit-trigger` key of the restored `lifecycleEventId`, and the
+`evaluationSeq` that only the evaluation's own answer advances — with `requestRef` restored by
+`backToProcess` and `eligibilityTrigger`, which nothing in the ceiling writes, kept. Every route
+on from there replaces the checkpoint: `enterPlan`, `enterEligibilityWait`, `enterPlanFailFast`,
+and `toLifecycle`, which records the wait so that a `back` from fragment (f) waits again rather
+than re-admitting. **Plan.** A `frozen` plan proceeds; `topology-unavailable`
 opens a plan task under either policy; `invalid-graph` opens a plan task under `remediate` and,
 under `fail-fast`, passes `begin-fulfillment` before the unwind because no Workflow transition
 leaves `approved`. **Waves.** Each wave is **one `call` carrying `lineRefs[]`**; per-line
