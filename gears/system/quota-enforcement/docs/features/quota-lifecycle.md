@@ -187,8 +187,10 @@ Realises `cpt-cf-quota-enforcement-seq-quota-create`.
    1. [ ] - `p1` - Run `cpt-cf-quota-enforcement-algo-quota-metadata-validation`; metadata changes never invalidate
       the quota ID - `inst-qup-meta`
 6. [ ] - `p1` - DB: `update_quota(quota_id, patch, events)` in a single transaction that also appends the
-   `operation_log` entry (I1); the cap-vs-consumed comparison is evaluated at the moment the transaction commits,
-   in-tx with a row-level lock (I6), never at request-receipt time, so concurrent debits cannot race the guard - `inst-qup-persist`
+   `operation_log` entry (I1); the row is re-read under its row lock, so a Quota deactivated meanwhile is rejected
+   with `QUOTA_DEACTIVATED` and nothing is written, and the cap-vs-consumed comparison is evaluated at the moment the
+   transaction commits, in-tx with the same lock (I6), never at request-receipt time, so concurrent debits cannot race
+   the guard - `inst-qup-persist`
 7. [ ] - `p1` - **IF** the reduced or newly numeric cap is strictly below the active period's consumed amount
    (consumption type) or the in-flight count (allocation type) - `inst-qup-guard-if`
    1. [ ] - `p1` - **RETURN** `CAP_BELOW_CONSUMED` (`DomainError::CapBelowConsumed`); the operator first issues

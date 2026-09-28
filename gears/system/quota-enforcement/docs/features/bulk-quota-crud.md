@@ -167,9 +167,9 @@ No dedicated sequence exists: per DECOMPOSITION §2.10 the bulk endpoints follow
    `cpt-cf-quota-enforcement-algo-quota-draft-validation`, `cpt-cf-quota-enforcement-algo-metric-validation`, and
    `cpt-cf-quota-enforcement-algo-quota-metadata-validation` when the patch carries `metadata` - `inst-qbu-validate`
 4. [ ] - `p2` - DB: apply every patch inside the single envelope transaction of
-   `cpt-cf-quota-enforcement-algo-bulk-envelope`; each item keeps the single-item commit-time semantics: the
-   cap-vs-consumed guard is evaluated at the moment the envelope transaction commits, in-tx with a row-level lock
-   (I6), and each item appends its operation-log entry (I1) and enqueues `quota-changed (change_kind='updated')`
+   `cpt-cf-quota-enforcement-algo-bulk-envelope`; each item keeps the single-item commit-time semantics: every
+   storage-side guard of the single-item update (the Quota exists and is still active, and the cap-vs-consumed guard)
+   is evaluated at the moment the envelope transaction commits, in-tx with a row-level lock (I6), and each item appends its operation-log entry (I1) and enqueues `quota-changed (change_kind='updated')`
    (I11) - `inst-qbu-apply`
 5. [ ] - `p2` - **IF** any item trips a commit-time guard such as `CAP_BELOW_CONSUMED` - `inst-qbu-guard-if`
    1. [ ] - `p2` - Roll back the entire envelope and **RETURN** the item's canonical error attributed by index and
