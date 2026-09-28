@@ -351,9 +351,10 @@ of a usage type in the platform `types-registry` gear. Metric instances follow t
 > (`ai-tokens-input`, `vCPU-hours`, `storage-bytes`, etc.) in examples, and use-case payloads for readability.
 > API requests, storage rows, and outbox events use the full GTS URI form shown above.
 
-Quota Enforcement itself treats the metric name as an opaque string at evaluation time. At Quota creation time, Quota
-Enforcement optionally validates that the referenced metric name exists in `types-registry`; an unknown metric is
-reported as an actionable creation-time error. The format of the metric name (length, allowed characters, namespace
+Quota Enforcement itself treats the metric name as an opaque string at evaluation time. At Quota creation and update
+time, Quota Enforcement validates that the referenced metric name exists in `types-registry`; an unknown metric is
+reported as an actionable creation-time error, and an unreachable registry fails the request rather than skipping the
+check (`cpt-cf-quota-enforcement-fr-metric-identity-validation`). The format of the metric name (length, allowed characters, namespace
 conventions) is governed entirely by `types-registry` — Quota Enforcement inherits whatever format the registry permits
 and adds no additional naming rules of its own. The `cf.qe.metric.*` namespace used in this document is provisional
 pending platform-wide alignment (§13 Open Questions).
@@ -1541,7 +1542,9 @@ batches with an actionable error.
 `100 × 5 ms = 500 ms` on Engine evaluation alone. The system **MUST** therefore enforce a **batch-level evaluation
 timeout** that supersedes per-Policy timeouts for the batch as a whole. The timeout is a single
 **operator-configurable** flat duration applied to the entire batch evaluation; deployment-default **250 ms**.
-Worst-case batch latency is bounded by this timeout together with the maximum batch size (default 100 items per batch);
+The timeout bounds the evaluation of the batch. Once evaluation completes, applying its outcome is never interrupted,
+so a batch is never reported as timed out after its effects took hold. Worst-case evaluation latency is bounded by this
+timeout together with the maximum batch size (default 100 items per batch);
 adaptation to load is the caller's responsibility (client-side retry / batch splitting), not a server-side concern.
 
 A batch-level timeout fire in **atomic** mode **MUST** surface a canonical `DeadlineExceeded` error (with
@@ -1777,8 +1780,8 @@ default to the latest version unless they explicitly request a specific version.
 **Operations** (version-based optimistic concurrency, no idempotency-key requirement):
 
 - `create_policy(scope, engine_id, engine_config, [comment])` — creates `policy_version = 1` with
-  `version_state = active`; latest-pointer initialized. Rejected if an active Policy already exists at the exact same
-  scope.
+  `version_state = active`; latest-pointer initialized. Rejected with `POLICY_SCOPE_OCCUPIED` (409) if an active Policy
+  already exists at the exact same scope.
 - `update_policy(policy_id, if_match_version, engine_id?, engine_config?, [comment])` — creates `policy_version = N+1`
   with `version_state = active`; previous active version transitions to `superseded`; latest-pointer moved to `N+1`.
   **Rejected with `VERSION_CONFLICT` if `if_match_version` does not equal the current latest** (lost-update protection).
@@ -2587,7 +2590,8 @@ The following commonly applicable NFR categories are not applicable to this gear
   locale-sensitive output.
 - **Privacy by Design (GDPR Art. 25)**: Not applicable as a standalone gear requirement. Subject IDs stored by Quota
   Enforcement are opaque internal platform identifiers; PII management is the responsibility of the platform identity
-  layer (e.g., `account-management`).
+  layer (e.g., `account-management`). Caller-supplied request metadata and operator-supplied Quota Metadata are
+  Platform Operational Data under the caller obligations of §6.2 (no PII; callers strip or hash it before sending).
 - **Regulatory Compliance (GDPR, HIPAA, PCI DSS, SOX)**: Not applicable as a standalone gear requirement — this is an
   internal platform infrastructure gear. Quota Enforcement handles no payment card data (PCI DSS N/A), no healthcare
   records (HIPAA N/A), and no financial reporting data (SOX N/A). Platform-level regulatory obligations are governed at

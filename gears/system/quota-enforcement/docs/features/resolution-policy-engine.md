@@ -127,7 +127,7 @@ consumption-operations feature), `cpt-cf-quota-enforcement-usecase-region-gated-
 - Engine config validation fails: actionable error before persistence (line/column for `cel`)
 - Referenced projection outside the configured catalogue: `PROJECTION_NOT_RESOLVABLE`
 - Stale `if_match_version` on update: `VERSION_CONFLICT` (409), no version row written
-- Create at a scope that already has an active Policy: rejected
+- Create at a scope that already has an active Policy: `POLICY_SCOPE_OCCUPIED` (canonical `AlreadyExists`, 409)
 
 **Steps**:
 1. [ ] - `p1` - Operator sends `POST /v1/quota-enforcement/policies` (create) or
@@ -136,7 +136,7 @@ consumption-operations feature), `cpt-cf-quota-enforcement-usecase-region-gated-
    the operator-configured upper bound), and optional `comment`; foundation admission
    (`cpt-cf-quota-enforcement-flow-authorized-admission`) has already attached `SecurityContext` and `AccessScope` - `inst-pw-request`
 2. [ ] - `p1` - **IF** create targets a scope that already has an active Policy - `inst-pw-dup-if`
-   1. [ ] - `p1` - **RETURN** rejection; one active Policy per exact scope - `inst-pw-dup`
+   1. [ ] - `p1` - **RETURN** `POLICY_SCOPE_OCCUPIED` (canonical `AlreadyExists`, 409); one active Policy per exact scope - `inst-pw-dup`
 3. [ ] - `p1` - Resolve `engine_id` against `EngineRegistry` - `inst-pw-engine-lookup`
 4. [ ] - `p1` - **IF** the `engine_id` is not registered in the current deployment - `inst-pw-unknown-if`
    1. [ ] - `p1` - **RETURN** `UNKNOWN_ENGINE` naming the registered Engines available in this deployment - `inst-pw-unknown`

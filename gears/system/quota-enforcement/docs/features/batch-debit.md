@@ -112,6 +112,10 @@ Realises `cpt-cf-quota-enforcement-seq-batch-debit`.
 - Any item with `amount <= 0`: envelope-level `INVALID_AMOUNT` naming the offending item index, regardless of `mode`;
   nothing is persisted
 - Batch larger than the operator-configured maximum: `BULK_TOO_LARGE` before any item is evaluated
+- An item with a blank idempotency key, or two items sharing one: envelope-level `InvalidArgument`
+  (`IDEMPOTENCY_KEY_REQUIRED` naming the item index, or `BATCH_ITEM_KEY_DUPLICATE`) before any lookup; nothing is
+  persisted. Distinct items that name the same subject and metric are not duplicates: each is evaluated against the
+  running state the earlier items left
 - `mode = independent`: `NOT_YET_IMPLEMENTED` (canonical `Unimplemented`, 501) until the P2 mode ships
 - Batch-level timeout fires: canonical `DeadlineExceeded` with `reason = "BATCH_TIMEOUT"` for the whole batch, no
   counter mutations
@@ -186,7 +190,9 @@ mutation
    (`cpt-cf-quota-enforcement-fr-batch-debit`); DESIGN §3.3 models it as the envelope tokio timeout
    (`DomainError::BatchTimeout`); a tokio timeout is observed only at an await point and the per-item Engine call is
    synchronous and I/O-free, so the tokio timeout guards the await-bearing stages while the item loop checks the
-   armed deadline cooperatively between items (step 4) - `inst-bev-timeout`
+   armed deadline cooperatively between items (step 4); the timer arms once the envelope's rows are locked, and the
+   write phase and the commit sit outside it and are never cancelled, so a batch is never reported timed out after
+   its effects committed - `inst-bev-timeout`
 4. [ ] - `p1` - **FOR EACH** item in submission order - `inst-bev-loop`
    1. [ ] - `p1` - Compare the current instant against the armed deadline; **IF** the deadline is exceeded, stop the
       loop and take the timeout branch (step 5) with `DomainError::BatchTimeout` - `inst-bev-deadline`

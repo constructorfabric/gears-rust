@@ -733,10 +733,7 @@ retry storm at 10x normal RPS with a 5% retry rate showing zero double-count eve
   (`cpt-cf-quota-enforcement-algo-engine-boundary`); this feature owns the pipeline that invokes them and the atomic
   application of the resulting plan. The evaluation-latency and throughput budgets that motivated the cached
   `ValidatedConfig` and the sync no-I/O Engine contract are verified by this feature's benchmarks.
-- **Upstream alignment items (tracked upstream prerequisites)**: DESIGN's rollback sequence names a
-  `StorageError::OperationNotFound` variant that the closed `StorageError` enum does not declare; this document
-  states only the domain outcome (canonical `NotFound` with `UNKNOWN_OPERATION`) and the enum alignment is a tracked
-  upstream DESIGN item. DESIGN's `RetentionSweeper` declares no policy-version reclamation primitive although PRD
+- **Upstream alignment items (tracked upstream prerequisites)**: DESIGN's `RetentionSweeper` declares no policy-version reclamation primitive although PRD
   §5.9 assigns that sweep to storage retention; the gap is already tracked by the resolution-policy-engine feature
   and no such primitive is promised here. The hot-path source of the `Direct`/`QuotaGated` classification is not
   spelled out in DESIGN beyond the closed `StorageError::MetricNotQuotaGated` variant; this document anchors the

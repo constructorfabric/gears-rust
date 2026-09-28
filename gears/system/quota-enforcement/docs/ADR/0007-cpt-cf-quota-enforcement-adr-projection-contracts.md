@@ -83,12 +83,11 @@ are instantiable. A representative subject projection is
 `gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.user.v1~`; an owner may publish both user- and
 tenant-scope projections.
 
-This replaces the illustrative `gts.cf.qe.subject.type.v1~cf.qe.subject.user.v1`, which has
-three defects:
+Every contract identifier follows three naming rules:
 
-* its root is `cf.qe.*` rather than core-owned `cf.core.qe.*`;
-* its last segment lacks the trailing `~`, making it an instance where QE needs a type;
-* its derived segment is owned by QE rather than by the metric-owning Gear.
+* its root is the core-owned `cf.core.qe.*`, not `cf.qe.*`;
+* its last segment ends with `~`, because QE needs a type, never an instance;
+* its derived segment is owned by the metric-owning Gear, not by QE.
 
 The decisions that follow:
 
