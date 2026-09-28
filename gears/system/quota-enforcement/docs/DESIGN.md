@@ -1631,17 +1631,24 @@ sequenceDiagram
     participant Caller as Quota Consumer
     participant GW as Gateway
     participant QES as QuotaEnforcementService
+    participant PEP as PolicyEnforcer (in-process)
+    participant PDP as authz-resolver
     participant SP as StoragePlugin
 
-    Caller ->> GW: POST /operations/rollback (RollbackRequest with original_idem_key)
+    Caller ->> GW: POST /operations/rollback (RollbackRequest: reversed debit's attribution, original_idem_key, idem_key)
     GW ->> QES: rollback(ctx, RollbackRequest)
+    QES ->> PEP: admit the attribution (action rollback), as for a debit
+    PEP ->> PDP: evaluate(request)
+    PDP -->> PEP: decision + constraints
+    PEP -->> QES: AccessScope (or EnforcerError ⇒ canonical error)
+    QES ->> QES: catalogue-map the authorized subjects, target = original scope + attribution digest
     QES ->> SP: BEGIN tx + lookup_idempotency(rollback_idem_key)
     alt replay
         SP -->> QES: stored Decision
         QES -->> Caller: stored Decision
     else fresh
-        SP ->> SP: lookup original commit by original_idem_key
-        alt original not found
+        SP ->> SP: lookup original commit by the target scope, compare its recorded attribution digest
+        alt original not found, or digest differs (indistinguishable)
             SP -->> QES: StorageError::OperationNotFound
             QES -->> Caller: 404 UNKNOWN_OPERATION (DomainError::NotFound)
         else period closed (consumption, settled)
@@ -1662,7 +1669,10 @@ sequenceDiagram
 `cpt-cf-quota-enforcement-fr-rollback`). Period attribution is taken from the original operation's
 `acquisition_period_id`, not the wall-clock current period (I5). Backdated rollbacks against a settled period
 (post-`period-rollover` emit) are rejected with `PERIOD_CLOSED` (PRD §5.5 cross-period rules). Rollback is idempotent
-under its own `idem_key`; replay returns the stored Decision verbatim.
+under its own `idem_key`; replay returns the stored Decision verbatim. The caller supplies the reversed debit's
+attribution, which is re-authorized and catalogue-mapped exactly as the debit's was, so the rollback's scope coincides
+with the original's however many Quotas the debit's plan spanned; an owning Quota is undefined for a multi-Quota plan.
+A key presented under a different authorized attribution is answered like an unknown key.
 
 #### Lease Acquisition
 
