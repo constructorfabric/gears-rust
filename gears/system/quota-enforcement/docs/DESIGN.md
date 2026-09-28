@@ -2131,7 +2131,7 @@ sequenceDiagram
         ND -->> OB: Ack
     else any Permanent, or attempts ≥ configured max
         ND -->> OB: Reject(reason)
-        Note over OB: framework dead-letters the event;<br/>operators replay via dead_letter_replay
+        Note over OB: framework dead-letters the event;<br/>kept for diagnostics, no replay in P1
     else any Timeout / Transient below max
         ND -->> OB: Retry
         Note over OB: framework re-delivers to ALL sinks later —<br/>duplicates permitted, sinks idempotent on event_id

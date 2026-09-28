@@ -109,8 +109,8 @@ primitive (P2; P1 sinks filter on the tenant arm of `event.scope` themselves).
       delivery is permitted and sinks tolerate it per contract - `inst-del-retry`
 7. [ ] - `p1` - **IF** any sink answers `Permanent`, or `OutboxMessage.attempts` has reached the operator-configured
    maximum with sinks still transient - `inst-del-reject-if`
-   1. [ ] - `p1` - The handler returns `Reject(reason)`; the framework moves the event to its dead-letter store and
-      operators replay via `dead_letter_replay` (re-delivery to all sinks; duplicates tolerated) - `inst-del-dead`
+   1. [ ] - `p1` - The handler returns `Reject(reason)`; the framework moves the event to its dead-letter store, which P1 keeps for
+      delivery-failure diagnostics only; P1 defines no replay - `inst-del-dead`
 8. [ ] - `p1` - **IF** every sink answered `Success` - `inst-del-term-if`
    1. [ ] - `p1` - The handler acks the event - `inst-del-ack`
 9. [ ] - `p1` - **RETURN** delivery is at-least-once: a lease that expires mid-dispatch drops the handler future and
@@ -190,12 +190,15 @@ that invoke it land with consumption-operations and lease-operations.
 2. [ ] - `p1` - **FROM** Enqueued **TO** Enqueued **WHEN** the handler returns `Retry` on `Timeout`/`Transient`
    outcomes below the attempts maximum — re-delivery goes to all sinks; duplicates permitted - `inst-obst-retry`
 3. [ ] - `p1` - **FROM** Enqueued **TO** DeadLettered **WHEN** the handler returns `Reject` — any `Permanent` sink
-   outcome, or `OutboxMessage.attempts` at the configured maximum; operators inspect and replay via the framework
-   `dead_letter_*` APIs - `inst-obst-dead`
+   outcome, or `OutboxMessage.attempts` at the configured maximum; operators inspect it via the framework
+   `dead_letter_list` / `dead_letter_count` APIs; P1 defines no replay - `inst-obst-dead`
 4. [ ] - `p1` - **FROM** Delivered **TO** Delivered **WHEN** the framework vacuum stage reclaims the row (terminal;
    physical cleanup only) - `inst-obst-reclaim`
 
 Dead-letter rows are retained per operator configuration for delivery-failure diagnostics (PRD §6.2 default: 7 days).
+P1 defines no dead-letter replay, since delivery is best-effort by requirement: the framework's `dead_letter_replay`
+only claims rows and leaves redelivery to the application. A QE replay routine (claim, re-run the same fan-out to all
+sinks, then `dead_letter_resolve` or `dead_letter_reject`) is deferred to P2 alongside the EventBus migration.
 
 ## 5. Definitions of Done
 
