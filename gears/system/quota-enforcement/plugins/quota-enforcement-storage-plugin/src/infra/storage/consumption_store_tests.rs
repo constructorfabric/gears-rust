@@ -17,13 +17,14 @@ use time::OffsetDateTime;
 use time::macros::datetime;
 use toolkit_db::Db;
 use toolkit_db::outbox::OutboxHandle;
-use toolkit_security::SecurityContext;
+use toolkit_security::{AccessScope, SecurityContext};
 
 use super::SqlConsumptionStore;
 use crate::domain::ports::{ConsumptionStore, LeaseStore, QuotaStore};
 use crate::infra::storage::{SqlPolicyStore, SqlQuotaStore};
 use crate::test_support::{
-    METRIC_TOKENS, actor, bound_outbox, draft, enqueued_messages, scope_for, tenant, test_db, user,
+    METRIC_TOKENS, actor, bound_outbox, draft, enqueued_messages, other_tenant, scope_for, tenant,
+    test_db, user,
 };
 
 /// A Tuesday, inside an ordinary day period.
@@ -597,6 +598,54 @@ async fn an_unknown_quota_is_refused_before_anything_is_written() {
         .expect_err("no such quota");
 
     assert_eq!(err, StorageError::QuotaNotFound { id: missing });
+    h.down().await;
+}
+
+#[tokio::test]
+async fn a_quota_outside_the_scope_is_as_unknown_as_a_missing_one() {
+    let h = Harness::up().await;
+    let id = h.consumption_quota("u1", Some(100), Vec::new()).await;
+    h.debit("u1", 10, &write(OperationType::Debit, "k1", 1))
+        .await
+        .expect("debit");
+    let events_before = h.events().await.len();
+    let foreign = PartialIdempotencyWrite {
+        tenant_id: other_tenant(),
+        ..partial("c1", 9)
+    };
+
+    // The scope is applied in the row-locked read, so the row never surfaces:
+    // an existing identifier answers exactly like a missing one.
+    let err = h
+        .store
+        .apply_credit(&ctx(), &scope_for(other_tenant()), id, 5, &foreign, &[])
+        .await
+        .expect_err("another tenant's quota is invisible");
+
+    assert_eq!(err, StorageError::QuotaNotFound { id });
+    assert_eq!(h.consumed("u1", id).await, 10, "nothing was credited");
+    assert_eq!(h.events().await.len(), events_before, "no event");
+    h.down().await;
+}
+
+#[tokio::test]
+async fn a_quota_in_scope_but_of_another_tenant_is_out_of_scope() {
+    let h = Harness::up().await;
+    let id = h.consumption_quota("u1", Some(100), Vec::new()).await;
+    let both = AccessScope::for_tenants(vec![tenant().as_uuid(), other_tenant().as_uuid()]);
+    let foreign = PartialIdempotencyWrite {
+        tenant_id: other_tenant(),
+        ..partial("c1", 9)
+    };
+
+    // The caller may already see the row, so refusing it reveals nothing.
+    let err = h
+        .store
+        .apply_credit(&ctx(), &both, id, 5, &foreign, &[])
+        .await
+        .expect_err("the request names another tenant");
+
+    assert_eq!(err, StorageError::SubjectOutOfScope);
     h.down().await;
 }
 

@@ -569,8 +569,10 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
     ///
     /// # Errors
     ///
-    /// - [`StorageError::QuotaNotFound`] when no such Quota exists, and
-    ///   [`StorageError::SubjectOutOfScope`] when it belongs to another tenant.
+    /// - [`StorageError::QuotaNotFound`] when no such Quota is visible under
+    ///   `scope`: an absent row and a row outside the scope are one answer.
+    ///   [`StorageError::SubjectOutOfScope`] when the row is visible but belongs
+    ///   to a tenant other than the request's.
     /// - [`StorageError::QuotaDeactivated`] for a fresh credit to an inactive
     ///   Quota, and [`StorageError::PeriodClosed`] when the Quota's latest
     ///   period has ended. Neither is raised for a replay.
