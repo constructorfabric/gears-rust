@@ -527,7 +527,7 @@ respectively. No high-cardinality identifier (`quota_id`, `tenant_id`, metric, p
 **Constraints**: `cpt-cf-quota-enforcement-constraint-bounded-cardinality`
 
 **Touches**:
-- API: platform observability stack (`tracing` + `toolkit` `otel` feature, per the foundation telemetry conventions)
+- API: platform observability stack (`QeMetrics` port with its `OpenTelemetry` adapter for metrics, `tracing` for logs and spans, `toolkit` `otel` feature, per the foundation telemetry conventions)
 - Entities: gear-specific gauges per PRD §5.16
 
 ## 6. Acceptance Criteria

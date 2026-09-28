@@ -416,7 +416,7 @@ NOT** appear as label values; permitted dimensions are the closed `surface` and 
 **Constraints**: `cpt-cf-quota-enforcement-constraint-types-registry-delegation`
 
 **Touches**:
-- API: platform observability stack (`tracing` + `toolkit` `otel` feature, per the foundation telemetry conventions)
+- API: platform observability stack (`QeMetrics` port with its `OpenTelemetry` adapter for metrics, `tracing` for logs and spans, `toolkit` `otel` feature, per the foundation telemetry conventions)
 - Entities: gear-specific counters per PRD §5.16
 
 ## 6. Acceptance Criteria

@@ -176,8 +176,7 @@ consumption-operations feature)
 **Output**: Emitted metric with only catalogue-declared, deployment-bounded labels
 
 **Steps**:
-1. [ ] - `p1` - Emit via `tracing` macros directly from the owning component (no adapter wrapper, no runtime filtering
-   layer) - `inst-tel-emit`
+1. [ ] - `p1` - Emit metrics from the owning component through the `QeMetrics` domain port, whose `OpenTelemetry` adapter records on a scoped `Meter` from the ToolKit meter provider (no runtime filtering layer); logs and spans use `tracing` - `inst-tel-emit`
 2. [ ] - `p1` - Emission sites use only the fixed PRD §5.16 instrument catalogue and the deployment-bounded labels
    declared there; canonical registered `metric` is permitted only on instruments that declare it - `inst-tel-closed`
 3. [ ] - `p1` - `tenant_id`, `subject_id`, `quota_id`, `policy_id`, `idempotency_key`, `lease_token`, projection type,
@@ -314,7 +313,7 @@ coordination contract, plugin crate, or bootstrap probe ships.
 
 - [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-telemetry-conventions`
 
-The system **MUST** emit gear-specific instruments via `tracing` with OTLP export under the `otel` feature, enforcing
+The system **MUST** emit gear-specific instruments through the `QeMetrics` port and its `OpenTelemetry` adapter, exported over OTLP by the platform under the `otel` feature, enforcing
 the bounded-cardinality label discipline through the type system: every label value is a static token of a closed
 enum or an admitted-metric label that only the catalogue frozen at bootstrap can construct, so no high-cardinality
 identifier can reach a label value. Export queueing, batching, and drop behaviour under backend saturation belong to
@@ -326,7 +325,7 @@ the platform OTLP pipeline, not to this gear.
 **Constraints**: `cpt-cf-quota-enforcement-constraint-bounded-cardinality`
 
 **Touches**:
-- API: platform observability stack (`tracing` + `toolkit` `otel` feature)
+- API: platform observability stack (`QeMetrics` port with its `OpenTelemetry` adapter for metrics, `tracing` for logs and spans, `toolkit` `otel` feature)
 - Entities: gear-specific counters, histograms, gauges per PRD §5.16
 
 ## 6. Acceptance Criteria
