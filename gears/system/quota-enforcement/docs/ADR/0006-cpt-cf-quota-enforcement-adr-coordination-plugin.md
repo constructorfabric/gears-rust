@@ -104,8 +104,8 @@ The shape on the QE side:
   The name appears in exactly two places: that marker and the operator's YAML.
 - In its lifecycle `start`, QE resolves the leader-election facade for that profile with the `Linearizable`
   capability requirement and scopes it under the `qe` prefix.
-- QE keeps a closed scope enum, `SingletonScope`, with the variants `LeaseSweeper` and `RetentionSweeper`. Each
-  variant maps to one election name (`lease-sweeper`, `retention-sweeper`). Free-form names never reach the cluster
+- QE keeps a closed scope enum, `SingletonScope`, with the variants `LeaseSweeper`, `RetentionSweeper`, and
+  `LifecycleGauges`. Each variant maps to one election name (`lease-sweeper`, `retention-sweeper`, `lifecycle-gauges`). Free-form names never reach the cluster
   facade from QE code.
 - A thin domain port, `SingletonCoordinator`, exposes one operation: run a unit of work while this replica is the
   leader of a scope. Its single infrastructure adapter, the `CoordinationAdapter` component

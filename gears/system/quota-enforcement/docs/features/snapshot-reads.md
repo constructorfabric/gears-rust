@@ -228,10 +228,11 @@ entries per page), the optional continuation cursor from a prior page
 
 **Steps**:
 1. [ ] - `p1` - **IF** the result set exceeds the operator-configured page size - `inst-spg-limit-if`
-   1. [ ] - `p1` - Truncate the page at the page size and attach a continuation cursor
+   1. [ ] - `p1` - Order the matching rows by `quota_id` ascending, truncate the page at the page size, and attach
+      an opaque continuation cursor holding only the last `quota_id` returned
       (`cpt-cf-quota-enforcement-fr-bulk-quota-snapshot-read`) - `inst-spg-limit`
-2. [ ] - `p1` - Resume from a supplied cursor so repeated calls walk the full result set to exhaustion
-   (cursor-based continuation) - `inst-spg-resume`
+2. [ ] - `p1` - Resume from a supplied cursor at the first `quota_id` after the one it holds, so repeated calls walk
+   the full result set to exhaustion, each row once (cursor-based continuation) - `inst-spg-resume`
 3. [ ] - `p1` - Apply the same pagination contract to all three cases; single-subject responses that fit one page
    return no continuation cursor - `inst-spg-uniform`
 4. [ ] - `p1` - **RETURN** the page; pagination state lives in the cursor, and the endpoint keeps no server-side

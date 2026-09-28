@@ -156,8 +156,8 @@ Realises `cpt-cf-quota-enforcement-seq-lease-acquire`.
       **RETURN** it as an HTTP 200 verdict with no capacity held in any Quota; increment `denial_total` by the closed
       `reason` kind - `inst-lac-denied`
 6. [ ] - `p1` - DB: `LeaseManager` locks the `lease_capacity_counters` row for `(tenant, metric)`; **IF** the count of
-   active leases would exceed the operator-configured cap (default 1000, sourced from `lease_capacity_config` with the
-   `tenant_id IS NULL`/`metric IS NULL` row as the platform default, cached in-process per I7) - `inst-lac-cap-if`
+   active leases would exceed the operator-configured cap (default 1000, sourced from the most specific `lease_capacity_config`
+   row per I7, the `(*, *)` row being the platform default, cached in-process) - `inst-lac-cap-if`
    1. [ ] - `p1` - **RETURN** `LEASE_INFLIGHT_LIMIT_EXCEEDED` (`StorageError::LeaseInflightLimitExceeded` lifted to
       canonical `ResourceExhausted`, 429) without holding any Quota; increment
       `lease_inflight_limit_exceeded_total` with the canonical registered `metric` label; expired leases never count
