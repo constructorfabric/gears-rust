@@ -181,8 +181,28 @@
   - [D-160 (M) Configuration changes are recorded in an append-only revision table, not the audit chain](#d-160-m-configuration-changes-are-recorded-in-an-append-only-revision-table-not-the-audit-chain)
   - [D-161 (H) An admission answers only for its own event, and a ceiling restores the return stage it interrupted](#d-161-h-an-admission-answers-only-for-its-own-event-and-a-ceiling-restores-the-return-stage-it-interrupted)
   - [D-162 (M) The gate-loop calls retry under a policy whose worst case fits their timeout](#d-162-m-the-gate-loop-calls-retry-under-a-policy-whose-worst-case-fits-their-timeout)
-- [Open Questions](#open-questions)
   - [D-163 (M) A ceiling that fires while parked at a ceiling re-arms, and keeps the first ceiling's return state](#d-163-m-a-ceiling-that-fires-while-parked-at-a-ceiling-re-arms-and-keeps-the-first-ceilings-return-state)
+  - [D-164 (H) The ceiling wait writes its own request reference, and a ceiling restores the payload of the stage it interrupted](#d-164-h-the-ceiling-wait-writes-its-own-request-reference-and-a-ceiling-restores-the-payload-of-the-stage-it-interrupted)
+  - [D-165 (H) A wave answer routes deferred, then failed, then lapsed, and no entry drops what another has not folded](#d-165-h-a-wave-answer-routes-deferred-then-failed-then-lapsed-and-no-entry-drops-what-another-has-not-folded)
+  - [D-166 (M) A completion report never answers terminal-event, and every terminate-instance names its terminal outcome](#d-166-m-a-completion-report-never-answers-terminal-event-and-every-terminate-instance-names-its-terminal-outcome)
+  - [D-167 (H) A settled key's answer lives on its registry row; the step log is recovery history with its own purge grant](#d-167-h-a-settled-keys-answer-lives-on-its-registry-row-the-step-log-is-recovery-history-with-its-own-purge-grant)
+  - [D-168 (H) A settlement that cannot commit aborts whole and answers the canonical infrastructure Problem](#d-168-h-a-settlement-that-cannot-commit-aborts-whole-and-answers-the-canonical-infrastructure-problem)
+  - [D-169 (H) `start-instance` reads the platform before its one transaction](#d-169-h-start-instance-reads-the-platform-before-its-one-transaction)
+  - [D-170 (M) One table says what each receipt records; `audit_kind` is the success kind](#d-170-m-one-table-says-what-each-receipt-records-audit_kind-is-the-success-kind)
+  - [D-171 (H) An early evaluation settles success with `due: false`](#d-171-h-an-early-evaluation-settles-success-with-due-false)
+  - [D-172 (H) A pre-admission `admit-trigger` audit entry may carry no seller](#d-172-h-a-pre-admission-admit-trigger-audit-entry-may-carry-no-seller)
+  - [D-173 (H) READ COMMITTED; the pre-admission append allocates and checks in one statement, and `start-instance` collides with it symmetrically](#d-173-h-read-committed-the-pre-admission-append-allocates-and-checks-in-one-statement-and-start-instance-collides-with-it-symmetrically)
+  - [D-174 (H) The quarantine counts from a per-family history of presented attempts](#d-174-h-the-quarantine-counts-from-a-per-family-history-of-presented-attempts)
+  - [D-175 (M) `terminate-instance` takes only the two permitted edges; from `suspended` or `parked` it refuses `fence-not-claimed`](#d-175-m-terminate-instance-takes-only-the-two-permitted-edges-from-suspended-or-parked-it-refuses-fence-not-claimed)
+  - [D-176 (L) The nesting invariant is enforced in four places, and §2.1 says so](#d-176-l-the-nesting-invariant-is-enforced-in-four-places-and-21-says-so)
+  - [D-177 (H) The six events publish to this gear's own topic, named in the abstract type's `x-gts-traits`](#d-177-h-the-six-events-publish-to-this-gears-own-topic-named-in-the-abstract-types-x-gts-traits)
+  - [D-178 (H) A producer-registration rotation rejects every message queued under the old id](#d-178-h-a-producer-registration-rotation-rejects-every-message-queued-under-the-old-id)
+  - [D-179 (M) A settlement enqueues zero or more events of its declared type, at most one per subject](#d-179-m-a-settlement-enqueues-zero-or-more-events-of-its-declared-type-at-most-one-per-subject)
+  - [D-180 (H) The suspension closure port also clears `owf_process_instance.suspended`](#d-180-h-the-suspension-closure-port-also-clears-owf_process_instancesuspended)
+  - [D-181 (M) The step-retry route records its task resolution request through slice 07's intake port](#d-181-m-the-step-retry-route-records-its-task-resolution-request-through-slice-07s-intake-port)
+  - [D-182 (M) The re-authorization mark is the cancellation fence's one rewritable stamp](#d-182-m-the-re-authorization-mark-is-the-cancellation-fences-one-rewritable-stamp)
+  - [D-183 (H) A suspension a Lifecycle resume overtook is closed by the poll before `terminate-instance`](#d-183-h-a-suspension-a-lifecycle-resume-overtook-is-closed-by-the-poll-before-terminate-instance)
+- [Open Questions](#open-questions)
   - [Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?](#q-01-which-durable-execution-substrate-backs-the-process--the-oss-workflow-engine-or-a-bss-local-mechanism)
   - [Q-02: The Generic Approval escalation threshold — the one PRD-deferred numeric value this design deliberately leaves unset](#q-02-the-generic-approval-escalation-threshold--the-one-prd-deferred-numeric-value-this-design-deliberately-leaves-unset)
   - [Q-03: Does a bounded hold/resume cycle count or bound the total elapsed non-terminal lifetime of an order, beyond the single-cycle remaining-window guarantee this design already keeps?](#q-03-does-a-bounded-holdresume-cycle-count-or-bound-the-total-elapsed-non-terminal-lifetime-of-an-order-beyond-the-single-cycle-remaining-window-guarantee-this-design-already-keeps)
@@ -1676,8 +1696,8 @@ The decisions in this section were taken when the order process flow moved from 
 gear to a versioned platform workflow definition (`ADR/0011`, `ADR/0012`, `ADR/0013`), and when
 each slice was restructured into step operations and a definition fragment. D-65…D-72 carry the
 three ADRs and their cross-cutting consequences; D-73…D-101 are the decisions the slice
-restructurings recorded, and D-102…D-163 the decisions taken on the second review of
-2026-09-26. Each names the entries it amends; the amended entries carry a dated
+restructurings recorded, D-102…D-163 the decisions taken on the second review of
+2026-09-26, and D-164…D-183 those taken on the re-review of 2026-09-28. Each names the entries it amends; the amended entries carry a dated
 **Amended by** note. D-65…D-101 were taken on 2026-09-24.
 
 ### D-65 (H) The order process flow is a versioned platform workflow definition executed by serverless-runtime
@@ -4785,9 +4805,6 @@ the SLA they fit.
 timeout*, *Fixed waits*; `design/01-foundation.md` §4.2, §4.5; `design/03-approval-execution.md`
 §1.2, §4.5 item 4; `ADR/0012` (amendment block after the D-161 block); D-148.
 
-## Open Questions
-
-
 ### D-163 (M) A ceiling that fires while parked at a ceiling re-arms, and keeps the first ceiling's return state
 
 **Accepted.**
@@ -5450,10 +5467,13 @@ would move a completed order through compensation. Letting `terminate-instance` 
 suspension was rejected too, because it would add the `suspended → terminated` edge D-82 and
 D-175 exclude.
 
-**Propagated**: `design/10-process-definition.md` §3.6 (a), (b), (e), §4.5;
+**Propagated**: `design/10-process-definition.md` §3.6 (a), (b), (e), §4.1, §4.5;
 `design/08-hold-and-cancel.md` §3.3, §3.6 `inst-ar-poll`, §4.7 item 10;
-`design/01-foundation.md` §3.3 (`terminate-instance`, the poll's round row). Related: D-82,
+`design/01-foundation.md` §3.3 (`terminate-instance`, the poll's round row); `DESIGN.md` §1.2
+(`fr-owf-hold-resume`). Related: D-82,
 D-114, D-130, D-133, D-141, D-143, D-175.
+
+## Open Questions
 
 ### Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?
 
@@ -5898,7 +5918,7 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-180 | H Suspension closure port clears `owf_process_instance.suspended` | `design/01-foundation.md` §3.3, §3.7, `design/08-hold-and-cancel.md` §3.7, `design/05-provisioning-intents.md` §3.4; D-82, D-149, D-153 |
 | D-181 | M Step-retry route records through slice 07's intake port | `design/07-manual-tasks.md` §3.2, §3.7, `design/09-read-and-authz.md` §3.1–§3.4, §3.6, `design/README.md`, `DESIGN.md` §3.7; D-85, D-139, D-153 |
 | D-182 | M Re-authorization mark: the fence's one rewritable stamp | `design/06-saga-and-compensation.md` §3.7, `DESIGN.md` §3.7; D-84, D-106 |
-| D-183 | H Poll closes an overtaken suspension before terminate-instance; `rejected`/`completed` are not held | `design/10-process-definition.md` §3.6 (a), (b), (e), §4.5, `design/08-hold-and-cancel.md` §3.3, §3.6, §4.7, `design/01-foundation.md` §3.3; D-130, D-133, D-141, D-175 |
+| D-183 | H Poll closes an overtaken suspension before terminate-instance; `rejected`/`completed` are not held | `design/10-process-definition.md` §3.6 (a), (b), (e), §4.1, §4.5, `design/08-hold-and-cancel.md` §3.3, §3.6, §4.7, `design/01-foundation.md` §3.3, `DESIGN.md` §1.2; D-130, D-133, D-141, D-175 |
 
 Highest decision number used: **D-183**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
 register; there are no parts.
