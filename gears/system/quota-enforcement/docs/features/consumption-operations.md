@@ -199,7 +199,9 @@ Realises `cpt-cf-quota-enforcement-seq-rollback`.
 - A rollback replay is a no-op returning the stored Decision
 
 **Error Scenarios**:
-- Original-debit key not found: `UNKNOWN_OPERATION` (canonical `NotFound`)
+- Original-debit key not found, or found under a different authorized attribution: `UNKNOWN_OPERATION` (canonical
+  `NotFound`); the two are indistinguishable, so a key alone neither probes nor reverses a debit
+- Attribution not admitted by the PDP: `PermissionDenied`, before any storage access
 - Attribution period already settled (`period-rollover` emitted): `PERIOD_CLOSED`; no mutation and no event
 - Rollback targeting a credit: rejected; credits are not reversible via rollback
 
@@ -422,8 +424,9 @@ instances is delegated to the storage plugin (I9).
 
 The system **MUST** enforce typed `IdempotencyScope { tenant_id, subject_key, operation_type, idem_key }` on every write
 operation. `subject_key: IdempotencySubjectKey` is the fixed-width SHA-256 fingerprint of the canonical complete
-PDP-authorized, catalogue-mapped subject set for debit, or of the owning Quota's persisted subject pair for credit and
-rollback; it is never derived from a caller-selected projection or from `quota_id`.
+PDP-authorized, catalogue-mapped subject set for debit and rollback (rollback re-authorizes the reversed debit's
+attribution), or of the owning Quota's persisted subject pair for credit; it is never derived from a caller-selected
+projection or from `quota_id`.
 Exact replays **MUST** return the stored `decision_blob` verbatim without re-invoking the Engine or re-binding `time`;
 divergent payloads **MUST** return `IDEMPOTENCY_PAYLOAD_MISMATCH` (409) leaving the original record untouched. The
 `payload_hash` is the canonical SHA-256 of the sorted-JSON payload stored as fixed-width binary; the evaluation
