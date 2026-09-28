@@ -1616,6 +1616,13 @@ cases:
    etc.). The system **MUST** reject with an actionable `IDEMPOTENCY_PAYLOAD_MISMATCH` error and **MUST NOT** touch the
    original record.
 
+**Exception — no applicable Quota.** A denial with reason `NO_APPLICABLE_QUOTA` is not an idempotency outcome. The
+system **MUST NOT** persist it, and a later request under the same key **MUST** be evaluated as a new operation against
+the Quotas present at that time. The denial changes no counter and holds no capacity, so re-evaluation can produce at
+most one counter effect for the key; persisting it would instead keep the key denied for the whole retention window
+after an operator provisions the missing Quota. A caller that received this denial and did not perform the work
+**MUST** treat a later `Allowed` under the same key as the authorization for that work.
+
 Replay requests **MUST NOT** carry any Decision-shaped field in the body; per §3.4, the server silently ignores any such
 fields if present, regardless of which branch above would otherwise apply.
 
