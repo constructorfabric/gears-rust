@@ -68,6 +68,8 @@ pub struct Operations<'a> {
     pub leases: super::leases::LeaseLimits,
     /// The batch debit's bounds.
     pub batch: super::batch::BatchLimits,
+    /// The snapshot read's bounds.
+    pub snapshot: super::snapshot::SnapshotLimits,
 }
 
 /// What a dry run evaluates: the read snapshot and the documents the policy

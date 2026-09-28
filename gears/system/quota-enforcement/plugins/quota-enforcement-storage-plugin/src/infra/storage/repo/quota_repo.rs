@@ -302,6 +302,70 @@ pub async fn count_active_cap_unbounded(runner: &impl DBRunner) -> Result<u64, S
         .await
 }
 
+/// One target of a snapshot read: a tenant's Quotas on `metric` bound to one
+/// of `subjects`, each `(projection_type, subject_id)`.
+#[derive(Debug, Clone)]
+pub struct SnapshotPair {
+    /// Owning tenant.
+    pub tenant_id: Uuid,
+    /// The metric.
+    pub metric: String,
+    /// `(projection_type, subject_id)` pairs.
+    pub subjects: Vec<(String, String)>,
+}
+
+/// The active Quota rows any of `pairs` selects, each once, ascending by id,
+/// after `after` and at most `limit` of them.
+///
+/// The read takes no lock: a snapshot read reads under its transaction's
+/// snapshot and never mutates a Quota.
+///
+/// # Errors
+///
+/// The scope or database error of the read.
+pub async fn find_snapshot_rows(
+    runner: &impl DBRunner,
+    scope: &AccessScope,
+    pairs: &[SnapshotPair],
+    after: Option<Uuid>,
+    limit: Option<u64>,
+) -> Result<Vec<quota::Model>, ScopeError> {
+    let mut targets = Condition::any();
+    for pair in pairs.iter().filter(|pair| !pair.subjects.is_empty()) {
+        let mut subjects = Condition::any();
+        for (projection_type, subject_id) in &pair.subjects {
+            subjects = subjects.add(
+                Condition::all()
+                    .add(Column::ProjectionType.eq(projection_type.as_str()))
+                    .add(Column::SubjectId.eq(subject_id.as_str())),
+            );
+        }
+        targets = targets.add(
+            Condition::all()
+                .add(Column::TenantId.eq(pair.tenant_id))
+                .add(Column::Metric.eq(pair.metric.as_str()))
+                .add(subjects),
+        );
+    }
+    if targets.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut condition = Condition::all()
+        .add(Column::Status.eq(STATUS_ACTIVE))
+        .add(targets);
+    if let Some(after) = after {
+        condition = condition.add(Column::Id.gt(after));
+    }
+    let query = Entity::find()
+        .filter(condition)
+        .order_by(Column::Id, Order::Asc);
+    let query = match limit {
+        Some(limit) => query.limit(limit),
+        None => query,
+    };
+    query.secure().scope_with(scope).all(runner).await
+}
+
 /// Ids of the active Quotas that apply to one operation: the tenant's Quotas
 /// on `metric` whose bound subject is one of `subjects`, ascending by id.
 ///

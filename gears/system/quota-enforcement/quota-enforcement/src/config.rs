@@ -42,6 +42,8 @@ pub struct QuotaEnforcementConfig {
     pub retention: RetentionSection,
     /// The lease TTL window and the lease sweeper's timing.
     pub leases: LeasesSection,
+    /// Bounds of the snapshot read.
+    pub snapshot: SnapshotSection,
 }
 
 impl Default for QuotaEnforcementConfig {
@@ -59,6 +61,7 @@ impl Default for QuotaEnforcementConfig {
             operations: OperationsSection::default(),
             retention: RetentionSection::default(),
             leases: LeasesSection::default(),
+            snapshot: SnapshotSection::default(),
         }
     }
 }
@@ -90,7 +93,8 @@ impl QuotaEnforcementConfig {
         self.gauges.validate()?;
         self.operations.validate()?;
         self.retention.validate()?;
-        self.leases.validate()
+        self.leases.validate()?;
+        self.snapshot.validate()
     }
 
     /// Budget for a sweep body to stop after leadership loss or shutdown.
@@ -587,6 +591,65 @@ impl GaugesSection {
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "config_tests.rs"]
 mod config_tests;
+
+/// Bounds of the snapshot read (`[quota-enforcement.snapshot]`).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct SnapshotSection {
+    /// The most rows one page returns, and the page size when a request names
+    /// none. No request may ask for more.
+    pub page_size: u32,
+    /// The most subjects one request may name.
+    pub max_filters: usize,
+}
+
+impl SnapshotSection {
+    /// The largest `page_size` an operator may configure: the most rows the
+    /// storage plugin serves in one page.
+    pub const PAGE_SIZE_CEILING: u32 = 500;
+    /// The largest `max_filters` an operator may configure, so one request
+    /// cannot carry an impractical PDP document or storage query.
+    pub const MAX_FILTERS_CEILING: usize = 500;
+
+    /// Reject bounds outside their ranges.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the field that is out of its range.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.page_size == 0 || self.page_size > Self::PAGE_SIZE_CEILING {
+            anyhow::bail!(
+                "[quota-enforcement.snapshot].page_size must be in 1..={}",
+                Self::PAGE_SIZE_CEILING
+            );
+        }
+        if self.max_filters == 0 || self.max_filters > Self::MAX_FILTERS_CEILING {
+            anyhow::bail!(
+                "[quota-enforcement.snapshot].max_filters must be in 1..={}",
+                Self::MAX_FILTERS_CEILING
+            );
+        }
+        Ok(())
+    }
+
+    /// The snapshot read's bounds.
+    #[must_use]
+    pub const fn to_limits(&self) -> crate::domain::operations::SnapshotLimits {
+        crate::domain::operations::SnapshotLimits {
+            page_size: self.page_size,
+            max_filters: self.max_filters,
+        }
+    }
+}
+
+impl Default for SnapshotSection {
+    fn default() -> Self {
+        Self {
+            page_size: 100,
+            max_filters: 100,
+        }
+    }
+}
 
 /// Bounds of the consumption hot path (`[quota-enforcement.operations]`).
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]

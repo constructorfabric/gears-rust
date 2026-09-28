@@ -507,6 +507,17 @@ impl crate::domain::ConsumptionStore for FakeConsumptionStore {
         Err(unreached())
     }
 
+    async fn bulk_read_quota_snapshot(
+        &self,
+        _ctx: &SecurityContext,
+        _scope: &AccessScope,
+        _pairs: &[quota_enforcement_sdk::ApplicableQuotas],
+        _page: quota_enforcement_sdk::PageRequest,
+    ) -> Result<quota_enforcement_sdk::PageResult<quota_enforcement_sdk::QuotaSnapshot>, StorageError>
+    {
+        Err(unreached())
+    }
+
     async fn lookup_idempotency(
         &self,
         _scope_of: &quota_enforcement_sdk::IdempotencyScope,

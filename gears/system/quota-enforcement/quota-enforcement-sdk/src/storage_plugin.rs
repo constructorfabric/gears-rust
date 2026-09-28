@@ -11,7 +11,9 @@
 //!   payload under the same scope returns
 //!   [`StorageError::IdempotencyPayloadMismatch`].
 //! - **I3 Read-only.** Reads do not mutate state, except snapshot reads may
-//!   materialize their current period row without settlement or events.
+//!   materialize the current window's period row of an active Quota within its
+//!   validity window, without settlement or events. Closing an elapsed period
+//!   belongs to the mutating operation that crosses the boundary.
 //! - **I4-I5 Lease periods.** Expired leases are treated as released; lease
 //!   settlement and rollback target the acquisition period.
 //! - **I6-I8 Bounds.** Cap updates, active-lease limits, and contention
@@ -684,8 +686,14 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
 
     // --- snapshot reads ---
 
-    /// Per-Quota state for one applicable set. May materialize the current
-    /// period row (the I3 exception).
+    /// Per-Quota state for one applicable set: every active Quota whose
+    /// subject is in the set, in `quota_id` order.
+    ///
+    /// The I3 exception: a consumption Quota within its validity window whose
+    /// current window has no row yet gets that row, `consumed = 0`, created in
+    /// the read's own transaction. Nothing is settled and no event is
+    /// emitted. A Quota outside its window gets no row, and its current window
+    /// reads as zero.
     async fn read_quota_snapshot(
         &self,
         ctx: &SecurityContext,
@@ -694,6 +702,22 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
     ) -> Result<Vec<QuotaSnapshot>, StorageError>;
 
     /// Paginated per-Quota state for many applicable sets.
+    ///
+    /// Selects every active Quota under `scope` whose tenant and metric match
+    /// a pair and whose subject is in that pair's subjects. The union is
+    /// ordered by `quota_id` ascending and returns each Quota once, however
+    /// many pairs select it; Quotas outside their validity window are
+    /// included. At most `page.limit` rows are returned (a zero limit means
+    /// the default). `next_cursor` is opaque and holds only the last
+    /// `quota_id` returned, so the next page resumes after it and a walk to
+    /// exhaustion yields each row once; it is `None` on the last page. The
+    /// page is read in one transaction and follows the I3 exception of
+    /// [`Self::read_quota_snapshot`].
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::InvalidCursor`] for a cursor this plugin did not issue;
+    /// [`StorageError::Unavailable`] when the backend cannot serve the page.
     async fn bulk_read_quota_snapshot(
         &self,
         ctx: &SecurityContext,

@@ -11,8 +11,8 @@ use toolkit_security::SecurityContext;
 use crate::models::{
     AcquireLeaseOutcome, AcquireLeaseRequest, BatchDebitRequest, BatchDecision, CommitLeaseRequest,
     CreditRequest, DeactivateOutcome, DebitRequest, Decision, DecisionPreview, PageRequest,
-    PageResult, PreviewRequest, QuotaFilter, QuotaId, QuotaPatch, QuotaSpec, QuotaView,
-    ReleaseLeaseRequest, RollbackRequest,
+    PageResult, PreviewRequest, QuotaFilter, QuotaId, QuotaPatch, QuotaSnapshot, QuotaSpec,
+    QuotaView, ReleaseLeaseRequest, RollbackRequest, SnapshotRequest,
 };
 
 /// Error of every client method: the platform canonical error.
@@ -220,6 +220,24 @@ pub trait QuotaEnforcementClientV1: Send + Sync + 'static {
         ctx: &SecurityContext,
         request: BatchDebitRequest,
     ) -> Result<BatchDecision, QuotaEnforcementError>;
+
+    /// Read the per-Quota state of explicit targets: every active Quota the
+    /// targets select, once each, ordered by `quota_id`, with no policy
+    /// attribution and no aggregate figure. A target matching nothing is an
+    /// empty page, not an error.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidArgument` for no subjects, too many, a bad `limit`, a malformed
+    /// target (naming the subject), a `tenant` subject naming another tenant,
+    /// a metric or kind the catalogue does not admit, or a cursor the service
+    /// did not issue; `PermissionDenied` when the PDP refuses any target;
+    /// `ServiceUnavailable` when the PDP or storage cannot answer.
+    async fn snapshot(
+        &self,
+        ctx: &SecurityContext,
+        request: SnapshotRequest,
+    ) -> Result<PageResult<QuotaSnapshot>, QuotaEnforcementError>;
 }
 
 /// Platform operator policy surface. Every method requires explicit PDP admission.

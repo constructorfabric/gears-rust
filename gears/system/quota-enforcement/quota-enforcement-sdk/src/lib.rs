@@ -63,9 +63,9 @@ pub use models::{
     ProjectionBinding, Quota, QuotaDebitPlan, QuotaDraft, QuotaFilter, QuotaId, QuotaPatch,
     QuotaSnapshot, QuotaSource, QuotaSpec, QuotaStatus, QuotaType, QuotaView, ReleaseLeaseRequest,
     ResourceProjection, Retention, RollbackRequest, RollbackTarget, RollbackableOperation,
-    ScopeError, SubjectClaim, SubjectRef, SubjectScope, TenantId, ThresholdCrossing,
-    TransitionOutcome, UnknownValue, ValidityWindow, ValidityWindowPatch, apportion,
-    positive_amount,
+    ScopeError, SnapshotRequest, SnapshotSubject, SubjectClaim, SubjectRef, SubjectScope, TenantId,
+    ThresholdCrossing, TransitionOutcome, UnknownValue, ValidityWindow, ValidityWindowPatch,
+    apportion, positive_amount,
 };
 pub use storage_plugin::{
     BatchEntry, BatchTimer, CONTRACT_MAJOR, EvaluatedBatch, EvaluatedMutation,

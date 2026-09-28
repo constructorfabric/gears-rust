@@ -62,6 +62,11 @@ impl From<DomainError> for CanonicalError {
             DomainError::InvalidBatchItem { .. }
             | DomainError::BulkTooLarge { .. }
             | DomainError::BatchTimeout => batch(err),
+            DomainError::InvalidSnapshot {
+                index,
+                field,
+                reason,
+            } => snapshot_violation(index, field, reason),
             DomainError::ProjectionNotRegistered { projection } => {
                 QuotaResource::invalid_argument()
                     .with_field_violation(
@@ -308,6 +313,26 @@ fn quota_lifecycle(err: DomainError) -> CanonicalError {
         .create(),
         other => CanonicalError::from(other),
     }
+}
+
+/// A refused snapshot request, naming the subject when one is at fault. A
+/// snapshot reads Quota records, so the violation is the Quota resource's.
+fn snapshot_violation(
+    index: Option<usize>,
+    field: &'static str,
+    reason: &'static str,
+) -> CanonicalError {
+    let at = index.map_or_else(
+        || field.to_owned(),
+        |index| format!("subjects[{index}].{field}"),
+    );
+    QuotaResource::invalid_argument()
+        .with_field_violation(
+            at.clone(),
+            format!("invalid argument {at}: {reason}"),
+            reason,
+        )
+        .create()
 }
 
 /// The batch debit's envelope rejections and its timeout.

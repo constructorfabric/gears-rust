@@ -1191,7 +1191,10 @@ runtime, so it has no `DomainError` lift target. The full `DomainError` enum liv
 - **I2. Idempotency** — replay returns the original outcome verbatim; mismatched payload under same `idem_key` returns
   `IdempotencyPayloadMismatch`.
 - **I3. Read-only** — `read_*`, `list_*`, `lookup_idempotency` MUST NOT write persistent state.
-  **Lazy period-row creation in `read_quota_snapshot`** is the single permitted exception.
+  **Lazy period-row creation in the snapshot reads** (`read_quota_snapshot`, `bulk_read_quota_snapshot`) is the
+  single permitted exception: the current window's row of an active consumption Quota within its validity window,
+  with nothing settled and no event emitted; closing the elapsed period belongs to the mutating operation that crosses
+  the boundary.
 - **I4. Lease lazy expiry** — read and write paths treat any lease with `expiry_at <= now()` as released regardless of
   physical row presence. An acquisition's holds sit in the counters, so an expired hold is **returned exactly once, by
   the first party that sees it**: every writer that locks a counter row first returns that Quota's expired, unreturned
@@ -2091,19 +2094,22 @@ sequenceDiagram
     participant EO as EvaluationOrchestrator
     participant SP as StoragePlugin
 
-    EO ->> SP: read_quota_snapshot(applicable, metric)
-    Note over SP: For each consumption Quota:<br/>SELECT counter row FOR period_end > now() OR row missing
+    EO ->> SP: mutating primitive (debit / lease commit / lease release), in its transaction
+    Note over SP: For each consumption Quota it touches:<br/>lock the latest counter row, compare period_end with now()
     alt current period row exists
-        SP -->> EO: Vec<QuotaSnapshot>
-    else period boundary crossed (lazy detection, I3 exception)
-        SP ->> SP: BEGIN nested or piggyback tx<br/>1. Mark closing-period row is_settled=true after every active lease with<br/>   acquisition_period=closing has resolved (settlement window per `cpt-cf-quota-enforcement-adr-settlement-window-emit`)<br/>2. INSERT new period row (consumed=0, highest_crossed_threshold_pct=NULL)<br/>3. Enqueue period-rollover event (closing_consumed, closing_cap, new_period_boundary)
-        SP -->> EO: Vec<QuotaSnapshot> (with new period row)
+        SP ->> SP: apply the mutation to the current row
+    else period boundary crossed (lazy detection)
+        SP ->> SP: same tx<br/>1. Mark closing-period row is_settled=true after every active lease with<br/>   acquisition_period=closing has resolved (settlement window per `cpt-cf-quota-enforcement-adr-settlement-window-emit`)<br/>2. INSERT new period row (consumed=0, highest_crossed_threshold_pct=NULL)<br/>3. Enqueue period-rollover event (closing_consumed, closing_cap, new_period_boundary)<br/>4. apply the mutation to the new row
     end
+    SP -->> EO: MutationResult
+    Note over EO,SP: A snapshot read (read_quota_snapshot / bulk_read_quota_snapshot) that meets a crossed boundary<br/>only creates the current window's row of a Quota within its validity window (the I3 exception):<br/>it settles nothing and emits no event; the next mutating operation closes the period
 ```
 
-**Description.** Lazy period detection (`cpt-cf-quota-enforcement-fr-period-rollover`). On any evaluate that observes
-`now() >= period_end` for a consumption Quota, the storage plugin atomically materialises the new period row, emits the
-`period-rollover` event for the closing period, and resets the threshold marker. The new `quota_consumption_counters`
+**Description.** Lazy period detection (`cpt-cf-quota-enforcement-fr-period-rollover`). On any mutating operation that
+observes `now() >= period_end` for a consumption Quota, the storage plugin atomically settles the closing period,
+materialises the new period row, emits the `period-rollover` event for the closing period, and resets the threshold
+marker. A snapshot read that observes the same boundary creates only the new period row, and only for a Quota within
+its validity window (I3); settlement and the event with the closing figures wait for the next mutating operation. The new `quota_consumption_counters`
 row MUST carry `highest_crossed_threshold_pct = NULL` per storage-plugin invariant **I13** (PRD §5.15: "the marker
 resets at period rollover so thresholds can fire again in the new period"; threshold-emission rule of
 `cpt-cf-quota-enforcement-fr-notification-plugin`). During the settlement window (between `period_end` and the moment

@@ -243,4 +243,15 @@ impl quota_enforcement_sdk::QuotaEnforcementClientV1 for InProcessQuotaEnforceme
     ) -> Result<quota_enforcement_sdk::BatchDecision, QuotaEnforcementError> {
         Ok(self.service.operations()?.batch_debit(ctx, request).await?)
     }
+
+    async fn snapshot(
+        &self,
+        ctx: &SecurityContext,
+        request: quota_enforcement_sdk::SnapshotRequest,
+    ) -> Result<
+        quota_enforcement_sdk::PageResult<quota_enforcement_sdk::QuotaSnapshot>,
+        QuotaEnforcementError,
+    > {
+        Ok(self.service.operations()?.snapshot(ctx, request).await?)
+    }
 }

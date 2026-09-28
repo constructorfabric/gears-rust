@@ -100,3 +100,11 @@ pub const BATCH_TENANT_MIXED: &str = "BATCH_TENANT_MIXED";
 pub const BATCH_ITEM_KEY_DUPLICATE: &str = "BATCH_ITEM_KEY_DUPLICATE";
 /// A batch has more items than the configured maximum.
 pub const BULK_TOO_LARGE: &str = "BULK_TOO_LARGE";
+/// A snapshot read names no subject.
+pub const SNAPSHOT_SUBJECTS_REQUIRED: &str = "SNAPSHOT_SUBJECTS_REQUIRED";
+/// A snapshot read names more subjects than the operator allows.
+pub const SNAPSHOT_TOO_MANY_SUBJECTS: &str = "SNAPSHOT_TOO_MANY_SUBJECTS";
+/// A snapshot page size outside `1..=page_size`.
+pub const SNAPSHOT_LIMIT_OUT_OF_RANGE: &str = "SNAPSHOT_LIMIT_OUT_OF_RANGE";
+/// A tenant-scope snapshot subject names a tenant other than the request's.
+pub const SNAPSHOT_TENANT_MISMATCH: &str = "SNAPSHOT_TENANT_MISMATCH";

@@ -207,6 +207,88 @@ impl AuthZResolverApi for TupleMatchingPdp {
     }
 }
 
+/// A snapshot policy that inspects every target: it permits only when the
+/// target tenant is one of `tenants` and each `{kind, id, metric}` of the
+/// `filters` property is on its allow list, so one target outside the grant
+/// denies the whole request.
+pub struct PermitFiltersPdp {
+    allowed: Vec<Value>,
+    tenants: Vec<Uuid>,
+    calls: AtomicUsize,
+}
+
+impl PermitFiltersPdp {
+    /// Permit exactly the `(kind, id, metric)` targets in `allowed`.
+    pub fn new(allowed: &[(&str, &str, &str)], tenants: Vec<Uuid>) -> Self {
+        Self {
+            allowed: allowed
+                .iter()
+                .map(|(kind, id, metric)| serde_json::json!({ "kind": kind, "id": id, "metric": metric }))
+                .collect(),
+            tenants,
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl AuthZResolverApi for PermitFiltersPdp {
+    async fn evaluate(
+        &self,
+        _ctx: PlatformSecurityContext,
+        request: EvaluationRequest,
+    ) -> Result<EvaluationResponse, CanonicalError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let tenant_allowed = request
+            .resource
+            .properties
+            .get(pep_properties::OWNER_TENANT_ID)
+            .is_some_and(|owner| {
+                self.tenants
+                    .iter()
+                    .any(|tenant| serde_json::to_value(tenant).ok().as_ref() == Some(owner))
+            });
+        let every_target_allowed = tenant_allowed
+            && request
+                .resource
+                .properties
+                .get(crate::domain::pep::properties::FILTERS)
+                .and_then(Value::as_array)
+                .is_some_and(|filters| {
+                    !filters.is_empty()
+                        && filters.iter().all(|filter| self.allowed.contains(filter))
+                });
+        if !every_target_allowed {
+            return Ok(EvaluationResponse {
+                decision: false,
+                context: EvaluationResponseContext {
+                    constraints: Vec::new(),
+                    deny_reason: Some(DenyReason {
+                        error_code: "TARGET_NOT_AUTHORIZED".to_owned(),
+                        details: None,
+                    }),
+                },
+            });
+        }
+        Ok(EvaluationResponse {
+            decision: true,
+            context: EvaluationResponseContext {
+                constraints: vec![Constraint {
+                    predicates: vec![Predicate::In(InPredicate::new(
+                        pep_properties::OWNER_TENANT_ID,
+                        self.tenants.clone(),
+                    ))],
+                }],
+                ..EvaluationResponseContext::default()
+            },
+        })
+    }
+}
+
 /// Permits every request with an `owner_tenant_id IN SUBTREE(root)` constraint,
 /// the shape a hierarchy-aware PDP returns. The filter has no literal values in
 /// memory; only `SecureConn` can evaluate it.
@@ -1530,6 +1612,7 @@ pub fn unbound_service(pdp: Arc<dyn AuthZResolverApi>) -> Arc<crate::domain::Ser
             preparation_max_attempts: std::num::NonZeroU32::new(3).expect("attempts"),
             leases: crate::domain::operations::LeaseLimits::default(),
             batch: crate::domain::operations::BatchLimits::default(),
+            snapshot: crate::domain::operations::SnapshotLimits::default(),
         },
     ))
 }

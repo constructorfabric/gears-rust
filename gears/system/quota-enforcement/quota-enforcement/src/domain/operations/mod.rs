@@ -14,6 +14,7 @@ pub mod lease_sweeper;
 pub mod leases;
 pub mod retention;
 pub mod service;
+pub mod snapshot;
 
 pub use batch::BatchLimits;
 pub use idempotency::{IdempotencyCache, ReplayRecord};
@@ -21,6 +22,7 @@ pub use lease_sweeper::{LeaseSweepReport, LeaseSweepTiming, LeaseSweeper};
 pub use leases::LeaseLimits;
 pub use retention::{RetentionSweeper, RetentionTiming, SweepReport};
 pub use service::Operations;
+pub use snapshot::SnapshotLimits;
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]

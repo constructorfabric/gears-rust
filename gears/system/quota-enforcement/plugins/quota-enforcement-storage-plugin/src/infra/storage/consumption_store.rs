@@ -19,16 +19,16 @@ use quota_enforcement_sdk::{
     Decision, DecisionResult, EvaluatedDebit, EvaluatedMutation, EvaluationContext,
     EvaluationFailure, EvaluationQuota, IdempotencyRecord, IdempotencyScope, IdempotencySubjectKey,
     IdempotencyWrite, MutationResult, NO_APPLICABLE_QUOTA, NotificationEvent,
-    NotificationEventKind, NotificationScope, OperationType, PartialIdempotencyWrite, PayloadHash,
-    PeriodId, PeriodType, PeriodWindow, PolicyScope, PolicyVersion, Quota, QuotaId, QuotaScopeTier,
-    QuotaSnapshot, QuotaStatus, QuotaType, Retention, RollbackTarget, StorageError, TenantId,
-    ThresholdCrossing, TransitionOutcome, threshold_crossings,
+    NotificationEventKind, NotificationScope, OperationType, PageRequest, PageResult,
+    PartialIdempotencyWrite, PayloadHash, PeriodId, PeriodType, PeriodWindow, PolicyScope,
+    PolicyVersion, Quota, QuotaId, QuotaScopeTier, QuotaSnapshot, QuotaStatus, QuotaType,
+    Retention, RollbackTarget, StorageError, TenantId, ThresholdCrossing, TransitionOutcome,
+    threshold_crossings,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 use toolkit_db::secure::{DBRunner, ScopeError};
-use toolkit_db::secure::{TxAccessMode, TxConfig, TxIsolationLevel};
 use toolkit_db::{Db, DbError};
 use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
@@ -1063,7 +1063,7 @@ pub(super) struct LockedCounter {
 }
 
 impl LockedCounter {
-    fn consumption(
+    pub(super) fn consumption(
         quota: &Quota,
         latest: Option<quota_consumption_counter::Model>,
         now: OffsetDateTime,
@@ -1078,7 +1078,7 @@ impl LockedCounter {
         }
     }
 
-    fn allocation(in_flight: Option<i64>) -> Self {
+    pub(super) fn allocation(in_flight: Option<i64>) -> Self {
         Self {
             stored: in_flight.map_or(0, |value| u64::try_from(value).unwrap_or(0)),
             period_id: None,
@@ -1113,7 +1113,10 @@ pub(super) async fn lock_counters_of(
 }
 
 /// The snapshot of `quota` from its `counter`, less the expired holds nobody
-/// has returned yet.
+/// has returned yet: the per-Quota state every snapshot read returns and every
+/// evaluation sees.
+// @cpt-algo:cpt-cf-quota-enforcement-algo-snapshot-state:p1
+// @cpt-dod:cpt-cf-quota-enforcement-dod-snapshot-state-contract:p1
 pub(super) async fn snapshot_of_locked(
     tx: &impl DBRunner,
     scope: &AccessScope,
@@ -1121,24 +1124,68 @@ pub(super) async fn snapshot_of_locked(
     counter: &LockedCounter,
     now: OffsetDateTime,
 ) -> Result<QuotaSnapshot, TxError> {
+    // @cpt-begin:cpt-cf-quota-enforcement-algo-snapshot-state:p1:inst-sst-identity
+    let (quota_id, subject, metric, quota_type) = (
+        quota.id,
+        quota.subject.clone(),
+        quota.metric.clone(),
+        quota.quota_type,
+    );
+    // @cpt-end:cpt-cf-quota-enforcement-algo-snapshot-state:p1:inst-sst-identity
+    // @cpt-begin:cpt-cf-quota-enforcement-algo-snapshot-state:p1:inst-sst-amounts
     // @cpt-begin:cpt-cf-quota-enforcement-algo-lazy-expiry:p1:inst-lzy-capacity
     let owed = unreturned_expired(tx, scope, quota.id.as_uuid(), counter.period_id, now).await?;
     let consumed = counter.stored.saturating_sub(owed);
     // @cpt-end:cpt-cf-quota-enforcement-algo-lazy-expiry:p1:inst-lzy-capacity
+    let remaining = quota.cap.map(|cap| cap.saturating_sub(consumed));
+    // @cpt-end:cpt-cf-quota-enforcement-algo-snapshot-state:p1:inst-sst-amounts
+    // @cpt-begin:cpt-cf-quota-enforcement-algo-snapshot-state:p1:inst-sst-mode
+    let enforcement_mode = quota.enforcement_mode;
+    // @cpt-end:cpt-cf-quota-enforcement-algo-snapshot-state:p1:inst-sst-mode
+    // @cpt-begin:cpt-cf-quota-enforcement-algo-snapshot-state:p1:inst-sst-period-if
+    let period = if quota_type == QuotaType::Consumption {
+        // @cpt-begin:cpt-cf-quota-enforcement-algo-snapshot-state:p1:inst-sst-period
+        // The current window: its row's bounds when the row exists, the same
+        // bounds computed from the period type when it does not yet.
+        counter.window
+        // @cpt-end:cpt-cf-quota-enforcement-algo-snapshot-state:p1:inst-sst-period
+    } else {
+        // @cpt-begin:cpt-cf-quota-enforcement-algo-snapshot-state:p1:inst-sst-noperiod-else
+        // @cpt-begin:cpt-cf-quota-enforcement-algo-snapshot-state:p1:inst-sst-noperiod
+        None
+        // @cpt-end:cpt-cf-quota-enforcement-algo-snapshot-state:p1:inst-sst-noperiod
+        // @cpt-end:cpt-cf-quota-enforcement-algo-snapshot-state:p1:inst-sst-noperiod-else
+    };
+    // @cpt-end:cpt-cf-quota-enforcement-algo-snapshot-state:p1:inst-sst-period-if
+    // @cpt-begin:cpt-cf-quota-enforcement-algo-snapshot-state:p1:inst-sst-metadata
+    let metadata = quota.metadata.clone();
+    // @cpt-end:cpt-cf-quota-enforcement-algo-snapshot-state:p1:inst-sst-metadata
+    // @cpt-begin:cpt-cf-quota-enforcement-algo-snapshot-state:p1:inst-sst-window
+    let validity_window = quota.validity_window;
+    let currently_within_window = validity_window.is_none_or(|window| window.contains(now));
+    // @cpt-end:cpt-cf-quota-enforcement-algo-snapshot-state:p1:inst-sst-window
+    // @cpt-begin:cpt-cf-quota-enforcement-algo-snapshot-state:p1:inst-sst-noattr
+    // @cpt-begin:cpt-cf-quota-enforcement-algo-snapshot-state:p1:inst-sst-noheadline
+    // @cpt-begin:cpt-cf-quota-enforcement-algo-snapshot-state:p1:inst-sst-return
+    // One Quota's own state: the type has no field for policy attribution
+    // and nothing here sums across Quotas.
     Ok(QuotaSnapshot {
-        quota_id: quota.id,
-        subject: quota.subject.clone(),
-        metric: quota.metric.clone(),
-        quota_type: quota.quota_type,
-        enforcement_mode: quota.enforcement_mode,
+        quota_id,
+        subject,
+        metric,
+        quota_type,
+        enforcement_mode,
         cap: quota.cap,
         consumed,
-        remaining: quota.cap.map(|cap| cap.saturating_sub(consumed)),
-        period: counter.window,
-        metadata: quota.metadata.clone(),
-        validity_window: quota.validity_window,
-        currently_within_window: quota.validity_window.is_none_or(|w| w.contains(now)),
+        remaining,
+        period,
+        metadata,
+        validity_window,
+        currently_within_window,
     })
+    // @cpt-end:cpt-cf-quota-enforcement-algo-snapshot-state:p1:inst-sst-return
+    // @cpt-end:cpt-cf-quota-enforcement-algo-snapshot-state:p1:inst-sst-noheadline
+    // @cpt-end:cpt-cf-quota-enforcement-algo-snapshot-state:p1:inst-sst-noattr
 }
 
 pub(super) fn counters_of(entries: &[AppliedEntry]) -> Vec<CounterSnapshot> {
@@ -1930,83 +1977,17 @@ impl crate::domain::ports::ConsumptionStore for SqlConsumptionStore {
         scope: &AccessScope,
         applicable: &ApplicableQuotas,
     ) -> Result<Vec<QuotaSnapshot>, StorageError> {
-        const OPERATION: &str = "read quota snapshot";
-        let now = self.now();
-        let subjects: Vec<(String, String)> = applicable
-            .subjects
-            .iter()
-            .map(|s| (s.projection_type.to_string(), s.subject_id.clone()))
-            .collect();
-        let conn = self
-            .db
-            .conn()
-            .map_err(|error| unavailable(OPERATION, "connection", &error))?;
-        let ids = quota_repo::find_applicable_ids(
-            &conn,
-            scope,
-            applicable.tenant_id.as_uuid(),
-            applicable.metric.as_str(),
-            &subjects,
-        )
-        .await
-        .map_err(|error| lift(OPERATION, error.into()))?;
-        let mut snapshots = Vec::with_capacity(ids.len());
-        for id in ids {
-            let Some(row) = quota_repo::find_by_id(&conn, scope, id, None)
-                .await
-                .map_err(|error| lift(OPERATION, error.into()))?
-            else {
-                continue;
-            };
-            let quota =
-                quota_mapping::row_to_quota(row).map_err(|error| lift(OPERATION, error.into()))?;
-            // I3 permits materializing only the row being read, without
-            // settlement or outbox events.
-            if quota.quota_type == QuotaType::Consumption {
-                let quota = quota.clone();
-                let scope = scope.clone();
-                let clock = Arc::clone(&self.clock);
-                self.db
-                    .transaction_ref_mapped(move |tx| {
-                        Box::pin(async move {
-                            // Read under the lock this transaction takes, so a
-                            // read that waited out a boundary materializes the
-                            // period it is actually in.
-                            // The read path is outside I8: it queues.
-                            ensure_current_period(tx, &scope, &quota, clock(), RowWait::Wait)
-                                .await?;
-                            Ok::<_, TxError>(())
-                        })
-                    })
-                    .await
-                    .map_err(|error| lift(OPERATION, error))?;
-            }
-            // The counter and the expired holds that correct it are two
-            // statements, so they run under one repeatable-read snapshot: at
-            // read-committed a sweeper committing between them would pair a
-            // pre-return counter with a post-return correction and over-report
-            // usage, denying work that actually fits. Read-only, so this
-            // remains the I3 read path.
-            let quota_for_read = quota.clone();
-            let scope_for_read = scope.clone();
-            let snapshot = self
-                .db
-                .transaction_ref_mapped_with_config(
-                    TxConfig {
-                        isolation: Some(TxIsolationLevel::RepeatableRead),
-                        access_mode: Some(TxAccessMode::ReadOnly),
-                    },
-                    move |tx| {
-                        Box::pin(async move {
-                            snapshot_of(tx, &scope_for_read, &quota_for_read, now).await
-                        })
-                    },
-                )
-                .await
-                .map_err(|error| lift(OPERATION, error))?;
-            snapshots.push(snapshot);
-        }
-        Ok(snapshots)
+        self.read_quota_snapshot_impl(scope, applicable).await
+    }
+
+    async fn bulk_read_quota_snapshot(
+        &self,
+        _ctx: &SecurityContext,
+        scope: &AccessScope,
+        pairs: &[ApplicableQuotas],
+        page: PageRequest,
+    ) -> Result<PageResult<QuotaSnapshot>, StorageError> {
+        self.bulk_read_quota_snapshot_impl(scope, pairs, page).await
     }
 
     async fn lookup_idempotency(

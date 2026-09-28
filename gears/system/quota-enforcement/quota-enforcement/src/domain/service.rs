@@ -30,6 +30,8 @@ pub struct OperationsRuntime {
     pub leases: super::operations::LeaseLimits,
     /// The batch debit's item limit and timeout.
     pub batch: super::operations::BatchLimits,
+    /// The snapshot read's page size and subject bound.
+    pub snapshot: super::operations::SnapshotLimits,
 }
 
 /// Composition root of the domain. Handlers and the in-process client reach
@@ -47,6 +49,7 @@ pub struct Service {
     preparation_max_attempts: std::num::NonZeroU32,
     leases: super::operations::LeaseLimits,
     batch: super::operations::BatchLimits,
+    snapshot: super::operations::SnapshotLimits,
 }
 
 impl Service {
@@ -74,6 +77,7 @@ impl Service {
             preparation_max_attempts: operations.preparation_max_attempts,
             leases: operations.leases,
             batch: operations.batch,
+            snapshot: operations.snapshot,
         }
     }
 
@@ -215,6 +219,7 @@ impl Service {
             preparation_max_attempts: self.preparation_max_attempts,
             leases: self.leases,
             batch: self.batch,
+            snapshot: self.snapshot,
         })
     }
 

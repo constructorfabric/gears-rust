@@ -268,6 +268,19 @@ pub enum DomainError {
         /// Closed `UPPER_SNAKE` reason token.
         reason: &'static str,
     },
+    // --- snapshot reads ---
+    /// A snapshot request is refused: its shape before the PDP, or a subject
+    /// the catalogue does not map after it. `index` names the subject when the
+    /// refusal is about one.
+    #[error("invalid snapshot {field}: {reason}")]
+    InvalidSnapshot {
+        /// The subject's position in the request, when one is at fault.
+        index: Option<usize>,
+        /// The request or subject field.
+        field: &'static str,
+        /// Closed `UPPER_SNAKE` reason token.
+        reason: &'static str,
+    },
     /// The batch has more items than the configured maximum.
     #[error("batch of {items} items exceeds the maximum of {max}")]
     BulkTooLarge {

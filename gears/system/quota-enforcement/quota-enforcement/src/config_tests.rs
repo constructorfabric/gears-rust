@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use super::{
     CatalogSection, ElectionTimingConfig, GaugesSection, LeasesSection, MetricsConfig,
-    OperationsSection, PoliciesSection, QuotaEnforcementConfig, QuotasSection,
+    OperationsSection, PoliciesSection, QuotaEnforcementConfig, QuotasSection, SnapshotSection,
 };
 
 #[test]
@@ -483,6 +483,43 @@ fn the_batch_bounds_default_to_the_platform_values_and_reject_zero() {
         OperationsSection {
             batch_timeout_ms: 0,
             ..OperationsSection::default()
+        },
+    ] {
+        assert!(bad.validate().is_err(), "{bad:?} must be rejected");
+    }
+}
+
+#[test]
+fn the_snapshot_bounds_default_to_the_platform_values_and_stay_in_range() {
+    let section = SnapshotSection::default();
+    section.validate().expect("defaults are valid");
+    let limits = section.to_limits();
+    assert_eq!(limits.page_size, 100);
+    assert_eq!(limits.max_filters, 100);
+    assert_eq!(limits, crate::domain::operations::SnapshotLimits::default());
+    SnapshotSection {
+        page_size: SnapshotSection::PAGE_SIZE_CEILING,
+        max_filters: SnapshotSection::MAX_FILTERS_CEILING,
+    }
+    .validate()
+    .expect("the ceilings themselves are allowed");
+
+    for bad in [
+        SnapshotSection {
+            page_size: 0,
+            ..SnapshotSection::default()
+        },
+        SnapshotSection {
+            page_size: SnapshotSection::PAGE_SIZE_CEILING + 1,
+            ..SnapshotSection::default()
+        },
+        SnapshotSection {
+            max_filters: 0,
+            ..SnapshotSection::default()
+        },
+        SnapshotSection {
+            max_filters: SnapshotSection::MAX_FILTERS_CEILING + 1,
+            ..SnapshotSection::default()
         },
     ] {
         assert!(bad.validate().is_err(), "{bad:?} must be rejected");

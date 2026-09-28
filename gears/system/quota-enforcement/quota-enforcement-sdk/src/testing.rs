@@ -25,7 +25,7 @@ use gts::GtsTypeId;
 use parking_lot::Mutex;
 use serde_json::Value;
 use time::OffsetDateTime;
-use toolkit_security::{AccessScope, SecurityContext};
+use toolkit_security::{AccessScope, ScopeFilter, ScopeValue, SecurityContext, pep_properties};
 use uuid::Uuid;
 
 use crate::engine::{
@@ -270,6 +270,87 @@ pub struct InMemoryStorage {
 impl Default for InMemoryStorage {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// The Quota value one scope filter constrains.
+#[derive(Debug, Clone, Copy)]
+enum ScopedValue {
+    /// The owning tenant (`owner_tenant_id`).
+    Tenant,
+    /// The Quota id (`id`).
+    Quota,
+}
+
+impl ScopedValue {
+    fn of(self, quota: &Quota) -> ScopeValue {
+        match self {
+            Self::Tenant => ScopeValue::Uuid(quota.tenant_id.as_uuid()),
+            Self::Quota => ScopeValue::Uuid(quota.id.as_uuid()),
+        }
+    }
+}
+
+/// A scope the double has checked it can evaluate: allow-all, deny-all, and
+/// equality or membership filters on the owner tenant and the Quota id, as an
+/// OR of constraints and an AND of their filters.
+///
+/// It is built before any row is read, so an unsupported scope is refused
+/// whether or not a row would have been checked against it: no test passes
+/// by skipping a scope the double cannot evaluate, on an empty store or a page
+/// past the last match included. Hierarchy-aware scopes are exercised against
+/// the SQL plugin.
+#[derive(Debug)]
+struct InMemoryScope<'a> {
+    unconstrained: bool,
+    constraints: Vec<Vec<(ScopedValue, &'a ScopeFilter)>>,
+}
+
+impl<'a> InMemoryScope<'a> {
+    /// Check every filter of `scope` once.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::Internal`] for a hierarchical filter or a property
+    /// other than the owner tenant and the Quota id.
+    fn of(scope: &'a AccessScope) -> Result<Self, StorageError> {
+        let mut constraints = Vec::with_capacity(scope.constraints().len());
+        for constraint in scope.constraints() {
+            let mut filters = Vec::with_capacity(constraint.filters().len());
+            for filter in constraint.filters() {
+                if !filter.is_representable_in_memory() {
+                    return Err(StorageError::Internal(format!(
+                        "the in-memory double cannot evaluate a hierarchical scope filter on `{}`",
+                        filter.property()
+                    )));
+                }
+                let value = match filter.property() {
+                    pep_properties::OWNER_TENANT_ID => ScopedValue::Tenant,
+                    pep_properties::RESOURCE_ID => ScopedValue::Quota,
+                    other => {
+                        return Err(StorageError::Internal(format!(
+                            "the in-memory double cannot evaluate scope property `{other}`"
+                        )));
+                    }
+                };
+                filters.push((value, filter));
+            }
+            constraints.push(filters);
+        }
+        Ok(Self {
+            unconstrained: scope.is_unconstrained(),
+            constraints,
+        })
+    }
+
+    /// Whether the scope admits `quota`.
+    fn admits(&self, quota: &Quota) -> bool {
+        self.unconstrained
+            || self.constraints.iter().any(|filters| {
+                filters
+                    .iter()
+                    .all(|(value, filter)| filter.values().contains(&value.of(quota)))
+            })
     }
 }
 
@@ -1086,6 +1167,29 @@ impl InMemoryStorage {
             validity_window: quota.validity_window,
             currently_within_window: quota.validity_window.is_none_or(|w| w.contains(now)),
         }
+    }
+
+    /// Snapshots of `ids`, in that order. The I3 exception: a consumption
+    /// Quota within its validity window gets its current window's row;
+    /// nothing is settled and no event is emitted. A Quota outside its window
+    /// gets no row, and an elapsed row reads as zero.
+    fn read_snapshots(st: &mut StorageState, ids: &[QuotaId]) -> Vec<QuotaSnapshot> {
+        let now = Self::now(st);
+        for id in ids {
+            let valid_consumption = st.quotas.get(id).is_some_and(|quota| {
+                quota.quota_type == QuotaType::Consumption
+                    && quota
+                        .validity_window
+                        .is_none_or(|window| window.contains(now))
+            });
+            if valid_consumption {
+                Self::ensure_current_row(st, *id, now);
+            }
+        }
+        ids.iter()
+            .filter_map(|id| st.quotas.get(id).cloned())
+            .map(|quota| Self::snapshot(st, &quota))
+            .collect()
     }
 
     fn matches(quota: &Quota, applicable: &ApplicableQuotas) -> bool {
@@ -2003,52 +2107,68 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
     async fn read_quota_snapshot(
         &self,
         _ctx: &SecurityContext,
-        _scope: &AccessScope,
+        scope: &AccessScope,
         applicable: &ApplicableQuotas,
     ) -> Result<Vec<QuotaSnapshot>, StorageError> {
-        // I3 permits materializing only the row being read, without settlement
-        // or outbox events.
+        let scope = InMemoryScope::of(scope)?;
         self.transact(|st| {
-            let now = Self::now(st);
             let matched: Vec<QuotaId> = st
                 .quotas
                 .values()
-                .filter(|q| Self::matches(q, applicable))
-                .map(|q| q.id)
+                .filter(|quota| Self::matches(quota, applicable) && scope.admits(quota))
+                .map(|quota| quota.id)
                 .collect();
-            for id in &matched {
-                if st
-                    .quotas
-                    .get(id)
-                    .is_some_and(|quota| quota.quota_type == QuotaType::Consumption)
-                {
-                    Self::ensure_current_row(st, *id, now);
-                }
-            }
-            Ok(matched
-                .iter()
-                .filter_map(|id| st.quotas.get(id).cloned())
-                .map(|quota| Self::snapshot(st, &quota))
-                .collect())
+            Ok(Self::read_snapshots(st, &matched))
         })
     }
 
     async fn bulk_read_quota_snapshot(
         &self,
         _ctx: &SecurityContext,
-        _scope: &AccessScope,
+        scope: &AccessScope,
         pairs: &[ApplicableQuotas],
         page: PageRequest,
     ) -> Result<PageResult<QuotaSnapshot>, StorageError> {
-        let st = self.state.lock();
-        Self::check(&st)?;
-        let items: Vec<QuotaSnapshot> = st
-            .quotas
-            .values()
-            .filter(|q| pairs.iter().any(|a| Self::matches(q, a)))
-            .map(|q| Self::snapshot(&st, q))
-            .collect();
-        Self::paginate(&items, &page)
+        let scope = InMemoryScope::of(scope)?;
+        // Keyset on `quota_id`: the cursor holds only the last id returned.
+        let after = page
+            .cursor
+            .as_deref()
+            .map(|cursor| {
+                Uuid::parse_str(cursor)
+                    .map(QuotaId::new)
+                    .map_err(|_| StorageError::InvalidCursor)
+            })
+            .transpose()?;
+        let limit = if page.limit == 0 {
+            PageRequest::DEFAULT_LIMIT
+        } else {
+            page.limit
+        } as usize;
+        self.transact(|st| {
+            let mut selected = Vec::new();
+            for quota in st.quotas.values() {
+                if after.is_some_and(|after| quota.id <= after)
+                    || !pairs.iter().any(|pair| Self::matches(quota, pair))
+                    || !scope.admits(quota)
+                {
+                    continue;
+                }
+                selected.push(quota.id);
+                if selected.len() > limit {
+                    break;
+                }
+            }
+            let more = selected.len() > limit;
+            selected.truncate(limit);
+            let next_cursor = more
+                .then(|| selected.last().map(|id| id.as_uuid().to_string()))
+                .flatten();
+            Ok(PageResult {
+                items: Self::read_snapshots(st, &selected),
+                next_cursor,
+            })
+        })
     }
 
     async fn create_policy(
