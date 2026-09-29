@@ -166,6 +166,8 @@ registration plus scoped `ClientHub` resolution, the same pattern already used b
   a private per-tenant credential/backend registry. Each client writes exactly the custom logic it needs, in a
   typed, testable, ordinarily-compiled crate, and this reuses machinery the platform already has rather than
   inventing a new one. See Pros and Cons for the comparison against the rejected options.
+* The expected first plugin is a resolver that reads a declarative tenant / GTS type → `backend_id` table from
+  configuration, so re-routing to another bucket is a config change, not a rebuild.
 
 ### Plugin contract
 
