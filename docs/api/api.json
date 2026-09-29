@@ -1041,6 +1041,92 @@
         ],
         "type": "object"
       },
+      "AttachmentDetailDto": {
+        "description": "Full attachment details returned by the GET attachment endpoint.",
+        "properties": {
+          "content_type": {
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "doc_summary": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "error_code": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "filename": {
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "img_thumbnail": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ImgThumbnailDto"
+              }
+            ]
+          },
+          "kind": {
+            "$ref": "#/components/schemas/AttachmentKindDto"
+          },
+          "size_bytes": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "status": {
+            "$ref": "#/components/schemas/AttachmentStatusDto"
+          },
+          "summary_updated_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "filename",
+          "content_type",
+          "size_bytes",
+          "status",
+          "kind",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "AttachmentKindDto": {
+        "description": "Attachment kind.",
+        "enum": [
+          "document",
+          "image"
+        ],
+        "type": "string"
+      },
+      "AttachmentStatusDto": {
+        "description": "Attachment lifecycle status.",
+        "enum": [
+          "pending",
+          "uploaded",
+          "ready",
+          "failed"
+        ],
+        "type": "string"
+      },
       "AttachmentSummaryDto": {
         "description": "Lightweight attachment metadata embedded in Message responses.",
         "properties": {
@@ -1062,10 +1148,10 @@
             ]
           },
           "kind": {
-            "type": "string"
+            "$ref": "#/components/schemas/AttachmentKindDto"
           },
           "status": {
-            "type": "string"
+            "$ref": "#/components/schemas/AttachmentStatusDto"
           }
         },
         "required": [
@@ -2647,6 +2733,8 @@
         "description": "A citation extracted from provider annotations.",
         "properties": {
           "attachment_id": {
+            "description": "The attachment UUID (the provider file id before mapping).",
+            "format": "uuid",
             "type": [
               "string",
               "null"
@@ -5359,7 +5447,7 @@
             "type": "string"
           },
           "type": {
-            "type": "string"
+            "$ref": "#/components/schemas/DeltaKind"
           }
         },
         "required": [
@@ -5367,6 +5455,14 @@
           "content"
         ],
         "type": "object"
+      },
+      "DeltaKind": {
+        "description": "Kind of a `delta` chunk.",
+        "enum": [
+          "text",
+          "reasoning"
+        ],
+        "type": "string"
       },
       "DenyReason": {
         "description": "Reason for an explicit deny from the PDP.",
@@ -5599,7 +5695,7 @@
             "type": "string"
           },
           "quota_decision": {
-            "type": "string"
+            "$ref": "#/components/schemas/QuotaDecisionKind"
           },
           "quota_warnings": {
             "items": {
@@ -5614,17 +5710,11 @@
             "type": "string"
           },
           "usage": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/Usage"
-              }
-            ]
+            "$ref": "#/components/schemas/Usage"
           }
         },
         "required": [
+          "usage",
           "effective_model",
           "selected_model",
           "quota_decision"
@@ -5729,6 +5819,18 @@
           "a6_backdating_biz_days",
           "pending_ttl_seconds",
           "is_default"
+        ],
+        "type": "object"
+      },
+      "EditTurnRequest": {
+        "description": "Request DTO for `PATCH /chats/{id}/turns/{request_id}` (edit).",
+        "properties": {
+          "content": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "content"
         ],
         "type": "object"
       },
@@ -9344,6 +9446,15 @@
         ],
         "type": "object"
       },
+      "MessageRoleDto": {
+        "description": "Message author role.",
+        "enum": [
+          "user",
+          "assistant",
+          "system"
+        ],
+        "type": "string"
+      },
       "MetadataEntryDto": {
         "description": "One custom-metadata key/value pair.",
         "properties": {
@@ -9680,9 +9791,14 @@
             ]
           },
           "my_reaction": {
-            "type": [
-              "string",
-              "null"
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ReactionKindDto",
+                "description": "The caller's reaction to this message; `null` when there is none."
+              }
             ]
           },
           "output_tokens": {
@@ -9697,7 +9813,7 @@
             "type": "string"
           },
           "role": {
-            "type": "string"
+            "$ref": "#/components/schemas/MessageRoleDto"
           }
         },
         "required": [
@@ -9706,6 +9822,7 @@
           "role",
           "content",
           "attachments",
+          "my_reaction",
           "created_at"
         ],
         "type": "object"
@@ -9722,7 +9839,7 @@
             "type": "string"
           },
           "reaction": {
-            "type": "string"
+            "$ref": "#/components/schemas/ReactionKindDto"
           }
         },
         "required": [
@@ -9731,6 +9848,137 @@
           "created_at"
         ],
         "type": "object"
+      },
+      "MiniChatSseEvent": {
+        "description": "`OpenAPI` description of one SSE event of the `messages:stream`, retry and\nedit responses. Each event is sent as `event: <name>` and `data: <payload>`\n(JSON); `event` below is the SSE event name and `data` its payload. This\ntype only documents the wire format; `StreamEvent::into_sse_event` writes it.",
+        "oneOf": [
+          {
+            "properties": {
+              "data": {
+                "$ref": "#/components/schemas/StreamStartedData"
+              },
+              "event": {
+                "enum": [
+                  "stream_started"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "data",
+              "event"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "data": {
+                "$ref": "#/components/schemas/PingData"
+              },
+              "event": {
+                "enum": [
+                  "ping"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "data",
+              "event"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "data": {
+                "$ref": "#/components/schemas/DeltaData"
+              },
+              "event": {
+                "enum": [
+                  "delta"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "data",
+              "event"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "data": {
+                "$ref": "#/components/schemas/ToolData"
+              },
+              "event": {
+                "enum": [
+                  "tool"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "data",
+              "event"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "data": {
+                "$ref": "#/components/schemas/CitationsData"
+              },
+              "event": {
+                "enum": [
+                  "citations"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "data",
+              "event"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "data": {
+                "$ref": "#/components/schemas/DoneData"
+              },
+              "event": {
+                "enum": [
+                  "done"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "data",
+              "event"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "data": {
+                "$ref": "#/components/schemas/ErrorData"
+              },
+              "event": {
+                "enum": [
+                  "error"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "data",
+              "event"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "MissingPartDto": {
         "description": "One part not yet uploaded (item 3.4).\n\n`upload_url` is present only while the session is still `in_progress` and\nunexpired; a terminal or expired session omits it.",
@@ -9794,7 +10042,7 @@
             "type": "string"
           },
           "tier": {
-            "type": "string"
+            "$ref": "#/components/schemas/ModelTierDto"
           }
         },
         "required": [
@@ -9821,6 +10069,14 @@
           "items"
         ],
         "type": "object"
+      },
+      "ModelTierDto": {
+        "description": "Model tier.",
+        "enum": [
+          "standard",
+          "premium"
+        ],
+        "type": "string"
       },
       "MoveMembershipRequest": {
         "description": "The body of `POST /customer-groups/{group}/members/{payerId}/move`.",
@@ -12429,6 +12685,10 @@
         "required": [
           "pin_eligible"
         ],
+        "type": "object"
+      },
+      "PingData": {
+        "description": "Payload of the `ping` event: an empty JSON object (a unit struct would\nbe documented as `null`).",
         "type": "object"
       },
       "PinnedComponentView": {
@@ -15045,6 +15305,14 @@
         ],
         "type": "object"
       },
+      "QuotaDecisionKind": {
+        "description": "Quota decision reported in `done`.",
+        "enum": [
+          "allow",
+          "downgrade"
+        ],
+        "type": "string"
+      },
       "QuotaPeriod": {
         "description": "Quota period classification.",
         "enum": [
@@ -15255,6 +15523,14 @@
           "reject",
           "queue",
           "degrade"
+        ],
+        "type": "string"
+      },
+      "ReactionKindDto": {
+        "description": "Reaction value.",
+        "enum": [
+          "like",
+          "dislike"
         ],
         "type": "string"
       },
@@ -18681,83 +18957,6 @@
         },
         "type": "array"
       },
-      "StreamEvent": {
-        "description": "Stream event envelope for the `messages:stream` pipeline.\n\nEach variant maps to a distinct SSE `event:` name and `data:` JSON payload.\nOrdering grammar: `stream_started ping* (delta | tool)* citations? (done | error)`.",
-        "oneOf": [
-          {
-            "properties": {
-              "StreamStarted": {
-                "$ref": "#/components/schemas/StreamStartedData"
-              }
-            },
-            "required": [
-              "StreamStarted"
-            ],
-            "type": "object"
-          },
-          {
-            "enum": [
-              "Ping"
-            ],
-            "type": "string"
-          },
-          {
-            "properties": {
-              "Delta": {
-                "$ref": "#/components/schemas/DeltaData"
-              }
-            },
-            "required": [
-              "Delta"
-            ],
-            "type": "object"
-          },
-          {
-            "properties": {
-              "Tool": {
-                "$ref": "#/components/schemas/ToolData"
-              }
-            },
-            "required": [
-              "Tool"
-            ],
-            "type": "object"
-          },
-          {
-            "properties": {
-              "Citations": {
-                "$ref": "#/components/schemas/CitationsData"
-              }
-            },
-            "required": [
-              "Citations"
-            ],
-            "type": "object"
-          },
-          {
-            "properties": {
-              "Done": {
-                "$ref": "#/components/schemas/DoneData"
-              }
-            },
-            "required": [
-              "Done"
-            ],
-            "type": "object"
-          },
-          {
-            "properties": {
-              "Error": {
-                "$ref": "#/components/schemas/ErrorData"
-              }
-            },
-            "required": [
-              "Error"
-            ],
-            "type": "object"
-          }
-        ]
-      },
       "StreamMessageRequest": {
         "description": "Request body for `POST /v1/chats/{id}/messages:stream`.",
         "properties": {
@@ -18774,7 +18973,7 @@
             "type": "string"
           },
           "request_id": {
-            "description": "Client-generated idempotency key (UUID v4). Optional in P1.",
+            "description": "Idempotency key: any UUID; generated by the server when omitted.",
             "format": "uuid",
             "type": [
               "string",
@@ -20050,7 +20249,9 @@
       "ToolData": {
         "description": "Tool lifecycle event.",
         "properties": {
-          "details": {},
+          "details": {
+            "type": "object"
+          },
           "name": {
             "type": "string"
           },
@@ -20234,6 +20435,51 @@
           "scale"
         ],
         "type": "object"
+      },
+      "TurnStatusResponse": {
+        "description": "Response DTO for `GET /chats/{id}/turns/{request_id}`.",
+        "properties": {
+          "assistant_message_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "error_code": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "request_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "state": {
+            "$ref": "#/components/schemas/TurnStatusState"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "request_id",
+          "state",
+          "updated_at"
+        ],
+        "type": "object"
+      },
+      "TurnStatusState": {
+        "description": "Turn state as reported by the turn status endpoint.",
+        "enum": [
+          "running",
+          "done",
+          "error",
+          "cancelled"
+        ],
+        "type": "string"
       },
       "TypeDto": {
         "description": "REST DTO for GTS type representation.",
@@ -46509,6 +46755,15 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "OData v4 orderby expression\n- updated_at asc\n- updated_at desc\n- id asc\n- id desc\n- title asc\n- title desc",
+            "in": "query",
+            "name": "$orderby",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -46561,6 +46816,24 @@
               }
             },
             "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -46597,6 +46870,16 @@
               "in"
             ]
           }
+        },
+        "x-odata-orderby": {
+          "allowedFields": [
+            "updated_at asc",
+            "updated_at desc",
+            "id asc",
+            "id desc",
+            "title asc",
+            "title desc"
+          ]
         }
       },
       "post": {
@@ -46621,7 +46904,15 @@
                 }
               }
             },
-            "description": "Created chat"
+            "description": "Created chat",
+            "headers": {
+              "Location": {
+                "description": "Path of the created chat",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "400": {
             "content": {
@@ -46653,6 +46944,16 @@
             },
             "description": "Forbidden"
           },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
           "500": {
             "content": {
               "application/problem+json": {
@@ -46662,6 +46963,24 @@
               }
             },
             "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -46696,13 +47015,6 @@
         ],
         "responses": {
           "204": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object"
-                }
-              }
-            },
             "description": "Chat deleted"
           },
           "400": {
@@ -46754,6 +47066,24 @@
               }
             },
             "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -46839,6 +47169,24 @@
               }
             },
             "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -46926,6 +47274,16 @@
             },
             "description": "Not Found"
           },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
           "500": {
             "content": {
               "application/problem+json": {
@@ -46935,6 +47293,24 @@
               }
             },
             "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -46962,16 +47338,36 @@
             }
           }
         ],
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "properties": {
+                  "file": {
+                    "format": "binary",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "file"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "description": "File to upload (expects field 'file' with file data)",
+          "required": true
+        },
         "responses": {
           "201": {
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "$ref": "#/components/schemas/AttachmentDetailDto"
                 }
               }
             },
-            "description": "Attachment uploaded"
+            "description": "Attachment uploaded and processed"
           },
           "400": {
             "content": {
@@ -47023,16 +47419,6 @@
             },
             "description": "Conflict"
           },
-          "415": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Unsupported Media Type"
-          },
           "429": {
             "content": {
               "application/problem+json": {
@@ -47052,6 +47438,24 @@
               }
             },
             "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -47090,13 +47494,6 @@
         ],
         "responses": {
           "204": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object"
-                }
-              }
-            },
             "description": "Attachment deleted"
           },
           "400": {
@@ -47149,16 +47546,6 @@
             },
             "description": "Conflict"
           },
-          "429": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Too Many Requests"
-          },
           "500": {
             "content": {
               "application/problem+json": {
@@ -47168,6 +47555,24 @@
               }
             },
             "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -47207,7 +47612,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "$ref": "#/components/schemas/AttachmentDetailDto"
                 }
               }
             },
@@ -47253,26 +47658,6 @@
             },
             "description": "Not Found"
           },
-          "409": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Conflict"
-          },
-          "429": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Too Many Requests"
-          },
           "500": {
             "content": {
               "application/problem+json": {
@@ -47282,6 +47667,24 @@
               }
             },
             "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -47321,6 +47724,24 @@
             "description": "Cursor for pagination",
             "in": "query",
             "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "OData v4 filter expression\n- created_at: eq|ne|gt|ge|lt|le|in\n- id: eq|ne|in\n- role: eq|ne|contains|startswith|endswith|in",
+            "in": "query",
+            "name": "$filter",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "OData v4 orderby expression\n- created_at asc\n- created_at desc\n- id asc\n- id desc\n- role asc\n- role desc",
+            "in": "query",
+            "name": "$orderby",
             "required": false,
             "schema": {
               "type": "string"
@@ -47378,26 +47799,6 @@
             },
             "description": "Not Found"
           },
-          "409": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Conflict"
-          },
-          "429": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Too Many Requests"
-          },
           "500": {
             "content": {
               "application/problem+json": {
@@ -47407,6 +47808,24 @@
               }
             },
             "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -47417,7 +47836,43 @@
         "summary": "List messages in a chat",
         "tags": [
           "Mini Chat Messages"
-        ]
+        ],
+        "x-odata-filter": {
+          "allowedFields": {
+            "created_at": [
+              "eq",
+              "ne",
+              "gt",
+              "ge",
+              "lt",
+              "le",
+              "in"
+            ],
+            "id": [
+              "eq",
+              "ne",
+              "in"
+            ],
+            "role": [
+              "eq",
+              "ne",
+              "contains",
+              "startswith",
+              "endswith",
+              "in"
+            ]
+          }
+        },
+        "x-odata-orderby": {
+          "allowedFields": [
+            "created_at asc",
+            "created_at desc",
+            "id asc",
+            "id desc",
+            "role asc",
+            "role desc"
+          ]
+        }
       }
     },
     "/mini-chat/v1/chats/{id}/messages/{msg_id}/reaction": {
@@ -47445,13 +47900,6 @@
         ],
         "responses": {
           "204": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object"
-                }
-              }
-            },
             "description": "Reaction removed"
           },
           "400": {
@@ -47494,26 +47942,6 @@
             },
             "description": "Not Found"
           },
-          "409": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Conflict"
-          },
-          "429": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Too Many Requests"
-          },
           "500": {
             "content": {
               "application/problem+json": {
@@ -47523,6 +47951,24 @@
               }
             },
             "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -47619,7 +48065,7 @@
             },
             "description": "Not Found"
           },
-          "409": {
+          "422": {
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -47627,17 +48073,7 @@
                 }
               }
             },
-            "description": "Conflict"
-          },
-          "429": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Too Many Requests"
+            "description": "Unprocessable Entity"
           },
           "500": {
             "content": {
@@ -47648,6 +48084,24 @@
               }
             },
             "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -47691,7 +48145,7 @@
             "content": {
               "text/event-stream": {
                 "schema": {
-                  "$ref": "#/components/schemas/StreamEvent"
+                  "$ref": "#/components/schemas/MiniChatSseEvent"
                 }
               }
             },
@@ -47747,6 +48201,16 @@
             },
             "description": "Conflict"
           },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
           "429": {
             "content": {
               "application/problem+json": {
@@ -47766,6 +48230,24 @@
               }
             },
             "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -47804,13 +48286,6 @@
         ],
         "responses": {
           "204": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object"
-                }
-              }
-            },
             "description": "Turn deleted"
           },
           "400": {
@@ -47863,16 +48338,6 @@
             },
             "description": "Conflict"
           },
-          "429": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Too Many Requests"
-          },
           "500": {
             "content": {
               "application/problem+json": {
@@ -47882,6 +48347,24 @@
               }
             },
             "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -47921,7 +48404,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "$ref": "#/components/schemas/TurnStatusResponse"
                 }
               }
             },
@@ -47967,26 +48450,6 @@
             },
             "description": "Not Found"
           },
-          "409": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Conflict"
-          },
-          "429": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Too Many Requests"
-          },
           "500": {
             "content": {
               "application/problem+json": {
@@ -47996,6 +48459,24 @@
               }
             },
             "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -48030,16 +48511,27 @@
             }
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EditTurnRequest"
+              }
+            }
+          },
+          "description": "Replacement user message",
+          "required": true
+        },
         "responses": {
           "200": {
             "content": {
-              "application/json": {
+              "text/event-stream": {
                 "schema": {
-                  "type": "object"
+                  "$ref": "#/components/schemas/MiniChatSseEvent"
                 }
               }
             },
-            "description": "Turn edited"
+            "description": "SSE stream of the regenerated response"
           },
           "400": {
             "content": {
@@ -48091,6 +48583,16 @@
             },
             "description": "Conflict"
           },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
           "429": {
             "content": {
               "application/problem+json": {
@@ -48110,6 +48612,24 @@
               }
             },
             "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -48117,7 +48637,7 @@
             "bearerAuth": []
           }
         ],
-        "summary": "Edit a turn (user message)",
+        "summary": "Edit the latest turn's user message and stream the new response via SSE",
         "tags": [
           "Mini Chat Turns"
         ]
@@ -48149,13 +48669,13 @@
         "responses": {
           "200": {
             "content": {
-              "application/json": {
+              "text/event-stream": {
                 "schema": {
-                  "type": "object"
+                  "$ref": "#/components/schemas/MiniChatSseEvent"
                 }
               }
             },
-            "description": "Turn retry initiated"
+            "description": "SSE stream of the regenerated response"
           },
           "400": {
             "content": {
@@ -48226,6 +48746,24 @@
               }
             },
             "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -48233,7 +48771,7 @@
             "bearerAuth": []
           }
         ],
-        "summary": "Retry a failed turn",
+        "summary": "Retry the latest terminal turn and stream the new response via SSE",
         "tags": [
           "Mini Chat Turns"
         ]
@@ -48253,16 +48791,6 @@
             },
             "description": "List of models"
           },
-          "400": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Bad Request"
-          },
           "401": {
             "content": {
               "application/problem+json": {
@@ -48283,36 +48811,6 @@
             },
             "description": "Forbidden"
           },
-          "404": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Not Found"
-          },
-          "409": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Conflict"
-          },
-          "429": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Too Many Requests"
-          },
           "500": {
             "content": {
               "application/problem+json": {
@@ -48322,6 +48820,24 @@
               }
             },
             "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -48360,16 +48876,6 @@
             },
             "description": "Model details"
           },
-          "400": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Bad Request"
-          },
           "401": {
             "content": {
               "application/problem+json": {
@@ -48400,26 +48906,6 @@
             },
             "description": "Not Found"
           },
-          "409": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Conflict"
-          },
-          "429": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Too Many Requests"
-          },
           "500": {
             "content": {
               "application/problem+json": {
@@ -48429,6 +48915,24 @@
               }
             },
             "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -48456,16 +48960,6 @@
             },
             "description": "Quota status with remaining percentages and warning flags"
           },
-          "400": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Bad Request"
-          },
           "401": {
             "content": {
               "application/problem+json": {
@@ -48486,36 +48980,6 @@
             },
             "description": "Forbidden"
           },
-          "404": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Not Found"
-          },
-          "409": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Conflict"
-          },
-          "429": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Too Many Requests"
-          },
           "500": {
             "content": {
               "application/problem+json": {
@@ -48525,6 +48989,24 @@
               }
             },
             "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           }
         },
         "security": [
