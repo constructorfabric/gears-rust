@@ -111,14 +111,25 @@ COMMENT ON COLUMN file_storage.files.meta_version   IS 'Monotonic counter; bumpe
 -- Indexes on files -----------------------------------------------------------
 
 -- Covers the primary `GET /files` listing query: tenant + owner_kind + owner_id
--- with created_at descending for stable cursor pagination.
-CREATE INDEX files_owner_listing_idx
-    ON file_storage.files (tenant_id, owner_kind, owner_id, created_at DESC);
+-- with created_at descending, file_id descending as the keyset tie-breaker
+-- for stable keyset cursor pagination (either direction) when two rows share a created_at
+-- instant (FileRepo::list_page sorts ORDER BY created_at DESC, file_id DESC).
+-- Supersedes files_owner_listing_idx (created_at DESC only,
+-- m20260624_000001_p1_initial), dropped in the same migration that adds this
+-- one (shipped, m20260924_000001_upload_flow_redesign).
+CREATE INDEX files_owner_listing_v2_idx
+    ON file_storage.files (tenant_id, owner_kind, owner_id, created_at DESC, file_id DESC);
 
 -- Per-tenant per-type queries (used by authorization audit, P2 policy checks).
 CREATE INDEX files_tenant_gts_idx
     ON file_storage.files (tenant_id, gts_file_type);
 
+-- Covers the cleanup engine's versionless-orphan-file sweep
+-- (FileRepo::list_versionless_orphan_files: content_id IS NULL AND created_at <
+-- cutoff, ordered by (created_at, file_id)) (shipped, m20260924_000001_upload_flow_redesign).
+CREATE INDEX files_versionless_sweep_idx
+    ON file_storage.files (created_at, file_id)
+    WHERE content_id IS NULL;
 
 -- Table: file_storage.file_versions ------------------------------------------
 -- @cpt-cf-file-storage-dbtable-file-versions
@@ -176,6 +187,27 @@ CREATE TABLE file_storage.file_versions (
     backend_id       text         NOT NULL,
     backend_path     text         NOT NULL,
 
+    -- Set the moment this version's OWN finalize call wins the bind-on-finalize
+    -- CAS (single-part `bind: "auto"` finalize, or multipart `complete` on an
+    -- `auto_bind` session), in the SAME transaction as that CAS. The
+    -- idempotent-retry fast path reads this back instead of re-deriving the
+    -- bind outcome from a live read of files.content_id, which can have moved
+    -- on to a different version by the time of the retry. Existing rows
+    -- default to false (shipped, m20260924_000001_upload_flow_redesign).
+    bound_on_finalize boolean      NOT NULL  DEFAULT false,
+
+    -- Migration lease (shipped, m20260924_000001_upload_flow_redesign):
+    -- migrate_backend acquires this lease on a version before ever writing
+    -- to its destination backend, so two concurrent migration attempts of
+    -- the same version -- which always target the same deterministic
+    -- /{file_id}/{version_id} destination path -- cannot race each other
+    -- there. Both NULL means no migration is currently in progress. The
+    -- lease's expiry is timed by the database's own clock (now()), never the
+    -- acquiring instance's, so instance clock skew cannot make a live lease
+    -- look expired (or vice versa) to a second attempt reading this row.
+    migration_lease_owner  uuid         NULL,
+    migration_lease_until  timestamptz  NULL,
+
     created_at       timestamptz  NOT NULL  DEFAULT now(),
 
     PRIMARY KEY (file_id, version_id)
@@ -184,11 +216,15 @@ CREATE TABLE file_storage.file_versions (
 COMMENT ON TABLE file_storage.file_versions IS
     'Immutable content versions. Backend object /{file_id}/{version_id} is never mutated; a content write is a new version + a pointer swap (files.content_id).';
 
--- ADR-0006: hash_mode = 'multipart-composite-sha256' <=> part_count IS NOT NULL; a composite row always has >= 2 parts (a one-part plan degenerates to whole-sha256).
+-- ADR-0006: hash_mode = 'multipart-composite-sha256' <=> part_count IS NOT NULL (shipped, m20260707_000001_content_hash_modes).
+-- The application never writes part_count = 1 (a one-part plan degenerates to
+-- whole-sha256 instead, ADR-0006 single-part amendment), but this CHECK does
+-- not enforce a >= 2 floor: versions finalized before that amendment
+-- legitimately carry part_count = 1 (ADR-0006, Compatibility), and this
+-- presence-only CHECK is what still accepts them.
 ALTER TABLE file_storage.file_versions
     ADD CONSTRAINT file_versions_part_count_presence_check
-        CHECK ((hash_mode = 'multipart-composite-sha256') = (part_count IS NOT NULL)
-               AND (part_count IS NULL OR part_count >= 2));
+        CHECK ((hash_mode = 'multipart-composite-sha256') = (part_count IS NOT NULL));
 
 -- At most one current version per file.
 CREATE UNIQUE INDEX file_versions_current_idx
@@ -200,9 +236,20 @@ CREATE INDEX file_versions_pending_idx
     ON file_storage.file_versions (created_at)
     WHERE status = 'pending';
 
--- Recovery / debugging index on backend pointer ("which versions live on backend X?").
-CREATE INDEX file_versions_backend_idx
-    ON file_storage.file_versions (backend_id);
+-- `file_versions_backend_idx` (backend_id) was DROPPED in
+-- m20260924_000001_upload_flow_redesign: no query filters file_versions by
+-- backend_id (backend migration reads/writes a version by (file_id,
+-- version_id), never scans by backend), so it only paid insert/update cost.
+
+-- Covers VersionRepo::list_by_file_page (GET /files/{id}/versions, cursor
+-- pagination) and VersionRepo::list_by_file (the unbounded read used by
+-- delete/expiry blob accounting, backend migration and the sweep engine):
+-- both filter file_id = ?, sort created_at DESC. The composite PK (file_id,
+-- version_id) serves the filter but not the sort, and versions are never
+-- pruned in P1/P2, so this was a full per-file scan + sort with no
+-- supporting index (shipped, m20260924_000001_upload_flow_redesign).
+CREATE INDEX file_versions_file_created_idx
+    ON file_storage.file_versions (file_id, created_at, version_id);
 
 -- version_id is globally unique in practice (assigned via gen_random_uuid());
 -- this index makes that a DB-enforced fact so version_hash_manifest below can
@@ -301,7 +348,7 @@ CREATE TABLE file_storage.multipart_uploads (
     part_size        bigint       NOT NULL  DEFAULT 0,
 
     -- Bind mode, fixed at session creation (shipped,
-    -- m20260722_000001_multipart_auto_bind): `POST /files` can open the session
+    -- m20260924_000001_upload_flow_redesign): `POST /files` can open the session
     -- directly with `bind: "auto"`, in which case `complete` performs the
     -- content bind itself, in the same transaction as the version finalize and
     -- under the same CAS a manual `POST /files/{id}/bind` would use. Sessions
@@ -320,6 +367,18 @@ CREATE TABLE file_storage.multipart_uploads (
     lease_owner      text,
     complete_result  text,
 
+    -- The backend and object path this session's upload actually targets
+    -- (same migration). Set once, at initiate, from the values the pending
+    -- file_versions row was just given -- never recomputed. Nullable because
+    -- a session created before this migration shipped predates the columns
+    -- (backfilled from its file_versions row where one still exists; NULL
+    -- otherwise, a legacy case cleanup falls back on the deterministic path
+    -- for). Read by the expired-multipart-session cleanup when the
+    -- file_versions row is already gone (e.g. reclaimed by a racing sweep
+    -- step) -- see `CleanupEngine::cleanup_expired_session_version_with_file`.
+    backend_id       text,
+    backend_path     text,
+
     -- TTL for abandoned uploads. The reaper marks expired in-flight uploads
     -- as 'aborted' and asks the backend to abort, freeing storage.
     created_at       timestamptz  NOT NULL  DEFAULT now(),
@@ -330,7 +389,7 @@ CREATE INDEX multipart_uploads_file_idx ON file_storage.multipart_uploads (file_
 CREATE INDEX multipart_uploads_expired_idx
     ON file_storage.multipart_uploads (expires_at)
     WHERE state = 'in_progress';
--- Sweep index (shipped, m20260902_000001_index_hardening). The sweep filters
+-- Sweep index (shipped, m20260924_000001_upload_flow_redesign). The sweep filters
 -- `expires_at < now AND (state = 'in_progress' OR (state = 'completing' AND
 -- lease_until < now))`; the partial index above serves only the first branch,
 -- so this one is deliberately non-partial and leads with `state` to cover both.
@@ -415,7 +474,7 @@ CREATE INDEX idempotency_keys_expired_idx ON file_storage.idempotency_keys (expi
 -- `file_id` carries ON DELETE CASCADE but is not part of the primary key, so
 -- without this index every `DELETE FROM files` seq-scans the whole table to
 -- find its cascade victims while already holding the row locks on `files`
--- (shipped, m20260902_000001_index_hardening).
+-- (shipped, m20260924_000001_upload_flow_redesign).
 CREATE INDEX idempotency_keys_file_idx ON file_storage.idempotency_keys (file_id);
 
 
@@ -559,6 +618,20 @@ CREATE INDEX retention_rules_scope_idx
 CREATE INDEX retention_rules_file_scope_idx
     ON file_storage.retention_rules (scope_target_id)
     WHERE scope = 'file';
+
+-- Covers `GET /retention-rules`' canonical order and non-admin visibility
+-- filter (RetentionRuleRepo::list_page: tenant_id = ?, ORDER BY created_at
+-- DESC, rule_id DESC) -- cursor pagination, tie-breaker reasoning mirrors
+-- files_owner_listing_v2_idx above (shipped, m20260924_000001_upload_flow_redesign).
+CREATE INDEX retention_rules_tenant_listing_idx
+    ON file_storage.retention_rules (tenant_id, created_at DESC, rule_id DESC);
+
+-- One-time cleanup (shipped, m20260924_000001_upload_flow_redesign): DELETE
+-- any scope = 'file' rule whose scope_target_id no longer matches a
+-- files.file_id row. retention_rules has no FK from scope_target_id to
+-- files.file_id (scope = 'file' rows are matched by id alone), so a files
+-- row deleted before this migration ran could leave its rule dangling with
+-- nothing left to reference.
 
 
 -- =============================================================================

@@ -27,8 +27,14 @@ pub mod models;
 pub use api::FileStorageClientV1;
 pub use gts::FILE_TYPE_RESOURCE;
 pub use models::{
-    ByteRange, CustomMetadataEntry, CustomMetadataPatch, File, FileId, FileVersion, NewFile,
-    OwnerFilter, OwnerKind, VersionId, VersionStatus,
+    AgeRetention, BindState, ByteRange, CompletedMultipartUpload, CreateFileOutcome,
+    CustomMetadataEntry, CustomMetadataPatch, DownloadTicket, EffectivePolicy, File, FileFetch,
+    FileId, FileRecord, FileVersion, InactivityRetention, MetadataLimits, MetadataRetention,
+    MimeSizeOverride, MissingPart, MultipartCompleteOutcome, MultipartIntent, MultipartPartPlan,
+    MultipartPlan, MultipartStatus, MultipartUploadState, NewFile, OwnerFilter, OwnerKind, Policy,
+    PolicyBody, PolicyScope, ReceivedPart, RetentionRule, RetentionRuleBody, RetentionScope,
+    SizeLimits, Storage, StorageCapabilities, UploadTicket, VersionId, VersionRecord,
+    VersionStatus,
 };
 
 pub use toolkit_canonical_errors::CanonicalError as FileStorageError;
