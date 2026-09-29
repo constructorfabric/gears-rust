@@ -623,23 +623,21 @@ async fn close_in_txn(
                 reasons.push(
                     "Mode-B FX revaluation not COMPLETE for the period (enforcement on)".to_owned(),
                 );
-                publisher
-                    .emit_invariant_alarm(
-                        ctx,
-                        LedgerInvariantAlarm {
-                            category: AlarmCategory::FxRevaluationIncomplete,
-                            severity: AlarmSeverity::Critical,
-                            tenant_id,
-                            scope: format!("tenant:{tenant_id}"),
-                            code: "FX_REVALUATION_INCOMPLETE".to_owned(),
-                            detail: format!(
-                                "period {period_id} closing without a COMPLETE Mode-B \
-                                 revaluation marker"
-                            ),
-                            affected: Vec::new(),
-                        },
-                    )
-                    .await;
+                publisher.emit_invariant_alarm(
+                    ctx,
+                    LedgerInvariantAlarm {
+                        category: AlarmCategory::FxRevaluationIncomplete,
+                        severity: AlarmSeverity::Critical,
+                        tenant_id,
+                        scope: format!("tenant:{tenant_id}"),
+                        code: "FX_REVALUATION_INCOMPLETE".to_owned(),
+                        detail: format!(
+                            "period {period_id} closing without a COMPLETE Mode-B \
+                             revaluation marker"
+                        ),
+                        affected: Vec::new(),
+                    },
+                );
             }
         }
     }
@@ -735,7 +733,6 @@ async fn close_in_txn(
                     closed_at_utc: closed_at,
                 },
             )
-            .await
             .map_err(|e| DbError::Other(anyhow::anyhow!("publish period.closed: {e}")))?;
     }
 

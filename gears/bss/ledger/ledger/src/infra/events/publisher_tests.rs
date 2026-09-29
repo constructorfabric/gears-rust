@@ -109,7 +109,6 @@ async fn noop_publish_entry_posted_returns_ok() {
             Box::pin(async move {
                 publisher
                     .publish_entry_posted(&ctx, txn, event)
-                    .await
                     .map_err(|e| toolkit_db::DbError::Sea(sea_orm::DbErr::Custom(e.to_string())))
             })
         })
@@ -140,7 +139,6 @@ async fn noop_publish_entry_reversed_returns_ok() {
             Box::pin(async move {
                 publisher
                     .publish_entry_reversed(&ctx, txn, event)
-                    .await
                     .map_err(|e| toolkit_db::DbError::Sea(sea_orm::DbErr::Custom(e.to_string())))
             })
         })
@@ -157,7 +155,7 @@ async fn noop_emit_invariant_alarm_does_not_panic() {
     // Fire-and-forget: noop path logs a warning and returns. No Err, no panic.
     let publisher = LedgerEventPublisher::noop();
     let ctx = SecurityContext::anonymous();
-    publisher.emit_invariant_alarm(&ctx, sample_alarm()).await;
+    publisher.emit_invariant_alarm(&ctx, sample_alarm());
     // Reaching here without a panic means the noop path is correct.
 }
 
@@ -181,6 +179,6 @@ async fn noop_emit_invariant_alarm_all_categories() {
             detail: "test".to_owned(),
             affected: vec![],
         };
-        publisher.emit_invariant_alarm(&ctx, alarm).await;
+        publisher.emit_invariant_alarm(&ctx, alarm);
     }
 }

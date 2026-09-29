@@ -405,7 +405,7 @@ impl PostingService {
                     ),
                     affected: Vec::new(),
                 };
-                self.publisher.emit_invariant_alarm(ctx, alarm).await;
+                self.publisher.emit_invariant_alarm(ctx, alarm);
             }
             crate::infra::posting::period::ClockSkewVerdict::Reject => {
                 return Err(DomainError::ClockSkewQuarantine(format!(
@@ -520,7 +520,7 @@ impl PostingService {
                         // is named in `scope`/`detail`; no per-grain list.
                         affected: Vec::new(),
                     };
-                    self.publisher.emit_invariant_alarm(ctx, alarm).await;
+                    self.publisher.emit_invariant_alarm(ctx, alarm);
                 }
                 Err(err)
             }
@@ -784,7 +784,6 @@ impl PostingService {
         };
         self.publisher
             .publish_entry_posted(ctx, txn, posted_event)
-            .await
             .map_err(|e| infra(format!("{e}")))?;
 
         // 9. COMMIT happens when the closure returns Ok.

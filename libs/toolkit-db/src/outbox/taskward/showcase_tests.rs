@@ -124,9 +124,12 @@ impl WorkerAction for EventDrivenAction {
     type Payload = ();
     type Error = String;
 
-    async fn execute(&mut self, _cancel: &CancellationToken) -> Result<Directive, String> {
+    fn execute(
+        &mut self,
+        _cancel: &CancellationToken,
+    ) -> impl std::future::Future<Output = Result<Directive, String>> + Send {
         self.call_count.fetch_add(1, Ordering::SeqCst);
-        Ok(Directive::idle())
+        std::future::ready(Ok(Directive::idle()))
     }
 }
 
@@ -192,12 +195,17 @@ impl WorkerAction for FlakyAction {
     type Payload = ();
     type Error = String;
 
-    async fn execute(&mut self, _cancel: &CancellationToken) -> Result<Directive, String> {
+    fn execute(
+        &mut self,
+        _cancel: &CancellationToken,
+    ) -> impl std::future::Future<Output = Result<Directive, String>> + Send {
         let idx = self.call_count.fetch_add(1, Ordering::SeqCst) as usize;
-        self.results
+        let result = self
+            .results
             .get(idx)
             .cloned()
-            .unwrap_or(Ok(Directive::sleep(Duration::from_hours(1))))
+            .unwrap_or(Ok(Directive::sleep(Duration::from_hours(1))));
+        std::future::ready(result)
     }
 }
 
@@ -286,9 +294,12 @@ impl WorkerAction for MultiSourceAction {
     type Payload = ();
     type Error = String;
 
-    async fn execute(&mut self, _cancel: &CancellationToken) -> Result<Directive, String> {
+    fn execute(
+        &mut self,
+        _cancel: &CancellationToken,
+    ) -> impl std::future::Future<Output = Result<Directive, String>> + Send {
         self.call_count.fetch_add(1, Ordering::SeqCst);
-        Ok(Directive::idle())
+        std::future::ready(Ok(Directive::idle()))
     }
 }
 
@@ -468,10 +479,13 @@ impl WorkerAction for VacuumAction {
     type Payload = ();
     type Error = String;
 
-    async fn execute(&mut self, _cancel: &CancellationToken) -> Result<Directive, String> {
+    fn execute(
+        &mut self,
+        _cancel: &CancellationToken,
+    ) -> impl std::future::Future<Output = Result<Directive, String>> + Send {
         self.call_count.fetch_add(1, Ordering::SeqCst);
         // Vacuum always self-schedules with a cooldown.
-        Ok(Directive::sleep(self.cooldown))
+        std::future::ready(Ok(Directive::sleep(self.cooldown)))
     }
 }
 
@@ -528,10 +542,13 @@ impl WorkerAction for PanickingAction {
     type Payload = ();
     type Error = String;
 
-    async fn execute(&mut self, _cancel: &CancellationToken) -> Result<Directive, String> {
+    fn execute(
+        &mut self,
+        _cancel: &CancellationToken,
+    ) -> impl std::future::Future<Output = Result<Directive, String>> + Send {
         let n = self.call_count.fetch_add(1, Ordering::SeqCst);
         assert!(n != self.panic_on_call, "segfault in row processor");
-        Ok(Directive::idle())
+        std::future::ready(Ok(Directive::idle()))
     }
 }
 
@@ -543,10 +560,87 @@ impl WorkerAction for StableAction {
     type Payload = ();
     type Error = String;
 
-    async fn execute(&mut self, _cancel: &CancellationToken) -> Result<Directive, String> {
+    fn execute(
+        &mut self,
+        _cancel: &CancellationToken,
+    ) -> impl std::future::Future<Output = Result<Directive, String>> + Send {
         self.call_count.fetch_add(1, Ordering::SeqCst);
-        Ok(Directive::idle())
+        std::future::ready(Ok(Directive::idle()))
     }
+}
+
+// ---- Regression: a panic thrown before the future is even constructed
+//      must still be caught by PanicPolicy::CatchAndRetry ----
+//
+// `WorkerAction::execute` is declared as `fn(...) -> impl Future<...> +
+// Send`, not `async fn`, so an implementor is free to run code -- and
+// therefore free to panic -- before it returns a future at all, not just
+// while that future is later polled. This action panics in exactly that
+// synchronous part. It pins the fix at the `CatchAndRetry` call site in
+// `task.rs`, which must evaluate `execute(...)` *inside* the future it
+// hands to `catch_unwind`, not while constructing that wrapper.
+
+struct SyncPanicAction {
+    panic_on_call: u32,
+    call_count: Arc<AtomicU32>,
+}
+
+impl WorkerAction for SyncPanicAction {
+    type Payload = ();
+    type Error = String;
+
+    fn execute(
+        &mut self,
+        _cancel: &CancellationToken,
+    ) -> impl std::future::Future<Output = Result<Directive, String>> + Send {
+        // Panics here, synchronously, before `std::future::ready(..)` is
+        // ever constructed -- i.e. before this call even returns a future.
+        let n = self.call_count.fetch_add(1, Ordering::SeqCst);
+        assert!(
+            n != self.panic_on_call,
+            "segfault before future construction"
+        );
+        std::future::ready(Ok(Directive::idle()))
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn sync_panic_before_future_is_caught_and_worker_keeps_running() {
+    // Same scenario as `panicking_worker_recovers_and_keeps_running`, but
+    // the panic happens before the returned future exists rather than
+    // during its poll -- the case `async fn` impls can never exercise.
+
+    let cancel = CancellationToken::new();
+    let notify = Arc::new(Notify::new());
+    let bad_count = Arc::new(AtomicU32::new(0));
+
+    let bad_action = SyncPanicAction {
+        panic_on_call: 0, // panic on first execute
+        call_count: bad_count.clone(),
+    };
+
+    let (poker_notify, _poker_handle) = poker(Duration::from_secs(1), cancel.clone());
+
+    let bad_worker = WorkerBuilder::new("sync-panic", cancel.clone())
+        .notifier(notify.clone())
+        .notifier(poker_notify)
+        .pacing(PacingConfig::default())
+        .on_panic(PanicPolicy::CatchAndRetry)
+        .build(bad_action);
+
+    let handle = tokio::spawn(bad_worker.run());
+
+    // Let it run — first call panics, subsequent calls succeed.
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    cancel.cancel();
+    handle.await.unwrap();
+
+    // The worker survived the panic and executed more times.
+    let calls = bad_count.load(Ordering::SeqCst);
+    assert!(
+        calls > 1,
+        "worker should have recovered from a pre-future panic and kept running, got {calls} calls",
+    );
 }
 
 #[tokio::test(start_paused = true)]

@@ -339,8 +339,7 @@ impl ReconciliationFramework {
                         CHECK_AR_DERIVED,
                         variance_minor,
                         within_tolerance,
-                    )
-                    .await?;
+                    )?;
                     Ok(ReconOutcome {
                         variance_minor,
                         within_tolerance,
@@ -464,8 +463,7 @@ impl ReconciliationFramework {
                         CHECK_PAYMENTS_PSP,
                         variance_minor,
                         within_tolerance,
-                    )
-                    .await?;
+                    )?;
                     Ok(ReconOutcome {
                         variance_minor,
                         within_tolerance,
@@ -594,8 +592,7 @@ impl ReconciliationFramework {
                                 CHECK_INVOICE_COMPLETENESS,
                                 variance_minor,
                                 within_tolerance,
-                            )
-                            .await?;
+                            )?;
                             Ok((
                                 ReconOutcome {
                                     variance_minor,
@@ -648,8 +645,7 @@ impl ReconciliationFramework {
                     CHECK_INVOICE_COMPLETENESS,
                     AlarmCategory::MissedPosting,
                     outcome.variance_minor,
-                )
-                .await;
+                );
             }
         }
         Ok(Some(run_id))
@@ -661,7 +657,7 @@ impl ReconciliationFramework {
         clippy::too_many_arguments,
         reason = "the event carries the full run identity + result"
     )]
-    async fn emit_completed_in_txn(
+    fn emit_completed_in_txn(
         publisher: &Arc<LedgerEventPublisher>,
         ctx: &SecurityContext,
         txn: &DbTx<'_>,
@@ -686,7 +682,6 @@ impl ReconciliationFramework {
                     at_utc: OffsetDateTime::now_utc(),
                 },
             )
-            .await
             .map_err(|e| DbError::Other(anyhow::anyhow!("publish reconciliation.completed: {e}")))
     }
 
@@ -726,14 +721,13 @@ impl ReconciliationFramework {
                 check_type,
                 AlarmCategory::ReconciliationVariance,
                 outcome.variance_minor,
-            )
-            .await;
+            );
         }
     }
 
     /// Raise a reconciliation alarm (fire-and-forget, out-of-band) with the catalog's
     /// severity for `category`.
-    async fn emit_alarm(
+    fn emit_alarm(
         &self,
         tenant: Uuid,
         check_type: &str,
@@ -750,8 +744,7 @@ impl ReconciliationFramework {
             affected: Vec::new(),
         };
         self.publisher
-            .emit_invariant_alarm(&SecurityContext::anonymous(), alarm)
-            .await;
+            .emit_invariant_alarm(&SecurityContext::anonymous(), alarm);
     }
 
     /// Resolve any OPEN `MISSED_POSTING` whose missing invoice has since been posted —

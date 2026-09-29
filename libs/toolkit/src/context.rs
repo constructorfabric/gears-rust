@@ -90,26 +90,31 @@ impl GearContextBuilder {
         self.internal_token_provider.as_ref()
     }
 
-    /// Build a gear-scoped context, resolving the `DbHandle` for the given
-    /// gear when the `db` feature is enabled.
-    ///
-    /// Kept `async` in both configurations so callers don't need cfg branches
-    /// around `.await`; under `not(feature = "db")` the future is ready on
-    /// first poll.
-    ///
-    /// # Errors
-    /// Returns an error if database resolution fails.
-    #[cfg_attr(not(feature = "db"), allow(clippy::unused_async))]
-    pub async fn for_gear(&self, gear_name: &str) -> anyhow::Result<GearCtx> {
-        let ctx = GearCtx::new(
+    /// Build the base gear-scoped context, before any database resolution.
+    fn base_ctx(&self, gear_name: &str) -> GearCtx {
+        GearCtx::new(
             Arc::<str>::from(gear_name),
             self.instance_id,
             self.config_provider.clone(),
             self.client_hub.clone(),
             self.root_token.child_token(),
         )
-        .with_internal_token_provider(self.internal_token_provider.clone());
-        #[cfg(feature = "db")]
+        .with_internal_token_provider(self.internal_token_provider.clone())
+    }
+
+    /// Build a gear-scoped context, resolving the `DbHandle` for the given
+    /// gear.
+    ///
+    /// The future returned here is awaited immediately by every caller, so
+    /// callers don't need cfg branches around `.await` even though only this
+    /// configuration genuinely suspends: see the `not(feature = "db")`
+    /// overload below, whose future is ready on first poll.
+    ///
+    /// # Errors
+    /// Returns an error if database resolution fails.
+    #[cfg(feature = "db")]
+    pub async fn for_gear(&self, gear_name: &str) -> anyhow::Result<GearCtx> {
+        let ctx = self.base_ctx(gear_name);
         let ctx = if let Some(mgr) = &self.db_manager
             && let Some(handle) = mgr.get(gear_name).await?
         {
@@ -118,6 +123,20 @@ impl GearContextBuilder {
             ctx
         };
         Ok(ctx)
+    }
+
+    /// Build a gear-scoped context.
+    ///
+    /// Without the `db` feature there is no database to resolve, so this
+    /// returns an already-ready future: callers can still `.await` it
+    /// uniformly with the `feature = "db"` overload above.
+    ///
+    /// # Errors
+    /// Never actually returns an error in this configuration; the `Result`
+    /// keeps the signature identical to the `feature = "db"` overload.
+    #[cfg(not(feature = "db"))]
+    pub fn for_gear(&self, gear_name: &str) -> std::future::Ready<anyhow::Result<GearCtx>> {
+        std::future::ready(Ok(self.base_ctx(gear_name)))
     }
 }
 

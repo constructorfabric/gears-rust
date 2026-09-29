@@ -5,9 +5,6 @@
 // STYLISTIC, none behavioural:
 //   * `integer_division` — deliberate minor-unit integer math with explicit,
 //     designed residual handling (banker's rounding / residual-to-last-segment);
-//   * `unused_async` — publisher methods stay `async` to match the future
-//     broker-wired signature (the event layer is parked, so they have no
-//     `.await` yet);
 //   * `cognitive_complexity` — several posting/recognition/FX functions exceed
 //     the threshold; refactoring financial logic purely to satisfy the metric
 //     is deferred (correctness-risk not worth the churn);
@@ -18,7 +15,6 @@
 // remain ENFORCED from the workspace table. Pay this down incrementally.
 #![allow(
     clippy::integer_division,
-    clippy::unused_async,
     clippy::cognitive_complexity,
     clippy::non_ascii_literal,
     clippy::redundant_pub_crate,

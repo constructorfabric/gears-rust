@@ -285,8 +285,7 @@ impl ChainVerifierJob {
                 affected: Vec::new(),
             };
             self.publisher
-                .emit_invariant_alarm(&SecurityContext::anonymous(), alarm)
-                .await;
+                .emit_invariant_alarm(&SecurityContext::anonymous(), alarm);
         }
     }
 
@@ -620,8 +619,7 @@ impl ChainVerifierJob {
             affected: Vec::new(),
         };
         self.publisher
-            .emit_invariant_alarm(&SecurityContext::anonymous(), alarm)
-            .await;
+            .emit_invariant_alarm(&SecurityContext::anonymous(), alarm);
     }
 
     /// Write the tenant-wide `scope_freeze` row, retrying a transient DB fault a

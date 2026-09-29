@@ -67,42 +67,52 @@ impl FakeExecutor {
 }
 
 impl ScriptExecutor for FakeExecutor {
-    async fn script_load(&self, source: &'static str) -> Result<String, Error> {
+    fn script_load(
+        &self,
+        source: &'static str,
+    ) -> impl Future<Output = Result<String, Error>> + Send {
         self.state.lock().expect("uncontended").loads.push(source);
         // A stand-in for the SHA the server computes: stable per source, as a
         // real one is.
-        Ok(format!("sha-of-{:x}", source.len()))
+        std::future::ready(Ok(format!("sha-of-{:x}", source.len())))
     }
 
-    async fn evalsha(&self, sha: &str, _key: &str, _args: &[Value]) -> Result<Value, Error> {
+    fn evalsha(
+        &self,
+        sha: &str,
+        _key: &str,
+        _args: &[Value],
+    ) -> impl Future<Output = Result<Value, Error>> + Send {
         self.state
             .lock()
             .expect("uncontended")
             .evalshas
             .push(sha.to_owned());
-        if self.outcome == EvalOutcome::Ok {
+        let result = if self.outcome == EvalOutcome::Ok {
             Ok(Value::Integer(1))
         } else {
             Err(Self::noscript())
-        }
+        };
+        std::future::ready(result)
     }
 
-    async fn eval_source(
+    fn eval_source(
         &self,
         source: &'static str,
         key: &str,
         _args: &[Value],
-    ) -> Result<Value, Error> {
+    ) -> impl Future<Output = Result<Value, Error>> + Send {
         self.state
             .lock()
             .expect("uncontended")
             .eval_sources
             .push((source, key.to_owned()));
-        if self.outcome == EvalOutcome::NoScript {
+        let result = if self.outcome == EvalOutcome::NoScript {
             Err(Self::noscript())
         } else {
             Ok(Value::Integer(1))
-        }
+        };
+        std::future::ready(result)
     }
 }
 
@@ -225,19 +235,31 @@ async fn a_second_noscript_is_a_provider_error_rather_than_an_unbounded_loop() {
 async fn a_non_noscript_failure_is_not_retried_at_all() {
     struct AlwaysDown;
     impl ScriptExecutor for AlwaysDown {
-        async fn script_load(&self, _source: &'static str) -> Result<String, Error> {
-            Ok("sha".to_owned())
+        fn script_load(
+            &self,
+            _source: &'static str,
+        ) -> impl Future<Output = Result<String, Error>> + Send {
+            std::future::ready(Ok("sha".to_owned()))
         }
-        async fn evalsha(&self, _sha: &str, _key: &str, _args: &[Value]) -> Result<Value, Error> {
-            Err(Error::new(ErrorKind::IO, "connection reset by peer"))
+        fn evalsha(
+            &self,
+            _sha: &str,
+            _key: &str,
+            _args: &[Value],
+        ) -> impl Future<Output = Result<Value, Error>> + Send {
+            std::future::ready(Err(Error::new(ErrorKind::IO, "connection reset by peer")))
         }
-        async fn eval_source(
+        fn eval_source(
             &self,
             _source: &'static str,
             _key: &str,
             _args: &[Value],
-        ) -> Result<Value, Error> {
-            panic!("an IO failure is not a script-cache miss and must not reach the recovery path")
+        ) -> impl Future<Output = Result<Value, Error>> + Send {
+            std::future::poll_fn(|_cx| {
+                panic!(
+                    "an IO failure is not a script-cache miss and must not reach the recovery path"
+                )
+            })
         }
     }
 

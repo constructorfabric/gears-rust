@@ -279,7 +279,6 @@ impl PostSidecar for SettlementReturnSidecar {
                     currency: self.currency.clone(),
                 },
             )
-            .await
             .map_err(|e| DomainError::Internal(format!("publish settlement_returned: {e}")))?;
         Ok(())
     }
@@ -370,7 +369,6 @@ impl PostSidecar for ChargebackSidecar {
                     variant: self.variant.as_str().to_owned(),
                 },
             )
-            .await
             .map_err(|e| DomainError::Internal(format!("publish dispute_recorded: {e}")))?;
         Ok(())
     }

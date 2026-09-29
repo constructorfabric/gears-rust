@@ -943,9 +943,12 @@ impl Gear for BssLedgerGear {
         // no-op publisher (events disabled). A financial post must never fail
         // because the events surface is misconfigured. The metrics handle backs
         // the alarm counter mirror even when the broker is absent.
-        let publisher = Arc::new(
-            build_event_publisher(ctx, &db, cfg.events_enabled, Arc::clone(&metrics)).await,
-        );
+        let publisher = Arc::new(build_event_publisher(
+            ctx,
+            &db,
+            cfg.events_enabled,
+            Arc::clone(&metrics),
+        ));
 
         // Platform PEP. Unlike events (graceful no-op), authz is
         // security-critical: a ledger must not run unauthorized, so a missing
@@ -1558,7 +1561,7 @@ impl Gear for BssLedgerGear {
 /// schemas (`crate::infra::events::schemas::register_event_schemas`), build one
 /// `AsyncProducer` per event type via `broker.producer_builder()...build_async()`,
 /// and return `LedgerEventPublisher::new(<producers>, db, metrics)`.
-async fn build_event_publisher(
+fn build_event_publisher(
     _ctx: &GearCtx,
     _db: &DBProvider<DbError>,
     events_enabled: bool,

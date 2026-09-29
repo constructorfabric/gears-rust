@@ -279,8 +279,7 @@ impl RecognitionRunner {
                     &seg.schedule_id,
                     seg.segment_no,
                     &seg.period_id,
-                )
-                .await;
+                );
                 continue;
             }
 
@@ -576,12 +575,12 @@ impl RecognitionRunner {
                 actual_minor: segment.amount_minor,
             }],
         };
-        self.publisher.emit_invariant_alarm(ctx, alarm).await;
+        self.publisher.emit_invariant_alarm(ctx, alarm);
     }
 
     /// Emit one out-of-band `RECOGNITION_PERIOD_QUEUED` `Warn` alarm for a segment
     /// parked out-of-order (design §4.6 / §6). Fire-and-forget; the run continues.
-    async fn emit_period_queued(
+    fn emit_period_queued(
         &self,
         ctx: &SecurityContext,
         tenant: Uuid,
@@ -603,7 +602,7 @@ impl RecognitionRunner {
             ),
             affected: Vec::new(),
         };
-        self.publisher.emit_invariant_alarm(ctx, alarm).await;
+        self.publisher.emit_invariant_alarm(ctx, alarm);
     }
 
     /// Map an already-account-bound recognition [`PostEntry`] to the engine's

@@ -1166,7 +1166,7 @@ impl RefundHandler {
                     actual_minor: 0,
                 }],
             };
-            self.publisher.emit_invariant_alarm(ctx, alarm).await;
+            self.publisher.emit_invariant_alarm(ctx, alarm);
         }
 
         Ok(business_id)
@@ -1408,7 +1408,7 @@ impl RefundHandler {
                 actual_minor: 0,
             }],
         };
-        self.publisher.emit_invariant_alarm(ctx, alarm).await;
+        self.publisher.emit_invariant_alarm(ctx, alarm);
         Ok(())
     }
 
@@ -1461,7 +1461,7 @@ impl RefundHandler {
                 actual_minor: 0,
             }],
         };
-        self.publisher.emit_invariant_alarm(ctx, alarm).await;
+        self.publisher.emit_invariant_alarm(ctx, alarm);
         Ok(())
     }
 
@@ -2167,7 +2167,7 @@ impl RefundHandler {
                 actual_minor: 0,
             }],
         };
-        self.publisher.emit_invariant_alarm(ctx, alarm).await;
+        self.publisher.emit_invariant_alarm(ctx, alarm);
 
         // Slice 7 Phase 2: ADDITIVELY open a durable close-blocking exception row
         // beside the alarm above (the escalation already logged + alarmed; this only
@@ -2350,7 +2350,7 @@ impl RefundHandler {
                     actual_minor: 0,
                 }],
             };
-            self.publisher.emit_invariant_alarm(ctx, alarm).await;
+            self.publisher.emit_invariant_alarm(ctx, alarm);
         }
 
         Ok(RefundOutcome::Quarantined(QuarantineHandle {
@@ -2587,7 +2587,7 @@ impl RefundHandler {
                 actual_minor: 0,
             }],
         };
-        self.publisher.emit_invariant_alarm(ctx, alarm).await;
+        self.publisher.emit_invariant_alarm(ctx, alarm);
         Ok(())
     }
 
@@ -3964,7 +3964,6 @@ impl PostSidecar for UnknownFinalSidecar {
                 txn,
                 refund_recorded_event(&self.refund_row, posted),
             )
-            .await
             .map_err(|e| {
                 DomainError::Internal(format!("publish refund_recorded (unknown_final): {e}"))
             })?;
@@ -4058,7 +4057,6 @@ impl PostSidecar for RefundPostSidecar {
                 txn,
                 refund_recorded_event(&self.refund_row, posted),
             )
-            .await
             .map_err(|e| DomainError::Internal(format!("publish refund_recorded: {e}")))?;
         Ok(())
     }

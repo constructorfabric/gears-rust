@@ -22,18 +22,27 @@ workspace = true
 # takes no context at all.
 toolkit-contract = { workspace = true, features = ["rest-client", "grpc-client"] }
 toolkit-contract-macros = { workspace = true }
+# `#[toolkit::provides]`'s generated body names `::toolkit::GearCtx` /
+# `::toolkit::ClientHub` / `::toolkit::wiring::*` directly, so exercising it
+# end to end (see `tests/provides_transport_shape.rs`) needs the runtime
+# crate, not just `toolkit-contract`.
+toolkit = { workspace = true }
 
 # Test framework
 trybuild = { workspace = true }
 
 # Required by UI test cases
+anyhow = { workspace = true }
 async-trait = { workspace = true }
 # The streaming projections emit `Pin<Box<dyn futures_core::Stream>>`, so a UI
 # case that names that type needs the crate in scope.
 futures-core = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
+tokio-util = { workspace = true }
 thiserror = { workspace = true }
 toolkit-security = { workspace = true }
+tracing = { workspace = true }
 secrecy = { workspace = true }
 uuid = { workspace = true }

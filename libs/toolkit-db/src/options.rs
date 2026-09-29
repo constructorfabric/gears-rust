@@ -76,13 +76,14 @@ impl DbConnectOptions {
     ///
     /// # Errors
     /// Returns an error if the database connection fails.
+    #[cfg(any(feature = "sqlite", feature = "pg", feature = "mysql"))]
     pub async fn connect(
         &self,
         pool: PoolCfg,
         lock_keepalive: std::time::Duration,
     ) -> Result<DbHandle> {
-        // Referenced here so the parameter is "used" in SQLite-only / no-backend builds where the
-        // PG/MySQL arms below are compiled out.
+        // Referenced here so the parameter is "used" in SQLite-only builds where the PG/MySQL
+        // arms below are compiled out.
         let _ = lock_keepalive;
         match self {
             #[cfg(feature = "sqlite")]
@@ -168,11 +169,25 @@ impl DbConnectOptions {
 
                 Ok(handle)
             }
-            #[cfg(not(any(feature = "sqlite", feature = "pg", feature = "mysql")))]
-            _ => {
-                unreachable!("No database features enabled")
-            }
         }
+    }
+
+    /// Connect to the database using the configured options.
+    ///
+    /// `lock_keepalive` sets the ping interval for the dedicated advisory-lock session
+    /// (PG/MySQL only; ignored for SQLite/file locks).
+    ///
+    /// # Errors
+    /// Returns an error if the database connection fails.
+    #[cfg(not(any(feature = "sqlite", feature = "pg", feature = "mysql")))]
+    pub fn connect(
+        &self,
+        _pool: PoolCfg,
+        _lock_keepalive: std::time::Duration,
+    ) -> std::future::Ready<Result<DbHandle>> {
+        // No database feature is enabled, so `DbConnectOptions` has no variants and no value of
+        // this type can exist — the same invariant the old body expressed with `unreachable!()`.
+        match *self {}
     }
 }
 

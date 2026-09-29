@@ -413,7 +413,6 @@ impl PostSidecar for RecognitionStampSidecar {
                     currency: self.currency.clone(),
                 },
             )
-            .await
             .map_err(|e| DomainError::Internal(format!("publish revenue_recognized: {e}")))?;
 
         Ok(())
@@ -547,7 +546,6 @@ impl PostSidecar for RecognitionReversalSidecar {
                     currency: self.currency.clone(),
                 },
             )
-            .await
             .map_err(|e| {
                 DomainError::Internal(format!("publish revenue_recognition_reversed: {e}"))
             })?;

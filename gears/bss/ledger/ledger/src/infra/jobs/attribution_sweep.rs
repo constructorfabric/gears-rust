@@ -28,7 +28,7 @@
 //! without standing up the AuthZ/Tenant service. Without the resolver there is
 //! nothing to compare against, so [`AttributionSweepJob::run`] is a documented
 //! no-op: it logs (at debug) that attribution-drift detection is inactive
-//! pending the resolver, and returns `Ok(())`.
+//! pending the resolver.
 //!
 //! ## The drop-in future
 //!
@@ -53,8 +53,10 @@ use crate::infra::events::publisher::LedgerEventPublisher;
 /// infrastructure fault (DB unreachable / read failure). Detected drift will be
 /// reported via an alarm, never as `Err` — same as tie-out and the Verifier.
 ///
-/// In the MVP no-op seam no variant is constructed yet; it exists so the
-/// resolver-wired future slots in without changing the public signature.
+/// Nothing constructs this yet: the MVP `run()` is a no-op seam (the resolver
+/// is not wired), so it has no infrastructure read to fail. The resolver-wired
+/// `run()` returns `Result<(), SweepError>` and raises [`SweepError::Db`] on
+/// an infrastructure read failure.
 #[derive(Debug, thiserror::Error)]
 pub enum SweepError {
     /// Storage / connection failure (driver text bounded by the caller).
@@ -86,21 +88,20 @@ impl AttributionSweepJob {
     /// **MVP: documented no-op.** Resolving each entry's `resource_tenant_id`
     /// to its nearest `self_managed` ancestor needs the `TenantResolverClient`,
     /// which is not wired into this gear (hermetic-test constraint). With no
-    /// resolver there is nothing to compare, so this logs that detection is
-    /// inactive and returns `Ok(())`. The resolver wiring, the per-entry
-    /// `resource_tenant` → `payer_tenant` comparison, and the
+    /// resolver there is nothing to compare, so this just logs that detection
+    /// is inactive. The resolver wiring, the per-entry `resource_tenant` →
+    /// `payer_tenant` comparison, and the
     /// [`crate::infra::events::payloads::AlarmCategory::PayerAttributionDrift`]
     /// emission are the drop-in future (see the module docs).
     ///
-    /// # Errors
-    /// Never `Err` in the MVP seam. The resolver-wired future returns
-    /// [`SweepError::Db`] on an infrastructure read failure; detected drift is
-    /// reported via an alarm, not as `Err`.
-    #[allow(
-        clippy::unused_async,
-        reason = "async kept to match the resolver-wired future + the other jobs' run() shape"
-    )]
-    pub async fn run(&self) -> Result<(), SweepError> {
+    /// The MVP seam cannot fail — it touches neither the database nor the
+    /// resolver — so it returns nothing. The resolver-wired implementation
+    /// will return `Result<(), SweepError>` and raise [`SweepError::Db`] on an
+    /// infrastructure read failure.
+    // Synchronous for now: the other jobs' `run()` methods are `async` because
+    // they actually `.await` DB work; this one has none until the resolver seam
+    // is wired (see the module docs), so it stays a plain `fn` until then.
+    pub fn run(&self) {
         // Touch the held wiring so it is not dead-code in the MVP seam; the
         // resolver-wired future enumerates lines via `self.db` and alarms via
         // `self.publisher`.
@@ -109,6 +110,5 @@ impl AttributionSweepJob {
             "bss-ledger: attribution-drift sweep is inactive pending the AuthZ/Tenant resolver \
              (§4.7 payer-attribution-drift detective seam); no-op"
         );
-        Ok(())
     }
 }

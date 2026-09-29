@@ -68,14 +68,17 @@ impl RecordingAuthenticator {
 }
 
 impl InternalAuthenticator for RecordingAuthenticator {
-    async fn authenticate(&self, token: &str) -> Result<PlatformIdentity, InternalAuthNError> {
+    fn authenticate(
+        &self,
+        token: &str,
+    ) -> impl Future<Output = Result<PlatformIdentity, InternalAuthNError>> + Send {
         self.seen
             .lock()
             .expect("not poisoned")
             .push(token.to_owned());
-        Ok(PlatformIdentity::Shared {
+        std::future::ready(Ok(PlatformIdentity::Shared {
             name: "recorded".to_owned(),
-        })
+        }))
     }
 }
 
@@ -239,10 +242,13 @@ impl pstub::cluster_profile_api_server::ClusterProfileApi for IdentityRecordingP
 struct TokenNames;
 
 impl InternalAuthenticator for TokenNames {
-    async fn authenticate(&self, token: &str) -> Result<PlatformIdentity, InternalAuthNError> {
-        Ok(PlatformIdentity::Shared {
+    fn authenticate(
+        &self,
+        token: &str,
+    ) -> impl Future<Output = Result<PlatformIdentity, InternalAuthNError>> + Send {
+        std::future::ready(Ok(PlatformIdentity::Shared {
             name: format!("caller-{token}"),
-        })
+        }))
     }
 }
 

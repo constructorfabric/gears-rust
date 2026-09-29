@@ -286,16 +286,14 @@ impl AgedAlarmJob {
             .await
         {
             Ok(rows) => {
-                self.emit_queue_alarms(AlarmCategory::AgedAllocationQueue, &rows)
-                    .await;
+                self.emit_queue_alarms(AlarmCategory::AgedAllocationQueue, &rows);
             }
             Err(e) => tracing::error!(error = %e,
                 "bss-ledger: aged allocation-queue scan failed (infra); continuing"),
         }
         match self.aged_queue_rows(FLOW_CHARGEBACK, now, threshold).await {
             Ok(rows) => {
-                self.emit_queue_alarms(AlarmCategory::DisputePhaseQueued, &rows)
-                    .await;
+                self.emit_queue_alarms(AlarmCategory::DisputePhaseQueued, &rows);
             }
             Err(e) => tracing::error!(error = %e,
                 "bss-ledger: aged chargeback-queue scan failed (infra); continuing"),
@@ -303,7 +301,7 @@ impl AgedAlarmJob {
 
         // --- Aged unallocated grains, per tenant (isolated failures).
         match self.aged_unallocated_grains(now, threshold).await {
-            Ok(rows) => self.emit_unallocated_alarms(&rows).await,
+            Ok(rows) => self.emit_unallocated_alarms(&rows),
             Err(e) => tracing::error!(error = %e,
                 "bss-ledger: aged unallocated scan failed (infra); continuing"),
         }
@@ -317,7 +315,7 @@ impl AgedAlarmJob {
                 "bss-ledger: aged refund-clearing scan failed (infra); continuing"),
         }
         match self.stage1_orphan_refunds(now).await {
-            Ok(rows) => self.emit_stage1_orphan_alarms(&rows).await,
+            Ok(rows) => self.emit_stage1_orphan_alarms(&rows),
             Err(e) => tracing::error!(error = %e,
                 "bss-ledger: stage-1 orphan-refund scan failed (infra); continuing"),
         }
@@ -326,7 +324,7 @@ impl AgedAlarmJob {
         //     window (design §4.5 / AC #17). In-window negatives are a legitimate reversal;
         //     only a CLOSED (prior) filing period that is negative pages Revenue Assurance.
         match self.negative_tax_subbalances(now).await {
-            Ok(rows) => self.emit_negative_tax_alarms(&rows).await,
+            Ok(rows) => self.emit_negative_tax_alarms(&rows),
             Err(e) => tracing::error!(error = %e,
                 "bss-ledger: negative-tax-subbalance scan failed (infra); continuing"),
         }
@@ -667,8 +665,7 @@ impl AgedAlarmJob {
                 AlarmSeverity::Warn,
                 &detail,
                 affected,
-            )
-            .await;
+            );
         }
 
         // 14-day Page: the close-blocking STUCK_REFUND_CLEARING exception (Critical).
@@ -700,8 +697,7 @@ impl AgedAlarmJob {
                 AlarmSeverity::Critical,
                 &detail,
                 affected,
-            )
-            .await;
+            );
 
             // Slice 7 Phase 2: ADDITIVELY open a durable close-blocking exception row
             // beside the alarm above. One deduped OPEN row per tenant (fixed
@@ -724,7 +720,7 @@ impl AgedAlarmJob {
     /// orphaned stage-1 refund (paged to Revenue Assurance), carrying the orphan
     /// psp-refund ids (capped) + their amounts/ages. Bumps
     /// `ledger_stage1_refund_orphan_total` per orphan (design §9).
-    async fn emit_stage1_orphan_alarms(&self, orphans: &[Stage1OrphanRefund]) {
+    fn emit_stage1_orphan_alarms(&self, orphans: &[Stage1OrphanRefund]) {
         let mut by_tenant: HashMap<Uuid, Vec<&Stage1OrphanRefund>> = HashMap::new();
         for o in orphans {
             by_tenant.entry(o.tenant_id).or_default().push(o);
@@ -758,8 +754,7 @@ impl AgedAlarmJob {
                 AlarmSeverity::Warn,
                 &detail,
                 affected,
-            )
-            .await;
+            );
         }
     }
 
@@ -809,7 +804,7 @@ impl AgedAlarmJob {
     /// per grain — each `(jurisdiction, filing-period)` discrepancy is a distinct
     /// reconciliation item Revenue Assurance triages. Re-detected each tick while the
     /// negative persists.
-    async fn emit_negative_tax_alarms(&self, grains: &[NegativeTaxGrain]) {
+    fn emit_negative_tax_alarms(&self, grains: &[NegativeTaxGrain]) {
         for g in grains {
             let detail = format!(
                 "tax_subbalance negative beyond filing window: jurisdiction={} filing_period={} balance_minor={}",
@@ -839,8 +834,7 @@ impl AgedAlarmJob {
                 AlarmSeverity::Critical,
                 &detail,
                 affected,
-            )
-            .await;
+            );
         }
     }
 
@@ -848,7 +842,7 @@ impl AgedAlarmJob {
     /// against `tenant` — the severity-parameterized twin of [`Self::emit`] (which
     /// is hard-wired to `Warn`). Used by the refund-clearing path, where the 14-day
     /// `STUCK_REFUND_CLEARING` page is `Critical` (design §13).
-    async fn emit_with_severity(
+    fn emit_with_severity(
         &self,
         tenant_id: Uuid,
         category: AlarmCategory,
@@ -867,13 +861,12 @@ impl AgedAlarmJob {
             affected,
         };
         self.publisher
-            .emit_invariant_alarm(&SecurityContext::anonymous(), alarm)
-            .await;
+            .emit_invariant_alarm(&SecurityContext::anonymous(), alarm);
     }
 
     /// Emit one `Warn` alarm per tenant that has at least one aged queue row for
     /// `category`, carrying the aged business ids (capped) as `affected`.
-    async fn emit_queue_alarms(&self, category: AlarmCategory, aged: &[AgedQueueItem]) {
+    fn emit_queue_alarms(&self, category: AlarmCategory, aged: &[AgedQueueItem]) {
         // Group the aged rows by tenant — one alarm per (tenant, category).
         let mut by_tenant: HashMap<Uuid, Vec<&AgedQueueItem>> = HashMap::new();
         for item in aged {
@@ -904,13 +897,13 @@ impl AgedAlarmJob {
                 })
                 .take(MAX_AFFECTED)
                 .collect();
-            self.emit(tenant_id, category, &detail, affected).await;
+            self.emit(tenant_id, category, &detail, affected);
         }
     }
 
     /// Emit one `AGED_UNALLOCATED` `Warn` alarm per tenant with at least one aged
     /// parked grain, carrying the grain keys (capped) + their balances/ages.
-    async fn emit_unallocated_alarms(&self, aged: &[AgedUnallocatedGrain]) {
+    fn emit_unallocated_alarms(&self, aged: &[AgedUnallocatedGrain]) {
         let mut by_tenant: HashMap<Uuid, Vec<&AgedUnallocatedGrain>> = HashMap::new();
         for g in aged {
             by_tenant.entry(g.tenant_id).or_default().push(g);
@@ -940,15 +933,14 @@ impl AgedAlarmJob {
                 })
                 .take(MAX_AFFECTED)
                 .collect();
-            self.emit(tenant_id, AlarmCategory::AgedUnallocated, &detail, affected)
-                .await;
+            self.emit(tenant_id, AlarmCategory::AgedUnallocated, &detail, affected);
         }
     }
 
     /// Emit one fire-and-forget `Warn` invariant alarm for `category` against
     /// `tenant`. Mirrors [`crate::infra::jobs::tieout::TieOutJob::emit`] but at
     /// `Warn` (aged alarms flag latency, not a books defect).
-    async fn emit(
+    fn emit(
         &self,
         tenant_id: Uuid,
         category: AlarmCategory,
@@ -966,8 +958,7 @@ impl AgedAlarmJob {
             affected,
         };
         self.publisher
-            .emit_invariant_alarm(&SecurityContext::anonymous(), alarm)
-            .await;
+            .emit_invariant_alarm(&SecurityContext::anonymous(), alarm);
     }
 }
 

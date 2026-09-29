@@ -149,23 +149,24 @@ mod extract {
 
     impl<T, S> FromRequestParts<S> for QueryParamsExtractor<T>
     where
-        T: DeserializeOwned,
+        T: DeserializeOwned + Send,
         S: Send + Sync,
     {
         type Rejection = Response;
 
-        async fn from_request_parts(
+        fn from_request_parts(
             parts: &mut Parts,
             _state: &S,
-        ) -> Result<Self, Self::Rejection> {
+        ) -> impl std::future::Future<Output = Result<Self, Self::Rejection>> + Send {
             let raw = parts.uri.query().unwrap_or_default();
-            match serde_html_form::from_str::<T>(raw) {
+            let result = match serde_html_form::from_str::<T>(raw) {
                 Ok(value) => Ok(Self(value)),
                 Err(e) => Err(QueryError::invalid_argument()
                     .with_field_violation("query", format!("{e}"), "INVALID_QUERY_STRING")
                     .create()
                     .into_response()),
-            }
+            };
+            std::future::ready(result)
         }
     }
 }
