@@ -604,6 +604,20 @@ Expiry **MUST** be handled without any background job:
 - **Rationale**: Expiry needs no resident reaper or scheduled job when every read ignores expired records and every write reclaims them.
 - **Actors**: `cpt-cf-credstore-actor-tenant-admin`, `cpt-cf-credstore-actor-integrations-admin`
 
+#### Store Adapter Portability
+
+- [ ] `p1` - **ID**: `cpt-cf-credstore-fr-store-portability`
+
+The store adapter (`cpt-cf-credstore-interface-plugin-client`) **MUST** stay replaceable by another backend — a relational database, an embedded database, or an in-process store for tests — without changing the gear's behaviour or its consumers:
+
+- its operations **MUST NOT** expose store-specific types: the version is an opaque monotonic number, and failures map to not-found, conflict, unavailable (with a retry hint when known) or other; authentication, token renewal, TLS and the installation prefix **MUST** stay inside each implementation;
+- no `p1` guarantee **MUST** depend on the store's own configuration: the only property required of a backend is an atomic conditional write to a single key, the gear **MUST** state the expected version on every write itself, and a tombstone **MUST** be an ordinary conditional write. Store configuration is relied on only by `p2` requirements (`cpt-cf-credstore-fr-store-config-check`, `cpt-cf-credstore-fr-no-secret-history`);
+- `p1` **MUST NOT** use capabilities specific to Vault-compatible stores, such as namespaces, custom metadata or soft delete.
+
+- **Rationale**: Keeping the adapter narrow and store-neutral lets tests and development run on an in-process or embedded backend, and leaves a pluggable production backend possible later; a backend other than a Vault-compatible store would additionally need its own encryption of secrets at rest, which this PRD does not specify.
+- **Actors**: `cpt-cf-credstore-actor-backend`, `cpt-cf-credstore-actor-platform-gear`
+- **Verification Method**: the in-process adapter and the Vault-compatible adapter pass the same adapter test suite.
+
 #### Derived Credential Index
 
 - [ ] `p1` - **ID**: `cpt-cf-credstore-fr-derived-index`
@@ -813,7 +827,7 @@ The gear **MUST** emit metrics sufficient to detect resolution anomalies and sto
 
 - **Type**: Rust trait (async), internal to the gear.
 - **Stability**: unstable
-- **Description**: The gear's only path to the secret store, with no store-specific types in its operations: read a record with its version, conditionally write a record (only if absent, or only if the stated version is current), delete a record while keeping its version history, remove a key entirely (p2 offboarding only), and list keys under a prefix. Keys are opaque to it; failures map to not-found, conflict, unavailable (with a retry hint when known) or other. It carries no policy and makes no visibility decision; authentication, token renewal, TLS and the installation prefix are internal to each implementation. Implemented for Vault-compatible KV version 2 and, for tests, in process. Shaped so that it can later become a pluggable backend SPI without changing consumers. Replaces the shipped value-store plugin SPI.
+- **Description**: The gear's only path to the secret store, with no store-specific types in its operations: read a record with its version, conditionally write a record (only if absent, or only if the stated version is current), delete a record while keeping its version history, remove a key entirely (p2 offboarding only), and list keys under a prefix. Keys are opaque to it; failures map to not-found, conflict, unavailable (with a retry hint when known) or other. It carries no policy and makes no visibility decision; authentication, token renewal, TLS and the installation prefix are internal to each implementation. Implemented for Vault-compatible KV version 2 and, for tests, in process. Shaped so that it can later become a pluggable backend SPI without changing consumers (`cpt-cf-credstore-fr-store-portability`). Replaces the shipped value-store plugin SPI.
 - **Breaking Change Policy**: minor version bump (unstable API).
 
 ### 7.2 External Integration Contracts
