@@ -213,9 +213,12 @@ called at **every** content-write entry point rather than each path re-implement
 - `create_file`'s idempotency-replay path (when a stored `idempotency_key` record matches the
   retried request) re-validates allowed-mime and metadata limits against the **current** effective policy rather
   than the policy in effect at the original call, recomputes the effective size ceiling from that current policy
-  and re-mints the upload URL under it, and re-runs the quota preflight — so a policy tightened (or a quota
-  exhausted) after the original `create_file` call is enforced on every replay for as long as the idempotency
-  window stays open
+  and re-mints the upload URL under it, and re-runs the quota preflight — so a policy tightened after the
+  original `create_file` call is unconditionally re-checked on every replay for as long as the idempotency
+  window stays open. Quota re-check applies only when a quota client is configured, which no deployment does
+  today (§6 Acceptance Criteria notes `cpt-cf-file-storage-fr-storage-quota` is not enforced in any real
+  deployment), so a quota exhausted after the original call is not actually enforceable on replay in any real
+  deployment
 
 **Steps**:
 1. [x] - `p1` - `check_allowed_mime`: `None` `allowed_mime_types` on the effective policy permits everything; `Some([])` permits nothing; `Some(list)` requires an exact match or a `type/*` wildcard match - `inst-enforce-mime`

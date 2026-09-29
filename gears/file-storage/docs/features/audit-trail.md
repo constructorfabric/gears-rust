@@ -240,11 +240,15 @@ against this exact shape.
 The system **MUST** insert exactly one `audit_outbox` row, in the same DB
 transaction as the mutation, for every write operation: `create_file`,
 `finalize_upload`/`finalize_upload_by_token`, `bind`, `update_metadata`,
-`delete_file`, `delete_version`, `complete_multipart_upload`,
-`abort_multipart_upload`, `transfer_ownership`, `migrate_backend`, and the
+`delete_file`, `delete_version`, `abort_multipart_upload`,
+`transfer_ownership`, `migrate_backend`, and the
 cleanup engine's `RetentionDelete`/`OrphanReconcile`/expired-multipart-session
-`MultipartAbort` deletions. A rolled-back mutation (failed CAS/`If-Match`,
-CAS predicate matching zero rows) **MUST** leave zero new audit rows.
+`MultipartAbort` deletions. **Exception:** `complete_multipart_upload` inserts, in that same
+transaction, one `finalize_version` row (always) and one `multipart_complete` row (when this call
+is the one that actually completes the session) — plus a third `patch_content` row when the
+upload's `bind: "auto"` claim wins its content-CAS swap in the same transaction. A rolled-back
+mutation (failed CAS/`If-Match`, CAS predicate matching zero rows) **MUST** leave zero new audit
+rows.
 
 **Implements**:
 - `cpt-cf-file-storage-flow-audit-trail-record-write`
@@ -303,7 +307,10 @@ tested.
 - [x] Updating metadata leaves exactly one `patch_metadata` audit row
 - [x] Deleting a file leaves exactly one `delete_file` audit row
 - [x] Deleting a version leaves exactly one `delete_version` audit row
-- [x] Completing a multipart upload leaves exactly one `multipart_complete` row and exactly one `finalize_version` row
+- [x] Completing a multipart upload leaves exactly one `finalize_version` row and, when this call is the
+  one that completes the session, exactly one `multipart_complete` row; when the upload was also
+  `bind: "auto"` and its content-CAS swap wins in the same transaction, a third `patch_content` row is
+  added
 - [x] A failed metadata CAS (stale metadata revision) leaves **no** new audit row — proves the same-transaction atomicity guarantee
 - [x] A failed bind (stale `If-Match`) leaves **no** new audit row
 - [x] Transferring ownership leaves exactly one `transfer_ownership` audit row; a CAS-losing transfer (target row not found) leaves **no** audit row and **no** file event

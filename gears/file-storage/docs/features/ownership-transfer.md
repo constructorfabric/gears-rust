@@ -136,7 +136,7 @@ owner changed but no audit trail exists for it, or vice versa.
 - File not found, or `transfer_ownership_atomic`'s scoped `UPDATE` matches
   zero rows (e.g. concurrent delete) — `404` (`FileNotFound`); **no** audit
   row and **no** file event are written in this case (proven by
-  proven by a dedicated regression test)
+  a dedicated regression test)
 - Caller lacks `WRITE` authorization on the file — `403`
 
 **Steps**:

@@ -79,10 +79,13 @@ planes:
 * **Data plane** — the **sidecar**. It has its own domain and URL and is the only component that
   moves user bytes. It is connected to N storage backends and validates the signed-URL signature
   (and a platform token only when the signed URL carries a token-claim predicate — see DESIGN §3.2).
-  **Shipped path (P2):** the sidecar reaches the control plane over a **plain, token-authenticated
-  HTTP callback** — `POST .../versions/{version_id}/finalize` after a successful `PUT`, and
+  **Shipped path (P2):** the sidecar reaches the control plane over a
+  **token-authenticated HTTP callback** — `POST .../versions/{version_id}/finalize` after a successful `PUT`, and
   `POST .../multipart/{upload_id}/parts/{n}/report` after a successful part write — both authorized
-  solely by the **same signed `fs-token`** that authorized the original operation. There is no FS SDK
+  solely by the **same signed `fs-token`** that authorized the original operation. These callbacks are
+  token-authenticated HTTP inside the deployment's trusted network boundary; when the callback path
+  crosses an untrusted or shared network it **MUST** use TLS (or equivalent authenticated encryption),
+  otherwise the internal token and the callback payload travel in cleartext. There is no FS SDK
   s2s call, no app-token, and no on-behalf-of delegation: the control plane treats a verified token as
   full authorization for that one `(file_id, version_id)` operation. The sidecar holds **no** direct
   database connection and is a thin, stateless byte-mover. It never binds a version as the file's
@@ -187,7 +190,10 @@ emergency revocation is the platform auth module's token revocation, not the URL
   When configured, `finalize`/`report-part` additionally require a `x-fs-internal-token` header
   matching the configured secret (constant-time comparison via `ring::constant_time`,
   `handlers::FinalizeAuth`), checked *after* `fs-token` verification; a missing/mismatched header is
-  a `403`. The sidecar sends this header (from `FS_SIDECAR_INTERNAL_TOKEN`) on both callbacks when
+  a `403`. Like the `fs-token` callback authorization above, this header is token-authenticated HTTP
+  within the deployment's trusted network boundary; it too **MUST** travel over TLS (or equivalent
+  authenticated encryption) when the callback path crosses an untrusted or shared network, since the
+  shared secret alone gives the header no confidentiality in transit. The sidecar sends this header (from `FS_SIDECAR_INTERNAL_TOKEN`) on both callbacks when
   configured; an unset secret on the control plane preserves pre-0.1 behavior (token-only trust),
   while a control plane that has the secret set answers `403` to any sidecar not yet sending the
   header, so **the rollout order matters**: (1) redeploy every sidecar talking to the control plane with the matching

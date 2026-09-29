@@ -287,12 +287,14 @@ inconsistency rather than a considered choice.
 
 **What it is.** A query on a hot endpoint, or an FK column with no index of its own, has no covering
 index — forcing a sequential scan, or forcing a cascading `DELETE` on the referenced table to scan the
-*entire* referencing table to find rows to cascade. A subtler variant: a partial index exists but its
-predicate doesn't textually match what the query filters on, so the planner never picks it. Looks like: a
+*entire* referencing table to find rows to cascade. A subtler variant: PostgreSQL's planner only uses a
+partial index when it can prove the query's `WHERE` clause logically implies the index's predicate — it
+proves simple implications, including some inequalities, but this is not a requirement that the two
+predicates textually match. Looks like: a
 `WHERE`/`ORDER BY` with no index whose leading columns match the equality predicates and trailing column
 matches the sort; a child table's FK column with no index at all; a partial index built `WHERE status =
-'x'` next to a query filtering `WHERE status IN ('x', 'y')` — never selected, since its predicate doesn't
-subsume the query's.
+'x'` next to a query filtering `WHERE status IN ('x', 'y')` — never selected, since the query's `IN`
+predicate doesn't imply the index's `status = 'x'` predicate.
 
 **How to find it.** Build the "query → serving index → hot or background path" table from
 [How to run an audit](#how-to-run-an-audit) for every repository method. For each row: does an index exist

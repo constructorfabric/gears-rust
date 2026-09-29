@@ -120,10 +120,11 @@ User-facing interactions that start with an actor (human or external system) and
 3. [x] - `p1` - API: validate declared_size <= effective per-file size limit; RETURN 400 if exceeded - `inst-init-size-check`
 4. [x] - `p1` - API: validate declared_size against storage quota; RETURN 429 if exceeded - `inst-init-quota-check`
 5. [x] - `p1` - Algorithm: compute parts plan using `cpt-cf-file-storage-algo-compute-parts-plan` - `inst-init-plan`
-6. [x] - `p1` - DB: INSERT into multipart_uploads (upload_id, file_id, version_id, declared_size, part_size, state=in_progress, expires_at) - `inst-init-db-session`
-7. [x] - `p1` - DB: INSERT pending version row into file_versions (version_id, file_id, status=pending) - `inst-init-db-version`
-8. [x] - `p1` - FOR EACH part in the plan: mint a signed URL (Ed25519, codec-equivalent to PASETO v4.public -- ADR-0004's Implementation note) with claims {upload_id, file_id, version_id, part_number, offset, size, op="multipart_part", exp} - `inst-init-sign-urls`
-9. [x] - `p1` - RETURN 200 {upload_id, version_id, part_hash_algorithm, part_size, parts: [{part_number, offset, size, upload_url}], expires_at} - `inst-init-return`
+6. [x] - `p1` - DB: INSERT pending version row into file_versions (version_id, file_id, status=pending) - `inst-init-db-version`
+7. [x] - `p1` - Backend: initiate_multipart(backend_path) -- obtain the backend's multipart upload handle - `inst-init-backend-initiate`
+8. [x] - `p1` - DB: INSERT into multipart_uploads (upload_id, file_id, version_id, backend_upload_handle, declared_size, part_size, state=in_progress, expires_at); on failure, best-effort compensate (abort the backend upload and the pending version) - `inst-init-db-session`
+9. [x] - `p1` - FOR EACH part in the plan: mint a signed URL (Ed25519, codec-equivalent to PASETO v4.public -- ADR-0004's Implementation note) with claims {upload_id, file_id, version_id, part_number, offset, size, op="multipart_part", exp} - `inst-init-sign-urls`
+10. [x] - `p1` - RETURN 200 {upload_id, version_id, part_hash_algorithm, part_size, parts: [{part_number, offset, size, upload_url}], expires_at} - `inst-init-return`
 
 ### Upload a Part
 
@@ -146,7 +147,10 @@ User-facing interactions that start with an actor (human or external system) and
   merely undocumented.
 
 **Error Scenarios**:
-- Request body length does not match the size claim in the signed token -- 413 before any bytes written
+- Request body length does not match the size claim in the signed token: an oversized body is aborted
+  mid-stream with `413` (on the offset-object path, bytes already reached the backend before the abort and
+  are then deleted; see [Enforce Per-Part Size Claim at Sidecar](#enforce-per-part-size-claim-at-sidecar)); a
+  short body is `400 Bad Request`
 - Signed token is invalid, expired, or tampered -- 403
 - Sidecar backend write failure -- 500
 

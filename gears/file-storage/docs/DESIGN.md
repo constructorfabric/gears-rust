@@ -1735,7 +1735,7 @@ methods: `record_operation`, `record_backend_error`, `record_quota_denied`, `rec
 | Efficiency | Lead time for change | One additive migration per change, upgrade and rollback in `operations.md` |
 | Efficiency | Cost per delivered feature | Platform delivery metrics |
 | Efficiency | Infrastructure cost per transaction/workflow | `record_ingress_bytes`, `record_egress_bytes`; fixed number of control-plane calls per upload (2, or N + 2 for multipart) |
-| Efficiency | Infrastructure cost per tenant/service | Storage usage reporting per owner and tenant (`usage-collector` contract) plus egress bytes |
+| Efficiency | Infrastructure cost per tenant/service | `record_egress_bytes` — observed; storage usage per owner and tenant via the `usage-collector` contract — not observed yet (integration not wired; no deployment configures a usage reporter) |
 | Reliability | MTTR | Stateless control plane and sidecar restart without recovery work; finalize-then-bind leaves no half-applied state to repair |
 | Reliability | MTBF | Platform monitoring |
 | Reliability | Failed workflow rate | `record_operation(op, result)` |

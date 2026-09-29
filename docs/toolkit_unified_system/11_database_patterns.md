@@ -190,9 +190,10 @@ Rules:
 takes a real row lock (checked in `sea-query`'s `backend/{postgres,mysql}/query.rs`). On
 SQLite it renders **nothing** — `backend/sqlite/query.rs`'s `prepare_select_lock` is a
 literal no-op ("SQLite doesn't supports row locking"), so `.lock(..)` silently compiles to a
-plain `SELECT` there. Correctness on SQLite instead comes from having a single writer: any
-write takes a database-level `RESERVED` lock, serializing all writers regardless of what any
-`SELECT` asked for. Practically this means a race test for this pattern only proves anything
+plain `SELECT` there. Correctness on SQLite instead comes from having a single writer: in
+rollback-journal mode (SQLite's default), a write takes a database-level `RESERVED` lock; in
+WAL mode, writers are instead serialized through the WAL write lock. Either way, only one
+writer commits at a time, regardless of what any `SELECT` asked for. Practically this means a race test for this pattern only proves anything
 against PostgreSQL (`testcontainers`) — running it against the SQLite backend passes for the
 wrong reason.
 

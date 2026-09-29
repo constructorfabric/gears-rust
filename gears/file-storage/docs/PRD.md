@@ -970,12 +970,14 @@ opacity while keeping internal optimizations available to FileStorage itself.
 - [x] `p1` - **ID**: `cpt-cf-file-storage-fr-backend-config-source`
 
 In P1, storage backend configurations (`type`, `endpoint`, `credentials`, `capabilities`, `hash_policy`) **MUST** be
-loaded from a static TOML configuration file at gear startup. Adding, removing, or re-configuring a backend
+loaded at gear startup from the gear's own section of the platform YAML configuration — there is no standalone
+TOML/JSON configuration file of its own. Adding, removing, or re-configuring a backend
 requires a gear restart. The configured set is exposed for read-only runtime introspection.
 
-**Rationale**: A static configuration file is the simplest viable mechanism for P1 — no DB or admin-UI dependency.
-Read-only HTTP introspection is sufficient for clients to discover available backends and their capabilities without
-granting any runtime mutation surface.
+**Rationale**: Loading backend configuration from the gear's own platform-YAML section is the simplest viable
+mechanism for P1 — no DB or admin-UI dependency, and no separate configuration file to keep in sync with the rest of
+the gear's config. Read-only HTTP introspection is sufficient for clients to discover available backends and their
+capabilities without granting any runtime mutation surface.
 **Actors**: `cpt-cf-file-storage-actor-cf-gears`
 
 #### Runtime Backend Configuration
@@ -984,7 +986,7 @@ granting any runtime mutation surface.
 
 The system **MUST** allow tenants to connect and configure storage backends at runtime without requiring service
 rebuild or redeployment. Runtime backend configurations **MUST** be persisted in the metadata database (replacing the
-P1 TOML source) and propagated to running gear instances.
+P1 platform-YAML source) and propagated to running gear instances.
 
 **Rationale**: Enterprise tenants need to bring their own storage (BYOS) and switch backends based on cost, compliance,
 or geographic requirements.
@@ -1118,8 +1120,13 @@ documented-but-not-yet-implemented gap, since every download token is already sc
 - [x] `p2` - **ID**: `cpt-cf-file-storage-fr-upload-idempotency`
 
 The system **MUST** support idempotent uploads. A client **MUST** be able to provide a unique idempotency key with an
-upload request. If a subsequent upload request arrives with the same idempotency key, the system **MUST** return the
-result of the original upload instead of creating a duplicate file. Idempotency keys **MUST** expire after a
+upload request. If a subsequent upload request arrives with the same idempotency key while the original upload's
+target version is still `pending`, the system **MUST** return the original result — the same `file_id`/`version_id`,
+with a freshly re-minted upload token authorizing that same still-open version — instead of creating a duplicate
+file. Once that target version is no longer `pending` (the original upload already completed), the system **MUST**
+reject the replay with `409 Conflict` instead of re-minting an upload token against content that has already been
+written. The `409` carries no `file_id`; a client that lost the original response finds the file by listing its
+own files (`GET /files`). Idempotency keys **MUST** expire after a
 configurable window.
 
 Idempotency keys **MUST** be scoped to the file owner specified in the upload request — the same entity that will own
@@ -1315,7 +1322,7 @@ The priority order and the trade-off rule are those of §6.4.
 | Lead time for change | Inherited — platform CI/CD; schema changes ship as one additive migration per change with a documented upgrade and rollback path | `operations.md` |
 | Cost per delivered feature | Inherited — platform delivery metrics | — |
 | Infrastructure cost per transaction/workflow | Observed — bytes moved per workflow; control-plane work per upload is a fixed number of metadata calls | ingress/egress byte signals; `cpt-cf-file-storage-fr-auto-bind` |
-| Infrastructure cost per tenant/service | Observed — storage usage per owner and tenant, egress bytes | `cpt-cf-file-storage-fr-usage-reporting`, `cpt-cf-file-storage-contract-usage-collector` |
+| Infrastructure cost per tenant/service | Egress bytes — Observed (`record_egress_bytes`); storage usage per owner and tenant — Not observed yet (Usage Collector integration is not wired; the usage reporter is not configured in any deployment) | `cpt-cf-file-storage-fr-usage-reporting`, `cpt-cf-file-storage-contract-usage-collector` |
 
 #### Reliability
 
@@ -1758,7 +1765,10 @@ code; see `cpt-cf-file-storage-fr-owner-deletion`.
   lost-update protection for concurrent metadata writers; when omitted, metadata updates remain last-write-wins
 - [x] An upload whose bind never completes leaves no current pointer to it; the orphan `pending` version and its blob
   are reconciled by the P2 cleanup engine (`cpt-cf-file-storage-fr-orphan-reconciliation`)
-- [x] Retried upload with the same idempotency key returns the original result without creating a duplicate file
+- [x] Retried upload with the same idempotency key returns the original result (same `file_id`/`version_id`, fresh
+  upload token) without creating a duplicate file, as long as the target version is still `pending`; once it is no
+  longer `pending`, the retry is instead rejected with `409 Conflict` rather than re-minting a token against content
+  that already exists
 - [x] Retried upload with the same idempotency key by a different owner does not return or create the original owner's
   file
 - [ ] Owner deletion event from EventBroker triggers a configurable Serverless Runtime workflow for file disposition
@@ -1779,9 +1789,10 @@ code; see `cpt-cf-file-storage-fr-owner-deletion`.
   `Accept-Ranges: bytes` set on every download response
 - [x] Retention policies automatically expire and delete files based on configured age, inactivity, or custom metadata
   criteria; per-file retention overrides are honored
-- [ ] Storage backends in P1 are loaded from a static TOML configuration file at gear startup; in P3, backends can
-  be connected and configured at runtime via admin API without service rebuild (**Partial:** the P1 TOML loading half
-  is implemented; the P3 runtime admin API half is not)
+- [ ] Storage backends in P1 are loaded from the gear's own section of the platform YAML configuration at gear
+  startup (no standalone TOML/JSON file); in P3, backends can
+  be connected and configured at runtime via admin API without service rebuild (**Partial:** the P1 platform-YAML
+  loading half is implemented; the P3 runtime admin API half is not)
 - [ ] File ownership transferable by current owner to another user or app within the same tenant; transfer requires
   authorization of both parties and emits an audit record (**Partial:** the current owner's authorization is checked
   and an audit record is emitted; the receiving principal's authorization/existence is not verified — see
