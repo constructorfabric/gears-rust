@@ -29,6 +29,11 @@ workspace = true
 [features]
 default = []
 
+# Gates the Postgres-backed real-DB integration suite; enable with
+# `--features integration` when Docker is available locally or in CI.
+# Empty for now -- the container-backed tests it will gate land in a later MR.
+integration = []
+
 [dependencies]
 # SDK - public API, models, and errors
 cf-gears-file-storage-sdk = { version = "0.1.3", path = "../file-storage-sdk" }
@@ -99,6 +104,9 @@ opentelemetry = { workspace = true }
 
 # Local dependencies
 toolkit = { workspace = true }
+# Cursor pagination codec (`CursorV1`) for the SQL-backed listings
+# (`domain::pagination`).
+toolkit-odata = { workspace = true }
 toolkit-db = { workspace = true, features = ["sqlite", "pg"] }
 toolkit-db-macros = { workspace = true }
 toolkit-security = { workspace = true }

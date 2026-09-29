@@ -32,3 +32,18 @@ pub fn content_etag(file_id: Uuid, content_id: Uuid) -> String {
 pub fn etag_for(file: &File) -> Option<String> {
     file.content_id.map(|cid| content_etag(file.file_id, cid))
 }
+
+/// Decide whether a conditional `If-None-Match` is satisfied against
+/// `current_etag` — i.e. whether the caller's cached copy is still current
+/// and a `304` should be returned instead of the file. Shared by any future
+/// caller that needs the exact same match rule (`"*"`, or an exact ETag
+/// match; no match, or no current ETag to compare against, is never
+/// "unchanged").
+#[must_use]
+pub fn if_none_match_satisfied(if_none_match: Option<&str>, current_etag: Option<&str>) -> bool {
+    let (Some(inm), Some(tag)) = (if_none_match, current_etag) else {
+        return false;
+    };
+    let inm = inm.trim();
+    inm == "*" || inm == tag
+}
