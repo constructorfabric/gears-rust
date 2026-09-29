@@ -160,6 +160,29 @@ pub(crate) fn check_idp_metadata_size(
     Ok(())
 }
 
+/// Trim the caller-supplied tenant `name` in place and reject an
+/// all-whitespace value.
+///
+/// Whitespace-equivalence is AM policy (as it is for `username` on the
+/// user surface and `name` on the service-account surface) and is
+/// wider than the structural contract: neither the published
+/// `gts.cf.core.am.tenant.v1~` schema's `minLength: 1` nor the DB
+/// `CHECK (length(name) BETWEEN 1 AND 255)` rejects `"   "`. Callers
+/// run this BEFORE the GTS check so the schema bounds apply to the
+/// value that is actually persisted.
+fn normalize_tenant_name(label: &'static str, name: &mut String) -> Result<(), DomainError> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(DomainError::Validation {
+            detail: format!("{label}: name MUST not be empty or all-whitespace"),
+        });
+    }
+    if trimmed.len() != name.len() {
+        *name = trimmed.to_owned();
+    }
+    Ok(())
+}
+
 /// Central AM domain service for tenant-hierarchy CRUD.
 #[domain_model]
 pub struct TenantService<R: TenantRepo> {
@@ -654,7 +677,8 @@ impl<R: TenantRepo> TenantService<R> {
     ///   caller access to the parent tenant.
     /// - [`DomainError::Validation`] when the parent is missing or not
     ///   `Active` (create under a suspended / deleted / provisioning
-    ///   parent is rejected).
+    ///   parent is rejected), or when `name` is empty or
+    ///   all-whitespace. A valid name is persisted trimmed.
     /// - [`DomainError::ServiceUnavailable`] when the provider reports a
     ///   clean compensable failure; the `provisioning` row is removed.
     /// - [`DomainError::UnsupportedOperation`] when the provider signals
@@ -677,7 +701,7 @@ impl<R: TenantRepo> TenantService<R> {
     pub async fn create_tenant(
         &self,
         ctx: &SecurityContext,
-        input: CreateTenantRequest,
+        mut input: CreateTenantRequest,
     ) -> Result<Tenant, DomainError> {
         // PEP gate (DESIGN §4.2). resource_id=None — child not committed
         // yet; ownership PEP keys on parent_id.
@@ -738,6 +762,10 @@ impl<R: TenantRepo> TenantService<R> {
         // Runs AFTER the local parent precondition so a missing or
         // inactive parent fails fast on the local read instead of
         // burning a Types Registry round-trip first.
+        //
+        // Trim first: an all-whitespace name passes both `minLength: 1`
+        // and the DB CHECK, so the AM-side rule is the only gate.
+        normalize_tenant_name("create_tenant", &mut input.name)?;
         if let Some(registry) = self.types_registry.as_ref() {
             crate::domain::gts_validation::validate_tenant_name_via_gts(
                 &input.name,
@@ -1695,8 +1723,9 @@ impl<R: TenantRepo> TenantService<R> {
     ///
     /// - [`DomainError::CrossTenantDenied`] when the PDP denies the
     ///   caller access to the target tenant.
-    /// - [`DomainError::Validation`] when the patch is empty or the new
-    ///   name fails GTS validation.
+    /// - [`DomainError::Validation`] when the patch is empty, the new
+    ///   name is empty or all-whitespace, or it fails GTS validation.
+    ///   A valid name is persisted trimmed.
     /// - [`DomainError::Conflict`] when the target tenant is in
     ///   `Deleted` status (read-only during retention).
     /// - [`DomainError::NotFound`] when the target tenant does not exist or
@@ -1707,7 +1736,7 @@ impl<R: TenantRepo> TenantService<R> {
         &self,
         ctx: &SecurityContext,
         id: Uuid,
-        patch: UpdateTenantRequest,
+        mut patch: UpdateTenantRequest,
     ) -> Result<Tenant, DomainError> {
         if patch.is_empty() {
             return Err(DomainError::Validation {
@@ -1756,6 +1785,13 @@ impl<R: TenantRepo> TenantService<R> {
         // Mirrors the ordering in `create_tenant`. Skipped when the
         // patched name is identical to the current name (idempotent
         // PATCH — no shape change, no need to validate).
+        //
+        // Trim BEFORE the same-name comparison so `" acme "` against a
+        // stored `"acme"` is the idempotent no-op it means, and reject
+        // an all-whitespace rename exactly as `create_tenant` does.
+        if let Some(new_name) = patch.name.as_mut() {
+            normalize_tenant_name("update_tenant", new_name)?;
+        }
         if let Some(ref new_name) = patch.name
             && new_name != &current.name
             && let Some(registry) = self.types_registry.as_ref()
