@@ -3069,6 +3069,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "cf-gears-platform-host"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cf-gears-account-management",
+ "cf-gears-api-gateway",
+ "cf-gears-authn-resolver",
+ "cf-gears-authz-resolver",
+ "cf-gears-credstore",
+ "cf-gears-gear-orchestrator",
+ "cf-gears-grpc-hub",
+ "cf-gears-oidc-authn-plugin",
+ "cf-gears-resource-group",
+ "cf-gears-rg-tr-plugin",
+ "cf-gears-single-tenant-tr-plugin",
+ "cf-gears-static-authn-plugin",
+ "cf-gears-static-authz-plugin",
+ "cf-gears-static-credstore-plugin",
+ "cf-gears-static-idp-plugin",
+ "cf-gears-static-tr-plugin",
+ "cf-gears-tenant-resolver",
+ "cf-gears-toolkit",
+ "cf-gears-tr-authz-plugin",
+ "cf-gears-types-registry",
+ "clap",
+ "mimalloc",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "cf-gears-resource-group"
 version = "0.4.5"
 dependencies = [
