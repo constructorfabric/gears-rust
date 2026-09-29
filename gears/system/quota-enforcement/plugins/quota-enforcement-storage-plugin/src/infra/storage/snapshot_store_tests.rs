@@ -582,8 +582,9 @@ fn gated_reader(db: &Db, enqueuer: &Arc<crate::QeOutbox>, times: u32) -> Gated {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_read_whose_snapshot_went_stale_before_its_insert_is_retried() {
-    let path = std::env::temp_dir().join(format!("qe-snapshot-{}.db", Uuid::now_v7()));
-    let db = wal_db(&path).await;
+    // Declared first so it is dropped last, after every handle on the file.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = wal_db(&dir.path().join("snapshot.db")).await;
     let (outbox, enqueuer) = bound_outbox(&db).await;
     let quotas =
         SqlQuotaStore::with_clock(db.clone(), Arc::clone(&enqueuer) as _, Arc::new(|| DAY_ONE));
@@ -640,13 +641,13 @@ async fn a_read_whose_snapshot_went_stale_before_its_insert_is_retried() {
         .expect("period rows");
     assert_eq!(rows.len(), 1, "one row for the window, not two");
     outbox.stop().await;
-    std::fs::remove_file(&path).expect("remove the test database");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_read_that_keeps_meeting_newer_commits_answers_unavailable() {
-    let path = std::env::temp_dir().join(format!("qe-snapshot-{}.db", Uuid::now_v7()));
-    let db = wal_db(&path).await;
+    // Declared first so it is dropped last, after every handle on the file.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = wal_db(&dir.path().join("snapshot.db")).await;
     let (outbox, enqueuer) = bound_outbox(&db).await;
     let quotas =
         SqlQuotaStore::with_clock(db.clone(), Arc::clone(&enqueuer) as _, Arc::new(|| DAY_ONE));
@@ -694,5 +695,4 @@ async fn a_read_that_keeps_meeting_newer_commits_answers_unavailable() {
     let error = read.await.expect("join").expect_err("three conflicts");
     assert!(matches!(error, StorageError::Unavailable(_)), "{error:?}");
     outbox.stop().await;
-    std::fs::remove_file(&path).expect("remove the test database");
 }
