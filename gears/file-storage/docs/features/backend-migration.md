@@ -47,16 +47,21 @@ it is read back and re-verified against the same stored hash before the
 migration is allowed to proceed, since an earlier, interrupted migration
 attempt could otherwise have left unverified bytes sitting there. Only a
 *confirmed* mismatch (the object read back in full with the wrong hash or
-length) is deleted; a re-verification that cannot complete at all (a read
-failure, a broken stream) proves nothing about the object's content, so it is
-left untouched and surfaces as a retryable error (`503 service_unavailable`
-with `Retry-After` when the underlying fault is transient, `500` otherwise)
-instead of a hash mismatch. If verification passes, the destination object's presence and size
-are re-confirmed immediately before the swap, so the version is never
-repointed at something that has since vanished; the version row's
-`(backend_id, backend_path)` are then swapped atomically under a
-compare-and-swap keyed on the pre-migration snapshot — all before the source
-blob is best-effort deleted.
+length) is even considered for deletion, and even then only once this call
+re-checks, as close to the delete as it can get, that no version row has since
+claimed that exact object as its live pointer and that the object itself has
+not changed since the read-back that confirmed the mismatch; a re-verification
+that cannot complete at all (a read failure, a broken stream) proves nothing
+about the object's content, so it is left untouched and surfaces as a
+retryable error (`503 service_unavailable` with `Retry-After` when the
+underlying fault is transient, `500` otherwise) instead of a hash mismatch —
+see [Concurrent-Migration CAS Resolution](#concurrent-migration-cas-resolution)
+for both of these checks. If verification passes, the destination object's
+presence and size are re-confirmed immediately before the swap — this narrows
+but does not close the window before the version row's `(backend_id,
+backend_path)` are then swapped atomically under a compare-and-swap keyed on
+the pre-migration snapshot (a known limitation, tracked as issue #5013; see
+below) — all before the source blob is best-effort deleted.
 
 **Traces to**: `cpt-cf-file-storage-fr-backend-migration`, `cpt-cf-file-storage-fr-audit-trail`
 
@@ -139,9 +144,16 @@ apply to it)
   writing but before verifying/cleaning up after itself) and, read back **in
   full** and re-verified, does not match the stored hash/length — `400`
   (`HashMismatch`), same as a source mismatch. This *confirmed*-mismatch case
-  is the one where the object is deleted **unconditionally** (this call did
-  not create it, but a confirmed mismatch also proves it never was anyone's
-  verified content, so it carries no live pointer either way) — see
+  is the one where the object is a deletion candidate regardless of who wrote
+  it (this call did not create it, but a confirmed mismatch also proves it
+  never was anyone's verified content) — but the delete itself only proceeds
+  once a re-check, made as close to it as possible, confirms no version row
+  has since pointed at this exact object and the object itself has not
+  changed since the read-back; when either does not hold, the object is left
+  untouched and `Conflict` is returned instead, since deleting on a confirmed
+  mismatch alone cannot tell apart "provably nobody's content" from "a
+  concurrent migration's write landed after this call's own read-back
+  completed" — see
   [Mode-Aware Content-Hash Verification Before Commit](#mode-aware-content-hash-verification-before-commit)
 - That same re-verification of a pre-existing destination object instead
   fails to even complete (the read-back never opens, breaks off mid-read, or
@@ -185,7 +197,7 @@ apply to it)
 6. [x] - `p1` - Open a stream from the source backend at the version's `backend_path` and write it, chunk by chunk, straight to the destination backend at the canonical path `/{file_id}/{version_id}` (create-exclusive — see [Concurrent-Migration CAS Resolution](#concurrent-migration-cas-resolution) for why), never buffering the whole object - `inst-migrate-stream-transfer`
 7. [x] - `p1` - Algorithm: verify the stream's hash incrementally, mode-aware per ADR-0006, using `cpt-cf-file-storage-algo-backend-migration-verify` below; its verdict is only available once the destination has finished receiving the stream - `inst-migrate-verify`
 8. [x] - `p1` - **IF** verification of the streamed source content failed (hash mismatch, wrong length, or the source stream broke before finishing): do **not** proceed to the CAS step; best-effort delete the destination object, but only if this call is the one that created it (see below) - `inst-migrate-verify-failed-no-commit`
-9. [x] - `p1` - **IF** source verification passed but the destination object already existed before this call (this call did not create it): read that object back and re-verify it against the exact same stored `(hash_mode, hash_value[, manifest], size)` used for the source stream, rather than assuming its mere presence means someone already verified it. **IF** that re-verification completes and confirms a mismatch (wrong hash or length, read in full): do **not** proceed to the CAS step; best-effort delete the destination object unconditionally; RETURN `HashMismatch` - `inst-migrate-verify-existing-dest`
+9. [x] - `p1` - **IF** source verification passed but the destination object already existed before this call (this call did not create it): read that object back and re-verify it against the exact same stored `(hash_mode, hash_value[, manifest], size)` used for the source stream, rather than assuming its mere presence means someone already verified it. **IF** that re-verification completes and confirms a mismatch (wrong hash or length, read in full): do **not** proceed to the CAS step; RETURN `HashMismatch`. Before deleting the destination object, re-check that (a) the version row, re-fetched by `(file_id, version_id)`, still points at the pre-migration source snapshot — not at this exact destination object, and not at anything else — and (b) a re-`stat` of the destination object still reports the same size the read-back just confirmed. Best-effort delete only when both hold; when either does not, leave the object untouched and RETURN `Conflict` instead of `HashMismatch`, asking for operator investigation - `inst-migrate-verify-existing-dest`
 10. [x] - `p1` - **IF** that same re-verification instead cannot complete at all (the read-back fails to open, breaks off mid-read, or otherwise never reaches a verdict): do **not** proceed to the CAS step and do **not** delete the destination object — an incomplete check proves nothing about its content, and it may be another migration's still-valid object that is merely momentarily unreachable; RETURN a retryable error (`503 service_unavailable` with `Retry-After` when the underlying backend fault is transient, otherwise `500`) - `inst-migrate-verify-existing-dest-unconfirmed`
 11. [x] - `p1` - **IF** verification passed (the source stream, or a pre-existing destination object confirmed correct): immediately before the CAS step, re-`stat` the destination object and confirm it still exists at the expected size. **IF** it does not: do **not** proceed to the CAS step; RETURN a retryable error (`503 service_unavailable` with `Retry-After`; retrying the migration is safe) - `inst-migrate-precommit-stat`
 12. [x] - `p1` - DB: `rebind_version_backend` — CAS the version row's `(backend_id, backend_path)` from the pre-migration snapshot to the destination, in the same transaction as a `BackendMigrate` audit row - `inst-migrate-cas-rebind`
@@ -208,6 +220,21 @@ fact. Both runs use the exact same stored `(hash_mode, hash_value[, manifest],
 size)` — the second run exists because a destination object's mere presence
 is never, on its own, proof that anyone already verified it (see
 [Concurrent-Migration CAS Resolution](#concurrent-migration-cas-resolution)).
+
+For a destination object this call itself creates, that verification is
+computed against the bytes on their way *to* the destination, as they are
+written — it is never re-derived from a second, independent read of the
+object once the write finishes. The service trusts the destination backend's
+write path to durably store exactly the bytes `publish_exclusive` was handed
+once that call reports success; it does not re-open and re-hash the object it
+just wrote to confirm the bytes landed intact. This is unlike upload
+finalization, which does re-read the stored object after the write and
+recomputes its hash/size/MIME from those actual on-disk bytes before trusting
+it. A source read that came back corrupted, or a source stream that broke
+mid-transfer, is still caught by this same verification (it sees those bad or
+short bytes as they stream past); a destination write that silently corrupts
+otherwise-good bytes on the way in is not independently caught by a second
+read here.
 
 **Input**: the object's bytes — either streamed from the source backend as
 they are written to the destination (never buffered whole), or, for the
@@ -277,18 +304,31 @@ created it, never an object that already existed there, since a passing
 source-stream verification says nothing about bytes this call never wrote.
 A pre-existing object is instead independently re-verified (see
 [Mode-Aware Content-Hash Verification Before Commit](#mode-aware-content-hash-verification-before-commit))
-before ever being trusted; only a *confirmed* mismatch from that
-re-verification — the object read in full and found wrong — is deleted
-**unconditionally**, regardless of who wrote it, since passing that check is
-what actually proves a destination object is someone else's verified
-transfer and not this call's to touch, not merely its presence. A
-re-verification that cannot complete at all (a read failure, a broken
-stream) proves nothing either way, so the object is left untouched and a
-retryable error is surfaced instead. Immediately before the CAS itself, the
-destination object's presence and size are re-confirmed one more time, so a
-delayed racer's own correctly-verified object can never be undone by
-something disappearing out from under it between that verification and the
-commit.
+before ever being trusted; a *confirmed* mismatch from that re-verification —
+the object read in full and found wrong — proves it is not this call's own
+current content and not, on its own, provably anyone's live pointer either —
+but a confirmed mismatch by itself only speaks to the moment the read-back
+completed, not to whatever may have happened since. So the delete does not
+follow automatically from the mismatch: as close to the delete as this call
+can manage, it re-fetches the version row and re-`stat`s the object one more
+time, and only deletes when both still say what they said when the mismatch
+was confirmed — the row still points at the pre-migration source snapshot
+(not at this exact destination object, and not at anything else), and the
+object's size hasn't changed. Either check failing means something changed
+after the read-back that the mismatch verdict cannot account for, so the
+object is left untouched and `Conflict` is returned instead of `HashMismatch`,
+asking for operator investigation rather than guessing. A re-verification
+that cannot complete at all (a read failure, a broken stream) proves nothing
+either way, so the object is left untouched and a retryable error is
+surfaced instead. Immediately before the CAS itself, the destination
+object's presence and size are re-confirmed one more time — this narrows,
+but does not close, the window before the commit; the two are not atomic
+with each other (a known limitation, tracked as issue #5013), so an object
+that vanishes or is rewritten strictly between that re-`stat` and the CAS
+is not caught by it. What the re-`stat` does close off is the far larger
+window this function would otherwise leave open — everything from this
+call's own verification up to that point — down to one final round trip
+immediately before the commit.
 
 ## 4. States (CDSL)
 
@@ -314,24 +354,34 @@ row's backend pointer alongside a `BackendMigrate` audit row. When the
 destination object already existed before this call wrote anything (this
 call did not create it), the system **MUST NOT** treat its mere presence as
 proof it was ever verified — it **MUST** read it back and re-verify it
-against that same stored hash spec before proceeding. It **MUST** delete that
-object unconditionally only when the re-verification completes and confirms
-a mismatch; when the re-verification cannot complete at all (a read failure,
-a broken stream, no verdict), the system **MUST NOT** delete the object and
-**MUST** instead surface a retryable error (`503 service_unavailable` with
-`Retry-After` when the underlying backend fault is transient, `500`
-otherwise). Immediately before committing the CAS, the system **MUST**
-re-confirm the destination object still exists at the expected size, and
-**MUST NOT** commit the CAS otherwise; a vanished or resized object at this
-point **MUST** surface as `503 service_unavailable` with `Retry-After`
-(a concurrent-change race, not a fault) rather than `500`.
+against that same stored hash spec before proceeding. The system **MUST NOT**
+delete that object on a confirmed mismatch alone: it **MUST** first re-check,
+as close to the delete as it can get, that no version row has since come to
+point at this exact object, and that the object's size has not changed since
+the read-back that confirmed the mismatch, and **MUST** delete the object
+only when both hold; when either does not, it **MUST** leave the object
+untouched and return `Conflict` instead of `HashMismatch`. When the
+re-verification cannot complete at all (a read failure, a broken stream, no
+verdict), the system **MUST NOT** delete the object and **MUST** instead
+surface a retryable error (`503 service_unavailable` with `Retry-After` when
+the underlying backend fault is transient, `500` otherwise). Immediately
+before committing the CAS, the system **MUST** re-confirm the destination
+object still exists at the expected size, and **MUST NOT** commit the CAS
+otherwise; a vanished or resized object at this point **MUST** surface as
+`503 service_unavailable` with `Retry-After` (a concurrent-change race, not a
+fault) rather than `500`. This pre-CAS re-`stat` narrows, but does not
+eliminate, the race between verification and commit: it is not atomic with
+the CAS itself, so an object deleted or rewritten strictly between the
+`stat` and the CAS is not caught by it — a known limitation, tracked as
+issue #5013.
 It **MUST NOT** commit the CAS when any of these verifications fails, and
-MUST resolve lost-CAS races without ever destroying a concurrent winner's
-blob, best-effort cleaning up a destination object only when doing so cannot
-destroy a concurrent winner's already-live content (this call created it and
-its own verification failed, or it already existed and a confirmed mismatch
-was found on re-verification), and best-effort clean up the source blob only
-after the CAS has won.
+**MUST** resolve lost-CAS races without ever destroying a concurrent
+winner's blob, best-effort cleaning up a destination object only when doing
+so cannot destroy a concurrent winner's already-live content (this call
+created it and its own verification failed; or it already existed, a
+confirmed mismatch was found on re-verification, and the version-row and
+object-identity re-checks above both passed), and best-effort clean up the
+source blob only after the CAS has won.
 
 **Implements**:
 - `cpt-cf-file-storage-flow-backend-migration`
@@ -376,7 +426,9 @@ implicitly.
 - [x] The source-to-destination transfer never materializes the whole object in memory: an object that arrives in many chunks streams through in many chunks, for both content-hash modes
 - [x] A source read that comes back with corrupted bytes (same length, different content) fails verification, leaves the version pointing at the source backend, and leaves nothing behind at the destination
 - [x] A source stream that breaks before finishing fails the migration the same way — version untouched, destination left empty
-- [x] A destination object that already exists at the canonical path before the migration call runs, and whose bytes do **not** match the stored hash, fails the migration (`HashMismatch`), leaves the version pointing at the source backend, and is deleted from the destination even though this call did not create it
+- [x] A destination object that already exists at the canonical path before the migration call runs, and whose bytes do **not** match the stored hash, fails the migration (`HashMismatch`), leaves the version pointing at the source backend, and — provided the version row still points at the pre-migration source snapshot and the object's size has not changed since the re-verification — is deleted from the destination even though this call did not create it
+- [x] The same confirmed-mismatch case, but the version row has since come to point at this exact destination object (a concurrent migration already committed to it): the object is left untouched and `Conflict` is returned instead of `HashMismatch`
+- [x] The same confirmed-mismatch case, but the object's size has changed since the re-verification that confirmed the mismatch: the object is left untouched and a `Conflict` is returned instead of `HashMismatch`
 - [x] A destination object that already exists at the canonical path before the migration call runs, and whose bytes **do** match the stored hash, is trusted and the migration succeeds, repointing the version at the destination without re-writing the object
 - [x] A destination object that already exists at the canonical path holds correct bytes, but re-verifying it hits a transient read failure — the migration fails with a retryable error (`503 service_unavailable` + `Retry-After` when the backend reports the failure as transient, otherwise `500`; not `HashMismatch`), the object is **not** deleted, and the version stays on the source backend; retrying the migration once the read succeeds then completes normally
 - [x] A destination object vanishes between this call's own successful verification and the CAS — the migration fails with `503 service_unavailable` + `Retry-After` (a concurrent-change race, not a fault), and the version stays on the source backend; retrying is safe

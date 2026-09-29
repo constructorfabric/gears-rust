@@ -112,7 +112,7 @@ COMMENT ON COLUMN file_storage.files.meta_version   IS 'Monotonic counter; bumpe
 
 -- Covers the primary `GET /files` listing query: tenant + owner_kind + owner_id
 -- with created_at descending, file_id descending as the keyset tie-breaker
--- for stable forward-only cursor pagination when two rows share a created_at
+-- for stable keyset cursor pagination (either direction) when two rows share a created_at
 -- instant (FileRepo::list_page sorts ORDER BY created_at DESC, file_id DESC).
 -- Supersedes files_owner_listing_idx (created_at DESC only,
 -- m20260624_000001_p1_initial), dropped in the same migration that adds this

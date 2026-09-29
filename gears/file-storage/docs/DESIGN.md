@@ -701,13 +701,15 @@ and `meta_version`. (The pointer-swap CAS itself is driven by `bind-service`; th
 - Persist the bind: set `File.content_id := version_id` and flip that version to `is_current`/`available`. Content
   writes do **not** bump `meta_version`; metadata-only updates bump `meta_version` and `last_modified_at`
 - Enforce tenant boundary via SecureConn — every query/mutation passes through the request's `SecurityContext`
-- Tenant + mandatory owner filter on `GET /files`; forward-only keyset cursor pagination (`limit`/`cursor` query
-  params, default 25, max 200, capped by `FileStorageConfig::max_page_size`);
+- Tenant + mandatory owner filter on `GET /files`; keyset cursor pagination, navigable in either direction
+  (`limit`/`cursor` query params, default 25, max 200, capped by `FileStorageConfig::max_page_size`);
   ordered `created_at DESC, file_id DESC` (the `file_id` tie-breaker keeps the keyset page boundary stable across
   rows sharing a `created_at` instant), index-backed by `(tenant_id, owner_kind, owner_id, created_at DESC, file_id
   DESC)`. `GET /files`, `GET /files/{id}/versions`, and `GET /retention-rules` all return
-  `{items, page_info: {next_cursor, prev_cursor: null, limit}}` (`toolkit_odata::Page<T>`), never a bare JSON array
-  — `prev_cursor` is always `null` (no backward paging). OData `$filter`/`$orderby` is not implemented. List a
+  `{items, page_info: {next_cursor, prev_cursor, limit}}` (`toolkit_odata::Page<T>`), never a bare JSON array —
+  `prev_cursor` is `null` only on the first page of a walk (no cursor supplied) or once a backward walk has reached
+  its end; a backward page (`cursor` set to a previous `prev_cursor`) is still returned in the same canonical
+  order, never reversed. OData `$filter`/`$orderby` is not implemented. List a
   file's versions ordered by `created_at DESC, version_id DESC` (same tie-breaker reasoning), same keyset model
 - Reject PRD-defined constraints at this layer when they are not enforceable as DB constraints (e.g., GTS format
   validation regex, tenant policy delta in P2)
@@ -1279,7 +1281,7 @@ sequenceDiagram
     MS->>DB: SELECT ... WHERE tenant_id=$1 AND owner_kind=$2 AND owner_id=$3 AND (created_at, file_id) < (decoded cursor) ORDER BY created_at DESC, file_id DESC LIMIT $4+1
     DB-->>MS: rows (limit + 1, to detect a next page)
     MS-->>CTL: rows
-    CTL-->>C: 200 + {items, page_info: {next_cursor, prev_cursor: null, limit}}
+    CTL-->>C: 200 + {items, page_info: {next_cursor, prev_cursor, limit}}
 ```
 
 #### Configure policy (P2-M1)
@@ -1711,7 +1713,7 @@ The NFR table above traces each platform NFR to its design response. Mapped onto
 | --- | --- | --- |
 | **Efficiency** | Control/data-plane split (ADR-0003) keeps content off the control plane; streaming without buffering on both upload and download (§4.3); default `bind: "auto"` collapses single-part upload to 2 requests, `N+2` for multipart; in-process SDK trait (`sdk-facade`) avoids a network hop for consuming Gears; storage backends selected by static config, no rebuild (Backend Configuration Source, PRD.md §5.8) | `record_ingress_bytes`, `record_egress_bytes` — bytes actually moved through the sidecar, the proxy for transfer/egress cost |
 | **Reliability** | Finalize-then-bind: a version is `pending` until the sidecar's token-authenticated finalize independently re-verifies size/hash and flips it to `available`; multipart `complete` is serialized under a completion lease with idempotent replay; `DELETE` locks the `files` row (`SELECT ... FOR UPDATE`) then re-reads its versions before removing them, closing a concurrent-presign race; transient sidecar/backend faults surface as `503` + `Retry-After` rather than a hard failure; the P2 cleanup-engine sweep reclaims orphans/abandoned sessions past their `expires_at` grace window; signing-key rotation is zero-outage via an accepted set of previous public keys | `record_operation(op, result)` — success/failure per operation, the failed-workflow-rate proxy; `record_backend_error(backend_id, op)`; `record_sweep_result(...)` — cleanup/orphan-reconciliation outcomes |
-| **Performance** | Streaming I/O end to end (no full-file buffering) on both planes; forward-only keyset cursor pagination (`created_at DESC, file_id DESC`) keeps list latency independent of page depth; covering/partial Postgres indexes back the metadata-latency and cleanup-sweep queries; `Range` translated to backend-native range where the backend supports it | `record_request(route, method, status, latency_ms)` — the per-route latency histogram behind the p95 metadata/transfer NFRs |
+| **Performance** | Streaming I/O end to end (no full-file buffering) on both planes; keyset cursor pagination, navigable in either direction (`created_at DESC, file_id DESC`), keeps list latency independent of page depth; covering/partial Postgres indexes back the metadata-latency and cleanup-sweep queries; `Range` translated to backend-native range where the backend supports it | `record_request(route, method, status, latency_ms)` — the per-route latency histogram behind the p95 metadata/transfer NFRs |
 | **Security** | Tenant-scoped authz via `SecureConn`/`SecurityContext.tenant_id` makes a cross-tenant row invisible before it could even be evaluated; `ADMIN_POLICY` scope gates creating/listing files under any owner other than the caller's own; content access is authorized only by a control-plane-minted, sidecar-verified Ed25519-signed token (§4.5); the callback second-factor secret (`x-fs-internal-token`) is held as a non-logged secret and redacted wherever config is dumped | `record_quota_denied(op)`; `403` statuses surfaced through `record_request(..., status, ...)` |
 | **Versatility** | Pluggable `StorageBackend` trait with capability discovery (`local-filesystem`, in-memory, `s3-compatible`); multipart upload and `Range` reads as backend-capability-gated features; tenant/user policy and retention rules (P2 `policy-engine`/`cleanup-engine`) configured, not coded; object placement is an opt-in `StoragePlacementResolver` plugin seam (ADR-0007) rather than a hard-coded convention | no dedicated signal yet |
 

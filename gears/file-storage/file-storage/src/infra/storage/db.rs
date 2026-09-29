@@ -45,6 +45,41 @@ use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 
+/// Extract the raw SQLSTATE/vendor error code from a `sea_orm::DbErr`, when
+/// the underlying driver error carries one. Follows the exact descent
+/// `sea_orm::DbErr::sql_err`'s own doc comment demonstrates for reaching
+/// "anything else" beyond its two portable constraint-violation
+/// classifications: unwrap `Exec`/`Query(RuntimeErr::SqlxError(_))` to the
+/// driver's `sqlx::Error::Database`, whose `code()` is the code itself —
+/// unlike the error's `Display` text, never translated by the server's
+/// `lc_messages` setting.
+fn sqlstate(err: &DbErr) -> Option<String> {
+    let (DbErr::Exec(sea_orm::RuntimeErr::SqlxError(e))
+    | DbErr::Query(sea_orm::RuntimeErr::SqlxError(e))) = err
+    else {
+        return None;
+    };
+    let sea_orm::sqlx::Error::Database(driver_err) = e.as_ref() else {
+        return None;
+    };
+    driver_err.code().map(std::borrow::Cow::into_owned)
+}
+
+/// Reach the SQLSTATE behind whichever of the two concrete error shapes this
+/// gear ever hands to [`db_err`] the caller actually passed (see
+/// [`ClassifiableDbError`]'s own doc comment for why only these two occur),
+/// via a plain runtime downcast — never changing the classification
+/// [`Display`] already produced for the message text, only supplementing it.
+fn sqlstate_of_any(e: &dyn std::any::Any) -> Option<String> {
+    if let Some(db_err) = e.downcast_ref::<DbErr>() {
+        return sqlstate(db_err);
+    }
+    if let Some(ScopeError::Db(db_err)) = e.downcast_ref::<ScopeError>() {
+        return sqlstate(db_err);
+    }
+    None
+}
+
 /// Convert any displayable error into a [`DomainError::Database`].
 ///
 /// The untyped fallback from the module doc comment: stringifies the error,
@@ -52,8 +87,23 @@ use crate::domain::error::DomainError;
 /// to exactly this shape when it does not recognize the error, so switching
 /// one call site to a more specific classifier never changes behaviour
 /// anywhere else.
-pub fn db_err(e: impl Display) -> DomainError {
-    DomainError::database(e.to_string())
+///
+/// When the error is (or wraps) a `sea_orm::DbErr` whose driver error carries
+/// a SQLSTATE code, that code is appended to the message as `(SQLSTATE
+/// <code>)` — the exact shape `toolkit_db::contention::is_retryable_contention`
+/// already recognizes via `contains_sqlstate`. This is what lets
+/// [`is_retryable_domain_error`] classify a contention error correctly even
+/// against a non-English `lc_messages` server, where the driver's own
+/// message text no longer contains a recognizable phrase: the code itself is
+/// never translated, so it survives flattening into this string-only
+/// `DomainError::Database` regardless of locale.
+pub fn db_err(e: impl Display + 'static) -> DomainError {
+    let message = e.to_string();
+    let message = match sqlstate_of_any(&e) {
+        Some(code) => format!("{message} (SQLSTATE {code})"),
+        None => message,
+    };
+    DomainError::database(message)
 }
 
 /// A database error shape that can report whether it wraps a
@@ -133,7 +183,7 @@ impl ClassifiableDbError for ScopeError {
 /// (`repo/idempotency_repo.rs::insert`, `repo/policy_repo.rs::upsert`); reads,
 /// unconditional deletes, and inserts with no such invariant have nothing
 /// more specific to say than "a database error occurred".
-pub fn conflict_on_unique_violation<E: ClassifiableDbError>(
+pub fn conflict_on_unique_violation<E: ClassifiableDbError + 'static>(
     e: E,
     conflict_message: impl Into<String>,
 ) -> DomainError {
@@ -169,7 +219,7 @@ pub fn conflict_on_unique_violation<E: ClassifiableDbError>(
 /// `file_id` is logged (`DEBUG`, only on the classified path) alongside the
 /// original error text for diagnosis; the returned `DomainError::FileNotFound`
 /// carries only `file_id`, same as every other `FileNotFound` call site.
-pub fn file_not_found_on_foreign_key_violation<E: ClassifiableDbError>(
+pub fn file_not_found_on_foreign_key_violation<E: ClassifiableDbError + 'static>(
     e: E,
     file_id: Uuid,
 ) -> DomainError {
@@ -243,11 +293,15 @@ fn retry_backoff_delay(next_attempt: u32) -> Duration {
 /// codes and message fragments), and already accepts a `DbErr::Custom(msg)`
 /// for exactly this case -- a documented path in `toolkit_db::contention` --
 /// so re-wrapping the stored string in a synthetic `DbErr::Custom` reuses
-/// that matching logic unchanged. Because the SQLSTATE code does not survive
-/// into the message on every path, this classification leans on message
-/// text, which is `lc_messages`-dependent: a `PostgreSQL` server running with
-/// a non-English locale can produce contention errors this does not
-/// recognize.
+/// that matching logic unchanged. This no longer depends on the driver's
+/// message text being in English: [`db_err`] appends the original error's raw
+/// SQLSTATE code (when the driver supplied one) to the stored message in the
+/// exact `(SQLSTATE <code>)` shape `is_retryable_contention` recognizes, and
+/// that code is never translated by the server's `lc_messages` setting the
+/// way the surrounding message text is. A driver error that carries no code
+/// at all (rare, but not impossible depending on how a proxy/pooler reports
+/// it) still falls back to matching the message text alone, which remains
+/// locale-dependent in that narrower case.
 ///
 /// A `DomainError` variant other than `Database` (e.g. `Conflict`,
 /// `PreconditionFailed`) is never retried: those are domain decisions made

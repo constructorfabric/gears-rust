@@ -185,33 +185,42 @@ pagination model (platform-wide convention, `guidelines/DNA/REST/QUERYING.md` /
 PLID-52.06):
 
 - **Request**: `limit` (integer, default 25, min 1, max 200 — `limit=0` is a `400`; a `limit` above 200 is silently
-  clamped down to 200, `limit.min(max_page_size)`) and `cursor` (an opaque string, the previous page's
-  `page_info.next_cursor`). No other query parameter is accepted — an unrecognized key (including the pre-redesign
-  `offset`) is rejected as a `400`, not silently ignored.
-- **Response**: `{"items": [...], "page_info": {"next_cursor": <string|null>, "prev_cursor": null, "limit": N}}`.
-  There is no `total`/count field — pagination never runs a `COUNT` query. `prev_cursor` is always `null`: this
-  platform's listings are **forward-only**, there is no backward paging.
+  clamped down to 200, `limit.min(max_page_size)`) and `cursor` (an opaque string — the previous page's
+  `page_info.next_cursor` to page forward, or its `page_info.prev_cursor` to page backward). No other query
+  parameter is accepted — an unrecognized key (including the pre-redesign `offset`) is rejected as a `400`, not
+  silently ignored.
+- **Response**: `{"items": [...], "page_info": {"next_cursor": <string|null>, "prev_cursor": <string|null>, "limit":
+  N}}`. There is no `total`/count field — pagination never runs a `COUNT` query. `items` is always in this
+  endpoint's canonical order (below), regardless of which cursor the request navigated with — a backward page is
+  never reversed before being returned. `next_cursor` is present whenever a further page exists forward (older, in
+  canonical order) of `items`' last row; `prev_cursor` is present whenever a further page exists backward (newer)
+  of `items`' first row. On the very first request (no `cursor`), `prev_cursor` is `null`; either field is `null`
+  once a walk in that direction has reached its end.
 - **Canonical order and tie-break**: fixed per endpoint, not client-selectable (no `$orderby`) — `created_at desc,
   file_id desc` for `/files`, `created_at desc, version_id desc` for `/files/{id}/versions`, `created_at desc,
   rule_id desc` for `/retention-rules`. The id-column tie-break exists because `created_at` has only
   millisecond resolution: two rows created in the same instant would otherwise have no defined relative order
   across two page requests, and a page boundary drawn through such a run could skip or repeat a row.
-- **Keyset semantics under concurrent writes**: `next_cursor` encodes the exact `(created_at, id)` position of the
-  last row a page returned; the next page's query is `WHERE (created_at, id) < (cursor's position)` in that same
-  order (never an `OFFSET`). A row deleted between two page requests is simply absent from the next page (no
-  skip/duplicate of any *other* row); a row inserted with a position **before** the cursor (i.e. newer than
-  everything already walked) is invisible to a walk already past it — it will not retroactively appear in a page
-  already served, and will not be skipped either, since it wasn't part of the walk's remaining range to begin
-  with. This is the standard keyset-pagination guarantee: no duplicates, no skips, at the cost of never showing a
-  client a "total" or letting it jump to an arbitrary page.
+- **Keyset semantics under concurrent writes**: a cursor encodes the exact `(created_at, id)` position of the row
+  it was built from, plus which way it seeks. `next_cursor` (built from a page's last row) queries `WHERE
+  (created_at, id) < (cursor's position)` in canonical order; `prev_cursor` (built from a page's first row) queries
+  the mirrored `WHERE (created_at, id) > (cursor's position)`, ordered ascending internally so the closest rows to
+  the cursor are the ones kept, then restored to canonical order before being returned — never an `OFFSET` either
+  way. A row deleted between two page requests is simply absent from the next page (no skip/duplicate of any
+  *other* row); a row inserted with a position **before** the cursor a forward walk is at (i.e. newer than
+  everything already walked forward) is invisible to that walk — it will not retroactively appear in a page already
+  served, and will not be skipped either, since it wasn't part of the walk's remaining range to begin with. This is
+  the standard keyset-pagination guarantee: no duplicates, no skips, at the cost of never showing a client a
+  "total" or letting it jump to an arbitrary page.
 - **Cursor errors**: a cursor is opaque (`toolkit_odata::CursorV1`, base64url-encoded) and bound to the query it was
   issued for. Decoding/validating it maps to canonical `400 InvalidArgument` reasons: `INVALID_CURSOR` (unreadable
-  token, wrong version, malformed fields, or a `"bwd"` direction — this platform never issues one and rejects a
-  client-supplied one outright), `ORDER_MISMATCH` (the cursor's encoded sort order doesn't match this endpoint's
-  canonical order — effectively "a cursor from a different listing"), `FILTER_MISMATCH` (the cursor is bound to a
-  different owner pair for `/files`, or a different `file_id` for `/files/{id}/versions`; `/retention-rules` has no
-  such binding). `GET /files/{id}/versions` additionally rejects a cursor issued for a different file, and
-  `GET /files` a cursor issued for a different `(owner_kind, owner_id)` pair.
+  token, wrong version, malformed fields, or a direction that is neither `"fwd"` nor `"bwd"`), `ORDER_MISMATCH` (the
+  cursor's encoded sort order doesn't match this endpoint's canonical order — effectively "a cursor from a
+  different listing"), `FILTER_MISMATCH` (the cursor is bound to a different owner pair for `/files`, or a
+  different `file_id` for `/files/{id}/versions`; `/retention-rules` has no such binding) — this applies to a
+  `prev_cursor` exactly as it does to a `next_cursor`. `GET /files/{id}/versions` additionally rejects a cursor
+  issued for a different file, and `GET /files` a cursor issued for a different `(owner_kind, owner_id)` pair,
+  regardless of which direction the cursor navigates.
 
 ## P1 — Sidecar (signed-URL authorized)
 

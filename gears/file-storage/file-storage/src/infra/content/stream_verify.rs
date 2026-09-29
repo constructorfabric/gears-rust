@@ -118,7 +118,15 @@ fn build_spec(
             for (i, entry) in entries.iter().enumerate() {
                 let start = entry.offset;
                 let end = entries.get(i + 1).map_or(expected_len, |next| next.offset);
-                if start > end || end > expected_len {
+                // `start == end` is a zero-length span: `process_chunk` never
+                // finalizes it at EOF (nothing ever advances `total_seen` to
+                // reach it as a *boundary* crossed from below), so it would
+                // never contribute a digest to `part_digests` and `compare`'s
+                // `zip` over `entries`/`part_digests` would silently drop it
+                // instead of ever comparing it -- rejected here up front,
+                // before any streaming begins, rather than left to surface
+                // (or not) as a length mismatch downstream.
+                if start >= end || end > expected_len {
                     return Err(DomainError::hash_mismatch(
                         hex::encode(hash_value),
                         format!(
@@ -193,6 +201,23 @@ fn compare(spec: &Spec, hash_value: &[u8], part_digests: Vec<[u8; 32]>) -> Resul
             Ok(())
         }
         Spec::Composite { entries } => {
+            // `zip` silently stops at the shorter side: if `part_digests` had
+            // fewer entries than the manifest (a span that never finalized,
+            // e.g. because the stream ended early against a span boundary
+            // `process_chunk` never reached), every check below would
+            // silently skip the unchecked tail entries instead of failing on
+            // them. Checked explicitly up front, before either `zip` below.
+            if part_digests.len() != entries.len() {
+                return Err(DomainError::hash_mismatch(
+                    hex::encode(hash_value),
+                    format!(
+                        "expected {} composite part(s) per the manifest, got {} finalized \
+                         span(s) from the stream",
+                        entries.len(),
+                        part_digests.len()
+                    ),
+                ));
+            }
             for (entry, digest) in entries.iter().zip(part_digests.iter()) {
                 if *digest != entry.digest {
                     return Err(DomainError::hash_mismatch(

@@ -109,8 +109,8 @@ documented as a process in §3 instead.
 
 **Success Scenarios**:
 - A caller holding `ADMIN_POLICY` receives every retention rule (any scope) belonging to their tenant,
-  one forward-only cursor-paginated page at a time (`limit`/`cursor`, default 25, max 200; canonical
-  order `created_at desc, rule_id desc`)
+  one cursor-paginated page at a time, navigable in either direction (`limit`/`cursor`, default 25, max 200;
+  canonical order `created_at desc, rule_id desc`)
 - A non-admin caller receives only the rules they may see: all `Tenant`-scope rules, `User`-scope
   rules that target themselves, and `File`-scope rules whose target file they own (owner compared
   as the `(owner_kind, owner_id)` pair, not `owner_id` alone — `user` and `app` are disjoint owner
@@ -598,6 +598,6 @@ from the guard.
   in one unpaginated read before scanning files (only the file scan itself is keyset-paginated, step 2 above). Safe
   today because the rule set is small relative to the number of files, but it is an unbounded read that would need
   its own pagination if the number of tenants/rules grows large enough to matter; deferred until that is observed
-  in practice. The REST-facing `GET /retention-rules` listing is forward-only
-  cursor-paginated (`limit`/`cursor`, canonical order `created_at desc, rule_id desc`, non-admin visibility filter
+  in practice. The REST-facing `GET /retention-rules` listing is cursor-paginated in either direction
+  (`limit`/`cursor`, canonical order `created_at desc, rule_id desc`, non-admin visibility filter
   applied in SQL) — this remaining limitation is scoped to the sweep's own data-plane read, not the public API.

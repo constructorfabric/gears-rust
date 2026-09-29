@@ -301,8 +301,8 @@ owner type as a mandatory filter:
 - **User-owned** — files owned by a specific user (`owner_kind = user`)
 - **App-owned** — files owned by a Gear (`owner_kind = app`)
 
-The response **MUST** be paginated following the platform API guidelines (forward-only cursor-based pagination with
-configurable page size; offset pagination **MUST NOT** be offered). The system **MUST** support optional additional filters (mime_type, date range, custom metadata
+The response **MUST** be paginated following the platform API guidelines (keyset cursor-based pagination, navigable
+in both directions, with configurable page size; offset pagination **MUST NOT** be offered). The system **MUST** support optional additional filters (mime_type, date range, custom metadata
 keys).
 
 **Rationale**: Users and gears need to discover and browse files they own or have access to. Mandatory owner type

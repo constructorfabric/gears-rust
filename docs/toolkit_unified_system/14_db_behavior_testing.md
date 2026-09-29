@@ -128,11 +128,14 @@ columns.
 only the columns that changed, or does it write back fields it merely read?
 
 **How to catch it with a test.** Unit test on SQLite: call the CAS twice with the same expected-state
-precondition; the second call must observe zero rows affected and return the domain error. For lost update:
-two sequential updates to *different* fields of the same row must both be visible afterward — assert the
-field the second update didn't touch still holds what the first set, via a direct entity query (12's
-"Direct DB assertions"). For the concurrent case, a barrier test against PostgreSQL with two writers
-touching disjoint fields proves the write-set is actually disjoint, not merely narrow-looking in one path.
+precondition; the second call must observe zero rows affected and return the domain error. For lost update,
+load *two* copies of the row before either write: a test that does "read a copy, write it, then read another
+copy, write it" still passes even with the bug, because the second read happens after the first write's
+commit, so its whole-row write already carries the first change forward. Change a different field in each of
+the two copies taken up front, write both, then assert via a direct entity query that both changes are
+present — not that either write's return value looked successful (12's "Direct DB assertions"). For the
+concurrent case, a barrier test against PostgreSQL with two writers touching disjoint fields proves the
+write-set is actually disjoint, not merely narrow-looking in one path.
 
 **Typical fix.** Check `rows_affected`; map zero to the specific domain outcome the caller needs
 (`Conflict`, `NotFound`, `StaleVersion`) instead of `Ok(())`. For lost update, narrow the `UPDATE`'s column
@@ -564,7 +567,12 @@ async fn concurrent_callers_leave_the_invariant_intact() {
     let t1 = tokio::spawn(async move { b1.wait().await; svc1.op(&ctx_a, ...).await });
     let t2 = tokio::spawn(async move { b2.wait().await; svc2.op(&ctx_b, ...).await });
     let (r1, r2) = tokio::join!(t1, t2);
-    // Assert a post-state invariant against the tables -- both r1/r2 can be Ok while it's broken.
+    let r1 = r1.expect("task 1 panicked");
+    let r2 = r2.expect("task 2 panicked");
+    // Assert the expected pair of outcomes explicitly -- e.g. exactly one Ok and one Conflict,
+    // in either order -- not just that both joins returned without panicking:
+    // assert!(matches!((&r1, &r2), (Ok(_), Err(DomainError::Conflict(_))) | (Err(DomainError::Conflict(_)), Ok(_))));
+    // Then assert a post-state invariant against the tables -- both r1/r2 can be Ok while it's broken.
     assert_invariant_holds(&db).await;
 }
 ```
@@ -574,6 +582,15 @@ hand off at `.await` points without ever actually overlapping, making a real bug
 for reasons unrelated to whether it's fixed. Fail closed on missing Docker via a
 `<GEAR>_PG_REQUIRE_DOCKER=1`-shaped CI variable, as both worked examples do, so an environment that should
 have Docker but doesn't fails loudly instead of silently skipping.
+
+A barrier released before both tasks start only widens the race window between the two operations; it does
+not guarantee both read the shared predicate before either writes, so a vulnerable operation can still run
+effectively sequentially inside the window and pass the post-state assertion. For a deterministic race —
+both sides *must* interleave at the exact read/write boundary being tested, not merely have a chance to —
+put the synchronization point there instead of before the call, via a test-only hook that the operation
+invokes at that boundary (as file-storage's migration-cleanup regression tests do in
+`gears/file-storage/file-storage/tests/cleanup_test.rs`: a wrapper backend runs the "concurrent" writer's
+CAS from inside the tested call's own precursor step, instead of racing it in from a separate task).
 
 ## Where to keep which test
 
