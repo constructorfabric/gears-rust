@@ -27,16 +27,18 @@ gear started with no `file-storage` config section at all gets every default bel
 actually boot**: `require_signing_key_seed` defaults to `true` with `signing_key_seed` unset, and
 `FileStorageConfig::validate()` fails gear init on exactly that combination (see `require_signing_key_seed` below).
 A genuinely zero-config deployment is dev/test-only (set `require_signing_key_seed: false` there).
-`FileStorageConfig::validate()` (called at gear init, before anything is wired up) rejects **twenty-one**
-invalid configurations — seven missing-secret/zero-value guards (`sweep_interval_secs == 0` or
+`FileStorageConfig::validate()` (called at gear init, before anything is wired up) rejects **twenty-five**
+invalid configurations — nine missing-secret/zero-value guards (`sweep_interval_secs == 0` or
 `sweep_time_budget_secs == 0` with the sweep enabled;
-`default_url_ttl_secs`, `multipart_session_ttl_secs` or `multipart_complete_lease_secs` equal to `0`, instead of
+`default_url_ttl_secs`, `multipart_session_ttl_secs`, `multipart_complete_lease_secs`, `migrate_timeout_secs` or
+`migrate_lease_margin_secs` equal to `0`, instead of
 silently using one second; `signing_key_seed` absent while required; `finalize_internal_secret` absent while
-required); nine absolute
+required); eleven absolute
 ceilings (`finalize_token_grace_secs` above `MAX_FINALIZE_TOKEN_GRACE_SECS`, 7 days; `max_page_size` above
 `MAX_PAGE_SIZE_CEILING`, 200; `max_url_ttl_secs` above `MAX_URL_TTL_CEILING`, 30 days; `multipart_session_ttl_secs`
 above `MAX_MULTIPART_SESSION_TTL_SECS`, 30 days; `multipart_complete_lease_secs` above
-`MAX_MULTIPART_COMPLETE_LEASE_SECS`, 1 day; `orphan_grace_secs` above `MAX_ORPHAN_GRACE_SECS`, 30 days;
+`MAX_MULTIPART_COMPLETE_LEASE_SECS`, 1 day; `migrate_timeout_secs` above `MAX_MIGRATE_TIMEOUT_SECS`, 1 day;
+`migrate_lease_margin_secs` above `MAX_MIGRATE_LEASE_MARGIN_SECS`, 1 hour; `orphan_grace_secs` above `MAX_ORPHAN_GRACE_SECS`, 30 days;
 `idempotency_ttl_secs` above `MAX_IDEMPOTENCY_TTL_SECS`, 30 days; `sweep_time_budget_secs` above
 `MAX_SWEEP_TIME_BUDGET_SECS`, 24 hours; `previous_signing_public_keys` having more than
 `infra::signed_url::MAX_PREVIOUS_SIGNING_PUBLIC_KEYS`, 8, entries — see those fields below); four cross-field ordering invariants (`default_url_ttl_secs`
@@ -58,6 +60,8 @@ there is no standalone TOML/JSON file of its own.
 | `finalize_token_grace_secs` | `3600` (1h) | `default_finalize_token_grace_secs()` |
 | `multipart_session_ttl_secs` | `86400` (24h) | `default_multipart_session_ttl_secs()` |
 | `multipart_complete_lease_secs` | `120` (2 min) | `default_multipart_complete_lease_secs()` |
+| `migrate_timeout_secs` | `3600` (1h) | `default_migrate_timeout_secs()` |
+| `migrate_lease_margin_secs` | `300` (5 min) | `default_migrate_lease_margin_secs()` |
 | `sidecar_base_url` | `"http://localhost:8087"` | `default_sidecar_base_url()` |
 | `default_page_size` | `25` | `default_page_size()` |
 | `max_page_size` | `200` | `default_max_page_size()` |
@@ -143,6 +147,36 @@ recommendation**: size it to the backend's assembly time for your largest object
 short → a slow-but-healthy assembly has its lease stolen and the work is redone by a second caller; too long → a
 session whose completer really did crash stays unavailable for takeover for the whole lease window. Capped at
 `MAX_MULTIPART_COMPLETE_LEASE_SECS` (`86400` s = 1 day); `validate()` fails gear init above it.
+
+### `migrate_timeout_secs` / `migrate_lease_margin_secs`
+Together these size the per-version **migration lease** `POST /files/{id}/migrate` acquires before it ever writes to
+a destination backend (upload-flow redesign): `lease = migrate_timeout_secs + migrate_lease_margin_secs`. A second
+migration attempt of the same version while the lease is live is rejected with `409 Conflict` immediately, before any
+backend I/O.
+
+`migrate_timeout_secs` (seconds, default `3600` = 1h) is the time budget for one migration attempt's transfer +
+verification + commit, enforced via `tokio::time::timeout`; exceeding it best-effort deletes only the destination
+object this call itself created and fails with a retryable `503 service_unavailable` + `Retry-After`. **Production
+recommendation**: size it to your largest realistic object divided by the slowest backend's sustained throughput this
+deployment expects to migrate, with headroom — e.g. a 50 GiB object over a backend sustaining 100 MiB/s needs at
+least ~500s; leave a comfortable multiple on top for backend hiccups rather than sizing to the exact expected
+duration. **Misconfiguration risk**: too short aborts legitimate large-object transfers before they can finish (each
+retry starts the transfer over, since the previous attempt's own destination write becomes the next attempt's
+reclaimable tail — see `docs/features/backend-migration.md`); too long lets a genuinely stuck attempt hold the lease,
+and therefore block every other migration attempt of that version, for the whole window. Capped at
+`MAX_MIGRATE_TIMEOUT_SECS` (`86400` s = 1 day).
+
+`migrate_lease_margin_secs` (seconds, default `300` = 5 min) is added on top of `migrate_timeout_secs` to cover two
+effects the timeout alone doesn't budget for: clock skew between the instance holding the lease and whichever clock
+ultimately evaluates its expiry (the lease itself is timed by the **database's own clock**, `now()` /
+`CURRENT_TIMESTAMP` — see `VersionRepo::acquire_migration_lease` — but the instance's own `tokio::time::timeout`
+still fires on its local clock, so the two can disagree by however far the instances have drifted); and the tail of a
+backend request already in flight when that local timeout fires, which does not itself observe the timeout and may
+keep running briefly afterward. **Production recommendation**: a few minutes is enough for typical clock-sync (NTP)
+drift and backend request tails; raise it if this deployment's instances are known to drift further than that.
+**Misconfiguration risk**: too small risks a second attempt taking over the lease while the first one's now-abandoned
+backend call is still writing; too large extends how long a stuck migration blocks every other attempt at the same
+version. Capped at `MAX_MIGRATE_LEASE_MARGIN_SECS` (`3600` s = 1 hour).
 
 ### `sidecar_base_url`
 The externally-reachable base URL of the data-plane sidecar that every signed URL points at (default assumes a

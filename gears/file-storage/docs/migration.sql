@@ -196,6 +196,18 @@ CREATE TABLE file_storage.file_versions (
     -- default to false (shipped, m20260924_000001_upload_flow_redesign).
     bound_on_finalize boolean      NOT NULL  DEFAULT false,
 
+    -- Migration lease (shipped, m20260924_000001_upload_flow_redesign):
+    -- migrate_backend acquires this lease on a version before ever writing
+    -- to its destination backend, so two concurrent migration attempts of
+    -- the same version -- which always target the same deterministic
+    -- /{file_id}/{version_id} destination path -- cannot race each other
+    -- there. Both NULL means no migration is currently in progress. The
+    -- lease's expiry is timed by the database's own clock (now()), never the
+    -- acquiring instance's, so instance clock skew cannot make a live lease
+    -- look expired (or vice versa) to a second attempt reading this row.
+    migration_lease_owner  uuid         NULL,
+    migration_lease_until  timestamptz  NULL,
+
     created_at       timestamptz  NOT NULL  DEFAULT now(),
 
     PRIMARY KEY (file_id, version_id)

@@ -589,10 +589,13 @@ POST /files/{id}/migrate   { "target_backend_id": "<string>" }   → 204
 
 Migrates a file's content to a different configured storage backend, preserving the file's identity (`file_id`
 unchanged). **Non-versioned files only** — a file with more than one `file_versions` row is rejected
-(`VersionedFileMigrationNotSupported`, `409`). The version must already be `available` (`409` otherwise). The
-content streams straight from the source backend into the destination, with its hash re-verified incrementally on
-the same pass; the verdict is only known once the destination has received the whole stream, and the version's
-backend pointer is only ever repointed (CAS) once that verification has passed — see
+(`VersionedFileMigrationNotSupported`, `409`). The version must already be `available` (`409` otherwise). A per-version
+migration lease is acquired first — a second migration attempt of the same version while one is already in progress
+gets `409 Conflict` immediately, before any backend is touched. The content then streams straight from the source
+backend into the destination, with its hash re-verified incrementally on the same pass; the verdict is only known
+once the destination has received the whole stream, and the version's backend pointer is only ever repointed (CAS,
+also gated on the lease) once that verification has passed. The whole attempt runs under a `migrate_timeout_secs`
+time budget; exceeding it fails with a retryable `503` + `Retry-After` — see
 [backend-migration.md](./features/backend-migration.md) for the full failure/cleanup contract. Migrating
 onto a non-durable backend (e.g. a dev/test `memory` backend) additionally requires the caller's `ADMIN_POLICY`
 authorization scope, not just `WRITE`, since it risks silent data loss on the next restart.
@@ -880,8 +883,9 @@ access or carry substantially more per-request state in the token than it does t
   - `bind`: the target `version_id`'s upload has not been finalized yet.
   - `delete_version` (`DELETE /files/{id}/versions/{version_id}`): attempting to delete the file's current version
     (bind another version first).
-  - `migrate` (`POST /files/{id}/migrate`): the version is not yet finalized, or a concurrent migration to a
-    different target already won the race.
+  - `migrate` (`POST /files/{id}/migrate`): the version is not yet finalized, another migration attempt of the same
+    version already holds its migration lease, a destination path already claimed by a concurrently-committed
+    migration, or a concurrent migration to a different target already won the CAS race.
   - multipart `complete`/`abort`: the session is not `in_progress` (e.g. completing an already-aborted upload), one
     or more planned parts have not been reported yet (`MultipartPartsMissing`; the error detail lists the missing
     part numbers, checked **before** the size check below), the assembled size does not match `declared_size`, or
@@ -924,7 +928,8 @@ access or carry substantially more per-request state in the token than it does t
     with the length already resolved by the caller's earlier `stat`/`HeadObject` — a transient read race, not a
     fault (see "P1 — Sidecar" above). Carries `Retry-After: 1`; the recovery is a plain retry.
   - any storage-backend call (control plane or sidecar) failing with a **transient** backend fault — network,
-    timeout, backend overload/5xx, or the losing side of a concurrent object change (`DomainError::BackendUnavailable`,
+    timeout, backend overload/5xx, the losing side of a concurrent object change, or `POST /files/{id}/migrate`
+    exceeding its own `migrate_timeout_secs` budget (`DomainError::BackendUnavailable`,
     per `docs/arch/errors/categories/14-service-unavailable.md`). Carries `retry_after_seconds` in the response body
     and a matching `Retry-After: 5` header; the recovery is a plain retry once that window has elapsed. Distinct
     from `502` (control-plane callback failure) and `500` (a **permanent** backend fault — bad config, a protocol
