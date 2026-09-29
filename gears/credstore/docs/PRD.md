@@ -84,7 +84,7 @@ REQUIREMENT LANGUAGE:
 
 CredStore is the platform's hierarchical, tenant-scoped credential store. Platform gears and tenant administrators use it to keep API keys, tokens, passwords and certificates, to share them down the tenant hierarchy, and to read them back under the platform's authorization model.
 
-CredStore is a thin policy layer in front of a Vault-compatible secret store (HashiCorp Vault or OpenBao, KV version 2). The secret store is the only system of record: it holds every credential — its secret together with every field that decides who can see it — and it provides durability, versioning, atomic conditional writes and encryption at rest. CredStore adds only what the secret store does not have: tenant hierarchy semantics (inheritance, override, suppression, descendant blocking), per-type authorization through the platform PDP, credential-type traits, anti-enumeration, per-secret audit, and a paginated catalogue of what a tenant can see. The gear reaches the secret store through a narrow internal adapter that a pluggable backend can replace later without changing consumers.
+CredStore is a thin policy layer in front of a Vault-compatible secret store (HashiCorp Vault or OpenBao, KV version 2). The secret store is the only system of record: it holds every credential — its secret together with every field that decides who can see it — and it provides durability, versioning, atomic conditional writes and encryption at rest. CredStore adds only what the secret store does not have: tenant hierarchy semantics (inheritance, override, suppression, descendant blocking), per-type authorization through the platform PDP, credential-type traits, anti-enumeration, a paginated catalogue of what a tenant can see, and fail-closed audit of every secret read and change through the platform event broker. The gear reaches the secret store through a narrow internal adapter that a pluggable backend can replace later without changing consumers.
 
 CredStore also keeps a small database, used only as a derived index that makes listing and hierarchical resolution cheap. The index holds no secret, never decides on its own what is served, and can be dropped and rebuilt from the secret store without losing any credential.
 
@@ -107,7 +107,7 @@ PRs #4737 (documentation) and #4741 (implementation) reshaped the consumer surfa
 - **No correctness-critical background work**: no reaper, saga recovery or maintenance job is required for any guarantee in this PRD.
 - **Least privilege end to end**: a caller holding only metadata actions never receives a secret; the gear's own access to the secret store is one identity limited to the gear's installation prefix.
 - **Hierarchy control**: a tenant can use, override, suppress, or withhold from its descendants any credential it inherits, without touching the ancestor's credential.
-- **Attributable disclosure**: 100% of secrets returned produce an audit event naming the platform subject.
+- **Attributable disclosure**: 100% of secrets returned and of secret changes produce an audit event on the platform event broker naming the platform subject; without a working audit path no secret is read or changed.
 
 ### 1.4 Glossary
 
@@ -215,7 +215,7 @@ PRs #4737 (documentation) and #4741 (implementation) reshaped the consumer surfa
 
 **ID**: `cpt-cf-credstore-actor-platform-services`
 
-- **Role**: `authz-resolver` evaluates per-operation access scopes; `tenant-resolver` supplies ancestor chains; `types-registry` holds the credential base type, the derived credential types and their traits; account-management owns the tenant lifecycle.
+- **Role**: `authz-resolver` evaluates per-operation access scopes; `tenant-resolver` supplies ancestor chains; `types-registry` holds the credential base type, the derived credential types and their traits; `event-broker` receives the audit events; account-management owns the tenant lifecycle.
 
 ## 3. Operational Concept & Environment
 
@@ -244,8 +244,9 @@ PRs #4737 (documentation) and #4741 (implementation) reshaped the consumer surfa
 - Optimistic concurrency with mandatory preconditions on every write and delete, and versions that never repeat
 - A Vault-compatible KV version 2 secret store as the only system of record, behind a narrow internal store adapter; the database as a derived, rebuildable index
 - Service-to-service retrieval on behalf of arbitrary tenants (OAGW pattern)
-- Per-secret audit; operational metrics; secret confidentiality
-- Later (p2): startup check of the store configuration, no retention of previous secret versions in the store, audit correlation with the store, tenant offboarding
+- Fail-closed audit of every secret read and secret change, published to the platform event broker
+- Operational metrics; secret confidentiality
+- Later (p2): correlation of audit events with the store's audit log, startup check of the store configuration, no retention of previous secret versions in the store, tenant offboarding
 
 ### 4.2 Out of Scope
 
@@ -256,6 +257,7 @@ PRs #4737 (documentation) and #4741 (implementation) reshaped the consumer surfa
 - Full-text search over references or secrets
 - Secrets in the catalogue listing unless the caller explicitly selects secret mode
 - Per-credential ACLs naming specific tenants, and sharing outside the tenant hierarchy
+- Storing, retaining or querying audit events; that is the event broker's topic retention and a downstream audit pipeline
 - Downward listing: a parent reads a descendant's catalogue only by acting in the descendant's context
 - Vault namespaces, per-tenant store policies or per-tenant store identities
 - Pluggable backends, backend selection by vendor, and a public backend SPI (the store adapter keeps this possible later)
@@ -325,7 +327,7 @@ A write of a `tenant` or `shared` record **MUST** address the tenant's single no
 
 - [ ] `p1` - **ID**: `cpt-cf-credstore-fr-write-secret`
 
-The system **MUST** write a secret only as part of writing its record and **MUST NOT** grant reading a secret as a side effect of granting writing it. `write_secret` **MUST** be required when a request writes a secret or removes an existing one; it **MUST NOT** be required when a full replace creates a declared record or restates the absence of a secret on an already declared record. A partial update carrying an explicit secret — a value or null — **MUST** require `write_secret` regardless of the record's prior state. A request that also carries record fields **MUST** additionally require `write`; a partial update carrying only a secret **MUST** need `write_secret` alone. Every write that supplies or removes a secret **MUST** produce a new version, even when the supplied secret equals the stored one. A tenant **MUST NOT** write the secret of an ancestor's record; it creates its own record instead.
+The system **MUST** write a secret only as part of writing its record and **MUST NOT** grant reading a secret as a side effect of granting writing it. `write_secret` **MUST** be required when a request writes a secret or removes an existing one; it **MUST NOT** be required when a full replace creates a declared record or restates the absence of a secret on an already declared record. A partial update carrying an explicit secret — a value or null — **MUST** require `write_secret` regardless of the record's prior state. A request that also carries record fields **MUST** additionally require `write`; a partial update carrying only a secret **MUST** need `write_secret` alone. Every write that supplies or removes a secret **MUST** produce a new version, even when the supplied secret equals the stored one. A tenant **MUST NOT** write the secret of an ancestor's record; it creates its own record instead. A secret change **MUST NOT** reach the secret store unless its audit event has been accepted (`cpt-cf-credstore-nfr-audit`).
 
 - **Rationale**: This is what makes the secret-blind configurator and the provisioning injector possible, and it avoids turning an equality check into an oracle for callers who may write but not read.
 - **Actors**: `cpt-cf-credstore-actor-integrations-admin`, `cpt-cf-credstore-actor-provisioner`, `cpt-cf-credstore-actor-self-rotating-app`
@@ -334,9 +336,9 @@ The system **MUST** write a secret only as part of writing its record and **MUST
 
 - [ ] `p1` - **ID**: `cpt-cf-credstore-fr-read-secret`
 
-The system **MUST** allow an authorized caller to read the secret of a credential resolved through the hierarchy, for one credential or in secret mode. Reading a secret **MUST** require `read_secret` independently of any record fields selected alongside it; a caller selecting only the secret and its usage envelope (reference, type, expiry) **MUST** need `read_secret` alone. Every secret returned **MUST** produce an audit event (`cpt-cf-credstore-nfr-audit`).
+The system **MUST** allow an authorized caller to read the secret of a credential resolved through the hierarchy, for one credential or in secret mode. Reading a secret **MUST** require `read_secret` independently of any record fields selected alongside it; a caller selecting only the secret and its usage envelope (reference, type, expiry) **MUST** need `read_secret` alone. A secret **MUST NOT** be returned unless its audit event has been accepted (`cpt-cf-credstore-nfr-audit`).
 
-- **Rationale**: Secret disclosure is its own privilege with its own auditable path, separate from reading or listing metadata.
+- **Rationale**: Secret disclosure is its own privilege, separate from reading or listing metadata.
 - **Actors**: `cpt-cf-credstore-actor-integration-app`, `cpt-cf-credstore-actor-oagw`, `cpt-cf-credstore-actor-platform-gear`
 
 #### Secret for Use
@@ -352,7 +354,7 @@ The in-process client **MUST** offer a `get_secret` operation that returns the s
 
 - [ ] `p1` - **ID**: `cpt-cf-credstore-fr-bulk-read-secrets`
 
-The system **MUST** allow an authorized caller to read the secrets of several credentials in one request through the listing. Secret mode **MUST** be scoped by exactly one selector: an explicit set of references, or one or more concrete credential types. It **MUST NOT** accept ordering, pagination, a cursor, or any other selector. Each item **MUST** be resolved and authorized as a point read would be, so the result never exceeds what the caller could read one by one. A refused or non-resolving item **MUST** be omitted, never reported. The result **MUST** be bounded by a configured cap; a selector matching more **MUST** fail the whole request rather than truncate it. The usage envelope (reference, type, expiry) selected alongside the secret **MUST NOT** require `list`; any other record field selected alongside it **MUST**.
+The system **MUST** allow an authorized caller to read the secrets of several credentials in one request through the listing. Secret mode **MUST** be scoped by exactly one selector: an explicit set of references, or one or more concrete credential types. It **MUST NOT** accept ordering, pagination, a cursor, or any other selector. Each item **MUST** be resolved and authorized as a point read would be, so the result never exceeds what the caller could read one by one. A refused or non-resolving item **MUST** be omitted, never reported. The result **MUST** be bounded by a configured cap; a selector matching more **MUST** fail the whole request rather than truncate it. The usage envelope (reference, type, expiry) selected alongside the secret **MUST NOT** require `list`; any other record field selected alongside it **MUST**. If the audit event of any returned secret cannot be accepted, the whole request **MUST** fail and return no secret.
 
 - **Rationale**: Applications need their whole credential set in one round-trip; disclosure stays bounded by the caller's own grant, a hard cap and the absence of pagination.
 - **Actors**: `cpt-cf-credstore-actor-integration-app`
@@ -497,7 +499,7 @@ When a tenant creates a record for a reference that currently resolves to an anc
 
 The system **MUST** serve retrieval on behalf of an arbitrary tenant through the ordinary read: an authorized service constructs a SecurityContext for the target tenant, and the PDP decides whether that subject may read in that scope. There **MUST NOT** be a separate service-to-service operation.
 
-- **Rationale**: OAGW and other gears need hierarchical retrieval for arbitrary tenants through the same audited, policy-checked path.
+- **Rationale**: OAGW and other gears need hierarchical retrieval for arbitrary tenants through the same policy-checked path.
 - **Actors**: `cpt-cf-credstore-actor-oagw`, `cpt-cf-credstore-actor-platform-gear`
 
 ### 5.3 P1 — Authorization
@@ -665,6 +667,7 @@ The credential surface — in-process client operations, REST addresses and verb
 - **Expired records** — filtered on read and healed on write (`cpt-cf-credstore-fr-expired-records`) instead of being removed by a maintenance job; a create-only write therefore succeeds over an expired own record.
 - **Maintenance operation** — the host-invoked maintenance operation is withdrawn, because nothing requires periodic maintenance.
 - **Backend** — the value-store plugin SPI and vendor selection are replaced by the internal store adapter; this affects backend implementers and operators, not consumers.
+- **Audit** — audit events go to the platform event broker and are fail-closed: when the audit path is unavailable, operations that return or change a secret fail as unavailable, a failure mode #4741 does not have (`cpt-cf-credstore-nfr-audit`).
 - **Addition** — the descendant block is new; a record without it behaves exactly as under #4741.
 
 The move from the shipped surface on main is a deliberate break, permitted before mass production use: a plain read no longer returns the secret; the owning tenant and the inherited flag are replaced by the inheritance status; the three shipped actions are replaced by six; the create-only address and the shipped write operations are replaced by the guarded full replace and the partial update.
@@ -732,17 +735,24 @@ An operation **MUST NOT** read or change a credential outside the caller's PDP-a
 
 - [ ] `p1` - **ID**: `cpt-cf-credstore-nfr-audit`
 
-Every secret returned — by a point read, `get_secret` or secret mode — **MUST** produce a structured audit event naming the subject, the tenant acted in, the reference, the credential type and the operation — never the secret.
+Every read and every change of a secret **MUST** be audited by publishing an event to the platform event broker (`event-broker`):
 
-- **Threshold**: one audit event per secret returned, 100% coverage in tests.
-- **Rationale**: The secret store sees only the gear's identity; attribution to a platform subject exists only in the gear.
+- **disclosure** — one event per secret returned by a point read, `get_secret` or secret mode;
+- **change** — one event per write, rotation or removal of a secret, including the deletion of a record that holds one.
+
+Each event **MUST** name the subject, the tenant acted in, the reference, the credential type, the operation, its outcome and the platform request identifier. It **MUST NOT** contain the secret, and **MUST NOT** identify an ancestor tenant beyond the inheritance status, because it is published in the tenant acted in (`cpt-cf-credstore-fr-no-ancestor-disclosure`).
+
+Auditing **MUST** be fail-closed: a secret **MUST NOT** be returned until the event broker has accepted its disclosure event, and a secret change **MUST NOT** reach the secret store until the event broker has accepted its change event; when the event broker is unavailable or rejects the event, the operation **MUST** fail fast as unavailable. The outcome of a change **MUST** also be published after the write; an outcome that could not be published **MUST** be counted by a metric and never reverses the change. Operations that neither return nor change a secret — metadata reads, listings without secrets, and writes that change no secret, such as editing metadata, creating a declared record or suppressing without an own secret — **MUST NOT** depend on the event broker.
+
+- **Threshold**: one accepted event per secret returned and per secret change, 100% coverage in tests; with the event broker unavailable, zero secrets returned and zero secret changes applied, while metadata operations keep working, in fault-injection tests.
+- **Rationale**: The secret store sees only the gear's identity, so attribution to a platform subject exists only in the gear; the event broker is the platform's path to an audit pipeline (`cpt-cf-evbk-usecase-audit-pipeline`), so the gear publishes events and neither stores nor queries them.
 - **Architecture Allocation**: see DESIGN.md observability section.
 
 #### Store Audit Correlation
 
 - [ ] `p2` - **ID**: `cpt-cf-credstore-nfr-store-audit-correlation`
 
-Every secret-store request **MUST** carry the platform request identifier so that the store's own audit log can be correlated with the gear's audit events.
+Every secret-store request **MUST** carry the platform request identifier so that the store's own audit log can be correlated with the gear's audit events on the event broker.
 
 - **Threshold**: 100% of store requests carry the identifier, verified against the store's audit log in an integration test.
 - **Rationale**: Incident reconstruction needs to join the gear's subject-level events with the store's access log.
@@ -772,7 +782,7 @@ In the steady state a single-credential read **MUST** cost at most one index que
 
 - [ ] `p1` - **ID**: `cpt-cf-credstore-nfr-availability`
 
-Every call to a dependency — secret store, index database, PDP, `tenant-resolver`, `types-registry` — **MUST** be bounded by a timeout. When the secret store is unreachable, sealed or throttling, or when any other dependency fails or times out, every affected operation **MUST** fail as unavailable, with a retry hint when one is known. The gear **MUST NOT** serve a secret whose record it has not read from the secret store for that request, and **MUST NOT** return a result decided by index data it could not confirm against the secret store. The gear **MUST NOT** add any availability dependency beyond those listed.
+Every call to a dependency — secret store, index database, PDP, `tenant-resolver`, `types-registry`, `event-broker` — **MUST** be bounded by a timeout. When the event broker is unavailable, only operations that return or change a secret fail (`cpt-cf-credstore-nfr-audit`). When the secret store is unreachable, sealed or throttling, or when any other dependency fails or times out, every affected operation **MUST** fail as unavailable, with a retry hint when one is known. The gear **MUST NOT** serve a secret whose record it has not read from the secret store for that request, and **MUST NOT** return a result decided by index data it could not confirm against the secret store. The gear **MUST NOT** add any availability dependency beyond those listed.
 
 - **Threshold**: zero secrets served under an unconfirmed visibility decision, and no request exceeding the sum of its dependency timeouts, in fault-injection tests.
 - **Rationale**: Credential access favours correctness over availability.
@@ -792,7 +802,7 @@ Credential durability **MUST** equal the secret store's: the recovery point of a
 
 - [ ] `p1` - **ID**: `cpt-cf-credstore-nfr-observability`
 
-The gear **MUST** emit metrics sufficient to detect resolution anomalies and store-side failures: resolution depth and outcome (own, inherited, overridden, suppressed, miss); latency and outcome per dependency (PDP, `tenant-resolver`, `types-registry`, secret store, index) with store failures classified as not-found, conflict, forbidden, throttled, sealed or other; index repairs and rebuild progress; cross-tenant denials. Metrics **MUST NOT** require counting queries, and metric labels **MUST NOT** contain references or secrets.
+The gear **MUST** emit metrics sufficient to detect resolution anomalies and store-side failures: resolution depth and outcome (own, inherited, overridden, suppressed, miss); latency and outcome per dependency (PDP, `tenant-resolver`, `types-registry`, secret store, index, event broker), operations refused because the audit event was not accepted, change outcomes that could not be published with store failures classified as not-found, conflict, forbidden, throttled, sealed or other; index repairs and rebuild progress; cross-tenant denials. Metrics **MUST NOT** require counting queries, and metric labels **MUST NOT** contain references or secrets.
 
 - **Threshold**: every listed signal present and exercised in integration tests.
 - **Rationale**: Index drift and store-side failures are quiet; operators need signals, not log archaeology.
@@ -805,7 +815,7 @@ The gear **MUST** emit metrics sufficient to detect resolution anomalies and sto
 - **Absolute latency SLO**: not stated; end-to-end latency is dominated by the secret store and depends on its deployment. `cpt-cf-credstore-nfr-resolution-cost` bounds the gear's own contribution.
 - **Index-rebuild duration**: no time bound is set; reads stay correct or unavailable while a rebuild runs (`cpt-cf-credstore-fr-derived-index`), and the duration depends on the secret store's listing throughput, which DESIGN measures before setting an operational target.
 - **Throughput and capacity targets**: inherited from the secret store's capacity; the gear adds no per-tenant quota.
-- **Audit retention and personal data**: audit events follow the platform's audit retention; the gear treats every secret as opaque and takes no responsibility for personal data a caller chooses to store in one.
+- **Audit retention and personal data**: audit events are retained by the event broker's topic retention and any downstream audit pipeline, not by this gear; the gear treats every secret as opaque and takes no responsibility for personal data a caller chooses to store in one.
 - **Usability, accessibility, internationalization**: not applicable — the gear has no user interface; human actors reach it through platform tooling.
 
 ## 7. Public Library Interfaces
@@ -845,8 +855,16 @@ The gear **MUST** emit metrics sufficient to detect resolution anomalies and sto
 - [ ] `p1` - **ID**: `cpt-cf-credstore-contract-gts`
 
 - **Direction**: provided to `types-registry`
-- **Protocol/Format**: GTS link-time inventory: the credential base type `gts.cf.core.credstore.credential.v1~` (also the PDP resource type, carrying the traits schema) and the derived credential-type catalogue with traits. Stored type references are UUIDs.
+- **Protocol/Format**: GTS link-time inventory: the credential base type `gts.cf.core.credstore.credential.v1~` (also the PDP resource type, carrying the traits schema), the derived credential-type catalogue with traits, and the credstore audit topic with its disclosure and change event types, derived from the event broker's base topic and event types. Stored type references are UUIDs.
 - **Compatibility**: type ids are stable; new versions are new ids. The rename from the shipped `secret.v1~` requires re-issuing every policy that granted the shipped actions.
+
+#### Audit Events
+
+- [ ] `p1` - **ID**: `cpt-cf-credstore-contract-audit-events`
+
+- **Direction**: provided to `event-broker`
+- **Protocol/Format**: GTS-typed events published through the event-broker SDK to the credstore audit topic, partitioned by the tenant acted in: a disclosure event per secret returned and a change event per secret change plus its outcome, with the fields of `cpt-cf-credstore-nfr-audit` and never a secret. Concrete type ids and payload schemas are in DESIGN.md.
+- **Compatibility**: event types are versioned GTS types; a new payload shape is a new type version.
 
 #### Secret Store
 
@@ -899,12 +917,13 @@ The gear **MUST** emit metrics sufficient to detect resolution anomalies and sto
 3. The gear reads that one record from the secret store, re-checks its visibility and returns the secret with its type, expiry and an opaque validator
 
 **Postconditions**:
-- OAGW has the secret; the customer never sees it; the read is audited; nothing names the partner
+- OAGW has the secret; the customer never sees it; the disclosure is audited on the event broker; nothing names the partner
 
 **Alternative Flows**:
 - **The customer holds its own record with a secret**: that secret is returned
 - **Nothing decisive in the chain, or the read is not permitted**: empty result
 - **Secret store unavailable**: unavailable; OAGW fails the upstream call rather than using a cached secret
+- **Event broker unavailable**: unavailable; the secret is not returned
 
 #### UC-003: Customer Overrides a Partner Credential
 
@@ -965,6 +984,7 @@ The gear **MUST** emit metrics sufficient to detect resolution anomalies and sto
 
 **Alternative Flows**:
 - **More matches than the cap**: the request fails; nothing is returned
+- **An audit event is not accepted**: the whole request fails; no secret is returned
 - **An item resolves to a suppression or has expired**: it is omitted
 - **The application reads a credential of another type by reference**: not found
 
@@ -986,7 +1006,7 @@ The gear **MUST** emit metrics sufficient to detect resolution anomalies and sto
 4. Delete under the new validator; the credential stops resolving and the reference is free
 
 **Postconditions**:
-- Every secret read is audited; the rotated and deleted secrets are no longer retrievable through the gear
+- Every secret read and secret change is audited on the event broker; the rotated and deleted secrets are no longer retrievable through the gear
 
 **Alternative Flows**:
 - **Stale validator**: conflict; nothing changes
@@ -1143,6 +1163,7 @@ The gear **MUST** emit metrics sufficient to detect resolution anomalies and sto
 
 **Alternative Flows**:
 - **Secret store unavailable**: unavailable; the credential is exactly as before
+- **Event broker unavailable**: unavailable; nothing is deleted
 - **Crash during the delete**: the credential is either fully present or fully deleted
 - **Retry after success**: not-found
 
@@ -1236,7 +1257,7 @@ The gear **MUST** emit metrics sufficient to detect resolution anomalies and sto
 - [ ] A binary secret written through the in-process client round-trips byte-exact for a type that allows binary; a non-UTF-8 secret is rejected on the REST transport
 - [ ] A single read costs at most one index query and one store read at chain depths 1, 5 and 10
 - [ ] No secret, store response body, store path or other tenant's identifier appears in any log, trace, metric, response or error
-- [ ] Every secret returned produces an audit event
+- [ ] Every secret returned and every secret change produces an event accepted by the event broker, carrying no secret; with the event broker unavailable, no secret is returned and no secret change is applied, while metadata operations keep working
 - [ ] The gear's store identity is short-lived and renewed without operator action
 - [ ] Two installations sharing one secret store under different installation prefixes cannot read or write each other's records
 - [ ] `p2` The gear refuses to start against a mount that retains older versions, does not require conditional writes, or is unreachable under the installation prefix, and when the in-process adapter is selected in production
@@ -1251,6 +1272,7 @@ The gear **MUST** emit metrics sufficient to detect resolution anomalies and sto
 | `authz-resolver` | Six actions per concrete credential type, fail-closed | `p1` |
 | `tenant-resolver` | Ancestor chains, including across isolation barriers | `p1` |
 | `types-registry` | Credential base type, derived types and traits | `p1` |
+| `event-broker` | Accepts the audit events; its availability gates every secret read and change | `p1` |
 | Database (PostgreSQL / SQLite) | Derived credential index only | `p1` |
 | PDP policy re-issuance | Policies granting the shipped `read`/`write`/`delete` on `secret.v1~` are re-issued under the six actions on `credential.v1~` before cutover | `p1` |
 | Consumer migration | OAGW, settings-service and the Keycloak IdP plugin move to the #4741 client operations | `p1` |
@@ -1273,6 +1295,7 @@ The gear **MUST** emit metrics sufficient to detect resolution anomalies and sto
 |------|--------|------------|
 | Secrets leaked through logs, traces or store error bodies | Critical security incident | Confidentiality NFR; store responses redacted before logging; zeroize; non-cacheable responses; log-capture tests |
 | Compromise of the gear's single store identity | Every credential of the installation readable | Short-lived renewable identity; store policy limited to the installation prefix and the operations used; store audit correlation (p2) |
+| Event broker outage | Secret reads and changes unavailable, including the OAGW hot path; metadata operations unaffected | Fail fast with retry hints; bounded timeouts; dependency metrics; broker high availability is a platform concern |
 | Secret store outage, seal or throttling | All credential operations unavailable, including the OAGW hot path | Fail closed with retry hints; bounded timeouts; dependency metrics; store high availability is a platform concern |
 | Store latency on the OAGW hot path | Slower upstream calls than with a local value store | One store read per call (`cpt-cf-credstore-nfr-resolution-cost`); value caching is an open question |
 | Index drift after partial failures or out-of-band store edits | Listing or resolution temporarily wrong for a reference | Every served result re-checked in the store; index updates ordered by version; repair on access; rebuild; drift metrics |
@@ -1286,7 +1309,6 @@ The gear **MUST** emit metrics sufficient to detect resolution anomalies and sto
 ## 13. Open Questions
 
 - **Delivery path**: land PR #4741 on its current storage first and swap storage behind the same surface later, or supersede #4741 and ship the Vault-backed gear directly?
-- **Audit failure behaviour**: must a secret be withheld when its audit event cannot be recorded (fail-closed), or is best-effort emission with a stated loss bound acceptable, and which platform sink receives the events?
 - **Value caching for OAGW**: is a short-lived in-process cache of resolved secrets acceptable on the hot path? Adopting one would amend `cpt-cf-credstore-nfr-availability` and add a bounded revocation delay, so it needs its own decision.
 - **Expired secrets**: must an expired secret be removed from the secret store at expiry for compliance, or is removal by the next write or delete (`cpt-cf-credstore-fr-expired-records`) sufficient?
 - **Descendant block field**: the name and representation of the field on the record (a boolean next to sharing mode, or a descendant-policy enumeration defaulting to the current behaviour).
