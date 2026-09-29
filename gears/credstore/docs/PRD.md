@@ -573,7 +573,12 @@ A delete **MUST** be a single step: once it returns, the credential no longer re
 
 - [ ] `p1` - **ID**: `cpt-cf-credstore-fr-immutable-value-versions`
 
-Every change of an own record **MUST** produce a new store-assigned version, monotonic per reference and sharing class and never reused — including after the record is deleted and the reference re-created. A validator obtained before a delete **MUST** therefore never match the re-created record, so a delete keeps a secret-less marker for the reference in the secret store instead of erasing its history.
+Every change of an own record **MUST** produce a new store-assigned version, monotonic per reference and sharing class and never reused — including after the record is deleted and the reference re-created. A validator obtained before a delete **MUST** therefore never match the re-created record. To guarantee this, a delete **MUST** keep a secret-less deletion marker (tombstone) for the reference in the secret store instead of erasing its history:
+
+- every read, listing and resolution **MUST** treat a tombstone as an absent record;
+- a create-only write over a tombstone **MUST** succeed and continue its version;
+- a guarded write carrying a validator from before the delete **MUST** fail as a conflict;
+- a tombstone **MUST** be removed from the secret store only by tenant offboarding (`cpt-cf-credstore-fr-tenant-offboarding`); the credential index is not the record of a tombstone, and its own entry for one can expire after a retention period, because the secret store stays authoritative.
 
 - **Rationale**: A reused version would let a delayed writer holding a stale validator overwrite a credential it never saw (ABA).
 - **Actors**: `cpt-cf-credstore-actor-tenant-admin`, `cpt-cf-credstore-actor-self-rotating-app`, `cpt-cf-credstore-actor-backend`
@@ -1258,7 +1263,7 @@ The gear **MUST** emit metrics sufficient to detect resolution anomalies and sto
 | Store latency on the OAGW hot path | Slower upstream calls than with a local value store | One store read per call (`cpt-cf-credstore-nfr-resolution-cost`); value caching is an open question |
 | Index drift after partial failures or out-of-band store edits | Listing or resolution temporarily wrong for a reference | Every served result re-checked in the store; index updates ordered by version; repair on access; rebuild; drift metrics |
 | Database loss | Listing and resolution degraded until rebuild | Online rebuild (UC-015); reads correct or unavailable meanwhile |
-| Records kept for deleted references so versions never repeat | Store key space grows with deletions | Storage cost only; bounded by tenant offboarding (p2) and nothing else |
+| Tombstones kept for deleted references so versions never repeat | Store key space grows with deletions | A tombstone holds no secret, so this is a storage cost only; it is bounded by tenant offboarding (p2) and nothing else, and index entries for tombstones expire after a retention period |
 | Previous and expired secrets remain in the store | A rotated secret stays as an older store version, and an expired secret stays until its reference is written or deleted; neither is reachable through the gear | No retained previous secrets (p2); expired-secret retention is an open question |
 | Ancestor-chain cache staleness | A re-parented tenant keeps its former inheritance for up to the cache TTL | Short TTL; closing the window needs a hierarchy change signal from `tenant-resolver` |
 | Consumer migration breaks OAGW, settings-service or the IdP plugin | Integrations fail after cutover | Surface of #4741; migrate all three in the cutover release; contract tests against OpenBao |
