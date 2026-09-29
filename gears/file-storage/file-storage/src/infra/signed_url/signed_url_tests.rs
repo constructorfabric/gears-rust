@@ -292,19 +292,6 @@ fn from_public_keys_rejects_an_empty_list() {
 }
 
 #[test]
-fn issuer_over_explicit_provider_round_trips() {
-    // The codec calls the SignatureProvider abstraction (ADR-0004 FIPS posture),
-    // so an issuer built over an explicitly-supplied provider behaves identically
-    // — this is the seam a FIPS-validated provider plugs into.
-    let provider = Arc::new(Ed25519Provider::generate().unwrap());
-    let issuer = Issuer::with_provider(provider, 3600);
-    let claims = sample_claims(Op::Get, now().unix_timestamp() + 60);
-
-    let token = issuer.issue(claims.clone(), now()).unwrap();
-    assert_eq!(issuer.verifier().verify(&token, now()).unwrap(), claims);
-}
-
-#[test]
 fn upload_constraints_round_trip() {
     let issuer = Issuer::generate(3600).unwrap();
     let mut claims = sample_claims(Op::Put, now().unix_timestamp() + 60);

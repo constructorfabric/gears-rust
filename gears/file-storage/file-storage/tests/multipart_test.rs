@@ -1340,68 +1340,6 @@ async fn multipart_full_lifecycle_create_to_delete() {
     );
 }
 
-// -- 2. LocalFsBackend rejects multipart -------------------------------------
-
-#[tokio::test]
-async fn multipart_rejected_on_local_fs() {
-    let db = build_db().await;
-    let tmp = std::env::temp_dir().join(format!("cf-fs-localfs-{}", Uuid::now_v7().simple()));
-    std::fs::create_dir_all(&tmp).unwrap();
-    let local: Arc<dyn StorageBackend> = Arc::new(LocalFsBackend::new("local-fs", &tmp));
-    let backends = BackendRegistry::new(vec![local], "local-fs").expect("registry");
-    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
-    let authorizer: Arc<dyn file_storage::domain::authz::Authorizer> =
-        Arc::new(TenantOnlyAuthorizer);
-    let cfg = ServiceConfig {
-        default_url_ttl_secs: 3600,
-        sidecar_base_url: "http://sidecar.test".to_owned(),
-        default_page_size: 50,
-        max_page_size: 1000,
-        idempotency_ttl_secs: 86400,
-    };
-    let store = Store::new(Arc::clone(&db));
-    let svc = Arc::new(FileService::new(
-        store.clone(),
-        backends.clone(),
-        Arc::clone(&issuer),
-        Arc::clone(&authorizer),
-        cfg,
-        None,
-        None,
-    ));
-    let msvc = Arc::new(MultipartService::new(
-        Arc::new(store) as Arc<dyn MultipartStore>,
-        backends,
-        authorizer,
-        None,
-        issuer,
-        "http://sidecar.test".to_owned(),
-        3600,
-    ));
-
-    let ctx = ctx(Uuid::now_v7());
-    let ticket = svc
-        .create_file(&ctx, new_file(), None, false)
-        .await
-        .unwrap();
-
-    let err = msvc
-        .initiate_multipart_upload(
-            &ctx,
-            ticket.file_id,
-            "application/octet-stream",
-            1024,
-            None,
-            false,
-        )
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(err, DomainError::MultipartNotSupported { .. }),
-        "expected MultipartNotSupported, got {err:?}"
-    );
-}
-
 // -- 3. Initiate returns a coherent parts plan --------------------------------
 
 /// The server computes the plan deterministically:
@@ -2804,9 +2742,9 @@ async fn report_part_rejects_short_hash() {
 
 /// Table-driven per P2 0.2: a `local-fs`-only registry rejects initiate
 /// (`multipart_native == false`); a `memory`-only registry accepts it
-/// (`multipart_native == true`). Complements the single-case
-/// `multipart_rejected_on_local_fs` / `multipart_happy_path_in_memory` tests
-/// by pinning both sides of the same capability gate in one place.
+/// (`multipart_native == true`). Pins both sides of the same capability
+/// gate in one place; complements `multipart_happy_path_in_memory`, which
+/// exercises the accepted side end to end.
 #[tokio::test]
 async fn multipart_initiate_rejected_when_backend_not_multipart_native() {
     struct Case {

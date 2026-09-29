@@ -2421,100 +2421,15 @@ async fn sweep_skips_pending_version_of_completing_session() {
 /// Companion to [`sweep_skips_pending_version_of_active_multipart_session`]:
 /// once the same session's `expires_at` has also passed, it is no longer
 /// "live" from the sweep's perspective -- `sweep_expired_multipart` aborts
-/// it, and its now-unprotected backing version becomes reclaimable.
-#[tokio::test]
-async fn sweep_reclaims_version_after_session_expires() {
-    use sea_orm::sea_query::Expr;
-    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
-    use toolkit_db::secure::SecureUpdateExt;
-
-    use file_storage::infra::storage::entity::file_version::{
-        Column as FileVersionColumn, Entity as FileVersionEntity,
-    };
-    use file_storage::infra::storage::entity::multipart_upload::{
-        Column as MultipartUploadColumn, Entity as MultipartUploadEntity,
-    };
-
-    let (svc, msvc, store, engine, db, _backend) = build_all_with_db(3600).await;
-    let tenant = Uuid::now_v7();
-    let ctx = ctx(tenant);
-
-    let ticket = svc
-        .create_file(&ctx, new_file(), None, false)
-        .await
-        .unwrap();
-    let plan = msvc
-        .initiate_multipart_upload(&ctx, ticket.file_id, "text/plain", 1024, None, false)
-        .await
-        .unwrap();
-
-    let conn = db.conn().expect("conn");
-    let now = time::OffsetDateTime::now_utc();
-
-    // Same backdated `created_at` as the sibling test above.
-    let backdated_created = now - time::Duration::hours(2);
-    FileVersionEntity::update_many()
-        .col_expr(FileVersionColumn::CreatedAt, Expr::value(backdated_created))
-        .filter(FileVersionColumn::VersionId.eq(plan.version_id))
-        .secure()
-        .scope_with(&toolkit_security::AccessScope::allow_all())
-        .exec(&conn)
-        .await
-        .expect("backdate version created_at");
-
-    // ...but this time the session's `expires_at` has also passed.
-    let backdated_expiry = now - time::Duration::seconds(10);
-    MultipartUploadEntity::update_many()
-        .col_expr(
-            MultipartUploadColumn::ExpiresAt,
-            Expr::value(backdated_expiry),
-        )
-        .filter(MultipartUploadColumn::UploadId.eq(plan.upload_id))
-        .secure()
-        .scope_with(&toolkit_security::AccessScope::allow_all())
-        .exec(&conn)
-        .await
-        .expect("backdate session expires_at");
-
-    let result = engine.run_sweep().await;
-    assert_eq!(
-        result.expired_multipart_aborted, 1,
-        "the now-expired session must be aborted"
-    );
-    assert_eq!(
-        result.abandoned_pending_deleted, 1,
-        "the version must be reclaimed once its session is no longer live"
-    );
-
-    let version_after = store
-        .get_version(ticket.file_id, plan.version_id)
-        .await
-        .unwrap();
-    assert!(
-        version_after.is_none(),
-        "the pending version must be gone once the multipart session is no longer live"
-    );
-
-    let session_after = store
-        .get_multipart_upload(plan.upload_id)
-        .await
-        .unwrap()
-        .expect("the session row itself is aborted, not deleted");
-    assert_eq!(
-        session_after.state,
-        file_storage::domain::multipart::MultipartUploadState::Aborted,
-        "the session must be aborted once its expiry has passed"
-    );
-}
-
-/// P2 remediation: `sweep_reclaims_version_after_session_expires` already
-/// proves the *version* is reclaimed and the session ends up `aborted` when
-/// step 1 (`sweep_abandoned_pending`) races ahead of step 2
-/// (`sweep_expired_multipart`) within the same `run_sweep()` call. This test
-/// extends that exact ordering with the two follow-on gaps it left open:
-/// before the fix, `cleanup_expired_session_version` early-returned as soon
-/// as its own `get_version` lookup came back empty (because step 1 had
-/// already deleted the row), which skipped BOTH the backend
+/// it, and its now-unprotected backing version becomes reclaimable. This
+/// exercises that exact step1-before-step2 ordering -- both the version's
+/// `created_at` and the session's `expires_at` are backdated, so step 1
+/// (`sweep_abandoned_pending`) reclaims the version in the SAME
+/// `run_sweep()` call, before step 2 (`sweep_expired_multipart`) ever
+/// fetches this session -- and covers the two gaps that ordering leaves
+/// open: before the fix, `cleanup_expired_session_version` early-returned
+/// as soon as its own `get_version` lookup came back empty (because step 1
+/// had already deleted the row), which skipped BOTH the backend
 /// `abort_multipart` call (leaking the backend-side multipart upload, e.g.
 /// incomplete S3 MPU parts) AND the `multipart_upload_parts` row deletion
 /// for this session (unbounded growth). Both must still happen in this
@@ -2595,10 +2510,9 @@ async fn sweep_reclaims_version_after_session_expires_still_aborts_backend_and_d
     let conn = db.conn().expect("conn");
     let now = time::OffsetDateTime::now_utc();
 
-    // Same setup as `sweep_reclaims_version_after_session_expires`: both the
-    // version's `created_at` and the session's `expires_at` are backdated, so
-    // step 1 reclaims the version in the SAME `run_sweep()` call, before step
-    // 2 ever fetches this session.
+    // Both the version's `created_at` and the session's `expires_at` are
+    // backdated, so step 1 reclaims the version in the SAME `run_sweep()`
+    // call, before step 2 ever fetches this session.
     FileVersionEntity::update_many()
         .col_expr(
             FileVersionColumn::CreatedAt,

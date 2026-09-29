@@ -452,35 +452,73 @@ fn validate_accepts_multipart_session_ttl_equal_to_default_url_ttl() {
     );
 }
 
+/// Merges what used to be eleven separate `validate_accepts_default_config_*`
+/// tests: each per-field `assert!` below is a sanity check that a specific
+/// shipped default sits on the accepting side of one cross-field or ceiling
+/// rule in `FileStorageConfig::validate` (see the section comments above for
+/// why each rule exists); the final `validate().is_ok()` is the one thing all
+/// eleven were actually asserting on the stock config.
+///
+/// `require_signing_key_seed` is turned off, same as every other test in this
+/// file that isn't specifically exercising that (unrelated) guard.
 #[test]
-fn validate_accepts_default_config_multipart_session_ttl() {
+fn default_config_passes_validation() {
     let cfg = FileStorageConfig {
         require_signing_key_seed: false,
         ..FileStorageConfig::default()
     };
+
     assert!(
         cfg.multipart_session_ttl_secs > cfg.default_url_ttl_secs,
         "sanity: the stock defaults are 24h session vs 15min url ttl"
     );
-    assert!(cfg.validate().is_ok());
-}
-
-#[test]
-fn validate_accepts_default_config_despite_max_url_ttl_exceeding_orphan_grace() {
     // The stock defaults are `max_url_ttl_secs = 7 days` and
     // `orphan_grace_secs = 1 hour` -- `max_url_ttl_secs` alone exceeding
     // `orphan_grace_secs` must stay a warning (see `FileStorageConfig::validate`),
     // never a hard failure, or every default deployment would refuse to boot.
-    // `require_signing_key_seed` is turned off, same as every other test in
-    // this file that isn't specifically exercising that (unrelated) guard.
-    let cfg = FileStorageConfig {
-        require_signing_key_seed: false,
-        ..FileStorageConfig::default()
-    };
     assert!(
         cfg.max_url_ttl_secs > cfg.orphan_grace_secs,
         "sanity: the defaults must exhibit the condition this test exercises"
     );
+    assert!(
+        cfg.default_url_ttl_secs <= cfg.max_url_ttl_secs,
+        "sanity: the stock defaults must not exhibit the condition this test guards against"
+    );
+    assert!(
+        cfg.default_page_size <= cfg.max_page_size,
+        "sanity: the stock defaults must not exhibit the condition this test guards against"
+    );
+    assert!(
+        cfg.max_page_size <= MAX_PAGE_SIZE_CEILING,
+        "sanity: the shipped default_max_page_size must not itself exceed the ceiling"
+    );
+    assert!(
+        cfg.max_url_ttl_secs <= MAX_URL_TTL_CEILING,
+        "sanity: the shipped default_max_url_ttl_secs must not itself exceed the ceiling"
+    );
+    assert!(
+        cfg.multipart_session_ttl_secs <= MAX_MULTIPART_SESSION_TTL_SECS,
+        "sanity: the shipped default_multipart_session_ttl_secs must not itself exceed the \
+         ceiling"
+    );
+    assert!(
+        cfg.multipart_complete_lease_secs <= MAX_MULTIPART_COMPLETE_LEASE_SECS,
+        "sanity: the shipped default_multipart_complete_lease_secs must not itself exceed the \
+         ceiling"
+    );
+    assert!(
+        cfg.orphan_grace_secs <= MAX_ORPHAN_GRACE_SECS,
+        "sanity: the shipped default_orphan_grace_secs must not itself exceed the ceiling"
+    );
+    assert!(
+        cfg.idempotency_ttl_secs <= MAX_IDEMPOTENCY_TTL_SECS,
+        "sanity: the shipped default_idempotency_ttl_secs must not itself exceed the ceiling"
+    );
+    assert!(
+        cfg.sweep_time_budget_secs <= MAX_SWEEP_TIME_BUDGET_SECS,
+        "sanity: the shipped default_sweep_time_budget_secs must not itself exceed the ceiling"
+    );
+
     assert!(
         cfg.validate().is_ok(),
         "the stock default config (module-config knobs only) must pass validation"
@@ -524,19 +562,6 @@ fn validate_accepts_default_url_ttl_equal_to_max_url_ttl() {
         cfg.validate().is_ok(),
         "default_url_ttl_secs == max_url_ttl_secs must be accepted"
     );
-}
-
-#[test]
-fn validate_accepts_default_config_url_ttl_pair() {
-    let cfg = FileStorageConfig {
-        require_signing_key_seed: false,
-        ..FileStorageConfig::default()
-    };
-    assert!(
-        cfg.default_url_ttl_secs <= cfg.max_url_ttl_secs,
-        "sanity: the stock defaults must not exhibit the condition this test guards against"
-    );
-    assert!(cfg.validate().is_ok());
 }
 
 // ── default_url_ttl_secs lower bound ────────────────────────────────────────
@@ -607,19 +632,6 @@ fn validate_accepts_default_page_size_equal_to_max_page_size() {
     );
 }
 
-#[test]
-fn validate_accepts_default_config_page_size_pair() {
-    let cfg = FileStorageConfig {
-        require_signing_key_seed: false,
-        ..FileStorageConfig::default()
-    };
-    assert!(
-        cfg.default_page_size <= cfg.max_page_size,
-        "sanity: the stock defaults must not exhibit the condition this test guards against"
-    );
-    assert!(cfg.validate().is_ok());
-}
-
 // ── max_page_size absolute ceiling ──────────────────────────────────────────
 //
 // `max_page_size` otherwise has no ceiling of its own: an operator could
@@ -656,19 +668,6 @@ fn validate_rejects_max_page_size_above_ceiling() {
         "max_page_size exceeding MAX_PAGE_SIZE_CEILING must be rejected regardless of what an \
          operator configures"
     );
-}
-
-#[test]
-fn validate_accepts_default_config_max_page_size() {
-    let cfg = FileStorageConfig {
-        require_signing_key_seed: false,
-        ..FileStorageConfig::default()
-    };
-    assert!(
-        cfg.max_page_size <= MAX_PAGE_SIZE_CEILING,
-        "sanity: the shipped default_max_page_size must not itself exceed the ceiling"
-    );
-    assert!(cfg.validate().is_ok());
 }
 
 // ── finalize_token_grace_secs upper bound ───────────────────────────────────
@@ -751,19 +750,6 @@ fn validate_rejects_max_url_ttl_above_ceiling() {
     );
 }
 
-#[test]
-fn validate_accepts_default_config_max_url_ttl() {
-    let cfg = FileStorageConfig {
-        require_signing_key_seed: false,
-        ..FileStorageConfig::default()
-    };
-    assert!(
-        cfg.max_url_ttl_secs <= MAX_URL_TTL_CEILING,
-        "sanity: the shipped default_max_url_ttl_secs must not itself exceed the ceiling"
-    );
-    assert!(cfg.validate().is_ok());
-}
-
 // ── multipart_session_ttl_secs absolute ceiling ─────────────────────────────
 //
 // `gear.rs` converts `multipart_session_ttl_secs` to `i64` via the same
@@ -797,20 +783,6 @@ fn validate_rejects_multipart_session_ttl_above_ceiling() {
         cfg.validate().is_err(),
         "multipart_session_ttl_secs exceeding MAX_MULTIPART_SESSION_TTL_SECS must be rejected"
     );
-}
-
-#[test]
-fn validate_accepts_default_config_multipart_session_ttl_ceiling() {
-    let cfg = FileStorageConfig {
-        require_signing_key_seed: false,
-        ..FileStorageConfig::default()
-    };
-    assert!(
-        cfg.multipart_session_ttl_secs <= MAX_MULTIPART_SESSION_TTL_SECS,
-        "sanity: the shipped default_multipart_session_ttl_secs must not itself exceed the \
-         ceiling"
-    );
-    assert!(cfg.validate().is_ok());
 }
 
 // ── multipart_session_ttl_secs lower bound ──────────────────────────────────
@@ -882,20 +854,6 @@ fn validate_rejects_multipart_complete_lease_above_ceiling() {
     );
 }
 
-#[test]
-fn validate_accepts_default_config_multipart_complete_lease() {
-    let cfg = FileStorageConfig {
-        require_signing_key_seed: false,
-        ..FileStorageConfig::default()
-    };
-    assert!(
-        cfg.multipart_complete_lease_secs <= MAX_MULTIPART_COMPLETE_LEASE_SECS,
-        "sanity: the shipped default_multipart_complete_lease_secs must not itself exceed the \
-         ceiling"
-    );
-    assert!(cfg.validate().is_ok());
-}
-
 // ── multipart_complete_lease_secs lower bound ───────────────────────────────
 //
 // `MultipartService` applies `complete_lease_secs.max(1)` as defense-in-depth
@@ -962,19 +920,6 @@ fn validate_rejects_orphan_grace_above_ceiling() {
     );
 }
 
-#[test]
-fn validate_accepts_default_config_orphan_grace_ceiling() {
-    let cfg = FileStorageConfig {
-        require_signing_key_seed: false,
-        ..FileStorageConfig::default()
-    };
-    assert!(
-        cfg.orphan_grace_secs <= MAX_ORPHAN_GRACE_SECS,
-        "sanity: the shipped default_orphan_grace_secs must not itself exceed the ceiling"
-    );
-    assert!(cfg.validate().is_ok());
-}
-
 // ── idempotency_ttl_secs absolute ceiling ───────────────────────────────────
 //
 // `FileService::create_file` adds it directly to `now` to compute the stored
@@ -1007,19 +952,6 @@ fn validate_rejects_idempotency_ttl_above_ceiling() {
         cfg.validate().is_err(),
         "idempotency_ttl_secs exceeding MAX_IDEMPOTENCY_TTL_SECS must be rejected"
     );
-}
-
-#[test]
-fn validate_accepts_default_config_idempotency_ttl_ceiling() {
-    let cfg = FileStorageConfig {
-        require_signing_key_seed: false,
-        ..FileStorageConfig::default()
-    };
-    assert!(
-        cfg.idempotency_ttl_secs <= MAX_IDEMPOTENCY_TTL_SECS,
-        "sanity: the shipped default_idempotency_ttl_secs must not itself exceed the ceiling"
-    );
-    assert!(cfg.validate().is_ok());
 }
 
 // ── previous_signing_public_keys (signing_key_seed rotation, thread #35) ───
@@ -1181,17 +1113,4 @@ fn validate_rejects_sweep_time_budget_above_ceiling() {
         cfg.validate().is_err(),
         "sweep_time_budget_secs exceeding MAX_SWEEP_TIME_BUDGET_SECS must be rejected"
     );
-}
-
-#[test]
-fn validate_accepts_default_config_sweep_time_budget_ceiling() {
-    let cfg = FileStorageConfig {
-        require_signing_key_seed: false,
-        ..FileStorageConfig::default()
-    };
-    assert!(
-        cfg.sweep_time_budget_secs <= MAX_SWEEP_TIME_BUDGET_SECS,
-        "sanity: the shipped default_sweep_time_budget_secs must not itself exceed the ceiling"
-    );
-    assert!(cfg.validate().is_ok());
 }

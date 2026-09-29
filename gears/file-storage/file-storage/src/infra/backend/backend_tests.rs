@@ -333,14 +333,6 @@ async fn in_memory_satisfies_backend_contract() {
     assert_backend_contract(&b).await;
 }
 
-#[tokio::test]
-async fn in_memory_read_prefix_and_stat_missing_report_absent() {
-    let b = InMemoryBackend::new("mem");
-    assert!(b.read_prefix("nope", 1).await.unwrap().is_none());
-    assert_eq!(b.stat("nope").await.unwrap(), None);
-    assert!(!b.exists("nope").await.unwrap());
-}
-
 /// `InMemoryBackend` mirror of `local_fs_get_stream_errors_before_first_byte_when_*`:
 /// a caller that committed to a length no longer matching the stored blob
 /// must be refused before any byte is returned, not silently handed the

@@ -314,30 +314,10 @@ fn empty_policy_body_serializes_to_valid_json() {
 }
 
 // ── mime_allowed ──────────────────────────────────────────────────────────────
-
-#[test]
-fn mime_allowed_exact_match() {
-    assert!(PolicyResolver::mime_allowed(
-        "image/jpeg",
-        &["image/jpeg".to_owned()]
-    ));
-}
-
-#[test]
-fn mime_allowed_wildcard_subtype() {
-    assert!(PolicyResolver::mime_allowed(
-        "image/jpeg",
-        &["image/*".to_owned()]
-    ));
-}
-
-#[test]
-fn mime_allowed_wildcard_does_not_match_different_type() {
-    assert!(!PolicyResolver::mime_allowed(
-        "video/mp4",
-        &["image/*".to_owned()]
-    ));
-}
+//
+// The exact-match, wildcard-subtype, empty-list and cross-type cases are
+// covered by `service::service_tests::mime_allowed_*`; only the malformed-
+// pattern edge case lives here.
 
 /// A stored pattern without a `/` (e.g. `"image"`) must NOT act as a wildcard
 /// that matches any `image/…` subtype. Only well-formed `"type/*"` patterns

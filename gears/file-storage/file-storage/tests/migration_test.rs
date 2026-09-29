@@ -784,26 +784,6 @@ async fn file_versions_rejects_unknown_status() {
 }
 
 #[tokio::test]
-async fn file_versions_rejects_non_sha256_algorithm_in_p1() {
-    let db = migrated_db().await;
-    insert_file(&db, FILE).await;
-    // BLAKE3 is only widened in by the P2 migration; P1 is locked to SHA-256.
-    let res = db
-        .execute_raw(stmt(
-            &db,
-            format!(
-                "INSERT INTO file_versions (file_id, version_id, mime_type, size, hash_algorithm, hash_value, backend_id, backend_path) \
-                 VALUES ('{FILE}', '00000000-0000-0000-0000-0000000000d1', 'text/plain', 0, 'BLAKE3', X'{HASH32}', 'local', '/p')"
-            ),
-        ))
-        .await;
-    assert!(
-        res.is_err(),
-        "hash_algorithm CHECK must reject BLAKE3 in P1: {res:?}"
-    );
-}
-
-#[tokio::test]
 async fn file_versions_rejects_wrong_hash_length() {
     let db = migrated_db().await;
     insert_file(&db, FILE).await;

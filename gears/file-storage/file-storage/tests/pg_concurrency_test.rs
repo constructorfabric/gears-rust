@@ -526,10 +526,11 @@ async fn simulate_all_parts(
 /// version at all (see the module doc's `f1_*` entry).
 ///
 /// Two independent mechanisms now reclaim it, and this test pins the second
-/// one: the orchestration layer compensates immediately (see
-/// `f1_capability_reject_with_compensation_reclaims_orphan` below, the
-/// primary path -- only the caller that made the failed initiate attempt
-/// knows which file to clean up), and the sweep's dedicated versionless-files
+/// one: the orchestration layer compensates immediately (the primary path --
+/// only the caller that made the failed initiate attempt knows which file to
+/// clean up; see
+/// `db_behavior_audit_test.rs::multipart_initiate_capability_reject_with_compensation_reclaims_orphan`
+/// for that end-to-end flow), and the sweep's dedicated versionless-files
 /// phase (`CleanupEngine::sweep_versionless_files`) is the backstop for a
 /// compensation that never ran or itself failed. This test calls
 /// `create_file_bare` + `initiate_multipart_upload` directly -- the same raw
@@ -585,50 +586,6 @@ async fn f1_capability_reject_orphan_reclaimed_by_versionless_sweep() {
         matches!(file_after, Err(DomainError::FileNotFound { .. })),
         "the orphaned bare file must be gone after a real sweep pass, even with no compensation \
          invoked -- got: {file_after:?}"
-    );
-}
-
-/// End-to-end, against real PostgreSQL: mirrors exactly what
-/// `api/rest/handlers.rs::create_file`'s multipart branch now does on an
-/// initiate failure -- call `compensate_failed_multipart_initiate` with the
-/// same `file_id`, then confirm the orphan is gone (no sweep needed at
-/// all).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn f1_capability_reject_with_compensation_reclaims_orphan() {
-    let (db, _pg_guard) = pg_db_or_skip!();
-    let store = Store::new(Arc::clone(&db));
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let backend: Arc<dyn StorageBackend> = Arc::new(LocalFsBackend::new("fs", tmp.keep()));
-    let backends = BackendRegistry::new(vec![Arc::clone(&backend)], "fs").expect("registry");
-    let multipart_store: Arc<dyn MultipartStore> = Arc::new(store.clone());
-    let svc = make_file_service(store.clone(), backends.clone());
-    let msvc = make_multipart_service(multipart_store, backends, 120);
-
-    let tenant_id = Uuid::now_v7();
-    let ctx = make_ctx(tenant_id);
-    let file_id = svc
-        .create_file_bare(&ctx, new_file())
-        .await
-        .expect("create_file_bare commits the bare file row");
-    msvc.initiate_multipart_upload(
-        &ctx,
-        file_id,
-        "application/octet-stream",
-        20,
-        Some(10),
-        false,
-    )
-    .await
-    .expect_err("local-fs backend does not advertise multipart_native");
-
-    svc.compensate_failed_multipart_initiate(&ctx, file_id)
-        .await;
-
-    let gone = svc.get_file(&ctx, file_id).await;
-    assert!(
-        matches!(gone, Err(DomainError::FileNotFound { .. })),
-        "FS-01/F1 fix: the compensating delete must reclaim the orphan file against real \
-         PostgreSQL too, got: {gone:?}"
     );
 }
 
