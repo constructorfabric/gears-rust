@@ -137,8 +137,8 @@ documented as a process in §3 instead.
 4. [x] - `p1` - DB: SELECT one page of retention rules for the caller's tenant, `LIMIT limit + 1`,
    keyset-seeking past `cursor`'s decoded position, with the non-admin `WHERE` visibility filter
    applied only when the `ADMIN_POLICY` probe was denied - `inst-retention-list-load`
-5. [x] - `p1` - RETURN 200 with `{items, page_info: {next_cursor, prev_cursor: null, limit}}` -
-   `inst-retention-list-return`
+5. [x] - `p1` - RETURN 200 with `{items, page_info: {next_cursor, prev_cursor, limit}}`; return
+   `prev_cursor: null` only when no previous page exists - `inst-retention-list-return`
 
 ### Create Retention Rule
 

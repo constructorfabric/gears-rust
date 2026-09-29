@@ -240,7 +240,7 @@ derive it from). Nothing stored at the path → `404` (same as `GET`'s missing-b
 `BackendUnavailable`/`Backend` split described under "Status code summary" below).
 
 **Planned / not implemented**: `If-None-Match` → `304` support on the sidecar `GET`/`HEAD`. Every download token is
-already single-use-scoped to one `(file_id, version_id)`, so the bandwidth win of a conditional download is small.
+already scoped to one `(file_id, version_id)` and a short expiry, so the bandwidth win of a conditional download is small.
 (`If-None-Match` → `304` **is** implemented on the control plane's `GET /files/{id}`, which is a distinct surface —
 see "Conditional headers" below.)
 

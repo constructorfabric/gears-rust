@@ -127,7 +127,7 @@ requirements per vector.
 |---------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | File                | Binary content stored in FileStorage with associated metadata                                                                                                                                                                                                                           |
 | Control Plane       | The FileStorage API/SDK. Owns metadata, authorization, versioning, and conditional-request semantics; issues signed URLs. Its REST surface never carries file content                                                                                                                    |
-| Sidecar (Data Plane)| The only component that moves user bytes. Has its own domain/URL, is connected to the storage backends, and verifies signed-URL signatures — it has no DB connection of its own and makes no platform-JWT call of any kind. Reports back to the control plane (finalize, per-part hash) over a plain, token-authenticated HTTP callback, never an SDK call. Serves content only through signed URLs |
+| Sidecar (Data Plane)| The only component that moves user bytes. Has its own domain/URL, is connected to the storage backends, and verifies signed-URL signatures — it has no DB connection of its own and makes no platform-JWT call of any kind. Reports back to the control plane (finalize, per-part hash) over token-authenticated HTTP within a documented trusted network boundary, or over TLS/equivalent authenticated encryption when the callback crosses an untrusted or shared network, never an SDK call. Serves content only through signed URLs |
 | Signed URL          | A short-lived, control-minted **codec-equivalent Ed25519-signed token** (bespoke `base64url(json).base64url(ed25519_signature)` in P1 -- opaque and codec-evolvable per ADR-0004's Implementation note, not a literal PASETO library) pointing at the sidecar that authorizes one content operation (`GET`/`PUT`/part) on a specific object, subject to AND-combined claims (`exp`, optional `ip`, optional token-claim predicates, upload size/hash). Carried in the query (`?fs-token=`) or a header; **opaque** to all but control+sidecar (`cpt-cf-file-storage-fr-signed-urls`) |
 | File ID             | The immutable uuid identity of a logical file. The current content is reached by resolving the file's content pointer (`content_id`)                                                                                                                                                     |
 | Version ID          | A uuid assigned by FileStorage (control plane) identifying one immutable content blob; the backend object lives at `/{file_id}/{version_id}` and is never mutated in place                                                                                                                |
@@ -376,7 +376,9 @@ attempt, while a dead lease holder's session still converges instead of getting 
 
 - [x] `p2` - **ID**: `cpt-cf-file-storage-fr-sidecar-callbacks`
 
-The sidecar **MUST** report back to the control plane over plain, token-authenticated HTTP callbacks for two events:
+The sidecar **MUST** report back to the control plane over token-authenticated HTTP callbacks within a documented
+trusted network boundary — or over TLS/equivalent authenticated encryption when the callback path crosses an
+untrusted or shared network — for two events:
 finalizing a version after a successful single-part `PUT`, and reporting a successfully-written multipart part. Each
 callback's sole authorization **MUST** be the same signed upload token (`cpt-cf-file-storage-fr-signed-urls`) that
 authorized the original upload — no separate app-token or on-behalf-of delegation. The control plane **MUST** accept
@@ -1108,8 +1110,8 @@ file metadata for all backends, ETags are a FileStorage-level feature independen
 **Partial:** the control plane implements `If-None-Match`/`If-Match` on metadata reads, requires `If-Match` on bind
 and `DELETE`, and supports the `If-Match-Metadata` revision precondition. The **sidecar** implements `Range`
 (`cpt-cf-file-storage-fr-range-requests`) but not `If-None-Match` → `304` on content download — a deliberate,
-documented-but-not-yet-implemented gap, since every download token is already single-use-scoped to one
-`(file_id, version_id)`, making the bandwidth win of a conditional download small.
+documented-but-not-yet-implemented gap, since every download token is already scoped to one
+`(file_id, version_id)` and a short expiry, making the bandwidth win of a conditional download small.
 
 #### Upload Idempotency
 

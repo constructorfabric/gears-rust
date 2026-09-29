@@ -115,18 +115,19 @@ fn build_spec(
             })?;
             let entries = manifest.entries().to_vec();
             let mut spans = Vec::with_capacity(entries.len());
+            let last_idx = entries.len().saturating_sub(1);
             for (i, entry) in entries.iter().enumerate() {
                 let start = entry.offset;
                 let end = entries.get(i + 1).map_or(expected_len, |next| next.offset);
-                // `start == end` is a zero-length span: `process_chunk` never
-                // finalizes it at EOF (nothing ever advances `total_seen` to
-                // reach it as a *boundary* crossed from below), so it would
-                // never contribute a digest to `part_digests` and `compare`'s
-                // `zip` over `entries`/`part_digests` would silently drop it
-                // instead of ever comparing it -- rejected here up front,
-                // before any streaming begins, rather than left to surface
-                // (or not) as a length mismatch downstream.
-                if start >= end || end > expected_len {
+                // `start == end` is a zero-length span: legitimate per S3
+                // composite-checksum semantics (a zero-byte object, or a
+                // trailing zero-length part) exactly when it is the *last*
+                // entry -- `Manifest::new`'s strictly-ascending offsets make
+                // every non-last span's `end` (the next entry's offset)
+                // strictly greater than its `start`, so the second half of
+                // this check can only ever fire on a hand-built manifest that
+                // skips that invariant; kept explicit rather than assumed.
+                if start > end || end > expected_len || (start == end && i != last_idx) {
                     return Err(DomainError::hash_mismatch(
                         hex::encode(hash_value),
                         format!(
@@ -304,6 +305,23 @@ pub fn verify_stream(
                 } => match inner.next().await {
                     None => {
                         let verdict = if total_seen == expected_len {
+                            // Any span still open here is a zero-length one
+                            // `process_chunk` could never reach: it finalizes
+                            // a span only while consuming chunk bytes, but a
+                            // `[start, start)` span needs none to already be
+                            // "done" the instant `total_seen` catches up to
+                            // it. `build_spec` only allows such a span as the
+                            // manifest's last entry, so this closes at most
+                            // one trailing span (or the sole span of a
+                            // zero-byte whole-object stream) with the digest
+                            // of whatever the hasher holds -- empty, since no
+                            // bytes were ever fed to it for that span.
+                            while span_idx < spans.len() {
+                                let digest =
+                                    digest_to_array(std::mem::take(&mut hasher).finalize());
+                                part_digests.push(digest);
+                                span_idx += 1;
+                            }
                             compare(&spec, &hash_value, part_digests)
                         } else {
                             Err(DomainError::hash_mismatch(

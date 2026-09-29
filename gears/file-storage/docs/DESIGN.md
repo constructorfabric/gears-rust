@@ -52,7 +52,8 @@ centralized per-byte metering, and uniform audit/policy coverage are preserved w
 independently of the control plane. A **read** is two requests: a control request to mint a signed GET URL, then a
 data request against the sidecar. A **write** touches the control plane three times and the data plane once: presign
 (control — pre-registers a `pending` version and mints a signed PUT URL) → `PUT` (data — the sidecar streams bytes to
-the backend) → finalize (data→control, a plain, token-authenticated HTTP callback the sidecar makes after a
+the backend) → finalize (data→control, a token-authenticated HTTP callback — within a trusted network boundary, or
+over TLS/equivalent authenticated encryption when it crosses an untrusted network — the sidecar makes after a
 successful `PUT` — the same signed `fs-token` is its sole authorization, with no separate app-token or on-behalf-of
 delegation — flipping the version `pending → available`) → `bind` (control — a separate, later request the client
 issues to swap the file's `content_id` pointer under `If-Match`). See §3.2 (`bind-service`, `sidecar-gateway`) for the
@@ -137,7 +138,7 @@ See [PRD.md](./PRD.md) §1 "Overview" and §1.3 "Goals":
 | `cpt-cf-file-storage-fr-multipart-upload`              | P2 resumable multipart upload, owned by the `multipart-coordinator` component: `POST .../multipart` computes a server-authoritative parts plan (one signed sidecar URL per part); the sidecar streams each part without buffering; `complete` assembles and hashes the parts (offset-manifest composite, ADR-0006) and finalizes the version; `abort`/`introspect` round out the session lifecycle |
 | `cpt-cf-file-storage-fr-auto-bind`                     | `bind: "auto"` (default) has the sidecar's finalize callback bind the first content itself under a `content_id IS NULL` CAS, in the same transaction as the `pending → available` flip — the dominant single-file upload is 2 requests (`POST /files` + `PUT`); `bind: "manual"` keeps the separate, client-issued `bind` request |
 | `cpt-cf-file-storage-fr-multipart-complete-lease`      | `complete_multipart_upload` is idempotent and returns `202 {state: "completing", retry_after_secs}` while another caller holds the completion lease, instead of a second concurrent assembly running; a retry (including after a page reload) replays the persisted result |
-| `cpt-cf-file-storage-fr-sidecar-callbacks`             | The sidecar's `finalize`/`report-part` callbacks are plain, token-authenticated HTTP `POST`s back to the control plane's `bind-service` — no FS SDK call, no app-token, no on-behalf-of delegation; the previously-verified signed token is the callback's sole authorization |
+| `cpt-cf-file-storage-fr-sidecar-callbacks`             | The sidecar's `finalize`/`report-part` callbacks are token-authenticated HTTP `POST`s back to the control plane's `bind-service`, within a trusted network boundary or over TLS/equivalent authenticated encryption when crossing an untrusted network — no FS SDK call, no app-token, no on-behalf-of delegation; the previously-verified signed token is the callback's sole authorization |
 | `cpt-cf-file-storage-fr-callback-internal-token`       | An optional interim gear-local shared-secret second factor (`x-fs-internal-token`, `FinalizeAuth`) layered on top of the signed upload token for the finalize/report-part callbacks; a stop-gap until the platform's `internal_auth` profiles are deployable in this gear |
 | `cpt-cf-file-storage-fr-allowed-types-policy`          | `policy-engine` (P2): tenant/user-scoped allowed-MIME-type policy, resolved most-restrictive-wins and enforced on every storage-increasing write |
 | `cpt-cf-file-storage-fr-size-limits-policy`            | `policy-engine` (P2): tenant/user-scoped size-limit policy (with per-MIME overrides), same most-restrictive-wins resolution and enforcement points as the allowed-types policy |
@@ -527,8 +528,9 @@ callback), and **bind** a finalized version as the file's current `content_id` u
 - **Pre-register**: `INSERT` a `pending` `file_versions` row and allocate `version_id` as part of handling
   `POST /files` / `POST /files/{id}/versions` — this runs on the control plane *before* the signed PUT URL is even
   returned, not as a separate call the sidecar makes later
-- **Finalize** (`status: pending → available`): invoked by the **sidecar**, over a plain HTTP `POST` authorized solely
-  by the same signed upload token (`fs-token`) that authorized the `PUT` — no FS SDK call, no app-token, no
+- **Finalize** (`status: pending → available`): invoked by the **sidecar**, over a token-authenticated HTTP `POST` —
+  within a trusted network boundary, or over TLS/equivalent authenticated encryption when it crosses an untrusted
+  network — authorized solely by the same signed upload token (`fs-token`) that authorized the `PUT` — no FS SDK call, no
   on-behalf-of delegation. Re-reads the blob from the backend and recomputes size/hash/MIME from the actual bytes
   rather than trusting the sidecar's claim (defense-in-depth); does **not** touch `content_id`
 - **Bind** (`content_id := version_id`): optimistic CAS on the current `content_id`/ETag via `If-Match`; on mismatch
@@ -602,8 +604,9 @@ honours/propagates `X-Request-Id` and applies its own per-instance connection/ba
 ##### Responsibility boundaries
 
 Makes no authorization *decision* — it enforces the decision already encoded in the signed URL and the token
-predicates. Does not own metadata authority — it calls control `bind-service`'s finalize endpoint over a plain,
-token-authenticated HTTP callback (not the FS SDK, no delegated identity); it never calls bind.
+predicates. Does not own metadata authority — it calls control `bind-service`'s finalize endpoint over a
+token-authenticated HTTP callback, within a trusted network boundary or over TLS/equivalent authenticated encryption
+when it crosses an untrusted network (not the FS SDK, no delegated identity); it never calls bind.
 
 ##### Related components
 
@@ -1479,8 +1482,9 @@ and the sidecar (a separate data-plane deployable on its own domain). The releva
   where the bandwidth budget (`cpt-cf-file-storage-nfr-bandwidth`) is spent. Holds no authoritative state and has
   **no direct DB connection at all** — everything it needs to serve a request (backend id,
   backend path, MIME, ETag) is carried in the verified signed token's claims, and it reports upload/part completion
-  back to the control plane via a plain token-authenticated HTTP callback (`.../finalize`, `.../report`), never a
-  DB write. It verifies signed URLs with the control-distributed Ed25519 public key. Can be co-located with a heavy
+  back to the control plane via a token-authenticated HTTP callback (`.../finalize`, `.../report`) — within a
+  trusted network boundary, or over TLS/equivalent authenticated encryption when it crosses an untrusted network —
+  never a DB write. It verifies signed URLs with the control-distributed Ed25519 public key. Can be co-located with a heavy
   consumer or pushed to the edge with **no wire-contract change** (it is a full FileStorage data plane, not an
   extracted byte-mover) and, in future, run its own cache
 - **API Gateway routing**:
