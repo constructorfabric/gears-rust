@@ -37,7 +37,8 @@ use quota_enforcement_storage_plugin::infra::storage::repo::{
     RowWait, operation_log_repo, quota_repo,
 };
 use quota_enforcement_storage_plugin::{
-    Actor, NotificationEnqueuer, QeOutbox, QuotaStore, SqlQuotaStore, StoreError, start_outbox,
+    Actor, NotificationOutbox, QeOutbox, QuotaStore, SqlQuotaStore, StoreError,
+    start_undelivered_outbox,
 };
 
 const USER_PROJECTION: &str = "gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.user.v1~";
@@ -121,12 +122,12 @@ impl PgHarness {
         run_migrations_for_testing(&db, Migrator::migrations())
             .await
             .expect("migrations");
-        let outbox = start_outbox(db.clone()).await.expect("outbox");
+        let outbox = start_undelivered_outbox(db.clone()).await.expect("outbox");
         let enqueuer = Arc::new(QeOutbox::new());
         enqueuer
             .bind(Arc::clone(outbox.outbox()))
             .expect("bind once");
-        let enqueuer: Arc<dyn NotificationEnqueuer> = enqueuer;
+        let enqueuer: Arc<dyn NotificationOutbox> = enqueuer;
         let store = SqlQuotaStore::new(db.clone(), enqueuer);
         Self {
             db,

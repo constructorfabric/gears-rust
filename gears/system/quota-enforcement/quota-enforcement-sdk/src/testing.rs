@@ -44,6 +44,10 @@ use crate::models::{
     QuotaId, QuotaPatch, QuotaSnapshot, QuotaSource, QuotaStatus, QuotaType, Retention,
     RollbackTarget, SubjectRef, TenantId, TransitionOutcome, ValidityWindowPatch,
 };
+use crate::notifications::{
+    DeliveryOutcome, DispatchError, NotificationDeliveryHandle, NotificationDeliveryV1, QuotaEvent,
+    QuotaNotificationSinkV1,
+};
 use crate::storage_plugin::{
     CONTRACT_MAJOR, EvaluatedBatch, EvaluatedMutation, QuotaEnforcementStoragePluginV1,
     StorageError,
@@ -265,6 +269,103 @@ pub struct PolicyTransitionAudit {
 /// Complete in-memory [`QuotaEnforcementStoragePluginV1`].
 pub struct InMemoryStorage {
     state: Mutex<StorageState>,
+    /// The notification pipeline, apart from the transactional state: it is
+    /// not rolled back with a mutation.
+    delivery: Arc<Mutex<DeliveryState>>,
+    /// Held for a whole drain, like the real pipeline's partition lease: one
+    /// drain at a time, and a stop waits for the delivery in flight.
+    drain: Arc<tokio::sync::Mutex<()>>,
+}
+
+/// The double's notification pipeline: the dispatcher's callback while
+/// started, how far delivery has come through the committed events, the
+/// failed attempts of the head event, and what was dead-lettered.
+#[derive(Default)]
+struct DeliveryState {
+    callback: Option<Arc<dyn NotificationDeliveryV1>>,
+    started: bool,
+    next: usize,
+    attempts: u16,
+    dead_letters: Vec<(NotificationEvent, String)>,
+}
+
+/// What one [`InMemoryStorage::drain_notifications`] call did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DrainReport {
+    /// Events acknowledged.
+    pub delivered: usize,
+    /// Events dead-lettered.
+    pub rejected: usize,
+    /// Whether the head event asked to be retried; draining stopped there.
+    pub retry_pending: bool,
+}
+
+/// The double's pipeline handle: stopping it drops the callback, then waits
+/// for a drain in progress to finish its delivery in flight.
+struct DeliveryHandle {
+    delivery: Arc<Mutex<DeliveryState>>,
+    drain: Arc<tokio::sync::Mutex<()>>,
+}
+
+#[async_trait]
+impl NotificationDeliveryHandle for DeliveryHandle {
+    async fn stop(self: Box<Self>) {
+        // A drain checks the callback before each event, so it ends after the
+        // one in flight; taking its lock waits for that.
+        self.delivery.lock().callback = None;
+        let _drained = self.drain.lock().await;
+    }
+}
+
+/// A notification sink that records what it received and answers from a
+/// script: each call takes the next scripted outcome, and `Ok` once the
+/// script is spent.
+pub struct RecordingSink {
+    id: String,
+    script: Mutex<std::collections::VecDeque<Result<(), DispatchError>>>,
+    received: Mutex<Vec<(SecurityContext, QuotaEvent)>>,
+}
+
+impl RecordingSink {
+    /// A sink that takes every event.
+    #[must_use]
+    pub fn new(id: &str) -> Self {
+        Self {
+            id: id.to_owned(),
+            script: Mutex::new(std::collections::VecDeque::new()),
+            received: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// A sink that answers `outcomes` in order, then takes every event.
+    #[must_use]
+    pub fn answering(id: &str, outcomes: Vec<Result<(), DispatchError>>) -> Self {
+        let sink = Self::new(id);
+        *sink.script.lock() = outcomes.into();
+        sink
+    }
+
+    /// Every call so far: the caller's context and the event.
+    #[must_use]
+    pub fn received(&self) -> Vec<(SecurityContext, QuotaEvent)> {
+        self.received.lock().clone()
+    }
+}
+
+#[async_trait]
+impl QuotaNotificationSinkV1 for RecordingSink {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    async fn dispatch(
+        &self,
+        ctx: &SecurityContext,
+        event: QuotaEvent,
+    ) -> Result<(), DispatchError> {
+        self.received.lock().push((ctx.clone(), event));
+        self.script.lock().pop_front().unwrap_or(Ok(()))
+    }
 }
 
 impl Default for InMemoryStorage {
@@ -369,7 +470,81 @@ impl InMemoryStorage {
                 installed_major: Some(CONTRACT_MAJOR),
                 ..StorageState::default()
             }),
+            delivery: Arc::new(Mutex::new(DeliveryState::default())),
+            drain: Arc::default(),
         }
+    }
+
+    /// The same storage after a process restart: a new plugin instance over
+    /// what this one committed, delivery included as far as it came, with no
+    /// pipeline started. The two diverge from here on.
+    #[must_use]
+    pub fn restarted(&self) -> Self {
+        let delivery = self.delivery.lock();
+        Self {
+            state: Mutex::new(self.state.lock().clone()),
+            delivery: Arc::new(Mutex::new(DeliveryState {
+                callback: None,
+                started: false,
+                next: delivery.next,
+                attempts: delivery.attempts,
+                dead_letters: delivery.dead_letters.clone(),
+            })),
+            drain: Arc::default(),
+        }
+    }
+
+    /// Hand every committed event not yet delivered to the started pipeline's
+    /// callback, in order, as the real pipeline's processor would: `Delivered`
+    /// moves on, `Reject` dead-letters the event and moves on, `Retry` counts
+    /// a failed attempt and stops at that event. Does nothing before
+    /// [`QuotaEnforcementStoragePluginV1::start_notification_delivery`] or after
+    /// the handle stopped. Concurrent drains run one after the other, so each
+    /// event is delivered once, in order.
+    pub async fn drain_notifications(&self) -> DrainReport {
+        let _draining = self.drain.lock().await;
+        let mut report = DrainReport::default();
+        loop {
+            let (callback, event, attempts) = {
+                let delivery = self.delivery.lock();
+                let Some(callback) = delivery.callback.clone() else {
+                    return report;
+                };
+                let events = &self.state.lock().events;
+                let Some(event) = events.get(delivery.next).cloned() else {
+                    return report;
+                };
+                (callback, event, delivery.attempts)
+            };
+            let outcome = callback
+                .deliver(event.clone(), attempts, Duration::from_secs(28))
+                .await;
+            let mut delivery = self.delivery.lock();
+            match outcome {
+                DeliveryOutcome::Delivered => {
+                    delivery.next += 1;
+                    delivery.attempts = 0;
+                    report.delivered += 1;
+                }
+                DeliveryOutcome::Reject(reason) => {
+                    delivery.dead_letters.push((event, reason));
+                    delivery.next += 1;
+                    delivery.attempts = 0;
+                    report.rejected += 1;
+                }
+                DeliveryOutcome::Retry => {
+                    delivery.attempts = delivery.attempts.saturating_add(1);
+                    report.retry_pending = true;
+                    return report;
+                }
+            }
+        }
+    }
+
+    /// Events the pipeline dead-lettered, with the reason.
+    #[must_use]
+    pub fn dead_letters(&self) -> Vec<(NotificationEvent, String)> {
+        self.delivery.lock().dead_letters.clone()
     }
 
     /// A backend that reports another installed schema major (I12 tests).
@@ -2577,6 +2752,24 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
             st.idempotency.remove(scope);
         }
         Ok(victims.len() as u64)
+    }
+
+    async fn start_notification_delivery(
+        &self,
+        delivery: Arc<dyn NotificationDeliveryV1>,
+    ) -> Result<Box<dyn NotificationDeliveryHandle>, StorageError> {
+        let mut state = self.delivery.lock();
+        if state.started {
+            return Err(StorageError::Internal(
+                "the notification pipeline is already started".to_owned(),
+            ));
+        }
+        state.started = true;
+        state.callback = Some(delivery);
+        Ok(Box::new(DeliveryHandle {
+            delivery: Arc::clone(&self.delivery),
+            drain: Arc::clone(&self.drain),
+        }))
     }
 
     async fn reclaim_operation_log(

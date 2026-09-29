@@ -132,6 +132,22 @@ pub struct Actor {
 }
 
 /// Schema metadata and the platform-default configuration rows.
+/// The plugin's one notification outbox pipeline.
+#[async_trait]
+pub trait NotificationPipeline: Send + Sync {
+    /// Start the pipeline, handing every claimed event to `delivery`, and bind
+    /// it for enqueueing.
+    ///
+    /// # Errors
+    ///
+    /// `Internal` when it was already started; `Unavailable` when the backend
+    /// cannot start it.
+    async fn start(
+        &self,
+        delivery: std::sync::Arc<dyn quota_enforcement_sdk::NotificationDeliveryV1>,
+    ) -> Result<Box<dyn quota_enforcement_sdk::NotificationDeliveryHandle>, StorageError>;
+}
+
 #[async_trait]
 pub trait FoundationStore: Send + Sync {
     /// The installed contract major, if the schema was ever bootstrapped.

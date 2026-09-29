@@ -22,6 +22,9 @@ workspace = true
 # Gates the PostgreSQL-backed concurrency suite (`tests/quota_store_integration_pg.rs`,
 # Docker required). Everything else runs on SQLite.
 postgres = ["toolkit-db/pg"]
+# The undelivered outbox starter (no handler) the store and PostgreSQL suites inspect
+# enqueued rows with. Never enabled by production builds.
+test-util = []
 
 [dependencies]
 quota-enforcement-sdk = { workspace = true }
@@ -33,6 +36,10 @@ toolkit-db = { workspace = true, features = ["sqlite"] }
 toolkit-db-macros = { workspace = true }
 toolkit-macros = { workspace = true }
 toolkit-security = { workspace = true }
+# Registers the plugin instance the gear selects storage by.
+types-registry-sdk = { workspace = true }
+# The `deps = [types_registry]` edge of the gear macro names this crate.
+types-registry = { workspace = true }
 
 sea-orm = { workspace = true }
 sea-orm-migration = { workspace = true }
@@ -54,6 +61,9 @@ tokio = { workspace = true, features = ["time"] }
 inventory = { workspace = true }
 
 [dev-dependencies]
+# Cargo unifies this edge with the lib under test into one `test-util = on`
+# build, so the integration suites reach the test-only outbox starter.
+cf-gears-quota-enforcement-storage-plugin = { path = ".", features = ["test-util"] }
 quota-enforcement-sdk = { workspace = true, features = ["test-util"] }
 tokio = { workspace = true, features = ["rt", "macros"] }
 tokio-util = { workspace = true }

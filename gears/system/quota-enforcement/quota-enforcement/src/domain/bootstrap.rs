@@ -8,8 +8,9 @@
 //! catalogue consistency set, and the compatibility check against active
 //! Quotas (`features/projection-contracts.md`). The quota-lifecycle feature
 //! adds the removed-metric scan over the bound metrics and binds the registries
-//! the write path needs. Later features extend [`Bootstrap::run`] with their
-//! own steps.
+//! the write path needs. The notifications feature ends it by resolving the
+//! notification sinks and starting delivery, so events flow before the gear
+//! is ready. Later features extend [`Bootstrap::run`] with their own steps.
 
 use std::sync::Arc;
 
@@ -22,6 +23,9 @@ use toolkit_macros::domain_model;
 use super::catalog::{CatalogBuilder, CatalogConfig, ProjectionContractCatalog};
 use super::engines::{EngineRegistry, PolicyArtifactCache, builtin_registry};
 use super::error::{Dependency, DomainError};
+use super::notifications::{
+    DeliveryLifecycle, DispatchLimits, NotificationDispatcher, dispatcher_context,
+};
 use super::plugins::PluginBinding;
 use super::policies::PolicyRuntimeLimits;
 use super::policies::PolicySchemas;
@@ -100,6 +104,8 @@ pub struct Bootstrap {
     metrics: Arc<dyn QeMetrics>,
     readiness: Arc<Readiness>,
     limits: PolicyRuntimeLimits,
+    dispatch: DispatchLimits,
+    delivery: Arc<DeliveryLifecycle>,
 }
 
 impl Bootstrap {
@@ -123,7 +129,24 @@ impl Bootstrap {
             metrics: reporting.metrics,
             readiness: reporting.readiness,
             limits,
+            dispatch: DispatchLimits::default(),
+            delivery: Arc::default(),
         }
+    }
+
+    /// Dispatch notifications within the operator's `limits` instead of the
+    /// defaults.
+    #[must_use]
+    pub const fn with_dispatch(mut self, limits: DispatchLimits) -> Self {
+        self.dispatch = limits;
+        self
+    }
+
+    /// The notification pipeline a successful run started; the lifecycle
+    /// entry stops it on shutdown.
+    #[must_use]
+    pub fn delivery(&self) -> Arc<DeliveryLifecycle> {
+        Arc::clone(&self.delivery)
     }
 
     /// Run every step. On success the readiness cell is `Ready`; on failure
@@ -249,6 +272,7 @@ impl Bootstrap {
         let schemas = CatalogPolicySchemas::new(Arc::clone(&catalog), self.limits.snapshot);
         self.publish_active_policies(storage.as_ref(), &engines, &artifacts, &schemas)
             .await?;
+        self.start_delivery(storage.as_ref()).await?;
 
         Ok(Bound {
             engines,
@@ -292,6 +316,42 @@ impl Bootstrap {
             engines: Arc::new(engines),
             artifacts: Arc::new(artifacts),
         })
+    }
+
+    /// Resolve every notification sink and start the storage plugin's
+    /// notification pipeline over a dispatcher to them. The last step: no
+    /// later failure can leave a pipeline running behind a failed bootstrap.
+    // @cpt-flow:cpt-cf-quota-enforcement-flow-sink-delivery:p1
+    async fn start_delivery(
+        &self,
+        storage: &dyn QuotaEnforcementStoragePluginV1,
+    ) -> Result<(), (Dependency, DomainError)> {
+        let sinks = self.binding.resolve_sinks().await.map_err(|e| match e {
+            DomainError::TypesRegistryUnavailable(_) => (Dependency::TypesRegistry, e),
+            other => (Dependency::NotificationSinks, other),
+        })?;
+        // @cpt-begin:cpt-cf-quota-enforcement-flow-sink-delivery:p1:inst-del-nosink-if
+        if sinks.is_empty() {
+            // @cpt-begin:cpt-cf-quota-enforcement-flow-sink-delivery:p1:inst-del-nosink-warn
+            tracing::warn!(
+                target: LOG_TARGET,
+                "no notification sinks registered; events are acknowledged undelivered"
+            );
+            // @cpt-end:cpt-cf-quota-enforcement-flow-sink-delivery:p1:inst-del-nosink-warn
+        }
+        // @cpt-end:cpt-cf-quota-enforcement-flow-sink-delivery:p1:inst-del-nosink-if
+        let ctx = dispatcher_context().map_err(|e| (Dependency::NotificationSinks, e))?;
+        let dispatcher =
+            NotificationDispatcher::new(sinks, ctx, self.dispatch, Arc::clone(&self.metrics));
+        let handle = storage
+            .start_notification_delivery(Arc::new(dispatcher))
+            .await
+            .map_err(|e| (Dependency::Storage, DomainError::from(e)))?;
+        if let Some(earlier) = self.delivery.hold(handle) {
+            // An earlier run's pipeline: stopped, never leaked.
+            earlier.stop().await;
+        }
+        Ok(())
     }
 
     /// Rebuild every active policy's immutable artifact from its persisted

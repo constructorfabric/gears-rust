@@ -609,6 +609,7 @@ impl RollbackableOperation {
 }
 
 /// Closed notification event catalog (PRD section 5.15).
+// @cpt-dod:cpt-cf-quota-enforcement-dod-event-catalog:p1
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum NotificationEventKind {

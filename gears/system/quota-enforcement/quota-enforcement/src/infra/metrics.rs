@@ -24,7 +24,8 @@ use crate::config::MetricsConfig;
 use crate::domain::ports::lifecycle_gauges::LifecycleCounts;
 use crate::domain::ports::metrics::{
     DenialReason, EngineLabel, METRIC_LABEL, MetricLabel, OperationKind, PolicyTransition,
-    QeMetrics, REASON_LABEL, RetentionTable, SURFACE_LABEL, ValidationReason, ValidationSurface,
+    QeMetrics, REASON_LABEL, RetentionTable, SURFACE_LABEL, SinkLabel, ValidationReason,
+    ValidationSurface,
 };
 use crate::infra::lease_backlog::{LEASE_UNRECLAIMED_EXPIRED, LeaseBacklogCell};
 use crate::infra::lifecycle_gauges::{
@@ -62,6 +63,25 @@ pub const LEASE_CONTENTION_REJECTED_TOTAL: &str = "lease_contention_rejected_tot
 /// Catalogue name of the lease cap-rejection counter.
 pub const LEASE_INFLIGHT_LIMIT_EXCEEDED_TOTAL: &str = "lease_inflight_limit_exceeded_total";
 
+/// Catalogue name of the per-sink dispatch failure counter.
+pub const NOTIFICATION_DISPATCH_FAILURES_TOTAL: &str = "notification_dispatch_failures_total";
+
+/// Catalogue name of the handler rejection counter.
+pub const OUTBOX_REJECTIONS_TOTAL: &str = "outbox_rejections_total";
+
+/// Label carrying the id of a sink resolved at bootstrap.
+pub const SINK_ID_LABEL: &str = "sink_id";
+
+/// Label carrying a closed notification event kind.
+pub const EVENT_KIND_LABEL: &str = "event_kind";
+
+/// Label carrying an outbox queue.
+pub const QUEUE_LABEL: &str = "queue";
+
+/// The `queue` value of the notification counters: the storage plugin's
+/// notification queue, the only queue this gear dispatches.
+pub const NOTIFICATION_QUEUE: &str = "qe_notifications";
+
 /// Bucket bounds of the acquisition histogram, in seconds: dense around the
 /// 100 ms p95 target, sparse beyond a second.
 const LEASE_WAIT_BOUNDARIES: [f64; 11] = [
@@ -93,6 +113,8 @@ pub struct QeMetricsMeter {
     lease_acquisition_wait: Histogram<f64>,
     lease_contention_rejected: Counter<u64>,
     lease_inflight_limit_exceeded: Counter<u64>,
+    notification_dispatch_failures: Counter<u64>,
+    outbox_rejections: Counter<u64>,
     /// Held so the observable gauges stay registered for the meter's life.
     _lifecycle_gauges: [ObservableGauge<u64>; 3],
     /// Held for the same reason.
@@ -189,6 +211,14 @@ impl QeMetricsMeter {
             .u64_counter(config.instrument_name(LEASE_INFLIGHT_LIMIT_EXCEEDED_TOTAL))
             .with_description("Lease acquisitions refused on the active-lease cap, by metric")
             .build();
+        let notification_dispatch_failures = meter
+            .u64_counter(config.instrument_name(NOTIFICATION_DISPATCH_FAILURES_TOTAL))
+            .with_description("Failed sink dispatches, by sink and event kind")
+            .build();
+        let outbox_rejections = meter
+            .u64_counter(config.instrument_name(OUTBOX_REJECTIONS_TOTAL))
+            .with_description("Events the notification handler dead-lettered, by queue")
+            .build();
         let lease_backlog = meter
             .u64_observable_gauge(config.instrument_name(LEASE_UNRECLAIMED_EXPIRED))
             .with_description("Expired leases the sweeper has not reclaimed yet, by metric")
@@ -228,6 +258,8 @@ impl QeMetricsMeter {
             lease_acquisition_wait,
             lease_contention_rejected,
             lease_inflight_limit_exceeded,
+            notification_dispatch_failures,
+            outbox_rejections,
             _lifecycle_gauges: lifecycle_gauges,
             _lease_backlog: lease_backlog,
         }
@@ -354,6 +386,27 @@ impl QeMetrics for QeMetricsMeter {
     fn record_lease_inflight_limit_exceeded(&self, metric: &MetricLabel) {
         self.lease_inflight_limit_exceeded
             .add(1, &[metric_key(metric)]);
+    }
+
+    fn record_notification_dispatch_failure(
+        &self,
+        sink: &SinkLabel,
+        kind: quota_enforcement_sdk::NotificationEventKind,
+    ) {
+        // Both labels are bounded: the sink ids bootstrap resolved and the
+        // closed event-kind set.
+        self.notification_dispatch_failures.add(
+            1,
+            &[
+                KeyValue::new(SINK_ID_LABEL, StringValue::from(sink.shared())),
+                KeyValue::new(EVENT_KIND_LABEL, kind.as_str()),
+            ],
+        );
+    }
+
+    fn record_outbox_rejection(&self) {
+        self.outbox_rejections
+            .add(1, &[KeyValue::new(QUEUE_LABEL, NOTIFICATION_QUEUE)]);
     }
 }
 

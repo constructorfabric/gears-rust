@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use authz_resolver_sdk::AuthZResolverApi;
 use gts::GtsTypeId;
-use quota_enforcement_sdk::testing::{InMemoryStorage, quota_draft};
+use quota_enforcement_sdk::testing::{InMemoryStorage, RecordingSink, quota_draft};
 use quota_enforcement_sdk::{
     CONTRACT_MAJOR, MetricId, PageRequest, PolicyDraft, PolicyId, PolicySchemaSnapshot,
     PolicyScope, QuotaEnforcementStoragePluginV1, SCOPE_TENANT, SCOPE_USER, StorageError,
@@ -16,7 +16,7 @@ use toolkit_security::AccessScope;
 
 use super::{Bootstrap, CatalogBinding};
 use crate::domain::catalog::CatalogConfig;
-use crate::domain::error::{Dependency, DomainError};
+use crate::domain::error::{Dependency, DomainError, PluginKind};
 use crate::domain::plugins::PluginBinding;
 use crate::domain::ports::contracts::ContractRegistry;
 use crate::domain::ports::coordination::SingletonScope;
@@ -31,7 +31,7 @@ use crate::test_support::{
     LLM_TENANT_PROJECTION, LLM_TOKEN_CONSTRAINT, LLM_TOKEN_REQUEST, LLM_USER_PROJECTION,
     METRIC_OTHER, METRIC_TOKENS, PermitTenantsPdp, RecordingMetrics, StaticCoordinatorBinding, ctx,
     hub_with, idle_work, in_process_registry, llm_gateway_documents, metric_base_documents,
-    register_storage, storage_instance, tenant,
+    register_sink, register_storage, sink_instance, storage_instance, tenant,
 };
 
 fn type_id(raw: &str) -> GtsTypeId {
@@ -553,7 +553,8 @@ fn persisted_policy(engine_id: &str, engine_config: serde_json::Value) -> Policy
 #[tokio::test]
 async fn bootstrap_registers_both_engines_seeds_the_global_policy_and_publishes_its_artifact() {
     let h = harness(Arc::new(InMemoryStorage::new()), true, permitting_pdp());
-    let bound = bootstrap(&h).run().await.expect("bootstrap succeeds");
+    let first = bootstrap(&h);
+    let bound = first.run().await.expect("bootstrap succeeds");
     assert_eq!(
         bound.engines.ids().collect::<Vec<_>>(),
         vec!["cel", "most-restrictive-wins"]
@@ -575,11 +576,12 @@ async fn bootstrap_registers_both_engines_seeds_the_global_policy_and_publishes_
     );
     assert!(h.metrics.engine_bootstrap_failures.lock().is_empty());
 
-    // A second bootstrap finds the scope occupied and seeds nothing new.
-    let again = harness(h.storage.clone(), true, permitting_pdp());
+    // A restart's bootstrap finds the scope occupied and seeds nothing new.
+    first.delivery().stop().await;
+    let restarted = Arc::new(h.storage.restarted());
+    let again = harness(restarted.clone(), true, permitting_pdp());
     bootstrap(&again).run().await.expect("repeat");
-    let versions = h
-        .storage
+    let versions = restarted
         .list_policy_versions(&PolicyId::global(), PageRequest::first(10))
         .await
         .expect("history");
@@ -644,4 +646,194 @@ async fn an_active_policy_whose_config_no_longer_compiles_fails_readiness_and_is
         h.metrics.engine_bootstrap_failures.lock().as_slice(),
         &[EngineLabel::MostRestrictiveWins]
     );
+}
+
+/// A harness whose registry also lists `sinks`, each registered as a scoped
+/// client unless it is `None`.
+fn harness_with_sinks(
+    sinks: &[(
+        &crate::test_support::PluginFixture,
+        Option<Arc<RecordingSink>>,
+    )],
+) -> Harness {
+    let mut h = harness(Arc::new(InMemoryStorage::new()), false, permitting_pdp());
+    let storage_fixture = storage_instance("cf.core._.qe_db_storage.v1", "acme", 100);
+    let mut fixtures = vec![&storage_fixture];
+    fixtures.extend(sinks.iter().map(|(fixture, _)| *fixture));
+    h.hub = hub_with(&fixtures);
+    register_storage(&h.hub, &storage_fixture, h.storage.clone());
+    for (fixture, sink) in sinks {
+        if let Some(sink) = sink {
+            register_sink(&h.hub, fixture, sink.clone());
+        }
+    }
+    h
+}
+
+/// Commit one Quota with one `quota-changed` event into the double's outbox.
+async fn commit_one_event(storage: &InMemoryStorage) -> quota_enforcement_sdk::NotificationEvent {
+    let event = crate::domain::quotas::events::quota_changed(
+        tenant(),
+        None,
+        None,
+        crate::domain::quotas::events::ChangeKind::Created,
+        time::OffsetDateTime::now_utc(),
+    );
+    storage
+        .create_quota(
+            &ctx(),
+            &AccessScope::allow_all(),
+            quota_draft(
+                SubjectRef {
+                    projection_type: type_id(LLM_USER_PROJECTION),
+                    subject_id: "u-1".to_owned(),
+                },
+                Some(10),
+            ),
+            std::slice::from_ref(&event),
+        )
+        .await
+        .expect("committed");
+    event
+}
+
+#[tokio::test]
+async fn bootstrap_starts_delivery_to_every_sink_of_every_vendor() {
+    let acme = sink_instance("cf.core._.qe_sink_acme.v1", "acme");
+    let globex = sink_instance("cf.core._.qe_sink_globex.v1", "globex");
+    let a = Arc::new(RecordingSink::new("acme-audit"));
+    let g = Arc::new(RecordingSink::new("globex-billing"));
+    let h = harness_with_sinks(&[(&acme, Some(a.clone())), (&globex, Some(g.clone()))]);
+    let bootstrap = bootstrap(&h);
+    bootstrap.run().await.expect("bootstrap succeeds");
+    assert!(bootstrap.delivery().is_running());
+
+    let event = commit_one_event(&h.storage).await;
+    let report = h.storage.drain_notifications().await;
+    assert_eq!(report.delivered, 1);
+    for sink in [&a, &g] {
+        let received = sink.received();
+        assert_eq!(received.len(), 1, "every vendor's sink receives the event");
+        assert_eq!(received[0].1.event_id, event.event_id);
+        assert!(!received[0].0.is_anonymous());
+    }
+
+    bootstrap.delivery().stop().await;
+    assert!(!bootstrap.delivery().is_running());
+}
+
+#[tokio::test]
+async fn without_sinks_bootstrap_is_ready_and_events_are_acknowledged() {
+    let h = harness_with_sinks(&[]);
+    let bootstrap = bootstrap(&h);
+    bootstrap
+        .run()
+        .await
+        .expect("zero sinks is a valid deployment");
+    assert_eq!(h.readiness.snapshot(), ReadinessState::Ready);
+    commit_one_event(&h.storage).await;
+    assert_eq!(h.storage.drain_notifications().await.delivered, 1);
+}
+
+#[tokio::test]
+async fn a_still_failing_event_is_delivered_eleven_times_then_dead_lettered() {
+    let fixture = sink_instance("cf.core._.qe_sink_busy.v1", "acme");
+    let busy = Arc::new(RecordingSink::answering(
+        "busy",
+        (0..11)
+            .map(|_| {
+                Err(quota_enforcement_sdk::DispatchError::Transient(
+                    "busy".to_owned(),
+                ))
+            })
+            .collect(),
+    ));
+    let h = harness_with_sinks(&[(&fixture, Some(busy.clone()))]);
+    bootstrap(&h).run().await.expect("bootstrap succeeds");
+    commit_one_event(&h.storage).await;
+
+    for call in 1..=10 {
+        let report = h.storage.drain_notifications().await;
+        assert!(report.retry_pending, "call {call} is retried");
+    }
+    let report = h.storage.drain_notifications().await;
+    assert_eq!((report.rejected, report.retry_pending), (1, false));
+    assert_eq!(busy.received().len(), 11);
+    assert_eq!(h.storage.dead_letters().len(), 1);
+    assert_eq!(h.metrics.outbox_rejections(), 1);
+    assert_eq!(h.metrics.dispatch_failures().len(), 11);
+}
+
+#[tokio::test]
+async fn two_sinks_answering_one_id_fail_readiness_on_the_sinks() {
+    let first = sink_instance("cf.core._.qe_sink_one.v1", "acme");
+    let second = sink_instance("cf.core._.qe_sink_two.v1", "globex");
+    let h = harness_with_sinks(&[
+        (&first, Some(Arc::new(RecordingSink::new("audit")))),
+        (&second, Some(Arc::new(RecordingSink::new("audit")))),
+    ]);
+    let bootstrap = bootstrap(&h);
+    let err = bootstrap.run().await.err().expect("duplicate sink id");
+    assert!(
+        matches!(
+            &err,
+            DomainError::InvalidPluginInstance { kind: PluginKind::NotificationSink, gts_id, reason }
+                if gts_id == &second.instance_id && reason.contains("audit")
+        ),
+        "{err:?}"
+    );
+    failed_on(&h, Dependency::NotificationSinks);
+    assert!(!bootstrap.delivery().is_running());
+}
+
+#[tokio::test]
+async fn a_malformed_sink_instance_fails_readiness_on_the_sinks() {
+    let broken = crate::test_support::PluginFixture::malformed_sink("cf.core._.qe_sink_broken.v1");
+    let h = harness_with_sinks(&[(&broken, None)]);
+    let err = bootstrap(&h).run().await.err().expect("malformed");
+    assert!(
+        matches!(
+            &err,
+            DomainError::InvalidPluginInstance { kind: PluginKind::NotificationSink, gts_id, .. }
+                if gts_id == &broken.instance_id
+        ),
+        "{err:?}"
+    );
+    failed_on(&h, Dependency::NotificationSinks);
+}
+
+#[tokio::test]
+async fn a_sink_instance_without_its_client_fails_readiness_on_the_sinks() {
+    let orphan = sink_instance("cf.core._.qe_sink_orphan.v1", "acme");
+    let h = harness_with_sinks(&[(&orphan, None)]);
+    let err = bootstrap(&h).run().await.err().expect("client missing");
+    assert_eq!(
+        err,
+        DomainError::PluginClientNotRegistered {
+            kind: PluginKind::NotificationSink,
+            gts_id: orphan.instance_id.clone(),
+        }
+    );
+    failed_on(&h, Dependency::NotificationSinks);
+}
+
+#[tokio::test]
+async fn a_storage_that_refuses_delivery_fails_readiness_on_storage() {
+    let h = harness_with_sinks(&[]);
+    // Delivery already runs on this plugin instance: a second start is refused.
+    let _running = h
+        .storage
+        .start_notification_delivery(Arc::new(
+            crate::domain::notifications::NotificationDispatcher::new(
+                Vec::new(),
+                crate::domain::notifications::dispatcher_context().expect("context"),
+                crate::domain::notifications::DispatchLimits::default(),
+                h.metrics.clone(),
+            ),
+        ))
+        .await
+        .expect("first start");
+    let err = bootstrap(&h).run().await.err().expect("second start");
+    assert!(matches!(err, DomainError::Internal(_)), "{err:?}");
+    failed_on(&h, Dependency::Storage);
 }

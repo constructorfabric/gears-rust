@@ -58,6 +58,35 @@ impl MetricLabel {
     }
 }
 
+/// A `sink_id` label value: the id of a notification sink resolved at
+/// bootstrap.
+///
+/// Only the dispatcher makes one, from the sink set bootstrap resolved, so the
+/// values an instrument can carry are exactly the deployment's sinks.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SinkLabel(Arc<str>);
+
+impl SinkLabel {
+    /// The label of a resolved sink. Crate-private: the dispatcher is the
+    /// only caller.
+    pub(crate) fn resolved(id: &str) -> Self {
+        Self(Arc::from(id))
+    }
+
+    /// The label value.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The label value, shared rather than copied.
+    #[must_use]
+    pub fn shared(&self) -> Arc<str> {
+        Arc::clone(&self.0)
+    }
+}
+
 /// Closed `reason` set of `denial_total`.
 // @cpt-dod:cpt-cf-quota-enforcement-dod-telemetry-conventions:p1
 #[domain_model]
@@ -404,6 +433,17 @@ pub trait QeMetrics: Send + Sync {
 
     /// `lease_inflight_limit_exceeded_total{metric}` += 1.
     fn record_lease_inflight_limit_exceeded(&self, metric: &MetricLabel);
+
+    /// `notification_dispatch_failures_total{sink_id, event_kind}` += 1.
+    fn record_notification_dispatch_failure(
+        &self,
+        sink: &SinkLabel,
+        kind: quota_enforcement_sdk::NotificationEventKind,
+    );
+
+    /// `outbox_rejections_total{queue}` += 1: the notification queue
+    /// dead-lettered one event.
+    fn record_outbox_rejection(&self);
 }
 
 /// One backlog sample: expired, unreclaimed leases per admitted metric.
@@ -460,6 +500,13 @@ impl QeMetrics for NoopMetrics {
     fn record_lease_acquisition_wait(&self, _: &MetricLabel, _: std::time::Duration) {}
     fn record_lease_contention_rejected(&self, _: &MetricLabel) {}
     fn record_lease_inflight_limit_exceeded(&self, _: &MetricLabel) {}
+    fn record_notification_dispatch_failure(
+        &self,
+        _: &SinkLabel,
+        _: quota_enforcement_sdk::NotificationEventKind,
+    ) {
+    }
+    fn record_outbox_rejection(&self) {}
 }
 
 /// Bounded deployment engine labels; unknown submitted strings cannot enter metrics.

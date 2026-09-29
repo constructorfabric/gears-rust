@@ -2,8 +2,9 @@
 //!
 //! `init` wires the PEP boundary, the domain service, the in-process manager
 //! client, and the cluster coordination binding. The lifecycle entry runs the
-//! fail-closed bootstrap before the ready signal, then hosts the leader-only
-//! lifecycle-gauge refresh under a child token. The REST surface mounts into
+//! fail-closed bootstrap before the ready signal, which ends by starting
+//! notification delivery, then hosts the leader-only sweepers under child
+//! tokens, and stops delivery on shutdown. The REST surface mounts into
 //! the platform `api-gateway`; the readiness check reports the bootstrap state
 //! and the cluster requirements verdict.
 //!
@@ -132,7 +133,8 @@ impl QuotaEnforcementGear {
         ready: ReadySignal,
     ) -> anyhow::Result<()> {
         let (service, bootstrap, gauges) = self.initialised()?;
-        let bound = bootstrap_or_shutdown(bootstrap, &cancel).await?;
+        let delivery = bootstrap.delivery();
+        let bound = bootstrap_or_stop(bootstrap, &cancel, gauges.stop_timeout).await?;
         let refresher = LifecycleGaugeRefresher::new(
             bound.storage.clone(),
             bound.metric_registry.clone(),
@@ -182,9 +184,16 @@ impl QuotaEnforcementGear {
         // @cpt-end:cpt-cf-quota-enforcement-algo-lease-sweep:p1:inst-swp-elect
         cancel.cancelled().await;
         info!(target: LOG_TARGET, "quota-enforcement is stopping");
-        join_leader_task("lifecycle gauge", gauge_task, gauges.stop_timeout).await;
-        join_leader_task("retention sweeper", retention_task, gauges.stop_timeout).await;
-        join_leader_task("lease sweeper", lease_task, gauges.stop_timeout).await;
+        stop_background(
+            [
+                ("lifecycle gauge", gauge_task),
+                ("retention sweeper", retention_task),
+                ("lease sweeper", lease_task),
+            ],
+            &delivery,
+            gauges.stop_timeout,
+        )
+        .await;
         Ok(())
     }
 }
@@ -215,6 +224,23 @@ async fn bootstrap_or_shutdown(
     }
 }
 
+/// [`bootstrap_or_shutdown`], stopping notification delivery when it fails: a
+/// shutdown can interrupt bootstrap after delivery started.
+async fn bootstrap_or_stop(
+    bootstrap: &Bootstrap,
+    cancel: &CancellationToken,
+    stop_timeout: Duration,
+) -> anyhow::Result<Bound> {
+    let outcome = bootstrap_or_shutdown(bootstrap, cancel).await;
+    if outcome.is_err() {
+        stop_delivery(&bootstrap.delivery(), stop_timeout).await;
+    }
+    outcome
+}
+
+/// A leader-only task: its election's outcome once it stops.
+type LeaderTask = tokio::task::JoinHandle<Result<(), crate::domain::DomainError>>;
+
 /// Leader-only: the elected replica refreshes and publishes the gauge sample;
 /// every other replica publishes nothing. Leadership loss cancels the child
 /// token and the refresher withdraws its sample.
@@ -223,17 +249,13 @@ fn spawn_leader_task(
     scope: SingletonScope,
     work: crate::domain::ports::coordination::LeaderWork,
     shutdown: CancellationToken,
-) -> tokio::task::JoinHandle<Result<(), crate::domain::DomainError>> {
+) -> LeaderTask {
     tokio::spawn(async move { coordinator.run_while_leader(scope, shutdown, work).await })
 }
 
 /// Wait for a leader task to stop within `budget`; a slow or failed stop is
 /// logged, never an error of the lifecycle entry.
-async fn join_leader_task(
-    name: &str,
-    task: tokio::task::JoinHandle<Result<(), crate::domain::DomainError>>,
-    budget: Duration,
-) {
+async fn join_leader_task(name: &str, task: LeaderTask, budget: Duration) {
     let failure = match tokio::time::timeout(budget, task).await {
         Ok(Ok(Ok(()))) => return,
         Ok(Ok(Err(err))) => format!("{name} election ended with an error: {err}"),
@@ -241,6 +263,33 @@ async fn join_leader_task(
         Err(_elapsed) => format!("{name} task did not stop within {budget:?}"),
     };
     tracing::warn!(target: LOG_TARGET, "{failure}");
+}
+
+/// Stop the leader tasks, then notification delivery, each within `budget`.
+async fn stop_background(
+    tasks: [(&str, LeaderTask); 3],
+    delivery: &crate::domain::notifications::DeliveryLifecycle,
+    budget: Duration,
+) {
+    for (name, task) in tasks {
+        join_leader_task(name, task, budget).await;
+    }
+    stop_delivery(delivery, budget).await;
+}
+
+/// Stop notification delivery within `budget`; events it did not finish stay
+/// queued for the next processor. A slow stop is logged, never an error of
+/// the lifecycle entry.
+async fn stop_delivery(
+    delivery: &crate::domain::notifications::DeliveryLifecycle,
+    budget: Duration,
+) {
+    if tokio::time::timeout(budget, delivery.stop()).await.is_err() {
+        tracing::warn!(
+            target: LOG_TARGET,
+            "notification delivery did not stop within {budget:?}"
+        );
+    }
 }
 
 #[async_trait]
@@ -335,7 +384,8 @@ impl Gear for QuotaEnforcementGear {
                 readiness,
             },
             policy_limits,
-        );
+        )
+        .with_dispatch(cfg.notifications.to_limits());
 
         let gauges = GaugeWiring {
             cell: gauge_cell,

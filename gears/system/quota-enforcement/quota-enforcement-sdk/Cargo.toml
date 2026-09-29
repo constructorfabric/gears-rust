@@ -21,7 +21,7 @@ workspace = true
 [features]
 # Exposes `pub mod testing`: a complete in-memory double of the storage plugin
 # contract. Test-only; never enable in a production build.
-test-util = ["dep:parking_lot"]
+test-util = ["dep:parking_lot", "dep:tokio"]
 
 [dependencies]
 async-trait = { workspace = true }
@@ -47,6 +47,8 @@ toolkit-security = { workspace = true }
 toolkit-canonical-errors = { workspace = true }
 
 parking_lot = { workspace = true, optional = true }
+# The in-memory double's drain lock, held across a delivery callback.
+tokio = { workspace = true, features = ["sync"], optional = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt", "macros"] }
+tokio = { workspace = true, features = ["rt", "macros", "sync", "time"] }

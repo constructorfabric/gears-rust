@@ -77,7 +77,7 @@ impl Harness {
         let reader = Arc::clone(&clock);
         let store = SqlConsumptionStore::with_clock(
             db.clone(),
-            Arc::clone(&enqueuer) as Arc<dyn crate::infra::outbox::NotificationEnqueuer>,
+            Arc::clone(&enqueuer) as Arc<dyn crate::infra::outbox::NotificationOutbox>,
             Arc::new(move || *reader.lock().expect("clock")),
         );
         let quota_clock = Arc::clone(&clock);

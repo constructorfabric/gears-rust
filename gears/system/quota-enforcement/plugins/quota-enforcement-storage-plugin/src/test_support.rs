@@ -20,14 +20,14 @@ use sea_orm_migration::MigratorTrait;
 use serde_json::json;
 use time::OffsetDateTime;
 use toolkit_db::migration_runner::run_migrations_for_testing;
-use toolkit_db::outbox::{OutboxHandle, OutboxMessageId};
+use toolkit_db::outbox::{OutboxHandle, Wake};
 use toolkit_db::secure::{DBRunner, SecureEntityExt};
 use toolkit_db::{ConnectOpts, Db, connect_db};
 use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
 use crate::domain::ports::{Actor, PolicyStore, QuotaStore, StoreError};
-use crate::infra::outbox::{EnqueueError, NotificationEnqueuer, QeOutbox, start_outbox};
+use crate::infra::outbox::{EnqueueError, NotificationOutbox, QeOutbox, start_undelivered_outbox};
 use crate::infra::storage::Migrator;
 
 /// The `llm_gateway` user projection the gear's fixtures use.
@@ -57,7 +57,9 @@ pub async fn test_db() -> Db {
 /// The outbox pipeline on `db` with the notification queue registered, and
 /// a bound handle over it. Stop the handle at the end of the test.
 pub async fn bound_outbox(db: &Db) -> (OutboxHandle, Arc<QeOutbox>) {
-    let handle = start_outbox(db.clone()).await.expect("start outbox");
+    let handle = start_undelivered_outbox(db.clone())
+        .await
+        .expect("start outbox");
     let outbox = Arc::new(QeOutbox::new());
     outbox.bind(Arc::clone(handle.outbox())).expect("bind once");
     (handle, outbox)
@@ -178,12 +180,12 @@ pub async fn count_rows<E: EntityTrait + toolkit_db::secure::ScopableEntity>(db:
 pub struct FailingEnqueuer;
 
 #[async_trait]
-impl NotificationEnqueuer for FailingEnqueuer {
-    async fn enqueue_all(
+impl NotificationOutbox for FailingEnqueuer {
+    async fn enqueue(
         &self,
         _runner: &(dyn DBRunner + Sync),
         _events: &[NotificationEvent],
-    ) -> Result<Vec<OutboxMessageId>, EnqueueError> {
+    ) -> Result<Wake, EnqueueError> {
         Err(EnqueueError::Serialize("injected".to_owned()))
     }
 }

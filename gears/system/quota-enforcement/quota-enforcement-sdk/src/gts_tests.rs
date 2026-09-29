@@ -75,6 +75,20 @@ fn the_storage_plugin_spec_type_id_derives_from_the_toolkit_plugin_base() {
 }
 
 #[test]
+fn the_notification_sink_spec_type_id_derives_from_the_toolkit_plugin_base() {
+    let sink = crate::QuotaNotificationSinkSpecV1::TYPE_ID;
+    assert!(
+        sink.starts_with("gts.cf.toolkit.plugins.plugin.v1~"),
+        "{sink}"
+    );
+    assert!(
+        sink.ends_with("~cf.core.qe.notification_sink.v1~"),
+        "{sink}"
+    );
+    assert_ne!(sink, QuotaEnforcementStoragePluginSpecV1::TYPE_ID);
+}
+
+#[test]
 fn resource_ids_are_distinct_five_segment_type_ids() {
     let all = [
         QUOTA_RESOURCE,

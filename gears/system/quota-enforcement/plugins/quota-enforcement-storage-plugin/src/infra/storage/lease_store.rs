@@ -63,7 +63,7 @@ use super::locking::{lock_scopes, with_budget};
 use super::repo::lease_repo;
 use super::repo::lease_repo::RowWait;
 use super::repo::operation_log_repo::{self, Entry};
-use crate::infra::outbox::NotificationEnqueuer;
+use crate::infra::outbox::{AttemptWakes, NotificationEnqueuer, SettleWakes};
 
 /// Operation-log verbs of the lease primitives.
 const OP_LEASE_ACQUIRE: &str = "lease_acquire";
@@ -101,58 +101,61 @@ impl SqlConsumptionStore {
             // A refused lock rolls this transaction back and runs it
             // again under the budget; a race goes to the arbiter below.
             let result = with_budget(budget, || {
-                let enqueuer = Arc::clone(&self.enqueuer);
+                let wakes = AttemptWakes::begin(&self.enqueuer);
+                let enqueuer = wakes.enqueuer();
                 let clock = Arc::clone(&self.clock);
                 let actor = actor.clone();
                 let scope = scope.clone();
                 let metric = metric.clone();
                 let owned = OwnedMutation::of(mutation);
-                self.db.transaction_ref_mapped(move |tx| {
-                    Box::pin(async move {
-                        let scope = &scope;
-                        let owned = &owned;
-                        // Rank 1: the Quota rows of the applicable set.
-                        let quotas = SqlConsumptionStore::lock_applicable(
-                            tx,
-                            scope,
-                            &owned.applicable,
-                            RowWait::Nowait,
-                        )
-                        .await?;
-                        // Every lock here is `NOWAIT`, so no time passes waiting
-                        // inside this transaction: one reading of the clock
-                        // serves the live count, the evaluation's period, the
-                        // holds and the expiry alike. A refused lock retries the
-                        // whole transaction, with a fresh reading.
-                        let now = clock();
-                        // Rank 2: the scope's stripe (I8), then the record.
-                        lock_scopes(tx, &[&owned.idempotency.scope]).await?;
-                        if let Replay::Stored(row) =
-                            replay_of(tx, scope, &owned.idempotency, now, Some(RowWait::Nowait))
-                                .await?
-                        {
-                            let acquired: EvaluatedLease = serde_json::from_str(&row.decision_blob)
-                                .map_err(|error| {
-                                    TxError::Storage(StorageError::Internal(error.to_string()))
-                                })?;
-                            return Ok(TransitionOutcome::NoOp(acquired));
-                        }
-                        let (policy, decision) =
-                            SqlConsumptionStore::evaluate(tx, scope, &quotas, owned, now).await?;
-                        if decision.denied_reason() == Some(NO_APPLICABLE_QUOTA) {
-                            return Ok(TransitionOutcome::Applied(EvaluatedLease {
-                                decision,
-                                token: None,
-                                expires_at: None,
-                            }));
-                        }
-                        let allowed = matches!(decision.result, DecisionResult::Allowed)
-                            && !decision.debit_plan.is_empty();
-                        let (token, expiry) = if allowed {
-                            // The cap is consulted only now: a verdict the
-                            // engine refused is the caller's answer whether or
-                            // not the cap is full.
-                            let row = lease_repo::lock_capacity_row(
+                self.db
+                    .transaction_ref_mapped(move |tx| {
+                        Box::pin(async move {
+                            let scope = &scope;
+                            let owned = &owned;
+                            // Rank 1: the Quota rows of the applicable set.
+                            let quotas = SqlConsumptionStore::lock_applicable(
+                                tx,
+                                scope,
+                                &owned.applicable,
+                                RowWait::Nowait,
+                            )
+                            .await?;
+                            // Every lock here is `NOWAIT`, so no time passes waiting
+                            // inside this transaction: one reading of the clock
+                            // serves the live count, the evaluation's period, the
+                            // holds and the expiry alike. A refused lock retries the
+                            // whole transaction, with a fresh reading.
+                            let now = clock();
+                            // Rank 2: the scope's stripe (I8), then the record.
+                            lock_scopes(tx, &[&owned.idempotency.scope]).await?;
+                            if let Replay::Stored(row) =
+                                replay_of(tx, scope, &owned.idempotency, now, Some(RowWait::Nowait))
+                                    .await?
+                            {
+                                let acquired: EvaluatedLease =
+                                    serde_json::from_str(&row.decision_blob).map_err(|error| {
+                                        TxError::Storage(StorageError::Internal(error.to_string()))
+                                    })?;
+                                return Ok(TransitionOutcome::NoOp(acquired));
+                            }
+                            let (policy, decision) =
+                                SqlConsumptionStore::evaluate(tx, scope, &quotas, owned, now)
+                                    .await?;
+                            if decision.denied_reason() == Some(NO_APPLICABLE_QUOTA) {
+                                return Ok(TransitionOutcome::Applied(EvaluatedLease {
+                                    decision,
+                                    token: None,
+                                    expires_at: None,
+                                }));
+                            }
+                            let allowed = matches!(decision.result, DecisionResult::Allowed)
+                                && !decision.debit_plan.is_empty();
+                            let (token, expiry) = if allowed {
+                                // The cap is consulted only now: a verdict the
+                                // engine refused is the caller's answer whether or
+                                // not the cap is full.
+                                let row = lease_repo::lock_capacity_row(
                                 tx,
                                 scope,
                                 tenant.as_uuid(),
@@ -167,130 +170,135 @@ impl SqlConsumptionStore {
                                     "no lease capacity row for tenant {tenant} and metric {metric}"
                                 )))
                             })?;
-                            // @cpt-begin:cpt-cf-quota-enforcement-flow-lease-acquire:p1:inst-lac-cap-if
-                            // @cpt-begin:cpt-cf-quota-enforcement-flow-lease-acquire:p1:inst-lac-cap
-                            // @cpt-begin:cpt-cf-quota-enforcement-algo-lazy-expiry:p1:inst-lzy-cap
-                            let live = lease_repo::count_live(
-                                tx,
-                                scope,
-                                tenant.as_uuid(),
-                                metric.as_str(),
-                                now,
-                            )
-                            .await?;
-                            // @cpt-end:cpt-cf-quota-enforcement-algo-lazy-expiry:p1:inst-lzy-cap
-                            let cap =
-                                SqlConsumptionStore::lease_cap(tx, tenant, metric.as_str()).await?;
-                            if live >= cap {
-                                return Err(TxError::Storage(
-                                    StorageError::LeaseInflightLimitExceeded,
-                                ));
-                            }
-                            // @cpt-end:cpt-cf-quota-enforcement-flow-lease-acquire:p1:inst-lac-cap
-                            // @cpt-end:cpt-cf-quota-enforcement-flow-lease-acquire:p1:inst-lac-cap-if
-                            // @cpt-begin:cpt-cf-quota-enforcement-flow-lease-acquire:p1:inst-lac-insert
-                            let applied = SqlConsumptionStore::hold_plan(
-                                tx, scope, &quotas, &decision, now, &enqueuer,
-                            )
-                            .await?;
-                            let token = LeaseToken::from(Uuid::now_v7());
-                            let expiry = now + ttl;
-                            lease_repo::insert_lease(
-                                tx,
-                                scope,
-                                &lease_repo::NewLease {
-                                    token: token.as_uuid(),
-                                    tenant_id: tenant.as_uuid(),
-                                    metric: metric.as_str(),
-                                    subject_key: owned.idempotency.scope.subject_key.as_bytes(),
-                                    attribution_hash: owned.authorized.as_bytes(),
-                                    idem_key: &owned.idempotency.scope.key,
-                                    reserved_amount: i64::try_from(owned.amount).map_err(|_| {
-                                        TxError::Storage(StorageError::Internal(
-                                            "reserved amount does not fit the column".to_owned(),
-                                        ))
-                                    })?,
-                                    now,
-                                    expiry_at: expiry,
-                                },
-                            )
-                            .await?;
-                            for entry in &applied {
-                                lease_repo::insert_hold(
+                                // @cpt-begin:cpt-cf-quota-enforcement-flow-lease-acquire:p1:inst-lac-cap-if
+                                // @cpt-begin:cpt-cf-quota-enforcement-flow-lease-acquire:p1:inst-lac-cap
+                                // @cpt-begin:cpt-cf-quota-enforcement-algo-lazy-expiry:p1:inst-lzy-cap
+                                let live = lease_repo::count_live(
                                     tx,
                                     scope,
-                                    token.as_uuid(),
                                     tenant.as_uuid(),
-                                    entry.quota_id,
-                                    i64::try_from(entry.amount).map_err(|_| {
-                                        TxError::Storage(StorageError::Internal(
-                                            "held amount does not fit the column".to_owned(),
-                                        ))
-                                    })?,
-                                    entry.period_id,
+                                    metric.as_str(),
+                                    now,
                                 )
                                 .await?;
-                                operation_log_repo::append(
+                                // @cpt-end:cpt-cf-quota-enforcement-algo-lazy-expiry:p1:inst-lzy-cap
+                                let cap =
+                                    SqlConsumptionStore::lease_cap(tx, tenant, metric.as_str())
+                                        .await?;
+                                if live >= cap {
+                                    return Err(TxError::Storage(
+                                        StorageError::LeaseInflightLimitExceeded,
+                                    ));
+                                }
+                                // @cpt-end:cpt-cf-quota-enforcement-flow-lease-acquire:p1:inst-lac-cap
+                                // @cpt-end:cpt-cf-quota-enforcement-flow-lease-acquire:p1:inst-lac-cap-if
+                                // @cpt-begin:cpt-cf-quota-enforcement-flow-lease-acquire:p1:inst-lac-insert
+                                let applied = SqlConsumptionStore::hold_plan(
+                                    tx, scope, &quotas, &decision, now, &enqueuer,
+                                )
+                                .await?;
+                                let token = LeaseToken::from(Uuid::now_v7());
+                                let expiry = now + ttl;
+                                lease_repo::insert_lease(
                                     tx,
                                     scope,
-                                    Entry {
+                                    &lease_repo::NewLease {
+                                        token: token.as_uuid(),
                                         tenant_id: tenant.as_uuid(),
-                                        quota_id: entry.quota_id,
-                                        operation: OP_LEASE_ACQUIRE,
-                                        actor: &actor,
-                                        record_version: 1,
-                                        detail: String::new(),
-                                        occurred_at: now,
+                                        metric: metric.as_str(),
+                                        subject_key: owned.idempotency.scope.subject_key.as_bytes(),
+                                        attribution_hash: owned.authorized.as_bytes(),
+                                        idem_key: &owned.idempotency.scope.key,
+                                        reserved_amount: i64::try_from(owned.amount).map_err(
+                                            |_| {
+                                                TxError::Storage(StorageError::Internal(
+                                                    "reserved amount does not fit the column"
+                                                        .to_owned(),
+                                                ))
+                                            },
+                                        )?,
+                                        now,
+                                        expiry_at: expiry,
                                     },
                                 )
                                 .await?;
-                            }
-                            lease_repo::bump_active_count(
+                                for entry in &applied {
+                                    lease_repo::insert_hold(
+                                        tx,
+                                        scope,
+                                        token.as_uuid(),
+                                        tenant.as_uuid(),
+                                        entry.quota_id,
+                                        i64::try_from(entry.amount).map_err(|_| {
+                                            TxError::Storage(StorageError::Internal(
+                                                "held amount does not fit the column".to_owned(),
+                                            ))
+                                        })?,
+                                        entry.period_id,
+                                    )
+                                    .await?;
+                                    operation_log_repo::append(
+                                        tx,
+                                        scope,
+                                        Entry {
+                                            tenant_id: tenant.as_uuid(),
+                                            quota_id: entry.quota_id,
+                                            operation: OP_LEASE_ACQUIRE,
+                                            actor: &actor,
+                                            record_version: 1,
+                                            detail: String::new(),
+                                            occurred_at: now,
+                                        },
+                                    )
+                                    .await?;
+                                }
+                                lease_repo::bump_active_count(
+                                    tx,
+                                    scope,
+                                    tenant.as_uuid(),
+                                    metric.as_str(),
+                                    row.active_count,
+                                    1,
+                                    now,
+                                )
+                                .await?;
+                                (Some(token), Some(expiry))
+                                // @cpt-end:cpt-cf-quota-enforcement-flow-lease-acquire:p1:inst-lac-insert
+                            } else {
+                                (None, None)
+                            };
+                            let acquired = EvaluatedLease {
+                                decision,
+                                token,
+                                expires_at: expiry,
+                            };
+                            // The acquisition's outcome is what replays, token and
+                            // all: a subject may hold several leases, so replaying
+                            // the decision alone would lose which one this was.
+                            let blob = serde_json::to_string(&acquired).map_err(|error| {
+                                TxError::Storage(StorageError::Internal(error.to_string()))
+                            })?;
+                            let deadline = expires_at(tx, tenant, metric.as_str(), now).await?;
+                            // The blob is the whole outcome, not only the decision,
+                            // so a replay returns the token this call issued.
+                            write_record(
                                 tx,
                                 scope,
-                                tenant.as_uuid(),
-                                metric.as_str(),
-                                row.active_count,
-                                1,
-                                now,
+                                &RecordWrite {
+                                    write: &owned.idempotency,
+                                    blob: RecordBlob::Verbatim(&blob),
+                                    entries: None,
+                                    authorized: Some(owned.authorized),
+                                    policy: Some(&policy),
+                                    expires_at: deadline,
+                                    now,
+                                },
                             )
                             .await?;
-                            (Some(token), Some(expiry))
-                            // @cpt-end:cpt-cf-quota-enforcement-flow-lease-acquire:p1:inst-lac-insert
-                        } else {
-                            (None, None)
-                        };
-                        let acquired = EvaluatedLease {
-                            decision,
-                            token,
-                            expires_at: expiry,
-                        };
-                        // The acquisition's outcome is what replays, token and
-                        // all: a subject may hold several leases, so replaying
-                        // the decision alone would lose which one this was.
-                        let blob = serde_json::to_string(&acquired).map_err(|error| {
-                            TxError::Storage(StorageError::Internal(error.to_string()))
-                        })?;
-                        let deadline = expires_at(tx, tenant, metric.as_str(), now).await?;
-                        // The blob is the whole outcome, not only the decision,
-                        // so a replay returns the token this call issued.
-                        write_record(
-                            tx,
-                            scope,
-                            &RecordWrite {
-                                write: &owned.idempotency,
-                                blob: RecordBlob::Verbatim(&blob),
-                                entries: None,
-                                authorized: Some(owned.authorized),
-                                policy: Some(&policy),
-                                expires_at: deadline,
-                                now,
-                            },
-                        )
-                        .await?;
-                        Ok::<_, TxError>(TransitionOutcome::Applied(acquired))
+                            Ok::<_, TxError>(TransitionOutcome::Applied(acquired))
+                        })
                     })
-                })
+                    .settling(wakes)
             })
             .await;
             match result {
@@ -349,214 +357,222 @@ impl SqlConsumptionStore {
         // A refused lock rolls this transaction back and runs it again under
         // the budget.
         with_budget(budget, || {
-            let enqueuer = Arc::clone(&self.enqueuer);
+            let wakes = AttemptWakes::begin(&self.enqueuer);
+            let enqueuer = wakes.enqueuer();
             let clock = Arc::clone(&self.clock);
             let scope_owned = scope.clone();
             let events = events.to_vec();
             let write_owned = write.clone();
             let metric = preview.metric.clone();
             let actor = actor.clone();
-            self.db.transaction_ref_mapped(move |tx| {
-                Box::pin(async move {
-                    let scope = &scope_owned;
-                    let now = clock();
-                    // Rank 2 first: the scope's stripe (I8), then the record,
-                    // so a settlement that already succeeded replays even
-                    // though its lease is no longer active.
-                    // @cpt-begin:cpt-cf-quota-enforcement-flow-lease-commit:p1:inst-lcm-idem
-                    // @cpt-begin:cpt-cf-quota-enforcement-flow-lease-release:p1:inst-lrl-idem
-                    lock_scopes(tx, &[&write_owned.scope]).await?;
-                    if let Replay::Stored(row) =
-                        replay_of(tx, scope, &write_owned, now, Some(RowWait::Nowait)).await?
-                    {
-                        return Ok(TransitionOutcome::NoOp(AppliedMutation {
-                            decision: decision_of(&row.decision_blob)?,
-                            mutation: MutationResult::default(),
-                            expires_at: row.expires_at,
-                        }));
-                    }
-                    // @cpt-end:cpt-cf-quota-enforcement-flow-lease-release:p1:inst-lrl-idem
-                    // @cpt-end:cpt-cf-quota-enforcement-flow-lease-commit:p1:inst-lcm-idem
-                    // Rank 3.
-                    // @cpt-begin:cpt-cf-quota-enforcement-flow-lease-commit:p1:inst-lcm-lock
-                    let lease =
-                        lease_repo::find_for_update(tx, scope, token.as_uuid(), RowWait::Nowait)
-                            .await?
-                            .ok_or(TxError::Storage(StorageError::LeaseNotFound { token }))?;
-                    // @cpt-end:cpt-cf-quota-enforcement-flow-lease-commit:p1:inst-lcm-lock
-                    // @cpt-begin:cpt-cf-quota-enforcement-flow-lease-commit:p1:inst-lcm-notactive-if
-                    // @cpt-begin:cpt-cf-quota-enforcement-flow-lease-commit:p1:inst-lcm-notactive
-                    // @cpt-begin:cpt-cf-quota-enforcement-flow-lease-release:p1:inst-lrl-notactive-if
-                    // @cpt-begin:cpt-cf-quota-enforcement-flow-lease-release:p1:inst-lrl-notactive
-                    // @cpt-begin:cpt-cf-quota-enforcement-algo-lazy-expiry:p1:inst-lzy-write
-                    if lease.state != lease_repo::STATE_ACTIVE || lease.expiry_at <= now {
-                        return Err(TxError::Storage(StorageError::LeaseNotActive { token }));
-                    }
-                    // @cpt-end:cpt-cf-quota-enforcement-algo-lazy-expiry:p1:inst-lzy-write
-                    // @cpt-end:cpt-cf-quota-enforcement-flow-lease-release:p1:inst-lrl-notactive
-                    // @cpt-end:cpt-cf-quota-enforcement-flow-lease-release:p1:inst-lrl-notactive-if
-                    // @cpt-end:cpt-cf-quota-enforcement-flow-lease-commit:p1:inst-lcm-notactive
-                    // @cpt-end:cpt-cf-quota-enforcement-flow-lease-commit:p1:inst-lcm-notactive-if
-                    let holds = lease_repo::holds_of(tx, scope, token.as_uuid()).await?;
-                    let held: Vec<u64> = holds
-                        .iter()
-                        .map(|hold| u64::try_from(hold.held_amount).unwrap_or(0))
-                        .collect();
-                    let reserved = u64::try_from(lease.reserved_amount).unwrap_or(0);
-                    let actual = settlement.kept(reserved);
-                    // @cpt-begin:cpt-cf-quota-enforcement-flow-lease-commit:p1:inst-lcm-overcommit-if
-                    // @cpt-begin:cpt-cf-quota-enforcement-flow-lease-commit:p1:inst-lcm-overcommit
-                    let kept = kept_of(&held, reserved, actual)?;
-                    // @cpt-end:cpt-cf-quota-enforcement-flow-lease-commit:p1:inst-lcm-overcommit
-                    // @cpt-end:cpt-cf-quota-enforcement-flow-lease-commit:p1:inst-lcm-overcommit-if
-                    // @cpt-begin:cpt-cf-quota-enforcement-flow-lease-commit:p1:inst-lcm-apply
-                    // @cpt-begin:cpt-cf-quota-enforcement-flow-lease-release:p1:inst-lrl-apply
-                    // Rank 4.
-                    let capacity = lease_repo::lock_capacity_row(
-                        tx,
-                        scope,
-                        tenant.as_uuid(),
-                        &metric,
-                        RowWait::Nowait,
-                    )
-                    .await?;
-                    // Rank 5 and 5b, ascending by `quota_id` as `holds_of`
-                    // returns them.
-                    let mut entries = Vec::new();
-                    for (hold, kept) in holds.iter().zip(&kept) {
-                        let held_amount = u64::try_from(hold.held_amount).unwrap_or(0);
-                        let returned = held_amount.saturating_sub(*kept);
-                        // Rank 5 before 5b: the counter row is taken first, and
-                        // only then is its hold stamped. Stamping under a row
-                        // this transaction does not hold would let a sweeper
-                        // returning the same hold interleave between the two.
-                        let value =
-                            counter_value_of(tx, scope, hold.quota_id, hold.period_id).await?;
-                        // The hold is settled here whatever its state: stamping
-                        // it keeps a later sweep from returning it again.
-                        let owed = lease_repo::mark_hold_returned(
+            self.db
+                .transaction_ref_mapped(move |tx| {
+                    Box::pin(async move {
+                        let scope = &scope_owned;
+                        let now = clock();
+                        // Rank 2 first: the scope's stripe (I8), then the record,
+                        // so a settlement that already succeeded replays even
+                        // though its lease is no longer active.
+                        // @cpt-begin:cpt-cf-quota-enforcement-flow-lease-commit:p1:inst-lcm-idem
+                        // @cpt-begin:cpt-cf-quota-enforcement-flow-lease-release:p1:inst-lrl-idem
+                        lock_scopes(tx, &[&write_owned.scope]).await?;
+                        if let Replay::Stored(row) =
+                            replay_of(tx, scope, &write_owned, now, Some(RowWait::Nowait)).await?
+                        {
+                            return Ok(TransitionOutcome::NoOp(AppliedMutation {
+                                decision: decision_of(&row.decision_blob)?,
+                                mutation: MutationResult::default(),
+                                expires_at: row.expires_at,
+                            }));
+                        }
+                        // @cpt-end:cpt-cf-quota-enforcement-flow-lease-release:p1:inst-lrl-idem
+                        // @cpt-end:cpt-cf-quota-enforcement-flow-lease-commit:p1:inst-lcm-idem
+                        // Rank 3.
+                        // @cpt-begin:cpt-cf-quota-enforcement-flow-lease-commit:p1:inst-lcm-lock
+                        let lease = lease_repo::find_for_update(
                             tx,
                             scope,
                             token.as_uuid(),
-                            hold.quota_id,
-                            now,
+                            RowWait::Nowait,
                         )
-                        .await?;
-                        // @cpt-begin:cpt-cf-quota-enforcement-flow-lease-commit:p1:inst-lcm-boundary
-                        let value = if owed && returned > 0 {
-                            credit_counter(
-                                tx,
-                                scope,
-                                hold.quota_id,
-                                hold.period_id,
-                                returned,
-                                now,
-                                RowWait::Nowait,
-                            )
-                            .await?
-                        } else {
-                            value
-                        };
-                        // @cpt-end:cpt-cf-quota-enforcement-flow-lease-commit:p1:inst-lcm-boundary
-                        if *kept > 0 {
-                            entries.push(AppliedEntry {
-                                quota_id: hold.quota_id,
-                                period_id: hold.period_id,
-                                amount: *kept,
-                                value,
-                            });
-                            operation_log_repo::append(
-                                tx,
-                                scope,
-                                Entry {
-                                    tenant_id: tenant.as_uuid(),
-                                    quota_id: hold.quota_id,
-                                    operation: settlement.log_verb(),
-                                    actor: &actor,
-                                    record_version: 1,
-                                    detail: String::new(),
-                                    occurred_at: now,
-                                },
-                            )
-                            .await?;
+                        .await?
+                        .ok_or(TxError::Storage(StorageError::LeaseNotFound { token }))?;
+                        // @cpt-end:cpt-cf-quota-enforcement-flow-lease-commit:p1:inst-lcm-lock
+                        // @cpt-begin:cpt-cf-quota-enforcement-flow-lease-commit:p1:inst-lcm-notactive-if
+                        // @cpt-begin:cpt-cf-quota-enforcement-flow-lease-commit:p1:inst-lcm-notactive
+                        // @cpt-begin:cpt-cf-quota-enforcement-flow-lease-release:p1:inst-lrl-notactive-if
+                        // @cpt-begin:cpt-cf-quota-enforcement-flow-lease-release:p1:inst-lrl-notactive
+                        // @cpt-begin:cpt-cf-quota-enforcement-algo-lazy-expiry:p1:inst-lzy-write
+                        if lease.state != lease_repo::STATE_ACTIVE || lease.expiry_at <= now {
+                            return Err(TxError::Storage(StorageError::LeaseNotActive { token }));
                         }
-                    }
-                    // @cpt-begin:cpt-cf-quota-enforcement-state-lease:p1:inst-lst-commit
-                    // @cpt-begin:cpt-cf-quota-enforcement-state-lease:p1:inst-lst-release
-                    let state = settlement.state();
-                    if !lease_repo::mark_state(tx, scope, token.as_uuid(), state, now).await? {
-                        return Err(TxError::Storage(StorageError::LeaseNotActive { token }));
-                    }
-                    // @cpt-end:cpt-cf-quota-enforcement-state-lease:p1:inst-lst-release
-                    // @cpt-end:cpt-cf-quota-enforcement-state-lease:p1:inst-lst-commit
-                    // Diagnostic only, so a missing row costs the count, not the
-                    // transition.
-                    if let Some(capacity) = &capacity {
-                        lease_repo::bump_active_count(
+                        // @cpt-end:cpt-cf-quota-enforcement-algo-lazy-expiry:p1:inst-lzy-write
+                        // @cpt-end:cpt-cf-quota-enforcement-flow-lease-release:p1:inst-lrl-notactive
+                        // @cpt-end:cpt-cf-quota-enforcement-flow-lease-release:p1:inst-lrl-notactive-if
+                        // @cpt-end:cpt-cf-quota-enforcement-flow-lease-commit:p1:inst-lcm-notactive
+                        // @cpt-end:cpt-cf-quota-enforcement-flow-lease-commit:p1:inst-lcm-notactive-if
+                        let holds = lease_repo::holds_of(tx, scope, token.as_uuid()).await?;
+                        let held: Vec<u64> = holds
+                            .iter()
+                            .map(|hold| u64::try_from(hold.held_amount).unwrap_or(0))
+                            .collect();
+                        let reserved = u64::try_from(lease.reserved_amount).unwrap_or(0);
+                        let actual = settlement.kept(reserved);
+                        // @cpt-begin:cpt-cf-quota-enforcement-flow-lease-commit:p1:inst-lcm-overcommit-if
+                        // @cpt-begin:cpt-cf-quota-enforcement-flow-lease-commit:p1:inst-lcm-overcommit
+                        let kept = kept_of(&held, reserved, actual)?;
+                        // @cpt-end:cpt-cf-quota-enforcement-flow-lease-commit:p1:inst-lcm-overcommit
+                        // @cpt-end:cpt-cf-quota-enforcement-flow-lease-commit:p1:inst-lcm-overcommit-if
+                        // @cpt-begin:cpt-cf-quota-enforcement-flow-lease-commit:p1:inst-lcm-apply
+                        // @cpt-begin:cpt-cf-quota-enforcement-flow-lease-release:p1:inst-lrl-apply
+                        // Rank 4.
+                        let capacity = lease_repo::lock_capacity_row(
                             tx,
                             scope,
                             tenant.as_uuid(),
                             &metric,
-                            capacity.active_count,
-                            -1,
-                            now,
+                            RowWait::Nowait,
                         )
                         .await?;
-                    }
-                    // Settling evaluates nothing: the plan was fixed at
-                    // acquisition, so the recorded decision is what it kept.
-                    let decision = Decision::allowed_with_plan(
-                        entries
-                            .iter()
-                            .map(|entry| {
-                                (
-                                    QuotaId::from(entry.quota_id),
-                                    quota_enforcement_sdk::QuotaDebitPlan {
-                                        amount: entry.amount,
+                        // Rank 5 and 5b, ascending by `quota_id` as `holds_of`
+                        // returns them.
+                        let mut entries = Vec::new();
+                        for (hold, kept) in holds.iter().zip(&kept) {
+                            let held_amount = u64::try_from(hold.held_amount).unwrap_or(0);
+                            let returned = held_amount.saturating_sub(*kept);
+                            // Rank 5 before 5b: the counter row is taken first, and
+                            // only then is its hold stamped. Stamping under a row
+                            // this transaction does not hold would let a sweeper
+                            // returning the same hold interleave between the two.
+                            let value =
+                                counter_value_of(tx, scope, hold.quota_id, hold.period_id).await?;
+                            // The hold is settled here whatever its state: stamping
+                            // it keeps a later sweep from returning it again.
+                            let owed = lease_repo::mark_hold_returned(
+                                tx,
+                                scope,
+                                token.as_uuid(),
+                                hold.quota_id,
+                                now,
+                            )
+                            .await?;
+                            // @cpt-begin:cpt-cf-quota-enforcement-flow-lease-commit:p1:inst-lcm-boundary
+                            let value = if owed && returned > 0 {
+                                credit_counter(
+                                    tx,
+                                    scope,
+                                    hold.quota_id,
+                                    hold.period_id,
+                                    returned,
+                                    now,
+                                    RowWait::Nowait,
+                                )
+                                .await?
+                            } else {
+                                value
+                            };
+                            // @cpt-end:cpt-cf-quota-enforcement-flow-lease-commit:p1:inst-lcm-boundary
+                            if *kept > 0 {
+                                entries.push(AppliedEntry {
+                                    quota_id: hold.quota_id,
+                                    period_id: hold.period_id,
+                                    amount: *kept,
+                                    value,
+                                });
+                                operation_log_repo::append(
+                                    tx,
+                                    scope,
+                                    Entry {
+                                        tenant_id: tenant.as_uuid(),
+                                        quota_id: hold.quota_id,
+                                        operation: settlement.log_verb(),
+                                        actor: &actor,
+                                        record_version: 1,
+                                        detail: String::new(),
+                                        occurred_at: now,
                                     },
                                 )
-                            })
-                            .collect(),
-                    );
-                    let deadline = expires_at(tx, tenant, &metric, now).await?;
-                    // A commit produces a debit its own key can reverse, so it
-                    // records what it kept and the attribution it was
-                    // authorized under. A release reverses nothing.
-                    let authorized = (operation == OperationType::Commit)
-                        .then(|| attribution_of(&lease.attribution_hash))
-                        .transpose()?;
-                    write_record(
-                        tx,
-                        scope,
-                        &RecordWrite {
-                            write: &write_owned,
-                            blob: RecordBlob::Decision(&decision),
-                            entries: (operation == OperationType::Commit).then_some(&entries[..]),
-                            authorized,
-                            policy: None,
+                                .await?;
+                            }
+                        }
+                        // @cpt-begin:cpt-cf-quota-enforcement-state-lease:p1:inst-lst-commit
+                        // @cpt-begin:cpt-cf-quota-enforcement-state-lease:p1:inst-lst-release
+                        let state = settlement.state();
+                        if !lease_repo::mark_state(tx, scope, token.as_uuid(), state, now).await? {
+                            return Err(TxError::Storage(StorageError::LeaseNotActive { token }));
+                        }
+                        // @cpt-end:cpt-cf-quota-enforcement-state-lease:p1:inst-lst-release
+                        // @cpt-end:cpt-cf-quota-enforcement-state-lease:p1:inst-lst-commit
+                        // Diagnostic only, so a missing row costs the count, not the
+                        // transition.
+                        if let Some(capacity) = &capacity {
+                            lease_repo::bump_active_count(
+                                tx,
+                                scope,
+                                tenant.as_uuid(),
+                                &metric,
+                                capacity.active_count,
+                                -1,
+                                now,
+                            )
+                            .await?;
+                        }
+                        // Settling evaluates nothing: the plan was fixed at
+                        // acquisition, so the recorded decision is what it kept.
+                        let decision = Decision::allowed_with_plan(
+                            entries
+                                .iter()
+                                .map(|entry| {
+                                    (
+                                        QuotaId::from(entry.quota_id),
+                                        quota_enforcement_sdk::QuotaDebitPlan {
+                                            amount: entry.amount,
+                                        },
+                                    )
+                                })
+                                .collect(),
+                        );
+                        let deadline = expires_at(tx, tenant, &metric, now).await?;
+                        // A commit produces a debit its own key can reverse, so it
+                        // records what it kept and the attribution it was
+                        // authorized under. A release reverses nothing.
+                        let authorized = (operation == OperationType::Commit)
+                            .then(|| attribution_of(&lease.attribution_hash))
+                            .transpose()?;
+                        write_record(
+                            tx,
+                            scope,
+                            &RecordWrite {
+                                write: &write_owned,
+                                blob: RecordBlob::Decision(&decision),
+                                entries: (operation == OperationType::Commit)
+                                    .then_some(&entries[..]),
+                                authorized,
+                                policy: None,
+                                expires_at: deadline,
+                                now,
+                            },
+                        )
+                        .await?;
+                        let mut result = MutationResult {
+                            counters: counters_of(&entries),
+                            threshold_crossings: Vec::new(),
+                            event_ids: Vec::new(),
+                        };
+                        if !events.is_empty() {
+                            enqueuer.enqueue_all(tx, &events).await?;
+                            result.event_ids = events.iter().map(|event| event.event_id).collect();
+                        }
+                        Ok::<_, TxError>(TransitionOutcome::Applied(AppliedMutation {
+                            decision,
+                            mutation: result,
                             expires_at: deadline,
-                            now,
-                        },
-                    )
-                    .await?;
-                    let mut result = MutationResult {
-                        counters: counters_of(&entries),
-                        threshold_crossings: Vec::new(),
-                        event_ids: Vec::new(),
-                    };
-                    if !events.is_empty() {
-                        enqueuer.enqueue_all(tx, &events).await?;
-                        result.event_ids = events.iter().map(|event| event.event_id).collect();
-                    }
-                    Ok::<_, TxError>(TransitionOutcome::Applied(AppliedMutation {
-                        decision,
-                        mutation: result,
-                        expires_at: deadline,
-                    }))
-                    // @cpt-end:cpt-cf-quota-enforcement-flow-lease-release:p1:inst-lrl-apply
-                    // @cpt-end:cpt-cf-quota-enforcement-flow-lease-commit:p1:inst-lcm-apply
+                        }))
+                        // @cpt-end:cpt-cf-quota-enforcement-flow-lease-release:p1:inst-lrl-apply
+                        // @cpt-end:cpt-cf-quota-enforcement-flow-lease-commit:p1:inst-lcm-apply
+                    })
                 })
-            })
+                .settling(wakes)
         })
         .await
         .map_err(|error| lift(op_name, error))
@@ -573,7 +589,8 @@ impl SqlConsumptionStore {
         before: OffsetDateTime,
     ) -> Result<Vec<ExpiredLease>, StorageError> {
         const OPERATION: &str = "reclaim expired leases";
-        let enqueuer = Arc::clone(&self.enqueuer);
+        let wakes = AttemptWakes::begin(&self.enqueuer);
+        let enqueuer = wakes.enqueuer();
         self.db
             .transaction_ref_mapped(move |tx| {
                 Box::pin(async move {
@@ -718,6 +735,7 @@ impl SqlConsumptionStore {
                     // @cpt-end:cpt-cf-quota-enforcement-algo-lease-sweep:p1:inst-swp-reclaim
                 })
             })
+            .settling(wakes)
             .await
             .map_err(|error| lift(OPERATION, error))
     }

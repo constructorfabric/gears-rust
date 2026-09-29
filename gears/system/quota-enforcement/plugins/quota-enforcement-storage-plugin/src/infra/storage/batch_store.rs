@@ -58,7 +58,7 @@ use super::repo::RowWait;
 use super::repo::operation_log_repo::{self, Entry, OP_BATCH_DEBIT};
 use super::repo::quota_repo;
 use crate::domain::ports::Actor;
-use crate::infra::outbox::NotificationEnqueuer;
+use crate::infra::outbox::{AttemptWakes, NotificationEnqueuer, SettleWakes};
 
 const OPERATION: &str = "apply batch debit";
 
@@ -176,27 +176,30 @@ impl SqlConsumptionStore {
             // A refused lock rolls the transaction back and runs it again,
             // within the contention budget and, once armed, the batch timer.
             let result = with_budget_within(budget, Some(batch.timer.as_ref()), || {
-                let enqueuer = Arc::clone(&self.enqueuer);
+                let wakes = AttemptWakes::begin(&self.enqueuer);
+                let enqueuer = wakes.enqueuer();
                 let clock = Arc::clone(&self.clock);
                 let actor = actor.clone();
                 let scope = scope.clone();
                 let events = events.to_vec();
                 let owned = OwnedBatch::of(batch);
-                self.db.transaction_ref_mapped(move |tx| {
-                    Box::pin(async move {
-                        if owned.timer.expired() {
-                            return Err(TxError::Storage(StorageError::BatchTimeout));
-                        }
-                        let env = BatchTx {
-                            scope: &scope,
-                            events: &events,
-                            actor: &actor,
-                            clock: &clock,
-                            enqueuer: &enqueuer,
-                        };
-                        Self::batch_in_tx(tx, &env, &owned).await
+                self.db
+                    .transaction_ref_mapped(move |tx| {
+                        Box::pin(async move {
+                            if owned.timer.expired() {
+                                return Err(TxError::Storage(StorageError::BatchTimeout));
+                            }
+                            let env = BatchTx {
+                                scope: &scope,
+                                events: &events,
+                                actor: &actor,
+                                clock: &clock,
+                                enqueuer: &enqueuer,
+                            };
+                            Self::batch_in_tx(tx, &env, &owned).await
+                        })
                     })
-                })
+                    .settling(wakes)
             })
             .await;
             match result {

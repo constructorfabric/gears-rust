@@ -832,6 +832,24 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
         scope: &IdempotencyScope,
     ) -> Result<Option<IdempotencyRecord>, StorageError>;
 
+    // --- notification delivery ---
+
+    /// Start the one notification outbox pipeline of this plugin instance,
+    /// handing every claimed event to `delivery`, and bind it for enqueueing.
+    ///
+    /// Until this returns, events enqueued by a mutation stay queued; an empty
+    /// enqueue never needs it. The pipeline is fenced by the outbox lease, so
+    /// every replica may run one. Keep the handle and stop it on shutdown.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::Internal`] when this instance already started one;
+    /// [`StorageError::Unavailable`] when the backend cannot start it.
+    async fn start_notification_delivery(
+        &self,
+        delivery: std::sync::Arc<dyn crate::notifications::NotificationDeliveryV1>,
+    ) -> Result<Box<dyn crate::notifications::NotificationDeliveryHandle>, StorageError>;
+
     // --- sweeper and reclamation ---
 
     /// Physically reclaim up to `batch_size` leases expired before `before`.

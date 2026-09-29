@@ -3074,3 +3074,266 @@ async fn a_read_creates_the_current_row_only_for_a_quota_within_its_validity_win
         "the single read follows the same rule"
     );
 }
+
+// --- the notification pipeline -------------------------------------------------
+
+/// A delivery callback answering from a script (then `Delivered`), recording
+/// each event id with the attempts it was handed.
+#[derive(Default)]
+struct ScriptedDelivery {
+    script: parking_lot::Mutex<std::collections::VecDeque<crate::DeliveryOutcome>>,
+    seen: parking_lot::Mutex<Vec<(EventId, u16)>>,
+}
+
+#[async_trait::async_trait]
+impl crate::NotificationDeliveryV1 for ScriptedDelivery {
+    async fn deliver(
+        &self,
+        event: NotificationEvent,
+        attempts: u16,
+        _budget: Duration,
+    ) -> crate::DeliveryOutcome {
+        self.seen.lock().push((event.event_id, attempts));
+        self.script
+            .lock()
+            .pop_front()
+            .unwrap_or(crate::DeliveryOutcome::Delivered)
+    }
+
+    fn undeliverable(&self, _payload_type: &str, _reason: &str) {}
+}
+
+fn changed() -> NotificationEvent {
+    NotificationEvent {
+        event_id: EventId::generate(),
+        kind: NotificationEventKind::QuotaChanged,
+        scope: crate::models::NotificationScope::Tenant {
+            tenant_id: test_tenant(),
+        },
+        quota_id: None,
+        policy_id: None,
+        subject: None,
+        payload: serde_json::json!({ "change_kind": "created" }),
+        emitted_at: OffsetDateTime::UNIX_EPOCH,
+    }
+}
+
+async fn with_events(storage: &InMemoryStorage, count: usize) -> Vec<EventId> {
+    let mut ids = Vec::new();
+    for index in 0..count {
+        let event = changed();
+        ids.push(event.event_id);
+        storage
+            .create_quota(
+                &ctx(),
+                &scope(),
+                quota_draft(test_subject(&format!("u{index}")), Some(10)),
+                &[event],
+            )
+            .await
+            .expect("create quota");
+    }
+    ids
+}
+
+#[tokio::test]
+async fn the_pipeline_delivers_in_order_retries_the_head_and_dead_letters_rejections() {
+    let storage = storage_with_policy().await;
+    let ids = with_events(&storage, 3).await;
+    let delivery = Arc::new(ScriptedDelivery::default());
+    *delivery.script.lock() = vec![
+        crate::DeliveryOutcome::Delivered,
+        crate::DeliveryOutcome::Retry,
+        crate::DeliveryOutcome::Reject("sink refused".to_owned()),
+    ]
+    .into();
+    let handle = storage
+        .start_notification_delivery(Arc::clone(&delivery) as _)
+        .await
+        .expect("start");
+
+    let first = storage.drain_notifications().await;
+    assert_eq!(first.delivered, 1);
+    assert!(first.retry_pending, "the second event asked to be retried");
+    let second = storage.drain_notifications().await;
+    assert_eq!(second.rejected, 1, "its retry was rejected");
+    assert_eq!(second.delivered, 1, "and the third went through");
+
+    assert_eq!(
+        *delivery.seen.lock(),
+        vec![(ids[0], 0), (ids[1], 0), (ids[1], 1), (ids[2], 0)],
+        "the retried event is handed back with one failed attempt"
+    );
+    let dead = storage.dead_letters();
+    assert_eq!(dead.len(), 1);
+    assert_eq!(dead[0].0.event_id, ids[1]);
+    assert_eq!(dead[0].1, "sink refused");
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn one_pipeline_per_storage_and_nothing_after_stop() {
+    let storage = storage_with_policy().await;
+    let delivery = Arc::new(ScriptedDelivery::default());
+    let handle = storage
+        .start_notification_delivery(Arc::clone(&delivery) as _)
+        .await
+        .expect("start");
+    let second = storage
+        .start_notification_delivery(Arc::clone(&delivery) as _)
+        .await;
+    assert!(
+        matches!(second, Err(StorageError::Internal(_))),
+        "never a second pipeline"
+    );
+
+    handle.stop().await;
+    with_events(&storage, 1).await;
+    assert_eq!(
+        storage.drain_notifications().await,
+        crate::testing::DrainReport::default()
+    );
+    assert!(delivery.seen.lock().is_empty());
+}
+
+#[tokio::test]
+async fn a_restarted_storage_starts_a_pipeline_of_its_own_where_delivery_left_off() {
+    let storage = storage_with_policy().await;
+    let delivered = with_events(&storage, 1).await;
+    let delivery = Arc::new(ScriptedDelivery::default());
+    let handle = storage
+        .start_notification_delivery(Arc::clone(&delivery) as _)
+        .await
+        .expect("start");
+    assert_eq!(storage.drain_notifications().await.delivered, 1);
+    let pending = with_events(&storage, 1).await;
+    handle.stop().await;
+
+    let restarted = storage.restarted();
+    let after = Arc::new(ScriptedDelivery::default());
+    let handle = restarted
+        .start_notification_delivery(Arc::clone(&after) as _)
+        .await
+        .expect("a new instance starts its own pipeline");
+    assert_eq!(restarted.drain_notifications().await.delivered, 1);
+    assert_eq!(*delivery.seen.lock(), vec![(delivered[0], 0)]);
+    assert_eq!(
+        *after.seen.lock(),
+        vec![(pending[0], 0)],
+        "only what the first instance left undelivered"
+    );
+    handle.stop().await;
+}
+
+/// A delivery callback that announces each call, then waits to be released.
+/// `entered` counts calls, so no announcement is lost.
+struct GatedDelivery {
+    entered: tokio::sync::Semaphore,
+    release: tokio::sync::Notify,
+    seen: parking_lot::Mutex<Vec<EventId>>,
+}
+
+impl GatedDelivery {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            entered: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Notify::new(),
+            seen: parking_lot::Mutex::new(Vec::new()),
+        })
+    }
+
+    async fn wait_entered(&self) {
+        self.entered.acquire().await.expect("open").forget();
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::NotificationDeliveryV1 for GatedDelivery {
+    async fn deliver(
+        &self,
+        event: NotificationEvent,
+        _attempts: u16,
+        _budget: Duration,
+    ) -> crate::DeliveryOutcome {
+        self.seen.lock().push(event.event_id);
+        self.entered.add_permits(1);
+        self.release.notified().await;
+        crate::DeliveryOutcome::Delivered
+    }
+
+    fn undeliverable(&self, _payload_type: &str, _reason: &str) {}
+}
+
+#[tokio::test]
+async fn concurrent_drains_deliver_each_event_once_in_order() {
+    let storage = storage_with_policy().await;
+    let ids = with_events(&storage, 2).await;
+    let delivery = GatedDelivery::new();
+    let handle = storage
+        .start_notification_delivery(Arc::clone(&delivery) as _)
+        .await
+        .expect("start");
+
+    // Release every call, one at a time, after letting the other drain reach
+    // the pipeline while it is held.
+    let release = async {
+        loop {
+            delivery.wait_entered().await;
+            tokio::task::yield_now().await;
+            delivery.release.notify_one();
+        }
+    };
+    let (first, second) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            reports = async {
+                tokio::join!(storage.drain_notifications(), storage.drain_notifications())
+            } => reports,
+            () = release => unreachable!("the release loop never ends"),
+        }
+    })
+    .await
+    .expect("both drains finish");
+
+    assert_eq!(*delivery.seen.lock(), ids, "each event once, in order");
+    assert_eq!(first.delivered + second.delivered, 2);
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn stop_waits_for_the_delivery_in_flight() {
+    let storage = storage_with_policy().await;
+    let ids = with_events(&storage, 2).await;
+    let delivery = GatedDelivery::new();
+    let handle = storage
+        .start_notification_delivery(Arc::clone(&delivery) as _)
+        .await
+        .expect("start");
+
+    let stopping = async {
+        delivery.wait_entered().await;
+        let mut stop = std::pin::pin!(handle.stop());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut stop)
+                .await
+                .is_err(),
+            "stop returned while a delivery was running"
+        );
+        delivery.release.notify_one();
+        stop.await;
+    };
+    let (report, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(storage.drain_notifications(), stopping)
+    })
+    .await
+    .expect("the drain and the stop finish");
+
+    assert_eq!(
+        report.delivered, 1,
+        "the delivery in flight finished and counted"
+    );
+    assert_eq!(
+        *delivery.seen.lock(),
+        vec![ids[0]],
+        "nothing started after stop"
+    );
+}

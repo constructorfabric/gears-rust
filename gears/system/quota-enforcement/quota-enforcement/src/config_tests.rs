@@ -2,7 +2,8 @@ use std::time::Duration;
 
 use super::{
     CatalogSection, ElectionTimingConfig, GaugesSection, LeasesSection, MetricsConfig,
-    OperationsSection, PoliciesSection, QuotaEnforcementConfig, QuotasSection, SnapshotSection,
+    NotificationsSection, OperationsSection, PoliciesSection, QuotaEnforcementConfig,
+    QuotasSection, SnapshotSection,
 };
 
 #[test]
@@ -524,4 +525,61 @@ fn the_snapshot_bounds_default_to_the_platform_values_and_stay_in_range() {
     ] {
         assert!(bad.validate().is_err(), "{bad:?} must be rejected");
     }
+}
+
+#[test]
+fn the_notification_bounds_default_to_ten_attempts_and_two_seconds_and_stay_in_range() {
+    let section = NotificationsSection::default();
+    section.validate().expect("defaults are valid");
+    assert_eq!(section.max_attempts, 10);
+    assert_eq!(section.sink_timeout(), Duration::from_secs(2));
+    NotificationsSection {
+        max_attempts: 1,
+        sink_timeout_ms: 1,
+    }
+    .validate()
+    .expect("the floors themselves are allowed");
+    NotificationsSection {
+        max_attempts: 32_767,
+        sink_timeout_ms: NotificationsSection::SINK_TIMEOUT_CEILING_MS,
+    }
+    .validate()
+    .expect("the ceilings themselves are allowed");
+
+    for bad in [
+        NotificationsSection {
+            max_attempts: 0,
+            ..NotificationsSection::default()
+        },
+        NotificationsSection {
+            max_attempts: 32_768,
+            ..NotificationsSection::default()
+        },
+        NotificationsSection {
+            sink_timeout_ms: 0,
+            ..NotificationsSection::default()
+        },
+        NotificationsSection {
+            sink_timeout_ms: 28_000,
+            ..NotificationsSection::default()
+        },
+    ] {
+        assert!(bad.validate().is_err(), "{bad:?} must be rejected");
+    }
+}
+
+#[test]
+fn the_notification_bounds_are_read_from_their_own_section() {
+    let config: QuotaEnforcementConfig = serde_json::from_value(serde_json::json!({
+        "notifications": { "max_attempts": 3, "sink_timeout_ms": 500 }
+    }))
+    .expect("parse");
+    assert_eq!(
+        config.notifications,
+        NotificationsSection {
+            max_attempts: 3,
+            sink_timeout_ms: 500,
+        }
+    );
+    config.validate().expect("valid");
 }

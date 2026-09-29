@@ -7,6 +7,7 @@ use gts::GtsTypeId;
 use serde::Deserialize;
 
 use crate::domain::catalog::CatalogConfig;
+use crate::domain::notifications::DispatchLimits;
 use crate::domain::policies::schemas::SnapshotLimits;
 use crate::domain::policies::{EvaluationLimits, PolicyLimits, PolicyRuntimeLimits};
 use crate::domain::quotas::{GaugeTiming, QuotaLimits};
@@ -44,6 +45,8 @@ pub struct QuotaEnforcementConfig {
     pub leases: LeasesSection,
     /// Bounds of the snapshot read.
     pub snapshot: SnapshotSection,
+    /// Retry and timeout bounds of notification dispatch.
+    pub notifications: NotificationsSection,
 }
 
 impl Default for QuotaEnforcementConfig {
@@ -62,6 +65,7 @@ impl Default for QuotaEnforcementConfig {
             retention: RetentionSection::default(),
             leases: LeasesSection::default(),
             snapshot: SnapshotSection::default(),
+            notifications: NotificationsSection::default(),
         }
     }
 }
@@ -94,7 +98,8 @@ impl QuotaEnforcementConfig {
         self.operations.validate()?;
         self.retention.validate()?;
         self.leases.validate()?;
-        self.snapshot.validate()
+        self.snapshot.validate()?;
+        self.notifications.validate()
     }
 
     /// Budget for a sweep body to stop after leadership loss or shutdown.
@@ -647,6 +652,76 @@ impl Default for SnapshotSection {
         Self {
             page_size: 100,
             max_filters: 100,
+        }
+    }
+}
+
+/// Retry and timeout bounds of notification dispatch
+/// (`[quota-enforcement.notifications]`).
+///
+/// An event whose delivery keeps failing transiently is dead-lettered once it
+/// has failed `max_attempts` times: the first delivery counts 0, so that is
+/// `max_attempts + 1` calls in all, spread over `ToolKit`'s retry backoff.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct NotificationsSection {
+    /// Failed deliveries after which a still-failing event is dead-lettered.
+    pub max_attempts: u16,
+    /// Budget, in milliseconds, for one sink to take one event. A call is
+    /// also cut short when the outbox lease has less time left.
+    pub sink_timeout_ms: u64,
+}
+
+impl NotificationsSection {
+    /// The largest `max_attempts`: `ToolKit` counts attempts in an `i16`.
+    pub const MAX_ATTEMPTS_CEILING: u16 = i16::MAX.unsigned_abs();
+    /// The largest `sink_timeout_ms`, below the outbox lease's usable budget
+    /// (a 30-second lease less 2 seconds of headroom), so a sink that uses
+    /// its whole timeout does not cost the lease.
+    pub const SINK_TIMEOUT_CEILING_MS: u64 = 27_999;
+
+    /// Reject bounds outside their ranges.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the field that is out of its range.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.max_attempts == 0 || self.max_attempts > Self::MAX_ATTEMPTS_CEILING {
+            anyhow::bail!(
+                "[quota-enforcement.notifications].max_attempts must be in 1..={}",
+                Self::MAX_ATTEMPTS_CEILING
+            );
+        }
+        if self.sink_timeout_ms == 0 || self.sink_timeout_ms > Self::SINK_TIMEOUT_CEILING_MS {
+            anyhow::bail!(
+                "[quota-enforcement.notifications].sink_timeout_ms must be in 1..={}",
+                Self::SINK_TIMEOUT_CEILING_MS
+            );
+        }
+        Ok(())
+    }
+
+    /// Budget for one sink to take one event.
+    #[must_use]
+    pub const fn sink_timeout(&self) -> Duration {
+        Duration::from_millis(self.sink_timeout_ms)
+    }
+
+    /// The dispatcher's bounds.
+    #[must_use]
+    pub const fn to_limits(&self) -> DispatchLimits {
+        DispatchLimits {
+            max_attempts: self.max_attempts,
+            sink_timeout: self.sink_timeout(),
+        }
+    }
+}
+
+impl Default for NotificationsSection {
+    fn default() -> Self {
+        Self {
+            max_attempts: 10,
+            sink_timeout_ms: 2000,
         }
     }
 }

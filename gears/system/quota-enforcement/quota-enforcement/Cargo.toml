@@ -63,6 +63,8 @@ time = { workspace = true }
 # The lifecycle-gauge sample cell read by observable-gauge callbacks.
 arc-swap = { workspace = true }
 async-trait = { workspace = true }
+# The notification dispatcher calls every sink at once.
+futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -89,6 +91,10 @@ opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tokio = { workspace = true, features = ["rt", "macros", "time", "test-util"] }
 # Router round trips in the REST tests.
 tower = { workspace = true, features = ["util"] }
+# The published SQL storage plugin over SQLite, for the end-to-end delivery test.
+quota-enforcement-storage-plugin = { workspace = true }
+toolkit-db = { workspace = true, features = ["sqlite"] }
+sea-orm-migration = { workspace = true }
 
 [[bench]]
 name = "debit"

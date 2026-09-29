@@ -25,12 +25,15 @@ use super::tokens;
 pub enum PluginKind {
     /// `QuotaEnforcementStoragePluginV1`.
     Storage,
+    /// `QuotaNotificationSinkV1`.
+    NotificationSink,
 }
 
 impl fmt::Display for PluginKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Storage => "storage",
+            Self::NotificationSink => "notification sink",
         })
     }
 }
@@ -51,6 +54,8 @@ pub enum Dependency {
     Catalog,
     /// The statically registered resolution engines and their artifacts.
     Engine,
+    /// The registered notification sinks.
+    NotificationSinks,
 }
 
 impl Dependency {
@@ -64,6 +69,7 @@ impl Dependency {
             Self::TypesRegistry => "types_registry",
             Self::Catalog => "catalog",
             Self::Engine => "engine",
+            Self::NotificationSinks => "notification_sinks",
         }
     }
 }

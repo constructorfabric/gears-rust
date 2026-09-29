@@ -26,6 +26,7 @@ pub mod client;
 pub mod engine;
 pub mod gts;
 pub mod models;
+pub mod notifications;
 pub mod period;
 pub mod storage_plugin;
 pub mod thresholds;
@@ -44,8 +45,9 @@ pub use engine::{
 };
 pub use gts::{
     CONSTRAINT_BASE, LEASE_RESOURCE, METRIC_BASE_TYPE, OPERATION_RESOURCE, OwnedDefinition,
-    POLICY_RESOURCE, QUOTA_RESOURCE, QuotaEnforcementStoragePluginSpecV1, REQUEST_BASE,
-    RESOURCE_BASE, SCOPE_TENANT, SCOPE_TYPE, SCOPE_USER, SUBJECT_BASE, owned_definitions,
+    POLICY_RESOURCE, QUOTA_RESOURCE, QuotaEnforcementStoragePluginSpecV1,
+    QuotaNotificationSinkSpecV1, REQUEST_BASE, RESOURCE_BASE, SCOPE_TENANT, SCOPE_TYPE, SCOPE_USER,
+    SUBJECT_BASE, owned_definitions,
 };
 pub use models::{
     AcquireLeaseOutcome, AcquireLeaseRequest, ActiveQuotaCounts, ApplicableQuotas, AppliedMutation,
@@ -66,6 +68,10 @@ pub use models::{
     ScopeError, SnapshotRequest, SnapshotSubject, SubjectClaim, SubjectRef, SubjectScope, TenantId,
     ThresholdCrossing, TransitionOutcome, UnknownValue, ValidityWindow, ValidityWindowPatch,
     apportion, positive_amount,
+};
+pub use notifications::{
+    DeliveryOutcome, DispatchError, NotificationDeliveryHandle, NotificationDeliveryV1, QuotaEvent,
+    QuotaNotificationSinkV1,
 };
 pub use storage_plugin::{
     BatchEntry, BatchTimer, CONTRACT_MAJOR, EvaluatedBatch, EvaluatedMutation,

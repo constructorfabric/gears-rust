@@ -6,10 +6,9 @@
 //! seeds the three platform-default configuration rows when missing. Both
 //! steps are idempotent and safe under concurrent replicas.
 //!
-//! The `QuotaEnforcementStoragePluginV1` implementation is wired only once
-//! every primitive the trait names exists. Until then this type is reached by
-//! the plugin gear and by tests only. The Quota primitives it forwards live in
-//! `domain::quotas`.
+//! The type implements `QuotaEnforcementStoragePluginV1` (`domain::contract`)
+//! by delegating to the primitives it forwards to its ports (`domain::quotas`,
+//! `consumption`, `leases`, `policies`, `notifications`).
 
 use std::sync::Arc;
 
@@ -18,7 +17,8 @@ use toolkit_macros::domain_model;
 use toolkit_security::SecurityContext;
 
 use super::ports::{
-    ConsumptionStore, FoundationStore, LeaseStore, PolicyStore, QuotaStore, SeedReport, StoreError,
+    ConsumptionStore, FoundationStore, LeaseStore, NotificationPipeline, PolicyStore, QuotaStore,
+    SeedReport, StoreError,
 };
 
 const LOG_TARGET: &str = "qe.storage";
@@ -32,6 +32,7 @@ pub struct StoragePlugin {
     pub(super) policies: Arc<dyn PolicyStore>,
     pub(super) consumption: Arc<dyn ConsumptionStore>,
     pub(super) leases: Arc<dyn LeaseStore>,
+    pub(super) notifications: Option<Arc<dyn NotificationPipeline>>,
 }
 
 impl StoragePlugin {
@@ -50,7 +51,16 @@ impl StoragePlugin {
             policies,
             consumption,
             leases,
+            notifications: None,
         }
+    }
+
+    /// The plugin with its notification pipeline. Without one,
+    /// `start_notification_delivery` is refused.
+    #[must_use]
+    pub fn with_notifications(mut self, pipeline: Arc<dyn NotificationPipeline>) -> Self {
+        self.notifications = Some(pipeline);
+        self
     }
 
     /// Verify the schema major and seed the default configuration rows.

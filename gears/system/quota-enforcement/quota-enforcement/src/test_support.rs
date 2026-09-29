@@ -65,7 +65,7 @@ use crate::domain::ports::metric_registry::{
     Classified, Freshness, MetricDescriptor, MetricMode, MetricRegistry,
 };
 use crate::domain::ports::metrics::{
-    DenialReason, MetricLabel, QeMetrics, ValidationReason, ValidationSurface,
+    DenialReason, MetricLabel, QeMetrics, SinkLabel, ValidationReason, ValidationSurface,
 };
 use crate::infra::cluster_coordination::QuotaEnforcementProfile;
 use crate::infra::metric_registry::contract as metric_contract;
@@ -425,9 +425,21 @@ pub struct RecordingMetrics {
     lease_waits: Mutex<Vec<String>>,
     lease_contention: Mutex<Vec<String>>,
     lease_cap: Mutex<Vec<String>>,
+    dispatch_failures: Mutex<Vec<(String, quota_enforcement_sdk::NotificationEventKind)>>,
+    outbox_rejections: Mutex<u64>,
 }
 
 impl RecordingMetrics {
+    /// `notification_dispatch_failures_total` emissions as `(sink_id, kind)`.
+    pub fn dispatch_failures(&self) -> Vec<(String, quota_enforcement_sdk::NotificationEventKind)> {
+        self.dispatch_failures.lock().expect("lock").clone()
+    }
+
+    /// `outbox_rejections_total` so far.
+    pub fn outbox_rejections(&self) -> u64 {
+        *self.outbox_rejections.lock().expect("lock")
+    }
+
     /// Metrics whose lease acquisition latency was observed, in order.
     pub fn lease_waits(&self) -> Vec<String> {
         self.lease_waits.lock().expect("lock").clone()
@@ -562,6 +574,21 @@ impl QeMetrics for RecordingMetrics {
             .expect("lock")
             .push(metric.as_str().to_owned());
     }
+
+    fn record_notification_dispatch_failure(
+        &self,
+        sink: &SinkLabel,
+        kind: quota_enforcement_sdk::NotificationEventKind,
+    ) {
+        self.dispatch_failures
+            .lock()
+            .expect("lock")
+            .push((sink.as_str().to_owned(), kind));
+    }
+
+    fn record_outbox_rejection(&self) {
+        *self.outbox_rejections.lock().expect("lock") += 1;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -588,7 +615,34 @@ pub fn storage_instance(segment: &str, vendor: &str, priority: i16) -> PluginFix
     }
 }
 
+/// A notification sink plugin instance.
+pub fn sink_instance(segment: &str, vendor: &str) -> PluginFixture {
+    let (id, payload) =
+        PluginV1::<quota_enforcement_sdk::QuotaNotificationSinkSpecV1>::build_registration(
+            segment, vendor, 0,
+        )
+        .expect("registration payload");
+    PluginFixture {
+        instance_id: id.to_string(),
+        entity: make_test_instance(id.as_ref(), payload),
+    }
+}
+
 impl PluginFixture {
+    /// A sink instance whose content is not a plugin spec.
+    pub fn malformed_sink(segment: &str) -> Self {
+        let (id, _) =
+            PluginV1::<quota_enforcement_sdk::QuotaNotificationSinkSpecV1>::build_registration(
+                segment, "acme", 0,
+            )
+            .expect("registration payload");
+        let broken = json!({ "id": id.to_string(), "vendor": 7 });
+        Self {
+            instance_id: id.to_string(),
+            entity: make_test_instance(id.as_ref(), broken),
+        }
+    }
+
     /// A storage instance whose content is not a plugin spec.
     pub fn malformed_storage(segment: &str) -> Self {
         let (id, _) =
@@ -631,6 +685,18 @@ pub fn register_storage(
     hub.register_scoped::<dyn QuotaEnforcementStoragePluginV1>(
         ClientScope::gts_id(&fixture.instance_id),
         api,
+    );
+}
+
+/// Registers `sink` as the scoped client of `fixture`.
+pub fn register_sink(
+    hub: &Arc<ClientHub>,
+    fixture: &PluginFixture,
+    sink: Arc<dyn quota_enforcement_sdk::QuotaNotificationSinkV1>,
+) {
+    hub.register_scoped::<dyn quota_enforcement_sdk::QuotaNotificationSinkV1>(
+        ClientScope::gts_id(&fixture.instance_id),
+        sink,
     );
 }
 

@@ -1,9 +1,8 @@
 //! The consumption primitives of the storage contract, forwarded to the
 //! [`ConsumptionStore`] port with the contract's own signatures.
 //!
-//! Like the Quota primitives, these are inherent methods rather than a trait
-//! implementation: the `ClientHub` client stays unpublished until the plugin
-//! implements the whole contract as one trait, policy primitives included.
+//! Like the Quota primitives, these are inherent methods; the contract's
+//! trait implementation delegates to them.
 
 use quota_enforcement_sdk::{
     ApplicableQuotas, AppliedMutation, EvaluatedDebit, EvaluatedMutation, IdempotencyRecord,
