@@ -542,7 +542,9 @@ the query recorder; the steps below are the same ones both worked-example audits
     that *is* there and say in the doc comment what changes when the fix lands.
 
 **Barrier-test template** (PostgreSQL via `testcontainers`, shared across a file via a process-wide
-`OnceCell` so the container starts once):
+`OnceCell` so the container starts once). This is a non-deterministic starting point: the barrier sits
+before the call, so it only gives the race a chance; for a deterministic race move the synchronization to
+the read/write boundary with a test hook, as described after the template:
 
 ```rust
 static PG: tokio::sync::OnceCell<Option<Arc<PgFixture>>> = tokio::sync::OnceCell::const_new();
@@ -556,7 +558,7 @@ async fn shared_pg() -> Option<Arc<PgFixture>> {
     }).await.clone()
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)] // NOT current_thread -- see below
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)] // more overlap than current_thread; see below
 async fn concurrent_callers_leave_the_invariant_intact() {
     let Some(pg) = shared_pg().await else {
         assert!(std::env::var("MYGEAR_PG_REQUIRE_DOCKER").is_err(), "Docker required in CI");
@@ -569,17 +571,21 @@ async fn concurrent_callers_leave_the_invariant_intact() {
     let (r1, r2) = tokio::join!(t1, t2);
     let r1 = r1.expect("task 1 panicked");
     let r2 = r2.expect("task 2 panicked");
-    // Assert the expected pair of outcomes explicitly -- e.g. exactly one Ok and one Conflict,
-    // in either order -- not just that both joins returned without panicking:
-    // assert!(matches!((&r1, &r2), (Ok(_), Err(DomainError::Conflict(_))) | (Err(DomainError::Conflict(_)), Ok(_))));
+    // Assert the expected pair of outcomes explicitly (here: exactly one Ok and one Conflict,
+    // in either order) -- not just that both joins returned without panicking:
+    assert!(matches!(
+        (&r1, &r2),
+        (Ok(_), Err(DomainError::Conflict(_))) | (Err(DomainError::Conflict(_)), Ok(_))
+    ));
     // Then assert a post-state invariant against the tables -- both r1/r2 can be Ok while it's broken.
     assert_invariant_holds(&db).await;
 }
 ```
 
-`multi_thread`, not the default `current_thread`: two tasks on a single-threaded runtime can cooperatively
-hand off at `.await` points without ever actually overlapping, making a real bug look intermittently absent
-for reasons unrelated to whether it's fixed. Fail closed on missing Docker via a
+Use `multi_thread` to increase task-level overlap, but it does not guarantee the required read/write
+ordering either. A `current_thread` runtime polls tasks one at a time while still letting them interleave
+at `.await` points, and separate database connections can still have statements in flight concurrently;
+neither flavor gives deterministic interleaving -- only the boundary hook below does. Fail closed on missing Docker via a
 `<GEAR>_PG_REQUIRE_DOCKER=1`-shaped CI variable, as both worked examples do, so an environment that should
 have Docker but doesn't fails loudly instead of silently skipping.
 

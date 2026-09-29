@@ -79,11 +79,13 @@ non-durable dev/test backend, or between two durable backends for capacity or
 policy reasons) without any downtime or content-identity change from the
 caller's point of view — the file's `file_id`, `content_id`/version pointer
 shape, and hash all stay the same; only where the bytes physically live
-changes. The mandatory hash re-verification before committing the swap means
-a corrupted read from the source, or a corrupted write to the destination,
-is caught before the file ever points at bad data — the operation either
-fully succeeds with a byte-identical copy, or fails and leaves the original
-backend binding untouched.
+changes. The mandatory hash re-verification of the source stream before
+committing the swap means a corrupted read from the source is caught before
+the file ever points at bad data — the operation either fully succeeds or
+fails and leaves the original backend binding untouched. The bytes written
+to the destination are not read back: their integrity is the destination
+backend's write-path responsibility (see [Mode-Aware Content-Hash Verification
+Before Commit](#mode-aware-content-hash-verification-before-commit)).
 
 **Requirements**: `cpt-cf-file-storage-fr-backend-migration`
 
