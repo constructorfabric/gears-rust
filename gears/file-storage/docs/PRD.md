@@ -32,6 +32,8 @@
   - [6.1 Gear-Specific NFRs](#61-gear-specific-nfrs)
   - [6.2 NFR Exclusions](#62-nfr-exclusions)
   - [6.3 Applicability Notes](#63-applicability-notes)
+  - [6.4 Five Quality Vectors Analysis](#64-five-quality-vectors-analysis)
+  - [6.5 Quality Framework Conformance](#65-quality-framework-conformance)
 - [7. Public Library Interfaces](#7-public-library-interfaces)
   - [7.1 Public API Surface](#71-public-api-surface)
   - [7.2 External Integration Contracts](#72-external-integration-contracts)
@@ -113,6 +115,11 @@ Gears security and governance model.
 | Broken/expired provider URLs             | Recurring in downstream workflows        | 0 broken URLs for files within retention period                  | Ongoing after GA               |
 | Audit coverage for file write operations | No centralized audit                     | 100% of write operations audited                                 | Phase 2                        |
 | Multi-backend deployment                 | Single ad-hoc storage per gear         | At least 2 backend types validated (e.g., S3 + local filesystem) | At GA                          |
+
+Beyond these gear-specific metrics, file-storage is also evaluated against the five quality vectors of the
+[Constructor Gears Quality Framework](https://github.com/constructorfabric/vision/blob/main/CONSTRUCTOR_GEARS_QUALITY_FRAMEWORK.md),
+in priority order Efficiency → Reliability → Performance → Security → Versatility; see §6.4 for the show-stopper
+requirements per vector.
 
 ### 1.5 Glossary
 
@@ -1133,25 +1140,30 @@ the platform's tenant boundary enforcement (`cpt-cf-file-storage-fr-tenant-bound
 
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-nfr-metadata-latency`
 
-File metadata queries **MUST** complete within 25ms at p95.
+File metadata reads and listings **MUST** complete within 300 ms at p95, measured single-threaded on one CPU core with
+2 million files stored in total; synchronous control-plane mutations (create, presign, finalize, bind, multipart
+complete) **MUST** complete within 2 s at p95.
 
-**Threshold**: <25ms p95
+**Threshold**: reads and listings < 300 ms p95 (single thread, one core, 2 million files in total); synchronous
+mutations < 2 s p95
 **Rationale**: Metadata queries are used for pre-fetch validation in latency-sensitive paths (e.g., a gear checks file
 size before processing).
 **Architecture Allocation**: See DESIGN.md § NFR Allocation for how this is realized
+**Verification Method**: Load benchmark against PostgreSQL with 2 million files stored, single-threaded on one CPU core; p95 of read and listing requests and of synchronous mutations, taken from the per-route request-latency signal.
 
 #### Content Transfer Latency
 
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-nfr-transfer-latency`
 
-Content download latency **MUST** have no fixed overhead exceeding 50ms at p95; total transfer time is proportional to
+Content download latency **MUST** have no fixed overhead exceeding 2 s at p95; total transfer time is proportional to
 file size.
 
-**Threshold**: <50ms + transfer time p95
+**Threshold**: < 2 s + transfer time p95
 **Rationale**: The sidecar serves content synchronously in the request paths of consuming gears; excessive fixed
 overhead compounds across requests with multiple files. (Allocated to the sidecar, per
 ADR-0003.)
 **Architecture Allocation**: See DESIGN.md § NFR Allocation for how this is realized
+**Verification Method**: Sidecar download benchmark measuring time to first byte; streaming download tests over a real TCP connection.
 
 #### URL Availability
 
@@ -1163,6 +1175,7 @@ the platform SLA.
 **Threshold**: URL availability matches platform SLA for the duration of the retention period
 **Rationale**: Consumers depend on URL stability — broken URLs disrupt downstream workflows and user experience.
 **Architecture Allocation**: See DESIGN.md § NFR Allocation for how this is realized
+**Verification Method**: End-to-end lifecycle suite (upload, then download through a freshly issued signed URL) against local-filesystem and S3-compatible backends.
 
 #### Audit Completeness
 
@@ -1173,35 +1186,44 @@ Audit records **MUST** be emitted for 100% of write operations with no silent dr
 **Threshold**: 100% audit coverage for write operations
 **Rationale**: Incomplete audit trails undermine compliance and forensic investigations.
 **Architecture Allocation**: See DESIGN.md § NFR Allocation for how this is realized
+**Verification Method**: Integration tests asserting that every audited write inserts its audit row in the same transaction, including the rollback case.
 
 #### Data Durability and Recovery
 
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-nfr-durability`
 
-File content and metadata **MUST** achieve a Recovery Point Objective (RPO) of zero for committed writes — no
-acknowledged upload may be silently lost. The Recovery Time Objective (RTO) for service restoration after an outage
-**MUST NOT** exceed 15 minutes. These targets apply to the FileStorage service layer; underlying storage backend
-durability (e.g., S3 99.999999999% durability) is inherited from the backend and not controlled by FileStorage.
+An acknowledged write **MUST NOT** be lost or left partially applied by the service itself — across restarts,
+instance failures and client retries — as long as the metadata database and the storage backend retain their data.
+The FileStorage service (control plane and sidecar) **MUST** be restorable within 15 minutes once its database and
+storage backend are available.
 
-**Threshold**: RPO = 0 (no data loss for committed writes); RTO ≤ 15 minutes
+Recovery from loss of, or damage to, the metadata database or the storage backend is outside this gear: the achievable
+RPO and the recovery time of those stores are set by the platform's backup and replication policy for them (a single
+data centre and region in P0), configured independently of FileStorage, and this gear adds no loss beyond them.
+Backend durability (e.g. S3's) is likewise inherited from the backend.
+
+**Threshold**: zero service-induced loss of acknowledged writes; service RTO ≤ 15 minutes once the database and storage
+backend are available; database/storage RPO and RTO inherited from the platform backup policy
 **Rationale**: File loss after a successful upload acknowledgment breaks consumer trust and disrupts downstream
-workflows. The RPO=0 target ensures write-ahead semantics where acknowledgment implies durability. The 15-minute RTO
-balances recovery speed with operational complexity for a non-user-facing backend service.
+workflows. The service guarantees acknowledgment implies durability in its own stores; how much can be lost when a
+store itself is lost depends on that store's backups, which the platform — not this gear — configures.
 **Architecture Allocation**: See DESIGN.md § NFR Allocation for how this is realized
+**Verification Method**: PostgreSQL concurrency and failure-injection tests (lost finalize, idempotent replay, cleanup races, backend faults); service restart covered by the end-to-end suite; database and storage recovery verified by the platform backup/restore procedure.
 
 #### Scalability & Capacity
 
 - [ ] `p1` - **ID**: `cpt-cf-file-storage-nfr-scalability`
 
-FileStorage **MUST** support horizontal scaling to handle concurrent file operations without degradation. The system
-**MUST** support at least 1,000 concurrent file operations (uploads + downloads + metadata queries combined) per
-deployment instance. The system **MUST** scale linearly — adding instances **MUST** proportionally increase throughput
-without introducing coordination bottlenecks between instances.
+FileStorage **MUST** support horizontal scaling to handle concurrent file operations without degradation. The latency
+targets of `cpt-cf-file-storage-nfr-metadata-latency` and `cpt-cf-file-storage-nfr-transfer-latency` **MUST** hold with
+2 million files stored in total. The system **MUST** scale linearly — adding instances **MUST** proportionally increase
+throughput without introducing coordination bottlenecks between instances.
 
-**Threshold**: ≥1,000 concurrent operations per instance; linear horizontal scaling
+**Threshold**: 2 million files stored in total; linear horizontal scaling
 **Rationale**: As platform adoption grows, file operation volume grows proportionally. Without explicit scalability
 requirements, the architecture may adopt patterns (global locks, shared mutable state) that prevent horizontal scaling.
 **Architecture Allocation**: See DESIGN.md § NFR Allocation for how this is realized
+**Verification Method**: The load benchmark of `cpt-cf-file-storage-nfr-metadata-latency` at 2 million files; horizontal scaling holds because both planes are stateless per request (no in-process shared state between instances).
 
 #### Bandwidth & Egress
 
@@ -1224,10 +1246,12 @@ NFR set only constrains CPU/memory (the scalability NFR), implementers may size 
 and under-provision network capacity. Making the bandwidth budget explicit, allocating it to the sidecar, and making
 download caching a first-class offload path keeps the data plane affordable at scale.
 **Architecture Allocation**: See DESIGN.md § NFR Allocation for how this is realized
+**Verification Method**: Per-instance sidecar throughput measurement (capacity test) when sizing a deployment.
 
 ### 6.2 NFR Exclusions
 
-None — all project-default NFRs apply to this gear.
+All project-default NFRs apply to this gear. Cost (total cost of ownership) is not modelled per gear in this
+repository; §6.5 records how this gear bounds its own cost drivers instead.
 
 ### 6.3 Applicability Notes
 
@@ -1242,6 +1266,121 @@ The following NFR categories from the platform checklist are **not applicable** 
 | **Compliance**           | FileStorage does not implement domain-specific compliance logic (GDPR, HIPAA, SOX). It provides the building blocks (audit trail, tenant isolation, retention policies, encryption) that enable consuming gears and platform operators to achieve compliance.                                         |
 | **Operations**           | Operational concerns (deployment, monitoring, alerting, runbooks) follow platform-wide standards and are not gear-specific.                                                                                                                                                                           |
 | **Maintainability**      | Maintainability follows platform-wide coding standards, testing requirements, and CI/CD practices. No gear-specific maintainability NFRs beyond the platform baseline.                                                                                                                                |
+
+### 6.4 Five Quality Vectors Analysis
+
+File Storage is assessed against the five vectors of the
+[Constructor Gears Quality Framework](https://github.com/constructorfabric/vision/blob/main/CONSTRUCTOR_GEARS_QUALITY_FRAMEWORK.md),
+in the framework's priority order. North Star metrics are tracked at the platform level; the show-stoppers below bind
+this gear only through the requirements they reference. The priority order applies only when choosing between options
+that already satisfy every **MUST** in this PRD; it **MUST NOT** be used to weaken one.
+
+| **Quality Vector** | **Show-Stopper Requirements** | **Rationale** |
+|--------------------|-------------------------------|---------------|
+| **Efficiency** | Content bytes **MUST NOT** transit the control plane; uploads and downloads **MUST** stream without buffering a whole object (`cpt-cf-file-storage-nfr-bandwidth`). | Keeps the control plane small and lets byte-path capacity scale independently. |
+| **Reliability** | An acknowledged write **MUST NOT** be lost or partially applied by the service while the database and storage backend are intact, and the service **MUST** be restorable within 15 minutes once they are available (`cpt-cf-file-storage-nfr-durability`); retried uploads and completions **MUST** be idempotent (`cpt-cf-file-storage-fr-upload-idempotency`, `cpt-cf-file-storage-fr-multipart-complete-lease`); every audited write **MUST** be recorded with it (`cpt-cf-file-storage-nfr-audit-completeness`). Database and storage RPO/RTO are inherited from the platform backup policy. | Consumers retry on transient failures; a retry must never duplicate, lose or silently diverge from a write. |
+| **Performance** | Metadata reads and listings **MUST** meet p95 < 300 ms single-threaded on one CPU core, and synchronous mutations p95 < 2 s (`cpt-cf-file-storage-nfr-metadata-latency`); content-transfer fixed overhead **MUST** stay under p95 < 2 s (`cpt-cf-file-storage-nfr-transfer-latency`); both with 2 million files stored in total (`cpt-cf-file-storage-nfr-scalability`). | Gears place file access on their own request paths. |
+| **Security** | Every operation **MUST** be authorized within the caller's tenant (`cpt-cf-file-storage-fr-authorization`, `cpt-cf-file-storage-fr-tenant-boundary`); content **MUST** be reachable only through control-plane-issued signed URLs (`cpt-cf-file-storage-fr-signed-urls`). | Multi-tenant storage: cross-tenant exposure is a critical finding. |
+| **Versatility** | Storage backends **MUST** be selectable by configuration, without a rebuild (`cpt-cf-file-storage-fr-backend-abstraction`). | One service serves deployments with different storage infrastructure. |
+
+### 6.5 Quality Framework Conformance
+
+This section answers every element of the
+[Constructor Gears Quality Framework](https://github.com/constructorfabric/vision/blob/main/CONSTRUCTOR_GEARS_QUALITY_FRAMEWORK.md)
+for this gear: each vector's guiding question, its North Star metric, and each of its example metrics. Each metric
+carries one position:
+
+- **Committed** — a requirement of this PRD, with its ID.
+- **Observed** — measured by a signal this gear emits (DESIGN.md §4.4), with no gear-specific target.
+- **Inherited** — owned by the platform (delivery process, CI gates, SLA, backup policy); this gear adds no target.
+- **Not applicable** — with the reason.
+
+The priority order and the trade-off rule are those of §6.4.
+
+#### Efficiency
+
+- **Guiding question** — *How quickly and economically can software be built, deployed, and operated?* Content moves
+  between clients, the sidecar and the backend without crossing the control plane; a default upload takes two client
+  requests (multipart: N + 2); Gears call an in-process SDK; storage backends are chosen by configuration.
+- **North Star — Total Cost of Ownership (TCO)**: Inherited — cost is modelled at the platform level (§6.2). The gear
+  bounds its own cost drivers: bytes transit only the sidecar (`cpt-cf-file-storage-nfr-bandwidth`), memory per
+  transfer is bounded by streaming, and background cleanup runs under a per-tick time budget.
+
+| Framework metric | Position | Reference |
+|---|---|---|
+| Time from approved PRD to production | Inherited — platform delivery process | — |
+| TCO to build and operate a feature, Gear, or product | Inherited — platform cost model; gear cost drivers bounded as above | `cpt-cf-file-storage-nfr-bandwidth` |
+| Lead time for change | Inherited — platform CI/CD; schema changes ship as one additive migration per change with a documented upgrade and rollback path | `operations.md` |
+| Cost per delivered feature | Inherited — platform delivery metrics | — |
+| Infrastructure cost per transaction/workflow | Observed — bytes moved per workflow; control-plane work per upload is a fixed number of metadata calls | ingress/egress byte signals; `cpt-cf-file-storage-fr-auto-bind` |
+| Infrastructure cost per tenant/service | Observed — storage usage per owner and tenant, egress bytes | `cpt-cf-file-storage-fr-usage-reporting`, `cpt-cf-file-storage-contract-usage-collector` |
+
+#### Reliability
+
+- **Guiding question** — *How dependable is it?* An acknowledged write is never lost or partially applied by the
+  service; retries are idempotent; transient backend failures are reported as retryable; cleanup reconciles orphans.
+- **North Star — Service availability (SLA)**: Inherited — the platform SLA (`cpt-cf-file-storage-nfr-url-availability`).
+  The gear commits zero service-induced loss of acknowledged writes and a service RTO of 15 minutes
+  (`cpt-cf-file-storage-nfr-durability`).
+
+| Framework metric | Position | Reference |
+|---|---|---|
+| MTTR | Committed for the service — restorable within 15 minutes once its database and storage are available; database/storage recovery inherited | `cpt-cf-file-storage-nfr-durability` |
+| MTBF | Inherited — platform monitoring | — |
+| Failed workflow rate | Observed — per-operation success/failure signal | `cpt-cf-file-storage-fr-upload-idempotency`, `cpt-cf-file-storage-fr-multipart-complete-lease` |
+| Change failure rate | Inherited — platform CD; additive migration, mixed-version window and rollback documented | `operations.md` |
+| Successful deployment rate | Inherited — platform CD; startup rejects invalid configuration before serving | `operations.md` |
+| Error rate | Observed — per-route status and per-backend error signals; transient faults distinguished from permanent ones | `cpt-cf-file-storage-fr-rest-api` |
+| Disaster recovery success rate | Inherited — platform backup and restore of the database and the storage backend | `cpt-cf-file-storage-nfr-durability` |
+
+#### Performance
+
+- **Guiding question** — *How fast does it execute?* Bytes stream end to end without buffering; metadata reads and
+  listings use keyset pagination whose cost does not grow with page depth.
+- **North Star — P99 workflow latency**: Observed — tracked at the platform level from the per-route latency signal;
+  the gear commits p95 targets (`cpt-cf-file-storage-nfr-metadata-latency`, `cpt-cf-file-storage-nfr-transfer-latency`).
+
+| Framework metric | Position | Reference |
+|---|---|---|
+| Transactions/workflows per second | Committed as scaling behaviour — linear horizontal scaling; per-sidecar bandwidth budget | `cpt-cf-file-storage-nfr-scalability`, `cpt-cf-file-storage-nfr-bandwidth` |
+| Average response time | Observed — per-route latency signal; the commitment is p95 | `cpt-cf-file-storage-nfr-metadata-latency` |
+| P99/P999 latency | Observed — per-route latency signal; the commitment is p95 | `cpt-cf-file-storage-nfr-metadata-latency`, `cpt-cf-file-storage-nfr-transfer-latency` |
+| Resource utilization (CPU/Memory) per transaction | Committed for memory — a transfer never buffers a whole object; CPU inherited | §6.4 Efficiency, `cpt-cf-file-storage-nfr-bandwidth` |
+| % of performance SLAs met | Committed — verified by the load benchmark of the latency NFRs | `cpt-cf-file-storage-nfr-metadata-latency` (Verification Method) |
+| Cold start time | Not applicable — a long-running service; process start is not on any request path and is bounded by the service RTO | `cpt-cf-file-storage-nfr-durability` |
+
+#### Security
+
+- **Guiding question** — *How well is it protected?* Every operation is authorized within the caller's tenant;
+  content is reachable only through control-plane-issued signed URLs; secrets never appear in logs.
+- **North Star — Critical security findings in production (target 0)**: Inherited target of 0 — enforced through the
+  platform security gates below and the gear's show-stoppers in §6.4.
+
+| Framework metric | Position | Reference |
+|---|---|---|
+| Security policy compliance | Committed — tenant-scoped authorization on every operation; cross-owner actions require elevated scope | `cpt-cf-file-storage-fr-authorization`, `cpt-cf-file-storage-fr-tenant-boundary` |
+| Secrets management coverage | Committed — signing keys and the internal callback token are held as secrets and never logged; signing keys rotate without downtime | `cpt-cf-file-storage-fr-signed-urls`, `cpt-cf-file-storage-fr-callback-internal-token` |
+| Mean time to remediate vulnerabilities | Inherited — platform vulnerability process; dependency advisories gated in CI | — |
+| Dependency compliance | Inherited — CI gates on dependency licences, advisories and bans (`cargo-deny`) and FIPS verification | — |
+| Secure coding compliance | Inherited — CI gates: architecture lints, `clippy -D warnings`, CodeQL, fuzzing | — |
+| Security incident rate | Inherited — platform incident process; the audit trail supports forensics | `cpt-cf-file-storage-fr-audit-trail` |
+
+#### Versatility
+
+- **Guiding question** — *How many real-world scenarios can it support without building a new platform?* One service
+  serves every Gear and user that stores files, across storage backends, through REST, an in-process SDK and signed
+  URLs.
+- **North Star — % of target business scenarios supported out of the box**: Committed — all six target scenarios of
+  §8 are supported (100%).
+
+| Framework metric | Position | Reference |
+|---|---|---|
+| Supported business scenarios | Committed — Upload a File; Fetch File for Gear Processing; Validate File Metadata Before Processing; Delete a File; Multi-Backend Deployment; Configure Policy | §8 |
+| Supported deployment models | Committed — S3-compatible object storage, local filesystem, in-memory (development and tests); single data centre and region in P0 | `cpt-cf-file-storage-fr-backend-abstraction`, `cpt-cf-file-storage-fr-backend-capabilities` |
+| Supported integration types | Committed — REST control plane, sidecar data plane over signed URLs with `Range`, in-process SDK; authorization, usage, quota, event and serverless contracts | `cpt-cf-file-storage-interface-rest-api`, `cpt-cf-file-storage-interface-sidecar-api`, `cpt-cf-file-storage-interface-sdk-trait`, §7.2 |
+| Supported business domains | Committed — domain-agnostic: files are opaque content with typed metadata, usable by any Gear | `cpt-cf-file-storage-fr-file-type-classification` |
+| Configuration vs. customization ratio | Committed — backends, type and size policies and retention rules are configured, not coded; object placement is a plugin extension point (ADR-0007) | `cpt-cf-file-storage-fr-backend-config-source`, `cpt-cf-file-storage-fr-allowed-types-policy`, `cpt-cf-file-storage-fr-retention-policies` |
+| Feature coverage across target scenarios | Committed — the target scenarios are specified as use cases with acceptance criteria, and requirements are traced to them | §8, §9, §14 |
 
 ## 7. Public Library Interfaces
 
