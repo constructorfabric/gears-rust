@@ -149,7 +149,7 @@ impl FileService {
     }
 
     pub(super) fn backend_path(file_id: Uuid, version_id: Uuid) -> String {
-        format!("/{file_id}/{version_id}")
+        crate::domain::storage_layout::backend_path(file_id, version_id)
     }
 
     pub(super) fn validate_gts_type(t: &str) -> Result<(), DomainError> {
