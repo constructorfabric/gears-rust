@@ -6082,8 +6082,7 @@ alternative — keep the graph and define a `resolve_topology` producer whose ow
 prerequisite, which is how Lifecycle's ask on this gear reads ("unknown topology must not become an
 empty dependency set") — would block order-taking on a contract nobody owns for a relation the
 model does not have. That sentence is answered by there being no topology at all, not by an empty
-graph; the Lifecycle owner is asked to reword it (hand-off note in
-`docs/reviews/2026-09-30-orders-workflow-pricebook-fix-plan.md`). **Precedent** for the ordering
+graph; the Lifecycle owner is asked to reword it. **Precedent** for the ordering
 that remains: `ADR/0004`'s barrier, whose decision drivers never depended on topology.
 
 **Propagated**: `design/04-fulfillment-plan.md` §1–§4 (principle `…-principle-lines-independent`,

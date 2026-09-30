@@ -587,8 +587,7 @@ facts, read through `get_version` (§2.4). What this section records instead:
   from TCV — §2.2. The one clause this design does **not** meet as written — "its approved-instance
   constructor requires a revision-stamped complete dependency graph before begin-fulfillment" — is
   answered by D-196: acquisition lines are independent, so there is no graph to require; the
-  Lifecycle owner is asked to reword that sentence (hand-off note in
-  `docs/reviews/2026-09-30-orders-workflow-pricebook-fix-plan.md`).
+  Lifecycle owner is asked to reword that sentence.
 - **Products.** SKU protection through activation is inherited from the accepted revision's
   `plan_item` references (Lifecycle D-164); this gear reserves nothing and holds no receipt. A forced
   retirement under an in-flight order surfaces as a Subscriptions refusal at activation and follows
