@@ -341,7 +341,7 @@ impl LeasedMessageHandler for ThreadSummaryHandler {
                         .map_err(|e| toolkit_db::DbError::Other(anyhow::anyhow!("{e}")))?;
 
                     if rows == 0 {
-                        return Ok(false);
+                        return Ok((false, crate::domain::repos::Wake::empty()));
                     }
 
                     // 5b. Mark messages as compressed
@@ -398,19 +398,20 @@ impl LeasedMessageHandler for ThreadSummaryHandler {
                         )),
                         system_task_type: Some("thread_summary_update".to_owned()),
                     };
-                    deps.outbox_enqueuer
+                    let wake = deps
+                        .outbox_enqueuer
                         .enqueue_usage_event(tx, usage_event)
                         .await
                         .map_err(|e| toolkit_db::DbError::Other(anyhow::anyhow!("{e}")))?;
 
-                    Ok(true)
+                    Ok((true, wake))
                 })
             })
             .await;
 
         match cas_result {
-            Ok(true) => {
-                self.deps.outbox_enqueuer.flush();
+            Ok((true, wake)) => {
+                wake.fire();
                 self.deps.metrics.record_thread_summary_execution("success");
                 info!(
                     chat_id = %payload.chat_id,
@@ -419,7 +420,7 @@ impl LeasedMessageHandler for ThreadSummaryHandler {
                 );
                 MessageResult::Ok
             }
-            Ok(false) => {
+            Ok((false, _)) => {
                 self.deps.metrics.record_thread_summary_cas_conflict();
                 info!(
                     chat_id = %payload.chat_id,
@@ -458,7 +459,7 @@ Your summary MUST include these sections:
 1. Conversation Purpose: The user's primary goals and recurring themes
 2. Key Information Exchanged: Important facts, decisions, recommendations, and answers
 3. User Requests and Preferences: All explicit user requests, stated preferences, and corrections
-4. Open Items: Any unresolved questions, pending actions, or things the user asked to revisit
+4. Open Items: Any unresolved questions, wake actions, or things the user asked to revisit
 5. Current Topic: What was being discussed most recently, with enough detail to continue naturally
 
 Respond with an <analysis> block followed by a <summary> block.";

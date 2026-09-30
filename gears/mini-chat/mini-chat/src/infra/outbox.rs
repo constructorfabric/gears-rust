@@ -8,10 +8,11 @@ use mini_chat_sdk::{
 use toolkit_db::outbox::Outbox;
 use tracing::{info, warn};
 
-use crate::domain::error::DomainError;
 use crate::domain::model::audit_envelope::AuditEnvelope;
 use crate::domain::ports::{MiniChatMetricsPort, metric_labels};
-use crate::domain::repos::{AttachmentCleanupEvent, ChatCleanupEvent, OutboxEnqueuer};
+use crate::domain::repos::{
+    AttachmentCleanupEvent, ChatCleanupEvent, OutboxEnqueuer, OutboxError, Wake,
+};
 use crate::infra::audit_gateway::AuditGateway;
 
 const AUDIT_PLUGIN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -46,7 +47,7 @@ fn outbox_message(
     queue: &str,
     partition: u32,
     payload: Vec<u8>,
-) -> Result<toolkit_db::outbox::Record<'_>, DomainError> {
+) -> Result<toolkit_db::outbox::Record<'_>, OutboxError> {
     toolkit_db::outbox::Record::to(queue, partition)
         .payload(payload, "application/json")
         .build()
@@ -55,11 +56,9 @@ fn outbox_message(
             // fault: queue and payload type are gear constants here, so this is
             // the only build rejection a caller can actually provoke.
             toolkit_db::outbox::OutboxError::PayloadTooLarge { size, max } => {
-                DomainError::validation(format!(
-                    "payload too large: {size} bytes exceeds max {max}"
-                ))
+                OutboxError::PayloadTooLarge { size, max }
             }
-            other => DomainError::internal(format!("outbox request: {other}")),
+            other => OutboxError::enqueue(other.to_string()),
         })
 }
 
@@ -121,16 +120,17 @@ impl InfraOutboxEnqueuer {
         runner: &(dyn toolkit_db::secure::DBRunner + Sync),
         chat_id: uuid::Uuid,
         payload: Vec<u8>,
-    ) -> Result<(), DomainError> {
+    ) -> Result<Wake, OutboxError> {
         let partition = Self::compute_partition(chat_id, self.num_partitions);
 
-        self.outbox()
+        let handle = self
+            .outbox()
             .enqueue(
                 runner,
                 outbox_message(&self.thread_summary_queue_name, partition, payload)?,
             )
             .await
-            .map_err(|e| DomainError::internal(format!("outbox enqueue: {e}")))?;
+            .map_err(|e| OutboxError::enqueue(e.to_string()))?;
 
         info!(
             queue = %self.thread_summary_queue_name,
@@ -139,7 +139,7 @@ impl InfraOutboxEnqueuer {
             "thread summary task enqueued"
         );
 
-        Ok(())
+        Ok(Wake::from_wake(handle))
     }
 }
 
@@ -149,18 +149,21 @@ impl OutboxEnqueuer for InfraOutboxEnqueuer {
         &self,
         runner: &(dyn toolkit_db::secure::DBRunner + Sync),
         event: UsageEvent,
-    ) -> Result<(), DomainError> {
+    ) -> Result<Wake, OutboxError> {
         let partition = self.partition_for(event.tenant_id);
-        let payload = serde_json::to_vec(&event)
-            .map_err(|e| DomainError::internal(format!("serialize UsageEvent: {e}")))?;
+        let payload = serde_json::to_vec(&event).map_err(|e| OutboxError::Serialize {
+            event: "UsageEvent",
+            source: e,
+        })?;
 
-        self.outbox()
+        let handle = self
+            .outbox()
             .enqueue(
                 runner,
                 outbox_message(&self.usage_queue_name, partition, payload)?,
             )
             .await
-            .map_err(|e| DomainError::internal(format!("outbox enqueue: {e}")))?;
+            .map_err(|e| OutboxError::enqueue(e.to_string()))?;
 
         info!(
             queue = %self.usage_queue_name,
@@ -170,25 +173,28 @@ impl OutboxEnqueuer for InfraOutboxEnqueuer {
             "usage event enqueued"
         );
 
-        Ok(())
+        Ok(Wake::from_wake(handle))
     }
 
     async fn enqueue_attachment_cleanup(
         &self,
         runner: &(dyn toolkit_db::secure::DBRunner + Sync),
         event: AttachmentCleanupEvent,
-    ) -> Result<(), DomainError> {
+    ) -> Result<Wake, OutboxError> {
         let partition = self.partition_for(event.tenant_id);
-        let payload = serde_json::to_vec(&event)
-            .map_err(|e| DomainError::internal(format!("serialize AttachmentCleanupEvent: {e}")))?;
+        let payload = serde_json::to_vec(&event).map_err(|e| OutboxError::Serialize {
+            event: "AttachmentCleanupEvent",
+            source: e,
+        })?;
 
-        self.outbox()
+        let handle = self
+            .outbox()
             .enqueue(
                 runner,
                 outbox_message(&self.cleanup_queue_name, partition, payload)?,
             )
             .await
-            .map_err(|e| DomainError::internal(format!("outbox enqueue: {e}")))?;
+            .map_err(|e| OutboxError::enqueue(e.to_string()))?;
 
         info!(
             queue = %self.cleanup_queue_name,
@@ -198,27 +204,30 @@ impl OutboxEnqueuer for InfraOutboxEnqueuer {
             "attachment cleanup event enqueued"
         );
 
-        Ok(())
+        Ok(Wake::from_wake(handle))
     }
 
     async fn enqueue_chat_cleanup(
         &self,
         runner: &(dyn toolkit_db::secure::DBRunner + Sync),
         event: ChatCleanupEvent,
-    ) -> Result<(), DomainError> {
+    ) -> Result<Wake, OutboxError> {
         // Partition by chat_id so all cleanup messages for the same chat
         // are serialized within one partition.
         let partition = Self::compute_partition(event.chat_id, self.num_partitions);
-        let payload = serde_json::to_vec(&event)
-            .map_err(|e| DomainError::internal(format!("serialize ChatCleanupEvent: {e}")))?;
+        let payload = serde_json::to_vec(&event).map_err(|e| OutboxError::Serialize {
+            event: "ChatCleanupEvent",
+            source: e,
+        })?;
 
-        self.outbox()
+        let handle = self
+            .outbox()
             .enqueue(
                 runner,
                 outbox_message(&self.chat_cleanup_queue_name, partition, payload)?,
             )
             .await
-            .map_err(|e| DomainError::internal(format!("outbox enqueue: {e}")))?;
+            .map_err(|e| OutboxError::enqueue(e.to_string()))?;
 
         info!(
             queue = %self.chat_cleanup_queue_name,
@@ -228,30 +237,33 @@ impl OutboxEnqueuer for InfraOutboxEnqueuer {
             "chat cleanup event enqueued"
         );
 
-        Ok(())
+        Ok(Wake::from_wake(handle))
     }
 
     async fn enqueue_audit_event(
         &self,
         runner: &(dyn toolkit_db::secure::DBRunner + Sync),
         event: AuditEnvelope,
-    ) -> Result<(), DomainError> {
+    ) -> Result<Wake, OutboxError> {
         let tenant_id = match &event {
             AuditEnvelope::Turn(e) => e.tenant_id,
             AuditEnvelope::Mutation(e) => e.tenant_id,
             AuditEnvelope::Delete(e) => e.tenant_id,
         };
         let partition = self.partition_for(tenant_id);
-        let payload = serde_json::to_vec(&event)
-            .map_err(|e| DomainError::internal(format!("serialize AuditEnvelope: {e}")))?;
+        let payload = serde_json::to_vec(&event).map_err(|e| OutboxError::Serialize {
+            event: "AuditEnvelope",
+            source: e,
+        })?;
 
-        self.outbox()
+        let handle = self
+            .outbox()
             .enqueue(
                 runner,
                 outbox_message(&self.audit_queue_name, partition, payload)?,
             )
             .await
-            .map_err(|e| DomainError::internal(format!("audit outbox enqueue: {e}")))?;
+            .map_err(|e| OutboxError::enqueue(e.to_string()))?;
 
         info!(
         queue = %self.audit_queue_name,
@@ -260,26 +272,28 @@ impl OutboxEnqueuer for InfraOutboxEnqueuer {
         "audit event enqueued"
         );
 
-        Ok(())
+        Ok(Wake::from_wake(handle))
     }
 
     async fn enqueue_thread_summary(
         &self,
         runner: &(dyn toolkit_db::secure::DBRunner + Sync),
         payload: crate::domain::repos::ThreadSummaryTaskPayload,
-    ) -> Result<(), DomainError> {
+    ) -> Result<Wake, OutboxError> {
         let partition = Self::compute_partition(payload.chat_id, self.num_partitions);
-        let serialized = serde_json::to_vec(&payload).map_err(|e| {
-            DomainError::internal(format!("serialize ThreadSummaryTaskPayload: {e}"))
+        let serialized = serde_json::to_vec(&payload).map_err(|e| OutboxError::Serialize {
+            event: "ThreadSummaryTaskPayload",
+            source: e,
         })?;
 
-        self.outbox()
+        let handle = self
+            .outbox()
             .enqueue(
                 runner,
                 outbox_message(&self.thread_summary_queue_name, partition, serialized)?,
             )
             .await
-            .map_err(|e| DomainError::internal(format!("outbox enqueue: {e}")))?;
+            .map_err(|e| OutboxError::enqueue(e.to_string()))?;
 
         info!(
             queue = %self.thread_summary_queue_name,
@@ -289,14 +303,7 @@ impl OutboxEnqueuer for InfraOutboxEnqueuer {
             "thread summary task enqueued"
         );
 
-        Ok(())
-    }
-
-    fn flush(&self) {
-        // flush is a no-op if outbox isn't set yet (before start).
-        if let Some(outbox) = self.outbox.get() {
-            outbox.flush();
-        }
+        Ok(Wake::from_wake(handle))
     }
 }
 
@@ -566,8 +573,17 @@ mod tests {
         let too_big = vec![0u8; 64 * 1024 + 1];
         let err = outbox_message("q", 0, too_big).unwrap_err();
         assert!(
-            matches!(err, DomainError::Validation { .. }),
-            "expected a validation error, got {err:?}"
+            matches!(err, OutboxError::PayloadTooLarge { .. }),
+            "expected a payload-too-large error, got {err:?}"
+        );
+        // Preserved as `Outbox(PayloadTooLarge)` so the source survives and the
+        // REST layer can render it as a client (4xx) error rather than a 500.
+        assert!(
+            matches!(
+                crate::domain::error::DomainError::from(err),
+                crate::domain::error::DomainError::Outbox(OutboxError::PayloadTooLarge { .. })
+            ),
+            "oversize must be preserved as an Outbox error carrying its source",
         );
     }
 
@@ -1067,11 +1083,11 @@ mod tests {
         let payload = make_audit_envelope_payload();
         let envelope: AuditEnvelope = serde_json::from_slice(&payload).unwrap();
         let conn = db.conn().expect("conn");
-        enqueuer
+        let wake = enqueuer
             .enqueue_audit_event(&conn, envelope)
             .await
             .expect("enqueue");
-        enqueuer.flush();
+        wake.fire();
 
         tokio::time::timeout(Duration::from_secs(5), plugin.notifier.notified())
             .await
@@ -1136,11 +1152,11 @@ mod tests {
         enqueuer.set_outbox(Arc::clone(handle.outbox()));
         let event = make_usage_event();
         let conn = db.conn().expect("conn");
-        enqueuer
+        let wake = enqueuer
             .enqueue_usage_event(&conn, event)
             .await
             .expect("enqueue");
-        enqueuer.flush();
+        wake.fire();
 
         // Wait for the handler to process (notification-based, no fixed sleep).
         tokio::time::timeout(Duration::from_secs(5), plugin.notifier.notified())

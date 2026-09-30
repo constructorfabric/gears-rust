@@ -191,21 +191,6 @@ gears:
       vendor: "constructorfabric"
       priority: 100
 
-  license-resolver:
-    config:
-      vendor: "constructorfabric"
-
-  # Requires --features static-license.
-  static-license-plugin:
-    config:
-      vendor: "constructorfabric"
-      priority: 100
-      # Deny by default: no rule, no grant. Rules are left empty because no gear
-      # gates on a licence yet -- a rule must name registered Subject/Resource
-      # contract types, and the resolver rejects a check against an unregistered
-      # one. See the plugin README for a worked rule set.
-      grants: []
-
   # Requires --features quota-enforcement. The storage plugin publishes no
   # client until the storage contract is complete, so the gear's bootstrap
   # fails by design in a live server (see gears/system/quota-enforcement).
@@ -233,11 +218,29 @@ gears:
       vendor: "constructorfabric"
       priority: 100
 
+  license-resolver:
+    config:
+      vendor: "constructorfabric"
+
+  # Requires --features static-license.
+  static-license-plugin:
+    config:
+      vendor: "constructorfabric"
+      priority: 100
+      # Deny by default: no rule, no grant. Rules are left empty because no gear
+      # gates on a licence yet -- a rule must name registered Subject/Resource
+      # contract types, and the resolver rejects a check against an unregistered
+      # one. See the plugin README for a worked rule set.
+      grants: []
+
   account-management:
     database:
       server: "sqlite_users"
       file: "account_management.db"
     config:
+      root_tenant_type:
+        gts_id: "gts.cf.core.am.tenant_type.v1~cf.core.am.platform.v1~"
+        idp_provisioning: false
       bootstrap:
         # Matches static-tr-plugin's `e2e-root` so AM's tenants table
         # ends up holding the same root id the platform middleware
@@ -245,7 +248,6 @@ gears:
         # under it without a separate seeding step.
         root_id: "00000000-df51-5b42-9538-d2b56b7ee953"
         root_name: "e2e-root"
-        root_tenant_type: "gts.cf.core.am.tenant_type.v1~cf.core.am.platform.v1~"
         idp_wait_timeout: "5m"
         idp_retry_backoff_initial: "2s"
         idp_retry_backoff_max: "30s"
@@ -438,18 +440,6 @@ gears:
     database:
       server: "sqlite_users"
       file: "types_registry.db"
-    config:
-      entities:
-        - $id: "gts://gts.cf.core.am.tenant_type.v1~cf.core.am.platform.v1~"
-          $schema: "http://json-schema.org/draft-07/schema#"
-          description: "Platform-root tenant type (no parents)."
-          type: "object"
-          allOf:
-            - $ref: "gts://gts.cf.core.am.tenant_type.v1~"
-          x-gts-traits:
-            allowed_parent_types: []
-            idp_provisioning: false
-
   credstore:
     database:
       server: "sqlite_users"
@@ -458,6 +448,21 @@ gears:
       # Gateway selects its value-store backend plugin by GTS vendor;
       # must match static-credstore-plugin (default "constructorfabric").
       vendor: "constructorfabric"
+
+  settings-service:
+    database:
+      server: "sqlite_users"
+      file: "settings-service.db"
+    # The empty section is deliberate and required. The gear reads its
+    # configuration fail-closed, so an absent `config:` key aborts startup
+    # rather than defaulting: bootstrap values are deployment-owned and are
+    # never themselves managed settings, so there is nothing to fall back to.
+    #
+    # Nothing is required today -- the only field, `cache_ttl_seconds`, has a
+    # value fixed by the design (30s) rather than by the operator. The section
+    # exists so that the first genuinely required value fails loudly here
+    # instead of being silently invented.
+    config: {}
 
   static-credstore-plugin:
     config:

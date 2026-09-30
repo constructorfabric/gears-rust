@@ -1,9 +1,11 @@
 use chrono::{DateTime, Utc};
+use gts::{GtsInstanceId, GtsTypeId};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error::ConsumerError;
 use crate::ids::{ConsumerGroupId, TopicId};
+use crate::sequence::Sequence;
 
 use super::DeadLetterRecord;
 
@@ -12,12 +14,12 @@ pub struct DeadLetterEnvelope {
     pub version: u16,
     pub group_id: Option<ConsumerGroupId>,
     pub topic_id: Option<TopicId>,
-    pub topic: String,
-    pub event_type: String,
+    pub topic: GtsInstanceId,
+    pub event_type: GtsTypeId,
     pub subject: String,
-    pub subject_type: String,
+    pub subject_type: GtsTypeId,
     pub partition: u32,
-    pub offset: i64,
+    pub offset: Sequence,
     pub attempts: Option<u16>,
     pub reason: String,
     pub payload: serde_json::Value,
@@ -30,12 +32,12 @@ pub struct DeadLetterEnvelope {
 pub struct DeadLetterSourceCoordinates {
     pub group_id: Option<ConsumerGroupId>,
     pub topic_id: Option<TopicId>,
-    pub topic: String,
-    pub event_type: String,
+    pub topic: GtsInstanceId,
+    pub event_type: GtsTypeId,
     pub subject: String,
-    pub subject_type: String,
+    pub subject_type: GtsTypeId,
     pub partition: u32,
-    pub offset: i64,
+    pub offset: Sequence,
     pub event_id: Uuid,
 }
 

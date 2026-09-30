@@ -64,14 +64,12 @@ pub(super) enum CurrentContent {
     TypeSchema {
         revision_no: i32,
         body: String,
-        hash: Vec<u8>,
         /// The compare-and-swap token for the artifact write the caller makes next.
         cas: CurrentSchemaCas,
     },
     Instance {
         revision_no: i32,
         body: String,
-        hash: Vec<u8>,
     },
 }
 
@@ -86,17 +84,18 @@ impl CurrentContent {
         }
     }
 
-    /// Whether the current content still equals the candidate's authored content —
-    /// the `unchanged` test.
-    pub(super) fn matches_authored(&self, hash: &[u8], body: &str) -> bool {
-        let (current_hash, current_body) = match self {
-            Self::TypeSchema { hash, body, .. } | Self::Instance { hash, body, .. } => (hash, body),
-        };
-        current_hash == hash && current_body == body
+    /// Whether the current content still equals the candidate's authored content
+    /// byte for byte — the `unchanged` test.
+    pub(super) fn matches_authored(&self, body: &str) -> bool {
+        match self {
+            Self::TypeSchema { body: current, .. } | Self::Instance { body: current, .. } => {
+                current == body
+            }
+        }
     }
 }
 
-/// The current revision's number, authored content and digest, whichever kind the
+/// The current revision's number and authored content, whichever kind the
 /// candidate is.
 ///
 /// The **authored** content, never the effective artifacts: those move when a
@@ -128,7 +127,6 @@ pub(super) async fn read_current_content(
             CurrentContent::TypeSchema {
                 revision_no: current.revision_no,
                 body: current.raw_schema,
-                hash: current.content_hash,
                 cas: current.projection,
             }
         }
@@ -141,7 +139,6 @@ pub(super) async fn read_current_content(
             CurrentContent::Instance {
                 revision_no: current.revision_no,
                 body: current.canonical_value,
-                hash: current.content_hash,
             }
         }
     })

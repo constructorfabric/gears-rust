@@ -32,3 +32,21 @@ logs
 # Test artifacts
 testing/e2e/.pytest_cache
 .testing-cache
+
+# Secrets and credentials
+# The Dockerfiles now do `COPY . .`, so the whole repo is the build
+# context: anything not ignored here can end up baked into an image
+# layer. Keep private keys, certs, and local credential files out.
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+.ssh
+.env
+.env.*
+.aws
+.gcloud
+.kube

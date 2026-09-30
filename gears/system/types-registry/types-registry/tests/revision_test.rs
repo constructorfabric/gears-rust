@@ -57,8 +57,12 @@ struct NoDispatch;
 
 #[async_trait::async_trait]
 impl OperationDispatch for NoDispatch {
-    async fn enqueue(&self, _tx: &DbTx<'_>, _operation_id: Uuid) -> anyhow::Result<()> {
-        Ok(())
+    async fn enqueue(
+        &self,
+        _tx: &DbTx<'_>,
+        _operation_id: Uuid,
+    ) -> Result<toolkit_db::outbox::Wake, types_registry::domain::admission::OutboxError> {
+        Ok(toolkit_db::outbox::Wake::empty())
     }
 }
 
@@ -108,7 +112,7 @@ async fn submit_with(
         },
         &dispatch,
         &SubmitRequest {
-            idempotency_key: key.to_owned(),
+            idempotency_key: Some(key.to_owned()),
             kind: domain_enums::OperationKind::Registration,
             dry_run: false,
             candidates: vec![Candidate {
@@ -550,7 +554,7 @@ async fn content_equal_to_an_older_revision_creates_a_new_revision() {
     let revisions = schema_revisions(&db, entity_id).await;
     assert_eq!(revisions.len(), 3);
     assert_eq!(
-        revisions[0].content_hash, revisions[2].content_hash,
+        revisions[0].raw_schema, revisions[2].raw_schema,
         "the fixture really is the same content under a new revision number",
     );
 }

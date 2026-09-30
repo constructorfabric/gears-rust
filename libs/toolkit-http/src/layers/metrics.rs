@@ -86,17 +86,20 @@ fn normalize_method(method: &http::Method) -> &'static str {
 
 /// Low-cardinality `error.type` value for a transport-level failure.
 ///
-/// This layer sits inside the load-shed/buffer layers and outside retry, and the
-/// inner service returns `Ok(Response)` for all HTTP statuses (including
+/// This layer sits outside the load-shed/retry layers (and inside the buffer),
+/// and the inner service returns `Ok(Response)` for all HTTP statuses (including
 /// 4xx/5xx). Only transport-class failures reach the `Err` arm here — the
-/// `OTel` analogue of go-appkit's `status="0"`. Everything else collapses to
-/// `"other"` rather than enumerating variants that cannot occur at this point.
+/// `OTel` analogue of go-appkit's `status="0"`. Because the layer is outside the
+/// concurrency limiter, a load-shed rejection reaches this arm too and is
+/// recorded as `"overloaded"`. Everything else collapses to `"other"` rather
+/// than enumerating variants that cannot occur at this point.
 fn error_type(err: &HttpError) -> &'static str {
     match err {
         HttpError::Timeout(_) => "timeout",
         HttpError::DeadlineExceeded(_) => "deadline_exceeded",
         HttpError::Transport(_) => "transport",
         HttpError::Tls(_) => "tls",
+        HttpError::Overloaded => "overloaded",
         _ => "other",
     }
 }
@@ -443,6 +446,35 @@ mod tests {
             error_type(&HttpError::Transport("boom".into())),
             "transport"
         );
-        assert_eq!(error_type(&HttpError::Overloaded), "other");
+        assert_eq!(error_type(&HttpError::Overloaded), "overloaded");
+    }
+
+    /// A load-shed rejection (`HttpError::Overloaded`) reaching this layer — as
+    /// it does in `build()`, where the concurrency limiter is inner to the
+    /// metrics layer — is recorded as `error.type = "overloaded"`, so shed
+    /// requests are counted rather than invisible.
+    #[tokio::test]
+    async fn records_error_type_overloaded_when_shed() {
+        let (provider, exporter) = test_provider();
+        let meter = provider.meter("test-client");
+        let layer = MetricsLayer::with_meter(&meter, Arc::new(default_classify));
+
+        let inner = service_fn(|_req: Request<Full<Bytes>>| async {
+            Err::<Response<ResponseBody>, _>(HttpError::Overloaded)
+        });
+        let mut svc = ServiceBuilder::new().layer(layer).service(inner);
+        let req = Request::builder()
+            .method(http::Method::GET)
+            .uri("https://example.com/")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+
+        let err = svc.ready().await.unwrap().call(req).await.unwrap_err();
+        assert!(matches!(err, HttpError::Overloaded));
+
+        provider.force_flush().unwrap();
+        let point = find_duration_point(&exporter, &[("error.type", "overloaded")])
+            .expect("a shed request should record error.type=overloaded");
+        assert_eq!(point.count(), 1);
     }
 }

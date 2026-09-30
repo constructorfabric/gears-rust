@@ -338,7 +338,8 @@ impl<
         let outbox_enqueuer = Arc::clone(&self.outbox_enqueuer);
         let scope_tx = chat_scope.clone();
 
-        self.db
+        let wake = self
+            .db
             .transaction(move |tx| {
                 Box::pin(async move {
                     let map = |e: DomainError| toolkit_db::DbError::Other(anyhow::Error::new(e));
@@ -366,12 +367,12 @@ impl<
                         chat_deleted_at: time::OffsetDateTime::now_utc(),
                         secondary_upstream_alias,
                     };
-                    outbox_enqueuer
+                    let wake = outbox_enqueuer
                         .enqueue_chat_cleanup(tx, event)
                         .await
-                        .map_err(map)?;
+                        .map_err(|e| map(e.into()))?;
 
-                    Ok(())
+                    Ok(wake)
                 })
             })
             .await
@@ -383,7 +384,7 @@ impl<
                 other => DomainError::from(other),
             })?;
 
-        self.outbox_enqueuer.flush();
+        wake.fire();
 
         tracing::debug!("Successfully deleted chat");
         Ok(())

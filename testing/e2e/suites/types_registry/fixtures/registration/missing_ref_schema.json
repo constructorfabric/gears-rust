@@ -1,0 +1,10 @@
+{
+  "gts_id": "gts.cf.e2e.registration.unresolved.v1~",
+  "content": {
+    "$id": "gts://gts.cf.e2e.registration.unresolved.v1~",
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "allOf": [
+      { "$ref": "gts://gts.cf.e2e.registration.absent.v1~" }
+    ]
+  }
+}

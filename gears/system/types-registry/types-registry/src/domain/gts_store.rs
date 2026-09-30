@@ -197,6 +197,29 @@ pub enum StoreBuildError {
     Register { gts_id: String, source: StoreError },
 }
 
+impl StoreBuildError {
+    /// Whether a redelivery can reach a different answer.
+    ///
+    /// Storage failures are classified by [`crate::domain::retry`]; scope and
+    /// configuration failures are permanent there, as with
+    /// `WorkerError::Storage`. Every other variant
+    /// is a statement about stored data or about this unit's own shape, and a
+    /// reread produces it again.
+    #[must_use]
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Self::Storage(error) => crate::domain::retry::scoped_failure_may_clear(error),
+            Self::MissingDocument { .. }
+            | Self::Content { .. }
+            | Self::MissingDialect { .. }
+            | Self::Duplicate { .. }
+            | Self::InstanceWithoutType { .. }
+            | Self::MissingValue { .. }
+            | Self::Register { .. } => false,
+        }
+    }
+}
+
 /// Register one Instance into the store, with the conforming type it declares by
 /// its identifier.
 ///

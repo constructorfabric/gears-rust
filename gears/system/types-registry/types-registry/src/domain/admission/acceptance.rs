@@ -15,7 +15,7 @@
 //! | 2 candidate identifiers | here |
 //! | 3 registration policy | here (via [`RegistrationPolicy`]), for creations only |
 //! | 4 managed identifier profile | here |
-//! | 5 declared dialect | here |
+//! | 5 declared identity and dialect | here |
 //! | 6 `force` | here |
 //! | 7 ADR-0015 major-0 quarantine | **the worker** — see below |
 //! | 8 canonicalize, fingerprint, idempotency | here |
@@ -27,7 +27,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use gts::{GtsId, GtsIdSegment};
+use gts::{GTS_ID_URI_PREFIX, GtsId, GtsIdSegment};
 use serde_json::Value;
 use time::OffsetDateTime;
 use toolkit_db::secure::{AccessScope, ScopeError};
@@ -75,6 +75,15 @@ pub enum AcceptanceError {
     ExplicitUuidTail { gts_id: String },
     #[error("registered Instance '{gts_id}' must name a stable version: {reason}")]
     InstanceVersionProfile { gts_id: String, reason: String },
+    #[error("Type Schema '{gts_id}' declares no string top-level $id")]
+    MissingSchemaId { gts_id: String },
+    /// The declared value is deliberately not carried: it is unbounded caller
+    /// input, checked before the document size limit, and would otherwise be
+    /// echoed into the Problem detail and the refusal log.
+    #[error(
+        "Type Schema '{gts_id}' declares a top-level $id other than '{GTS_ID_URI_PREFIX}{gts_id}'"
+    )]
+    SchemaIdMismatch { gts_id: String },
     #[error("'{gts_id}' declares no top-level $schema")]
     MissingDialect { gts_id: String },
     #[error("'{gts_id}' declares dialect '{found}', which is not the Draft-07 spelling set")]
@@ -137,6 +146,8 @@ impl AcceptanceError {
             Self::PolicyRefused(_) => "policy_refused",
             Self::ExplicitUuidTail { .. } => "explicit_uuid_tail",
             Self::InstanceVersionProfile { .. } => "instance_version_profile",
+            Self::MissingSchemaId { .. } => "missing_schema_id",
+            Self::SchemaIdMismatch { .. } => "schema_id_mismatch",
             Self::MissingDialect { .. } => "missing_dialect",
             Self::UnsupportedDialect { .. } => "unsupported_dialect",
             Self::ConflictingDialect { .. } => "conflicting_dialect",
@@ -197,7 +208,13 @@ pub fn validate(
     request: &SubmitRequest,
 ) -> Result<Validated, AcceptanceError> {
     // --- step 1: envelope and batch size ---------------------------------
-    let key = request.idempotency_key.trim();
+    // An absent header and a blank one are one refusal: both leave acceptance
+    // without the key a replay would have to match.
+    let key = request
+        .idempotency_key
+        .as_deref()
+        .unwrap_or_default()
+        .trim();
     if key.is_empty() {
         return Err(AcceptanceError::MissingIdempotencyKey);
     }
@@ -324,7 +341,7 @@ pub fn validate(
             }
         }
 
-        // --- step 5: declared dialect ------------------------------------
+        // --- step 5: declared identity and dialect -----------------------
         // Deletion skips document checks (steps 5 and 8). Store JSON `null` because
         // `ck_tr_operation_item_state` requires a non-null pending payload.
         let content = match (&candidate.content, deletion) {
@@ -344,6 +361,7 @@ pub fn validate(
         if let Some(content) = content
             && id.is_type()
         {
+            check_schema_id(id.id(), content)?;
             check_dialect(id.id(), content)?;
         }
 
@@ -417,6 +435,7 @@ pub fn validate(
     Ok(Validated {
         kind: request.kind,
         dry_run: request.dry_run,
+        // Past the check above, so a plain `String`: this key exists.
         idempotency_key: key.to_owned(),
         // ponytail: ceiling C2 — the three inputs are constants in P0, so the key
         // namespace is global. See `fingerprint::P0_PRINCIPAL_ID`.
@@ -537,26 +556,36 @@ async fn accept_inner(
                 tx_stores
                     .insert_items(tx, &tx_scope, &parent, &validated.items)
                     .await?;
-                tx_dispatch
+                // Enqueue last, so any earlier failure rolls back before a wake
+                // exists: an escaped wake means the rows are about to commit.
+                let wake = tx_dispatch
                     .enqueue(tx, parent.id)
                     .await
-                    .map_err(AcceptanceError::Dispatch)?;
-                Ok(Accepted {
-                    operation_id: parent.id,
-                    replayed: false,
-                    status: parent.status,
-                })
+                    .map_err(|e| AcceptanceError::Dispatch(e.into()))?;
+                Ok((
+                    Accepted {
+                        operation_id: parent.id,
+                        replayed: false,
+                        status: parent.status,
+                    },
+                    wake,
+                ))
             })
         })
         .await;
 
     match insert {
-        Ok(accepted) => Ok(accepted),
+        Ok((accepted, wake)) => {
+            // The rows are durable now; wake the sequencer against them.
+            wake.fire();
+            Ok(accepted)
+        }
         // The unique constraint on (idempotency_scope_hash, idempotency_key) is the
         // serialization point between two concurrent acceptances — this layer has no
         // row to lock, and the read above cannot close the window. The loser re-reads
         // the winner outside the rolled-back transaction; see `load_replay`.
         Err(AcceptanceError::Storage(e)) if e.is_unique_violation() => {
+            // The transaction rolled back before `enqueue`, so no wake exists to drop.
             let winner = find_operation_by_key(stores, db, scope, &validated)
                 .await?
                 .ok_or(AcceptanceError::Storage(ScopeError::Invalid(
@@ -585,6 +614,28 @@ fn resolve_replay(
             operation_id: existing.id,
         })
     }
+}
+
+/// Step 5. The document names the entity the item names: a Type Schema's
+/// top-level `$id` is exactly `gts://<gts_id>`.
+///
+/// `gts_id` is already canonical (step 2), so exact string equality is the
+/// canonical comparison. Nothing is trimmed or normalized: like step 2, a second
+/// spelling of the same identity is refused as ambiguous rather than repaired,
+/// and a bare `gts.` spelling is not a schema URI (GTS forbids it in `$id`).
+/// Instances are not checked: their identity lives in the item alone.
+fn check_schema_id(gts_id: &str, content: &Value) -> Result<(), AcceptanceError> {
+    let declared = content.get("$id").and_then(Value::as_str).ok_or_else(|| {
+        AcceptanceError::MissingSchemaId {
+            gts_id: gts_id.to_owned(),
+        }
+    })?;
+    if declared.strip_prefix(GTS_ID_URI_PREFIX) != Some(gts_id) {
+        return Err(AcceptanceError::SchemaIdMismatch {
+            gts_id: gts_id.to_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// Step 5. A top-level `$schema` in the closed Draft-07 set, and no differing

@@ -274,7 +274,7 @@ setup: .setup-stamp py-env
 # |             | - Ensures clean compilation across all targets and features          |
 # +-------------+----------------------------------------------------------------------+
 
-.PHONY: fmt clippy clippy-deep lychee docs-preview kani geiger safety lint dylint dylint-list dylint-test shear gts-docs cfs-ensure cfs-repair cfs-validate cfs-validate-kits cfs-validate-kit-local cfs-spec-coverage ensure-submodules
+.PHONY: fmt clippy clippy-deep lychee docs-preview kani geiger safety lint dylint dylint-list dylint-test shear gts-docs docker-pins cfs-ensure cfs-repair cfs-validate cfs-validate-kits cfs-validate-kit-local cfs-spec-coverage ensure-submodules
 
 ## Verify git submodules (e.g. guidelines/DNA) are initialized; fails otherwise.
 ensure-submodules:
@@ -375,6 +375,13 @@ lint:
 ## Validate GTS identifiers in .md and .json files (DE0903)
 # Uses gts-validator binary (install via: cargo install gts-validator)
 
+## Check Dockerfile base images are digest-pinned and match rust-toolchain.toml
+# Uses PYTHON_BOOTSTRAP, not the venv: this check is pure stdlib text parsing,
+# so it must stay runnable without `make py-env` first.
+docker-pins:
+	$(call print_target_banner)
+	$(PYTHON_BOOTSTRAP) tools/scripts/ci.py docker-pins
+
 gts-docs:
 	$(call print_target_banner)
 	$(call check_tool,gts-validator)
@@ -422,11 +429,6 @@ validate-gear-names: py-env
 pr-review-lint: py-env
 	$(call print_target_banner)
 	@$(PYTHON) tools/scripts/toolkit-pr-review/lint.py
-
-## Check docs/toolkit-pr-review/agent-rules/ matches the authored rules/
-pr-review-render-check: py-env
-	$(call print_target_banner)
-	@$(PYTHON) tools/scripts/toolkit-pr-review/review.py render-rules --check
 
 ## Run the toolkit-pr-review script tests (saved fixtures, no network)
 pr-review-test: py-env
@@ -1024,7 +1026,7 @@ bench-db-longhaul: bench-pg-longhaul bench-mysql-longhaul bench-mariadb-longhaul
 
 # -------- E2E tests --------
 
-.PHONY: e2e e2e-local e2e-local-smoke e2e-mini-chat e2e-docker e2e-docker-smoke e2e-tr-authz e2e-usage-collector
+.PHONY: e2e e2e-local e2e-local-smoke e2e-mini-chat e2e-docker e2e-docker-smoke e2e-tr-authz e2e-usage-collector e2e-event-broker
 
 E2E_TARGET ?=
 # E2E selectors for `make e2e-local`:
@@ -1102,6 +1104,13 @@ e2e-mini-chat:
 e2e-usage-collector:
 	$(call print_target_banner)
 	$(MAKE) e2e-local SUITE=usage-collector
+
+## Run event-broker E2E tests (its own standalone binary, not a cf-gears-example-server feature)
+e2e-event-broker: py-env
+	$(call print_target_banner)
+	cargo build -p cf-gears-event-broker --bin cf-gears-event-broker-server
+	E2E_BINARY=target/debug/cf-gears-event-broker-server \
+		$(PYTHON) -m pytest testing/e2e/suites/event_broker/ -vv
 
 # -------- Code coverage --------
 
@@ -1359,7 +1368,7 @@ oop-example:
 	cargo run --bin cf-gears-example-server --features oop-example,users-info-example,static-authn,static-authz,static-tenants,static-credstore -- --config config/quickstart.yaml run
 
 # Run all quality checks
-check: fmt cfs-validate clippy lychee security dylint gts-docs test
+check: fmt cfs-validate docker-pins clippy lychee security dylint gts-docs test
 	$(call print_target_banner)
 
 # Lightweight quality check for gear-scoped CI (gear-scoped-ci.yml).

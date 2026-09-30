@@ -9,7 +9,7 @@ purpose: Cross-cutting rules every review sub-agent follows, regardless of which
 
 Read this before emitting findings. It holds what is common to every sub-agent: how severity is
 assigned, what the inline markers on a criterion mean, and what discipline applies to reporting.
-The checks themselves live in each agent's own prompt under `docs/toolkit-pr-review/agents/`, and the
+The checks themselves live in the rule modules under `docs/toolkit-pr-review/rules/`, and the
 wording of a comment is governed by `docs/toolkit-pr-review/comment-style.md`.
 
 ## Severity

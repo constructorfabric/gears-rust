@@ -72,21 +72,20 @@ patterns = ["gears/system/oagw/docs/adr-*.md"]
 
 
 [[ignore]]
-reason = "Ignore usage-collector DESIGN, DECOMPOSITION, features and ADRs — they still describe the superseded model (counter/gauge usage kinds, event deactivation, signed compensation) and reference concepts the PRD no longer defines, pending the rewrite to aggregation folds and invalidation tracked in PRD section 13. PRD.md still validated via autodetect."
+reason = "Ignore usage-collector DECOMPOSITION, features and code — they still describe the superseded model (counter/gauge usage kinds, event deactivation, signed compensation) and reference identifiers the current specs no longer define, pending their rewrite to aggregation folds and invalidation."
 patterns = [
-  "gears/system/usage-collector/docs/DESIGN.md",
   "gears/system/usage-collector/docs/DECOMPOSITION.md",
   "gears/system/usage-collector/docs/features/*",
-  "gears/system/usage-collector/docs/ADR/*",
   "gears/system/usage-collector/usage-collector/src/*",
   "gears/system/usage-collector/usage-collector/tests/*",
   "gears/system/usage-collector/usage-collector-sdk/src/*",
 ]
 
 [[ignore]]
-reason = "Ignore the TimescaleDB usage-collector storage plugin — its specs and code still describe the superseded model and reference usage-collector concepts the PRD no longer defines (fr-usage-compensation, fr-event-deactivation, fr-usage-type-registration, fr-usage-type-deletion, fr-usage-type-existence-and-semantics), pending the plugin's own update to aggregation folds and invalidation once the rewrite tracked in PRD section 13 lands. Docs and code are ignored together: ignoring the specs alone would orphan the plugin's code traceability markers."
+reason = "Ignore the TimescaleDB usage-collector storage plugin's stale documents and its code traceability. docs/PRD.md and docs/DESIGN.md are written docs-first against the gear's target Plugin SPI and stay unignored; DESIGN §4.5 says the crate predates them. docs/DECOMPOSITION.md and docs/features/ still describe the superseded model (usage-type catalog, counter/gauge kinds, compensation rows and deactivation cascade, 4-tuple dedup, AVG, a table-wide retention policy) and cite plugin IDs that PRD.md and DESIGN.md no longer define. src/ and tests/ implement that superseded model: src/gear.rs marks cpt-cf-usage-collector-flow-foundation-plugin-host-binding, defined only in the gear's stale docs/features/foundation.md and usage-type-lifecycle.md that the block above ignores, and src/infra/storage/record_store.rs and catalog_store.rs mark cpt-cf-uc-plugin-seq-deactivate-cascade, cpt-cf-uc-plugin-seq-create-type and cpt-cf-uc-plugin-seq-delete-type-fk, which DESIGN.md no longer defines. Drop the code patterns when the crate is ported to the target SPI and every marker names a defined ID; drop the doc patterns when DECOMPOSITION.md and features/ are rewritten."
 patterns = [
-  "gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/docs/*",
+  "gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/docs/DECOMPOSITION.md",
+  "gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/docs/features/*",
   "gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/src/*",
   "gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/tests/*",
 ]
@@ -124,10 +123,20 @@ patterns = [
 ]
 
 [[ignore]]
-reason = "Ignore file-storage companion docs — api.md is a reference summary supplementary to DESIGN.md, and operations.md is an operator-facing config/runbook reference (P2 remediation item 3.8), not standalone SDLC artifacts."
+reason = "Ignore file-storage companion docs — api.md is a reference summary supplementary to DESIGN.md, operations.md is an operator-facing config/runbook reference, and concurrency-and-failure-model.md is a reference catalogue of the gear's races and failure modes (cited from its tests). All three are supplementary to DESIGN.md, not standalone SDLC artifacts."
 patterns = [
   "gears/file-storage/docs/api.md",
   "gears/file-storage/docs/operations.md",
+  "gears/file-storage/docs/concurrency-and-failure-model.md",
+]
+
+[[ignore]]
+reason = "Ignore file-storage codebase and features — the feature docs declare CDSL flows (multipart collide/reclaim, policy-set, retention-create) that were reworked in the file-storage feature branch and cannot be validated against the current main code until the code MR (2/3) lands; the matching code/tests/sdk markers stay in sync with them there. Same shape as the oagw entry above. PRD/DESIGN/ADR/DECOMPOSITION and non-flow feature docs stay validated via autodetect."
+patterns = [
+  "gears/file-storage/file-storage/src/*",
+  "gears/file-storage/file-storage/tests/*",
+  "gears/file-storage/file-storage-sdk/src/*",
+  "gears/file-storage/docs/features/*",
 ]
 
 [[ignore]]

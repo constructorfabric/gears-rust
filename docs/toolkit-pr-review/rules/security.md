@@ -13,7 +13,7 @@ Apply `RUST-DEP-001` **only** to the files listed in `manifest_files`, which you
 separately. No other agent applies this rule.
 If the PR contains no manifest file, skip that rule and report nothing for it.
 
-A manifest file that is also in `deleted_files` was removed outright. Its snapshot in `files/` is
+A manifest file whose `status` in `context.json` is `deleted` was removed outright. Its snapshot in `files/` is
 the **base** content, so read it there to see what the PR dropped. Deleting `deny.toml` or
 `.cargo/audit.toml` removes a supply-chain control and is a `RUST-DEP-001` finding in its own
 right; emit it with **no** `line` field at all, since the file has no RIGHT-side line. Do not skip
@@ -145,5 +145,5 @@ comment on it, and do not ask for the file to be read.
 - The `deny.toml` license allowlist widened, or `[sources]` loosened, with no stated reason
 - A `rust-toolchain.toml` pin change: call it out, since it shifts which version-gated criteria are live across every agent
 - Deleting `deny.toml` or `.cargo/audit.toml` outright, which removes a supply-chain control. Emit it with **no** `line` field
-  why: such a file is in `deleted_files` and its snapshot in `files/` is the **base** content,
+  why: such a file has `status: "deleted"` and its snapshot in `files/` is the **base** content,
        so read it there. It has no RIGHT-side line to anchor on.

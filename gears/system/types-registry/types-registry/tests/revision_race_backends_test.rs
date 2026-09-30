@@ -37,7 +37,7 @@ use types_registry::domain::admission::revision::RevisionCommit;
 use types_registry::domain::admission::unit::{EvaluatedOutcome, EvaluatedUnit, commit_revision};
 use types_registry::domain::admission::vector::RevisionVector;
 use types_registry::domain::admission::worker::{ItemFailure, WorkerError};
-use types_registry::domain::artifacts::{MaterializedArtifacts, content_hash};
+use types_registry::domain::artifacts::MaterializedArtifacts;
 use types_registry::domain::enums::{DependencyKind, EntityKind, OperationKind, OwnershipScope};
 use types_registry::domain::family::family_key;
 use types_registry::domain::ports::metrics::PassLabels;
@@ -89,7 +89,6 @@ fn unit(gts_id: &str, body: &str, operation_item_id: i64) -> EvaluatedUnit {
         gts_uuid: parsed.to_uuid(),
         family_key: family_key(&parsed),
         canonical_body: body.to_owned(),
-        content_hash: content_hash(body),
         outcome: EvaluatedOutcome::TypeSchema {
             is_abstract: false,
             artifacts: MaterializedArtifacts {
@@ -114,8 +113,7 @@ fn unit(gts_id: &str, body: &str, operation_item_id: i64) -> EvaluatedUnit {
 }
 
 /// One admitted entity at `resource_version = 1` whose current revision carries
-/// `BODY_A` under its **real** digest, which is what makes the `unchanged`
-/// prefilter meaningful.
+/// `BODY_A`, byte for byte what an `unchanged` candidate must match.
 async fn seed_entity_at_revision_one(db: &Provider, gts_id: &str) -> i64 {
     let conn = db.conn().expect("conn");
     let scope = allow_all();
@@ -157,7 +155,6 @@ async fn seed_entity_at_revision_one(db: &Provider, gts_id: &str) -> i64 {
             entity_id: entity.id,
             revision_no: 1,
             raw_schema: BODY_A.to_owned(),
-            content_hash: content_hash(BODY_A),
             gts_spec_version: gts::GTS_SPECIFICATION_VERSION.to_owned(),
             gts_impl_version: gts::GTS_IMPLEMENTATION_VERSION.to_owned(),
             compat_forced: false,

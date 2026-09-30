@@ -42,6 +42,13 @@ pub enum DomainError {
     #[error("Internal error: {message}")]
     InternalError { message: String },
 
+    /// An outbox enqueue failed. The typed [`OutboxError`](crate::domain::repos::OutboxError)
+    /// is kept as the error source so the chain survives; the REST layer derives
+    /// the HTTP status from the inner variant (oversize is a client error, the
+    /// rest are server faults).
+    #[error(transparent)]
+    Outbox(#[from] crate::domain::repos::OutboxError),
+
     #[error("Web search is currently disabled")]
     WebSearchDisabled,
 

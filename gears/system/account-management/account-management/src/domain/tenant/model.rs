@@ -115,6 +115,23 @@ pub struct TenantModel {
     pub deleted_at: Option<OffsetDateTime>,
 }
 
+/// One ancestor on the path between a recursive-listing root and a
+/// listed tenant — the projection
+/// [`crate::domain::tenant::repo::TenantRepo::ancestor_chains`]
+/// returns. Narrower than [`TenantModel`] on purpose: the chain is
+/// path context for placing a row in the tree, not a tenant read.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantAncestorRow {
+    pub id: Uuid,
+    pub name: String,
+    /// Raw stored type uuid; the service lowers it to the chained
+    /// type string through the types registry, like `TenantModel`.
+    pub tenant_type_uuid: Uuid,
+    /// Absolute depth (root = 0), used to order a chain top-down.
+    pub depth: u32,
+}
+
 // `retention_window_secs` lives on the `tenants` entity (see
 // `src/infra/storage/entity/tenants.rs`) but stays off `TenantModel`:
 // it is an operator-set per-tenant override of the gear-default

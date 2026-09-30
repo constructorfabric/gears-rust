@@ -50,8 +50,12 @@ struct NoDispatch;
 
 #[async_trait::async_trait]
 impl OperationDispatch for NoDispatch {
-    async fn enqueue(&self, _tx: &DbTx<'_>, _operation_id: Uuid) -> anyhow::Result<()> {
-        Ok(())
+    async fn enqueue(
+        &self,
+        _tx: &DbTx<'_>,
+        _operation_id: Uuid,
+    ) -> Result<toolkit_db::outbox::Wake, types_registry::domain::admission::OutboxError> {
+        Ok(toolkit_db::outbox::Wake::empty())
     }
 }
 
@@ -80,7 +84,7 @@ async fn submit(db: &Arc<DBProvider<DbError>>, key: &str, gts_id: &str, content:
         },
         &dispatch,
         &SubmitRequest {
-            idempotency_key: key.to_owned(),
+            idempotency_key: Some(key.to_owned()),
             kind: domain_enums::OperationKind::Registration,
             dry_run: false,
             candidates: vec![Candidate {
@@ -693,7 +697,7 @@ async fn an_unresolvable_reference_is_an_item_failure_not_a_worker_error() {
     assert_eq!(item.status, domain_enums::OperationItemStatus::Failed);
     assert_eq!(
         item.failure.as_ref().expect("failure").reason,
-        AdmissionFailureReason::InvalidSchema,
+        AdmissionFailureReason::DependencyNotFound,
     );
 
     let provider = worker_provider(&db);

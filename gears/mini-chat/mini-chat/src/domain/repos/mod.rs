@@ -26,7 +26,7 @@ pub(crate) use message_repo::{
 pub(crate) use model_resolver::ModelResolver;
 pub(crate) use outbox_enqueuer::{
     AttachmentCleanupEvent, ChatCleanupEvent, CleanupOutcome, CleanupReason, OutboxEnqueuer,
-    SecondaryCleanupRef, ThreadSummaryTaskPayload,
+    OutboxError, SecondaryCleanupRef, ThreadSummaryTaskPayload, Wake,
 };
 pub(crate) use policy_snapshot_provider::PolicySnapshotProvider;
 pub(crate) use quota_usage_repo::{IncrementReserveParams, QuotaUsageRepository, SettleParams};

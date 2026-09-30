@@ -306,7 +306,7 @@ AM coordinates user lifecycle operations but **does not own user identity data**
 - User self-registration: users are provisioned via API within tenant security context (invite model only).
 - User authentication flows: covered by IAM PRD.
 - Tenant context propagation (SecurityContext population, cross-tenant rejection, service-to-service forwarding): framework and AuthZ Resolver responsibility.
-- Barrier-aware tenant tree traversal (ancestor chains, descendant queries with `BarrierMode`): Tenant Resolver Plugin responsibility. AM owns the underlying `tenants` + `tenant_closure` storage and the canonical closure shape, and exposes it to the Plugin via a read-only database role; barrier-aware SDK queries are served by the Plugin over that shared storage. AM's own public API exposes tenant CRUD and direct-children discovery, not barrier-aware subtree traversal.
+- Barrier-aware tenant tree traversal (ancestor chains, descendant queries with `BarrierMode`): Tenant Resolver Plugin responsibility. AM owns the underlying `tenants` + `tenant_closure` storage and the canonical closure shape, and exposes it to the Plugin via a read-only database role; barrier-aware SDK queries are served by the Plugin over that shared storage. AM's own public API exposes tenant CRUD and children discovery — direct, or over the caller's visible subtree with `recursive=true` — under the PDP-emitted scope; it does not expose `BarrierMode` selection or ancestor-chain resolution for arbitrary tenants, which stay with the Plugin.
 - AuthZ Resolver (PDP) implementation: covered by Gears DESIGN; this gear covers the tenant model consumed by PDP.
 - Resource provisioning and lifecycle for non-identity platform resources: outside AM scope. AM provides tenant context and ownership boundaries but does not manage downstream resource CRUD or provisioning workflows.
 - Tenant lifecycle events (CloudEvents): deferred until EVT (Events and Audit Bus) is introduced.
@@ -439,9 +439,9 @@ The system **MUST** allow deletion of a **non-root** tenant only when it has no 
 
 **Actors**: `cpt-cf-account-management-actor-tenant-admin`
 
-The system **MUST** return direct children of a given tenant with pagination support and optional status filtering.
+The system **MUST** return direct children of a given tenant with pagination support and optional status filtering, and **MUST**, when the caller requests it (`recursive=true`), return every descendant of that tenant visible to the caller under the same visibility rules as the direct-children listing, each row carrying its ancestor chain relative to the requested tenant so a client can place it in the hierarchy. Name search **MUST** be expressible through the OData `$filter` string operators (`eq`, `ne`, `in`, `contains`, `startswith`, `endswith`) on `name`.
 
-- **Rationale**: Tenant administrators need a predictable way to browse and manage immediate children; deeper barrier-aware traversal is handled by Tenant Resolver.
+- **Rationale**: Tenant administrators need a predictable way to browse immediate children and to find a tenant anywhere below a root in one paginated request; without a server-side recursive search a client has to walk every level and filter in memory, which prevents lazy loading. The Tenant Resolver SDK facade remains the barrier-mode traversal primitive for gears; the REST recursive listing is Account Management's own read surface over the same tables.
 
 #### Read Tenant Details
 

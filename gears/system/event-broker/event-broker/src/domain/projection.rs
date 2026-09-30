@@ -17,6 +17,7 @@
 
 use event_broker_sdk::gts::data_contract;
 use event_broker_sdk::models::{EventType, Topic};
+use gts::GtsIdPattern;
 use types_registry_sdk::{GtsInstance, GtsTypeSchema};
 
 use toolkit_utils::iso8601_duration::{Iso8601Duration, Iso8601DurationError};
@@ -82,7 +83,7 @@ pub fn event_type(schema: &GtsTypeSchema) -> Result<EventType, DomainError> {
         .map(|values| {
             values
                 .iter()
-                .filter_map(|value| value.as_str().map(str::to_owned))
+                .filter_map(|value| value.as_str().and_then(|s| GtsIdPattern::try_new(s).ok()))
                 .collect()
         })
         .unwrap_or_default();

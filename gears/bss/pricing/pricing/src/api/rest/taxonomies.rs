@@ -87,7 +87,7 @@ use axum::http::header::{ETAG, LOCATION};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router, http::StatusCode};
 use toolkit::api::canonical_prelude::CanonicalError;
-use toolkit::api::operation_builder::{ParamLocation, ParamSpec};
+use toolkit::api::operation_builder::ParamSpec;
 use toolkit::api::{OpenApiRegistry, operation_builder::OperationBuilder};
 use toolkit_db::secure::AccessScope;
 use toolkit_security::SecurityContext;
@@ -314,67 +314,40 @@ pub struct TaxonomyValueMutationView {
 
 /// The `{class}` path parameter.
 fn class_param() -> ParamSpec {
-    ParamSpec {
-        name: "class".to_owned(),
-        location: ParamLocation::Path,
-        required: true,
-        description: Some(
-            "Which value universe: `region`, `brand`, `partner` or `org_tier`. Each segment is \
-             the same token the class carries in an overlay's `scopeClass` field, so a \
-             generated client has one name per class (D-241); the camelCase `orgTier` section 5 \
-             used to spell is refused rather than accepted as an alias. `global` and \
-             `customerGroup` are deliberately not addressable: the first has no value universe, \
-             and the second's table belongs to the customer-group membership half and does not \
-             exist."
-                .to_owned(),
-        ),
-        param_type: "string".to_owned(),
-        // Scalar: every parameter this gear declares is single-valued.
-        // `array` arrived upstream for `?tag=a&tag=b` repeats, which no route
-        // here has.
-        array: false,
-    }
+    ParamSpec::path("class").description(
+        "Which value universe: `region`, `brand`, `partner` or `org_tier`. Each segment is \
+         the same token the class carries in an overlay's `scopeClass` field, so a \
+         generated client has one name per class (D-241); the camelCase `orgTier` section 5 \
+         used to spell is refused rather than accepted as an alias. `global` and \
+         `customerGroup` are deliberately not addressable: the first has no value universe, \
+         and the second's table belongs to the customer-group membership half and does not \
+         exist.",
+    )
 }
 
 /// The `{value}` path parameter.
 fn value_param() -> ParamSpec {
-    ParamSpec {
-        name: "value".to_owned(),
-        location: ParamLocation::Path,
-        required: true,
-        description: Some(
-            "The declared code - the string a price row's `region` or an overlay's `scopeValue` \
-             carries, exactly as the taxonomy lists it. Retired values are still addressable: \
-             retirement is a state, not a deletion, and `PATCH` with `state: active` is the way \
-             back."
-                .to_owned(),
-        ),
-        param_type: "string".to_owned(),
-        array: false,
-    }
+    ParamSpec::path("value").description(
+        "The declared code - the string a price row's `region` or an overlay's `scopeValue` \
+         carries, exactly as the taxonomy lists it. Retired values are still addressable: \
+         retirement is a state, not a deletion, and `PATCH` with `state: active` is the way \
+         back.",
+    )
 }
 
 /// The `If-Match` header the per-value `PATCH` requires (D-171), asserting the
 /// **value's own** tag rather than the set's.
 fn if_match_value_param() -> ParamSpec {
-    ParamSpec {
-        name: "If-Match".to_owned(),
-        location: ParamLocation::Header,
-        required: true,
-        description: Some(
-            "Mandatory precondition (RFC 9110). The value is the **opaque** tag `GET \
-             .../values/{value}` returns in its `ETag` header - copy it back verbatim. It \
-             digests this one value's code, state, label and (region) tax markers, so it moves \
-             when this value changes and **not** when a sibling does: two admins editing two \
-             different values do not refuse each other, which is the reason this route exists \
-             beside the whole-set `PUT`. The set's tag from `GET .../taxonomies/{class}` does \
-             not satisfy it. A tag that no longer describes the value is `409` `STALE_VERSION`; \
-             an absent or malformed one is `400`."
-                .to_owned(),
-        ),
-        param_type: "string".to_owned(),
-        array: false,
-    }
+    ParamSpec::header("If-Match").required(true).description(
+        "Mandatory precondition (RFC 9110). The value is the **opaque** tag `GET \
+         .../values/{value}` returns in its `ETag` header - copy it back verbatim. It \
+         digests this one value's code, state, label and (region) tax markers, so it moves \
+         when this value changes and **not** when a sibling does: two admins editing two \
+         different values do not refuse each other, which is the reason this route exists \
+         beside the whole-set `PUT`. The set's tag from `GET .../taxonomies/{class}` does \
+         not satisfy it. A tag that no longer describes the value is `409` `STALE_VERSION`; \
+         an absent or malformed one is `400`.",
+    )
 }
 
 /// Build the Axum router for the taxonomy operations and register them.

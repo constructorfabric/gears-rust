@@ -34,8 +34,12 @@ struct NoDispatch;
 
 #[async_trait::async_trait]
 impl OperationDispatch for NoDispatch {
-    async fn enqueue(&self, _tx: &DbTx<'_>, _operation_id: Uuid) -> anyhow::Result<()> {
-        Ok(())
+    async fn enqueue(
+        &self,
+        _tx: &DbTx<'_>,
+        _operation_id: Uuid,
+    ) -> Result<toolkit_db::outbox::Wake, types_registry::domain::admission::OutboxError> {
+        Ok(toolkit_db::outbox::Wake::empty())
     }
 }
 
@@ -145,7 +149,7 @@ async fn submit(
         },
         &dispatch,
         &SubmitRequest {
-            idempotency_key: key.to_owned(),
+            idempotency_key: Some(key.to_owned()),
             kind,
             dry_run,
             candidates,
@@ -1001,7 +1005,7 @@ async fn run_batch_permitting_force(
         },
         &dispatch,
         &SubmitRequest {
-            idempotency_key: key.to_owned(),
+            idempotency_key: Some(key.to_owned()),
             kind: OperationKind::Registration,
             dry_run,
             candidates,
@@ -1114,7 +1118,7 @@ async fn a_dry_run_does_not_waive_where_the_deployment_refuses_force() {
         },
         &dispatch,
         &SubmitRequest {
-            idempotency_key: "forced".to_owned(),
+            idempotency_key: Some("forced".to_owned()),
             kind: OperationKind::Registration,
             dry_run: true,
             candidates: vec![forced_creation(FORCED_ONE, open_schema(FORCED_ONE, true))],
