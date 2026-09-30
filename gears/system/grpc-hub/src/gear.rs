@@ -33,6 +33,27 @@ use toolkit_transport_grpc::{InternalAuthEnforcement, InternalAuthGrpcLayer};
 #[cfg(windows)]
 use toolkit_transport_grpc::create_named_pipe_incoming;
 
+/// Accepted TCP connections with `TCP_NODELAY` set.
+///
+/// tonic applies its own `tcp_nodelay` option only when it binds the listener
+/// itself (`Server::serve`). The hub binds its own listener (to learn the bound
+/// address before serving), so without this every accepted socket keeps
+/// Nagle's algorithm on. A small write that follows an unacknowledged one then
+/// waits for the peer's delayed ACK, about 40 ms on Linux. Unary calls mostly
+/// escape it; server-streamed messages (cache watch events, leader status) do
+/// not. Measured on minikube with the cluster perf suite: watch delivery went
+/// from 44.6 ms to 1.55 ms at p50 (48 ms to 3.6 ms at p99), unary latency
+/// unchanged.
+fn nodelay_incoming(
+    listener: TcpListener,
+) -> impl tokio_stream::Stream<Item = std::io::Result<tokio::net::TcpStream>> {
+    tokio_stream::StreamExt::map(TcpListenerStream::new(listener), |accepted| {
+        let stream = accepted?;
+        stream.set_nodelay(true)?;
+        Ok(stream)
+    })
+}
+
 const DEFAULT_LISTEN_ADDR: SocketAddr =
     SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 50051));
 
@@ -599,11 +620,10 @@ impl GrpcHub {
 
         ready.notify();
 
-        let incoming = TcpListenerStream::new(listener);
         Server::builder()
             .layer(self.effective_auth_layer()?)
             .add_routes(routes)
-            .serve_with_incoming_shutdown(incoming, async move {
+            .serve_with_incoming_shutdown(nodelay_incoming(listener), async move {
                 cancel.cancelled().await;
             })
             .await?;
@@ -873,6 +893,21 @@ mod tests {
     use toolkit::{client_hub::ClientHub, config::ConfigProvider, context::GearCtx};
     use tower::Service;
     use uuid::Uuid;
+
+    #[tokio::test]
+    async fn accepted_tcp_connections_have_nodelay_set() {
+        use tokio_stream::StreamExt as _;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut incoming = Box::pin(nodelay_incoming(listener));
+        let _client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let accepted = incoming.next().await.unwrap().unwrap();
+        assert!(
+            accepted.nodelay().unwrap(),
+            "Nagle must be off on accepted sockets"
+        );
+    }
 
     const SERVICE_A: &str = "grpc_hub.test.ServiceA";
     const SERVICE_B: &str = "grpc_hub.test.ServiceB";
