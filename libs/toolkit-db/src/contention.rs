@@ -41,7 +41,15 @@ use sea_orm::{DbBackend, DbErr};
 
 /// `MySQL` deadlock SQLSTATE code.
 const MYSQL_DEADLOCK_SQLSTATE: &str = "40001";
-const MYSQL_DEADLOCK_MSG: &str = "deadlock";
+/// The SQLSTATE under which `MySQL` reports contention in words rather than
+/// with a code of its own: `InnoDB`'s lock-wait timeout (`1205`) and every
+/// Galera/wsrep abort arrive as the generic `HY000`.
+const MYSQL_GENERIC_SQLSTATE: &str = "HY000";
+/// `InnoDB`'s deadlock message, whole. The bare word `deadlock` is not enough:
+/// `MySQL` echoes a rejected value into an `HY000` message too (`Incorrect
+/// DATE value: '...'`), so a value that merely contains the word would read as
+/// a conflict and be retried.
+const MYSQL_INNODB_DEADLOCK_MSG: &str = "deadlock found when trying to get lock";
 const MYSQL_WSREP_DEADLOCK_MSG: &str = "wsrep detected deadlock/conflict";
 const MYSQL_WSREP_CERTIFICATION_ERROR_MSG: &str = "transaction failed due to certification error";
 const MYSQL_WSREP_CANNOT_CERTIFY_MSG: &str = "transaction cannot be certified";
@@ -49,6 +57,19 @@ const MYSQL_WSREP_WRITE_SET_CONFLICT_MSG: &str = "write-set conflict";
 const MYSQL_WSREP_CERTIFICATION_FAILURE_MSG: &str =
     "transaction rolled back due to certification failure";
 const MYSQL_RESTART_MSG: &str = "try restarting transaction";
+/// The `MySQL` contention conditions that are told by their wording, written
+/// once: both tiers that read `MySQL` text consult this list, so a new wsrep
+/// message added here classifies the same whether or not the driver reported
+/// a code beside it.
+const MYSQL_CONTENTION_WORDINGS: [&str; 7] = [
+    MYSQL_INNODB_DEADLOCK_MSG,
+    MYSQL_WSREP_DEADLOCK_MSG,
+    MYSQL_WSREP_CERTIFICATION_ERROR_MSG,
+    MYSQL_WSREP_CANNOT_CERTIFY_MSG,
+    MYSQL_WSREP_WRITE_SET_CONFLICT_MSG,
+    MYSQL_WSREP_CERTIFICATION_FAILURE_MSG,
+    MYSQL_RESTART_MSG,
+];
 
 /// `PostgreSQL` retryable SQLSTATE codes.
 const PG_SERIALIZATION_FAILURE: &str = "40001";
@@ -69,15 +90,13 @@ const PG_DEADLOCK_DETECTED: &str = "40P01";
 const PG_SERIALIZATION_MSG: &str = "could not serialize access";
 const PG_DEADLOCK_MSG: &str = "deadlock detected";
 
-/// `SQLite` error codes for write contention.
-///
-/// sqlx surfaces these as `"error returned from database: (code: N) database is locked"`.
-const SQLITE_BUSY_CODE: &str = "(code: 5)";
-const SQLITE_BUSY_SNAPSHOT_CODE: &str = "(code: 517)";
-/// The same two, as the driver reports them rather than as a message renders
-/// them.
-const SQLITE_BUSY: &str = "5";
-const SQLITE_BUSY_SNAPSHOT: &str = "517";
+/// `SQLite` result codes for write contention, as the driver reports them.
+const SQLITE_BUSY_CODE: &str = "5";
+const SQLITE_BUSY_SNAPSHOT_CODE: &str = "517";
+/// The same two as a rendered message carries them: sqlx writes
+/// `"error returned from database: (code: N) database is locked"`.
+const SQLITE_BUSY_RENDERED: &str = "(code: 5)";
+const SQLITE_BUSY_SNAPSHOT_RENDERED: &str = "(code: 517)";
 const SQLITE_LOCKED_MSG: &str = "database is locked";
 
 /// Returns `true` if the error is a transient lock-contention error that is
@@ -89,9 +108,14 @@ const SQLITE_LOCKED_MSG: &str = "database is locked";
 /// * `SQLite` `SQLITE_BUSY` (code 5) — `busy_timeout` expired
 /// * `SQLite` `SQLITE_BUSY_SNAPSHOT` (code 517) — WAL snapshot conflict
 ///
-/// Detection prefers the code the driver reported ([`crate::db_error`]), and
-/// falls back to the error's string representation when there is none. Neither
-/// puts a `sqlx` type in this signature.
+/// Detection reads the code the driver reported ([`crate::db_error`]) first.
+/// On `PostgreSQL` and `SQLite` the code decides alone: a contention code is
+/// retryable, any other code is not, and the message is never read. On
+/// `MySQL` the code decides too, with one opening: under the generic `HY000`
+/// the wording is consulted, because that is the code Galera aborts and the
+/// lock-wait timeout arrive under. The string representation is read only for
+/// an error that carried no code at all. Nothing here puts a `sqlx` type in
+/// the signature.
 ///
 /// # Why `DbErr::Custom` is also checked
 ///
@@ -119,22 +143,20 @@ pub fn is_retryable_contention(backend: DbBackend, err: &DbErr) -> bool {
             return true;
         }
         // The code the driver gave us settles the question -- except on
-        // `MySQL`, where Galera reports a certification conflict in wording and
-        // a build we have not measured may do so under a generic code such as
-        // `HY000`. Everywhere else every contention condition has a code of its
-        // own, and letting the rendered text answer after the code has spoken
-        // only invites the value the statement supplied to answer for it:
-        // `PostgreSQL` prints that value into the message of a `22P02` just as
-        // it does into a `23505`, so a row carrying the text `deadlock
-        // detected` would be retried forever instead of reported as the
-        // deterministic refusal it is.
-        //
-        // The same reasoning bounds the `MySQL` exception: Class 23 ends the
-        // question there too, because a duplicate-key message also quotes the
-        // offending value.
+        // `MySQL` under `HY000`, the one code it reports contention in words
+        // under: Galera's certification aborts and `InnoDB`'s lock-wait
+        // timeout. Everywhere else every contention condition has a code of
+        // its own, and letting the rendered text answer after the code has
+        // spoken only invites the value the statement supplied to answer for
+        // it: `PostgreSQL` prints that value into the message of a `22P02`
+        // just as it does into a `23505`, so a row carrying the text
+        // `deadlock detected` would be retried forever instead of reported as
+        // the deterministic refusal it is. The same holds for `MySQL` under
+        // any code but `HY000`: a `22007` or a `23000` quotes the rejected
+        // value too, and no contention arrives under them.
         return backend == DbBackend::MySql
-            && !mysql_names_a_refusal(&code)
-            && is_contention_wording(backend, &err.to_string());
+            && code == MYSQL_GENERIC_SQLSTATE
+            && mysql_contention_wording(&err.to_string());
     }
 
     // No code to read: a `DbErr::Custom` a caller composed, or a driver error
@@ -149,21 +171,6 @@ pub fn is_retryable_contention(backend: DbBackend, err: &DbErr) -> bool {
     }
 }
 
-/// Whether `code` names a deterministic refusal on `MySQL` -- something the
-/// statement did wrong, which retrying cannot fix.
-///
-/// Class 23 (`integrity_constraint_violation`) entire, wider than
-/// [`crate::db_error::constraint_violation`] on purpose: that table names only
-/// the conditions a caller in this workspace branches on, while this question
-/// is the cruder one of whether retrying could possibly help.
-///
-/// `MySQL` is the only backend that has to ask. On the others a code that is
-/// not a contention code already ends the question, so a refusal never reaches
-/// the wording tier.
-fn mysql_names_a_refusal(code: &str) -> bool {
-    code.starts_with("23")
-}
-
 /// Whether `code`, as the driver reported it, is a contention condition.
 ///
 /// `PostgreSQL` and `MySQL` report a SQLSTATE; `SQLite` reports its extended
@@ -172,35 +179,23 @@ fn is_contention_code(backend: DbBackend, code: &str) -> bool {
     match backend {
         DbBackend::MySql => code == MYSQL_DEADLOCK_SQLSTATE,
         DbBackend::Postgres => code == PG_SERIALIZATION_FAILURE || code == PG_DEADLOCK_DETECTED,
-        DbBackend::Sqlite => code == SQLITE_BUSY || code == SQLITE_BUSY_SNAPSHOT,
+        DbBackend::Sqlite => code == SQLITE_BUSY_CODE || code == SQLITE_BUSY_SNAPSHOT_CODE,
         _ => false,
     }
 }
 
-/// The message signals that are *words*, not codes.
+/// The `MySQL` contention conditions that are told by their wording.
 ///
-/// Kept for an error that carried a code we do not recognise: Galera surfaces
-/// certification conflicts in wording, and a serialization failure says so in
-/// its text. What is deliberately absent is the numeric matching in
-/// `contains_sqlstate` -- when the driver handed us a code, digging a different
-/// one out of the rendered text can only be a coincidence, and a UUID in an
-/// interpolated message supplies those.
-fn is_contention_wording(backend: DbBackend, msg: &str) -> bool {
-    match backend {
-        DbBackend::MySql => {
-            let msg = msg.to_ascii_lowercase();
-            msg.contains(MYSQL_DEADLOCK_MSG)
-                || msg.contains(MYSQL_WSREP_DEADLOCK_MSG)
-                || msg.contains(MYSQL_WSREP_CERTIFICATION_ERROR_MSG)
-                || msg.contains(MYSQL_WSREP_CANNOT_CERTIFY_MSG)
-                || msg.contains(MYSQL_WSREP_WRITE_SET_CONFLICT_MSG)
-                || msg.contains(MYSQL_WSREP_CERTIFICATION_FAILURE_MSG)
-                || msg.contains(MYSQL_RESTART_MSG)
-        }
-        DbBackend::Postgres => msg.contains(PG_SERIALIZATION_MSG) || msg.contains(PG_DEADLOCK_MSG),
-        DbBackend::Sqlite => is_sqlite_busy(msg),
-        _ => false,
-    }
+/// `MySQL` alone: it is the one backend whose text is read after a code, and
+/// the one whose no-code tier has a wording list at all. What is deliberately
+/// absent is the numeric matching in `contains_sqlstate` -- when the driver
+/// handed us a code, digging a different one out of the rendered text can only
+/// be a coincidence, and a UUID in an interpolated message supplies those.
+fn mysql_contention_wording(msg: &str) -> bool {
+    let msg = msg.to_ascii_lowercase();
+    MYSQL_CONTENTION_WORDINGS
+        .iter()
+        .any(|wording| msg.contains(wording))
 }
 
 /// Match an error message against the contention signatures of `backend`.
@@ -219,16 +214,10 @@ fn is_contention_message(backend: DbBackend, msg: &str) -> bool {
     }
 }
 
+/// The no-code tier for `MySQL`: the wording list, plus the SQLSTATE a
+/// rendered message may carry when the driver gave none.
 fn is_mysql_deadlock(msg: &str) -> bool {
-    let msg = msg.to_ascii_lowercase();
-    msg.contains(MYSQL_DEADLOCK_SQLSTATE)
-        || msg.contains(MYSQL_DEADLOCK_MSG)
-        || msg.contains(MYSQL_WSREP_DEADLOCK_MSG)
-        || msg.contains(MYSQL_WSREP_CERTIFICATION_ERROR_MSG)
-        || msg.contains(MYSQL_WSREP_CANNOT_CERTIFY_MSG)
-        || msg.contains(MYSQL_WSREP_WRITE_SET_CONFLICT_MSG)
-        || msg.contains(MYSQL_WSREP_CERTIFICATION_FAILURE_MSG)
-        || msg.contains(MYSQL_RESTART_MSG)
+    msg.contains(MYSQL_DEADLOCK_SQLSTATE) || mysql_contention_wording(msg)
 }
 
 fn is_pg_contention(msg: &str) -> bool {
@@ -258,7 +247,7 @@ fn contains_sqlstate(msg: &str, sqlstate: &str) -> bool {
 }
 
 fn is_sqlite_busy(msg: &str) -> bool {
-    (msg.contains(SQLITE_BUSY_CODE) || msg.contains(SQLITE_BUSY_SNAPSHOT_CODE))
+    (msg.contains(SQLITE_BUSY_RENDERED) || msg.contains(SQLITE_BUSY_SNAPSHOT_RENDERED))
         && msg.contains(SQLITE_LOCKED_MSG)
 }
 
@@ -334,12 +323,25 @@ mod tests {
             "a unique violation must not be retried because its value spells contention"
         );
 
-        // Class 23 entire, not only the two codes `constraint_violation` names.
+        // Class 23 entire, not only the two codes `constraint_violation` names,
+        // on `PostgreSQL` and on `MySQL` alike. `MySQL` is the backend where
+        // this is a decision rather than a consequence: its wording is read
+        // after a code, and only under `HY000`.
         for code in ["23505", "23503", "23001", "23514", "23502", "23P01"] {
             let err = refused(code, "could not serialize access due to concurrent update");
             assert!(
                 !is_retryable_contention(DbBackend::Postgres, &err),
                 "{code} is a refusal"
+            );
+        }
+        for code in ["23000", "23505", "23503"] {
+            let err = refused(
+                code,
+                "Duplicate entry 'x' for key 'PRIMARY'; try restarting transaction",
+            );
+            assert!(
+                !is_retryable_contention(DbBackend::MySql, &err),
+                "MySQL {code} is a refusal, whatever its text says"
             );
         }
 
@@ -372,6 +374,58 @@ mod tests {
             "WSREP detected deadlock/conflict and aborted the transaction",
         );
         assert!(is_retryable_contention(DbBackend::MySql, &err));
+    }
+
+    /// The `MySQL` wording tier, under a code: every wording in the list is
+    /// reached under `HY000` -- each on its own, so no case rides on the
+    /// `deadlock` phrase answering first -- and none of them answers under any
+    /// other code. The generic code is the only one `MySQL` reports contention
+    /// in words under; a `22007` or a `42000` quotes what the statement
+    /// supplied, and `Sequencer::run` would re-push such a refusal as dirty on
+    /// every cycle with no budget to stop it.
+    #[test]
+    #[cfg(any(feature = "pg", feature = "mysql", feature = "sqlite"))]
+    fn mysql_wording_answers_under_the_generic_code_alone() {
+        let wordings = [
+            "Deadlock found when trying to get lock; try restarting transaction",
+            "Lock wait timeout exceeded; try restarting transaction",
+            "WSREP detected deadlock/conflict and aborted the transaction",
+            "Transaction failed due to certification error",
+            "Transaction cannot be certified",
+            "WSREP: Transaction failed due to write-set conflict",
+            "Transaction rolled back due to certification failure",
+        ];
+        for wording in wordings {
+            assert!(
+                is_retryable_contention(DbBackend::MySql, &refused("HY000", wording)),
+                "under HY000 `{wording}` is contention"
+            );
+            for code in ["22007", "42000", "23000", "HY001"] {
+                assert!(
+                    !is_retryable_contention(DbBackend::MySql, &refused(code, wording)),
+                    "under {code} `{wording}` is what the statement did, not contention"
+                );
+            }
+        }
+        assert!(
+            wordings
+                .iter()
+                .filter(|w| !w.to_ascii_lowercase().contains("deadlock"))
+                .count()
+                >= 5,
+            "most of the list has to be reached without the deadlock phrase"
+        );
+
+        // And the word alone is not the condition: `MySQL` echoes a rejected
+        // value into an `HY000` message too.
+        let echoed = refused(
+            "HY000",
+            "Incorrect DATE value: 'deadlock' for column 'due' at row 1",
+        );
+        assert!(
+            !is_retryable_contention(DbBackend::MySql, &echoed),
+            "a value that contains the word is not a deadlock"
+        );
     }
 
     /// And the wording tier is `MySQL`'s alone. `PostgreSQL` and `SQLite` name
