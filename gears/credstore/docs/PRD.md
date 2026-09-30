@@ -139,6 +139,8 @@ PRs #4737 (documentation) and #4741 (implementation) reshaped the consumer surfa
 | Shipped storage | The storage of the shipped gear: metadata in the gear's database and values in a `CredStorePluginClientV1` value-store backend; the source of the one-off migration |
 | Owner offboarding | Removal of all private records of one owner in one tenant |
 | Credential index | The gear's derived, rebuildable database of record fields used for listing and resolution; holds no secret |
+| Operation identifier | A unique identifier the gear generates for every write and stores inside the record it writes to the secret store, so that the outcome of a write whose store request ended without a definite answer can be read back |
+| Unfinished write | The mark the gear records in the credential index for a reference before writing it in the secret store; it identifies the write that recorded it, directs every read of that reference to the secret store, and is cleared only by that write once the secret store has accepted it |
 | Installation prefix | The part of the secret store's key space reserved for one CredStore installation |
 | PDP | The platform policy decision point, `authz-resolver` |
 | SecurityContext | The request security context carrying the authenticated tenant, subject and claims |
@@ -230,7 +232,7 @@ PRs #4737 (documentation) and #4741 (implementation) reshaped the consumer surfa
 - Several installations **MUST** be able to share one secret store, each confined to its own installation prefix.
 - The gear requires a database (PostgreSQL or SQLite) for the credential index only.
 - The gear depends on `authz-resolver`, `tenant-resolver` and `types-registry` and initializes at system priority; its consumers resolve the client during their own initialization.
-- No resident background task and no scheduled job is required for correctness; the only background work is index repair and the operator-triggered index rebuild.
+- No resident background task and no scheduled job exists: the credential index is repaired on access to a reference and rebuilt only when an operator triggers it.
 - Development and automated tests run against an OpenBao instance or the in-process test backend, an in-process store adapter with the same observable behaviour; preventing the in-process adapter from being selected in production is `cpt-cf-credstore-fr-store-config-check` (p2).
 
 ## 4. Scope
@@ -584,7 +586,7 @@ Every change of an own record **MUST** produce a new store-assigned version, mon
 - every read, listing and resolution **MUST** treat a tombstone as an absent record;
 - a create-only write over a tombstone **MUST** succeed and continue its version;
 - a guarded write carrying a validator from before the delete **MUST** fail as a conflict;
-- a tombstone **MUST** be removed from the secret store only by tenant offboarding (`cpt-cf-credstore-fr-tenant-offboarding`); the credential index is not the record of a tombstone, and its own entry for one can expire after a retention period, because the secret store stays authoritative.
+- a tombstone **MUST** be removed from the secret store only by tenant offboarding (`cpt-cf-credstore-fr-tenant-offboarding`) or owner offboarding (`cpt-cf-credstore-fr-owner-offboarding`); the credential index keeps its entry for a tombstone for as long as the tombstone exists, so no index entry expires on its own.
 
 - **Rationale**: A reused version would let a delayed writer holding a stale validator overwrite a credential it never saw (ABA).
 - **Actors**: `cpt-cf-credstore-actor-tenant-admin`, `cpt-cf-credstore-actor-self-rotating-app`, `cpt-cf-credstore-actor-backend`
@@ -657,9 +659,20 @@ The gear's database **MUST** serve only as a derived index of record fields. It 
 - **self-healing** — an index entry left stale by a crash, a lost update or a reordered update is corrected on the next access to its reference or by a rebuild, and an older state never overwrites a newer one;
 - **online rebuild** — an operator-triggered rebuild runs while the gear serves traffic, is safe to interrupt and re-run, and converges to exactly the secret store's content.
 
+To make these guarantees hold without background work, every write — create, full replace, partial update and delete — **MUST** follow these rules:
+
+- **intent before the store** — before writing a reference in the secret store, the gear **MUST** record an unfinished write for that reference in the index; when the index database is unavailable the write **MUST** fail as unavailable and **MUST NOT** reach the secret store;
+- **conditioned on the index version** — the store write **MUST** be conditioned on the version the index holds for the reference (absent for a reference never written, the tombstone's version over a tombstone); on a conflict the gear **MUST** re-read the stored record, bring the index entry up to the stored state, leave the unfinished write in place and report the conflict;
+- **identifier in the record** — the record written to the secret store **MUST** carry the write's operation identifier;
+- **completion** — after the secret store accepts the write, the gear **MUST** bring the index entry up to the stored state, never replacing a newer state with an older one, and **MUST** clear the unfinished write only if it is still the one this write recorded, leaving an unfinished write recorded by a later write in place; a failure of this step **MUST NOT** fail the write, because the unfinished write already directs later reads to the secret store;
+- **uncertain outcome** — when the store request fails without a definite answer, the gear **MUST** read the record back: if it carries the write's operation identifier the write succeeded and **MUST** be reported as such; otherwise the write **MUST** be reported as unavailable and its unfinished write left in place;
+- **reads honour unfinished writes** — resolution, point reads and listings **MUST** read from the secret store every reference on the requesting subject's chain that has an unfinished write and is not farther from the requesting tenant than the decisive record (every such reference when no record is decisive), and **MUST** resolve by the stored state; this applies at every level of the hierarchy, so a change in the middle of the chain (an override, a suppression or a descendant block) is honoured by every descendant at once, and **MUST NOT** clear the unfinished write;
+- **clearing** — an unfinished write **MUST** be cleared only by the write that recorded it, after the secret store accepted that write; reads, repairs and rebuilds **MUST NOT** clear it; an unfinished write left by an interrupted write stays until a later write to the same reference records its own and clears it, and until then every resolution that reaches it costs one extra store read;
+- **no time-based decisions** — resolution, repair and clearing decisions **MUST NOT** depend on the age of an unfinished write or on any clock; its age serves observability only.
+
 Loss of the database **MUST NOT** lose any credential.
 
-- **Rationale**: The index exists only to make listing and hierarchical resolution cheap; making it disposable removes backup coupling between two stores and the class of bugs where the two disagree about what may be served.
+- **Rationale**: The index exists only to make listing and hierarchical resolution cheap; making it disposable removes backup coupling between two stores, and recording the intent before the store write means an interrupted write can never leave a stored credential that reads skip — including in the middle of the hierarchy, where a missed override, suppression or descendant block would otherwise serve an ancestor's secret.
 - **Actors**: `cpt-cf-credstore-actor-platform-gear`, `cpt-cf-credstore-actor-platform-operator`
 
 #### Migration from the Shipped Storage
@@ -757,7 +770,7 @@ The system **MUST** remove every private record of one owner in one tenant — i
 - by a user-deletion hook of account-management, which does not exist yet and has to be agreed with account-management (account-management today has such a cascade hook only for tenant hard deletion);
 - by a manual administrative operation with the same effect, authorized by its own dedicated PDP action, for users who already left.
 
-Owner offboarding **MUST** start only after the owner has been deprovisioned in the identity provider, so that no new access token can be issued for the owner. A private record the owner recreates with an access token issued earlier **MUST** be removed by repeating the removal once the longest platform access-token lifetime has passed; the repeated run is an ordinary idempotent run, and no write fence or other stored state is kept for the owner. Completion **MUST** be reported only after every private record of the owner in the tenant has been removed from both the secret store and the index.
+Owner offboarding **MUST** start only after the owner has been deprovisioned in the identity provider, so that no new access token can be issued for the owner. A private record the owner recreates with an access token issued earlier is visible to no subject, because its owner no longer exists; it **MUST** be removed by the next owner offboarding run or by tenant offboarding, and no delayed, repeated or scheduled run is kept for it. Completion **MUST** be reported only after every private record of the owner in the tenant has been removed from both the secret store and the index.
 
 `tenant` and `shared` records created by the departed user **MUST NOT** be affected: they belong to the tenant.
 
@@ -841,7 +854,7 @@ In the steady state a single-credential read **MUST** cost at most one index que
 
 - [ ] `p1` - **ID**: `cpt-cf-credstore-nfr-availability`
 
-Every call to a dependency — secret store, index database, PDP, `tenant-resolver`, `types-registry`, `event-broker` — **MUST** be bounded by a timeout. When the event broker is unavailable, only operations that return or change a secret fail (`cpt-cf-credstore-nfr-audit`). When the secret store is unreachable, sealed or throttling, or when any other dependency fails or times out, every affected operation **MUST** fail as unavailable, with a retry hint when one is known. The gear **MUST NOT** serve a secret whose record it has not read from the secret store for that request, and **MUST NOT** return a result decided by index data it could not confirm against the secret store. The gear **MUST NOT** add any availability dependency beyond those listed. The gear **MUST NOT** cache secrets across requests; caching is permitted only inside the backend under `cpt-cf-credstore-fr-store-portability`.
+Every call to a dependency — secret store, index database, PDP, `tenant-resolver`, `types-registry`, `event-broker` — **MUST** be bounded by a timeout. When the event broker is unavailable, only operations that return or change a secret fail (`cpt-cf-credstore-nfr-audit`). When the secret store is unreachable, sealed or throttling, or when any other dependency fails or times out, every affected operation **MUST** fail as unavailable, with a retry hint when one is known. The gear **MUST NOT** serve a secret whose record it has not read from the secret store for that request, and **MUST NOT** return a result decided by index data it could not confirm against the secret store. The gear **MUST NOT** add any availability dependency beyond those listed. The gear **MUST NOT** cache secrets across requests; caching is permitted only inside the backend under `cpt-cf-credstore-fr-store-portability`. When the index database is unavailable, every write **MUST** fail as unavailable before reaching the secret store (`cpt-cf-credstore-fr-derived-index`).
 
 - **Threshold**: zero secrets served under an unconfirmed visibility decision, and no request exceeding the sum of its dependency timeouts, in fault-injection tests.
 - **Rationale**: Credential access favours correctness over availability.
@@ -861,7 +874,7 @@ Credential durability **MUST** equal the secret store's: the recovery point of a
 
 - [ ] `p1` - **ID**: `cpt-cf-credstore-nfr-observability`
 
-The gear **MUST** emit metrics sufficient to detect resolution anomalies and store-side failures: resolution depth and outcome (own, inherited, overridden, suppressed, miss); latency and outcome per dependency (PDP, `tenant-resolver`, `types-registry`, secret store, index, event broker), operations refused because the audit event was not accepted, change outcomes that could not be published with store failures classified as not-found, conflict, forbidden, throttled, sealed or other; index repairs and rebuild progress; cross-tenant denials. Metrics **MUST NOT** require counting queries, and metric labels **MUST NOT** contain references or secrets.
+The gear **MUST** emit metrics sufficient to detect resolution anomalies and store-side failures: resolution depth and outcome (own, inherited, overridden, suppressed, miss); latency and outcome per dependency (PDP, `tenant-resolver`, `types-registry`, secret store, index, event broker), operations refused because the audit event was not accepted, change outcomes that could not be published with store failures classified as not-found, conflict, forbidden, throttled, sealed or other; index repairs and rebuild progress; cross-tenant denials. Metrics **MUST NOT** require counting queries, and metric labels **MUST NOT** contain references or secrets. The gear **MUST** expose the number and the age of unfinished writes, so that writes interrupted before reaching the secret store are visible to operators.
 
 - **Threshold**: every listed signal present and exercised in integration tests.
 - **Rationale**: Index drift and store-side failures are quiet; operators need signals, not log archaeology.
@@ -958,7 +971,7 @@ The gear **MUST** emit metrics sufficient to detect resolution anomalies and sto
 - **Reference already taken by a live own non-private record**: conflict; nothing changes
 - **Type forbids `shared`**: validation error; nothing is written
 - **Secret store unavailable**: unavailable; nothing is visible and the reference is not reserved
-- **Index update fails after the store accepted the write**: the caller still gets success and sees the credential in its next read and listing; the index is corrected on the next access or by a rebuild
+- **Index update fails after the store accepted the write**: the caller still gets success; the unfinished write recorded before the store write directs the next read — the caller's and every descendant's — to the secret store, which serves the new state and repairs the index
 
 #### UC-002: OAGW Retrieves a Credential for a Customer
 
@@ -1348,7 +1361,7 @@ The gear **MUST** emit metrics sufficient to detect resolution anomalies and sto
 **Alternative Flows**:
 - **The hook is retried**: the removal is idempotent and changes nothing further
 - **The user left before the hook existed**: a tenant administrator runs the manual administrative operation, authorized by its own PDP action, with the same effect
-- **A write with an earlier-issued token races the removal**: the removal repeated after the longest access-token lifetime removes the recreated record
+- **A write with an earlier-issued token races the removal**: the recreated private record is visible to nobody and is removed by the next owner offboarding run or by tenant offboarding; nothing is scheduled for it
 
 ## 9. Acceptance Criteria
 
@@ -1359,6 +1372,10 @@ The gear **MUST** emit metrics sufficient to detect resolution anomalies and sto
 - [ ] A filtered listing never reports an item that a point read of the same reference would not return, including when an ancestor's record of that reference has a different type
 - [ ] Every credential lives in the secret store as one record with all its visibility fields; dropping the index database and rebuilding it changes no listing and no resolution result, and loses no credential
 - [ ] Fault injection at every step of a write and a delete leaves the credential either as before or as specified; no reaper, saga or maintenance job runs
+- [ ] With the gear stopped after the secret store accepted a write and before the index was updated, the next read returns the written state for the writer and for every descendant, including an override, a suppression and a descendant block set in the middle of a three-level hierarchy
+- [ ] With the index database unavailable, no write reaches the secret store
+- [ ] A write whose store request timed out is reported as succeeded exactly when the stored record carries its operation identifier
+- [ ] No resolution, repair or clearing decision changes when the clock is moved
 - [ ] Versions never repeat across delete and re-create; of two concurrent writes under one validator exactly one succeeds
 - [ ] Expired records are invisible to every read and are replaced or removed by the next write or delete that addresses them, with no job running
 - [ ] A binary secret written through the in-process client round-trips byte-exact for a type that allows binary; a non-UTF-8 secret is rejected on the REST transport
@@ -1411,9 +1428,9 @@ The gear **MUST** emit metrics sufficient to detect resolution anomalies and sto
 | Event broker outage | Secret reads and changes unavailable, including the OAGW hot path; metadata operations unaffected | Fail fast with retry hints; bounded timeouts; dependency metrics; broker high availability is a platform concern |
 | Secret store outage, seal or throttling | All credential operations unavailable, including the OAGW hot path | Fail closed with retry hints; bounded timeouts; dependency metrics; store high availability is a platform concern |
 | Store latency on the OAGW hot path | Slower upstream calls than with a local value store | One store read per call (`cpt-cf-credstore-nfr-resolution-cost`); no gear-side secret cache; the backend may cache under per-key linearizability |
-| Index drift after partial failures or out-of-band store edits | Listing or resolution temporarily wrong for a reference | Every served result re-checked in the store; index updates ordered by version; repair on access; rebuild; drift metrics |
+| Index drift after partial failures or out-of-band store edits | Listing or resolution temporarily wrong for a reference | Unfinished write recorded before every store write and honoured by every read; index updates ordered by version; repair on access; rebuild; unfinished-write metrics; out-of-band store edits are unsupported |
 | Database loss | Listing and resolution degraded until rebuild | Online rebuild (UC-015); reads correct or unavailable meanwhile |
-| Tombstones kept for deleted references so versions never repeat | Store key space grows with deletions | A tombstone holds no secret, so this is a storage cost only; it is bounded by tenant offboarding (p2) and nothing else, and index entries for tombstones expire after a retention period |
+| Tombstones kept for deleted references so versions never repeat | Store key space grows with deletions | A tombstone holds no secret, so this is a storage cost only; it is bounded by tenant and owner offboarding (p2) and nothing else, and their index entries are kept for as long as the tombstones |
 | Previous and expired secrets remain in the store | A rotated secret stays as an older store version, and an expired secret stays until its reference is written or deleted; neither is reachable through the gear | No retained previous secrets (p2); expired-secret retention is an open question |
 | Ancestor-chain cache staleness | A re-parented tenant keeps its former inheritance for up to the cache TTL | Short TTL; closing the window needs a hierarchy change signal from `tenant-resolver` |
 | Consumer migration breaks OAGW, settings-service or the IdP plugin | Integrations fail after cutover | Surface of #4741; migrate all three in the cutover release; contract tests against OpenBao |
