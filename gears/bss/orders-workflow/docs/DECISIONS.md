@@ -6072,7 +6072,7 @@ reasons `invalid-dependency-graph` and `catalog-topology-unavailable` are withdr
 subject to wait for (`owf_compensation_record.outcome` is `succeeded | failed-pending-escalation`;
 `blocked_by_record_id` is dropped). The Catalog ask (`…-upreq-catalog-dependency-topology-read`)
 and the topology row of the failure-reason coverage ask are withdrawn; PRD §6.1, §5.1, §7.1 and
-acceptance criterion 5 are amended through `UPSTREAM_REQS.md` §4 item 15. The catalogue holds 41 reasons.
+acceptance criterion 5 are rewritten in place, recorded as `UPSTREAM_REQS.md` §4 item 15. The catalogue holds 41 reasons.
 
 **Rationale**: under PriceBook a line is one plan revision with its selected items; an add-on is an
 optional item of the same revision, inside the line; Pricing refuses bundle SKUs as plan items; and
@@ -6091,7 +6091,7 @@ constraint `…-constraint-bundle-one-line` retitled, `…-constraint-dependency
 `…-entity-dependency-edge` retired); `design/05-provisioning-intents.md` §3.2, §3.6;
 `design/06-saga-and-compensation.md` §2.1, §3.3, §3.6, §3.7, §4.8; `design/07-manual-tasks.md` §3.3, §3.7, §4;
 `design/08-hold-and-cancel.md` §3.2; `design/10-process-definition.md` §3.6 (b); `design/01-foundation.md`
-§4.9; `ADR/0005`; `DESIGN.md` §1.2, §3.5; `PRD.md` §6.1 and criterion 5 (notes); `UPSTREAM_REQS.md`
+§4.9; `ADR/0005`; `DESIGN.md` §1.2, §3.5; `PRD.md` §1.3, §5.1, §6.1, §7.1, criterion 5, §15 (rewritten in place); `UPSTREAM_REQS.md`
 §1.1, §1.2, §2.4, §2.5, §3, §4 item 15, §5.
 
 ### D-197 (H) The approval policy owner is this gear's approval-policy adapter; the Generic Approval service is withdrawn
