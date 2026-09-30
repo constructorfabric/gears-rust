@@ -458,7 +458,7 @@ A tenant **MUST** be able to mark its own non-private record so that the referen
 - **use the ancestor's credential, pass nothing down** — a declared record with fallback `inherit` and a block: the tenant resolves the ancestor's secret; its descendants resolve nothing;
 - **own secret for me, nothing for my descendants** — a record holding a secret with a block: the tenant resolves its own secret; its descendants resolve neither that secret nor the ancestor's.
 
-A descendant **MUST** still be able to hold its own record under a block: its own record wins for itself and, per its own sharing mode, for its subtree; deleting it returns the descendant to the block, not to the ancestor's credential. The block **MUST** apply across isolation barriers, **MUST** be settable and removable with `write` alone, and **MUST** be reported to descendants as `suppressed` without naming the blocking tenant. The block **MUST** be an addition to the record: sharing mode and fallback policy keep their meaning, and a record without a block resolves exactly as it would without this requirement. Preventing a descendant from creating its own record is a PDP grant decision, not a record field.
+A descendant **MUST** still be able to hold its own record under a block: its own record wins for itself and, per its own sharing mode, for its subtree; deleting it returns the descendant to the block, not to the ancestor's credential. The block **MUST** apply across isolation barriers, **MUST** be settable and removable with `write` alone, and a descendant that holds its own record under the block **MUST** see the inheritance status `suppressed` on that record, while a descendant without an own record **MUST** resolve the reference as not found, in point reads and listings alike, without learning that a block exists or who set it. The block **MUST** be an addition to the record: sharing mode and fallback policy keep their meaning, and a record without a block resolves exactly as it would without this requirement. Preventing a descendant from creating its own record is a PDP grant decision, not a record field.
 
 - **Rationale**: Partners reselling to sub-partners need to consume a credential without passing it on, or to replace it for themselves without exposing either key to their customers.
 - **Actors**: `cpt-cf-credstore-actor-tenant-admin`, `cpt-cf-credstore-actor-integrations-admin`
@@ -472,7 +472,7 @@ Every credential representation **MUST** carry an inheritance status describing 
 - `own` — the decisive record is the caller's tenant's (or the caller's private) record and no ancestor record of the reference is visible;
 - `inherited` — the decisive record is an ancestor's;
 - `overridden` — the decisive record is the caller's own and takes precedence over an ancestor's `shared` record of the reference (with or without a secret) or over a descendant block;
-- `suppressed` — the decisive record makes the reference resolve as absent, whether it is the caller's own or an ancestor's.
+- `suppressed` — the decisive record makes the reference resolve as absent, whether it is the caller's own or an ancestor's; this status is carried only by the caller's own record — a caller without an own record receives not found, so a point read and a listing agree.
 
 The status **MUST** be readable with metadata actions alone and **MUST NOT** be stored.
 
@@ -620,7 +620,7 @@ Addressing and operations:
 
 - every key is addressed as the SPI shipped today addresses it: a tenant, a reference and an optional owner; an owner present means the private class;
 - the SPI **MUST** provide: reading a record with its backend-assigned version; a conditional write of a record, either only if the key is absent or only if the stated version is current, returning the new version; a cursor-paginated listing of keys with their versions — for the whole installation, for one tenant, or for one owner in a tenant — without a total count; and, for `p2` offboarding only, removing a key together with its whole history;
-- the record is opaque to the backend: the gear **MUST** serialize the secret together with all its visibility fields, and **MUST** write a delete as a secret-less tombstone through the same conditional write, so no separate delete operation exists in `p1`.
+- the record is opaque to the backend: the gear **MUST** serialize the secret together with all its visibility fields, and **MUST** write a delete as a secret-less tombstone through the same conditional write, so no separate delete operation exists in `p1`; a create-only write of the consumer surface over a tombstone **MUST** be performed by the gear as a conditional write on the tombstone's current version, so the version continues and the backend needs no knowledge of tombstones, and the "only if the key is absent" condition applies only to a key that was never written or was removed with its whole history.
 
 Required guarantees. Every backend **MUST** provide:
 
@@ -756,6 +756,8 @@ The system **MUST** remove every private record of one owner in one tenant — i
 
 - by a user-deletion hook of account-management, which does not exist yet and has to be agreed with account-management (account-management today has such a cascade hook only for tenant hard deletion);
 - by a manual administrative operation with the same effect, authorized by its own dedicated PDP action, for users who already left.
+
+Owner offboarding **MUST** start only after the owner has been deprovisioned in the identity provider, so that no new access token can be issued for the owner. A private record the owner recreates with an access token issued earlier **MUST** be removed by repeating the removal once the longest platform access-token lifetime has passed; the repeated run is an ordinary idempotent run, and no write fence or other stored state is kept for the owner. Completion **MUST** be reported only after every private record of the owner in the tenant has been removed from both the secret store and the index.
 
 `tenant` and `shared` records created by the departed user **MUST NOT** be affected: they belong to the tenant.
 
@@ -1166,7 +1168,7 @@ The gear **MUST** emit metrics sufficient to detect resolution anomalies and sto
 **Main Flow**:
 1. T2 creates its own `shared` record with V2 → T2 and T3 resolve V2; T2 sees `overridden`
 2. T2 rotates to V3 → T2 and T3 resolve V3; V2 is no longer retrievable through the gear
-3. T2 sets fallback `none` and removes the secret in one partial update → T2 and T3 resolve nothing and see `suppressed`; T1 and its other descendants are unaffected
+3. T2 sets fallback `none` and removes the secret in one partial update → T2 resolves nothing and sees `suppressed` on its own record; T3 resolves nothing and gets not found; T1 and its other descendants are unaffected
 4. T2 deletes its record → T2 and T3 resolve V1 again and see `inherited`
 
 **Postconditions**:
@@ -1188,7 +1190,7 @@ The gear **MUST** emit metrics sufficient to detect resolution anomalies and sto
 
 **Main Flow**:
 1. T2 creates a declared record with fallback `inherit` and a descendant block
-2. T2 resolves V1 and sees `inherited`; T3 resolves nothing and sees `suppressed`, without learning who blocked it
+2. T2 resolves V1 and sees `inherited`; T3 resolves nothing and gets not found, without learning that a block exists or who set it
 
 **Postconditions**:
 - T2 uses T1's credential; T3 and its subtree receive nothing
@@ -1346,6 +1348,7 @@ The gear **MUST** emit metrics sufficient to detect resolution anomalies and sto
 **Alternative Flows**:
 - **The hook is retried**: the removal is idempotent and changes nothing further
 - **The user left before the hook existed**: a tenant administrator runs the manual administrative operation, authorized by its own PDP action, with the same effect
+- **A write with an earlier-issued token races the removal**: the removal repeated after the longest access-token lifetime removes the recreated record
 
 ## 9. Acceptance Criteria
 
