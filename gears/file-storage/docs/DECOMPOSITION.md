@@ -269,8 +269,10 @@ gear's code. It remains a planned P2 requirement (see PRD.md/DESIGN.md).
     merge algorithm that resolves them into one effective policy
   - `GET`/`PUT /policy` (tenant or user scope) and `GET /policy/effective` (the resolved effective policy for the
     caller's context)
-  - Enforcement call sites: allowed-MIME check, effective size-limit check, metadata-limit check, wired into
-    the create-file and multipart-initiate paths
+  - Enforcement call sites: allowed-MIME, effective size-limit and metadata-limit checks on `create_file`
+    (including idempotent replay) and `presign_version`; size re-check at single-shot finalization; MIME and
+    size checks at multipart initiate and size re-check at multipart completion; metadata-limit check on the
+    merged metadata in `update_metadata`
 
 - **Out of scope**:
   - Storage quota enforcement (a related but separate control -- `cpt-cf-file-storage-fr-storage-quota`, not
