@@ -75,7 +75,7 @@ what exactly stays?
 * PRD §6.1: this gear owns the process record at audit grade independently of engine history. Whatever drives the flow, every step must land in Orders' own tables in Orders' own transaction, with the outbox enqueue of ADR-0008 in that same transaction.
 * PRD §15 criteria: commercial data must not sit in engine history; history isolation, retention and residency must be assessable; gear-owned audit must survive an engine purge. Task inputs and outputs are what an engine persists, so their content is the lever.
 * PRD §5.2: an instance is pinned to the definition version it started under; the platform pins in-flight invocations to the callable version (DESIGN.md line 614), and Orders must record the same binding on its side.
-* Seam rules R1–R5: Lifecycle, Subscriptions, Payments and Generic Approval are called only from inside Orders code. A definition that called them directly would move seam authority into a document that a platform operator can publish.
+* Seam rules R1–R5: Lifecycle, Subscriptions, Payments and the approval policy adapter are called only from inside Orders code. A definition that called them directly would move seam authority into a document that a platform operator can publish.
 * The closed sets stay PRD-owned: nine Lifecycle triggers in, six process events out, a closed registered reason catalogue. The definition may order the flow; it may not widen a set.
 * Honesty: `gears/serverless-runtime/` contains documentation and a `gear.toml` and no crate — no `Cargo.toml`, no Rust source, no `plugins/<backend>-plugin/` directory (the layout ADR-0005 line 83 prescribes). The decision must state what holds if the platform slips.
 

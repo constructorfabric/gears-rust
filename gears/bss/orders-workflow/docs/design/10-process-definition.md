@@ -172,7 +172,7 @@ outside Orders' record) and **no `emit`** task (Orders publishes its six process
 its own producer inside operations, [`01 §4.7`](./01-foundation.md#47-declared-events-per-settlement-and-the-six-named-process-events-only)).
 No `call` targets a registered platform Function, because a Function's effect would be outside
 Orders' record and outside the step surface's authorization (decision D-136). It never calls
-Orders Lifecycle, Subscriptions, Payments or the Generic Approval service
+Orders Lifecycle, Subscriptions, Payments or the approval policy adapter
 directly — seam rules R1–R5 bind the operations — and its jq expressions select and re-key
 references; they never compute a business value ([`01 §4.14`](./01-foundation.md#414-determinism-discipline-what-is-computed-on-which-side-of-the-boundary)).
 
@@ -392,7 +392,7 @@ lines 1136–1230), so no member falls to a schema default (decision D-127):
     at most 1 % of lines, so about 3 % of orders at p50 3 lines (1 − 0.99³), each held about 24 h
     (the longer SLA class; a breach escalates rather than ends the wait), 5 × 0.0297 × 86,400 ≈
     **12,830**. Phase 1 therefore needs about **14,630**, since no approval gate fires while
-    Generic Approval is inert (Q-05). Each further 1 % of orders held for a 72 h escalation window
+    the approval policy adapter is inert behind its stand-in (Q-05, D-197). Each further 1 % of orders held for a 72 h escalation window
     adds 5 × 0.01 × 259,200 = **12,960**, and each 1 % of orders dated *d* days ahead in
     `awaitExpected` adds 4,320 × *d*; the design does not fix either share, which is an input to
     the NFR workshop. 50,000 covers phase 1 with about 35,000 to spare, for example 1 % gated at
@@ -612,7 +612,7 @@ are **never published to the broker**: they are not among the six process events
 |-------------------|----------------|----------|
 | `serverless-runtime` | Function registry, invocation, event-trigger APIs (§3.3) | Publishing and executing the definition; **no code today** |
 | `orders-workflow` (this gear, `01`–`09`) | `POST /bss-orders-workflow/v1/steps/{operation}` | Every `call` task |
-| `event-broker` | Broker topics of Lifecycle, Generic Approval, Subscriptions and Orders' own process events | The `listen` targets, consumed by the plugin's event subscription |
+| `event-broker` | Broker topics of Lifecycle, the approval policy adapter, Subscriptions and Orders' own process events | The `listen` targets, consumed by the plugin's event subscription |
 
 **Dependency Rules** (per project conventions):
 - No circular dependencies
@@ -624,7 +624,7 @@ are **never published to the broker**: they are not among the six process events
 ### 3.5 External Dependencies
 
 None. The definition calls no dependency outside this gear; Lifecycle, Subscriptions, Payments
-and the Generic Approval service are reached only from inside step operations (seam rules R1–R5,
+and the approval policy adapter are reached only from inside step operations (seam rules R1–R5,
 `01 §3.5`).
 
 ### 3.6 Interactions & Sequences
@@ -1375,9 +1375,9 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
 - onPlan:                               # 04 §4.8 item 3 and §4.3
     switch:
       - frozen:           { when: '${ $context.planState == "frozen" }', then: beginFulfillment }
-      - topology:         { when: '${ $context.planState == "topology-unavailable" }', then: planTask }   # a plan task under EITHER policy
-      - invalidRemediate: { when: '${ $context.policy == "remediate" }', then: planTask }
-      - invalidFailFast:  { then: planFailFast }
+      - bindingExpired:   { when: '${ $context.planState == "binding-expired" }', then: planTask }   # a plan task under EITHER policy: the expected-fulfillment instant is at or after the accepted-binding deadline (04 §3.6, D-194)
+      - otherRemediate:   { when: '${ $context.policy == "remediate" }', then: planTask }   # any other non-frozen planState 04 §4.3 registers; none today, since D-196 withdrew invalid-graph and topology-unavailable
+      - otherFailFast:    { then: planFailFast }
 - planTask:                             # fragment (c)
     set: { failureScope: plan, failureSubjects: '${ [ { subjectRef: $context.planRef, reason: $context.planReason, cause: "plan-not-frozen" } ] }', sourceStep: construct-and-freeze-plan, sourceAttempt: '${ $context.planAttempt | tostring }', forceTask: true, nextStage: failure, stageLoop: null }
     then: exit
@@ -1393,7 +1393,7 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
       - begun:   { when: '${ $context.beginResult == "in-fulfillment" }', then: planFailFastUnwind }
       - waiting: { then: enterPlanFailedWait }   # withheld | held | version-conflict: the order is not in fulfillment, so no failure can be acknowledged yet
 - enterPlanFailedWait: { set: { planFailed: true }, then: enterEligibilityWait }   # the next eligible round calls begin-fulfillment under a new eligibilitySeq; the lifecycle arm ends the wait on an amendment or expiry
-- planFailFastUnwind: { set: { unwind: failure, nextStage: unwind, stageLoop: null }, then: exit }   # fragment (c): nothing to void; fulfillment_failed with dependency-graph-invalid (06 §4.8)
+- planFailFastUnwind: { set: { unwind: failure, nextStage: unwind, stageLoop: null }, then: exit }   # fragment (c): nothing to void; fulfillment_failed with the plan's reason (06 §4.8)
 - beginFulfillment:                     # protected (04): the R1 seam call approved → in_fulfillment; enqueues OrderFulfillmentStarted
     timeout: step
     try:
@@ -1589,11 +1589,12 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
       as: waveError
       when: '${ $waveError.status as $s | any((409, 408, 429, 503, 504); . == $s) }'
       do: [ { classify: { set: { waveOutcome: '${ if $waveError.status == 409 then "reread" else "exhausted" end }', waveCause: '${ if $waveError.status == 408 then "step-deadline-exceeded" else "retry-budget-exhausted" end }' } } } ]
-    export: { as: '${ $context + { waveOutcome: (.waveOutcome // "answered"), waveCause: (.waveCause // null), wave2Attempt: (($context.wave2Round | tostring) + (if $context.wave2AttemptKey then ":" + ($context.wave2AttemptKey | tostring) else "" end)), wave2AttemptKey: (if (.waveOutcome // "answered") == "answered" then null else $context.wave2AttemptKey end), wave2Failed: ($context.wave2Failed + (.failed // [])), wave2Pending: (.pending // []), pendingLapsed: ((($context.pendingLapsed // []) + (.lapsed // [])) | unique), wave2Deferred: (.deferred // []), wave2DeferReason: (.deferReason // null), wave2Round: (.nextDispatchRound // $context.wave2Round) } }' }
+    export: { as: '${ $context + { waveOutcome: (.waveOutcome // "answered"), waveCause: (.waveCause // null), wave2Attempt: (($context.wave2Round | tostring) + (if $context.wave2AttemptKey then ":" + ($context.wave2AttemptKey | tostring) else "" end)), wave2AttemptKey: (if (.waveOutcome // "answered") == "answered" then null else $context.wave2AttemptKey end), wave2Failed: ($context.wave2Failed + (.failed // [])), wave2Pending: (.pending // []), pendingLapsed: ((($context.pendingLapsed // []) + (.lapsed // [])) | unique), wave2Deferred: (.deferred // []), wave2DeferReason: (.deferReason // null), wave2BindingExpired: (.bindingExpired // false), wave2Round: (.nextDispatchRound // $context.wave2Round) } }' }
 - onWave2:                              # 05 §4.5 items 4–6 and 9; as onWave1: deferred, then failed, then lapsed (D-165)
     switch:
       - reread:     { when: '${ $context.waveOutcome == "reread" }',    then: wave2Reread }
       - exhausted:  { when: '${ $context.waveOutcome == "exhausted" }', then: wave2Exhausted }
+      - bindingExpired: { when: '${ $context.wave2BindingExpired }', then: wave2BindingExpired }   # D-194: the guard's deadline half; nothing was submitted, and no list is non-empty
       - deferred:   { when: '${ ($context.wave2Deferred | length) > 0 }', then: awaitDeferral2 }   # the deferral loop is the deferred lines' only carrier (item 4); wave2Failed and pendingLapsed accumulate across answers, so neither is dropped by the wait
       - anyFailed:  { when: '${ ($context.wave2Failed | length) > 0 }', then: lineFailure2 }   # D-54; before lapsed, so a line failed in the same answer as a lapsed one gets its task (item 6)
       - lapsed:     { when: '${ ($context.pendingLapsed | length) > 0 }', then: rebuildLapsed }   # after a failure, onEvaluate rebuilds them on the return to the barrier
@@ -1612,6 +1613,7 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
 - wave2Exhausted:
     set: { failureScope: line, failureSubjects: '${ [ $context.eligibleLineRefs[] | { subjectRef: ., reason: "wave2-activation-failed", cause: $context.waveCause } ] }', sourceStep: dispatch-wave2-activate, sourceAttempt: '${ $context.wave2Attempt }', nextStage: failure, stageLoop: null }
     then: exit
+- wave2BindingExpired: { set: { unwind: failure, nextStage: unwind, stageLoop: null, wave2BindingExpired: false }, then: exit }   # fragment (c), EITHER policy, no manual task (07 §4.8): the unwind voids the drafts and cancels any activated line, then fulfillment_failed with order-binding-expired (06 §4.8); the cause is the record's elapsed activation_deadline_at (04 §3.7), never a definition value (D-106, D-194)
 - rebuildLapsed:                        # composable (05): a lapsed draft is rebuilt and goes back through wave 1 and the barrier, never straight to wave 2
     timeout: step
     try:
@@ -1749,10 +1751,12 @@ for. A ceiling during either call re-enters at that call, which re-issues under 
 `backToProcess` and `eligibilityTrigger`, which nothing in the ceiling writes, kept. Every route
 on from there replaces the checkpoint: `enterPlan`, `enterEligibilityWait`, `enterPlanFailFast`,
 and `toLifecycle`, which records the wait so that a `back` from fragment (f) waits again rather
-than re-admitting. **Plan.** A `frozen` plan proceeds; `topology-unavailable`
-opens a plan task under either policy; `invalid-graph` opens a plan task under `remediate` and,
+than re-admitting. **Plan.** A `frozen` plan proceeds; `binding-expired` (the expected-fulfillment
+instant is at or after the version's accepted-binding deadline, 04 §3.6, decision D-194) opens a
+plan task under either policy; `line-count-exceeded` opens a plan task under `remediate` and,
 under `fail-fast`, passes `begin-fulfillment` before the unwind because no Workflow transition
-leaves `approved`. **Waves.** Each wave is **one `call` carrying `lineRefs[]`**; per-line
+leaves `approved`. There is no dependency graph to validate: lines are independent (decision
+D-196). **Waves.** Each wave is **one `call` carrying `lineRefs[]`**; per-line
 parallelism and admission are inside the operation (§2.2), and a wave's per-line outcomes come
 back as reference lists that route the `switch`. A deferral (`deferred[]`) is a settled success:
 the definition waits the fixed `PT1M` of `waitDeferral1` or `waitDeferral2` and calls again under the next
@@ -2969,7 +2973,9 @@ subject an operator can act on, and only on these routes:
 
 `reflect-verdict`'s Lifecycle refusal is not on this table: it is the settled answer `refused`,
 routed on the output to its order-scope task (`03 §4.5` item 3), so no `catch` names a 400 of it
-(decision D-190). Everything else faults: every listen-arm admission, `apply-hold`, `apply-resume`,
+(decision D-190). Nor is `dispatch-wave2-activate`'s elapsed accepted-binding deadline: it is the
+settled answer `bindingExpired: true`, routed on the output to the unwind (`wave2BindingExpired`,
+§3.6 (b); decision D-194), so no `catch` names it either. Everything else faults: every listen-arm admission, `apply-hold`, `apply-resume`,
 `authorize-cancel`, every failure of `reflect-verdict`, the evaluations and `begin-fulfillment` of slice 04,
 `report-spawn-signal`, `run-cancellation-fence`, `report-outcome`, `create-manual-task` and
 `terminate-instance`. A fault on one of them is a failure of Orders or of a dependency the order

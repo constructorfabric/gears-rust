@@ -150,8 +150,9 @@ reach. Concretely:
   > artifacts. It is part of what remains in history, stated in *Residual* below. It shows no line's
   > content: no product, offer, quantity, price or subscription. "Line counts" is therefore struck
   > from the list below, and "line items" stays.
-* **What may never cross**: resolved totals, prices, currencies or any price-pin field; catalog,
-  offer, plan or product references; line items or line counts; approver identities and any
+* **What may never cross**: totals, the TCV, prices, currencies or any field of the accepted
+  `OrderPin` (plan revision, selected items, chain bindings, price ids, the activation deadline);
+  plan-revision, item or SKU references; line items or line counts; approver identities and any
   `subject_id`; buyer or seller identity, and any tenant axis beyond `resource_tenant_id`
   (`seller_tenant_id` included); payment-authorization identifiers or instrument data; subscription
   identifiers and transition-request identifiers (they stay in the intent record and the sweep's
@@ -164,14 +165,17 @@ reach. Concretely:
 * **Trigger inputs and consumed events.** The rule covers them as well as task data. The start
   trigger's input is the raw `$workflow.input` (Serverless Workflow DSL 1.0.0, dsl.md *Runtime
   expression arguments*) and a `listen` output is the array of consumed events (dsl-reference.md
-  *Listen*), and the events as published are not references: Lifecycle's `OrderSubmitted` carries
-  the tenant axes, per-line references and pins and the resolved total's per-line net components;
+  *Listen*), and the events as published are not references only: under Lifecycle D-158 (its
+  PriceBook remediation, ADR-0008) every state event carries a **bounded projection plus a version
+  reference**, and the expanded `OrderPin`, totals and TCV are never in an event — they are read by
+  `get_version(orderId, orderVersion)` inside an operation (decision D-193). What still rides the
+  events is the projection: `OrderSubmitted` the tenant axes and the order summary;
   `OrderApproved` and `OrderRejected` the deciding authority; `OrderHeld` the hold reason;
   `OrderCancelled` the cancelling actor and the cancel reason; `OrderCompleted` the
   line-to-subscription mapping
-  ([Lifecycle `01 §4.4`](../../../orders-lifecycle/docs/design/01-foundation.md#44-events-audit-and-the-outbox-normative),
-  lines 2396–2406); the Subscriptions outcome event carries a `subscriptionId`. The start trigger
-  and every Lifecycle, Generic Approval and Subscriptions `listen` **MUST** therefore keep only the
+  ([Lifecycle `01 §4.4`](../../../orders-lifecycle/docs/design/01-foundation.md#44-events-audit-and-the-outbox-normative));
+  the Subscriptions outcome event carries a `subscriptionId`. The start trigger
+  and every Lifecycle, approval-decision and Subscriptions `listen` **MUST** therefore keep only the
   members of the permitted list above — the envelope's event identity, `orderId`, `orderVersion`
   and the fields a filter or correlation needs — through the workflow's `input.from` and the
   `listen` task's `read` mode, `output.as` and `export.as`. Whether that filtering keeps the raw
@@ -179,16 +183,17 @@ reach. Concretely:
   platform, so two routes are registered in `UPSTREAM_REQS.md` and either closes the gap: (1) the
   platform persists only the selected members
   (`cpt-cf-bss-orders-workflow-upreq-serverless-runtime-consumed-event-member-storage`); (2)
-  Lifecycle publishes thin event variants, or confirms that the full events may be stored
-  (`cpt-cf-bss-orders-workflow-upreq-lifecycle-thin-events`), with the Generic Approval decision
+  Lifecycle's bounded projections (D-158) are confirmed as storable, the residual of
+  `cpt-cf-bss-orders-workflow-upreq-lifecycle-thin-events` now that the pins and totals no longer
+  ride the events, with the approval decision
   event reference-only under `cpt-cf-bss-orders-workflow-upreq-generic-approval-expectations-contract`.
 * **Operations read commercial data under the PDP, inside Orders.** Every operation resolves
   `correlationId` (and `taskRef`/`gateRef` where given) to rows in this gear's record and performs
-  its Lifecycle, Subscriptions, Payments and Generic Approval reads and writes through the seam
+  its Lifecycle, Subscriptions, Payments and approval policy adapter reads and writes through the seam
   clients under this gear's configured authority, narrowed to that instance's `resource_tenant_id`
   and `seller_tenant_id` exactly as the step executor did (ADR-0010 as amended: the step route is
   PDP-authorized for the serverless-runtime service principal; the caller supplies references,
-  never authority). The resolved total reaches the approval request from Lifecycle through
+  never authority). The TCV reaches the approval request from Lifecycle `get_version` through
   `obtain-verdict`/`open-gates` and is never returned to the definition.
 * **Error answers** (added 2026-09-26 by D-132). A refused step call is task data too. The DSL
   raises its 4xx or 5xx answer as the communication error the `catch` sees as `$error`, and the
@@ -227,7 +232,7 @@ reach. Concretely:
   serverless-runtime section, not an assertion. **Until the member-storage ask or the Lifecycle
   thin-event ask lands, the start trigger's input and the consumed events may sit in history in
   full**: the Lifecycle commercial fields listed above, the Subscriptions `subscriptionId`, and
-  whatever the unspecified Generic Approval decision event carries. That is the stated residual of
+  whatever the unspecified approval decision event carries. That is the stated residual of
   this decision, and the platform path is not ready for a tenant for whom it is disqualifying.
 
   > **Amended 2026-09-26 by D-131**: the residual identifiers are the whole vocabulary above, not
@@ -306,7 +311,7 @@ D-65 onward.
 - **Decisions register**: [`DECISIONS.md`](../DECISIONS.md) — Q-01, D-61, D-64, D-66 (as amended), D-131, D-132, D-150, D-155, D-156, Q-12
 - **Upstream asks**: [`UPSTREAM_REQS.md`](../UPSTREAM_REQS.md) — serverless-runtime section
   (history residency and retention; member-only storage of trigger inputs and consumed events);
-  Orders Lifecycle section (thin event variants); Generic Approval section (reference-only
+  Orders Lifecycle section (thin event variants); the approval policy adapter section (reference-only
   decision event)
 - **Platform**: serverless-runtime [DESIGN.md](../../../../serverless-runtime/docs/DESIGN.md)
   §1.4.2, §3.1 (`TenantRuntimePolicy`), §3.3 (Executions API);
@@ -318,5 +323,5 @@ This decision directly addresses the following requirements or design elements:
 * `cpt-cf-bss-orders-workflow-fr-owf-process-state-nonauth` — the process record is complete in this gear because nothing crosses the engine boundary that is not already recorded here; engine history is reference-only
 * `cpt-cf-bss-orders-workflow-fr-owf-authorization` — commercial data is read only inside PDP-authorized operations; the definition and the engine never hold it
 * `cpt-cf-bss-orders-workflow-nfr-owf-retention` — retention and erasure of process artifacts apply in one store; the residual identifiers in engine history are covered by the residency and retention asks
-* `cpt-cf-bss-orders-workflow-fr-owf-approval-request` — the resolved total reaches the approval request through the seam inside `obtain-verdict`/`open-gates` and is never a task output
+* `cpt-cf-bss-orders-workflow-fr-owf-approval-request` — the TCV reaches the approval request through the seam (`get_version`) inside `obtain-verdict`/`open-gates` and is never a task output
 * `cpt-cf-bss-orders-workflow-component-foundation` (**reason catalogue**, the component `design/01-foundation.md` §3.2 declares under its unchanged identifier) — task outputs carry reason codes only; messages stay in the audit entry and the manual task

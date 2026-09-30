@@ -77,10 +77,10 @@ The second driver is auditability under multi-actor orchestration. Every route t
 registers — the four control and progress routes, the manual-task and approval endpoints of
 slices 03 and 07, the plan projection of slice 04, and the step routes of `01 §3.3` — is reachable
 by **nine** principal classes: three human (Approver, Fulfillment Operator, Seller Operator), four
-system counterparties (Orders Lifecycle, Generic Approval, Subscriptions, Payments), the platform
+system counterparties (Orders Lifecycle, the approval policy owner, Subscriptions, Payments), the platform
 Events/Audit sink, which the PRD names as an actor, and the **serverless-runtime** service
 principal that executes the definition, which the PRD does not name but which is now the only
-caller of the step surface. Three of the system actors (Generic Approval, Subscriptions, Payments)
+caller of the step surface. Three of the system actors (the approval policy owner, Subscriptions, Payments)
 are permitted to *report an outcome* but never to *drive an order state transition* directly, and
 none of them now calls this gear at all: their outcomes reach the process as events the platform
 consumes and as reads Orders makes inside its own operations. The asymmetry therefore holds on
@@ -677,7 +677,7 @@ route. `POST /bss-orders-workflow/v1/workflows` (start workflow) is removed with
 `process_instance × start` pair: an invocation is started by the platform event trigger of
 `10 §3.3` and the instance by `admit-trigger` → `start-instance`, both authorized as
 `process_step × execute`. The twelve `EVENT` handler rows — the nine Lifecycle triggers, the
-Generic Approval decision callback and the two Subscriptions outcome events — are removed because
+approval decision callback and the two Subscriptions outcome events — are removed because
 this gear no longer subscribes to any topic: the platform consumes those events as the start
 trigger or a definition `listen` (`02 §2.2`), and each reaches Orders only as the argument of a
 step call (§4.2). The three *pending* rows register only when the platform answers the dead-letter
@@ -1143,7 +1143,7 @@ sequenceDiagram
 4. [ ] - `p1` - Before any effect, the consuming operation re-reads the system of record under this gear's configured authority: `admit-trigger` performs the PDP-authorized Lifecycle `order × read` scoped to the event's order (`02 §2.1`); `record-decision` reads the decision record by `decisionEventId` (`03 §3.3`); `reconcile-intent` treats a Subscriptions confirmation as a wake-up and reads the intent's status (`05 §3.3`). A denial, timeout or configuration failure is `retryable-failure`, never staleness evidence - `inst-ev-read-gate`
 5. [ ] - `p1` - A delivery the platform cannot hand to any invocation, or whose consuming call keeps failing, is the platform trigger path's dead letter (`01 §4.8`), never an Orders record - `inst-ev-admit`
 
-**Description**: The nine Orders Lifecycle triggers, the Generic Approval decision event and the
+**Description**: The nine Orders Lifecycle triggers, the approval decision event and the
 two Subscriptions outcome events still arrive by subscription, not through the REST gateway; what
 changes under ADR-0011 is that the **platform** subscribes (`02 §2.2`). Their authenticity is
 still the **broker's produce grant on the topic plus platform-root tenancy**: only the gear granted
@@ -1466,7 +1466,7 @@ and recomposed server-side (`cpt-cf-bss-orders-workflow-constraint-tenant-namesp
 signal*); `+pg` = paged (`cpt-cf-bss-orders-workflow-constraint-bounded-page-size`);
 `+re` = authority re-checked at apply time (§4.4).
 
-| Operation (routing-table key) | Approver | Fulfillment Operator | Seller Operator | Orders Lifecycle | Generic Approval | Subscriptions | Payments | Events/Audit | serverless-runtime |
+| Operation (routing-table key) | Approver | Fulfillment Operator | Seller Operator | Orders Lifecycle | Approval policy owner | Subscriptions | Payments | Events/Audit | serverless-runtime |
 |-----------|----------|-----------------------|------------------|-------------------|-------------------|----------------|----------|----------|----------|
 | `POST /bss-orders-workflow/v1/steps/{operation}` (every step route) | — | — | — | — | — | — | — | — | ✓ `Gr` `+key`; `settle-from-lookup`, `retry-step` — |
 | `GET /bss-orders-workflow/v1/workflows/{orderId}/progress` | ✓ `A*`, §4.5 projection | ✓ `S` | ✓ `S` | ✓ `Gc` | — | — | — | — | — |
@@ -1543,7 +1543,7 @@ not a cancellation.
 order content** in every row they appear in — their grants are process-control and task-resolution
 grants, never content-authoring grants, which remain exclusively Orders Lifecycle's.
 
-**No reporting system actor drives an order state transition.** Generic Approval, Subscriptions
+**No reporting system actor drives an order state transition.** The approval policy owner, Subscriptions
 and Payments hold no pair at all, and Orders Lifecycle holds only two `Gc` reads; the order state
 transitions this gear triggers are made by its own seam calls inside step operations under its
 own authority, not by any caller's grant (ADR-0010 as amended).
@@ -1574,13 +1574,13 @@ scope that also learns an instance's invocation id (the progress read shows it t
 it closes when the platform asserts the invocation on the call itself
 (`…-upreq-serverless-runtime-attempt-and-deadline-propagation`).
 
-Three of the four PRD system actors — Generic Approval, Subscriptions, Payments — are restricted
+Three of the four PRD system actors — the approval policy owner, Subscriptions, Payments — are restricted
 to reporting an outcome; none of the three may drive an order state transition directly, and none
 holds a pair. Only this gear's own step operations, invoked by the definition and subject to the
 `Gr` grant, drive transitions, through seam calls made under this gear's authority.
 
 **The event transport is the platform's, and Orders re-verifies inside the operation.** The nine
-Lifecycle triggers, the Generic Approval decision event and the two Subscriptions outcome events
+Lifecycle triggers, the approval decision event and the two Subscriptions outcome events
 arrive by **event subscription**, and the subscriber is now the platform — the event triggers
 bound to the order-process workflow and the running invocation's `listen` tasks (`02 §2.2`,
 `10 §3.3`). This gear holds no consumer group and no handler, so there is no inbound event
@@ -1588,7 +1588,7 @@ surface for it to authenticate. What it relies on, in order:
 
 1. **The broker's produce grant on the topic.** Each topic names the gear permitted to produce
    on it — the Lifecycle topic accepts only Orders Lifecycle's producer, the decision topic only
-   Generic Approval's, the outcome topic only Subscriptions'. A message on a topic *is* the
+   the approval policy owner's (this gear's own producer under the library adapter, D-197), the outcome topic only Subscriptions'. A message on a topic *is* the
    authorization: the broker refused everyone else. Neither the platform nor this gear sees a
    producer principal or a signature — `EnvelopedEvent`
    ([`typed_event.rs`](../../../../system/event-broker/event-broker-sdk/src/typed_event.rs))

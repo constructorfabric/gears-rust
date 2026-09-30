@@ -76,7 +76,7 @@ Two sibling key families exist alongside it, at their own granularity:
 * **Approval requests**: `orderId + orderVersion + gateId`, with no line or wave component, since a
   gate is order-scoped. `gateId` is **derived deterministically** as a UUIDv5 over
   `(orderId, orderVersion, party)` rather than minted as a random uuid, so a crash between
-  submitting to the Generic Approval service and committing the gate row re-derives the *same*
+  submitting to the approval policy adapter and committing the gate row re-derives the *same*
   identifier on replay, and therefore the same key and the same gate — a randomly minted `gateId`
   would produce a second gate with a second key and defeat approval idempotency outright.
 * **Lifecycle transition calls**: `orderId + orderVersion + transitionName`, where `transitionName`

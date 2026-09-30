@@ -28,7 +28,7 @@ decision-makers: BSS Orders team (Architecture)
 
 Orders Workflow has two different kinds of "something needs a human, or at least an inspectable
 record": a fulfillment step that exhausts remediation, and an inbound trigger or callback
-(Lifecycle, Subscriptions, Payments, Generic Approval) that keeps failing delivery. Both look like
+(Lifecycle, Subscriptions, Payments, the approval policy adapter) that keeps failing delivery. Both look like
 "parking a failure somewhere inspectable," which invites collapsing them into one object. Should a
 fulfillment step's exhausted-remediation object and a poisoned-delivery dead-letter record be the
 same object, or two distinct objects with distinct entry conditions?

@@ -229,7 +229,7 @@ definition version the instance is bound to (`10`). Neither half may absorb the 
 operation **MUST NOT** call another step operation to advance the process (it may call the
 foundation's own `settle-from-lookup` and `park`/`unpark` in-process as part of its effect), and
 the definition **MUST NOT** perform an effect the envelope does not record — it has no `run`, no
-`emit`, and no direct call to Lifecycle, Subscriptions, Payments or Generic Approval (seam rules
+`emit`, and no direct call to Lifecycle, Subscriptions, Payments or the approval policy adapter (seam rules
 R1–R5 bind the operations, `10 §2`). Adjusting the flow is a new definition version; changing what
 a step does is an Orders release.
 
@@ -609,7 +609,7 @@ from it, and how they are ordered is the definition's.
 
 A definition executed by a durable engine re-issues calls by design — on task retry, on worker
 replay, on operator `retry` of a failed invocation — and each re-issue reaches Orders Lifecycle,
-Subscriptions or the Generic Approval service through an Orders operation. Storing the outcome of
+Subscriptions or the approval policy adapter through an Orders operation. Storing the outcome of
 each logical call under its key is what makes every one of those re-issues safe rather than merely
 likely-safe.
 
@@ -1252,7 +1252,7 @@ terminal.
 ### 3.5 External Dependencies
 
 This engine slice **calls** no external dependency itself. Every outbound call — to Subscriptions
-for provisioning, to Payments for authorization outcomes, to the Generic Approval service for gate
+for provisioning, to Payments for authorization outcomes, to the approval policy adapter for gate
 decisions — is made by the step operation that owns it, through that slice's own port, inside the
 envelope this engine provides; and the definition of `10` calls none of them directly (seam rules
 R1–R5, `10 §2`). The one platform egress the engine binds itself is the Event Broker, through
@@ -1261,7 +1261,7 @@ settlement transaction.
 
 It is nonetheless **not** dependency-free: the engine owns the idempotency, breaker and
 settlement semantics for the Subscriptions provisioning path, so that contract constrains this
-slice's design even though no line of this slice dials it. Payments and Generic Approval are bound
+slice's design even though no line of this slice dials it. Payments and the approval policy adapter are bound
 in the slices that call them.
 
 #### Subscriptions (provisioning path)
@@ -1680,7 +1680,7 @@ operation shape, from `owf_step_operation.submits_downstream`:
 - **An operation that submits nothing downstream** (`submits_downstream = false`) — every
   record-only operation, and every operation whose only outside call is a read: `admit-trigger`,
   `apply-hold` and `apply-resume` (a Lifecycle order read), `start-instance` (the platform's
-  invocation read), `obtain-verdict` and `record-decision` (Generic Approval reads), the
+  invocation read), `obtain-verdict` and `record-decision` (the approval policy adapter reads), the
   evaluations and `construct-and-freeze-plan` of slice 04, `reread-draft-liveness`,
   `reconcile-intent` and `verify-override` (Subscriptions status reads), `authorize-cancel` (a PDP
   decision) — **does not age while its instance is non-terminal**: its `expires_at` is evaluated
@@ -1693,7 +1693,7 @@ operation shape, from `owf_step_operation.submits_downstream`:
 - **An operation that submits downstream** (`submits_downstream = true`) — the intent-submitting
   `dispatch-wave1-create`, `dispatch-wave2-activate` and `compensate-order` (Subscriptions); the
   Lifecycle transitions of `reflect-verdict`, `begin-fulfillment`, `report-spawn-signal` and
-  `report-outcome`; `open-gates` (the Generic Approval gate submission) and `escalate-gate` (the
+  `report-outcome`; `open-gates` (the approval policy adapter gate submission) and `escalate-gate` (the
   escalation command, delivered under the step key) — **ages at `expires_at` whatever the
   instance's state**, and an aged-out key is never re-run. Its re-issue after the lifetime is a
   handled route (§4.3 *Aged-out key*): the call is resolved under a successor key once an
@@ -1830,7 +1830,7 @@ after the purge finds an instance that answers every operation `version-mismatch
 | sweep_only | boolean, NOT NULL, DEFAULT false | True only for `settle-from-lookup`: never a definition `call` target |
 | input_type, output_type | text, NOT NULL | The GTS reference schemas of §3.3 |
 | key_family | enum, NOT NULL | `intent`, `approval-request`, `lifecycle-transition`, `instance-scoped`, `trigger` |
-| submits_downstream | boolean, NOT NULL | True for the nine operations whose effect submits to a downstream — Subscriptions intents, Lifecycle transitions, the Generic Approval gate submission and escalation command; false for the twenty-six whose effect is record-only or whose only outside call is a read. Decides whether the key lifetime is evaluated while the instance is non-terminal (§3.7 `owf_idempotency_registry` *Key lifetime*, decision D-185) |
+| submits_downstream | boolean, NOT NULL | True for the nine operations whose effect submits to a downstream — Subscriptions intents, Lifecycle transitions, the approval policy adapter gate submission and escalation command; false for the twenty-six whose effect is record-only or whose only outside call is a read. Decides whether the key lifetime is evaluated while the instance is non-terminal (§3.7 `owf_idempotency_registry` *Key lifetime*, decision D-185) |
 | declared_event | text, nullable | One of the six GTS event types of §4.7, or NULL |
 | compensation | text, nullable | The paired operation name, or NULL; FK to this table |
 | audit_kind | enum, NOT NULL | The `owf_audit_entry.event_kind` its success settlement writes (§3.3 *What each receipt records*) |
@@ -2525,7 +2525,7 @@ exactly one of them:
 | **Absorbed duplicate** | `settled`, `request_fingerprint` matches | Return the stored outcome unchanged, from `settled_output` (§3.7); the effect is **never** re-run. |
 | **Key conflict** | Any state, `request_fingerprint` does **not** match | Refuse the call (`idempotency-key-conflict`, `permanent-failure`). The same key was presented for a materially different request, which is a caller defect — a wrongly authored definition input — not a duplicate. |
 | **Still-processing** | `in_flight`, lease **live** | **MUST NOT** be inferred as success and **MUST NOT** be resubmitted under a new key; the definition re-issues the same key after backoff (`still-processing`, 409 `Aborted`). |
-| **Lease-expired** | `in_flight`, `lease_expires_at` passed, the key **not** aged out (§3.7 *Key lifetime*) | Resolved by the key's family (D-103). **The intent-submitting operations** — `dispatch-wave1-create`, `dispatch-wave2-activate` and `compensate-order` — treat it as **still-processing** (`idempotency-lease-expired`, 409 `Aborted`): the real outcome is confirmed by lookup and settled only by `settle-from-lookup` (§3.3); the effect is **never** re-run blind, because the holder may have crashed *after* Subscriptions accepted an intent. **Every other operation** re-runs it as a re-run under a new `lease_holder`: its outbound call is either a read or a submission the downstream de-duplicates under the key the step derives — Lifecycle answers a committed transition with its stored outcome ([Lifecycle `01 §4.2`](../../../orders-lifecycle/docs/design/01-foundation.md#42-idempotency-semantics-normative), first row), and the approval-request key does the same at Generic Approval (`../ADR/0006`) — so a crash after the downstream accepted is absorbed downstream (past Lifecycle's 24-hour window, by the read-back of §3.3 *Rounds and attempts* rule 4, and at Generic Approval by `open-gates`' look-up of the gate's request before it submits, decisions D-188, D-189), and the old holder's late settlement fails the fence. A record-only operation never leaves this state behind (§3.7). |
+| **Lease-expired** | `in_flight`, `lease_expires_at` passed, the key **not** aged out (§3.7 *Key lifetime*) | Resolved by the key's family (D-103). **The intent-submitting operations** — `dispatch-wave1-create`, `dispatch-wave2-activate` and `compensate-order` — treat it as **still-processing** (`idempotency-lease-expired`, 409 `Aborted`): the real outcome is confirmed by lookup and settled only by `settle-from-lookup` (§3.3); the effect is **never** re-run blind, because the holder may have crashed *after* Subscriptions accepted an intent. **Every other operation** re-runs it as a re-run under a new `lease_holder`: its outbound call is either a read or a submission the downstream de-duplicates under the key the step derives — Lifecycle answers a committed transition with its stored outcome ([Lifecycle `01 §4.2`](../../../orders-lifecycle/docs/design/01-foundation.md#42-idempotency-semantics-normative), first row), and the approval-request key does the same at the approval policy adapter (`../ADR/0006`) — so a crash after the downstream accepted is absorbed downstream (past Lifecycle's 24-hour window, by the read-back of §3.3 *Rounds and attempts* rule 4, and at the approval policy adapter by `open-gates`' look-up of the gate's request before it submits, decisions D-188, D-189), and the old holder's late settlement fails the fence. A record-only operation never leaves this state behind (§3.7). |
 | **Aged-out key** | `expires_at` passed with no settled record, on an operation that submits downstream; on any other operation, only once the instance is terminal (§3.7 *Key lifetime*, D-185) | Evaluated on the retained row — the tombstone rule of §3.7 keeps it until no replay can arrive, so expiry is logical and never inferred from a missing row. `settle-from-lookup` is read-only past this point. The next attempt is a **new operation under a new key** — it appends the key's `attempt` component (minted by `retry-step`; for an intent key, the per-line `wave_attempt` minted by the rebuild path or by an operator's retry of a `failed` intent, slice 05) — never a resume of the old one and never a replay of the identical key string. **The successor key** (D-185): when the family holds an `attempt` minted after the aged key's `created_at`, the envelope resolves the re-issued aged key under its successor — the same key with the latest such `attempt` in its attempt component — through this table: a first call the first time, and thereafter whatever the successor's own record resolves to, so a definition that keeps presenting the key it holds reaches the same successor every time; the first arrival is recorded in the family's `presented` history with the key it arrived under (§3.3 *Rounds and attempts*, rule 3, D-174). Without such an attempt it answers `aged-out`. The attempt is minted only by an operator's decision: the `retry` of the order-scope task the answer reaches — the `invocation-dead` task, because no `catch` of the canonical definition routes a 400 of these operations (`10 §4.6`; `reflect-verdict`'s refusal is an answer, not a 400, decision D-190) — in the transaction that records the request (`09 §3.6` `inst-cs-record`), and the dead-instance unwind after a recorded cancel (§4.16 item 2). |
 
 No seventh outcome exists. **These six are registry outcomes, not additional step outcomes.**
@@ -2609,7 +2609,7 @@ whole train is the task timeout on the same `try` (§4.2, `10 §2.2` rule 4).
 
 **Circuit breakers on every outbound dependency.** A retry budget throttles *retries*; it does
 nothing about first attempts. Every outbound dependency an operation calls — Subscriptions, Orders
-Lifecycle, Payments, Generic Approval — **MUST** sit behind a circuit breaker at a common working
+Lifecycle, Payments, the approval policy adapter — **MUST** sit behind a circuit breaker at a common working
 baseline: **open at a 50 % failure rate over 20 calls in 10 s, stay open 60 s, then admit 3
 half-open probes**. A call refused by an open breaker settles `retryable-failure` with
 `circuit-breaker-open` and leaves the key `open`; it is a capacity signal the definition's retry
@@ -2971,8 +2971,7 @@ example — and they are stated once so no slice chooses them again.
 | `prior-instance-active` | `02-triggers-and-start` | `PRIOR_INSTANCE_ACTIVE` | Aborted | 409 |
 | `overlap-collision` | `04-fulfillment-plan` | `OVERLAP_COLLISION` | FailedPrecondition | 400 |
 | `market-divergence` | `04-fulfillment-plan` | `MARKET_DIVERGENCE` | FailedPrecondition | 400 |
-| `invalid-dependency-graph` | `04-fulfillment-plan` | `INVALID_DEPENDENCY_GRAPH` | FailedPrecondition | 400 |
-| `catalog-topology-unavailable` | `04-fulfillment-plan` | `CATALOG_TOPOLOGY_UNAVAILABLE` | ServiceUnavailable | 503 |
+| `order-binding-expired` | `04-fulfillment-plan` (raised also by `05-provisioning-intents`' wave-2 guard) | `ORDER_BINDING_EXPIRED` | FailedPrecondition | 400 |
 | `payment-authorization-stale` | `04-fulfillment-plan` | `PAYMENT_AUTHORIZATION_STALE` | FailedPrecondition | 400 |
 | `overlap-read-unevaluable` | `04-fulfillment-plan` | `OVERLAP_READ_UNEVALUABLE` | ServiceUnavailable | 503 |
 | `identity-party-unavailable` | `04-fulfillment-plan` | `IDENTITY_PARTY_UNAVAILABLE` | ServiceUnavailable | 503 |
@@ -2984,7 +2983,6 @@ example — and they are stated once so no slice chooses them again.
 | `intent-unresolved` | `05-provisioning-intents` | `INTENT_UNRESOLVED` | FailedPrecondition | 400 |
 | `draft-void-failed` | `06-saga-and-compensation` | `DRAFT_VOID_FAILED` | FailedPrecondition | 400 |
 | `activated-cancel-failed` | `06-saga-and-compensation` | `ACTIVATED_CANCEL_FAILED` | FailedPrecondition | 400 |
-| `blocked-upstream` | `06-saga-and-compensation` | `BLOCKED_UPSTREAM` | FailedPrecondition | 400 |
 | `fence-not-claimed` | `06-saga-and-compensation` | `FENCE_NOT_CLAIMED` | FailedPrecondition | 400 |
 | `outcome-not-reportable` | `06-saga-and-compensation` | `OUTCOME_NOT_REPORTABLE` | FailedPrecondition | 400 |
 | `order-fenced` | `07-manual-tasks` | `ORDER_FENCED` | FailedPrecondition | 400 |
@@ -3001,9 +2999,13 @@ example — and they are stated once so no slice chooses them again.
 | `not-found` | `09-read-and-authz` | `NOT_FOUND` | NotFound | 404 |
 | `authority-withdrawn` | `09-read-and-authz` | `AUTHORITY_WITHDRAWN` | FailedPrecondition | 400 |
 
-The table registers **43** reasons: the engine's ten and 33 contributed by slices 02–09 — two by
-02, three by 03, eight by 04, five by 05, five by 06, five by 07 and five by 09 (`invocation-dead`,
-the order-scope task reason of the instance liveness pass, added by D-105; decision D-77: the twelve reasons the step-operation slices introduced —
+The table registers **41** reasons: the engine's ten and 31 contributed by slices 02–09 — two by
+02, three by 03, seven by 04, five by 05, four by 06, five by 07 and five by 09 (`invocation-dead`,
+the order-scope task reason of the instance liveness pass, added by D-105; `order-binding-expired`,
+the accepted binding's activation deadline elapsed before initial activation, added by D-194 and
+raised by `re-check-pre-activation` and by `dispatch-wave2-activate`'s guard; `invalid-dependency-graph`
+and `catalog-topology-unavailable` withdrawn by D-196 with the inter-line dependency graph they served, and
+`blocked-upstream` withdrawn with it, since a reverse walk over independent lines has no upstream subject to wait for; decision D-77: the twelve reasons the step-operation slices introduced —
 `trigger-applicability-unverified`, `prior-instance-active`, `identity-party-unavailable`,
 `activation-precondition-unmet`, `intent-unresolved`, `fence-not-claimed`,
 `outcome-not-reportable`, `order-fenced`, `action-not-offered`, `override-unverified`,
@@ -3022,7 +3024,7 @@ different fingerprint — Lifecycle's `idempotency-mismatch`). A time bound exha
 `DeadlineExceeded` (`per-attempt-timeout`, `step-deadline-exceeded`); an attempt bound exhausted
 is a state the caller must change before retrying, `FailedPrecondition` (`retry-budget-exhausted`, `definition-not-bound`,
 `poison-step`). Dependency unavailability is `ServiceUnavailable` (503) and is never disguised as
-a business refusal (`circuit-breaker-open`, `catalog-topology-unavailable`,
+a business refusal (`circuit-breaker-open`,
 `overlap-read-unevaluable`, `identity-party-unavailable`, `trigger-applicability-unverified`). Authorization refusals keep the existence-oracle rule of `09 §4.4`:
 `not-found` for a target outside the caller's scope, `not-authorized` only when the caller may
 read the target or the request has no target. Platform authentication failures, PDP outages and

@@ -57,8 +57,8 @@ documents below and nowhere else, so there is exactly one normative statement of
   unwind-then-start, and `terminate-on-terminal-event`.
 - [`03-approval-execution.md`](./03-approval-execution.md) — the approval step: verdict,
   reflection, gates, decision recording, the fail-closed park and escalation as six operations
-  over the approval record, the stand-in behaviour while the Generic Approval service does not
-  exist, and the gate-window port.
+  over the approval record, the approval policy adapter port with its stand-in behaviour while
+  the library adapter is not bound, and the gate-window port.
 - [`04-fulfillment-plan.md`](./04-fulfillment-plan.md) — payment-authorization eligibility, plan
   construction and freeze, the begin-fulfillment seam call, activation eligibility and the
   pre-activation re-check.
@@ -166,14 +166,15 @@ that every route 07 and 08 declared maps to the pair 09 registers.
 
 Three gaps are stated here plainly rather than left implicit in the documents.
 
-**(a) The phase-1 approval path is inert.** Until the Generic Approval service exists, a stand-in
+**(a) The phase-1 approval path is inert.** Until the library adapter is bound, a stand-in
 sits behind the same expectations contract and unconditionally returns "approval not required",
 and that stand-in must be recorded as the deciding authority by name on every verdict it produces.
 As a direct consequence, multi-party approval gates, escalation, and the approver inbox never fire
 in this phase, and two of the six process events — `OrderApprovalRequested` and
-`OrderApprovalEscalated` — never fire either. The Generic Approval service has **no specification
-anywhere in this repository**; `03-approval-execution.md` designs against its expectations
-contract only, not against an implementation.
+`OrderApprovalEscalated` — never fire either. **No approval service exists anywhere in this
+repository and none is asked for** (D-197): the policy owner is the gear's own approval policy
+adapter, whose library implementation over `cf-gears-bss-approval` is intended but not yet
+designed (Q-14); `03-approval-execution.md` designs against the port's expectations contract.
 
 **(b) Fulfillment's pre-activation abort check cannot be fully evaluated today.** One half of that
 check needs the upstream overlap-presence read `SUB-O5`. `SUB-O5` is registered on the upstream

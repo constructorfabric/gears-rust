@@ -22,7 +22,7 @@
   - [3.7 Database schemas & tables](#37-database-schemas--tables)
   - [3.8 Deployment Topology](#38-deployment-topology)
 - [4. Additional context](#4-additional-context)
-  - [4.0 Detecting a Generic Approval outage](#40-detecting-a-generic-approval-outage)
+  - [4.0 Detecting an approval policy adapter outage](#40-detecting-an-approval-policy-adapter-outage)
   - [4.1 The fail-closed park](#41-the-fail-closed-park)
   - [4.2 The outage threshold, the TTL lead time, and the paused window](#42-the-outage-threshold-the-ttl-lead-time-and-the-paused-window)
   - [4.3 Multi-party routing is sequential-capable, and sequence is a column](#43-multi-party-routing-is-sequential-capable-and-sequence-is-a-column)
@@ -57,20 +57,22 @@ transaction and returns references and small enums the definition branches on
 ([`../ADR/0013`](../ADR/0013-cpt-cf-bss-orders-workflow-adr-references-not-payloads.md)).
 
 Orders Workflow does not decide whether an order requires approval, and it does not decide who
-must approve it — both are policy questions owned by the Generic Approval service. The operations
+must approve it — both are policy questions owned by the approval policy adapter. The operations
 are narrower and mechanical: obtain the requirement verdict for a specific order version,
 reflect it into Lifecycle exactly once, open one durable `OrderApprovalRequest` per configured
 gate party, record every arm, pause and fire of a gate's escalation window, and reflect the
 eventual decision back into Lifecycle idempotently.
 
-The central design tension this slice resolves is that **the policy dependency it calls does not
-exist yet**. Rather than blocking the slice on an unbuilt service, the design fixes a single
-seam — the §9.2 expectations contract (PRD) — and satisfies it today with a named stand-in that
-always answers "approval not required." This keeps the request/gate, idempotency, escalation, and
-inbox machinery fully specified and buildable now, while making unmistakably explicit that none of
-that machinery executes a single real gate until the Generic Approval service is built. The second
+The central design tension this slice resolves is that **the policy implementation it calls is
+not bound yet**. No approval service exists and none is asked for (D-197; Lifecycle D-166): the
+policy owner is this gear's own approval policy adapter, a port behind the §9.2 expectations
+contract (PRD), satisfied today by a named stand-in that always answers "approval not required"
+and intended to be satisfied by the built `cf-gears-bss-approval` library embedded as Pricing and
+Products embed it. This keeps the request/gate, idempotency, escalation, and inbox machinery fully
+specified and buildable now, while making unmistakably explicit that none of that machinery
+executes a single real gate until the library adapter is bound. The second
 governing decision is the fail-closed posture: every unavailability path (verdict source down,
-approval service down mid-gate) answers a verdict class or a service state the definition routes
+the bound adapter down mid-gate) answers a verdict class or a service state the definition routes
 to a park or a pause rather than to success, and the escalation reaches a human queue before the
 Lifecycle `submitted` TTL can expire the order out from under it.
 
@@ -100,7 +102,7 @@ Lifecycle `submitted` TTL can expire the order out from under it.
 | `cpt-cf-bss-orders-workflow-adr-idempotency-key-composition` | Idempotency keys for approval requests are `orderId` + `orderVersion` + `gateId`; never the process `correlationId` (per [`02-triggers-and-start.md`](./02-triggers-and-start.md) §2.1, `correlationId` is a whole-instance identifier, not a per-request dedup key) |
 | `cpt-cf-bss-orders-workflow-adr-flow-as-platform-definition` | The approval stage's ordering, waits and branches are the definition of `10 §3.6` (a); this slice provides the operations and the record |
 | `cpt-cf-bss-orders-workflow-adr-definition-versioning-and-protected-steps` | `obtain-verdict`, `reflect-verdict` and `record-decision` are `protected`: ordered by the definition, never omitted, never inside a swallowing `catch` |
-| `cpt-cf-bss-orders-workflow-adr-references-not-payloads` | The resolved total, approver identities and the deciding authority stay in this slice's tables; only a verdict class, gate references, positions and durations cross to the definition |
+| `cpt-cf-bss-orders-workflow-adr-references-not-payloads` | The TCV, approver identities and the deciding authority stay in this slice's tables; only a verdict class, gate references, positions and durations cross to the definition |
 
 ### 1.3 Architecture Layers
 
@@ -119,7 +121,7 @@ Platform: serverless-runtime Temporal plugin executing 10 §3.6 (a)
 │ Infrastructure: step envelope / idempotency registry /       │
 │   audit writer / producer adapter (01-foundation §3.2),      │
 │   Lifecycle seam client (approval-reflection),               │
-│   Generic Approval SDK client (stand-in in phase 1)          │
+│   approval policy adapter (stand-in in phase 1)          │
 ├─────────────────────────────────────────────────────────────┤
 │ Presentation: Approver Inbox read + decision API (p2)        │
 └─────────────────────────────────────────────────────────────┘
@@ -130,7 +132,7 @@ Platform: serverless-runtime Temporal plugin executing 10 §3.6 (a)
 | Presentation | Approver Inbox read/decision surface, scoped to assigned gates | REST read API + decision endpoint, per SDK-first conventions |
 | Application | The six step operations of §3.3; each one effect, one settlement | Operations registered against the operation registration boundary of [`01 §3.2`](./01-foundation.md#32-component-model) |
 | Domain | `OrderApprovalRequest`, `ApprovalGate`, `ApprovalPark`, `ApprovalVerdictCache` | Rust structs, no persistence logic of their own |
-| Infrastructure | Envelope, idempotency registry, audit writer, producer adapter (inherited from `01`), Lifecycle `approval-reflection` seam client, Generic Approval SDK client (stand-in today) | Slice-owned tables of §3.7 + SDK client abstractions |
+| Infrastructure | Envelope, idempotency registry, audit writer, producer adapter (inherited from `01`), Lifecycle `approval-reflection` seam client, approval policy adapter (stand-in today) | Slice-owned tables of §3.7 + SDK client abstractions |
 
 ## 2. Principles & Constraints
 
@@ -203,15 +205,21 @@ evaluator and outside `owf_audit_entry`; the second is refused by the validation
 
 ### 2.2 Constraints
 
-#### The Generic Approval service does not exist yet
+#### The approval policy adapter is the policy owner, and only its stand-in exists today
 
 - [ ] `p2` - **ID**: `cpt-cf-bss-orders-workflow-constraint-generic-approval-unbuilt`
 
-The Generic Approval service — the intended policy owner for the approval-requirement verdict, the
-multi-party routing configuration, and the escalation-path configuration — has no canonical
-specification anywhere in this repository. This slice depends on it only through the §9.2
-expectations contract (PRD), never through a concrete API surface, and satisfies that contract
-today with a named stand-in. See §4 for the full disclosure of what this makes inert.
+No approval service exists anywhere in this repository, and none is asked for (decision D-197;
+Lifecycle D-166). The policy owner for the approval-requirement verdict, the multi-party routing
+configuration and the escalation-path configuration is this gear's own **approval policy adapter**
+(§3.2), a port whose contract is the §9.2 expectations contract (PRD), never a concrete API surface
+of another gear. Two implementations stand behind the port: the named **stand-in**, which is the
+one in place today, and the **library** adapter over the built `cf-gears-bss-approval` crate
+(`Engine`, `ApprovalSubject`, `Store`), which Pricing and Products already embed inside their own
+transactions and which this gear intends to embed the same way; its gate-to-unit mapping is open
+question Q-14 and is not designed here. The verdict is computed by neither Orders gear's order
+logic (Lifecycle R2): the adapter is the policy authority, and every verdict names it. See §4 for
+the full disclosure of what the stand-in makes inert.
 
 **ADRs**: `cpt-cf-bss-orders-workflow-adr-fail-closed-verdict-park`
 
@@ -234,7 +242,7 @@ downstream submission; the two never substitute for each other.
 **`gateId` is derived, not minted.** It is a UUIDv5 over (`orderId`, `orderVersion`, `party`),
 computed from the routing configuration before any row is written. A `uuid` minted by this gear at
 gate-open time would defeat the very key it composes: a crash between submitting the request to
-Generic Approval and committing the gate row mints a *different* uuid on replay, which composes a
+the approval policy adapter and committing the gate row mints a *different* uuid on replay, which composes a
 *different* idempotency key, which the registry reads as a first call — and the order acquires a
 second gate for the same party with its own 72-hour window. Derivation makes the platform's
 replay of `open-gates` re-derive the key it already used, so the registry absorbs it. The same
@@ -289,7 +297,9 @@ rule is what lets `open-gates` address a gate before it has been persisted, and 
 This slice's components are the **owners of its operations**. Three of them — Verdict Gateway,
 Approval Gate Manager, Decision Reflector — own the six step operations of §3.3, each run through
 the step envelope of `01 §3.2` on a `call` from the definition. The fourth, Approver Inbox
-Projection, is a read-and-capture surface called by an approver, not by the definition. None of
+Projection, is a read-and-capture surface called by an approver, not by the definition. The fifth,
+the Approval Policy Adapter, owns no operation: it is the port the other four call for every
+policy question, with the stand-in and the library as its two implementations (D-197). None of
 them writes an engine-owned table directly; the phase projection is written by the foundation's
 `park`/`unpark` and the envelope writes the step log, the registry and the audit entry.
 
@@ -298,17 +308,17 @@ graph LR
     DEF[Definition 10 §3.6 a<br/>serverless-runtime plugin] -->|obtain-verdict, reflect-verdict, arm-park-escalation| VG[Verdict Gateway]
     DEF -->|open-gates, escalate-gate| AGM[Approval Gate Manager]
     DEF -->|listen approval decision, then record-decision| DR[Decision Reflector]
-    VG -->|approval-reflection seam, expected_version| LC[Lifecycle seam client]
-    VG -->|verdict query| GAS[Generic Approval SDK client / stand-in]
+    VG -->|approval-reflection seam, expected_version, get_version| LC[Lifecycle SDK client]
+    VG -->|verdict| APA[Approval Policy Adapter<br/>stand-in today · library intended]
     VG --> PARK[(owf_approval_park)]
     VG --> CACHE[(owf_approval_verdict_cache)]
-    AGM -->|request submission, escalation command, liveness probe| GAS
+    AGM -->|submit, lookup_by_key, escalate| APA
     AGM --> GATE[(owf_approval_gate + owf_approval_request)]
-    DR -->|decision record read| GAS
+    DR -->|read_decision| APA
     DR --> GATE
     H08[apply-hold / apply-resume, slice 08] -->|gate-window port| AGM
     F06[run-cancellation-fence, slice 06] -->|closure port| AGM
-    INBOX[Approver Inbox Projection] -->|approve/reject + reason| GAS
+    INBOX[Approver Inbox Projection] -->|approve/reject + reason| APA
     INBOX --> GATE
 ```
 
@@ -388,7 +398,7 @@ record.
 Owns `open-gates` and `escalate-gate` (§3.3), and two in-process ports other slices' operations
 call inside their own unit of work.
 
-`open-gates` reads the routing configuration from the Generic Approval service (or, in phase 1,
+`open-gates` reads the routing configuration from the approval policy adapter (or, in phase 1,
 receives none, since the stand-in never returns "required"); on the first call for a version
 **persists the whole routing plan** — every gate row, those at position 0 as `open`, those at later
 positions as `planned` — deriving each `gateId` from that configuration (§2.2); submits one
@@ -431,17 +441,21 @@ terminal-event paths, inside that operation's unit of work.
 **Request payload contents.** The §9.2 expectations contract requires the request to carry enough
 for the approval authority to decide without fetching the order back, and requires the submission
 to be idempotent at the receiving end too. The payload therefore carries, in addition to order and
-party context: the **resolved order total (TCV)** with its currency, read non-authoritatively from
-Orders Lifecycle per seam R4 inside `open-gates` and passed through without computation or
-adjustment by this gear; and the **request idempotency key** itself, so the receiving service can
-absorb a redelivery on the same key rather than relying on this gear's registry alone. A request
-missing either is refused before submission rather than submitted incomplete. Neither the total
-nor the party nor the assigned principal is ever returned to the definition (ADR-0013).
+party context: the **TCV** — the net pre-tax, annualised total-contract-value figure Rating computed
+and Lifecycle stored verbatim with the order version, in integer minor units with its currency and
+`currency_minor_digits` (Lifecycle D-154, D-167) — read non-authoritatively through Lifecycle's
+`get_version(orderId, orderVersion)` per seam R4 inside `open-gates` and passed through without
+computation, conversion or adjustment by this gear (decision D-198); and the **request idempotency
+key** itself, so the receiving implementation can absorb a redelivery on the same key rather than
+relying on this gear's registry alone. A request missing either is refused before submission
+rather than submitted incomplete; a submitted version carries its TCV by Lifecycle's own gate, so
+a missing figure is a contract violation, never an approval bypass. Neither the figure nor the
+party nor the assigned principal is ever returned to the definition (ADR-0013).
 
 ##### Responsibility boundaries
 
 Does not decide the routing configuration (sequential vs. parallel, which parties) — that is
-Generic Approval service policy, consumed as configuration; this component owns only the *record*
+the approval policy adapter's policy, consumed as configuration; this component owns only the *record*
 of the ordering that configuration expresses, and the definition executes it by calling
 `open-gates` again with the next position. Does not evaluate any individual gate's decision —
 `record-decision` does. Does not own a clock: it records the window and returns durations, and the
@@ -472,7 +486,7 @@ Orders timer owner, scheduler or probe loop.
 
 ##### Why this component exists
 
-An approval decision arriving from the Generic Approval service must be recorded exactly once per
+An approval decision arriving from the approval policy adapter must be recorded exactly once per
 gate, guarded against a gate that has since closed and against the submitter deciding their own
 order, and turned into the one aggregate fact the definition branches on — without this component
 computing anything the approval authority already decided.
@@ -482,7 +496,7 @@ computing anything the approval authority already decided.
 Owns `record-decision` (§3.3). The definition's `gateLoop` consumes the approval decision event
 through `listen` and calls `record-decision` with the gate reference, the decision event id and
 the outcome enum. The operation reads the decision record — outcome, catalogue reason, deciding
-authority, deciding subject — from the Generic Approval service by `decisionEventId` through the
+authority, deciding subject — from the approval policy adapter by `decisionEventId` through the
 §9.2 client, so none of those cross the engine boundary; applies the guards of §4.4; and on an
 applied decision records it with its named deciding authority and catalogue reason, clears the
 gate's window, and computes the aggregate over the persisted plan: every gate `approved` →
@@ -533,7 +547,7 @@ open the next position — it returns it, and the definition calls `open-gates`.
 
 Approvers need one surface to see the gates assigned to them and act, rather than relying on
 out-of-band notification. Priority p2: this component is built but, per §4, produces zero rows
-until the Generic Approval service exists, since no real gate ever opens under the stand-in.
+until the library adapter is bound, since no real gate ever opens under the stand-in.
 
 ##### Responsibility scope
 
@@ -542,7 +556,7 @@ requesting approver's assigned gates, surfacing order context, requesting party,
 and the escalation SLA countdown computed from the gate's recorded window
 (`window_remaining_ms − (now − window_armed_at)` while armed; `window_remaining_ms`, flagged paused,
 while `pause_causes` is non-empty); accepts an approve or reject decision with a mandatory
-catalogue reason and an optional free-text justification, and forwards it to the Generic Approval
+catalogue reason and an optional free-text justification, and forwards it to the approval policy adapter
 service (or, in phase 1, is unreachable in practice, since no gate ever opens).
 
 **Scope is the assignment, and the assignment is a column.** The filter is
@@ -559,12 +573,12 @@ refused at `POST /bss-orders-workflow/v1/approver-inbox/gates/{gateId}/decision`
 (403, `PermissionDenied`), a distinct `error_code` from the out-of-scope refusal, which is
 `not-found` (404) because a gate outside the caller's assignment is not readable by them
 (`09 §4.4`), so the two are separable in the audit trail. The submitting identity is
-`owf_approval_request.submitter_subject_id`, captured by `open-gates` from the Lifecycle order read,
+`owf_approval_request.submitter_subject_id`, captured by `open-gates` from Lifecycle `get_version`,
 never from the decision request body. `record-decision` applies the same check to the deciding
 subject of the decision record, so a decision captured outside this inbox is held to the same
 control. Accepted as a settled control (`DECISIONS.md` D-56): `PRD.md:134` permits an
 Approver to be a seller operator, so without this refusal one actor can submit an order and
-approve its gate with every other stated control passing. Routing remains Generic Approval's
+approve its gate with every other stated control passing. Routing remains the approval policy adapter's
 policy; this is a local refusal on the surface this gear owns, and the corresponding expectation
 belongs in the §9.2 contract as a clause on the approval service.
 
@@ -572,7 +586,7 @@ belongs in the §9.2 contract as a clause on the approval service.
 
 Never surfaces a gate outside the requesting approver's scope — scope filtering happens at the
 query boundary, not the presentation layer. Does not itself record the decision as final — it
-forwards to the Generic Approval service, and the decision is recorded only when the definition's
+forwards to the approval policy adapter, and the decision is recorded only when the definition's
 `listen` consumes the resulting event and calls `record-decision`, so the inbox's "capture" step
 and the process's "record" step are not the same write.
 
@@ -580,6 +594,63 @@ and the process's "record" step are not the same write.
 
 - `cpt-cf-bss-orders-workflow-component-approval-gate-manager` — source of the approver's assigned
   gates and of the recorded window the countdown reads
+
+#### Approval Policy Adapter
+
+- [ ] `p2` - **ID**: `cpt-cf-bss-orders-workflow-component-approval-policy-adapter`
+
+##### Why this component exists
+
+The approval-requirement verdict, the routing configuration and the decision are policy, and
+policy is computed by neither Orders gear's order logic (Lifecycle R2). There is no approval
+service to hold it (decision D-197; Lifecycle D-166), so the policy owner is a port of this gear
+with a named implementation behind it. Naming the port once keeps every policy question in one
+place and lets the stand-in and the library be exchanged without touching an operation.
+
+##### Responsibility scope
+
+Owns the port the other components call. Its operations are the clauses (a)–(g) of the §9.2
+expectations contract plus the two D-189 clauses, and nothing else:
+
+| Port operation | Called by | Answers |
+|----------------|-----------|---------|
+| `verdict(orderId, orderVersion)` | `obtain-verdict` (Verdict Gateway) | `required` \| `not_required`, with the deciding authority's name; cacheable per version |
+| `submit(request)` | `open-gates` (Approval Gate Manager) | Acceptance of an `OrderApprovalRequest` under its approval-request key, idempotent for the life of the gate |
+| `lookup_by_key(requestKey)` | `open-gates` | The request held under the key — `open`, decided or `cancelled` — with its opened instant, never "not found" for a request it holds (D-189) |
+| `read_decision(decisionEventId)` | `record-decision` (Decision Reflector), the inbox capture | The decision record: outcome, reason, deciding authority, deciding subject; the record is authoritative over any event body |
+| `escalate(gate)` | `escalate-gate` | Routing of the escalation command; the liveness probe of §4.2 is the same call with no command |
+
+Two implementations satisfy the port:
+
+- **`stand-in`** — the implementation in place today, `cpt-cf-bss-orders-workflow-actor-owf-generic-approval`.
+  It answers `not_required` to every `verdict`, names itself as the deciding authority, is audited
+  as a stand-in, and is never asked anything else because no gate opens under that verdict (§4,
+  Disclosure 1).
+- **`library`** — the intended implementation: the built `cf-gears-bss-approval` crate (`Engine`,
+  `ApprovalSubject<R>`, `Store<R>`) embedded inside this gear's own transactions, as Pricing and
+  Products embed it. It is not designed here: how a gate maps to an approval unit, where the
+  requirement threshold and the party routing live (the seller-policy store of `01 §3.7` is the
+  candidate), and the `owf_`-prefixed library tables are open question Q-14 (`../DECISIONS.md`).
+  Under it the decision event the definition's `gateLoop` `listen`s for is published on this
+  gear's own topic through the platform producer (the D-164 precedent); the `listen` target and
+  `record-decision` are unchanged.
+
+##### Responsibility boundaries
+
+Does not run an operation of §3.3 and holds no step key. Does not decide a gate — `record-decision`
+does, from the record this port returns. Does not reflect a verdict into Lifecycle — the Verdict
+Gateway does, naming the authority this port answered. Does not choose which implementation is
+bound: that is configuration, fail-closed when absent, like the scheduler's system actor (`01 §3.7`,
+D-115).
+
+##### Related components (by ID)
+
+- `cpt-cf-bss-orders-workflow-component-verdict-gateway` — calls `verdict`
+- `cpt-cf-bss-orders-workflow-component-approval-gate-manager` — calls `submit`, `lookup_by_key`
+  and `escalate`
+- `cpt-cf-bss-orders-workflow-component-decision-reflector` — calls `read_decision`
+- `cpt-cf-bss-orders-workflow-component-approver-inbox-projection` — forwards a captured decision
+  through the port
 
 ### 3.3 API Contracts
 
@@ -629,7 +700,7 @@ park paths, so no version may drop them there (decision D-135).
 | `GET` | `/bss-orders-workflow/v1/approver-inbox/gates` | List gates whose `assigned_principal` is the calling `subject_id` — the PDP constraint `assigned_principal = subject_id`, compiled to the `AccessScope` the query runs under (`09 §3.1`); keyset-paginated, page size default 50 and maximum 200; empty in phase 1 since no real gate opens | unstable |
 | `POST` | `/bss-orders-workflow/v1/approver-inbox/gates/{gateId}/decision` | Submit approve/reject with a mandatory catalogue `reason` and an optional free-text `justification`, for a gate in the caller's scope and in state `open`. **`Idempotency-Key` is REQUIRED**, recomposed server-side as `{tenant}:{gateId}:decision:{subject_id}` (`idempotency-key-mismatch` otherwise); `not-found` (404) if the gate is outside the caller's PDP scope — the same `assigned_principal = subject_id` constraint as the inbox, applied inside the decision statement, and a 403 would confirm the gate exists (`09 §4.4`); `submitter-barred` (403) if the caller is the order's submitting identity (`owf_approval_request.submitter_subject_id`, §3.2); `gate-not-open` (409) if the gate is not `open`, enforced by the `state = 'open'` predicate in the same statement, which is why this endpoint carries no `If-Match` | unstable |
 
-| `EVENT` | The Generic Approval decision event — the decision-callback topic | Consumed by the definition's `listen` in `gateLoop` (`10 §3.6` (a)), correlated on `orderId` and `orderVersion`, then recorded by `record-decision`; it is in the closed `listen` set of [`10 §2.2`](./10-process-definition.md#the-closed-trigger-set). Authenticity is the broker produce grant on that topic under platform-root tenancy (Lifecycle D-95), never a consumer-side publisher check. The event **MUST** carry references only — `orderId`, `orderVersion`, `gateId`, `decisionEventId`, the outcome enum — because the platform's history keeps what a `listen` consumes; the reason, the deciding authority and the deciding subject are read by `record-decision` from the decision record by `decisionEventId`. That shape and the read are a §9.2 clause and an upstream ask on the approval service (`../UPSTREAM_REQS.md` §2.9) | unstable |
+| `EVENT` | The approval decision event — the decision-callback topic | Consumed by the definition's `listen` in `gateLoop` (`10 §3.6` (a)), correlated on `orderId` and `orderVersion`, then recorded by `record-decision`; it is in the closed `listen` set of [`10 §2.2`](./10-process-definition.md#the-closed-trigger-set). Authenticity is the broker produce grant on that topic under platform-root tenancy (Lifecycle D-95), never a consumer-side publisher check. The event **MUST** carry references only — `orderId`, `orderVersion`, `gateId`, `decisionEventId`, the outcome enum — because the platform's history keeps what a `listen` consumes; the reason, the deciding authority and the deciding subject are read by `record-decision` from the decision record by `decisionEventId`. That shape and the read are a §9.2 clause and an upstream ask on the approval service (`../UPSTREAM_REQS.md` §2.9) | unstable |
 
 Both endpoints follow the platform's canonical OperationBuilder registration and RFC-9457 Problem
 error envelope conventions; the one gear-level deviation — 404 for a target outside the caller's
@@ -647,7 +718,7 @@ optional on approve and expected on reject.
 
 | Dependency Gear | Interface Used | Purpose |
 |-------------------|----------------|----------|
-| orders-lifecycle | `POST /bss-orders-lifecycle/v1/orders/{orderId}/approval-reflection` ([Lifecycle `06 §3.3`](../../../orders-lifecycle/docs/design/06-workflow-seam.md#33-api-contracts)) with idempotency key, expected version and correlation identifier; the order read (R4) | `reflect-verdict`: triggers `reflect-approval-required`, `reflect-approval-not-required`, `reflect-approval-granted`, `reflect-approval-denied`; `obtain-verdict` / `open-gates`: order context, resolved total, submitting subject |
+| orders-lifecycle | `OrdersLifecycleWorkflowV1` through `ClientHub` (Lifecycle D-155; decision D-193): `reflect_approval(OrderRef, ApprovalReflection, CallMeta)`, the REST adapter of which is `POST /bss-orders-lifecycle/v1/orders/{orderId}/approval-reflection` ([Lifecycle `06 §3.3`](../../../orders-lifecycle/docs/design/06-workflow-seam.md#33-api-contracts)), with idempotency key, expected version and correlation identifier; `get(orderId)` for the current state and version; `get_version(orderId, orderVersion)` for the immutable commercial content of the version acted on (R4) | `reflect-verdict`: triggers `reflect-approval-required`, `reflect-approval-not-required`, `reflect-approval-granted`, `reflect-approval-denied`, every verdict carrying its deciding authority; `obtain-verdict` / `open-gates`: order context, the stored TCV, submitting subject |
 | orders-workflow foundation (`01`) | Step envelope, `park`/`unpark`, reason catalogue | Every operation of §3.3 runs inside the envelope; the phase projection |
 | serverless-runtime | None called; it calls this slice's operations | The definition of `10 §3.6` (a) |
 
@@ -660,14 +731,17 @@ optional on approve and expected on reject.
 
 ### 3.5 External Dependencies
 
-#### Generic Approval service (stand-in in phase 1)
+#### The approval policy adapter (stand-in in phase 1, library intended)
 
 - **Contract**: `cpt-cf-bss-orders-workflow-contract-owf-approval-contract` (PRD §9.2, inlined by
-  reference — this slice does not restate the contract text)
+  reference — this slice does not restate the contract text). It is the contract of the port
+  `cpt-cf-bss-orders-workflow-component-approval-policy-adapter` (§3.2), not of another gear:
+  no approval service exists and none is asked for (decision D-197; Lifecycle D-166).
 
-| Dependency Gear | Interface Used | Purpose |
+| Dependency | Interface Used | Purpose |
 |-------------------|---------------|---------|
-| generic-approval (unbuilt; stand-in client today) | Expectations-contract SDK client, called only from inside this slice's operations (R2) | Approval-requirement verdict query (`obtain-verdict`), routing configuration, request read by request key and multi-party gate submission (`open-gates`, D-189), escalation command delivery and liveness probe (`escalate-gate`), decision record read by `decisionEventId` (`record-decision`) |
+| approval policy adapter, `stand-in` implementation (bound today) | The port of §3.2, called only from inside this slice's operations (R2) | Approval-requirement verdict (`obtain-verdict`, `verdict`); never asked anything else, since no gate opens under `not_required` |
+| approval policy adapter, `library` implementation (intended; `cf-gears-bss-approval`, embedded in this gear's transactions as Pricing and Products embed it; mapping open under Q-14) | The same port | Routing configuration, request read by request key and multi-party gate submission (`open-gates`, `lookup_by_key`, `submit`, D-189), escalation command delivery and liveness probe (`escalate-gate`, `escalate`), decision record read by `decisionEventId` (`record-decision`, `read_decision`); the decision event on this gear's own topic |
 
 **Dependency Rules** (per project conventions):
 - No circular dependencies
@@ -676,7 +750,7 @@ optional on approve and expected on reject.
 - Only integration/adapter gears talk to external systems
 - `SecurityContext` must be propagated across all in-process calls
 
-**Stand-in behavior (phase 1, normative for this slice today)**: the SDK client resolves to a
+**Stand-in behavior (phase 1, normative for this slice today)**: the port resolves to a
 named stand-in implementation, `cpt-cf-bss-orders-workflow-actor-owf-generic-approval` (recorded as
 the deciding authority by name on every verdict it answers), which always returns "approval not
 required" for the verdict query and is never asked to route a gate, accept an escalation command,
@@ -709,7 +783,7 @@ sequenceDiagram
     alt cache row present
         R -->> OV: stored verdict (authoritative, no query)
     else absent
-        OV ->> OV: query Generic Approval (or stand-in) via breaker
+        OV ->> OV: verdict through the approval policy adapter (stand-in today) via breaker
         alt verdict with named authority
             OV ->> R: insert cache row, reflected_at NULL; close open park verdict-obtained
         else unobtainable
@@ -765,7 +839,7 @@ from the stored row. The unobtainable branch is §4.1; it writes no verdict-cach
 sequenceDiagram
     participant D as Definition (10 §3.6 a)
     participant OG as open-gates
-    participant GA as Generic Approval
+    participant GA as Approval policy adapter
     participant R as Record (gate, request)
     D ->> OG: openGates (ref, position)
     alt first call for the version
@@ -774,7 +848,7 @@ sequenceDiagram
     end
     loop each gate at position
         OG ->> GA: read request by request key (adopt it if held, D-189)
-        OG ->> GA: OrderApprovalRequest(gateId, resolved total, request key), only if none is held
+        OG ->> GA: OrderApprovalRequest(gateId, TCV, request key), only if none is held
         OG ->> R: request row; gate open; window recorded (from the adopted request's opened instant, else now)
     end
     OG ->> OG: enqueue OrderApprovalRequested per gate (settlement transaction)
@@ -787,7 +861,7 @@ sequenceDiagram
 1. [ ] - `p1` - Resolve the instance and require a cache row with `verdict = required` whose `reflected_at` is set; refuse `version-mismatch` otherwise - `inst-og-resolve`
 2. [ ] - `p1` - **IF** no gate row exists for the version: read the routing configuration, derive every `gateId` as UUIDv5 over (`orderId`, `orderVersion`, `party`), insert every gate — `open` at the lowest position, `planned` elsewhere — with `assigned_principal`, and with `escalation_window_ms` resolved from the seller's policy through the foundation's seller-policy port ([`01 §3.7`](./01-foundation.md#table-owf_seller_policy), decision D-140) — the window it names for the gate's party, else the seller's default window (72 h unless the policy says otherwise) — and pinned on the gate row, so a later policy write does not move it (decision D-134) - `inst-og-plan`
 3. [ ] - `p1` - Require every gate at a position below `position` to be `approved` and the gates at `position` to be `planned` or `open`; refuse `version-mismatch` otherwise - `inst-og-position`
-4. [ ] - `p1` - **FOR EACH** gate at `position`: read the resolved total and currency (R4) and the submitting subject; look the request up at Generic Approval by its approval-request key and, **IF** one is held under it, adopt it rather than submit again — a re-run whose earlier call submitted but never settled, including a successor re-run after the step key aged out, finds the request that call made — **ELSE** submit the request under the approval-request key; a look-up the service does not answer is `retryable-failure`, never a blind resubmission (decision D-189); the look-up answers the request's state and opened instant, and **MATCH** it: an `open` or a decided request is adopted, a decided one because the service re-publishes its decision event until `record-decision` reads it by `decisionEventId` (`../UPSTREAM_REQS.md` §2.3), so the decision reaches the gate loop's `listen` and `record-decision`'s guards like any other and no other path decides a gate; a `cancelled` request is not adopted and the operation settles `permanent-failure` with `version-mismatch`, since the request key carries no attempt and no other key exists for the gate; insert the request row; set `state = open` and `window_armed_at = now`; for a submitted request set `opened_at = now` and `window_remaining_ms = escalation_window_ms`, and for an adopted one set `opened_at` = the adopted request's opened instant and `window_remaining_ms = max(0, escalation_window_ms − (now − opened_at))`, the pinned window counted from when the request opened, never from the adoption (decision D-189) - `inst-og-submit`
+4. [ ] - `p1` - **FOR EACH** gate at `position`: read the version's stored TCV — `tcv_minor`, `currency`, `currency_minor_digits` — through Lifecycle `get_version(orderId, orderVersion)` (R4, D-198) and the submitting subject; look the request up through the approval policy adapter's `lookup_by_key` under its approval-request key and, **IF** one is held under it, adopt it rather than submit again — a re-run whose earlier call submitted but never settled, including a successor re-run after the step key aged out, finds the request that call made — **ELSE** submit the request under the approval-request key; a look-up the service does not answer is `retryable-failure`, never a blind resubmission (decision D-189); the look-up answers the request's state and opened instant, and **MATCH** it: an `open` or a decided request is adopted, a decided one because the service re-publishes its decision event until `record-decision` reads it by `decisionEventId` (`../UPSTREAM_REQS.md` §2.3), so the decision reaches the gate loop's `listen` and `record-decision`'s guards like any other and no other path decides a gate; a `cancelled` request is not adopted and the operation settles `permanent-failure` with `version-mismatch`, since the request key carries no attempt and no other key exists for the gate; insert the request row; set `state = open` and `window_armed_at = now`; for a submitted request set `opened_at = now` and `window_remaining_ms = escalation_window_ms`, and for an adopted one set `opened_at` = the adopted request's opened instant and `window_remaining_ms = max(0, escalation_window_ms − (now − opened_at))`, the pinned window counted from when the request opened, never from the adoption (decision D-189) - `inst-og-submit`
 5. [ ] - `p1` - Enqueue one `OrderApprovalRequested` per opened gate and **RETURN** the gate references, `position`, and `escalationRound = 0`; the window stays in the record, and the definition learns of its end only from `escalate-gate`'s `due` - `inst-og-return`
 
 **Description**: Repeated by the definition for every sequence position, each call naming the
@@ -1076,31 +1150,34 @@ approver-surface scoping). `decision_reason` is a catalogue value and is what th
 | resource_tenant_id | uuid | Resource recipient; the tenant isolation axis for this table |
 | seller_tenant_id | uuid | Selling party |
 | correlation_id | uuid | The process correlation id, for cross-reference only, not dedup |
-| resolved_total | numeric | The order's resolved total (TCV) as read from Orders Lifecycle, carried verbatim; this gear performs no price computation (seam R4) |
-| currency | text | Currency of `resolved_total`; a figure without one is not a figure |
-| submitter_subject_id | uuid | Opaque subject id of the identity that submitted the order, from the Lifecycle order read; the separation-of-duties comparand of §3.2 (D-61 minimisation: no name, no email) |
+| tcv_minor | bigint | The order version's TCV — net pre-tax, annualised, Rating-computed and Lifecycle-stored (Lifecycle D-154, D-167) — as read through `get_version`, in integer minor units, carried verbatim; this gear performs no price computation or conversion (seam R4, decision D-198) |
+| currency | text | Currency of `tcv_minor`; a figure without one is not a figure |
+| currency_minor_digits | smallint | The scale of `tcv_minor`, as Lifecycle stores it from the book; carried, never applied |
+| submitter_subject_id | uuid | Opaque subject id of the identity that submitted the order, from Lifecycle `get_version`; the separation-of-duties comparand of §3.2 (D-61 minimisation: no name, no email) |
 | submitted_at | timestamptz | Submission time |
 | request_payload | jsonb | Order context, requesting party, gate identifier, and the request idempotency key echoed for the receiver's own dedup |
 
 **PK**: `gate_id`
 
 **Constraints**: `gate_id` foreign key to `owf_approval_gate`; `resource_tenant_id` NOT NULL;
-`resolved_total`, `currency` and `submitter_subject_id` NOT NULL — the §9.2 contract requires the
-approval authority to see the order's value, so a request cannot be submitted without it.
+`tcv_minor`, `currency`, `currency_minor_digits` and `submitter_subject_id` NOT NULL — the §9.2
+contract requires the approval authority to see the order's value, so a request cannot be
+submitted without it; a submitted version always carries one (Lifecycle's gate refuses a
+submit without totals), so an absent figure is a contract violation, refused, never `not_required`.
 
 **Additional info**: **Ownership**: inserted only by `open-gates`. **Mutability**: append-only; no
 UPDATE grant. **Tenant axis**: `resource_tenant_id` (isolation), `seller_tenant_id`. One request row
 per gate; the idempotency key that guarantees single submission lives on `owf_approval_gate` and is
 echoed into `request_payload` for the receiving service, not stored twice as a column here.
-`resolved_total` is non-authoritative: it is a snapshot for the approver's benefit, and Orders
+`tcv_minor` is non-authoritative: it is a snapshot for the approver's benefit, and Orders
 Lifecycle remains the system of record for price; it never crosses to the definition (ADR-0013).
 **Retention**: ≥ 400 days, purged row-wise through a `submitted_at` index; not partitioned (`01 §3.7`, D-104).
 
 **Example**:
 
-| gate_id | resource_tenant_id | correlation_id | resolved_total | currency | submitted_at |
-|--------|--------|--------|--------|--------|--------|
-| gate-1 | tnt-001 | corr-abc | 48000.00 | USD | 2026-09-10T10:05:00Z |
+| gate_id | resource_tenant_id | correlation_id | tcv_minor | currency | currency_minor_digits | submitted_at |
+|--------|--------|--------|--------|--------|--------|--------|
+| gate-1 | tnt-001 | corr-abc | 4800000 | USD | 2 | 2026-09-10T10:05:00Z |
 
 #### Table: owf_approval_park
 
@@ -1161,7 +1238,7 @@ introduced.
 
 ## 4. Additional context
 
-### 4.0 Detecting a Generic Approval outage
+### 4.0 Detecting an approval policy adapter outage
 
 Two different quantities have been conflated elsewhere and are separated here deliberately: how
 this gear *notices* an outage, and how long it *waits* before making one a human's problem. The
@@ -1317,7 +1394,7 @@ so a later configuration change does not silently move the deadline of a park al
 
 **Making the outage detectable before the window burns.** AC 2a requires a gate's escalation
 window to pause during an outage. The only detector is the breaker, the breaker only sees calls,
-and **while a gate is open no operation calls Generic Approval** — the definition is waiting on a
+and **while a gate is open no operation calls the approval policy adapter** — the definition is waiting on a
 `listen`. Nothing trips the breaker, so without help the outage would be noticed only when the
 escalation fires at 72 hours, by which point the window it was supposed to protect has fully
 burned.
@@ -1382,7 +1459,7 @@ recorded as D-88: the routing plan is persisted at the first `open-gates` with t
 
 The Gate Manager records this ordering; it does not decide it, and it does not execute it — the
 definition does, by calling `open-gates` with the `nextPosition` `record-decision` returns. Which
-parties, in which order, remains Generic Approval's configuration (§3.2), and in phase 1 there is no
+parties, in which order, remains the approval policy adapter's configuration (§3.2), and in phase 1 there is no
 configuration at all, since the stand-in never returns "required".
 
 ### 4.4 Operation rules
@@ -1480,9 +1557,9 @@ this slice stores. The definition reads only `due` and `serviceState` from these
 
 ### Disclosure 1 — the whole capability is inert in phase 1
 
-Until the Generic Approval service exists, every verdict query in this slice resolves through a
+Until the library adapter is bound, every verdict query in this slice resolves through a
 named stand-in, `cpt-cf-bss-orders-workflow-actor-owf-generic-approval`, behind the same §9.2
-expectations contract the real service will eventually satisfy — this is a stand-in behind the
+expectations contract the library adapter will satisfy — this is a stand-in behind the
 contract, not a second policy author. The stand-in returns "approval not required" for every order,
 and that verdict is recorded with the stand-in named as the deciding authority. This naming is not
 cosmetic: because the stand-in currently exempts every order, the deciding-authority field is the
@@ -1494,7 +1571,7 @@ not: the stand-in can fail to resolve, can be misconfigured, and can answer with
 and each of those is a verdict this gear could not obtain. `obtain-verdict`'s `unobtainable`
 answer, the park row, `arm-park-escalation` and the park loop are therefore built and exercised in
 phase 1 — which is consistent with the park being the one approval acceptance criterion that applies
-before the Generic Approval service exists, while the gate criteria are deferred behind the
+before the library adapter is bound, while the gate criteria are deferred behind the
 stand-in. In phase 1 the live operations are `obtain-verdict`, `reflect-verdict` (`stage =
 requirement`) and `arm-park-escalation`.
 
@@ -1502,14 +1579,14 @@ A direct consequence: while the stand-in is in place, no gate is ever opened, so
 `record-decision`, `escalate-gate`, `reflect-verdict` with `stage = gate-outcome`, the approver
 inbox, and the `OrderApprovalRequested` / `OrderApprovalEscalated` events never execute. All of
 that is fully specified and buildable now, and the definition's gate stage is present in every
-published version, but exercises zero real gates until the Generic Approval service is built. The
-Generic Approval service has no canonical specification anywhere in this repository today (PRD
-§9.2, §15, §16); this slice depends on it only through the expectations contract, and this design
-does not speculate about that service's own internal design.
+published version, but exercises zero real gates until the library adapter is bound. No approval
+service exists anywhere in this repository and none is asked for (D-197; PRD §9.2, §15, §16);
+this slice depends on the port only through the expectations contract, and the library adapter's
+gate-to-unit mapping is open question Q-14, not designed here.
 
 The two disclosures above are load-bearing for this slice: they are why the acceptance criteria in
 PRD §12 mark ACs 1 through 4a (including 2a) as deferred, and only ACs 0, 0a, 0b apply until the
-Generic Approval service exists.
+library adapter is bound.
 
 ### Disclosure 2 — open PRD gap on re-obtaining the verdict after OrderAmended
 

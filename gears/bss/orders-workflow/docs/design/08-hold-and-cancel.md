@@ -100,7 +100,7 @@ this slice calls no Lifecycle endpoint.
 
 | ADR ID | Decision Summary |
 |--------|-----------------|
-| `cpt-cf-bss-orders-workflow-adr-fail-closed-verdict-park` | The Generic Approval fail-closed park (slice 03) and the retry-then-failure-arm path for the other dependencies are structurally distinct mechanisms with distinct triggers and distinct effects on the Lifecycle `submitted` TTL, and must never be implemented as one path branching on dependency name. |
+| `cpt-cf-bss-orders-workflow-adr-fail-closed-verdict-park` | The approval-verdict fail-closed park (slice 03) and the retry-then-failure-arm path for the other dependencies are structurally distinct mechanisms with distinct triggers and distinct effects on the Lifecycle `submitted` TTL, and must never be implemented as one path branching on dependency name. |
 | `cpt-cf-bss-orders-workflow-adr-flow-as-platform-definition` | Hold, resume and cancel are definition arms; this slice's operations record them. The pause table and the retry governor are retired. |
 | `cpt-cf-bss-orders-workflow-adr-definition-versioning-and-protected-steps` | `apply-hold`, `apply-resume` and `authorize-cancel` are `protected`; §4.7 lists the constraints the validation hook enforces for them. |
 | `cpt-cf-bss-orders-workflow-adr-references-not-payloads` | Inputs and outputs are event ids, row references and durations; the authorization snapshot and the approver identities never cross the engine boundary. |
@@ -141,9 +141,13 @@ the dispatch operations of slice 05 issue no intent the process had not already 
 issuing, and the approval-escalation windows of the open gates are paused, because a hold must
 not let this process's escalation clock burn against the order. It does not, and structurally
 cannot, pause the Subscriptions draft auto-void TTL — that TTL is owned and clocked by
-Subscriptions and continues through a hold exactly as it would with no hold at all. It does not
-pause the lifetime ceiling, the barrier or the overdue window either: those are definition `wait`
-arms placed where no hold arm cancels them (§4.7). Already-accepted provisioning intents are not
+Subscriptions and continues through a hold exactly as it would with no hold at all. Nor does it
+pause the accepted-binding `activation_deadline` of the order version (Lifecycle D-152: a hold or
+resume changes no deadline): that clock is Pricing's and Subscriptions', and after a resume the
+first wave-2 dispatch re-runs its guard against it (`05 §3.6` `inst-pi-wave2-guard`, decision
+D-194), so an order held past its deadline goes to the unwind, never to a re-priced activation.
+It does not pause the lifetime ceiling, the barrier or the overdue window either: those are
+definition `wait` arms placed where no hold arm cancels them (§4.7). Already-accepted provisioning intents are not
 reversed by a hold; they run to their terminal outcome and are recorded against the frozen plan.
 This principle is why nothing in the resume path assumes wave-1 drafts survived: the only
 mechanism that detects a voided draft is slice 05's re-read inside the wave-2 dispatch, which runs
@@ -158,7 +162,7 @@ concern: the operation answers `retryable-failure`, the definition's task retry 
 the same key, and on exhaustion either the definition's named failure route marks the subject
 failed and hands it to the configured partial-failure policy — the wave calls — or the
 invocation faults and the instance liveness pass raises the `invocation-dead` task (`10 §4.6`,
-D-114). Unavailability of the Generic Approval service is not this
+D-114). Unavailability of the approval policy adapter is not this
 path: slice 03's `obtain-verdict` answers `unobtainable`, the definition routes only to the park
 arm, the order stays `submitted`, the Lifecycle `submitted` TTL is not paused, and the park
 escalates before it elapses. The two are triggered by different answers, resolved by different
@@ -186,7 +190,7 @@ The mechanism is slice 03's gate-window port
 remainder is captured by the port into `owf_approval_gate.window_remaining_ms`, which is the
 **single** authority for it (`03 §4.2`); this slice stores no copy of it and returns none; `apply-resume`'s
 `due` is computed from the deadline the port re-bases from that column in the same transaction. Because the port counts pause
-causes, a hold that overlaps a Generic Approval outage pause captures nothing a second time and a
+causes, a hold that overlaps an approval-policy outage pause captures nothing a second time and a
 resume that leaves the outage cause open re-arms nothing (`03 §4.2`).
 
 #### Hold/Resume Cycles Do Not Extend a Bounded Lifetime Indefinitely
@@ -479,8 +483,9 @@ exhaustion is the definition's named failure route and the partial-failure polic
 per-dependency budget table formerly here is superseded by the definition's per-task retry policy,
 which **MAY** be tighter per task and **MUST** nest inside the task timeout (`10 §2.2` rule 4)
 (decision D-70: the per-dependency retry budgets of the former governor
-are superseded by the definition's task retry policy under the nesting rule). Slice 04's Catalog
-read, which the governor used to wrap, is covered by the same rule (`04 §3.2`).
+are superseded by the definition's task retry policy under the nesting rule). Slice 04's
+Lifecycle and Account Management reads, which the governor used to wrap, are covered by the same
+rule (`04 §3.2`); the Catalog topology read it also wrapped no longer exists (decision D-196).
 
 #### Cancel Mediator
 
@@ -630,7 +635,7 @@ The Lifecycle `workflow-cancel` endpoint is no longer listed here: its only call
 
 | Dependency Gear | Interface Used | Purpose |
 |-------------------|---------------|----------|
-| bss-orders-lifecycle | The PDP-authorized order read ([Lifecycle `08 §4.2`](../../../orders-lifecycle/docs/design/08-read-and-authz.md#42-what-a-read-exposes-normative)), and nothing else | `apply-resume` reads whether Lifecycle still holds the order, on the poll (D-130) and on an `OrderResumed` (D-141); `apply-hold` reads it when a `resume_ahead` row exists (D-141). `OrderHeld` / `OrderResumed` arrive through the definition's `listen`; the `workflow-cancel` submission is slice 06's `report-outcome` |
+| bss-orders-lifecycle | `OrdersLifecycleWorkflowV1::get(order_id)` — the PDP-authorized current-order read ([Lifecycle `08 §4.2`](../../../orders-lifecycle/docs/design/08-read-and-authz.md#42-what-a-read-exposes-normative); Lifecycle D-155, decision D-193), and nothing else: this slice never calls `hold` or `resume` (Lifecycle's hold is the operator's, consumed here as `OrderHeld` / `OrderResumed`) and never reads a version's commercial content | `apply-resume` reads whether Lifecycle still holds the order, on the poll (D-130) and on an `OrderResumed` (D-141); `apply-hold` reads it when a `resume_ahead` row exists (D-141). `OrderHeld` / `OrderResumed` arrive through the definition's `listen`; the `workflow-cancel` submission is slice 06's `report-outcome` |
 
 #### Subscriptions (BSS)
 
@@ -727,7 +732,7 @@ on exhaustion of any other step call a fault of the invocation → the instance 
 The step is marked failed exactly once, by the operation that owns it, and the partial-failure
 policy — never a retry component — decides whether a manual task follows.
 
-#### Generic Approval Park (Distinguished, Not This Slice's Path)
+#### Approval Policy Park (Distinguished, Not This Slice's Path)
 
 **ID**: `cpt-cf-bss-orders-workflow-seq-generic-approval-park-reference`
 

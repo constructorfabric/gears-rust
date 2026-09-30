@@ -27,9 +27,10 @@ decision-makers: BSS Orders team (Architecture)
 ## Context and Problem Statement
 
 On `OrderSubmitted`, Orders Workflow must obtain the approval-**requirement** verdict from the
-Generic Approval service and reflect it into Orders Lifecycle (`submitted → pending_approval` or
-`submitted → approved`). That service has no canonical specification anywhere in this repository
-today; until it exists, Workflow invokes a stand-in behind the same PRD §9.2 expectations contract,
+approval policy adapter and reflect it into Orders Lifecycle (`submitted → pending_approval` or
+`submitted → approved`). No approval service exists anywhere in this repository and none is asked
+for (D-197): the adapter is a port of this gear, and until its library implementation is bound
+Workflow invokes a stand-in behind the same PRD §9.2 expectations contract,
 and after it exists the service can be unavailable when the verdict is needed. What must Workflow
 do with the order when the verdict cannot be obtained?
 
@@ -40,7 +41,7 @@ do with the order when the verdict cannot be obtained?
 * An order that fails open to `approved` without a verdict defeats the entire reason multi-party approval gating exists (financial authorization, legal review, partner sign-off).
 * An order that auto-rejects on a transient outage converts an infrastructure problem into a commercial refusal the customer did not cause.
 * The `submitted` TTL keeps running regardless of what Workflow does, so whatever is chosen must still escalate before that TTL elapses.
-* Until the Generic Approval service exists, some deciding authority must still be named, or every order would stall on a decision nobody is making.
+* Until the library adapter is bound, some deciding authority must still be named, or every order would stall on a decision nobody is making.
 
 ## Considered Options
 
@@ -51,10 +52,10 @@ do with the order when the verdict cannot be obtained?
 ## Decision Outcome
 
 Chosen option: "Fail-closed park", because it is the only option that neither asserts a verdict
-nobody computed nor manufactures a commercial refusal nobody intended. Until the Generic Approval
-service exists, the stand-in behind the same PRD §9.2 expectations contract is the deciding
+nobody computed nor manufactures a commercial refusal nobody intended. Until the library adapter
+is bound, the stand-in behind the same PRD §9.2 expectations contract is the deciding
 authority of record and returns `approval not required`; every such reflection is audited as
-stand-in, not as a Generic Approval verdict. After the service exists, its unavailability parks the
+stand-in, not as a library verdict. Once the library adapter is bound, its unavailability parks the
 process in the `parked` phase with the order remaining `submitted` — Workflow **MUST NOT**
 fail-open to `approved`. The park **does not suspend** the Lifecycle `submitted` TTL: expiry remains the bound (Lifecycle §6.3),
 so Workflow **MUST** escalate to the fulfillment-operator / operator queue **before** that TTL
@@ -72,7 +73,7 @@ must not fail-open to `approved` or auto-reject the gate.
   * **Outage escalation threshold** — how long the verdict may stay unobtainable before the parked process becomes an operator-visible incident: `min(30 min, 0.25 × lifecycle_submitted_ttl)`. **Accepted.**
   * **Escalation lead time before the `submitted` TTL** — the margin by which the escalation must precede expiry: `max(4 h, 0.25 × lifecycle_submitted_ttl)`. **Accepted.**
   * `lifecycle_submitted_ttl` is read from configuration, not inferred, and its presence and plausibility are **asserted at startup** — a missing or non-positive value, or one smaller than the lead time it must exceed, refuses the configuration rather than being silently defaulted. Orders Lifecycle exposing that value is an open upstream ask (`UPSTREAM_REQS.md`, Orders Lifecycle); until it lands the assertion fails closed and the escalation path is configured, not operating.
-* Every stand-in reflection must be tagged as stand-in in the audit trail, so a later cutover to the real Generic Approval service can be distinguished from genuine verdicts in historical data.
+* Every stand-in reflection must be tagged as stand-in in the audit trail, so a later cutover to the library adapter can be distinguished from genuine verdicts in historical data.
 * The gate-pause mechanism must reuse the same pause primitive as hold, so escalation-timer arithmetic does not silently include downtime as elapsed window.
 * There is deliberately **no in-band un-park authority**: no operator surface force-approves a parked order, because that would be the fail-open this decision refuses, reintroduced through an endpoint. A park is left only by a verdict arriving, by the Lifecycle TTL expiring, or by a workflow-mediated cancel. The absence is recorded here so it reads as a decision rather than an omission.
 * No new "approved-without-verdict" or "auto-rejected-without-verdict" order state is ever introduced, which keeps Lifecycle's state machine exactly as documented in its own PRD.
@@ -127,8 +128,8 @@ asserting a gate-open outage pauses the escalation timer rather than letting it 
 ## More Information
 
 The stand-in's `approval not required` behavior is not a second policy author — it answers behind
-the identical PRD §9.2 expectations contract the real Generic Approval service will satisfy, so
-swapping the stand-in for the real service requires no change to Workflow's reflection logic.
+the identical PRD §9.2 expectations contract the library adapter will satisfy, so
+swapping the stand-in for the library adapter requires no change to Workflow's reflection logic.
 
 ## Traceability
 
@@ -137,7 +138,7 @@ swapping the stand-in for the real service requires no change to Workflow's refl
 
 This decision directly addresses the following requirements or design elements:
 
-* `cpt-cf-bss-orders-workflow-fr-owf-approval-request` — fixes the fail-closed park behavior and the stand-in's role as the deciding authority until the Generic Approval service exists
+* `cpt-cf-bss-orders-workflow-fr-owf-approval-request` — fixes the fail-closed park behavior and the stand-in's role as the deciding authority until the library adapter is bound
 * `cpt-cf-bss-orders-workflow-fr-owf-approval-escalation` — fixes that a gate-open outage pauses the escalation timer rather than burning the window, and that a prolonged outage escalates to the operator queue without failing open or auto-rejecting
 * `cpt-cf-bss-orders-workflow-nfr-owf-escalation-timer` — the ± 5 minute accuracy requirement applies to the same timer this decision requires to be pausable across an outage
 * `cpt-cf-bss-orders-workflow-component-approval-execution` (**verdict gateway**) — the single call site for the verdict query and the Lifecycle reflection it drives; it is this component that parks the process in `parked` when the verdict cannot be obtained, never fulfillment orchestration

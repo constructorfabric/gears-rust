@@ -211,6 +211,13 @@
   - [D-190 (M) `reflect-verdict` answers a Lifecycle refusal as the settled answer `refused`, and the definition catches no 400 of it](#d-190-m-reflect-verdict-answers-a-lifecycle-refusal-as-the-settled-answer-refused-and-the-definition-catches-no-400-of-it)
   - [D-191 (M) The audit read is access-logged like Lifecycle's: one `owf_read_access_log` row per request, served or refused](#d-191-m-the-audit-read-is-access-logged-like-lifecycles-one-owf_read_access_log-row-per-request-served-or-refused)
   - [D-192 (M) The operator re-drive of a dead invocation is an explicit readiness item that gates the action, not readiness](#d-192-m-the-operator-re-drive-of-a-dead-invocation-is-an-explicit-readiness-item-that-gates-the-action-not-readiness)
+  - [D-193 (H) PriceBook reaches this gear only through Lifecycle's Workflow SDK and its immutable-version read](#d-193-h-pricebook-reaches-this-gear-only-through-lifecycles-workflow-sdk-and-its-immutable-version-read)
+  - [D-194 (H) The accepted binding's activation deadline is checked early at freeze, at the re-check and before every activation submit; expiry after an activation compensates first](#d-194-h-the-accepted-bindings-activation-deadline-is-checked-early-at-freeze-at-the-re-check-and-before-every-activation-submit-expiry-after-an-activation-compensates-first)
+  - [D-195 (H) A provisioning intent carries the source version tuple as the accepted-binding reference, and `activated` means Subscriptions' `applied`](#d-195-h-a-provisioning-intent-carries-the-source-version-tuple-as-the-accepted-binding-reference-and-activated-means-subscriptions-applied)
+  - [D-196 (H) Acquisition lines are independent: the dependency graph, its Catalog source and the `blocked-upstream` outcome are withdrawn](#d-196-h-acquisition-lines-are-independent-the-dependency-graph-its-catalog-source-and-the-blocked-upstream-outcome-are-withdrawn)
+  - [D-197 (H) The approval policy owner is this gear's approval-policy adapter; the Generic Approval service is withdrawn](#d-197-h-the-approval-policy-owner-is-this-gears-approval-policy-adapter-the-generic-approval-service-is-withdrawn)
+  - [D-198 (M) The approval request carries the stored TCV as an integer in minor units with its currency and scale](#d-198-m-the-approval-request-carries-the-stored-tcv-as-an-integer-in-minor-units-with-its-currency-and-scale)
+  - [D-199 (L) Seam notes: the payment amount is separate from the TCV, no Products reservation exists, and change orders wait for their own PriceBook pass](#d-199-l-seam-notes-the-payment-amount-is-separate-from-the-tcv-no-products-reservation-exists-and-change-orders-wait-for-their-own-pricebook-pass)
 - [Open Questions](#open-questions)
   - [Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?](#q-01-which-durable-execution-substrate-backs-the-process--the-oss-workflow-engine-or-a-bss-local-mechanism)
   - [Q-02: The Generic Approval escalation threshold — the one PRD-deferred numeric value this design deliberately leaves unset](#q-02-the-generic-approval-escalation-threshold--the-one-prd-deferred-numeric-value-this-design-deliberately-leaves-unset)
@@ -225,6 +232,7 @@
   - [Q-11: Does the platform's DSL express the hold pattern and the other constructs the definition needs, or do they need Functions?](#q-11-does-the-platforms-dsl-express-the-hold-pattern-and-the-other-constructs-the-definition-needs-or-do-they-need-functions)
   - [Q-12: Engine-history isolation, retention and residency — the pending half of Q-01](#q-12-engine-history-isolation-retention-and-residency--the-pending-half-of-q-01)
   - [Q-13: Which caller-facing route or event sends `reauthorize-requested` and `unpark-requested`?](#q-13-which-caller-facing-route-or-event-sends-reauthorize-requested-and-unpark-requested)
+  - [Q-14: How does an approval gate map onto a `cf-gears-bss-approval` unit once the library adapter replaces the stand-in?](#q-14-how-does-an-approval-gate-map-onto-a-cf-gears-bss-approval-unit-once-the-library-adapter-replaces-the-stand-in)
 - [What This Design Set Does Not Claim](#what-this-design-set-does-not-claim)
 - [Traceability](#traceability)
 
@@ -530,6 +538,8 @@ or let a real provisioning failure escape compensation.
 Pre-Activation Abort Is Not a Line Failure` and § `3.6 Pre-Activation Abort`
 
 ### D-16: Dependency resolution is Catalog-owned, graph-validated, and frozen per orderId plus orderVersion before any provisioning intent; a bundle is one line item
+
+**Superseded by D-196 (2026-09-30).** Under PriceBook there is no inter-line product topology: a line is one plan revision with its selected items, and nothing links one revision to another. The plan carries no dependency graph and reads no Catalog; the freeze per `orderId` + `orderVersion` and the one-task-per-line rule stand. Historical rationale follows.
 
 **Decision**: the order document carries no dependency data. The Plan Constructor reads Catalog's
 published topology, builds exactly one `FulfillmentTask` per order line item — bundle lines are
@@ -1710,7 +1720,9 @@ gear to a versioned platform workflow definition (`ADR/0011`, `ADR/0012`, `ADR/0
 each slice was restructured into step operations and a definition fragment. D-65…D-72 carry the
 three ADRs and their cross-cutting consequences; D-73…D-101 are the decisions the slice
 restructurings recorded, D-102…D-163 the decisions taken on the second review of
-2026-09-26, and D-164…D-192 those taken on the re-review of 2026-09-28. Each names the entries it amends; the amended entries carry a dated
+2026-09-26, D-164…D-192 those taken on the re-review of 2026-09-28, and D-193…D-199 those taken on
+2026-09-30 to mirror PriceBook and the Orders Lifecycle rewrite for it (Lifecycle `ADR/0008`,
+D-150–D-168, uncommitted in its worktree at the time of writing). Each names the entries it amends; the amended entries carry a dated
 **Amended by** note. D-65…D-101 were taken on 2026-09-24.
 
 ### D-65 (H) The order process flow is a versioned platform workflow definition executed by serverless-runtime
@@ -2135,6 +2147,10 @@ whose manual task slice 07 creates (`01 §4.9`). The engine contributes ten fami
 **Amended (2026-09-26)**: `invocation-dead` is registered for slice 07 (D-105); the catalogue is
 **43** reasons — ten engine, thirty-three slice.
 
+**Amended by D-194 and D-196 (2026-09-30)**: `order-binding-expired` is registered for slices 04 and
+05; `invalid-dependency-graph` and `catalog-topology-unavailable` (04) and `blocked-upstream` (06)
+are withdrawn; the catalogue is **41** reasons — ten engine, thirty-one slice (04 seven, 06 four).
+
 ### D-78 (M) The barrier and the park are definition patterns over Orders guards
 
 **Accepted.** *(amends D-12, D-23, D-24; ADR-0004 and ADR-0007 as amended)*
@@ -2479,6 +2495,8 @@ nearest the resource-affecting step, and an honest reason distinguishes an outag
 ### D-92 (M) A plan-level failure never leaves `approved` by itself
 
 **Accepted.**
+
+**Amended by D-194 and D-196 (2026-09-30).** `topology-unavailable` no longer exists; the plan-level manual task under either policy is now `binding-expired` — the expected fulfillment time at or after the accepted-binding activation deadline (`design/04-fulfillment-plan.md` §4.3). The rule itself — no Lifecycle transition from `approved` by a plan-level failure alone; every route passes `begin-fulfillment` — is unchanged.
 
 **Decision**: plan-level failures take no Lifecycle transition from `approved`; `topology-unavailable`
 is a plan-level manual task under either policy; a plan-level failure that must report
@@ -2871,6 +2889,8 @@ unwind; the request row names the task it resolves.
 
 **Amended by D-192 (2026-09-28)**: "`retry` is offered only once the platform confirms" is stated as an explicit item of the readiness gate (`design/01-foundation.md` §3.8) that gates the action, not readiness; `design/07-manual-tasks.md` §4.4 names the unwind as the only remedy until then, and aged-out downstream keys (D-185) and deterministic 500s (D-168) as faults that land there.
 
+**Amended by D-194 and D-196 (2026-09-30)**: the catalogue is **41** reasons (D-77 as amended); `invocation-dead` is unchanged.
+
 ### D-106 (H) Every step call is bound to the instance's invocation, and the fence needs a recorded cause
 
 **Accepted (2026-09-26).** *(amends D-67)*
@@ -3013,6 +3033,8 @@ for a terminal order (`04 §3.6`), `begin-fulfillment`'s `version-conflict` is a
 (d); `DESIGN.md` §3.3, §3.6; D-84, D-92, D-105.
 
 ### D-110 (H) The fence resolves the failure reason from the record and maps it to Lifecycle's closed enumeration
+
+**Amended by D-194 and D-196 (2026-09-30).** Plan failures no longer map to `dependency-graph-invalid`: the two graph causes are withdrawn, and the three accepted-binding causes — construction `binding-expired`, the re-check abort and the wave-2 guard or receiver refusal — map to Lifecycle's `order-binding-expired` (`06 §4.8`; Lifecycle feature 06 §4.4). `payment-authorization-stale` remains the one interim value.
 
 **Accepted (2026-09-26).**
 
@@ -5935,6 +5957,216 @@ gear unready: the pending dead-letter routes of `09 §4.1` stay unregistered unt
 
 **Clarified (2026-09-28, verification V2)**: `ADR/0011`'s *Runtime gate* held readiness on "the platform asks below", and its signals ask covers the re-drive. It gains an amendment block that carves the re-drive out of readiness (V2-4). `design/10-process-definition.md` §4.6 described the re-drive as available, in the one failure rule and in the aged-out-key paragraph. It now adds "once the platform confirms it", and names the dead-instance unwind (`01 §4.16` item 2) as the remedy until then (V2-6).
 
+### D-193 (H) PriceBook reaches this gear only through Lifecycle's Workflow SDK and its immutable-version read
+
+**Accepted (2026-09-30).** *(amends D-66 as amended and D-131; carries Lifecycle `ADR/0008`, D-155, D-158)*
+
+**Decision**: (1) Every Lifecycle call is a method of `OrdersLifecycleWorkflowV1`, obtained through
+`ClientHub`: `reflect_approval`, `begin_fulfillment`, `report_spawn_signal`, `acknowledge`,
+`workflow_cancel`, `hold`, `resume`, `get` and `get_version`. The REST paths this design used to
+cite stay as correspondence text only. (2) The immutable commercial content of a fixed order
+version — the lines, their selected items, the accepted `OrderPin` (plan revision, per-item chain
+bindings, SKU versions, activation deadline), the overlap keys, the totals and the TCV — is read
+inside step operations through `get_version(orderId, orderVersion)`; the current-state read `get`
+serves admissibility and applicability only, and possession of an event or version reference grants
+no authority. (3) Lifecycle publishes its state events as bounded projections plus a version
+reference (Lifecycle D-158); that answers `…-upreq-lifecycle-thin-events`, which keeps its ID with
+the residual of confirming the projection schema. (4) The retired catalog vocabulary goes:
+`catalogPricePin` and `priceId` become the accepted `OrderPin`, `plan_revision_id` and `price_id`;
+"Catalog / Plan & Price" becomes Pricing (PriceBook), Products and Rating, none of which this gear
+calls — their facts reach it only as Lifecycle's stored order version.
+
+**Rationale**: **Precedent**: Lifecycle D-155 (SDK parity — an SDK method enters the same authorized
+application service as REST and is not an authorization bypass) and D-158 (expanded pins through
+authorized immutable-version reads, events bounded). ADR-0013 keeps only references across the
+engine boundary; a version reference plus an authorized read is the shape it always wanted, and it
+removes the commercial payload from the consumed events without a thin variant of each. The
+producer baseline is diffora `bss/products` at `16705a243`; the Lifecycle rewrite (ADR-0008,
+D-150–D-168) is uncommitted in its worktree, so this entry cites it by decision number.
+
+**Propagated**: `DESIGN.md` §2.2 (*No price computation*), §3.1, §3.5; `design/03-approval-execution.md`
+§3.2, §3.4, §3.6; `design/04-fulfillment-plan.md` §1.3, §3.2, §3.4, §3.6; `design/05-provisioning-intents.md`
+§2.2, §3.2, §3.5; `design/06-saga-and-compensation.md` §3.2, §3.3; `design/08-hold-and-cancel.md` §3.5;
+`ADR/0013`; `UPSTREAM_REQS.md` §1.2, §2.4, §2.5, §5; `PRD.md` §1.4, §5.2, §6.5, §12 (`UPSTREAM_REQS.md` §4 item 16).
+
+### D-194 (H) The accepted binding's activation deadline is checked early at freeze, at the re-check and before every activation submit; expiry after an activation compensates first
+
+**Accepted (2026-09-30).** *(amends D-15, D-91, D-92, D-110; carries Lifecycle D-152, D-162)*
+
+**Decision**: (1) `construct-and-freeze-plan` refuses to freeze a plan whose expected fulfillment
+time is at or after the earliest `activation_deadline` of its lines: `planState = binding-expired`, a
+plan-level failure that opens a plan task under either policy and needs no compensation;
+`owf_fulfillment_plan.activation_deadline_at` (the earliest, exclusive) is written at freeze and is
+immutable. (2) `re-check-pre-activation` aborts with `abort_record` `order-binding-expired` when any
+line's deadline has elapsed, beside the stale-authorization leg. (3) `dispatch-wave2-activate`'s guard
+refuses the whole call as the settled answer `bindingExpired: true` when any deadline has elapsed at
+database time; nothing is submitted, and the definition routes it to the unwind
+(`wave2BindingExpired`) under either policy with no manual task. (4) Subscriptions is the
+authority: it verifies the accepted prices by comparison at activation (Lifecycle D-162), and its
+refusal — the binding comparison, the deadline, a lost SKU protection, a source-version mismatch —
+is a synchronous `wave2-activation-failed` with the cause preserved. (5) The fence maps all three
+causes to Lifecycle's `failure_reason` `order-binding-expired` (Lifecycle feature 06 §4.4). Once
+any line is active the path is the normal fence — void the drafts, cancel the activated lines,
+evidence with `no_active_subscription_remains = true`, then `acknowledge failed` — never a
+pre-activation abort. (6) A hold does not pause the deadline; `apply-resume` re-runs the wave-2
+guard. (7) `order-binding-expired` is one catalogue reason (owner slice 04, raised also by slice 05's
+guard; `ORDER_BINDING_EXPIRED`, FailedPrecondition, 400); `binding-expired` is a `planState` value
+and a task path, never a second reason.
+
+**Rationale**: **Precedent**: Lifecycle D-152 — state TTLs, hold/resume and payment-tolerance
+elections neither extend the deadline nor authorise repricing; an expiry during fulfillment stops
+dispatch and follows evidence-gated compensation, not a new expiry edge — and D-162, under which the
+deadline is an early check and the receiver's comparison needs no clock agreement between the
+gears. The three early checks are early aborts only, exactly as the overlap re-check is (D-91): a
+receiver may still refuse, and that refusal has its own path.
+
+**Propagated**: `design/04-fulfillment-plan.md` §2.2, §3.1, §3.3, §3.6, §3.7, §4.3, §4.6;
+`design/05-provisioning-intents.md` §3.3, §3.6, §4.5, §4.6; `design/06-saga-and-compensation.md` §3.6,
+§4.8; `design/07-manual-tasks.md` §3.3, §3.7, §4; `design/08-hold-and-cancel.md` §2.1;
+`design/10-process-definition.md` §3.6 (b), §4.6; `design/01-foundation.md` §4.9; `UPSTREAM_REQS.md`
+§2.1 (`SUB-O11`), §2.4; `PRD.md` §6.1 (note); D-77, D-105 (counts).
+
+### D-195 (H) A provisioning intent carries the source version tuple as the accepted-binding reference, and `activated` means Subscriptions' `applied`
+
+**Accepted (2026-09-30).** *(amends D-97 as amended, D-125; carries Lifecycle D-157, D-163, D-165, D-168)*
+
+**Decision**: (1) Every forward intent carries the source tuple `(orderId, orderVersion,
+orderLineId)`, which is also the accepted-binding reference: Subscriptions reads the accepted
+composition through Lifecycle's `get_version` and verifies it at activation; no pin, price, item or
+amount crosses from this gear. It also carries the explicit start intent (`SUB-O10`), the tenant
+axes, the process `correlationId`, and the order and line external references snapshotted at the
+first handoff (`owf_provisioning_intent.external_refs_snapshot`) and reused on every retry. The
+intent key is unchanged. (2) `activate` carries the draft id, its expected version, the same tuple
+and the actual instant as start. (3) Status mapping: Subscriptions' `applied` is this gear's
+`activated`; `approved` (accepted, OSS pending) leaves the intent `submitted`; `oss_unconfirmed` is
+`wave2-activation-failed`. (4) `SUB-O5` is the count read — active count, effective
+`max_concurrent_active`, provenance per `(payer, overlap_scope_key)`, drafts excluded — over the
+registry-owned `SUB-G1` key stored on the order line, never derived here. (5) `SUB-O11`'s refusal
+kinds include the binding comparison, the deadline, a lost protection and a source-version
+mismatch. (6) Instants: the actual activation is `serviceActivatedAt`; `customerAcceptedAt` is
+mapped from Lifecycle's acceptance record by the receiver; `contractEffectiveAt` comes from the
+Contract.
+
+**Rationale**: **Precedent**: Lifecycle D-157 (versioned creation keys, actual start, fee-free
+compensation), D-165 (the existing three instants and the OSS-async `activate`; `applied`, not
+`approved`, is completion) and D-168 (external references travel order → create → billable fact →
+invoice, snapshotted at the first handoff). The counterpart note explicitly keeps this gear's
+tenant/order/version/line/wave/kind/attempt key: a line-only key would conflate amended orders and
+rebuilt drafts. ADR-0013 is untouched — the tuple is a reference.
+
+**Propagated**: `design/05-provisioning-intents.md` §2.1, §2.2, §3.3, §3.6, §3.7, §4.1;
+`design/06-saga-and-compensation.md` §3.3; `design/04-fulfillment-plan.md` §2.1; `DESIGN.md` §3.1;
+`UPSTREAM_REQS.md` §2.1 (`SUB-O5`, `SUB-O10`, `SUB-O11`, `SUB-O13`, *PriceBook provisioning amendment*); Q-08.
+
+### D-196 (H) Acquisition lines are independent: the dependency graph, its Catalog source and the `blocked-upstream` outcome are withdrawn
+
+**Accepted (2026-09-30).** *(supersedes D-16; amends D-77, D-92, D-105, D-110, `ADR/0004` and `ADR/0005` as amended)*
+
+**Decision**: the plan is one `FulfillmentTask` per line and nothing else: no `DependencyEdge`, no
+`dependency_graph`, no `catalog_topology_revision`, no `dependency_rank`, no acyclicity or
+completeness check, no Catalog read. The two-wave barrier is unchanged — every draft before any
+activation, and the expected-fulfillment instant — and is the whole ordering; the order within a
+released wave is dispatch admission (`05 §4.3`). `planState` is `frozen` or `binding-expired`; the
+reasons `invalid-dependency-graph` and `catalog-topology-unavailable` are withdrawn, and so is
+`blocked-upstream`, because a reverse compensation walk over `execution_seq` has no upstream
+subject to wait for (`owf_compensation_record.outcome` is `succeeded | failed-pending-escalation`;
+`blocked_by_record_id` is dropped). The Catalog ask (`…-upreq-catalog-dependency-topology-read`)
+and the topology row of the failure-reason coverage ask are withdrawn; PRD §6.1, §5.1, §7.1 and
+acceptance criterion 5 are amended through `UPSTREAM_REQS.md` §4 item 15. The catalogue holds 41 reasons.
+
+**Rationale**: under PriceBook a line is one plan revision with its selected items; an add-on is an
+optional item of the same revision, inside the line; Pricing refuses bundle SKUs as plan items; and
+nothing links one revision to another (Lifecycle `ADR/0008`, D-150, D-156). The "add-on requires its
+platform plan" example the PRD gave is therefore inside one line, not an edge between two. The
+alternative — keep the graph and define a `resolve_topology` producer whose owner is a release
+prerequisite, which is how Lifecycle's ask on this gear reads ("unknown topology must not become an
+empty dependency set") — would block order-taking on a contract nobody owns for a relation the
+model does not have. That sentence is answered by there being no topology at all, not by an empty
+graph; the Lifecycle owner is asked to reword it (hand-off note in
+`docs/reviews/2026-09-30-orders-workflow-pricebook-fix-plan.md`). **Precedent** for the ordering
+that remains: `ADR/0004`'s barrier, whose decision drivers never depended on topology.
+
+**Propagated**: `design/04-fulfillment-plan.md` §1–§4 (principle `…-principle-lines-independent`,
+constraint `…-constraint-bundle-one-line` retitled, `…-constraint-dependency-ordering-owner` and
+`…-entity-dependency-edge` retired); `design/05-provisioning-intents.md` §3.2, §3.6;
+`design/06-saga-and-compensation.md` §2.1, §3.3, §3.6, §3.7, §4.8; `design/07-manual-tasks.md` §3.3, §3.7, §4;
+`design/08-hold-and-cancel.md` §3.2; `design/10-process-definition.md` §3.6 (b); `design/01-foundation.md`
+§4.9; `ADR/0005`; `DESIGN.md` §1.2, §3.5; `PRD.md` §6.1 and criterion 5 (notes); `UPSTREAM_REQS.md`
+§1.1, §1.2, §2.4, §2.5, §3, §4 item 15, §5.
+
+### D-197 (H) The approval policy owner is this gear's approval-policy adapter; the Generic Approval service is withdrawn
+
+**Accepted (2026-09-30).** *(amends D-12, D-14, D-189; answers Q-05 in part; carries Lifecycle D-166)*
+
+**Decision**: approval policy — the requirement verdict, routing, thresholds, the decision, the
+escalation path — is reached only through the **approval policy adapter**, a port of this gear
+(`cpt-cf-bss-orders-workflow-component-approval-policy-adapter`) whose contract is PRD §9.2's
+clauses (a)–(g) plus D-189's read-by-key and decision re-publication: `verdict(orderId,
+orderVersion)`, `submit(request)`, `lookup_by_key(requestKey)`, `read_decision(decisionEventId)`,
+`escalate(gate)`. Two implementations: `stand-in`, today's behaviour, answering `not_required` and
+audited as the deciding authority by name (D-14); and `library`, the intended one, embedding
+`cf-gears-bss-approval` (`Engine`, `ApprovalSubject`, `Store`) as Pricing and Products do — not
+designed here, its gate-to-unit mapping is Q-14. The decision event stays a `listen` target; under
+the library adapter it is published on this gear's own topic (D-177). "Generic Approval service" is
+withdrawn from the PRD, `DESIGN.md`, `UPSTREAM_REQS.md`, the slices, the ADRs and the README; ask
+2.3 becomes LOCAL and keeps its ID; the actor ID `…-actor-owf-generic-approval` is kept.
+
+**Rationale**: **Precedent**: `gears/bss/libs/approval` is built and embedded by Pricing and Products
+inside their own transactions; no approval service exists (upstream's `gears/approval-service` PRD
+is a stub) and Lifecycle D-166 records the same conclusion for the sibling gear. The port keeps the
+policy owner separate from the orchestration even when both live in this gear (Lifecycle R2), and
+the deciding authority on every verdict names which implementation answered.
+
+**Propagated**: `PRD.md` §1, §3.2 (*Approval Policy Owner*), §5, §6.2, §6.3, §6.5, §7.1, §9.2, §12, §13,
+§15, §16, §17.1; `DESIGN.md` §1.3, §3.1, §3.5, §4; `UPSTREAM_REQS.md` §1, §2.3, §4 item 17;
+`design/03-approval-execution.md` §1.1, §2.2, §3.2, §3.5, §3.6, §4.0; `design/01-foundation.md`,
+`design/02-triggers-and-start.md`, `design/08-hold-and-cancel.md`, `design/09-read-and-authz.md`,
+`design/10-process-definition.md`, `design/README.md` (rename); `ADR/0002`, `ADR/0006`, `ADR/0007`,
+`ADR/0009`, `ADR/0011`, `ADR/0013`; Q-05, Q-14.
+
+### D-198 (M) The approval request carries the stored TCV as an integer in minor units with its currency and scale
+
+**Accepted (2026-09-30).** *(amends D-09's request record; carries Lifecycle D-154, D-167)*
+
+**Decision**: `owf_approval_request` carries `tcv_minor bigint`, `currency text` and
+`currency_minor_digits smallint`, all NOT NULL, read by `open-gates` from Lifecycle's `get_version`
+and carried verbatim; `resolved_total numeric` is gone and the wording is "TCV", never "resolved
+total (TCV)". The figure is Rating's net pre-tax annualised TCV as Lifecycle stores it; this gear
+adds, converts and rounds nothing, and calls neither Rating nor Pricing (the Atlas trait map's
+"called by Orders Workflow" for `PrePurchaseEvaluationV1` is wrong). A submitted version always
+has a TCV (Lifecycle refuses to submit without totals), so a missing figure is a contract-violation
+refusal before submission, and the fail-closed rule stands.
+
+**Rationale**: **Precedent**: Lifecycle D-154 (Rating supplies whole-order figures and the TCV over
+the exact selected prices; Orders stores integer minor-unit figures verbatim and neither sums nor
+converts) and D-167 (the Rating request in resolve's vocabulary, periods `month` or `year`). A
+`numeric` column invited a local reading of money that R4 forbids.
+
+**Propagated**: `design/03-approval-execution.md` §3.2, §3.6, §3.7; `DESIGN.md` §2.2, §3.1; `PRD.md`
+§3.2, §5.2, §6.2, §6.5, §9.2, §12 (`UPSTREAM_REQS.md` §4 item 16).
+
+### D-199 (L) Seam notes: the payment amount is separate from the TCV, no Products reservation exists, and change orders wait for their own PriceBook pass
+
+**Accepted (2026-09-30).** *(amends D-17 as amended by D-90; carries Lifecycle D-156, D-164, D-168)*
+
+**Decision**: (1) A payment authorization request is bound to the order version's Rating figure in
+the book currency, an integer in minor units — separate from the TCV the approval request carries;
+who mints `payment_auth_request_ref` (Lifecycle's acceptance path or this gear's
+`reauthorize-requested` signal) is open under Q-06, and Ledger settlement is never accepted as an
+authorized outcome (Lifecycle D-168). (2) SKU protection through activation is inherited from the
+accepted revision's `plan_item` references (Lifecycle D-164): this gear reserves nothing, holds no
+receipt, and a forced retirement surfaces as a Subscriptions refusal on the provisioning-failure
+path. (3) The market re-check compares the book currency and the producer-declared market
+applicability with the payer profile (Lifecycle D-156); the composed algorithm is unchanged. (4)
+The Change Orders PRD (`gears/bss/orders-changes`) asks this gear for a single transactional change
+intent and still uses the retired vocabulary; it needs its own PriceBook pass before the change
+intent is designed here.
+
+**Rationale**: each is a fact of the counterpart's rewrite that this design would otherwise
+contradict by silence; none warrants a design of its own here.
+
+**Propagated**: `design/04-fulfillment-plan.md` §3.4, §3.5; `UPSTREAM_REQS.md` §2.2, §2.5; Q-06.
+
 ## Open Questions
 
 ### Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?
@@ -6036,6 +6268,8 @@ stand-in (returning "approval not required", audited) is recorded as the decidin
 name only as an interim measure, not as a second policy author, and cannot be extended until the
 spec lands.
 
+**Amended by D-197 (2026-09-30)**: no specification is awaited any more. The approval policy owner is this gear's approval-policy adapter, whose intended implementation embeds `cf-gears-bss-approval` as Pricing and Products do (Lifecycle D-166 records the same). What still keeps multi-party gates, escalation and the inbox inert is the library adapter itself: its gate-to-unit mapping is Q-14. The stand-in stays the deciding authority by name until then.
+
 ### Q-06: Payments has no specification and no register, so the payment-authorization ask has no owner; only "provision first, collect after" is expressible
 
 **Owner**: Architecture, with Product.
@@ -6047,6 +6281,8 @@ card checkout that collects before provisioning — with its own capture, SCA-ch
 retry-with-another-instrument, and refund-as-reversal needs — has no home in the current flow and
 cannot be implemented against this design until a Payments spec exists and the ordering, outcome
 visibility, and reversal-artifact open questions in the PRD are resolved.
+
+**Amended by D-199 (2026-09-30)**: two items are added to the question — the amount an authorization request is bound to (the order version's Rating figure in the book currency, in integer minor units, separate from the TCV the approval request carries) and who mints `payment_auth_request_ref` (Lifecycle's acceptance path or this gear's `reauthorize-requested` signal). Ledger settlement is not authorization (Lifecycle D-168).
 
 ### Q-07: Tension between asynchronous outbox publication and the PRD's p95 < 30 s process-event delivery target
 
@@ -6078,6 +6314,8 @@ re-check follows Lifecycle's `defer` ladder and then aborts with `overlap-read-u
 compensation leg has no cancellation-reason value to send, since reason values ride event payloads
 consumers key on and adding one after Billing consumes the contract would be a breaking change;
 this design names the requirement and defers the value rather than inventing a placeholder.
+
+**Amended by D-195 (2026-09-30)**: the read is Lifecycle's count amendment — the active count, the effective `max_concurrent_active` and the policy provenance per `(payer, overlap_scope_key)`, drafts excluded — and the key is Subscriptions' registry-owned `catalogSubscriptionProductKey` of `SUB-G1`, stored on the order line at submit and reused as stored (Lifecycle D-126, D-153, D-163; the derivation proposed to Subscriptions is the SKU of the line's paid recurring item). `UPSTREAM_REQS.md` §2.1 carries the wording; the fail-closed posture is unchanged.
 
 ### Q-09: Do the Orders gears and Pricing converge on toolkit-db session advisory locks or on the `gears/bss/libs/coord` fenced lease for worker coordination?
 
@@ -6199,6 +6437,26 @@ canonical definition** and the corresponding cases fall back to the paths that e
 park).
 
 **Review trigger**: the platform readiness gate.
+
+### Q-14: How does an approval gate map onto a `cf-gears-bss-approval` unit once the library adapter replaces the stand-in?
+
+**Owner**: Architecture, with Product for the requirement thresholds.
+
+**Open.** D-197 makes this gear's approval-policy adapter the policy owner and names the built
+library as its intended implementation, without designing the mapping. The candidate this
+register expects, to be confirmed or replaced: a gate is one approval unit (`ApprovalSubject` kind
+`order_version`, `ref_type` the order, one unit per gate party, `validate_submit` carrying the
+TCV-threshold policy); the Approver Inbox decision route is `Engine::approve` / `Engine::reject`
+with the client's `seen_generation`, the library's submitter exclusion doubling D-56's separation
+of duties; the requirement verdict, the thresholds and the sequential positions live in
+`owf_seller_policy` (D-140) since the library holds quorum within a unit but no routing; the four
+library tables are created under this gear's prefix through `bss_approval::ddl::apply_up(manager,
+"owf_", Some("bss"))`; the decision event is enqueued on this gear's own topic (D-177) in the same
+transaction as `Engine::approve`; escalation stays this gear's (D-10). What the library does not
+give — the requirement verdict, positions, the escalation path — stays in this gear's record.
+
+**Review trigger**: before the library adapter is bound; answering it closes the §15 approval row
+of the PRD and the open item of `UPSTREAM_REQS.md` §2.3.
 
 ## What This Design Set Does Not Claim
 
@@ -6390,6 +6648,13 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-190 | M `reflect-verdict` answers its refusal `refused`; no 400 catch | `design/03-approval-execution.md` §3.3, §3.6, §4.4, §4.5, `design/10-process-definition.md` §3.6 (a), §4.6, `design/01-foundation.md` §4.3, §4.9, `design/07-manual-tasks.md` §3.3, `ADR/0012`; D-112, D-185 |
 | D-191 | M Audit read access-logged: `owf_read_access_log`, one row per request, served or refused | `design/09-read-and-authz.md` §3.2, §3.3, §3.7, §4.3, `design/01-foundation.md` §3.7, §3.8, `DESIGN.md` §3.3, §3.7, §4.4; D-48, D-104, D-186 |
 | D-192 | M Dead-invocation re-drive: explicit readiness item gating the action, not readiness | `design/01-foundation.md` §3.8, `design/07-manual-tasks.md` §4.4, `design/10-process-definition.md` §3.3, `UPSTREAM_REQS.md` §2.9; D-86, D-105 |
+| D-193 | H PriceBook through Lifecycle's Workflow SDK and `get_version`; retired vocabulary | `DESIGN.md` §2.2, §3.1, §3.5, `design/03` §3.2, §3.4, §3.6, `design/04` §1.3, §3.2, §3.4, §3.6, `design/05` §2.2, §3.2, §3.5, `design/06` §3.2, §3.3, `design/08` §3.5, `ADR/0013`, `UPSTREAM_REQS.md` §1.2, §2.4, §2.5, §5, `PRD.md`; D-66, D-131 |
+| D-194 | H Activation deadline checked at freeze, re-check and wave-2 guard; expiry after activation compensates first; `order-binding-expired` | `design/04` §2.2, §3.1, §3.3, §3.6, §3.7, §4.3, §4.6, `design/05` §3.3, §3.6, §4.5, §4.6, `design/06` §3.6, §4.8, `design/07` §3.3, §3.7, §4, `design/08` §2.1, `design/10` §3.6 (b), §4.6, `design/01` §4.9, `UPSTREAM_REQS.md` §2.1, §2.4; D-15, D-91, D-92, D-110 |
+| D-195 | H Intent carries the source version tuple as the accepted-binding reference; `activated` = `applied`; `SUB-O5` counts | `design/05` §2.1, §2.2, §3.3, §3.6, §3.7, §4.1, `design/06` §3.3, `design/04` §2.1, `DESIGN.md` §3.1, `UPSTREAM_REQS.md` §2.1; D-97, D-125, Q-08 |
+| D-196 | H Lines are independent: dependency graph, Catalog source and `blocked-upstream` withdrawn; catalogue 41 | `design/04` §1–§4, `design/05` §3.2, §3.6, `design/06` §2.1, §3.3, §3.6, §3.7, §4.8, `design/07` §3.3, §3.7, §4, `design/08` §3.2, `design/10` §3.6 (b), `design/01` §4.9, `ADR/0005`, `DESIGN.md` §1.2, §3.5, `PRD.md` §6.1, §12, `UPSTREAM_REQS.md` §1, §2.4, §2.5, §3, §4, §5; D-16, D-77, D-92, D-105, D-110 |
+| D-197 | H Approval policy owner = this gear's approval-policy adapter (stand-in, library); Generic Approval service withdrawn | `PRD.md` §1, §3.2, §5, §6, §9.2, §12, §13, §15, §16, `DESIGN.md` §1.3, §3.1, §3.5, §4, `UPSTREAM_REQS.md` §1, §2.3, §4, `design/03` §1.1, §2.2, §3.2, §3.5, §3.6, §4.0, `design/01`, `02`, `08`, `09`, `10`, `README`, `ADR/0002`, `0006`, `0007`, `0009`, `0011`, `0013`; D-12, D-14, D-189, Q-05, Q-14 |
+| D-198 | M Approval request carries `tcv_minor`, `currency`, `currency_minor_digits` from `get_version` | `design/03` §3.2, §3.6, §3.7, `DESIGN.md` §2.2, §3.1, `PRD.md` §3.2, §5.2, §6.2, §6.5, §9.2, §12; D-09 |
+| D-199 | L Payment amount separate from TCV; no Products reservation; market wording; change orders deferred | `design/04` §3.4, §3.5, `UPSTREAM_REQS.md` §2.2, §2.5; D-17, D-90, Q-06 |
 
-Highest decision number used: **D-192**; highest question number: **Q-13**. Numbering is one continuous sequence across the whole
+Highest decision number used: **D-199**; highest question number: **Q-14**. Numbering is one continuous sequence across the whole
 register; there are no parts.

@@ -472,7 +472,7 @@ requests and their escalation, ceasing pending provisioning intents through the 
 steps, compensating completed steps including voiding un-activated wave-1 drafts, and recording
 termination are now the definition's `do` list in `10 §3.6` (f) over slice 06's
 `run-cancellation-fence`, `compensate-order` and `report-outcome` and slice 01's
-`terminate-instance`. This component no longer calls Generic Approval or Subscriptions.
+`terminate-instance`. This component no longer calls the approval policy adapter or Subscriptions.
 
 ##### Responsibility boundaries
 

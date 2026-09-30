@@ -32,7 +32,7 @@ Orders Workflow spans trigger binding, approval execution, fulfillment planning,
 ## Decision Drivers
 
 * The correctness core (the shared process engine: durable state, audit, idempotency, saga bookkeeping established in ADR-0001) must be reviewable and buildable before any capability that depends on it.
-* Two capability areas depend on unresolved upstream asks (Generic Approval spec; the Subscriptions asks `SUB-O1` and `SUB-O5`, registered-and-unagreed, and `SUB-O11`–`SUB-O14`, this gear's own renumbered asks, UNASKED — see `UPSTREAM_REQS.md` §2.1); their design must be isolatable so an upstream change is a boundary change, not a rewrite of unrelated slices.
+* Two capability areas depend on unresolved upstream asks (the approval policy adapter's library implementation, Q-14; the Subscriptions asks `SUB-O1` and `SUB-O5`, registered-and-unagreed, and `SUB-O11`–`SUB-O14`, this gear's own renumbered asks, UNASKED — see `UPSTREAM_REQS.md` §2.1); their design must be isolatable so an upstream change is a boundary change, not a rewrite of unrelated slices.
 * Implementation needs an explicit dependency order: trigger binding and the shared engine must exist before approval execution can start a process, which must exist before fulfillment planning can act on an approved order.
 * Sibling BSS gears (`orders-lifecycle`, `pricing`, `rating`, `subscriptions`) already use an index-plus-slices document shape; divergence costs review effort.
 * A slug numbered by PRD section (§6.1, §6.2, ...) would not communicate build sequence, since PRD sections group requirements by topic, not by what must exist first at runtime.
@@ -52,7 +52,7 @@ Chosen option: **nine slice documents numbered by implementation build order**, 
 * `01-foundation` must be complete and stable — its guard/state/audit contract frozen — before `02` through `09` can be implemented against it without rework.
 * A slice author touches one file for their capability; a reviewer reads one file per capability rather than a single interleaved document.
 * Any new capability that needs a new process-engine primitive (a new state, a new saga step type) is a `01-foundation` change, mirroring the same non-negotiable-chokepoint shape as `orders-lifecycle` ADR-0001; slices `02`-`09` may not silently extend the engine's contract.
-* The two upstream-dependent slices (`03-approval-execution` on the Generic Approval spec; `05-provisioning-intents` on the Subscriptions upstream asks) are isolated to their own documents, so an upstream change is scoped to one file's revision rather than forcing a renumbering or a rewrite of unrelated slices.
+* The two upstream-dependent slices (`03-approval-execution` on the approval policy adapter's library implementation; `05-provisioning-intents` on the Subscriptions upstream asks) are isolated to their own documents, so an upstream change is scoped to one file's revision rather than forcing a renumbering or a rewrite of unrelated slices.
 * `design/README.md` and any other document that lists these nine slices must cite the numbers and titles from this ADR rather than re-deriving them, so a future renumbering is a single-ADR change rather than a multi-document hunt.
 * The numbering communicates build sequence, not review priority or PRD traceability; a reader who wants requirement traceability must still consult the PRD IDs cited in each slice, not infer them from the slice number.
 
