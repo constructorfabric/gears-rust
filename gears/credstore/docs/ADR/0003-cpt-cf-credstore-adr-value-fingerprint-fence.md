@@ -131,6 +131,6 @@ Inline-frame `magic‖version‖value`, or route each version to a distinct back
 
 ## Traceability
 
-- Requirements: `cpt-cf-credstore-fr-put-secret`, `cpt-cf-credstore-fr-get-secret`, `cpt-cf-credstore-fr-sharing-modes`, `cpt-cf-credstore-fr-optimistic-concurrency`, `cpt-cf-credstore-nfr-tenant-isolation`, `cpt-cf-credstore-nfr-confidentiality`
+- Requirements: `cpt-cf-credstore-fr-write-secret`, `cpt-cf-credstore-fr-get-secret`, `cpt-cf-credstore-fr-sharing-modes`, `cpt-cf-credstore-fr-optimistic-concurrency`, `cpt-cf-credstore-nfr-tenant-isolation`, `cpt-cf-credstore-nfr-confidentiality`
 - Supersedes the bare-version `ETag` described in earlier revisions of DESIGN §4.3; builds on the dual-write model of [ADR-0001](0001-cpt-cf-credstore-adr-stateful-gear.md) / [ADR-0002](0002-cpt-cf-credstore-adr-deprovisioning-saga.md).
 - Related: cluster ADR-002 (`gears/system/cluster/docs/ADR/002-async-boundary-no-remote-in-critical-section.md`).
