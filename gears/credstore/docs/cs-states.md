@@ -154,7 +154,8 @@ C (create) and D (delete) follow these steps and describe only where they differ
   - **W.7.1** The write whose store write landed, in W.5. It clears every intent recorded at a lower version, its own and any concurrent writer's, because none of those writers can land any more.
   - **W.7.2** Any later successful write to the same reference. It sets its own intent over the old one (W.3) and clears it in its own W.5.
   - **W.7.3** **Fencing repair**, started by a read (R.3.4) or a rebuild when the intent is older than the configured threshold (default 60 s):
-    - **W.7.3.1** read the record from Vault at version `vk`;
+    - **W.7.3.0** **Vault is ahead of the index** (Vault has the key and the row's `version IS NULL OR version < vault`): no store write. A single PG update `UPDATE … SET fields, version = vault, write_intent_at = NULL WHERE key AND (version IS NULL OR version < vault)` completes the repair. Every intent recorded at a lower version belongs to a writer whose conditional write can no longer land, so clearing it is safe. Rewriting the store in this case would be wrong: a late W.5 of the writer that landed could then clear the intent while the index lags behind the rewritten version (found by the TLA+ model in `tla/`).
+    - **W.7.3.1** Otherwise (the index is at the Vault version, or Vault has no key): read the record from Vault at version `vk`;
     - **W.7.3.2** `put(IfVersion(vk))` with **the same data**, producing `vk+1`; if Vault holds no record, write a tombstone with `IfAbsent`;
     - **W.7.3.3** `UPDATE PG SET fields, version = vk+1, write_intent_at = NULL WHERE version IS NULL OR version < vk+1`.
 
@@ -252,7 +253,7 @@ They hold in every reachable state, S.1–S.13.
 - **I.7 Reads are correct.** A read of any state answers exactly what the Vault state implies, as in the "A read returns" column of S. Together, I.1 and R.3 guarantee this.
 - **I.8 One winner per base.** Of any writes conditioned on the same base version, at most one lands in Vault. This is the store's CAS guarantee (F.14.5).
 
-I.1, I.2, I.3, I.5, I.6 and I.7 are model-checked in `tla/CredStoreIntent.tla`.
+I.1 (strict, including version equality), I.2, I.3, I.5, I.6 and I.7 are model-checked in `tla/CredStoreIntent.tla`.
 
 ## T — Transitions (state × event)
 
@@ -262,7 +263,7 @@ Events that change state:
 - **T.b** a store write lands (W.4 / C.4 / D.4);
 - **T.c** confirm (W.5 / C.5 / D.5);
 - **T.d** read repair raises the index (R.3.1, R.5.2, W.1.3, W.4.2.2);
-- **T.e** fencing repair, store step (W.7.3.2);
+- **T.e** fencing repair: the PG-only repair when Vault is ahead (W.7.3.0), otherwise the store rewrite (W.7.3.2);
 - **T.f** fencing repair, PG step (W.7.3.3);
 - **T.g** offboarding deletes the PG row;
 - **T.h** offboarding purges the Vault key.
@@ -273,16 +274,16 @@ A crash, a timeout, an unavailable dependency and a rejected request (E.5–E.11
 |---|---|---|---|---|---|---|---|---|
 | **S.1** | create → S.2 | — ¹ | — ¹ | — ² | — ³ | — ³ | S.1 | S.1 |
 | **S.2** | create → S.2 | create → S.3 | — ¹ | — ² | → S.4 | — ⁴ | S.1 | — |
-| **S.3** | via T.d | — ⁵ | → S.5 | → S.6 | → S.3 (m+1) | → S.5 | S.13 | — |
-| **S.4** | via T.d | — ⁵ | — ¹ | → S.10 | → S.4 (m+1) | → S.9 | S.13 | — |
+| **S.3** | via T.d | — ⁵ | → S.5 | → S.6 | PG-only → S.5 | — ⁴ | S.13 | — |
+| **S.4** | via T.d | — ⁵ | — ¹ | → S.10 | PG-only → S.9 | → S.9 | S.13 | — |
 | **S.5** | update / delete / create over expired → S.6 | — ⁶ | — ¹ | — ² | — ³ | — ³ | S.13 | — |
 | **S.6** | any → S.6 | update → S.7, delete → S.8 | — ¹ | — ² | → S.7 | → S.5 | S.13 | — |
-| **S.7** | via T.d | — ⁵ | → S.5 | → S.6 | → S.7 (m+1) | → S.5 | S.13 | — |
-| **S.8** | via T.d | — ⁵ | → S.9 | → S.10 | → S.8 (m+1) | → S.9 | S.13 | — |
+| **S.7** | via T.d | — ⁵ | → S.5 | → S.6 | PG-only → S.5 | → S.5 | S.13 | — |
+| **S.8** | via T.d | — ⁵ | → S.9 | → S.10 | PG-only → S.9 | — ⁴ | S.13 | — |
 | **S.9** | create → S.10 | — ⁶ | — ¹ | — ² | — ³ | — ³ | S.13 | — |
 | **S.10** | create → S.10 | create → S.11 | — ¹ | — ² | → S.12 | → S.9 | S.13 | — |
-| **S.11** | via T.d | — ⁵ | → S.5 | → S.6 | → S.11 (m+1) | → S.5 | S.13 | — |
-| **S.12** | via T.d | — ⁵ | — ¹ | → S.10 | → S.12 (m+1) | → S.9 | S.13 | — |
+| **S.11** | via T.d | — ⁵ | → S.5 | → S.6 | PG-only → S.5 | — ⁴ | S.13 | — |
+| **S.12** | via T.d | — ⁵ | — ¹ | → S.10 | PG-only → S.9 | → S.9 | S.13 | — |
 | **S.13** | — ⁷ | — ⁷ | — ⁷ | — ⁷ | — ⁷ | — ⁷ | — | S.1 |
 
 Notes:
@@ -290,7 +291,7 @@ Notes:
 1. Nothing has landed in the store for this state's intent, so there is nothing to confirm. In S.1, S.5 and S.9 there is no intent at all.
 2. PG already equals Vault (or Vault is empty in S.2, where R.3.3 answers "absent"), so there is nothing to raise.
 3. There is no intent, so there is nothing to repair (W.7.3 starts only on an intent).
-4. The PG step runs only after its own store step (T.e).
+4. The PG step of a fencing repair runs only after its own store rewrite, which happens only in S.2, S.6 and S.10 (leading to S.4, S.7 and S.12). Where Vault is already ahead, T.e is the PG-only repair and there is no separate PG step.
 5. The PG base is behind Vault, so a conditional write from it fails (W.4.2) and only repairs the index. A new writer first raises the index (W.1.3, i.e. T.d) and then sets its intent from the raised state.
 6. A store write needs an intent first (I.3). The write always goes through T.a before T.b.
 7. The tenant or owner is removed. Requests are rejected before any side effect, and offboarding finishes with T.h.
