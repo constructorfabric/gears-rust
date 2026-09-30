@@ -139,9 +139,9 @@ impl DriverRefusal {
     ///
     /// On `PostgreSQL` and `MySQL` this is the five-character SQLSTATE. On
     /// `SQLite` it is the extended result code (`2067` for a unique
-    /// violation), which is not a SQLSTATE and which
-    /// [`constraint_violation`] therefore names no condition for — the
-    /// accessor is called `code` rather than `sqlstate` for that reason.
+    /// violation), which is not a SQLSTATE — the accessor is called `code`
+    /// rather than `sqlstate` for that reason. [`constraint_violation`] names
+    /// a condition for both shapes.
     #[must_use]
     pub fn code(&self) -> &str {
         &self.code
@@ -164,24 +164,34 @@ impl DriverRefusal {
     }
 }
 
-/// The condition a `PostgreSQL` SQLSTATE names.
+/// The condition a driver's code names, whichever shape the driver reports:
+/// a `PostgreSQL` or `MySQL` SQLSTATE, or a `SQLite` extended result code.
 ///
-/// Class 23 (`integrity_constraint_violation`) only, because that is the class
-/// a caller can act on. Deliberate omissions:
+/// The two shapes cannot collide -- a SQLSTATE is five characters and a
+/// `SQLite` result code is a decimal of at most four -- so one table serves
+/// both, and a caller holding a [`DriverRefusal`] reads its condition on every
+/// backend without knowing which one answered. Class 23
+/// (`integrity_constraint_violation`) and its `SQLite` counterpart
+/// (`SQLITE_CONSTRAINT`, primary code 19) only, because that is the class a
+/// caller can act on. Deliberate omissions:
 ///
 /// * `23000` — `PostgreSQL` never sends it, and `MySQL` sends it for unique
 ///   *and* foreign-key violations alike, so it names no single condition. A
 ///   `MySQL` caller needs the vendor error number, which is what
-///   [`sea_orm::DbErr::sql_err`] already reads.
-/// * `SQLite` extended codes are not SQLSTATEs and are not in this table;
-///   [`is_unique_violation`] and [`is_foreign_key_violation`] below remain the
-///   portable path, because `SeaORM`'s own `sql_err()` does read them.
+///   [`sea_orm::DbErr::sql_err`] already reads and what
+///   [`is_unique_violation`] and [`is_foreign_key_violation`] consult next.
+/// * The rest of both classes (`23502`, `23514`, `SQLITE_CONSTRAINT_CHECK`
+///   `275`, ...) stays unnamed until a caller branches on it; the code itself
+///   is still reachable through [`DriverRefusal::code`].
 #[must_use]
-pub fn constraint_violation(sqlstate: &str) -> Option<ConstraintViolation> {
-    match sqlstate {
-        "23505" => Some(ConstraintViolation::Unique),
-        // One condition, two codes. See `ConstraintViolation::ForeignKey`.
-        "23503" | "23001" => Some(ConstraintViolation::ForeignKey),
+pub fn constraint_violation(code: &str) -> Option<ConstraintViolation> {
+    match code {
+        // `SQLite`: `SQLITE_CONSTRAINT_UNIQUE` and `SQLITE_CONSTRAINT_PRIMARYKEY`,
+        // the same two `sql_err()` reads as a unique violation.
+        "23505" | "2067" | "1555" => Some(ConstraintViolation::Unique),
+        // One condition, two SQLSTATEs (see `ConstraintViolation::ForeignKey`),
+        // and `SQLITE_CONSTRAINT_FOREIGNKEY`.
+        "23503" | "23001" | "787" => Some(ConstraintViolation::ForeignKey),
         _ => None,
     }
 }
@@ -319,10 +329,8 @@ pub fn violation_of(err: &DbErr) -> Option<ConstraintViolation> {
 ///
 /// * `sql_err()` reads `MySQL`'s vendor error number. `MySQL` reports both a
 ///   duplicate key and a failed foreign key as `23000`, so the SQLSTATE alone
-///   cannot tell the two conditions apart — only the vendor number can. It also
-///   carries `SQLite`, whose extended result codes are not SQLSTATEs and which
-///   [this module](self) therefore names no condition for. This tier retires
-///   when [this module](self) reads both itself.
+///   cannot tell the two conditions apart — only the vendor number can. This
+///   tier retires when [this module](self) reads the vendor number itself.
 /// * The message match catches errors re-wrapped as [`DbErr::Custom`] on the
 ///   way here, which have no driver error left to read at all. It retires when
 ///   no call site can hand these classifiers a re-wrapped error — a property of
@@ -344,9 +352,17 @@ pub fn violation_of(err: &DbErr) -> Option<ConstraintViolation> {
 /// chose for it.
 ///
 /// So: a code that names a condition is the final answer, yes or no. A code
-/// that names none (a `SQLite` extended code, a SQLSTATE outside class 23)
-/// still leaves `sql_err()` its turn. And the text is read only when no driver
-/// spoke at all, which is exactly the re-wrapped case it documents.
+/// that names none still leaves `sql_err()` its turn. After that the code
+/// decides how far the text may be trusted: a code in the constraint class
+/// (`23xxx`, or `SQLITE_CONSTRAINT` and its extensions) has already said
+/// "a constraint refused this", and the text may say *which* -- that is a
+/// `MySQL` vendor number `sql_err()` lacks, or a `SQLite` constraint code the
+/// table does not name -- while a code outside it (`22P02`, a syntax error)
+/// has said what the statement did wrong, and its text is the caller's
+/// evidence, not the server's. And when a driver spoke without a code, or the
+/// failure was the connection itself, the text is not read at all: only an
+/// error with no driver behind it -- the re-wrapped [`DbErr::Custom`] -- is
+/// classified from its words.
 ///
 /// [`DbErr::Custom`]: sea_orm::DbErr::Custom
 fn classifies_as(
@@ -364,13 +380,57 @@ fn classifies_as(
         return true;
     }
 
-    // A driver spoke and neither tier above recognised what it said. Guessing
-    // from text here is what let caller-supplied content decide the answer.
-    if driver_code(err).is_some() {
+    if let Some(code) = driver_code(err) {
+        // A constraint refused and nothing above could say which one: the
+        // text may. Any other code has answered a different question, and
+        // its text is what the statement supplied.
+        return in_constraint_class(&code) && message_says(&err.to_string().to_lowercase());
+    }
+
+    // A driver spoke without a code, or the connection itself failed: not a
+    // refusal this module reads, and not text to classify from either. A
+    // connect-time message names the server's reason in server-written
+    // words, which is exactly what the text tier must not be handed.
+    if is_driver_error(err) {
         return false;
     }
 
     message_says(&err.to_string().to_lowercase())
+}
+
+/// Whether `code` says "an integrity constraint refused this" without
+/// necessarily saying which: SQLSTATE class 23 on `PostgreSQL` and `MySQL`,
+/// `SQLITE_CONSTRAINT` (primary code 19) and its extended codes on `SQLite`.
+///
+/// The shapes are told apart the way [`constraint_violation`] tells them
+/// apart: a SQLSTATE is five characters, a `SQLite` result code is a decimal
+/// whose low byte is the primary code.
+fn in_constraint_class(code: &str) -> bool {
+    if code.len() == 5 {
+        return code.starts_with("23");
+    }
+    code.parse::<u32>()
+        .is_ok_and(|extended| extended & 0xff == 19)
+}
+
+/// Whether a driver produced this error at all -- refused a statement, with
+/// or without a code, or failed to connect. Only an error with no driver
+/// behind it is classified from its text.
+fn is_driver_error(err: &sea_orm::DbErr) -> bool {
+    #[cfg(any(feature = "pg", feature = "mysql", feature = "sqlite"))]
+    {
+        matches!(
+            err,
+            sea_orm::DbErr::Conn(sea_orm::RuntimeErr::SqlxError(_))
+                | sea_orm::DbErr::Exec(sea_orm::RuntimeErr::SqlxError(_))
+                | sea_orm::DbErr::Query(sea_orm::RuntimeErr::SqlxError(_))
+        )
+    }
+    #[cfg(not(any(feature = "pg", feature = "mysql", feature = "sqlite")))]
+    {
+        let _ = err;
+        false
+    }
 }
 
 /// Check whether a `sea_orm::DbErr` represents a unique-constraint violation.
@@ -424,7 +484,8 @@ pub fn is_unique_violation(err: &sea_orm::DbErr) -> bool {
 ///
 /// Recognized patterns across backends:
 /// - **Postgres** SQLSTATE `23503` / `23001` — "`foreign_key_violation`" /
-///   "violates foreign key constraint" / "violates RESTRICT setting of"
+///   "violates foreign key constraint" (which 18's `RESTRICT` wording still
+///   contains)
 /// - **`SQLite`** extended code `787` (`SQLITE_CONSTRAINT_FOREIGNKEY`) —
 ///   "FOREIGN KEY constraint failed"
 /// - **`MySQL`** errors `1451`/`1452` — "a foreign key constraint fails"
@@ -440,12 +501,12 @@ pub fn is_foreign_key_violation(err: &sea_orm::DbErr) -> bool {
             )
         },
         |msg| {
+            // `PostgreSQL` 18's `RESTRICT` wording, "violates RESTRICT setting
+            // of foreign key constraint", is caught by the first of these: it
+            // still contains `foreign key constraint`.
             msg.contains("foreign key constraint")
                 || msg.contains("foreign_key_violation")
                 || msg.contains("violates foreign key")
-                // PostgreSQL 18's RESTRICT wording, for an error that reached
-                // here stripped of its SQLSTATE.
-                || msg.contains("violates restrict setting")
         },
     )
 }
@@ -521,6 +582,18 @@ pub(crate) mod driver_shaped {
         )))
     }
 
+    /// A connect-time refusal carrying a server code: the shape
+    /// `driver_refusal` excludes on purpose, so the exclusion can be held
+    /// without a live server.
+    pub fn connection_refused(code: &'static str, message: &str) -> sea_orm::DbErr {
+        sea_orm::DbErr::Conn(sea_orm::RuntimeErr::SqlxError(Arc::new(
+            sqlx::Error::Database(Box::new(Refusal {
+                code: Some(code),
+                message: message.to_owned(),
+            })),
+        )))
+    }
+
     /// A driver error that is not a database refusal at all.
     pub fn not_a_refusal() -> sea_orm::DbErr {
         sea_orm::DbErr::Exec(sea_orm::RuntimeErr::SqlxError(Arc::new(
@@ -533,8 +606,6 @@ pub(crate) mod driver_shaped {
     /// its callers silently.
     #[cfg(test)]
     mod self_check {
-        use sqlx::error::DatabaseError as _;
-
         fn database_error_of(err: &sea_orm::DbErr) -> &(dyn sqlx::error::DatabaseError + 'static) {
             let (sea_orm::DbErr::Exec(sea_orm::RuntimeErr::SqlxError(e))
             | sea_orm::DbErr::Query(sea_orm::RuntimeErr::SqlxError(e))) = err
@@ -558,21 +629,16 @@ pub(crate) mod driver_shaped {
 
             let err = super::refused_without_a_code("no code here");
             assert!(database_error_of(&err).code().is_none());
-        }
 
-        #[test]
-        fn it_can_be_taken_apart_the_way_sqlx_takes_errors_apart() {
-            let mut refusal = super::Refusal {
-                code: Some("23505"),
-                message: "duplicate key".to_owned(),
+            // The connect-time shape is a `Conn`, and it does carry the code.
+            let err = super::connection_refused("28P01", "password authentication failed");
+            let sea_orm::DbErr::Conn(sea_orm::RuntimeErr::SqlxError(e)) = &err else {
+                panic!("the double must build a connection error");
             };
-            assert!(refusal.as_error_mut().to_string().contains("duplicate key"));
-            assert!(
-                Box::new(refusal)
-                    .into_error()
-                    .to_string()
-                    .contains("duplicate key")
-            );
+            let sqlx::Error::Database(db) = &**e else {
+                panic!("the double must build a database error");
+            };
+            assert_eq!(db.code().as_deref(), Some("28P01"));
         }
     }
 }
@@ -633,52 +699,124 @@ mod tests {
     /// No backend the workspace supports does it, which is why the code is a
     /// `String` rather than an `Option<String>` -- but the contract says this
     /// is indistinguishable from the other three, and that is asserted here
-    /// rather than only described.
+    /// rather than only described. A driver still spoke, though, so its text
+    /// is not evidence either: the classifiers do not read it.
     #[test]
     #[cfg(any(feature = "pg", feature = "mysql", feature = "sqlite"))]
     fn a_refusal_without_a_code_reads_as_no_refusal() {
-        let err = driver_shaped::refused_without_a_code("refused, but said nothing");
+        let err = driver_shaped::refused_without_a_code("duplicate key, but said no code");
         assert!(driver_refusal(&err).is_none());
         assert!(driver_code(&err).is_none());
         assert!(violation_of(&err).is_none());
-    }
-
-    /// A code this table names no condition for does not reach the text, even
-    /// when the text would have matched.
-    ///
-    /// The tier below is `sql_err()`, and it cannot be reached from here:
-    /// `SeaORM` classifies by `try_downcast_ref` to a concrete driver type
-    /// (`SqliteError`, `PgDatabaseError`, `MySqlDatabaseError`), which a test
-    /// double is not. So this asserts the part that is testable without a
-    /// driver -- that the message is not consulted -- and the real `SQLite`
-    /// path, where `sql_err()` does answer for `2067`, is covered by the
-    /// sqlite lane in `tests/error_classification.rs`.
-    #[test]
-    #[cfg(any(feature = "pg", feature = "mysql", feature = "sqlite"))]
-    fn a_code_that_names_nothing_does_not_fall_through_to_the_text() {
-        let err = driver_shaped::refused("2067", "UNIQUE constraint failed: users.email");
-        assert_eq!(
-            violation_of(&err),
-            None,
-            "the table names no condition for it"
-        );
         assert!(
             !is_unique_violation(&err),
-            "and with a driver code in hand the message is not evidence"
+            "a driver spoke, so its words are not the text tier's to read"
         );
+    }
+
+    /// The second documented `None`, held without a server: a connect-time
+    /// refusal carries a code of its own (`28P01`, a bad password) and is
+    /// still not a statement refusal. `a_connect_time_refusal_carries_no_driver_refusal`
+    /// in `tests/error_classification.rs` holds the same against a live
+    /// `PostgreSQL`; this one holds it on every `cargo test`.
+    #[test]
+    #[cfg(any(feature = "pg", feature = "mysql", feature = "sqlite"))]
+    fn a_connection_refusal_carries_no_driver_refusal() {
+        let err = driver_shaped::connection_refused(
+            "28P01",
+            "password authentication failed for user \"duplicate key\"",
+        );
+        assert!(driver_refusal(&err).is_none());
+        assert!(driver_code(&err).is_none());
+        assert!(violation_of(&err).is_none());
+        // And the server's words about the login are not read as a
+        // constraint's.
+        assert!(!is_unique_violation(&err));
+        assert!(!is_foreign_key_violation(&err));
+    }
+
+    /// How far a code lets the text be trusted, on the double -- `sql_err()`
+    /// cannot be reached from here, since `SeaORM` classifies by
+    /// `try_downcast_ref` to a concrete driver type, so what is asserted is
+    /// the tier rule itself.
+    ///
+    /// A code outside the constraint class has answered a different question,
+    /// and its text is the caller's: `22P02` quoting `duplicate key` is not a
+    /// conflict, and `SQLITE_ERROR` (`1`) with a constraint's wording is not
+    /// one either. A code inside the class that the table does not name has
+    /// said a constraint refused, and the text may say which:
+    /// `SQLITE_CONSTRAINT_ROWID` (`2579`) and `MySQL`'s `23000` reach the
+    /// wording, so a gear answers 409 rather than 500 where the vendor number
+    /// is one `sql_err()` lacks.
+    #[test]
+    #[cfg(any(feature = "pg", feature = "mysql", feature = "sqlite"))]
+    fn the_code_decides_how_far_the_text_is_trusted() {
+        for (code, text) in [
+            (
+                "22P02",
+                "invalid input syntax for type uuid: \"duplicate key\"",
+            ),
+            ("1", "UNIQUE constraint failed: users.email"),
+            ("42601", "syntax error at or near \"duplicate key\""),
+        ] {
+            let err = driver_shaped::refused(code, text);
+            assert_eq!(violation_of(&err), None, "{code} names no condition");
+            assert!(
+                !is_unique_violation(&err),
+                "{code}: outside the constraint class the text is not evidence"
+            );
+        }
+        for (code, text) in [
+            ("2579", "UNIQUE constraint failed: users.rowid"),
+            ("23000", "Duplicate entry 'a' for key 'users.email'"),
+        ] {
+            let err = driver_shaped::refused(code, text);
+            assert_eq!(violation_of(&err), None, "{code} names no single condition");
+            assert!(
+                is_unique_violation(&err),
+                "{code}: a constraint refused, and the text says which"
+            );
+            assert!(
+                !is_foreign_key_violation(&err),
+                "{code}: and not the other one"
+            );
+        }
+    }
+
+    /// The codes `SQLite` reports for the two named conditions are in the
+    /// table, so a `DriverRefusal` answers `violation()` on that backend as it
+    /// does on `PostgreSQL` -- the example in `driver_refusal`'s doc holds on
+    /// both.
+    #[test]
+    #[cfg(any(feature = "pg", feature = "mysql", feature = "sqlite"))]
+    fn sqlite_result_codes_name_their_condition() {
+        let unique = driver_shaped::refused("2067", "UNIQUE constraint failed: users.email");
+        assert_eq!(violation_of(&unique), Some(ConstraintViolation::Unique));
+        assert!(is_unique_violation(&unique));
+        let foreign = driver_shaped::refused("787", "FOREIGN KEY constraint failed");
+        assert_eq!(
+            violation_of(&foreign),
+            Some(ConstraintViolation::ForeignKey)
+        );
+        assert!(is_foreign_key_violation(&foreign));
+        assert!(!is_unique_violation(&foreign));
     }
 
     /// The constructor exists so a gear can test its own mapping; this is that
-    /// use, in miniature.
+    /// use, in miniature: two refusals built with different codes classify
+    /// differently, which is the only thing a mapping under test can observe.
     #[test]
     fn a_refusal_can_be_built_for_a_test() {
-        let refusal = DriverRefusal::new("23503").with_constraint("orders_customer_fk");
-        assert_eq!(refusal.code(), "23503");
-        assert_eq!(refusal.constraint(), Some("orders_customer_fk"));
-        assert_eq!(refusal.violation(), Some(ConstraintViolation::ForeignKey));
+        let foreign = DriverRefusal::new("23503").with_constraint("orders_customer_fk");
+        let unique = DriverRefusal::new("23505");
+        assert_ne!(foreign.violation(), unique.violation());
+        assert_eq!(foreign.violation(), Some(ConstraintViolation::ForeignKey));
+        assert_eq!(unique.violation(), Some(ConstraintViolation::Unique));
 
-        // Most refusals name no constraint, and that is the default.
-        assert_eq!(DriverRefusal::new("23505").constraint(), None);
+        // The constraint name travels only when given; most refusals name
+        // none, and that is the default a mapping must cope with.
+        assert_eq!(foreign.constraint(), Some("orders_customer_fk"));
+        assert_eq!(unique.constraint(), None);
     }
 
     #[test]
@@ -715,31 +853,47 @@ mod tests {
     /// start: `SQLite` in memory is enough to exercise the extraction path and
     /// all three accessors.
     ///
-    /// It also pins the documented `SQLite` behaviour rather than assuming it:
-    /// the driver reports an extended result code (`2067`), not a SQLSTATE, and
-    /// names no constraint — so the table names no condition for it and a
-    /// `SQLite` caller keeps using
-    /// [`is_unique_violation`]. The `PostgreSQL` half, where the
-    /// code *is* a SQLSTATE, is covered by
-    /// `tests/error_classification.rs::pg_restrict_delete_is_classified_as_foreign_key_violation`
-    /// against a real server.
+    /// It pins the documented `SQLite` behaviour rather than assuming it: the
+    /// driver reports an extended result code (`2067`), not a SQLSTATE, names
+    /// no constraint, and the table names the condition for that code all the
+    /// same. The `PostgreSQL` half, where the code *is* a SQLSTATE, is covered
+    /// by `tests/error_classification.rs::pg_restrict_delete_is_classified_as_foreign_key_violation`
+    /// against a real server. The schema and the rows are built through
+    /// `sea_query`, like every other schema this crate's tests create.
     #[cfg(feature = "sqlite")]
     #[tokio::test]
-    async fn a_real_sqlite_refusal_is_reached_but_names_no_condition() {
+    async fn a_real_sqlite_refusal_names_its_condition() {
         use sea_orm::ConnectionTrait as _;
+        use sea_orm::sea_query;
+        use sea_orm::sea_query::{ColumnDef, Iden, Query, Table};
+
+        #[derive(Iden)]
+        enum T {
+            Table,
+            Id,
+            K,
+        }
 
         let db = sea_orm::Database::connect("sqlite::memory:")
             .await
             .expect("in-memory sqlite");
-        db.execute_unprepared("CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT UNIQUE)")
-            .await
-            .expect("create");
-        db.execute_unprepared("INSERT INTO t (id, k) VALUES (1, 'a')")
-            .await
-            .expect("first insert");
+        let create = Table::create()
+            .table(T::Table)
+            .col(ColumnDef::new(T::Id).integer().primary_key())
+            .col(ColumnDef::new(T::K).text().unique_key())
+            .to_owned();
+        db.execute(&create).await.expect("create");
+        let insert = |id: i32| {
+            Query::insert()
+                .into_table(T::Table)
+                .columns([T::Id, T::K])
+                .values_panic([id.into(), "a".into()])
+                .to_owned()
+        };
+        db.execute(&insert(1)).await.expect("first insert");
 
         let err = db
-            .execute_unprepared("INSERT INTO t (id, k) VALUES (2, 'a')")
+            .execute(&insert(2))
             .await
             .expect_err("the unique index must refuse the second insert");
 
@@ -756,12 +910,9 @@ mod tests {
         );
         assert_eq!(
             refusal.violation(),
-            None,
-            "an extended result code is not a SQLSTATE, so the table names no \
-             condition for it"
+            Some(ConstraintViolation::Unique),
+            "the table names the condition for SQLite's code as it does for a SQLSTATE"
         );
-        // The portable classifier still recognises it, which is the path a
-        // SQLite caller is meant to use.
         assert!(is_unique_violation(&err));
     }
 
@@ -817,10 +968,10 @@ mod tests {
     /// text path.
     ///
     /// The structured path is what recognises this in production (the SQLSTATE
-    /// is `23001`, and `crate::db_error` names both codes one condition). This
-    /// branch is the last resort, for an error that reached a classifier
-    /// stripped of its code — and it exists because 18 reworded the message
-    /// as well as renumbering it, so the pre-18 substrings no longer match
+    /// is `23001`, and `crate::db_error` names both codes one condition). The
+    /// text path is the last resort, for an error that reached a classifier
+    /// stripped of its code, and what matches there is `foreign key
+    /// constraint`: 18 reworded the message around it, and it is still in it
     /// (issue #4645).
     #[test]
     fn the_postgres_18_restrict_wording_is_recognised_without_a_code() {
