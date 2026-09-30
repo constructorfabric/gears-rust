@@ -596,7 +596,7 @@ impl<
         let outbox_enqueuer = Arc::clone(&self.outbox_enqueuer);
         let scope_tx = scope.clone();
 
-        let affected = self
+        let (affected, wake) = self
             .db
             .transaction(move |tx| {
                 Box::pin(async move {
@@ -606,19 +606,24 @@ impl<
                         .await
                         .map_err(|e| toolkit_db::DbError::Other(anyhow::Error::new(e)))?;
 
+                    let mut wake = crate::domain::repos::Wake::empty();
                     if affected > 0 {
                         // Enqueue cleanup event in the same TX
-                        outbox_enqueuer
+                        wake += outbox_enqueuer
                             .enqueue_attachment_cleanup(tx, event)
                             .await
                             .map_err(|e| toolkit_db::DbError::Other(anyhow::Error::new(e)))?;
                     }
 
-                    Ok(affected)
+                    Ok((affected, wake))
                 })
             })
             .await
             .map_err(|e: toolkit_db::DbError| DomainError::database(e.to_string()))?;
+
+        // Post-commit: wake the sequencer for the cleanup event (no-op when
+        // nothing was enqueued).
+        wake.fire();
 
         if affected == 0 {
             // Ambiguity: rows_affected=0 could mean concurrent delete OR message reference.
@@ -849,7 +854,7 @@ impl<
             }
         };
 
-        // Keep polling only while the row exists but is still pending.
+        // Keep polling only while the row exists but is still wake.
         let still_pending = |e: &DomainError| matches!(e, DomainError::ProviderError { code, .. } if code.as_str() == "vector_store_timeout");
 
         RetryIf::start(strategy, poll, still_pending).await
@@ -858,7 +863,7 @@ impl<
     /// Upload a file attachment to a chat.
     ///
     /// Flow: use pre-resolved `UploadContext` (from `get_upload_context`) ->
-    ///   TX(lock chat, check limits, insert pending) -> COMMIT ->
+    ///   TX(lock chat, check limits, insert wake) -> COMMIT ->
     ///   upload stream to provider via OAGW -> CAS `set_uploaded` (with exact size) ->
     ///   branch on kind:
     ///   - Document: vector store get-or-create + add file with attributes + CAS `set_ready`
@@ -1007,7 +1012,7 @@ impl<
                         }
                     }
 
-                    // Insert pending row (size_bytes = hint or 0; exact set in set_uploaded)
+                    // Insert wake row (size_bytes = hint or 0; exact set in set_uploaded)
                     let row = attachment_repo
                         .insert(tx, &scope_tx, insert_params)
                         .await
@@ -1019,7 +1024,7 @@ impl<
             .await
             .map_err(unwrap_mutation_err)?;
 
-        // Metrics: attachment is now pending (in-flight to provider).
+        // Metrics: attachment is now wake (in-flight to provider).
         // PendingGuard ensures decrement on every exit path (Drop-based).
         let kind_metric = if is_document {
             kind_label::DOCUMENT
@@ -1092,7 +1097,7 @@ impl<
                 } = e
                     && code == "file_too_large"
                 {
-                    self.try_set_failed(&scope, attachment_id, "pending", "file_too_large")
+                    self.try_set_failed(&scope, attachment_id, "wake", "file_too_large")
                         .await;
                     self.metrics
                         .record_attachment_upload(kind_metric, upload_result::FILE_TOO_LARGE);
@@ -1100,8 +1105,8 @@ impl<
                         message: message.clone(),
                     });
                 }
-                // P1-13: upload failure → CAS set_failed from pending
-                self.try_set_failed(&scope, attachment_id, "pending", "upload_failed")
+                // P1-13: upload failure → CAS set_failed from wake
+                self.try_set_failed(&scope, attachment_id, "wake", "upload_failed")
                     .await;
                 self.metrics
                     .record_attachment_upload(kind_metric, upload_result::PROVIDER_ERROR);
@@ -1109,7 +1114,7 @@ impl<
             }
         };
 
-        // 4. CAS: pending → uploaded (with exact size from provider)
+        // 4. CAS: wake → uploaded (with exact size from provider)
         {
             use crate::domain::repos::SetUploadedParams;
             #[allow(clippy::cast_possible_wrap)]
@@ -1238,7 +1243,7 @@ impl<
                         tracing::warn!(
                             attachment_id = %attachment_id,
                             error = %e,
-                            "failed to persist secondary pending status; \
+                            "failed to persist secondary wake status; \
                              watchdog will have no in-flight signal"
                         );
                     }
@@ -1247,7 +1252,7 @@ impl<
                     tracing::warn!(
                         attachment_id = %attachment_id,
                         error = %e,
-                        "could not acquire DB connection for pending-status write; continuing"
+                        "could not acquire DB connection for wake-status write; continuing"
                     );
                 }
             }
@@ -1319,7 +1324,7 @@ impl<
                             attachment_id = %attachment_id,
                             error = %e,
                             "failed to persist Anthropic upload outcome; \
-                             row stays in pending (best-effort)"
+                             row stays in wake (best-effort)"
                         );
                     }
                 }
@@ -1328,7 +1333,7 @@ impl<
                         attachment_id = %attachment_id,
                         error = %e,
                         "could not acquire DB connection to record Anthropic upload outcome; \
-                         row stays in pending/not_attempted (best-effort)"
+                         row stays in wake/not_attempted (best-effort)"
                     );
                 }
             }

@@ -1,18 +1,20 @@
+use event_broker_sdk::Sequence;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use chrono::Utc;
 use event_broker_sdk::dlq::{DeadLetterRecord, DeadLetterSink};
+use event_broker_sdk::gts_id;
 use event_broker_sdk::{
     ConsumerBuilder, ConsumerError, ConsumerGroupRef, EventBrokerError, Fallback, HandlerOutcome,
     InMemoryOffsetManager, RawEvent, SingleEventHandler,
 };
 use uuid::Uuid;
 
-use crate::consumer::common::{publish_json, topic_fixture, wait_until};
+use crate::consumer::common::{event_type, publish_json, topic, topic_fixture, wait_until};
 
-const TOPIC: &str = "gts.cf.core.events.topic.v1~example.mock.showcase.dlq.v1";
-const EVENT_TYPE: &str = "gts.cf.core.events.event.v1~example.mock.showcase.dlq.v1~";
+const TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.showcase.dlq.v1");
+const EVENT_TYPE: &str = gts_id!("cf.core.events.event.v1~example.mock.showcase.dlq.v1~");
 
 #[derive(Clone, Default)]
 struct RecordingDeadLetterSink {
@@ -23,14 +25,14 @@ struct RecordingDeadLetterSink {
 fn rejected_event() -> RawEvent {
     RawEvent {
         id: Uuid::new_v4(),
-        type_id: EVENT_TYPE.to_owned(),
-        topic: TOPIC.to_owned(),
+        type_id: event_type(EVENT_TYPE),
+        topic: topic(TOPIC),
         tenant_id: Uuid::nil(),
         subject: "dlq-1".to_owned(),
-        subject_type: "test".to_owned(),
+        subject_type: event_type(gts_id!("x.eb.showcase.subject.v1~")),
         partition: 0,
-        sequence: 1,
-        offset: 1,
+        sequence: Sequence::assigned(1),
+        offset: Sequence::assigned(1),
         occurred_at: Utc::now(),
         sequence_time: Utc::now(),
         trace_parent: None,
@@ -92,7 +94,7 @@ async fn if_i_want_permanent_failures_parked_i_do_it_in_the_handler() {
 
     let handle = ConsumerBuilder::new(fixture.broker.clone())
         .group(ConsumerGroupRef::auto_anonymous("showcase-dlq"))
-        .topics([TOPIC])
+        .topics([topic(TOPIC)])
         .offset_manager(InMemoryOffsetManager::new(Fallback::Earliest))
         .handler(HandlerOwnedDlqPolicy { sink })
         .start()

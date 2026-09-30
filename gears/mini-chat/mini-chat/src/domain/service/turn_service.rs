@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use super::current_otel_trace_id;
+use crate::domain::repos::Wake;
 use authz_resolver_sdk::{EnforcerError, PolicyEnforcer};
 use toolkit_macros::domain_model;
 use toolkit_security::{AccessScope, SecurityContext};
@@ -276,12 +277,12 @@ impl<
                         turn_id: target.id,
                         request_id,
                     });
-                    outbox_enqueuer
+                    let wake = outbox_enqueuer
                         .enqueue_audit_event(tx, audit_event)
                         .await
                         .map_err(|e| toolkit_db::DbError::Other(anyhow::Error::new(e)))?;
 
-                    Ok(())
+                    Ok(wake)
                 })
             })
             .await
@@ -291,10 +292,10 @@ impl<
         self.metrics
             .record_turn_mutation(op::DELETE, mutation_result_label(&result));
         self.metrics.record_turn_mutation_latency_ms(op::DELETE, ms);
-        result?;
+        let wake = result?;
 
         // Post-commit side effects (outside transaction).
-        self.outbox_enqueuer.flush();
+        wake.fire();
 
         Ok(())
     }
@@ -326,10 +327,10 @@ impl<
         self.metrics
             .record_turn_mutation(op::RETRY, mutation_result_label(&result));
         self.metrics.record_turn_mutation_latency_ms(op::RETRY, ms);
-        let result = result?;
+        let (result, wake) = result?;
 
         // Post-commit side effects (outside transaction).
-        self.outbox_enqueuer.flush();
+        wake.fire();
 
         Ok(result)
     }
@@ -369,10 +370,10 @@ impl<
         self.metrics
             .record_turn_mutation(op::EDIT, mutation_result_label(&result));
         self.metrics.record_turn_mutation_latency_ms(op::EDIT, ms);
-        let result = result?;
+        let (result, wake) = result?;
 
         // Post-commit side effects (outside transaction).
-        self.outbox_enqueuer.flush();
+        wake.fire();
 
         Ok(result)
     }
@@ -387,7 +388,7 @@ impl<
         request_id: Uuid,
         override_content: Option<String>,
         trace_id: Option<String>,
-    ) -> Result<MutationResult, MutationError> {
+    ) -> Result<(MutationResult, Wake), MutationError> {
         let new_request_id = Uuid::new_v4();
         let new_turn_id = Uuid::new_v4();
 
@@ -399,7 +400,7 @@ impl<
         let scope_tx = chat_scope.clone();
         let ctx_clone = ctx.clone();
 
-        let (user_content, snapshot_boundary, chat_model, web_search_enabled) = self
+        let (user_content, snapshot_boundary, chat_model, web_search_enabled, wake) = self
             .db
             .transaction(|tx| {
                 Box::pin(async move {
@@ -534,25 +535,28 @@ impl<
                             new_request_id,
                         )
                     });
-                    outbox_enqueuer
+                    let wake = outbox_enqueuer
                         .enqueue_audit_event(tx, audit_event)
                         .await
                         .map_err(|e| toolkit_db::DbError::Other(anyhow::Error::new(e)))?;
 
-                    Ok((user_content, boundary, chat_model, web_search_enabled))
+                    Ok((user_content, boundary, chat_model, web_search_enabled, wake))
                 })
             })
             .await
             .map_err(unwrap_mutation_err)?;
 
-        Ok(MutationResult {
-            new_request_id,
-            new_turn_id,
-            user_content,
-            snapshot_boundary,
-            chat_model,
-            web_search_enabled,
-        })
+        Ok((
+            MutationResult {
+                new_request_id,
+                new_turn_id,
+                user_content,
+                snapshot_boundary,
+                chat_model,
+                web_search_enabled,
+            },
+            wake,
+        ))
     }
 }
 

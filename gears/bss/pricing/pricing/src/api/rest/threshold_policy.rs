@@ -136,7 +136,7 @@ use axum::http::header::ETAG;
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router, http::StatusCode};
 use toolkit::api::canonical_prelude::CanonicalError;
-use toolkit::api::operation_builder::{ParamLocation, ParamSpec};
+use toolkit::api::operation_builder::ParamSpec;
 use toolkit::api::{OpenApiRegistry, operation_builder::OperationBuilder};
 use toolkit_db::secure::AccessScope;
 use toolkit_security::SecurityContext;
@@ -193,31 +193,20 @@ pub const MAX_PERCENT_BP: u32 = 10_000;
 /// plus D-186. Reusing the sentence would have declared a true header under a false
 /// reason.
 fn if_match_param() -> ParamSpec {
-    ParamSpec {
-        name: "If-Match".to_owned(),
-        location: ParamLocation::Header,
-        required: true,
-        description: Some(
-            "Mandatory precondition (RFC 9110), and the governance section 5 `ETag` cell for this \
-             row. The value is \
-             the **opaque** tag the `GET` returns in its `ETag` header - copy it back verbatim. \
-             It is not a row version: this store is append-only and has no version column, so \
-             the tag is a digest over the representation the `GET` serves, which means it moves \
-             when a version takes effect **and** when a proposal opens or closes. A tenant with \
-             no policy at all is answered `200` and carries a tag, so the first proposal a \
-             tenant ever makes satisfies this like any other. A tag that no longer describes \
-             the policy is `409` `STALE_VERSION`; an absent or malformed one is `400`. Weak \
-             validators, the wildcard `*` and tag lists are all refused - a wildcard would \
-             author a governance policy over whatever happens to be current, which is what the \
-             precondition exists to prevent."
-                .to_owned(),
-        ),
-        param_type: "string".to_owned(),
-        // Scalar: every parameter this gear declares is single-valued.
-        // `array` arrived upstream for `?tag=a&tag=b` repeats, which no route
-        // here has.
-        array: false,
-    }
+    ParamSpec::header("If-Match").required(true).description(
+        "Mandatory precondition (RFC 9110), and the governance section 5 `ETag` cell for this \
+         row. The value is \
+         the **opaque** tag the `GET` returns in its `ETag` header - copy it back verbatim. \
+         It is not a row version: this store is append-only and has no version column, so \
+         the tag is a digest over the representation the `GET` serves, which means it moves \
+         when a version takes effect **and** when a proposal opens or closes. A tenant with \
+         no policy at all is answered `200` and carries a tag, so the first proposal a \
+         tenant ever makes satisfies this like any other. A tag that no longer describes \
+         the policy is `409` `STALE_VERSION`; an absent or malformed one is `400`. Weak \
+         validators, the wildcard `*` and tag lists are all refused - a wildcard would \
+         author a governance policy over whatever happens to be current, which is what the \
+         precondition exists to prevent.",
+    )
 }
 
 /// The tenant's policy as it stands: what is in force, and what is under review.

@@ -36,14 +36,14 @@ impl ConsumerTypeCache {
         &self,
         broker: &Arc<dyn EventBrokerApi>,
         ctx: &SecurityContext,
-        declared_topics: &[String],
+        declared_topics: &[GtsInstanceId],
     ) -> Result<(), EventBrokerError> {
         let event_types = broker.list_event_types(ctx).await?;
         let mut cached = self.topics.write().await;
         for event_type in event_types {
             if declared_topics
                 .iter()
-                .any(|topic| topic == event_type.topic.as_ref())
+                .any(|topic| topic == &event_type.topic)
             {
                 cached.insert(event_type.id.as_ref().to_owned(), event_type.topic);
             }

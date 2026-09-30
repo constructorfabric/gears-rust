@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-authz-resolver"
-version = "0.2.4"
+version = "0.2.5"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -21,7 +21,7 @@ workspace = true
 # Trait boundaries of consumed SDKs are `CanonicalError` (ADR 0005).
 toolkit-canonical-errors = { workspace = true }
 # Local dependencies
-authz-resolver-sdk = { package = "cf-gears-authz-resolver-sdk", version = "0.5.1", path = "../authz-resolver-sdk", features = [
+authz-resolver-sdk = { package = "cf-gears-authz-resolver-sdk", version = "0.5.2", path = "../authz-resolver-sdk", features = [
     "rest-client",
     "rest-server",
 ] }

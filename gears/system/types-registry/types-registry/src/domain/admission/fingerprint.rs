@@ -37,8 +37,8 @@
 //!   but once P1 puts a real tenant in it a forgeable digest lets one tenant
 //!   collide into another's `Idempotency-Key` namespace.
 //!
-//! That rules out the inline FNV-1a of [`crate::domain::artifacts`] — not on
-//! collision *probability*, ~2⁻⁶⁴ per comparison either way, but because FNV-1a's
+//! That rules out a non-cryptographic digest such as FNV-1a — not on collision
+//! *probability*, ~2⁻⁶⁴ per comparison either way, but because FNV-1a's
 //! round is invertible (`h ← (h ^ b) · PRIME`, odd `PRIME`), so a target digest can
 //! be solved for rather than searched. This layout hands an attacker the freedom to
 //! do it: only the 1-byte `force` field follows the 8 arbitrary bytes of

@@ -7,16 +7,19 @@ conventions, and `docs/toolkit-pr-review/comment-style.md` for how a finding is 
 
 ## Scope of this module
 
-Apply every rule in this module **only** to the files listed in
-`toolkit_owned_files` in `context.json`, which is the file list you were given. If the PR contains no ToolKit-owned file, skip this
-module entirely and report nothing for it.
+These rules check that gears use the ToolKit framework correctly. Apply them to every file you
+were given — gear code, its tests, examples, apps, and the `Cargo.toml` of each — except the
+framework's own implementation under `libs/toolkit*/`. Code there *is* ToolKit: it defines
+`SecureConn`, runs raw SQL on the gear's behalf and wires REST, so the consumer rules below do not
+apply to it. Skip those files and report nothing for them.
 
-`TOOLKIT-CORE-003` (crate naming) reads `Cargo.toml` from `manifest_files`, and the folder-name
-half of it is answerable from paths alone.
+`Cargo.toml` changes are in scope for `TOOLKIT-CORE-001` (a consumer depending on a gear
+implementation crate instead of its `-sdk`) and `TOOLKIT-CORE-003` (crate naming); the folder-name
+half of `TOOLKIT-CORE-003` is answerable from paths alone.
 
 ## Check IDs to Apply
 
-You own **every** `TOOLKIT-*` rule. Apply them **only** to files listed in `toolkit_owned_files`.
+You own **every** `TOOLKIT-*` rule.
 Each rule's `**Severity**` is the value to put in the finding; do not infer it from the example in
 the Output Contract.
 

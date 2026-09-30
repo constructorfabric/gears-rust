@@ -33,7 +33,6 @@ pub struct Model {
     pub revision_no: i32,
     /// The authored value as submitted, canonical UTF-8 text.
     pub canonical_value: String,
-    pub content_hash: Vec<u8>,
     /// Entity half of the exact Type Schema revision this value was validated
     /// against.
     pub type_schema_entity_id: i64,

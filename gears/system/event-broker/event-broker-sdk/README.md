@@ -115,10 +115,13 @@ let outbox_handle = event_outbox
     .await?;
 let producer_outbox = event_outbox.bind(&outbox_handle);
 
-let mut txn = db.begin().await?;
-write_business_state(&txn).await?;
-producer_outbox.enqueue(&txn, OrderCreated { ... }).await?;
-txn.commit().await?;
+// in_transaction flushes the producer-outbox handle only if the transaction
+// commits, so nothing is published for a rolled-back write.
+toolkit_db::outbox::in_transaction(&db, |txn| Box::pin(async move {
+    write_business_state(txn).await?;
+    let flush = producer_outbox.enqueue(txn, OrderCreated { ... }).await?;
+    Ok(((), flush))
+})).await?;
 ```
 
 `DbProducer` validates typed events before writing producer outbox rows. In lazy
@@ -280,13 +283,14 @@ impl TxSingleEventHandler<LocalDbOffsetManager> for MyHandler {
                 .attempts(attempts)
                 .build();
 
-            self.db.transaction_ref(|tx| {
-                Box::pin(async move {
-                    self.dlq.enqueue(tx, record).await?;
-                    commit.commit_offset_in_tx(tx, event.offset).await?;
-                    Ok(())
-                })
-            }).await?;
+            // in_transaction flushes the DLQ handle only after the commit lands.
+            // Enqueue last, so an error on the offset write never leaves a handle
+            // to drop.
+            toolkit_db::outbox::in_transaction(&self.db, |tx| Box::pin(async move {
+                commit.commit_offset_in_tx(tx, event.offset).await?;
+                let flush = self.dlq.enqueue(tx, record).await?;
+                Ok(((), flush))
+            })).await?;
 
             return Ok(HandlerOutcome::Success);
         }

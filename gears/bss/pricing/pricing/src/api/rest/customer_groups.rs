@@ -56,7 +56,7 @@ use bss_pricing_sdk::odata::MembershipFilterField;
 
 use toolkit::api::canonical_prelude::CanonicalError;
 use toolkit::api::odata::OData;
-use toolkit::api::operation_builder::{OperationBuilderODataExt, ParamLocation, ParamSpec};
+use toolkit::api::operation_builder::{OperationBuilderODataExt, ParamSpec};
 use toolkit::api::{OpenApiRegistry, operation_builder::OperationBuilder};
 use toolkit_db::secure::{AccessScope, DBRunner};
 use toolkit_db::{DBProvider, DbError};
@@ -210,29 +210,18 @@ pub struct PutCustomerGroupTaxonomyRequest {
 /// The `If-Match` header this `PUT` requires (D-171) —
 /// `taxonomies::if_match_param`'s wording, restated for this resource.
 fn if_match_param() -> ParamSpec {
-    ParamSpec {
-        name: "If-Match".to_owned(),
-        location: ParamLocation::Header,
-        required: true,
-        description: Some(
-            "Mandatory precondition (RFC 9110). The value is the **opaque** tag the `GET` \
-             returns in its `ETag` header - copy it back verbatim. It is not a row version: this \
-             taxonomy is a value set with no version column, so the tag is a digest over the \
-             representation the `GET` serves - every value's code, state and label. A tenant with \
-             no values at all is answered `200` with an empty list and carries a tag, so a first \
-             `PUT` asserts it like any other. It matters here more than the row count suggests, \
-             because this `PUT` replaces the **whole** set: without it, two admins who each add \
-             one value would leave a taxonomy carrying one addition and silently retiring the \
-             other's. A tag that no longer describes the taxonomy is `409` `STALE_VERSION`; an \
-             absent or malformed one is `400`."
-                .to_owned(),
-        ),
-        param_type: "string".to_owned(),
-        // Scalar: every parameter this gear declares is single-valued.
-        // `array` arrived upstream for `?tag=a&tag=b` repeats, which no route
-        // here has.
-        array: false,
-    }
+    ParamSpec::header("If-Match").required(true).description(
+        "Mandatory precondition (RFC 9110). The value is the **opaque** tag the `GET` \
+         returns in its `ETag` header - copy it back verbatim. It is not a row version: this \
+         taxonomy is a value set with no version column, so the tag is a digest over the \
+         representation the `GET` serves - every value's code, state and label. A tenant with \
+         no values at all is answered `200` with an empty list and carries a tag, so a first \
+         `PUT` asserts it like any other. It matters here more than the row count suggests, \
+         because this `PUT` replaces the **whole** set: without it, two admins who each add \
+         one value would leave a taxonomy carrying one addition and silently retiring the \
+         other's. A tag that no longer describes the taxonomy is `409` `STALE_VERSION`; an \
+         absent or malformed one is `400`.",
+    )
 }
 
 /// Build the Axum router for the two customer-group taxonomy operations and

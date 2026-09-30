@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-types-registry"
-version = "0.3.3"
+version = "0.4.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -29,12 +29,15 @@ gts = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
+# Runtime cancellation for the stateful worker.
+tokio-util = { workspace = true }
 tracing = { workspace = true }
 # Admission metrics use ToolKit's global meter provider.
 opentelemetry = { workspace = true }
 inventory = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+# `raw_value`: stored canonical documents are served verbatim, not re-parsed.
+serde_json = { workspace = true, features = ["raw_value"] }
 utoipa = { workspace = true, features = ["time"] }
 axum = { workspace = true, features = ["macros"] }
 uuid = { workspace = true, features = ["v5"] }
@@ -63,6 +66,9 @@ toolkit = { workspace = true }
 toolkit-db = { workspace = true, features = ["sqlite"] }
 toolkit-canonical-errors = { workspace = true, features = ["axum"] }
 toolkit-gts = { workspace = true }
+# Versioned base64url keyset cursors for content-free discovery (D12): `CursorV1`
+# refuses an unknown version, which is the property the page contract needs.
+toolkit-odata = { workspace = true }
 toolkit-macros = { workspace = true }
 toolkit-utils = { workspace = true }
 # Derives the default metric prefix from the gear name.
@@ -76,9 +82,15 @@ heck = { workspace = true }
 integration = ["toolkit-db/pg", "toolkit-db/mysql"]
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }
-# In-memory SQLite for the schema-level migration tests.
-toolkit-db = { workspace = true, features = ["sqlite"] }
+# Deterministic Tokio time for lease tests.
+tokio = { workspace = true, features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "test-util",
+] }
+# SQLite and transaction observation for dispatch tests.
+toolkit-db = { workspace = true, features = ["sqlite", "test-support"] }
 # PostgreSQL / MySQL bring-up for the `integration` suite. Not optional --
 # `[dev-dependencies]` cannot be -- but every reference is behind
 # `#![cfg(feature = "integration")]`, so a default `cargo test` needs no Docker.
@@ -97,3 +109,5 @@ tracing-test = { workspace = true }
 # Captures admission spans in integration tests.
 tracing-subscriber = { workspace = true }
 time = { workspace = true, features = ["macros"] }
+# Builds test `OutboxMessage` timestamps.
+chrono = { workspace = true }

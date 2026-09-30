@@ -494,6 +494,12 @@ impl From<DomainError> for CanonicalError {
             }
 
             // ---- Internal (HTTP 500) ----
+            // Startup wiring handles this variant specially so it can never be
+            // downgraded by `bootstrap.strict`. Keep the canonical mapping
+            // complete for direct domain-service callers.
+            DomainError::RootBindingMismatch { detail } => {
+                CanonicalError::internal(detail).create()
+            }
             DomainError::Internal {
                 diagnostic,
                 cause: _,

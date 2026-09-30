@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use toolkit_security::{AccessScope, PlatformSecurityContext, SecurityContext};
+use toolkit_security::{AccessScope, PlatformSecurityContext, SecurityContext, pep_properties};
 
 use super::IntoPropertyValue;
 use uuid::Uuid;
@@ -26,7 +26,9 @@ use crate::models::{
     Action, BarrierMode, Capability, EvaluationRequest, EvaluationRequestContext, Resource,
     Subject, TenantContext, TenantMode,
 };
-use crate::pep::compiler::{ConstraintCompileError, compile_to_access_scope};
+use crate::pep::compiler::{
+    ConstraintCompileError, compile_to_access_scope_with_negotiated_capabilities,
+};
 
 /// Error from the PEP enforcement flow.
 #[derive(Debug, thiserror::Error)]
@@ -174,6 +176,7 @@ impl AccessRequest {
 pub struct ResourceType {
     name: Cow<'static, str>,
     supported_properties: &'static [&'static str],
+    native_group_predicates: bool,
 }
 
 impl ResourceType {
@@ -188,6 +191,7 @@ impl ResourceType {
         Self {
             name: Cow::Borrowed(name),
             supported_properties,
+            native_group_predicates: false,
         }
     }
 
@@ -205,7 +209,21 @@ impl ResourceType {
         Self {
             name: name.into(),
             supported_properties,
+            native_group_predicates: false,
         }
+    }
+
+    /// Enable native `InGroup`/`InGroupSubtree` predicates for this resource.
+    ///
+    /// The resource name itself is used as the RG membership discriminator, so
+    /// it must be an exact canonical GTS type path and the resource must support
+    /// the `id` property. This flag is deliberately per resource while
+    /// [`PolicyEnforcer::with_capabilities`] records service-level access to the
+    /// required projection tables.
+    #[must_use]
+    pub const fn with_native_group_predicates(mut self) -> Self {
+        self.native_group_predicates = true;
+        self
     }
 
     /// Dotted resource type name (for example, a `gts_id!(...)` value).
@@ -218,6 +236,21 @@ impl ResourceType {
     #[must_use]
     pub fn supported_properties(&self) -> &'static [&'static str] {
         self.supported_properties
+    }
+
+    /// Return the canonical GTS type path used to qualify native RG membership
+    /// rows, or `None` when the policy resource name is not a GTS type path.
+    ///
+    /// Policy and membership use one identity. Resources without the explicit
+    /// opt-in, and non-GTS policy labels, can still be authorized, but their
+    /// group scopes must be expanded by the PDP to explicit `In` predicates.
+    fn native_group_membership_type(&self) -> Option<&str> {
+        if !self.native_group_predicates {
+            return None;
+        }
+        let name = self.name.as_ref();
+        let parsed = gts::GtsTypeId::try_new(name).ok()?;
+        (parsed.as_ref() == name).then_some(name)
     }
 }
 
@@ -317,8 +350,26 @@ impl PolicyEnforcer {
     }
 
     /// Set PEP capabilities advertised to the PDP.
+    ///
+    /// The advertised set is re-validated per request against the resource
+    /// descriptor: `GroupMembership`/`GroupHierarchy` are suppressed unless the
+    /// resource explicitly enables native group predicates, uses an exact
+    /// canonical GTS type path, and supports the `id` property. `GroupHierarchy`
+    /// is additionally suppressed unless `GroupMembership` is advertised
+    /// alongside it (`InGroupSubtree` compilation requires both). The incoherent
+    /// hierarchy-without-membership combination is warned about here, once,
+    /// rather than on every request.
     #[must_use]
     pub fn with_capabilities(mut self, capabilities: Vec<Capability>) -> Self {
+        if capabilities.contains(&Capability::GroupHierarchy)
+            && !capabilities.contains(&Capability::GroupMembership)
+        {
+            tracing::warn!(
+                "GroupHierarchy configured without GroupMembership; the \
+                 hierarchy capability will be suppressed on every request \
+                 (InGroupSubtree requires both)"
+            );
+        }
         self.capabilities = capabilities;
         self
     }
@@ -380,6 +431,48 @@ impl PolicyEnforcer {
 
         let bearer_token = ctx.bearer_token().cloned();
 
+        // Native group predicates require per-resource opt-in, then use the
+        // AuthZ resource's canonical GTS type path to qualify
+        // `resource_group_membership.gts_type_id`. They can target only `id`.
+        // Suppress group capabilities whenever a prerequisite is missing so the
+        // PDP expands the group scope to explicit resource IDs or denies.
+        // `GroupHierarchy` is not independently executable: `InGroupSubtree`
+        // also requires `GroupMembership`.
+        let membership_type = resource.native_group_membership_type();
+        let supports_resource_id = resource
+            .supported_properties
+            .contains(&pep_properties::RESOURCE_ID);
+        let group_predicates_executable = membership_type.is_some() && supports_resource_id;
+        let has_group_capability = self.capabilities.iter().any(|capability| {
+            matches!(
+                capability,
+                Capability::GroupMembership | Capability::GroupHierarchy
+            )
+        });
+        if has_group_capability && resource.native_group_predicates && membership_type.is_none() {
+            tracing::warn!(
+                resource = %resource.name,
+                "native group predicates enabled for a non-canonical GTS type path; \
+                 suppressing group capabilities"
+            );
+        } else if has_group_capability && membership_type.is_some() && !supports_resource_id {
+            tracing::warn!(
+                resource = %resource.name,
+                "resource does not support the 'id' property; suppressing group capabilities"
+            );
+        }
+        let has_group_membership = self.capabilities.contains(&Capability::GroupMembership);
+        let capabilities: Vec<Capability> = self
+            .capabilities
+            .iter()
+            .filter(|capability| match capability {
+                Capability::GroupMembership => group_predicates_executable,
+                Capability::GroupHierarchy => group_predicates_executable && has_group_membership,
+                Capability::TenantHierarchy => true,
+            })
+            .cloned()
+            .collect();
+
         EvaluationRequest {
             subject: Subject {
                 id: ctx.subject_id(),
@@ -398,7 +491,7 @@ impl PolicyEnforcer {
                 tenant_context,
                 token_scopes: ctx.token_scopes().to_vec(),
                 require_constraints,
-                capabilities: self.capabilities.clone(),
+                capabilities,
                 supported_properties: resource
                     .supported_properties
                     .iter()
@@ -459,6 +552,17 @@ impl PolicyEnforcer {
         let require = request.require_constraints.unwrap_or(true);
         let eval_request =
             self.build_request_with(ctx, resource, action, resource_id, require, request);
+        // Preserve the exact post-filter capability set sent to the PDP. The
+        // response compiler rejects native predicates that were not negotiated,
+        // preventing missing-table errors or stronger hierarchy predicates than
+        // the querying service advertised.
+        let negotiated_capabilities = eval_request.context.capabilities.clone();
+        // `build_request_with` retained GroupMembership only after validating
+        // the resource opt-in, canonical GTS type and `id` support. Reuse that
+        // decision instead of parsing the GTS name again after the PDP call.
+        let group_membership_type = negotiated_capabilities
+            .contains(&Capability::GroupMembership)
+            .then_some(resource.name());
         let authz = self.resolve_authz()?;
         // `evaluate` is a platform-plane method: the transport attaches this
         // gear's service-identity credential below the contract layer to
@@ -496,10 +600,12 @@ impl PolicyEnforcer {
             });
         }
 
-        Ok(compile_to_access_scope(
+        Ok(compile_to_access_scope_with_negotiated_capabilities(
             &response,
             require,
             resource.supported_properties,
+            group_membership_type,
+            &negotiated_capabilities,
         )?)
     }
 }

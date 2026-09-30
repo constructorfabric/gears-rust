@@ -70,7 +70,7 @@ jobs:
       # ── Build & generate spec ──────────────────────────────────────────
 
       - name: Install protoc
-        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3 # v2.87.16
         with:
           tool: protoc@3.34.1
 

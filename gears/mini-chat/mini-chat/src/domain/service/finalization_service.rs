@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use super::current_otel_trace_id;
+use crate::domain::repos::Wake;
 use toolkit_macros::domain_model;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
@@ -32,7 +33,10 @@ use crate::domain::ports::metric_labels::{period, result as result_label, trigge
 
 use super::DbProvider;
 
-fn to_db(e: DomainError) -> toolkit_db::DbError {
+fn to_db<E: Into<DomainError>>(e: E) -> toolkit_db::DbError {
+    // Accepts both `DomainError` (repository failures) and `OutboxError`
+    // (enqueue failures), which converts into `DomainError`.
+    let e: DomainError = e.into();
     toolkit_db::DbError::Other(anyhow::anyhow!(e))
 }
 
@@ -139,10 +143,10 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
         let result = self.try_finalize(&input, trace_id.clone()).await;
 
         match result {
-            Ok(outcome) => {
+            Ok((outcome, wake)) => {
                 // Post-commit side effects (outside transaction).
                 if outcome.won_cas {
-                    self.outbox_enqueuer.flush();
+                    wake.fire();
                 }
                 if let Some(billing) = outcome.billing_outcome {
                     let ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -163,7 +167,7 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
                     let mut retry_input = input;
                     retry_input.terminal_state = TurnState::Failed;
                     retry_input.error_code = Some("message_persistence_failed".to_owned());
-                    let retry_outcome = self
+                    let (retry_outcome, retry_wake) = self
                         .try_finalize(&retry_input, trace_id.clone())
                         .await
                         .map_err(|fe| match fe {
@@ -173,7 +177,7 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
                             }
                         })?;
                     if retry_outcome.won_cas {
-                        self.outbox_enqueuer.flush();
+                        retry_wake.fire();
                     }
                     if let Some(billing) = retry_outcome.billing_outcome {
                         let ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -197,19 +201,19 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
                     );
                     let mut retry_input = input;
                     retry_input.accumulated_text = String::new();
-                    let retry_outcome =
-                        self.try_finalize(&retry_input, trace_id)
-                            .await
-                            .map_err(|fe| match fe {
-                                FinalizationError::Domain(de) => de,
-                                FinalizationError::MessagePersistenceFailed(e2) => {
-                                    DomainError::internal(format!(
-                                        "unexpected message persist on empty text: {e2}"
-                                    ))
-                                }
-                            })?;
+                    let (retry_outcome, retry_wake) = self
+                        .try_finalize(&retry_input, trace_id)
+                        .await
+                        .map_err(|fe| match fe {
+                            FinalizationError::Domain(de) => de,
+                            FinalizationError::MessagePersistenceFailed(e2) => {
+                                DomainError::internal(format!(
+                                    "unexpected message persist on empty text: {e2}"
+                                ))
+                            }
+                        })?;
                     if retry_outcome.won_cas {
-                        self.outbox_enqueuer.flush();
+                        retry_wake.fire();
                     }
                     if let Some(billing) = retry_outcome.billing_outcome {
                         let ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -233,7 +237,7 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
         &self,
         input: &FinalizationInput,
         trace_id: Option<String>,
-    ) -> Result<FinalizationOutcome, FinalizationError> {
+    ) -> Result<(FinalizationOutcome, Wake), FinalizationError> {
         let turn_repo = Arc::clone(&self.turn_repo);
         let message_repo = Arc::clone(&self.message_repo);
         let quota_settler = Arc::clone(&self.quota_settler);
@@ -270,12 +274,19 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
 
                     if rows == 0 {
                         debug!(turn_id = %input.turn_id, "CAS loser: another finalizer won");
-                        return Ok(FinalizationOutcome {
-                            won_cas: false,
-                            billing_outcome: None,
-                            settlement_outcome: None,
-                        });
+                        return Ok((
+                            FinalizationOutcome {
+                                won_cas: false,
+                                billing_outcome: None,
+                                settlement_outcome: None,
+                            },
+                            Wake::empty(),
+                        ));
                     }
+
+                    // Accumulate the wakes of every enqueue in this unit
+                    // of work; fired post-commit by the caller.
+                    let mut wake = Wake::empty();
 
                     // 2. Derive billing outcome (pure function, no DB)
                     let billing = derive_billing_outcome(&BillingDerivationInput {
@@ -357,14 +368,14 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
 
                     // 5. Enqueue usage outbox event
                     let usage_event = build_usage_event(&input, billing, &settlement_outcome);
-                    outbox_enqueuer
+                    wake += outbox_enqueuer
                         .enqueue_usage_event(tx, usage_event)
                         .await
                         .map_err(to_db)?;
 
                     // 6. Enqueue audit outbox event
                     let audit_event = build_turn_audit_envelope(&input, trace_id);
-                    outbox_enqueuer
+                    wake += outbox_enqueuer
                         .enqueue_audit_event(tx, audit_event)
                         .await
                         .map_err(to_db)?;
@@ -450,7 +461,7 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
                                     frozen_target_created_at: target.created_at,
                                     frozen_target_message_id: target.message_id,
                                 };
-                                outbox_enqueuer
+                                wake += outbox_enqueuer
                                     .enqueue_thread_summary(tx, payload)
                                     .await
                                     .map_err(to_db)?;
@@ -461,11 +472,14 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
                         }
                     }
 
-                    Ok(FinalizationOutcome {
-                        won_cas: true,
-                        billing_outcome: Some(billing),
-                        settlement_outcome: Some(settlement_outcome),
-                    })
+                    Ok((
+                        FinalizationOutcome {
+                            won_cas: true,
+                            billing_outcome: Some(billing),
+                            settlement_outcome: Some(settlement_outcome),
+                        },
+                        wake,
+                    ))
                 })
             })
             .await;
@@ -608,8 +622,12 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
                             turn_id = %input.turn_id,
                             "orphan CAS loser: turn already finalized or progress renewed"
                         );
-                        return Ok(false);
+                        return Ok((false, Wake::empty()));
                     }
+
+                    // Accumulate the wakes of every enqueue in this unit
+                    // of work; fired post-commit once the transaction lands.
+                    let mut wake = Wake::empty();
 
                     // 2. Derive billing outcome (pure function)
                     let billing = derive_billing_outcome(&BillingDerivationInput {
@@ -717,7 +735,7 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
                         dedupe_key: None,
                         system_task_type: None,
                     };
-                    outbox_enqueuer
+                    wake += outbox_enqueuer
                         .enqueue_usage_event(tx, usage_event)
                         .await
                         .map_err(to_db)?;
@@ -765,20 +783,21 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
                         attachments: Vec::new(),
                         tool_calls: None,
                     });
-                    outbox_enqueuer
+                    wake += outbox_enqueuer
                         .enqueue_audit_event(tx, audit_event)
                         .await
                         .map_err(to_db)?;
 
-                    Ok(true)
+                    Ok((true, wake))
                 })
             })
             .await
             .map_err(DomainError::from)?;
 
         // Post-commit side effects (outside transaction).
+        let (tx_result, wake) = tx_result;
         if tx_result {
-            self.outbox_enqueuer.flush();
+            wake.fire();
             let ms = start.elapsed().as_secs_f64() * 1000.0;
             self.metrics.record_audit_emit(result_label::OK);
             self.metrics.record_finalization_latency_ms(ms);
@@ -979,23 +998,28 @@ mod tests {
         }
     }
 
-    // ── Noop OutboxEnqueuer (with flush tracking) ──
+    // ── Noop OutboxEnqueuer (with enqueue tracking) ──
 
     #[domain_model]
     struct NoopOutboxEnqueuer {
-        flush_count: std::sync::atomic::AtomicU32,
+        enqueue_count: std::sync::atomic::AtomicU32,
     }
 
     impl NoopOutboxEnqueuer {
         fn new() -> Self {
             Self {
-                flush_count: std::sync::atomic::AtomicU32::new(0),
+                enqueue_count: std::sync::atomic::AtomicU32::new(0),
             }
         }
 
+        // Firing happens on the returned Wake, which this mock
+        // returns as `empty()` and cannot observe; the counter tracks
+        // enqueue activity instead. The finalize -> fire wiring is covered by
+        // the sqlite-backed integration tests below.
         #[allow(dead_code)]
-        fn flush_count(&self) -> u32 {
-            self.flush_count.load(std::sync::atomic::Ordering::Relaxed)
+        fn enqueue_count(&self) -> u32 {
+            self.enqueue_count
+                .load(std::sync::atomic::Ordering::Relaxed)
         }
     }
 
@@ -1005,45 +1029,50 @@ mod tests {
             &self,
             _runner: &(dyn toolkit_db::secure::DBRunner + Sync),
             _event: mini_chat_sdk::UsageEvent,
-        ) -> Result<(), DomainError> {
-            Ok(())
+        ) -> Result<crate::domain::repos::Wake, crate::domain::repos::OutboxError> {
+            self.enqueue_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(crate::domain::repos::Wake::empty())
         }
 
         async fn enqueue_attachment_cleanup(
             &self,
             _runner: &(dyn toolkit_db::secure::DBRunner + Sync),
             _event: crate::domain::repos::AttachmentCleanupEvent,
-        ) -> Result<(), DomainError> {
-            Ok(())
+        ) -> Result<crate::domain::repos::Wake, crate::domain::repos::OutboxError> {
+            self.enqueue_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(crate::domain::repos::Wake::empty())
         }
 
         async fn enqueue_chat_cleanup(
             &self,
             _runner: &(dyn toolkit_db::secure::DBRunner + Sync),
             _event: crate::domain::repos::ChatCleanupEvent,
-        ) -> Result<(), DomainError> {
-            Ok(())
+        ) -> Result<crate::domain::repos::Wake, crate::domain::repos::OutboxError> {
+            self.enqueue_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(crate::domain::repos::Wake::empty())
         }
 
         async fn enqueue_audit_event(
             &self,
             _runner: &(dyn toolkit_db::secure::DBRunner + Sync),
             _event: crate::domain::model::audit_envelope::AuditEnvelope,
-        ) -> Result<(), DomainError> {
-            Ok(())
+        ) -> Result<crate::domain::repos::Wake, crate::domain::repos::OutboxError> {
+            self.enqueue_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(crate::domain::repos::Wake::empty())
         }
 
         async fn enqueue_thread_summary(
             &self,
             _: &(dyn toolkit_db::secure::DBRunner + Sync),
             _: crate::domain::repos::ThreadSummaryTaskPayload,
-        ) -> Result<(), DomainError> {
-            Ok(())
-        }
-
-        fn flush(&self) {
-            self.flush_count
+        ) -> Result<crate::domain::repos::Wake, crate::domain::repos::OutboxError> {
+            self.enqueue_count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(crate::domain::repos::Wake::empty())
         }
     }
 
@@ -1260,9 +1289,9 @@ mod tests {
         assert!(outcome.billing_outcome.is_some());
         assert!(outcome.settlement_outcome.is_some());
         assert_eq!(
-            outbox.flush_count(),
-            1,
-            "flush should be called once after CAS win"
+            outbox.enqueue_count(),
+            2,
+            "CAS winner enqueues the usage + audit events"
         );
 
         // Verify turn is now in completed state
@@ -1324,11 +1353,12 @@ mod tests {
         assert!(!outcome2.won_cas, "second finalizer should lose CAS");
         assert!(outcome2.billing_outcome.is_none());
         assert!(outcome2.settlement_outcome.is_none());
-        // First call won CAS → 1 flush. Second lost CAS → no additional flush.
+        // First call won CAS → 2 enqueues (usage + audit). Second lost CAS →
+        // no enqueues.
         assert_eq!(
-            outbox.flush_count(),
-            1,
-            "flush should only be called for CAS winner"
+            outbox.enqueue_count(),
+            2,
+            "only the CAS winner enqueues; the loser enqueues nothing"
         );
     }
 
@@ -1998,11 +2028,11 @@ mod tests {
             other => panic!("expected Turn event, got: {other:?}"),
         }
 
-        // Verify flush was called
+        // Verify events were enqueued
         assert_eq!(
-            outbox.flush_count(),
-            1,
-            "flush should be called after CAS win"
+            outbox.enqueue_count(),
+            2,
+            "orphan CAS winner enqueues the usage + audit events"
         );
     }
 
@@ -2126,7 +2156,7 @@ mod tests {
         let audit_events = outbox.audit_events();
         assert!(audit_events.is_empty(), "no audit events for CAS loser");
 
-        assert_eq!(outbox.flush_count(), 0, "no flush for CAS loser");
+        assert_eq!(outbox.enqueue_count(), 0, "CAS loser enqueues nothing");
     }
 
     #[tokio::test]
@@ -2189,5 +2219,254 @@ mod tests {
             "usage event should be enqueued even without settlement"
         );
         drop(usage_events);
+    }
+
+    // ── finalize → post-commit fire wiring over a REAL outbox pipeline ──
+    //
+    // Every other finalization test injects a mock enqueuer that returns an
+    // inert `Wake::empty()`, so they can only prove an event was
+    // *enqueued*, never that the post-commit `wake.fire()` actually fired.
+    // These two drive the real `InfraOutboxEnqueuer` over a started `Outbox`
+    // on the same sqlite DB the finalize transaction writes to, then assert the
+    // usage event is *delivered* to a leased handler — delivery the wake is
+    // the trigger for. If `finalize_turn_cas` / `finalize_orphan_turn` failed
+    // to fire the wake they get back, the handler is never notified and the
+    // 5s timeout below fails the test.
+
+    /// Leased handler that records delivery and wakes a `Notify`. Placed on the
+    /// usage queue, which both finalize paths enqueue to.
+    struct SignalingLeasedHandler {
+        delivered: Arc<tokio::sync::Notify>,
+        count: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    #[async_trait::async_trait]
+    impl toolkit_db::outbox::LeasedMessageHandler for SignalingLeasedHandler {
+        async fn handle(
+            &self,
+            _msg: &toolkit_db::outbox::OutboxMessage,
+        ) -> toolkit_db::outbox::MessageResult {
+            self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.delivered.notify_one();
+            toolkit_db::outbox::MessageResult::Ok
+        }
+    }
+
+    /// Ack-and-forget handler for the audit queue, which is enqueued to but not
+    /// asserted on.
+    struct AckLeasedHandler;
+
+    #[async_trait::async_trait]
+    impl toolkit_db::outbox::LeasedMessageHandler for AckLeasedHandler {
+        async fn handle(
+            &self,
+            _msg: &toolkit_db::outbox::OutboxMessage,
+        ) -> toolkit_db::outbox::MessageResult {
+            toolkit_db::outbox::MessageResult::Ok
+        }
+    }
+
+    /// A single sqlite in-memory DB (shared-cache, so every pooled connection
+    /// sees the same data) carrying both the mini-chat schema and the outbox
+    /// schema. The finalize transaction and the outbox pipeline share it.
+    async fn inmem_db_with_outbox(name: &str) -> toolkit_db::Db {
+        use sea_orm_migration::MigratorTrait;
+        use toolkit_db::{ConnectOpts, connect_db, migration_runner::run_migrations_for_testing};
+
+        let url = format!("sqlite:file:{name}?mode=memory&cache=shared");
+        let db = connect_db(
+            &url,
+            ConnectOpts {
+                max_conns: Some(1),
+                min_conns: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("connect");
+        run_migrations_for_testing(&db, crate::infra::db::migrations::Migrator::migrations())
+            .await
+            .expect("mini-chat migrations");
+        run_migrations_for_testing(&db, toolkit_db::outbox::outbox_migrations())
+            .await
+            .expect("outbox migrations");
+        db
+    }
+
+    /// Start an outbox with the usage + audit queues (the queues both finalize
+    /// paths enqueue to), a signaling handler on usage, and a real
+    /// `InfraOutboxEnqueuer` wired to it. Returns everything the caller needs to
+    /// build the service and assert on delivery.
+    async fn start_real_outbox(
+        db: &toolkit_db::Db,
+    ) -> (
+        toolkit_db::outbox::OutboxHandle,
+        Arc<crate::infra::outbox::InfraOutboxEnqueuer>,
+        Arc<tokio::sync::Notify>,
+        Arc<std::sync::atomic::AtomicU32>,
+    ) {
+        use toolkit_db::outbox::{Outbox, Partitions};
+
+        let delivered = Arc::new(tokio::sync::Notify::new());
+        let count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+        let handle = Outbox::builder(db.clone())
+            .queue("test.usage", Partitions::of(1))
+            .leased(SignalingLeasedHandler {
+                delivered: Arc::clone(&delivered),
+                count: Arc::clone(&count),
+            })
+            .queue("test.audit", Partitions::of(1))
+            .leased(AckLeasedHandler)
+            .start()
+            .await
+            .expect("outbox start");
+
+        let enqueuer = Arc::new(crate::infra::outbox::InfraOutboxEnqueuer::new(
+            "test.usage".to_owned(),
+            "test.cleanup".to_owned(),
+            "test.chat_cleanup".to_owned(),
+            "test.thread_summary".to_owned(),
+            "test.audit".to_owned(),
+            1u32,
+        ));
+        enqueuer.set_outbox(Arc::clone(handle.outbox()));
+
+        (handle, enqueuer, delivered, count)
+    }
+
+    fn build_service_with_enqueuer(
+        db: Arc<DbProvider>,
+        enqueuer: Arc<dyn OutboxEnqueuer>,
+    ) -> FinalizationService<TurnRepo, MsgRepo> {
+        FinalizationService::new(
+            db,
+            Arc::new(TurnRepo),
+            Arc::new(MsgRepo::new(toolkit_db::odata::LimitCfg {
+                default: 20,
+                max: 100,
+            })),
+            Arc::new(MockQuotaSettler),
+            enqueuer,
+            Arc::new(crate::domain::ports::metrics::NoopMetrics),
+            crate::config::background::ThreadSummaryWorkerConfig::default(),
+        )
+    }
+
+    #[tokio::test]
+    async fn finalize_turn_cas_flushes_and_delivers_usage_event() {
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let db = inmem_db_with_outbox("finalize_cas_flush").await;
+        let db_provider = mock_db_provider(db.clone());
+
+        let (handle, enqueuer, delivered, count) = start_real_outbox(&db).await;
+        let svc = build_service_with_enqueuer(
+            Arc::clone(&db_provider),
+            Arc::clone(&enqueuer) as Arc<dyn OutboxEnqueuer>,
+        );
+
+        let tenant_id = Uuid::new_v4();
+        let chat_id = Uuid::new_v4();
+        let turn_id = Uuid::new_v4();
+        let request_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+
+        insert_test_chat(&db_provider, tenant_id, chat_id, user_id).await;
+        insert_running_turn(&db_provider, tenant_id, chat_id, turn_id, request_id).await;
+
+        let input = make_input(
+            tenant_id,
+            chat_id,
+            turn_id,
+            request_id,
+            user_id,
+            TurnState::Completed,
+        );
+        let outcome = svc
+            .finalize_turn_cas(input)
+            .await
+            .expect("finalization should succeed");
+        assert!(outcome.won_cas, "should be CAS winner");
+
+        // Delivery only happens if the CAS winner fired the Wake it got
+        // back from the enqueuer after the transaction committed.
+        tokio::time::timeout(Duration::from_secs(5), delivered.notified())
+            .await
+            .expect("usage event should be delivered within 5s (finalize must flush post-commit)");
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "exactly one usage event delivered"
+        );
+
+        handle.stop().await;
+    }
+
+    #[tokio::test]
+    async fn finalize_orphan_turn_flushes_and_delivers_usage_event() {
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let db = inmem_db_with_outbox("finalize_orphan_flush").await;
+        let db_provider = mock_db_provider(db.clone());
+
+        let (handle, enqueuer, delivered, count) = start_real_outbox(&db).await;
+        let svc = build_service_with_enqueuer(
+            Arc::clone(&db_provider),
+            Arc::clone(&enqueuer) as Arc<dyn OutboxEnqueuer>,
+        );
+
+        let tenant_id = Uuid::new_v4();
+        let chat_id = Uuid::new_v4();
+        let turn_id = Uuid::new_v4();
+        let request_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+
+        insert_test_chat(&db_provider, tenant_id, chat_id, user_id).await;
+        insert_running_turn(&db_provider, tenant_id, chat_id, turn_id, request_id).await;
+
+        // Make the turn orphan-eligible by backdating last_progress_at.
+        let conn = db_provider.conn().unwrap();
+        backdate_turn_progress(&conn, turn_id).await;
+
+        let input = crate::domain::model::finalization::OrphanFinalizationInput {
+            turn_id,
+            tenant_id,
+            chat_id,
+            request_id,
+            user_id: Some(user_id),
+            requester_type: mini_chat_sdk::RequesterType::User,
+            effective_model: Some("gpt-5.2".to_owned()),
+            reserve_tokens: Some(100),
+            max_output_tokens_applied: Some(4096),
+            reserved_credits_micro: Some(1000),
+            policy_version_applied: Some(1),
+            minimal_generation_floor_applied: Some(10),
+            started_at: time::OffsetDateTime::now_utc(),
+            web_search_completed_count: 0,
+            code_interpreter_completed_count: 0,
+            file_search_completed_count: 0,
+        };
+
+        let won = svc
+            .finalize_orphan_turn(input, 60)
+            .await
+            .expect("orphan finalization should succeed");
+        assert!(won, "should be CAS winner");
+
+        // Delivery only happens if the orphan path fired the Wake it
+        // got back from the enqueuer after the transaction committed.
+        tokio::time::timeout(Duration::from_secs(5), delivered.notified())
+            .await
+            .expect("usage event should be delivered within 5s (orphan finalize must flush post-commit)");
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "exactly one usage event delivered"
+        );
+
+        handle.stop().await;
     }
 }

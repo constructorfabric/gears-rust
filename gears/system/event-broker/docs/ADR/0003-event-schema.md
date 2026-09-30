@@ -114,7 +114,7 @@ A top-level publish-input field `meta` (marked `writeOnly`) carries producer-pro
 - **Transport-agnostic**: same shape over REST, gRPC, message-queue replay, or file import. No header/body split per transport.
 - **Stripped on read**: the public read API does NOT echo `meta` to consumers. Storage MAY retain `meta` for audit; the read projection layer strips it. The `writeOnly` marker makes this contract explicit in the schema.
 
-`meta` namespacing eliminates the body↔header duplication that an HTTP-header design (`Producer-Id` header vs. `event.producer_id` body field) would create — there is only one canonical location for each field.
+`meta` namespacing gives every producer-protocol field exactly one canonical location in the body, shared unchanged across every transport.
 
 ### Field-Level Changes
 

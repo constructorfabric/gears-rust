@@ -265,7 +265,7 @@ POST /v1/subscriptions { consumer_group, client_agent, session_timeout, interest
 6. Collect the topic set from interest.topic across all interests (no derivation; topics are explicit).
 7. Run rebalance with this member's (topic, partition) interest set.
 8. Persist subscription cache entry: { compiled_filters_or_None[], resolved_type_sets[], topic_set, assignments }.
-9. Return 201 Created with { id, assigned, topology_version, expires_at, interests[] (echoed) }.
+9. Return 201 Created with { id, assigned, topology_version, interests[] (echoed) }.
 ```
 
 All validation BEFORE persistence. Failed JOIN leaves no broker state.

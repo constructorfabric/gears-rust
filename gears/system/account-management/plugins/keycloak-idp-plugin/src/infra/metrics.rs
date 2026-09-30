@@ -54,6 +54,16 @@ use crate::domain::ports::metrics::{
     UserOp, UserOpMetricsPort, VersionObserved,
 };
 
+/// Seconds-scale bucket boundaries for the single-KC-call-scale duration
+/// histograms; the SDK default boundaries are millisecond-scale.
+const OP_DURATION_BOUNDARIES_SECS: &[f64] = &[
+    0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+];
+
+/// Taller set for `provision_tenant`, which cascades many KC Admin calls.
+const PROVISION_TENANT_BOUNDARIES_SECS: &[f64] =
+    &[0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 7.5, 10.0, 15.0, 30.0];
+
 /// OpenTelemetry adapter that owns one instrument per plugin metric
 /// family and implements every port trait.
 pub struct KeycloakIdpPluginMetricsAdapter {
@@ -115,10 +125,12 @@ impl KeycloakIdpPluginMetricsAdapter {
                     prefix,
                 ))
                 .with_description("provision_tenant end-to-end latency in seconds by realm_binding")
+                .with_boundaries(PROVISION_TENANT_BOUNDARIES_SECS.to_vec())
                 .build(),
             user_op_duration: meter
                 .f64_histogram(rename(KEYCLOAK_IDP_PLUGIN_USER_OP_DURATION, prefix))
                 .with_description("User-op latency in seconds by op")
+                .with_boundaries(OP_DURATION_BOUNDARIES_SECS.to_vec())
                 .build(),
             kc_admin_request_duration: meter
                 .f64_histogram(rename(
@@ -126,10 +138,12 @@ impl KeycloakIdpPluginMetricsAdapter {
                     prefix,
                 ))
                 .with_description("Single KC Admin REST call latency in seconds by endpoint_class")
+                .with_boundaries(OP_DURATION_BOUNDARIES_SECS.to_vec())
                 .build(),
             sa_op_duration: meter
                 .f64_histogram(rename(KEYCLOAK_IDP_PLUGIN_SA_OP_DURATION, prefix))
                 .with_description("Service-account op latency in seconds by op")
+                .with_boundaries(OP_DURATION_BOUNDARIES_SECS.to_vec())
                 .build(),
             failure: meter
                 .u64_counter(rename(KEYCLOAK_IDP_PLUGIN_FAILURE, prefix))

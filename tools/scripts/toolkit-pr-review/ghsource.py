@@ -123,13 +123,22 @@ def local_base(base_ref: str | None, branch: str) -> str:
 
     The prose hardcoded `main` then `origin/main` then stopped, so a repository whose
     trunk is `master` could not use local mode at all.
+
+    Remotes are tried in the order `resolve_repo` uses, `upstream` before `origin`. In a
+    fork checkout `origin` is the fork, whose trunk lags upstream, and a merge base taken
+    from it pulls every upstream commit the fork has not synced into the review. No
+    fetch happens here, so the base is as fresh as the last fetch.
     """
     candidates = [base_ref] if base_ref else []
-    head = run(["git", "symbolic-ref", "--short", "-q", "refs/remotes/origin/HEAD"],
-               check=False).strip()
-    if head:
-        candidates.append(head)
-    candidates += ["main", "origin/main", "master", "origin/master"]
+    for remote in ("upstream", "origin"):
+        if not run(["git", "remote", "get-url", remote], check=False).strip():
+            continue
+        head = run(["git", "symbolic-ref", "--short", "-q", f"refs/remotes/{remote}/HEAD"],
+                   check=False).strip()
+        if head:
+            candidates.append(head)
+        candidates += [f"{remote}/main", f"{remote}/master"]
+    candidates += ["main", "master"]
     for cand in candidates:
         if not cand:
             continue

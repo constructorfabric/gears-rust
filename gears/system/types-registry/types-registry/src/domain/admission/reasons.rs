@@ -20,6 +20,8 @@ pub enum AdmissionFailureReason {
     BlockedByPredecessor,
     /// `compare_documents` returned `Unknown`, distinct from an incompatible verdict.
     CompatibilityUndecidable,
+    /// A required base, conforming type or schema reference is absent.
+    DependencyNotFound,
     DependentInvalid,
     /// The declared dialect differs from the major's pinned dialect (ADR-0014).
     DialectChanged,
@@ -52,6 +54,8 @@ pub enum AdmissionFailureReason {
     StableDerivesFromMajorZero,
     /// ADR-0015: a stable candidate `$ref`s a major-0 entity.
     StableRefsMajorZero,
+    /// The system failed, not the candidate; `error_code` names the cause.
+    SystemFailure,
     UnparsablePayload,
     UnreadableVersion,
     UnrecognizedPayload,
@@ -70,6 +74,7 @@ impl AdmissionFailureReason {
             "blocked_by_dependency" => Self::BlockedByDependency,
             "blocked_by_predecessor" => Self::BlockedByPredecessor,
             "compatibility_undecidable" => Self::CompatibilityUndecidable,
+            "dependency_not_found" => Self::DependencyNotFound,
             "dependent_invalid" => Self::DependentInvalid,
             "dialect_changed" => Self::DialectChanged,
             "entity_deleted" => Self::EntityDeleted,
@@ -90,6 +95,7 @@ impl AdmissionFailureReason {
             "revalidation_exhausted" => Self::RevalidationExhausted,
             "stable_derives_from_major_zero" => Self::StableDerivesFromMajorZero,
             "stable_refs_major_zero" => Self::StableRefsMajorZero,
+            "system_failure" => Self::SystemFailure,
             "unparsable_payload" => Self::UnparsablePayload,
             "unreadable_version" => Self::UnreadableVersion,
             "unrecognized_payload" => Self::UnrecognizedPayload,
@@ -116,6 +122,7 @@ impl AdmissionFailureReason {
             Self::BlockedByDependency => "blocked_by_dependency",
             Self::BlockedByPredecessor => "blocked_by_predecessor",
             Self::CompatibilityUndecidable => "compatibility_undecidable",
+            Self::DependencyNotFound => "dependency_not_found",
             Self::DependentInvalid => "dependent_invalid",
             Self::DialectChanged => "dialect_changed",
             Self::EntityDeleted => "entity_deleted",
@@ -136,6 +143,7 @@ impl AdmissionFailureReason {
             Self::RevalidationExhausted => "revalidation_exhausted",
             Self::StableDerivesFromMajorZero => "stable_derives_from_major_zero",
             Self::StableRefsMajorZero => "stable_refs_major_zero",
+            Self::SystemFailure => "system_failure",
             Self::UnparsablePayload => "unparsable_payload",
             Self::UnreadableVersion => "unreadable_version",
             Self::UnrecognizedPayload => "unrecognized_payload",
@@ -145,6 +153,49 @@ impl AdmissionFailureReason {
 }
 
 impl std::fmt::Display for AdmissionFailureReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Stable delivery-level failure codes.
+/// Candidate failures remain in [`AdmissionFailureReason`].
+#[domain_model]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeliveryFailure {
+    /// Admission failed with a `WorkerError` code.
+    Admission(&'static str),
+    /// The envelope declared a `payload_type` this queue does not handle.
+    UnexpectedPayloadType,
+    /// The message body is not an operation UUID.
+    InvalidOperationPayload,
+    /// A non-worker service failure; details remain in operator logs.
+    ServiceFailure,
+    /// The operation row disappeared before exhausted delivery could finish.
+    OperationNotFound,
+    /// The delivery budget was spent and the operation is still not terminal.
+    DeliveryBudgetExhausted,
+    /// Admission exceeded its deadline before the delivery budget was exhausted.
+    AdmissionDeadlineExceeded,
+}
+
+impl DeliveryFailure {
+    /// Return the stable `error_code` string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Admission(code) => code,
+            Self::UnexpectedPayloadType => "unexpected_payload_type",
+            Self::InvalidOperationPayload => "invalid_operation_payload",
+            Self::ServiceFailure => "admission_service_failure",
+            Self::OperationNotFound => "operation_not_found",
+            Self::DeliveryBudgetExhausted => "delivery_budget_exhausted",
+            Self::AdmissionDeadlineExceeded => "admission_deadline_exceeded",
+        }
+    }
+}
+
+impl std::fmt::Display for DeliveryFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }

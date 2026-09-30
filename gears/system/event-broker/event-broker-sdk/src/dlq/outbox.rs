@@ -38,11 +38,24 @@ impl ConsumerDlqOutbox {
         record.partition % self.partitions
     }
 
+    /// Enqueue a dead-letter handoff record within the caller's transaction.
+    ///
+    /// The row is written atomically with `runner`'s transaction, but the DLQ
+    /// sequencer is **not** woken by the write itself. Call
+    /// [`Wake::fire`](toolkit_db::outbox::Wake::fire) on the
+    /// returned handle once that transaction has committed; on rollback, drop
+    /// the handle instead. Until it is fired the record is durable but stays
+    /// unsequenced until the outbox's cold reconciler discovers it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the envelope cannot be serialized or the database
+    /// rejects the write.
     pub async fn enqueue(
         &self,
         runner: &(impl toolkit_db::secure::DBRunner + Sync + ?Sized),
         record: DeadLetterRecord,
-    ) -> Result<toolkit_db::outbox::OutboxMessageId, ConsumerError> {
+    ) -> Result<toolkit_db::outbox::Wake, ConsumerError> {
         let partition = self.partition_for_record(&record);
         let envelope = DeadLetterEnvelope::from_record(record);
         let payload = envelope.to_vec()?;

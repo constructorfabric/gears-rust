@@ -3,9 +3,9 @@
 Reliable async message production with per-partition ordering guarantees.
 Supports PostgreSQL, MySQL/MariaDB, and SQLite.
 
-Four-stage pipeline: enqueue (inside your transaction) -> sequencer
-(assigns per-partition sequence numbers) -> processor (calls your handler)
--> vacuum (GC). Two processing modes: transactional (exactly-once) and
+Four-stage pipeline: enqueue (inside your transaction, then flush the returned
+handle after commit) -> sequencer (assigns per-partition sequence numbers) ->
+processor (calls your handler) -> vacuum (GC). Two processing modes: transactional (exactly-once) and
 leased (at-least-once with lease-based locking and framework-managed
 cancellation).
 
@@ -130,21 +130,33 @@ A submission is built, not constructed as a literal: everything checkable
 without the database is checked while it is built, so a rejected submission has
 issued no statement.
 
+Enqueue is atomic with your business logic, but it does **not** wake the
+sequencer on its own: it returns a `Wake` that must be flushed *after*
+the transaction commits. `outbox::in_transaction` owns that contract — it runs
+the closure in a transaction and flushes the handle only if the commit succeeds,
+so no call site holds a handle across the commit boundary:
+
 ```rust
 let outbox = handle.outbox();
 
-// Atomic with your business logic:
-outbox.enqueue(&txn, Record::to("orders", partition)
-    .payload(payload, "application/json")
-    .build()?).await?;
+// Enqueue inside the closure and hand the resulting handle back; in_transaction
+// flushes it after the commit. Several enqueues in one unit of work combine
+// with `+=` into a single handle.
+outbox::in_transaction(&db, |txn| Box::pin(async move {
+    let mut pending = outbox.enqueue(txn, Record::to("orders", partition)
+        .payload(payload, "application/json")
+        .build()?).await?;
 
-// A batch states the queue and the payload type once:
-outbox.enqueue_batch(&txn, Records::to("orders")
-    .payload_type("application/json")
-    .push(0, first)
-    .push(1, second)
-    .push_with_type(2, legacy, "application/vnd.legacy+json")
-    .build()?).await?;
+    // A batch states the queue and the payload type once:
+    wake += outbox.enqueue_batch(txn, Records::to("orders")
+        .payload_type("application/json")
+        .push(0, first)
+        .push(1, second)
+        .push_with_type(2, legacy, "application/vnd.legacy+json")
+        .build()?).await?;
+
+    Ok(((), wake))
+})).await?;
 ```
 
 A batch is all-or-nothing: one entity that breaks a rule rejects the whole
@@ -184,15 +196,18 @@ batch is the unit: you are told once, not per message.
 // commit, so registering first means nothing can be missed.
 let waiting = outbox.subscribe("import-2026-09-08")?;
 
-db.in_transaction(|txn| async move {
+// in_transaction flushes after the commit, so the sequencer wakes promptly -
+// otherwise completion would wait on the cold reconciler.
+outbox::in_transaction(&db, |txn| Box::pin(async move {
     orders_repo.insert(txn, &orders).await?;
-    outbox.enqueue_batch(txn, Records::to("orders")
+    let pending = outbox.enqueue_batch(txn, Records::to("orders")
         .payload_type("application/json")
         .trace("import-2026-09-08")
         .push(0, first)
         .push(1, second)
-        .build()?).await
-}).await?;
+        .build()?).await?;
+    Ok(((), wake))
+})).await?;
 
 match waiting.completion().await {
     Some(outcome) if outcome.is_clean() => info!(entities = outcome.entities, "all delivered"),

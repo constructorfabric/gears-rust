@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use event_broker_sdk::error::ConsumerError;
 use event_broker_sdk::{
-    Consumer, ConsumerBuilder, ConsumerGroupRef, Fallback, HandlerOutcome, InMemoryOffsetManager,
-    RawEvent, SingleEventHandler,
+    Consumer, ConsumerBuilder, ConsumerGroupRef, Fallback, GtsInstanceId, HandlerOutcome,
+    InMemoryOffsetManager, RawEvent, SingleEventHandler, gts_id,
 };
 
 struct NoopHandler;
@@ -28,7 +28,10 @@ fn consumer_builder_chains_correctly() {
     // machinery routes correctly at compile time.
     let builder: ConsumerBuilder<()> = ConsumerBuilder::new_unbound()
         .group(ConsumerGroupRef::auto_anonymous("test"))
-        .topics(["gts.cf.core.events.topic.v1~example.orders.v1"])
+        .topics([GtsInstanceId::try_new(gts_id!(
+            "cf.core.events.topic.v1~example.mock.showcase.builder.v1"
+        ))
+        .unwrap()])
         .parallelism(3);
 
     let with_om = builder.offset_manager(InMemoryOffsetManager::new(Fallback::Earliest));

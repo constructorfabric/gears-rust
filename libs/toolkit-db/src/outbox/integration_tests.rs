@@ -37,7 +37,7 @@ use super::types::{LeaseConfig, OutboxConfig, SequencerConfig, WorkerTuning};
 use super::workers::sequencer::Sequencer;
 use super::{Outbox, OutboxError, Partitions};
 use crate::migration_runner::run_migrations_for_testing;
-use crate::outbox::OutboxMessageId;
+use crate::outbox::{OutboxMessageId, Wake};
 use crate::{ConnectOpts, Db, connect_db};
 
 // ======================================================================
@@ -111,16 +111,14 @@ async fn setup_empty_db_with_pool(name: &str, max_conns: u32) -> Db {
     connect_db(&url, opts).await.expect("connect")
 }
 
-// Must be async: `prioritizer` is a tokio::sync::RwLock and `blocking_write()`
-// panics when called from within a tokio runtime (i.e. every `#[tokio::test]`).
+// Kept async for call-site symmetry with the rest of the setup helpers, which
+// removing would ripple through `make_default_test_outbox` into dozens of call
+// sites; the prioritizer is now a set-once `OnceLock`, so no await is needed.
+#[allow(clippy::unused_async)]
 async fn make_test_outbox(config: OutboxConfig) -> TestOutbox {
     let prioritizer = Arc::new(SharedPrioritizer::new());
     let outbox = Arc::new(Outbox::new(config));
-    outbox
-        .prioritizer
-        .write()
-        .await
-        .replace(Arc::clone(&prioritizer));
+    outbox.prioritizer.set(Arc::clone(&prioritizer)).ok();
     TestOutbox {
         outbox,
         prioritizer,
@@ -179,8 +177,9 @@ async fn enqueue_msgs(
 ) -> Vec<OutboxMessageId> {
     let conn = db.conn().expect("conn");
     let mut ids = Vec::with_capacity(payloads.len());
+    let mut pending = Wake::empty();
     for payload in payloads {
-        let id = outbox
+        let handle = outbox
             .enqueue(
                 &conn,
                 Record::to(queue, partition)
@@ -190,8 +189,12 @@ async fn enqueue_msgs(
             )
             .await
             .expect("enqueue");
-        ids.push(id);
+        ids.push(handle.ids()[0]);
+        pending += handle;
     }
+    // The conn autocommits each enqueue, so wake the sequencers now - the same
+    // post-commit flush a real caller performs.
+    pending.fire();
     ids
 }
 
@@ -801,7 +804,8 @@ async fn enqueue_batch_creates_n_items() {
         .build()
         .unwrap();
     let conn = db.conn().unwrap();
-    let ids = t.outbox.enqueue_batch(&conn, batch).await.unwrap();
+    let handle = t.outbox.enqueue_batch(&conn, batch).await.unwrap();
+    let ids = handle.ids();
 
     assert_eq!(ids.len(), 50);
     assert_eq!(count_rows(&db, "toolkit_outbox_body").await, 50);
@@ -823,9 +827,115 @@ async fn enqueue_batch_mixed_partitions() {
         .build()
         .unwrap();
     let conn = db.conn().unwrap();
-    let ids = t.outbox.enqueue_batch(&conn, batch).await.unwrap();
+    let handle = t.outbox.enqueue_batch(&conn, batch).await.unwrap();
+    let ids = handle.ids();
     assert_eq!(ids.len(), 4);
     assert_eq!(count_rows(&db, "toolkit_outbox_incoming").await, 4);
+}
+
+#[tokio::test]
+async fn enqueue_batch_flush_marks_each_partition_once() {
+    // A batch that touches several partitions - with repeats - must record each
+    // distinct partition once on the handle and, on flush, mark each dirty
+    // exactly once rather than once per message. This covers the sort+dedup in
+    // enqueue_batch.
+    let db = setup_db("ch2_batch_flush_dirty").await;
+    let t = make_default_test_outbox().await;
+    t.outbox.register_queue(&db, "q", 2).await.unwrap();
+
+    let batch = Records::to("q")
+        .payload_type("text/plain")
+        .push(0, b"a".to_vec())
+        .push(1, b"b".to_vec())
+        .push(0, b"c".to_vec())
+        .push(1, b"d".to_vec())
+        .build()
+        .unwrap();
+    let conn = db.conn().unwrap();
+    let handle = t.outbox.enqueue_batch(&conn, batch).await.unwrap();
+
+    // Four messages, two distinct partitions: the handle is deduped and sorted.
+    let expected = handle.partitions().to_vec();
+    assert_eq!(expected.len(), 2, "two distinct partitions, not four");
+    assert!(
+        expected.windows(2).all(|w| w[0] < w[1]),
+        "partitions sorted and unique"
+    );
+
+    // Enqueue alone signals nothing before the commit-time flush.
+    assert!(
+        t.prioritizer.take().is_none(),
+        "enqueue_batch must not mark partitions dirty before flush"
+    );
+
+    handle.fire();
+    let mut dirtied = Vec::new();
+    while let Some(guard) = t.prioritizer.take() {
+        dirtied.push(guard.partition_id());
+        guard.processed();
+    }
+    dirtied.sort_unstable();
+    assert_eq!(
+        dirtied, expected,
+        "each distinct partition marked dirty exactly once"
+    );
+}
+
+#[tokio::test]
+async fn in_transaction_flushes_on_commit_and_not_on_rollback() {
+    let db = setup_db("ch2_in_tx").await;
+    let t = make_default_test_outbox().await;
+    t.outbox.register_queue(&db, "q", 1).await.unwrap();
+    let outbox = Arc::clone(&t.outbox);
+
+    // Commit path: the helper flushes the handle after the commit, so the
+    // partition becomes claimable.
+    let pid: i64 = crate::outbox::in_transaction(&db, |tx| {
+        let outbox = Arc::clone(&outbox);
+        Box::pin(async move {
+            let handle = outbox
+                .enqueue(
+                    tx,
+                    Record::to("q", 0)
+                        .payload(b"a".to_vec(), "text/plain")
+                        .build()
+                        .unwrap(),
+                )
+                .await?;
+            let pid = handle.partitions()[0];
+            Ok::<_, anyhow::Error>((pid, handle))
+        })
+    })
+    .await
+    .unwrap();
+    let guard = t.prioritizer.take().expect("commit path flushes");
+    assert_eq!(guard.partition_id(), pid);
+    guard.processed();
+
+    // Rollback path: the closure discards the handle and returns Err, so the
+    // transaction rolls back and nothing is ever flushed.
+    let result: Result<(), anyhow::Error> = crate::outbox::in_transaction(&db, |tx| {
+        let outbox = Arc::clone(&outbox);
+        Box::pin(async move {
+            let handle = outbox
+                .enqueue(
+                    tx,
+                    Record::to("q", 0)
+                        .payload(b"b".to_vec(), "text/plain")
+                        .build()
+                        .unwrap(),
+                )
+                .await?;
+            handle.discard();
+            Err::<((), crate::outbox::Wake), _>(anyhow::anyhow!("rollback"))
+        })
+    })
+    .await;
+    assert!(result.is_err());
+    assert!(
+        t.prioritizer.take().is_none(),
+        "rollback path flushes nothing"
+    );
 }
 
 #[tokio::test]
@@ -869,7 +979,8 @@ async fn enqueue_empty_batch_returns_empty_vec() {
 
     let conn = db.conn().unwrap();
     let empty = Records::to("q").payload_type("text/plain").build().unwrap();
-    let ids = t.outbox.enqueue_batch(&conn, empty).await.unwrap();
+    let handle = t.outbox.enqueue_batch(&conn, empty).await.unwrap();
+    let ids = handle.ids();
     assert!(ids.is_empty());
 }
 
@@ -886,7 +997,8 @@ async fn enqueue_batch_over_chunk_size_works() {
         .build()
         .unwrap();
     let conn = db.conn().unwrap();
-    let ids = t.outbox.enqueue_batch(&conn, batch).await.unwrap();
+    let handle = t.outbox.enqueue_batch(&conn, batch).await.unwrap();
+    let ids = handle.ids();
 
     assert_eq!(ids.len(), 150);
     assert_eq!(count_rows(&db, "toolkit_outbox_body").await, 150);
@@ -923,7 +1035,7 @@ async fn a_traced_batch_records_one_trace_row_its_bodies_point_at() {
         .push(0, b"c".to_vec())
         .build()
         .unwrap();
-    t.outbox.enqueue_batch(&conn, batch).await.unwrap();
+    t.outbox.enqueue_batch(&conn, batch).await.unwrap().fire();
 
     let sea = db.sea_internal();
     let row = TraceRow::find_by_statement(Statement::from_string(
@@ -966,7 +1078,7 @@ async fn an_untraced_batch_records_no_trace_at_all() {
         .push(0, b"b".to_vec())
         .build()
         .unwrap();
-    t.outbox.enqueue_batch(&conn, batch).await.unwrap();
+    t.outbox.enqueue_batch(&conn, batch).await.unwrap().fire();
 
     assert_eq!(count_rows(&db, "toolkit_outbox_trace").await, 0);
     assert_eq!(count_rows(&db, "toolkit_outbox_body").await, 2);
@@ -1016,7 +1128,7 @@ async fn a_traced_batch_counts_down_to_completion_as_it_is_processed() {
         .push(0, b"two".to_vec())
         .build()
         .unwrap();
-    outbox.enqueue_batch(&conn, batch).await.unwrap();
+    let flush = outbox.enqueue_batch(&conn, batch).await.unwrap();
 
     // Before anything is processed the batch is wholly outstanding.
     let before = outbox
@@ -1032,7 +1144,7 @@ async fn a_traced_batch_counts_down_to_completion_as_it_is_processed() {
     assert!(!before.is_retrying());
     assert!(before.completed_at.is_none());
 
-    outbox.flush();
+    flush.fire();
     // The handler notifies once per batch, not once per message, so wait on
     // the message count rather than on a notification count.
     for _ in 0..250 {
@@ -1114,9 +1226,9 @@ async fn a_traced_batch_enqueued_on_a_standalone_conn_still_delivers_completion(
         .push(0, b"two".to_vec())
         .build()
         .unwrap();
-    outbox.enqueue_batch(&conn, batch).await.unwrap();
+    let flush = outbox.enqueue_batch(&conn, batch).await.unwrap();
 
-    outbox.flush();
+    flush.fire();
 
     // Wait for the pipeline to count the trace down. Had the key been written
     // as `0`, the ack's `WHERE trace = ?` would never match and this would spin
@@ -1195,9 +1307,9 @@ async fn a_single_traced_record_delivers_its_completion() {
         .trace("single-1")
         .build()
         .unwrap();
-    outbox.enqueue(&conn, record).await.unwrap();
+    let flush = outbox.enqueue(&conn, record).await.unwrap();
 
-    outbox.flush();
+    flush.fire();
 
     let status = outbox
         .trace_status(&conn, "single-1")
@@ -1272,8 +1384,8 @@ async fn a_rejected_entity_completes_its_trace_and_is_counted_as_a_failure() {
         .push(0, b"bad".to_vec())
         .build()
         .unwrap();
-    outbox.enqueue_batch(&conn, batch).await.unwrap();
-    outbox.flush();
+    let flush = outbox.enqueue_batch(&conn, batch).await.unwrap();
+    flush.fire();
 
     let mut status = outbox
         .trace_status(&conn, "doomed-1")
@@ -1398,7 +1510,14 @@ async fn a_completion_is_delivered_only_to_the_instance_that_submitted_it() {
         .push(0, b"work".to_vec())
         .build()
         .unwrap();
-    instance_a.outbox.enqueue_batch(&conn, batch).await.unwrap();
+    // A does not flush: it discards the handle, so no dirty signal is raised and
+    // B must discover the committed row through the cold reconciler.
+    instance_a
+        .outbox
+        .enqueue_batch(&conn, batch)
+        .await
+        .unwrap()
+        .discard();
 
     // B processes it. Its ack tries to claim the completion and cannot,
     // because the trace belongs to A - so the mail is left where A will find
@@ -1513,7 +1632,8 @@ async fn a_partial_countdown_does_not_try_to_claim() {
                 .unwrap(),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .fire();
     run_sequencer_once(&t, &db).await;
 
     // Ack the first partition: the trace still has one entity outstanding.
@@ -1848,8 +1968,8 @@ async fn a_retrying_trace_is_visible_before_it_completes() {
         .push(0, b"never succeeds".to_vec())
         .build()
         .unwrap();
-    outbox.enqueue_batch(&conn, batch).await.unwrap();
-    outbox.flush();
+    let flush = outbox.enqueue_batch(&conn, batch).await.unwrap();
+    flush.fire();
 
     // Wait for the handler to have been tried at least twice, so the retry is
     // a fact about the batch rather than a first attempt in progress.
@@ -1936,7 +2056,7 @@ async fn a_trace_on_an_empty_batch_is_refused() {
 
     // Untraced, an empty batch remains legal: it asks for nothing.
     let conn = db.conn().unwrap();
-    let ids = t
+    let handle = t
         .outbox
         .enqueue_batch(
             &conn,
@@ -1944,6 +2064,7 @@ async fn a_trace_on_an_empty_batch_is_refused() {
         )
         .await
         .unwrap();
+    let ids = handle.ids();
     assert!(ids.is_empty());
     assert_eq!(count_rows(&db, "toolkit_outbox_trace").await, 0);
 }
@@ -2015,9 +2136,8 @@ async fn enqueue_transaction_helper_auto_flushes() {
     let notified = t.prioritizer.notifier();
     let notified = notified.notified();
 
-    let (_db, result) = t
-        .outbox
-        .transaction(db, |tx| {
+    let (_db, result) = db
+        .transaction(|tx| {
             let outbox = Arc::clone(&t.outbox);
             Box::pin(async move {
                 outbox
@@ -2029,12 +2149,11 @@ async fn enqueue_transaction_helper_auto_flushes() {
                             .unwrap(),
                     )
                     .await
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-                Ok(())
+                    .map_err(|e| anyhow::anyhow!("{e}"))
             })
         })
         .await;
-    result.unwrap();
+    result.unwrap().fire();
 
     // Notify should fire within a short timeout
     tokio::time::timeout(Duration::from_millis(100), notified)
@@ -2048,21 +2167,55 @@ async fn enqueue_transaction_helper_no_flush_on_rollback() {
     let t = make_default_test_outbox().await;
     t.outbox.register_queue(&db, "q", 1).await.unwrap();
 
-    let (_db, result) = t
-        .outbox
-        .transaction(db, |_tx| {
-            Box::pin(async move { Err::<(), _>(anyhow::anyhow!("rollback")) })
-        })
-        .await;
-    assert!(result.is_err());
+    let outbox = Arc::clone(&t.outbox);
 
-    // Give a brief window — notify should NOT fire
-    let notifier = t.prioritizer.notifier();
-    let notified_fut = notifier.notified();
-    let timed_out = tokio::time::timeout(Duration::from_millis(50), notified_fut)
-        .await
-        .is_err();
-    assert!(timed_out, "sequencer should NOT be notified on rollback");
+    // Enqueue a row inside a transaction that then rolls back, capturing the
+    // handle so a stray post-rollback flush can be exercised. This gives the
+    // assertion teeth: the enqueue really ran, so if it had wrongly marked the
+    // partition dirty (the race this design closes) the flush below would
+    // surface committed rows.
+    let captured: Arc<std::sync::Mutex<Option<crate::outbox::Wake>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let capture = Arc::clone(&captured);
+    let result: Result<(), anyhow::Error> = crate::outbox::in_transaction(&db, |tx| {
+        let outbox = Arc::clone(&outbox);
+        let capture = Arc::clone(&capture);
+        Box::pin(async move {
+            let handle = outbox
+                .enqueue(
+                    tx,
+                    Record::to("q", 0)
+                        .payload(b"a".to_vec(), "text/plain")
+                        .build()
+                        .unwrap(),
+                )
+                .await?;
+            *capture.lock().unwrap() = Some(handle);
+            Err::<((), crate::outbox::Wake), _>(anyhow::anyhow!("rollback"))
+        })
+    })
+    .await;
+    assert!(result.is_err());
+    assert_eq!(
+        count_rows(&db, "toolkit_outbox_incoming").await,
+        0,
+        "rollback wrote no rows"
+    );
+
+    // A stray post-rollback flush wakes the sequencer, but the incoming table is
+    // empty - the rollback, not a missing wake, is what guarantees nothing is
+    // sequenced.
+    captured
+        .lock()
+        .unwrap()
+        .take()
+        .expect("handle captured")
+        .fire();
+    assert_eq!(
+        count_rows(&db, "toolkit_outbox_incoming").await,
+        0,
+        "a stray flush surfaces no rows after rollback"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2157,7 +2310,7 @@ async fn a_retrying_batch_is_reported_and_completes_cleanly() {
         .push(0, b"more".to_vec())
         .build()
         .unwrap();
-    outbox.enqueue_batch(&conn, batch).await.unwrap();
+    outbox.enqueue_batch(&conn, batch).await.unwrap().fire();
 
     // The reporter is driven by hand so the test does not race its timer.
     let mut reporter = test_retry_reporter(&outbox, &db);
@@ -2503,6 +2656,49 @@ async fn sequencer_unsaturated_partition_not_re_dirtied() {
 }
 
 #[tokio::test]
+async fn enqueue_defers_dirty_signal_until_flush() {
+    // The race this fix closes: enqueue may run inside a not-yet-committed
+    // transaction, so it must NOT mark the partition dirty. If it did, a
+    // sequencer could claim the partition, find no committed rows, and clear
+    // the dirty flag before the commit landed - leaving the rows for the cold
+    // reconciler. Only Wake::flush (called after commit) announces the
+    // work. Here we prove enqueue alone leaves the partition clean and flush is
+    // what makes it claimable.
+    let db = setup_db("enqueue_defers_dirty").await;
+    let t = make_default_test_outbox().await;
+    t.outbox.register_queue(&db, "q", 1).await.unwrap();
+
+    let conn = db.conn().expect("conn");
+    let handle = t
+        .outbox
+        .enqueue(
+            &conn,
+            Record::to("q", 0)
+                .payload(b"a".to_vec(), "text/plain")
+                .build()
+                .unwrap(),
+        )
+        .await
+        .expect("enqueue");
+    let pid = handle.partitions()[0];
+
+    // Enqueue alone must not signal the sequencer.
+    assert!(
+        t.prioritizer.take().is_none(),
+        "enqueue must not mark the partition dirty before flush"
+    );
+
+    // The post-commit flush is what marks it dirty and wakes the sequencers.
+    handle.fire();
+    let guard = t
+        .prioritizer
+        .take()
+        .expect("flush must mark the partition dirty");
+    assert_eq!(guard.partition_id(), pid);
+    guard.processed();
+}
+
+#[tokio::test]
 async fn sequencer_skips_empty_partitions() {
     let db = setup_db("ch3_skip_empty").await;
     let t = make_default_test_outbox().await;
@@ -2775,7 +2971,7 @@ async fn a_lost_lease_before_ack_delivers_no_completion() {
         .push(0, b"a".to_vec())
         .build()
         .unwrap();
-    t.outbox.enqueue_batch(&conn, batch).await.unwrap();
+    t.outbox.enqueue_batch(&conn, batch).await.unwrap().fire();
     run_sequencer_once(&t, &db).await;
 
     let mailbox = super::subscription::Mailbox::new(
@@ -2847,7 +3043,7 @@ async fn a_batch_whose_trace_was_swept_still_processes_cleanly() {
         .push(0, b"b".to_vec())
         .build()
         .unwrap();
-    t.outbox.enqueue_batch(&conn, batch).await.unwrap();
+    t.outbox.enqueue_batch(&conn, batch).await.unwrap().fire();
     run_sequencer_once(&t, &db).await;
 
     // The sweep collects the trace row before the work is processed.
@@ -3977,8 +4173,9 @@ async fn graceful_shutdown_completes_current_batch() {
 
     let db2 = setup_db("ch10_graceful_shutdown").await;
     let conn = db2.conn().unwrap();
+    let mut flush = Wake::empty();
     for i in 0..3 {
-        outbox
+        flush += outbox
             .enqueue(
                 &conn,
                 Record::to("q", 0)
@@ -3989,7 +4186,7 @@ async fn graceful_shutdown_completes_current_batch() {
             .await
             .unwrap();
     }
-    outbox.flush();
+    flush.fire();
 
     // Wait for at least 1 message to be processed (handler is active)
     tokio::time::timeout(Duration::from_secs(5), handler_entered.notified())
@@ -3998,8 +4195,9 @@ async fn graceful_shutdown_completes_current_batch() {
 
     // Messages enqueued while the handler is active are picked up by the
     // current or the next batch cycle.
+    let mut flush = Wake::empty();
     for i in 3..6 {
-        outbox
+        flush += outbox
             .enqueue(
                 &conn,
                 Record::to("q", 0)
@@ -4010,7 +4208,7 @@ async fn graceful_shutdown_completes_current_batch() {
             .await
             .unwrap();
     }
-    outbox.flush();
+    flush.fire();
 
     // Wait for all 6 messages to be processed
     poll_until(
@@ -4091,7 +4289,8 @@ async fn default_prefix_builder_enqueue_uses_default_tables() {
                 .unwrap(),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .fire();
 
     assert_eq!(count_rows(&db, "toolkit_outbox_body").await, 1);
     assert_eq!(count_rows(&db, "toolkit_outbox_incoming").await, 1);
@@ -4154,7 +4353,8 @@ async fn custom_prefix_containing_default_body_token_registers_and_enqueues() {
                 .unwrap(),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .ids()[0];
 
     assert!(message_id.0 > 0);
     assert_eq!(count_rows(&db, tables.body()).await, 1);
@@ -4192,7 +4392,7 @@ async fn custom_prefix_processes_message_without_default_tables() {
         .unwrap();
 
     let outbox = handle.outbox();
-    outbox
+    let flush = outbox
         .enqueue(
             &db.conn().unwrap(),
             Record::to("q", 0)
@@ -4202,7 +4402,7 @@ async fn custom_prefix_processes_message_without_default_tables() {
         )
         .await
         .unwrap();
-    outbox.flush();
+    flush.fire();
 
     poll_until(
         || {
@@ -4245,7 +4445,7 @@ async fn custom_prefix_dead_letter_uses_custom_table() {
         .unwrap();
 
     let outbox = handle.outbox();
-    outbox
+    let flush = outbox
         .enqueue(
             &db.conn().unwrap(),
             Record::to("q", 0)
@@ -4255,7 +4455,7 @@ async fn custom_prefix_dead_letter_uses_custom_table() {
         )
         .await
         .unwrap();
-    outbox.flush();
+    flush.fire();
 
     poll_until(
         || {
@@ -4303,7 +4503,7 @@ async fn custom_prefix_vacuum_cleans_custom_tables() {
         .unwrap();
 
     let outbox = handle.outbox();
-    outbox
+    let flush = outbox
         .enqueue(
             &db.conn().unwrap(),
             Record::to("q", 0)
@@ -4313,7 +4513,7 @@ async fn custom_prefix_vacuum_cleans_custom_tables() {
         )
         .await
         .unwrap();
-    outbox.flush();
+    flush.fire();
 
     poll_until(
         || {
@@ -4395,7 +4595,7 @@ async fn default_and_custom_prefix_instances_coexist() {
         .await
         .unwrap();
 
-    default_handle
+    let default_flush = default_handle
         .outbox()
         .enqueue(
             &db.conn().unwrap(),
@@ -4406,7 +4606,7 @@ async fn default_and_custom_prefix_instances_coexist() {
         )
         .await
         .unwrap();
-    custom_handle
+    let custom_flush = custom_handle
         .outbox()
         .enqueue(
             &db.conn().unwrap(),
@@ -4417,8 +4617,8 @@ async fn default_and_custom_prefix_instances_coexist() {
         )
         .await
         .unwrap();
-    default_handle.outbox().flush();
-    custom_handle.outbox().flush();
+    default_flush.fire();
+    custom_flush.fire();
 
     poll_until(
         || {
@@ -4490,7 +4690,7 @@ async fn builder_multiple_queues() {
 
     let db2 = setup_db("ch10_multi_queue").await;
     let conn = db2.conn().unwrap();
-    outbox
+    let mut flush = outbox
         .enqueue(
             &conn,
             Record::to("a", 0)
@@ -4500,7 +4700,7 @@ async fn builder_multiple_queues() {
         )
         .await
         .unwrap();
-    outbox
+    flush += outbox
         .enqueue(
             &conn,
             Record::to("b", 0)
@@ -4510,7 +4710,7 @@ async fn builder_multiple_queues() {
         )
         .await
         .unwrap();
-    outbox.flush();
+    flush.fire();
 
     // Wait for processing
     poll_until(
@@ -5697,14 +5897,10 @@ async fn sequencer_processes_across_enqueue_cycles() {
 
     enqueue_msgs(&t.outbox, &db, "q", 0, &["a"]).await;
 
-    let shared = make_shared_prioritizer();
+    // The sequencer shares the outbox's own prioritizer, so subsequent
+    // enqueues feed the partitions this sequencer drains.
+    let shared = Arc::clone(&t.prioritizer);
     shared.push_dirty(pid);
-    // Wire outbox to use shared prioritizer for subsequent enqueues
-    t.outbox
-        .prioritizer
-        .write()
-        .await
-        .replace(Arc::clone(&shared));
     let config = SequencerConfig::default();
     let mut seq = make_sequencer_with_shared(&t, config, &db, Arc::clone(&shared));
     let cancel = CancellationToken::new();
@@ -5777,8 +5973,8 @@ async fn pipeline_single_enqueue_one_delivery() {
 
     let outbox = handle.outbox();
 
-    let (db, result) = outbox
-        .transaction(db, |tx| {
+    let (db, result) = db
+        .transaction(|tx| {
             let o = Arc::clone(outbox);
             Box::pin(async move {
                 o.enqueue(
@@ -5789,12 +5985,11 @@ async fn pipeline_single_enqueue_one_delivery() {
                         .unwrap(),
                 )
                 .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-                Ok(())
+                .map_err(|e| anyhow::anyhow!("{e}"))
             })
         })
         .await;
-    result.unwrap();
+    result.unwrap().fire();
 
     // Wait for the message to be consumed
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -5872,7 +6067,8 @@ async fn concurrent_enqueue_during_sequencer_preserves_order() {
                         .unwrap(),
                 )
                 .await
-                .expect("bg enqueue");
+                .expect("bg enqueue")
+                .fire();
         }
     });
 
@@ -6051,26 +6247,28 @@ async fn batch_transactional_respects_configured_batch_size() {
 
     let outbox = handle.outbox();
 
-    let (db, result) = outbox
-        .transaction(db, |tx| {
+    let (db, result) = db
+        .transaction(|tx| {
             let o = Arc::clone(outbox);
             Box::pin(async move {
+                let mut flush = Wake::empty();
                 for i in 0..5u8 {
-                    o.enqueue(
-                        tx,
-                        Record::to("batch-q", 0)
-                            .payload(vec![i], "test/msg")
-                            .build()
-                            .unwrap(),
-                    )
-                    .await
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    flush += o
+                        .enqueue(
+                            tx,
+                            Record::to("batch-q", 0)
+                                .payload(vec![i], "test/msg")
+                                .build()
+                                .unwrap(),
+                        )
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
                 }
-                Ok(())
+                Ok(flush)
             })
         })
         .await;
-    result.unwrap();
+    result.unwrap().fire();
 
     // Wait for all 5 messages to be consumed
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);

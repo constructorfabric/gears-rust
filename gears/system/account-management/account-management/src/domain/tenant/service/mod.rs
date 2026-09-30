@@ -77,7 +77,8 @@ pub(crate) mod pep {
 
 use account_management_sdk::{
     CreateTenantRequest, IdpDeprovisionFailure, IdpDeprovisionTenantRequest, IdpPluginClient,
-    IdpProvisionFailure, IdpProvisionTenantRequest, IdpTenantContext, Tenant, UpdateTenantRequest,
+    IdpProvisionFailure, IdpProvisionTenantRequest, IdpTenantContext, Tenant, TenantAncestor,
+    TenantNode, UpdateTenantRequest,
 };
 use serde_json::Value;
 use tenant_resolver_sdk::TenantId;
@@ -95,7 +96,9 @@ use crate::domain::metrics::{
 use crate::domain::tenant::closure::build_activation_rows;
 use crate::domain::tenant::context::TenantContext;
 use crate::domain::tenant::hooks::TenantHardDeleteHook;
-use crate::domain::tenant::model::{ChildCountFilter, NewTenant, TenantModel, TenantStatus};
+use crate::domain::tenant::model::{
+    ChildCountFilter, NewTenant, TenantAncestorRow, TenantModel, TenantStatus,
+};
 use crate::domain::tenant::repo::TenantRepo;
 use crate::domain::tenant::resource_checker::ResourceOwnershipChecker;
 use crate::domain::tenant_type::checker::TenantTypeChecker;
@@ -415,35 +418,56 @@ impl<R: TenantRepo> TenantService<R> {
         })
     }
 
-    /// Batched lowering for `list_children`. Issues one
-    /// `get_type_schemas_by_uuid` round-trip for the page so latency
-    /// scales with number of pages, not number of rows.
+    /// One types-registry round-trip for a set of tenant-type uuids.
+    /// Uuids the registry fails on are absent from the map; the
+    /// projection then carries `tenant_type: None` (best-effort, same
+    /// policy as the single-row helper). Empty when no registry is
+    /// wired.
+    async fn resolve_type_strings(
+        &self,
+        mut uuids: Vec<Uuid>,
+    ) -> std::collections::HashMap<Uuid, String> {
+        let mut out = std::collections::HashMap::new();
+        let Some(registry) = self.types_registry.as_ref() else {
+            return out;
+        };
+        uuids.sort_unstable();
+        uuids.dedup();
+        if uuids.is_empty() {
+            return out;
+        }
+        for (uuid, res) in registry.get_type_schemas_by_uuid(uuids).await {
+            if let Ok(schema) = res {
+                out.insert(uuid, schema.type_id.as_ref().to_owned());
+            }
+        }
+        out
+    }
+
+    /// Batched lowering of a listing page (`list_children`): one
+    /// types-registry round-trip and one grouped child-count query per
+    /// page, so latency scales with pages, not rows.
     async fn lower_to_tenant_page(
         &self,
         scope: &AccessScope,
         page: Page<TenantModel>,
     ) -> Result<Page<Tenant>, DomainError> {
-        let Page { items, page_info } = page;
+        let type_strings = self
+            .resolve_type_strings(page.items.iter().map(|m| m.tenant_type_uuid).collect())
+            .await;
+        self.lower_page_with_types(scope, page, &type_strings).await
+    }
 
-        // Fan out one batch lookup for distinct uuids in the page; we
-        // tolerate per-uuid registry failures by leaving `tenant_type`
-        // as `None` for the affected row (same policy as the
-        // single-row helper).
-        let mut type_strings: std::collections::HashMap<Uuid, String> =
-            std::collections::HashMap::new();
-        if let Some(registry) = self.types_registry.as_ref() {
-            let mut distinct: Vec<Uuid> = items.iter().map(|m| m.tenant_type_uuid).collect();
-            distinct.sort_unstable();
-            distinct.dedup();
-            if !distinct.is_empty() {
-                let resolved = registry.get_type_schemas_by_uuid(distinct).await;
-                for (uuid, res) in resolved {
-                    if let Ok(schema) = res {
-                        type_strings.insert(uuid, schema.type_id.as_ref().to_owned());
-                    }
-                }
-            }
-        }
+    /// [`Self::lower_to_tenant_page`] with the tenant-type strings
+    /// already resolved, so `list_descendants` can resolve the page's
+    /// and the ancestor chains' types in a single registry round-trip.
+    async fn lower_page_with_types(
+        &self,
+        scope: &AccessScope,
+        page: Page<TenantModel>,
+        type_strings: &std::collections::HashMap<Uuid, String>,
+    ) -> Result<Page<Tenant>, DomainError> {
+        let Page { items, page_info } = page;
 
         // One grouped COUNT covers the whole page's direct-child tallies
         // (scope-filtered, excludes Provisioning, includes Deleted) — no
@@ -1467,6 +1491,39 @@ impl<R: TenantRepo> TenantService<R> {
     // List children (paginated, status-filterable)
     // -----------------------------------------------------------------
 
+    /// PEP gate plus parent-existence gate shared by `list_children`
+    /// and `list_descendants`: authorize `LIST_CHILDREN` on
+    /// `parent_id` (DESIGN §4.2, DB-level subtree clamp per
+    /// gears-rust#1813; `resource_id = None` because listings return a
+    /// collection), then require the parent to exist and be
+    /// SDK-visible under the PDP-emitted barrier-respecting scope — an
+    /// out-of-subtree or past-barrier parent collapses to `NotFound`
+    /// at the DB JOIN, not just at the PEP gate.
+    async fn gate_listing_parent(
+        &self,
+        ctx: &SecurityContext,
+        parent_id: Uuid,
+    ) -> Result<(AccessScope, TenantModel), DomainError> {
+        let scope = self
+            .authorize(ctx, pep::actions::LIST_CHILDREN, parent_id, None)
+            .await?;
+        let parent = self
+            .repo
+            .find_by_id(&scope, parent_id)
+            .await?
+            .ok_or_else(|| DomainError::NotFound {
+                detail: format!("tenant {parent_id} not found"),
+                resource: parent_id.to_string(),
+            })?;
+        if !parent.status.is_sdk_visible() {
+            return Err(DomainError::NotFound {
+                detail: format!("tenant {parent_id} not found"),
+                resource: parent_id.to_string(),
+            });
+        }
+        Ok((scope, parent))
+    }
+
     /// Implements FEATURE `List Children (Paginated, Status-Filterable)`.
     /// The parent itself must exist + be SDK-visible, otherwise the
     /// whole call is `NotFound`.
@@ -1490,23 +1547,7 @@ impl<R: TenantRepo> TenantService<R> {
         // scope flows into the read so an out-of-subtree caller
         // collapses to NotFound at the DB JOIN, not just at the PEP gate.
         // resource_id=None — listings return a collection, not a single row.
-        let scope = self
-            .authorize(ctx, pep::actions::LIST_CHILDREN, parent_id, None)
-            .await?;
-        let parent = self
-            .repo
-            .find_by_id(&scope, parent_id)
-            .await?
-            .ok_or_else(|| DomainError::NotFound {
-                detail: format!("tenant {parent_id} not found"),
-                resource: parent_id.to_string(),
-            })?;
-        if !parent.status.is_sdk_visible() {
-            return Err(DomainError::NotFound {
-                detail: format!("tenant {parent_id} not found"),
-                resource: parent_id.to_string(),
-            });
-        }
+        let (scope, _parent) = self.gate_listing_parent(ctx, parent_id).await?;
         // Direct-child carve-out: the parent-existence gate above
         // stays under the PDP-emitted barrier-respecting scope, so any
         // `parent_id` past a self-managed barrier already collapses to
@@ -1532,6 +1573,111 @@ impl<R: TenantRepo> TenantService<R> {
     }
     // @cpt-end:cpt-cf-account-management-dod-tenant-hierarchy-management-children-query-paginated:p1:inst-dod-children-query-service
     // @cpt-end:cpt-cf-account-management-flow-tenant-hierarchy-management-list-children:p1:inst-flow-listch-service
+
+    // -----------------------------------------------------------------
+    // List descendants (recursive children listing)
+    // -----------------------------------------------------------------
+
+    /// Implements the `recursive=true` mode of FEATURE `List Children`
+    /// (`algo-recursive-visible-set`): every descendant of `root_id`
+    /// that iterating `list_children` level by level would reach under
+    /// the caller's scope, cursor-paginated, each row with its ancestor
+    /// chain relative to `root_id`.
+    ///
+    /// Visibility is the `list_children` direct-child carve-out
+    /// generalised over the subtree: the repository lists rows whose
+    /// parent is in `root_id`'s subtree AND visible under the
+    /// PDP-emitted scope, with the rows themselves under the
+    /// barrier-relaxed clone — so a self-managed direct child of any
+    /// visible tenant is returned as an identity and nothing below a
+    /// barrier ever is. `child_count` and the ancestor rows are read
+    /// under the original scope, and a row whose chain comes back with
+    /// a hole (an ancestor on the path not visible under that scope —
+    /// a per-descendant `descendant_status` list, or a barrier change
+    /// that committed between the page read and the chain read) is
+    /// dropped: iteration could not have reached it. The page may
+    /// therefore hold fewer than `limit` rows; `next_cursor` stays valid.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::list_children`]: `CrossTenantDenied` from the
+    /// PDP, `NotFound` for a missing / `Provisioning` / out-of-scope
+    /// root, repository errors propagated unchanged.
+    // @cpt-begin:cpt-cf-account-management-flow-tenant-hierarchy-management-list-children:p1:inst-flow-listch-recursive-set
+    // @cpt-begin:cpt-cf-account-management-algo-tenant-hierarchy-management-recursive-visible-set:p1:inst-algo-rvs-gate
+    // @cpt-begin:cpt-cf-account-management-dod-tenant-hierarchy-management-children-query-paginated:p1:inst-dod-children-query-recursive-service
+    pub async fn list_descendants(
+        &self,
+        ctx: &SecurityContext,
+        root_id: Uuid,
+        query: &ODataQuery,
+    ) -> Result<Page<TenantNode>, DomainError> {
+        let (scope, root) = self.gate_listing_parent(ctx, root_id).await?;
+        // `scope` gates the parents (PDP scope, barrier-respecting, any
+        // `descendant_status` list included); `relaxed` bounds the rows
+        // so a self-managed direct child of a visible parent surfaces as
+        // an identity — the same split `list_children` makes between its
+        // parent gate and its enumeration query.
+        let relaxed = scope_util::relax_barriers(&scope);
+        let mut page = self
+            .repo
+            .list_descendants(&scope, &relaxed, root_id, query)
+            .await?;
+        // Defence-in-depth, as in `list_children`.
+        page.items.retain(|r| r.status.is_sdk_visible());
+
+        let ids: Vec<Uuid> = page.items.iter().map(|m| m.id).collect();
+        let mut chains = self.repo.ancestor_chains(&scope, root.depth, &ids).await?;
+        // @cpt-begin:cpt-cf-account-management-algo-tenant-hierarchy-management-recursive-visible-set:p1:inst-algo-rvs-complete-chain
+        let listed = page.items.len();
+        page.items.retain(|m| {
+            chain_is_complete(root.depth, m.depth, chains.get(&m.id).map(Vec::as_slice))
+        });
+        if page.items.len() != listed {
+            tracing::debug!(
+                target: "am.tenant",
+                root_id = %root_id,
+                dropped = listed - page.items.len(),
+                "list_descendants dropped rows whose ancestor chain is not visible"
+            );
+        }
+        // @cpt-end:cpt-cf-account-management-algo-tenant-hierarchy-management-recursive-visible-set:p1:inst-algo-rvs-complete-chain
+
+        // One registry round-trip for the rows' and the chains' types.
+        let type_strings = self
+            .resolve_type_strings(
+                page.items
+                    .iter()
+                    .map(|m| m.tenant_type_uuid)
+                    .chain(chains.values().flatten().map(|a| a.tenant_type_uuid))
+                    .collect(),
+            )
+            .await;
+
+        let Page { items, page_info } = self
+            .lower_page_with_types(&scope, page, &type_strings)
+            .await?;
+        let nodes: Vec<TenantNode> = items
+            .into_iter()
+            .map(|tenant| {
+                let ancestors = chains
+                    .remove(&tenant.id.0)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|a| TenantAncestor {
+                        id: TenantId(a.id),
+                        name: a.name,
+                        tenant_type: type_strings.get(&a.tenant_type_uuid).cloned(),
+                    })
+                    .collect();
+                TenantNode { tenant, ancestors }
+            })
+            .collect();
+        Ok(Page::new(nodes, page_info))
+    }
+    // @cpt-end:cpt-cf-account-management-dod-tenant-hierarchy-management-children-query-paginated:p1:inst-dod-children-query-recursive-service
+    // @cpt-end:cpt-cf-account-management-algo-tenant-hierarchy-management-recursive-visible-set:p1:inst-algo-rvs-gate
+    // @cpt-end:cpt-cf-account-management-flow-tenant-hierarchy-management-list-children:p1:inst-flow-listch-recursive-set
 
     // -----------------------------------------------------------------
     // Update tenant (mutable-fields-only)
@@ -1902,6 +2048,17 @@ impl<R: TenantRepo> TenantService<R> {
     // @cpt-end:cpt-cf-account-management-dod-tenant-hierarchy-management-soft-delete-preconditions:p1:inst-dod-soft-delete-preconditions
     // @cpt-end:cpt-cf-account-management-algo-tenant-hierarchy-management-soft-delete-preconditions:p1:inst-algo-sdelpc-service
     // @cpt-end:cpt-cf-account-management-flow-tenant-hierarchy-management-soft-delete-tenant:p1:inst-flow-sdel-service
+}
+
+/// `true` when `chain` holds exactly one ancestor per depth strictly
+/// between the listing root and the row (`root_depth + 1 ..
+/// row_depth`), top-down. A missing depth means an ancestor on the path
+/// is not visible under the caller's scope, so level-by-level iteration
+/// of `list_children` could not have reached the row.
+fn chain_is_complete(root_depth: u32, row_depth: u32, chain: Option<&[TenantAncestorRow]>) -> bool {
+    let expected = root_depth.saturating_add(1)..row_depth;
+    let chain = chain.unwrap_or(&[]);
+    chain.len() == expected.len() && chain.iter().zip(expected).all(|(a, d)| a.depth == d)
 }
 
 #[cfg(test)]
