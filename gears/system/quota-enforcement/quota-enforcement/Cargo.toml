@@ -92,7 +92,7 @@ tokio = { workspace = true, features = ["rt", "macros", "time", "test-util"] }
 # Router round trips in the REST tests.
 tower = { workspace = true, features = ["util"] }
 # The published SQL storage plugin over SQLite, for the end-to-end delivery test.
-quota-enforcement-storage-plugin = { workspace = true }
+quota-enforcement-storage-plugin = { package = "cf-gears-quota-enforcement-storage-plugin", path = "../plugins/quota-enforcement-storage-plugin" }
 toolkit-db = { workspace = true, features = ["sqlite"] }
 sea-orm-migration = { workspace = true }
 

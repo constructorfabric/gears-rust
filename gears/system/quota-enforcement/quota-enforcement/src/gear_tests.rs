@@ -312,7 +312,7 @@ async fn commit_one_event(
 }
 
 /// The published SQL storage plugin's context: its config and an in-memory
-/// SQLite database with its migrations applied.
+/// `SQLite` database with its migrations applied.
 async fn sql_plugin_ctx(hub: Arc<ClientHub>) -> GearCtx {
     use quota_enforcement_storage_plugin::infra::storage::Migrator;
     use sea_orm_migration::MigratorTrait as _;
