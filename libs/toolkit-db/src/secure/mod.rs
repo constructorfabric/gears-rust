@@ -136,8 +136,12 @@ mod tx_error;
 pub use entity_traits::ScopableEntity;
 pub use error::ScopeError;
 // The two classifiers live in `crate::db_error` -- they answer "what kind of
-// database error is this", which has nothing to do with scoping. Re-exported
-// here so the paths gears already import keep working.
+// database error is this", which has nothing to do with scoping. This is the
+// old path, kept so the gears that import it keep building and hidden from
+// the docs so nothing new is written against it: import them from
+// `crate::db_error`. (`#[deprecated]` on a `use` item is refused by rustc, so
+// the marker is the hiding and this note.)
+#[doc(hidden)]
 pub use crate::db_error::{is_foreign_key_violation, is_unique_violation};
 
 // Security types from toolkit-security

@@ -439,7 +439,7 @@ fn is_driver_error(err: &sea_orm::DbErr) -> bool {
 /// reported ([this module](self)), then `SeaORM`'s own `sql_err()`
 /// classification, then a match on the message text for errors that were
 /// re-wrapped on the way here and lost their typed shape. See
-/// [`classifies_as`] for which of them is allowed to answer when.
+/// `classifies_as` for which of them is allowed to answer when.
 ///
 /// Recognized patterns across backends:
 /// - **Postgres** SQLSTATE `23505` — "`unique_violation`" / "duplicate key"

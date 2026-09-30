@@ -6,7 +6,7 @@
 
 //! Regression tests for the two DB-error classifiers that inspect error *text*.
 //!
-//! [`toolkit_db::secure::is_unique_violation`] and
+//! [`toolkit_db::db_error::is_unique_violation`] and
 //! [`toolkit_db::contention::is_retryable_contention`] both fall back to
 //! matching substrings of `DbErr`'s `Display` output (SQLSTATE codes, driver
 //! message fragments). That makes them uniquely fragile across a `SeaORM` / sqlx
@@ -29,6 +29,9 @@ use sea_orm::entity::prelude::*;
 use sea_orm_migration::prelude as mig;
 use sea_orm_migration::prelude::Iden;
 use sea_orm_migration::sea_query;
+use toolkit_db::db_error::{
+    ConstraintViolation, driver_refusal, is_foreign_key_violation, is_unique_violation,
+};
 use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::secure::{ScopableEntity, ScopeError, secure_insert};
 use toolkit_db::{DbConnConfig, build_db};
@@ -46,7 +49,10 @@ enum ClassifyTbl {
 struct CreateClassifyTable;
 
 impl mig::MigrationName for CreateClassifyTable {
-    #[allow(clippy::unnecessary_literal_bound)]
+    #[expect(
+        clippy::unnecessary_literal_bound,
+        reason = "`MigrationName::name` fixes the return type to `&str`; the literal cannot be `&'static str` here"
+    )]
     fn name(&self) -> &str {
         "m001_create_error_classify"
     }
@@ -103,7 +109,10 @@ enum RestrictChild {
 struct CreateRestrictTables;
 
 impl mig::MigrationName for CreateRestrictTables {
-    #[allow(clippy::unnecessary_literal_bound)]
+    #[expect(
+        clippy::unnecessary_literal_bound,
+        reason = "`MigrationName::name` fixes the return type to `&str`; the literal cannot be `&'static str` here"
+    )]
     fn name(&self) -> &str {
         "m002_create_restrict_pair"
     }
@@ -259,23 +268,35 @@ async fn assert_duplicate_insert_is_unique_violation(db: toolkit_db::Db) -> Resu
     };
     let refusal = toolkit_db::db_error::driver_refusal(db_err)
         .unwrap_or_else(|| panic!("driver_refusal must reach a real refusal: {err}"));
-    assert!(
-        !refusal.code().is_empty(),
-        "the driver must have reported a code: {refusal:?}"
-    );
-    // `DbBackend` has no `Display`; the name is enough to tell the lanes apart
-    // in a run's output.
-    let backend = match db.backend() {
-        sea_orm::DatabaseBackend::Postgres => "postgres",
-        sea_orm::DatabaseBackend::MySql => "mysql",
-        sea_orm::DatabaseBackend::Sqlite => "sqlite",
+    // The code each engine reports for a duplicate key, asserted rather than
+    // printed: a server that renumbers the condition is the shape of #4645,
+    // and a `println!` never turns a run red. `MySQL` reports the ambiguous
+    // `23000`, which the table names no condition for -- there `sql_err()`'s
+    // vendor number is what answered above.
+    match db.backend() {
+        sea_orm::DatabaseBackend::Postgres => {
+            assert_eq!(refusal.code(), "23505", "unique_violation: {err}");
+            assert_eq!(refusal.violation(), Some(ConstraintViolation::Unique));
+        }
+        sea_orm::DatabaseBackend::MySql => {
+            assert_eq!(
+                refusal.code(),
+                "23000",
+                "MySQL's one code for class 23: {err}"
+            );
+            assert_eq!(refusal.violation(), None, "23000 names no single condition");
+        }
+        sea_orm::DatabaseBackend::Sqlite => {
+            assert!(
+                matches!(refusal.code(), "2067" | "1555"),
+                "SQLITE_CONSTRAINT_UNIQUE or SQLITE_CONSTRAINT_PRIMARYKEY, got {}: {err}",
+                refusal.code()
+            );
+            assert_eq!(refusal.violation(), Some(ConstraintViolation::Unique));
+        }
         // `DatabaseBackend` is non-exhaustive.
-        _ => "unknown backend",
-    };
-    println!(
-        "{backend} reported code {} for the duplicate key",
-        refusal.code()
-    );
+        other => panic!("no expectation for backend {other:?}"),
+    }
 
     Ok(())
 }
@@ -570,72 +591,69 @@ async fn pg_serialization_failure_is_classified_as_retryable_contention() -> Res
 // FK / RESTRICT, from a real server
 // ════════════════════════════════════════════════════════════════════
 
-/// Delete a row a `RESTRICT` foreign key still references, on a real server,
+/// Delete a row a `RESTRICT` foreign key still references, on a real engine,
 /// and assert what comes back is classified as a foreign-key refusal.
 ///
 /// `RESTRICT` rather than `NO ACTION` on purpose: it is the action whose
 /// SQLSTATE `PostgreSQL` 18 changed, and the two are not interchangeable —
 /// `RESTRICT` is checked immediately and cannot be deferred.
 ///
-/// The point of a live server rather than a `DbErr` built from a literal: the
-/// code and the wording are the server's to change, and it changed both.
-/// `PostgreSQL` 18 reports this refusal as `23001` (`restrict_violation`)
-/// where 17 and earlier reported `23503`, and reworded the message from
-/// "violates foreign key constraint" to "violates RESTRICT setting of foreign
-/// key constraint". A test shaped `classify("23503") == ForeignKey` cannot
-/// notice either, because the code under test and the test agree on a premise
-/// the server has abandoned (issue #4645).
+/// The point of a live engine rather than a `DbErr` built from a literal: the
+/// code and the wording are the server's to change, and `PostgreSQL` changed
+/// both. 18 reports this refusal as `23001` (`restrict_violation`) where 17
+/// and earlier reported `23503`, and reworded the message from "violates
+/// foreign key constraint" to "violates RESTRICT setting of foreign key
+/// constraint". A test shaped `classify("23503") == ForeignKey` cannot notice
+/// either, because the code under test and the test agree on a premise the
+/// server has abandoned (issue #4645).
 ///
-/// Three assertions, none of them pinned to one major:
+/// One body for the three engines, because they answer differently and each
+/// answer is a tier of the classifier: `PostgreSQL` names the condition by
+/// SQLSTATE (the structured tier), `SQLite` by an extended result code the
+/// table also names, and `MySQL` reports the ambiguous `23000`, where only
+/// `sql_err()`'s vendor number can answer -- the tier the text must not be
+/// allowed to replace.
 ///
-/// 1. the classifier says foreign-key refusal;
-/// 2. the structured accessor reaches a SQLSTATE, and it is one of the two
-///    codes that name this condition — printed, so a run records what this
-///    server actually sent;
-/// 3. the driver named the constraint, which is what tells two foreign keys on
-///    one table apart.
-#[cfg(feature = "pg")]
-#[tokio::test]
-async fn pg_restrict_delete_is_classified_as_foreign_key_violation() -> Result<()> {
+/// `conn` is a plain connection for the statements: the subject is how a
+/// driver refusal classifies, not how toolkit-db wraps a pool. The statements
+/// are built through `sea_query` against the same idens the migration uses.
+async fn assert_restrict_delete_is_foreign_key_violation(
+    db: toolkit_db::Db,
+    conn: sea_orm::DatabaseConnection,
+) -> Result<()> {
     use sea_orm::ConnectionTrait as _;
-    use toolkit_db::db_error::{ConstraintViolation, driver_refusal};
-    use toolkit_db::secure::is_foreign_key_violation;
+    use sea_query::ExprTrait as _;
 
-    let dut = common::bring_up_postgres().await?;
-    let url = dut.url.clone();
-    let config = DbConnConfig {
-        dsn: Some(toolkit_utils::SecretString::new(dut.url)),
-        ..Default::default()
-    };
-    let db = build_db(config, None).await?;
     run_migrations_for_testing(&db, vec![Box::new(CreateRestrictTables)])
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    // A plain connection for the statements: the subject is how a driver
-    // refusal classifies, not how toolkit-db wraps a pool.
-    let conn = sea_orm::Database::connect(url).await?;
 
     let parent = Uuid::new_v4();
     let child = Uuid::new_v4();
-    conn.execute_raw(sea_orm::Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        "INSERT INTO restrict_parent (id) VALUES ($1)",
-        [parent.into()],
-    ))
+    conn.execute(
+        &sea_query::Query::insert()
+            .into_table(RestrictParent::Table)
+            .columns([RestrictParent::Id])
+            .values_panic([parent.into()])
+            .to_owned(),
+    )
     .await?;
-    conn.execute_raw(sea_orm::Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        "INSERT INTO restrict_child (id, parent_id) VALUES ($1, $2)",
-        [child.into(), parent.into()],
-    ))
+    conn.execute(
+        &sea_query::Query::insert()
+            .into_table(RestrictChild::Table)
+            .columns([RestrictChild::Id, RestrictChild::ParentId])
+            .values_panic([child.into(), parent.into()])
+            .to_owned(),
+    )
     .await?;
 
     let err = conn
-        .execute_raw(sea_orm::Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "DELETE FROM restrict_parent WHERE id = $1",
-            [parent.into()],
-        ))
+        .execute(
+            &sea_query::Query::delete()
+                .from_table(RestrictParent::Table)
+                .and_where(sea_query::Expr::col(RestrictParent::Id).eq(parent))
+                .to_owned(),
+        )
         .await
         .expect_err("a RESTRICT foreign key must refuse this delete");
 
@@ -643,31 +661,119 @@ async fn pg_restrict_delete_is_classified_as_foreign_key_violation() -> Result<(
         is_foreign_key_violation(&err),
         "a live RESTRICT refusal must classify as a foreign-key violation: {err}"
     );
+    assert!(
+        !is_unique_violation(&err),
+        "and not as a duplicate key: {err}"
+    );
 
     let refusal = driver_refusal(&err).unwrap_or_else(|| {
         panic!("the structured accessor must reach the driver's refusal: {err}")
     });
-    println!(
-        "PostgreSQL reported SQLSTATE {} for the RESTRICT refusal",
-        refusal.code()
-    );
-    assert!(
-        matches!(refusal.code(), "23001" | "23503"),
-        "an FK refusal must arrive as one of the two codes that name it, got {}: {err}",
-        refusal.code()
-    );
-    assert_eq!(
-        refusal.violation(),
-        Some(ConstraintViolation::ForeignKey),
-        "both codes must name one condition"
-    );
-    assert_eq!(
-        refusal.constraint(),
-        Some("restrict_child_parent_fk"),
-        "the driver must name the constraint that refused"
-    );
+    match conn.get_database_backend() {
+        sea_orm::DatabaseBackend::Postgres => {
+            assert!(
+                matches!(refusal.code(), "23001" | "23503"),
+                "an FK refusal must arrive as one of the two codes that name it, got {}: {err}",
+                refusal.code()
+            );
+            assert_eq!(
+                refusal.violation(),
+                Some(ConstraintViolation::ForeignKey),
+                "both codes must name one condition"
+            );
+            assert_eq!(
+                refusal.constraint(),
+                Some("restrict_child_parent_fk"),
+                "the driver must name the constraint that refused"
+            );
+        }
+        sea_orm::DatabaseBackend::Sqlite => {
+            // `SQLite` reports a `NO ACTION` refusal as `787`
+            // (`SQLITE_CONSTRAINT_FOREIGNKEY`) and a `RESTRICT` one as `1811`
+            // (`SQLITE_CONSTRAINT_TRIGGER`: the action is enforced through
+            // an internal `RAISE`). The second is a code neither the table
+            // nor `sql_err()` names, and the case above still classified it
+            // -- through the text, admitted because the code is in the
+            // constraint class. That is the tier rule, held by a live engine.
+            assert!(
+                matches!(refusal.code(), "787" | "1811"),
+                "SQLITE_CONSTRAINT_FOREIGNKEY or SQLITE_CONSTRAINT_TRIGGER, got {}: {err}",
+                refusal.code()
+            );
+            let named = if refusal.code() == "787" {
+                Some(ConstraintViolation::ForeignKey)
+            } else {
+                None
+            };
+            assert_eq!(refusal.violation(), named, "{err}");
+        }
+        sea_orm::DatabaseBackend::MySql => {
+            assert_eq!(
+                refusal.code(),
+                "23000",
+                "MySQL's one code for class 23: {err}"
+            );
+            assert_eq!(
+                refusal.violation(),
+                None,
+                "23000 names no single condition; sql_err()'s vendor number answered above"
+            );
+        }
+        other => panic!("no expectation for backend {other:?}"),
+    }
 
     Ok(())
+}
+
+#[cfg(feature = "pg")]
+#[tokio::test]
+async fn pg_restrict_delete_is_classified_as_foreign_key_violation() -> Result<()> {
+    let dut = common::bring_up_postgres().await?;
+    let url = dut.url.clone();
+    let config = DbConnConfig {
+        dsn: Some(toolkit_utils::SecretString::new(dut.url)),
+        ..Default::default()
+    };
+    let db = build_db(config, None).await?;
+    let conn = sea_orm::Database::connect(url).await?;
+    assert_restrict_delete_is_foreign_key_violation(db, conn).await
+}
+
+/// `SQLite` enforces a foreign key only with `PRAGMA foreign_keys = ON` on
+/// the connection that runs the statement, and the pragma is not one the
+/// pool's whitelist accepts, so the statements run on a plain connection
+/// with it set. A file rather than `:memory:`, so the migration's tables and
+/// the plain connection see one database.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn sqlite_restrict_delete_is_classified_as_foreign_key_violation() -> Result<()> {
+    use sea_orm::ConnectionTrait as _;
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("restrict.sqlite");
+    let dsn = format!("sqlite://{}?mode=rwc", path.display());
+    let config = DbConnConfig {
+        dsn: Some(toolkit_utils::SecretString::new(dsn.clone())),
+        ..Default::default()
+    };
+    let db = build_db(config, None).await?;
+    let conn = sea_orm::Database::connect(dsn).await?;
+    conn.execute_unprepared("PRAGMA foreign_keys = ON").await?;
+    assert_restrict_delete_is_foreign_key_violation(db, conn).await
+}
+
+#[cfg(feature = "mysql")]
+#[tokio::test]
+async fn mysql_restrict_delete_is_classified_as_foreign_key_violation() -> Result<()> {
+    let dut = common::bring_up_mysql().await?;
+    let url = dut.url.clone();
+    let config = DbConnConfig {
+        dsn: Some(toolkit_utils::SecretString::new(dut.url)),
+        ..Default::default()
+    };
+    let db = build_db(config, None).await?;
+    let conn = sea_orm::Database::connect(url).await?;
+    assert_restrict_delete_is_foreign_key_violation(db, conn).await
 }
 
 /// A connect-time failure must not look like a refused statement.
@@ -685,8 +791,6 @@ async fn pg_restrict_delete_is_classified_as_foreign_key_violation() -> Result<(
 #[cfg(feature = "pg")]
 #[tokio::test]
 async fn a_connect_time_refusal_carries_no_driver_refusal() -> Result<()> {
-    use toolkit_db::db_error::driver_refusal;
-
     let dut = common::bring_up_postgres().await?;
     let wrong_password = dut
         .url
@@ -696,9 +800,25 @@ async fn a_connect_time_refusal_carries_no_driver_refusal() -> Result<()> {
         .await
         .expect_err("PostgreSQL must refuse a login with the wrong password");
 
+    // The premise first: this is the server refusing the login, not a closed
+    // port or a URL that failed to parse, both of which are `Conn` errors too
+    // and would satisfy the assertion below without testing the exclusion.
+    assert!(
+        matches!(err, sea_orm::DbErr::Conn(_)),
+        "a refused login must arrive as a connection error: {err}"
+    );
+    assert!(
+        err.to_string().contains("password authentication failed"),
+        "and the server must be the one refusing it: {err}"
+    );
+
     assert!(
         driver_refusal(&err).is_none(),
         "a connect-time refusal must not arrive as a statement refusal: {err}"
+    );
+    assert!(
+        !is_unique_violation(&err) && !is_foreign_key_violation(&err),
+        "and its words are not read as a constraint's: {err}"
     );
 
     Ok(())
@@ -714,7 +834,6 @@ async fn a_connect_time_refusal_carries_no_driver_refusal() -> Result<()> {
 #[tokio::test]
 async fn a_value_the_caller_chose_does_not_classify_the_error() -> Result<()> {
     use sea_orm::ConnectionTrait as _;
-    use toolkit_db::secure::{is_foreign_key_violation, is_unique_violation};
 
     let dut = common::bring_up_postgres().await?;
     let conn = sea_orm::Database::connect(dut.url.clone()).await?;
