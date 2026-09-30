@@ -10,6 +10,7 @@ use super::core::Outbox;
 use super::handler::{
     LeasedHandler, PerMessageAdapter, TransactionalHandler, TransactionalMessageHandler,
 };
+use super::limits::QueueLimits;
 use super::manager::{OutboxBuilder, QueueDeclaration};
 use super::stats::StatsRegistry;
 use super::strategy::{LeasedStrategy, TransactionalStrategy, generate_worker_id};
@@ -102,6 +103,7 @@ pub struct QueueBuilder {
     builder: OutboxBuilder,
     name: String,
     partitions: Partitions,
+    limits: Option<QueueLimits>,
 }
 
 impl QueueBuilder {
@@ -110,7 +112,20 @@ impl QueueBuilder {
             builder,
             name,
             partitions,
+            limits: None,
         }
+    }
+
+    /// Bound how much unprocessed work this queue will hold.
+    ///
+    /// Without this, the queue accepts work without bound. With it, an
+    /// enqueue past the
+    /// bound is refused with [`OutboxError::QueueFull`](super::OutboxError::QueueFull)
+    /// and the caller's transaction issues no additional statement for the
+    /// privilege.
+    pub const fn limits(mut self, limits: QueueLimits) -> Self {
+        self.limits = Some(limits);
+        self
     }
 
     /// Register a single-message transactional handler (common case).
@@ -143,6 +158,7 @@ impl QueueBuilder {
         builder.queue_declarations.push(QueueDeclaration {
             name: self.name,
             partitions: self.partitions,
+            limits: self.limits,
             factory: Box::new(factory),
         });
         builder
@@ -169,6 +185,7 @@ impl QueueBuilder {
             builder: self.builder,
             name: self.name,
             partitions: self.partitions,
+            limits: self.limits,
             factory,
         }
     }
@@ -180,6 +197,7 @@ pub struct LeasedQueueBuilder {
     builder: OutboxBuilder,
     name: String,
     partitions: Partitions,
+    limits: Option<QueueLimits>,
     factory: LeasedProcessorFactory,
 }
 
@@ -214,6 +232,7 @@ impl LeasedQueueBuilder {
         builder.queue_declarations.push(QueueDeclaration {
             name: self.name,
             partitions: self.partitions,
+            limits: self.limits,
             factory: Box::new(self.factory),
         });
         builder

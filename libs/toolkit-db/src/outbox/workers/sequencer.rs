@@ -6,6 +6,7 @@ use tracing::warn;
 
 use super::super::Outbox;
 use super::super::dialect::AllocSql;
+use super::super::limits::Volume;
 use super::super::prioritizer::SharedPrioritizer;
 use super::super::store::OutboxStore;
 use super::super::taskward::{Directive, WorkerAction};
@@ -42,6 +43,9 @@ pub struct Sequencer {
 struct ClaimedIncoming {
     id: i64,
     body_id: i64,
+    /// Payload bytes, carried across to the outgoing row so the released side
+    /// later subtracts exactly what the admitted side added.
+    bytes: i64,
 }
 
 impl Sequencer {
@@ -112,24 +116,28 @@ impl Sequencer {
                 break;
             }
 
-            let item_count = i64::try_from(claimed.len()).unwrap_or(i64::MAX);
+            let moved = Volume {
+                entities: i64::try_from(claimed.len()).unwrap_or(i64::MAX),
+                bytes: claimed.iter().map(|item| item.bytes).sum(),
+            };
 
             #[allow(clippy::cast_possible_truncation)]
             let drained_this_iteration = (claimed.len() as u32) < self.config.batch_size;
 
             // Allocate sequences
             let start_seq = self
-                .allocate_sequences(&txn, &store, partition_id, item_count)
+                .allocate_sequences(&txn, &store, partition_id, moved.entities)
                 .await?;
 
             let outgoing_sql = store.build_insert_outgoing_batch(claimed.len());
-            let mut values: Vec<sea_orm::Value> = Vec::with_capacity(claimed.len() * 3);
+            let mut values: Vec<sea_orm::Value> = Vec::with_capacity(claimed.len() * 4);
             for (i, item) in claimed.iter().enumerate() {
                 #[allow(clippy::cast_possible_wrap)]
                 let seq = start_seq + 1 + i as i64;
                 values.push(partition_id.into());
                 values.push(item.body_id.into());
                 values.push(seq.into());
+                values.push(item.bytes.into());
             }
             txn.execute_raw(Statement::from_sql_and_values(
                 store.backend(),
@@ -144,6 +152,13 @@ impl Sequencer {
             {
                 total_claimed += claimed.len() as u32;
             }
+
+            // Post-commit, because a rolled-back claim moved nothing. One
+            // report for both counters: this move is one transaction, so the
+            // incoming channel's exit and the outgoing channel's entry are the
+            // same fact, and they can only diverge if something moved rows
+            // outside the pipeline.
+            self.outbox.record_sequenced(partition_id, moved);
 
             // Post-commit: notify the partition's processor
             self.outbox.notify_partition(partition_id);
@@ -293,7 +308,7 @@ impl Sequencer {
     ) -> Result<Vec<ClaimedIncoming>, OutboxError> {
         let claim = store.claim_incoming(self.config.batch_size);
 
-        // SELECT id, body_id ... ORDER BY id
+        // SELECT id, body_id, bytes ... ORDER BY id
         let rows = ClaimedIncoming::find_by_statement(Statement::from_sql_and_values(
             store.backend(),
             &claim.select,

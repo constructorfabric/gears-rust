@@ -12,7 +12,7 @@ use super::prioritizer::SharedPrioritizer;
 use super::stats::{StatsListener, StatsRegistry, StatsReporter};
 use super::tables::OutboxTables;
 use super::taskward::{
-    BackoffConfig, Bulkhead, BulkheadConfig, ConcurrencyLimit, PanicPolicy, TaskSet,
+    BackoffConfig, Bulkhead, BulkheadConfig, ConcurrencyLimit, PanicPolicy, Signal, TaskSet,
     TracingListener, WorkerBuilder, poker,
 };
 use super::types::{
@@ -26,6 +26,7 @@ use crate::Db;
 pub struct QueueDeclaration {
     pub(crate) name: String,
     pub(crate) partitions: Partitions,
+    pub(crate) limits: Option<super::limits::QueueLimits>,
     pub(crate) factory: Box<dyn super::builder::ProcessorFactory>,
 }
 
@@ -41,6 +42,7 @@ struct ResolvedTuning {
     reconciler: WorkerTuning,
     notifier: WorkerTuning,
     trace_sweeper: WorkerTuning,
+    counter_audit: WorkerTuning,
 }
 
 /// Short-lived context bag passed to spawn helpers during `start()`.
@@ -309,6 +311,7 @@ impl OutboxBuilder {
                 .unwrap_or_else(|| profile.reconciler.clone()),
             notifier: profile.notifier.clone(),
             trace_sweeper: profile.trace_sweeper.clone(),
+            counter_audit: profile.counter_audit.clone(),
         };
         resolved.processor.validate();
         resolved.sequencer.validate();
@@ -316,6 +319,7 @@ impl OutboxBuilder {
         resolved.reconciler.validate();
         resolved.notifier.validate();
         resolved.trace_sweeper.validate();
+        resolved.counter_audit.validate();
         resolved
     }
 
@@ -382,6 +386,7 @@ impl OutboxBuilder {
         ctx: &mut StartContext<'_>,
         outbox: &Arc<Outbox>,
         collectable_traces: &CollectableTraces,
+        unaudited: &Arc<Signal<i64>>,
         tuning: &WorkerTuning,
         shared_sem: &Arc<Semaphore>,
         count: usize,
@@ -393,6 +398,7 @@ impl OutboxBuilder {
                 outbox.statements_arc(),
                 tuning.batch_size as usize,
                 collectable_traces.clone(),
+                Arc::clone(unaudited),
             );
             let name = format!("vacuum-{i}");
             let (poker_notify, _poker_handle) = poker(tuning.idle_interval, ctx.cancel.clone());
@@ -512,6 +518,96 @@ impl OutboxBuilder {
             .on_panic(PanicPolicy::CatchAndRetry);
         let builder = register_stats(builder, ctx.stats_registry.as_ref(), name, count_payload());
         ctx.task_set.spawn(name, builder.build(reporter).run());
+    }
+
+    /// return the shortest refresh interval any of them asked for.
+    ///
+    /// Separate from the spawn, and synchronous, so the caller can take the
+    /// startup reading between the two without holding a borrow of the queue
+    /// declarations across an await - the processor factories they carry are
+    /// not `Sync`.
+    fn register_bounded_queues(
+        outbox: &Arc<Outbox>,
+        declarations: &[QueueDeclaration],
+    ) -> Option<Duration> {
+        let mut shortest = None;
+        for declaration in declarations {
+            let Some(limits) = declaration.limits else {
+                continue;
+            };
+            outbox.set_bounded(
+                &declaration.name,
+                Arc::new(super::admission::Admission::new(
+                    limits,
+                    usize::from(declaration.partitions.count()),
+                )),
+            );
+            shortest = Some(
+                shortest.map_or(limits.refresh_interval(), |current: Duration| {
+                    current.min(limits.refresh_interval())
+                }),
+            );
+        }
+
+        shortest
+    }
+
+    /// Spawn the worker that publishes and refreshes the admission counters.
+    fn spawn_counter_flush(ctx: &mut StartContext<'_>, outbox: &Arc<Outbox>, interval: Duration) {
+        let flush = super::workers::counter_flush::CounterFlush {
+            outbox: Arc::clone(outbox),
+            db: ctx.db.clone(),
+        };
+        let name = "counter-flush";
+        let (poker_notify, _poker_handle) = poker(interval, ctx.cancel.clone());
+        let tuning = WorkerTuning::reconciler().idle_interval(interval);
+        let worker = WorkerBuilder::new(name, ctx.cancel.clone())
+            .stop_grace(tuning.stop_grace)
+            .pacing(&tuning)
+            .notifier(poker_notify)
+            .notifier(Arc::clone(ctx.start_notify))
+            .listener(TracingListener)
+            .on_panic(PanicPolicy::CatchAndRetry)
+            .build(flush);
+        ctx.task_set.spawn(name, worker.run());
+    }
+
+    /// Spawn the counter audit, told by the vacuum which partition it drained.
+    fn spawn_counter_audit(
+        ctx: &mut StartContext<'_>,
+        outbox: &Arc<Outbox>,
+        unaudited: &Arc<Signal<i64>>,
+        tuning: &WorkerTuning,
+    ) {
+        let audit = super::workers::counter_audit::CounterAudit {
+            outbox: Arc::clone(outbox),
+            db: ctx.db.clone(),
+            unaudited: Arc::clone(unaudited),
+        };
+        let name = "counter-audit";
+        let (poker_notify, _poker_handle) = poker(tuning.idle_interval, ctx.cancel.clone());
+        let worker = WorkerBuilder::new(name, ctx.cancel.clone())
+            .stop_grace(tuning.stop_grace)
+            .pacing(tuning)
+            // The only wakeup this worker has a use for. A signal raised while
+            // it is mid-execute is not lost - `notify_one` stores a permit
+            // with no waiter - so there is nothing for a timer to recover, and
+            // a timer wake could only find the set empty and idle again.
+            .notifier(unaudited.notifier())
+            // A timer as well as the signal, because the signal cannot cover
+            // everything. The vacuum can only recognise one shape of drift -
+            // a partition it was told was dirty that turned out to have
+            // nothing to collect - and it never looks at the incoming channel
+            // at all, so rows deleted from there are never acked, never bump
+            // the marker, and would never bring the vacuum round. The sweep
+            // filters on the in-memory snapshot first, so a partition
+            // claiming nothing costs no statement.
+            .notifier(poker_notify)
+            .notifier(Arc::clone(ctx.start_notify))
+            .listener(TracingListener)
+            .on_panic(PanicPolicy::CatchAndRetry)
+            .build(audit);
+        ctx.task_set.spawn(name, worker.run());
     }
 
     /// Spawn cold reconciler as a `WorkerAction` (ungated, poker-driven).
@@ -696,12 +792,26 @@ impl OutboxBuilder {
         // latency as learning it finished.
         Self::spawn_retry_reporter(&mut ctx, &outbox, &tuning.notifier);
 
-        // 9. Spawn vacuum workers, and the sweeper they tell about their work
+        // 8d. Give bounded queues their admission state, publish and refresh it
+        let bounded_interval = Self::register_bounded_queues(&outbox, &self.queue_declarations);
+        if let Some(interval) = bounded_interval {
+            // Read the saved numbers before anything can be enqueued. Without
+            // this a restarted instance starts with no snapshot and an empty
+            // journal, so its reading would be zero until the first flush tick
+            // - long enough to admit a whole limit's worth past the bound.
+            outbox.restore_admission(ctx.db).await;
+            Self::spawn_counter_flush(&mut ctx, &outbox, interval);
+        }
+
+        // 9. Spawn vacuum workers, and the sweeper and the audit they tell
+        // about their work
         let collectable_traces = CollectableTraces::new();
+        let unaudited = Arc::new(Signal::<i64>::new());
         Self::spawn_vacuum_workers(
             &mut ctx,
             &outbox,
             &collectable_traces,
+            &unaudited,
             &tuning.vacuum,
             &shared_sem,
             shared,
@@ -712,6 +822,7 @@ impl OutboxBuilder {
             &collectable_traces,
             &tuning.trace_sweeper,
         );
+        Self::spawn_counter_audit(&mut ctx, &outbox, &unaudited, &tuning.counter_audit);
 
         // 10. Spawn stats reporter (if enabled)
         if let Some(interval) = self.stats_interval {

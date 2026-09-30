@@ -53,6 +53,7 @@ impl MigrationTrait for CreateOutboxSchema {
         create_dead_letters(conn, backend, tables).await?;
         create_processor(conn, backend, tables).await?;
         create_vacuum_counter(conn, backend, tables).await?;
+        create_partition_counter(conn, backend, tables).await?;
         create_mysql_id_sequence_tables(conn, backend, tables).await?;
 
         Ok(())
@@ -459,7 +460,8 @@ async fn create_incoming(
                     "CREATE TABLE IF NOT EXISTS {incoming} (
                 id           BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
                 partition_id BIGINT   NOT NULL REFERENCES {partitions}(id),
-                body_id      BIGINT   NOT NULL REFERENCES {body_table}(id)
+                body_id      BIGINT   NOT NULL REFERENCES {body_table}(id),
+                bytes        BIGINT   NOT NULL
             )"
                 )
             }
@@ -468,7 +470,8 @@ async fn create_incoming(
                     "CREATE TABLE IF NOT EXISTS {incoming} (
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
                 partition_id INTEGER NOT NULL REFERENCES {partitions}(id),
-                body_id      INTEGER NOT NULL REFERENCES {body_table}(id)
+                body_id      INTEGER NOT NULL REFERENCES {body_table}(id),
+                bytes        INTEGER NOT NULL
             )"
                 )
             }
@@ -478,6 +481,7 @@ async fn create_incoming(
                 id           BIGINT PRIMARY KEY,
                 partition_id BIGINT NOT NULL,
                 body_id      BIGINT NOT NULL,
+                bytes        BIGINT NOT NULL,
                 FOREIGN KEY (partition_id) REFERENCES {partitions}(id),
                 FOREIGN KEY (body_id) REFERENCES {body_table}(id)
             )"
@@ -536,6 +540,7 @@ async fn create_outgoing(
                 partition_id BIGINT NOT NULL REFERENCES {partitions}(id),
                 body_id      BIGINT NOT NULL REFERENCES {body_table}(id),
                 seq          BIGINT NOT NULL,
+                bytes        BIGINT NOT NULL,
                 sequenced_at TIMESTAMPTZ NOT NULL DEFAULT now()
             )"
                 )
@@ -547,6 +552,7 @@ async fn create_outgoing(
                 partition_id INTEGER NOT NULL REFERENCES {partitions}(id),
                 body_id      INTEGER NOT NULL REFERENCES {body_table}(id),
                 seq          INTEGER NOT NULL,
+                bytes        INTEGER NOT NULL,
                 sequenced_at TEXT    NOT NULL DEFAULT (datetime('now'))
             )"
                 )
@@ -558,6 +564,7 @@ async fn create_outgoing(
                 partition_id BIGINT NOT NULL,
                 body_id      BIGINT NOT NULL,
                 seq          BIGINT NOT NULL,
+                bytes        BIGINT NOT NULL,
                 sequenced_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
                 FOREIGN KEY (partition_id) REFERENCES {partitions}(id),
                 FOREIGN KEY (body_id) REFERENCES {body_table}(id)
@@ -802,6 +809,71 @@ async fn create_vacuum_counter(
                     "CREATE TABLE IF NOT EXISTS {vacuum_counter} (
                 partition_id BIGINT PRIMARY KEY,
                 counter      BIGINT NOT NULL DEFAULT 0,
+                FOREIGN KEY (partition_id) REFERENCES {partitions}(id)
+            )"
+                )
+            }
+            _ => return Err(unsupported_backend(backend)),
+        },
+    ))
+    .await?;
+    Ok(())
+}
+
+/// The channel counters, in their own table.
+///
+/// Its own table and not the vacuum's, because it is its own piece of
+/// functionality: the vacuum's marker is bumped by the ack on its hot path,
+/// while these are written only by the flusher and the audit. Sharing a table
+/// would mean sharing a lock granularity that is not the same on every backend.
+async fn create_partition_counter(
+    conn: &DatabaseExecutor<'_>,
+    backend: DatabaseBackend,
+    tables: &OutboxTables,
+) -> Result<(), DbErr> {
+    let partition_counter = tables.partition_counter();
+    let partitions = tables.partitions();
+    let columns = |width: &str| {
+        format!(
+            "incoming_in_entities  {width} NOT NULL DEFAULT 0,
+                incoming_in_bytes     {width} NOT NULL DEFAULT 0,
+                incoming_out_entities {width} NOT NULL DEFAULT 0,
+                incoming_out_bytes    {width} NOT NULL DEFAULT 0,
+                outgoing_in_entities  {width} NOT NULL DEFAULT 0,
+                outgoing_in_bytes     {width} NOT NULL DEFAULT 0,
+                outgoing_out_entities {width} NOT NULL DEFAULT 0,
+                outgoing_out_bytes    {width} NOT NULL DEFAULT 0"
+        )
+    };
+    conn.execute_raw(Statement::from_string(
+        backend,
+        match backend {
+            DatabaseBackend::Postgres => {
+                let counters = columns("BIGINT");
+                format!(
+                    "CREATE TABLE IF NOT EXISTS {partition_counter} (
+                partition_id BIGINT PRIMARY KEY
+                    REFERENCES {partitions}(id),
+                {counters}
+            )"
+                )
+            }
+            DatabaseBackend::Sqlite => {
+                let counters = columns("INTEGER");
+                format!(
+                    "CREATE TABLE IF NOT EXISTS {partition_counter} (
+                partition_id INTEGER PRIMARY KEY
+                    REFERENCES {partitions}(id),
+                {counters}
+            )"
+                )
+            }
+            DatabaseBackend::MySql => {
+                let counters = columns("BIGINT");
+                format!(
+                    "CREATE TABLE IF NOT EXISTS {partition_counter} (
+                partition_id BIGINT PRIMARY KEY,
+                {counters},
                 FOREIGN KEY (partition_id) REFERENCES {partitions}(id)
             )"
                 )
@@ -1208,6 +1280,52 @@ mod tests {
                 assert!(
                     indexes.iter().any(|i| i == index),
                     "missing index {index}: have {indexes:?}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn schema_carries_the_counter_columns() {
+            let db = setup_shared_db("outbox_counter_shape").await;
+            let conn = db.sea_internal();
+            let manager = SchemaManager::new(&conn);
+            CreateOutboxSchema::default()
+                .up(&manager)
+                .await
+                .expect("up");
+            let tables = OutboxTables::default();
+
+            // Every counter lives in one table, keyed by partition. Each of
+            // the two channels has an in and an out, so a channel's depth is
+            // its own difference and can be proved zero on its own.
+            for (table, expected) in [(
+                tables.partition_counter(),
+                [
+                    "incoming_in_entities",
+                    "incoming_in_bytes",
+                    "incoming_out_entities",
+                    "incoming_out_bytes",
+                    "outgoing_in_entities",
+                    "outgoing_in_bytes",
+                    "outgoing_out_entities",
+                    "outgoing_out_bytes",
+                ],
+            )] {
+                let columns = columns_of(&conn, table).await;
+                for column in expected {
+                    assert!(
+                        columns.iter().any(|c| c == column),
+                        "{table} is missing {column}"
+                    );
+                }
+            }
+
+            // Byte counts ride incoming -> outgoing so the released side
+            // subtracts exactly what the admitted side added.
+            for table in [tables.incoming(), tables.outgoing()] {
+                assert!(
+                    columns_of(&conn, table).await.iter().any(|c| c == "bytes"),
+                    "{table} is missing bytes"
                 );
             }
         }

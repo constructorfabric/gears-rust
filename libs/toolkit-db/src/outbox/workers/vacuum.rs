@@ -4,9 +4,10 @@ use sea_orm::{ConnectionTrait, Statement, TransactionTrait};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
+use super::super::limits::Volume;
 use super::super::statements::OutboxStatements;
 use super::super::store::OutboxStore;
-use super::super::taskward::{Directive, WorkerAction};
+use super::super::taskward::{Directive, Signal, WorkerAction};
 use super::super::types::OutboxError;
 use crate::Db;
 
@@ -75,6 +76,10 @@ pub struct VacuumTask {
     /// Nudged when bodies were actually deleted, since that is what can make a
     /// trace collectable ahead of its own clock.
     collectable_traces: CollectableTraces,
+    /// Partitions whose counters look wrong: dirty enough to be visited, yet
+    /// with nothing to collect. A separate task checks them, because a failed
+    /// chunk delete must not stop the counters from ever being looked at.
+    unaudited: Arc<Signal<i64>>,
 }
 
 impl VacuumTask {
@@ -83,6 +88,7 @@ impl VacuumTask {
         statements: Arc<OutboxStatements>,
         batch_size: usize,
         collectable_traces: CollectableTraces,
+        unaudited: Arc<Signal<i64>>,
     ) -> Self {
         assert!(
             batch_size > 0,
@@ -93,6 +99,7 @@ impl VacuumTask {
             statements,
             batch_size,
             collectable_traces,
+            unaudited,
         }
     }
 }
@@ -118,7 +125,7 @@ impl WorkerAction for VacuumTask {
 
         // Phase 2: Drain each partition (per-partition errors logged, not propagated)
         let mut errors = 0u32;
-        let mut total_deleted: u64 = 0;
+        let mut reclaimed = Volume::ZERO;
         for (partition_id, snapshot_counter) in &dirty {
             if cancel.is_cancelled() {
                 break;
@@ -127,7 +134,7 @@ impl WorkerAction for VacuumTask {
                 .drain_partition(&self.db, &store, *partition_id, *snapshot_counter, cancel)
                 .await
             {
-                Ok(deleted) => total_deleted += deleted,
+                Ok(volume) => reclaimed = reclaimed + volume,
                 Err(e) => {
                     warn!(
                         partition_id,
@@ -150,13 +157,13 @@ impl WorkerAction for VacuumTask {
         // Bodies were deleted, which may have been the last thing keeping a
         // trace alive. Told conditionally: a sweep that collected nothing
         // cannot have made any trace collectable, so it says nothing.
-        if total_deleted > 0 {
+        if reclaimed.entities > 0 {
             self.collectable_traces.notify();
         }
 
         let report = VacuumReport {
             partitions_swept: dirty.len(),
-            rows_deleted: total_deleted,
+            rows_deleted: u64::try_from(reclaimed.entities).unwrap_or(0),
         };
         Ok(Directive::Idle(report))
     }
@@ -173,8 +180,8 @@ impl VacuumTask {
         partition_id: i64,
         snapshot_counter: i64,
         cancel: &CancellationToken,
-    ) -> Result<u64, OutboxError> {
-        let deleted = self
+    ) -> Result<Volume, OutboxError> {
+        let reclaimed = self
             .vacuum_partition(db, store, partition_id, cancel)
             .await?;
 
@@ -191,7 +198,7 @@ impl VacuumTask {
             .await?;
         }
 
-        Ok(deleted)
+        Ok(reclaimed)
     }
 
     /// Collect all dirty partitions (counter > 0) via paginated cursor.
@@ -247,15 +254,17 @@ impl VacuumTask {
 
     /// Drain a single partition: read `processed_seq`, then delete all
     /// outgoing + body rows with `seq <= processed_seq` in bounded chunks
-    /// until `deleted < batch_size`.
-    /// Returns total rows deleted for this partition.
+    /// until a chunk comes back short.
+    /// Returns how many rows were deleted for this partition. The vacuum
+    /// reports no counters: a row past the cursor left the queue at the ack,
+    /// so deleting it is not a channel boundary.
     async fn vacuum_partition(
         &self,
         db: &Db,
         store: &OutboxStore<'_>,
         partition_id: i64,
         cancel: &CancellationToken,
-    ) -> Result<u64, OutboxError> {
+    ) -> Result<Volume, OutboxError> {
         // Read processed_seq (PK lookup, cheap).
         let row = {
             let conn = db.sea_internal();
@@ -268,7 +277,7 @@ impl VacuumTask {
         };
 
         let Some(row) = row else {
-            return Ok(0);
+            return Ok(Volume::ZERO);
         };
         let processed_seq: i64 = row.try_get_by_index(0).map_err(|e| {
             OutboxError::Database(sea_orm::DbErr::Custom(format!(
@@ -276,11 +285,11 @@ impl VacuumTask {
             )))
         })?;
         if processed_seq == 0 {
-            return Ok(0);
+            return Ok(Volume::ZERO);
         }
 
         let vacuum_sql = store.vacuum_cleanup();
-        let mut total_deleted: u64 = 0;
+        let mut total = Volume::ZERO;
 
         // Delete in bounded chunks until drained.
         // The bulkhead holds the maintenance semaphore for the entire sweep.
@@ -289,7 +298,7 @@ impl VacuumTask {
                 break;
             }
 
-            let deleted = Self::delete_chunk(
+            let chunk = Self::delete_chunk(
                 db,
                 store,
                 vacuum_sql,
@@ -299,18 +308,33 @@ impl VacuumTask {
             )
             .await?;
 
-            total_deleted += deleted as u64;
+            total = total + chunk;
 
-            if deleted < self.batch_size {
+            if chunk.entities < i64::try_from(self.batch_size).unwrap_or(i64::MAX) {
                 break; // Partition drained.
             }
         }
 
-        Ok(total_deleted)
+        // Told only when this partition was dirty enough to be visited and yet
+        // had nothing to collect. That is the anomaly: the counters claimed
+        // there was processed work here and the rows disagree, which is the
+        // shape an operator's `DELETE` leaves behind. A sweep that collected
+        // rows is the healthy case and says nothing, so the audit is not woken
+        // once per partition per sweep to confirm that all is well.
+        //
+        // Note this is *not* "the partition is empty" - work may still be
+        // waiting past the cursor. Emptiness is what makes the backlog
+        // provably zero, and only the audit can establish it, which is why it
+        // probes rather than trusting the wakeup.
+        if !cancel.is_cancelled() && total.entities == 0 {
+            self.unaudited.signal(partition_id);
+        }
+
+        Ok(total)
     }
 
     /// Execute one bounded chunk of cleanup for a single partition.
-    /// Returns the number of outgoing rows deleted.
+    /// Returns what the chunk reclaimed.
     async fn delete_chunk(
         db: &Db,
         store: &OutboxStore<'_>,
@@ -318,7 +342,7 @@ impl VacuumTask {
         partition_id: i64,
         processed_seq: i64,
         batch_limit: i64,
-    ) -> Result<usize, OutboxError> {
+    ) -> Result<Volume, OutboxError> {
         let conn = db.sea_internal();
         let txn = conn.begin().await?;
 
@@ -334,11 +358,12 @@ impl VacuumTask {
 
         if rows.is_empty() {
             txn.rollback().await?;
-            return Ok(0);
+            return Ok(Volume::ZERO);
         }
 
         let mut outgoing_ids: Vec<i64> = Vec::with_capacity(rows.len());
         let mut body_ids: Vec<i64> = Vec::with_capacity(rows.len());
+        let mut reclaimed = Volume::ZERO;
         for r in &rows {
             let oid: i64 = r.try_get_by_index(0).map_err(|e| {
                 OutboxError::Database(sea_orm::DbErr::Custom(format!("outgoing_id column: {e}")))
@@ -347,9 +372,14 @@ impl VacuumTask {
             if let Ok(bid) = r.try_get_by_index::<i64>(1) {
                 body_ids.push(bid);
             }
+            // The bytes recorded when this work was admitted, so what the
+            // vacuum reports reclaimed is the same number the admitted side
+            // added rather than a re-measurement.
+            let bytes: i64 = r.try_get_by_index(2).map_err(|e| {
+                OutboxError::Database(sea_orm::DbErr::Custom(format!("bytes column: {e}")))
+            })?;
+            reclaimed = reclaimed + Volume { entities: 1, bytes };
         }
-
-        let count = outgoing_ids.len();
 
         // DELETE outgoing rows by ID.
         if !outgoing_ids.is_empty() {
@@ -376,7 +406,7 @@ impl VacuumTask {
         }
 
         txn.commit().await?;
-        Ok(count)
+        Ok(reclaimed)
     }
 }
 

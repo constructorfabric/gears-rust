@@ -126,7 +126,7 @@ impl<'a> OutboxStore<'a> {
     pub(super) async fn exec_insert_incoming_batch(
         &self,
         conn: &DatabaseExecutor<'_>,
-        entries: &[(i64, i64)],
+        entries: &[(i64, i64, i64)],
     ) -> Result<Vec<i64>, DbErr> {
         if entries.is_empty() {
             return Ok(Vec::new());
@@ -143,11 +143,12 @@ impl<'a> OutboxStore<'a> {
                 .reserve_mysql_ids(conn, reservation, entries.len(), "incoming")
                 .await?;
             let sql = self.build_insert_incoming_batch_with_ids(entries.len());
-            let mut values: Vec<sea_orm::Value> = Vec::with_capacity(entries.len() * 3);
-            for (id, &(partition_id, body_id)) in ids.iter().zip(entries) {
+            let mut values: Vec<sea_orm::Value> = Vec::with_capacity(entries.len() * 4);
+            for (id, &(partition_id, body_id, bytes)) in ids.iter().zip(entries) {
                 values.push((*id).into());
                 values.push(partition_id.into());
                 values.push(body_id.into());
+                values.push(bytes.into());
             }
             conn.execute_raw(Statement::from_sql_and_values(self.backend(), &sql, values))
                 .await?;
@@ -157,10 +158,11 @@ impl<'a> OutboxStore<'a> {
         let sql = self
             .dialect()
             .build_insert_incoming_batch(self.tables(), entries.len());
-        let mut values: Vec<sea_orm::Value> = Vec::with_capacity(entries.len() * 2);
-        for &(partition_id, body_id) in entries {
+        let mut values: Vec<sea_orm::Value> = Vec::with_capacity(entries.len() * 3);
+        for &(partition_id, body_id, bytes) in entries {
             values.push(partition_id.into());
             values.push(body_id.into());
+            values.push(bytes.into());
         }
 
         if self.dialect().supports_returning() {
@@ -261,9 +263,10 @@ impl<'a> OutboxStore<'a> {
         conn: &DatabaseExecutor<'_>,
         partition_id: i64,
         body_id: i64,
+        bytes: i64,
     ) -> Result<i64, DbErr> {
         if self.backend() == DbBackend::MySql {
-            let entries = [(partition_id, body_id)];
+            let entries = [(partition_id, body_id, bytes)];
             let mut ids = self.exec_insert_incoming_batch(conn, &entries).await?;
             return ids
                 .pop()
@@ -274,7 +277,7 @@ impl<'a> OutboxStore<'a> {
         self.exec_insert_returning_id(
             conn,
             sql,
-            vec![partition_id.into(), body_id.into()],
+            vec![partition_id.into(), body_id.into(), bytes.into()],
             "incoming",
         )
         .await
@@ -288,6 +291,8 @@ impl<'a> OutboxStore<'a> {
         payload_type: &str,
         trace: Option<&str>,
     ) -> Result<i64, DbErr> {
+        let bytes = super::limits::Volume::of_payload(&payload).bytes;
+
         if let Some(cte) = self.statements.enqueue().insert_body_and_incoming_cte() {
             self.exec_insert_returning_id(
                 conn,
@@ -297,6 +302,7 @@ impl<'a> OutboxStore<'a> {
                     payload_type.into(),
                     trace.into(),
                     partition_id.into(),
+                    bytes.into(),
                 ],
                 "incoming",
             )
@@ -306,7 +312,8 @@ impl<'a> OutboxStore<'a> {
             let body_id = self
                 .exec_insert_body(conn, payload, payload_type, trace)
                 .await?;
-            self.exec_insert_incoming(conn, partition_id, body_id).await
+            self.exec_insert_incoming(conn, partition_id, body_id, bytes)
+                .await
         }
     }
 
@@ -529,6 +536,35 @@ impl<'a> OutboxStore<'a> {
         })
     }
 
+    /// The one statement that writes a channel counter, always a delta.
+    pub(super) fn apply_channel_deltas(&self) -> &str {
+        self.statements.channels().apply_deltas()
+    }
+
+    pub(super) fn read_queue_channels(&self) -> &str {
+        self.statements.channels().read_queue()
+    }
+
+    pub(super) fn read_partition_channels(&self) -> &str {
+        self.statements.channels().read_partition()
+    }
+
+    pub(super) fn any_incoming(&self) -> &str {
+        self.statements.channels().any_incoming()
+    }
+
+    pub(super) fn any_outgoing_past_cursor(&self) -> &str {
+        self.statements.channels().any_outgoing_past_cursor()
+    }
+
+    pub(super) fn count_incoming(&self) -> &str {
+        self.statements.channels().count_incoming()
+    }
+
+    pub(super) fn count_outgoing_past_cursor(&self) -> &str {
+        self.statements.channels().count_outgoing_past_cursor()
+    }
+
     pub(super) fn lock_partition(&self) -> Option<&str> {
         self.statements.sequencer().lock_partition()
     }
@@ -698,6 +734,12 @@ impl<'a> OutboxStore<'a> {
         self.statements.registration().insert_vacuum_counter_row()
     }
 
+    pub(super) fn insert_partition_counter_row(&self) -> &str {
+        self.statements
+            .registration()
+            .insert_partition_counter_row()
+    }
+
     pub(super) fn dead_letter_select_columns(&self) -> &str {
         self.statements.dead_letters().select_columns()
     }
@@ -755,10 +797,10 @@ impl<'a> OutboxStore<'a> {
 
     fn build_insert_incoming_batch_with_ids(&self, count: usize) -> String {
         let mut sql = format!(
-            "INSERT INTO {} (id, partition_id, body_id) VALUES ",
+            "INSERT INTO {} (id, partition_id, body_id, bytes) VALUES ",
             self.tables().incoming()
         );
-        append_mysql_value_tuples(&mut sql, count, 3);
+        append_mysql_value_tuples(&mut sql, count, 4);
         sql
     }
 }
@@ -812,7 +854,7 @@ mod tests {
 
         assert_eq!(
             sql,
-            "INSERT INTO toolkit_outbox_incoming (id, partition_id, body_id) VALUES (?, ?, ?), (?, ?, ?)"
+            "INSERT INTO toolkit_outbox_incoming (id, partition_id, body_id, bytes) VALUES (?, ?, ?, ?), (?, ?, ?, ?)"
         );
     }
 }
