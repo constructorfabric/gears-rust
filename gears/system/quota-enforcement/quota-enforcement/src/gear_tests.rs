@@ -574,3 +574,152 @@ async fn a_second_init_fails_and_the_health_check_exists_only_after_init() {
     assert!(err.to_string().contains("already initialized"), "{err}");
     fixture.stop().await;
 }
+
+/// Permits the test tenant, until it is narrowed to another tenant only.
+struct NarrowingPdp {
+    narrowed: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl AuthZResolverApi for NarrowingPdp {
+    async fn evaluate(
+        &self,
+        _ctx: toolkit_security::PlatformSecurityContext,
+        _request: authz_resolver_sdk::models::EvaluationRequest,
+    ) -> Result<authz_resolver_sdk::models::EvaluationResponse, CanonicalError> {
+        use authz_resolver_sdk::constraints::{Constraint, InPredicate, Predicate};
+        let visible = if self.narrowed.load(std::sync::atomic::Ordering::SeqCst) {
+            Uuid::from_u128(0x0bad)
+        } else {
+            tenant().as_uuid()
+        };
+        Ok(authz_resolver_sdk::models::EvaluationResponse {
+            decision: true,
+            context: authz_resolver_sdk::models::EvaluationResponseContext {
+                constraints: vec![Constraint {
+                    predicates: vec![Predicate::In(InPredicate::new(
+                        toolkit_security::pep_properties::OWNER_TENANT_ID,
+                        vec![visible],
+                    ))],
+                }],
+                ..authz_resolver_sdk::models::EvaluationResponseContext::default()
+            },
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bulk_envelope_over_the_sql_plugin_replays_only_while_its_targets_stay_visible() {
+    let mut documents = llm_gateway_documents();
+    documents.extend(metric_base_documents());
+    let hub = hub_with_registry(in_process_registry(documents));
+    let pdp = Arc::new(NarrowingPdp {
+        narrowed: std::sync::atomic::AtomicBool::new(false),
+    });
+    register_pdp(&hub, pdp.clone());
+    let fixture = wire_cluster(&hub);
+    let plugin = StoragePluginGear::default();
+    plugin
+        .init(&sql_plugin_ctx(hub.clone()).await)
+        .await
+        .expect("plugin init");
+    let gear = Arc::new(QuotaEnforcementGear::default());
+    gear.init(&make_ctx(hub.clone())).await.expect("init");
+    let (tx, rx) = oneshot::channel();
+    let cancel = CancellationToken::new();
+    let handle = tokio::spawn(
+        gear.clone()
+            .serve(cancel.clone(), ReadySignal::from_sender(tx)),
+    );
+    rx.await.expect("ready");
+
+    let client = hub
+        .get::<dyn QuotaManagerClientV1>()
+        .expect("manager client");
+    let spec = |subject: &str| quota_enforcement_sdk::QuotaSpec {
+        tenant_id: tenant(),
+        subject: SubjectRef {
+            projection_type: gts::GtsTypeId::new(LLM_USER_PROJECTION),
+            subject_id: subject.to_owned(),
+        },
+        metric: quota_enforcement_sdk::MetricId::parse(crate::test_support::METRIC_TOKENS)
+            .expect("metric"),
+        quota_type: quota_enforcement_sdk::QuotaType::Consumption,
+        period: Some(quota_enforcement_sdk::PeriodType::Month),
+        enforcement_mode: quota_enforcement_sdk::EnforcementMode::Hard,
+        cap: Some(100),
+        notification_thresholds: Vec::new(),
+        validity_window: None,
+        fail_open_hint: false,
+        metadata: json!({ "regions": ["eu"], "weight": 5 })
+            .as_object()
+            .cloned()
+            .expect("object"),
+        source: quota_enforcement_sdk::QuotaSource::Operator,
+    };
+    let created = client
+        .bulk_create_quotas(
+            &security_ctx(),
+            quota_enforcement_sdk::BulkCreateQuotasRequest {
+                tenant_id: tenant(),
+                idempotency_key: "pack".to_owned(),
+                items: vec![
+                    quota_enforcement_sdk::BulkCreateItem {
+                        idempotency_key: None,
+                        spec: spec("u1"),
+                    },
+                    quota_enforcement_sdk::BulkCreateItem {
+                        idempotency_key: None,
+                        spec: spec("u2"),
+                    },
+                ],
+            },
+        )
+        .await
+        .expect("bulk create over the SQL plugin");
+    let update = quota_enforcement_sdk::BulkUpdateQuotasRequest {
+        tenant_id: tenant(),
+        idempotency_key: "raise".to_owned(),
+        items: created
+            .items
+            .iter()
+            .map(|item| quota_enforcement_sdk::BulkUpdateItem {
+                idempotency_key: None,
+                quota_id: item.quota_id,
+                patch: quota_enforcement_sdk::QuotaPatch {
+                    cap: Some(quota_enforcement_sdk::CapPatch::Bounded(200)),
+                    ..quota_enforcement_sdk::QuotaPatch::default()
+                },
+            })
+            .collect(),
+    };
+    let updated = client
+        .bulk_update_quotas(&security_ctx(), update.clone())
+        .await
+        .expect("bulk update");
+    assert_eq!(
+        client
+            .bulk_update_quotas(&security_ctx(), update.clone())
+            .await
+            .expect("replay"),
+        updated
+    );
+
+    // The caller's scope no longer covers the tenant: not found, pointed at
+    // the first target, never the stored outcome.
+    pdp.narrowed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let err = client
+        .bulk_update_quotas(&security_ctx(), update)
+        .await
+        .expect_err("hidden targets");
+    assert!(matches!(err, CanonicalError::NotFound { .. }), "{err:?}");
+    assert!(err.detail().starts_with("items[0]"), "{}", err.detail());
+
+    cancel.cancel();
+    handle
+        .await
+        .expect("serve task joins")
+        .expect("serve returns Ok on shutdown");
+    fixture.stop().await;
+}

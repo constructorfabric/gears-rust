@@ -22,6 +22,7 @@
 //! storage contract in [`testing`].
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
+pub mod bulk;
 pub mod client;
 pub mod engine;
 pub mod gts;
@@ -34,6 +35,12 @@ pub mod thresholds;
 #[cfg(feature = "test-util")]
 pub mod testing;
 
+pub use bulk::{
+    BulkCreateEntry, BulkCreateEnvelope, BulkCreateItem, BulkCreateQuotasRequest, BulkCreated,
+    BulkCreatedItem, BulkDeactivateEntry, BulkDeactivateEnvelope, BulkDeactivateItem,
+    BulkDeactivateQuotasRequest, BulkDeactivated, BulkDeactivatedItem, BulkRecord, BulkUpdateEntry,
+    BulkUpdateEnvelope, BulkUpdateItem, BulkUpdateQuotasRequest, BulkUpdated, BulkUpdatedItem,
+};
 pub use client::{
     QuotaEnforcementClientV1, QuotaEnforcementError, QuotaManagerClientV1, QuotaOperatorClientV1,
 };

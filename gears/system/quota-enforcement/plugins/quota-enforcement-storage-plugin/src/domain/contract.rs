@@ -82,6 +82,30 @@ impl QuotaEnforcementStoragePluginV1 for StoragePlugin {
         StoragePlugin::read_quotas(self, ctx, scope, filter, page).await
     }
 
+    async fn bulk_create_quotas(
+        &self,
+        ctx: &SecurityContext,
+        envelope: &quota_enforcement_sdk::BulkCreateEnvelope,
+    ) -> Result<TransitionOutcome<quota_enforcement_sdk::BulkCreated>, StorageError> {
+        StoragePlugin::bulk_create_quotas(self, ctx, envelope).await
+    }
+
+    async fn bulk_update_quotas(
+        &self,
+        ctx: &SecurityContext,
+        envelope: &quota_enforcement_sdk::BulkUpdateEnvelope,
+    ) -> Result<TransitionOutcome<quota_enforcement_sdk::BulkUpdated>, StorageError> {
+        StoragePlugin::bulk_update_quotas(self, ctx, envelope).await
+    }
+
+    async fn bulk_deactivate_quotas(
+        &self,
+        ctx: &SecurityContext,
+        envelope: &quota_enforcement_sdk::BulkDeactivateEnvelope,
+    ) -> Result<TransitionOutcome<quota_enforcement_sdk::BulkDeactivated>, StorageError> {
+        StoragePlugin::bulk_deactivate_quotas(self, ctx, envelope).await
+    }
+
     async fn apply_debit_plan(
         &self,
         ctx: &SecurityContext,

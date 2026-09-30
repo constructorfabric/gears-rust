@@ -8,6 +8,10 @@ use async_trait::async_trait;
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::SecurityContext;
 
+use crate::bulk::{
+    BulkCreateQuotasRequest, BulkCreated, BulkDeactivateQuotasRequest, BulkDeactivated,
+    BulkUpdateQuotasRequest, BulkUpdated,
+};
 use crate::models::{
     AcquireLeaseOutcome, AcquireLeaseRequest, BatchDebitRequest, BatchDecision, CommitLeaseRequest,
     CreditRequest, DeactivateOutcome, DebitRequest, Decision, DecisionPreview, PageRequest,
@@ -94,6 +98,46 @@ pub trait QuotaManagerClientV1: Send + Sync + 'static {
         ctx: &SecurityContext,
         request: CreditRequest,
     ) -> Result<Decision, QuotaEnforcementError>;
+
+    /// Create every listed Quota of one tenant in one transaction, or none.
+    /// A replay of the envelope key returns the original outcome.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidArgument` (`BULK_TOO_LARGE`) for too many items; the canonical
+    /// error of the first failing item, pointing at `items[index]`; `Aborted`
+    /// (`IDEMPOTENCY_PAYLOAD_MISMATCH`) when the key was used for other items.
+    async fn bulk_create_quotas(
+        &self,
+        ctx: &SecurityContext,
+        request: BulkCreateQuotasRequest,
+    ) -> Result<BulkCreated, QuotaEnforcementError>;
+
+    /// Apply every listed patch to one tenant's Quotas in one transaction, or
+    /// none.
+    ///
+    /// # Errors
+    ///
+    /// As [`QuotaManagerClientV1::bulk_create_quotas`], with the item errors
+    /// of [`QuotaManagerClientV1::update_quota`].
+    async fn bulk_update_quotas(
+        &self,
+        ctx: &SecurityContext,
+        request: BulkUpdateQuotasRequest,
+    ) -> Result<BulkUpdated, QuotaEnforcementError>;
+
+    /// Deactivate every listed Quota of one tenant in one transaction, or
+    /// none, resolving their active leases with it.
+    ///
+    /// # Errors
+    ///
+    /// As [`QuotaManagerClientV1::bulk_create_quotas`], with the item errors
+    /// of [`QuotaManagerClientV1::deactivate_quota`].
+    async fn bulk_deactivate_quotas(
+        &self,
+        ctx: &SecurityContext,
+        request: BulkDeactivateQuotasRequest,
+    ) -> Result<BulkDeactivated, QuotaEnforcementError>;
 }
 
 /// Performs guarded consumption operations.

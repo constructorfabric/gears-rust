@@ -427,6 +427,17 @@ pub enum DomainError {
     /// Last-resort opaque failure. Never carries caller-facing detail.
     #[error("internal error: {0}")]
     Internal(String),
+
+    // --- bulk quota CRUD ---
+    /// One item of a bulk envelope failed; nothing of the envelope was
+    /// applied. The cause keeps its own canonical category.
+    #[error("bulk item {index}: {cause}")]
+    BulkItem {
+        /// The item's position in the request.
+        index: usize,
+        /// What failed, as the single-item operation reports it.
+        cause: Box<Self>,
+    },
 }
 
 impl DomainError {
@@ -553,6 +564,18 @@ impl From<StorageError> for DomainError {
                 "storage reported schema major {installed} (expected {expected}) after bootstrap"
             )),
             StorageError::Internal(detail) => Self::Internal(detail),
+            StorageError::BulkItem { index, cause } => Self::from(*cause).at_item(index),
+        }
+    }
+}
+
+impl DomainError {
+    /// `self` as the failure of the bulk envelope's item at `index`.
+    #[must_use]
+    pub fn at_item(self, index: usize) -> Self {
+        Self::BulkItem {
+            index,
+            cause: Box::new(self),
         }
     }
 }

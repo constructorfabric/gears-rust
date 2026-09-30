@@ -273,6 +273,11 @@ impl CatalogSection {
     }
 }
 
+/// The most items any bulk Quota envelope may carry, whatever the operator
+/// configures. Checked before any authorization call, so the PDP work one
+/// envelope can cause stays bounded.
+pub const BULK_MAX_ITEMS_CEILING: usize = crate::domain::quotas::BULK_MAX_ITEMS_CEILING;
+
 /// Bounds of the Quota lifecycle surface (`[quota-enforcement.quotas]`).
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
@@ -294,6 +299,9 @@ pub struct QuotasSection {
     pub list_max_limit: u32,
     /// Largest number of explicit ids one list request may name.
     pub list_max_ids: usize,
+    /// Most items one bulk create, update, or deactivate may carry (PRD
+    /// section 5.2, default 50). At most [`BULK_MAX_ITEMS_CEILING`].
+    pub bulk_max_items: usize,
 }
 
 impl Default for QuotasSection {
@@ -305,6 +313,7 @@ impl Default for QuotasSection {
             metric_cache_stale_grace_secs: 300,
             list_max_limit: 500,
             list_max_ids: 100,
+            bulk_max_items: 50,
         }
     }
 }
@@ -341,6 +350,11 @@ impl QuotasSection {
         if self.list_max_ids == 0 {
             anyhow::bail!("[quota-enforcement.quotas].list_max_ids must be at least 1");
         }
+        if self.bulk_max_items == 0 || self.bulk_max_items > BULK_MAX_ITEMS_CEILING {
+            anyhow::bail!(
+                "[quota-enforcement.quotas].bulk_max_items must be in 1..={BULK_MAX_ITEMS_CEILING}"
+            );
+        }
         Ok(())
     }
 
@@ -351,6 +365,7 @@ impl QuotasSection {
             metadata_max_bytes: self.metadata_max_bytes,
             list_max_limit: self.list_max_limit,
             list_max_ids: self.list_max_ids,
+            bulk_max_items: self.bulk_max_items,
         }
     }
 

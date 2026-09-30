@@ -50,7 +50,7 @@ use crate::infra::outbox::{
 const LOG_TARGET: &str = "qe.storage";
 
 /// Fallback retention when no configuration row exists: 24 hours (PRD 5.8).
-const DEFAULT_RETENTION_SECS: i64 = 86_400;
+pub(super) const DEFAULT_RETENTION_SECS: i64 = 86_400;
 
 /// How many times a transaction that lost the record's primary key is retried.
 /// Two: one to observe the winner, and the original attempt.
@@ -769,18 +769,10 @@ fn record_to_model(row: idempotency_row::Model) -> Result<IdempotencyRecord, TxE
         .clone()
         .try_into()
         .map_err(|_| bad("payload hash"))?;
-    let operation_type = [
-        OperationType::Debit,
-        OperationType::Credit,
-        OperationType::Rollback,
-        OperationType::Reserve,
-        OperationType::Commit,
-        OperationType::Release,
-        OperationType::BatchDebit,
-    ]
-    .into_iter()
-    .find(|op| op.as_str() == row.operation_type)
-    .ok_or_else(|| bad("operation type"))?;
+    let operation_type = OperationType::ALL
+        .into_iter()
+        .find(|op| op.as_str() == row.operation_type)
+        .ok_or_else(|| bad("operation type"))?;
     Ok(IdempotencyRecord {
         scope: IdempotencyScope {
             tenant_id: TenantId::new(row.tenant_id),
@@ -1217,7 +1209,7 @@ impl SqlConsumptionStore {
             Self::lock_applicable(tx, scope, &mutation.applicable, RowWait::Nowait).await?;
         // Rank 2: the scope's stripe keeps out a writer of the
         // same key over other Quotas (I8).
-        lock_scopes(tx, &[&mutation.idempotency.scope]).await?;
+        lock_scopes::<TxError>(tx, &[&mutation.idempotency.scope]).await?;
         // Sample time after locking so boundary waits charge the
         // period in which the transaction commits.
         let now = clock();
@@ -1347,7 +1339,7 @@ impl SqlConsumptionStore {
         }
         // Rank 2: the stripes of this rollback's own scope and
         // of the original's, whose record it marks (I8).
-        lock_scopes(tx, &[&idempotency.scope, &target.original]).await?;
+        lock_scopes::<TxError>(tx, &[&idempotency.scope, &target.original]).await?;
         let now = (env.clock)();
         // Check the rollback key first so replay outlives the
         // original record's retention window.
@@ -1723,7 +1715,7 @@ impl crate::domain::ports::ConsumptionStore for SqlConsumptionStore {
                                 OperationType::Credit,
                             );
                             // Rank 2: the scope's stripe (I8).
-                            lock_scopes(tx, &[&write.scope]).await?;
+                            lock_scopes::<TxError>(tx, &[&write.scope]).await?;
                             // @cpt-begin:cpt-cf-quota-enforcement-flow-credit:p1:inst-cre-idem
                             if let Replay::Stored(stored) =
                                 replay_of(tx, scope, &write, now, Some(RowWait::Nowait)).await?

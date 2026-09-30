@@ -61,6 +61,7 @@ fn unbound_service() -> Arc<Service> {
             metadata_max_bytes: 4096,
             list_max_limit: 500,
             list_max_ids: 100,
+            bulk_max_items: 50,
         },
         crate::test_support::policy_limits(),
         crate::domain::service::OperationsRuntime {

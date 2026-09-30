@@ -39,6 +39,8 @@ pub struct QuotaLimits {
     pub list_max_limit: u32,
     /// Largest number of explicit ids one list request may name.
     pub list_max_ids: usize,
+    /// Most items one bulk envelope may carry.
+    pub bulk_max_items: usize,
 }
 
 /// A create request that passed the draft validation. Everything but the

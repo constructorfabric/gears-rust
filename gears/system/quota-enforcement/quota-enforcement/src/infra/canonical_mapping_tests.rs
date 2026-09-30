@@ -408,3 +408,56 @@ fn engine_failures_map_to_their_canonical_classes_and_leak_no_engine_detail() {
             .contains("ENGINE_COST_EXCEEDED")
     );
 }
+
+#[test]
+fn a_bulk_item_error_keeps_its_category_and_names_the_item() {
+    let field = CanonicalError::from(
+        DomainError::InvalidArgument {
+            field: "cap",
+            reason: "CAP_MUST_BE_NON_NEGATIVE",
+        }
+        .at_item(3),
+    );
+    assert_eq!(field.status_code(), 400);
+    let rendered = serde_json::to_string(&Problem::from(field)).expect("json");
+    assert!(rendered.contains("items[3].cap"), "{rendered}");
+
+    let precondition = CanonicalError::from(
+        DomainError::CapBelowConsumed {
+            new_cap: 5,
+            consumed: 9,
+        }
+        .at_item(1),
+    );
+    assert_eq!(
+        precondition.status_code(),
+        status(DomainError::CapBelowConsumed {
+            new_cap: 5,
+            consumed: 9
+        })
+    );
+    let rendered = serde_json::to_string(&Problem::from(precondition)).expect("json");
+    assert!(rendered.contains("items[1].cap"), "{rendered}");
+    assert!(rendered.contains("CAP_BELOW_CONSUMED"), "{rendered}");
+
+    let missing = CanonicalError::from(
+        DomainError::NotFound {
+            kind: ResourceKind::Quota,
+            id: Uuid::nil().to_string(),
+        }
+        .at_item(0),
+    );
+    assert_eq!(missing.status_code(), 404);
+    assert!(
+        missing.detail().starts_with("items[0]: "),
+        "{}",
+        missing.detail()
+    );
+
+    let internal = CanonicalError::from(DomainError::Internal("secret".to_owned()).at_item(2));
+    assert!(
+        !internal.detail().contains("items[2]") && !internal.detail().contains("secret"),
+        "an internal error stays opaque: {}",
+        internal.detail()
+    );
+}

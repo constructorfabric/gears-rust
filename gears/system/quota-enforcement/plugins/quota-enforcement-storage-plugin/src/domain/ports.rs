@@ -5,12 +5,14 @@ use std::collections::HashSet;
 
 use async_trait::async_trait;
 use quota_enforcement_sdk::{
-    ActiveQuotaCounts, ApplicableQuotas, AppliedMutation, ConfigDefaults, DeactivateOutcome,
-    EvaluatedDebit, EvaluatedLease, EvaluatedMutation, ExpiredLease, IdempotencyRecord,
-    IdempotencyScope, IdempotencyWrite, LeaseToken, MetricId, NotificationEvent, PageRequest,
-    PageResult, PartialIdempotencyWrite, PolicyDraft, PolicyId, PolicyScope, PolicyUpdate,
-    PolicyVersion, PolicyVersionMeta, ProjectionBinding, Quota, QuotaDraft, QuotaFilter, QuotaId,
-    QuotaPatch, QuotaSnapshot, RollbackTarget, StorageError, TransitionOutcome,
+    ActiveQuotaCounts, ApplicableQuotas, AppliedMutation, BulkCreateEnvelope, BulkCreated,
+    BulkDeactivateEnvelope, BulkDeactivated, BulkUpdateEnvelope, BulkUpdated, ConfigDefaults,
+    DeactivateOutcome, EvaluatedDebit, EvaluatedLease, EvaluatedMutation, ExpiredLease,
+    IdempotencyRecord, IdempotencyScope, IdempotencyWrite, LeaseToken, MetricId, NotificationEvent,
+    PageRequest, PageResult, PartialIdempotencyWrite, PolicyDraft, PolicyId, PolicyScope,
+    PolicyUpdate, PolicyVersion, PolicyVersionMeta, ProjectionBinding, Quota, QuotaDraft,
+    QuotaFilter, QuotaId, QuotaPatch, QuotaSnapshot, RollbackTarget, StorageError,
+    TransitionOutcome,
 };
 use time::OffsetDateTime;
 use toolkit_macros::domain_model;
@@ -119,6 +121,34 @@ pub enum StoreError {
         /// What did not add up.
         detail: String,
     },
+
+    // --- bulk envelopes ---
+    /// One item of a bulk envelope failed; the envelope rolled back.
+    #[error("bulk item {index}: {cause}")]
+    BulkItem {
+        /// Position of the failing item in the request.
+        index: usize,
+        /// What failed, as the single-item operation reports it.
+        cause: Box<Self>,
+    },
+    /// The envelope key was already used for other items (I2).
+    #[error("the idempotency key was used for a different payload")]
+    IdempotencyPayloadMismatch,
+    /// A concurrent writer of the envelope's scope held its stripe past the
+    /// contention budget (I8).
+    #[error("contention on the idempotency scope outlasted the budget")]
+    ContentionTimeout,
+}
+
+impl StoreError {
+    /// `self` as the failure of the bulk envelope's item at `index`.
+    #[must_use]
+    pub fn at_item(self, index: usize) -> Self {
+        Self::BulkItem {
+            index,
+            cause: Box::new(self),
+        }
+    }
 }
 
 /// Who performed a mutation, for the operation log.
@@ -211,6 +241,28 @@ pub trait QuotaStore: Send + Sync {
 
     /// Active-Quota counts behind the lifecycle gauges.
     async fn read_active_quota_counts(&self) -> Result<ActiveQuotaCounts, StoreError>;
+
+    /// Create every draft of `envelope` in one transaction, or none, with the
+    /// envelope's record.
+    async fn bulk_create_quotas(
+        &self,
+        actor: &Actor,
+        envelope: &BulkCreateEnvelope,
+    ) -> Result<TransitionOutcome<BulkCreated>, StoreError>;
+
+    /// Apply every patch of `envelope` in one transaction, or none.
+    async fn bulk_update_quotas(
+        &self,
+        actor: &Actor,
+        envelope: &BulkUpdateEnvelope,
+    ) -> Result<TransitionOutcome<BulkUpdated>, StoreError>;
+
+    /// Deactivate every Quota of `envelope` in one transaction, or none.
+    async fn bulk_deactivate_quotas(
+        &self,
+        actor: &Actor,
+        envelope: &BulkDeactivateEnvelope,
+    ) -> Result<TransitionOutcome<BulkDeactivated>, StoreError>;
 }
 
 /// The consumption primitives: counter mutations, their replay records, and the

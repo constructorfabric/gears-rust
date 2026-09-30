@@ -28,6 +28,10 @@ use time::OffsetDateTime;
 use toolkit_security::{AccessScope, ScopeFilter, ScopeValue, SecurityContext, pep_properties};
 use uuid::Uuid;
 
+use crate::bulk::{
+    BulkCreateEnvelope, BulkCreated, BulkCreatedItem, BulkDeactivateEnvelope, BulkDeactivated,
+    BulkDeactivatedItem, BulkRecord, BulkUpdateEnvelope, BulkUpdated, BulkUpdatedItem,
+};
 use crate::engine::{
     EngineError, EvaluationBudget, EvaluationContext, EvaluationFailure, EvaluationQuota,
     QuotaScopeTier,
@@ -698,6 +702,256 @@ impl InMemoryStorage {
         let outcome = work(&mut staged)?;
         *committed = staged;
         Ok(outcome)
+    }
+
+    /// The stored outcome of a bulk envelope under `write`, or the payload
+    /// mismatch when its key carried other items.
+    fn bulk_replayed<T: serde::de::DeserializeOwned>(
+        st: &StorageState,
+        write: &IdempotencyWrite,
+    ) -> Result<Option<T>, StorageError> {
+        let Some(blob) = Self::replayed(st, write)? else {
+            return Ok(None);
+        };
+        serde_json::from_value::<BulkRecord<T>>(blob)
+            .map(|record| Some(record.outcome))
+            .map_err(|e| StorageError::Internal(e.to_string()))
+    }
+
+    /// Record a committed bulk outcome under its envelope key.
+    fn remember_bulk(
+        st: &mut StorageState,
+        write: &IdempotencyWrite,
+        outcome: &impl serde::Serialize,
+    ) -> Result<(), StorageError> {
+        let blob = Self::blob(&BulkRecord::new(outcome))?;
+        Self::remember(st, write, blob, None, None);
+        Ok(())
+    }
+
+    /// `id` names a Quota of `tenant_id`; the double keeps no scopes, so the
+    /// envelope tenant is the visibility rule.
+    fn visible(st: &StorageState, tenant_id: TenantId, id: QuotaId) -> Result<(), StorageError> {
+        if st
+            .quotas
+            .get(&id)
+            .is_none_or(|quota| quota.tenant_id != tenant_id)
+        {
+            return Err(StorageError::QuotaNotFound { id });
+        }
+        Ok(())
+    }
+
+    /// A replay answers only when every target is still visible; the first
+    /// that is not is not found, at its item's index.
+    fn replay_visible(
+        st: &StorageState,
+        tenant_id: TenantId,
+        ids: &[QuotaId],
+    ) -> Result<(), StorageError> {
+        for (index, id) in ids.iter().enumerate() {
+            Self::visible(st, tenant_id, *id).map_err(|error| error.at_item(index))?;
+        }
+        Ok(())
+    }
+
+    /// Insert a new Quota and enqueue its events, as `create_quota` does.
+    fn create_in(
+        st: &mut StorageState,
+        draft: QuotaDraft,
+        events: &[NotificationEvent],
+    ) -> QuotaId {
+        let now = OffsetDateTime::now_utc();
+        let id = QuotaId::generate();
+        st.quotas.insert(
+            id,
+            Quota {
+                id,
+                tenant_id: draft.tenant_id,
+                subject: draft.subject,
+                metric: draft.metric,
+                quota_type: draft.quota_type,
+                period: draft.period,
+                enforcement_mode: draft.enforcement_mode,
+                cap: draft.cap,
+                notification_thresholds: draft.notification_thresholds,
+                validity_window: draft.validity_window,
+                fail_open_hint: draft.fail_open_hint,
+                metadata: draft.metadata,
+                source: draft.source,
+                status: QuotaStatus::Active,
+                constraint_contract: draft.constraint_contract,
+                record_version: 1,
+                created_at: now,
+                updated_at: now,
+            },
+        );
+        let events: Vec<NotificationEvent> = events
+            .iter()
+            .cloned()
+            .map(|mut event| {
+                if event.quota_id.is_none() {
+                    event.quota_id = Some(id);
+                }
+                event
+            })
+            .collect();
+        Self::push_events(st, &events);
+        id
+    }
+
+    /// Apply a patch under the I6 and I14 guards, as `update_quota` does.
+    fn update_in(
+        st: &mut StorageState,
+        quota_id: QuotaId,
+        patch: QuotaPatch,
+        events: &[NotificationEvent],
+    ) -> Result<Quota, StorageError> {
+        Self::active_quota(st, quota_id)?;
+        let consumed = Self::counter_value(st, quota_id);
+        let quota = st
+            .quotas
+            .get_mut(&quota_id)
+            .ok_or(StorageError::QuotaNotFound { id: quota_id })?;
+        // I6 and I14 are decided on the merged row before anything changes.
+        let merged_cap = match patch.cap {
+            Some(CapPatch::Bounded(new_cap)) => Some(new_cap),
+            Some(CapPatch::Unbounded) => None,
+            None => quota.cap,
+        };
+        if let Some(new_cap) = merged_cap
+            && patch.cap.is_some()
+            && new_cap < consumed
+        {
+            return Err(StorageError::CapBelowConsumed { new_cap, consumed });
+        }
+        let merged_thresholds_present = patch
+            .notification_thresholds
+            .as_ref()
+            .map_or(!quota.notification_thresholds.is_empty(), |t| !t.is_empty());
+        if merged_cap.is_none() && merged_thresholds_present {
+            return Err(StorageError::ThresholdsRequireBoundedCap);
+        }
+        if patch.cap.is_some() {
+            quota.cap = merged_cap;
+        }
+        if let Some(thresholds) = patch.notification_thresholds {
+            quota.notification_thresholds = thresholds;
+        }
+        if let Some(window) = patch.validity_window {
+            quota.validity_window = match window {
+                ValidityWindowPatch::Clear => None,
+                ValidityWindowPatch::Set(w) => Some(w),
+            };
+        }
+        if let Some(metadata) = patch.metadata {
+            let contract = patch.constraint_contract.ok_or_else(|| {
+                StorageError::Internal(
+                    "metadata patch without the contract it was validated against".to_owned(),
+                )
+            })?;
+            quota.metadata = metadata;
+            quota.constraint_contract = contract;
+        }
+        if let Some(mode) = patch.enforcement_mode {
+            quota.enforcement_mode = mode;
+        }
+        if let Some(hint) = patch.fail_open_hint {
+            quota.fail_open_hint = hint;
+        }
+        quota.record_version += 1;
+        quota.updated_at = OffsetDateTime::now_utc();
+        let updated = quota.clone();
+        Self::push_events(st, events);
+        Ok(updated)
+    }
+
+    /// Deactivate a Quota and resolve its live leases, as `deactivate_quota`
+    /// does.
+    fn deactivate_in(
+        st: &mut StorageState,
+        quota_id: QuotaId,
+        events: &[NotificationEvent],
+    ) -> Result<DeactivateOutcome, StorageError> {
+        Self::active_quota(st, quota_id)?;
+        let now = OffsetDateTime::now_utc();
+        let quota = st
+            .quotas
+            .get_mut(&quota_id)
+            .ok_or(StorageError::QuotaNotFound { id: quota_id })?;
+        quota.status = QuotaStatus::Deactivated;
+        quota.record_version += 1;
+        quota.updated_at = now;
+        // Resolve live leases and return their held capacity; expired leases
+        // have already been released (I4) and are left to the sweeper.
+        let mut resolved = Vec::new();
+        let mut returned: Vec<(LeaseToken, TenantId, SubjectRef, LeaseHold)> = Vec::new();
+        let subject = st.quotas.get(&quota_id).map(|quota| quota.subject.clone());
+        for (token, lease) in &mut st.leases {
+            if lease.state != LeaseState::Active
+                || lease.expires_at <= now
+                || !lease.holds.iter().any(|h| h.hold.quota_id == quota_id)
+            {
+                continue;
+            }
+            lease.state = LeaseState::ResolvedByDeactivation;
+            resolved.push(*token);
+            let tenant_id = lease.tenant_id;
+            for held in &mut lease.holds {
+                if held.returned {
+                    continue;
+                }
+                held.returned = true;
+                if let Some(subject) = subject.clone() {
+                    returned.push((*token, tenant_id, subject, held.hold.clone()));
+                }
+            }
+        }
+        for (_, _, _, hold) in &returned {
+            Self::lower_counter(
+                st,
+                &AppliedEntry {
+                    quota_id: hold.quota_id,
+                    period_id: hold.period_id,
+                    amount: hold.held_amount,
+                },
+            );
+        }
+        // One event per resolved lease, built here because only the
+        // transaction knows which leases it resolved (I11).
+        let mut seen = BTreeSet::new();
+        for (token, tenant_id, subject, hold) in &returned {
+            if !seen.insert(*token) {
+                continue;
+            }
+            let held: u64 = returned
+                .iter()
+                .filter(|(other, _, _, _)| other == token)
+                .map(|(_, _, _, hold)| hold.held_amount)
+                .sum();
+            let _ = hold;
+            let event = NotificationEvent {
+                event_id: EventId::generate(),
+                kind: NotificationEventKind::LeaseResolvedByDeactivation,
+                scope: NotificationScope::Tenant {
+                    tenant_id: *tenant_id,
+                },
+                quota_id: Some(quota_id),
+                policy_id: None,
+                subject: Some(subject.clone()),
+                payload: serde_json::json!({
+                    "lease_token": token,
+                    "held_amount": held,
+                    "quota_id": quota_id,
+                }),
+                emitted_at: now,
+            };
+            st.events.push(event);
+        }
+        Self::push_events(st, events);
+        Ok(DeactivateOutcome {
+            resolved_leases: resolved,
+        })
     }
 
     /// The transaction clock: a test-set instant, or the wall clock.
@@ -1585,43 +1839,7 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
     ) -> Result<QuotaId, StorageError> {
         let mut st = self.state.lock();
         Self::check(&st)?;
-        let now = OffsetDateTime::now_utc();
-        let id = QuotaId::generate();
-        st.quotas.insert(
-            id,
-            Quota {
-                id,
-                tenant_id: draft.tenant_id,
-                subject: draft.subject,
-                metric: draft.metric,
-                quota_type: draft.quota_type,
-                period: draft.period,
-                enforcement_mode: draft.enforcement_mode,
-                cap: draft.cap,
-                notification_thresholds: draft.notification_thresholds,
-                validity_window: draft.validity_window,
-                fail_open_hint: draft.fail_open_hint,
-                metadata: draft.metadata,
-                source: draft.source,
-                status: QuotaStatus::Active,
-                constraint_contract: draft.constraint_contract,
-                record_version: 1,
-                created_at: now,
-                updated_at: now,
-            },
-        );
-        let events: Vec<NotificationEvent> = events
-            .iter()
-            .cloned()
-            .map(|mut event| {
-                if event.quota_id.is_none() {
-                    event.quota_id = Some(id);
-                }
-                event
-            })
-            .collect();
-        Self::push_events(&mut st, &events);
-        Ok(id)
+        Ok(Self::create_in(&mut st, draft, events))
     }
 
     async fn update_quota(
@@ -1634,63 +1852,7 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
     ) -> Result<Quota, StorageError> {
         let mut st = self.state.lock();
         Self::check(&st)?;
-        Self::active_quota(&st, quota_id)?;
-        let consumed = Self::counter_value(&st, quota_id);
-        let quota = st
-            .quotas
-            .get_mut(&quota_id)
-            .ok_or(StorageError::QuotaNotFound { id: quota_id })?;
-        // I6 and I14 are decided on the merged row before anything changes.
-        let merged_cap = match patch.cap {
-            Some(CapPatch::Bounded(new_cap)) => Some(new_cap),
-            Some(CapPatch::Unbounded) => None,
-            None => quota.cap,
-        };
-        if let Some(new_cap) = merged_cap
-            && patch.cap.is_some()
-            && new_cap < consumed
-        {
-            return Err(StorageError::CapBelowConsumed { new_cap, consumed });
-        }
-        let merged_thresholds_present = patch
-            .notification_thresholds
-            .as_ref()
-            .map_or(!quota.notification_thresholds.is_empty(), |t| !t.is_empty());
-        if merged_cap.is_none() && merged_thresholds_present {
-            return Err(StorageError::ThresholdsRequireBoundedCap);
-        }
-        if patch.cap.is_some() {
-            quota.cap = merged_cap;
-        }
-        if let Some(thresholds) = patch.notification_thresholds {
-            quota.notification_thresholds = thresholds;
-        }
-        if let Some(window) = patch.validity_window {
-            quota.validity_window = match window {
-                ValidityWindowPatch::Clear => None,
-                ValidityWindowPatch::Set(w) => Some(w),
-            };
-        }
-        if let Some(metadata) = patch.metadata {
-            let contract = patch.constraint_contract.ok_or_else(|| {
-                StorageError::Internal(
-                    "metadata patch without the contract it was validated against".to_owned(),
-                )
-            })?;
-            quota.metadata = metadata;
-            quota.constraint_contract = contract;
-        }
-        if let Some(mode) = patch.enforcement_mode {
-            quota.enforcement_mode = mode;
-        }
-        if let Some(hint) = patch.fail_open_hint {
-            quota.fail_open_hint = hint;
-        }
-        quota.record_version += 1;
-        quota.updated_at = OffsetDateTime::now_utc();
-        let updated = quota.clone();
-        Self::push_events(&mut st, events);
-        Ok(updated)
+        Self::update_in(&mut st, quota_id, patch, events)
     }
 
     async fn deactivate_quota(
@@ -1702,84 +1864,94 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
     ) -> Result<DeactivateOutcome, StorageError> {
         let mut st = self.state.lock();
         Self::check(&st)?;
-        Self::active_quota(&st, quota_id)?;
-        let now = OffsetDateTime::now_utc();
-        let quota = st
-            .quotas
-            .get_mut(&quota_id)
-            .ok_or(StorageError::QuotaNotFound { id: quota_id })?;
-        quota.status = QuotaStatus::Deactivated;
-        quota.record_version += 1;
-        quota.updated_at = now;
-        // Resolve live leases and return their held capacity; expired leases
-        // have already been released (I4) and are left to the sweeper.
-        let mut resolved = Vec::new();
-        let mut returned: Vec<(LeaseToken, TenantId, SubjectRef, LeaseHold)> = Vec::new();
-        let subject = st.quotas.get(&quota_id).map(|quota| quota.subject.clone());
-        for (token, lease) in &mut st.leases {
-            if lease.state != LeaseState::Active
-                || lease.expires_at <= now
-                || !lease.holds.iter().any(|h| h.hold.quota_id == quota_id)
-            {
-                continue;
+        Self::deactivate_in(&mut st, quota_id, events)
+    }
+
+    async fn bulk_create_quotas(
+        &self,
+        _ctx: &SecurityContext,
+        envelope: &BulkCreateEnvelope,
+    ) -> Result<TransitionOutcome<BulkCreated>, StorageError> {
+        self.transact(|st| {
+            if let Some(stored) = Self::bulk_replayed(st, &envelope.idempotency)? {
+                return Ok(TransitionOutcome::NoOp(stored));
             }
-            lease.state = LeaseState::ResolvedByDeactivation;
-            resolved.push(*token);
-            let tenant_id = lease.tenant_id;
-            for held in &mut lease.holds {
-                if held.returned {
-                    continue;
+            let mut items = Vec::with_capacity(envelope.items.len());
+            for (index, entry) in envelope.items.iter().enumerate() {
+                if entry.draft.tenant_id != envelope.tenant_id {
+                    return Err(StorageError::SubjectOutOfScope.at_item(index));
                 }
-                held.returned = true;
-                if let Some(subject) = subject.clone() {
-                    returned.push((*token, tenant_id, subject, held.hold.clone()));
-                }
+                let quota_id = Self::create_in(st, entry.draft.clone(), &entry.events);
+                items.push(BulkCreatedItem {
+                    index,
+                    idempotency_key: entry.idempotency_key.clone(),
+                    quota_id,
+                });
             }
-        }
-        for (_, _, _, hold) in &returned {
-            Self::lower_counter(
-                &mut st,
-                &AppliedEntry {
-                    quota_id: hold.quota_id,
-                    period_id: hold.period_id,
-                    amount: hold.held_amount,
-                },
-            );
-        }
-        // One event per resolved lease, built here because only the
-        // transaction knows which leases it resolved (I11).
-        let mut seen = BTreeSet::new();
-        for (token, tenant_id, subject, hold) in &returned {
-            if !seen.insert(*token) {
-                continue;
+            let outcome = BulkCreated { items };
+            Self::remember_bulk(st, &envelope.idempotency, &outcome)?;
+            Ok(TransitionOutcome::Applied(outcome))
+        })
+    }
+
+    async fn bulk_update_quotas(
+        &self,
+        _ctx: &SecurityContext,
+        envelope: &BulkUpdateEnvelope,
+    ) -> Result<TransitionOutcome<BulkUpdated>, StorageError> {
+        self.transact(|st| {
+            let targets: Vec<QuotaId> = envelope.items.iter().map(|item| item.quota_id).collect();
+            if let Some(stored) = Self::bulk_replayed(st, &envelope.idempotency)? {
+                Self::replay_visible(st, envelope.tenant_id, &targets)?;
+                return Ok(TransitionOutcome::NoOp(stored));
             }
-            let held: u64 = returned
-                .iter()
-                .filter(|(other, _, _, _)| other == token)
-                .map(|(_, _, _, hold)| hold.held_amount)
-                .sum();
-            let _ = hold;
-            let event = NotificationEvent {
-                event_id: EventId::generate(),
-                kind: NotificationEventKind::LeaseResolvedByDeactivation,
-                scope: NotificationScope::Tenant {
-                    tenant_id: *tenant_id,
-                },
-                quota_id: Some(quota_id),
-                policy_id: None,
-                subject: Some(subject.clone()),
-                payload: serde_json::json!({
-                    "lease_token": token,
-                    "held_amount": held,
-                    "quota_id": quota_id,
-                }),
-                emitted_at: now,
-            };
-            st.events.push(event);
-        }
-        Self::push_events(&mut st, events);
-        Ok(DeactivateOutcome {
-            resolved_leases: resolved,
+            let mut items = Vec::with_capacity(envelope.items.len());
+            for (index, entry) in envelope.items.iter().enumerate() {
+                Self::visible(st, envelope.tenant_id, entry.quota_id)
+                    .map_err(|e| e.at_item(index))?;
+                let updated =
+                    Self::update_in(st, entry.quota_id, entry.patch.clone(), &entry.events)
+                        .map_err(|e| e.at_item(index))?;
+                items.push(BulkUpdatedItem {
+                    index,
+                    idempotency_key: entry.idempotency_key.clone(),
+                    quota_id: entry.quota_id,
+                    record_version: updated.record_version,
+                });
+            }
+            let outcome = BulkUpdated { items };
+            Self::remember_bulk(st, &envelope.idempotency, &outcome)?;
+            Ok(TransitionOutcome::Applied(outcome))
+        })
+    }
+
+    async fn bulk_deactivate_quotas(
+        &self,
+        _ctx: &SecurityContext,
+        envelope: &BulkDeactivateEnvelope,
+    ) -> Result<TransitionOutcome<BulkDeactivated>, StorageError> {
+        self.transact(|st| {
+            let targets: Vec<QuotaId> = envelope.items.iter().map(|item| item.quota_id).collect();
+            if let Some(stored) = Self::bulk_replayed(st, &envelope.idempotency)? {
+                Self::replay_visible(st, envelope.tenant_id, &targets)?;
+                return Ok(TransitionOutcome::NoOp(stored));
+            }
+            let mut items = Vec::with_capacity(envelope.items.len());
+            for (index, entry) in envelope.items.iter().enumerate() {
+                Self::visible(st, envelope.tenant_id, entry.quota_id)
+                    .map_err(|e| e.at_item(index))?;
+                let deactivated = Self::deactivate_in(st, entry.quota_id, &entry.events)
+                    .map_err(|e| e.at_item(index))?;
+                items.push(BulkDeactivatedItem {
+                    index,
+                    idempotency_key: entry.idempotency_key.clone(),
+                    quota_id: entry.quota_id,
+                    resolved_leases: deactivated.resolved_leases,
+                });
+            }
+            let outcome = BulkDeactivated { items };
+            Self::remember_bulk(st, &envelope.idempotency, &outcome)?;
+            Ok(TransitionOutcome::Applied(outcome))
         })
     }
 

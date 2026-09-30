@@ -3337,3 +3337,232 @@ async fn stop_waits_for_the_delivery_in_flight() {
         "nothing started after stop"
     );
 }
+
+fn bulk_idem(op: OperationType, key: &str, payload: u8) -> IdempotencyWrite {
+    IdempotencyWrite {
+        scope: IdempotencyScope {
+            tenant_id: test_tenant(),
+            subject_key: IdempotencySubjectKey::of(&[]),
+            operation_type: op,
+            key: key.to_owned(),
+        },
+        payload_hash: PayloadHash::from_bytes([payload; 32]),
+    }
+}
+
+fn create_entry(subject: &str, cap: Option<u64>) -> crate::bulk::BulkCreateEntry {
+    crate::bulk::BulkCreateEntry {
+        idempotency_key: Some(format!("item-{subject}")),
+        scope: scope(),
+        draft: quota_draft(test_subject(subject), cap),
+        events: vec![changed()],
+    }
+}
+
+fn update_entry(quota_id: QuotaId, cap: u64) -> crate::bulk::BulkUpdateEntry {
+    crate::bulk::BulkUpdateEntry {
+        idempotency_key: None,
+        scope: scope(),
+        quota_id,
+        patch: QuotaPatch {
+            cap: Some(CapPatch::Bounded(cap)),
+            ..QuotaPatch::default()
+        },
+        events: vec![changed()],
+    }
+}
+
+fn deactivate_entry(quota_id: QuotaId) -> crate::bulk::BulkDeactivateEntry {
+    crate::bulk::BulkDeactivateEntry {
+        idempotency_key: None,
+        scope: scope(),
+        quota_id,
+        events: vec![changed()],
+    }
+}
+
+async fn created(storage: &InMemoryStorage, subject: &str, cap: Option<u64>) -> QuotaId {
+    storage
+        .create_quota(
+            &ctx(),
+            &scope(),
+            quota_draft(test_subject(subject), cap),
+            &[],
+        )
+        .await
+        .expect("create")
+}
+
+#[tokio::test]
+async fn a_bulk_create_commits_every_draft_and_its_record_or_nothing() {
+    let storage = storage_with_policy().await;
+    let envelope = crate::bulk::BulkCreateEnvelope {
+        tenant_id: test_tenant(),
+        idempotency: bulk_idem(OperationType::BulkCreateQuotas, "pack-1", 1),
+        items: vec![create_entry("u1", Some(10)), create_entry("u2", None)],
+    };
+    let outcome = storage
+        .bulk_create_quotas(&ctx(), &envelope)
+        .await
+        .expect("bulk create");
+    assert!(outcome.is_applied());
+    let created = outcome.into_inner();
+    assert_eq!(created.items.len(), 2);
+    assert_eq!(created.items[1].index, 1);
+    assert_eq!(created.items[0].idempotency_key.as_deref(), Some("item-u1"));
+    for item in &created.items {
+        assert!(storage.quota(item.quota_id).is_some());
+    }
+    let events = storage.events();
+    assert!(
+        events.iter().all(|event| event.quota_id.is_some()),
+        "every event carries its assigned id"
+    );
+
+    let replay = storage
+        .bulk_create_quotas(&ctx(), &envelope)
+        .await
+        .expect("replay");
+    assert!(!replay.is_applied(), "a replay writes nothing");
+    assert_eq!(replay.into_inner(), created);
+    assert_eq!(storage.events().len(), events.len());
+
+    let changed_items = crate::bulk::BulkCreateEnvelope {
+        idempotency: bulk_idem(OperationType::BulkCreateQuotas, "pack-1", 2),
+        ..envelope.clone()
+    };
+    assert_eq!(
+        storage.bulk_create_quotas(&ctx(), &changed_items).await,
+        Err(StorageError::IdempotencyPayloadMismatch)
+    );
+
+    let mut foreign = create_entry("u3", None);
+    foreign.draft.tenant_id = crate::models::TenantId::new(Uuid::from_u128(0xf0));
+    let failing = crate::bulk::BulkCreateEnvelope {
+        tenant_id: test_tenant(),
+        idempotency: bulk_idem(OperationType::BulkCreateQuotas, "pack-2", 1),
+        items: vec![create_entry("u4", None), foreign],
+    };
+    assert_eq!(
+        storage.bulk_create_quotas(&ctx(), &failing).await,
+        Err(StorageError::SubjectOutOfScope.at_item(1))
+    );
+    assert_eq!(
+        storage.events().len(),
+        events.len(),
+        "nothing of the failed envelope"
+    );
+    assert!(
+        storage
+            .lookup_idempotency(&failing.idempotency.scope)
+            .await
+            .expect("lookup")
+            .is_none(),
+        "a rolled-back envelope keeps no record"
+    );
+}
+
+#[tokio::test]
+async fn a_bulk_update_rolls_back_every_patch_when_one_item_fails() {
+    let storage = storage_with_policy().await;
+    let first = created(&storage, "u1", Some(10)).await;
+    let second = created(&storage, "u2", Some(10)).await;
+    let envelope = crate::bulk::BulkUpdateEnvelope {
+        tenant_id: test_tenant(),
+        idempotency: bulk_idem(OperationType::BulkUpdateQuotas, "raise", 1),
+        items: vec![
+            update_entry(first, 20),
+            update_entry(QuotaId::generate(), 20),
+        ],
+    };
+    let err = storage.bulk_update_quotas(&ctx(), &envelope).await;
+    assert!(
+        matches!(
+            &err,
+            Err(StorageError::BulkItem { index: 1, cause })
+                if matches!(**cause, StorageError::QuotaNotFound { .. })
+        ),
+        "{err:?}"
+    );
+    assert_eq!(
+        storage.quota(first).expect("first").cap,
+        Some(10),
+        "the first patch rolled back"
+    );
+
+    let good = crate::bulk::BulkUpdateEnvelope {
+        items: vec![update_entry(first, 20), update_entry(second, 30)],
+        ..envelope
+    };
+    let outcome = storage
+        .bulk_update_quotas(&ctx(), &good)
+        .await
+        .expect("bulk update")
+        .into_inner();
+    assert_eq!(
+        outcome
+            .items
+            .iter()
+            .map(|item| (item.quota_id, item.record_version))
+            .collect::<Vec<_>>(),
+        vec![(first, 2), (second, 2)]
+    );
+    assert_eq!(storage.quota(second).expect("second").cap, Some(30));
+}
+
+#[tokio::test]
+async fn a_bulk_deactivate_reports_the_first_failing_item_in_submission_order() {
+    let storage = storage_with_policy().await;
+    let active = created(&storage, "u1", Some(10)).await;
+    let gone = created(&storage, "u2", Some(10)).await;
+    storage
+        .deactivate_quota(&ctx(), &scope(), gone, &[])
+        .await
+        .expect("deactivate");
+    let envelope = crate::bulk::BulkDeactivateEnvelope {
+        tenant_id: test_tenant(),
+        idempotency: bulk_idem(OperationType::BulkDeactivateQuotas, "offboard", 1),
+        items: vec![deactivate_entry(active), deactivate_entry(gone)],
+    };
+    let err = storage.bulk_deactivate_quotas(&ctx(), &envelope).await;
+    assert!(
+        matches!(
+            &err,
+            Err(StorageError::BulkItem { index: 1, cause })
+                if matches!(**cause, StorageError::QuotaDeactivated { .. })
+        ),
+        "{err:?}"
+    );
+    assert_eq!(
+        storage.quota(active).expect("active").status,
+        QuotaStatus::Active,
+        "the first deactivation rolled back"
+    );
+}
+
+#[tokio::test]
+async fn a_one_item_replay_whose_target_is_hidden_names_item_zero() {
+    let storage = storage_with_policy().await;
+    let quota = created(&storage, "u1", Some(10)).await;
+    let envelope = crate::bulk::BulkUpdateEnvelope {
+        tenant_id: test_tenant(),
+        idempotency: bulk_idem(OperationType::BulkUpdateQuotas, "raise", 1),
+        items: vec![update_entry(quota, 20)],
+    };
+    storage
+        .bulk_update_quotas(&ctx(), &envelope)
+        .await
+        .expect("bulk update");
+
+    // The stored record answers this key and digest, but its target is one
+    // the double cannot see: the replay is refused, pointed at the item.
+    let unknown = QuotaId::generate();
+    let hidden = crate::bulk::BulkUpdateEnvelope {
+        items: vec![update_entry(unknown, 20)],
+        ..envelope
+    };
+    assert_eq!(
+        storage.bulk_update_quotas(&ctx(), &hidden).await,
+        Err(StorageError::QuotaNotFound { id: unknown }.at_item(0))
+    );
+}

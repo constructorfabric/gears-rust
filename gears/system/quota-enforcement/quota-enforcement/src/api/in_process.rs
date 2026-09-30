@@ -10,13 +10,18 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use quota_enforcement_sdk::{
-    DeactivateOutcome, PageRequest, PageResult, QuotaEnforcementError, QuotaFilter, QuotaId,
-    QuotaManagerClientV1, QuotaPatch, QuotaSpec, QuotaView,
+    BulkCreateQuotasRequest, BulkCreated, BulkDeactivateQuotasRequest, BulkDeactivated,
+    BulkUpdateQuotasRequest, BulkUpdated, DeactivateOutcome, PageRequest, PageResult,
+    QuotaEnforcementError, QuotaFilter, QuotaId, QuotaManagerClientV1, QuotaPatch, QuotaSpec,
+    QuotaView,
 };
 use toolkit_security::SecurityContext;
 
 use crate::domain::Service;
-use crate::domain::quotas::{CreateQuotaRequest, ListQuotasRequest, UpdateQuotaRequest};
+use crate::domain::quotas::{
+    BulkCreateItem, BulkCreateRequest, BulkDeactivateItem, BulkDeactivateRequest, BulkUpdateItem,
+    BulkUpdateRequest, CreateQuotaRequest, ListQuotasRequest, UpdateQuotaRequest,
+};
 
 /// The gear's own implementation of the manager client.
 pub struct InProcessQuotaManager {
@@ -84,6 +89,94 @@ impl QuotaManagerClientV1 for InProcessQuotaManager {
     ) -> Result<quota_enforcement_sdk::Decision, QuotaEnforcementError> {
         Ok(self.service.operations()?.credit(ctx, request).await?)
     }
+
+    async fn bulk_create_quotas(
+        &self,
+        ctx: &SecurityContext,
+        request: BulkCreateQuotasRequest,
+    ) -> Result<BulkCreated, QuotaEnforcementError> {
+        let quotas = self.service.quotas()?;
+        let items = create_items(request.items);
+        Ok(quotas
+            .bulk_create(
+                ctx,
+                BulkCreateRequest {
+                    tenant_id: request.tenant_id,
+                    idempotency_key: request.idempotency_key,
+                    items,
+                },
+            )
+            .await?)
+    }
+
+    async fn bulk_update_quotas(
+        &self,
+        ctx: &SecurityContext,
+        request: BulkUpdateQuotasRequest,
+    ) -> Result<BulkUpdated, QuotaEnforcementError> {
+        let quotas = self.service.quotas()?;
+        let items = update_items(request.items);
+        Ok(quotas
+            .bulk_update(
+                ctx,
+                BulkUpdateRequest {
+                    tenant_id: request.tenant_id,
+                    idempotency_key: request.idempotency_key,
+                    items,
+                },
+            )
+            .await?)
+    }
+
+    async fn bulk_deactivate_quotas(
+        &self,
+        ctx: &SecurityContext,
+        request: BulkDeactivateQuotasRequest,
+    ) -> Result<BulkDeactivated, QuotaEnforcementError> {
+        let quotas = self.service.quotas()?;
+        Ok(quotas
+            .bulk_deactivate(
+                ctx,
+                BulkDeactivateRequest {
+                    tenant_id: request.tenant_id,
+                    idempotency_key: request.idempotency_key,
+                    items: request
+                        .items
+                        .into_iter()
+                        .map(|item| BulkDeactivateItem {
+                            idempotency_key: item.idempotency_key,
+                            quota_id: item.quota_id,
+                        })
+                        .collect(),
+                },
+            )
+            .await?)
+    }
+}
+
+/// The domain items of a bulk create. A spec that does not narrow to a
+/// request carries its error to the item checks, after the envelope's own.
+fn create_items(items: Vec<quota_enforcement_sdk::BulkCreateItem>) -> Vec<BulkCreateItem> {
+    items
+        .into_iter()
+        .map(|item| BulkCreateItem {
+            idempotency_key: item.idempotency_key,
+            request: CreateQuotaRequest::try_from(item.spec),
+        })
+        .collect()
+}
+
+/// The domain items of a bulk update; a patch that does not narrow carries its
+/// error likewise.
+fn update_items(items: Vec<quota_enforcement_sdk::BulkUpdateItem>) -> Vec<BulkUpdateItem> {
+    items
+        .into_iter()
+        .map(|item| BulkUpdateItem {
+            idempotency_key: item.idempotency_key,
+            quota_id: item.quota_id,
+            request: UpdateQuotaRequest::try_from(item.patch),
+        })
+        .collect()
 }
 
 #[cfg(test)]

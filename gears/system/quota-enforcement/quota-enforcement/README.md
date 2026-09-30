@@ -46,6 +46,12 @@ gears:
       pdp_deadline_ms: 250                  # budget for one PDP evaluation; overrun is 503
       metrics:
         prefix: ""                          # empty: catalogue names verbatim
+      quotas:
+        bulk_max_items: 50                  # most items one bulk create, update, or deactivate
+                                            # may carry; 1..=500, and more than 500 is always refused
+      notifications:
+        max_attempts: 10                    # failed deliveries before an event is dead-lettered
+        sink_timeout_ms: 2000               # budget for one sink to take one event
 
   # The election backend is the operator's choice in the cluster gear's
   # profile YAML. QE code does not change with the backend.
@@ -69,11 +75,11 @@ tier, readiness gating from the SDK-submitted consumer registration.
 
 ## Runtime state of the foundation
 
-The storage plugin does not publish a `QuotaEnforcementStoragePluginV1`
-client until every primitive of the contract exists. Until then bootstrap
-fails at "storage plugin client not registered" in a live server, by design.
-The bootstrap path is exercised in tests against the SDK's complete
-in-memory storage double and a real cluster over the standalone backend.
+The SQL storage plugin publishes its `QuotaEnforcementStoragePluginV1`
+client and plugin instance at `init`, and bootstrap selects it by vendor. The
+bootstrap path is exercised in tests against the SDK's complete in-memory
+storage double, against the published SQL plugin over SQLite, and against a
+real cluster over the standalone backend.
 
 ## Design source
 

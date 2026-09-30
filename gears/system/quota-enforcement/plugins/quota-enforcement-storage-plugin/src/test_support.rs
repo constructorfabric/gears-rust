@@ -280,6 +280,61 @@ impl QuotaStore for FakeQuotaStore {
         self.check(None)?;
         Ok(ActiveQuotaCounts::default())
     }
+
+    async fn bulk_create_quotas(
+        &self,
+        actor: &Actor,
+        envelope: &quota_enforcement_sdk::BulkCreateEnvelope,
+    ) -> Result<
+        quota_enforcement_sdk::TransitionOutcome<quota_enforcement_sdk::BulkCreated>,
+        StoreError,
+    > {
+        self.check(Some(actor))?;
+        Ok(quota_enforcement_sdk::TransitionOutcome::Applied(
+            quota_enforcement_sdk::BulkCreated {
+                items: envelope
+                    .items
+                    .iter()
+                    .enumerate()
+                    .map(|(index, item)| quota_enforcement_sdk::BulkCreatedItem {
+                        index,
+                        idempotency_key: item.idempotency_key.clone(),
+                        quota_id: QuotaId::generate(),
+                    })
+                    .collect(),
+            },
+        ))
+    }
+
+    async fn bulk_update_quotas(
+        &self,
+        actor: &Actor,
+        envelope: &quota_enforcement_sdk::BulkUpdateEnvelope,
+    ) -> Result<
+        quota_enforcement_sdk::TransitionOutcome<quota_enforcement_sdk::BulkUpdated>,
+        StoreError,
+    > {
+        self.check(Some(actor))?;
+        let id = envelope
+            .items
+            .first()
+            .map_or_else(QuotaId::generate, |item| item.quota_id);
+        Err(StoreError::QuotaNotFound { id }.at_item(0))
+    }
+
+    async fn bulk_deactivate_quotas(
+        &self,
+        actor: &Actor,
+        _envelope: &quota_enforcement_sdk::BulkDeactivateEnvelope,
+    ) -> Result<
+        quota_enforcement_sdk::TransitionOutcome<quota_enforcement_sdk::BulkDeactivated>,
+        StoreError,
+    > {
+        self.check(Some(actor))?;
+        Ok(quota_enforcement_sdk::TransitionOutcome::Applied(
+            quota_enforcement_sdk::BulkDeactivated { items: Vec::new() },
+        ))
+    }
 }
 
 /// A policy store double that records seeding attempts and can pretend the

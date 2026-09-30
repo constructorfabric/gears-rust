@@ -257,7 +257,7 @@ impl SqlConsumptionStore {
         // @cpt-begin:cpt-cf-quota-enforcement-algo-batch-envelope-evaluation:p1:inst-bev-resolve
         // @cpt-begin:cpt-cf-quota-enforcement-algo-batch-envelope-evaluation:p1:inst-bev-union
         let union = lock_union(tx, batch).await?;
-        lock_scopes(tx, &[&batch.envelope.scope]).await?;
+        lock_scopes::<TxError>(tx, &[&batch.envelope.scope]).await?;
         // @cpt-end:cpt-cf-quota-enforcement-algo-batch-envelope-evaluation:p1:inst-bev-union
         // @cpt-end:cpt-cf-quota-enforcement-algo-batch-envelope-evaluation:p1:inst-bev-resolve
         let now = (env.clock)();

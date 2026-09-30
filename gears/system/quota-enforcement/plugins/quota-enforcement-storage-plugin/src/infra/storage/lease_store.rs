@@ -128,7 +128,7 @@ impl SqlConsumptionStore {
                             // whole transaction, with a fresh reading.
                             let now = clock();
                             // Rank 2: the scope's stripe (I8), then the record.
-                            lock_scopes(tx, &[&owned.idempotency.scope]).await?;
+                            lock_scopes::<TxError>(tx, &[&owned.idempotency.scope]).await?;
                             if let Replay::Stored(row) =
                                 replay_of(tx, scope, &owned.idempotency, now, Some(RowWait::Nowait))
                                     .await?
@@ -375,7 +375,7 @@ impl SqlConsumptionStore {
                         // though its lease is no longer active.
                         // @cpt-begin:cpt-cf-quota-enforcement-flow-lease-commit:p1:inst-lcm-idem
                         // @cpt-begin:cpt-cf-quota-enforcement-flow-lease-release:p1:inst-lrl-idem
-                        lock_scopes(tx, &[&write_owned.scope]).await?;
+                        lock_scopes::<TxError>(tx, &[&write_owned.scope]).await?;
                         if let Replay::Stored(row) =
                             replay_of(tx, scope, &write_owned, now, Some(RowWait::Nowait)).await?
                         {

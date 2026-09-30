@@ -34,6 +34,7 @@ pub fn register_routes(
     let router = super::policies::register(router, openapi);
     let router = super::operations::register(router, openapi);
     let router = super::batch::register(router, openapi);
+    let router = super::bulk::register(router, openapi);
     let router = super::snapshot::register(router, openapi);
     super::leases::register(router, openapi).layer(Extension(service))
 }
