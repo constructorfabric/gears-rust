@@ -1,8 +1,8 @@
-Updated:  2026-09-29 by Virtuozzo International GmbH
+Updated:  2026-09-30 by Virtuozzo International GmbH
 
 # PRD — CredStore
 
-> **Status: target contract, not implemented.** This PRD specifies the Vault-backed CredStore. The gear shipped on main still follows the design of ADR-0001..0003 until the cutover (§14). Priority `p1` is the first delivery (P0 scope); `p2` follows later.
+> **Status: target contract, not implemented.** This PRD specifies CredStore with the secret store as the system of record, reached through a public backend SPI (Vault/OpenBao KV v2 as the reference backend). The gear shipped on main still follows the design of ADR-0001..0003 until the cutover (§14). Priority `p1` is the first delivery (P0 scope); `p2` follows later.
 
 
 <!-- toc -->
@@ -84,7 +84,7 @@ REQUIREMENT LANGUAGE:
 
 CredStore is the platform's hierarchical, tenant-scoped credential store. Platform gears and tenant administrators use it to keep API keys, tokens, passwords and certificates, to share them down the tenant hierarchy, and to read them back under the platform's authorization model.
 
-CredStore is a thin policy layer in front of a Vault-compatible secret store (HashiCorp Vault or OpenBao, KV version 2). The secret store is the only system of record: it holds every credential — its secret together with every field that decides who can see it — and it provides durability, versioning, atomic conditional writes and encryption at rest. CredStore adds only what the secret store does not have: tenant hierarchy semantics (inheritance, override, suppression, descendant blocking), per-type authorization through the platform PDP, credential-type traits, anti-enumeration, a paginated catalogue of what a tenant can see, and fail-closed audit of every secret read and change through the platform event broker. The gear reaches the secret store through a narrow internal adapter that a pluggable backend can replace later without changing consumers.
+CredStore is a thin policy layer in front of a secret store reached through a public backend SPI. Vault or OpenBao with a KV version 2 mount is the reference backend, and any backend that meets the SPI contract (`cpt-cf-credstore-fr-store-portability`) can be the system of record. The secret store is the only system of record: it holds every credential — its secret together with every field that decides who can see it — and it provides durability, versioning, atomic conditional writes and encryption at rest. CredStore adds only what the secret store does not have: tenant hierarchy semantics (inheritance, override, suppression, descendant blocking), per-type authorization through the platform PDP, credential-type traits, anti-enumeration, a paginated catalogue of what a tenant can see, and fail-closed audit of every secret read and change through the platform event broker. The gear reaches the secret store only through the public store adapter SPI `CredStorePluginClientV2`, implemented by backend plugins.
 
 CredStore also keeps a small database, used only as a derived index that makes listing and hierarchical resolution cheap. The index holds no secret, never decides on its own what is served, and can be dropped and rebuilt from the secret store without losing any credential.
 
@@ -96,9 +96,9 @@ The shipped CredStore stores all credential metadata in its own database and tre
 
 PRs #4737 (documentation) and #4741 (implementation) reshaped the consumer surface — a credential record with a selectable secret, a catalogue listing, six authorization actions, suppression and an explicit inheritance status — but kept the split storage. This PRD keeps that consumer surface and delegates storage, versioning and transactionality to the secret store, reducing the gear to authorization, hierarchy and translation.
 
-**Why one store family.** Every production deployment of the platform runs a Vault-compatible store, and HashiCorp Vault and OpenBao share one API, so supporting that family costs one adapter. A provider-neutral abstraction over cloud secret managers would force the gear to reimplement versioning and conditional writes for stores that lack them — the very machinery this PRD removes. The adapter boundary keeps a later pluggable backend possible.
+**Why a narrow backend SPI.** The gear needs from a backend only an atomic conditional write to one key with never-repeating versions, a durable read and a key listing. Vault and OpenBao provide this natively and share one API; a relational database provides it with a version column. A provider-neutral abstraction over cloud secret managers without conditional writes is still not a goal, because it would force the gear to rebuild versioning and conditional writes itself — the very machinery this PRD removes.
 
-**Why one store identity.** The gear must read any tenant's credentials to resolve inheritance, so per-tenant store policies would all be held by the same process and would not contain a compromise of the gear. They would only guard against a malformed key path, which reference validation already excludes, at the cost of a store role per tenant. Tenant isolation therefore lives in the gear, and the store identity is scoped to the installation prefix.
+**Why one store identity.** With a Vault-compatible backend, the gear must read any tenant's credentials to resolve inheritance, so per-tenant store policies would all be held by the same process and would not contain a compromise of the gear. They would only guard against a malformed key path, which reference validation already excludes, at the cost of a store role per tenant. Tenant isolation therefore lives in the gear, and the store identity is scoped to the installation prefix.
 
 ### 1.3 Goals (Business Outcomes)
 
@@ -134,8 +134,10 @@ PRs #4737 (documentation) and #4741 (implementation) reshaped the consumer surfa
 | Credential type | A GTS type derived from `gts.cf.core.credstore.credential.v1~` that classifies a credential and carries enforceable traits; `generic` by default; immutable per credential |
 | Version | The store-assigned, monotonic revision number of an own record; never reused for a reference, including after delete and re-create |
 | Validator | The opaque value a caller echoes in a write precondition; for an inherited result it is opaque and not usable as a precondition |
-| Secret store | The Vault-compatible KV version 2 service that is the system of record for credentials |
-| Store adapter | The gear's narrow internal boundary to the secret store; replaceable by a pluggable backend later |
+| Secret store | The backend that is the system of record for credentials: a Vault-compatible KV version 2 store (the reference backend) or another backend implementing the store adapter SPI |
+| Store adapter | The public backend SPI (`CredStorePluginClientV2`) through which the gear reaches the secret store; implemented by backend plugins; carries opaque records and no policy |
+| Shipped storage | The storage of the shipped gear: metadata in the gear's database and values in a `CredStorePluginClientV1` value-store backend; the source of the one-off migration |
+| Owner offboarding | Removal of all private records of one owner in one tenant |
 | Credential index | The gear's derived, rebuildable database of record fields used for listing and resolution; holds no secret |
 | Installation prefix | The part of the secret store's key space reserved for one CredStore installation |
 | PDP | The platform policy decision point, `authz-resolver` |
@@ -205,11 +207,11 @@ PRs #4737 (documentation) and #4741 (implementation) reshaped the consumer surfa
 
 - **Role**: Any internal gear using the in-process client — today OAGW, settings-service and the Keycloak IdP plugin of account-management. Acts under the calling tenant's SecurityContext or under a system SecurityContext it constructs.
 
-#### Vault-Compatible Secret Store
+#### Secret Store Backend
 
 **ID**: `cpt-cf-credstore-actor-backend`
 
-- **Role**: HashiCorp Vault or OpenBao with a KV version 2 mount, operated by the platform. System of record for every credential. Authorizes only the gear's own identity, never tenants or end users, and holds no platform policy. Reached exclusively through the gear.
+- **Role**: A backend implementing the store adapter SPI — HashiCorp Vault or OpenBao with a KV version 2 mount (the reference backend), or another backend plugin such as a relational database. System of record for every credential. Authorizes only the gear, never tenants or end users, and holds no platform policy. Reached exclusively through the gear.
 
 #### Platform Policy & Directory Services
 
@@ -223,13 +225,13 @@ PRs #4737 (documentation) and #4741 (implementation) reshaped the consumer surfa
 
 ### 3.1 Gear-Specific Environment Constraints
 
-- Every deployment that stores real credentials **MUST** provide a Vault-compatible secret store with a KV version 2 mount usable by the gear; there is no other production backend in this PRD.
-- The gear authenticates to the secret store as **one platform identity** for the whole installation, obtained from the runtime (a Kubernetes service-account role or an AppRole). Tenants and end users never hold store credentials, and the store holds no per-tenant policy.
+- Every deployment that stores real credentials **MUST** provide a durable secret store backend implementing the store adapter SPI; a Vault-compatible KV version 2 store is the reference backend.
+- With a Vault-compatible backend, the gear authenticates to the secret store as **one platform identity** for the whole installation, obtained from the runtime (a Kubernetes service-account role or an AppRole). Tenants and end users never hold store credentials, and the store holds no per-tenant policy. Other backends keep their own access credentials inside the plugin.
 - Several installations **MUST** be able to share one secret store, each confined to its own installation prefix.
 - The gear requires a database (PostgreSQL or SQLite) for the credential index only.
 - The gear depends on `authz-resolver`, `tenant-resolver` and `types-registry` and initializes at system priority; its consumers resolve the client during their own initialization.
 - No resident background task and no scheduled job is required for correctness; the only background work is index repair and the operator-triggered index rebuild.
-- Development and automated tests run against an OpenBao instance or an in-process store adapter with the same observable behaviour; preventing the in-process adapter from being selected in production is `cpt-cf-credstore-fr-store-config-check` (p2).
+- Development and automated tests run against an OpenBao instance or the in-process test backend, an in-process store adapter with the same observable behaviour; preventing the in-process adapter from being selected in production is `cpt-cf-credstore-fr-store-config-check` (p2).
 
 ## 4. Scope
 
@@ -242,11 +244,12 @@ PRs #4737 (documentation) and #4741 (implementation) reshaped the consumer surfa
 - Credential types with enforceable traits (allowed sharing modes, secret schema, size and encoding bounds, expiry), including binary secrets through the in-process client
 - Expired records filtered on every read and healed by the next write or delete
 - Optimistic concurrency with mandatory preconditions on every write and delete, and versions that never repeat
-- A Vault-compatible KV version 2 secret store as the only system of record, behind a narrow internal store adapter; the database as a derived, rebuildable index
+- A secret store as the only system of record, reached through the public store adapter SPI (`CredStorePluginClientV2`) with Vault/OpenBao KV version 2 as the reference backend; the database as a derived, rebuildable index
+- One-off migration of the shipped storage into the new backend, with a single-deployment cutover per installation
 - Service-to-service retrieval on behalf of arbitrary tenants (OAGW pattern)
 - Fail-closed audit of every secret read and secret change, published to the platform event broker
 - Operational metrics; secret confidentiality
-- Later (p2): correlation of audit events with the store's audit log, startup check of the store configuration, no retention of previous secret versions in the store, tenant offboarding
+- Later (p2): correlation of audit events with the store's audit log, startup check of the store configuration, no retention of previous secret versions in the store, tenant offboarding, owner offboarding
 
 ### 4.2 Out of Scope
 
@@ -260,11 +263,12 @@ PRs #4737 (documentation) and #4741 (implementation) reshaped the consumer surfa
 - Storing, retaining or querying audit events; that is the event broker's topic retention and a downstream audit pipeline
 - Downward listing: a parent reads a descendant's catalogue only by acting in the descendant's context
 - Vault namespaces, per-tenant store policies or per-tenant store identities
-- Pluggable backends, backend selection by vendor, and a public backend SPI (the store adapter keeps this possible later)
 - Any maintenance job or host-invoked maintenance operation
 - A separate create-only address on the collection; creation is a guarded full replace
 - Direct use of the secret store by any component other than this gear; edits made directly in the store are unsupported
-- Migration of values stored by the shipped in-memory backend (it keeps nothing across restarts)
+- Caching of secrets in the gear; caching is the backend's concern (`cpt-cf-credstore-fr-store-portability`)
+- Reading a private credential on its owner's behalf by another subject; pending an ADR (§13)
+- Running the shipped storage and the new backend side by side within one installation
 - MySQL as the index database
 
 ## 5. Functional Requirements
@@ -544,7 +548,7 @@ Authorization, sharing, hierarchy and type-trait enforcement **MUST** live exclu
 
 ### 5.4 P1 — Storage, Consistency and Concurrency
 
-#### Vault-Compatible Secret Store as the System of Record
+#### Secret Store as the System of Record
 
 - [ ] `p1` - **ID**: `cpt-cf-credstore-fr-production-backend`
 
@@ -606,19 +610,41 @@ Expiry **MUST** be handled without any background job:
 - **Rationale**: Expiry needs no resident reaper or scheduled job when every read ignores expired records and every write reclaims them.
 - **Actors**: `cpt-cf-credstore-actor-tenant-admin`, `cpt-cf-credstore-actor-integrations-admin`
 
-#### Store Adapter Portability
+#### Store Adapter Contract
 
 - [ ] `p1` - **ID**: `cpt-cf-credstore-fr-store-portability`
 
-The store adapter (`cpt-cf-credstore-interface-plugin-client`) **MUST** stay replaceable by another backend — a relational database, an embedded database, or an in-process store for tests — without changing the gear's behaviour or its consumers:
+The store adapter (`cpt-cf-credstore-interface-plugin-client`) is the public SPI `CredStorePluginClientV2`, the successor of the shipped value-only `CredStorePluginClientV1`. Backend plugins implement it and are discovered through the platform's GTS plugin mechanism with vendor selection. Any durable backend that meets this contract — a Vault-compatible store, a relational database such as PostgreSQL, or an in-process store for tests — **MUST** be usable as the system of record without changing the gear's behaviour or its consumers.
 
-- its operations **MUST NOT** expose store-specific types: the version is an opaque monotonic number, and failures map to not-found, conflict, unavailable (with a retry hint when known) or other; authentication, token renewal, TLS and the installation prefix **MUST** stay inside each implementation;
-- no `p1` guarantee **MUST** depend on the store's own configuration: the only property required of a backend is an atomic conditional write to a single key, the gear **MUST** state the expected version on every write itself, and a tombstone **MUST** be an ordinary conditional write. Store configuration is relied on only by `p2` requirements (`cpt-cf-credstore-fr-store-config-check`, `cpt-cf-credstore-fr-no-secret-history`);
+Addressing and operations:
+
+- every key is addressed as the SPI shipped today addresses it: a tenant, a reference and an optional owner; an owner present means the private class;
+- the SPI **MUST** provide: reading a record with its backend-assigned version; a conditional write of a record, either only if the key is absent or only if the stated version is current, returning the new version; a cursor-paginated listing of keys with their versions — for the whole installation, for one tenant, or for one owner in a tenant — without a total count; and, for `p2` offboarding only, removing a key together with its whole history;
+- the record is opaque to the backend: the gear **MUST** serialize the secret together with all its visibility fields, and **MUST** write a delete as a secret-less tombstone through the same conditional write, so no separate delete operation exists in `p1`.
+
+Required guarantees. Every backend **MUST** provide:
+
+- an atomic conditional write to a single key: of two writes under the same version exactly one succeeds;
+- versions that are monotonic per key and never repeated until the key is removed with its history;
+- per-key linearizability: an acknowledged write is visible to the next read on every replica of the gear;
+- success reported only after a durable write;
+- a listing that includes every key whose write was acknowledged before the listing started;
+- encryption of stored records at rest: Vault-compatible stores provide it, and for any other backend the plugin or the platform **MUST** provide it;
+- no secret in any log or error;
+- no policy decision: the backend **MUST NOT** decide visibility, and the security context **MUST** be passed to it only for request correlation.
+
+Not required of a backend: multi-key transactions, server-side logic, expiry in the store, secondary indexes, reading history, namespaces, or any Vault-specific capability.
+
+Further rules:
+
+- the gear **MUST NOT** cache secrets; a backend is permitted to cache only while preserving per-key linearizability, and a per-replica cache in an in-process plugin violates the contract;
+- the operations **MUST NOT** expose store-specific types: the version is an opaque monotonic number, and failures map to not-found, conflict, unavailable (with a retry hint when known) or other; authentication, token renewal, TLS and the installation prefix **MUST** stay inside each implementation;
+- no `p1` guarantee **MUST** depend on the store's own configuration beyond the guarantees listed above: the gear **MUST** state the expected version on every write itself, and a tombstone **MUST** be an ordinary conditional write. Store configuration is relied on only by `p2` requirements (`cpt-cf-credstore-fr-store-config-check`, `cpt-cf-credstore-fr-no-secret-history`);
 - `p1` **MUST NOT** use capabilities specific to Vault-compatible stores, such as namespaces, custom metadata or soft delete.
 
-- **Rationale**: Keeping the adapter narrow and store-neutral lets tests and development run on an in-process or embedded backend, and leaves a pluggable production backend possible later; a backend other than a Vault-compatible store would additionally need its own encryption of secrets at rest, which this PRD does not specify.
+- **Rationale**: A narrow contract lets any durable backend be the system of record without changing the gear or its consumers.
 - **Actors**: `cpt-cf-credstore-actor-backend`, `cpt-cf-credstore-actor-platform-gear`
-- **Verification Method**: the in-process adapter and the Vault-compatible adapter pass the same adapter test suite.
+- **Verification Method**: every backend — the in-process test backend, the Vault-compatible backend and any other — passes the same store adapter conformance suite, including concurrent conditional writes and linearizable reads across two gear replicas.
 
 #### Derived Credential Index
 
@@ -635,6 +661,23 @@ Loss of the database **MUST NOT** lose any credential.
 
 - **Rationale**: The index exists only to make listing and hierarchical resolution cheap; making it disposable removes backup coupling between two stores and the class of bugs where the two disagree about what may be served.
 - **Actors**: `cpt-cf-credstore-actor-platform-gear`, `cpt-cf-credstore-actor-platform-operator`
+
+#### Migration from the Shipped Storage
+
+- [ ] `p1` - **ID**: `cpt-cf-credstore-fr-migration`
+
+Installations that hold credentials in the shipped storage (metadata in the gear's database, values in a persistent `CredStorePluginClientV1` backend) **MUST** be migrated by a one-off converter. The converter **MUST** read the shipped gear's metadata together with the values from the existing `CredStorePluginClientV1` backend and write full records into the `CredStorePluginClientV2` backend with create-only writes. It:
+
+- **MUST** be idempotent: a re-run after an interruption or completion skips what is already present;
+- **MUST** report, and **MUST NOT** overwrite, a reference that already exists in the new backend with different content;
+- **MUST NOT** convert expired records, records left mid-write by the shipped saga, records whose value fails the shipped value-fingerprint check, or the shipped gear's internal fence key, and **MUST** report the records that could not be read;
+- **MUST NOT** modify the source in any way.
+
+During the transition the gear **MUST** run in exactly one mode per installation — the whole installation on the shipped storage or the whole installation on the new backend, never mixed per tenant. Cutover **MUST** be one deployment per installation, made when that installation is ready, in this order: freeze writes, run the converter, switch the gear's backend selection to the `CredStorePluginClientV2` plugin, rebuild the index, unfreeze. Rollback **MUST** be possible by switching the configuration back; writes accepted on the new backend after cutover are then lost, so the rollback window is bounded. Validators issued before cutover **MUST** stop matching, and their holders receive a conflict and re-read. An installation that uses only the in-memory backend has nothing to convert and **MUST** only switch its configuration.
+
+- **Rationale**: Installations already hold real credentials in a persistent V1 backend; a single-deployment cutover with an untouched source keeps the change reversible.
+- **Actors**: `cpt-cf-credstore-actor-platform-operator`, `cpt-cf-credstore-actor-backend`
+- **Verification Method**: converting a populated shipped installation twice yields the same content in the new backend; every reference resolves for every subject exactly as before cutover; the source is byte-identical after conversion.
 
 ### 5.5 P1 — Credential Types
 
@@ -691,7 +734,7 @@ After a secret is rotated, removed or deleted, the secret store **MUST NOT** kee
 
 - [ ] `p2` - **ID**: `cpt-cf-credstore-fr-store-config-check`
 
-At startup the gear **MUST** verify that the secret store mount is KV version 2, requires conditional writes, and retains no older versions, that the gear's identity can reach its installation prefix, and that the in-process store adapter is not selected outside an explicitly declared test configuration. On any failed check the gear **MUST** refuse to become ready and name the failed check.
+At startup the gear **MUST** verify, for a Vault-compatible backend, that the secret store mount is KV version 2, requires conditional writes, and retains no older versions, and that the gear's identity can reach its installation prefix. For any backend the gear **MUST** verify that the selected plugin implements `CredStorePluginClientV2` (a `CredStorePluginClientV1` value-store backend is accepted only as the migration source), and that the in-process store adapter is not selected outside an explicitly declared test configuration. On any failed check the gear **MUST** refuse to become ready and name the failed check.
 
 - **Rationale**: A mis-configured mount silently weakens concurrency control or retains rotated secrets, and a test adapter in production loses every credential on restart; failing at boot is the safe outcome.
 - **Actors**: `cpt-cf-credstore-actor-platform-operator`, `cpt-cf-credstore-actor-backend`
@@ -700,10 +743,24 @@ At startup the gear **MUST** verify that the secret store mount is KV version 2,
 
 - [ ] `p2` - **ID**: `cpt-cf-credstore-fr-tenant-offboarding`
 
-When account-management hard-deletes a tenant — after its retention period, not at soft deletion, so that a tenant restored within the retention window keeps its credentials — the system **MUST** remove every record of that tenant — including the private records of all its owners and the records kept for deleted references — from the secret store and the index, **MUST** be idempotent under retry, and **MUST** report completion to account-management. Writes for a tenant in `deleted` status **MUST** be rejected from soft deletion on. Account-management deletes only tenants without non-deleted children, so offboarding never affects a live descendant.
+When account-management hard-deletes a tenant — after its retention period, not at soft deletion, so that a tenant restored within the retention window keeps its credentials — and invokes the tenant hard-delete cascade hook that CredStore registers with it, the system **MUST** remove every record of that tenant — including the private records of all its owners and the records kept for deleted references — from the secret store and the index, **MUST** be idempotent under retry, and **MUST** report completion to account-management. Writes for a tenant in `deleted` status **MUST** be rejected from soft deletion on. Account-management deletes only tenants without non-deleted children, so offboarding never affects a live descendant.
 
 - **Rationale**: Credentials of a removed tenant are a liability, and they are the only data the gear keeps in the secret store indefinitely.
 - **Actors**: `cpt-cf-credstore-actor-platform-services`, `cpt-cf-credstore-actor-backend`
+
+#### Owner Offboarding
+
+- [ ] `p2` - **ID**: `cpt-cf-credstore-fr-owner-offboarding`
+
+The system **MUST** remove every private record of one owner in one tenant — including the records kept for deleted references — from the secret store and the index, and **MUST** be idempotent under retry. It is triggered in two ways:
+
+- by a user-deletion hook of account-management, which does not exist yet and has to be agreed with account-management (account-management today has such a cascade hook only for tenant hard deletion);
+- by a manual administrative operation with the same effect, authorized by its own dedicated PDP action, for users who already left.
+
+`tenant` and `shared` records created by the departed user **MUST NOT** be affected: they belong to the tenant.
+
+- **Rationale**: Personal tokens of a departed user are a liability and their owner is no longer there to delete them.
+- **Actors**: `cpt-cf-credstore-actor-platform-services`, `cpt-cf-credstore-actor-tenant-admin`, `cpt-cf-credstore-actor-backend`
 
 ## 6. Non-Functional Requirements
 
@@ -742,7 +799,7 @@ Every read and every change of a secret **MUST** be audited by publishing an eve
 
 Each event **MUST** name the subject, the tenant acted in, the reference, the credential type, the operation, its outcome and the platform request identifier. It **MUST NOT** contain the secret, and **MUST NOT** identify an ancestor tenant beyond the inheritance status, because it is published in the tenant acted in (`cpt-cf-credstore-fr-no-ancestor-disclosure`).
 
-Auditing **MUST** be fail-closed: a secret **MUST NOT** be returned until the event broker has accepted its disclosure event, and a secret change **MUST NOT** reach the secret store until the event broker has accepted its change event; when the event broker is unavailable or rejects the event, the operation **MUST** fail fast as unavailable. The outcome of a change **MUST** also be published after the write; an outcome that could not be published **MUST** be counted by a metric and never reverses the change. Operations that neither return nor change a secret — metadata reads, listings without secrets, and writes that change no secret, such as editing metadata, creating a declared record or suppressing without an own secret — **MUST NOT** depend on the event broker.
+Auditing **MUST** be fail-closed: a secret **MUST NOT** be returned until the event broker has accepted its disclosure event, and a secret change **MUST NOT** reach the secret store until the event broker has accepted its change event; when the event broker is unavailable or rejects the event, the operation **MUST** fail fast as unavailable. The outcome of a change **MUST** also be published after the write; an outcome that could not be published **MUST** be counted by a metric and never reverses the change. Operations that neither return nor change a secret — metadata reads, listings without secrets, and writes that change no secret, such as editing metadata, creating a declared record or suppressing without an own secret — **MUST NOT** depend on the event broker. This failure mode is the default pending an ADR that decides whether an installation may instead record the event and continue, counted by a metric, when the event broker is unavailable (§13).
 
 - **Threshold**: one accepted event per secret returned and per secret change, 100% coverage in tests; with the event broker unavailable, zero secrets returned and zero secret changes applied, while metadata operations keep working, in fault-injection tests.
 - **Rationale**: The secret store sees only the gear's identity, so attribution to a platform subject exists only in the gear; the event broker is the platform's path to an audit pipeline (`cpt-cf-evbk-usecase-audit-pipeline`), so the gear publishes events and neither stores nor queries them.
@@ -762,9 +819,9 @@ Every secret-store request **MUST** carry the platform request identifier so tha
 
 - [ ] `p1` - **ID**: `cpt-cf-credstore-nfr-store-access`
 
-In production the gear **MUST** authenticate to the secret store with a short-lived, renewable identity obtained from the runtime — never a long-lived static token — renew it before expiry, and re-authenticate after a failed renewal without operator action. The identity's store permissions **MUST** be limited to the operations the gear uses, within its installation prefix.
+In production, for a backend that authenticates the gear with a token (a Vault-compatible backend), the gear **MUST** authenticate to the secret store with a short-lived, renewable identity obtained from the runtime — never a long-lived static token — renew it before expiry, and re-authenticate after a failed renewal without operator action. The identity's store permissions **MUST** be limited to the operations the gear uses, within its installation prefix. Every other backend **MUST** keep its access credentials inside the plugin, never in logs or errors, limited to what the gear uses.
 
-- **Threshold**: zero requests failing solely because the gear's store token expired, over a soak test spanning at least three token lifetimes.
+- **Threshold**: for the Vault-compatible backend, zero requests failing solely because the gear's store token expired, over a soak test spanning at least three token lifetimes.
 - **Rationale**: One identity serves the whole installation, so its lifetime and scope bound the blast radius of a compromise.
 - **Architecture Allocation**: see DESIGN.md security section.
 
@@ -782,7 +839,7 @@ In the steady state a single-credential read **MUST** cost at most one index que
 
 - [ ] `p1` - **ID**: `cpt-cf-credstore-nfr-availability`
 
-Every call to a dependency — secret store, index database, PDP, `tenant-resolver`, `types-registry`, `event-broker` — **MUST** be bounded by a timeout. When the event broker is unavailable, only operations that return or change a secret fail (`cpt-cf-credstore-nfr-audit`). When the secret store is unreachable, sealed or throttling, or when any other dependency fails or times out, every affected operation **MUST** fail as unavailable, with a retry hint when one is known. The gear **MUST NOT** serve a secret whose record it has not read from the secret store for that request, and **MUST NOT** return a result decided by index data it could not confirm against the secret store. The gear **MUST NOT** add any availability dependency beyond those listed.
+Every call to a dependency — secret store, index database, PDP, `tenant-resolver`, `types-registry`, `event-broker` — **MUST** be bounded by a timeout. When the event broker is unavailable, only operations that return or change a secret fail (`cpt-cf-credstore-nfr-audit`). When the secret store is unreachable, sealed or throttling, or when any other dependency fails or times out, every affected operation **MUST** fail as unavailable, with a retry hint when one is known. The gear **MUST NOT** serve a secret whose record it has not read from the secret store for that request, and **MUST NOT** return a result decided by index data it could not confirm against the secret store. The gear **MUST NOT** add any availability dependency beyond those listed. The gear **MUST NOT** cache secrets across requests; caching is permitted only inside the backend under `cpt-cf-credstore-fr-store-portability`.
 
 - **Threshold**: zero secrets served under an unconfirmed visibility decision, and no request exceeding the sum of its dependency timeouts, in fault-injection tests.
 - **Rationale**: Credential access favours correctness over availability.
@@ -810,7 +867,7 @@ The gear **MUST** emit metrics sufficient to detect resolution anomalies and sto
 
 ### 6.2 NFR Exclusions
 
-- **Encryption at rest**: provided by the secret store's barrier encryption and seal; the gear adds no encryption layer of its own.
+- **Encryption at rest**: provided by the backend — the secret store's barrier encryption and seal for Vault-compatible stores, or the backend plugin or the platform for other backends (`cpt-cf-credstore-fr-store-portability`); the gear adds no encryption layer of its own.
 - **Backup of the index**: not required; the index is rebuilt from the secret store (`cpt-cf-credstore-nfr-recovery`).
 - **Absolute latency SLO**: not stated; end-to-end latency is dominated by the secret store and depends on its deployment. `cpt-cf-credstore-nfr-resolution-cost` bounds the gear's own contribution.
 - **Index-rebuild duration**: no time bound is set; reads stay correct or unavailable while a rebuild runs (`cpt-cf-credstore-fr-derived-index`), and the duration depends on the secret store's listing throughput, which DESIGN measures before setting an operational target.
@@ -835,9 +892,9 @@ The gear **MUST** emit metrics sufficient to detect resolution anomalies and sto
 
 - [ ] `p1` - **ID**: `cpt-cf-credstore-interface-plugin-client`
 
-- **Type**: Rust trait (async), internal to the gear.
+- **Type**: Rust trait (async) `CredStorePluginClientV2`, public; backend plugins are discovered through the platform's GTS plugin mechanism with vendor selection.
 - **Stability**: unstable
-- **Description**: The gear's only path to the secret store, with no store-specific types in its operations: read a record with its version, conditionally write a record (only if absent, or only if the stated version is current), delete a record while keeping its version history, remove a key entirely (p2 offboarding only), and list keys under a prefix. Keys are opaque to it; failures map to not-found, conflict, unavailable (with a retry hint when known) or other. It carries no policy and makes no visibility decision; authentication, token renewal, TLS and the installation prefix are internal to each implementation. Implemented for Vault-compatible KV version 2 and, for tests, in process. Shaped so that it can later become a pluggable backend SPI without changing consumers (`cpt-cf-credstore-fr-store-portability`). Replaces the shipped value-store plugin SPI.
+- **Description**: The gear's only path to the secret store, with no store-specific types in its operations: read a record with its version; conditionally write an opaque record (only if absent, or only if the stated version is current), returning the new version; list keys with their versions under a scope (installation, tenant, or owner in a tenant) with a cursor and no total count; and remove a key with its whole history (p2 offboarding only). Addressing is tenant, reference and optional owner. Failures map to not-found, conflict, unavailable (with a retry hint when known) or other. It carries no policy and makes no visibility decision; authentication, token renewal, TLS and the installation prefix are internal to each implementation. Implemented for Vault-compatible KV version 2 and, for tests, in process; other backends (for example PostgreSQL) are external plugins. Replaces `CredStorePluginClientV1` (value-only); V1 backends remain readable only as the migration source (`cpt-cf-credstore-fr-migration`). The contract is `cpt-cf-credstore-fr-store-portability`.
 - **Breaking Change Policy**: minor version bump (unstable API).
 
 ### 7.2 External Integration Contracts
@@ -866,12 +923,12 @@ The gear **MUST** emit metrics sufficient to detect resolution anomalies and sto
 - **Protocol/Format**: GTS-typed events published through the event-broker SDK to the credstore audit topic, partitioned by the tenant acted in: a disclosure event per secret returned and a change event per secret change plus its outcome, with the fields of `cpt-cf-credstore-nfr-audit` and never a secret. Concrete type ids and payload schemas are in DESIGN.md.
 - **Compatibility**: event types are versioned GTS types; a new payload shape is a new type version.
 
-#### Secret Store
+#### Vault-Compatible Secret Store (Reference Backend)
 
 - [ ] `p1` - **ID**: `cpt-cf-credstore-contract-secret-store`
 
 - **Direction**: required from the platform
-- **Protocol/Format**: Vault HTTP API, KV version 2 secrets engine, over TLS. Required capabilities: versioned JSON records, conditional writes on version, metadata reads, key listing, and a machine-identity auth method (Kubernetes or AppRole) with renewable tokens. A delete in `p1` keeps a secret-less marker under the key so its version keeps counting; removing a key with all its versions is needed only for `p2` offboarding. Also for `p2`: per-mount version retention and mandatory conditional writes, and audit of requests with a caller-supplied request identifier. Not required: namespaces, soft delete, custom metadata.
+- **Protocol/Format**: Applies to the reference backend; other backends are bound only by `cpt-cf-credstore-fr-store-portability`. Vault HTTP API, KV version 2 secrets engine, over TLS. Required capabilities: versioned JSON records, conditional writes on version, metadata reads, key listing, and a machine-identity auth method (Kubernetes or AppRole) with renewable tokens. A delete in `p1` keeps a secret-less marker under the key so its version keeps counting; removing a key with all its versions is needed only for `p2` offboarding. Also for `p2`: per-mount version retention and mandatory conditional writes, and audit of requests with a caller-supplied request identifier. Not required: namespaces, soft delete, custom metadata.
 - **Compatibility**: any HashiCorp Vault or OpenBao release providing these capabilities.
 
 ## 8. Use Cases
@@ -1243,11 +1300,58 @@ The gear **MUST** emit metrics sufficient to detect resolution anomalies and sto
 **Postconditions**:
 - No request is served against a store that would weaken concurrency control, retain rotated secrets, or lose credentials on restart
 
+#### UC-018: Installation Migrates from a Persistent V1 Backend
+
+- [ ] `p1` - **ID**: `cpt-cf-credstore-usecase-migration`
+
+**Actor**: `cpt-cf-credstore-actor-platform-operator`
+
+**Preconditions**:
+- The installation's credentials live in the shipped storage: metadata in the gear's database and values in a PostgreSQL `CredStorePluginClientV1` value plugin
+- A `CredStorePluginClientV2` backend is provisioned and empty
+
+**Main Flow**:
+1. The operator freezes writes for the installation
+2. The operator runs the converter, which reads metadata and values from the shipped storage and writes full records into the new backend with create-only writes
+3. The operator switches the gear's backend selection to the `CredStorePluginClientV2` plugin
+4. The operator triggers the index rebuild
+5. The operator unfreezes writes
+
+**Postconditions**:
+- Every reference resolves for every subject exactly as before cutover; the source is unchanged; validators issued before cutover no longer match
+
+**Alternative Flows**:
+- **Converter interrupted**: re-running it skips what is already present and completes the rest
+- **A reference already exists with different content**: the converter reports it and does not overwrite it
+- **Unreadable, expired or half-written shipped records**: reported or skipped, never converted
+- **Rollback**: the operator switches the configuration back to the shipped storage; writes accepted on the new backend after cutover are lost
+
+#### UC-019: Departed User's Private Credentials Removed
+
+- [ ] `p2` - **ID**: `cpt-cf-credstore-usecase-owner-offboarding`
+
+**Actor**: `cpt-cf-credstore-actor-platform-services`
+
+**Preconditions**:
+- A user who owned private records in a tenant is deleted in account-management
+
+**Main Flow**:
+1. Account-management calls CredStore's user-deletion hook for the user in the tenant
+2. The gear removes every private record of that owner in that tenant from the secret store and the index
+3. The gear reports completion
+
+**Postconditions**:
+- No private record of the departed user remains in the tenant; `tenant` and `shared` records the user created stay, because they belong to the tenant
+
+**Alternative Flows**:
+- **The hook is retried**: the removal is idempotent and changes nothing further
+- **The user left before the hook existed**: a tenant administrator runs the manual administrative operation, authorized by its own PDP action, with the same effect
+
 ## 9. Acceptance Criteria
 
 - [ ] The #4741 credential contract test suites pass against the new gear, except for tests pinned to the differences in `cpt-cf-credstore-fr-consumer-compat`
 - [ ] The resolution table of `cpt-cf-credstore-fr-hierarchical-resolve` holds row by row for the point read, `get_secret`, the listing and secret mode alike, including across an isolation barrier
-- [ ] Use cases UC-001 through UC-016 behave exactly as described, including every alternative flow
+- [ ] Use cases UC-001 through UC-016 and UC-018 behave exactly as described, including every alternative flow
 - [ ] A caller holding only metadata actions never receives a secret on any surface; a caller holding only `read_secret` reads a secret through `get_secret`; a caller holding only `write_secret` rotates a secret through a partial update; a type-denied read is indistinguishable from not-found; a PDP failure fails closed
 - [ ] A filtered listing never reports an item that a point read of the same reference would not return, including when an ancestor's record of that reference has a different type
 - [ ] Every credential lives in the secret store as one record with all its visibility fields; dropping the index database and rebuilding it changes no listing and no resolution result, and loses no credential
@@ -1258,17 +1362,21 @@ The gear **MUST** emit metrics sufficient to detect resolution anomalies and sto
 - [ ] A single read costs at most one index query and one store read at chain depths 1, 5 and 10
 - [ ] No secret, store response body, store path or other tenant's identifier appears in any log, trace, metric, response or error
 - [ ] Every secret returned and every secret change produces an event accepted by the event broker, carrying no secret; with the event broker unavailable, no secret is returned and no secret change is applied, while metadata operations keep working
-- [ ] The gear's store identity is short-lived and renewed without operator action
+- [ ] With a Vault-compatible backend, the gear's store identity is short-lived and renewed without operator action
 - [ ] Two installations sharing one secret store under different installation prefixes cannot read or write each other's records
+- [ ] Every backend passes the store adapter conformance suite, including concurrent conditional writes and linearizable reads across two gear replicas
+- [ ] The gear holds no secret across requests
+- [ ] Migration: two converter runs yield identical content in the new backend, the source is unchanged, every reference resolves as before cutover, and conflicts and unreadable shipped records are reported, not converted
 - [ ] `p2` The gear refuses to start against a mount that retains older versions, does not require conditional writes, or is unreachable under the installation prefix, and when the in-process adapter is selected in production
 - [ ] `p2` Deleting a tenant removes all of its records from the secret store and the index, idempotently, and rejects later writes for it
+- [ ] `p2` Removing an owner removes all of that owner's private records in the tenant, idempotently, and no `tenant` or `shared` record
 
 ## 10. Dependencies
 
 | Dependency | Description | Criticality |
 |------------|-------------|-------------|
-| Vault-compatible secret store (Vault / OpenBao, KV v2) | System of record for every credential | `p1` |
-| Machine identity for the store (Kubernetes auth or AppRole) | The gear's single store identity and its policy limited to the installation prefix | `p1` |
+| Secret store backend implementing `CredStorePluginClientV2` (reference: Vault / OpenBao KV v2) | System of record for every credential | `p1` |
+| Machine identity for the store (Kubernetes auth or AppRole) | Vault-compatible backend: the gear's single store identity and its policy limited to the installation prefix | `p1` |
 | `authz-resolver` | Six actions per concrete credential type, fail-closed | `p1` |
 | `tenant-resolver` | Ancestor chains, including across isolation barriers | `p1` |
 | `types-registry` | Credential base type, derived types and traits | `p1` |
@@ -1276,14 +1384,16 @@ The gear **MUST** emit metrics sufficient to detect resolution anomalies and sto
 | Database (PostgreSQL / SQLite) | Derived credential index only | `p1` |
 | PDP policy re-issuance | Policies granting the shipped `read`/`write`/`delete` on `secret.v1~` are re-issued under the six actions on `credential.v1~` before cutover | `p1` |
 | Consumer migration | OAGW, settings-service and the Keycloak IdP plugin move to the #4741 client operations | `p1` |
-| Account-management tenant hard deletion and tenant status | Trigger for tenant offboarding; `deleted` status to reject writes | `p2` |
+| Account-management tenant hard deletion and tenant status | Tenant hard-delete cascade hook as the trigger for tenant offboarding; `deleted` status to reject writes | `p2` |
+| Shipped storage (metadata database and `CredStorePluginClientV1` backend) | Source of the one-off migration until the installation's cutover | `p1` |
+| Account-management user-deletion hook | Trigger for owner offboarding; does not exist yet and must be agreed with account-management | `p2` |
 
 ## 11. Assumptions
 
-- Every production deployment runs a Vault-compatible secret store operated by the platform; its availability, sealing, snapshots and encryption at rest are the platform's responsibility
-- One store identity per installation is acceptable; tenant isolation is the gear's responsibility, not the store's
+- Every production deployment runs a secret store backend implementing the store adapter SPI; its availability, durability, backups and encryption at rest are the responsibility of whoever operates it
+- With a Vault-compatible backend, one store identity per installation is acceptable; tenant isolation is the gear's responsibility, not the store's
 - No component other than the gear writes under the installation prefix
-- The shipped gear holds no persistent credentials to migrate: main ships only the in-memory development backend. This must be confirmed for every environment before cutover
+- Installations with a persistent V1 backend exist (at least one consumer runs a PostgreSQL value plugin) and are converted by `cpt-cf-credstore-fr-migration`; installations with only the in-memory backend have nothing to convert
 - Tenant hierarchy is managed externally and served by `tenant-resolver`; short-TTL caching of ancestor chains is acceptable
 - The PDP is the sole authorization authority; there is no local policy cache
 - Consumers that provision infrastructure from credentials at startup tolerate a missing credential by degrading rather than failing boot
@@ -1297,22 +1407,27 @@ The gear **MUST** emit metrics sufficient to detect resolution anomalies and sto
 | Compromise of the gear's single store identity | Every credential of the installation readable | Short-lived renewable identity; store policy limited to the installation prefix and the operations used; store audit correlation (p2) |
 | Event broker outage | Secret reads and changes unavailable, including the OAGW hot path; metadata operations unaffected | Fail fast with retry hints; bounded timeouts; dependency metrics; broker high availability is a platform concern |
 | Secret store outage, seal or throttling | All credential operations unavailable, including the OAGW hot path | Fail closed with retry hints; bounded timeouts; dependency metrics; store high availability is a platform concern |
-| Store latency on the OAGW hot path | Slower upstream calls than with a local value store | One store read per call (`cpt-cf-credstore-nfr-resolution-cost`); value caching is an open question |
+| Store latency on the OAGW hot path | Slower upstream calls than with a local value store | One store read per call (`cpt-cf-credstore-nfr-resolution-cost`); no gear-side secret cache; the backend may cache under per-key linearizability |
 | Index drift after partial failures or out-of-band store edits | Listing or resolution temporarily wrong for a reference | Every served result re-checked in the store; index updates ordered by version; repair on access; rebuild; drift metrics |
 | Database loss | Listing and resolution degraded until rebuild | Online rebuild (UC-015); reads correct or unavailable meanwhile |
 | Tombstones kept for deleted references so versions never repeat | Store key space grows with deletions | A tombstone holds no secret, so this is a storage cost only; it is bounded by tenant offboarding (p2) and nothing else, and index entries for tombstones expire after a retention period |
 | Previous and expired secrets remain in the store | A rotated secret stays as an older store version, and an expired secret stays until its reference is written or deleted; neither is reachable through the gear | No retained previous secrets (p2); expired-secret retention is an open question |
 | Ancestor-chain cache staleness | A re-parented tenant keeps its former inheritance for up to the cache TTL | Short TTL; closing the window needs a hierarchy change signal from `tenant-resolver` |
 | Consumer migration breaks OAGW, settings-service or the IdP plugin | Integrations fail after cutover | Surface of #4741; migrate all three in the cutover release; contract tests against OpenBao |
+| A backend plugin violates the store adapter contract (no real conditional write, per-replica cache) | Lost updates or stale secrets after rotation | Conformance suite required for every backend; configuration check (p2) |
+| A non-Vault backend stores secrets unencrypted | Secrets readable from database backups | Encryption at rest required by the contract; stated per backend in DESIGN |
+| Migration loses, duplicates or mis-scopes records | Credentials missing or visible to the wrong subjects after cutover | Idempotent create-only conversion; conflicts and unreadable records reported; source untouched; write freeze; rollback by configuration |
 | Type-trait misconfiguration | Overly permissive or broken writes for a type | Catalogue pinned to registered GTS schemas by tests; `generic` stays permissive |
 
 ## 13. Open Questions
 
 - **Delivery path**: land PR #4741 on its current storage first and swap storage behind the same surface later, or supersede #4741 and ship the Vault-backed gear directly?
-- **Value caching for OAGW**: is a short-lived in-process cache of resolved secrets acceptable on the hot path? Adopting one would amend `cpt-cf-credstore-nfr-availability` and add a bounded revocation delay, so it needs its own decision.
 - **Expired secrets**: must an expired secret be removed from the secret store at expiry for compliance, or is removal by the next write or delete (`cpt-cf-credstore-fr-expired-records`) sufficient?
 - **Descendant block field**: the name and representation of the field on the record (a boolean next to sharing mode, or a descendant-policy enumeration defaulting to the current behaviour).
 - **Platform maximum secret size**: which limit applies to every type, given the secret store's own request-size limits?
+- **Audit failure mode**: fail-closed (current default) or an installation-selectable "record the event and continue, counted by a metric" mode when the event broker is unavailable; to be decided in an ADR.
+- **Reading a private credential on the owner's behalf**: whether a trusted service may read another subject's private credential; to be decided in an ADR, starting from whether platform delegation already lets a service act as the owner, in which case it is a PDP policy decision and needs no new operation.
+- **Owner offboarding trigger**: the shape of the account-management user-deletion hook and who owns it.
 
 ## 14. Traceability
 
@@ -1321,3 +1436,4 @@ The gear **MUST** emit metrics sufficient to detect resolution anomalies and sto
 - **ADRs**: [ADR-0001 stateful gear](./ADR/0001-cpt-cf-credstore-adr-stateful-gear.md), [ADR-0002 deprovisioning saga](./ADR/0002-cpt-cf-credstore-adr-deprovisioning-saga.md) and [ADR-0003 value-fingerprint fence](./ADR/0003-cpt-cf-credstore-adr-value-fingerprint-fence.md) describe the shipped design and are superseded by this PRD's system-of-record model; the ADRs for the Vault-backed design are written with the new DESIGN
 - **Retired requirement IDs**: `cpt-cf-credstore-fr-put-secret` (shipped create/update of a secret) is retired; its successors are `cpt-cf-credstore-fr-write-credential-record`, `cpt-cf-credstore-fr-write-secret` and `cpt-cf-credstore-fr-sharing-classes`. Every other requirement ID of the shipped PRD is kept with the same subject.
 - **Features**: features/ (planned)
+- **Consumer feedback**: PR #5071, comment 5897181636 (Studio) — backend SPI, migration, audit failure mode, owner offboarding, on-behalf reads, caching
