@@ -868,8 +868,10 @@ pub const LLM_REQUEST_COUNT_CONSTRAINT: &str =
 pub const LLM_MODEL_RESOURCE: &str = "gts.cf.core.qe.res.v1~cf.genai.llm_gateway.model.v1~";
 
 /// The metrics the `llm_gateway` set admits, plus one it does not.
-pub const METRIC_TOKENS: &str = "gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.ai_tokens_input.v1";
-pub const METRIC_REQUESTS: &str = "gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.ai_requests.v1";
+pub const METRIC_TOKENS: &str =
+    "gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.ai_tokens_input.v1";
+pub const METRIC_REQUESTS: &str =
+    "gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.ai_requests.v1";
 pub const METRIC_OTHER: &str = "gts.cf.core.qe.metric_type.v1~cf.qetest.metric.other.v1";
 
 /// Test-only contracts exercising references and GTS-typed fields.

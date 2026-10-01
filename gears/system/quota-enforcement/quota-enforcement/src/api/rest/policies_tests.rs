@@ -262,3 +262,36 @@ async fn a_caller_the_pdp_denies_gets_403_on_the_policy_endpoints() {
     let (status, body) = send(&app, Method::GET, "/policies/global", None).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
 }
+
+#[tokio::test]
+async fn if_match_version_is_a_required_positive_integer() {
+    let app = operator_app().await;
+    let id = created(&app, metric_policy()).await;
+
+    // Absent or not an integer: the JSON extractor refuses the body.
+    for patch in [
+        json!({ "timeout_ms": 2 }),
+        json!({ "if_match_version": "1" }),
+        json!({ "if_match_version": -1 }),
+    ] {
+        let (status, body) = send(
+            &app,
+            Method::PATCH,
+            &format!("/policies/{id}"),
+            Some(patch.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{patch}: {body}");
+    }
+
+    // Zero parses but is not a version.
+    let (status, body) = send(
+        &app,
+        Method::PATCH,
+        &format!("/policies/{id}"),
+        Some(json!({ "if_match_version": 0 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.to_string().contains("INVALID_POLICY"), "{body}");
+}
