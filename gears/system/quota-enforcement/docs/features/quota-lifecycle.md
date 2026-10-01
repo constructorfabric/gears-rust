@@ -227,13 +227,13 @@ Realises `cpt-cf-quota-enforcement-seq-quota-deactivate-cascade`.
 **Output**: a validated draft, or a canonical error before any storage call
 
 **Steps**:
-1. [x] - `p1` - Require `quota_type` to be a GTS instance under `gts.cf.qe.quota.type.v1~` - `inst-qdv-type`
-2. [x] - `p1` - **IF** `quota_type` is the reserved `rate` instance (`gts.cf.qe.quota.type.v1~cf.qe.quota.rate.v1`) - `inst-qdv-rate-if`
+1. [x] - `p1` - Require `quota_type` to be a GTS instance under `gts.cf.core.qe.quota_type.v1~` - `inst-qdv-type`
+2. [x] - `p1` - **IF** `quota_type` is the reserved `rate` instance (`gts.cf.core.qe.quota_type.v1~cf.core.qe.rate.v1`) - `inst-qdv-rate-if`
    1. [x] - `p1` - **RETURN** `DomainError::NotYetImplemented`, canonicalized as `Unimplemented` (HTTP 501, `NOT_YET_IMPLEMENTED`); the identifier and data-model slot stay reserved so P3 activation needs no migration of existing `allocation`/`consumption` Quotas (`cpt-cf-quota-enforcement-fr-quota-type-rate-rejection`) - `inst-qdv-rate`
 3. [x] - `p1` - **IF** `quota_type` is `allocation` and any period field is present - `inst-qdv-period-if`
    1. [x] - `p1` - **RETURN** rejection; allocation Quotas must reject any period field, while consumption Quotas carry the period specification (period semantics themselves are owned by `cpt-cf-quota-enforcement-fr-period-semantics` through the consumption-operations feature) - `inst-qdv-period`
-4. [x] - `p1` - Require `enforcement_mode` to be a GTS instance under `gts.cf.qe.enforcement.type.v1~`; P1 accepts only `gts.cf.qe.enforcement.type.v1~cf.qe.enforcement.hard.v1`; future modes arrive as new GTS instances without API breakage (`cpt-cf-quota-enforcement-fr-enforcement-mode`) - `inst-qdv-mode`
-5. [x] - `p1` - Require `source` to be a GTS instance under `gts.cf.qe.source.type.v1~`; P1 seeds `licensing` (default) and `operator`; mutation rules are uniform across both values in P1, and a stored `source` never changes silently - `inst-qdv-source`
+4. [x] - `p1` - Require `enforcement_mode` to be a GTS instance under `gts.cf.core.qe.enforcement_type.v1~`; P1 accepts only `gts.cf.core.qe.enforcement_type.v1~cf.core.qe.hard.v1`; future modes arrive as new GTS instances without API breakage (`cpt-cf-quota-enforcement-fr-enforcement-mode`) - `inst-qdv-mode`
+5. [x] - `p1` - Require `source` to be a GTS instance under `gts.cf.core.qe.source_type.v1~`; P1 seeds `licensing` (default) and `operator`; mutation rules are uniform across both values in P1, and a stored `source` never changes silently - `inst-qdv-source`
 6. [x] - `p1` - **IF** `cap` is numeric and negative - `inst-qdv-cap-if`
    1. [x] - `p1` - **RETURN** `CAP_MUST_BE_NON_NEGATIVE` (`DomainError::CapMustBeNonNegative`, canonical `InvalidArgument`); `cap = 0` (deny-everything) and `cap = null` (unbounded, always satisfiable) are both explicitly valid and are never auto-rejected - `inst-qdv-cap`
 7. [x] - `p1` - **IF** `notification_thresholds` are present and `cap` is `null` - `inst-qdv-thresh-if`
@@ -424,7 +424,7 @@ the evaluation paths.
 
 - [x] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-rate-rejection`
 
-The system **MUST** reserve the `rate` GTS instance (`gts.cf.qe.quota.type.v1~cf.qe.quota.rate.v1`) and reject Quota
+The system **MUST** reserve the `rate` GTS instance (`gts.cf.core.qe.quota_type.v1~cf.core.qe.rate.v1`) and reject Quota
 create and update requests referencing it with `DomainError::NotYetImplemented`, canonicalized as `Unimplemented`
 (HTTP 501, `NOT_YET_IMPLEMENTED`), leaving the data model and API surface able to add rate semantics in P3 without
 breaking changes and without migrating persisted `allocation`/`consumption` Quotas.

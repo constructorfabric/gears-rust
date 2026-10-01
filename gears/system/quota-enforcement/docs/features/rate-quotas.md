@@ -113,7 +113,7 @@ a P3 DESIGN concern per DECOMPOSITION §2.11)
 
 **Steps**:
 1. [ ] - `p3` - Caller sends `POST /v1/quota-enforcement/quotas` (or `PATCH /v1/quota-enforcement/quotas/{id}`) with
-   `quota_type = gts.cf.qe.quota.type.v1~cf.qe.quota.rate.v1` and a `rate_spec` object; DECOMPOSITION §2.11 activates
+   `quota_type = gts.cf.core.qe.quota_type.v1~cf.core.qe.rate.v1` and a `rate_spec` object; DECOMPOSITION §2.11 activates
    the existing endpoints for `type = rate`, adding no new route - `inst-rqc-request`
 2. [ ] - `p3` - Run `cpt-cf-quota-enforcement-algo-rate-draft-validation` in place of the P1 rejection arms
    (`inst-qdv-rate` in `cpt-cf-quota-enforcement-algo-quota-draft-validation` and `inst-qup-rate` in

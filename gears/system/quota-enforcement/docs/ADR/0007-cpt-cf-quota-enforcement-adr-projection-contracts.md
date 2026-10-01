@@ -117,9 +117,9 @@ The decisions that follow:
   boundary decouples domain evolution from contract evolution. An owner must therefore design
   one request contract usable by every caller, and adding a required property is breaking for
   all of them.
-* **Metric identity is unchanged.** Metrics stay registry-owned. Naming a metric beneath its
-  owning Gear is a candidate for the open cross-gear namespace question, and Usage Collector
-  may adopt the same model later, but neither is required here.
+* **Metric identity follows the same naming rule.** The metric base is
+  `gts.cf.core.qe.metric_type.v1~`, and each metric instance is named under its owning Gear.
+  Usage Collector keeps its own usage-record family, so the two are mapped, not shared.
 
 ### Projection contents
 
