@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import atexit
 import os
+import secrets
 import shutil
 import subprocess
 import time
@@ -51,6 +52,19 @@ def timescaledb_tag() -> str:
     against another, with nothing in the diff to show it.
     """
     return os.environ.get(ENV_TIMESCALEDB_TAG, "").strip() or TIMESCALEDB_TAG
+
+
+# The plain PostgreSQL pin, mirrored from libs/test-containers/src/lib.rs
+# (POSTGRES_TAG, ENV_POSTGRES_TAG); the Rust test
+# `e2e_sidecar_pins_the_same_postgres_image` fails the build if either drifts.
+POSTGRES_IMAGE = "postgres"
+POSTGRES_TAG = "18-alpine"
+ENV_POSTGRES_TAG = "GEARS_TEST_PG_TAG"
+
+
+def postgres_tag() -> str:
+    """Effective PostgreSQL tag, honoring GEARS_TEST_PG_TAG (unset or empty: the pin)."""
+    return os.environ.get(ENV_POSTGRES_TAG, "").strip() or POSTGRES_TAG
 
 
 class DockerUnavailable(RuntimeError):
@@ -100,6 +114,9 @@ class TimescaleDbSidecar:
 
     IMAGE = f"{TIMESCALEDB_IMAGE}:{timescaledb_tag()}"
     LABEL = "cf-gears-e2e=usage-collector"
+    # When set, the container is named `<NAME_PREFIX>-<6 hex>` so `docker ps`
+    # shows who started it.
+    NAME_PREFIX: str | None = None
 
     DB_USER = "uc"
     DB_PASSWORD = "uc"
@@ -168,8 +185,12 @@ class TimescaleDbSidecar:
         self.reap_orphans(self.label)
         self.pull()
 
+        name = (
+            ["--name", f"{self.NAME_PREFIX}-{secrets.token_hex(3)}"]
+            if self.NAME_PREFIX else []
+        )
         self.container_id = _run([
-            "docker", "run", "-d", "-P",
+            "docker", "run", "-d", "-P", *name,
             "--label", self.label,
             "-e", f"POSTGRES_USER={self.DB_USER}",
             "-e", f"POSTGRES_PASSWORD={self.DB_PASSWORD}",
@@ -194,7 +215,7 @@ class TimescaleDbSidecar:
             self.stop()
             raise
 
-        print(f"[sidecar] timescaledb ready on 127.0.0.1:{self.port} "
+        print(f"[sidecar] {self.name} ready on 127.0.0.1:{self.port} "
               f"({self.container_id[:12]})")
 
     def _wait_ready(self) -> None:
@@ -264,3 +285,30 @@ class TimescaleDbSidecar:
         )
         self.container_id = None
         self.port = None
+
+
+class PostgresSidecar(TimescaleDbSidecar):
+    """A throwaway plain PostgreSQL container, on the same lifecycle as
+    `TimescaleDbSidecar`: label reaper, timed pull, query-based readiness.
+
+    The image is `libs/test-containers`' pinned PostgreSQL tag, so the E2E lane
+    and the Rust plugin tests run the same major.
+    """
+
+    IMAGE = f"{POSTGRES_IMAGE}:{postgres_tag()}"
+    LABEL = "cf-gears-e2e=postgres"
+    NAME_PREFIX = "eb-e2e-postgres"
+
+    DB_USER = "evbk"
+    DB_PASSWORD = "evbk"
+    DB_NAME = "evbk"
+
+    name = "postgres"
+
+    def url(self) -> str:
+        """Connection URL over the mapped host port."""
+        return (
+            f"postgres://{self.DB_USER}:{self.DB_PASSWORD}"
+            f"@127.0.0.1:{self.dsn_port}/{self.DB_NAME}"
+        )
+

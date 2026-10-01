@@ -116,7 +116,7 @@ Today a module needing these properties must either bring up an external broker 
 | FilterEngine | Plugin trait (`compile()` + `eval()`) for evaluating filter expressions over events. GTS-typed; base type `gts.cf.core.events.filter.v1~`; v1 built-in CEL engine. Resolved at JOIN via `ClientHub`. |
 | FilterContext | Per-engine declaration of which event fields are visible to filter expressions. CEL engine v1 exposes the read-side event (`gts.cf.core.events.event.v1~.schema.json` with `readOnly` fields populated; `writeOnly` `meta` stripped). |
 | Offset | Backend-assigned, monotonic-per-`(topic, partition)` ordering key. Consumer-visible; the only sequence consumers paginate by. |
-| Storage Backend | Pluggable persistence layer for events. Discovered via GTS instance registration and resolved via ClientHub. Built-in implementations: memory, postgres. Backend enforces retention, compaction, and offset assignment. |
+| Storage Backend | Pluggable persistence layer for events. Each instance is a named entry in the `backends` registry, built by a `backend::Provider` linked into the build ([feature 0005](features/0005-backend-registry-and-routing.md) §2.1, [feature 0007](features/0007-storage-backend-api.md) §2.7). Backend enforces retention, compaction, and offset assignment. |
 | Cluster Module | The platform-level `modules/system/cluster` system module providing KV-with-TTL, leader election, and distributed locks. Consumed by the broker for coordination. |
 | GTS | Global Type System — the platform's schema and instance registration system used for type identification, validation, and pattern matching in authorization. |
 
@@ -138,7 +138,7 @@ Before the functional requirements, this section establishes the conceptual enti
 
 7. **Offset / Cursor** — The **offset** is a backend-assigned, monotonic position within a `(topic, partition)` log; it is the only ordering coordinate consumers observe. The **cursor** is the group-scoped ephemeral session position set by SEEK. The cursor advances **forward-only** during streaming and may be repositioned explicitly for replay via SEEK (`POST /v1/subscriptions/{id}:seek`).
 
-8. **Storage Backend** — The pluggable persistence layer bound to a topic. It durably stores events, **assigns their offsets**, and **enforces retention, compaction/consolidation, and deletion** - retention as the topic declares it, the rest as its own configuration directs. Built-in backends are provided (in-memory for dev/test, PostgreSQL for production); third-party backends register via GTS without modifying broker core.
+8. **Storage Backend** - The pluggable persistence layer bound to a topic. It durably stores events, **assigns their offsets**, and **enforces retention, compaction/consolidation, and deletion** - retention as the topic declares it, the rest as its own configuration directs. Every backend, first-party or third-party, is a `backend::Provider` linked into the build and instantiated from the `backends` registry ([feature 0005](features/0005-backend-registry-and-routing.md) §2.1), without modifying broker core.
 
 **Relationships**:
 
@@ -165,8 +165,8 @@ Subscription *  ──*  Partition       (a subscription is assigned partitions 
 
 **ID**: `cpt-cf-evbk-actor-platform-operator`
 
-- **Role**: Configures broker deployment topology (standalone vs cluster), partition count, bound storage backend instances per topic, and operational policies (stream connection caps, group caps, retention via backend config).
-- **Needs**: Operate broker as a managed platform service; observe per-topic / per-group lag; scale delivery shards horizontally; rebind topics to different backend instances on infrastructure changes.
+- **Role**: Configures broker deployment topology (standalone vs cluster), partition count, the backend registry and per-topic backend routing, and operational policies (stream connection caps, group caps, retention via backend config).
+- **Needs**: Operate broker as a managed platform service; observe per-topic / per-group lag; scale delivery shards horizontally; route topics to backend instances through `backend_routing` ([feature 0005](features/0005-backend-registry-and-routing.md) §2.2) and move a topic between backends per [ADR-0008](ADR/0008-topic-log-identity.md) O3.
 
 #### Module Developer (Producer Side)
 
@@ -212,13 +212,13 @@ Subscription *  ──*  Partition       (a subscription is assigned partitions 
 
 **ID**: `cpt-cf-evbk-actor-types-registry`
 
-- **Role**: Stores GTS schema and instance registrations. The broker uses it to validate topic / event-type / consumer-group GTS identifiers; to resolve the event-type `data_schema` against which event payloads are validated at ingest; reads named consumer-group instances at startup to upsert `evbk_consumer_group` rows; resolves storage backend type instances for ClientHub-based backend resolution.
+- **Role**: Stores GTS schema and instance registrations. The broker uses it to validate topic / event-type / consumer-group GTS identifiers; to resolve the event-type `data_schema` against which event payloads are validated at ingest; reads named consumer-group instances at startup to upsert `evbk_consumer_group` rows.
 
 #### Storage Backend Plugin
 
 **ID**: `cpt-cf-evbk-actor-storage-backend`
 
-- **Role**: Persists events. Implements the `StorageBackend` async trait (`persist`, `query`, `truncate`, `segments`). Owns retention, compaction, offset assignment. Built-in plugins: memory, postgres. Third-party plugins (Kafka, S3) plug in via GTS type registration without modifying broker core.
+- **Role**: Persists events. Implements `backend::Backend` ([feature 0007](features/0007-storage-backend-api.md)): `provision`, `append`, `read`, `resolve`, `watch`, `query`. Owns retention - enforced by its own workers, never by the gear - compaction, partition and offset assignment. Every backend, first-party or third-party, ships a `backend::Provider` linked into the build, without modifying broker core.
 
 ## 3. Operational Concept & Environment
 
@@ -230,7 +230,7 @@ The Event Broker follows standard Gears module conventions. Module-specific depl
 
 - **Two deployment topologies** are first-class: **Standalone** (single process; in-process `cluster` provider; one ingest + one delivery in-process) and **Cluster** (separate ingest / delivery / dispatcher processes, scaled independently, coordinating via the platform `cluster` module backed by Redis / etcd / NATS).
 - **Per-module DB schema invariant**: in standalone mode, the producer module's outbox and the broker module's ingest outbox live in distinct DB schemas (one per Gears module), so no table-name collision arises.
-- **Two streaming-delivery deployment patterns** for ingest in cluster mode: **hetero** (every ingest serves every topic; load-balance across ingest set; default) and **sharded** (specific topic patterns pinned to specific ingest instances; opt-in for noisy-neighbor isolation or hardware affinity).
+- **Every ingest and delivery instance handles every topic** in cluster mode. An instance may declare an **affinity** - a routing hint the dispatcher prefers for matching topics, for noisy-neighbor isolation or hardware affinity - without becoming unable to serve any other topic ([feature 0005](features/0005-backend-registry-and-routing.md) §2.3).
 
 ## 4. Scope
 
@@ -238,14 +238,14 @@ The Event Broker follows standard Gears module conventions. Module-specific depl
 
 - REST API for produce (single + batch), consume (stream, ack, seek, leave), producer lifecycle, consumer-group lifecycle, topic introspection.
 - Three producer modes (chained / monotonic / stateless) with broker-side chain-of-custody dedup at ingest.
-- Long-poll consumption with per-partition append-only in-memory cache and iterator-driven notification fan-out.
+- Long-poll consumption with per-partition append-only in-memory cache woken through the head cache ([feature 0007](features/0007-storage-backend-api.md) §3.2).
 - GTS-typed topics, event types, subject types, consumer groups; full GTS pattern wildcards in authorization.
-- Storage backend plugin contract with built-in memory and postgres implementations; vendor-extensible via GTS instance registration.
+- Storage backend plugin contract; first-party and vendor backends alike are plugins linked through a `backend::Provider`.
 - Per-(resource, action) authorization via the `authz-resolver` framework (4 resource types × 3 actions: `produce`, `consume`, `define`).
 - Persistent consumer-group registry (`evbk_consumer_group`) with two exclusive provisioning paths (anonymous via REST, named via `types_registry`).
 - Per-event size limit (64 KiB combined headers + payload); per-batch limit (100 events / 1 MiB).
 - Cluster-mode failover with `DirectoryService` as source of truth for delivery-shard liveness.
-- Standalone and cluster deployment topologies; hetero and sharded ingest routing modes.
+- Standalone and cluster deployment topologies; affinity-preferring dispatcher routing over instances that each handle every topic.
 - RFC 9457 Problem Details for all error responses with stable GTS type identifiers.
 
 ### 4.2 Out of Scope
@@ -292,7 +292,7 @@ The system MUST support event-type registration via `types_registry`. Each event
 
 The system MUST expose read-only REST endpoints for listing topics, listing event types, retrieving a single topic's metadata, and retrieving a single event type's schema. Read access is gated by the `topic:consume` PEP check.
 
-- **Rationale**: Producers and SDKs may need topic metadata for local broker-partition hints or batching, consumers need event-type schemas to validate, and tooling needs discovery.
+- **Rationale**: Producers and SDKs may need topic metadata for batching, consumers need event-type schemas to validate, and tooling needs discovery.
 - **Actors**: `cpt-cf-evbk-actor-module-dev-producer`, `cpt-cf-evbk-actor-module-dev-consumer`
 
 ### 5.2 Producer Path (Ingest)
@@ -301,7 +301,7 @@ The system MUST expose read-only REST endpoints for listing topics, listing even
 
 - [ ] `p1` - **ID**: `cpt-cf-evbk-fr-publish-single`
 
-The system MUST accept single-event publish requests. The event MUST carry `id` (UUID, client-provided), `type`, `subject`, `subject_type`, `tenant_id`, and `data`; the owning topic is resolved from the event type, and the partition is broker-derived, not client-set. Publish MUST be **accepted asynchronously and durably** — the broker acknowledges once the event is durably recorded in the ingest outbox, with persistence to the storage backend completing asynchronously under an at-least-once guarantee. A synchronous mode MUST be available for callers needing read-after-write, acknowledging only after backend persistence completes. Wire endpoint, status codes, and headers are defined in DESIGN §3.3.
+The system MUST accept single-event publish requests. The event MUST carry `id` (UUID, client-provided), `type`, `subject`, `subject_type`, `tenant_id`, and `data`; the owning topic is resolved from the event type, and the partition is backend-assigned, not client-set. Publish MUST be **accepted asynchronously and durably** - the broker acknowledges once the event is durably recorded in the ingest outbox, with persistence to the storage backend completing asynchronously under an at-least-once guarantee. A synchronous mode (`Prefer: wait=N`) MUST be available for callers needing read-after-write, acknowledging stored only after backend persistence completes. Wire endpoint, status codes, and headers are defined in DESIGN §3.3.
 
 - **Rationale**: Standard event-streaming publish primitive with explicit at-least-once semantics.
 - **Actors**: `cpt-cf-evbk-actor-module-dev-producer`
@@ -310,16 +310,16 @@ The system MUST accept single-event publish requests. The event MUST carry `id` 
 
 - [ ] `p1` - **ID**: `cpt-cf-evbk-fr-publish-batch`
 
-The system MUST accept batch publish via `POST /v1/events:batch`. All events in a batch MUST resolve to the same `(topic, partition)` — i.e. share the same topic and the same partitioning input (default: same `tenant`). Hard limits: 100 events per batch, 1 MiB total payload, 64 KiB per event. The batch is atomic — if any event fails dedup validation, the entire batch is rejected.
+The system MUST accept batch publish via `POST /v1/events:batch`. A batch MAY carry events of several producer ids and topics; it is validated per `(producer_id, topic)` run (rules in DESIGN §3.3 and ADR-0004). Hard limits: 100 events per batch, 1 MiB total payload, 64 KiB per event. The batch is atomic - if any event fails dedup validation, the entire batch is rejected and nothing is enqueued.
 
-- **Rationale**: High-throughput producers benefit from batching; same-(topic, partition) requirement keeps batching aligned with the dispatcher's routing model.
+- **Rationale**: High-throughput producers benefit from batching; ingest cannot know an event's partition, so a batch is not bounded by one.
 - **Actors**: `cpt-cf-evbk-actor-module-dev-producer`
 
 #### Producer Modes
 
 - [ ] `p1` - **ID**: `cpt-cf-evbk-fr-producer-modes`
 
-The system MUST recognize three producer modes inferred from the fields set on each event: **chained** (`producer_id` + `previous` + `sequence`), **monotonic** (`producer_id` + `sequence` only), **stateless** (none). Chained mode MUST verify `event.previous == state.last_sequence` AND `event.sequence > state.last_sequence` against `evbk_producer_state`; mismatched chains MUST surface as `412 SequenceViolation`. Monotonic mode MUST verify only `event.sequence > state.last_sequence`. Stateless mode MUST do no broker-side dedup. On `412 SequenceViolation` there are two cases. **(1) Transient async retry / duplicate** — resolved automatically with no human involvement: a duplicate is treated as success, and a benign reorder is re-driven from the broker's cursor. **(2) Genuine divergence** — e.g. the producer's local DB was restored from backup and its sequence regressed — which cannot be reconciled silently and MUST surface for **operator acknowledgement**; the operator reconciles against `GET /v1/producers/{producer_id}/cursors` (resume from `last_sequence + 1`) or rotates to a fresh `producer_id` to start a new chain.
+The system MUST recognize three producer modes, declared at registration and validated against the fields set on each event: **chained** (`producer_id` + `previous` + `sequence`), **monotonic** (`producer_id` + `sequence` only), **stateless** (none). Chained mode MUST verify `event.previous == state.last_sequence` AND `event.sequence > state.last_sequence` against `evbk_producer_state`; mismatched chains MUST surface as `412 SequenceViolation`. Monotonic mode MUST verify only `event.sequence > state.last_sequence`. Stateless mode MUST do no broker-side dedup. On `412 SequenceViolation` there are two cases. **(1) Transient async retry / duplicate** - resolved automatically with no human involvement: a duplicate is treated as success, and a benign reorder is re-driven from the broker's cursor. **(2) Genuine divergence** - e.g. the producer's local DB was restored from backup and its sequence regressed - which cannot be reconciled silently and MUST surface for **operator acknowledgement**; the operator reconciles against `GET /v1/producers/{producer_id}/cursors` (resume from `last_sequence + 1`) or rotates to a fresh `producer_id` to start a new chain.
 
 - **Rationale**: Different producer profiles need different dedup guarantees; chain-of-custody is the broker-side primitive that supports all three without an event.id index.
 - **Actors**: `cpt-cf-evbk-actor-module-dev-producer`
@@ -337,7 +337,7 @@ The system MUST expose `POST /v1/producers` returning a server-issued `id` (UUID
 
 - [ ] `p1` - **ID**: `cpt-cf-evbk-fr-producer-cursors`
 
-The system MUST expose `GET /v1/producers/{producer_id}/cursors` returning the broker's known `last_sequence` per `(topic, partition)` for the registered producer. Producers MUST use this for desync recovery (DB restore, restart without persistent state, suspected divergence).
+The system MUST expose `GET /v1/producers/{producer_id}/cursors` returning the broker's known `last_sequence` per topic for the registered producer. Producers MUST use this for desync recovery (DB restore, restart without persistent state, suspected divergence).
 
 - **Rationale**: Recovery from chain-state divergence requires producer to read broker's authoritative view.
 - **Actors**: `cpt-cf-evbk-actor-module-dev-producer`
@@ -424,25 +424,27 @@ The system MUST enforce two distinct authorization paths at JOIN: **anonymous gr
 
 - [ ] `p1` - **ID**: `cpt-cf-evbk-fr-backend-trait`
 
-The system MUST define a `StorageBackend` async trait with four methods — `persist`, `query`, `truncate`, and `segments`. `persist` MUST NOT return offsets inline — the backend assigns offsets natively and consumers learn them via `query`. Method signatures, arguments, and error types are defined in DESIGN §3.2.
+The system MUST define a backend trait, `backend::Backend`, covering topic provisioning, append, read by offset, position resolution, head watch, segment query and retention maintenance. The backend assigns partition and offset; `append` returns no per-event positions, MAY return the head of each partition it touched, and otherwise heads become known through `watch`. Method signatures, arguments, and error types are defined in [feature 0007](features/0007-storage-backend-api.md).
 
-- **Rationale**: Minimal trait surface — backend owns storage and offset assignment; broker owns dedup, ordering (via outbox), and notification.
+- **Rationale**: Minimal trait surface - backend owns storage, partition and offset assignment; broker owns dedup, ordering (via outbox), and the head cache that wakes readers ([feature 0007](features/0007-storage-backend-api.md) §3.2).
 - **Actors**: `cpt-cf-evbk-actor-storage-backend`
 
-#### Built-in Backends
+#### Shipped Backends
 
 - [ ] `p1` - **ID**: `cpt-cf-evbk-fr-builtin-backends`
 
-The system MUST ship two built-in storage backend instances: `gts.cf.core.events.backend.v1~cf.core.backend.memory.v1` (in-memory, dev/test only, no persistence across restarts) and `gts.cf.core.events.backend.v1~cf.core.backend.postgres.v1` (SeaORM-based, multi-SQL: PostgreSQL primary, also MySQL / SQLite, production default).
+The system MUST ship, as plugins linked into the build, at least one storage backend that needs no external service, a durable SQL backend that several broker processes can share, and a partitioned-log backend.
 
-- **Rationale**: Memory backend supports development and testing; postgres backend is the production default for self-contained deployments.
+First-party storage plugins: SQLite (single process), MySQL, PostgreSQL, Kafka - each a plugin crate linked into the build.
+
+- **Rationale**: A backend that needs no external service serves development, testing and single-process deployments; a shared durable SQL backend is the production default for self-contained deployments; a partitioned-log backend serves deployments that run on a streaming platform.
 - **Actors**: `cpt-cf-evbk-actor-platform-operator`
 
 #### Third-Party Backend Extension
 
 - [ ] `p2` - **ID**: `cpt-cf-evbk-fr-third-party-backends`
 
-The system MUST allow third-party storage backend plugins (e.g., Kafka, S3, custom) to register via GTS instance registration without modifying broker core. The plugin MUST implement the `StorageBackend` trait and its GTS type MUST extend `gts.cf.core.events.backend.v1~`. ClientHub MUST resolve the bound instance per-topic at runtime.
+The system MUST allow third-party storage backend plugins (e.g., Kafka, S3, custom) without modifying broker core. The plugin MUST implement `backend::Backend` and ship a `backend::Provider` linked into the build, and its GTS backend type MUST extend `gts.cf.core.events.backend.v1~`. `backend_routing` MUST resolve each topic to its `backends` registry entry at runtime ([feature 0005](features/0005-backend-registry-and-routing.md) §2.2).
 
 - **Rationale**: Deployment-specific scale or compliance needs (Kafka for cross-region, S3 for cold archival) shouldn't require forking the broker.
 - **Actors**: `cpt-cf-evbk-actor-platform-operator`
@@ -547,11 +549,11 @@ The Event Broker exposes its capability via a versioned REST API. The full surfa
 
 ```
 POST   /v1/events                                # produce single event
-POST   /v1/events:batch                          # produce batch (atomic; same topic+partition)
+POST   /v1/events:batch                          # produce batch (atomic; any producer ids and topics)
 GET    /v1/events:stream?subscription_id=...       # streaming consume
 
 POST   /v1/producers                             # register producer (server-issued id)
-GET    /v1/producers/{producer_id}/cursors       # read broker's last_sequence per (topic, partition)
+GET    /v1/producers/{producer_id}/cursors       # read broker's last_sequence per topic
 
 POST   /v1/consumer-groups                       # register anonymous consumer group
 GET    /v1/consumer-groups/{id}                  # read consumer group registry record
@@ -576,7 +578,7 @@ GET    /v1/event-types/{id}                      # read event-type schema and al
 
 **Consumer SDK trait** — `cf-gears-event-broker-sdk` will export a `EventBrokerConsumer` trait covering JOIN / poll / seek / leave with normative behavior on `410 Gone` / `404 SubscriptionNotFound` / `412 SequenceViolation` / `409 PartitionNotAssigned` (re-JOIN, drop in-flight, etc.). Per-language SDK realization is implementation-phase work.
 
-**Storage Backend plugin contract** — third-party plugins implement `StorageBackend` and register their GTS type as an extension of `gts.cf.core.events.backend.v1~`. Resolution happens via ClientHub at runtime; no broker-core modification needed.
+**Storage Backend plugin contract** - third-party plugins implement `backend::Backend` and ship a `backend::Provider` linked into the build, whose GTS backend type extends `gts.cf.core.events.backend.v1~` ([feature 0007](features/0007-storage-backend-api.md)). Each topic resolves to a `backends` registry entry through `backend_routing` ([feature 0005](features/0005-backend-registry-and-routing.md)); no broker-core modification needed.
 
 ## 8. Use Cases
 
@@ -674,8 +676,8 @@ GET    /v1/event-types/{id}                      # read event-type schema and al
 - All P1 NFRs (6.1) verifiable via integration tests or static configuration assertions.
 - The DESIGN.md document is in canonical place (`modules/system/event-broker/docs/DESIGN.md`) and is the source of truth for technical decisions.
 - The partition-selection ADR is in canonical place (`modules/system/event-broker/docs/ADR/0002-partition-selection.md`).
-- Standalone deployment (single process, in-process cluster provider, in-memory backend) functions end-to-end against the producer + consumer SDKs.
-- Cluster deployment (multi-process; persistent cluster provider; postgres backend) functions end-to-end with at least 2 ingest, 2 delivery, 1 dispatcher.
+- Standalone deployment (single process, in-process cluster provider, a storage backend that needs no external service) functions end-to-end against the producer + consumer SDKs.
+- Cluster deployment (multi-process; persistent cluster provider; a durable storage backend shared by the processes) functions end-to-end with at least 2 ingest, 2 delivery, 1 dispatcher.
 - All authorization decisions go through `authz-resolver`'s PEP — no broker-local authz rules.
 
 ## 10. Dependencies
@@ -702,9 +704,9 @@ GET    /v1/event-types/{id}                      # read event-type schema and al
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
-| Storage backend selection lock-in | A topic's bound backend cannot be changed without data migration tooling (post-MVP). Selecting an inappropriate backend at topic registration may require a full topic rebuild for migration. | Document backend characteristics and capacity ceilings clearly at registration time; restrict ad-hoc backend choices; prefer postgres unless an explicit scale or compliance constraint forces an alternative. Backend instance migration tooling is on the post-MVP roadmap. |
+| Storage backend selection lock-in | A topic's log stays on the backend `backend_routing` named when it was provisioned; moving it is a data-plus-log-id operation by tooling outside the broker ([ADR-0008](ADR/0008-topic-log-identity.md) O3). Routing a topic to an inappropriate backend may require a full topic rebuild for migration. | Document backend characteristics and capacity ceilings clearly before routing a topic; restrict ad-hoc backend choices; prefer the deployment's default durable backend unless an explicit scale or compliance constraint forces an alternative. Backend instance migration tooling is on the post-MVP roadmap. |
 | Consumer-cursor durability under cache-only model | In standalone mode, broker runtime cursors die with the process; consumers may re-process from their chosen start position after restart unless they persist progress themselves. | Idempotent consumer processing is a normative SDK requirement (per the at-least-once contract). Consumers that need durable progress persist offsets in their own store; broker runtime cursor state is not the durable source of truth. |
-| Hot-topic scaling in sharded ingest mode | A single hot topic pinned to a single ingest instance via `serves_topic_patterns` becomes a bottleneck and a noisy neighbor for any topics co-located with it. | Hetero ingest mode (default) load-balances all topics across all ingest instances. Sharded mode is opt-in for explicit isolation; operators choosing sharded mode are responsible for capacity planning per shard. Partition-sharded ingest (sub-topic level) is on the post-MVP roadmap. |
+| Hot-topic noisy neighbor | A hot topic sharing instances with every other topic becomes a noisy neighbor for them. | Instances with `affinity` for the hot topic take its traffic by preference; every instance still handles every topic, so losing the dedicated instances falls back to the rest ([feature 0005](features/0005-backend-registry-and-routing.md) §2.3). Operators adding dedicated instances are responsible for their capacity planning. Partition-sharded ingest (sub-topic level) is on the post-MVP roadmap. |
 | Schema evolution gap | v1's "new GTS identifier per change" rule makes long-lived event logs operationally awkward without the post-MVP compatible-evolution feature. | Consumers use type-pattern wildcards (`gts.cf.core.events.event.v1~vendor.audit.*`) to subscribe to families of versions. Compatible schema evolution + inter-version casting is on the post-MVP roadmap. |
 | Abuse / resource exhaustion without quotas | Without rate limits and storage quotas, a misbehaving or malicious tenant can flood ingest, exhaust backend storage, or starve consumers. The limits **must** be set before broad production exposure. | Interim per-tenant safety-floor caps on resource-creation endpoints (`cpt-cf-evbk-nfr-tenant-rate-caps`) bound the worst vector now. Full **Quotas & Rate Limiting** — scoped per topic / per producer / per consumer (produce rate, poll rate, active-subscription caps, storage quotas) — is the immediate post-MVP feature and needs dedicated design; tracked in BACKLOG.md. |
 
@@ -718,5 +720,5 @@ GET    /v1/event-types/{id}                      # read event-type schema and al
 
 - DESIGN.md — technical realization of every requirement in §5; cross-references via section IDs (`cpt-cf-evbk-*`).
 - ADR/0002-partition-selection.md — architectural decision behind partition selection and rationale.
-- Future ADR extractions — follow-up design iterations for the remaining DESIGN.md §1.2 ADR-IDs (cluster-capabilities, streaming-delivery, topic-sharding, dispatcher, sequence-assignment, outbox-ingest).
+- Future ADR extractions - follow-up design iterations for the remaining DESIGN.md §1.2 ADR-IDs (cluster-capabilities, streaming-delivery, dispatcher, sequence-assignment, outbox-ingest).
 - Future DECOMPOSITION.md — feature phasing and MVP boundaries; final design iteration in this sequence.

@@ -31,11 +31,14 @@ use toolkit_gts::{GtsInstanceId, GtsSchema};
 use toolkit_security::AccessScope;
 use types_registry_sdk::{InstanceQuery, TypeSchemaQuery, TypesRegistryClient};
 
+mod provisioning;
+
 use crate::config::EventBrokerConfig;
+use crate::domain::backend::BackendResolver;
 use crate::domain::error::{DomainError, ErrorCode};
 use crate::domain::model::Topic;
 use crate::domain::resolution::{Declaration, resolve};
-use crate::domain::specification::SpecificationManager;
+use crate::domain::specification::{ProvisioningLimits, SpecificationManager, TopicState};
 use crate::domain::{event_type as event_type_traits, projection};
 use crate::infra::storage::entity::spec_cache::{
     self, ActiveModel as SpecCacheAM, Column as SpecCacheColumn, Entity as SpecCacheEntity,
@@ -359,7 +362,17 @@ impl SpecificationManager for TypesRegistrySpecificationManager {
                 return None;
             }
         };
-        deserialize_row(&row)
+        let topic: Topic = deserialize_row(&row)?;
+        match self.read_topic_state(id).await {
+            Ok(Some(TopicState::Provisioned { partitions, .. })) => {
+                Some(with_backend_partitions(topic, i64::from(partitions)))
+            }
+            Ok(_) => Some(topic),
+            Err(err) => {
+                tracing::warn!(%err, topic_id = %id, "topic binding lookup failed while resolving topic");
+                Some(topic)
+            }
+        }
     }
 
     async fn get_event_type(&self, id: &GtsTypeId) -> Option<EventType> {
@@ -383,13 +396,24 @@ impl SpecificationManager for TypesRegistrySpecificationManager {
     }
 
     async fn list_topics(&self) -> Vec<Topic> {
-        match self.list_rows(SpecKind::Topic).await {
+        let topics: Vec<Topic> = match self.list_rows(SpecKind::Topic).await {
             Ok(rows) => rows.iter().filter_map(deserialize_row).collect(),
             Err(err) => {
                 tracing::warn!(%err, "spec cache list failed while listing topics");
-                Vec::new()
+                return Vec::new();
             }
-        }
+        };
+        let provisioned = self.provisioned_partitions().await.unwrap_or_else(|err| {
+            tracing::warn!(%err, "topic binding list failed while listing topics");
+            HashMap::new()
+        });
+        topics
+            .into_iter()
+            .map(|topic| match provisioned.get(topic.id.as_ref()) {
+                Some(partitions) => with_backend_partitions(topic, *partitions),
+                None => topic,
+            })
+            .collect()
     }
 
     async fn list_event_types(&self) -> Vec<EventType> {
@@ -427,6 +451,29 @@ impl SpecificationManager for TypesRegistrySpecificationManager {
                 resource: id.as_ref().to_owned(),
             })
     }
+
+    async fn topic_state(&self, id: &GtsInstanceId) -> Result<Option<TopicState>, DomainError> {
+        self.read_topic_state(id).await
+    }
+
+    async fn provision_topics(
+        &self,
+        backends: &dyn BackendResolver,
+        limits: ProvisioningLimits,
+    ) -> usize {
+        self.provision_all(backends, limits).await
+    }
+}
+
+/// `topic` with the partition count its backend holds, which is in force once
+/// the topic is provisioned, whatever configuration resolved.
+fn with_backend_partitions(mut topic: Topic, partitions: i64) -> Topic {
+    if let Ok(partitions) = i32::try_from(partitions)
+        && *topic.settings.partitions().value() != partitions
+    {
+        topic.settings = topic.settings.with_partitions_held_by_backend(partitions);
+    }
+    topic
 }
 
 #[cfg(test)]

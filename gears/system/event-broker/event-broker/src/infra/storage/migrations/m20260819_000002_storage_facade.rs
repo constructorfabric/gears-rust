@@ -55,11 +55,10 @@ CREATE INDEX IF NOT EXISTS event_broker_producer_tenant_idx
 CREATE TABLE IF NOT EXISTS event_broker_producer_sequence (
     producer_id    TEXT NOT NULL,
     topic          TEXT NOT NULL,
-    partition      INTEGER NOT NULL,
     tenant_id      TEXT NOT NULL,
     last_sequence  INTEGER NOT NULL,
     updated_at     TEXT NOT NULL,
-    PRIMARY KEY (producer_id, topic, partition)
+    PRIMARY KEY (producer_id, topic)
 );
 
 CREATE INDEX IF NOT EXISTS event_broker_producer_sequence_tenant_idx

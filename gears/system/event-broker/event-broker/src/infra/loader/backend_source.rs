@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use toolkit_security::SecurityContext;
+use event_broker_sdk::backend::{BackendError, Partition, TopicPartition, Wait};
 
 use crate::domain::backend::{BackendResolver, from_sdk_event};
 use crate::domain::model::{Event, Sequence};
@@ -48,20 +48,20 @@ impl EventSource for BackendEventSource {
 
         let backend = self.backends.resolve(&topic);
 
-        // `SecurityContext::anonymous()`, matching the ingest outbox worker: a
-        // shard's loader serves every group on the instance, so there is no one
-        // caller whose context it could borrow, and borrowing the first
-        // attacher's would read one tenant's partition under another's identity.
-        let events = backend
-            .read(
-                &SecurityContext::anonymous(),
-                topic.id.as_ref(),
-                key.partition.cast_unsigned(),
-                after,
-                max_events,
-            )
-            .await
-            .map_err(|err| SourceError::Failed(err.to_string()))?;
+        // `Wait::No`: the loader fetches under a pool permit, and a wait for
+        // new events belongs to the head notification, never to a permit
+        // holder (feature 0007 §3.3).
+        let at = TopicPartition::new(
+            topic.id.clone(),
+            Partition::new(key.partition.cast_unsigned()),
+        );
+        let events = match backend.read(&at, after, max_events, Wait::No).await {
+            Ok(events) => events,
+            // Registered but not provisioned on its backend yet: a partition
+            // nothing was written to.
+            Err(BackendError::NotProvisioned { .. }) => Vec::new(),
+            Err(err) => return Err(SourceError::Failed(err.to_string())),
+        };
 
         events
             .into_iter()

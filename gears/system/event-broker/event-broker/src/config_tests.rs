@@ -12,9 +12,8 @@ use serde_json::json;
 use crate::config::{EventBrokerConfig, RetentionSize, StreamingConfig, TopicSettingsError};
 
 /// The backend types the fixtures name. Written out rather than imported from
-/// the plugin: the gear deliberately does not depend on a backend crate, and an
-/// operator writes these strings by hand too.
-const SQLITE_BACKEND: &str = "gts.cf.core.events.backend.v1~cf.core.backend.sqlite.v1~";
+/// the plugins: an operator writes these strings by hand too.
+const MEMORY_BACKEND: &str = "gts.cf.core.events.backend.v1~cf.core.backend.memory.v1~";
 const POSTGRES_BACKEND: &str = "gts.cf.core.events.backend.v1~cf.core.backend.postgres.v1~";
 
 const TOPIC_TYPE: &str = "gts.cf.core.events.topic.v1~";
@@ -25,7 +24,7 @@ const AUDIT_TOPIC: &str = "gts.cf.core.events.topic.v1~cf.billing.audit.topic.v1
 fn config_with_topics(topics: &serde_json::Value) -> EventBrokerConfig {
     serde_json::from_value(json!({
         "mode": "standalone",
-        "default_storage_backend": SQLITE_BACKEND,
+        "default_storage_backend": MEMORY_BACKEND,
         "topics": topics.clone(),
     }))
     .expect("test configuration deserializes")
@@ -121,7 +120,7 @@ fn an_explicitly_unbounded_byte_bound_releases_a_topic_from_a_bounded_default() 
 fn an_unknown_key_in_a_topic_entry_is_a_deserialization_error() {
     let err = serde_json::from_value::<EventBrokerConfig>(json!({
         "mode": "standalone",
-        "default_storage_backend": SQLITE_BACKEND,
+        "default_storage_backend": MEMORY_BACKEND,
         "topics": { TOPIC_TYPE: { "partition": 8 } },
     }))
     .expect_err("a typo must not be silently ignored");
@@ -138,12 +137,12 @@ fn the_backend_is_built_from_the_selection_the_configured_topics_name() {
     let cfg = config_with_topics(&json!({
         TOPIC_TYPE: {
             "partitions": 1,
-            "backend": { "type": SQLITE_BACKEND, "path": "/var/lib/event-broker/event_log.db" },
+            "backend": { "type": MEMORY_BACKEND, "path": "/var/lib/event-broker/event_log.db" },
         },
     }));
 
     let selection = cfg.backend_selection().expect("one entry cannot disagree");
-    assert_eq!(selection.r#type.as_ref(), SQLITE_BACKEND);
+    assert_eq!(selection.r#type.as_ref(), MEMORY_BACKEND);
     assert_eq!(
         selection.settings,
         json!({ "path": "/var/lib/event-broker/event_log.db" })
@@ -163,7 +162,7 @@ fn configuration_naming_no_backend_at_all_yields_the_deployment_default() {
     }));
 
     let selection = cfg.backend_selection().expect("no entry can disagree");
-    assert_eq!(selection.r#type.as_ref(), SQLITE_BACKEND);
+    assert_eq!(selection.r#type.as_ref(), MEMORY_BACKEND);
     assert_eq!(selection.settings, serde_json::Map::new());
 }
 
@@ -173,8 +172,8 @@ fn configuration_naming_no_backend_at_all_yields_the_deployment_default() {
 #[test]
 fn two_entries_naming_different_settings_fail_loudly() {
     let cfg = config_with_topics(&json!({
-        AUDIT_TOPIC: { "backend": { "type": SQLITE_BACKEND, "path": "/var/lib/eb/audit.db" } },
-        USAGE_TOPIC: { "backend": { "type": SQLITE_BACKEND, "path": "/var/lib/eb/usage.db" } },
+        AUDIT_TOPIC: { "backend": { "type": MEMORY_BACKEND, "path": "/var/lib/eb/audit.db" } },
+        USAGE_TOPIC: { "backend": { "type": MEMORY_BACKEND, "path": "/var/lib/eb/usage.db" } },
     }));
 
     assert_eq!(
@@ -192,7 +191,7 @@ fn two_entries_naming_different_settings_fail_loudly() {
 #[test]
 fn two_entries_naming_different_backend_types_fail_loudly() {
     let cfg = config_with_topics(&json!({
-        AUDIT_TOPIC: { "backend": { "type": SQLITE_BACKEND } },
+        AUDIT_TOPIC: { "backend": { "type": MEMORY_BACKEND } },
         USAGE_TOPIC: { "backend": { "type": POSTGRES_BACKEND } },
     }));
 
@@ -211,7 +210,7 @@ fn two_entries_naming_different_backend_types_fail_loudly() {
 #[test]
 fn an_entry_with_no_backend_block_does_not_conflict_with_one_that_has_it() {
     let cfg = config_with_topics(&json!({
-        TOPIC_TYPE: { "partitions": 1, "backend": { "type": SQLITE_BACKEND, "path": ":memory:" } },
+        TOPIC_TYPE: { "partitions": 1, "backend": { "type": MEMORY_BACKEND, "path": ":memory:" } },
         USAGE_TOPIC: { "partitions": 32 },
         AUDIT_TOPIC: { "retention": { "duration": "1h" } },
     }));
@@ -219,7 +218,7 @@ fn an_entry_with_no_backend_block_does_not_conflict_with_one_that_has_it() {
     let selection = cfg
         .backend_selection()
         .expect("silence is not disagreement");
-    assert_eq!(selection.r#type.as_ref(), SQLITE_BACKEND);
+    assert_eq!(selection.r#type.as_ref(), MEMORY_BACKEND);
     assert_eq!(
         selection.settings,
         json!({ "path": ":memory:" })
@@ -238,7 +237,7 @@ fn an_entry_with_no_backend_block_does_not_conflict_with_one_that_has_it() {
 fn a_backend_block_with_no_type_fails_to_deserialize() {
     let err = serde_json::from_value::<EventBrokerConfig>(json!({
         "mode": "standalone",
-        "default_storage_backend": SQLITE_BACKEND,
+        "default_storage_backend": MEMORY_BACKEND,
         "topics": { TOPIC_TYPE: { "partitions": 1, "backend": { "path": ":memory:" } } },
     }))
     .expect_err("a backend block must say which backend");
@@ -256,7 +255,7 @@ fn an_unrecognised_key_inside_a_backend_block_reaches_the_backend() {
     let cfg = config_with_topics(&json!({
         TOPIC_TYPE: {
             "partitions": 1,
-            "backend": { "type": SQLITE_BACKEND, "pathh": ":memory:" },
+            "backend": { "type": MEMORY_BACKEND, "pathh": ":memory:" },
         },
     }));
 

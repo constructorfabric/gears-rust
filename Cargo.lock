@@ -2321,7 +2321,8 @@ dependencies = [
  "cf-gears-cluster",
  "cf-gears-cluster-sdk",
  "cf-gears-event-broker-sdk",
- "cf-gears-sqlite-event-broker-plugin",
+ "cf-gears-memory-event-broker-plugin",
+ "cf-gears-postgres-event-broker-plugin",
  "cf-gears-standalone-cluster-plugin",
  "cf-gears-static-authn-plugin",
  "cf-gears-static-authz-plugin",
@@ -2363,6 +2364,37 @@ dependencies = [
  "tracing",
  "tracing-test",
  "utoipa",
+ "uuid",
+]
+
+[[package]]
+name = "cf-gears-event-broker-backend-bench"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cf-gears-event-broker-sdk",
+ "chrono",
+ "clap",
+ "futures-util",
+ "humantime",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "uuid",
+]
+
+[[package]]
+name = "cf-gears-event-broker-backend-conformance"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cf-gears-event-broker-sdk",
+ "chrono",
+ "futures-util",
+ "serde_json",
+ "tokio",
+ "tokio-util",
  "uuid",
 ]
 
@@ -2791,6 +2823,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "cf-gears-memory-event-broker-plugin"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cf-gears-event-broker-backend-bench",
+ "cf-gears-event-broker-backend-conformance",
+ "cf-gears-event-broker-sdk",
+ "chrono",
+ "futures-util",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "uuid",
+]
+
+[[package]]
 name = "cf-gears-mini-chat"
 version = "0.4.5"
 dependencies = [
@@ -3069,6 +3117,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "cf-gears-postgres-event-broker-plugin"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cf-gears-event-broker-backend-bench",
+ "cf-gears-event-broker-backend-conformance",
+ "cf-gears-event-broker-sdk",
+ "cf-gears-test-containers",
+ "cf-gears-toolkit-utils",
+ "chrono",
+ "futures-util",
+ "rand 0.10.1",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "testcontainers",
+ "testcontainers-modules",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "cf-gears-resource-group"
 version = "0.4.5"
 dependencies = [
@@ -3306,25 +3378,6 @@ dependencies = [
  "serde",
  "tokio",
  "tracing",
- "uuid",
-]
-
-[[package]]
-name = "cf-gears-sqlite-event-broker-plugin"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "cf-gears-event-broker-sdk",
- "cf-gears-toolkit-db",
- "cf-gears-toolkit-db-macros",
- "cf-gears-toolkit-security",
- "chrono",
- "sea-orm",
- "sea-orm-migration",
- "serde",
- "serde_json",
- "tokio",
  "uuid",
 ]
 

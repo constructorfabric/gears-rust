@@ -1,8 +1,7 @@
-//! `BackendResolver` (eb-single-process-implementation D3): resolves the
-//! event-storage backend for a topic.
+//! `BackendResolver`: resolves the event-storage backend for a topic.
 //! `IngestServiceImpl`/`DeliveryServiceImpl` call the resolved
-//! `event_broker_sdk::EventBrokerBackend` directly for event
-//! append/query/segments, with no repo-level indirection.
+//! `event_broker_sdk::backend::Backend` directly for event
+//! append/read/resolve/segments, with no repo-level indirection.
 //!
 //! Also home to the `domain::model::Event`/`Topic` <-> SDK `models::Event`
 //! conversion functions every backend call site needs - this depends only
@@ -13,41 +12,35 @@
 
 use std::sync::Arc;
 
-use event_broker_sdk::EventBrokerBackend;
-use event_broker_sdk::models::{Event as SdkEvent, ProducerMeta as SdkProducerMeta};
+use event_broker_sdk::backend::Backend;
+use event_broker_sdk::models::Event as SdkEvent;
 use toolkit_gts::GtsInstanceId;
 
 use crate::domain::error::{DomainError, ErrorCode};
 use crate::domain::ingest::PublishRequest;
-use crate::domain::model::{Event, Meta, Topic};
+use crate::domain::model::{Event, Topic};
 
-/// Resolves the backend for a topic. Takes `&Topic` (not nothing) so that
-/// when a second backend type eventually exists, call sites - which already
-/// look up the topic via `SpecificationManager` before doing anything else -
-/// don't need to change; only this trait's implementation does. For this
-/// change there is exactly one registered backend, so resolution is
-/// trivial - deliberately not implementing DESIGN.md's full GTS
-/// backend-type + `ClusterCapabilities.register_shard()` backend-instance
-/// registration scheme (design.md D3's "Alternatives considered").
+/// Resolves the backend for a topic. Takes `&Topic` so per-topic routing can
+/// land behind this trait without touching call sites, which already hold the
+/// topic from `SpecificationManager`.
 pub trait BackendResolver: Send + Sync {
-    fn resolve(&self, topic: &Topic) -> Arc<dyn EventBrokerBackend>;
+    fn resolve(&self, topic: &Topic) -> Arc<dyn Backend>;
 }
 
-/// The trivial resolver for this change: always the one backend it was
-/// constructed with, regardless of `topic`.
+/// Always the one backend it was constructed with, regardless of `topic`.
 pub struct SingleBackendResolver {
-    backend: Arc<dyn EventBrokerBackend>,
+    backend: Arc<dyn Backend>,
 }
 
 impl SingleBackendResolver {
     #[must_use]
-    pub fn new(backend: Arc<dyn EventBrokerBackend>) -> Self {
+    pub fn new(backend: Arc<dyn Backend>) -> Self {
         Self { backend }
     }
 }
 
 impl BackendResolver for SingleBackendResolver {
-    fn resolve(&self, _topic: &Topic) -> Arc<dyn EventBrokerBackend> {
+    fn resolve(&self, _topic: &Topic) -> Arc<dyn Backend> {
         Arc::clone(&self.backend)
     }
 }
@@ -94,16 +87,17 @@ pub fn partition_input(request: &PublishRequest, pointer: &str) -> Result<String
         })
 }
 
-/// `domain::model::Event` (publish input) -> the SDK's `Event` shape a
-/// backend's `persist` call expects. `partition` is resolved by the caller
-/// (`IngestServiceImpl::publish_event`'s existing `partition_for(...)`
-/// logic) before this conversion, not derived here.
+/// `domain::model::Event` (publish input) -> the SDK's `Event` a backend's
+/// `append` stores. Carries no partition, no sequence and no producer
+/// metadata: the first two are the backend's to assign, and the producer
+/// chain was checked and recorded at admission, so nothing downstream reads
+/// it.
 ///
-/// The owning topic is not part of the SDK event: `persist` takes it as its
+/// The owning topic is not part of the SDK event: `append` takes it as its
 /// own argument, so the caller names the log it is appending to rather than
-/// repeating it once per event in the batch.
+/// repeating it once per event.
 #[must_use]
-pub fn to_sdk_event(partition: i32, event: &Event) -> SdkEvent {
+pub fn to_sdk_event(event: &Event) -> SdkEvent {
     SdkEvent {
         id: event.id,
         type_id: event.r#type.clone(),
@@ -114,27 +108,10 @@ pub fn to_sdk_event(partition: i32, event: &Event) -> SdkEvent {
         occurred_at: event.occurred_at,
         trace_parent: event.trace_parent.clone(),
         data: Some(event.data.clone()),
-        // Broker-stamped fields: unset on publish input, matching the SDK's
-        // own "readOnly on the wire; absent on publish" framing for these.
-        partition: u32::try_from(partition).ok(),
+        partition: None,
         sequence: None,
         sequence_time: None,
-        meta: event.meta.as_ref().map(to_sdk_producer_meta),
-    }
-}
-
-fn to_sdk_producer_meta(meta: &Meta) -> SdkProducerMeta {
-    SdkProducerMeta {
-        // `Meta::version` (domain, `i32`) is always a small protocol version
-        // number (`1` today) - `unwrap_or(1)` rather than propagating a
-        // conversion error keeps this a pure, infallible mapping; an
-        // out-of-range version would already have failed earlier
-        // (schema/type validation), not here.
-        version: u8::try_from(meta.version).unwrap_or(1),
-        producer_id: Some(meta.producer_id),
-        previous: meta.previous,
-        sequence: Some(meta.sequence),
-        partition_hint: None,
+        meta: None,
     }
 }
 

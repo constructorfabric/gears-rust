@@ -523,6 +523,31 @@ mod tests {
         });
     }
 
+    /// The plain `PostgreSQL` image is pinned twice too: here and in the
+    /// Python `E2E` sidecar the event-broker suite runs its `PostgreSQL`
+    /// backend lane on.
+    #[test]
+    fn e2e_sidecar_pins_the_same_postgres_image() {
+        let sidecars = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testing/e2e/lib/sidecars.py"
+        );
+        let Ok(source) = std::fs::read_to_string(sidecars) else {
+            panic!("cannot read {sidecars}; update this test if the file moved");
+        };
+        for expected in [
+            format!("POSTGRES_TAG = \"{POSTGRES_TAG}\""),
+            format!("ENV_POSTGRES_TAG = \"{ENV_POSTGRES_TAG}\""),
+        ] {
+            assert!(
+                source.contains(&expected),
+                "testing/e2e/lib/sidecars.py does not define `{expected}`; \
+                 the E2E lane and the Rust plugin tests would run different \
+                 PostgreSQL majors"
+            );
+        }
+    }
+
     /// The `TimescaleDB` image is pinned twice — here and in the Python `E2E`
     /// sidecar — so the comments that point at each other are backed by a
     /// check. A skew validates plugin migrations against a different

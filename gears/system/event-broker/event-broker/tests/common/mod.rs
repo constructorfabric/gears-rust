@@ -169,16 +169,13 @@ gears:
       file: "event_broker.db"
     config:
       mode: standalone
-      default_storage_backend: "gts.cf.core.events.backend.v1~cf.core.backend.sqlite.v1~"
-      # The event log lives in the backend's own database, beside the gear's
-      # rather than inside it - the gear's keeps ingest and delivery metadata.
-      # A file rather than `:memory:` because the restart test asserts events
-      # survive the process that wrote them.
+      default_storage_backend: "gts.cf.core.events.backend.v1~cf.core.backend.memory.v1~"
+      # The event log lives in the memory backend, inside this process: it does
+      # not survive a restart.
       topics:
         "gts.cf.core.events.topic.v1~":
           backend:
-            type: "gts.cf.core.events.backend.v1~cf.core.backend.sqlite.v1~"
-            path: '{home}/event-broker/event_log.db'
+            type: "gts.cf.core.events.backend.v1~cf.core.backend.memory.v1~"
 {topic_settings}
 
   api-gateway:

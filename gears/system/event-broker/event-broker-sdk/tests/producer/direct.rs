@@ -5,9 +5,10 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use event_broker::test_support::{EventBrokerHarness, StaticTypesRegistry};
+use event_broker_sdk::backend::{Backend, Partition, TopicPartition, Wait};
 use event_broker_sdk::{
-    DirectDeduplication, IngestOutcome, Producer, ProducerIdentity, ProducerMode, Sequence,
-    TypedEvent, gts_id,
+    DirectDeduplication, GtsInstanceId, IngestOutcome, Producer, ProducerIdentity, ProducerMode,
+    Sequence, TypedEvent, gts_id,
 };
 use toolkit_security::SecurityContext;
 
@@ -42,11 +43,13 @@ async fn stored_count(harness: &EventBrokerHarness, partition: u32) -> usize {
     harness
         .backend()
         .read(
-            &SecurityContext::anonymous(),
-            TOPIC,
-            partition,
+            &TopicPartition::new(
+                GtsInstanceId::try_new(TOPIC).unwrap(),
+                Partition::new(partition),
+            ),
             Sequence::NONE,
             1024,
+            Wait::No,
         )
         .await
         .expect("read stored events")
@@ -141,10 +144,7 @@ async fn register_on_start_chained_mints_id_and_publishes_first_sequence() {
         .get_producer_cursors(&SecurityContext::anonymous(), producer_id)
         .await
         .unwrap();
-    assert_eq!(
-        cursors.last_sequence(&topic_instance(), TENANT_PARTITION),
-        Some(0)
-    );
+    assert_eq!(cursors.last_sequence(&topic_instance()), Some(0));
     wait_for_stored(&harness, TENANT_PARTITION, 1).await;
 }
 
@@ -191,10 +191,7 @@ async fn reuse_monotonic_primes_from_broker_cursor() {
         .get_producer_cursors(&ctx, producer_id)
         .await
         .unwrap();
-    assert_eq!(
-        cursors.last_sequence(&topic_instance(), TENANT_PARTITION),
-        Some(1)
-    );
+    assert_eq!(cursors.last_sequence(&topic_instance()), Some(1));
 }
 
 /// `publish_persisted` asks for a durable-write confirmation, but the in-process

@@ -688,7 +688,7 @@ OPENAPI_BUILD_FEATURE_ARGS := $(if $(GEAR),$(GEAR_OPENAPI_FEATURE_ARGS),$(OPENAP
 
 # -------- Tests --------
 
-.PHONY: test test-no-macros test-macros test-sqlite test-pg test-pgq test-mysql test-db test-users-info-pg test-usage-collector-pg test-types-registry-db test-cluster-pg test-cluster-redis test-cluster-k8s coverage-cluster-k8s test-rg-pg test-pricing-pg test-coord-pg test-fixtures-narrow test-fips
+.PHONY: test test-no-macros test-macros test-sqlite test-pg test-pgq test-mysql test-db test-users-info-pg test-usage-collector-pg test-types-registry-db test-cluster-pg test-eb-pg bench-eb-memory bench-eb-pg test-cluster-redis test-cluster-k8s coverage-cluster-k8s test-rg-pg test-pricing-pg test-coord-pg test-fixtures-narrow test-fips
 
 # Run all tests, or a single gear when GEAR=<gear> is set.
 # When GEAR= is set, cargo gears ls packages finds matching crates + their
@@ -776,6 +776,39 @@ test-types-registry-db: install-tools
 test-cluster-pg: install-tools
 	$(call print_target_banner)
 	cargo nextest run -p cf-postgres-cluster-plugin --features integration --retries 1
+
+## The event-broker PostgreSQL backend: the shared backend conformance suite
+## and the plugin's own tests against a real PostgreSQL (testcontainers). Needs
+## a Docker daemon; `EB_TEST_POSTGRES_URL` points it at an existing server.
+test-eb-pg: install-tools
+	$(call print_target_banner)
+	cargo nextest run -p cf-gears-postgres-event-broker-plugin --features integration --retries 1
+
+## Event-broker backend bench (plugins/event-broker-backend-bench/README.md)
+## against the memory backend. Extra flags go in BENCH_ARGS, e.g.
+## `make bench-eb-memory BENCH_ARGS="--quick --scenarios b2"`. The build runs
+## first; the run itself is confined to BENCH_MEMORY_MAX (systemd user scope,
+## no swap), so a runaway is killed before it takes the machine with it.
+BENCH_MEMORY_MAX ?= 6G
+# Two malloc arenas: with one per thread, memory a finished phase freed on one
+# thread is not reused by the next phase's allocations on another, and RSS
+# climbs phase after phase.
+BENCH_SCOPE ?= MALLOC_ARENA_MAX=2 systemd-run --user --scope --quiet -p MemoryMax=$(BENCH_MEMORY_MAX) -p MemorySwapMax=0
+
+bench-eb-memory:
+	$(call print_target_banner)
+	cargo bench -p cf-gears-memory-event-broker-plugin --bench backend --no-run
+	$(BENCH_SCOPE) cargo bench -p cf-gears-memory-event-broker-plugin --bench backend -- \
+		--out $(CURDIR)/target/eb-bench/memory.json $(BENCH_ARGS)
+
+## The same against PostgreSQL: the server EB_BENCH_POSTGRES_URL names, or a
+## testcontainers container (needs a Docker daemon; the container runs outside
+## the memory scope).
+bench-eb-pg:
+	$(call print_target_banner)
+	cargo bench -p cf-gears-postgres-event-broker-plugin --features integration --bench backend --no-run
+	$(BENCH_SCOPE) cargo bench -p cf-gears-postgres-event-broker-plugin --features integration --bench backend -- \
+		--out $(CURDIR)/target/eb-bench/postgres.json $(BENCH_ARGS)
 
 ## Kubernetes cluster plugin: L2 (conformance) + L3 (integration) against a real
 ## k3s API server (docs/TESTING.md 4, 7). Docker required, and k3s needs
@@ -1026,7 +1059,7 @@ bench-db-longhaul: bench-pg-longhaul bench-mysql-longhaul bench-mariadb-longhaul
 
 # -------- E2E tests --------
 
-.PHONY: e2e e2e-local e2e-local-smoke e2e-mini-chat e2e-docker e2e-docker-smoke e2e-tr-authz e2e-usage-collector e2e-event-broker
+.PHONY: e2e e2e-local e2e-local-smoke e2e-mini-chat e2e-docker e2e-docker-smoke e2e-tr-authz e2e-usage-collector e2e-event-broker e2e-event-broker-pg
 
 E2E_TARGET ?=
 # E2E selectors for `make e2e-local`:
@@ -1110,6 +1143,14 @@ e2e-event-broker: py-env
 	$(call print_target_banner)
 	cargo build -p cf-gears-event-broker --bin cf-gears-event-broker-server
 	E2E_BINARY=target/debug/cf-gears-event-broker-server \
+		$(PYTHON) -m pytest testing/e2e/suites/event_broker/ -vv
+
+## The same suite with the server on the PostgreSQL storage backend (a
+## PostgreSQL sidecar; needs a Docker daemon).
+e2e-event-broker-pg: py-env
+	$(call print_target_banner)
+	cargo build -p cf-gears-event-broker --bin cf-gears-event-broker-server
+	EB_E2E_BACKEND=postgres E2E_BINARY=target/debug/cf-gears-event-broker-server \
 		$(PYTHON) -m pytest testing/e2e/suites/event_broker/ -vv
 
 # -------- Code coverage --------

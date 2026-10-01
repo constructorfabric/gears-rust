@@ -763,21 +763,26 @@ where
             // The backend owns this: it is the only thing that knows where
             // retention has reached, what it has assigned, and when each event
             // occurred. An inadmissible `Exact` fails to resolve.
-            match backend
-                .resolve(
-                    ctx,
-                    topic.id.as_ref(),
-                    target.partition.cast_unsigned(),
-                    target.value,
-                )
-                .await
-            {
+            let at = event_broker_sdk::backend::TopicPartition::new(
+                topic.id.clone(),
+                event_broker_sdk::backend::Partition::new(target.partition.cast_unsigned()),
+            );
+            let position = target.value.clone();
+            let outcome = match backend.resolve(&at, target.value).await {
+                // A registered topic its backend does not hold yet reads as a
+                // partition nothing was written to (feature 0007 §3.3).
+                Err(event_broker_sdk::backend::BackendError::NotProvisioned { .. }) => {
+                    resolve_unprovisioned(&position)
+                }
+                outcome => outcome,
+            };
+            match outcome {
                 Ok(offset) => resolved.push(SeekPosition {
                     topic: target.topic,
                     partition: target.partition,
                     offset,
                 }),
-                Err(event_broker_sdk::StorageBackendError::OffsetOutOfRange {
+                Err(event_broker_sdk::backend::BackendError::OffsetOutOfRange {
                     floor,
                     ceiling,
                     breached,
@@ -913,5 +918,22 @@ where
             });
         }
         self.repo.delete_consumer_group(id).await
+    }
+}
+
+/// Where `position` resolves on a partition nothing was written to: head 0,
+/// and 0 the only position a cursor can hold.
+fn resolve_unprovisioned(
+    position: &Position,
+) -> Result<Sequence, event_broker_sdk::backend::BackendError> {
+    match position {
+        Position::Exact(requested) if !requested.is_none() => {
+            Err(event_broker_sdk::backend::BackendError::out_of_range(
+                *requested,
+                Sequence::NONE,
+                Sequence::NONE,
+            ))
+        }
+        _ => Ok(Sequence::NONE),
     }
 }

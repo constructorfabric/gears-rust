@@ -13,7 +13,7 @@ use crate::config::{DEFAULT_RETENTION_DURATION, EventBrokerConfig};
 
 const TOPIC_TYPE: &str = "gts.cf.core.events.topic.v1~";
 const USAGE_TOPIC: &str = "gts.cf.core.events.topic.v1~cf.billing.usage.topic.v1";
-const SQLITE_BACKEND: &str = "gts.cf.core.events.backend.v1~cf.core.backend.sqlite.v1~";
+const MEMORY_BACKEND: &str = "gts.cf.core.events.backend.v1~cf.core.backend.memory.v1~";
 const POSTGRES_BACKEND: &str = "gts.cf.core.events.backend.v1~cf.core.backend.postgres.v1~";
 
 fn topic() -> GtsInstanceId {
@@ -23,7 +23,7 @@ fn topic() -> GtsInstanceId {
 fn config(topics: &serde_json::Value) -> EventBrokerConfig {
     serde_json::from_value(json!({
         "mode": "standalone",
-        "default_storage_backend": SQLITE_BACKEND,
+        "default_storage_backend": MEMORY_BACKEND,
         "topics": topics.clone(),
     }))
     .expect("test configuration deserializes")
@@ -165,13 +165,13 @@ fn a_partition_count_reports_the_entry_that_supplied_it() {
 fn a_backend_reports_the_entry_that_supplied_it_and_resolves_whole() {
     let built_in =
         resolve(&config(&json!({})), &topic(), &Declaration::default()).expect("resolves");
-    assert_eq!(built_in.backend().value().r#type.as_ref(), SQLITE_BACKEND);
+    assert_eq!(built_in.backend().value().r#type.as_ref(), MEMORY_BACKEND);
     assert!(built_in.backend().value().settings.is_empty());
     assert_eq!(built_in.backend().source(), Source::BuiltIn);
 
     let overridden = resolve(
         &config(&json!({
-            TOPIC_TYPE: { "backend": { "type": SQLITE_BACKEND, "path": ":memory:" } },
+            TOPIC_TYPE: { "backend": { "type": MEMORY_BACKEND, "path": ":memory:" } },
             USAGE_TOPIC: { "backend": { "type": POSTGRES_BACKEND, "host": "db-1" } },
         })),
         &topic(),

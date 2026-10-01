@@ -264,12 +264,7 @@ async def test_cursor_recovery_returns_last_sequence(api):
         "topics": [
             {
                 "topic": TOPIC_STREAM,
-                "partitions": [
-                    {
-                        "partition": body["topics"][0]["partitions"][0]["partition"],
-                        "last_sequence": 2,
-                    }
-                ],
+                "last_sequence": 2,
             }
         ],
     }
@@ -422,11 +417,8 @@ async def test_chained_producer_desync_recovery(api):
         assert cursors_resp.status_code == 200
         cursor_body = cursors_resp.json()
         assert cursor_body["producer_id"] == producer_id
-        topics = cursor_body["topics"]
-        assert len(topics) > 0
-        partitions = topics[0]["partitions"]
-        last_seq = partitions[0]["last_sequence"]
-        assert last_seq == 2
+        assert cursor_body["topics"] == [{"topic": TOPIC_STREAM, "last_sequence": 2}]
+        last_seq = 2
 
         # Step 3 — Republish with the correct sequence (previous=2, sequence=3).
         recovered_resp = await client.post(
@@ -462,9 +454,7 @@ async def _last_sequence(client, producer_id: str) -> int:
     assert cursors.status_code == 200
     topics = cursors.json()["topics"]
     assert len(topics) == 1, f"expected one topic in the cursor, got {topics}"
-    partitions = topics[0]["partitions"]
-    assert len(partitions) == 1, f"expected one partition, got {partitions}"
-    return partitions[0]["last_sequence"]
+    return topics[0]["last_sequence"]
 
 
 async def test_monotonic_publish_with_gap_accepted(api):

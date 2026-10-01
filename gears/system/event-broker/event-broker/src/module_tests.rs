@@ -121,10 +121,10 @@ async fn make_ctx_with_hub(mode: &str, hub: Arc<ClientHub>) -> GearCtx {
         "event-broker": {
             "config": {
                 "mode": mode,
-                "default_storage_backend": "gts.cf.core.events.backend.v1~cf.core.backend.sqlite.v1~",
+                "default_storage_backend": "gts.cf.core.events.backend.v1~cf.core.backend.memory.v1~",
                 // Only load-bearing for cluster_ingest/cluster_delivery
-                // (registration `init`-time validation, `eb-dispatcher-routing`
-                // design.md D5); harmless for the other two modes.
+                // (registration `init`-time validation); harmless for the other
+                // two modes.
                 "registration": { "advertise_addr": "127.0.0.1:8080" },
             }
         }
@@ -209,7 +209,7 @@ async fn init_fails_on_wildcard_bind_with_no_advertise_addr_in_cluster_mode() {
         "event-broker": {
             "config": {
                 "mode": "cluster_ingest",
-                "default_storage_backend": "gts.cf.core.events.backend.v1~cf.core.backend.sqlite.v1~",
+                "default_storage_backend": "gts.cf.core.events.backend.v1~cf.core.backend.memory.v1~",
                 // `registration` omitted entirely -> defaults to
                 // `listen_addr: "0.0.0.0:0"`, `advertise_addr: None`.
             }

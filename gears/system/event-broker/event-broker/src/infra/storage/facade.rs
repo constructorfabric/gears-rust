@@ -34,14 +34,16 @@ use uuid::Uuid;
 use crate::domain::error::{DomainError, ErrorCode};
 use crate::domain::idempotency::{IdempotencyGuard, ProducerIdempotencyOutcome, PublishEnqueue};
 use crate::domain::ingest::{
-    ProducerCursors, ProducerMode, ProducerPartitionCursor, ProducerRecord, ProducerRegistration,
-    ProducerRegistry, ProducerResetScope, ProducerTopicCursors,
+    ProducerCursors, ProducerMode, ProducerRecord, ProducerRegistration, ProducerRegistry,
+    ProducerResetScope, ProducerTopicCursors,
 };
 use crate::domain::model::{ConsumerGroup, ConsumerGroupKind, Cursor};
 use crate::domain::notify::{DeliveryNotifier, NOTIFICATION_PREFIX};
 use crate::domain::repo::{ConsumerGroupRepo, CursorRepo, RoutingMarkers};
 use crate::domain::specification::SpecificationManager;
-use crate::infra::storage::entity::{consumer_group, cursor, producer, producer_sequence};
+use crate::infra::storage::entity::{
+    consumer_group, cursor, outbox_identity, producer, producer_sequence,
+};
 use crate::infra::storage::error::db_err_from_scope;
 
 /// Subscription id -> its consumer group.
@@ -409,14 +411,10 @@ impl IdempotencyGuard for Storage {
         let outbox = Arc::clone(outbox);
         let PublishEnqueue {
             chain,
-            topic_partition,
+            ingest_partition,
             payload,
             payload_type,
         } = request;
-        // Every event of one topic partition has to reach the same outbox
-        // partition to keep its relative order, and the topic's partition
-        // count is unrelated to the outbox's - see `outbox_partition_for`.
-        let partition_for_outbox = crate::domain::outbox::outbox_partition_for(topic_partition);
 
         let (outcome, wake) = self
             .db
@@ -428,7 +426,6 @@ impl IdempotencyGuard for Storage {
                             let existing = producer_sequence::Entity::find()
                                 .filter(producer_sequence::Column::ProducerId.eq(c.producer_id))
                                 .filter(producer_sequence::Column::Topic.eq(c.topic.as_ref()))
-                                .filter(producer_sequence::Column::Partition.eq(c.partition))
                                 .secure()
                                 .scope_with(&AccessScope::allow_all())
                                 .one(tx)
@@ -460,7 +457,6 @@ impl IdempotencyGuard for Storage {
                                         let am = producer_sequence::ActiveModel {
                                             producer_id: Set(c.producer_id),
                                             topic: Set(c.topic.as_ref().to_owned()),
-                                            partition: Set(c.partition),
                                             tenant_id: Set(producer_row.tenant_id),
                                             last_sequence: Set(c.sequence),
                                             updated_at: Set(Utc::now()),
@@ -486,10 +482,6 @@ impl IdempotencyGuard for Storage {
                                                     .add(
                                                         producer_sequence::Column::Topic
                                                             .eq(c.topic.as_ref()),
-                                                    )
-                                                    .add(
-                                                        producer_sequence::Column::Partition
-                                                            .eq(c.partition),
                                                     ),
                                             )
                                             .col_expr(
@@ -514,7 +506,7 @@ impl IdempotencyGuard for Storage {
                     let wake = if matches!(outcome, ProducerIdempotencyOutcome::Accept) {
                         let record = toolkit_db::outbox::Record::to(
                             crate::domain::outbox::INGEST_QUEUE_NAME,
-                            partition_for_outbox,
+                            ingest_partition,
                         )
                         .payload(payload, &payload_type)
                         .build()
@@ -645,27 +637,15 @@ impl ProducerRegistry for Storage {
             .all(&conn)
             .await?;
 
-        let mut by_topic: std::collections::HashMap<String, Vec<ProducerPartitionCursor>> =
-            std::collections::HashMap::new();
-        for row in sequence_rows {
-            by_topic
-                .entry(row.topic)
-                .or_default()
-                .push(ProducerPartitionCursor {
-                    partition: row.partition,
-                    last_sequence: row.last_sequence,
-                });
-        }
-
         Ok(Some(ProducerCursors {
             producer_id,
             client_agent: producer_row.client_agent,
-            topics: by_topic
+            topics: sequence_rows
                 .into_iter()
-                .map(|(topic, partitions)| {
+                .map(|row| {
                     Ok(ProducerTopicCursors {
-                        topic: parse_gts_id(&topic)?,
-                        partitions,
+                        topic: parse_gts_id(&row.topic)?,
+                        last_sequence: row.last_sequence,
                     })
                 })
                 .collect::<Result<Vec<_>, DomainError>>()?,
@@ -680,10 +660,8 @@ impl ProducerRegistry for Storage {
         let conn = self.db.conn()?;
         let mut filter =
             Condition::all().add(producer_sequence::Column::ProducerId.eq(producer_id));
-        if let ProducerResetScope::TopicPartition { topic, partition } = scope {
-            filter = filter
-                .add(producer_sequence::Column::Topic.eq(topic.as_str()))
-                .add(producer_sequence::Column::Partition.eq(*partition));
+        if let ProducerResetScope::Topic { topic } = scope {
+            filter = filter.add(producer_sequence::Column::Topic.eq(topic.as_str()));
         }
         producer_sequence::Entity::delete_many()
             .filter(filter)
@@ -692,6 +670,52 @@ impl ProducerRegistry for Storage {
             .exec(&conn)
             .await?;
         Ok(())
+    }
+}
+
+impl Storage {
+    /// The identity of the ingest outbox `queue` (feature 0005 §2.5): created
+    /// once, as random 64 bits, by whichever instance reads it first, and the
+    /// same on every instance and restart after that. The high half of every
+    /// fence key the queue's messages append under.
+    ///
+    /// # Errors
+    /// Returns a `DomainError` if the connection, the read or the insert fails.
+    pub async fn outbox_identity(
+        &self,
+        queue: &str,
+    ) -> Result<crate::domain::outbox::OutboxId, DomainError> {
+        let conn = self.db.conn()?;
+        let read = || async {
+            outbox_identity::Entity::find_by_id(queue.to_owned())
+                .secure()
+                .scope_with(&AccessScope::allow_all())
+                .one(&conn)
+                .await
+        };
+        if let Some(row) = read().await? {
+            return Ok(crate::domain::outbox::OutboxId::from_signed(row.outbox_id));
+        }
+        let candidate = crate::domain::outbox::OutboxId::new(Uuid::new_v4().as_u64_pair().0);
+        let inserted = secure_insert::<outbox_identity::Entity>(
+            outbox_identity::ActiveModel {
+                queue: Set(queue.to_owned()),
+                outbox_id: Set(candidate.signed()),
+            },
+            &AccessScope::allow_all(),
+            &conn,
+        )
+        .await;
+        // Another instance may have inserted first; its identity is the one.
+        match (inserted, read().await?) {
+            (_, Some(row)) => Ok(crate::domain::outbox::OutboxId::from_signed(row.outbox_id)),
+            (Err(err), None) => Err(DomainError::Internal(format!(
+                "ingest outbox identity for '{queue}' could not be stored: {err}"
+            ))),
+            (Ok(_), None) => Err(DomainError::Internal(format!(
+                "ingest outbox identity for '{queue}' vanished after it was stored"
+            ))),
+        }
     }
 }
 
@@ -916,21 +940,18 @@ mod tests {
             .collect()
     }
 
-    /// Stateless publishes - the common case, no producer `meta` at all - used
-    /// to be enqueued onto outbox partition `0` unconditionally, leaving every
-    /// other sequencer/processor slot permanently idle.
+    /// Stateless publishes - the common case, no producer `meta` at all - land
+    /// in the ingest outbox partition they are given, so every
+    /// sequencer/processor slot carries work.
     #[tokio::test]
     async fn stateless_publishes_reach_every_outbox_partition() {
         let (storage, dsn) = test_storage_with_db().await;
 
-        // One publish per topic partition of an eight-partition topic. Eight
-        // is deliberately more than the outbox has, so this also covers the
-        // partitions that used to address slots that do not exist.
-        for topic_partition in 0..8 {
+        for ingest_partition in [0, 1, 2, 3, 0, 1, 2, 3] {
             let outcome = storage
                 .check_and_enqueue(
                     PublishEnqueue::builder(
-                        topic_partition,
+                        ingest_partition,
                         b"payload".to_vec(),
                         "application/json",
                     )
@@ -943,52 +964,7 @@ mod tests {
 
         assert_eq!(
             outbox_partition_row_counts(&dsn).await,
-            vec![(0, 2), (1, 2), (2, 2), (3, 2)],
-            "eight topic partitions over a four-partition outbox must land two \
-             apiece, not eight on partition 0"
-        );
-    }
-
-    /// A topic with more partitions than the outbox has used to hand
-    /// `toolkit-db` a partition index it had never registered, which failed
-    /// the whole enqueue transaction and rejected the publish.
-    #[tokio::test]
-    async fn chained_publish_beyond_the_outbox_partition_count_is_accepted() {
-        let (storage, dsn) = test_storage_with_db().await;
-        let owner = Uuid::new_v4();
-        let registration = storage
-            .register(
-                owner,
-                Uuid::new_v4(),
-                ProducerMode::Chained,
-                "agent".to_owned(),
-            )
-            .await
-            .expect("register must succeed");
-        let topic = GtsInstanceId::try_new(TOPIC_ID).unwrap();
-
-        // Partition 7 of an eight-partition topic: past the outbox's four.
-        let outcome = storage
-            .check_and_enqueue(
-                PublishEnqueue::builder(7, b"payload".to_vec(), "application/json")
-                    .chain(ProducerChainCheck {
-                        producer_id: registration.id,
-                        topic,
-                        partition: 7,
-                        previous: 0,
-                        sequence: 1,
-                        mode: ProducerMode::Chained,
-                    })
-                    .build(),
-            )
-            .await
-            .expect("a chained publish past the outbox partition count must be accepted");
-        assert_eq!(outcome, ProducerIdempotencyOutcome::Accept);
-
-        assert_eq!(
-            outbox_partition_row_counts(&dsn).await,
-            vec![(0, 0), (1, 0), (2, 0), (3, 1)],
-            "topic partition 7 must land on outbox partition 3"
+            vec![(0, 2), (1, 2), (2, 2), (3, 2)]
         );
     }
 
@@ -1268,7 +1244,6 @@ mod tests {
                 .chain(ProducerChainCheck {
                     producer_id: registration.id,
                     topic: topic.clone(),
-                    partition: 0,
                     previous,
                     sequence,
                     mode: ProducerMode::Chained,
@@ -1323,7 +1298,7 @@ mod tests {
             .expect("cursors lookup must succeed")
             .expect("producer must exist");
         assert_eq!(cursors.topics.len(), 1);
-        assert_eq!(cursors.topics[0].partitions[0].last_sequence, 10);
+        assert_eq!(cursors.topics[0].last_sequence, 10);
 
         storage
             .reset(registration.id, &ProducerResetScope::All)

@@ -378,6 +378,9 @@ jobs:
       - name: Test postgres-cluster-plugin (pg integration)
         run: make test-cluster-pg
 
+      - name: Test postgres-event-broker-plugin (pg integration)
+        run: make test-eb-pg
+
       - name: Test k8s-cluster-plugin (k3s L2+L3 integration)
         # k3s runs in a **privileged** container (testcontainers-modules sets it);
         # GitHub-hosted ubuntu runners permit that. The target uses `cargo test`, not

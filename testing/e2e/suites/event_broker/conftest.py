@@ -33,6 +33,7 @@ import httpx
 import pytest
 
 from lib.orchestrator import GearTestEnv
+from lib.sidecars import PostgresSidecar
 
 # ── Constants ─────────────────────────────────────────────────────────────
 
@@ -72,6 +73,16 @@ EVENT_TYPE_LONGPOLL = "gts.cf.core.events.event.v1~cf.e2e.event_broker.longpoll.
 # consumer/flows/1.01): needs enough partitions to split across multiple members.
 TOPIC_4P = "gts.cf.core.events.topic.v1~cf.e2e.event_broker.four_part.v1"
 EVENT_TYPE_4P = "gts.cf.core.events.event.v1~cf.e2e.event_broker.four_part.v1~"
+
+# Key-order topic (feature 0007 §11 S1): four partitions, so two keys may land
+# on different ones and each key's order is checked within its own.
+TOPIC_ORDER = "gts.cf.core.events.topic.v1~cf.e2e.event_broker.key_order.v1"
+EVENT_TYPE_ORDER = "gts.cf.core.events.event.v1~cf.e2e.event_broker.key_order.v1~"
+
+# Never-published topic (feature 0007 §11 S5): a consumer joins and seeks it
+# before any producer publishes, so its first event is sequence 1.
+TOPIC_FRESH = "gts.cf.core.events.topic.v1~cf.e2e.event_broker.fresh.v1"
+EVENT_TYPE_FRESH = "gts.cf.core.events.event.v1~cf.e2e.event_broker.fresh.v1~"
 
 # Strict-schema topic for schema-validation tests (producer/single/1.03):
 # its event type requires data.strict_field as a string, so publishing
@@ -113,6 +124,8 @@ _TOPIC_PARTITIONS = {
     TOPIC_4P: 4,
     TOPIC_STRICT: 1,
     TOPIC_PREFILLED: 1,
+    TOPIC_ORDER: 4,
+    TOPIC_FRESH: 1,
 }
 
 
@@ -201,9 +214,54 @@ _EXTRA_ENTITIES = [
     _strict_event_type(EVENT_TYPE_STRICT, TOPIC_STRICT),
     _topic_instance(TOPIC_PREFILLED),
     _derived_event_type(EVENT_TYPE_PREFILLED, TOPIC_PREFILLED),
+    _topic_instance(TOPIC_ORDER),
+    _derived_event_type(EVENT_TYPE_ORDER, TOPIC_ORDER),
+    _topic_instance(TOPIC_FRESH),
+    _derived_event_type(EVENT_TYPE_FRESH, TOPIC_FRESH),
 ]
 
 _TEMP_HOME = tempfile.mkdtemp(prefix="cf-gears-e2e-event-broker-")
+
+# ── Storage backend ───────────────────────────────────────────────────────
+#
+# The suite runs against either storage backend, chosen by `EB_E2E_BACKEND`:
+# `memory` (the default, what the committed config names) or `postgres` (a
+# PostgreSQL sidecar, `make e2e-event-broker-pg`). The restart test needs
+# events to outlive the process, so it runs on postgres only.
+
+MEMORY_BACKEND = "gts.cf.core.events.backend.v1~cf.core.backend.memory.v1~"
+POSTGRES_BACKEND = "gts.cf.core.events.backend.v1~cf.core.backend.postgres.v1~"
+BACKEND = os.environ.get("EB_E2E_BACKEND", "").strip() or "memory"
+if BACKEND not in ("memory", "postgres"):
+    raise RuntimeError(f"EB_E2E_BACKEND must be memory or postgres, not {BACKEND!r}")
+
+
+def patch_backend(config_text: str, sidecars, schema: str) -> str:
+    """Point the committed config's backend at `BACKEND`.
+
+    `sidecars` is whatever the caller holds - `GearTestEnv.sidecars` (a list)
+    or `RunningTestEnv.sidecars` (a dict) - and `schema` keeps one server's
+    events apart from another's in the shared PostgreSQL database.
+    """
+    if BACKEND == "memory":
+        return config_text
+    sidecars = sidecars.values() if isinstance(sidecars, dict) else sidecars
+    postgres = next(sc for sc in sidecars if sc.name == "postgres")
+    default = f'default_storage_backend: "{MEMORY_BACKEND}"'
+    block = f'            type: "{MEMORY_BACKEND}"\n'
+    assert default in config_text and block in config_text, (
+        "the committed config no longer names the memory backend where the "
+        "backend switch expects it"
+    )
+    return config_text.replace(
+        default, f'default_storage_backend: "{POSTGRES_BACKEND}"'
+    ).replace(
+        block,
+        f'            type: "{POSTGRES_BACKEND}"\n'
+        f'            url: "{postgres.url()}"\n'
+        f'            schema: "{schema}"\n'
+        f"            maintenance_interval_ms: 1000\n",
+    )
 
 
 # ── Environment gate ──────────────────────────────────────────────────────
@@ -234,17 +292,10 @@ def pytest_collection_modifyitems(items):
 # ── Test environment ──────────────────────────────────────────────────────
 
 def _patch_config(config_text: str, env: GearTestEnv) -> str:
+    config_text = patch_backend(config_text, env.sidecars, "evbk_e2e")
     config_text = config_text.replace(
         'home_dir: "~/.cf-gears-event-broker"',
         f'home_dir: "{_TEMP_HOME}"',
-    )
-    # The storage backend opens its own database, and the committed config
-    # points it at the real home directory. Redirect it into this session's
-    # temp home too, or every run of this suite would append to one event log
-    # shared with the last run and with the restart test's own server.
-    config_text = config_text.replace(
-        'path: "~/.cf-gears-event-broker/event-broker/event_log.db"',
-        f'path: "{_TEMP_HOME}/event-broker/event_log.db"',
     )
     config_text = config_text.replace(
         'bind_addr: "127.0.0.1:8080"',
@@ -270,6 +321,7 @@ def gear_test_env() -> GearTestEnv:
         health_path="/healthz",
         health_timeout=30,
         env={"RUST_LOG": os.environ.get("RUST_LOG", "info,event_broker=debug")},
+        sidecars=[PostgresSidecar()] if BACKEND == "postgres" else [],
         log_suffix="event-broker",
     )
 

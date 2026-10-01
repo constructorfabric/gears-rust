@@ -99,7 +99,7 @@ pub async fn reset_producer(
         })?
     };
 
-    let scope = ProducerResetScope::try_from(ProducerResetSelector::from(req))?;
+    let scope = ProducerResetScope::from(ProducerResetSelector::from(req));
     state
         .ingest
         .reset_producer(&ctx, producer_id, scope)
