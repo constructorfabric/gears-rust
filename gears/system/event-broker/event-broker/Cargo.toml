@@ -17,8 +17,8 @@ autobins = false
 # Exposes `test_support` (the in-process `EventBrokerHarness` + `test_router`)
 # to other crates' tests, mirroring oagw's `test-utils`. The event-broker SDK's
 # integration tests enable it to resolve a real in-process `EventBrokerApi`
-# (`LocalBroker`) from the harness's `ClientHub` instead of a mock. All deps the
-# harness's own deps (`sqlite-event-broker-plugin`, `types-registry-sdk`,
+# (`LocalBroker`) from the harness's `ClientHub` instead of a mock. The
+# harness's own deps (`memory-event-broker-plugin`, `types-registry-sdk`,
 # `sea-orm-migration`, `tokio-util`) are already regular dependencies; the
 # router-driving side modules (`request`/`response`) additionally need `http`
 # + `tower`, and the fixtures need `types-registry-sdk`'s `test-util`, so the
@@ -141,10 +141,11 @@ authn-resolver = { workspace = true }
 static-authn-plugin = { workspace = true }
 static-authz-plugin = { workspace = true }
 standalone-cluster-plugin = { workspace = true }
-# The SQLite storage backend, injected at wiring as a provider (`module.rs`),
-# the same way the cluster gear injects its cache providers. The gear links it
-# but knows only the `EventBrokerBackend` trait behind it.
-sqlite-event-broker-plugin = { workspace = true }
+# The storage backends, injected at wiring as providers (`module.rs`), the way
+# the cluster gear injects its cache providers. The gear links them but knows
+# only the `backend::Backend` trait behind them; the test harness runs on memory.
+memory-event-broker-plugin = { workspace = true }
+postgres-event-broker-plugin = { workspace = true }
 
 [[bench]]
 name = "partition_cache"

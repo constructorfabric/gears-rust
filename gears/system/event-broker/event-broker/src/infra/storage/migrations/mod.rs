@@ -16,6 +16,7 @@ use sea_orm_migration::prelude::*;
 
 mod m20260819_000001_spec_cache;
 mod m20260819_000002_storage_facade;
+mod m20260819_000003_backend_binding;
 
 pub struct Migrator;
 
@@ -25,6 +26,7 @@ impl MigratorTrait for Migrator {
         let mut migrations: Vec<Box<dyn MigrationTrait>> = vec![
             Box::new(m20260819_000001_spec_cache::Migration),
             Box::new(m20260819_000002_storage_facade::Migration),
+            Box::new(m20260819_000003_backend_binding::Migration),
         ];
         // `toolkit_db::outbox::outbox_migrations()` already returns the
         // correct `Vec<Box<dyn MigrationTrait>>` shape `DatabaseCapability::

@@ -129,7 +129,7 @@ Concrete edits to the event shape vs. today's `gts.cf.core.events.event.v1~.sche
 | `producer_id` | body | **moved to `meta`** | Producer-protocol mechanic; should not appear on the consumer-visible body |
 | `previous` | body | **moved to `meta`** | Producer-protocol mechanic; per-event in batches |
 | `sequence` (producer-side) | body | **moved to `meta`** | Producer-protocol mechanic; renamed under `meta` (the body-level `sequence` after this ADR is the server-assigned consumer-visible field, see "Terminology Cleanup") |
-| `partition` | body, producer-set | body, `readOnly` | Broker derives from the member the event type's partition-key pointer names, per [ADR-0002](0002-partition-selection.md); rejected on publish; surfaced on read |
+| `partition` | body, producer-set | body, `readOnly` | The backend assigns it from the partition key - the member the event type's partition-key pointer names, per [ADR-0002](0002-partition-selection.md) ([feature 0007](../features/0007-storage-backend-api.md) §2.2); rejected on publish; surfaced on read |
 | `offset` | body, `readOnly: true` | **renamed `sequence`**, `readOnly` | Wire / cursor terminology alignment |
 | `offset_time` | body, `readOnly: true` | **renamed `sequence_time`**, `readOnly` | Same |
 | `created_at` | body, `readOnly: true` | **dropped entirely** | Redundant between `occurred_at` (producer-stamped) and `sequence_time` (server-stamped); the ingest-accept moment is observability data, not event-record data |
@@ -155,7 +155,7 @@ No collision between `meta.sequence` and body-level `sequence`: the `meta.` qual
 
 All event string fields (`id`, `type`, `source`, `subject`, `subject_type`, `trace_parent`, and all `meta.*` string fields) MUST be ASCII on the publish wire. UTF-8 is permitted only inside the `data` payload. The broker rejects publishes containing non-ASCII bytes in any event field with `400 InvalidEventFieldEncoding`. Per-field byte caps apply (e.g., `subject` ≤ 1024 bytes; `400 EventFieldTooLong` on overflow).
 
-This is a platform-wide convention, not a broker-specific choice. It keeps first-party partition-hint derivation deterministic without normalization concerns, and it keeps event-field parsing in any language cheap.
+This is a platform-wide convention, not a broker-specific choice. It keeps the partition key the backend maps to a partition deterministic without normalization concerns, and it keeps event-field parsing in any language cheap.
 
 ### Optional CloudEvents Converter, Not Wire Conformance
 
@@ -182,7 +182,7 @@ For the codegen-ignores-markers case, producers using such SDKs MUST filter `rea
 - Good, because the producer protocol can evolve without bumping the event schema; new `meta.version`s ship behind feature flags on producer SDKs.
 - Good, because batch publish ergonomics are uniform — each event carries its own `meta`; HTTP headers do not block batch chain support.
 - Good, because wire and cursor agree on `sequence` terminology; the "Three Sequences" mental model collapses to two.
-- Good, because the broker stays a thin validator: `required` + property markers in JSON Schema cover most of the shape; only runtime checks (mode lookup, partition re-hash, `readOnly`-on-publish rejection) need broker code.
+- Good, because the broker stays a thin validator: `required` + property markers in JSON Schema cover most of the shape; only runtime checks (mode lookup, `readOnly`-on-publish rejection) need broker code; the backend assigns the partition from the partition key.
 - Good, because one schema file replaces two — no `$ref` duplication burden.
 - Bad / accepted, because strict JSON-Schema validators that don't honor `readOnly` will demand `partition` on publish unless the SDK filters first. Mitigation: prose descriptions are explicit; broker `400 BadRequest` is unambiguous; SDK contract spells out the filter requirement.
 - Bad / accepted, because `meta.sequence` (producer-side) and body-level `sequence` (server-assigned) share a word. Mitigation: the `meta.` qualifier disambiguates; documentation always shows the full path; `writeOnly` vs. `readOnly` markers reinforce the directional distinction.

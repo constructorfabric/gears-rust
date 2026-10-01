@@ -11,6 +11,7 @@
 #![deny(rust_2018_idioms)]
 
 pub mod api;
+pub mod backend;
 pub mod consumer;
 pub mod dlq;
 pub mod error;
@@ -39,10 +40,9 @@ mod validate_tests;
 pub mod rest;
 
 pub use api::{
-    AssignedPartition, BarrierMode, EventBrokerApi, EventBrokerBackend, EventBrokerBackendProvider,
-    IngestOutcome, JoinRequest, PartitionCursor, Position, ProducerCursors, ProducerMode,
-    RetentionReport, RetentionRequest, RetentionRequestBuilder, SeekResult, StorageBackendConfig,
-    SubscriptionAssignment, TenantTraversalDepth, TopicCursors,
+    AssignedPartition, BarrierMode, EventBrokerApi, IngestOutcome, JoinRequest, Position,
+    ProducerCursors, ProducerMode, SeekResult, StorageBackendConfig, SubscriptionAssignment,
+    TenantTraversalDepth, TopicCursors,
 };
 pub use consumer::{
     BatchHandlerOutcome, CommitOffset, ConnectionDropReason, Consumer, ConsumerBatching,
@@ -62,7 +62,6 @@ pub use consumer::{
 
 pub use error::{
     ConsumerError, EventBrokerError, OffsetManagerError, OutOfRange, PositionViolation,
-    StorageBackendError,
 };
 pub use gts::{
     CONSUMER_GROUP_RESOURCE_TYPE, EVENT_TYPE_RESOURCE_TYPE, PRODUCER_RESOURCE_TYPE,
@@ -75,13 +74,12 @@ pub use ::gts::{GtsIdPattern, GtsInstanceId, GtsTypeId};
 pub use ids::{ConsumerGroupId, EventTypeId, ProducerId, SubscriptionId, TopicId};
 pub use models::{
     ConsumerGroup, ConsumerGroupKind, ConsumerGroupQuery, CreateConsumerGroupRequest, Event, Page,
-    PartitionAssignment, PartitionLeader, PartitionRange, ResetScope, Subscription, Topic,
-    TopicSegment,
+    PartitionAssignment, PartitionRange, ResetScope, Subscription, Topic, TopicSegment,
 };
 #[cfg(feature = "db")]
 pub use producer::{
     DbDeduplication, DbProducer, DbProducerBuilder, ManagedDeduplication,
-    MissingProducerRegistration, UnknownProducerRegistration, producer_registration_migrations,
+    producer_registration_migrations,
 };
 pub use producer::{
     DirectDeduplication, Producer, ProducerBuilder, ProducerIdentity, ValidationTiming,

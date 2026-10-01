@@ -21,6 +21,7 @@ use uuid::Uuid;
 
 use super::EventBrokerModule;
 use crate::config::DeploymentMode;
+use event_broker_sdk::backend::Role;
 
 struct NoopOpenApiRegistry;
 
@@ -121,10 +122,10 @@ async fn make_ctx_with_hub(mode: &str, hub: Arc<ClientHub>) -> GearCtx {
         "event-broker": {
             "config": {
                 "mode": mode,
-                "default_storage_backend": "gts.cf.core.events.backend.v1~cf.core.backend.sqlite.v1~",
+                "default_storage_backend": "gts.cf.core.events.backend.v1~cf.core.backend.memory.v1~",
                 // Only load-bearing for cluster_ingest/cluster_delivery
-                // (registration `init`-time validation, `eb-dispatcher-routing`
-                // design.md D5); harmless for the other two modes.
+                // (registration `init`-time validation); harmless for the other
+                // two modes.
                 "registration": { "advertise_addr": "127.0.0.1:8080" },
             }
         }
@@ -153,6 +154,7 @@ async fn standalone_activates_ingest_delivery_and_reaper_but_no_dispatcher() {
     assert!(mode.delivery_active());
     assert!(!mode.dispatcher_active());
     assert!(mode.reaper_active());
+    assert_eq!(mode.backend_role(), Some(Role::Standalone));
 }
 
 #[tokio::test]
@@ -162,6 +164,7 @@ async fn cluster_ingest_activates_only_ingest_and_reaper() {
     assert!(!mode.delivery_active());
     assert!(!mode.dispatcher_active());
     assert!(mode.reaper_active());
+    assert_eq!(mode.backend_role(), Some(Role::Ingest));
 }
 
 #[tokio::test]
@@ -171,6 +174,7 @@ async fn cluster_delivery_activates_only_delivery_and_reaper() {
     assert!(mode.delivery_active());
     assert!(!mode.dispatcher_active());
     assert!(mode.reaper_active());
+    assert_eq!(mode.backend_role(), Some(Role::Delivery));
 }
 
 #[tokio::test]
@@ -180,6 +184,15 @@ async fn cluster_dispatcher_activates_only_the_dispatcher() {
     assert!(!mode.delivery_active());
     assert!(mode.dispatcher_active());
     assert!(!mode.reaper_active());
+    assert_eq!(mode.backend_role(), None);
+}
+
+#[tokio::test]
+async fn cluster_dispatcher_builds_no_backend() {
+    let module = EventBrokerModule::default();
+    let ctx = make_ctx("cluster_dispatcher").await;
+    module.init(&ctx).await.expect("init must succeed");
+    assert_eq!(module.backends.get().map(Vec::len), Some(0));
 }
 
 #[tokio::test]
@@ -209,7 +222,7 @@ async fn init_fails_on_wildcard_bind_with_no_advertise_addr_in_cluster_mode() {
         "event-broker": {
             "config": {
                 "mode": "cluster_ingest",
-                "default_storage_backend": "gts.cf.core.events.backend.v1~cf.core.backend.sqlite.v1~",
+                "default_storage_backend": "gts.cf.core.events.backend.v1~cf.core.backend.memory.v1~",
                 // `registration` omitted entirely -> defaults to
                 // `listen_addr: "0.0.0.0:0"`, `advertise_addr: None`.
             }

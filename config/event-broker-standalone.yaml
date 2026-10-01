@@ -151,7 +151,7 @@ gears:
       # startup against the backend this build links, so a name nothing
       # implements fails to boot instead of being served by whichever backend
       # happened to be compiled in.
-      default_storage_backend: "gts.cf.core.events.backend.v1~cf.core.backend.sqlite.v1~"
+      default_storage_backend: "gts.cf.core.events.backend.v1~cf.core.backend.memory.v1~"
 
       # Per-topic settings, keyed by topic GTS identifier. A key with an empty
       # instance part supplies the settings every topic of that type shares.
@@ -164,13 +164,10 @@ gears:
             # Everything under `type` belongs to the named backend, which
             # publishes the schema that validates it - so a second backend's
             # block looks nothing like this one and the gear needs no change.
-            type: "gts.cf.core.events.backend.v1~cf.core.backend.sqlite.v1~"
-            # Where this deployment keeps its event log. A file, so events
-            # outlive the process; `:memory:` would be a broker that starts
-            # empty on every boot. Naming no path at all means `:memory:` -
-            # nothing tells the backend where a deployment keeps its data, so
-            # it invents no location on disk.
-            path: "~/.cf-gears-event-broker/event-broker/event_log.db"
+            # The in-process backend: events live as long as this process,
+            # and a restart starts empty. A durable backend names its own
+            # medium here instead.
+            type: "gts.cf.core.events.backend.v1~cf.core.backend.memory.v1~"
 
   api-gateway:
     config:

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import atexit
 import os
+import secrets
 import shutil
 import subprocess
 import time
@@ -149,6 +150,19 @@ def reap_min_age_secs() -> int:
 REAP_MIN_AGE_SECS = reap_min_age_secs()
 
 
+# The plain PostgreSQL pin, mirrored from libs/test-containers/src/lib.rs
+# (POSTGRES_TAG, ENV_POSTGRES_TAG); the Rust test
+# `e2e_sidecar_pins_the_same_postgres_image` fails the build if either drifts.
+POSTGRES_IMAGE = "postgres"
+POSTGRES_TAG = "18-alpine"
+ENV_POSTGRES_TAG = "GEARS_TEST_PG_TAG"
+
+
+def postgres_tag() -> str:
+    """Effective PostgreSQL tag, honoring GEARS_TEST_PG_TAG (unset or empty: the pin)."""
+    return os.environ.get(ENV_POSTGRES_TAG, "").strip() or POSTGRES_TAG
+
+
 class DockerUnavailable(RuntimeError):
     """Docker CLI missing, or the daemon is not reachable."""
 
@@ -202,6 +216,9 @@ class _DockerSidecar:
     # The container-side port to map, in `docker port` syntax, e.g. "5432/tcp".
     CONTAINER_PORT = ""
     name = ""
+    # When set, the container is named `<NAME_PREFIX>-<6 hex>` so `docker ps`
+    # shows who started it.
+    NAME_PREFIX: str | None = None
 
     def __init__(self, label: str | None = None) -> None:
         # Default to a per-RUN label, not the bare class constant: `start()`
@@ -432,8 +449,12 @@ class _DockerSidecar:
         self.reap_stale(own_label=self.label)
         self.pull()
 
+        name = (
+            ["--name", f"{self.NAME_PREFIX}-{secrets.token_hex(3)}"]
+            if self.NAME_PREFIX else []
+        )
         self.container_id = _run([
-            "docker", "run", "-d", "-P",
+            "docker", "run", "-d", "-P", *name,
             "--label", self.label,
             *self._env_args(),
             self.IMAGE,
@@ -648,3 +669,29 @@ class ClickHouseSidecar(_DockerSidecar):
         if resp.status_code == 200 and resp.text.strip() == "1":
             return True, ""
         return False, f"HTTP {resp.status_code}: {resp.text.strip()[:200]}"
+
+
+class PostgresSidecar(TimescaleDbSidecar):
+    """A throwaway plain PostgreSQL container, on the same lifecycle as
+    `TimescaleDbSidecar`: label reaper, timed pull, query-based readiness.
+
+    The image is `libs/test-containers`' pinned PostgreSQL tag, so the E2E lane
+    and the Rust plugin tests run the same major.
+    """
+
+    IMAGE = f"{POSTGRES_IMAGE}:{postgres_tag()}"
+    LABEL = f"{LABEL_KEY}=postgres"
+    NAME_PREFIX = "eb-e2e-postgres"
+
+    DB_USER = "evbk"
+    DB_PASSWORD = "evbk"
+    DB_NAME = "evbk"
+
+    name = "postgres"
+
+    def url(self) -> str:
+        """Connection URL over the mapped host port."""
+        return (
+            f"postgres://{self.DB_USER}:{self.DB_PASSWORD}"
+            f"@127.0.0.1:{self.dsn_port}/{self.DB_NAME}"
+        )

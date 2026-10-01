@@ -21,18 +21,15 @@ use crate::domain::specification::SpecificationManager;
 use crate::infra::specification::TypesRegistrySpecificationManager;
 use crate::infra::storage::Storage;
 use crate::infra::workers::IngestOutboxHandler;
-use sqlite_event_broker_plugin::{EventLogPath, SqliteEventBackend};
+use memory_event_broker_plugin::MemoryBackend;
 
 /// A fresh temp-file `SQLite` DB (`SQLite` has no row-level locking, so this
-/// stays single-process, matching `eb-single-process-implementation` D3),
-/// migrated with every table this crate owns (`SpecificationManager`'s
-/// cache, `Storage`'s durable namespaces, the `SQLite` `EventBrokerBackend`,
-/// the ingest outbox) via the same `Migrator`
+/// stays single-process), migrated with every table this crate owns
+/// (`SpecificationManager`'s cache, `Storage`'s durable namespaces, the topic
+/// bindings, the ingest outbox) via the same `Migrator`
 /// `EventBrokerModule::migrations()` runs in production. One shared
-/// connection pool (`max_conns: 1`) for every table family - `Storage` and
-/// the backend are two different types over the *same* underlying `SQLite`
-/// file, matching production (`module.rs::init()` resolves one `db` and
-/// hands it to both).
+/// connection pool (`max_conns: 1`) for every table family. The events
+/// themselves live in the memory backend, not here.
 async fn test_db() -> Arc<toolkit_db::DBProvider<toolkit_db::DbError>> {
     let mut path = std::env::temp_dir();
     path.push(format!("cf-eb-harness-{}.db", Uuid::now_v7().simple()));
@@ -91,57 +88,75 @@ async fn seeded_spec_manager(
     Arc::new(TypesRegistrySpecificationManager::new(db))
 }
 
-/// The real, permanent `SQLite` `EventBrokerBackend` (eb-single-process-
-/// implementation D3) wrapped in a `SingleBackendResolver`, plus the ingest
-/// outbox pipeline draining into it - the harness's `Storage` is wired to
+/// The in-process memory backend wrapped in a `SingleBackendResolver`, every
+/// registered topic provisioned on it the way the specification refresh
+/// provisions them in production, plus the ingest outbox pipeline draining
+/// into it - the harness's `Storage` is wired to
 /// the same outbox handle via `Storage::set_outbox`, matching
 /// `EventBrokerModule::serve()`'s production sequencing. The returned
 /// `OutboxHandle` MUST be kept alive for the harness's lifetime - unlike a
 /// `ClusterHandle`, dropping an `OutboxHandle` without calling `.stop()`
 /// does not leave it harmlessly running: its own doc comment states
 /// `TaskSet::Drop` cancels the pipeline's cancellation token on drop,
-/// stopping every background worker immediately (discovered the hard way -
-/// a dropped-at-function-return handle here meant nothing ever drained).
+/// stopping every background worker immediately.
 async fn start_outbox(
     db: Arc<toolkit_db::DBProvider<toolkit_db::DbError>>,
     spec_manager: Arc<dyn SpecificationManager>,
     storage: &Storage,
     cluster_cache: cluster_sdk::ClusterCacheV1,
+    provisioning: Provisioning,
 ) -> (
-    Arc<dyn event_broker_sdk::EventBrokerBackend>,
+    MemoryBackend,
     Arc<dyn BackendResolver>,
     toolkit_db::outbox::OutboxHandle,
 ) {
     // The backend's own event log, not the harness's `db`: that database keeps
     // the metadata behind `Storage` and the ingest outbox, and events are not
     // metadata. In memory, because a harness outlives no process.
-    let backend = Arc::new(
-        SqliteEventBackend::open(&EventLogPath::InMemory)
-            .await
-            .expect("an in-memory event log must open"),
-    );
-    let backend_resolver: Arc<dyn BackendResolver> = Arc::new(SingleBackendResolver::new(
-        Arc::clone(&backend) as Arc<dyn event_broker_sdk::EventBrokerBackend>,
-    ));
+    let backend = MemoryBackend::new();
+    let backend_resolver: Arc<dyn BackendResolver> =
+        Arc::new(SingleBackendResolver::new(Arc::new(backend.clone())));
+    if provisioning == Provisioning::AtStart {
+        spec_manager
+            .provision_topics(backend_resolver.as_ref(), PROVISIONING_LIMITS)
+            .await;
+    }
 
+    let outbox_id = storage
+        .outbox_identity(INGEST_QUEUE_NAME)
+        .await
+        .expect("ingest outbox identity");
     let handle = Outbox::builder(db.db())
         .queue(INGEST_QUEUE_NAME, Partitions::of(4))
         .leased(IngestOutboxHandler::new(
             Arc::clone(&spec_manager),
             Arc::clone(&backend_resolver),
             cluster_cache,
+            outbox_id,
         ))
         .start()
         .await
         .expect("outbox start");
     storage.set_outbox(Arc::clone(handle.outbox()));
 
-    (
-        Arc::clone(&backend) as Arc<dyn event_broker_sdk::EventBrokerBackend>,
-        backend_resolver,
-        handle,
-    )
+    (backend, backend_resolver, handle)
 }
+
+/// Whether the harness provisions every registered topic as it starts, the
+/// way a booting instance's first specification refresh does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Provisioning {
+    #[default]
+    AtStart,
+    /// Left to the test, through [`EventBrokerHarness::provision_topics`].
+    Deferred,
+}
+
+const PROVISIONING_LIMITS: crate::domain::specification::ProvisioningLimits =
+    crate::domain::specification::ProvisioningLimits {
+        call_timeout: std::time::Duration::from_secs(5),
+        attempt_timeout: std::time::Duration::from_mins(5),
+    };
 
 use super::api_v1::ApiV1;
 use super::authz_doubles::AllowAllAuthZ;
@@ -289,8 +304,8 @@ pub struct EventBrokerHarness {
     leases: Arc<crate::domain::streaming::lease::InProcessStreamLeases>,
     /// The storage the events actually land in. Exposed because retention is
     /// the backend's own business: a test that needs a prefix-erased or an
-    /// emptied partition has to ask the backend to run a pass.
-    backend: Arc<dyn event_broker_sdk::EventBrokerBackend>,
+    /// emptied partition truncates it through the backend.
+    backend: MemoryBackend,
     /// Cancels the loader on drop, so a test's loader does not outlive it and
     /// keep fetching against a closing pool.
     loader_shutdown: tokio_util::sync::CancellationToken,
@@ -302,6 +317,9 @@ pub struct EventBrokerHarness {
     client_hub: Arc<ClientHub>,
     /// Arms the publish-path fault injection wrapped around `ingest`.
     publish_faults: PublishFaultHandle,
+    /// What [`EventBrokerHarness::provision_topics`] drives.
+    spec_manager: Arc<dyn SpecificationManager>,
+    backend_resolver: Arc<dyn BackendResolver>,
 }
 
 impl Drop for EventBrokerHarness {
@@ -323,10 +341,10 @@ impl EventBrokerHarness {
         &self.leases
     }
 
-    /// The backend behind every topic here, for a test that has to run a
-    /// retention pass or read what storage holds.
+    /// The backend behind every topic here, for a test that has to truncate a
+    /// partition or read what storage holds.
     #[must_use]
-    pub fn backend(&self) -> &Arc<dyn event_broker_sdk::EventBrokerBackend> {
+    pub fn backend(&self) -> &MemoryBackend {
         &self.backend
     }
 
@@ -395,6 +413,15 @@ impl EventBrokerHarness {
         self.publish_faults.set_rate_limited(on);
     }
 
+    /// Runs one provisioning pass over every registered topic, as the
+    /// specification refresh does - for a harness built
+    /// [`without_provisioning`](EventBrokerHarnessBuilder::without_provisioning).
+    pub async fn provision_topics(&self) {
+        self.spec_manager
+            .provision_topics(self.backend_resolver.as_ref(), PROVISIONING_LIMITS)
+            .await;
+    }
+
     pub fn router(&self) -> &axum::Router {
         &self.router
     }
@@ -424,6 +451,7 @@ pub struct EventBrokerHarnessBuilder {
     type_registry: Option<StaticTypesRegistry>,
     policy_enforcer: Option<PolicyEnforcer>,
     heartbeat: Option<std::time::Duration>,
+    provisioning: Provisioning,
 }
 
 impl EventBrokerHarnessBuilder {
@@ -441,6 +469,15 @@ impl EventBrokerHarnessBuilder {
     #[must_use]
     pub fn with_heartbeat(mut self, heartbeat: std::time::Duration) -> Self {
         self.heartbeat = Some(heartbeat);
+        self
+    }
+
+    /// Leaves every registered topic unprovisioned until the test calls
+    /// [`EventBrokerHarness::provision_topics`]: the window between a topic's
+    /// registration and its first provisioning pass.
+    #[must_use]
+    pub fn without_provisioning(mut self) -> Self {
+        self.provisioning = Provisioning::Deferred;
         self
     }
 
@@ -474,6 +511,7 @@ impl EventBrokerHarnessBuilder {
             Arc::clone(&spec_manager),
             &storage,
             cluster.cache,
+            self.provisioning,
         )
         .await;
 
@@ -515,8 +553,8 @@ impl EventBrokerHarnessBuilder {
         let HandlerState { ingest, delivery } = crate::infra::wiring::build_handler_state(
             Arc::clone(&storage),
             policy_enforcer,
-            spec_manager,
-            backend_resolver,
+            Arc::clone(&spec_manager),
+            Arc::clone(&backend_resolver),
             attacher,
             Arc::clone(&groups),
             Arc::clone(&leases),
@@ -578,6 +616,8 @@ impl EventBrokerHarnessBuilder {
             _loader_handle: loader_handle,
             client_hub,
             publish_faults,
+            spec_manager,
+            backend_resolver,
         }
     }
 }

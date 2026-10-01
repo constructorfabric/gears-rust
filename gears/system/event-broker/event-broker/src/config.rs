@@ -68,6 +68,8 @@ pub struct EventBrokerConfig {
     pub workers: WorkersConfig,
     #[serde(default)]
     pub registration: RegistrationConfig,
+    #[serde(default)]
+    pub provisioning: ProvisioningConfig,
     /// Per-topic deployment settings, keyed by topic GTS identifier. Empty by
     /// default, which makes every topic unresolvable - a deployment that serves
     /// any topic configures at least the instance-less key for its type.
@@ -276,20 +278,37 @@ impl Default for LoaderConfig {
     }
 }
 
+/// How topics are provisioned on their storage backends (feature 0006).
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProvisioningConfig {
+    /// An attempt no instance has acted on for this long may be replaced by a
+    /// new one. Must exceed the longest a backend plausibly takes to answer one
+    /// `provision` call. Default 5 minutes.
+    #[serde(
+        default = "default_attempt_timeout",
+        with = "toolkit_utils::humantime_serde"
+    )]
+    pub attempt_timeout: std::time::Duration,
+}
+
+impl Default for ProvisioningConfig {
+    fn default() -> Self {
+        Self {
+            attempt_timeout: default_attempt_timeout(),
+        }
+    }
+}
+
+const fn default_attempt_timeout() -> std::time::Duration {
+    std::time::Duration::from_mins(5)
+}
+
 /// Broker-owned background workers: `reaper` (expired subscriptions +
-/// idempotency-key cleanup) and the retention tick.
-///
-/// The retention knob is a cadence only. `DESIGN.md` §3.7 Key Invariants
-/// states the storage backend owns all event deletion, and it still does - the
-/// broker decides when a backend performs a pass and what bounds it must end
-/// within, never which rows go (see
-/// `docs/ADR/0007-service-decomposition.md`).
+/// idempotency-key cleanup) and the specification refresh. Event retention is
+/// not among them: each storage backend enforces it on its own schedule.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-// The shared `_interval_secs` suffix is deliberate: each field name is also its
-// config-file key (deny_unknown_fields, no serde rename), and the suffix states
-// the unit. Dropping it to satisfy the lint would rename the config keys and
-// lose that, so the postfix stays.
 #[allow(clippy::struct_field_names)]
 pub struct WorkersConfig {
     pub reaper_interval_secs: u32,
@@ -302,14 +321,6 @@ pub struct WorkersConfig {
     /// configuration-seeded entities once, at boot - so the interval covers an
     /// operator using its REST API, not a hot path.
     pub specification_refresh_interval_secs: u32,
-    /// How often each topic's backend is driven through one retention pass.
-    /// Default 60.
-    ///
-    /// A cadence, not a bound: a partition may sit past its bounds for up to
-    /// one tick, which is nothing against the days and megabytes those bounds
-    /// are expressed in. Shorter buys a tighter ceiling at the cost of
-    /// re-scanning partitions that were within their bounds a moment ago.
-    pub retention_interval_secs: u32,
 }
 
 impl Default for WorkersConfig {
@@ -317,7 +328,6 @@ impl Default for WorkersConfig {
         Self {
             reaper_interval_secs: 60,
             specification_refresh_interval_secs: 60,
-            retention_interval_secs: 60,
         }
     }
 }
@@ -482,14 +492,15 @@ pub struct BackendSettingsEntry {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RetentionSettingsEntry {
-    /// Oldest event a partition may hold, as a humantime string (`30d`, `12h`).
-    /// Unstated here falls through to the entry for the topic's type, then to
-    /// the topic's own declared retention, and last to
+    /// Age past which an event may be removed, as a humantime string (`30d`,
+    /// `12h`). Unstated here falls through to the entry for the topic's type,
+    /// then to the topic's own declared retention, and last to
     /// [`DEFAULT_RETENTION_DURATION`].
     #[serde(default, with = "toolkit_utils::humantime_serde::option")]
     pub duration: Option<std::time::Duration>,
-    /// Bytes a partition may hold. Omit the key to state nothing about the
-    /// bound; write `null` to state that this topic has none.
+    /// Bytes past which the oldest events may be removed. Omit the key to
+    /// state nothing about the bound; write `null` to state that this topic
+    /// has none.
     ///
     /// The unit is in the name because the value carries none. A human-readable
     /// form (`128mb`) is the intended end state and will arrive with a shared
@@ -574,9 +585,10 @@ where
 
 /// How a partition is kept bounded, fully resolved.
 ///
-/// Both bounds apply per partition, independently of every other partition, and
-/// whichever is reached first triggers removal. Removal always takes the oldest
-/// sequences first, so what remains is a suffix of what was stored.
+/// Both bounds apply per partition, independently of every other partition; an
+/// event past either may be removed, never one within both. Removal always
+/// takes the oldest sequences first, so what remains is a suffix of what was
+/// stored. How soon past a bound it happens is the topic's storage backend's.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RetentionSettings {
     pub duration: std::time::Duration,

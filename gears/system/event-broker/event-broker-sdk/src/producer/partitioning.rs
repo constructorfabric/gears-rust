@@ -1,26 +1,16 @@
 use toolkit_stable_hash::murmur3_x86_32;
 
-/// First-party local partition assignment per ADR-0002.
+/// The producer outbox partition an event of `topic` with partition-key value
+/// `key` is enqueued into: `(murmur3_x86_32("{topic}:{key}", 0) & 0x7FFFFFFF) % count`.
 ///
-/// The caller passes the value the event type's partition-key pointer resolves
-/// to within the event. Must be ASCII.
-/// Formula: `(murmur3_x86_32(key.as_bytes(), 0) & 0x7FFFFFFF) % partition_count`.
-pub(crate) fn partition_for(key: &str, partition_count: u32) -> u32 {
-    let h = murmur3_x86_32(key.as_bytes(), 0) & 0x7FFF_FFFF;
-    h % partition_count
-}
-
-pub(crate) fn broker_partition(key: &str, broker_partition_count: u32) -> u32 {
-    partition_for(key, broker_partition_count.max(1))
-}
-
+/// Every event of one key of one topic lands in one partition, so they drain in
+/// enqueue order.
 #[cfg(feature = "outbox")]
 pub(crate) fn producer_outbox_partition(
     topic: &str,
-    broker_partition: u32,
+    key: &str,
     outbox_partition_count: u32,
 ) -> u32 {
-    let key = format!("{topic}:{broker_partition}");
-    let hash = murmur3_x86_32(key.as_bytes(), 0) & 0x7FFF_FFFF;
-    hash % outbox_partition_count.max(1)
+    let placement = format!("{topic}:{key}");
+    (murmur3_x86_32(placement.as_bytes(), 0) & 0x7FFF_FFFF) % outbox_partition_count.max(1)
 }

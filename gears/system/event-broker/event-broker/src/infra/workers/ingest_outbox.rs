@@ -1,30 +1,32 @@
-//! `LeasedMessageHandler` draining the ingest outbox (design.md D5). Leases
-//! one row -> decodes the `domain::model::Event` it carries (partition
-//! already stamped by `IngestServiceImpl::publish_event`, before enqueue) ->
-//! resolves the topic's backend and converts via `domain::backend::
-//! to_sdk_event` -> calls
-//! `EventBrokerBackend::persist()` as a plain, out-of-transaction call
-//! (D5's component-boundary rule: "we always work with backend out-of-tx")
-//! -> acks/retries/rejects based on the outcome, and - on success - publishes
-//! a `domain::notify` wake-up notification (design.md D6) for delivery's
-//! stream loop to pick up on its next iteration.
-//! `LeasedMessageHandler::handle`'s own signature (`&self, msg:
-//! &OutboxMessage) -> MessageResult`, with no DB handle at all) is what
-//! makes that rule structurally true here, not just conventional.
+//! `LeasedMessageHandler` draining the ingest outbox. Leases one row ->
+//! decodes its `IngestPayload` (event, topic, partition-key value; the backend
+//! picks the partition) -> resolves the topic's backend -> `Backend::append`s
+//! the event under the fence keyed by `(outbox identity, message partition)`
+//! with the message's seq -> on success, publishes a `domain::notify` wake-up for each
+//! partition the backend reports it wrote.
+//!
+//! The backend is always called outside any transaction;
+//! `LeasedMessageHandler::handle`'s signature, with no DB handle, makes that
+//! structural.
+//!
+//! Every backend error is retried: nothing an ingest outbox holds is
+//! dead-lettered for a backend failure (feature 0007 §3.1), so a message that
+//! keeps failing stalls its outbox partition visibly instead of being lost. A
+//! retry of a message the backend already stored is answered `Duplicate` by
+//! the fence and acknowledged.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use cluster_sdk::ClusterCacheV1;
 use cluster_sdk::cache::{PutRequest, Ttl};
-use event_broker_sdk::StorageBackendError;
+use event_broker_sdk::backend::{AppendRequest, Appended, Fence, FenceSeq, Flush, KeyedEvent};
 use toolkit_db::outbox::{LeasedMessageHandler, MessageResult, OutboxMessage};
-use toolkit_security::SecurityContext;
 use tracing::{error, warn};
 
 use crate::domain::backend::{BackendResolver, to_sdk_event};
-use crate::domain::model::Event;
 use crate::domain::notify::notification_key;
+use crate::domain::outbox::{IngestPayload, OutboxId, fence_key};
 use crate::domain::specification::SpecificationManager;
 
 /// How long a notification entry lives in `ClusterCacheV1` before expiring.
@@ -39,6 +41,8 @@ pub struct IngestOutboxHandler {
     spec_manager: Arc<dyn SpecificationManager>,
     backend_resolver: Arc<dyn BackendResolver>,
     cache: ClusterCacheV1,
+    /// This outbox's identity: the high half of every fence key it appends under.
+    outbox: OutboxId,
 }
 
 impl IngestOutboxHandler {
@@ -47,11 +51,13 @@ impl IngestOutboxHandler {
         spec_manager: Arc<dyn SpecificationManager>,
         backend_resolver: Arc<dyn BackendResolver>,
         cache: ClusterCacheV1,
+        outbox: OutboxId,
     ) -> Self {
         Self {
             spec_manager,
             backend_resolver,
             cache,
+            outbox,
         }
     }
 
@@ -88,8 +94,8 @@ impl IngestOutboxHandler {
 impl LeasedMessageHandler for IngestOutboxHandler {
     #[tracing::instrument(name = "worker", skip_all, fields(worker = "ingest_outbox"))]
     async fn handle(&self, msg: &OutboxMessage) -> MessageResult {
-        let event = match serde_json::from_slice::<Event>(&msg.payload) {
-            Ok(event) => event,
+        let payload = match serde_json::from_slice::<IngestPayload>(&msg.payload) {
+            Ok(payload) => payload,
             Err(e) => {
                 error!(
                     partition_id = msg.partition_id,
@@ -101,66 +107,52 @@ impl LeasedMessageHandler for IngestOutboxHandler {
             }
         };
 
-        let Some(partition) = event.partition else {
-            error!(topic = %event.topic, "ingest outbox payload has no stamped partition");
-            return MessageResult::Reject("missing partition".to_owned());
-        };
-
-        // `get_topic` returning `None` currently conflates two cases: the topic
-        // was genuinely deregistered, and the local spec-cache read itself
-        // failed (a transient SQLite error is swallowed into `None` in
-        // `infra::specification`). Dead-lettering (`Reject`) is the intentional
-        // interim behaviour for both. Distinguishing a transient read failure
-        // and retrying it belongs to the backend-integration redesign, which is
-        // out of scope here.
-        let Some(topic) = self.spec_manager.get_topic(&event.topic).await else {
-            error!(topic = %event.topic, "ingest outbox payload references a topic that is no longer registered");
-            return MessageResult::Reject(format!("topic '{}' is not registered", event.topic));
+        // `get_topic` returning `None` conflates two cases: the topic was
+        // genuinely deregistered, and the local spec-cache read itself failed
+        // (a transient SQLite error is swallowed into `None` in
+        // `infra::specification`). Both are dead-lettered (`Reject`), a known
+        // gap for the transient case.
+        let Some(topic) = self.spec_manager.get_topic(&payload.topic).await else {
+            error!(topic = %payload.topic, "ingest outbox payload references a topic that is no longer registered");
+            return MessageResult::Reject(format!("topic '{}' is not registered", payload.topic));
         };
 
         let backend = self.backend_resolver.resolve(&topic);
-        let topic_str = topic.id.to_string();
-        let sdk_event = to_sdk_event(partition, &event);
-
-        match backend
-            .persist(
-                &SecurityContext::anonymous(),
-                &topic_str,
-                partition.cast_unsigned(),
-                &[sdk_event],
-            )
-            .await
-        {
-            Ok(()) => {
-                self.notify(&topic.id, partition).await;
+        let events = [KeyedEvent {
+            key: payload.key,
+            event: to_sdk_event(&payload.event),
+        }];
+        let request = AppendRequest {
+            fence: Fence {
+                key: fence_key(self.outbox, msg.partition_id),
+                seq: FenceSeq::new(msg.seq),
+            },
+            topic: &topic.id,
+            events: &events,
+            // `Prefer: wait` is answered `501`, so nothing waits on positions
+            // being assigned.
+            flush: Flush::Async,
+        };
+        match backend.append(&request).await {
+            Ok(Appended::Heads(heads)) => {
+                for head in heads {
+                    self.notify(&topic.id, head.at.partition.value().cast_signed())
+                        .await;
+                }
                 MessageResult::Ok
             }
-            // Transient - the backend (or its connection) may recover; retry.
-            Err(
-                e @ (StorageBackendError::Unavailable { .. }
-                | StorageBackendError::PersistFailed { .. }
-                | StorageBackendError::Internal(_)),
-            ) => {
-                warn!(topic = %topic_str, partition, error = %e, "ingest outbox persist failed transiently - will retry");
+            // `Accepted`: stored, positions arrive through the backend's watch;
+            // `Duplicate`: stored by an earlier attempt of this message.
+            Ok(Appended::Accepted | Appended::Duplicate) => MessageResult::Ok,
+            Err(e) => {
+                warn!(
+                    topic = %topic.id,
+                    partition_id = msg.partition_id,
+                    seq = msg.seq,
+                    error = %e,
+                    "ingest outbox append failed - will retry"
+                );
                 MessageResult::Retry
-            }
-            // Permanent - retrying with the same config/partition can't help.
-            Err(
-                e @ (StorageBackendError::InvalidConfig { .. }
-                | StorageBackendError::PartitionNotFound { .. }),
-            ) => {
-                error!(topic = %topic_str, partition, error = %e, "ingest outbox persist failed permanently - dead-lettering");
-                MessageResult::Reject(e.to_string())
-            }
-            // Variants `persist()` cannot produce: read-path errors, and a
-            // retention failure, which only a maintenance pass raises.
-            Err(
-                e @ (StorageBackendError::OffsetOutOfRange { .. }
-                | StorageBackendError::ReadFailed { .. }
-                | StorageBackendError::RetentionFailed { .. }),
-            ) => {
-                error!(topic = %topic_str, partition, error = %e, "ingest outbox persist returned an error persist cannot raise - dead-lettering");
-                MessageResult::Reject(e.to_string())
             }
         }
     }
@@ -170,21 +162,27 @@ impl LeasedMessageHandler for IngestOutboxHandler {
 mod tests {
     use std::sync::Arc;
 
-    use event_broker_sdk::{EventBrokerBackend, Sequence};
+    use event_broker_sdk::Sequence;
+    use event_broker_sdk::backend::{
+        Backend, LogClaim, LogId, Replacing, Retention, TopicPartition, TopicSpec, Wait,
+    };
+    use memory_event_broker_plugin::MemoryBackend;
     use toolkit_db::DBProvider;
     use types_registry_sdk::testing::{MockTypesRegistryClient, make_test_instance};
     use uuid::Uuid;
 
+    use event_broker_sdk::backend::Partition;
+
     use super::*;
     use crate::domain::backend::SingleBackendResolver;
-    use crate::domain::model::Meta;
+    use crate::domain::model::{Event, Meta};
     use crate::domain::outbox::INGEST_PAYLOAD_TYPE;
     use crate::infra::specification::TypesRegistrySpecificationManager;
     use crate::infra::storage::migrations::Migrator;
-    use sqlite_event_broker_plugin::{EventLogPath, SqliteEventBackend};
 
     const TOPIC_ID: &str =
         toolkit_gts::gts_id!("cf.core.events.topic.v1~example.eb.ingestoutbox.topic.v1");
+    const OUTBOX: OutboxId = OutboxId::new(0x0123_4567_89ab_cdef);
 
     async fn test_db() -> Arc<DBProvider<toolkit_db::DbError>> {
         let mut path = std::env::temp_dir();
@@ -214,7 +212,13 @@ mod tests {
         Arc::new(DBProvider::new(db))
     }
 
-    async fn test_handler() -> (IngestOutboxHandler, Arc<SqliteEventBackend>) {
+    fn topic() -> toolkit_gts::GtsInstanceId {
+        toolkit_gts::GtsInstanceId::try_new(TOPIC_ID).unwrap()
+    }
+
+    /// The handler over a registered topic; `provisioned` decides whether the
+    /// backend holds the topic's log.
+    async fn test_handler(provisioned: bool) -> (IngestOutboxHandler, MemoryBackend) {
         let db = test_db().await;
         let instance = make_test_instance(
             TOPIC_ID,
@@ -234,17 +238,27 @@ mod tests {
         .expect("bulk_load");
         let spec_manager: Arc<dyn SpecificationManager> =
             Arc::new(TypesRegistrySpecificationManager::new(Arc::clone(&db)));
-        let backend = Arc::new(
-            SqliteEventBackend::open(&EventLogPath::InMemory)
+        let backend = MemoryBackend::new();
+        if provisioned {
+            backend
+                .provision(
+                    &TopicSpec {
+                        topic: topic(),
+                        partitions: 1,
+                        retention: Retention::default(),
+                    },
+                    &LogClaim {
+                        replacing: Replacing::Nothing,
+                        new: LogId::from_uuid(Uuid::from_u128(1)),
+                    },
+                )
                 .await
-                .expect("an in-memory event log must open"),
-        );
-        let resolver = Arc::new(SingleBackendResolver::new(
-            Arc::clone(&backend) as Arc<dyn EventBrokerBackend>
-        ));
+                .expect("provision");
+        }
+        let resolver = Arc::new(SingleBackendResolver::new(Arc::new(backend.clone())));
         let (_hub, cluster) = crate::test_support::standalone_event_broker_cluster().await;
         (
-            IngestOutboxHandler::new(spec_manager, resolver, cluster.cache),
+            IngestOutboxHandler::new(spec_manager, resolver, cluster.cache, OUTBOX),
             backend,
         )
     }
@@ -255,7 +269,7 @@ mod tests {
             r#type: crate::test_support::event_type_id(toolkit_gts::gts_id!(
                 "cf.core.events.event.v1~example.eb.ingestoutbox.event.v1~"
             )),
-            topic: toolkit_gts::GtsInstanceId::try_new(TOPIC_ID).unwrap(),
+            topic: topic(),
             tenant_id: Uuid::new_v4(),
             source: "test".to_owned(),
             subject: "subject".to_owned(),
@@ -271,7 +285,7 @@ mod tests {
                 previous: Some(0),
                 sequence,
             }),
-            partition: Some(0),
+            partition: None,
             sequence: None,
             sequence_time: None,
         }
@@ -281,61 +295,60 @@ mod tests {
         OutboxMessage {
             partition_id: 0,
             seq: 1,
-            payload: serde_json::to_vec(event).expect("serialize event"),
+            payload: serde_json::to_vec(&IngestPayload {
+                topic: event.topic.clone(),
+                key: "key".to_owned(),
+                event: event.clone(),
+            })
+            .expect("serialize payload"),
             payload_type: INGEST_PAYLOAD_TYPE.to_owned(),
             created_at: chrono::Utc::now(),
             attempts: 0,
         }
     }
 
-    /// Task 6.5: a redelivery of the exact same outbox row - simulating a
-    /// crash between `persist()` succeeding and the row being marked done
-    /// - must not double-append, because `SqliteEventBackend::persist`'s
-    /// own outbox-retry dedup (design.md D4, task 5.4) compares the
-    /// event's producer chain sequence against the stored
-    /// `last_chain_sequence` for the partition, not `event.id`.
+    /// A redelivery of the exact same outbox row - a crash between `append`
+    /// succeeding and the row being marked done - carries the same fence, so
+    /// the backend answers `Duplicate`, the row is acknowledged, and the event
+    /// is stored once.
     #[tokio::test]
-    async fn redelivery_after_persist_is_a_safe_noop() {
-        let (handler, backend) = test_handler().await;
+    async fn redelivery_after_append_is_a_duplicate() {
+        let (handler, backend) = test_handler(true).await;
         let event = test_event(1);
         let msg = test_message(&event);
 
-        let first = handler.handle(&msg).await;
-        assert!(
-            matches!(first, MessageResult::Ok),
-            "first delivery: {first:?}"
-        );
+        assert!(matches!(handler.handle(&msg).await, MessageResult::Ok));
+        assert!(matches!(handler.handle(&msg).await, MessageResult::Ok));
 
-        // Redeliver the identical message - as the outbox processor would
-        // if the process crashed after persist() committed but before the
-        // outbox row was marked done.
-        let second = handler.handle(&msg).await;
-        assert!(
-            matches!(second, MessageResult::Ok),
-            "redelivery: {second:?}"
-        );
-
-        let events = backend
+        let stored = backend
             .read(
-                &SecurityContext::anonymous(),
-                TOPIC_ID,
-                0,
-                Sequence::assigned(0),
+                &TopicPartition::new(topic(), Partition::new(0)),
+                Sequence::NONE,
                 100,
+                Wait::No,
             )
             .await
             .expect("read must succeed");
+        let stored: Vec<_> = stored
+            .iter()
+            .map(|e| (e.id, e.partition, e.sequence))
+            .collect();
         assert_eq!(
-            events.len(),
-            1,
-            "redelivery must not durably append the event a second time"
+            stored,
+            vec![(event.id, Some(0_u32), Some(Sequence::assigned(1)))]
         );
-        assert_eq!(events[0].id, event.id);
+    }
+
+    #[tokio::test]
+    async fn a_topic_not_provisioned_is_retried() {
+        let (handler, _backend) = test_handler(false).await;
+        let result = handler.handle(&test_message(&test_event(1))).await;
+        assert!(matches!(result, MessageResult::Retry), "{result:?}");
     }
 
     #[tokio::test]
     async fn malformed_payload_is_rejected() {
-        let (handler, _backend) = test_handler().await;
+        let (handler, _backend) = test_handler(true).await;
         let msg = OutboxMessage {
             partition_id: 0,
             seq: 1,
@@ -350,14 +363,13 @@ mod tests {
 
     #[tokio::test]
     async fn unregistered_topic_is_rejected() {
-        let (handler, _backend) = test_handler().await;
+        let (handler, _backend) = test_handler(true).await;
         let mut event = test_event(1);
         event.topic = toolkit_gts::GtsInstanceId::try_new(toolkit_gts::gts_id!(
             "cf.core.events.topic.v1~example.eb.ingestoutbox.unregistered.v1"
         ))
         .unwrap();
-        let msg = test_message(&event);
-        let result = handler.handle(&msg).await;
+        let result = handler.handle(&test_message(&event)).await;
         assert!(matches!(result, MessageResult::Reject(_)), "{result:?}");
     }
 }

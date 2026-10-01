@@ -1,0 +1,35 @@
+[package]
+name = "cf-gears-event-broker-backend-bench"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Performance benchmark for event-broker storage backends: one set of workloads every backend plugin runs against its own medium through the backend contract"
+keywords = ["constructorfabric", "cf-gears", "event-broker"]
+categories = ["development-tools::profiling"]
+publish = false
+
+[lib]
+name = "event_broker_backend_bench"
+
+[lints]
+workspace = true
+
+[dependencies]
+# The contract under load. Every workload is generic over `backend::Backend`,
+# so the bench depends on the SDK only, never on a plugin or the gear.
+event-broker-sdk = { workspace = true }
+
+async-trait = { workspace = true }
+chrono = { workspace = true, features = ["clock"] }
+clap = { workspace = true }
+futures-util = { workspace = true, features = ["std"] }
+humantime = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+tokio-util = { workspace = true }
+toolkit-gts = { workspace = true }
+uuid = { workspace = true }

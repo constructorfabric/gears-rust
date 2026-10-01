@@ -1,0 +1,41 @@
+# The PostgreSQL server the long-haul run writes to and the operator watches
+# (longhaul/README.md). The tag follows libs/test-containers' POSTGRES_TAG, and
+# GEARS_TEST_PG_TAG overrides it the same way.
+#
+#   docker compose -f longhaul/compose.yaml up -d
+#   EB_LONGHAUL_URL=postgres://postgres:postgres@127.0.0.1:54329/events
+services:
+  pg:
+    image: postgres:${GEARS_TEST_PG_TAG:-18-alpine}
+    container_name: evbk-longhaul-pg
+    ports: ["54329:5432"]
+    environment:
+      POSTGRES_PASSWORD: postgres
+      # A database of the run's own, apart from the `postgres` maintenance
+      # database; created only when the volume is first initialised.
+      POSTGRES_DB: events
+    # Lock waits over 200 ms and statements over 200 ms go to the container's
+    # log (`docker compose logs -f pg`); pg_stat_statements ranks the plugin's
+    # queries by total time.
+    command: >
+      postgres
+      -c shared_preload_libraries=pg_stat_statements
+      -c log_lock_waits=on
+      -c deadlock_timeout=200ms
+      -c log_min_duration_statement=200
+      -c track_io_timing=on
+      -c max_connections=200
+    volumes:
+      - evbk-longhaul:/var/lib/postgresql
+      # observe.sql and the invariants it loads, at the same relative paths
+      # as in the repository, for psql inside the container.
+      - ./:/evbk/longhaul:ro
+      - ../tests:/evbk/tests:ro
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres", "-d", "events"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+volumes:
+  evbk-longhaul: {}

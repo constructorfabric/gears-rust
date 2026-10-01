@@ -14,7 +14,8 @@ use authz_resolver as _;
 use cluster as _;
 use types_registry as _;
 
-use sqlite_event_broker_plugin as _;
+use memory_event_broker_plugin as _;
+use postgres_event_broker_plugin as _;
 use standalone_cluster_plugin as _;
 use static_authn_plugin as _;
 use static_authz_plugin as _;

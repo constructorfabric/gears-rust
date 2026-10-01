@@ -163,6 +163,7 @@ async fn publish_then_consume_happy_path() {
 }
 
 #[tokio::test]
+#[ignore = "needs a durable storage backend: the memory backend loses events with the process; re-enabled on the new SQLite backend plugin (eb-postgres-reference-backend task 9.4)"]
 async fn restart_preserves_events_and_consumer_groups_but_not_subscriptions() {
     let topic = "gts.cf.core.events.topic.v1~x.eb.t10r.topic.v1";
     let event_type = "gts.cf.core.events.event.v1~x.eb.t10r.foo.v1~";
@@ -336,8 +337,8 @@ async fn restart_preserves_events_and_consumer_groups_but_not_subscriptions() {
     let (topology2_kind, _) = reader2.next_frame(Duration::from_secs(5)).await;
     assert_eq!(topology2_kind, "topology");
 
-    // The event itself - not just the cursor row - is still in the SQLite
-    // `EventBrokerBackend` table: a fresh subscription's in-memory replay
+    // The event itself - not just the cursor row - is still in the durable
+    // storage backend: a fresh subscription's in-memory replay
     // cursor starts from its own join-time `assigned.offset` (always `0`
     // for a new JOIN, `domain/delivery.rs::join`), so it re-reads from the
     // beginning and must see the same event again.

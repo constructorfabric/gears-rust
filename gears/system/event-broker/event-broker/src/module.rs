@@ -21,7 +21,8 @@ use anyhow::Context;
 use async_trait::async_trait;
 use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
 use axum::Extension;
-use event_broker_sdk::{EventBrokerApi, EventBrokerBackendProvider};
+use event_broker_sdk::EventBrokerApi;
+use event_broker_sdk::backend::{BuildContext, Provider, Role};
 use tokio_util::sync::CancellationToken;
 use toolkit::api::OpenApiRegistry;
 use toolkit::client_hub::ClientHub;
@@ -41,24 +42,34 @@ use crate::infra::health::EventBrokerReadiness;
 use crate::infra::storage::Storage;
 use crate::infra::workers::IngestOutboxHandler;
 
+/// The storage backend providers of the plugins linked into this build; a
+/// further backend adds a line here and nowhere else.
+///
+/// Mirrors the cluster gear's own `provider_registry()`: each plugin implements
+/// the SDK's provider trait, the gear names it once at wiring, and nothing else
+/// in the gear knows which backend it got.
+fn backend_providers() -> Vec<Box<dyn Provider>> {
+    vec![
+        Box::new(memory_event_broker_plugin::MemoryBackendProvider::default()),
+        Box::new(postgres_event_broker_plugin::PostgresBackendProvider::default()),
+    ]
+}
+
+/// How long the start phase waits for the topics to be provisioned before it
+/// goes on regardless: a backend still starting is waited for, one that is
+/// down never fails the start.
+const STARTUP_PROVISIONING_WAIT: Duration = Duration::from_secs(10);
+
+/// The longest one `provision` call may take before the attempt is left for
+/// the next pass, so a slow backend never holds up the specification refresh.
+const PROVISION_CALL_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// How often a registered ingest/delivery instance sends a heartbeat to
 /// `DirectoryService` to stay routable (design.md D4). A placeholder
 /// interval - `docs/DESIGN.md`'s "Open — broker team" note flags that
 /// `DirectoryService`'s actual heartbeat-loss timing still needs to be
 /// confirmed against the broker's failover budget.
 const DIRECTORY_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
-
-/// The storage backend provider assembled from the backend plugins linked into
-/// this build; a second backend adds a line here and nowhere else.
-///
-/// Mirrors the cluster gear's own `provider_registry()`: the plugin implements
-/// the SDK's provider trait, the gear names it once at wiring, and nothing else
-/// in the gear knows which backend it got. No database handle is passed: a
-/// backend opens the storage its own options name, which is what lets a topic's
-/// events live somewhere this gear's metadata does not.
-fn backend_provider() -> impl EventBrokerBackendProvider {
-    sqlite_event_broker_plugin::SqliteBackendProvider
-}
 
 /// Expressed as predicates on [`DeploymentMode`] itself so the activation
 /// set can never disagree with the mode it's derived from
@@ -85,6 +96,18 @@ impl DeploymentMode {
     #[must_use]
     pub fn reaper_active(self) -> bool {
         !matches!(self, Self::ClusterDispatcher)
+    }
+
+    /// What this instance is to its storage backends; `None` in
+    /// `cluster_dispatcher`, which uses none and builds none.
+    #[must_use]
+    pub fn backend_role(self) -> Option<Role> {
+        match self {
+            Self::Standalone => Some(Role::Standalone),
+            Self::ClusterIngest => Some(Role::Ingest),
+            Self::ClusterDelivery => Some(Role::Delivery),
+            Self::ClusterDispatcher => None,
+        }
     }
 }
 
@@ -126,16 +149,17 @@ pub struct EventBrokerModule {
     /// delivery service and `serve` hands it to the sweeper, and two would be
     /// two disjoint sets of members.
     groups: OnceLock<Arc<crate::domain::consumer_group_coordinator::ConsumerGroupCoordinator>>,
-    /// The whole operator config, kept because the retention worker needs two
-    /// parts of it that no other collaborator does: the per-topic settings map
-    /// and the deployment's default backend name, which together decide what
-    /// bounds each topic is held to.
+    /// The whole operator config, kept because the specification refresh needs
+    /// the per-topic settings map to re-resolve what `types-registry` holds.
     config: OnceLock<EventBrokerConfig>,
     /// The storage backend a topic's events are stored by and read back
     /// from, wrapped in the trivial `SingleBackendResolver` - built in
     /// `init()` alongside `spec_manager` from the backend plugin's provider,
     /// read by `register_rest()`.
     backend_resolver: OnceLock<Arc<dyn crate::domain::backend::BackendResolver>>,
+    /// Every backend built in `init()`, in build order: `serve()` starts them
+    /// before its own workers and stops them, in reverse, after.
+    backends: OnceLock<Vec<Arc<dyn event_broker_sdk::backend::Backend>>>,
     /// The real `Storage` (`ConsumerGroupRepo`/`CursorRepo`/`RoutingMarkers`/
     /// `IdempotencyGuard`/`ProducerRegistry`/`ActiveStreamMarker`) -
     /// `InMemoryDomainRepo`'s permanent replacement (eb-single-process-
@@ -234,41 +258,58 @@ impl Gear for EventBrokerModule {
 
         // The storage backend comes from a plugin, built through its provider
         // the way the cluster gear builds a cache backend from a cache
-        // provider. The gear links the plugin but knows only the
-        // `EventBrokerBackend` trait behind it - which is what lets a second
-        // backend bring its own storage and its own retention rather than
-        // inheriting this one's.
+        // provider. The gear knows only the `backend::Backend` trait behind
+        // it, so each backend brings its own storage and its own retention.
         //
-        // Every topic resolves to it regardless of `topic`, so it is built from
-        // the selection every configured topic agrees on; binding a topic to the
-        // backend its own settings name is the next step, and needs the
-        // per-topic settings to be the source of truth first.
+        // Every topic resolves to this one backend regardless of `topic`, so it
+        // is built from the selection every configured topic agrees on.
         //
-        // The database it opens is its own. The one resolved above keeps ingest
-        // and delivery metadata - cursors, consumer groups, producers, the
-        // specification cache, the ingest outbox - and the event log is not
-        // among them.
-        let provider = backend_provider();
-        // The configured type has to be one this build can serve. Checked here
-        // rather than trusted, because a type nothing implements would otherwise
-        // reach the one linked backend and be stored by it silently, under a
-        // name the operator did not choose.
-        if backend_selection.r#type.as_ref() != provider.backend_type() {
-            anyhow::bail!(
-                "configuration names backend type '{}', which this build does not serve; it links '{}'",
-                backend_selection.r#type.as_ref(),
-                provider.backend_type(),
+        // The storage it opens is its own. The database resolved above keeps
+        // ingest and delivery metadata - cursors, consumer groups, producers,
+        // the specification cache, topic bindings, the ingest outbox and its
+        // identity - and the event log is not among them.
+        // The configured type has to be one this build can serve: a type
+        // nothing implements fails to start rather than being stored by some
+        // other backend under a name the operator did not choose.
+        // `cluster_dispatcher` reads and writes no event: it builds no backend,
+        // and its `backends` stay empty.
+        if let Some(role) = cfg.mode.backend_role() {
+            let providers = backend_providers();
+            let Some(provider) = providers.iter().find(|provider| {
+                provider.backend_type().as_ref() == backend_selection.r#type.as_ref()
+            }) else {
+                let linked: Vec<String> = providers
+                    .iter()
+                    .map(|p| p.backend_type().to_string())
+                    .collect();
+                anyhow::bail!(
+                    "configuration names backend type '{}', which this build does not serve; it links {linked:?}",
+                    backend_selection.r#type.as_ref(),
+                );
+            };
+            let backend = provider
+                .build(&BuildContext::new(&backend_selection.settings, role))
+                .await
+                .map_err(|e| anyhow::anyhow!("could not build the storage backend: {e}"))?;
+            tracing::info!(
+                module = Self::MODULE_NAME,
+                backend_type = %provider.backend_type(),
+                dedup = ?backend.dedup(),
+                "storage backend built"
             );
+            self.backends
+                .set(vec![Arc::clone(&backend)])
+                .map_err(|_| anyhow::anyhow!("{} module already initialized", Self::MODULE_NAME))?;
+            self.backend_resolver
+                .set(Arc::new(
+                    crate::domain::backend::SingleBackendResolver::new(backend),
+                ))
+                .map_err(|_| anyhow::anyhow!("{} module already initialized", Self::MODULE_NAME))?;
+        } else {
+            self.backends
+                .set(Vec::new())
+                .map_err(|_| anyhow::anyhow!("{} module already initialized", Self::MODULE_NAME))?;
         }
-        let backend = provider
-            .build_backend(&backend_selection.settings)
-            .await
-            .map_err(|e| anyhow::anyhow!("could not build the storage backend: {e}"))?;
-        self.backend_resolver
-            .set(Arc::new(
-                crate::domain::backend::SingleBackendResolver::new(backend),
-            ))
-            .map_err(|_| anyhow::anyhow!("{} module already initialized", Self::MODULE_NAME))?;
 
         // eb-single-process-implementation D2 risk mitigation: the real
         // `Storage`, wired against the same `db` and `spec_manager`. Its
@@ -489,7 +530,7 @@ impl EventBrokerModule {
     /// Background lifecycle entry point (`lifecycle(entry = "serve")`).
     ///
     /// Every background task this gear runs - specification refresh, the ingest
-    /// outbox pipeline, the delivery loader, retention, and directory presence -
+    /// outbox pipeline, the delivery loader, and directory presence -
     /// is one supervised worker in a single [`Supervisor`], keyed on a child of
     /// the lifecycle token. `start_workers` registers exactly the workers the
     /// [`DeploymentMode`] calls for; `supervise` then blocks until the first
@@ -501,27 +542,35 @@ impl EventBrokerModule {
     /// whatever already started.
     ///
     /// Directory presence is just another worker: in `cluster_ingest`/
-    /// `cluster_delivery` it registers with `DirectoryService` (design.md D4,
-    /// register-on-start awaited so a failure is fatal), heartbeats until
-    /// cancelled, and deregisters on shutdown (`DirectoryClient` has no TTL-lease
-    /// semantics, unlike the removed `ServiceDiscoveryV1`); in `standalone`/
-    /// `cluster_dispatcher` it is a bare cancel-gate that keeps the set non-empty
-    /// so `serve()` blocks until cancellation. The `reaper` worker lands with a
-    /// future ticket - it slots in as one more `start_*` under `reaper_active()`.
+    /// `cluster_delivery` it registers with `DirectoryService` (register-on-start
+    /// awaited so a failure is fatal), heartbeats until cancelled, and
+    /// deregisters on shutdown (`DirectoryClient` has no TTL-lease semantics);
+    /// in `standalone`/`cluster_dispatcher` it is a bare cancel-gate that keeps
+    /// the set non-empty so `serve()` blocks until cancellation.
     pub(crate) async fn serve(&self, cancel: CancellationToken) -> anyhow::Result<()> {
         let mode = *self
             .mode
             .get()
             .ok_or_else(|| anyhow::anyhow!("init must run before serve()"))?;
 
+        let backends = self
+            .backends
+            .get()
+            .ok_or_else(|| anyhow::anyhow!("init must run before serve()"))?;
+        start_backends(backends).await?;
+
         // Child token: workers observe it, and the supervisor cancels it on the
         // first worker exit without touching the lifecycle's own token.
         let mut supervisor = Supervisor::new(cancel.child_token());
         if let Err(e) = self.start_workers(&mut supervisor, mode).await {
             supervisor.shutdown().await;
+            stop_backends(backends).await;
             return Err(e);
         }
-        supervisor.supervise().await
+        let outcome = supervisor.supervise().await;
+        // After the workers: they read and write through the backends.
+        stop_backends(backends).await;
+        outcome
     }
 
     /// Registers exactly the workers `mode` calls for, in the established order,
@@ -567,12 +616,6 @@ impl EventBrokerModule {
         if mode.delivery_active() {
             self.start_loader(sup)?;
             self.start_subscription_sweeper(sup)?;
-        }
-
-        // Wherever events are stored: an instance that holds rows is the one
-        // that has to keep them bounded, whether or not anything reads them.
-        if mode.ingest_active() || mode.delivery_active() {
-            self.start_retention(sup)?;
         }
 
         // Registered last, so the instance advertises itself only once its
@@ -672,30 +715,6 @@ impl EventBrokerModule {
             .ok_or_else(|| anyhow::anyhow!("init must run before serve()"))?
             .get::<dyn types_registry_sdk::TypesRegistryClient>()?;
 
-        let worker = crate::infra::workers::SpecificationRefreshWorker::new(
-            types_registry,
-            Arc::clone(db),
-            config.clone(),
-            Duration::from_secs(u64::from(
-                config.workers.specification_refresh_interval_secs,
-            )),
-        );
-        worker.run_once().await;
-        let token = sup.cancel().clone();
-        sup.spawn("specification-refresh", async move {
-            worker.run(token).await;
-            Ok(())
-        });
-        Ok(())
-    }
-
-    /// Registers the tick that drives each topic's backend through one retention
-    /// pass, running until the child token fires.
-    fn start_retention(&self, sup: &mut Supervisor) -> anyhow::Result<()> {
-        let config = self
-            .config
-            .get()
-            .ok_or_else(|| anyhow::anyhow!("init must run before serve()"))?;
         let spec_manager = self
             .spec_manager
             .get()
@@ -706,15 +725,33 @@ impl EventBrokerModule {
             .get()
             .ok_or_else(|| anyhow::anyhow!("init must run before serve()"))?
             .clone();
-
-        let worker = crate::infra::workers::RetentionWorker::new(
+        let worker = crate::infra::workers::SpecificationRefreshWorker::new(
+            types_registry,
+            Arc::clone(db),
+            config.clone(),
+            Duration::from_secs(u64::from(
+                config.workers.specification_refresh_interval_secs,
+            )),
+        )
+        .provisioning(
             spec_manager,
             backend_resolver,
-            config.clone(),
-            Duration::from_secs(u64::from(config.workers.retention_interval_secs)),
+            crate::domain::specification::ProvisioningLimits {
+                call_timeout: PROVISION_CALL_TIMEOUT,
+                attempt_timeout: config.provisioning.attempt_timeout,
+            },
         );
+        worker.run_once().await;
+        let unprovisioned = worker.settle_provisioning(STARTUP_PROVISIONING_WAIT).await;
+        if unprovisioned > 0 {
+            tracing::warn!(
+                module = Self::MODULE_NAME,
+                unprovisioned,
+                "starting with topics not provisioned yet; their publishes answer 503 until they are"
+            );
+        }
         let token = sup.cancel().clone();
-        sup.spawn("retention", async move {
+        sup.spawn("specification-refresh", async move {
             worker.run(token).await;
             Ok(())
         });
@@ -815,6 +852,11 @@ impl EventBrokerModule {
             .ok_or_else(|| anyhow::anyhow!("init must run before start_outbox_pipeline()"))?
             .clone();
 
+        let outbox_id = storage
+            .outbox_identity(crate::domain::outbox::INGEST_QUEUE_NAME)
+            .await
+            .map_err(|e| anyhow::anyhow!("ingest outbox identity: {e}"))?;
+        tracing::info!(module = Self::MODULE_NAME, outbox = %outbox_id, "ingest outbox identity");
         let handle = Outbox::builder(db.db())
             .queue(
                 crate::domain::outbox::INGEST_QUEUE_NAME,
@@ -824,6 +866,7 @@ impl EventBrokerModule {
                 spec_manager,
                 backend_resolver,
                 cluster_cache,
+                outbox_id,
             ))
             .start()
             .await
@@ -921,6 +964,43 @@ async fn presence_loop(
                     );
                 }
             }
+        }
+    }
+}
+
+/// How long the backends get to stop in good order, inside the gear's 30 s
+/// `stop_timeout`; past it they are told to stop at once.
+const BACKEND_STOP_GRACE: Duration = Duration::from_secs(20);
+
+/// Starts `backends` in order. One that fails stops those already started,
+/// in reverse, and fails `serve()`.
+async fn start_backends(
+    backends: &[Arc<dyn event_broker_sdk::backend::Backend>],
+) -> anyhow::Result<()> {
+    for (started, backend) in backends.iter().enumerate() {
+        if let Err(e) = backend.start().await {
+            stop_backends(&backends[..started]).await;
+            return Err(anyhow::anyhow!("could not start the storage backend: {e}"));
+        }
+    }
+    Ok(())
+}
+
+/// Stops `backends` in reverse order and waits for them: in good order for
+/// [`BACKEND_STOP_GRACE`], then at once.
+async fn stop_backends(backends: &[Arc<dyn event_broker_sdk::backend::Backend>]) {
+    let deadline = CancellationToken::new();
+    let stopping = async {
+        for backend in backends.iter().rev() {
+            backend.stop(deadline.clone()).await;
+        }
+    };
+    tokio::pin!(stopping);
+    tokio::select! {
+        () = &mut stopping => {}
+        () = tokio::time::sleep(BACKEND_STOP_GRACE) => {
+            deadline.cancel();
+            stopping.await;
         }
     }
 }

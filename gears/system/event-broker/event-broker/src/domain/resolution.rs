@@ -40,6 +40,10 @@ pub enum Source {
     Specification,
     /// Nothing stated it, so the broker's built-in value stands.
     BuiltIn,
+    /// What the topic's storage backend holds: once a topic is provisioned,
+    /// its partition count is the backend's, whatever configuration says
+    /// later (feature 0007 §2.6).
+    Backend,
 }
 
 /// One effective value and the statement behind it.
@@ -84,6 +88,14 @@ impl<T> Sourced<T> {
         Self {
             value,
             source: Source::BuiltIn,
+        }
+    }
+
+    /// What the topic's storage backend holds.
+    pub const fn held_by_backend(value: T) -> Self {
+        Self {
+            value,
+            source: Source::Backend,
         }
     }
 
@@ -152,6 +164,14 @@ impl EffectiveSettings {
     #[must_use]
     pub const fn backend(&self) -> &Sourced<BackendSettings> {
         &self.backend
+    }
+
+    /// The same settings with the partition count the topic's backend holds,
+    /// which is in force once the topic is provisioned.
+    #[must_use]
+    pub fn with_partitions_held_by_backend(mut self, partitions: i32) -> Self {
+        self.partitions = Sourced::held_by_backend(partitions);
+        self
     }
 }
 
@@ -283,6 +303,7 @@ fn retention(
         Source::TypeEntry => Sourced::configured_for_type(settings),
         Source::Specification => Sourced::declared(settings),
         Source::BuiltIn => Sourced::built_in(settings),
+        Source::Backend => Sourced::held_by_backend(settings),
     }
 }
 

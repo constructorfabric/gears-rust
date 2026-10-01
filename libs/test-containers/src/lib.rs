@@ -585,6 +585,20 @@ mod tests {
         }
     }
 
+    /// The plain `PostgreSQL` image is pinned twice too: here and in the
+    /// Python `E2E` sidecar the event-broker suite runs its `PostgreSQL`
+    /// backend lane on.
+    #[test]
+    fn e2e_sidecar_pins_the_same_postgres_image() {
+        assert_sidecar_pins(
+            &[
+                ("POSTGRES_TAG", POSTGRES_TAG),
+                ("ENV_POSTGRES_TAG", ENV_POSTGRES_TAG),
+            ],
+            "PostgreSQL majors",
+        );
+    }
+
     /// The `TimescaleDB` image is pinned twice — here and in the Python `E2E`
     /// sidecar — so the comments that point at each other are backed by a
     /// check. A skew validates plugin migrations against a different
