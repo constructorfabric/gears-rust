@@ -116,7 +116,9 @@ async fn acquire(app: &Router, amount: i64, ttl_secs: Value, key: &str) -> (Stat
 }
 
 fn token_of(body: &Value) -> LeaseToken {
-    let raw = body["token"].as_str().expect("a token");
+    let raw = body["token"]
+        .as_str()
+        .unwrap_or_else(|| panic!("an acquired lease, got {body}"));
     LeaseToken::new(uuid::Uuid::parse_str(raw).expect("uuid"))
 }
 
@@ -173,8 +175,10 @@ async fn a_bad_amount_or_ttl_is_a_four_hundred_not_a_four_twenty_two() {
 #[tokio::test]
 async fn commit_and_release_settle_the_lease_named_in_the_path() {
     let (app, storage, quota) = seeded().await;
-    let (_, first) = acquire(&app, 30, json!(60), "a1").await;
-    let (_, second) = acquire(&app, 20, json!(60), "a2").await;
+    let (status, first) = acquire(&app, 30, json!(60), "a1").await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let (status, second) = acquire(&app, 20, json!(60), "a2").await;
+    assert_eq!(status, StatusCode::OK, "{second}");
     let (committed, released) = (token_of(&first), token_of(&second));
 
     let (status, body) = post(
